@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 
-use crate::{Resolver, Result};
+use super::{Resolver, Result};
 
 /// Time source used by zero-argument EXSLT date functions during one execution.
 ///

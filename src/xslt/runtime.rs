@@ -9,24 +9,24 @@ use icu_collator::preferences::CollationCaseFirst;
 use icu_collator::{Collator, CollatorBorrowed, CollatorPreferences, options::CollatorOptions};
 use icu_locale::Locale;
 
-use crate::budget::{
+use super::budget::{
     EXECUTION_RECURSION_DEPTH_CEILING, Meter, append_metered_string, reconcile_replacement_growth,
     reserve_metered_string, reserve_retained_hash_map_slot, reserve_retained_hash_set_slot,
     reserve_retained_vec_slot, reserve_temporary_vec_slot,
 };
-use crate::compiler::{
+use super::compiler::{
     AttributeSet, AttributeValueTemplate, AvtPart, Expression, ExsltFunction, Instruction,
     InstructionSequence, NameTest, NamespaceAlias, Sort, Stylesheet, Template, Variable,
 };
-use crate::lexical::{
+use super::lexical::{
     is_ncname, is_xml_whitespace, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
 };
-use crate::serializer::{serialize, serialize_fragment};
-use crate::xpath::{
+use super::serializer::{serialize, serialize_fragment};
+use super::xpath::{
     CustomCallSession, EXSLT_COMMON_NS, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource,
     SourceNode, XPathValue, parse_xpath_number, prepare_evaluator_source, xpath_number,
 };
-use crate::{
+use super::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
     Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
 };
@@ -40,7 +40,7 @@ struct SourceParameterRemap {
 }
 
 struct PreparedParameters<'a> {
-    effective_globals: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
+    effective_globals: HashMap<ExpandedName, &'a super::compiler::GlobalVariable>,
     source_remap: SourceParameterRemap,
 }
 
@@ -188,7 +188,7 @@ impl Stylesheet {
         for identity in self.resource_identities() {
             environment
                 .resolver
-                .authorize(crate::ResourceAccess::Dependency(identity))?;
+                .authorize(super::ResourceAccess::Dependency(identity))?;
         }
         let effective_globals = effective_globals(self, &mut meter)?;
         // XSLT 1.0 section 11.4 defines externally bindable stylesheet parameters through
@@ -294,7 +294,7 @@ pub(crate) fn apply_source_whitespace_rules(
 
 fn should_strip_source_whitespace(
     document: &Document,
-    node: &crate::model::Node,
+    node: &super::model::Node,
     rules: &[(NameTest, bool, usize, usize)],
     meter: &mut Meter,
 ) -> Result<bool> {
@@ -379,7 +379,7 @@ struct Execution<'a> {
     scopes_reserved_owned_bytes: usize,
     // A global leaves this map before evaluation, so recursive access is detected without
     // replaying side effects or retrying a failed initializer.
-    pending_globals: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
+    pending_globals: HashMap<ExpandedName, &'a super::compiler::GlobalVariable>,
     initializing_globals: Vec<&'a ExpandedName>,
     initializing_globals_reserved_owned_bytes: usize,
     meter: Meter,
@@ -977,7 +977,7 @@ impl<'a> Execution<'a> {
         roots: &[NodeId],
     ) -> Result<()> {
         let (calls, reservation) =
-            crate::expression::metered_unprefixed_call_arguments(source, "key", &mut self.meter)?;
+            super::expression::metered_unprefixed_call_arguments(source, "key", &mut self.meter)?;
         let result = (|| {
             if calls
                 .iter()
@@ -1104,7 +1104,7 @@ impl<'a> Execution<'a> {
     fn append_key_values(
         &mut self,
         key_slot: usize,
-        declaration: &crate::compiler::KeyDeclaration,
+        declaration: &super::compiler::KeyDeclaration,
         node: SourceNode,
         variables: &HashMap<ExpandedName, Value>,
     ) -> Result<()> {
@@ -1143,7 +1143,7 @@ impl<'a> Execution<'a> {
 
     fn matches_pattern(
         &mut self,
-        pattern: &crate::compiler::Pattern,
+        pattern: &super::compiler::Pattern,
         node: &SourceNode,
         variables: &HashMap<ExpandedName, Value>,
     ) -> Result<bool> {
@@ -1153,7 +1153,7 @@ impl<'a> Execution<'a> {
 
     fn matches_pattern_precharged(
         &mut self,
-        pattern: &crate::compiler::Pattern,
+        pattern: &super::compiler::Pattern,
         node: &SourceNode,
         variables: &HashMap<ExpandedName, Value>,
     ) -> Result<bool> {
@@ -1171,7 +1171,7 @@ impl<'a> Execution<'a> {
         &mut self,
         parameters: &Parameters,
         source_remap: Option<&HashMap<NodeId, NodeId>>,
-        mut effective: HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>,
+        mut effective: HashMap<ExpandedName, &'a super::compiler::GlobalVariable>,
     ) -> Result<()> {
         let mut order = Vec::new();
         let mut order_reservation = 0usize;
@@ -2746,7 +2746,7 @@ impl<'a> Execution<'a> {
                     // XSLT 1.0 section 7.7 permits recovery from an invalid explicit value only by
                     // inserting its XPath string-value, before numbering tokens are considered.
                     // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                    return self.append_text(&crate::value::format_xpath_number(*value), false);
+                    return self.append_text(&super::value::format_xpath_number(*value), false);
                 }
                 let grouping_separator_value = number
                     .grouping_separator
@@ -3005,7 +3005,7 @@ impl<'a> Execution<'a> {
 
     fn evaluate(
         &mut self,
-        expression: &crate::compiler::Expression,
+        expression: &super::compiler::Expression,
         node: &SourceNode,
         position: usize,
         size: usize,
@@ -3017,7 +3017,7 @@ impl<'a> Execution<'a> {
 
     fn evaluate_after_charge(
         &mut self,
-        expression: &crate::compiler::Expression,
+        expression: &super::compiler::Expression,
         node: &SourceNode,
         position: usize,
         size: usize,
@@ -3657,7 +3657,7 @@ impl<'a> Execution<'a> {
     }
     fn select_nodes(
         &mut self,
-        expression: &crate::compiler::Expression,
+        expression: &super::compiler::Expression,
         node: &SourceNode,
         position: usize,
         size: usize,
@@ -3754,7 +3754,7 @@ impl<'a> Execution<'a> {
     }
     fn evaluate_with_params(
         &mut self,
-        parameters: &[crate::compiler::WithParam],
+        parameters: &[super::compiler::WithParam],
         node: &SourceNode,
         position: usize,
         size: usize,
@@ -4584,7 +4584,7 @@ impl<'a> Execution<'a> {
                 .result
                 .node(parent)
                 .and_then(|node| node.base_uri.as_deref());
-            Some(crate::resolver::resolve_uri_reference(
+            Some(super::resolver::resolve_uri_reference(
                 inherited,
                 &attribute.value,
             )?)
@@ -4907,7 +4907,7 @@ impl<'a> Execution<'a> {
     }
     fn number_sequence(
         &mut self,
-        instruction: &crate::compiler::NumberInstruction,
+        instruction: &super::compiler::NumberInstruction,
         node: &SourceNode,
     ) -> Result<(Vec<f64>, usize)> {
         let mut lineage = Vec::new();
@@ -5147,18 +5147,18 @@ fn terminating_message_error(mut content: String, meter: &mut Meter) -> Result<E
 fn effective_globals<'a>(
     stylesheet: &'a Stylesheet,
     meter: &mut Meter,
-) -> Result<HashMap<ExpandedName, &'a crate::compiler::GlobalVariable>> {
+) -> Result<HashMap<ExpandedName, &'a super::compiler::GlobalVariable>> {
     // The table retains control bytes and spare buckets for the complete declaration upper bound.
     let table_bytes = stylesheet
         .globals
         .len()
         .saturating_mul(std::mem::size_of::<(
             ExpandedName,
-            &crate::compiler::GlobalVariable,
+            &super::compiler::GlobalVariable,
         )>())
         .saturating_mul(2);
     meter.charge(BudgetKind::OwnedBytes, table_bytes)?;
-    let mut effective: HashMap<ExpandedName, &crate::compiler::GlobalVariable> =
+    let mut effective: HashMap<ExpandedName, &super::compiler::GlobalVariable> =
         HashMap::with_capacity(stylesheet.globals.len());
     for global in stylesheet.globals.iter() {
         if let Some(current) = effective.get_mut(&global.variable.name) {
@@ -5392,7 +5392,7 @@ fn sort_workspace_bytes(node_count: usize, sort_count: usize) -> usize {
 }
 
 fn xpath_calls_key(source: &str) -> bool {
-    crate::expression::has_unprefixed_function_call(source, "key")
+    super::expression::has_unprefixed_function_call(source, "key")
 }
 
 fn literal_key_name<'a>(
@@ -5690,7 +5690,7 @@ fn default_collation_key(value: &str, key_bytes: usize) -> String {
 }
 
 fn apply_secondary_output_property(
-    definition: &mut crate::OutputDefinition,
+    definition: &mut super::OutputDefinition,
     name: &str,
     value: String,
     meter: &mut Meter,
@@ -5716,7 +5716,7 @@ fn apply_secondary_output_property(
 }
 
 fn set_secondary_output_property(
-    definition: &mut crate::OutputDefinition,
+    definition: &mut super::OutputDefinition,
     name: &str,
     value: String,
 ) -> Result<()> {
@@ -5730,9 +5730,9 @@ fn set_secondary_output_property(
     match name {
         "method" => {
             let method = match value.as_str() {
-                "xml" => crate::OutputMethod::Xml,
-                "html" => crate::OutputMethod::Html,
-                "text" => crate::OutputMethod::Text,
+                "xml" => super::OutputMethod::Xml,
+                "html" => super::OutputMethod::Html,
+                "text" => super::OutputMethod::Text,
                 _ => {
                     return Err(Error::Dynamic(format!(
                         "unsupported secondary-output method {value:?}"
@@ -5766,7 +5766,7 @@ fn set_secondary_output_property(
 }
 
 fn secondary_output_property_owned_bytes(
-    definition: &crate::OutputDefinition,
+    definition: &super::OutputDefinition,
     name: &str,
 ) -> Result<usize> {
     match name {
@@ -5916,7 +5916,7 @@ fn xpath_value_kind(value: &XPathValue) -> &'static str {
 }
 
 fn direct_variable_reference(
-    expression: &crate::compiler::Expression,
+    expression: &super::compiler::Expression,
 ) -> Result<Option<ExpandedName>> {
     let source = trim_xml_whitespace(&expression.source);
     let Some(lexical) = source.strip_prefix('$') else {
@@ -6023,7 +6023,7 @@ fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Result<Opti
     };
     explicit.map_or_else(
         || Ok(inherited.map(str::to_owned)),
-        |attribute| crate::resolver::resolve_uri_reference(inherited, &attribute.value).map(Some),
+        |attribute| super::resolver::resolve_uri_reference(inherited, &attribute.value).map(Some),
     )
 }
 
@@ -6392,7 +6392,7 @@ fn value_string<'a>(
         Value::Boolean(true) => Ok(Cow::Borrowed("true")),
         Value::Boolean(false) => Ok(Cow::Borrowed("false")),
         Value::Number(value) => {
-            let value = crate::value::format_xpath_number(*value);
+            let value = super::value::format_xpath_number(*value);
             meter.check_additional(
                 BudgetKind::OwnedBytes,
                 concurrent_owned_bytes.saturating_add(value.len()),
@@ -6680,7 +6680,7 @@ fn format_number_into(
         // disambiguates language-specific letter tokens.
         // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
         "A" | "a" => {
-            let decimal = crate::value::format_xpath_number(rounded);
+            let decimal = super::value::format_xpath_number(rounded);
             let value = alphabetic_decimal(&decimal, format == "A");
             append_metered(output, &value, meter)
         }
@@ -6688,7 +6688,7 @@ fn format_number_into(
             let value = if rounded <= 3999.0 {
                 roman(rounded as usize, format == "I")
             } else {
-                crate::value::format_xpath_number(rounded)
+                super::value::format_xpath_number(rounded)
             };
             append_metered(output, &value, meter)
         }

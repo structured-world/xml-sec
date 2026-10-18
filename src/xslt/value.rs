@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::{Document, NodeReference};
+use super::{Document, NodeReference};
 
 /// XSLT 1.0 value space, including the distinct result-tree-fragment type.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,7 +52,7 @@ impl Value {
                     NodeReference::Attribute { owner, index } => document
                         .node(owner)
                         .and_then(|node| match &node.kind {
-                            crate::NodeKind::Element { attributes, .. } => attributes.get(index),
+                            super::NodeKind::Element { attributes, .. } => attributes.get(index),
                             _ => None,
                         })
                         .map(|attribute| attribute.value.clone())
@@ -60,7 +60,7 @@ impl Value {
                     NodeReference::Namespace { owner, index } => document
                         .node(owner)
                         .and_then(|node| match &node.kind {
-                            crate::NodeKind::Element { namespaces, .. } => namespaces.get(index),
+                            super::NodeKind::Element { namespaces, .. } => namespaces.get(index),
                             _ => None,
                         })
                         .map(|namespace| namespace.uri.clone())

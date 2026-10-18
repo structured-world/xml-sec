@@ -1,8 +1,10 @@
 use std::sync::Arc;
 
+#[cfg(feature = "embedded")]
+use crate::sxd_xpath as sxd_xpath_no_unsafe;
 use sxd_xpath_no_unsafe::{Value, context::ScopedContext, function};
 
-use crate::Clock;
+use super::Clock;
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
 pub(crate) fn register(context: &mut ScopedContext<'_, '_>, clock: Option<Arc<dyn Clock>>) {
@@ -79,7 +81,7 @@ fn xpath_string<'a>(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     value: &'a Value<'_>,
 ) -> std::result::Result<std::borrow::Cow<'a, str>, function::Error> {
-    crate::xpath::extension_string(context, value)
+    super::xpath::extension_string(context, value)
 }
 
 impl function::Function for DateFunction {
@@ -1192,7 +1194,7 @@ fn trim_float(value: f64) -> String {
     } else {
         value
     };
-    crate::value::format_xpath_number(rendered)
+    super::value::format_xpath_number(rendered)
 }
 fn argument_error<T>(message: &str) -> std::result::Result<T, function::Error> {
     Err(function::Error::Other {

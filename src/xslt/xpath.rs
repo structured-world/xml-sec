@@ -5,29 +5,34 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+#[cfg(feature = "embedded")]
+use crate::{
+    sxd_document as sxd_document_no_unsafe, sxd_xpath as sxd_xpath_no_unsafe,
+    xml_input_shared as xml_sec_xml_input,
+};
 use sxd_document_no_unsafe::dom::{Document as SxdDocument, Element as SxdElement};
 use sxd_document_no_unsafe::{Package, QName, StorageRequirements};
 #[cfg(test)]
 use sxd_xpath_no_unsafe::Context;
 use sxd_xpath_no_unsafe::{Factory, Value as SxdValue, XPath, function, nodeset};
 
-use crate::budget::{
+use super::budget::{
     Meter, ParseBudget, XINCLUDE_RECURSION_DEPTH_CEILING, reconcile_replacement_growth,
     reserve_retained_hash_map_slot, reserve_retained_hash_set_slot, reserve_retained_vec_slot,
     reserve_temporary_vec_slot, retained_hash_storage,
 };
-use crate::compiler::{
+use super::compiler::{
     DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, Pattern,
     StylesheetDocumentId, normalize_xpath_for_sxd,
 };
-use crate::expression::innermost_namespaced_call;
-use crate::lexical::{
+use super::expression::innermost_namespaced_call;
+use super::lexical::{
     ValidatedXPointerFragment, is_ncname, is_ncname_char, is_xml_whitespace, trim_xml_whitespace,
 };
-use crate::model::parser_workspace_bytes;
-use crate::resolver::decode_resource;
-use crate::runtime::{apply_source_whitespace_rules, expanded_name_owned_bytes};
-use crate::{
+use super::model::parser_workspace_bytes;
+use super::resolver::decode_resource;
+use super::runtime::{apply_source_whitespace_rules, expanded_name_owned_bytes};
+use super::{
     Attribute, BudgetKind, Clock, Document, Error, ErrorKind, ExpandedName, Node, NodeId, NodeKind,
     NodeReference, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver, ResourceIdentity,
     Result, Value,
@@ -704,6 +709,9 @@ fn deferred_sxd_value_size(value: &SxdValue<'_>) -> usize {
         SxdValue::Boolean(_) | SxdValue::Number(_) => 0,
         // Scalar payloads move out of the argument values; only their enum slots are new here.
         SxdValue::String(_) | SxdValue::ResultTreeFragment(_, _) => 0,
+        // Work-accounted text is copied into an ordinary owned string.
+        #[cfg(feature = "embedded")]
+        SxdValue::AccountedString(text) => text.len(),
         SxdValue::Nodeset(nodes) => nodes.size().saturating_mul(std::mem::size_of::<NodePath>()),
     })
 }
@@ -716,6 +724,8 @@ fn defer_sxd_value(
         SxdValue::Boolean(value) => DeferredXPathValue::Boolean(value),
         SxdValue::Number(value) => DeferredXPathValue::Number(value.to_bits()),
         SxdValue::String(value) => DeferredXPathValue::String(value),
+        #[cfg(feature = "embedded")]
+        SxdValue::AccountedString(text) => DeferredXPathValue::String(text.as_str().to_owned()),
         SxdValue::ResultTreeFragment(identity, value) => {
             DeferredXPathValue::ResultTreeFragment { identity, value }
         }
@@ -2196,7 +2206,7 @@ impl Evaluator {
             .resolve(document.root().into(), context_path)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
         let uses_current =
-            crate::expression::has_unprefixed_function_call(&expression.source, "current");
+            super::expression::has_unprefixed_function_call(&expression.source, "current");
         let context_workspace = xpath_context_workspace_upper_bound(
             expression,
             custom_calls
@@ -2825,7 +2835,7 @@ impl Evaluator {
             } else {
                 format!("//{branch}")
             };
-            let uses_current = crate::expression::has_unprefixed_function_call(branch, "current");
+            let uses_current = super::expression::has_unprefixed_function_call(branch, "current");
             let cache_key = if !branch.contains('$') && !uses_current {
                 Some(clone_pattern_cache_key(
                     &expression,
@@ -2944,7 +2954,7 @@ impl Evaluator {
         if let Some(path) = simple_absolute_element_pattern_path(pattern) {
             let mut current = Some(*id);
             for segment in path.rsplit('/') {
-                let segment = segment.trim_matches(crate::lexical::is_xml_whitespace);
+                let segment = segment.trim_matches(super::lexical::is_xml_whitespace);
                 let Some(current_id) = current else {
                     return Ok(Some(false));
                 };
@@ -2978,7 +2988,7 @@ impl Evaluator {
             else {
                 return Ok(Some(false));
             };
-            let lexical = lexical.trim_matches(crate::lexical::is_xml_whitespace);
+            let lexical = lexical.trim_matches(super::lexical::is_xml_whitespace);
             return Ok(Some(
                 (lexical == "*" || element_pattern_name_matches(lexical, name, namespaces)?)
                     && attributes.iter().any(|attribute| {
@@ -3017,7 +3027,7 @@ impl Evaluator {
         namespaces: &[(String, String)],
         node: &SourceNode,
     ) -> Result<Option<bool>> {
-        let Some(lexical) = crate::lexical::strip_xpath_attribute_axis(pattern) else {
+        let Some(lexical) = super::lexical::strip_xpath_attribute_axis(pattern) else {
             return Ok(None);
         };
         if lexical.contains(['/', '[', '(', ')']) {
@@ -3569,7 +3579,7 @@ fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
     let source = expression.source.as_str();
     let source_bytes = source.len();
     let normalizes =
-        source.chars().any(crate::lexical::is_xml_whitespace) || source.as_bytes().contains(&b'*');
+        source.chars().any(super::lexical::is_xml_whitespace) || source.as_bytes().contains(&b'*');
     let normalized_bytes = if normalizes {
         // One wildcard can expand from one byte to `child::*` (eight bytes). Account for the
         // allocator's geometric String growth while the normalized buffer remains live.
@@ -3775,7 +3785,7 @@ fn simple_absolute_element_pattern_path(pattern: &str) -> Option<&str> {
     }
     remainder
         .split('/')
-        .map(|segment| segment.trim_matches(crate::lexical::is_xml_whitespace))
+        .map(|segment| segment.trim_matches(super::lexical::is_xml_whitespace))
         .all(|segment| {
             !segment.is_empty()
                 && !segment.contains(['[', ']', '(', ')', '|', '@', '*'])
@@ -4037,7 +4047,7 @@ impl XPathValue {
                 // smallest subnormal is the longest). Reserve that bound before formatting.
                 const MAX_XPATH_F64_BYTES: usize = 327;
                 meter.charge(BudgetKind::OwnedBytes, MAX_XPATH_F64_BYTES)?;
-                let value = crate::value::format_xpath_number(value);
+                let value = super::value::format_xpath_number(value);
                 let retained =
                     reconcile_owned_string_capacity(meter, MAX_XPATH_F64_BYTES, value.capacity())?;
                 Ok((value, retained))
@@ -5107,14 +5117,14 @@ fn resolve_xinclude(
         accept_language: attribute("accept-language"),
     };
     resolver
-        .authorize(crate::ResourceAccess::Request(request))
+        .authorize(super::ResourceAccess::Request(request))
         .map_err(XIncludeFailure::Fatal)?;
     let resource = resolver.resolve(request).map_err(|error| match error {
         Error::ResourceNotFound { .. } | Error::Resolver { .. } => XIncludeFailure::Resource(error),
         error => XIncludeFailure::Fatal(error),
     })?;
     resolver
-        .authorize(crate::ResourceAccess::Retained {
+        .authorize(super::ResourceAccess::Retained {
             request,
             identity: &resource.identity,
         })
@@ -5155,7 +5165,7 @@ fn resolve_xinclude(
         if let Some(character) = value
             .value
             .chars()
-            .find(|character| !crate::lexical::is_xml10_character(*character))
+            .find(|character| !super::lexical::is_xml10_character(*character))
         {
             return Err(XIncludeFailure::Fatal(Error::Xml(format!(
                 "XInclude text resource contains forbidden XML character U+{:04X}",
@@ -5878,6 +5888,12 @@ impl NodeMaps {
             SxdValue::Boolean(value) => XPathValue::Boolean(value),
             SxdValue::Number(value) => XPathValue::Number(value),
             SxdValue::String(value) => XPathValue::String(value),
+            #[cfg(feature = "embedded")]
+            SxdValue::AccountedString(text) => {
+                let mut value = String::new();
+                super::budget::append_metered_string(&mut value, text.as_str(), meter)?;
+                XPathValue::String(value)
+            }
             SxdValue::ResultTreeFragment(_, _) => {
                 return Err(Error::Dynamic(
                     "result-tree fragment escaped without its owning document".into(),
@@ -6038,7 +6054,7 @@ fn projected_sibling_source(
     }
 }
 
-fn xpath_namespace_is_visible(namespace: &crate::Namespace) -> bool {
+fn xpath_namespace_is_visible(namespace: &super::Namespace) -> bool {
     !namespace.uri.is_empty()
 }
 
@@ -6159,7 +6175,7 @@ fn node_base_uri_at<'a>(
 
 fn element_pattern_name_matches(
     lexical: &str,
-    name: &crate::ExpandedName,
+    name: &super::ExpandedName,
     namespaces: &[(String, String)],
 ) -> Result<bool> {
     if let Some((_, local)) = lexical.split_once(':') {
@@ -6381,9 +6397,9 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
                 .saturating_add(value.len())
                 .saturating_add(2usize.saturating_mul(RESULT_PREFIX.len()))
                 .saturating_add(2usize.saturating_mul(EXSLT_COMMON_NS.len()))
-                .saturating_add(std::mem::size_of::<Vec<crate::Namespace>>())
+                .saturating_add(std::mem::size_of::<Vec<super::Namespace>>())
                 .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>()))
-                .saturating_add(std::mem::size_of::<crate::Namespace>()),
+                .saturating_add(std::mem::size_of::<super::Namespace>()),
         )?;
         document.reserve_metered_push_containers(document.root(), meter)?;
         let element = document.push(
@@ -6392,7 +6408,7 @@ fn dynamic_map_document(values: &[(&str, String)], meter: &mut Meter) -> Result<
                 name: ExpandedName::new(Some(EXSLT_COMMON_NS), *local),
                 prefix: Some(RESULT_PREFIX.into()),
                 attributes: Vec::new(),
-                namespaces: Arc::new(vec![crate::Namespace {
+                namespaces: Arc::new(vec![super::Namespace {
                     prefix: Some(RESULT_PREFIX.into()),
                     uri: EXSLT_COMMON_NS.into(),
                 }]),
@@ -7019,7 +7035,7 @@ impl function::Function for IdFunction {
             // ASCII whitespace class: https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
             context.charge_work(value.len())?;
             for token in value
-                .split(crate::lexical::is_xml_whitespace)
+                .split(super::lexical::is_xml_whitespace)
                 .filter(|token| !token.is_empty())
             {
                 context.charge_work(token.len())?;
@@ -7267,8 +7283,8 @@ fn authorize_document_request<R: Resolver + ?Sized>(
         .map_or(request.href.as_str(), |(uri, _)| uri);
     let request = ResolveRequest::new(uri, request.base_uri.as_deref(), ResolvePurpose::Document);
     resolver.authorize(match identity {
-        Some(identity) => crate::ResourceAccess::Retained { request, identity },
-        None => crate::ResourceAccess::Request(request),
+        Some(identity) => super::ResourceAccess::Retained { request, identity },
+        None => super::ResourceAccess::Request(request),
     })
 }
 
@@ -7297,7 +7313,7 @@ fn register_exslt_functions(
             context.set_function(($namespace, $name), $function);
         }};
     }
-    crate::exslt_date::register(context, clock);
+    super::exslt_date::register(context, clock);
     register!(EXSLT_MATH_NS, "max", ExsltMathFunction::Max);
     register!(EXSLT_MATH_NS, "min", ExsltMathFunction::Min);
     register!(EXSLT_MATH_NS, "highest", ExsltMathFunction::Highest);
@@ -8337,11 +8353,11 @@ impl function::Function for SystemProperty {
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         let name = one_qname_argument(context, args, &self.namespaces, "system-property")?;
-        if name.namespace.as_deref() == Some(crate::compiler::XSLT_NS) && name.local == "version" {
+        if name.namespace.as_deref() == Some(super::compiler::XSLT_NS) && name.local == "version" {
             // XSLT 1.0 section 12.4 defines xsl:version as the number 1.0.
             return Ok(SxdValue::Number(1.0));
         }
-        let value = if name.namespace.as_deref() == Some(crate::compiler::XSLT_NS) {
+        let value = if name.namespace.as_deref() == Some(super::compiler::XSLT_NS) {
             match name.local.as_str() {
                 "vendor" => "structured-world xml-sec-xslt",
                 "vendor-url" => "https://github.com/structured-world/xml-sec",
@@ -8364,7 +8380,7 @@ impl function::Function for ElementAvailable {
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
         let name = one_qname_argument(context, args, &self.namespaces, "element-available")?;
-        let available = (name.namespace.as_deref() == Some(crate::compiler::XSLT_NS)
+        let available = (name.namespace.as_deref() == Some(super::compiler::XSLT_NS)
             && matches!(
                 name.local.as_str(),
                 "apply-imports"
@@ -8389,7 +8405,7 @@ impl function::Function for ElementAvailable {
                     | "value-of"
                     | "variable"
             ))
-            || (name.namespace.as_deref() == Some(crate::compiler::EXSLT_FUNCTIONS_NS)
+            || (name.namespace.as_deref() == Some(super::compiler::EXSLT_FUNCTIONS_NS)
                 && name.local == "result")
             || matches!(
                 (name.namespace.as_deref(), name.local.as_str()),
@@ -8634,8 +8650,8 @@ fn is_builtin_extension_function(name: &ExpandedName) -> bool {
                 "md5" | "sha1" | "rc4_encrypt" | "rc4_decrypt"
             )
         }
-        Some(crate::exslt_date::NAMESPACE) => {
-            crate::exslt_date::function_names().any(|candidate| candidate == name.local)
+        Some(super::exslt_date::NAMESPACE) => {
+            super::exslt_date::function_names().any(|candidate| candidate == name.local)
         }
         Some(SAXON_NS) => matches!(
             name.local.as_str(),

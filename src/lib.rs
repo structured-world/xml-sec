@@ -87,10 +87,16 @@ mod sxd_document;
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[path = "sxd_xpath/lib.rs"]
 mod sxd_xpath;
+// The same sources build the standalone XSLT workspace crate and its conformance suite.
 #[path = "xml_input/shared.rs"]
 // The internal xml-input crate also compiles this source for XSLT's wider API.
 #[allow(dead_code)]
 mod xml_input_shared;
+#[cfg(feature = "xslt")]
+#[doc(hidden)]
+#[allow(dead_code, unused_imports, missing_docs)]
+#[path = "xslt/lib.rs"]
+mod xslt;
 /// Bounded XML input decoding and lexical helpers.
 ///
 /// [`decode_xml_bounded`] accepts trusted encoding metadata and a caller-supplied

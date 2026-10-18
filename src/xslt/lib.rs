@@ -13,10 +13,11 @@
 //! storage are rejected before their corresponding work or allocations.
 //!
 //! ```
+//! # #[cfg(not(feature = "embedded"))]
+//! # {
 //! use std::sync::Arc;
 //! use xml_sec_xslt::{CompileBudget, Compiler, NoResolver};
 //!
-//! # fn main() -> Result<(), xml_sec_xslt::Error> {
 //! let stylesheet = Compiler::new(
 //!     Arc::new(NoResolver),
 //!     CompileBudget::new(64 * 1024, 0, 128, 256 * 1024),
@@ -26,9 +27,8 @@
 //!          <xsl:template match="/"><result/></xsl:template>
 //!        </xsl:stylesheet>"#,
 //!     None,
-//! )?;
+//! ).expect("stylesheet compiles");
 //! assert_eq!(stylesheet.resource_identities(), []);
-//! # Ok(())
 //! # }
 //! ```
 

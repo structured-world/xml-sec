@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use super::{Error, Result};
 
 pub(crate) fn is_ncname(value: &str) -> bool {
     let mut chars = value.chars();

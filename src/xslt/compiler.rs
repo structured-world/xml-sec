@@ -4,14 +4,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use crate::budget::{COMPILE_RECURSION_DEPTH_CEILING, ensure};
-use crate::lexical::{
+#[cfg(feature = "embedded")]
+use crate::{sxd_xpath as sxd_xpath_no_unsafe, xml_input_shared as xml_sec_xml_input};
+
+use super::budget::{COMPILE_RECURSION_DEPTH_CEILING, ensure};
+use super::lexical::{
     ValidatedXPointerFragment, is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace,
     strip_xpath_attribute_axis, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
 };
-use crate::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
-use crate::resolver::decode_resource;
-use crate::{
+use super::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
+use super::resolver::decode_resource;
+use super::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, NodeKind,
     OutputDefinition, OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
     Result,
@@ -455,8 +458,8 @@ impl<R: Resolver> Compiler<R> {
             purpose,
         };
         if let Some(resource) = state.resolved_requests.get(&request) {
-            self.resolver.authorize(crate::ResourceAccess::Retained {
-                request: crate::ResolveRequest::new(
+            self.resolver.authorize(super::ResourceAccess::Retained {
+                request: super::ResolveRequest::new(
                     resource_href,
                     effective_base.as_deref(),
                     purpose,
@@ -474,12 +477,12 @@ impl<R: Resolver> Compiler<R> {
             state.imported_modules,
         )?;
         self.resolver
-            .authorize(crate::ResourceAccess::Request(crate::ResolveRequest::new(
+            .authorize(super::ResourceAccess::Request(super::ResolveRequest::new(
                 resource_href,
                 effective_base.as_deref(),
                 purpose,
             )))?;
-        let resolved = match self.resolver.resolve(crate::ResolveRequest::new(
+        let resolved = match self.resolver.resolve(super::ResolveRequest::new(
             resource_href,
             effective_base.as_deref(),
             purpose,
@@ -490,8 +493,8 @@ impl<R: Resolver> Compiler<R> {
                 return Err(error);
             }
         };
-        self.resolver.authorize(crate::ResourceAccess::Retained {
-            request: crate::ResolveRequest::new(resource_href, effective_base.as_deref(), purpose),
+        self.resolver.authorize(super::ResourceAccess::Retained {
+            request: super::ResolveRequest::new(resource_href, effective_base.as_deref(), purpose),
             identity: &resolved.identity,
         })?;
         let (resource, document_id, new_identity) =
@@ -746,7 +749,7 @@ impl<R: Resolver> Compiler<R> {
                 let explicit_priority = node
                     .attribute("priority")
                     .map(|value| {
-                        let priority = crate::xpath::xpath_number(value);
+                        let priority = super::xpath::xpath_number(value);
                         priority.is_finite().then_some(priority).ok_or_else(|| {
                             Error::Static("template priority must be a finite XPath number".into())
                         })
@@ -1429,7 +1432,7 @@ fn visit_referenced_variables<'a>(
         };
         let mut byte_end = byte_start;
         while let Some(&(offset, character)) = characters.peek() {
-            if !crate::lexical::is_ncname_char(character) && character != ':' {
+            if !super::lexical::is_ncname_char(character) && character != ':' {
                 break;
             }
             byte_end = offset + character.len_utf8();
@@ -1653,7 +1656,7 @@ fn validate_xpath_prefixes(
 pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
     // XPath 1.0 §3.7 defines whitespace as only XML S characters:
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
-    if !source.chars().any(crate::lexical::is_xml_whitespace) && !source.contains('*') {
+    if !source.chars().any(super::lexical::is_xml_whitespace) && !source.contains('*') {
         return Cow::Borrowed(source);
     }
     let mut length = 0usize;
@@ -2671,9 +2674,9 @@ fn estimate_compiled_owned_bytes_for_nodes<'nodes, 'input: 'nodes>(
         // Compilation retains both a normalized semantic node and, conservatively, one IR
         // instruction for each frontend node. Child IDs, attributes, and namespaces live in
         // separately allocated containers and therefore need explicit structural accounting.
-        let structural_bytes = std::mem::size_of::<crate::Node>()
+        let structural_bytes = std::mem::size_of::<super::Node>()
             .saturating_add(std::mem::size_of::<Instruction>())
-            .saturating_add(std::mem::size_of::<crate::NodeId>());
+            .saturating_add(std::mem::size_of::<super::NodeId>());
         let node_bytes = if node.is_element() {
             let tag = node.tag_name();
             let name_bytes = tag
@@ -2681,13 +2684,13 @@ fn estimate_compiled_owned_bytes_for_nodes<'nodes, 'input: 'nodes>(
                 .map_or(0, str::len)
                 .saturating_add(tag.name().len());
             let attribute_bytes = node.attributes().fold(0usize, |sum, attribute| {
-                sum.saturating_add(std::mem::size_of::<crate::Attribute>())
+                sum.saturating_add(std::mem::size_of::<super::Attribute>())
                     .saturating_add(attribute.namespace().map_or(0, str::len))
                     .saturating_add(attribute.name().len())
                     .saturating_add(attribute.value().len())
             });
             let namespace_bytes = node.namespaces().fold(0usize, |sum, namespace| {
-                sum.saturating_add(std::mem::size_of::<crate::Namespace>())
+                sum.saturating_add(std::mem::size_of::<super::Namespace>())
                     .saturating_add(namespace.name().map_or(0, str::len))
                     .saturating_add(namespace.uri().len())
             });
@@ -3449,7 +3452,7 @@ fn stylesheet_module_root<'nodes, 'input>(
     Ok(selected)
 }
 
-fn semantic_element_ordinal(document: &Document, owner: crate::NodeId) -> Result<usize> {
+fn semantic_element_ordinal(document: &Document, owner: super::NodeId) -> Result<usize> {
     document
         .nodes()
         .filter(|(_, node)| matches!(node.kind, NodeKind::Element { .. }))
@@ -3474,7 +3477,7 @@ fn stylesheet_version_is_forward_compatible(version: &str) -> Result<bool> {
 fn parse_stylesheet_version(version: &str) -> Result<f64> {
     // XSLT 1.0 sections 2.2 and 2.3 define version as XPath's Number production;
     // host float syntax is wider: https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
-    crate::xpath::parse_xpath_number_token(version)
+    super::xpath::parse_xpath_number_token(version)
         .filter(|value| value.is_finite())
         .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))
 }
@@ -3491,7 +3494,7 @@ fn effective_base_uri(
     ancestors.reverse();
     for ancestor in ancestors {
         if let Some(reference) = ancestor.attribute((XML_NS, "base")) {
-            base = Some(crate::resolver::resolve_uri_reference(
+            base = Some(super::resolver::resolve_uri_reference(
                 base.as_deref(),
                 reference,
             )?);
@@ -4798,7 +4801,7 @@ fn validate_key_dependency_expression(
             "xsl:key {attribute} must not contain a variable reference"
         )));
     }
-    if crate::expression::has_unprefixed_function_call(source, "key") {
+    if super::expression::has_unprefixed_function_call(source, "key") {
         return Err(workspace.static_error(format_args!("xsl:key {attribute} must not call key()")));
     }
     Ok(())

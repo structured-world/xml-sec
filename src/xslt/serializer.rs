@@ -3,8 +3,11 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::ops::Deref;
 
-use crate::budget::Meter;
-use crate::{BudgetKind, Document, Error, NodeId, NodeKind, Result};
+#[cfg(feature = "embedded")]
+use crate::xml_input_shared as xml_sec_xml_input;
+
+use super::budget::Meter;
+use super::{BudgetKind, Document, Error, NodeId, NodeKind, Result};
 
 /// XSLT output method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,7 +30,7 @@ pub struct OutputDefinition {
     pub doctype_system: Option<String>,
     pub indent: bool,
     pub media_type: Option<String>,
-    pub cdata_section_elements: HashSet<crate::ExpandedName>,
+    pub cdata_section_elements: HashSet<super::ExpandedName>,
     pub(crate) method_explicit: bool,
     pub(crate) encoding_explicit: bool,
     pub(crate) indent_explicit: bool,
@@ -64,7 +67,7 @@ impl OutputDefinition {
             .saturating_add(self.doctype_public.as_ref().map_or(0, String::len))
             .saturating_add(self.doctype_system.as_ref().map_or(0, String::len))
             .saturating_add(self.media_type.as_ref().map_or(0, String::len))
-            .saturating_add(crate::budget::retained_hash_storage::<crate::ExpandedName>(
+            .saturating_add(super::budget::retained_hash_storage::<super::ExpandedName>(
                 self.cdata_section_elements.capacity(),
             ))
             .saturating_add(
@@ -865,7 +868,7 @@ impl<'document> RenderWorkspace<'document> {
     }
 
     fn push(&mut self, task: RenderTask, meter: &mut Meter) -> Result<()> {
-        crate::budget::reserve_temporary_vec_slot(
+        super::budget::reserve_temporary_vec_slot(
             &mut self.tasks,
             meter,
             &mut self.reserved_owned_bytes,
@@ -880,13 +883,13 @@ impl<'document> RenderWorkspace<'document> {
         uri: &'document str,
         meter: &mut Meter,
     ) -> Result<()> {
-        crate::budget::reserve_temporary_vec_slot(
+        super::budget::reserve_temporary_vec_slot(
             &mut self.namespace_rollbacks,
             meter,
             &mut self.reserved_owned_bytes,
         )?;
         if !self.active_namespaces.contains_key(&prefix) {
-            crate::budget::reserve_retained_hash_map_slot(
+            super::budget::reserve_retained_hash_map_slot(
                 &mut self.active_namespaces,
                 meter,
                 &mut self.namespace_index_bytes,
@@ -1709,7 +1712,7 @@ fn escape_html_uri_attribute(
     escape_html_attribute(&value[plain_start..], encoding, output);
 }
 
-fn is_replaceable_legacy_content_type_meta(node: &crate::Node) -> bool {
+fn is_replaceable_legacy_content_type_meta(node: &super::Node) -> bool {
     let NodeKind::Element {
         name, attributes, ..
     } = &node.kind
@@ -1967,7 +1970,7 @@ fn infer_html_output(document: &Document) -> bool {
     for child in &root.children {
         match document.node(*child).map(|node| &node.kind) {
             Some(NodeKind::Text { value, .. })
-                if !value.chars().all(crate::lexical::is_xml_whitespace) =>
+                if !value.chars().all(super::lexical::is_xml_whitespace) =>
             {
                 return false;
             }
@@ -1992,7 +1995,7 @@ fn validate_document_output_shape(document: &Document) -> Result<()> {
         match document.node(*child).map(|node| &node.kind) {
             Some(NodeKind::Element { .. }) if !has_element => has_element = true,
             Some(NodeKind::Comment(_) | NodeKind::ProcessingInstruction { .. }) => {},
-            Some(NodeKind::Text { value, .. }) if value.chars().all(crate::lexical::is_xml_whitespace) => {},
+            Some(NodeKind::Text { value, .. }) if value.chars().all(super::lexical::is_xml_whitespace) => {},
             _ => return Err(Error::Serialization("standalone/DOCTYPE output requires one document element and no top-level character data".into())),
         }
     }
@@ -2016,7 +2019,7 @@ fn validate_xml_character(character: char, version: &str) -> Result<()> {
     let valid = if version == "1.1" {
         matches!(code, 0x1..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF)
     } else {
-        crate::lexical::is_xml10_character(character)
+        super::lexical::is_xml10_character(character)
     };
     if !valid {
         // XML 1.0 section 4.1 requires a character reference to denote a Char too. Validate

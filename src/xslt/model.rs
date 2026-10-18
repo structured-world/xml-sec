@@ -1,14 +1,16 @@
+#[cfg(feature = "embedded")]
+use crate::xml_input_shared as xml_sec_xml_input;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
-use crate::budget::{
+use super::budget::{
     ENTITY_EXPANSION_BYTE_CEILING, ENTITY_EXPANSION_DEPTH_CEILING, Meter, append_metered_string,
     ensure, reserve_temporary_vec_slot,
 };
-use crate::{BudgetKind, Error, ParseBudget, Result};
+use super::{BudgetKind, Error, ParseBudget, Result};
 
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
@@ -319,7 +321,7 @@ impl Document {
     /// Use [`Self::parse_bytes_with_budget`] for untrusted input.
     pub fn parse_bytes(bytes: &[u8], base_uri: Option<&str>) -> Result<Self> {
         let xml =
-            xml_sec_xml_input::decode_xml(bytes, None).map_err(crate::error::decoded_xml_error)?;
+            xml_sec_xml_input::decode_xml(bytes, None).map_err(super::error::decoded_xml_error)?;
         Self::parse_iterative(&xml, base_uri)
     }
 
@@ -519,10 +521,10 @@ impl Document {
                 .ok_or_else(|| Error::Xml("parsed node has no projected parent".into()))?;
             let kind = if source.is_element() {
                 let prefix = lexical_prefix(xml, source.range().start, source.tag_name().name());
-                if !crate::lexical::is_ncname(source.tag_name().name())
+                if !super::lexical::is_ncname(source.tag_name().name())
                     || prefix
                         .as_deref()
-                        .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                        .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
                 {
                     return Err(Error::Xml("invalid element QName".into()));
                 }
@@ -530,10 +532,10 @@ impl Document {
                     .attributes()
                     .map(|attribute| {
                         let prefix = attribute_prefix(xml, source, attribute);
-                        if !crate::lexical::is_ncname(attribute.name())
+                        if !super::lexical::is_ncname(attribute.name())
                             || prefix
                                 .as_deref()
-                                .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                                .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
                         {
                             return Err(Error::Xml("invalid attribute QName".into()));
                         }
@@ -549,7 +551,7 @@ impl Document {
                 for namespace in source.namespaces() {
                     if namespace
                         .name()
-                        .is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+                        .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
                     {
                         return Err(Error::Xml("invalid namespace prefix".into()));
                     }
@@ -603,7 +605,7 @@ impl Document {
                 .then(|| source.attribute((XML_NS, "base")))
                 .flatten()
             {
-                Some(crate::resolver::resolve_uri_reference(
+                Some(super::resolver::resolve_uri_reference(
                     inherited_base.as_deref(),
                     reference,
                 )?)
@@ -866,7 +868,7 @@ impl Document {
             return Err(Error::Xml("document element is missing".into()));
         }
         for (name, system_identifier) in declarations.unparsed {
-            let uri = crate::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
+            let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
             document.register_unparsed_entity(name, uri)?;
         }
         document.register_xml_ids()?;
@@ -1195,7 +1197,7 @@ impl Document {
         reference: &str,
     ) -> Result<Vec<(NodeId, Option<String>)>> {
         let inherited = self.node(owner).and_then(|node| node.base_uri.as_deref());
-        let owner_base = Some(crate::resolver::resolve_uri_reference(
+        let owner_base = Some(super::resolver::resolve_uri_reference(
             inherited, reference,
         )?);
         let mut updates = vec![(owner, owner_base)];
@@ -1208,7 +1210,7 @@ impl Document {
                     self.nodes[child.0].xml_base_reference().map_or_else(
                         || Ok(child_base.map(str::to_owned)),
                         |reference| {
-                            crate::resolver::resolve_uri_reference(child_base, reference).map(Some)
+                            super::resolver::resolve_uri_reference(child_base, reference).map(Some)
                         },
                     )?
                 };
@@ -1818,7 +1820,7 @@ pub(crate) fn normalized_xml_id(value: &str) -> Result<Cow<'_, str>> {
     let normalized = collapse_xml_whitespace(value);
     // xml:id 1.0 section 4 requires validation after whitespace normalization.
     // https://www.w3.org/TR/xml-id/#processing
-    if !crate::lexical::is_ncname(&normalized) {
+    if !super::lexical::is_ncname(&normalized) {
         return Err(Error::Xml(format!(
             "xml:id value `{normalized}` is not a valid NCName"
         )));
@@ -2138,7 +2140,7 @@ fn push_stream_element(
                 &mut meter.namespace_scope_bytes,
             )?;
         } else if let Some(prefix) = name.strip_prefix("xmlns:") {
-            if !crate::lexical::is_ncname(prefix) {
+            if !super::lexical::is_ncname(prefix) {
                 return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
             }
             validate_namespace_binding(Some(prefix), &value)?;
@@ -2252,7 +2254,7 @@ fn push_stream_element(
     let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
         attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
     }) {
-        Some(crate::resolver::resolve_uri_reference(
+        Some(super::resolver::resolve_uri_reference(
             inherited_base.as_deref(),
             &attribute.value,
         )?)
@@ -2375,7 +2377,7 @@ fn xml_line_starts(xml: &str) -> Vec<usize> {
 
 fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
     let mut parts = value
-        .split(crate::lexical::is_xml_whitespace)
+        .split(super::lexical::is_xml_whitespace)
         .filter(|part| !part.is_empty());
     let Some(first) = parts.next() else {
         return Cow::Owned(String::new());
@@ -2430,8 +2432,8 @@ fn split_lexical_name(name: &str) -> Result<(Option<String>, String)> {
     let (prefix, local) = name
         .split_once(':')
         .map_or((None, name), |(prefix, local)| (Some(prefix), local));
-    if !crate::lexical::is_ncname(local)
-        || prefix.is_some_and(|prefix| !crate::lexical::is_ncname(prefix))
+    if !super::lexical::is_ncname(local)
+        || prefix.is_some_and(|prefix| !super::lexical::is_ncname(prefix))
         || local.contains(':')
     {
         return Err(Error::Xml(format!("invalid XML QName {name}")));
@@ -2841,7 +2843,7 @@ fn collect_internal_entity_declarations(
         if subset[cursor..]
             .chars()
             .next()
-            .is_some_and(crate::lexical::is_xml_whitespace)
+            .is_some_and(super::lexical::is_xml_whitespace)
         {
             skip_xml_whitespace(subset, &mut cursor);
             continue;
@@ -3062,7 +3064,7 @@ fn dtd_keyword_at(subset: &str, cursor: usize, keyword: &str) -> bool {
             .chars()
             .next()
             .is_none_or(|character| {
-                crate::lexical::is_xml_whitespace(character) || character == '>'
+                super::lexical::is_xml_whitespace(character) || character == '>'
             })
 }
 
@@ -3329,7 +3331,7 @@ fn parse_dtd_attribute_type(subset: &str, cursor: &mut usize) -> Result<Internal
         && subset[*cursor + "NOTATION".len()..]
             .chars()
             .next()
-            .is_some_and(crate::lexical::is_xml_whitespace)
+            .is_some_and(super::lexical::is_xml_whitespace)
     {
         *cursor += "NOTATION".len();
         require_dtd_whitespace(subset, cursor, "after NOTATION")?;
@@ -3401,7 +3403,7 @@ fn parse_dtd_enumeration(
 fn parse_dtd_nmtoken(subset: &str, cursor: &mut usize) -> Result<()> {
     let start = *cursor;
     while let Some(character) = subset[*cursor..].chars().next()
-        && (character == ':' || crate::lexical::is_ncname_char(character))
+        && (character == ':' || super::lexical::is_ncname_char(character))
     {
         *cursor += character.len_utf8();
     }
@@ -3454,7 +3456,7 @@ fn validate_attribute_value_references(value: &str) -> Result<()> {
         let valid = if let Some(reference) = reference.strip_prefix('#') {
             valid_xml_character_reference(reference)
         } else {
-            crate::lexical::is_xml_name(reference)
+            super::lexical::is_xml_name(reference)
         };
         if !valid {
             return Err(Error::Xml(
@@ -3535,12 +3537,12 @@ fn parse_dtd_system_literal<'a>(
 fn parse_dtd_name<'a>(subset: &'a str, cursor: &mut usize, context: &str) -> Result<&'a str> {
     let start = *cursor;
     while let Some(character) = subset[*cursor..].chars().next()
-        && (character == ':' || crate::lexical::is_ncname_char(character))
+        && (character == ':' || super::lexical::is_ncname_char(character))
     {
         *cursor += character.len_utf8();
     }
     let name = &subset[start..*cursor];
-    if crate::lexical::is_xml_name(name) {
+    if super::lexical::is_xml_name(name) {
         Ok(name)
     } else {
         Err(Error::Xml(format!("{context} has an invalid XML Name")))
@@ -3603,7 +3605,7 @@ fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()>
             .chars()
             .next()
             .expect("cursor is before the end of the entity value");
-        if !crate::lexical::is_xml10_character(character) {
+        if !super::lexical::is_xml10_character(character) {
             return Err(Error::Xml(format!(
                 "{declaration_kind} entity declaration `{name}` has an invalid EntityValue"
             )));
@@ -3619,11 +3621,11 @@ fn validate_entity_value(name: &str, value: &str, parameter: bool) -> Result<()>
                 })?;
             let reference = &value[cursor + 1..end];
             let valid = if character == '%' {
-                crate::lexical::is_xml_name(reference)
+                super::lexical::is_xml_name(reference)
             } else if let Some(reference) = reference.strip_prefix('#') {
                 valid_xml_character_reference(reference)
             } else {
-                crate::lexical::is_xml_name(reference)
+                super::lexical::is_xml_name(reference)
             };
             if !valid {
                 return Err(Error::Xml(format!(
@@ -3745,7 +3747,7 @@ fn expand_parameter_entity_references_into<'entities>(
             if after_percent
                 .chars()
                 .next()
-                .is_some_and(crate::lexical::is_xml_whitespace)
+                .is_some_and(super::lexical::is_xml_whitespace)
             {
                 // In PEDecl, `%` followed by XML S marks a parameter-entity declaration rather
                 // than a PEReference. XML 1.0 production [72]: https://www.w3.org/TR/xml/#NT-PEDecl
@@ -3762,7 +3764,7 @@ fn expand_parameter_entity_references_into<'entities>(
                 .position(|byte| *byte == b';')
                 .ok_or_else(|| Error::Xml("unterminated parameter entity reference".into()))?;
             let name = &after_percent[..end];
-            if !crate::lexical::is_xml_name(name) {
+            if !super::lexical::is_xml_name(name) {
                 return Err(Error::Xml("invalid parameter entity reference name".into()));
             }
             if let Some((entity_name, replacement)) = context.entities.get_key_value(name) {
@@ -3946,7 +3948,7 @@ fn scan_doctype_end(doctype: &str) -> Result<(usize, Option<(usize, usize)>)> {
 
 fn skip_xml_whitespace(value: &str, cursor: &mut usize) {
     while let Some(character) = value[*cursor..].chars().next()
-        && crate::lexical::is_xml_whitespace(character)
+        && super::lexical::is_xml_whitespace(character)
     {
         *cursor += character.len_utf8();
     }
@@ -4289,13 +4291,13 @@ impl EntityExpansionMeter {
         // XML 1.0 section 4.4.2 defines recursive inclusion without a fixed depth ceiling. The
         // caller's recursion budget governs it; the internal clamp only protects native frames.
         // https://www.w3.org/TR/xml/#included
-        crate::budget::ensure(crate::BudgetKind::RecursionDepth, self.depth_limit, actual)
+        super::budget::ensure(super::BudgetKind::RecursionDepth, self.depth_limit, actual)
     }
 
     fn charge_reference(&self, references: &mut usize) -> Result<()> {
         let actual = references.saturating_add(1);
-        crate::budget::ensure(
-            crate::BudgetKind::EntityReferences,
+        super::budget::ensure(
+            super::BudgetKind::EntityReferences,
             self.reference_limit,
             actual,
         )?;
@@ -4310,12 +4312,12 @@ impl EntityExpansionMeter {
     }
 
     fn check(&self, amount: usize) -> Result<()> {
-        crate::budget::ensure(self.kind, self.limit, self.used.saturating_add(amount))
+        super::budget::ensure(self.kind, self.limit, self.used.saturating_add(amount))
     }
 
     fn charge(&mut self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
-        crate::budget::ensure(self.kind, self.limit, actual)?;
+        super::budget::ensure(self.kind, self.limit, actual)?;
         self.used = actual;
         Ok(())
     }

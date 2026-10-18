@@ -1,4 +1,7 @@
-use crate::Result;
+#[cfg(feature = "embedded")]
+use crate::xml_input_shared as xml_sec_xml_input;
+
+use super::Result;
 
 /// Stable caller-defined identity for resolved bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,12 +84,12 @@ pub enum AccessDenialReason {
 impl ResourceAccess<'_> {
     /// Construct a typed permission refusal without conflating it with transport failure.
     #[must_use]
-    pub fn denied(self, reason: AccessDenialReason) -> crate::Error {
+    pub fn denied(self, reason: AccessDenialReason) -> super::Error {
         let resource = match self {
             Self::Request(request) | Self::Retained { request, .. } => request.uri,
             Self::Dependency(identity) => &identity.0,
         };
-        crate::Error::ResourceAccessDenied {
+        super::Error::ResourceAccessDenied {
             resource: resource.into(),
             reason,
         }

@@ -1,5 +1,5 @@
-use crate::lexical::{is_ncname_char, is_ncname_start, is_xml_whitespace, trim_xml_whitespace};
-use crate::{
+use super::lexical::{is_ncname_char, is_ncname_start, is_xml_whitespace, trim_xml_whitespace};
+use super::{
     Result,
     budget::{Meter, reserve_temporary_vec_slot},
 };

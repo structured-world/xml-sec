@@ -1,4 +1,7 @@
-use crate::{AccessDenialReason, BudgetKind, ResourceIdentity};
+#[cfg(feature = "embedded")]
+use crate::xml_input_shared as xml_sec_xml_input;
+
+use super::{AccessDenialReason, BudgetKind, ResourceIdentity};
 
 /// Result type returned by the XSLT engine.
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 
-use crate::{Error, Result};
+use super::{Error, Result};
 
 pub(crate) const ENTITY_EXPANSION_DEPTH_CEILING: usize = 256;
 // This is an absolute parser safety ceiling, not a deployment policy default.
