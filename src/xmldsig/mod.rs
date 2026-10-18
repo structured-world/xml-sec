@@ -120,7 +120,7 @@ pub use verify::{
     FailureReason, HashUseAlgorithm, HashUseCompleteness, HashUseRole, HashUseState, KeyResolver,
     LexicalSource, ReferenceCoverage, ReferenceLocation, ReferenceParent, ReferenceProcessingError,
     ReferenceResolution, ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode,
-    ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod,
+    ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod, SessionDigest,
     SignatureEvidence, SignatureHashUse, SignatureKeyInfoMetadata, SignatureRequirement,
     SignatureSelection, UriTypeSet, VerificationRequest, VerifiedSession, VerifyContext,
     VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,

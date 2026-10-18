@@ -9,10 +9,10 @@ description = "XAdES baseline validation of signatures verified by xml-sec"
 
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "c14n"] }
-structured-xades = { version = "0.6.3", default-features = false, features = ["std"] }
-structured-asn1 = { version = "0.6.3", default-features = false, features = ["std"] }
-structured-pkix = { version = "0.6.3", default-features = false, features = ["std"] }
-structured-cms = { version = "0.6.3", default-features = false, features = ["std"] }
+structured-xades = { version = "0.7.0", default-features = false, features = ["std"] }
+structured-asn1 = { version = "0.7.0", default-features = false, features = ["std"] }
+structured-pkix = { version = "0.7.0", default-features = false, features = ["std"] }
+structured-cms = { version = "0.7.0", default-features = false, features = ["std"] }
 thiserror = "2"
 
 [features]

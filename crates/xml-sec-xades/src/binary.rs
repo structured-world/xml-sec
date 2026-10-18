@@ -1,17 +1,19 @@
 //! Base64 values and certificate digests through the verified operation.
 
+use core::cmp::Ordering;
+
 use crate::signature::{MD5, any_uri};
 use crate::{Document, Error, Snapshot};
+use structured_asn1::digest::{Digest, Resolution};
 use structured_asn1::memory::Work;
 use structured_asn1::{Parser, Reader};
-use structured_cms::provider::Resolution;
 use structured_xades::binary::{BinaryXml, Decoded};
 use structured_xades::certificate::DigestProvider;
 use structured_xades::hashes::HashClass;
 use structured_xades::xml::{Access, Name};
 use xml_sec::document::NodeIdentity;
 use xml_sec::xmldsig::extension;
-use xml_sec::xmldsig::{DigestAlgorithm, DigestMethodResolution, constant_time_eq};
+use xml_sec::xmldsig::{DigestAlgorithm, DigestMethodResolution, SessionDigest, constant_time_eq};
 
 impl<W: Work> BinaryXml for Document<'_, '_, '_, '_, W> {
     fn with_octets<R, C, Q: Work>(
@@ -68,12 +70,106 @@ pub enum DigestIdentity {
     Digest(DigestAlgorithm),
 }
 
-impl<'s, 'view, 'scope, 'inputs, W: Work> DigestProvider<Document<'s, 'view, 'scope, 'inputs, W>>
-    for Document<'s, 'view, 'scope, 'inputs, W>
-{
+/// A finished certificate digest, held inline.
+#[derive(Debug, Clone, Copy)]
+pub struct DigestOutput {
+    bytes: [u8; 64],
+    len: usize,
+}
+
+impl AsRef<[u8]> for DigestOutput {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl DigestIdentity {
+    /// Total order key: equal keys name the same digest, so outputs can be shared.
+    fn order_key(self) -> (u8, &'static str) {
+        match self {
+            Self::Md5 => (0, ""),
+            Self::Digest(algorithm) => (1, algorithm.uri()),
+        }
+    }
+}
+
+impl<'a, W: Work> Digest<'a> for Document<'_, '_, '_, '_, W> {
     type Identity = DigestIdentity;
+    type State = SessionDigest<'a>;
+    type Output = DigestOutput;
     type Error = Error;
 
+    fn width(&self, identity: &DigestIdentity) -> Option<usize> {
+        Some(match identity {
+            DigestIdentity::Md5 => 16,
+            DigestIdentity::Digest(algorithm) => algorithm.output_len(),
+        })
+    }
+
+    fn compare<Q: Work>(
+        &self,
+        left: &DigestIdentity,
+        right: &DigestIdentity,
+        execution: &Q,
+    ) -> Result<Ordering, Error> {
+        let (left, right) = (left.order_key(), right.order_key());
+        execution.charge_work((left.1.len() + right.1.len()) as u64)?;
+        Ok(left.cmp(&right))
+    }
+
+    fn start<Q: Work>(
+        &'a self,
+        identity: &DigestIdentity,
+        execution: &Q,
+    ) -> Result<Resolution<SessionDigest<'a>>, Error> {
+        let DigestIdentity::Digest(algorithm) = identity else {
+            return Err(Error::ProhibitedDigest);
+        };
+        execution.charge_work(1)?;
+        Ok(Resolution::Supported(
+            self.session.begin_digest(*algorithm)?,
+        ))
+    }
+
+    fn update<Q: Work>(
+        &self,
+        state: &mut SessionDigest<'a>,
+        bytes: &[u8],
+        execution: &Q,
+    ) -> Result<(), Error> {
+        Ok(state.update(bytes, execution)?)
+    }
+
+    fn finish<Q: Work>(
+        &self,
+        state: SessionDigest<'a>,
+        execution: &Q,
+    ) -> Result<DigestOutput, Error> {
+        let digest = state.finish()?;
+        execution.charge_work(digest.len() as u64)?;
+        // The session checked the width against the algorithm; no XMLDSig
+        // digest is wider than 64 bytes.
+        let mut output = DigestOutput {
+            bytes: [0; 64],
+            len: digest.len(),
+        };
+        output.bytes[..digest.len()].copy_from_slice(&digest);
+        Ok(output)
+    }
+
+    fn matches<Q: Work>(
+        &self,
+        _identity: &DigestIdentity,
+        output: &DigestOutput,
+        expected: &[u8],
+        execution: &Q,
+    ) -> Result<bool, Error> {
+        execution.charge_work(expected.len() as u64)?;
+        Ok(constant_time_eq(output.as_ref(), expected))
+    }
+}
+
+impl<'a, W: Work> DigestProvider<'a, Self> for Document<'_, '_, '_, '_, W> {
     fn resolve<Q: Work>(
         &self,
         access: &Access<'_, Self, Q>,
@@ -110,27 +206,5 @@ impl<'s, 'view, 'scope, 'inputs, W: Work> DigestProvider<Document<'s, 'view, 'sc
             DigestIdentity::Md5 => HashClass::Md5,
             DigestIdentity::Digest(algorithm) => crate::signature::hash_class(*algorithm),
         }
-    }
-
-    fn width(&self, identity: &DigestIdentity) -> Option<usize> {
-        Some(match identity {
-            DigestIdentity::Md5 => 16,
-            DigestIdentity::Digest(algorithm) => algorithm.output_len(),
-        })
-    }
-
-    fn matches<Q: Work>(
-        &self,
-        identity: &DigestIdentity,
-        certificate: &[u8],
-        expected: &[u8],
-        execution: &Q,
-    ) -> Result<bool, Error> {
-        let DigestIdentity::Digest(algorithm) = identity else {
-            return Err(Error::ProhibitedDigest);
-        };
-        let digest = self.session.digest_in(*algorithm, certificate, execution)?;
-        execution.charge_work(digest.len() as u64)?;
-        Ok(constant_time_eq(&digest, expected))
     }
 }
