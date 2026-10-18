@@ -766,6 +766,19 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             .get(position + 1)
             .and_then(|id| self.document.get_node(*id))
     }
+    /// Returns the following sibling in constant time. The arena stores each
+    /// subtree contiguously in preorder, so the node after this subtree is the
+    /// next sibling exactly when it has the same parent.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn following_sibling(self) -> Option<Self> {
+        let parent = self.data().parent?;
+        let next = NodeId(self.data().subtree_end);
+        let data = self.document.nodes.get(next.index())?;
+        (data.parent == Some(parent)).then_some(Self {
+            document: self.document,
+            id: next,
+        })
+    }
     /// Returns the next sibling that is an element.
     pub fn next_sibling_element(self) -> Option<Self> {
         let mut current = self.next_sibling();

@@ -76,6 +76,14 @@ impl X509TrustEvidence {
         self.verification_time
     }
 
+    /// The same validation instant the path processor used, at nanosecond
+    /// precision, for consumers that re-check this exact path.
+    pub fn validation_instant(
+        &self,
+    ) -> Result<structured_pkix::temporal::Instant, super::X509ChainError> {
+        super::pkix::verification_instant(self.verification_time)
+    }
+
     /// Whether the policy requested and validation enforced CRL processing.
     pub fn revocation_checked(&self) -> bool {
         self.revocation_checked

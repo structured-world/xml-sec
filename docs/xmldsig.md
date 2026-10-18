@@ -744,6 +744,42 @@ The incorporated historical RFC 2732/2373 IPv6 grammar permits decimal IPv4
 tail octets with leading zeroes; modern address-parser restrictions do not
 silently replace that XSD 1.0 lexical contract.
 
+## Original Tree Navigation and Operation Lookups
+
+`inspect_node`, `first_child` and `next_sibling` walk the original semantic
+document by stable `NodeIdentity`, including text, comment and processing
+instruction children. Each step resolves its identities against the current
+view, refuses foreign or stale ones, and charges current `Work` first. A sibling
+query names its parent; a node outside that parent's children is refused with
+`TreeError::NotChild` rather than continuing in another subtree. Sibling steps
+are constant time. `subtree_contains` reports ancestor-or-self containment.
+
+`with_base64` decodes an element's XSD 1.0 `base64Binary` simple content with
+the XMLDSig decoder: the four XML whitespace characters and interleaved comments
+are skipped, element children and non-canonical padding are refused. The child
+visits and both linear passes are admitted before the first byte is scanned,
+and the decoded bytes live in storage of the supplied account only while the
+visitor runs.
+
+A `VerifiedSession` also answers operation-bound lookups for extension formats:
+
+- `resolve_bare_name_in` resolves a `#id` URI through this operation's ID
+  registrations and URI kernel. Other fragment or URI forms are reported as
+  `NotBareName`, and a missing or ambiguous ID as `Unresolved`.
+- `resolve_digest_method_in` interprets an original `ds:DigestMethod` under the
+  compiled digest policy: `Supported`, `Unsupported` (unknown URI) or
+  `Malformed` (no Algorithm). A recognized algorithm the policy forbids is a
+  policy error.
+- `digest_in` hashes through the selected provider under the same policy and
+  returns the output in the supplied account.
+- `certificate_path_verifier` lends a `structured_pkix::path::Verify` over the
+  selected provider, the certificate-signature permissions and the issuer key
+  policy, restricted to the keys of the supplied chain and anchor.
+
+`X509TrustEvidence::validation_instant` returns the exact instant the path
+processor used, so a consumer re-checking a validated path evaluates it at the
+same time.
+
 ## Original Signature Hash Uses
 
 Inside `with_verified_request`, `SelectedSignature::signature_method` returns

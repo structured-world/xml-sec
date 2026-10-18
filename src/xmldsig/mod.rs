@@ -90,6 +90,7 @@ pub use parse::{
     find_signature_node, parse_key_info, parse_reference, parse_signed_info,
     x509_certificate_matches_selectors,
 };
+pub use pkix::CertificatePathVerifier;
 pub use sign::{
     ComputedReferenceDigest, DerEncodedKeyValueInfoWriter, DsaSigningKey, EcdsaP256SigningKey,
     EcdsaP384SigningKey, EcdsaP521SigningKey, HmacSigningKey, KeyInfoWriteError, KeyInfoWriter,
@@ -112,16 +113,16 @@ pub use transforms::{
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
 pub use verify::{
-    AuthenticatedReference, CallerTrustedSignatureKey, CatalogueCompleteness, CatalogueError,
-    DsigError, DsigStatus, ExternalResourceUnavailable, FailureReason, HashUseAlgorithm,
-    HashUseCompleteness, HashUseRole, HashUseState, KeyResolver, LexicalSource, ReferenceCoverage,
-    ReferenceLocation, ReferenceParent, ReferenceProcessingError, ReferenceResolution,
-    ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode, ReplayOutcome,
-    SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod, SignatureEvidence,
-    SignatureHashUse, SignatureKeyInfoMetadata, SignatureRequirement, SignatureSelection,
-    UriTypeSet, VerificationRequest, VerifiedSession, VerifyContext, VerifyEvidence, VerifyResult,
-    VerifyingKey, has_same_document_encapsulation, inspect_pinned_verification_key_info,
-    inspect_signing_key_info, inspect_verification_key_info,
+    AuthenticatedReference, BareNameTarget, CallerTrustedSignatureKey, CatalogueCompleteness,
+    CatalogueError, DigestMethodResolution, DsigError, DsigStatus, ExternalResourceUnavailable,
+    FailureReason, HashUseAlgorithm, HashUseCompleteness, HashUseRole, HashUseState, KeyResolver,
+    LexicalSource, ReferenceCoverage, ReferenceLocation, ReferenceParent, ReferenceProcessingError,
+    ReferenceResolution, ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode,
+    ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod,
+    SignatureEvidence, SignatureHashUse, SignatureKeyInfoMetadata, SignatureRequirement,
+    SignatureSelection, UriTypeSet, VerificationRequest, VerifiedSession, VerifyContext,
+    VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,
+    inspect_pinned_verification_key_info, inspect_signing_key_info, inspect_verification_key_info,
     materialize_signing_key_info_references, materialize_verification_key_info_references,
     process_all_references, process_reference, verify_signature_with_pem_key,
     with_verified_request,

@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<Document><Data Id="payload">Enveloped baseline payload</Data>
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference Id="sig-data" URI="">
+      <ds:Transforms>
+        <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+        <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      </ds:Transforms>
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue>PVwfDgi+CsPGTIocwLdIOzXFMNdZ25H5p3lU+4kFSJ0=</ds:DigestValue>
+    </ds:Reference>
+    <ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp">
+      <ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue>K2CCB45TwlPzIXMkCVQdrA8PvEjNDPg24dFmHOFJ2qk=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue>IbrBgvZFHtSJ3WIp6LUJ+FhwbIf0iVNpsFvxnfv+zizXsnO7K0kYAdb/n559lRgh
+xeRwqGzL0KUqC91wSwpoyZKTC6w9N91hgVgudslUnfbwpBrLVKnlW+li90xKOXYR
+Yancszt9zCQhGW/Q2fAhIFL7HFQ5TlMmcWlzrNUHidB1XpdgkOo7m5LGBnkzeHOc
+bLwxG4NSnmt51PRIoIRm/Ij20ZJKYd2WQ7kIEaXROt/VUU56icz7w8gHlqBlK9q5
+mjiuq66fpcyjVasZfWoEOp/xIoNgE//rI6Dzz/mNqxxlXttGqXz7KORWmAdaVBMv
+c7s+7d0olD2L1C/wIpyqXw==</ds:SignatureValue>
+  <ds:KeyInfo><ds:X509Data><ds:X509Certificate>MIIDPDCCAiSgAwIBAgIUV36GV/OidH/quPhfJOgvLCI0GN0wDQYJKoZIhvcNAQEL
+BQAwKjEoMCYGA1UEAwwfeG1sLXNlYyBYQWRFUyBUZXN0IEludGVybWVkaWF0ZTAe
+Fw0yNjEwMTgxNTA2MjdaFw00NTA5MDgxNTA2MjdaMCQxIjAgBgNVBAMMGXhtbC1z
+ZWMgWEFkRVMgVGVzdCBTaWduZXIwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEK
+AoIBAQCITJkyZ7LMdNERkMNiyudJd9pjz4cpsDi6MqArdOLcDCJb9I20j639VecA
+ALpzznzOswOkC3U6WXlx3JHVSfkL1PzfBY2j7VezVvhmxDRXWBBZRb0eGD8FTi7o
+M7nR1NvvIDOKoyHEnIK0MEdok5xe85P0R7mMGYSvKIZk6UQhITQOzKLF/XmdIizJ
+r3eggIJkGDCLwGFr6369HYbs/HTfFnQGiKVsUFlzqcXluYv1oHpgnmOGlS/cpycF
+6UZ6nRqrCEZRz58/uoVDhpIgVpaLUtpS3Ff5Rv3wKZbLBo3rXBxDpYFkzppARr0d
+nztLqv99sArHdoJtTBNcfSa/RuGPAgMBAAGjYDBeMAwGA1UdEwEB/wQCMAAwDgYD
+VR0PAQH/BAQDAgbAMB0GA1UdDgQWBBTyEeMPcwA+oQLOH+7lpvmKNS+15TAfBgNV
+HSMEGDAWgBT0NkasgT2dqmfkFMyRzbzDkhJhqjANBgkqhkiG9w0BAQsFAAOCAQEA
+F/gwUJXfZmZkeKHZKTDDb+TVH1Io27B/WaehaG4152kIP0UpCBkqDbtFrtj14dAD
+cLs+UHj2FUF6VuJwTx6dtxEe0OMMqujOPd0pPWWa2gNslZNsSln1GzvoLvWfyoqq
+ztWJewMn05xcvlivGWVtsmX7mia1fYN3+RoCYCUbnId/e0As99G+SgUpEsFCwC+F
+bqVZyJKe5m5kwJB4rbgiLf4y929Rz7fVNJTd2o1ZQSxNHD+2g/N1Rqtsq2FTgntE
+6qqeGjXIK7YLYRlKnc+5Ldyx/o80Z+TGyNjlKH4hIeei1QcvcL4dJkdk3IGMmBSN
+mcAPG+dfOVMzdwadt4chKA==
+</ds:X509Certificate>
+<ds:X509Certificate>MIIDQDCCAiigAwIBAgIUNwYQYaaHkX5haTNOUlG04tNy+SkwDQYJKoZIhvcNAQEL
+BQAwIjEgMB4GA1UEAwwXeG1sLXNlYyBYQWRFUyBUZXN0IFJvb3QwHhcNMjYxMDE4
+MTUwNjI3WhcNNDUxMjE3MTUwNjI3WjAqMSgwJgYDVQQDDB94bWwtc2VjIFhBZEVT
+IFRlc3QgSW50ZXJtZWRpYXRlMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
+AQEA1D0YxDUz8GXzvbjWFeKrEZE96+SCTDNfjLrsZz57snETuBLxVWJnfzq6AHJ5
+TQQsN7Dx4YURZWpzmjfj4x4IX0tPc2yBdsI7fm/x5jYvgueELvUiXDmC4SHN6tsh
+hctSGz6w+K8SA8b56Mpi0ciKXwEBICMstLZibPlGCoA7B/iYDvjG0brRcFlFdAzL
+on8B7Tcm/aMnq8wft06/DRbcUDwJ+OkgadAgrSdN4TQgy0gzFk3KI6j+hNcMMH6i
+w5oqjZKurGfKXTiqIzyGoinGG8akgR3uTA3i5rESOxqoeF5kG4QEbiOd4DGP9dpH
+r5pBLlbJqfh8AVSvo7xWQIIitQIDAQABo2YwZDASBgNVHRMBAf8ECDAGAQH/AgEA
+MA4GA1UdDwEB/wQEAwIBBjAdBgNVHQ4EFgQU9DZGrIE9napn5BTMkc28w5ISYaow
+HwYDVR0jBBgwFoAUXwvmWC4lIX1njtTA4gJvaeB01yQwDQYJKoZIhvcNAQELBQAD
+ggEBABs3q+wCVgvy9212R9jz0ldBxIfPte8CMy9KD8fPjjnxygemc5w1oaHauGEc
+0Wetr2SuUTu+fj9Eymxf/gNqDZ17MLNvq6OxL1vmgbsvlawiZ4uMkMwjjPWCKuAg
+w6R47OKofVanZhKoaT9QX78c7DBZgRObZ/7rLHa3VweHeUaph3xeq/B57LEAcnPj
+KdCyJY2Y529ngU4vwfonmbwsEUb68AL/JNWeZ6BWHGEUXnqBCOMEvA+1lA2JXNcW
+VivJ4/t9X250LNpYXK/yP9PkS1D6uCWAjB0baW6x5O5LrAdgAoh1oiGEsCdkvgcE
+xzv7MhSHN7BNTeeYsGYmPmRwkow=
+</ds:X509Certificate></ds:X509Data></ds:KeyInfo>
+  
+  <ds:Object>
+    <xades:QualifyingProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Target="#sig">
+      <xades:SignedProperties Id="sp">
+        <xades:SignedSignatureProperties>
+          <xades:SigningTime>2026-10-18T12:00:00</xades:SigningTime>
+          <xades:SigningCertificateV2>
+            <xades:Cert>
+              <xades:CertDigest>
+                <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <ds:DigestValue>K+VFtJEx/Xx7QtHMfykehaAqQTRsyY4DklKJCYbrMp4=</ds:DigestValue>
+              </xades:CertDigest>
+            </xades:Cert>
+          </xades:SigningCertificateV2>
+        </xades:SignedSignatureProperties>
+        <xades:SignedDataObjectProperties>
+          <xades:DataObjectFormat ObjectReference="#sig-data">
+            <xades:MimeType>text/xml</xades:MimeType>
+          </xades:DataObjectFormat>
+        </xades:SignedDataObjectProperties>
+      </xades:SignedProperties>
+    </xades:QualifyingProperties>
+  </ds:Object>
+</ds:Signature>
+</Document>
