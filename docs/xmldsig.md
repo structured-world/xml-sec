@@ -764,7 +764,8 @@ visitor runs.
 A `VerifiedSession` also answers operation-bound lookups for extension formats:
 
 - `resolve_bare_name_in` resolves a `#id` URI through this operation's ID
-  registrations and URI kernel. Other fragment or URI forms are reported as
+  registrations, fragment unescaping and same-document ID semantics, exactly as
+  reference dereferencing does. XPointer and non-fragment forms are reported as
   `NotBareName`, and a missing or ambiguous ID as `Unresolved`.
 - `resolve_digest_method_in` interprets an original `ds:DigestMethod` under the
   compiled digest policy: `Supported`, `Unsupported` (unknown URI) or
@@ -775,10 +776,19 @@ A `VerifiedSession` also answers operation-bound lookups for extension formats:
 - `certificate_path_verifier` lends a `structured_pkix::path::Verify` over the
   selected provider, the certificate-signature permissions and the issuer key
   policy, restricted to the keys of the supplied chain and anchor.
+- `certificate_parser` returns a DER parser on a fresh account bounded by the
+  operation's `max_x509_work` and `max_x509_workspace_bytes`, and
+  `certificate_path_bounds` the path-processor bounds of
+  `max_x509_chain_depth`: the limits verification applied to its own
+  certificate processing. `execution` lends the request's own execution, so a
+  continuation can spend it instead of a separately supplied account.
 
 `X509TrustEvidence::validation_instant` returns the exact instant the path
-processor used, so a consumer re-checking a validated path evaluates it at the
-same time.
+processor used, and `X509TrustEvidence::certificate_identity_in` computes a
+certificate's path identity with the mechanism that recorded
+`certificate_fingerprints`. A consumer re-checking a validated path finds the
+same certificates and evaluates them at the same time; this identity lookup is
+not a use of a document digest and is independent of the digest policy.
 
 ## Original Signature Hash Uses
 

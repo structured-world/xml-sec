@@ -2,18 +2,16 @@
 
 use crate::Error;
 use structured_asn1::Parser;
-use structured_asn1::memory::{Memory, OwnedVec, Work};
+use structured_asn1::memory::{HashWork, MemoryError, OwnedVec, Work};
 use structured_pkix::Certificate;
-use structured_pkix::path::{
-    Anchor, BuildError, Interval, Policy, Truncation, ValidationBounds, ValidationContext,
-};
+use structured_pkix::path::{Anchor, BuildError, Interval, Policy, Truncation, ValidationContext};
 use structured_xades::pki::{CheckedPath, PathOutcome};
 use xml_sec::document::NodeIdentity;
 use xml_sec::xmldsig::extension::{self, NodeView};
-use xml_sec::xmldsig::{
-    DigestAlgorithm, KeyTrustEvidence, VerifiedSession, X509ChainError, X509TrustEvidence,
-    constant_time_eq,
-};
+use xml_sec::xmldsig::{KeyTrustEvidence, VerifiedSession, X509ChainError, X509TrustEvidence};
+
+#[cfg(test)]
+mod tests;
 
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
@@ -35,62 +33,98 @@ pub enum PathFailure {
     Incomplete(Truncation),
 }
 
-/// Every signer of `root`'s subtree whose verification validated an X.509 path.
-pub(crate) fn signers<'e, W: Work>(
+/// Why a countersignature's checked path could not be supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterPathError {
+    /// The countersigner has no checked path.
+    Missing(PathFailure),
+    /// The current execution refused the lookup.
+    Resource(MemoryError),
+}
+
+/// Refuse an identity that is not a Signature of the verified request.
+pub(crate) fn require_member<W: Work, Q: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: NodeIdentity,
+    work: &Q,
+) -> Result<(), Error> {
+    for entry in session.evidence().signatures() {
+        work.charge_work(signature.hash_work()?)?;
+        if entry.identity() == signature {
+            return Ok(());
+        }
+    }
+    Err(Error::UnknownSignature)
+}
+
+/// The root and each incorporated countersignature whose verification
+/// validated an X.509 path. Other signatures of the document, including ones
+/// nested inside signed content, are not actors of this root.
+pub(crate) fn signers<'e, W: Work, Q: Work>(
     session: &'e VerifiedSession<'_, '_, '_, W>,
     root: NodeIdentity,
-    memory: &Memory,
+    counters: &[NodeIdentity],
+    work: &Q,
 ) -> Result<OwnedVec<(NodeIdentity, &'e X509TrustEvidence)>, Error> {
-    let mut signers = memory.vector();
+    let mut signers = work.vector();
     for entry in session.evidence().signatures() {
-        memory.charge_work(1)?;
-        if !extension::subtree_contains(session.view(), root, entry.identity(), memory)? {
+        let identity = entry.identity();
+        work.charge_work(
+            identity
+                .hash_work()?
+                .checked_mul(
+                    u64::try_from(counters.len() + 1).map_err(|_| MemoryError::WorkExceeded)?,
+                )
+                .ok_or(MemoryError::WorkExceeded)?,
+        )?;
+        if identity != root && !counters.contains(&identity) {
             continue;
         }
         if let Ok(result) = entry.result()
             && let KeyTrustEvidence::ValidatedX509(evidence) = &result.key_trust
         {
-            signers.try_push((entry.identity(), evidence))?;
+            signers.try_push((identity, evidence))?;
         }
     }
-    Ok(signers)
+    Ok(signers.into_owned())
 }
 
 /// Decode the `X509Certificate` values in each signer's direct `KeyInfo`.
-pub(crate) fn key_info_certificates<W: Work>(
+pub(crate) fn key_info_certificates<W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signers: &[(NodeIdentity, &X509TrustEvidence)],
-    memory: &Memory,
+    work: &Q,
 ) -> Result<OwnedVec<OwnedVec<u8>>, Error> {
     let view = session.view();
-    let mut decoded = memory.vector();
+    let mut decoded = work.vector();
     for (signature, _) in signers {
-        for key_info in children(session, *signature, "KeyInfo", memory)?.iter() {
-            for data in children(session, *key_info, "X509Data", memory)?.iter() {
-                for value in children(session, *data, "X509Certificate", memory)?.iter() {
-                    let bytes = extension::with_base64(view, *value, memory, |bytes| {
-                        let mut copy = memory.vector();
-                        copy.try_extend_from_slice(bytes).map(|()| copy)
+        for key_info in children(session, *signature, "KeyInfo", work)?.iter() {
+            for data in children(session, *key_info, "X509Data", work)?.iter() {
+                for value in children(session, *data, "X509Certificate", work)?.iter() {
+                    let bytes = extension::with_base64(view, *value, work, |bytes| {
+                        let mut copy = work.vector();
+                        copy.try_extend_from_slice(bytes)
+                            .map(|()| copy.into_owned())
                     })??;
                     decoded.try_push(bytes)?;
                 }
             }
         }
     }
-    Ok(decoded)
+    Ok(decoded.into_owned())
 }
 
-fn children<W: Work>(
+fn children<W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     parent: NodeIdentity,
     local: &str,
-    memory: &Memory,
+    work: &Q,
 ) -> Result<OwnedVec<NodeIdentity>, Error> {
     let view = session.view();
-    let mut found = memory.vector();
-    let mut next = extension::first_child(view, parent, memory)?;
+    let mut found = work.vector();
+    let mut next = extension::first_child(view, parent, work)?;
     while let Some(node) = next {
-        let matches = extension::inspect_node(view, node, memory, |value| {
+        let matches = extension::inspect_node(view, node, work, |value| {
             matches!(
                 value,
                 NodeView::Element { namespace: Some(namespace), local_name }
@@ -100,9 +134,9 @@ fn children<W: Work>(
         if matches {
             found.try_push(node)?;
         }
-        next = extension::next_sibling(view, parent, node, memory)?;
+        next = extension::next_sibling(view, parent, node, work)?;
     }
-    Ok(found)
+    Ok(found.into_owned())
 }
 
 /// One signer, its trust evidence and its path as positions into the parsed
@@ -120,31 +154,32 @@ pub(crate) struct Selection<'d> {
 }
 
 /// Identify the exact certificates of each validated path among `candidates`
-/// by their recorded SHA-256 identities, and parse each certificate once.
-pub(crate) fn select<'d, W: Work>(
-    session: &VerifiedSession<'_, '_, '_, W>,
+/// by their recorded path identities, and parse each certificate once with
+/// the operation's policy-bounded certificate parser.
+pub(crate) fn select<'d, Q: Work>(
     signers: &[(NodeIdentity, &'d X509TrustEvidence)],
     candidates: &[&'d [u8]],
     parser: &'d Parser,
-    memory: &Memory,
+    work: &Q,
 ) -> Result<Selection<'d>, Error> {
-    let mut fingerprints: OwnedVec<Option<OwnedVec<u8>>> = memory.vector();
+    let mut identities: OwnedVec<Option<[u8; 32]>, Q> = work.vector();
+    identities.try_reserve_exact(candidates.len())?;
     for _ in candidates {
-        fingerprints.try_push(None)?;
+        identities.try_push(None)?;
     }
     // Candidate index of each parsed certificate, parallel to `certificates`.
-    let mut sources: OwnedVec<usize> = memory.vector();
-    let mut certificates = memory.vector();
-    let mut selected = memory.vector();
+    let mut sources: OwnedVec<usize, Q> = work.vector();
+    let mut certificates = work.vector();
+    let mut selected = work.vector();
     for (signature, evidence) in signers {
-        let mut path = memory.vector();
+        let mut path = work.vector();
         let mut missing = false;
         for fingerprint in evidence.certificate_fingerprints() {
-            let Some(index) = find(session, candidates, &mut fingerprints, fingerprint, memory)?
-            else {
+            let Some(index) = find(candidates, &mut identities, fingerprint, work)? else {
                 missing = true;
                 break;
             };
+            work.charge_work(u64::try_from(sources.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
             let position = match sources.iter().position(|source| *source == index) {
                 Some(position) => position,
                 None => {
@@ -163,33 +198,35 @@ pub(crate) fn select<'d, W: Work>(
             if missing {
                 Err(PathFailure::MissingCertificate)
             } else {
-                Ok(path)
+                Ok(path.into_owned())
             },
         ))?;
     }
     Ok(Selection {
-        certificates,
-        signers: selected,
+        certificates: certificates.into_owned(),
+        signers: selected.into_owned(),
     })
 }
 
-fn find<W: Work>(
-    session: &VerifiedSession<'_, '_, '_, W>,
+fn find<Q: Work>(
     candidates: &[&[u8]],
-    fingerprints: &mut [Option<OwnedVec<u8>>],
+    identities: &mut [Option<[u8; 32]>],
     fingerprint: &[u8; 32],
-    memory: &Memory,
+    work: &Q,
 ) -> Result<Option<usize>, Error> {
     for (index, candidate) in candidates.iter().enumerate() {
-        if fingerprints[index].is_none() {
-            let digest = session.digest_in(DigestAlgorithm::Sha256, candidate, memory)?;
-            fingerprints[index] = Some(digest.into_owned());
-        }
-        memory.charge_work(32)?;
-        if fingerprints[index]
-            .as_deref()
-            .is_some_and(|candidate| constant_time_eq(candidate, fingerprint))
-        {
+        let identity = match identities[index] {
+            Some(identity) => identity,
+            None => {
+                // The same internal identity the trust evidence recorded,
+                // independent of the document's digest policy.
+                let identity = X509TrustEvidence::certificate_identity_in(candidate, work)?;
+                identities[index] = Some(identity);
+                identity
+            }
+        };
+        work.charge_work(32)?;
+        if identity == *fingerprint {
             return Ok(Some(index));
         }
     }
@@ -202,39 +239,57 @@ pub(crate) struct Paths<'d> {
 }
 
 impl<'d> Paths<'d> {
-    /// The checked path of `signature`, or why it has none.
-    pub(crate) fn get(&self, signature: NodeIdentity) -> Result<&CheckedPath<'d>, PathFailure> {
-        match self.entries.iter().find(|(signer, _)| *signer == signature) {
-            Some((_, Ok(path))) => Ok(path),
-            Some((_, Err(failure))) => Err(*failure),
-            None => Err(PathFailure::NotValidated),
+    /// The checked path of `signature`, or why it has none. Every identity
+    /// comparison is charged to `work` first.
+    pub(crate) fn get<Q: Work>(
+        &self,
+        signature: NodeIdentity,
+        work: &Q,
+    ) -> Result<&CheckedPath<'d>, CounterPathError> {
+        for (signer, path) in self.entries.iter() {
+            work.charge_work(
+                signature
+                    .hash_work()
+                    .and_then(|cost| cost.checked_mul(2).ok_or(MemoryError::WorkExceeded))
+                    .map_err(CounterPathError::Resource)?,
+            )
+            .map_err(CounterPathError::Resource)?;
+            if *signer == signature {
+                return path
+                    .as_ref()
+                    .map_err(|failure| CounterPathError::Missing(*failure));
+            }
         }
+        Err(CounterPathError::Missing(PathFailure::NotValidated))
     }
 }
 
-/// Re-check each selected path with the operation's provider and policy.
-pub(crate) fn check<'d, W: Work>(
+/// Re-check each selected path with the operation's provider, certificate
+/// policy and path bounds.
+pub(crate) fn check<'d, W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     selection: &'d Selection<'d>,
-    memory: &Memory,
+    work: &Q,
 ) -> Result<Paths<'d>, Error> {
-    let mut entries = memory.vector();
+    let mut entries = work.vector();
     for (signature, evidence, path) in selection.signers.iter() {
         let outcome = match path {
-            Ok(path) => checked(session, &selection.certificates, evidence, path, memory)?,
+            Ok(path) => checked(session, &selection.certificates, evidence, path, work)?,
             Err(failure) => Err(*failure),
         };
         entries.try_push((*signature, outcome))?;
     }
-    Ok(Paths { entries })
+    Ok(Paths {
+        entries: entries.into_owned(),
+    })
 }
 
-fn checked<'d, W: Work>(
+fn checked<'d, W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     certificates: &'d [Certificate<'d>],
     evidence: &X509TrustEvidence,
     path: &[usize],
-    memory: &Memory,
+    work: &Q,
 ) -> Result<Result<CheckedPath<'d>, PathFailure>, Error> {
     let Some((anchor, members)) = path.split_last() else {
         return Ok(Err(PathFailure::MissingCertificate));
@@ -242,23 +297,17 @@ fn checked<'d, W: Work>(
     if members.is_empty() {
         return Ok(Err(PathFailure::AnchorOnly));
     }
-    let mut chain = memory.vector();
+    let mut chain = work.vector();
     for position in members {
         chain.try_push(&certificates[*position])?;
     }
     let anchor = &certificates[*anchor];
     let verifier = session.certificate_path_verifier(&chain, anchor);
     let context = ValidationContext {
-        execution: memory,
+        execution: work,
         interval: Interval::at_instant(evidence.validation_instant()?),
         policy: Policy::default(),
-        bounds: ValidationBounds {
-            // The exact validated path is re-checked; the operation account,
-            // not these mechanism bounds, limits the work.
-            depth: chain.len(),
-            work: u64::MAX,
-            policies: usize::MAX,
-        },
+        bounds: session.certificate_path_bounds(),
         verifier: &verifier,
         watch: &(),
         recognizer: &(),

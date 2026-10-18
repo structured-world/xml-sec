@@ -802,6 +802,37 @@ impl<'a> UriReferenceResolver<'a> {
         Ok(target.and_then(|id| self.doc.get_node(id)))
     }
 
+    /// Resolve a `#name` URI only when it is a bare name under this resolver's
+    /// fragment normalization and ID semantics. `None` means another form: a
+    /// non-fragment URI, an XPointer, or a fragment the grammar rejects;
+    /// `Some(None)` is a bare name no single element carries.
+    pub(crate) fn bare_name_node_in(
+        &self,
+        uri: &str,
+        budget: Option<&NodeSetMaterializationBudget>,
+        scratch: &impl UriScratch,
+    ) -> Result<Option<Option<Node<'a, 'a>>>, TransformError> {
+        let Some(fragment) = uri.strip_prefix('#') else {
+            return Ok(None);
+        };
+        let normalized = match Self::normalize_fragment_in(
+            fragment,
+            budget,
+            self.same_document_id_semantics,
+            scratch,
+        ) {
+            Ok(normalized) => normalized,
+            Err(TransformError::InvalidFragment) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let fragment = normalized.view(scratch)?;
+        scratch.charge(fragment.len())?;
+        Ok(match self.same_document_id_fragment(fragment) {
+            Some((id, false)) => Some(self.id_index.node(self.doc, id)),
+            Some((_, true)) | None => None,
+        })
+    }
+
     /// Borrowed association prefilter, sharing the normal URI grammar and ID
     /// index without constructing errors for unrelated or malformed references.
     #[cfg(feature = "xmlenc")]

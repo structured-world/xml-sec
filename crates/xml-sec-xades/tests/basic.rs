@@ -4,32 +4,35 @@
 //! every template with a real root -> intermediate -> signer path, so XMLDSig
 //! verification succeeds and only the XAdES properties differ.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use structured_asn1::memory::{Memory, MemoryAccount};
+use structured_cms::provider::Resolution;
 use structured_xades::binding::BindingError;
-use structured_xades::certificate::{Agreement, CheckError};
+use structured_xades::certificate::{Agreement, CheckError, DigestProvider};
+use structured_xades::hashes::HashClass;
 use structured_xades::prepare::{Error as PrepareError, FieldError};
 use structured_xades::properties::{ClaimedTimeFailure, Error as PropertyError};
+use structured_xades::xml::{Access, Xml};
 use xml_sec::XmlDocument;
 use xml_sec::document::NodeIdentity;
 use xml_sec::policy::VerificationPolicy;
+use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, KeyResolverConfig, UriTypeSet, VerificationRequest, VerifiedSession,
-    VerifyContext, with_verified_request,
+    DefaultKeyResolver, DigestAlgorithm, DsigError, KeyResolverConfig, UriTypeSet,
+    VerificationRequest, VerifiedSession, VerifyContext, with_verified_request,
 };
-use xml_sec_xades::{Error, Outcome, PathFailure, Report, ValidationError, validate_basic};
+use xml_sec_xades::{
+    DigestIdentity, Document, Error, Outcome, PathFailure, Report, ValidationError, validate_basic,
+};
 
 const ROOT: &[u8] = include_bytes!("fixtures/root.der");
 const SIGNER: &[u8] = include_bytes!("fixtures/signer.der");
 const INTERMEDIATE: &[u8] = include_bytes!("fixtures/intermediate.der");
 const DETACHED: &[u8] = include_bytes!("fixtures/detached.txt");
-
-fn memory() -> Memory {
-    Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 30)))
-}
+type Session<'v, 'c, 'i> = VerifiedSession<'v, 'c, 'i, Memory>;
 
 /// Facts a test asserts, copied out of the borrowed report.
 #[derive(Debug, PartialEq, Eq)]
@@ -56,28 +59,22 @@ const MET: Facts = Facts {
     first_digest: Agreement::Matches,
 };
 
-/// Verify `xml` with X.509 path validation to the fixture root, then run
+/// Verify `xml` with X.509 path validation at a fixed instant inside every
+/// fixture certificate's validity, on an account of `work` units, then run
 /// `check` over the verified session.
-fn verified<R>(
+fn verify_in<R>(
     xml: &str,
     resolver: &DefaultKeyResolver,
-    check: impl FnOnce(&VerifiedSession<'_, '_, '_, Memory>, &Memory) -> R,
-) -> R {
-    verified_with(xml, resolver, true, check)
-}
-
-fn verified_with<R>(
-    xml: &str,
-    resolver: &DefaultKeyResolver,
-    chains: bool,
-    check: impl FnOnce(&VerifiedSession<'_, '_, '_, Memory>, &Memory) -> R,
-) -> R {
+    configure: impl FnOnce(&mut VerificationPolicy),
+    work: usize,
+    check: impl FnOnce(&Session<'_, '_, '_>) -> R,
+) -> (Result<R, DsigError>, Memory) {
     let mut policy = VerificationPolicy::default();
-    policy.key_trust.verify_x509_chains = chains;
-    // Inside every fixture certificate's validity; never the system clock.
+    policy.key_trust.verify_x509_chains = true;
     policy.key_trust.verification_time =
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
     policy.uris.references = UriTypeSet::ALL;
+    configure(&mut policy);
     let context = VerifyContext::new().policy(policy).key_resolver(resolver);
     let document = XmlDocument::parse(xml).expect("fixture parses");
     let resources = HashMap::from([("detached.txt".to_owned(), DETACHED.to_vec())]);
@@ -85,14 +82,22 @@ fn verified_with<R>(
         external_resources: Some(&resources),
         ..VerificationRequest::default()
     };
-    let account = memory();
-    let mut result = None;
-    with_verified_request(&document, &context, &request, &account, |session| {
-        result = Some(check(&session, &account));
-        Ok(())
-    })
-    .expect("fixture verifies as XMLDSig");
-    result.expect("continuation ran")
+    let account = Memory::new(Arc::new(MemoryAccount::new(1 << 24, work)));
+    let result = with_verified_request(&document, &context, &request, &account, |session| {
+        Ok(check(&session))
+    });
+    (result, account)
+}
+
+fn verified<R>(
+    xml: &str,
+    resolver: &DefaultKeyResolver,
+    configure: impl FnOnce(&mut VerificationPolicy),
+    check: impl FnOnce(&Session<'_, '_, '_>) -> R,
+) -> R {
+    verify_in(xml, resolver, configure, 1 << 30, check)
+        .0
+        .expect("fixture verifies as XMLDSig")
 }
 
 fn anchored() -> DefaultKeyResolver {
@@ -102,14 +107,17 @@ fn anchored() -> DefaultKeyResolver {
     })
 }
 
-fn signature(session: &VerifiedSession<'_, '_, '_, Memory>, index: usize) -> NodeIdentity {
+fn signature(session: &Session<'_, '_, '_>, index: usize) -> NodeIdentity {
     session.evidence().signatures()[index].identity()
 }
 
 fn assess(xml: &str, index: usize) -> Result<Outcome<Facts>, ValidationError> {
-    verified(xml, &anchored(), |session, memory| {
-        validate_basic(session, signature(session, index), &[ROOT], memory, facts)
-    })
+    verified(
+        xml,
+        &anchored(),
+        |_| {},
+        |session| validate_basic(session, signature(session, index), &[ROOT], facts),
+    )
 }
 
 fn assessed(xml: &str, index: usize) -> Facts {
@@ -121,17 +129,34 @@ fn assessed(xml: &str, index: usize) -> Facts {
 
 #[test]
 fn baseline_forms_meet_every_root_requirement() {
-    // Enveloped, enveloping and detached data objects, and both independent
-    // parallel signatures, satisfy EN 319 132-1 §6.3 B-B over a real path.
+    // Enveloped, enveloping and detached data objects, both independent
+    // parallel signatures, and a root whose signed payload carries its own
+    // unrelated signature satisfy EN 319 132-1 §6.3 B-B over a real path.
     for (xml, index) in [
         (include_str!("fixtures/enveloped.xml"), 0),
         (include_str!("fixtures/enveloping.xml"), 0),
         (include_str!("fixtures/detached.xml"), 0),
         (include_str!("fixtures/parallel.xml"), 0),
         (include_str!("fixtures/parallel.xml"), 1),
+        (include_str!("fixtures/nested.xml"), 0),
     ] {
         assert_eq!(assessed(xml, index), MET);
     }
+}
+
+#[test]
+fn certificate_path_identities_ignore_the_reference_digest_policy() {
+    // A document that uses only SHA-384, under a policy that permits only
+    // SHA-384, verifies with a validated X.509 path. Locating that path's
+    // certificates is an identity lookup, not a use of a document digest, so
+    // the reference digest allowlist must not stop B-B.
+    let outcome = verified(
+        include_str!("fixtures/sha384.xml"),
+        &anchored(),
+        |policy| policy.digest_algorithms = Some(HashSet::from([DigestAlgorithm::Sha384])),
+        |session| validate_basic(session, signature(session, 0), &[ROOT], facts),
+    );
+    assert!(matches!(outcome, Ok(Outcome::Assessed(MET))), "{outcome:?}");
 }
 
 #[test]
@@ -142,9 +167,10 @@ fn countersignature_joins_the_root_with_its_own_checked_path() {
     let outcome = verified(
         include_str!("fixtures/countersigned.xml"),
         &anchored(),
-        |session, memory| {
+        |_| {},
+        |session| {
             let counter = signature(session, 1);
-            validate_basic(session, signature(session, 0), &[ROOT], memory, |report| {
+            validate_basic(session, signature(session, 0), &[ROOT], |report| {
                 let actors = report.inputs().counters.actors();
                 (
                     facts(report),
@@ -187,6 +213,57 @@ fn md5_signing_certificate_digest_is_prohibited() {
     let facts = assessed(include_str!("fixtures/certificate-digest-md5.xml"), 0);
     assert!(!facts.met && !facts.bound);
     assert_eq!(facts.first_digest, Agreement::ProhibitedAlgorithm);
+}
+
+/// The first `ds:DigestMethod` element below `node` in document order.
+fn digest_method(session: &Session<'_, '_, '_>, node: NodeIdentity) -> Option<NodeIdentity> {
+    let view = session.view();
+    let work = session.execution();
+    let named = extension::inspect_node(view, node, work, |value| {
+        matches!(
+            value,
+            NodeView::Element {
+                local_name: "DigestMethod",
+                ..
+            }
+        )
+    })
+    .unwrap();
+    if named {
+        return Some(node);
+    }
+    let mut child = extension::first_child(view, node, work).unwrap();
+    while let Some(current) = child {
+        if let Some(found) = digest_method(session, current) {
+            return Some(found);
+        }
+        child = extension::next_sibling(view, node, current, work).unwrap();
+    }
+    None
+}
+
+#[test]
+fn md5_method_is_classified_before_deployment_policy() {
+    // The adapter itself classifies an MD5 certificate digest method as the
+    // format prohibition, whatever the XMLDSig digest policy or build accepts,
+    // instead of reporting it unsupported or as a policy error.
+    verified(
+        include_str!("fixtures/certificate-digest-md5.xml"),
+        &anchored(),
+        |_| {},
+        |session| {
+            let document = Document::new(session);
+            let access = Access::new(&document, document.snapshot(), session.execution());
+            let properties = session.view().node_for_id("sp", &[]).unwrap();
+            let method = digest_method(session, properties).unwrap();
+            let resolved = DigestProvider::resolve(&document, &access, method).unwrap();
+            assert!(
+                matches!(resolved, Resolution::Supported(DigestIdentity::Md5)),
+                "{resolved:?}"
+            );
+            assert_eq!(document.classify(&DigestIdentity::Md5), HashClass::Md5);
+        },
+    );
 }
 
 #[test]
@@ -250,12 +327,12 @@ fn key_info_must_carry_the_signing_certificate() {
     let error = verified(
         include_str!("fixtures/issuer-serial-only.xml"),
         &lookup,
-        |session, memory| {
+        |_| {},
+        |session| {
             validate_basic(
                 session,
                 signature(session, 0),
                 &[ROOT, SIGNER, INTERMEDIATE],
-                memory,
                 facts,
             )
         },
@@ -283,7 +360,8 @@ fn signer_trusted_as_its_own_anchor_has_no_certification_path() {
     let outcome = verified(
         include_str!("fixtures/enveloped.xml"),
         &pinned,
-        |session, memory| validate_basic(session, signature(session, 0), &[], memory, facts),
+        |_| {},
+        |session| validate_basic(session, signature(session, 0), &[], facts),
     );
     assert!(
         matches!(
@@ -305,11 +383,11 @@ fn caller_trusted_key_has_no_certificate_path() {
         trusted_certs: vec![SIGNER.to_vec()],
         ..KeyResolverConfig::default()
     });
-    let outcome = verified_with(
+    let outcome = verified(
         include_str!("fixtures/enveloped.xml"),
         &pinned,
-        false,
-        |session, memory| validate_basic(session, signature(session, 0), &[], memory, facts),
+        |policy| policy.key_trust.verify_x509_chains = false,
+        |session| validate_basic(session, signature(session, 0), &[], facts),
     );
     assert!(
         matches!(
@@ -324,50 +402,65 @@ fn caller_trusted_key_has_no_certificate_path() {
 }
 
 #[test]
-fn foreign_signature_identity_is_refused() {
-    // An identity from another document must not select anything here.
+fn identities_outside_the_request_are_refused() {
+    // Neither another document's Signature nor an element of this document
+    // that is no Signature of the request may be reported as a signer that
+    // merely lacks a path.
     let foreign = verified(
         include_str!("fixtures/enveloping.xml"),
         &anchored(),
-        |session, _| signature(session, 0),
+        |_| {},
+        |session| signature(session, 0),
     );
-    let error = verified(
+    verified(
         include_str!("fixtures/enveloped.xml"),
         &anchored(),
-        |session, memory| validate_basic(session, foreign, &[ROOT], memory, facts),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(error, ValidationError::Adapter(Error::Tree(_))),
-        "{error:?}"
+        |_| {},
+        |session| {
+            for identity in [foreign, session.view().root_element()] {
+                let error = validate_basic(session, identity, &[ROOT], facts).unwrap_err();
+                assert!(
+                    matches!(error, ValidationError::Adapter(Error::UnknownSignature)),
+                    "{error:?}"
+                );
+            }
+        },
     );
 }
 
 #[test]
 fn every_unit_of_work_is_admitted_before_use() {
-    // The exact work of a complete validation suffices; one unit less fails
-    // with the resource cause and releases every retained allocation. A
-    // charge after the work it pays for would let the short account succeed.
-    verified(
-        include_str!("fixtures/enveloped.xml"),
-        &anchored(),
-        |session, _| {
-            let funded = memory();
-            let outcome = validate_basic(session, signature(session, 0), &[ROOT], &funded, facts);
-            assert!(matches!(outcome, Ok(Outcome::Assessed(MET))), "{outcome:?}");
-            let needed = funded.work_used();
-            for (limit, succeeds) in [(needed, true), (needed - 1, false)] {
-                let account = Memory::new(Arc::new(MemoryAccount::new(1 << 24, limit)));
-                let outcome =
-                    validate_basic(session, signature(session, 0), &[ROOT], &account, facts);
-                if succeeds {
-                    assert!(matches!(outcome, Ok(Outcome::Assessed(MET))), "{outcome:?}");
-                } else {
-                    let error = format!("{:?}", outcome.unwrap_err());
-                    assert!(error.contains("WorkExceeded"), "{error}");
-                }
-                assert_eq!(account.used(), 0);
-            }
-        },
+    // Validation spends the verified request's own execution. The exact work
+    // of verification plus validation suffices; one unit less leaves the
+    // request unable to finish validation with the resource cause, and every
+    // retained allocation is released. A charge after the work it pays for
+    // would let the short account succeed.
+    let run = |work| {
+        verify_in(
+            include_str!("fixtures/enveloped.xml"),
+            &anchored(),
+            |_| {},
+            work,
+            |session| validate_basic(session, signature(session, 0), &[ROOT], facts),
+        )
+    };
+    let (outcome, funded) = run(1 << 30);
+    assert!(
+        matches!(outcome, Ok(Ok(Outcome::Assessed(MET)))),
+        "{outcome:?}"
     );
+    let needed = funded.work_used();
+    let (outcome, exact) = run(needed);
+    assert!(
+        matches!(outcome, Ok(Ok(Outcome::Assessed(MET)))),
+        "{outcome:?}"
+    );
+    assert_eq!(exact.used(), 0);
+    let (outcome, short) = run(needed - 1);
+    let error = format!(
+        "{:?}",
+        outcome.expect("verification needs less").unwrap_err()
+    );
+    assert!(error.contains("WorkExceeded"), "{error}");
+    assert_eq!(short.used(), 0);
 }

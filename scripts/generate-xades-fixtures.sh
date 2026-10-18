@@ -8,6 +8,7 @@
 # properties violate EN 319 132-1.
 #
 # Usage: XMLSEC1_BIN=/path/to/xmlsec1 scripts/generate-xades-fixtures.sh
+# Requires OpenSSL 3.4 or later for fixed certificate validity dates.
 set -euo pipefail
 
 repository="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,12 +28,30 @@ DS="http://www.w3.org/2000/09/xmldsig#"
 XADES="http://uri.etsi.org/01903/v1.3.2#"
 SIGNED_PROPERTIES="http://uri.etsi.org/01903#SignedProperties"
 SHA256="http://www.w3.org/2001/04/xmlenc#sha256"
+SHA384="http://www.w3.org/2001/04/xmldsig-more#sha384"
 MD5="http://www.w3.org/2001/04/xmldsig-more#md5"
 EXC_C14N="http://www.w3.org/2001/10/xml-exc-c14n#"
 ENVELOPED="http://www.w3.org/2000/09/xmldsig#enveloped-signature"
 RSA_SHA256="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"
+RSA_SHA384="http://www.w3.org/2001/04/xmldsig-more#rsa-sha384"
 
-openssl req -x509 -newkey rsa:2048 -nodes -keyout root.key -out root.pem -days 7300 \
+# Every certificate has the same fixed validity, independent of the date the
+# script runs. It must contain the claimed SigningTime below and the instant
+# the tests verify at (Unix time 1_800_000_000 = 2027-01-15T08:00:00Z).
+NOT_BEFORE=20260101000000Z
+NOT_AFTER=20450101000000Z
+TIME="2026-10-18T12:00:00Z"
+TIME_COMPACT=20261018120000Z
+TEST_INSTANT=20270115080000Z
+for instant in "$TIME_COMPACT" "$TEST_INSTANT"; do
+  if [[ "$instant" < "$NOT_BEFORE" || ! "$instant" < "$NOT_AFTER" ]]; then
+    echo "certificate validity must contain $instant" >&2
+    exit 1
+  fi
+done
+
+openssl req -x509 -newkey rsa:2048 -nodes -keyout root.key -out root.pem \
+  -not_before "$NOT_BEFORE" -not_after "$NOT_AFTER" \
   -subj "/CN=xml-sec XAdES Test Root" \
   -addext "basicConstraints=critical,CA:TRUE" \
   -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
@@ -40,17 +59,22 @@ openssl req -newkey rsa:2048 -nodes -keyout intermediate.key -out intermediate.c
   -subj "/CN=xml-sec XAdES Test Intermediate" 2>/dev/null
 printf 'basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' >intermediate.ext
 openssl x509 -req -in intermediate.csr -CA root.pem -CAkey root.key -out intermediate.pem \
-  -days 7000 -extfile intermediate.ext 2>/dev/null
+  -not_before "$NOT_BEFORE" -not_after "$NOT_AFTER" -extfile intermediate.ext 2>/dev/null
 openssl req -newkey rsa:2048 -nodes -keyout signer.key -out signer.csr \
   -subj "/CN=xml-sec XAdES Test Signer" 2>/dev/null
 printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n' >signer.ext
 openssl x509 -req -in signer.csr -CA intermediate.pem -CAkey intermediate.key -out signer.pem \
-  -days 6900 -extfile signer.ext 2>/dev/null
+  -not_before "$NOT_BEFORE" -not_after "$NOT_AFTER" -extfile signer.ext 2>/dev/null
 
 digest() { openssl x509 -in "$1" -outform DER | openssl dgst "-$2" -binary | openssl base64 -A; }
 signer_sha256="$(digest signer.pem sha256)"
+signer_sha384="$(digest signer.pem sha384)"
 root_sha256="$(digest root.pem sha256)"
 signer_md5="$(digest signer.pem md5)"
+
+# Reference digest and signature method of the templates below.
+REFERENCE_DIGEST="$SHA256"
+SIGNATURE_METHOD="$RSA_SHA256"
 
 # signature ID, SignedProperties ID, data Reference, DataObjectFormat MIME,
 # SigningTime, CertDigest method, CertDigest value, extra Cert attributes,
@@ -65,11 +89,11 @@ signature() {
 <ds:Signature xmlns:ds="$DS" Id="$id">
   <ds:SignedInfo>
     <ds:CanonicalizationMethod Algorithm="$EXC_C14N"/>
-    <ds:SignatureMethod Algorithm="$RSA_SHA256"/>
+    <ds:SignatureMethod Algorithm="$SIGNATURE_METHOD"/>
     $data_reference
     <ds:Reference $type URI="#$properties">
       <ds:Transforms><ds:Transform Algorithm="$EXC_C14N"/></ds:Transforms>
-      <ds:DigestMethod Algorithm="$SHA256"/>
+      <ds:DigestMethod Algorithm="$REFERENCE_DIGEST"/>
       <ds:DigestValue/>
     </ds:Reference>
   </ds:SignedInfo>
@@ -110,7 +134,7 @@ enveloped_reference() {
         <ds:Transform Algorithm="$ENVELOPED"/>
         <ds:Transform Algorithm="$EXC_C14N"/>
       </ds:Transforms>
-      <ds:DigestMethod Algorithm="$SHA256"/>
+      <ds:DigestMethod Algorithm="$REFERENCE_DIGEST"/>
       <ds:DigestValue/>
     </ds:Reference>
 EOF
@@ -120,7 +144,7 @@ target_reference() {
   cat <<EOF
 <ds:Reference Id="$1-data" URI="$2">
       <ds:Transforms><ds:Transform Algorithm="$EXC_C14N"/></ds:Transforms>
-      <ds:DigestMethod Algorithm="$SHA256"/>
+      <ds:DigestMethod Algorithm="$REFERENCE_DIGEST"/>
       <ds:DigestValue/>
     </ds:Reference>
 EOF
@@ -129,9 +153,28 @@ EOF
 detached_reference() {
   cat <<EOF
 <ds:Reference Id="$1-data" URI="$2">
-      <ds:DigestMethod Algorithm="$SHA256"/>
+      <ds:DigestMethod Algorithm="$REFERENCE_DIGEST"/>
       <ds:DigestValue/>
     </ds:Reference>
+EOF
+}
+
+# A plain XMLDSig signature over the element named by $2.
+plain_signature() {
+  cat <<EOF
+<ds:Signature xmlns:ds="$DS" Id="$1">
+              <ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="$EXC_C14N"/>
+                <ds:SignatureMethod Algorithm="$SIGNATURE_METHOD"/>
+                <ds:Reference $3 URI="#$2">
+                  <ds:Transforms><ds:Transform Algorithm="$EXC_C14N"/></ds:Transforms>
+                  <ds:DigestMethod Algorithm="$REFERENCE_DIGEST"/>
+                  <ds:DigestValue/>
+                </ds:Reference>
+              </ds:SignedInfo>
+              <ds:SignatureValue/>
+              <ds:KeyInfo><ds:X509Data><ds:X509Certificate/></ds:X509Data></ds:KeyInfo>
+            </ds:Signature>
 EOF
 }
 
@@ -142,19 +185,7 @@ counter_signature() {
 <xades:UnsignedProperties>
         <xades:UnsignedSignatureProperties>
           <xades:CounterSignature>
-            <ds:Signature Id="$1">
-              <ds:SignedInfo>
-                <ds:CanonicalizationMethod Algorithm="$EXC_C14N"/>
-                <ds:SignatureMethod Algorithm="$RSA_SHA256"/>
-                <ds:Reference Type="http://uri.etsi.org/01903#CountersignedSignature" URI="#$2">
-                  <ds:Transforms><ds:Transform Algorithm="$EXC_C14N"/></ds:Transforms>
-                  <ds:DigestMethod Algorithm="$SHA256"/>
-                  <ds:DigestValue/>
-                </ds:Reference>
-              </ds:SignedInfo>
-              <ds:SignatureValue/>
-              <ds:KeyInfo><ds:X509Data><ds:X509Certificate/></ds:X509Data></ds:KeyInfo>
-            </ds:Signature>
+            $(plain_signature "$1" "$2" 'Type="http://uri.etsi.org/01903#CountersignedSignature"')
           </xades:CounterSignature>
         </xades:UnsignedSignatureProperties>
       </xades:UnsignedProperties>
@@ -174,7 +205,6 @@ sign() {
     --output "$result" "$input"
 }
 
-TIME="2026-10-18T12:00:00Z"
 TYPE="Type=\"$SIGNED_PROPERTIES\""
 
 # enveloped: signature over the whole document except itself.
@@ -196,6 +226,14 @@ enveloped certificate-digest-md5 "$TIME" "$MD5" "$signer_md5" "" "#sig" "$TYPE"
 enveloped certificate-uri "$TIME" "$SHA256" "$signer_sha256" ' URI="https://example.invalid/signer.cer"' "#sig" "$TYPE"
 enveloped wrong-target "$TIME" "$SHA256" "$signer_sha256" "" "#payload" "$TYPE"
 enveloped untyped-signed-properties "$TIME" "$SHA256" "$signer_sha256" "" "#sig" ""
+
+# SHA-384 throughout: no digest in the document uses SHA-256, which certificate
+# path identities are computed with.
+REFERENCE_DIGEST="$SHA384"
+SIGNATURE_METHOD="$RSA_SHA384"
+enveloped sha384 "$TIME" "$SHA384" "$signer_sha384" "" "#sig" "$TYPE"
+REFERENCE_DIGEST="$SHA256"
+SIGNATURE_METHOD="$RSA_SHA256"
 
 # The signing certificate is identified only by issuer and serial number;
 # B-B requires the certificate itself in KeyInfo (EN 319 132-1 §6.3(a)).
@@ -223,6 +261,15 @@ signature sig sp "$(target_reference sig '#object')" text/plain "$TIME" "$SHA256
   "$signer_sha256" "" "#sig" "$TYPE" \
   '<ds:Object Id="object">Enveloping baseline payload</ds:Object>' >enveloping.template.xml
 sign enveloping.template.xml "$output/enveloping.xml" sig
+
+# nested: the enveloping payload, inside the root Signature, carries its own
+# independent signature, which is no countersignature of the root.
+signature sig sp "$(target_reference sig '#object')" text/xml "$TIME" "$SHA256" \
+  "$signer_sha256" "" "#sig" "$TYPE" \
+  "<ds:Object Id=\"object\"><Data Id=\"inner-data\">Inner payload</Data>$(plain_signature inner inner-data '')</ds:Object>" \
+  >nested.template.xml
+sign nested.template.xml nested.inner.xml inner
+sign nested.inner.xml "$output/nested.xml" sig
 
 # detached: the payload is a caller-supplied external resource.
 printf 'Detached baseline payload\n' >detached.txt

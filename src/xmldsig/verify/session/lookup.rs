@@ -25,30 +25,20 @@ pub enum DigestMethodResolution {
 }
 
 impl<W: Work> VerifiedSession<'_, '_, '_, W> {
-    /// Resolve `#id` through this operation's ID registrations and URI kernel,
-    /// charging `work`. XMLDSig 1.1 §4.4.3.3 defines the bare-name form; other
-    /// fragment forms are reported, never interpreted.
+    /// Resolve `#id` through this operation's ID registrations, fragment
+    /// unescaping and same-document ID semantics, charging `work`. XMLDSig 1.1
+    /// §4.4.3.3 defines the bare-name form; XPointer and non-fragment forms are
+    /// reported, never interpreted.
     /// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Same-Document>
     pub fn resolve_bare_name_in<Q: Work>(
         &self,
         uri: &str,
         work: &Q,
     ) -> Result<BareNameTarget, DsigError> {
-        work.charge_work(
-            u64::try_from(uri.len())
-                .ok()
-                .and_then(|length| length.checked_add(1))
-                .ok_or(MemoryError::WorkExceeded)?,
-        )?;
-        let Some(fragment) = uri.strip_prefix('#') else {
-            return Ok(BareNameTarget::NotBareName);
-        };
-        if !crate::xml::is_xml_ncname(fragment) {
-            return Ok(BareNameTarget::NotBareName);
-        }
+        work.charge_work(1)?;
         let target = self
             .resolver
-            .node_for_same_document_reference_in(
+            .bare_name_node_in(
                 uri,
                 Some(self.budgets.transforms.node_set_materialization()),
                 &crate::c14n::scratch::Accounted(work),
@@ -57,10 +47,11 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
                 DsigError::Reference(ReferenceProcessingError::UriDereference(error))
             })?;
         Ok(match target {
-            Some(node) if node.is_element() => {
+            None => BareNameTarget::NotBareName,
+            Some(Some(node)) if node.is_element() => {
                 BareNameTarget::Element(self.view.node_identity(node))
             }
-            _ => BareNameTarget::Unresolved,
+            Some(_) => BareNameTarget::Unresolved,
         })
     }
 
@@ -119,6 +110,29 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
             .map_err(DsigError::from)?;
         output.try_extend_from_slice(&digest)?;
         Ok(output)
+    }
+
+    /// This verified request's own execution. A continuation that funds its
+    /// work from the request, rather than from a separately supplied query
+    /// account, keeps the caller's local and aggregate ceilings.
+    pub fn execution(&self) -> &W {
+        self.work
+    }
+
+    /// A DER certificate parser bounded by this operation's X.509 resource
+    /// policy (`max_x509_work`, `max_x509_workspace_bytes`, under the hard
+    /// ceilings), on a fresh account of its own, as verification's
+    /// certificate processing is. Path validation and certificate storage
+    /// that use its account obey the same limits.
+    pub fn certificate_parser(&self) -> structured_asn1::Parser {
+        super::super::super::pkix::CertificateSession::new(&self.context.policy.resources)
+            .into_parser()
+    }
+
+    /// Shared path-processor bounds from this operation's key-trust policy,
+    /// the same bounds verification applied to its own paths.
+    pub fn certificate_path_bounds(&self) -> structured_pkix::path::ValidationBounds {
+        super::super::super::pkix::path_bounds(self.context.policy.key_trust.max_x509_chain_depth)
     }
 
     /// Certificate-path signature checks for `chain` and `anchor` through this

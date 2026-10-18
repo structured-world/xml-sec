@@ -519,6 +519,18 @@ fn validate_crl_serials(
     Ok(())
 }
 
+/// Shared path-processor bounds for a maximum path length that includes the
+/// anchor; RFC 5280 §6.1 counts only the certificates below it.
+pub(crate) fn path_bounds(max_chain_depth: usize) -> structured_pkix::path::ValidationBounds {
+    structured_pkix::path::ValidationBounds {
+        depth: max_chain_depth.saturating_sub(1),
+        // The operation account owns the work/storage ceilings. These
+        // mechanism limits must not divide or reset that shared budget.
+        work: u64::MAX,
+        policies: usize::MAX,
+    }
+}
+
 pub(crate) fn validate_supplied_path<'a>(
     chain: &[&'a Certificate<'a>],
     anchor: &'a Certificate<'a>,
@@ -528,7 +540,7 @@ pub(crate) fn validate_supplied_path<'a>(
 ) -> Result<structured_pkix::path::ValidationFacts<'a>, X509ChainError> {
     use structured_pkix::path::{
         Anchor, BuildError, ConstraintSource, Interval, Policy, RejectionReason, Validation,
-        ValidationBounds, ValidationContext,
+        ValidationContext,
     };
     let verifier = CertificatePathVerifier {
         signatures: ProviderVerifier {
@@ -544,13 +556,7 @@ pub(crate) fn validate_supplied_path<'a>(
         execution: session.memory(),
         interval: Interval::at_instant(verification_instant(options.verification_time)?),
         policy: Policy::default(),
-        bounds: ValidationBounds {
-            depth: options.max_chain_depth.saturating_sub(1),
-            // The operation account owns the work/storage ceilings. These
-            // mechanism limits must not divide or reset that shared budget.
-            work: u64::MAX,
-            policies: usize::MAX,
-        },
+        bounds: path_bounds(options.max_chain_depth),
         verifier: &verifier,
         watch: &(),
         recognizer: &(),
@@ -996,6 +1002,11 @@ impl CertificateSession {
             .min(crate::hard_limits::X509_WORKSPACE_BYTE_CEILING);
         let memory = Memory::new(Arc::new(MemoryAccount::new(memory_limit, work_limit)));
         Self::with_account(work_limit, memory_limit, memory)
+    }
+
+    /// The bounded parser, keeping its fresh policy-limited account.
+    pub(crate) fn into_parser(self) -> Parser {
+        self.parser
     }
 
     pub(crate) fn share(&self) -> Self {

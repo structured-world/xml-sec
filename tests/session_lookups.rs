@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
-use xml_sec::policy::{PolicyViolation, VerificationPolicy};
+use xml_sec::policy::{PolicyViolation, SameDocumentIdSemantics, VerificationPolicy};
 use xml_sec::{XmlDocument, xmldsig::*};
 
 const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
@@ -18,17 +18,25 @@ fn account() -> Memory {
 /// A verified HMAC signature over `#target`, next to DigestMethod elements
 /// with a known, an unknown, an absent and a policy-restricted algorithm.
 fn with_session(check: impl FnOnce(&VerifiedSession<'_, '_, '_, Memory>, &Memory)) {
+    with_session_in(|_| {}, check);
+}
+
+fn with_session_in(
+    configure: impl FnOnce(&mut VerificationPolicy),
+    check: impl FnOnce(&VerifiedSession<'_, '_, '_, Memory>, &Memory),
+) {
     let template = format!(
-        r##"<r xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><target Id="target">payload</target><twin Id="twin"/><twin Id="twin"/><methods><ds:DigestMethod Id="known" Algorithm="{SHA256}"/><ds:DigestMethod Id="unknown" Algorithm="urn:example:digest"/><ds:DigestMethod Id="absent"/><ds:DigestMethod Id="restricted" Algorithm="{SHA1}"/><other Id="other"/></methods><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></r>"##
+        r##"<r xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><target Id="target">payload</target><numeric Id="12345"/><twin Id="twin"/><twin Id="twin"/><methods><ds:DigestMethod Id="known" Algorithm="{SHA256}"/><ds:DigestMethod Id="unknown" Algorithm="urn:example:digest"/><ds:DigestMethod Id="absent"/><ds:DigestMethod Id="restricted" Algorithm="{SHA1}"/><other Id="other"/></methods><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></r>"##
     );
     let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
     let document =
         XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
     let key = HmacVerificationKey::new(vec![0x61; 32]).unwrap();
-    let policy = VerificationPolicy {
+    let mut policy = VerificationPolicy {
         digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha256])),
         ..VerificationPolicy::default()
     };
+    configure(&mut policy);
     let context = VerifyContext::new().policy(policy).key(&key);
     let work = account();
     with_verified_request(
@@ -65,7 +73,10 @@ fn bare_names_resolve_only_in_their_specified_form() {
             "",
             "target",
             "#xpointer(id('target'))",
+            "#%78pointer(id('target'))",
             "#1target",
+            "#12345",
+            "#tar%6",
             "other#target",
         ] {
             assert_eq!(
@@ -74,6 +85,58 @@ fn bare_names_resolve_only_in_their_specified_form() {
                 "{uri}"
             );
         }
+    });
+}
+
+#[test]
+fn bare_names_follow_the_operation_fragment_rules() {
+    // The lookup shares the dereference kernel: XPointer Framework §§3-4
+    // unescaping applies to a specification bare name, and a compatibility
+    // mode's own ID grammar decides, rather than a separate NCName check.
+    // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#escaping
+    with_session(|session, work| {
+        let target = session.view().node_for_id("target", &[]).unwrap();
+        assert_eq!(
+            session.resolve_bare_name_in("#tar%67et", work).unwrap(),
+            BareNameTarget::Element(target)
+        );
+    });
+    let visa3d = |policy: &mut VerificationPolicy| {
+        policy.transforms.same_document_id_semantics = SameDocumentIdSemantics::XmlSecVisa3d;
+    };
+    with_session_in(visa3d, |session, work| {
+        let numeric = session.view().node_for_id("12345", &[]).unwrap();
+        assert_eq!(
+            session.resolve_bare_name_in("#12345", work).unwrap(),
+            BareNameTarget::Element(numeric)
+        );
+        assert_eq!(
+            session
+                .resolve_bare_name_in("#xpointer(id('12345'))", work)
+                .unwrap(),
+            BareNameTarget::NotBareName
+        );
+    });
+}
+
+#[test]
+fn certificate_processing_limits_come_from_the_policy() {
+    // Extension formats re-checking certificates get no separate limit
+    // surface: the parser's fresh account carries the operation's X.509 work
+    // and workspace allowances, and the path bounds its maximum depth.
+    let configure = |policy: &mut VerificationPolicy| {
+        policy.resources.max_x509_work = 123_456;
+        policy.resources.max_x509_workspace_bytes = 654_321;
+        policy.key_trust.max_x509_chain_depth = 4;
+    };
+    with_session_in(configure, |session, work| {
+        let parser = session.certificate_parser();
+        assert_eq!(parser.memory().work_remaining(), 123_456);
+        assert_eq!(parser.memory().limit(), 654_321);
+        assert!(!parser.memory().same_account(work));
+        // RFC 5280 §6.1: the anchor is not part of the bounded path.
+        assert_eq!(session.certificate_path_bounds().depth, 3);
+        assert!(std::ptr::eq(session.execution(), work));
     });
 }
 

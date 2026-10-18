@@ -23,7 +23,9 @@ mod path;
 mod signature;
 mod xml;
 
-pub use basic::{Outcome, PathFailure, Report, ValidationError, validate_basic};
+pub use basic::{CounterError, Outcome, PathFailure, Report, ValidationError, validate_basic};
+pub use binary::DigestIdentity;
+pub use path::CounterPathError;
 
 /// Original document identity and generation, as seen by the shared core.
 pub type Snapshot = structured_xades::xml::Snapshot<DocumentIdentity, u64>;
@@ -91,6 +93,10 @@ pub enum Error {
     /// A URI read from simple content contains element children.
     #[error("reference URI source contains element content")]
     MalformedUri,
+    /// A prohibited digest reached computation; the format check refuses it
+    /// before any hashing, so this marks a broken invariant.
+    #[error("prohibited digest algorithm cannot be computed")]
+    ProhibitedDigest,
     /// The replay receiver refused further bytes.
     #[error("reference replay receiver refused output")]
     ReceiverRefused,

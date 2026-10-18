@@ -1,12 +1,11 @@
 //! The XAdES B-B pipeline for one verified signature.
 
-use crate::path::{self, PathFailure as Failure};
+use crate::path::{self, CounterPathError};
 use crate::{Document, Error};
-use structured_asn1::Parser;
-use structured_asn1::memory::{Memory, Work};
+use structured_asn1::memory::Work;
 use structured_xades::baseline::{self, Basic, BasicInput};
 use structured_xades::certificate::{self, KeyAssociation};
-use structured_xades::counter::WalkError;
+use structured_xades::counter::{self, WalkError};
 use structured_xades::hashes::{self, HashError, ParticipantBinding, ParticipantProblem};
 use structured_xades::pki::{self, CounterSelectionError};
 use structured_xades::prepare;
@@ -49,7 +48,7 @@ pub enum Outcome<R> {
 
 /// Countersignature traversal failure with the original selection cause.
 pub type CounterError =
-    WalkError<Error, CounterSelectionError<Failure, Error, NodeIdentity>, NodeIdentity>;
+    WalkError<Error, CounterSelectionError<CounterPathError, Error, NodeIdentity>, NodeIdentity>;
 
 /// Processing failure of one pipeline stage, with the stage's original cause.
 ///
@@ -86,57 +85,79 @@ pub enum ValidationError {
 
 /// Validate the B-B level (ETSI EN 319 132-1 §6.3) of `signature`.
 ///
-/// `signature` must belong to `session`'s request. `certificates` are the
-/// caller's DER certificates beyond the Signature's `KeyInfo`: the trust
-/// anchors and intermediates the verification's key resolver used. The
-/// signer's path is the exact path verification validated, re-checked by the
-/// shared processor; countersignatures need validated paths of their own.
-/// `memory` funds all work and storage of this call.
+/// `signature` must be a Signature of `session`'s request. `certificates`
+/// are the caller's DER certificates beyond the Signature's `KeyInfo`: the
+/// trust anchors and intermediates the verification's key resolver used.
+/// Each signer's path is the exact path verification validated, re-checked
+/// by the shared processor; countersignatures need validated paths of their
+/// own.
+///
+/// All limits come from the session's compiled policy: XML queries spend the
+/// request's own execution, and certificate processing runs on a fresh
+/// account bounded by the operation's X.509 resource and path policy, as the
+/// verification's certificate processing does.
 ///
 /// The visitor receives the assembled report; nothing borrowed from it can
 /// escape. A completed negative fact returns as an [`Outcome`] variant.
 ///
 /// # Errors
-/// Returns the original cause of the stage that could not complete.
+/// Returns the original cause of the stage that could not complete, and
+/// [`Error::UnknownSignature`] for an identity outside the request.
 pub fn validate_basic<W: Work, R>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signature: NodeIdentity,
     certificates: &[&[u8]],
-    memory: &Memory,
     visitor: impl for<'a> FnOnce(&Report<'a>) -> R,
 ) -> Result<Outcome<R>, ValidationError> {
-    let signers = path::signers(session, signature, memory)?;
-    let decoded = path::key_info_certificates(session, &signers, memory)?;
-    let mut candidates = memory.vector();
+    let work = session.execution();
+    path::require_member(session, signature, work)?;
+
+    let document = Document::new(session);
+    let access = Access::new(&document, document.snapshot(), work);
+    let prepared = prepare::prepare(&access, signature, Requirements::Basic, None)
+        .map_err(|error| ValidationError::Prepare(Box::new(error)))?;
+    let fields = prepare::check_fields(&prepared, &access)
+        .map_err(|error| ValidationError::Fields(Box::new(error)))?;
+    let incorporated = counter::walk(&access, prepared.bound(), |binding, _| {
+        Ok::<_, CounterSelectionError<CounterPathError, Error, NodeIdentity>>(
+            binding.original().child(),
+        )
+    })
+    .map_err(|error| ValidationError::Counters(Box::new(error)))?;
+
+    let parser = session.certificate_parser();
+    let x509 = parser.memory();
+    let signers = path::signers(session, signature, &incorporated, x509)?;
+    let decoded = path::key_info_certificates(session, &signers, x509)?;
+    let mut candidates = x509.vector();
+    candidates
+        .try_reserve_exact(decoded.len() + certificates.len())
+        .map_err(Error::from)?;
     for bytes in decoded.iter() {
         candidates.try_push(&bytes[..]).map_err(Error::from)?;
     }
     for bytes in certificates {
         candidates.try_push(*bytes).map_err(Error::from)?;
     }
-    let parser = Parser::der(memory.clone());
-    let selection = path::select(session, &signers, &candidates, &parser, memory)?;
-    let paths = path::check(session, &selection, memory)?;
-    let root = match paths.get(signature) {
+    let selection = path::select(&signers, &candidates, &parser, x509)?;
+    let paths = path::check(session, &selection, x509)?;
+    let root = match paths.get(signature, x509) {
         Ok(root) => root,
-        Err(failure) => return Ok(Outcome::Path { signature, failure }),
+        Err(CounterPathError::Missing(failure)) => {
+            return Ok(Outcome::Path { signature, failure });
+        }
+        Err(CounterPathError::Resource(cause)) => return Err(Error::from(cause).into()),
     };
 
-    let document = Document::new(session);
-    let access = Access::new(&document, document.snapshot(), memory);
-    let prepared = prepare::prepare(&access, signature, Requirements::Basic, None)
-        .map_err(|error| ValidationError::Prepare(Box::new(error)))?;
-    let fields = prepare::check_fields(&prepared, &access)
-        .map_err(|error| ValidationError::Fields(Box::new(error)))?;
-    let counters = match pki::bind_counters(prepared.bound(), &access, |binding, _| {
-        paths.get(binding.original().child())
+    let counters = match pki::bind_counters(prepared.bound(), &access, |binding, work| {
+        paths.get(binding.original().child(), work)
     }) {
         Ok(counters) => counters,
-        Err(WalkError::Visitor(CounterSelectionError::Selection { signature, cause })) => {
-            return Ok(Outcome::Path {
-                signature,
-                failure: cause,
-            });
+        Err(WalkError::Visitor(CounterSelectionError::Selection {
+            signature,
+            cause: CounterPathError::Missing(failure),
+        })) => {
+            return Ok(Outcome::Path { signature, failure });
         }
         Err(WalkError::Visitor(CounterSelectionError::Differs { signature })) => {
             return Ok(Outcome::CounterKey {
@@ -164,7 +185,7 @@ pub fn validate_basic<W: Work, R>(
         prepared.certificates(),
         root,
         &document,
-        memory,
+        work,
     )
     .map_err(|error| ValidationError::Certificate(Box::new(error)))?;
     let operation = parser.read(&[], 0).map_err(ValidationError::Operation)?;

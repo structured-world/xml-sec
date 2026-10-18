@@ -25,7 +25,7 @@ use xml_sec::xmldsig::{
 };
 
 /// RFC 9231 §2.1.1 digest identifier; EN 319 132-1 §6.2.1 forbids MD5.
-const MD5: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
+pub(crate) const MD5: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
 
 pub(crate) fn hash_class(algorithm: DigestAlgorithm) -> HashClass {
     if algorithm.uri() == MD5 {
