@@ -1086,7 +1086,7 @@ impl DefaultKeyResolver {
         let spki = effective_key
             .as_deref()
             .unwrap_or_else(|| certificate.tbs().public_key().as_bytes());
-        validate_spki_algorithm(spki, algorithm)?;
+        validate_spki_algorithm(&budget.certificates, spki, algorithm)?;
         let storage = VerificationKeyStorage::reserve(
             &budget.certificates,
             spki.len(),
@@ -1521,6 +1521,7 @@ impl DefaultKeyResolver {
     fn resolve_key_value(
         key_value: &KeyValueInfo,
         algorithm: SignatureAlgorithm,
+        session: &super::pkix::CertificateSession,
     ) -> Result<Option<VerificationKey>, KeyResolutionError> {
         let public_key_bytes = match key_value {
             KeyValueInfo::Dsa { p, q, g, y } => {
@@ -1554,7 +1555,7 @@ impl DefaultKeyResolver {
             // DH key agreement keys cannot verify an XML signature.
             KeyValueInfo::Dh { .. } | KeyValueInfo::Unsupported { .. } => return Ok(None),
         };
-        validate_spki_algorithm(&public_key_bytes, algorithm)?;
+        validate_spki_algorithm(session, &public_key_bytes, algorithm)?;
 
         Ok(Some(VerificationKey {
             algorithm,
@@ -1682,7 +1683,11 @@ impl DefaultKeyResolver {
                 }
                 KeyInfoSource::DerEncodedKeyValue(public_key_bytes) => {
                     candidate_budget.charge()?;
-                    validate_spki_algorithm(public_key_bytes, algorithm)?;
+                    validate_spki_algorithm(
+                        &candidate_budget.certificates,
+                        public_key_bytes,
+                        algorithm,
+                    )?;
                     storage = Some(VerificationKeyStorage::reserve(
                         &candidate_budget.certificates,
                         public_key_bytes.len(),
@@ -1705,7 +1710,11 @@ impl DefaultKeyResolver {
                             if key.algorithm != algorithm {
                                 return Err(KeyResolutionError::AlgorithmMismatch);
                             }
-                            validate_spki_algorithm(&key.public_key_bytes, algorithm)?;
+                            validate_spki_algorithm(
+                                &candidate_budget.certificates,
+                                &key.public_key_bytes,
+                                algorithm,
+                            )?;
                             storage = Some(VerificationKeyStorage::reserve(
                                 &candidate_budget.certificates,
                                 key.public_key_bytes.len(),
@@ -1718,7 +1727,11 @@ impl DefaultKeyResolver {
                 }
                 KeyInfoSource::KeyValue(key_value) => {
                     candidate_budget.charge()?;
-                    match Self::resolve_key_value(key_value, algorithm) {
+                    match Self::resolve_key_value(
+                        key_value,
+                        algorithm,
+                        &candidate_budget.certificates,
+                    ) {
                         Ok(resolved) => resolved,
                         Err(error) if key_value_error_allows_fallback(key_value, &error) => {
                             deferred_key_value_error.get_or_insert(error);
@@ -2007,6 +2020,7 @@ fn key_value_error_allows_fallback(key_value: &KeyValueInfo, error: &KeyResoluti
 }
 
 fn validate_spki_algorithm(
+    session: &super::pkix::CertificateSession,
     public_key_bytes: &[u8],
     algorithm: SignatureAlgorithm,
 ) -> Result<(), KeyResolutionError> {
@@ -2038,29 +2052,22 @@ fn validate_spki_algorithm(
             Ok(())
         }
         (method, pkcs1::ALGORITHM_OID) if method.is_rsa() => {
-            let octets = spki
-                .subject_public_key
-                .as_bytes()
-                .ok_or(KeyResolutionError::InvalidPublicKey)?;
-            let key = pkcs1::RsaPublicKeyRef::from_der(octets)
-                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-            bounded_rsa_public_components(key.modulus.as_bytes(), key.public_exponent.as_bytes())?;
-            Ok(())
+            validate_rsa_spki(session, public_key_bytes)
         }
         (method, oid)
             if method.ecdsa_digest().is_some() && oid == p256::elliptic_curve::ALGORITHM_OID =>
         {
-            validate_ec_spki_point(&spki)
+            validate_ec_spki_point(session, public_key_bytes)
         }
         _ => Err(KeyResolutionError::AlgorithmMismatch),
     }
 }
 
 pub(crate) fn supported_parsed_spki_is_rsa(
+    session: &super::pkix::CertificateSession,
     spki: &pkcs8::SubjectPublicKeyInfoRef<'_>,
     public_key_bytes: &[u8],
 ) -> Result<bool, KeyResolutionError> {
-    use der::Decode as _;
     if let Some(parameter) = super::PqAlgorithm::from_oid(spki.algorithm.oid) {
         super::modern::validate_public_key(
             SignatureAlgorithm::PostQuantum(parameter),
@@ -2083,13 +2090,7 @@ pub(crate) fn supported_parsed_spki_is_rsa(
     }
     match spki.algorithm.oid {
         pkcs1::ALGORITHM_OID => {
-            let octets = spki
-                .subject_public_key
-                .as_bytes()
-                .ok_or(KeyResolutionError::InvalidPublicKey)?;
-            let key = pkcs1::RsaPublicKeyRef::from_der(octets)
-                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-            bounded_rsa_public_components(key.modulus.as_bytes(), key.public_exponent.as_bytes())?;
+            validate_rsa_spki(session, public_key_bytes)?;
             rsa::RsaPublicKey::from_public_key_der(public_key_bytes)
                 .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
             Ok(true)
@@ -2100,27 +2101,60 @@ pub(crate) fn supported_parsed_spki_is_rsa(
             Ok(false)
         }
         oid if oid == p256::elliptic_curve::ALGORITHM_OID => {
-            validate_ec_spki_point(spki)?;
+            validate_ec_spki_point(session, public_key_bytes)?;
             Ok(false)
         }
         _ => Err(KeyResolutionError::AlgorithmMismatch),
     }
 }
 
-fn validate_ec_spki_point(
-    spki: &pkcs8::SubjectPublicKeyInfoRef<'_>,
+/// Exhausting the session stays a resource failure; every other refusal of the
+/// key structure is an invalid key.
+fn structured_key_error(
+    session: &super::pkix::CertificateSession,
+    error: structured_pkix::Error,
+) -> KeyResolutionError {
+    if error.is_resource() {
+        certificate_resolution_error(session.error(error))
+    } else {
+        KeyResolutionError::InvalidPublicKey
+    }
+}
+
+fn validate_rsa_spki(
+    session: &super::pkix::CertificateSession,
+    spki: &[u8],
 ) -> Result<(), KeyResolutionError> {
-    let curve = spki
-        .algorithm
-        .parameters
-        .and_then(|parameters| parameters.decode_as::<der::asn1::ObjectIdentifier>().ok())
+    let key = match session.read_public_key(spki) {
+        Ok(super::pkix::PublicKey::Rsa(key)) => key,
+        Ok(super::pkix::PublicKey::Ec(_)) => return Err(KeyResolutionError::InvalidPublicKey),
+        Err(error) => return Err(structured_key_error(session, error)),
+    };
+    bounded_rsa_public_components(key.modulus().as_bytes(), key.exponent().as_bytes())?;
+    Ok(())
+}
+
+fn validate_ec_spki_point(
+    session: &super::pkix::CertificateSession,
+    spki: &[u8],
+) -> Result<(), KeyResolutionError> {
+    let key = match session.read_public_key(spki) {
+        Ok(super::pkix::PublicKey::Ec(key)) => key,
+        // RFC 5480 2.1.1 requires ECParameters; without them no curve is named.
+        Err(error) if error.code() == structured_pkix::ErrorCode::MissingField => {
+            return Err(KeyResolutionError::AlgorithmMismatch);
+        }
+        Err(error) => return Err(structured_key_error(session, error)),
+        Ok(super::pkix::PublicKey::Rsa(_)) => return Err(KeyResolutionError::InvalidPublicKey),
+    };
+    // RFC 5480 2.1.1: implicitCurve and specifiedCurve MUST NOT be used.
+    // https://www.rfc-editor.org/rfc/rfc5480.html#section-2.1.1
+    let structured_pkix::key::ec::Curve::Named(curve) = key.curve() else {
+        return Err(KeyResolutionError::AlgorithmMismatch);
+    };
+    let curve = super::signature::EcCurve::from_oid_bytes(curve.as_bytes())
         .ok_or(KeyResolutionError::AlgorithmMismatch)?;
-    let curve =
-        super::signature::EcCurve::from_oid(curve).ok_or(KeyResolutionError::AlgorithmMismatch)?;
-    let point = spki
-        .subject_public_key
-        .as_bytes()
-        .ok_or(KeyResolutionError::InvalidPublicKey)?;
+    let point = key.as_bytes();
     curve
         .validate_point(point)
         .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
@@ -2132,7 +2166,10 @@ fn validate_ec_spki_point(
     .map_err(|_| KeyResolutionError::InvalidPublicKey)
 }
 
-pub(crate) fn supported_key_value_is_rsa(value: &KeyValueInfo) -> Result<bool, KeyResolutionError> {
+pub(crate) fn supported_key_value_is_rsa(
+    session: &super::pkix::CertificateSession,
+    value: &KeyValueInfo,
+) -> Result<bool, KeyResolutionError> {
     let (spki, is_rsa) = match value {
         KeyValueInfo::Rsa { modulus, exponent } => {
             (rsa_key_value_to_spki_der(modulus, exponent)?, true)
@@ -2156,7 +2193,7 @@ pub(crate) fn supported_key_value_is_rsa(value: &KeyValueInfo) -> Result<bool, K
     } else {
         SignatureAlgorithm::EcdsaSha256
     };
-    validate_spki_algorithm(&spki, algorithm)?;
+    validate_spki_algorithm(session, &spki, algorithm)?;
     Ok(is_rsa)
 }
 
@@ -2294,8 +2331,10 @@ mod tests {
             subject_public_key: der::asn1::BitStringRef::new(1, &[0])?,
         };
         let encoded = der::Encode::to_der(&opaque)?;
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
         assert!(matches!(
-            supported_parsed_spki_is_rsa(&opaque, &encoded),
+            supported_parsed_spki_is_rsa(&session, &opaque, &encoded),
             Err(KeyResolutionError::AlgorithmMismatch)
         ));
         for method in [
@@ -2304,7 +2343,7 @@ mod tests {
             SignatureAlgorithm::EcdsaSha256,
         ] {
             assert!(matches!(
-                validate_spki_algorithm(&encoded, method),
+                validate_spki_algorithm(&session, &encoded, method),
                 Err(KeyResolutionError::AlgorithmMismatch)
             ));
         }
@@ -2622,8 +2661,10 @@ mod tests {
         ));
         // Ordinary verification must use the same borrowed preflight, not
         // reject only after an allocating crypto decoder reports mismatch.
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
         assert!(matches!(
-            validate_spki_algorithm(&encoded, SignatureAlgorithm::DsaSha256),
+            validate_spki_algorithm(&session, &encoded, SignatureAlgorithm::DsaSha256),
             Err(KeyResolutionError::InvalidPublicKey)
         ));
     }

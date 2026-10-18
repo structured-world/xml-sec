@@ -3473,22 +3473,18 @@ pub(crate) fn certificate_metadata(
     // Unknown keys retain Unsupported rather than inheriting RSA/EC rules.
     // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
     let public_key = if spki.algorithm().algorithm() == structured_pkix::oid::RSA_ENCRYPTION {
-        let key_octets = spki.key_octets().ok_or_else(|| {
-            ParseError::InvalidStructure(
-                "X509Certificate RSA public key is not octet-aligned".into(),
-            )
+        // RFC 8017 A.1.1: positive modulus and exponent, nothing after them.
+        let rsa = structured_pkix::key::rsa::read(spki, session.memory()).map_err(|error| {
+            if error.is_resource() {
+                session.parse_error(session.error(error))
+            } else {
+                ParseError::InvalidStructure(format!("X509Certificate RSA key: {error}"))
+            }
         })?;
-        let rsa = pkcs1::RsaPublicKeyRef::from_der(key_octets).map_err(|error| {
-            ParseError::InvalidStructure(format!("X509Certificate RSA key: {error}"))
-        })?;
-        let modulus = trim_leading_zeroes(rsa.modulus.as_bytes());
-        let exponent = trim_leading_zeroes(rsa.public_exponent.as_bytes());
-        if modulus.is_empty() || exponent.is_empty() {
-            return Err(ParseError::InvalidStructure(
-                "X509Certificate RSA key contains empty modulus or exponent".into(),
-            ));
+        X509PublicKeyInfo::Rsa {
+            modulus: rsa.modulus().as_bytes().to_vec(),
+            exponent: rsa.exponent().as_bytes().to_vec(),
         }
-        X509PublicKeyInfo::Rsa { modulus, exponent }
     } else if spki.algorithm().algorithm() == structured_pkix::oid::EC_PUBLIC_KEY {
         let key_octets = spki.key_octets().ok_or_else(|| {
             ParseError::InvalidStructure(
@@ -3612,14 +3608,6 @@ fn x509_serial_decimal_bytes(serial: &str) -> Option<[u8; MAX_X509_SERIAL_NUMBER
 #[cfg(test)]
 fn x509_serial_decimal_to_hex(serial: &str) -> Option<String> {
     x509_serial_decimal_bytes(serial).map(|bytes| format_x509_serial_value_hex(&bytes))
-}
-
-fn trim_leading_zeroes(bytes: &[u8]) -> Vec<u8> {
-    let first_non_zero = bytes
-        .iter()
-        .position(|byte| *byte != 0)
-        .unwrap_or(bytes.len());
-    bytes[first_non_zero..].to_vec()
 }
 
 fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), ParseError> {

@@ -946,6 +946,12 @@ impl<W: Work> structured_pkix::path::Verify<W> for PathVerifier<'_, '_> {
     }
 }
 
+/// Structure of an RSA or EC public key, borrowed from its SPKI encoding.
+pub(crate) enum PublicKey<'a> {
+    Rsa(structured_pkix::key::rsa::PublicKey<'a>),
+    Ec(structured_pkix::key::ec::PublicKey<'a>),
+}
+
 /// A single account covers all candidates, nested decodes and retries.
 #[derive(Debug)]
 pub(crate) struct CertificateSession {
@@ -1010,6 +1016,42 @@ impl CertificateSession {
 
     pub(crate) fn read<'a>(&'a self, bytes: &'a [u8]) -> Result<Certificate<'a>, X509ChainError> {
         Certificate::read(&self.parser, bytes, 0).map_err(|error| self.error(error))
+    }
+
+    /// Structural RSA or EC public key of a standalone SPKI, read with this
+    /// session's work.
+    pub(crate) fn read_public_key<'a>(
+        &'a self,
+        spki: &'a [u8],
+    ) -> Result<PublicKey<'a>, structured_pkix::Error> {
+        use structured_pkix::key::{PublicKeyInfo, ec, rsa};
+        use structured_pkix::{Error, ErrorCode};
+        const FIELD: &str = "subjectPublicKeyInfo";
+        let encoding = |error: structured_asn1::Error| {
+            Error::new(ErrorCode::Encoding(error.code()), FIELD, error.offset())
+        };
+        let mut reader = self.parser.read(spki, 0).map_err(encoding)?;
+        let element = reader
+            .next_element()
+            .map_err(encoding)?
+            .ok_or_else(|| Error::new(ErrorCode::MissingField, FIELD, 0))?;
+        let info = PublicKeyInfo::read_element(&reader, &element, FIELD)?;
+        // RFC 5280 4.1.2.7: the encoding is exactly one SubjectPublicKeyInfo.
+        if !reader.is_empty() {
+            return Err(Error::new(ErrorCode::TrailingData, FIELD, reader.offset()));
+        }
+        let execution = reader.execution();
+        // Both readers compare the algorithm identifier again, paid; this only
+        // selects which one to ask.
+        if info.algorithm().algorithm() == structured_pkix::oid::EC_PUBLIC_KEY {
+            ec::read(
+                structured_pkix::path::WorkingKey::standing(info),
+                &execution,
+            )
+            .map(PublicKey::Ec)
+        } else {
+            rsa::read(info, &execution).map(PublicKey::Rsa)
+        }
     }
 
     pub(crate) fn read_crl<'a>(

@@ -769,12 +769,20 @@ pub(crate) enum EcCurve {
 
 impl EcCurve {
     pub(crate) fn from_oid(oid: der::asn1::ObjectIdentifier) -> Option<Self> {
+        Self::from_oid_bytes(oid.as_bytes())
+    }
+
+    /// Curve named by the contents octets of an OBJECT IDENTIFIER.
+    pub(crate) fn from_oid_bytes(oid: &[u8]) -> Option<Self> {
         use pkcs8::AssociatedOid as _;
-        match oid {
-            p256::NistP256::OID => Some(Self::P256),
-            p384::NistP384::OID => Some(Self::P384),
-            p521::NistP521::OID => Some(Self::P521),
-            _ => None,
+        if oid == p256::NistP256::OID.as_bytes() {
+            Some(Self::P256)
+        } else if oid == p384::NistP384::OID.as_bytes() {
+            Some(Self::P384)
+        } else if oid == p521::NistP521::OID.as_bytes() {
+            Some(Self::P521)
+        } else {
+            None
         }
     }
 

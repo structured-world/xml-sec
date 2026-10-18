@@ -1414,9 +1414,14 @@ impl KeyInventory {
         let material_len = der.len();
         let mut key_info = KeyInfo::default();
         key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
+        let session = crate::xmldsig::pkix::CertificateSession::new(resources);
         let is_rsa = if let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(&der) {
-            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(&spki, &der)
-                .map_err(|_| KeyStoreError::Selection("unsupported public key algorithm"))?;
+            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(&session, &spki, &der)
+                .map_err(|error| {
+                    key_import_error(error, || {
+                        KeyStoreError::Selection("unsupported public key algorithm")
+                    })
+                })?;
             key_info
                 .sources
                 .push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -1430,7 +1435,6 @@ impl KeyInventory {
                 // https://www.rfc-editor.org/rfc/rfc7468#section-2
                 return Err(KeyStoreError::Selection("invalid PUBLIC KEY payload"));
             }
-            let session = crate::xmldsig::pkix::CertificateSession::new(resources);
             let certificate = session.read(&der).map_err(certificate_import_error)?;
             let parsed = crate::xmldsig::parse::certificate_metadata(&certificate, &session)
                 .map_err(|error| match error {
@@ -1440,8 +1444,13 @@ impl KeyInventory {
             let spki_der = certificate.tbs().public_key().as_bytes();
             let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(spki_der)
                 .map_err(|_| KeyStoreError::Selection("unsupported X.509 certificate key"))?;
-            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(&spki, spki_der)
-                .map_err(|_| KeyStoreError::Selection("unsupported X.509 certificate key"))?;
+            let is_rsa =
+                crate::xmldsig::keys::supported_parsed_spki_is_rsa(&session, &spki, spki_der)
+                    .map_err(|error| {
+                        key_import_error(error, || {
+                            KeyStoreError::Selection("unsupported X.509 certificate key")
+                        })
+                    })?;
             drop(certificate);
             key_info.sources.push(KeyInfoSource::X509Data(X509DataInfo {
                 certificates: vec![der],
@@ -2232,6 +2241,8 @@ impl KeyInventory {
         let mut names = HashSet::new();
         let mut store = Self::default();
         let mut entry_count = 0_usize;
+        // One account for every public key read while loading this store.
+        let session = crate::xmldsig::pkix::CertificateSession::new(resources);
         for info in root.children().filter(|child| child.is_element()) {
             if !info.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
                 return Err(KeyStoreError::Invalid("unexpected child of Keys".into()));
@@ -2370,8 +2381,12 @@ impl KeyInventory {
                             _ => None,
                         })
                         .ok_or_else(|| KeyStoreError::Invalid("invalid public KeyValue".into()))?;
-                    let is_rsa = crate::xmldsig::keys::supported_key_value_is_rsa(is_rsa)
-                        .map_err(|_| KeyStoreError::Invalid("invalid public KeyValue".into()))?;
+                    let is_rsa = crate::xmldsig::keys::supported_key_value_is_rsa(&session, is_rsa)
+                        .map_err(|error| {
+                            key_import_error(error, || {
+                                KeyStoreError::Invalid("invalid public KeyValue".into())
+                            })
+                        })?;
                     let usages = if is_rsa {
                         KeyUsages::VERIFY.union(KeyUsages::ENCRYPT)
                     } else {
@@ -2386,8 +2401,13 @@ impl KeyInventory {
                 ParsedMaterial::Dsa(public, private) => {
                     // This inventory has no external DSA parameter inheritance;
                     // its stored public tuple must be independently resolvable.
-                    crate::xmldsig::keys::supported_key_value_is_rsa(&public)
-                        .map_err(|_| KeyStoreError::Invalid("invalid public DSAKeyValue".into()))?;
+                    crate::xmldsig::keys::supported_key_value_is_rsa(&session, &public).map_err(
+                        |error| {
+                            key_import_error(error, || {
+                                KeyStoreError::Invalid("invalid public DSAKeyValue".into())
+                            })
+                        },
+                    )?;
                     let mut key_info = KeyInfo::default();
                     key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
                     key_info.sources.push(KeyInfoSource::KeyValue(public));
@@ -2423,6 +2443,19 @@ impl KeyInventory {
             ));
         }
         Ok(store)
+    }
+}
+
+/// Exhausting the import session while reading a key stays a policy violation.
+fn key_import_error(
+    error: crate::xmldsig::KeyResolutionError,
+    otherwise: impl FnOnce() -> KeyStoreError,
+) -> KeyStoreError {
+    match error {
+        crate::xmldsig::KeyResolutionError::Chain(crate::xmldsig::X509ChainError::Policy(
+            error,
+        )) => KeyStoreError::Policy(error),
+        _ => otherwise(),
     }
 }
 
