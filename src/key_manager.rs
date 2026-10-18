@@ -1361,6 +1361,7 @@ impl KeyInventory {
             usages,
             resources,
             PublicDerFormat::KeyOrCertificate,
+            &crate::xmldsig::pkix::CertificateSession::new(resources),
         )
     }
 
@@ -1371,6 +1372,8 @@ impl KeyInventory {
         usages: Option<KeyUsages>,
         resources: &ResourcePolicy,
         format: PublicDerFormat,
+        // One import pays every key and certificate it reads from this account.
+        session: &crate::xmldsig::pkix::CertificateSession,
     ) -> Result<(), KeyStoreError> {
         self.check_new_name(&name, resources)?;
         let permitted = KeyUsages::VERIFY.union(KeyUsages::ENCRYPT);
@@ -1414,14 +1417,13 @@ impl KeyInventory {
         let material_len = der.len();
         let mut key_info = KeyInfo::default();
         key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
-        let session = crate::xmldsig::pkix::CertificateSession::new(resources);
         let is_rsa = if let Ok(spki) = pkcs8::SubjectPublicKeyInfoRef::from_der(&der) {
-            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(&session, &spki, &der)
+            let is_rsa = crate::xmldsig::keys::supported_parsed_spki_is_rsa(session, &spki, &der)
                 .map_err(|error| {
-                    key_import_error(error, || {
-                        KeyStoreError::Selection("unsupported public key algorithm")
-                    })
-                })?;
+                key_import_error(error, || {
+                    KeyStoreError::Selection("unsupported public key algorithm")
+                })
+            })?;
             key_info
                 .sources
                 .push(KeyInfoSource::DerEncodedKeyValue(der));
@@ -1436,7 +1438,7 @@ impl KeyInventory {
                 return Err(KeyStoreError::Selection("invalid PUBLIC KEY payload"));
             }
             let certificate = session.read(&der).map_err(certificate_import_error)?;
-            let parsed = crate::xmldsig::parse::certificate_metadata(&certificate, &session)
+            let parsed = crate::xmldsig::parse::certificate_metadata(&certificate, session)
                 .map_err(|error| match error {
                     crate::xmldsig::ParseError::Policy(error) => KeyStoreError::Policy(error),
                     _ => KeyStoreError::Selection("unsupported X.509 certificate key"),
@@ -1445,7 +1447,7 @@ impl KeyInventory {
             let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(spki_der)
                 .map_err(|_| KeyStoreError::Selection("unsupported X.509 certificate key"))?;
             let is_rsa =
-                crate::xmldsig::keys::supported_parsed_spki_is_rsa(&session, &spki, spki_der)
+                crate::xmldsig::keys::supported_parsed_spki_is_rsa(session, &spki, spki_der)
                     .map_err(|error| {
                         key_import_error(error, || {
                             KeyStoreError::Selection("unsupported X.509 certificate key")
@@ -1583,6 +1585,7 @@ impl KeyInventory {
             usages,
             resources,
             PublicDerFormat::SubjectPublicKeyInfo,
+            &crate::xmldsig::pkix::CertificateSession::new(resources),
         )?;
         debug_assert!(self.material_bytes >= previous_total);
         self.material_bytes = charged_total;
@@ -2335,6 +2338,7 @@ impl KeyInventory {
                         None,
                         resources,
                         PublicDerFormat::SubjectPublicKeyInfo,
+                        &session,
                     )?;
                 }
                 ParsedMaterial::Symmetric(kind, bytes) => {
@@ -4522,6 +4526,56 @@ mod tests {
                 .iter()
                 .any(|source| matches!(source, KeyInfoSource::KeyValue(KeyValueInfo::Ec { .. })))
         );
+    }
+
+    #[test]
+    fn xml_store_der_keys_share_one_x509_work_budget() {
+        // Every key read while loading one store is paid by the same X.509
+        // work account: the allowance that admits one DEREncodedKeyValue must
+        // not admit two, as it already does not for two KeyValue entries.
+        let encoded = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+            "../tests/fixtures/xmlenc/keys/ec/ec-prime256v1-pubkey.der"
+        ));
+        let store = |keys: usize| {
+            let mut xml = format!("<Keys xmlns=\"{XMLSEC_NS}\">");
+            for index in 0..keys {
+                xml.push_str(&format!(
+                    "<KeyInfo xmlns=\"{XMLDSIG_NS}\"><KeyName>ec{index}</KeyName><DEREncodedKeyValue xmlns=\"{XMLDSIG11_NS}\">{encoded}</DEREncodedKeyValue></KeyInfo>"
+                ));
+            }
+            xml.push_str("</Keys>");
+            xml
+        };
+        let import = |xml: &str, max_x509_work: usize| {
+            KeyInventory::from_xml_bytes(
+                xml.as_bytes(),
+                &xml_policy(ResourcePolicy {
+                    max_x509_work,
+                    ..ResourcePolicy::default()
+                }),
+                XmlBackend::default(),
+            )
+        };
+        let (one, two) = (store(1), store(2));
+        let (mut refused, mut admitted) = (0_usize, ResourcePolicy::default().max_x509_work);
+        assert!(import(&one, admitted).is_ok(), "the default admits one key");
+        while admitted - refused > 1 {
+            let middle = refused + (admitted - refused) / 2;
+            if import(&one, middle).is_ok() {
+                admitted = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        assert!(matches!(
+            import(&two, admitted),
+            Err(KeyStoreError::Policy(
+                crate::policy::PolicyViolation::ResourceLimitExceeded {
+                    resource: crate::policy::resource_name::X509_WORK,
+                    ..
+                }
+            ))
+        ));
     }
 
     #[cfg(feature = "legacy-algorithms")]
