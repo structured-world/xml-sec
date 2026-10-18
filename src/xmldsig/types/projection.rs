@@ -832,6 +832,8 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         match &mut self.members {
             Members::Sparse(sparse) => {
                 let indexes = &mut sparse.indexes;
+                // One unit per examined member; removals pay their lookup too.
+                keys.charge(indexes.len())?;
                 let mut kept = 0;
                 for position in 0..indexes.len() {
                     let index = indexes[position];
@@ -851,7 +853,8 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             }
             Members::Dense(words) => {
                 for position in 0..words.len() {
-                    keys.charge(1)?;
+                    // The word scan and each member it holds.
+                    keys.charge(1 + words[position].count_ones() as usize)?;
                     let mut bits = words[position];
                     while bits != 0 {
                         let offset = bits.trailing_zeros();
@@ -1052,6 +1055,9 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 self.projected_string_bytes = 0;
                 return Ok(());
             }
+            self.keys
+                .charge(search_work(excluded.len()))
+                .map_err(C14nError::from)?;
             let after = excluded.partition_point(|range| range.start <= removed.start);
             if after > 0 && excluded[after - 1].end >= removed.end {
                 return Ok(());
@@ -1062,10 +1068,10 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             let mut nested = after;
             let mut id = removed.start;
             while id < removed.end {
-                self.keys.charge(1).map_err(C14nError::from)?;
                 if let Some(range) = excluded.get(nested)
                     && range.start == id
                 {
+                    self.keys.charge(1).map_err(C14nError::from)?;
                     id = range.end;
                     nested += 1;
                     continue;
@@ -1076,16 +1082,24 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                     .expect("subtree IDs belong to their document");
                 id += 1;
                 if member.is_comment() && !comments {
+                    self.keys.charge(1).map_err(C14nError::from)?;
                     continue;
                 }
-                entries += owned_indexes(member).len();
+                let owned = owned_indexes(member).len();
+                // The visit and each axis whose name bytes are released.
+                self.keys.charge(1 + owned).map_err(C14nError::from)?;
+                entries += owned;
                 bytes += owned_bytes(member).map_err(C14nError::from)?;
             }
             let (retained, nested_end) = (after, nested);
             let Members::Subtree { excluded, .. } = &mut self.members else {
                 unreachable!("checked semantic members");
             };
-            // Replace the nested exclusions by their enclosing subtree.
+            // Replace the nested exclusions by their enclosing subtree; the
+            // rotations move every exclusion after the insertion point.
+            self.keys
+                .charge(excluded.len() + 1 - retained)
+                .map_err(C14nError::from)?;
             let tail = excluded.len() - nested_end;
             excluded.push(removed.clone())?;
             excluded[retained..].rotate_right(1);

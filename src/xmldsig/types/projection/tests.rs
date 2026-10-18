@@ -207,6 +207,74 @@ fn semantic_members_pay_work_for_every_emitted_index() {
 }
 
 #[test]
+fn excluding_from_explicit_sets_pays_every_examined_member() {
+    // An enveloped exclusion after XPath scans the explicit set; a subtree
+    // holding none of its members still costs one unit per examined member,
+    // in both the sparse and the dense representation.
+    let xml = format!("<root>{}<signature/></root>", "<a/>".repeat(4096));
+    let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide source XML");
+    let signature = document
+        .root_element()
+        .last_element_child()
+        .expect("signature child");
+    let budget = NodeSetMaterializationBudget::default();
+    for stride in [256, 1] {
+        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        let mut nodes = Projection::empty(&document, PaidKeys::new(&memory));
+        for element in document
+            .root_element()
+            .children()
+            .filter(|node| node.is_element() && *node != signature)
+            .step_by(stride)
+        {
+            nodes
+                .insert_tree(element, Some(&budget))
+                .expect("selection fits");
+        }
+        let before = memory.work_remaining();
+        nodes
+            .exclude_subtree(signature)
+            .expect("disjoint exclusion fits");
+        let spent = before - memory.work_remaining();
+        assert!(
+            spent >= nodes.len(),
+            "{} excluding from {} members spent {spent} work units",
+            nodes.representation(),
+            nodes.len()
+        );
+    }
+}
+
+#[test]
+fn excluding_semantic_subtrees_pays_every_removed_axis() {
+    // Removing an attribute-heavy element from a semantic projection walks
+    // each of its axes to release their name bytes; each axis costs work.
+    let attributes = (0..4096)
+        .map(|index| format!(" a{index}='v'"))
+        .collect::<String>();
+    let xml = format!("<root><signature{attributes}/></root>");
+    let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide element");
+    let signature = document
+        .root_element()
+        .first_element_child()
+        .expect("signature child");
+    let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+    let mut whole = Projection::accounted_subtree(
+        document.root(),
+        true,
+        &NodeSetMaterializationBudget::default(),
+        &memory,
+    )
+    .expect("semantic projection fits");
+    let before = memory.work_remaining();
+    whole
+        .exclude_subtree(signature)
+        .expect("semantic exclusion fits");
+    let spent = before - memory.work_remaining();
+    assert!(spent >= 4096, "removing 4096 axes spent {spent} work units");
+}
+
+#[test]
 fn semantic_projection_stores_no_nodes_and_explicit_sets_pay_capacity() {
     // A whole-document projection is an arena range: it needs no per-node
     // storage even in an account too small for one index per XPath node. An
