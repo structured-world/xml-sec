@@ -15,18 +15,18 @@
     <ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp">
       <ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>
       <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-      <ds:DigestValue>XnEM8WTk3cshkghmBBIHGPCEP3lmNINUD/E0AH93Ij8=</ds:DigestValue>
+      <ds:DigestValue>5x1iGGWJCOp/nRCnJ0FiJ7E3nL8h3HpA3E9Z+/hj+TQ=</ds:DigestValue>
     </ds:Reference>
   </ds:SignedInfo>
-  <ds:SignatureValue>J92LlbyDTA6NQuulIJUtiE/CdYjkHH5qLfdq6+4VjGponGmSOibtRsbzKjN8PbZF
-WXllu5jHkQoI4wXZEAQuAMNvVrzTNGS60FoV1raxoez6vN+eijEm2Eux34vwagQe
-xsWSknhrXKZvsMdMwFHSNOpdPXGRy56IJmdhHcjm6Zr5/SeNW9gqTbvzcxbdsU5j
-MUWKr97OwPRofNkv7rcUOtSXillAAyFKn2s5FpC0F5DMidjOlpIazoHaouKSTWVx
-Qn6cQBxO1/wwzz0PeODOZm8vzoTQDs/W8rofxry97wuPiR2cETP0LSA4Fh3w8hYy
-E1hV7u7rLCoV0uafYONamg==</ds:SignatureValue>
+  <ds:SignatureValue Id="sig-value">L/tgog2w3t7n9McXQGMYEdgsXfgnTCUv2doKEltHoKakVKxPmDKcds3qhj0+nwAz
+00v7cyzRITnR++JuJaIQj12mJGrYUtAvi56Xq9zK6W4QGV5BY2st+oTgS3benfet
+ss3tbd2HwnrCvmU8HqIhFnAL4VOcQ1PS8ske9rmcDGKaWYLOmJabLShquFSQjoVQ
+escOhLpmZNqdcctYrGGKbrcXDinCYeJkH/IXILQaPaLHKyy2fE3XCzhZgnw+jW5C
+xSrlLh5r5oXt9n1W14Rjkgbzfc6MSIns0haNd7XJnPpLzoC6BP1EVxlDwXp7oatd
+rOU7DQK/5eBA46p8hQZDsg==</ds:SignatureValue>
   <ds:KeyInfo><ds:X509Data><ds:X509IssuerSerial>
 <ds:X509IssuerName>CN=xml-sec XAdES Test Intermediate</ds:X509IssuerName>
-<ds:X509SerialNumber>499503793931415593079764956434680999236924086493</ds:X509SerialNumber>
+<ds:X509SerialNumber>558134223096825175286287246455151697508234990482</ds:X509SerialNumber>
 </ds:X509IssuerSerial></ds:X509Data></ds:KeyInfo>
   
   <ds:Object>
@@ -38,7 +38,7 @@ E1hV7u7rLCoV0uafYONamg==</ds:SignatureValue>
             <xades:Cert>
               <xades:CertDigest>
                 <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <ds:DigestValue>K+VFtJEx/Xx7QtHMfykehaAqQTRsyY4DklKJCYbrMp4=</ds:DigestValue>
+                <ds:DigestValue>t9WbsbZzTAB11BMkEVoc1CcCxorRmM6n/luOuFxwYEM=</ds:DigestValue>
               </xades:CertDigest>
             </xades:Cert>
           </xades:SigningCertificateV2>
@@ -49,6 +49,7 @@ E1hV7u7rLCoV0uafYONamg==</ds:SignatureValue>
           </xades:DataObjectFormat>
         </xades:SignedDataObjectProperties>
       </xades:SignedProperties>
+      
     </xades:QualifyingProperties>
   </ds:Object>
 </ds:Signature>

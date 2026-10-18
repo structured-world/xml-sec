@@ -55,11 +55,12 @@ signer_md5="$(digest signer.pem md5)"
 # signature ID, SignedProperties ID, data Reference, DataObjectFormat MIME,
 # SigningTime, CertDigest method, CertDigest value, extra Cert attributes,
 # QualifyingProperties Target, SignedProperties Reference Type attribute,
-# Object elements preceding the qualifying properties, X509Data content.
+# Object elements preceding the qualifying properties, X509Data content,
+# UnsignedProperties element.
 signature() {
   local id="$1" properties="$2" data_reference="$3" mime="$4" time="$5"
   local method="$6" value="$7" cert_attributes="$8" target="$9" type="${10}"
-  local objects="${11:-}" x509="${12:-<ds:X509Certificate/>}"
+  local objects="${11:-}" x509="${12:-<ds:X509Certificate/>}" unsigned="${13:-}"
   cat <<EOF
 <ds:Signature xmlns:ds="$DS" Id="$id">
   <ds:SignedInfo>
@@ -72,7 +73,7 @@ signature() {
       <ds:DigestValue/>
     </ds:Reference>
   </ds:SignedInfo>
-  <ds:SignatureValue/>
+  <ds:SignatureValue Id="$id-value"/>
   <ds:KeyInfo><ds:X509Data>$x509</ds:X509Data></ds:KeyInfo>
   $objects
   <ds:Object>
@@ -95,6 +96,7 @@ signature() {
           </xades:DataObjectFormat>
         </xades:SignedDataObjectProperties>
       </xades:SignedProperties>
+      $unsigned
     </xades:QualifyingProperties>
   </ds:Object>
 </ds:Signature>
@@ -133,12 +135,39 @@ detached_reference() {
 EOF
 }
 
+# A plain XMLDSig countersignature over the parent's complete SignatureValue
+# element (EN 319 132-1 §5.2.7.2).
+counter_signature() {
+  cat <<EOF
+<xades:UnsignedProperties>
+        <xades:UnsignedSignatureProperties>
+          <xades:CounterSignature>
+            <ds:Signature Id="$1">
+              <ds:SignedInfo>
+                <ds:CanonicalizationMethod Algorithm="$EXC_C14N"/>
+                <ds:SignatureMethod Algorithm="$RSA_SHA256"/>
+                <ds:Reference Type="http://uri.etsi.org/01903#CountersignedSignature" URI="#$2">
+                  <ds:Transforms><ds:Transform Algorithm="$EXC_C14N"/></ds:Transforms>
+                  <ds:DigestMethod Algorithm="$SHA256"/>
+                  <ds:DigestValue/>
+                </ds:Reference>
+              </ds:SignedInfo>
+              <ds:SignatureValue/>
+              <ds:KeyInfo><ds:X509Data><ds:X509Certificate/></ds:X509Data></ds:KeyInfo>
+            </ds:Signature>
+          </xades:CounterSignature>
+        </xades:UnsignedSignatureProperties>
+      </xades:UnsignedProperties>
+EOF
+}
+
 sign() {
   local input="$1" result="$2" node="$3" key="${4:-signer.key,signer.pem,intermediate.pem}"
   "$xmlsec1" --sign --lax-key-search \
     --privkey-pem "$key" \
     --id-attr:Id "$DS:Signature" \
     --id-attr:Id "$DS:Object" \
+    --id-attr:Id "$DS:SignatureValue" \
     --id-attr:Id "$XADES:SignedProperties" \
     --id-attr:Id Data \
     --node-id "$node" \
@@ -177,6 +206,17 @@ enveloped untyped-signed-properties "$TIME" "$SHA256" "$signer_sha256" "" "#sig"
   echo '</Document>'
 } >issuer-serial-only.template.xml
 sign issuer-serial-only.template.xml "$output/issuer-serial-only.xml" sig signer.key,signer.pem
+
+# countersigned: the parent is signed first; the enveloped countersignature
+# then covers the parent's final SignatureValue.
+{
+  echo '<Document><Data Id="payload">Countersigned baseline payload</Data>'
+  signature sig sp "$(enveloped_reference sig)" text/xml "$TIME" "$SHA256" "$signer_sha256" \
+    "" "#sig" "$TYPE" "" "<ds:X509Certificate/>" "$(counter_signature counter sig-value)"
+  echo '</Document>'
+} >countersigned.template.xml
+sign countersigned.template.xml countersigned.parent.xml sig
+sign countersigned.parent.xml "$output/countersigned.xml" counter
 
 # enveloping: the payload is an Object inside the Signature.
 signature sig sp "$(target_reference sig '#object')" text/plain "$TIME" "$SHA256" \

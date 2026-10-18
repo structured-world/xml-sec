@@ -135,6 +135,37 @@ fn baseline_forms_meet_every_root_requirement() {
 }
 
 #[test]
+fn countersignature_joins_the_root_with_its_own_checked_path() {
+    // §5.2.7.2 / §6.3(aa): an incorporated countersignature is an actor of its
+    // own. Its validated path, key association and hash uses must all bind,
+    // and the root keeps meeting its B-B requirements.
+    let outcome = verified(
+        include_str!("fixtures/countersigned.xml"),
+        &anchored(),
+        |session, memory| {
+            let counter = signature(session, 1);
+            validate_basic(session, signature(session, 0), &[ROOT], memory, |report| {
+                let actors = report.inputs().counters.actors();
+                (
+                    facts(report),
+                    actors.len(),
+                    actors.first().is_some_and(|actor| {
+                        actor.signer().counter().original().child() == counter
+                    }),
+                    report.inputs().hashes.counters().len(),
+                )
+            })
+        },
+    );
+    let Ok(Outcome::Assessed((facts, actors, same_child, hashes))) = outcome else {
+        panic!("expected assembled B-B facts, got {outcome:?}");
+    };
+    assert_eq!(facts, MET);
+    assert_eq!((actors, hashes), (1, 1));
+    assert!(same_child, "the actor is the document's countersignature");
+}
+
+#[test]
 fn signing_certificate_digest_of_another_certificate_is_not_bound() {
     // §5.2.2: the first Cert digest names the signing certificate. A digest of
     // the root is a completed mismatch, not a processing error.
