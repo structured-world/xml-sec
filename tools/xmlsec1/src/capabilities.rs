@@ -43,6 +43,8 @@ pub const TRANSFORMS: &[&str] = &[
     "exc-c14n-with-comments",
     "xpath",
     "xpath2",
+    #[cfg(feature = "xslt")]
+    "xslt",
     // Executable for same-document inputs and explicitly mapped detached
     // resources; this registry does not claim OPC package validation.
     "relationship",
@@ -297,7 +299,10 @@ mod tests {
             TRANSFORMS,
             &["c14n,rsa-sha256".into(), "sha256".into()]
         ));
-        assert!(!all_requested_available(TRANSFORMS, &["xslt".into()]));
+        assert_eq!(
+            all_requested_available(TRANSFORMS, &["xslt".into()]),
+            cfg!(feature = "xslt")
+        );
         assert!(all_requested_available(
             TRANSFORMS,
             &["rsa-oaep-enc11".into()]

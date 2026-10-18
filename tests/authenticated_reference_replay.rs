@@ -1953,6 +1953,88 @@ fn current_query_replays_opc_with_the_original_edition_after_producer_exhaustion
     }
 }
 
+#[cfg(feature = "xslt")]
+#[test]
+fn current_query_replays_xslt_within_its_memory_account() {
+    // The stylesheet comes from the authenticated original instruction, and its
+    // compilation and execution workspace is reserved from the current query's
+    // account: a small account refuses before the receiver sees any output.
+    let uri = "https://example.test/xslt-input";
+    let transforms = concat!(
+        r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xslt-19991116">"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">"#,
+        r#"<xsl:template match="/"><values><xsl:for-each select="//item"><xsl:sort select="."/>"#,
+        r#"<v><xsl:value-of select="."/></v></xsl:for-each></values></xsl:template>"#,
+        r#"</xsl:stylesheet></ds:Transform></ds:Transforms>"#
+    );
+    let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
+    let resources = HashMap::from([(
+        uri.to_owned(),
+        b"<doc><item>b</item><item>a</item></doc>".to_vec(),
+    )]);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    for backend in backends() {
+        let document = XmlDocument::parse_with_backend(xml.clone(), backend).unwrap();
+        let context = VerifyContext::new()
+            .xml_backend(backend)
+            .key(&key)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .process_manifests(true);
+        with_verified_request(&document, &context, &request, &account(), |session| {
+            for (current, expected) in [
+                (account(), Ok(())),
+                (Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24))), Err(())),
+            ] {
+                let mut output = Vec::new();
+                session
+                    .with_query(
+                        session.evidence().signatures()[0].identity(),
+                        &current,
+                        |selected| {
+                            let result = selected.replay_reference(
+                                session.view().node_for_id("inside", &[]).unwrap(),
+                                ReplayMode::ReferenceOutput,
+                                &mut |chunk: &[u8]| {
+                                    output.extend_from_slice(chunk);
+                                    Ok::<_, ()>(())
+                                },
+                            );
+                            match expected {
+                                Ok(()) => {
+                                    assert_eq!(result.unwrap(), ReplayOutcome::Complete);
+                                    assert_eq!(
+                                        output,
+                                        b"<?xml version=\"1.0\"?>\n<values><v>a</v><v>b</v></values>\n"
+                                    );
+                                }
+                                Err(()) => {
+                                    assert!(
+                                        matches!(
+                                            result,
+                                            Err(ReplayError::Processing(DsigError::SharedExecution(
+                                                structured_asn1::memory::MemoryError::LimitExceeded
+                                            )))
+                                        ),
+                                        "workspace must come from the current account, got {result:?}"
+                                    );
+                                    assert!(output.is_empty());
+                                }
+                            }
+                            Ok::<_, ()>(())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(current.used(), 0);
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
 #[test]
 fn stale_and_foreign_reference_identities_are_rejected_before_the_sink() {
     // A parse-local ordinal must never authorize the same ordinal from another

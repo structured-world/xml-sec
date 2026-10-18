@@ -124,7 +124,7 @@ impl XsltStylesheet {
 /// text between the first and last child is the same markup.
 pub(super) fn stylesheet_source<'a>(transform: crate::xml::dom::Node<'a, 'a>) -> Option<&'a str> {
     let first = transform.first_child()?;
-    let last = transform.children().last()?;
+    let last = transform.children().next_back()?;
     transform
         .document()
         .input_text()

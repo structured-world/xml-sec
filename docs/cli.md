@@ -97,7 +97,7 @@ when decoding fails.
 
 Capability checks and runtime dispatch use one registry. A transform or key-data
 class absent from `list-*` is not silently substituted and causes `check-*` to
-fail. XML parser selection is available on `sign`, `verify`, `encrypt`, and
+fail. The `xslt` transform is registered only in builds with `--features xslt`. XML parser selection is available on `sign`, `verify`, `encrypt`, and
 `decrypt` through `--xml-backend xmloxide|roxmltree|differential`. The selected
 backend is preserved through metadata discovery, recursive external XML,
 transforms, mutation validation, and the complete operation pipeline. A thin

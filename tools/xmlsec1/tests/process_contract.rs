@@ -9837,12 +9837,13 @@ fn capability_queries_report_supported_and_unsupported_names() {
             .code(),
         Some(0)
     );
-    assert!(
-        !Command::new(binary())
+    assert_eq!(
+        Command::new(binary())
             .args(["check-transforms", "xslt"])
             .status()
             .unwrap()
-            .success()
+            .success(),
+        cfg!(feature = "xslt")
     );
 }
 

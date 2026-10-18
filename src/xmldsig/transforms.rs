@@ -1535,8 +1535,9 @@ impl<'w, W: structured_asn1::memory::Work> TransformScratch
         maximum: usize,
     ) -> Result<(Self::Reservation, usize), TransformError> {
         let memory = self.0.memory();
-        // An account never admits beyond its limit; a violated invariant grants nothing.
-        let available = memory.limit().checked_sub(memory.used()).unwrap_or(0);
+        // An account never admits beyond its limit; clamping to zero grants nothing
+        // if that invariant were ever violated.
+        let available = memory.limit().saturating_sub(memory.used());
         let granted = maximum.min(available);
         Ok((memory.reserve(granted)?, granted))
     }

@@ -223,6 +223,12 @@ jobs:
           - rust: stable
             xml-backend: legacy-fat-runtime
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all,legacy-algorithms
+          - rust: stable
+            xml-backend: xslt-fat-runtime
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all,xslt
+          - rust: "1.92.0"
+            xml-backend: xslt-xmloxide
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide,xslt
           - rust: "1.92.0"
             xml-backend: legacy-aws-fips
             native-fips: true
@@ -364,6 +370,8 @@ jobs:
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-differential
           - xml-backend: fat-runtime
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all
+          - xml-backend: xslt-fat-runtime
+            cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backends-all,xslt
     steps:
       - uses: actions/checkout@v7
         with:

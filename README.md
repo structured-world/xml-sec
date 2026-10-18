@@ -74,6 +74,7 @@ xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c
 |------|-----------------|
 | Canonicalization | Canonical XML 1.0/1.1, Exclusive C14N, comments, and document subsets |
 | XML signatures | XMLDSig signing and verification, RSA-PSS/PKCS#1, DSA/ECDSA/HMAC, XPath and [OPC Relationship transforms](docs/relationship-transforms.md), `Manifest`, `KeyInfo`, and caller-provided references |
+| Optional XSLT transform | `xslt`: the XMLDSig XSLT transform on the safe-Rust XSLT 1.0 engine, without external resources and within operation-wide XSLT limits |
 | XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, opt-in Camellia-CBC/Key Wrap and experimental ChaCha20/Poly1305 profiles, ECDH/X25519/X448/DH, bounded KDFs, referenced ciphertext, nested recipients, and Element/Content replacement |
 | Optional compatibility algorithms | `legacy-algorithms`: MD5/RIPEMD-160 signatures and digests, AES-192, TripleDES-CBC/CMS wrap, and RSA-1.5 transport; library policy denies these by default |
 | X.509 | Certificate key extraction, chain validation, CRLs, required key authorization by default, and typed trust evidence |
@@ -99,8 +100,8 @@ cargo run --example verify -- signed.xml
 ```
 
 The signing and verification pipelines support same-document and caller-provided references,
-XPath 1.0 and XPath Filter 2 transforms, `Manifest`, structured `KeyInfo`, and policy-controlled
-X.509 validation. See [XML Digital Signatures](docs/xmldsig.md) for algorithms, transform semantics,
+XPath 1.0 and XPath Filter 2 transforms, XSLT transforms with the `xslt` feature, `Manifest`,
+structured `KeyInfo`, and policy-controlled X.509 validation. See [XML Digital Signatures](docs/xmldsig.md) for algorithms, transform semantics,
 key resolution, failure handling, and current interoperability boundaries.
 See [Key management](docs/key-management.md) for inventory ownership, format import,
 password handling, and CLI key-store behavior.
@@ -173,8 +174,9 @@ ambiguous BOM-less UTF-16/UTF-32, and unsupported EBCDIC variants fail explicitl
 maximum decoded-byte count as its second argument. `encoding::XmlEncodingError` is now the
 shared, non-exhaustive `xml_sec::encoding::XmlEncodingError`; update matches to handle the new error
 variants and include a fallback arm. Code constructing `ResourcePolicy` with every field must
-also set `max_xml_namespace_bindings` (or start from `ResourcePolicy::default()` and override
-selected fields). These changes keep decoding and namespace-scope allocation under explicit
+also set `max_xml_namespace_bindings` and the `max_xslt_*` limits (or start from
+`ResourcePolicy::default()` and override selected fields); matches on `xmldsig::Transform`
+need a fallback arm. These changes keep decoding and namespace-scope allocation under explicit
 resource limits. For trusted resolver-provided encoding metadata, use
 `xml_input::decode_xml_bounded(bytes, Some(encoding), maximum_decoded_bytes)`; the unbounded
 decoder remains internal.
@@ -222,11 +224,11 @@ request host-clock compatibility.
 Resolver authorization also gates cached documents and retained stylesheet dependencies, with
 typed expiry/revocation failures that cannot be hidden by resource fallback.
 
-The engine currently remains an in-repository workspace crate rather than a separately published
-package; `xml-sec` is the only crate published to crates.io. The main crate continues to reject XMLDSig
-XSLT transforms until the policy, resource identity, and node-set adapter contracts are connected.
-The shared strict byte-decoding and lexical source is compiled into `xml-sec` and reused by the
-internal XSLT workspace crate.
+The engine remains an in-repository workspace crate rather than a separately published package;
+`xml-sec` is the only crate published to crates.io. Its optional `xslt` feature compiles the same
+engine sources and executes the XMLDSig XSLT transform with them; see
+[XML Digital Signatures](docs/xmldsig.md#xslt-transform). The shared strict byte-decoding and
+lexical source is compiled into `xml-sec` and reused by the internal XSLT workspace crate.
 
 ## Specifications
 
@@ -237,7 +239,7 @@ internal XSLT workspace crate.
 | [Exclusive C14N](https://www.w3.org/TR/xml-exc-c14n/) | Implemented; `InclusiveNamespaces PrefixList` support |
 | [XMLDSig 1.0/1.1](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines; complete Merlin, Phaos 3, XMLDSig 1.1, and Second Edition corpora classified and executed |
 | [XML Encryption](https://www.w3.org/TR/xmlenc-core1/) | Core AES-CBC/GCM, RSA-OAEP, and AES-KW pipelines implemented; broader conformance work continues |
-| [XSLT 1.0](https://www.w3.org/TR/xslt-10/) | Separate safe-Rust engine implemented; XMLDSig transform adapter not yet connected |
+| [XSLT 1.0](https://www.w3.org/TR/xslt-10/) | Safe-Rust engine implemented; the XMLDSig XSLT transform executes with the optional `xslt` feature |
 
 The project tracks stable Rust and supports Rust 1.92 or newer. Detailed contracts and limitations
 live in the [XMLDSig guide](docs/xmldsig.md), [XML Encryption guide](docs/xmlenc.md), and

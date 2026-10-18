@@ -7362,12 +7362,21 @@ mod tests {
         );
         assert!(matches!(
             execute(
-                invocation(&["xmlsec1", "check-transforms", "xslt"]),
+                invocation(&["xmlsec1", "check-transforms", "unknown-transform"]),
                 &mut output,
                 &mut Vec::new()
             ),
             Err(CommandError::CapabilityUnavailable)
         ));
+        assert_eq!(
+            execute(
+                invocation(&["xmlsec1", "check-transforms", "xslt"]),
+                &mut output,
+                &mut Vec::new()
+            )
+            .is_ok(),
+            cfg!(feature = "xslt")
+        );
     }
 
     #[test]

@@ -13,7 +13,8 @@ use wildcard match arms and obtain `SignedInfo` through the parser.
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures and detached references whose payloads the caller supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
-Base64, XPath 1.0, and XPath Filter 2.0 transforms, RSA PKCS#1 v1.5, RSA-PSS, DSA,
+Base64, XPath 1.0, and XPath Filter 2.0 transforms, XSLT transforms with the optional `xslt`
+feature, RSA PKCS#1 v1.5, RSA-PSS, DSA,
 ECDSA with P-256/P-384/P-521 keys, HMAC truncation, embedded X.509 certificates,
 and configured key resolution.
 
@@ -22,8 +23,8 @@ corpora are checked in for
 deterministic offline interoperability testing. Every signature document is executed through the
 public verification API and must be classified exactly once. Supported vectors
 must verify, invalid vectors must return their exact failure class, and vectors
-that depend on an unavailable capability such as XSLT or HMAC-MD5 must fail at
-an explicit typed boundary rather than being skipped.
+that depend on an unavailable capability such as HMAC-MD5, or XSLT in a build without the `xslt`
+feature, must fail at an explicit typed boundary rather than being skipped.
 
 ## Experimental Recipient Encapsulation
 
@@ -501,9 +502,43 @@ use `execute_transforms_with_policy` with the same `VerificationPolicy::xml` all
 `SigningPolicy::xml.allow_internal_dtd` across its complete pipeline. External entity resolution
 remains disabled. Internal-DTD ID declarations are carried into the shared semantic DOM and ID
 index without implicit external DTD loading. Other attribute names require an explicit
-request-scoped ID registration. XSLT is intentionally not executed because transforms operate on
-attacker-controlled documents; an authenticated Manifest reference using unsupported XSLT is
-reported as an invalid per-reference result without changing core `SignedInfo` validity.
+request-scoped ID registration. Without the `xslt` feature an authenticated Manifest reference
+using the XSLT transform is reported as an invalid per-reference result without changing core
+`SignedInfo` validity.
+
+## XSLT Transform
+
+The optional `xslt` feature executes the XSLT transform
+(`http://www.w3.org/TR/1999/REC-xslt-19991116`, XMLDSig 1.1 section 6.6.5) with the safe-Rust
+XSLT 1.0 engine. `Transform::Xslt` carries an `XsltStylesheet`: the markup of the `<Transform>`
+content, written into generated signatures unchanged. A parsed signature uses the same markup,
+as libxmlsec1 does, so only namespace declarations written on the stylesheet are in scope; those
+inherited from `<Signature>` are not copied into literal result elements.
+
+The transform consumes octets. Node-set input is first converted with inclusive C14N 1.0, binary
+input is used as is, and the serialized result tree (with its XML declaration for the `xml`
+output method) is passed to the next transform or digested. A following node-set transform
+reparses it.
+
+Execution is bounded by the operation's policy:
+
+- `TransformPolicy::allowed_algorithms` decides whether XSLT may run at all; secure profiles
+  exclude it, while the default and libxmlsec1-compatible policies permit it when built.
+- `ResourcePolicy::max_xslt_work` bounds each kind of XSLT work (XPath evaluations and steps,
+  extension calls, pattern tests, template applications, sort comparisons, key entries, result
+  nodes and messages) across every XSLT execution of the operation, and
+  `max_xslt_output_bytes` bounds their cumulative serialized output.
+- `max_xslt_workspace_bytes` bounds the memory owned at once by one compilation or execution,
+  and `max_xslt_recursion_depth` its compilation and template recursion. Scoped replay reserves
+  that workspace from the current query's memory account.
+- Stylesheet and input documents obey the XML document, node, depth and parse-work limits. A
+  document type declaration in binary input follows `xml.allow_internal_dtd`, as for any other
+  reparsed transform output.
+
+Stylesheets cannot resolve external resources: `xsl:import`, `xsl:include` and `document()`
+fail with `PolicyViolation::Uri`. Exhausted limits are `PolicyViolation::ResourceLimit` errors,
+and invalid stylesheets or execution failures are `TransformError::Xslt`; none of them is a
+digest mismatch.
 
 ## Current Scope
 
@@ -629,8 +664,8 @@ for mixed content.
 All implemented transform branches,
 parser/DOM construction, XPath workspaces, binary/XML transitions and terminal
 C14N admit their work and actual capacity before allocation or receiver effects.
-Existing unsupported capabilities remain unsupported; no new XSLT adapter is
-implied by independently funding a query.
+The XSLT transform reserves its workspace from the current query's account before
+compiling the stylesheet.
 
 The selected handle's
 `visit_authenticated_references` visitor supplies original Reference identity,

@@ -82,6 +82,10 @@ name = "base64_transform_integration"
 required-features = ["xmldsig", "c14n"]
 
 [[test]]
+name = "xslt_transform_integration"
+required-features = ["xslt", "c14n"]
+
+[[test]]
 name = "merlin_interop"
 required-features = ["xmldsig"]
 

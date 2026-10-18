@@ -166,7 +166,7 @@ fn complete_surface_categories_are_stable() {
         "https://github.com/lsh123/xmlsec"
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
-    assert_eq!(ledger.classifications.len(), 24);
+    assert_eq!(ledger.classifications.len(), 25);
     assert_eq!(ledger.availability.len(), 427);
 
     let counts = ledger
@@ -355,8 +355,12 @@ fn native_algorithm_claims_match_the_rust_api() {
                 )
         })
         .collect();
-    assert_eq!(claims.len(), 74);
+    assert_eq!(claims.len(), 75);
     for item in claims {
+        if item.classification == "feature-gated-xslt-uri" {
+            // Its parameter is a stylesheet; xslt_transform_contract_executes runs it.
+            continue;
+        }
         if item.classification == "feature-gated-legacy-uri" {
             // The ledger records the build requirement, not unconditional API
             // availability. Thin/default builds must reject every optional URI.
@@ -600,6 +604,48 @@ fn opc_relationship_contract_executes() {
 
 #[cfg(feature = "xmldsig")]
 #[test]
+fn xslt_transform_contract_executes() {
+    // The XSLT claim is the executed transform of an xslt build, refused by URI otherwise.
+    let ledger = ledger();
+    let item = ledger
+        .items
+        .iter()
+        .find(|item| item.name == "xmlSecHrefXslt")
+        .expect("XSLT URI must remain inventoried");
+    assert_eq!(item.classification, "feature-gated-xslt-uri");
+    let document = xml_sec::Document::parse(concat!(
+        r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">"#,
+        r#"<Transform Algorithm="http://www.w3.org/TR/1999/REC-xslt-19991116">"#,
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">"#,
+        r#"<xsl:output method="text"/><xsl:template match="/">"#,
+        r#"<xsl:value-of select="count(//item)"/></xsl:template></xsl:stylesheet>"#,
+        r#"</Transform></Transforms>"#
+    ))
+    .unwrap();
+    let chain = xml_sec::xmldsig::parse_transforms(document.root_element());
+    #[cfg(feature = "xslt")]
+    {
+        let input = xml_sec::Document::parse("<root><item/><item/></root>").unwrap();
+        let output = xml_sec::xmldsig::execute_transforms(
+            input.root_element(),
+            xml_sec::xmldsig::TransformData::NodeSet(
+                xml_sec::xmldsig::NodeSet::entire_document_without_comments(&input).unwrap(),
+            ),
+            &chain.expect("an xslt build parses the transform"),
+        )
+        .unwrap();
+        assert_eq!(output, b"2");
+    }
+    #[cfg(not(feature = "xslt"))]
+    assert!(matches!(
+        chain,
+        Err(xml_sec::xmldsig::TransformError::UnsupportedTransform(uri))
+            if uri == "http://www.w3.org/TR/1999/REC-xslt-19991116"
+    ));
+}
+
+#[cfg(feature = "xmldsig")]
+#[test]
 fn legacy_algorithm_claims_are_policy_gated() {
     // Legacy algorithms and the OPC edition contract are independently selected
     // by compiled policy; OPC compatibility is not a cryptographic downgrade.
@@ -632,6 +678,7 @@ fn legacy_algorithm_claims_are_policy_gated() {
             "xmlSecHrefHmacMd5",
             "xmlSecHrefHmacRipemd160",
             "xmlSecHrefEcdsaRipemd160",
+            "xmlSecHrefXslt",
         ])
     );
 

@@ -110,7 +110,8 @@ fn reported_usage_is_the_work_the_budget_enforces() {
     assert_eq!(usage.external_documents, 0);
     assert_eq!(usage.messages, 0);
 
-    let cases: [(BudgetKind, usize, fn(&mut ExecutionBudget, usize)); 6] = [
+    type SetLimit = fn(&mut ExecutionBudget, usize);
+    let cases: [(BudgetKind, usize, SetLimit); 6] = [
         (
             BudgetKind::XPathEvaluations,
             usage.xpath_evaluations,
