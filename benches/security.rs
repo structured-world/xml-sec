@@ -46,6 +46,39 @@ fn projection(bencher: divan::Bencher, spec: Spec) {
         });
 }
 
+/// Signed-document shape for node-set measurements: `elements` siblings with
+/// two attributes under two in-scope namespace declarations.
+fn node_set_document(elements: usize) -> String {
+    let body = (0..elements)
+        .map(|index| format!("<p:e id='e{index}' a:k='{index}'>text {index}</p:e>"))
+        .collect::<String>();
+    format!("<p:root xmlns:p='urn:p' xmlns:a='urn:a'>{body}<p:Signature/></p:root>")
+}
+
+#[divan::bench(args = [1_024, 16_384])]
+fn node_set_enveloped(bencher: divan::Bencher, elements: usize) {
+    let xml = node_set_document(elements);
+    let sets = xml_sec::benchmark_support::NodeSets::new(&xml).expect("node-set document");
+    bencher.bench_local(|| std::hint::black_box(sets.enveloped()));
+}
+
+/// Selected-element strides from half the document to two elements.
+const NODE_SET_STRIDES: [usize; 7] = [2, 8, 32, 128, 512, 2_048, 8_192];
+
+#[divan::bench(args = NODE_SET_STRIDES)]
+fn node_set_sparse(bencher: divan::Bencher, stride: usize) {
+    let xml = node_set_document(16_384);
+    let sets = xml_sec::benchmark_support::NodeSets::new(&xml).expect("node-set document");
+    bencher.bench_local(|| std::hint::black_box(sets.selection(stride, false)));
+}
+
+#[divan::bench(args = NODE_SET_STRIDES)]
+fn node_set_dense(bencher: divan::Bencher, stride: usize) {
+    let xml = node_set_document(16_384);
+    let sets = xml_sec::benchmark_support::NodeSets::new(&xml).expect("node-set document");
+    bencher.bench_local(|| std::hint::black_box(sets.selection(stride, true)));
+}
+
 #[divan::bench(args = [1, 8, 32, 64])]
 fn plan_compile(bencher: divan::Bencher, references: usize) {
     bencher

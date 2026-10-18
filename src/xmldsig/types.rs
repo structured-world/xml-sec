@@ -177,7 +177,7 @@ impl<'a> NodeSet<'a> {
                 root,
                 comments,
                 budget,
-                projection::NativeKeys::default(),
+                projection::NativeKeys,
             )?,
         })
     }
@@ -254,7 +254,7 @@ impl<'a> NodeSet<'a> {
     #[cfg(test)]
     pub(crate) fn empty(doc: &'a Document<'a>) -> Self {
         Self {
-            projection: projection::Projection::empty(doc, projection::NativeKeys::default()),
+            projection: projection::Projection::empty(doc, projection::NativeKeys),
         }
     }
     #[cfg(test)]
@@ -297,7 +297,7 @@ impl<'a> NodeSet<'a> {
             comments,
             budget.max_entries,
             budget.max_owned_string_bytes,
-            &projection::NativeKeys::default(),
+            &projection::NativeKeys,
         )?
         .entries)
     }

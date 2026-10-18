@@ -150,9 +150,10 @@ fn assert_binary_xml_storage_refused(bytes: Vec<u8>) {
 }
 
 #[test]
-fn current_query_admits_original_node_projection_before_receiver() {
-    // A retained document is caller-owned, but each replay projection is not:
-    // its map capacity must be refused before the receiver sees any bytes.
+fn current_query_replays_subtree_projection_without_node_storage() {
+    // A same-document subtree projection is a range of the retained arena: a
+    // query too small for one entry per projected node still replays it, and
+    // releases all of its working storage afterwards.
     let (xml, key) = signed_manifest("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "");
     let document =
         XmlDocument::parse(xml.replace("payload", &"<child a='v'/>".repeat(1024))).unwrap();
@@ -164,7 +165,7 @@ fn current_query_admits_original_node_projection_before_receiver() {
         &account(),
         |session| {
             let current = Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24)));
-            let mut called = false;
+            let mut received = 0;
             session
                 .with_query(
                     session.evidence().signatures()[0].identity(),
@@ -173,17 +174,17 @@ fn current_query_admits_original_node_projection_before_receiver() {
                         let result = selected.replay_reference(
                             session.view().node_for_id("inside", &[]).unwrap(),
                             ReplayMode::ReferenceOutput,
-                            &mut |_: &[u8]| {
-                                called = true;
+                            &mut |bytes: &[u8]| {
+                                received += bytes.len();
                                 Ok::<_, ()>(())
                             },
                         );
-                        assert!(matches!(result, Err(ReplayError::Processing(_))));
+                        assert!(result.is_ok(), "subtree replay: {result:?}");
                         Ok::<_, ()>(())
                     },
                 )
                 .unwrap();
-            assert!(!called);
+            assert!(received > 1024 * "<child a=\"v\"></child>".len());
             assert_eq!(current.used(), 0);
             Ok(())
         },

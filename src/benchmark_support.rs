@@ -27,6 +27,79 @@ impl<'a> Projection<'a> {
     }
 }
 
+/// XMLDSig node sets over one prepared document, canonicalized after selection.
+pub struct NodeSets<'a> {
+    document: crate::xml::dom::Document<'a>,
+}
+
+impl<'a> NodeSets<'a> {
+    /// Parse once outside measurement.
+    pub fn new(input: &'a str) -> Result<Self, crate::xml::dom::ParseError> {
+        Ok(Self {
+            document: crate::xml::dom::Document::parse(input)?,
+        })
+    }
+
+    /// `URI=""` minus the document element's last child, as an enveloped
+    /// signature, then inclusive C14N. Returns the canonical length.
+    pub fn enveloped(&self) -> usize {
+        let mut nodes = crate::xmldsig::NodeSet::entire_document_without_comments(&self.document)
+            .expect("benchmark document fits node-set limits");
+        let signature = self
+            .document
+            .root_element()
+            .last_element_child()
+            .expect("benchmark document has an enveloped child");
+        nodes.exclude_subtree(signature);
+        self.canonicalize(&nodes)
+    }
+
+    /// Every `stride`-th element with its attribute and namespace nodes,
+    /// stored as a bitset or a sorted vector, then inclusive C14N.
+    pub fn selection(&self, stride: usize, dense: bool) -> usize {
+        use crate::xmldsig::types::projection::{NativeKeys, Projection};
+        let budget = crate::xmldsig::types::NodeSetMaterializationBudget::default();
+        let mut nodes = Projection::empty(&self.document, NativeKeys);
+        nodes
+            .pin_representation(dense)
+            .expect("native storage is infallible");
+        for element in self
+            .document
+            .descendants()
+            .filter(|node| node.is_element())
+            .step_by(stride)
+        {
+            nodes
+                .insert_tree(element, Some(&budget))
+                .expect("selection fits");
+            for ordinal in 0..element.attributes().len() {
+                nodes
+                    .insert_attribute_at(element, ordinal, &budget)
+                    .expect("selection fits");
+            }
+            for ordinal in 0..element.namespaces().len() {
+                nodes
+                    .insert_namespace_at(element, ordinal, &budget)
+                    .expect("selection fits");
+            }
+        }
+        self.canonicalize(&nodes)
+    }
+
+    fn canonicalize(&self, nodes: &dyn crate::c14n::NodeVisibility) -> usize {
+        let algorithm = crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_0, false);
+        let mut output = Vec::new();
+        crate::c14n::canonicalize_with_visibility(
+            &self.document,
+            Some(nodes),
+            &algorithm,
+            &mut output,
+        )
+        .expect("benchmark canonicalization");
+        output.len()
+    }
+}
+
 /// A dependency fan-out representative of reference digest admission.
 pub struct Plan {
     context: OperationExecutionContext<(), ()>,

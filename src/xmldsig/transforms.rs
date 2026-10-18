@@ -40,7 +40,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest as _, Sha256};
 
 use super::parse::XMLDSIG_NS;
-use super::types::projection::{NativeKeys, PaidKeys, Projection, RetainKeys};
+use super::types::projection::{Keys, NativeKeys, PaidKeys, Projection};
 use super::types::{
     NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
 };
@@ -1368,7 +1368,7 @@ fn retain_visible_dependencies<K: super::types::projection::Keys, D: DomStorage>
 }
 
 pub(crate) trait TransformScratch: Scratch {
-    type NodeKeys: RetainKeys;
+    type NodeKeys: Keys;
     type Decoder: crate::xml_input_shared::DecodeStorage;
     type Dom: NameStorage;
     fn parse_xml<'input>(
@@ -1404,7 +1404,7 @@ impl TransformScratch for Native {
         map_transform_xml_decode_error(error)
     }
     fn node_keys(&self) -> NativeKeys {
-        NativeKeys::default()
+        NativeKeys
     }
 }
 

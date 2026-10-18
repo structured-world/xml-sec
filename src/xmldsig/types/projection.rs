@@ -1,18 +1,26 @@
 //! Storage-specialized projection of the original XML XPath node identities.
+//!
+//! A whole document or rooted subtree, minus any excluded subtrees, remains a
+//! range of the contiguous preorder arena and stores no per-node entries.
+//! Arbitrary selections are explicit sets over the document-order XPath index:
+//! a sorted index vector while sparse, a bitset once dense.
 
 use super::{NodeSetMaterializationBudget, TransformError, charge_resource_bytes};
+use crate::c14n::scratch::{List as _, Scratch as _};
 use crate::c14n::{C14nError, NodeVisibility};
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
-use crate::xml::dom::{Document, Node};
-use std::collections::HashMap;
-use structured_asn1::memory::{HashWork, MemoryError, OwnedMap, Work};
+use crate::xml::dom::{Document, Node, NodeId};
+use std::ops::Range;
+use structured_asn1::memory::{HashWork, MemoryError, Work};
 
-// Arena ordinals are private to this projection's one original document.
-// Tree, attribute and namespace axes cannot collide, including inherited axes.
-pub(crate) type Key = (usize, usize, usize);
-const TREE: usize = 0;
-const ATTRIBUTE: usize = 1;
-const NAMESPACE: usize = 2;
+/// Sets with at least `1 / DENSE_DIVISOR` of the document's XPath nodes use the
+/// bitset. Measured with the `node_set_*` benchmarks (16K elements, inclusive
+/// C14N, medians of three runs): at 1/37 density the vector matches the bitset's
+/// peak memory but costs 48% more time; at 1/149 it costs 5% more with half the
+/// memory.
+const DENSE_DIVISOR: usize = 128;
+/// Out-of-order inserts below this length shift the sparse tail in place.
+const SPARSE_SHIFT_LIMIT: usize = 64;
 
 fn name_work(parts: &[&str]) -> Result<usize, MemoryError> {
     let mut work = 1_usize;
@@ -22,6 +30,15 @@ fn name_work(parts: &[&str]) -> Result<usize, MemoryError> {
             .ok_or(MemoryError::WorkExceeded)?;
     }
     Ok(work)
+}
+
+/// Comparisons of one binary search over `len` ordered values, plus the probe.
+fn search_work(len: usize) -> usize {
+    (usize::BITS - len.leading_zeros()) as usize + 1
+}
+
+fn prefers_dense(entries: usize, universe: u32) -> bool {
+    entries >= (universe as usize).div_ceil(DENSE_DIVISOR)
 }
 
 pub(super) struct Materialization {
@@ -93,6 +110,61 @@ pub(super) fn measure<D: DomStorage>(
     Ok(measured)
 }
 
+/// Name bytes a materialized key for this XPath node would have owned.
+fn node_bytes<D: DomStorage>(owner: Node<'_, '_, D>, offset: u32) -> Result<usize, MemoryError> {
+    let Some(axis) = (offset as usize).checked_sub(1) else {
+        return Ok(0);
+    };
+    let attributes = owner.attributes().len();
+    let bytes = match owner.attributes().nth(axis) {
+        Some(attribute) => attribute
+            .name()
+            .len()
+            .checked_add(attribute.namespace().map_or(0, str::len)),
+        None => owner
+            .namespaces()
+            .nth(axis - attributes)
+            .and_then(|namespace| {
+                namespace
+                    .uri()
+                    .len()
+                    .checked_add(namespace.name().map_or(0, str::len))
+            }),
+    };
+    bytes.ok_or(MemoryError::WorkExceeded)
+}
+
+/// Name bytes of every XPath node owned by `node`.
+fn owned_bytes<D: DomStorage>(node: Node<'_, '_, D>) -> Result<usize, MemoryError> {
+    let mut bytes = 0_usize;
+    for attribute in node.attributes() {
+        bytes = bytes
+            .checked_add(attribute.name().len())
+            .and_then(|bytes| bytes.checked_add(attribute.namespace().map_or(0, str::len)))
+            .ok_or(MemoryError::WorkExceeded)?;
+    }
+    for namespace in node.namespaces() {
+        bytes = bytes
+            .checked_add(namespace.uri().len())
+            .and_then(|bytes| bytes.checked_add(namespace.name().map_or(0, str::len)))
+            .ok_or(MemoryError::WorkExceeded)?;
+    }
+    Ok(bytes)
+}
+
+/// Every XPath node owned by `node`: itself, then its attributes and namespaces.
+fn owned_indexes<D: DomStorage>(node: Node<'_, '_, D>) -> Range<u32> {
+    let start = node.xpath_index();
+    // The arena admitted these axes into the same bounded u32 index space.
+    let axes = (node.attributes().len() + node.namespaces().len()) as u32;
+    start..start + 1 + axes
+}
+
+fn subtree_ids<D: DomStorage>(node: Node<'_, '_, D>) -> Range<u32> {
+    // Descendant counts come from the same bounded u32 arena.
+    node.id().get()..node.id().get() + node.descendants().len() as u32
+}
+
 pub(crate) trait Keys {
     type Execution: Copy;
     type Scratch: crate::c14n::scratch::Scratch + crate::xmldsig::xpath::XPathStorage;
@@ -109,27 +181,12 @@ pub(crate) trait Keys {
     fn charge(&self, units: usize) -> Result<(), MemoryError> {
         Self::admit(self.execution(), units)
     }
-    fn len(&self) -> usize;
-    fn contains_in(&self, key: Key, execution: Self::Execution) -> Result<bool, MemoryError>;
-    fn contains(&self, key: Key) -> Result<bool, MemoryError> {
-        self.contains_in(key, self.execution())
-    }
-    fn insert(&mut self, key: Key, bytes: usize) -> Result<(), MemoryError>;
-    fn entries_in(
-        &self,
-        execution: Self::Execution,
-    ) -> Result<impl Iterator<Item = (Key, usize)> + '_, MemoryError>;
 }
 
-pub(crate) trait RetainKeys: Keys {
-    fn retain(
-        &mut self,
-        predicate: impl FnMut(Key, usize) -> Result<bool, MemoryError>,
-    ) -> Result<(), MemoryError>;
-}
+type Values<K, T> = <<K as Keys>::Scratch as crate::c14n::scratch::Scratch>::Values<T>;
 
 #[derive(Default)]
-pub(crate) struct NativeKeys(HashMap<Key, usize>);
+pub(crate) struct NativeKeys;
 impl Keys for NativeKeys {
     type Execution = ();
     type Scratch = crate::c14n::scratch::Native;
@@ -156,86 +213,44 @@ impl Keys for NativeKeys {
     }
     fn execution(&self) {}
     fn empty_like(&self) -> Self {
-        Self::default()
+        Self
     }
     fn admit(_: (), _: usize) -> Result<(), MemoryError> {
         Ok(())
     }
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-    fn contains_in(&self, key: Key, _: ()) -> Result<bool, MemoryError> {
-        Ok(self.0.contains_key(&key))
-    }
-    fn insert(&mut self, key: Key, bytes: usize) -> Result<(), MemoryError> {
-        self.0.insert(key, bytes);
-        Ok(())
-    }
-    fn entries_in(&self, _: ()) -> Result<impl Iterator<Item = (Key, usize)> + '_, MemoryError> {
-        Ok(self.0.iter().map(|(key, bytes)| (*key, *bytes)))
-    }
-}
-impl RetainKeys for NativeKeys {
-    fn retain(
-        &mut self,
-        mut predicate: impl FnMut(Key, usize) -> Result<bool, MemoryError>,
-    ) -> Result<(), MemoryError> {
-        let mut failure = None;
-        self.0.retain(|key, bytes| {
-            if failure.is_some() {
-                return true;
-            }
-            match predicate(*key, *bytes) {
-                Ok(keep) => keep,
-                Err(error) => {
-                    failure = Some(error);
-                    true
-                }
-            }
-        });
-        failure.map_or(Ok(()), Err)
-    }
 }
 
 pub(crate) struct PaidKeys<'w, W: Work> {
-    values: OwnedMap<Key, usize, W>,
     work: &'w W,
 }
 impl<'w, W: Work> PaidKeys<'w, W> {
     pub(crate) fn new(work: &'w W) -> Self {
-        Self {
-            values: work.map(),
-            work,
-        }
-    }
-}
-impl<W: Work> RetainKeys for PaidKeys<'_, W> {
-    fn retain(
-        &mut self,
-        mut predicate: impl FnMut(Key, usize) -> Result<bool, MemoryError>,
-    ) -> Result<(), MemoryError> {
-        self.values
-            .try_retain(self.work, |key, bytes| predicate(*key, *bytes))
-            .map_err(MemoryError::from)
+        Self { work }
     }
 }
 impl<'w, W: Work> Keys for PaidKeys<'w, W> {
     type Execution = &'w W;
     type Scratch = crate::c14n::scratch::Accounted<'w, W>;
-    type Bindings<'source> =
-        OwnedMap<super::super::xpath::storage::Prefix<'source>, &'source str, W>;
+    type Bindings<'source> = structured_asn1::memory::OwnedMap<
+        super::super::xpath::storage::Prefix<'source>,
+        &'source str,
+        W,
+    >;
     fn bindings<'source>(execution: &'w W) -> Self::Bindings<'source> {
         execution.map()
     }
     fn scratch(execution: &'w W) -> Self::Scratch {
         crate::c14n::scratch::Accounted(execution)
     }
-    type NamespaceIndex<'source> =
-        OwnedMap<super::super::xpath::storage::NamespaceKey<'source>, usize, W>;
+    type NamespaceIndex<'source> = structured_asn1::memory::OwnedMap<
+        super::super::xpath::storage::NamespaceKey<'source>,
+        usize,
+        W,
+    >;
     fn namespace_index<'source>(execution: &'w W) -> Self::NamespaceIndex<'source> {
         execution.map()
     }
-    type Index<T: HashWork, V> = OwnedMap<T, V, W>;
+    type Index<T: HashWork, V> = structured_asn1::memory::OwnedMap<T, V, W>;
     fn index<T: HashWork, V>(execution: &'w W) -> Self::Index<T, V> {
         execution.map()
     }
@@ -243,82 +258,99 @@ impl<'w, W: Work> Keys for PaidKeys<'w, W> {
         self.work
     }
     fn empty_like(&self) -> Self {
-        Self {
-            values: self.work.map(),
-            work: self.work,
-        }
+        Self { work: self.work }
     }
     fn admit(work: &'w W, units: usize) -> Result<(), MemoryError> {
         work.charge_work(u64::try_from(units).map_err(|_| MemoryError::WorkExceeded)?)
     }
-    fn len(&self) -> usize {
-        self.values.len()
+}
+
+/// XPath axis of one node owned by a tree node.
+#[derive(Clone, Copy)]
+enum Axis {
+    Tree,
+    Attribute(usize),
+    Namespace(usize),
+}
+
+enum Members<K: Keys> {
+    /// Every XPath node owned by an arena node in `nodes`, except the owners in
+    /// `excluded` (sorted, disjoint whole subtrees) and, without `comments`,
+    /// comment nodes.
+    Subtree {
+        nodes: Range<u32>,
+        excluded: Values<K, Range<u32>>,
+        comments: bool,
+    },
+    Sparse(SparseIndexes<K>),
+    /// One bit per document-order XPath index.
+    Dense(Values<K, u64>),
+}
+
+/// Sorted document-order XPath indexes with one summary bit per 64-index
+/// block. C14N queries every document node, so a miss in an unoccupied block
+/// must not cost a binary search.
+struct SparseIndexes<K: Keys> {
+    indexes: Values<K, u32>,
+    /// Allocated with the first member.
+    blocks: Values<K, u64>,
+}
+
+impl<K: Keys> SparseIndexes<K> {
+    fn new(scratch: &K::Scratch) -> Self {
+        Self {
+            indexes: scratch.values(),
+            blocks: scratch.values(),
+        }
     }
-    fn contains_in(&self, key: Key, work: &'w W) -> Result<bool, MemoryError> {
-        Ok(self.values.get(&key, work)?.is_some())
+    fn contains(&self, index: u32, execution: K::Execution) -> Result<bool, MemoryError> {
+        K::admit(execution, 1)?;
+        if !bit(&self.blocks, index / 64) {
+            return Ok(false);
+        }
+        K::admit(execution, search_work(self.indexes.len()))?;
+        Ok(self.indexes.binary_search(&index).is_ok())
     }
-    fn insert(&mut self, key: Key, bytes: usize) -> Result<(), MemoryError> {
-        self.values.try_insert(key, bytes)?;
+    /// Record an index added to `indexes` in a document of `universe` indexes.
+    fn mark(
+        &mut self,
+        index: u32,
+        universe: u32,
+        execution: K::Execution,
+    ) -> Result<(), TransformError> {
+        if self.blocks.is_empty() {
+            let words = (universe as usize).div_ceil(64 * 64);
+            K::admit(execution, words).map_err(C14nError::from)?;
+            self.blocks.reserve_exact(words)?;
+            for _ in 0..words {
+                self.blocks.push(0)?;
+            }
+        }
+        set_bit(&mut self.blocks, index / 64);
         Ok(())
     }
-    fn entries_in(
-        &self,
-        work: &'w W,
-    ) -> Result<impl Iterator<Item = (Key, usize)> + '_, MemoryError> {
-        Ok(self
-            .values
-            .try_iter(work)?
-            .map(|(key, bytes)| (*key, *bytes)))
+    /// Recompute the summary after members were removed.
+    fn summarize(&mut self, execution: K::Execution) -> Result<(), MemoryError> {
+        K::admit(execution, self.blocks.len() + self.indexes.len())?;
+        self.blocks.fill(0);
+        for &index in self.indexes.iter() {
+            set_bit(&mut self.blocks, index / 64);
+        }
+        Ok(())
     }
 }
 
 pub(crate) struct Projection<'a, K: Keys, D: DomStorage = NativeDom> {
     document: &'a Document<'a, D>,
     keys: K,
+    members: Members<K>,
+    entries: usize,
     projected_string_bytes: usize,
     with_comments: bool,
     failure: Option<MemoryError>,
-}
-
-fn walk<K: Keys, D: DomStorage>(
-    root: Node<'_, '_, D>,
-    comments: bool,
-    execution: K::Execution,
-    mut visit: impl FnMut(Key, usize, bool) -> Result<(), TransformError>,
-) -> Result<(), TransformError> {
-    K::admit(execution, root.descendants().len()).map_err(C14nError::from)?;
-    for node in root.descendants() {
-        if node.is_comment() && !comments {
-            continue;
-        }
-        visit((TREE, node.id().get() as usize, 0), 0, node.is_comment())?;
-        let axes = node
-            .attributes()
-            .len()
-            .checked_add(node.namespaces().len())
-            .ok_or(MemoryError::WorkExceeded)
-            .map_err(C14nError::from)?;
-        K::admit(execution, axes).map_err(C14nError::from)?;
-        for (ordinal, attribute) in node.attributes().enumerate() {
-            let bytes = attribute
-                .name()
-                .len()
-                .checked_add(attribute.namespace().map_or(0, str::len))
-                .ok_or(MemoryError::WorkExceeded)
-                .map_err(C14nError::from)?;
-            visit((ATTRIBUTE, node.id().get() as usize, ordinal), bytes, false)?;
-        }
-        for (ordinal, namespace) in node.namespaces().enumerate() {
-            let bytes = namespace
-                .uri()
-                .len()
-                .checked_add(namespace.name().map_or(0, str::len))
-                .ok_or(MemoryError::WorkExceeded)
-                .map_err(C14nError::from)?;
-            visit((NAMESPACE, node.id().get() as usize, ordinal), bytes, false)?;
-        }
-    }
-    Ok(())
+    /// Ordered growth keeps the representation chosen by `pin_representation`.
+    #[cfg(feature = "benchmark-internals")]
+    pinned: bool,
 }
 
 #[cfg(test)]
@@ -329,15 +361,7 @@ impl<'a, 'w, W: Work, D: DomStorage> Projection<'a, PaidKeys<'w, W>, D> {
         budget: &NodeSetMaterializationBudget,
         work: &'w W,
     ) -> Result<Self, TransformError> {
-        Self::subtree(
-            root,
-            with_comments,
-            budget,
-            PaidKeys {
-                values: work.map(),
-                work,
-            },
-        )
+        Self::subtree(root, with_comments, budget, PaidKeys::new(work))
     }
 }
 
@@ -348,71 +372,49 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         budget: &NodeSetMaterializationBudget,
         keys: K,
     ) -> Result<Self, TransformError> {
-        let mut projection = Self::empty(root.document(), keys);
-        projection.with_comments = with_comments;
         let measured = measure(
             root,
             with_comments,
             budget.max_entries,
             budget.max_owned_string_bytes,
-            &projection.keys,
+            &keys,
         )?;
         budget.charge(measured.owned_string_bytes)?;
-        walk::<K, D>(
-            root,
-            with_comments,
-            projection.keys.execution(),
-            |key, bytes, _| {
-                projection
-                    .keys
-                    .insert(key, bytes)
-                    .map_err(C14nError::from)?;
-                Ok(())
+        let excluded = K::scratch(keys.execution()).values();
+        Ok(Self {
+            document: root.document(),
+            keys,
+            members: Members::Subtree {
+                nodes: subtree_ids(root),
+                excluded,
+                comments: with_comments,
             },
-        )?;
-        projection.projected_string_bytes = measured.owned_string_bytes;
-        debug_assert_eq!(projection.keys.len(), measured.entries);
-        Ok(projection)
+            entries: measured.entries,
+            projected_string_bytes: measured.owned_string_bytes,
+            with_comments,
+            failure: None,
+            #[cfg(feature = "benchmark-internals")]
+            pinned: false,
+        })
     }
 
-    fn insert_new(
-        &mut self,
-        key: Key,
-        bytes: usize,
-        budget: &NodeSetMaterializationBudget,
-    ) -> Result<(), TransformError> {
-        let next = charge_resource_bytes(
-            self.keys.len(),
-            1,
-            budget.max_entries,
-            crate::policy::resource_name::NODE_SET_ENTRIES,
-        )?;
-        let strings = charge_resource_bytes(
-            self.projected_string_bytes,
-            bytes,
-            budget.max_owned_string_bytes,
-            crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
-        )?;
-        // Preserve the original compiled projection allowance. Source names
-        // remain borrowed; actual table capacity is separately allocator-paid.
-        budget.charge(bytes)?;
-        self.keys.insert(key, bytes).map_err(C14nError::from)?;
-        debug_assert_eq!(self.keys.len(), next);
-        self.projected_string_bytes = strings;
-        Ok(())
+    pub(crate) fn empty(document: &'a Document<'a, D>, keys: K) -> Self {
+        let members = Members::Sparse(SparseIndexes::new(&K::scratch(keys.execution())));
+        Self {
+            document,
+            keys,
+            members,
+            entries: 0,
+            projected_string_bytes: 0,
+            with_comments: false,
+            failure: None,
+            #[cfg(feature = "benchmark-internals")]
+            pinned: false,
+        }
     }
 
     fn owns(&self, node: Node<'_, '_, D>) -> bool {
         std::ptr::eq(self.document, node.document())
-    }
-    pub(crate) fn empty(document: &'a Document<'a, D>, keys: K) -> Self {
-        Self {
-            document,
-            keys,
-            projected_string_bytes: 0,
-            with_comments: false,
-            failure: None,
-        }
     }
     fn available(&self) -> Result<(), C14nError> {
         match self.failure {
@@ -420,8 +422,44 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             None => Ok(()),
         }
     }
+    /// A mutation refused part-way leaves no successful subset observable.
+    fn sticky<T>(&mut self, result: Result<T, TransformError>) -> Result<T, TransformError> {
+        if let Err(TransformError::C14n(C14nError::SharedExecution(error))) = &result {
+            self.failure = Some(*error);
+        }
+        result
+    }
+    fn values<T>(&self) -> Values<K, T> {
+        K::scratch(self.keys.execution()).values()
+    }
+    fn no_members(&self) -> Members<K> {
+        Members::Sparse(SparseIndexes::new(&K::scratch(self.keys.execution())))
+    }
+    fn universe(&self) -> u32 {
+        self.document.xpath_node_count()
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.keys.len()
+        self.entries
+    }
+    /// Grow this empty set as a bitset or a sorted vector regardless of density,
+    /// so both representations are measured without conversions.
+    #[cfg(feature = "benchmark-internals")]
+    pub(crate) fn pin_representation(&mut self, dense: bool) -> Result<(), TransformError> {
+        assert_eq!(self.entries, 0, "only an empty set is pinned");
+        if dense {
+            self.members = Members::Dense(self.dense_words()?);
+        }
+        self.pinned = true;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn representation(&self) -> &'static str {
+        match self.members {
+            Members::Subtree { .. } => "subtree",
+            Members::Sparse(_) => "sparse",
+            Members::Dense(_) => "dense",
+        }
     }
     pub(crate) fn admit_walk(&self, nodes: usize) -> Result<(), C14nError> {
         self.available()?;
@@ -459,29 +497,381 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         .map(|measured| measured.entries)
     }
 
+    fn index(node: Node<'_, '_, D>, axis: Axis) -> Option<u32> {
+        let start = node.xpath_index();
+        // Ordinals are bounded by the owner's axes, which share the u32 index space.
+        let offset = match axis {
+            Axis::Tree => return Some(start),
+            Axis::Attribute(ordinal) if ordinal < node.attributes().len() => ordinal,
+            Axis::Namespace(ordinal) if ordinal < node.namespaces().len() => {
+                node.attributes().len() + ordinal
+            }
+            Axis::Attribute(_) | Axis::Namespace(_) => return None,
+        };
+        Some(start + 1 + offset as u32)
+    }
+
+    /// Owner arena node and name bytes of one document-order XPath index.
+    fn resolve(
+        &self,
+        index: u32,
+        execution: K::Execution,
+    ) -> Result<(Node<'a, 'a, D>, usize), MemoryError> {
+        K::admit(execution, search_work(self.document.node_count()))?;
+        let owner = self
+            .document
+            .xpath_owner(index)
+            .expect("projected indexes belong to their document");
+        Ok((owner, node_bytes(owner, index - owner.xpath_index())?))
+    }
+
+    fn semantic_contains(
+        nodes: &Range<u32>,
+        excluded: &[Range<u32>],
+        comments: bool,
+        node: Node<'_, '_, D>,
+        tree: bool,
+    ) -> bool {
+        let id = node.id().get();
+        if !nodes.contains(&id) || (tree && !comments && node.is_comment()) {
+            return false;
+        }
+        let after = excluded.partition_point(|range| range.start <= id);
+        after == 0 || !excluded[after - 1].contains(&id)
+    }
+
+    fn contains(&self, node: Node<'_, '_, D>, axis: Axis) -> Result<bool, C14nError> {
+        self.available()?;
+        if !self.owns(node) {
+            return Ok(false);
+        }
+        let Some(index) = Self::index(node, axis) else {
+            return Ok(false);
+        };
+        match &self.members {
+            Members::Subtree {
+                nodes,
+                excluded,
+                comments,
+            } => {
+                self.keys.charge(search_work(excluded.len()))?;
+                Ok(Self::semantic_contains(
+                    nodes,
+                    excluded,
+                    *comments,
+                    node,
+                    matches!(axis, Axis::Tree),
+                ))
+            }
+            Members::Sparse(indexes) => Ok(indexes.contains(index, self.keys.execution())?),
+            Members::Dense(words) => {
+                self.keys.charge(1)?;
+                Ok(bit(words, index))
+            }
+        }
+    }
+
+    /// Membership of a document index, paid by the querying `execution`.
+    fn contains_index(&self, index: u32, execution: K::Execution) -> Result<bool, MemoryError> {
+        match &self.members {
+            Members::Subtree {
+                nodes,
+                excluded,
+                comments,
+            } => {
+                let (owner, _) = self.resolve(index, execution)?;
+                K::admit(execution, search_work(excluded.len()))?;
+                Ok(Self::semantic_contains(
+                    nodes,
+                    excluded,
+                    *comments,
+                    owner,
+                    index == owner.xpath_index(),
+                ))
+            }
+            Members::Sparse(indexes) => indexes.contains(index, execution),
+            Members::Dense(words) => {
+                K::admit(execution, 1)?;
+                Ok(bit(words, index))
+            }
+        }
+    }
+
+    /// Visit member indexes in increasing order, paid by the querying `execution`
+    /// per emitted index and per stored unit scanned.
+    fn for_each_index(
+        &self,
+        execution: K::Execution,
+        mut visit: impl FnMut(u32) -> Result<(), TransformError>,
+    ) -> Result<(), TransformError> {
+        match &self.members {
+            Members::Subtree {
+                nodes,
+                excluded,
+                comments,
+            } => {
+                let mut id = nodes.start;
+                let mut next_excluded = 0;
+                while id < nodes.end {
+                    if let Some(range) = excluded.get(next_excluded)
+                        && range.start == id
+                    {
+                        K::admit(execution, 1).map_err(C14nError::from)?;
+                        id = range.end;
+                        next_excluded += 1;
+                        continue;
+                    }
+                    let node = self
+                        .document
+                        .get_node(NodeId::from(id))
+                        .expect("subtree IDs belong to their document");
+                    id += 1;
+                    if node.is_comment() && !comments {
+                        K::admit(execution, 1).map_err(C14nError::from)?;
+                        continue;
+                    }
+                    let indexes = owned_indexes(node);
+                    // One unit for the visit and one per emitted index.
+                    K::admit(execution, 1 + indexes.len()).map_err(C14nError::from)?;
+                    for index in indexes {
+                        visit(index)?;
+                    }
+                }
+                Ok(())
+            }
+            Members::Sparse(sparse) => {
+                K::admit(execution, sparse.indexes.len()).map_err(C14nError::from)?;
+                for &index in sparse.indexes.iter() {
+                    visit(index)?;
+                }
+                Ok(())
+            }
+            Members::Dense(words) => {
+                for (position, &word) in words.iter().enumerate() {
+                    K::admit(execution, 1 + word.count_ones() as usize).map_err(C14nError::from)?;
+                    let mut bits = word;
+                    while bits != 0 {
+                        // The bitset covers the u32 document index space.
+                        visit((position * 64) as u32 + bits.trailing_zeros())?;
+                        bits &= bits - 1;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn dense_words(&self) -> Result<Values<K, u64>, TransformError> {
+        let length = (self.universe() as usize).div_ceil(64);
+        self.keys.charge(length).map_err(C14nError::from)?;
+        let mut words = self.values();
+        words.reserve_exact(length)?;
+        for _ in 0..length {
+            words.push(0)?;
+        }
+        Ok(words)
+    }
+
+    /// Store the current members explicitly, choosing the representation by density.
+    fn materialize(&mut self) -> Result<(), TransformError> {
+        let dense = prefers_dense(self.entries, self.universe());
+        let execution = self.keys.execution();
+        let members = match (&self.members, dense) {
+            (Members::Subtree { .. }, true) | (Members::Sparse(_), true) => {
+                let mut words = self.dense_words()?;
+                self.for_each_index(execution, |index| {
+                    set_bit(&mut words, index);
+                    Ok(())
+                })?;
+                Members::Dense(words)
+            }
+            (Members::Subtree { .. }, false) | (Members::Dense(_), false) => {
+                Members::Sparse(self.sparse_copy()?)
+            }
+            (Members::Sparse(_), false) | (Members::Dense(_), true) => return Ok(()),
+        };
+        self.members = members;
+        Ok(())
+    }
+
+    fn sparse_copy(&self) -> Result<SparseIndexes<K>, TransformError> {
+        let execution = self.keys.execution();
+        let universe = self.universe();
+        let mut sparse = SparseIndexes::<K>::new(&K::scratch(execution));
+        sparse.indexes.reserve_exact(self.entries)?;
+        self.for_each_index(execution, |index| {
+            K::admit(execution, 1).map_err(C14nError::from)?;
+            sparse.indexes.push(index)?;
+            sparse.mark(index, universe, execution)
+        })?;
+        Ok(sparse)
+    }
+
+    /// Explicit members in the representation their density selects.
+    fn compact(&mut self) -> Result<(), TransformError> {
+        let result = match &self.members {
+            Members::Subtree { .. } => Ok(()),
+            _ => self.materialize(),
+        };
+        self.sticky(result)
+    }
+
     fn insert(
         &mut self,
-        key: Key,
+        index: u32,
         bytes: usize,
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<(), TransformError> {
         self.available()?;
-        if self.keys.contains(key).map_err(C14nError::from)? {
+        if self
+            .contains_index(index, self.keys.execution())
+            .map_err(C14nError::from)?
+        {
             return Ok(());
         }
-        match budget {
-            Some(budget) => self.insert_new(key, bytes, budget),
-            None => {
-                let next = self
-                    .projected_string_bytes
-                    .checked_add(bytes)
-                    .ok_or(MemoryError::WorkExceeded)
-                    .map_err(C14nError::from)?;
-                self.keys.insert(key, bytes).map_err(C14nError::from)?;
-                self.projected_string_bytes = next;
-                Ok(())
-            }
+        if matches!(self.members, Members::Subtree { .. }) {
+            let result = self.materialize();
+            self.sticky(result)?;
         }
+        let strings = match budget {
+            Some(budget) => {
+                charge_resource_bytes(
+                    self.entries,
+                    1,
+                    budget.max_entries,
+                    crate::policy::resource_name::NODE_SET_ENTRIES,
+                )?;
+                let strings = charge_resource_bytes(
+                    self.projected_string_bytes,
+                    bytes,
+                    budget.max_owned_string_bytes,
+                    crate::policy::resource_name::NODE_SET_OWNED_STRING_BYTES,
+                )?;
+                // Preserve the original compiled projection allowance. Source names
+                // remain borrowed; actual index capacity is separately allocator-paid.
+                budget.charge(bytes)?;
+                strings
+            }
+            None => self
+                .projected_string_bytes
+                .checked_add(bytes)
+                .ok_or(MemoryError::WorkExceeded)
+                .map_err(C14nError::from)?,
+        };
+        let result = self.add_absent(index);
+        self.sticky(result)?;
+        self.projected_string_bytes = strings;
+        Ok(())
+    }
+
+    fn add_absent(&mut self, index: u32) -> Result<(), TransformError> {
+        let entries = self.entries + 1;
+        let universe = self.universe();
+        let execution = self.keys.execution();
+        let promote = match &mut self.members {
+            Members::Sparse(sparse) => {
+                let indexes = &mut sparse.indexes;
+                if indexes.last().is_none_or(|last| *last < index) {
+                    indexes.push(index)?;
+                    sparse.mark(index, universe, execution)?;
+                    #[cfg(feature = "benchmark-internals")]
+                    if self.pinned {
+                        self.entries = entries;
+                        return Ok(());
+                    }
+                    prefers_dense(entries, universe)
+                } else if indexes.len() < SPARSE_SHIFT_LIMIT {
+                    let position = indexes.partition_point(|value| *value < index);
+                    K::admit(execution, indexes.len() - position).map_err(C14nError::from)?;
+                    indexes.push(index)?;
+                    indexes[position..].rotate_right(1);
+                    sparse.mark(index, universe, execution)?;
+                    false
+                } else {
+                    // Unordered growth would shift the tail per insert.
+                    true
+                }
+            }
+            Members::Dense(words) => {
+                set_bit(words, index);
+                false
+            }
+            Members::Subtree { .. } => unreachable!("insertion materializes semantic members"),
+        };
+        if promote {
+            let mut words = self.dense_words()?;
+            self.for_each_index(self.keys.execution(), |index| {
+                set_bit(&mut words, index);
+                Ok(())
+            })?;
+            set_bit(&mut words, index);
+            self.members = Members::Dense(words);
+        }
+        self.entries = entries;
+        Ok(())
+    }
+
+    /// Keep only members accepted by `keep`, releasing their name bytes.
+    fn filter(
+        &mut self,
+        mut keep: impl FnMut(u32) -> Result<bool, MemoryError>,
+    ) -> Result<(), TransformError> {
+        let document = self.document;
+        let keys = &self.keys;
+        let mut entries = self.entries;
+        let mut bytes = self.projected_string_bytes;
+        let mut drop_index = |index: u32| -> Result<(), MemoryError> {
+            keys.charge(search_work(document.node_count()))?;
+            let owner = document
+                .xpath_owner(index)
+                .expect("projected indexes belong to their document");
+            entries -= 1;
+            bytes -= node_bytes(owner, index - owner.xpath_index())?;
+            Ok(())
+        };
+        match &mut self.members {
+            Members::Sparse(sparse) => {
+                let indexes = &mut sparse.indexes;
+                // One unit per examined member; removals pay their lookup too.
+                keys.charge(indexes.len())?;
+                let mut kept = 0;
+                for position in 0..indexes.len() {
+                    let index = indexes[position];
+                    if keep(index)? {
+                        indexes[kept] = index;
+                        kept += 1;
+                    } else {
+                        drop_index(index)?;
+                    }
+                }
+                if indexes.len() > kept {
+                    while indexes.len() > kept {
+                        indexes.pop();
+                    }
+                    sparse.summarize(keys.execution())?;
+                }
+            }
+            Members::Dense(words) => {
+                for position in 0..words.len() {
+                    // The word scan and each member it holds.
+                    keys.charge(1 + words[position].count_ones() as usize)?;
+                    let mut bits = words[position];
+                    while bits != 0 {
+                        let offset = bits.trailing_zeros();
+                        bits &= bits - 1;
+                        let index = (position * 64) as u32 + offset;
+                        if !keep(index)? {
+                            words[position] &= !(1 << offset);
+                            drop_index(index)?;
+                        }
+                    }
+                }
+            }
+            Members::Subtree { .. } => unreachable!("filtering materializes semantic members"),
+        }
+        self.entries = entries;
+        self.projected_string_bytes = bytes;
+        Ok(())
     }
 
     pub(crate) fn insert_tree(
@@ -493,7 +883,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         if !self.owns(node) {
             return Ok(());
         }
-        self.insert((TREE, node.id().get() as usize, 0), 0, budget)?;
+        self.insert(node.xpath_index(), 0, budget)?;
         self.with_comments |= node.is_comment();
         Ok(())
     }
@@ -509,20 +899,11 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             return Ok(());
         }
         self.keys.charge(1).map_err(C14nError::from)?;
-        let Some(attribute) = owner.attributes().nth(ordinal) else {
+        let Some(index) = Self::index(owner, Axis::Attribute(ordinal)) else {
             return Ok(());
         };
-        let bytes = attribute
-            .name()
-            .len()
-            .checked_add(attribute.namespace().map_or(0, str::len))
-            .ok_or(MemoryError::WorkExceeded)
-            .map_err(C14nError::from)?;
-        self.insert(
-            (ATTRIBUTE, owner.id().get() as usize, ordinal),
-            bytes,
-            Some(budget),
-        )
+        let bytes = node_bytes(owner, index - owner.xpath_index()).map_err(C14nError::from)?;
+        self.insert(index, bytes, Some(budget))
     }
     pub(crate) fn insert_namespace_at(
         &mut self,
@@ -535,20 +916,11 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             return Ok(());
         }
         self.keys.charge(1).map_err(C14nError::from)?;
-        let Some(namespace) = owner.namespaces().nth(ordinal) else {
+        let Some(index) = Self::index(owner, Axis::Namespace(ordinal)) else {
             return Ok(());
         };
-        let bytes = namespace
-            .uri()
-            .len()
-            .checked_add(namespace.name().map_or(0, str::len))
-            .ok_or(MemoryError::WorkExceeded)
-            .map_err(C14nError::from)?;
-        self.insert(
-            (NAMESPACE, owner.id().get() as usize, ordinal),
-            bytes,
-            Some(budget),
-        )
+        let bytes = node_bytes(owner, index - owner.xpath_index()).map_err(C14nError::from)?;
+        self.insert(index, bytes, Some(budget))
     }
 
     #[cfg(test)]
@@ -576,14 +948,11 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 )
                 .map_err(C14nError::from)?;
             if attribute.name() == local && attribute.namespace() == namespace {
-                return self.insert(
-                    (ATTRIBUTE, owner.id().get() as usize, ordinal),
-                    attribute
-                        .name()
-                        .len()
-                        .saturating_add(attribute.namespace().map_or(0, str::len)),
-                    budget,
-                );
+                let index = Self::index(owner, Axis::Attribute(ordinal))
+                    .expect("enumerated attribute ordinal");
+                let bytes =
+                    node_bytes(owner, index - owner.xpath_index()).map_err(C14nError::from)?;
+                return self.insert(index, bytes, budget);
             }
         }
         Ok(())
@@ -609,11 +978,11 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 )
                 .map_err(C14nError::from)?;
             if namespace.name().unwrap_or("") == prefix && namespace.uri() == uri {
-                return self.insert(
-                    (NAMESPACE, owner.id().get() as usize, ordinal),
-                    prefix.len().saturating_add(uri.len()),
-                    budget,
-                );
+                let index = Self::index(owner, Axis::Namespace(ordinal))
+                    .expect("enumerated namespace ordinal");
+                let bytes =
+                    node_bytes(owner, index - owner.xpath_index()).map_err(C14nError::from)?;
+                return self.insert(index, bytes, budget);
             }
         }
         Ok(())
@@ -629,92 +998,168 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         if !std::ptr::eq(self.document, other.document) {
             return Ok(());
         }
-        for (key, bytes) in other
-            .keys
-            .entries_in(self.keys.execution())
-            .map_err(C14nError::from)?
-        {
-            self.insert(key, bytes, Some(budget))?;
-        }
+        let execution = self.keys.execution();
+        other.for_each_index(execution, |index| {
+            let (_, bytes) = self.resolve(index, execution).map_err(C14nError::from)?;
+            self.insert(index, bytes, Some(budget))
+        })?;
         self.with_comments |= other.with_comments;
-        Ok(())
+        self.compact()
     }
+
     pub(crate) fn contains_tree(&self, node: Node<'_, '_, D>) -> Result<bool, C14nError> {
-        self.available()?;
-        if !self.owns(node) {
-            return Ok(false);
-        }
-        self.keys
-            .contains((TREE, node.id().get() as usize, 0))
-            .map_err(Into::into)
+        self.contains(node, Axis::Tree)
     }
     pub(crate) fn contains_attribute_at(
         &self,
         owner: Node<'_, '_, D>,
         ordinal: usize,
     ) -> Result<bool, C14nError> {
-        self.available()?;
-        if !self.owns(owner) {
-            return Ok(false);
-        }
-        self.keys
-            .contains((ATTRIBUTE, owner.id().get() as usize, ordinal))
-            .map_err(Into::into)
+        self.contains(owner, Axis::Attribute(ordinal))
     }
     pub(crate) fn contains_namespace_at(
         &self,
         owner: Node<'_, '_, D>,
         ordinal: usize,
     ) -> Result<bool, C14nError> {
-        self.available()?;
-        if !self.owns(owner) {
-            return Ok(false);
-        }
-        self.keys
-            .contains((NAMESPACE, owner.id().get() as usize, ordinal))
-            .map_err(Into::into)
+        self.contains(owner, Axis::Namespace(ordinal))
     }
-}
 
-impl<K: RetainKeys, D: DomStorage> Projection<'_, K, D> {
-    fn retain(
-        &mut self,
-        mut predicate: impl FnMut(Key) -> Result<bool, MemoryError>,
-    ) -> Result<(), C14nError> {
-        self.available()?;
-        let bytes = &mut self.projected_string_bytes;
-        let result = self.keys.retain(|key, weight| {
-            let keep = predicate(key)?;
-            if !keep {
-                *bytes -= weight;
-            }
-            Ok(keep)
-        });
-        if let Err(error) = result {
-            self.failure = Some(error);
-        }
-        result.map_err(Into::into)
-    }
     pub(crate) fn exclude_subtree(&mut self, node: Node<'_, '_, D>) -> Result<(), C14nError> {
         self.available()?;
         if !self.owns(node) {
             return Ok(());
         }
-        let range = super::subtree_node_id_range(node);
-        self.retain(|key| Ok(!range.contains(&(key.1 as u32))))
+        let result = self.exclude(node);
+        self.sticky(result).map_err(|error| match error {
+            TransformError::C14n(error) => error,
+            other => unreachable!("subtree exclusion only fails on execution: {other}"),
+        })
     }
+
+    fn exclude(&mut self, node: Node<'_, '_, D>) -> Result<(), TransformError> {
+        let removed = subtree_ids(node);
+        if let Members::Subtree {
+            nodes,
+            excluded,
+            comments,
+        } = &self.members
+        {
+            if removed.end <= nodes.start || nodes.end <= removed.start {
+                return Ok(());
+            }
+            if removed.start <= nodes.start {
+                // Arena subtrees nest: this one contains the whole projection.
+                self.members = self.no_members();
+                self.entries = 0;
+                self.projected_string_bytes = 0;
+                return Ok(());
+            }
+            self.keys
+                .charge(search_work(excluded.len()))
+                .map_err(C14nError::from)?;
+            let after = excluded.partition_point(|range| range.start <= removed.start);
+            if after > 0 && excluded[after - 1].end >= removed.end {
+                return Ok(());
+            }
+            // Remove the members not already excluded by a nested subtree.
+            let mut entries = 0_usize;
+            let mut bytes = 0_usize;
+            let mut nested = after;
+            let mut id = removed.start;
+            while id < removed.end {
+                if let Some(range) = excluded.get(nested)
+                    && range.start == id
+                {
+                    self.keys.charge(1).map_err(C14nError::from)?;
+                    id = range.end;
+                    nested += 1;
+                    continue;
+                }
+                let member = self
+                    .document
+                    .get_node(NodeId::from(id))
+                    .expect("subtree IDs belong to their document");
+                id += 1;
+                if member.is_comment() && !comments {
+                    self.keys.charge(1).map_err(C14nError::from)?;
+                    continue;
+                }
+                let owned = owned_indexes(member).len();
+                // The visit and each axis whose name bytes are released.
+                self.keys.charge(1 + owned).map_err(C14nError::from)?;
+                entries += owned;
+                bytes += owned_bytes(member).map_err(C14nError::from)?;
+            }
+            let (retained, nested_end) = (after, nested);
+            let Members::Subtree { excluded, .. } = &mut self.members else {
+                unreachable!("checked semantic members");
+            };
+            // Replace the nested exclusions by their enclosing subtree; the
+            // rotations move every exclusion after the insertion point.
+            self.keys
+                .charge(excluded.len() + 1 - retained)
+                .map_err(C14nError::from)?;
+            let tail = excluded.len() - nested_end;
+            excluded.push(removed.clone())?;
+            excluded[retained..].rotate_right(1);
+            let keep = retained + 1 + tail;
+            excluded[retained + 1..].rotate_left(nested_end - retained);
+            while excluded.len() > keep {
+                excluded.pop();
+            }
+            self.entries -= entries;
+            self.projected_string_bytes -= bytes;
+            return Ok(());
+        }
+        let indexes = node.xpath_index()..node.xpath_subtree_end();
+        self.filter(|index| Ok(!indexes.contains(&index)))?;
+        self.compact()
+    }
+
     pub(crate) fn intersect(&mut self, other: &Self) -> Result<(), C14nError> {
+        self.available()?;
         other.available()?;
+        let result = self.intersect_with(other);
+        self.sticky(result).map_err(transform_c14n)
+    }
+
+    fn intersect_with(&mut self, other: &Self) -> Result<(), TransformError> {
         if !std::ptr::eq(self.document, other.document) {
-            self.retain(|_| Ok(false))?;
+            self.members = self.no_members();
+            self.entries = 0;
+            self.projected_string_bytes = 0;
             self.with_comments = false;
             return Ok(());
         }
+        if !matches!(other.members, Members::Subtree { .. })
+            && (matches!(self.members, Members::Subtree { .. }) || other.entries < self.entries)
+        {
+            // The result is a subset of the smaller explicit operand; scan only it.
+            let execution = self.keys.execution();
+            let mut result = Self::empty(self.document, self.keys.empty_like());
+            other.for_each_index(execution, |index| {
+                if self
+                    .contains_index(index, execution)
+                    .map_err(C14nError::from)?
+                {
+                    let (_, bytes) = self.resolve(index, execution).map_err(C14nError::from)?;
+                    result.insert(index, bytes, None)?;
+                }
+                Ok(())
+            })?;
+            result.with_comments = self.with_comments & other.with_comments;
+            result.compact()?;
+            *self = result;
+            return Ok(());
+        }
+        self.materialize()?;
         let execution = self.keys.execution();
-        self.retain(|key| other.keys.contains_in(key, execution))?;
+        self.filter(|index| other.contains_index(index, execution))?;
         self.with_comments &= other.with_comments;
-        Ok(())
+        self.compact()
     }
+
     pub(crate) fn subtract(&mut self, other: &Self) -> Result<(), C14nError> {
         self.available()?;
         other.available()?;
@@ -722,13 +1167,56 @@ impl<K: RetainKeys, D: DomStorage> Projection<'_, K, D> {
             return Ok(());
         }
         let execution = self.keys.execution();
-        self.retain(|key| {
-            other
-                .keys
-                .contains_in(key, execution)
-                .map(|present| !present)
-        })
+        let result = self.materialize().and_then(|()| {
+            if matches!(self.members, Members::Dense(_))
+                && !matches!(other.members, Members::Subtree { .. })
+            {
+                // Clear the explicit operand's bits instead of testing every member.
+                other.for_each_index(execution, |index| self.remove_dense(index))?;
+            } else {
+                self.filter(|index| {
+                    other
+                        .contains_index(index, execution)
+                        .map(|present| !present)
+                })?;
+            }
+            self.compact()
+        });
+        self.sticky(result).map_err(transform_c14n)
     }
+
+    fn remove_dense(&mut self, index: u32) -> Result<(), TransformError> {
+        let execution = self.keys.execution();
+        K::admit(execution, 1).map_err(C14nError::from)?;
+        let Members::Dense(words) = &mut self.members else {
+            unreachable!("caller checked dense members");
+        };
+        if !bit(words, index) {
+            return Ok(());
+        }
+        words[index as usize / 64] &= !(1 << (index % 64));
+        let (_, bytes) = self.resolve(index, execution).map_err(C14nError::from)?;
+        self.entries -= 1;
+        self.projected_string_bytes -= bytes;
+        Ok(())
+    }
+}
+
+fn transform_c14n(error: TransformError) -> C14nError {
+    match error {
+        TransformError::C14n(error) => error,
+        other => unreachable!("node-set algebra only fails on execution: {other}"),
+    }
+}
+
+fn bit(words: &[u64], index: u32) -> bool {
+    words
+        .get(index as usize / 64)
+        .is_some_and(|word| word & (1 << (index % 64)) != 0)
+}
+
+fn set_bit(words: &mut [u64], index: u32) {
+    words[index as usize / 64] |= 1 << (index % 64);
 }
 
 impl<K: Keys, D: DomStorage> NodeVisibility<D> for Projection<'_, K, D> {
@@ -800,184 +1288,4 @@ impl<K: Keys, D: DomStorage> NodeVisibility<D> for Projection<'_, K, D> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use structured_asn1::memory::{Memory, MemoryAccount};
-
-    #[test]
-    fn set_algebra_reads_retained_keys_only_with_current_execution() {
-        // The right-hand set may outlive an exhausted producer. Its storage
-        // remains retained there; filtering, membership and insertion use the
-        // left-hand current query, including attributes and namespace axes.
-        use structured_asn1::{Encoding, Limits, Parser};
-        let document = Document::parse("<root xmlns:p='urn:p'><left p:a='v'/><right/></root>")
-            .expect("fixed XML");
-        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        let producer = Parser::new(
-            Encoding::Der,
-            Limits {
-                max_work: 4096,
-                ..Default::default()
-            },
-            memory.clone(),
-        );
-        let producer_reader = producer.read(&[], 0).expect("empty producer input");
-        let producer_work = producer_reader.execution();
-        let query = Parser::new(Encoding::Der, Limits::default(), memory.clone());
-        let reader = query.read(&[], 0).expect("empty query input");
-        let work = reader.execution();
-        let budget = NodeSetMaterializationBudget::default();
-        let child = document
-            .root_element()
-            .first_element_child()
-            .expect("left child");
-        let retained = Projection::accounted_subtree(child, true, &budget, &producer_work)
-            .expect("producer projection fits");
-        for shift in (0..=12).rev() {
-            while producer_work.charge_work(1 << shift).is_ok() {}
-        }
-        let mut selected = Projection::accounted_subtree(document.root(), true, &budget, &work)
-            .expect("current projection fits");
-        selected.intersect(&retained).expect("current intersection");
-        assert!(selected.contains_tree(child).expect("current lookup"));
-        assert!(
-            selected
-                .contains_attribute_at(child, 0)
-                .expect("current attribute lookup")
-        );
-        assert!(
-            !selected
-                .contains_tree(document.root_element())
-                .expect("excluded root lookup")
-        );
-        selected.subtract(&retained).expect("current subtraction");
-        assert_eq!(selected.len(), 0);
-        selected.union(&retained, &budget).expect("current union");
-        assert_eq!(selected.len(), retained.len());
-        selected.exclude_subtree(child).expect("current exclusion");
-        assert_eq!(selected.len(), 0);
-        assert!(producer_work.charge_work(1).is_err());
-        drop(selected);
-        drop(retained);
-        assert_eq!(memory.used(), 0);
-    }
-
-    #[test]
-    fn failed_filter_is_sticky_and_cannot_be_observed_as_successful_subset() {
-        // Even when a sparse-table scan refuses before its first predicate,
-        // subsequent membership and serialization must retain that refusal.
-        let document = Document::parse("<root><child/></root>").expect("fixed source XML");
-        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 4096)));
-        let mut nodes = Projection::accounted_subtree(
-            document.root(),
-            true,
-            &NodeSetMaterializationBudget::default(),
-            &memory,
-        )
-        .expect("initial projection fits");
-        memory
-            .charge_work(memory.work_remaining() as u64)
-            .expect("spend exactly remaining work");
-        assert!(matches!(
-            nodes.exclude_subtree(document.root_element()),
-            Err(C14nError::SharedExecution(MemoryError::WorkExceeded))
-        ));
-        assert!(matches!(
-            nodes.contains_tree(document.root()),
-            Err(C14nError::SharedExecution(MemoryError::WorkExceeded))
-        ));
-        let mut output = Vec::new();
-        let algorithm = crate::c14n::C14nAlgorithm::new(crate::c14n::C14nMode::Inclusive1_0, false);
-        assert!(
-            crate::c14n::canonicalize_with_visibility(
-                &document,
-                Some(&nodes),
-                &algorithm,
-                &mut output
-            )
-            .is_err()
-        );
-        assert!(output.is_empty());
-        drop(nodes);
-        assert_eq!(memory.used(), 0);
-    }
-
-    #[test]
-    fn compact_projection_matches_original_axes_and_canonical_bytes() {
-        // Private axis ordinals must preserve owner-specific namespace identity
-        // and subset inheritance on both storage strategies and every C14N mode.
-        let document = crate::xml::dom::Document::parse(
-            r#"<outer xmlns="urn:default" xmlns:p="urn:a" xml:lang="en"><child p:a="v"><!--kept--><p:leaf xmlns:p="urn:b"/></child></outer>"#,
-        ).expect("fixed namespace source XML");
-        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        for root in [
-            document.root(),
-            document
-                .root_element()
-                .first_element_child()
-                .expect("fixed child subtree"),
-        ] {
-            let budget = super::super::NodeSetMaterializationBudget::default();
-            let original = super::super::NodeSet::subtree(root).expect("collecting projection");
-            let native = Projection::subtree(root, true, &budget, NativeKeys::default())
-                .expect("native projection");
-            let paid = Projection::accounted_subtree(root, true, &budget, &memory)
-                .expect("paid projection");
-            assert!(paid.with_comments());
-            assert!(std::ptr::eq(paid.document(), &document));
-            for mode in [
-                crate::c14n::C14nMode::Inclusive1_0,
-                crate::c14n::C14nMode::Inclusive1_1,
-                crate::c14n::C14nMode::Exclusive1_0,
-            ] {
-                for comments in [false, true] {
-                    let algorithm = crate::c14n::C14nAlgorithm::new(mode, comments);
-                    let mut expected = Vec::new();
-                    crate::c14n::canonicalize_with_visibility(
-                        &document,
-                        Some(&original),
-                        &algorithm,
-                        &mut expected,
-                    )
-                    .expect("collecting canonical output");
-                    for visibility in [&native as &dyn NodeVisibility, &paid] {
-                        let mut actual = Vec::new();
-                        crate::c14n::canonicalize_with_visibility(
-                            &document,
-                            Some(visibility),
-                            &algorithm,
-                            &mut actual,
-                        )
-                        .expect("storage-specialized canonical output");
-                        assert_eq!(actual, expected);
-                    }
-                }
-            }
-        }
-        assert_eq!(memory.used(), 0);
-    }
-
-    #[test]
-    fn paid_projection_refuses_capacity_and_releases_storage() {
-        // A wide source cannot materialize its XPath axes in an unaccounted
-        // table. Projection failure and normal drop both release capacity.
-        let xml = format!("<root>{}</root>", "<a p='v'/>".repeat(1024));
-        let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide source XML");
-        let small = Memory::new(Arc::new(MemoryAccount::new(1024, 1 << 24)));
-        let budget = super::super::NodeSetMaterializationBudget::default();
-        assert!(Projection::accounted_subtree(document.root(), true, &budget, &small).is_err());
-        assert_eq!(small.used(), 0);
-        let large = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        let nodes = Projection::accounted_subtree(document.root(), true, &budget, &large)
-            .expect("larger account admits projection");
-        assert!(large.used() > 1024);
-        assert!(
-            nodes
-                .contains_tree(document.root_element())
-                .expect("admitted membership lookup")
-        );
-        drop(nodes);
-        assert_eq!(large.used(), 0);
-    }
-}
+mod tests;

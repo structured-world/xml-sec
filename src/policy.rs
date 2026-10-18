@@ -566,12 +566,13 @@ pub struct ResourcePolicy {
     pub max_xpath_filters: usize,
     /// Maximum cumulative node-set entries visited by filtering transforms.
     pub max_node_set_filter_work: usize,
-    /// Maximum entries materialized in one exact node set. Defaults to 262,144;
-    /// callers may raise it to the absolute ceiling of 524,288.
+    /// Maximum tree, attribute and namespace nodes in one exact node set,
+    /// whether it is stored as a document range or explicitly. Defaults to
+    /// 262,144; callers may raise it to the absolute ceiling of 524,288.
     pub max_node_set_entries: usize,
-    /// Maximum owned string bytes in one materialized node set.
+    /// Maximum attribute and namespace name bytes covered by one node set.
     pub max_node_set_owned_string_bytes: usize,
-    /// Maximum cumulative owned node-set string bytes per operation.
+    /// Maximum cumulative node-set name bytes per operation.
     pub max_node_set_cumulative_owned_string_bytes: usize,
     /// Maximum cumulative OPC parameter allocations retained during signature parsing.
     pub max_opc_parameter_bytes: usize,

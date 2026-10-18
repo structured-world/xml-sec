@@ -57,6 +57,10 @@ pub(super) struct NodeData<S: Storage = Native> {
     pub(super) range: Range<usize>,
     pub(super) range_actionable: bool,
     pub(super) subtree_end: u32,
+    // Document-order XPath index: the node itself, then its attribute and
+    // namespace nodes, so every subtree occupies one contiguous index range.
+    #[cfg(feature = "xmldsig")]
+    pub(super) xpath_start: u32,
 }
 
 pub(super) enum NodeKind<S: Storage = Native> {
@@ -286,6 +290,8 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             range,
             range_actionable,
             subtree_end: id.0 + 1,
+            #[cfg(feature = "xmldsig")]
+            xpath_start: 0,
         })?;
         if let Some(parent) = parent {
             self.nodes[parent.index()].children.push(id)?;
@@ -354,7 +360,26 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         preflight: &super::LexicalPreflight<'_, P>,
     ) -> Result<Document<'input, S>, ParseError> {
         self.storage.charge(self.nodes.len())?;
+        #[cfg(feature = "xmldsig")]
+        let mut xpath_nodes = 0_u32;
         for node in &mut *self.nodes {
+            #[cfg(feature = "xmldsig")]
+            {
+                node.xpath_start = xpath_nodes;
+                let axes = match &node.kind {
+                    NodeKind::Element {
+                        attributes,
+                        namespaces,
+                        ..
+                    } => attributes.len().checked_add(namespaces.len()),
+                    _ => Some(0),
+                };
+                xpath_nodes = axes
+                    .and_then(|axes| u32::try_from(axes).ok())
+                    .and_then(|axes| axes.checked_add(1))
+                    .and_then(|count| xpath_nodes.checked_add(count))
+                    .ok_or(ParseError::NodesLimitReached)?;
+            }
             if let NodeKind::Element {
                 name,
                 prefix,
@@ -404,6 +429,8 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         Ok(Document {
             input: self.input,
             nodes: self.nodes,
+            #[cfg(feature = "xmldsig")]
+            xpath_nodes,
         })
     }
 
@@ -420,6 +447,8 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
 pub struct Document<'input, S: Storage = Native> {
     input: &'input str,
     nodes: S::Values<NodeData<S>>,
+    #[cfg(feature = "xmldsig")]
+    xpath_nodes: u32,
 }
 
 impl<S: Storage> std::fmt::Debug for Document<'_, S> {
@@ -517,6 +546,25 @@ impl<'input, S: Storage> Document<'input, S> {
         self.nodes
             .get(id.index())
             .map(|_| Node { document: self, id })
+    }
+
+    /// Number of XPath nodes: tree nodes with their attribute and namespace nodes.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn xpath_node_count(&self) -> u32 {
+        self.xpath_nodes
+    }
+
+    /// Tree node owning a document-order XPath index (itself for tree nodes).
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn xpath_owner(&self, index: u32) -> Option<Node<'_, 'input, S>> {
+        if index >= self.xpath_nodes {
+            return None;
+        }
+        // The root starts at index zero, so every valid index has an owner.
+        let owner = self.nodes.partition_point(|node| node.xpath_start <= index) - 1;
+        self.get_node(NodeId(
+            u32::try_from(owner).expect("bounded XML node count must fit into u32"),
+        ))
     }
 }
 
@@ -674,6 +722,19 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             document: self.document,
             ids: self.id.0..self.data().subtree_end,
         }
+    }
+    /// Document-order XPath index of this tree node.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn xpath_index(self) -> u32 {
+        self.data().xpath_start
+    }
+    /// End of the contiguous XPath index range covering this subtree and its axes.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn xpath_subtree_end(self) -> u32 {
+        self.document
+            .nodes
+            .get(self.data().subtree_end as usize)
+            .map_or(self.document.xpath_nodes, |next| next.xpath_start)
     }
     /// Iterates this node and then its ancestors.
     pub fn ancestors(self) -> Ancestors<'a, 'input, S> {
