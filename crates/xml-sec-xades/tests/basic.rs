@@ -315,6 +315,14 @@ fn signed_properties_reference_needs_its_type() {
 }
 
 #[test]
+fn uri_attributes_bind_after_whitespace_collapse() {
+    // Reference/@Type (XMLDSig 1.1 §4.4.3) and QualifyingProperties/@Target
+    // (EN 319 132-1 §4.3.1) are xs:anyURI, whose whiteSpace facet is collapse
+    // (XSD 1.0 §4.3.6): edge whitespace still names SignedProperties and #sig.
+    assert_eq!(assessed(include_str!("fixtures/padded-uris.xml"), 0), MET);
+}
+
+#[test]
 fn key_info_must_carry_the_signing_certificate() {
     // §6.3(a): an issuer/serial selector resolves the key through the caller's
     // certificates, which XMLDSig accepts, but B-B needs the certificate itself
@@ -425,6 +433,49 @@ fn identities_outside_the_request_are_refused() {
                 );
             }
         },
+    );
+}
+
+#[test]
+fn key_info_navigation_spends_the_request_execution() {
+    // Reading certificate text from the original KeyInfo is an XML query, so
+    // it is charged to the request; the X.509 account holds only certificate
+    // storage, parsing and path checks. base64Binary whitespace (XSD 1.0
+    // §3.2.16) outside the enveloped digest leaves the certificate unchanged
+    // but lengthens that read.
+    const PADDING: usize = 4096;
+    let enveloped = include_str!("fixtures/enveloped.xml");
+    let padded = enveloped.replacen(
+        "<ds:X509Certificate>",
+        &format!("<ds:X509Certificate>{}", "\n".repeat(PADDING)),
+        1,
+    );
+    let validation_work = |xml: &str| {
+        let run = |validate: bool| {
+            let (outcome, account) = verify_in(
+                xml,
+                &anchored(),
+                |_| {},
+                1 << 30,
+                |session| {
+                    validate.then(|| validate_basic(session, signature(session, 0), &[ROOT], facts))
+                },
+            );
+            let outcome = outcome.expect("fixture verifies as XMLDSig");
+            assert!(
+                outcome
+                    .as_ref()
+                    .is_none_or(|result| matches!(result, Ok(Outcome::Assessed(MET)))),
+                "{outcome:?}"
+            );
+            account.work_used()
+        };
+        run(true) - run(false)
+    };
+    let (plain, padded) = (validation_work(enveloped), validation_work(&padded));
+    assert!(
+        padded >= plain + PADDING,
+        "KeyInfo walk charged elsewhere: {plain} -> {padded}"
     );
 }
 

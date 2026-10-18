@@ -226,6 +226,9 @@ enveloped certificate-digest-md5 "$TIME" "$MD5" "$signer_md5" "" "#sig" "$TYPE"
 enveloped certificate-uri "$TIME" "$SHA256" "$signer_sha256" ' URI="https://example.invalid/signer.cer"' "#sig" "$TYPE"
 enveloped wrong-target "$TIME" "$SHA256" "$signer_sha256" "" "#payload" "$TYPE"
 enveloped untyped-signed-properties "$TIME" "$SHA256" "$signer_sha256" "" "#sig" ""
+# Reference/@Type and QualifyingProperties/@Target are xs:anyURI, whose
+# whiteSpace facet is collapse (XSD 1.0 §4.3.6): edge whitespace is legal.
+enveloped padded-uris "$TIME" "$SHA256" "$signer_sha256" "" "  #sig " "Type=\" $SIGNED_PROPERTIES  \""
 
 # SHA-384 throughout: no digest in the document uses SHA-256, which certificate
 # path identities are computed with.

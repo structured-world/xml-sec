@@ -27,6 +27,15 @@ use xml_sec::xmldsig::{
 /// RFC 9231 §2.1.1 digest identifier; EN 319 132-1 §6.2.1 forbids MD5.
 pub(crate) const MD5: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
 
+/// The value of an xs:anyURI attribute for comparison and resolution. Its
+/// whiteSpace facet is collapse (XSD 1.0 §4.3.6); interior whitespace never
+/// matches a URI or bare name either way, so trimming the four XML whitespace
+/// characters decides the same as collapsing.
+/// <https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#rf-whiteSpace>
+pub(crate) fn any_uri(value: &str) -> &str {
+    value.trim_matches([' ', '\t', '\r', '\n'])
+}
+
 pub(crate) fn hash_class(algorithm: DigestAlgorithm) -> HashClass {
     if algorithm.uri() == MD5 {
         HashClass::Md5
@@ -170,7 +179,7 @@ impl<W: Work> SignatureXml for Document<'_, '_, '_, '_, W> {
                 visitor(Reference {
                     node,
                     target,
-                    kind,
+                    kind: kind.map(any_uri),
                     status,
                     coverage,
                 })
@@ -196,10 +205,15 @@ impl<W: Work> SignatureXml for Document<'_, '_, '_, '_, W> {
                 let Some(value) = value else {
                     return Ok(Target::Missing);
                 };
-                Ok(match self.session.resolve_bare_name_in(value, execution)? {
-                    BareNameTarget::Element(node) => Target::LocalBareName(node),
-                    BareNameTarget::NotBareName | BareNameTarget::Unresolved => Target::Other,
-                })
+                Ok(
+                    match self
+                        .session
+                        .resolve_bare_name_in(any_uri(value), execution)?
+                    {
+                        BareNameTarget::Element(node) => Target::LocalBareName(node),
+                        BareNameTarget::NotBareName | BareNameTarget::Unresolved => Target::Other,
+                    },
+                )
             },
         )?
     }

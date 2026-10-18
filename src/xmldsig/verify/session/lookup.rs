@@ -83,6 +83,11 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
             return Ok(DigestMethodResolution::Malformed);
         };
         work.charge_work(u64::try_from(uri.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
+        // XMLDSig 1.1 §4.4.3.5 types Algorithm as anyURI, whose whiteSpace is
+        // collapse (XSD 1.0 §4.3.6). No algorithm URI has interior whitespace,
+        // so trimming the four XML whitespace characters decides the same.
+        // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#rf-whiteSpace
+        let uri = uri.trim_matches([' ', '\t', '\r', '\n']);
         let Some(algorithm) = DigestAlgorithm::from_uri(uri) else {
             return Ok(DigestMethodResolution::Unsupported);
         };

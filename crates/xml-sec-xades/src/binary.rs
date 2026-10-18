@@ -1,6 +1,6 @@
 //! Base64 values and certificate digests through the verified operation.
 
-use crate::signature::MD5;
+use crate::signature::{MD5, any_uri};
 use crate::{Document, Error, Snapshot};
 use structured_asn1::memory::Work;
 use structured_asn1::{Parser, Reader};
@@ -91,7 +91,7 @@ impl<'s, 'view, 'scope, 'inputs, W: Work> DigestProvider<Document<'s, 'view, 'sc
                 local: "Algorithm",
             },
             work,
-            |value| value.is_some_and(|value| value.trim_matches([' ', '\t', '\r', '\n']) == MD5),
+            |value| value.is_some_and(|value| any_uri(value) == MD5),
         )?;
         if md5 {
             return Ok(Resolution::Supported(DigestIdentity::Md5));

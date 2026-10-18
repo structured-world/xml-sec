@@ -827,6 +827,9 @@ impl<'a> UriReferenceResolver<'a> {
         };
         let fragment = normalized.view(scratch)?;
         scratch.charge(fragment.len())?;
+        // `same_document_id_fragment` returns `None` only when the grammar
+        // rejects the fragment. A missing or duplicated ID takes the first arm,
+        // where the index lookup yields `Some(None)`.
         Ok(match self.same_document_id_fragment(fragment) {
             Some((id, false)) => Some(self.id_index.node(self.doc, id)),
             Some((_, true)) | None => None,

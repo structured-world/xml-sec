@@ -26,7 +26,7 @@ fn with_session_in(
     check: impl FnOnce(&VerifiedSession<'_, '_, '_, Memory>, &Memory),
 ) {
     let template = format!(
-        r##"<r xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><target Id="target">payload</target><numeric Id="12345"/><twin Id="twin"/><twin Id="twin"/><methods><ds:DigestMethod Id="known" Algorithm="{SHA256}"/><ds:DigestMethod Id="unknown" Algorithm="urn:example:digest"/><ds:DigestMethod Id="absent"/><ds:DigestMethod Id="restricted" Algorithm="{SHA1}"/><other Id="other"/></methods><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></r>"##
+        r##"<r xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><target Id="target">payload</target><numeric Id="12345"/><twin Id="twin"/><twin Id="twin"/><methods><ds:DigestMethod Id="known" Algorithm="{SHA256}"/><ds:DigestMethod Id="padded" Algorithm="&#10; {SHA256}&#9;"/><ds:DigestMethod Id="unknown" Algorithm="urn:example:digest"/><ds:DigestMethod Id="absent"/><ds:DigestMethod Id="restricted" Algorithm="{SHA1}"/><other Id="other"/></methods><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></r>"##
     );
     let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
     let document =
@@ -144,14 +144,16 @@ fn certificate_processing_limits_come_from_the_policy() {
 fn digest_methods_resolve_under_the_compiled_policy() {
     // Unknown and absent algorithms are facts; a known algorithm the policy
     // forbids is a policy error, never reported as merely unsupported.
+    // Algorithm is xs:anyURI, so edge XML whitespace collapses away.
     with_session(|session, work| {
         let node = |id| session.view().node_for_id(id, &[]).unwrap();
-        assert_eq!(
-            session
-                .resolve_digest_method_in(node("known"), work)
-                .unwrap(),
-            DigestMethodResolution::Supported(DigestAlgorithm::Sha256)
-        );
+        for id in ["known", "padded"] {
+            assert_eq!(
+                session.resolve_digest_method_in(node(id), work).unwrap(),
+                DigestMethodResolution::Supported(DigestAlgorithm::Sha256),
+                "{id}"
+            );
+        }
         assert_eq!(
             session
                 .resolve_digest_method_in(node("unknown"), work)

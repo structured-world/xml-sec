@@ -15,18 +15,18 @@
     <ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp">
       <ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>
       <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-      <ds:DigestValue>CROIFZdz14NTBgTGLZ5VJKZ/1ngNGzmvmjxyYLrPxzw=</ds:DigestValue>
+      <ds:DigestValue>FK2rVOshJ9xlo+ZSNHSkc/Za7vhKJD8LCqOehXGK7gI=</ds:DigestValue>
     </ds:Reference>
   </ds:SignedInfo>
-  <ds:SignatureValue Id="sig-value">ww0iAEgz4CVkGyBXxO7WQYcW0bDJUekVk/9xQVO4+KHfOyNH3QpMQFnSv5/k6d9R
-nKaBOjWJX+tY7mIAAGvl5S53E6L7RudYH/4S3JqrYn95oE+/YLmUnf4ADqRDRRf+
-77bIRvb5pga7Z3HuJxmcxTJyCXSO9ehGdpMx8qQxnaRCG5G7Yg/YQ8fs34N8gI7V
-8VajhImt2gMydX8a1bPU2A+KTqX6xh1ahaI+9/btUZTZYACBvvpcZfQ8Bbua6rJS
-twPX828NgjndAleh05SSgk3wl2in0ta6u/RkVE0pW8eG+vxJTvEePb7NWcgcK3AH
-SXs0AlgrZzIFRtGcdT/5BQ==</ds:SignatureValue>
+  <ds:SignatureValue Id="sig-value">RPKwOSviYQbHZuezr3HZ5gWSFjLf0Ej7LZFfn7edGnc5DbKSbZR3pj3M62C+vMwe
+1PSc6Y+Om0FVceKPMfoIo46MHfs6ld7oa0zye04nQhrf0YIGBLDFLdx6cGR64bjw
+VhuGjWQV89yS/DViPz4jUKR7levSlvwdQnqBlF5+gH1bwq21KkfGyo5j6n/NDhFV
+V2JG24z205KstYXVsN9NWeib06SnoLf0koAHO0NfD3N+EadrgkRv1ZD1nLyCwJn1
+FvTrw/IXij9Xxhu1AvZXvN2yskWmYiQpWl3WGHEI1dijD1dWIEN5iqBe3qltXrQA
+MAFO/i2V29fEUQ+32FRDng==</ds:SignatureValue>
   <ds:KeyInfo><ds:X509Data><ds:X509IssuerSerial>
 <ds:X509IssuerName>CN=xml-sec XAdES Test Intermediate</ds:X509IssuerName>
-<ds:X509SerialNumber>72731637384884160790538840571616106317983606359</ds:X509SerialNumber>
+<ds:X509SerialNumber>399250692272557296183854527732826938760025571253</ds:X509SerialNumber>
 </ds:X509IssuerSerial></ds:X509Data></ds:KeyInfo>
   
   <ds:Object>
@@ -38,7 +38,7 @@ SXs0AlgrZzIFRtGcdT/5BQ==</ds:SignatureValue>
             <xades:Cert>
               <xades:CertDigest>
                 <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                <ds:DigestValue>amm+9rX2r8rV6sf9gnznXy2+BleLJ6IYo587gkCJWQg=</ds:DigestValue>
+                <ds:DigestValue>BptLbOEZdH5TniFKrki0oAbds8rKpqRqaI9SC09obBs=</ds:DigestValue>
               </xades:CertDigest>
             </xades:Cert>
           </xades:SigningCertificateV2>

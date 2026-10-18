@@ -93,16 +93,18 @@ pub(crate) fn signers<'e, W: Work, Q: Work>(
 pub(crate) fn key_info_certificates<W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signers: &[(NodeIdentity, &X509TrustEvidence)],
-    work: &Q,
+    storage: &Q,
 ) -> Result<OwnedVec<OwnedVec<u8>>, Error> {
-    let view = session.view();
-    let mut decoded = work.vector();
+    // Navigation and base64 decoding are XML queries on the request's own
+    // execution; only the retained certificate bytes belong to `storage`.
+    let (view, work) = (session.view(), session.execution());
+    let mut decoded = storage.vector();
     for (signature, _) in signers {
         for key_info in children(session, *signature, "KeyInfo", work)?.iter() {
             for data in children(session, *key_info, "X509Data", work)?.iter() {
                 for value in children(session, *data, "X509Certificate", work)?.iter() {
                     let bytes = extension::with_base64(view, *value, work, |bytes| {
-                        let mut copy = work.vector();
+                        let mut copy = storage.vector();
                         copy.try_extend_from_slice(bytes)
                             .map(|()| copy.into_owned())
                     })??;
