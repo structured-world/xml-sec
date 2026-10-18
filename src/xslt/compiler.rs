@@ -29,16 +29,40 @@ const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
 const LIBXSLT_TEST_NS: &str = "http://xmlsoft.org/XSLT/";
 const LIBXSLT_TEST_PLUGIN_NS: &str = "http://xmlsoft.org/xslt/testplugin";
 
+/// Handling of a prefix without a namespace binding in `exclude-result-prefixes` or
+/// `extension-element-prefixes`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnboundPrefixLists {
+    /// XSLT 1.0 section 7.1.1 makes such a prefix an error.
+    /// <https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element>
+    #[default]
+    Reject,
+    /// Skip only that prefix, as libxslt does after reporting it as a warning.
+    Ignore,
+}
+
 /// XSLT compiler with an explicit resource boundary and compile budget.
 pub struct Compiler<R> {
     resolver: Arc<R>,
     budget: CompileBudget,
+    prefix_lists: UnboundPrefixLists,
 }
 
 impl<R: Resolver> Compiler<R> {
     #[must_use]
     pub fn new(resolver: Arc<R>, budget: CompileBudget) -> Self {
-        Self { resolver, budget }
+        Self {
+            resolver,
+            budget,
+            prefix_lists: UnboundPrefixLists::Reject,
+        }
+    }
+
+    /// Select how unbound prefixes in namespace prefix lists are handled.
+    #[must_use]
+    pub fn unbound_prefix_lists(mut self, handling: UnboundPrefixLists) -> Self {
+        self.prefix_lists = handling;
+        self
     }
 
     /// Compile a complete stylesheet graph into immutable executable IR.
@@ -143,7 +167,7 @@ impl<R: Resolver> Compiler<R> {
         };
         validate_standard_stylesheet_content(root)?;
         validate_top_level_declaration_attributes(root, forward)?;
-        validate_namespace_prefix_attributes(root, forward)?;
+        validate_namespace_prefix_attributes(root, forward, self.prefix_lists)?;
         let mut saw_non_import = false;
         self.compile_effective_imports(
             root,
@@ -249,7 +273,11 @@ impl<R: Resolver> Compiler<R> {
                                 {
                                     validate_standard_stylesheet_content(target)?;
                                     validate_top_level_declaration_attributes(target, forward)?;
-                                    validate_namespace_prefix_attributes(target, forward)?;
+                                    validate_namespace_prefix_attributes(
+                                        target,
+                                        forward,
+                                        self.prefix_lists,
+                                    )?;
                                     self.compile_effective_imports(
                                         target,
                                         source_xml,
@@ -286,6 +314,7 @@ impl<R: Resolver> Compiler<R> {
                                             validate_namespace_prefix_attributes(
                                                 included_root,
                                                 forward,
+                                                self.prefix_lists,
                                             )?;
                                             self.compile_effective_imports(
                                                 included_root,
@@ -656,6 +685,7 @@ impl<R: Resolver> Compiler<R> {
             base_uri,
             state.current_stylesheet_document(),
             state.workspace(),
+            self.prefix_lists,
         )?;
         let body = vec![compile_literal_element(root, context)?].into();
         state.templates.push(Template {
@@ -680,7 +710,7 @@ impl<R: Resolver> Compiler<R> {
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
-        if is_exslt_function_declaration(node)? {
+        if is_exslt_function_declaration(node, self.prefix_lists)? {
             validate_exslt_function_result_structure(node)?;
             let context = CompileContext::new(
                 forward,
@@ -689,6 +719,7 @@ impl<R: Resolver> Compiler<R> {
                 base_uri,
                 state.current_stylesheet_document(),
                 state.workspace(),
+                self.prefix_lists,
             )?
             .inside_function();
             let mut children = node.children().peekable();
@@ -775,6 +806,7 @@ impl<R: Resolver> Compiler<R> {
                     base_uri,
                     state.current_stylesheet_document(),
                     state.workspace(),
+                    self.prefix_lists,
                 )?;
                 let mut children = node.children().peekable();
                 let mut params = Vec::new();
@@ -832,6 +864,7 @@ impl<R: Resolver> Compiler<R> {
                         base_uri,
                         state.current_stylesheet_document(),
                         state.workspace(),
+                        self.prefix_lists,
                     )?,
                 )?;
                 let order = state.next_order();
@@ -941,6 +974,7 @@ impl<R: Resolver> Compiler<R> {
                     base_uri,
                     state.current_stylesheet_document(),
                     state.workspace(),
+                    self.prefix_lists,
                 )?;
                 let attribute_set = AttributeSet::parse(node, context, precedence, order)?;
                 state.attribute_sets.push(attribute_set)
@@ -3027,6 +3061,7 @@ struct CompileContext<'a> {
     namespace_snapshot: NamespaceSnapshot,
     base_uri_snapshot: BaseUriSnapshot,
     local_bindings: Rc<RefCell<LocalBindingIndex<'a>>>,
+    prefix_lists: UnboundPrefixLists,
 }
 
 type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
@@ -3179,9 +3214,11 @@ impl<'a> CompileContext<'a> {
         static_base_uri: Option<&str>,
         stylesheet_document: StylesheetDocumentId,
         workspace: CompileWorkspace<'a>,
+        prefix_lists: UnboundPrefixLists,
     ) -> Result<Self> {
         ensure(BudgetKind::RecursionDepth, max_depth, depth)?;
         Ok(Self {
+            prefix_lists,
             forward,
             depth,
             max_depth,
@@ -3574,7 +3611,7 @@ fn compile_instruction(
         });
     }
     if node.tag_name().namespace() != Some(XSLT_NS) {
-        if is_extension_element(node)? {
+        if is_extension_element(node, context.prefix_lists)? {
             let locator = match (node.tag_name().namespace(), node.tag_name().name()) {
                 (Some(XT_NS), "document") => Some("href"),
                 (Some(SAXON_NS), "output") | (Some(XALAN_REDIRECT_NS), "write") => Some("file"),
@@ -4086,7 +4123,10 @@ fn validate_exslt_function_result_structure(function: roxmltree::Node<'_, '_>) -
     Ok(())
 }
 
-fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
+fn is_extension_element(
+    node: roxmltree::Node<'_, '_>,
+    prefix_lists: UnboundPrefixLists,
+) -> Result<bool> {
     let Some(namespace) = node.tag_name().namespace() else {
         return Ok(false);
     };
@@ -4106,6 +4146,7 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
             ancestor,
             "extension-element-prefixes",
             forward_compatible_at(ancestor)?,
+            prefix_lists,
             |resolved| extension |= resolved == namespace,
         )?;
         if extension {
@@ -4115,8 +4156,12 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
     Ok(false)
 }
 
-fn is_exslt_function_declaration(node: roxmltree::Node<'_, '_>) -> Result<bool> {
-    Ok(node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) && is_extension_element(node)?)
+fn is_exslt_function_declaration(
+    node: roxmltree::Node<'_, '_>,
+    prefix_lists: UnboundPrefixLists,
+) -> Result<bool> {
+    Ok(node.has_tag_name((EXSLT_FUNCTIONS_NS, "function"))
+        && is_extension_element(node, prefix_lists)?)
 }
 
 fn forward_compatible_at(node: roxmltree::Node<'_, '_>) -> Result<bool> {
@@ -4158,7 +4203,7 @@ fn compile_literal_element(
             })
         })
         .collect::<Result<_>>()?;
-    let excluded = excluded_result_namespaces(node)?;
+    let excluded = excluded_result_namespaces(node, context.prefix_lists)?;
     let mut used_prefixes = HashSet::new();
     if node.tag_name().namespace().is_some() {
         used_prefixes.insert(prefix.as_deref());
@@ -4229,7 +4274,10 @@ fn validate_literal_result_attributes(
     Ok(())
 }
 
-fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<String>> {
+fn excluded_result_namespaces(
+    node: roxmltree::Node<'_, '_>,
+    prefix_lists: UnboundPrefixLists,
+) -> Result<HashSet<String>> {
     let mut excluded = HashSet::new();
     if node.ancestors().any(|ancestor| {
         ancestor.has_tag_name((XSLT_NS, "variable")) || ancestor.has_tag_name((XSLT_NS, "param"))
@@ -4238,7 +4286,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
             || ancestor.has_tag_name((XSLT_NS, "transform"))
     }) {
         for function in stylesheet.children() {
-            if !is_exslt_function_declaration(function)? {
+            if !is_exslt_function_declaration(function, prefix_lists)? {
                 continue;
             }
             if let Some((prefix, _)) = function
@@ -4260,7 +4308,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
         if let Some(local) = local_forward_compatible(ancestor)? {
             forward_compatible = local;
         }
-        if is_exslt_function_declaration(ancestor)?
+        if is_exslt_function_declaration(ancestor, prefix_lists)?
             && let Some((prefix, _)) = ancestor
                 .attribute("name")
                 .and_then(|name| name.split_once(':'))
@@ -4276,6 +4324,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
                 ancestor,
                 attribute,
                 forward_compatible,
+                prefix_lists,
                 |namespace| {
                     excluded.insert(namespace.to_owned());
                 },
@@ -4288,9 +4337,16 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
 fn validate_namespace_prefix_attributes(
     node: roxmltree::Node<'_, '_>,
     forward_compatible: bool,
+    prefix_lists: UnboundPrefixLists,
 ) -> Result<()> {
     for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
-        visit_namespace_prefix_attribute(node, attribute, forward_compatible, |_| {})?;
+        visit_namespace_prefix_attribute(
+            node,
+            attribute,
+            forward_compatible,
+            prefix_lists,
+            |_| {},
+        )?;
     }
     Ok(())
 }
@@ -4299,6 +4355,7 @@ fn visit_namespace_prefix_attribute(
     node: roxmltree::Node<'_, '_>,
     attribute: &str,
     forward_compatible: bool,
+    prefix_lists: UnboundPrefixLists,
     mut visit: impl FnMut(&str),
 ) -> Result<()> {
     let value = if node.tag_name().namespace() == Some(XSLT_NS) {
@@ -4328,7 +4385,9 @@ fn visit_namespace_prefix_attribute(
                 )));
             }
             let prefix = (token != "#default").then_some(token);
-            if node.lookup_namespace_uri(prefix).is_none() {
+            if node.lookup_namespace_uri(prefix).is_none()
+                && prefix_lists == UnboundPrefixLists::Reject
+            {
                 return Err(Error::Static(format!(
                     "{attribute} prefix {token} is not bound"
                 )));
@@ -4347,10 +4406,10 @@ fn visit_namespace_prefix_attribute(
     }
     for token in value.split_ascii_whitespace() {
         let prefix = (token != "#default").then_some(token);
-        let namespace = node
-            .lookup_namespace_uri(prefix)
-            .expect("namespace prefix list was validated before visitation");
-        visit(namespace);
+        // Validation admitted an unbound prefix only when it is to be ignored.
+        if let Some(namespace) = node.lookup_namespace_uri(prefix) {
+            visit(namespace);
+        }
     }
     Ok(())
 }

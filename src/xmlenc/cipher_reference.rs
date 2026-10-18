@@ -428,6 +428,7 @@ impl<'a> CipherReferenceContext<'a> {
                     .id_attributes(resolver.id_registrations())
                     .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
                     .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+                    .xslt_prefix_list_semantics(self.policy.transforms.xslt_prefix_list_semantics)
                     .allow_internal_dtd(self.policy.xml.allow_internal_dtd),
                 &self.transforms,
                 xml_parse,

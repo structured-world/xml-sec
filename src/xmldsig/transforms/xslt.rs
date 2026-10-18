@@ -8,11 +8,11 @@ use std::sync::Arc;
 use super::{ExecutionData, TransformError, TransformExecutionBudget, TransformScratch};
 use crate::c14n::scratch::Bytes as _;
 use crate::document::{DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget};
-use crate::policy::{PolicyViolation, ResourcePolicy, resource_name};
+use crate::policy::{PolicyViolation, ResourcePolicy, XsltPrefixListSemantics, resource_name};
 use crate::xml::dom::storage::Storage as DomStorage;
 use crate::xslt::{
     BudgetKind, CompileBudget, Compiler, Document, Error, ExecutionBudget, ExecutionOptions,
-    ExecutionUsage, NoResolver, Parameters, ParseBudget,
+    ExecutionUsage, NoResolver, Parameters, ParseBudget, UnboundPrefixLists,
 };
 
 /// Work kinds that `ResourcePolicy::max_xslt_work` bounds independently.
@@ -318,6 +318,7 @@ fn reject_document_type(xml: &str, settings: DocumentParseSettings) -> Result<()
 pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     stylesheet: &str,
     input: &[u8],
+    prefix_lists: XsltPrefixListSemantics,
     allow_dtd: bool,
     budget: &TransformExecutionBudget,
     xml_parse: &XmlParseWorkBudget,
@@ -337,6 +338,10 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
             workspace,
         ),
     )
+    .unbound_prefix_lists(match prefix_lists {
+        XsltPrefixListSemantics::Specification => UnboundPrefixLists::Reject,
+        XsltPrefixListSemantics::Libxslt => UnboundPrefixLists::Ignore,
+    })
     .compile(stylesheet, None)
     .map_err(|error| fail(error, Phase::Stylesheet))?;
 

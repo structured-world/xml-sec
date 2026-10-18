@@ -535,6 +535,12 @@ Execution is bounded by the operation's policy:
   document type declaration in binary input follows `xml.allow_internal_dtd`, as for any other
   reparsed transform output.
 
+`TransformPolicy::xslt_prefix_list_semantics` decides how a prefix without a namespace binding
+in `exclude-result-prefixes` or `extension-element-prefixes` is handled. The default
+`Specification` rejects the stylesheet (XSLT 1.0 section 7.1.1). `Libxslt` skips only that
+prefix, as libxslt and therefore libxmlsec1 do after a warning; the `XmlSecCompatible` profile
+and the native CLI select it, so their signers and verifiers agree with libxmlsec1 digests.
+
 Stylesheets cannot resolve external resources: `xsl:import`, `xsl:include` and `document()`
 fail with `PolicyViolation::Uri`. Exhausted limits are `PolicyViolation::ResourceLimit` errors,
 and invalid stylesheets or execution failures are `TransformError::Xslt`; none of them is a

@@ -278,6 +278,14 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     OpcRelationshipEdition::Ecma2021
                 )
             }
+            "xslt_prefix_list_semantics" => {
+                p.xslt_prefix_list_semantics = choice!(
+                    value,
+                    key,
+                    XsltPrefixListSemantics::Specification,
+                    XsltPrefixListSemantics::Libxslt
+                )
+            }
             _ => return Err(invalid(key)),
         }
     }
@@ -760,6 +768,10 @@ fn transform_snapshot(p: &TransformPolicy) -> Value {
         (
             "opc_relationship_edition".into(),
             named(p.opc_relationship_edition),
+        ),
+        (
+            "xslt_prefix_list_semantics".into(),
+            named(p.xslt_prefix_list_semantics),
         ),
     ]))
 }

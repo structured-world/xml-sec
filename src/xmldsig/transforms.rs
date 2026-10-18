@@ -128,6 +128,7 @@ pub(crate) struct TransformOptions<'r> {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
     opc_relationship_edition: crate::policy::OpcRelationshipEdition,
+    xslt_prefix_list_semantics: crate::policy::XsltPrefixListSemantics,
     id_attributes: &'r [crate::xml::IdAttributeRegistration],
 }
 
@@ -499,6 +500,13 @@ impl<'r> TransformOptions<'r> {
         edition: crate::policy::OpcRelationshipEdition,
     ) -> Self {
         self.opc_relationship_edition = edition;
+        self
+    }
+    pub(crate) fn xslt_prefix_list_semantics(
+        mut self,
+        semantics: crate::policy::XsltPrefixListSemantics,
+    ) -> Self {
+        self.xslt_prefix_list_semantics = semantics;
         self
     }
     /// Select the node returned by the XPath `here()` extension function.
@@ -940,6 +948,7 @@ fn apply_transform_with_context<
             xslt::execute(
                 stylesheet,
                 bytes,
+                options.xslt_prefix_list_semantics,
                 options.internal_dtd_allowed(),
                 budget,
                 xml_parse,
@@ -1228,6 +1237,7 @@ pub fn execute_transforms_with_policy<'a>(
     let options = TransformOptions::default()
         .opc_relationship_edition(policy.transforms.opc_relationship_edition)
         .xpath_here_semantics(policy.transforms.xpath_here_semantics)
+        .xslt_prefix_list_semantics(policy.transforms.xslt_prefix_list_semantics)
         .allow_internal_dtd(policy.xml.allow_internal_dtd);
     let budget = TransformExecutionBudget::from_resources(&policy.resources);
     execute_transforms_with_options_and_budget(

@@ -8,7 +8,7 @@ use xml_sec_xslt::{
     ErrorKind, ExecutionBudget, ExecutionEnvironment, ExecutionOptions, ExpandedName, FixedClock,
     NoResolver, NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest,
     ResolvedResource, Resolver, ResourceAccess, ResourceIdentity, SystemClock, TransformResult,
-    Value,
+    UnboundPrefixLists, Value,
 };
 
 #[derive(Clone, Copy)]
@@ -162,6 +162,85 @@ fn reported_usage_is_the_work_the_budget_enforces() {
         assert!(
             matches!(run(short), Err(Error::Budget { kind: refused, .. }) if refused == kind),
             "{kind:?} must refuse one unit below the reported usage"
+        );
+    }
+}
+
+#[test]
+fn unbound_prefix_lists_follow_the_selected_handling() {
+    // XSLT 1.0 section 7.1.1 makes an unbound prefix in these lists an error, which stays the
+    // default. libxslt reports it as a warning and skips only that prefix; the expected bytes
+    // are xsltproc 1.1 output for the same stylesheets.
+    let source = Document::parse(
+        r#"<Notaries xmlns:foo="http://example.org/foo"><Notary name="Great, A. T."/></Notaries>"#,
+        None,
+    )
+    .expect("source parses");
+    let cases = [
+        (
+            concat!(
+                r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" "#,
+                r#"xmlns="http://www.w3.org/TR/xhtml1/strict" exclude-result-prefixes="foo" "#,
+                r#"version="1.0"><xsl:output encoding="UTF-8" indent="no" method="xml"/>"#,
+                r#"<xsl:template match="/"><html><xsl:for-each select="Notaries/Notary">"#,
+                r#"<th><xsl:value-of select="@name"/></th></xsl:for-each></html>"#,
+                r#"</xsl:template></xsl:stylesheet>"#
+            ),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<html xmlns=\"http://www.w3.org/TR/xhtml1/strict\"><th>Great, A. T.</th></html>"
+            ),
+        ),
+        (
+            concat!(
+                r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" "#,
+                r#"extension-element-prefixes="bar" version="1.0">"#,
+                r#"<xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#
+            ),
+            "<?xml version=\"1.0\"?>\n<out/>\n",
+        ),
+        (
+            // The bound prefix in the same list is still excluded.
+            concat!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" "#,
+                r#"xmlns:p="urn:p" exclude-result-prefixes="foo p">"#,
+                r#"<xsl:template match="/"><r/></xsl:template></xsl:stylesheet>"#
+            ),
+            "<?xml version=\"1.0\"?>\n<r/>\n",
+        ),
+    ];
+    for (stylesheet, expected) in cases {
+        let compiler = |handling| {
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+            )
+            .unbound_prefix_lists(handling)
+            .compile(stylesheet, None)
+        };
+        assert!(
+            matches!(
+                compiler(UnboundPrefixLists::Reject),
+                Err(Error::Static(message)) if message.contains("is not bound")
+            ),
+            "{stylesheet}"
+        );
+        let result = compiler(UnboundPrefixLists::Ignore)
+            .expect("libxslt handling compiles")
+            .execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1 << 20),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("transform succeeds");
+        assert_eq!(
+            String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+            expected
         );
     }
 }

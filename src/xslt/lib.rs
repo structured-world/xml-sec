@@ -47,7 +47,7 @@ mod value;
 mod xpath;
 
 pub use budget::{BudgetKind, CompileBudget, ExecutionBudget, ExecutionUsage, ParseBudget};
-pub use compiler::{Compiler, Stylesheet};
+pub use compiler::{Compiler, Stylesheet, UnboundPrefixLists};
 pub use environment::{Clock, ExecutionEnvironment, FixedClock, SystemClock};
 pub use error::{Error, ErrorKind, Result};
 pub use model::{

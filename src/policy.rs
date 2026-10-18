@@ -1016,6 +1016,18 @@ pub enum SameDocumentIdSemantics {
     XmlSecVisa3d,
 }
 
+/// Handling of a prefix without a namespace binding in an XSLT stylesheet's
+/// `exclude-result-prefixes` or `extension-element-prefixes`.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XsltPrefixListSemantics {
+    /// XSLT 1.0 section 7.1.1 makes such a prefix a stylesheet error.
+    #[default]
+    Specification,
+    /// Skip only that prefix, as libxslt (and so libxmlsec1) does after a warning.
+    Libxslt,
+}
+
 /// Wire representation used for ECDSA `SignatureValue` bytes.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1039,6 +1051,8 @@ pub struct TransformPolicy {
     pub same_document_id_semantics: SameDocumentIdSemantics,
     /// Trusted normalization edition, not package validation; never inferred from XML.
     pub opc_relationship_edition: OpcRelationshipEdition,
+    /// Unbound prefixes in XSLT stylesheet prefix lists; applies to builds with `xslt`.
+    pub xslt_prefix_list_semantics: XsltPrefixListSemantics,
 }
 
 /// URI-class decisions shared by XMLDSig reference and key retrieval processing.

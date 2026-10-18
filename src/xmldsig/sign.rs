@@ -2128,7 +2128,8 @@ impl<'a> SignContext<'a> {
             .id_attributes(self.id_attributes)
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
-            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition);
+            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+            .xslt_prefix_list_semantics(self.policy.transforms.xslt_prefix_list_semantics);
         let external_resources = ExternalResourceContext::new(
             self.external_resources,
             self.policy.resources.max_external_resource_bytes,

@@ -9,7 +9,9 @@ use base64::Engine as _;
 use xml_sec::XmlDomParseError;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::document::XmlDocumentError;
-use xml_sec::policy::{PolicyViolation, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{
+    PolicyViolation, SigningPolicy, VerificationPolicy, XsltPrefixListSemantics,
+};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus, ReferenceBuilder,
     ReferenceProcessingError, RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder,
@@ -320,6 +322,58 @@ fn stylesheets_cannot_reach_external_resources() {
             "{body}: {error:?}"
         );
     }
+}
+
+#[test]
+fn unbound_prefix_lists_follow_the_operation_policy() {
+    // XSLT 1.0 section 7.1.1 makes an unbound prefix in exclude-result-prefixes an error by
+    // default; the libxslt handling that libxmlsec1 applies is an explicit policy choice.
+    let unbound = || {
+        Transform::Xslt(
+            XsltStylesheet::new(format!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}" exclude-result-prefixes="foo"><xsl:template match="/"><r/></xsl:template></xsl:stylesheet>"#
+            ))
+            .expect("well-formed stylesheet markup"),
+        )
+    };
+    let builder = builder(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(Transform::Enveloped)
+            .transform(unbound()),
+    );
+    let error = transform_error(sign(ITEMS, &builder).expect_err("specification rejects it"));
+    assert!(matches!(error, TransformError::Xslt(_)), "{error:?}");
+
+    let mut signing = SigningPolicy::default();
+    signing.transforms.xslt_prefix_list_semantics = XsltPrefixListSemantics::Libxslt;
+    let signed = sign_with_policy(ITEMS, &builder, signing).expect("libxslt handling signs");
+    let verify = |semantics| {
+        let mut policy = VerificationPolicy::default();
+        policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+        policy.transforms.xslt_prefix_list_semantics = semantics;
+        let resolver = DefaultKeyResolver::default();
+        xml_sec::xmldsig::VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&resolver)
+            .store_pre_digest(true)
+            .verify(&signed)
+    };
+    let result = verify(XsltPrefixListSemantics::Libxslt).expect("libxslt handling verifies");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert_eq!(
+        result.signed_info_references[0].pre_digest_data.as_deref(),
+        Some(b"<?xml version=\"1.0\"?>\n<r/>\n".as_slice())
+    );
+    let error = verify(XsltPrefixListSemantics::Specification)
+        .expect_err("specification rejects the stylesheet");
+    assert!(
+        matches!(
+            error,
+            DsigError::Reference(ReferenceProcessingError::Transform(TransformError::Xslt(_)))
+        ),
+        "{error:?}"
+    );
 }
 
 #[test]

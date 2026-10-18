@@ -624,6 +624,78 @@ fn conflicting_semantics_empty_algorithms_and_invalid_limits_fail_compilation() 
 }
 
 #[test]
+fn xslt_prefix_list_semantics_comes_from_the_base_profile() {
+    // Interpretation semantics are not relaxations: the libxmlsec1-compatible base
+    // selects libxslt handling, a layer may only restate its base, and unknown names
+    // are schema errors.
+    use xml_sec::policy::{PolicyViolation, XsltPrefixListSemantics};
+    let base = |base: &str, extra: &str| {
+        Configuration::from_str(
+            &format!("schema_version = 1\n[profiles.team]\nbase = '{base}'\n{extra}"),
+            LoadLimits::default(),
+        )
+    };
+    let semantics = |base_name: &str| {
+        effective(&base(base_name, "").expect("strict config"), "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .transforms
+            .xslt_prefix_list_semantics
+    };
+    assert_eq!(
+        semantics("XmlSecCompatible"),
+        XsltPrefixListSemantics::Libxslt
+    );
+    assert_eq!(semantics("Modern"), XsltPrefixListSemantics::Specification);
+
+    let restated = base(
+        "XmlSecCompatible",
+        "[profiles.team.verification.transforms]\nxslt_prefix_list_semantics='Libxslt'",
+    )
+    .expect("strict config");
+    assert_eq!(
+        effective(&restated, "team")
+            .compiled()
+            .verification()
+            .unwrap()
+            .transforms
+            .xslt_prefix_list_semantics,
+        XsltPrefixListSemantics::Libxslt
+    );
+    let compile = |value: &str| {
+        base(
+            "Modern",
+            &format!(
+                "[profiles.team.verification.transforms]\nxslt_prefix_list_semantics='{value}'"
+            ),
+        )
+        .expect("strict config")
+        .compile(
+            "team",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: true,
+            },
+            None,
+        )
+    };
+    assert!(matches!(
+        compile("Libxslt"),
+        Err(xml_sec_config::Error::Policy(PolicyViolation::Configuration { reason }))
+            if reason.contains("incompatible interpretation semantics")
+    ));
+    assert!(matches!(
+        base(
+            "Modern",
+            "[profiles.team.verification.transforms]\nxslt_prefix_list_semantics='Lenient'",
+        ),
+        Err(xml_sec_config::Error::Schema(message)) if message.contains("xslt_prefix_list_semantics")
+    ));
+}
+
+#[test]
 fn configured_snapshots_enforce_real_sign_and_verify_limits() {
     // The loader must deliver enforced core snapshots, not a parallel config
     // object that the cryptographic operation ignores.

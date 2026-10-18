@@ -447,6 +447,7 @@ fn local_binding_index_reserves_and_releases_compile_workspace() {
         None,
         StylesheetDocumentId::PRINCIPAL,
         workspace,
+        UnboundPrefixLists::Reject,
     )
     .expect("compile context is valid");
 
@@ -470,6 +471,7 @@ fn local_binding_index_reserves_and_releases_compile_workspace() {
         None,
         StylesheetDocumentId::PRINCIPAL,
         constrained,
+        UnboundPrefixLists::Reject,
     )
     .expect("empty compile context fits");
     assert!(matches!(
@@ -971,6 +973,7 @@ fn expressions_on_one_node_share_their_namespace_snapshot() {
             occupied: 0,
             retained: &retained,
         },
+        UnboundPrefixLists::Reject,
     )
     .expect("context is valid");
     let first = context
