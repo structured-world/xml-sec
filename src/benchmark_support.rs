@@ -60,6 +60,9 @@ impl<'a> NodeSets<'a> {
         use crate::xmldsig::types::projection::{NativeKeys, Projection};
         let budget = crate::xmldsig::types::NodeSetMaterializationBudget::default();
         let mut nodes = Projection::empty(&self.document, NativeKeys);
+        nodes
+            .pin_representation(dense)
+            .expect("native storage is infallible");
         for element in self
             .document
             .descendants()
@@ -80,9 +83,6 @@ impl<'a> NodeSets<'a> {
                     .expect("selection fits");
             }
         }
-        nodes
-            .force_representation(dense)
-            .expect("native storage is infallible");
         self.canonicalize(&nodes)
     }
 

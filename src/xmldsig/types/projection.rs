@@ -15,8 +15,9 @@ use structured_asn1::memory::{HashWork, MemoryError, Work};
 
 /// Sets with at least `1 / DENSE_DIVISOR` of the document's XPath nodes use the
 /// bitset. Measured with the `node_set_*` benchmarks (16K elements, inclusive
-/// C14N): at 1/37 density the vector matches the bitset's peak memory but costs
-/// 56% more time; at 1/149 it costs under 10% more with half the memory.
+/// C14N, medians of three runs): at 1/37 density the vector matches the bitset's
+/// peak memory but costs 48% more time; at 1/149 it costs 5% more with half the
+/// memory.
 const DENSE_DIVISOR: usize = 128;
 /// Out-of-order inserts below this length shift the sparse tail in place.
 const SPARSE_SHIFT_LIMIT: usize = 64;
@@ -347,6 +348,9 @@ pub(crate) struct Projection<'a, K: Keys, D: DomStorage = NativeDom> {
     projected_string_bytes: usize,
     with_comments: bool,
     failure: Option<MemoryError>,
+    /// Ordered growth keeps the representation chosen by `pin_representation`.
+    #[cfg(feature = "benchmark-internals")]
+    pinned: bool,
 }
 
 #[cfg(test)]
@@ -389,6 +393,8 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             projected_string_bytes: measured.owned_string_bytes,
             with_comments,
             failure: None,
+            #[cfg(feature = "benchmark-internals")]
+            pinned: false,
         })
     }
 
@@ -402,6 +408,8 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             projected_string_bytes: 0,
             with_comments: false,
             failure: None,
+            #[cfg(feature = "benchmark-internals")]
+            pinned: false,
         }
     }
 
@@ -434,20 +442,15 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
     pub(crate) fn len(&self) -> usize {
         self.entries
     }
-    /// Store explicit members as a bitset or a sorted vector regardless of density.
+    /// Grow this empty set as a bitset or a sorted vector regardless of density,
+    /// so both representations are measured without conversions.
     #[cfg(feature = "benchmark-internals")]
-    pub(crate) fn force_representation(&mut self, dense: bool) -> Result<(), TransformError> {
-        let execution = self.keys.execution();
-        self.members = if dense {
-            let mut words = self.dense_words()?;
-            self.for_each_index(execution, |index| {
-                set_bit(&mut words, index);
-                Ok(())
-            })?;
-            Members::Dense(words)
-        } else {
-            Members::Sparse(self.sparse_copy()?)
-        };
+    pub(crate) fn pin_representation(&mut self, dense: bool) -> Result<(), TransformError> {
+        assert_eq!(self.entries, 0, "only an empty set is pinned");
+        if dense {
+            self.members = Members::Dense(self.dense_words()?);
+        }
+        self.pinned = true;
         Ok(())
     }
     #[cfg(test)]
@@ -594,7 +597,8 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         }
     }
 
-    /// Visit member indexes in increasing order, paid by the querying `execution`.
+    /// Visit member indexes in increasing order, paid by the querying `execution`
+    /// per emitted index and per stored unit scanned.
     fn for_each_index(
         &self,
         execution: K::Execution,
@@ -609,10 +613,10 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 let mut id = nodes.start;
                 let mut next_excluded = 0;
                 while id < nodes.end {
-                    K::admit(execution, 1).map_err(C14nError::from)?;
                     if let Some(range) = excluded.get(next_excluded)
                         && range.start == id
                     {
+                        K::admit(execution, 1).map_err(C14nError::from)?;
                         id = range.end;
                         next_excluded += 1;
                         continue;
@@ -623,15 +627,20 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                         .expect("subtree IDs belong to their document");
                     id += 1;
                     if node.is_comment() && !comments {
+                        K::admit(execution, 1).map_err(C14nError::from)?;
                         continue;
                     }
-                    for index in owned_indexes(node) {
+                    let indexes = owned_indexes(node);
+                    // One unit for the visit and one per emitted index.
+                    K::admit(execution, 1 + indexes.len()).map_err(C14nError::from)?;
+                    for index in indexes {
                         visit(index)?;
                     }
                 }
                 Ok(())
             }
             Members::Sparse(sparse) => {
+                K::admit(execution, sparse.indexes.len()).map_err(C14nError::from)?;
                 for &index in sparse.indexes.iter() {
                     visit(index)?;
                 }
@@ -639,7 +648,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             }
             Members::Dense(words) => {
                 for (position, &word) in words.iter().enumerate() {
-                    K::admit(execution, 1).map_err(C14nError::from)?;
+                    K::admit(execution, 1 + word.count_ones() as usize).map_err(C14nError::from)?;
                     let mut bits = word;
                     while bits != 0 {
                         // The bitset covers the u32 document index space.
@@ -714,15 +723,15 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<(), TransformError> {
         self.available()?;
-        if matches!(self.members, Members::Subtree { .. }) {
-            let result = self.materialize();
-            self.sticky(result)?;
-        }
         if self
             .contains_index(index, self.keys.execution())
             .map_err(C14nError::from)?
         {
             return Ok(());
+        }
+        if matches!(self.members, Members::Subtree { .. }) {
+            let result = self.materialize();
+            self.sticky(result)?;
         }
         let strings = match budget {
             Some(budget) => {
@@ -765,6 +774,11 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 if indexes.last().is_none_or(|last| *last < index) {
                     indexes.push(index)?;
                     sparse.mark(index, universe, execution)?;
+                    #[cfg(feature = "benchmark-internals")]
+                    if self.pinned {
+                        self.entries = entries;
+                        return Ok(());
+                    }
                     prefers_dense(entries, universe)
                 } else if indexes.len() < SPARSE_SHIFT_LIMIT {
                     let position = indexes.partition_point(|value| *value < index);

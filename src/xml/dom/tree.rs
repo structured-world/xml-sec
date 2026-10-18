@@ -59,6 +59,7 @@ pub(super) struct NodeData<S: Storage = Native> {
     pub(super) subtree_end: u32,
     // Document-order XPath index: the node itself, then its attribute and
     // namespace nodes, so every subtree occupies one contiguous index range.
+    #[cfg(feature = "xmldsig")]
     pub(super) xpath_start: u32,
 }
 
@@ -289,6 +290,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             range,
             range_actionable,
             subtree_end: id.0 + 1,
+            #[cfg(feature = "xmldsig")]
             xpath_start: 0,
         })?;
         if let Some(parent) = parent {
@@ -358,22 +360,26 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         preflight: &super::LexicalPreflight<'_, P>,
     ) -> Result<Document<'input, S>, ParseError> {
         self.storage.charge(self.nodes.len())?;
+        #[cfg(feature = "xmldsig")]
         let mut xpath_nodes = 0_u32;
         for node in &mut *self.nodes {
-            node.xpath_start = xpath_nodes;
-            let axes = match &node.kind {
-                NodeKind::Element {
-                    attributes,
-                    namespaces,
-                    ..
-                } => attributes.len().checked_add(namespaces.len()),
-                _ => Some(0),
-            };
-            xpath_nodes = axes
-                .and_then(|axes| u32::try_from(axes).ok())
-                .and_then(|axes| axes.checked_add(1))
-                .and_then(|count| xpath_nodes.checked_add(count))
-                .ok_or(ParseError::NodesLimitReached)?;
+            #[cfg(feature = "xmldsig")]
+            {
+                node.xpath_start = xpath_nodes;
+                let axes = match &node.kind {
+                    NodeKind::Element {
+                        attributes,
+                        namespaces,
+                        ..
+                    } => attributes.len().checked_add(namespaces.len()),
+                    _ => Some(0),
+                };
+                xpath_nodes = axes
+                    .and_then(|axes| u32::try_from(axes).ok())
+                    .and_then(|axes| axes.checked_add(1))
+                    .and_then(|count| xpath_nodes.checked_add(count))
+                    .ok_or(ParseError::NodesLimitReached)?;
+            }
             if let NodeKind::Element {
                 name,
                 prefix,
@@ -423,6 +429,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         Ok(Document {
             input: self.input,
             nodes: self.nodes,
+            #[cfg(feature = "xmldsig")]
             xpath_nodes,
         })
     }
@@ -440,6 +447,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
 pub struct Document<'input, S: Storage = Native> {
     input: &'input str,
     nodes: S::Values<NodeData<S>>,
+    #[cfg(feature = "xmldsig")]
     xpath_nodes: u32,
 }
 
@@ -541,11 +549,13 @@ impl<'input, S: Storage> Document<'input, S> {
     }
 
     /// Number of XPath nodes: tree nodes with their attribute and namespace nodes.
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_node_count(&self) -> u32 {
         self.xpath_nodes
     }
 
     /// Tree node owning a document-order XPath index (itself for tree nodes).
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_owner(&self, index: u32) -> Option<Node<'_, 'input, S>> {
         if index >= self.xpath_nodes {
             return None;
@@ -714,10 +724,12 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         }
     }
     /// Document-order XPath index of this tree node.
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_index(self) -> u32 {
         self.data().xpath_start
     }
     /// End of the contiguous XPath index range covering this subtree and its axes.
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_subtree_end(self) -> u32 {
         self.document
             .nodes

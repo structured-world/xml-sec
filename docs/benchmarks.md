@@ -56,8 +56,9 @@ Phase RSS still includes the common prepared corpus and is not an isolated phase
 Node-set measurements parse one 1K/16K-element signed shape outside the timer.
 `node_set_enveloped` projects the whole document, excludes the enveloped element
 and canonicalizes; `node_set_sparse` and `node_set_dense` select every Nth element
-with its attribute and namespace nodes, store the selection in the named explicit
-representation regardless of density, and canonicalize. Comparing the two at each
+with its attribute and namespace nodes, build the selection directly in the named
+explicit representation regardless of density (no conversion between the two), and
+canonicalize. Comparing the two at each
 stride, with allocation runs for peak memory, is how the sparse/dense threshold
 is chosen.
 

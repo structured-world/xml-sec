@@ -151,6 +151,62 @@ fn compact_projection_matches_original_axes_and_canonical_bytes() {
 }
 
 #[test]
+fn inserting_present_members_keeps_semantic_projection_unmaterialized() {
+    // A Filter 2.0 union into the whole document adds nothing; it must not
+    // copy the semantic projection into explicit storage, which an account
+    // too small for one index per XPath node would refuse.
+    let xml = format!("<root>{}</root>", "<a p='v'/>".repeat(16 * 1024));
+    let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide source XML");
+    let budget = super::super::NodeSetMaterializationBudget::default();
+    let small = Memory::new(Arc::new(MemoryAccount::new(1024, 1 << 24)));
+    let mut whole = Projection::accounted_subtree(document.root(), true, &budget, &small)
+        .expect("a semantic projection allocates no node storage");
+    let entries = whole.len();
+    let child = document
+        .root_element()
+        .first_element_child()
+        .expect("first child");
+    let part = Projection::accounted_subtree(child, true, &budget, &small)
+        .expect("a semantic child projection allocates no node storage");
+    whole
+        .union(&part, &budget)
+        .expect("a union of present members needs no storage");
+    whole
+        .insert_tree(document.root_element(), Some(&budget))
+        .expect("a present tree node needs no storage");
+    whole
+        .insert_attribute_at(child, 0, &budget)
+        .expect("a present attribute needs no storage");
+    assert_eq!(whole.len(), entries);
+    assert_eq!(small.used(), 0);
+}
+
+#[test]
+fn semantic_members_pay_work_for_every_emitted_index() {
+    // Attribute and namespace nodes of one element are emitted individually
+    // when a semantic projection becomes explicit; each costs execution work.
+    let attributes = (0..4096)
+        .map(|index| format!(" a{index}='v'"))
+        .collect::<String>();
+    let xml = format!("<root{attributes}/>");
+    let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide element");
+    let budget = super::super::NodeSetMaterializationBudget::default();
+    let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+    let mut whole = Projection::accounted_subtree(document.root(), true, &budget, &memory)
+        .expect("semantic projection fits");
+    let before = memory.work_remaining();
+    whole.materialize().expect("explicit copy fits");
+    let spent = before - memory.work_remaining();
+    assert!(
+        spent >= whole.len(),
+        "materializing {} members spent {spent} work units",
+        whole.len()
+    );
+    drop(whole);
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
 fn semantic_projection_stores_no_nodes_and_explicit_sets_pay_capacity() {
     // A whole-document projection is an arena range: it needs no per-node
     // storage even in an account too small for one index per XPath node. An
