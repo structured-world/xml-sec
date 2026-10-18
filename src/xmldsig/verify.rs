@@ -7,7 +7,8 @@
 //! This module wires together:
 //! - [`UriReferenceResolver`] for URI dereference
 //! - [`super::transforms::execute_transforms`] for the transform pipeline
-//! - [`compute_digest`] + [`constant_time_eq`] for digest computation and comparison
+//! - [`compute_digest`](super::digest::compute_digest) + [`constant_time_eq`] for digest
+//!   computation and comparison
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
 use crate::xml::dom::{Node, NodeId};

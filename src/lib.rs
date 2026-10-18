@@ -99,7 +99,7 @@ mod xml_input_shared;
 mod xslt;
 /// Bounded XML input decoding and lexical helpers.
 ///
-/// [`decode_xml_bounded`] accepts trusted encoding metadata and a caller-supplied
+/// [`decode_xml_bounded`](xml_input::decode_xml_bounded) accepts trusted encoding metadata and a caller-supplied
 /// decoded-byte limit. The unbounded internal helpers are not public.
 ///
 /// ```compile_fail

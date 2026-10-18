@@ -973,7 +973,7 @@ impl<'a, S: Storage> Attribute<'a, S> {
     ///
     /// xml:id 1.0 sections 4 and 6 require assignment even for invalid values;
     /// applications may inspect this diagnostic before relying on an ID.
-    /// https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+    /// <https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing>
     pub fn xml_id_error(self) -> Option<XmlIdError> {
         self.data.xml_id_error
     }

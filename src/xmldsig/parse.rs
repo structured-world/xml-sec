@@ -55,7 +55,7 @@ pub struct SignatureContext(Vec<u8>);
 
 impl SignatureContext {
     /// RFC 8032 section 5 limits contexts to 255 octets, independently of policy.
-    /// https://www.rfc-editor.org/rfc/rfc8032.html#section-5
+    /// <https://www.rfc-editor.org/rfc/rfc8032.html#section-5>
     pub fn new(bytes: &[u8]) -> Result<Self, ParseError> {
         if bytes.len() > 255 {
             return Err(ParseError::InvalidStructure(
