@@ -96,6 +96,43 @@ fn xpath_filter2_signing_builder() -> SignatureBuilder {
         .key_info(true)
 }
 
+#[cfg(feature = "xslt")]
+fn xslt_signing_builder() -> SignatureBuilder {
+    let stylesheet = || {
+        xml_sec::xmldsig::XsltStylesheet::new(concat!(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">"#,
+            r#"<xsl:template match="/"><summary count="{count(//item)}">"#,
+            r#"<xsl:for-each select="//item"><xsl:sort select="@rank" data-type="number"/>"#,
+            r#"<entry><xsl:value-of select="."/></entry></xsl:for-each></summary>"#,
+            r#"</xsl:template></xsl:stylesheet>"#
+        ))
+        .expect("interop stylesheet is valid markup")
+    };
+    SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        // Terminal XSLT: the serialized result, declaration included, is the digest input.
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::Enveloped)
+                .transform(Transform::Xslt(stylesheet())),
+        )
+        // XSLT output reparsed for a following canonicalization.
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::Enveloped)
+                .transform(Transform::Xslt(stylesheet()))
+                .transform(Transform::C14n(exclusive_c14n())),
+        )
+        .key_info(true)
+}
+
+#[cfg(feature = "xslt")]
+fn xslt_payload_xml() -> &'static str {
+    r#"<root><item rank="2">b</item><item rank="1">a &amp; c</item></root>"#
+}
+
 fn xpath_filter2_payload_xml() -> &'static str {
     "<root><Payload><Included>external verifier contract</Included><Excluded>mutable</Excluded></Payload><Outside>not signed</Outside></root>"
 }
@@ -475,6 +512,72 @@ fn xml_sec_verifies_base64_reference_signature_from_xmlsec1() {
             .pre_digest_data
             .as_deref(),
         Some(b"external verifier contract".as_slice())
+    );
+}
+
+#[cfg(feature = "xslt")]
+#[test]
+fn xmlsec1_verifies_xslt_reference_signature_from_xml_sec() {
+    // libxmlsec1 runs the same stylesheet through libxslt; accepting both
+    // digests proves the terminal serialization and the reparsed result agree.
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let key = RsaSigningKey::from_pkcs8_pem(
+        &fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem")
+            .expect("RSA private-key fixture must load"),
+    )
+    .expect("RSA private-key fixture must parse");
+    let signed = SignContext::new(&key)
+        .sign_with_builder(xslt_payload_xml(), &xslt_signing_builder())
+        .expect("xml-sec must sign the XSLT references");
+
+    assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+}
+
+#[cfg(feature = "xslt")]
+#[test]
+fn xml_sec_verifies_xslt_reference_signature_from_xmlsec1() {
+    // Reciprocal signing: digests computed by libxmlsec1 and libxslt must match
+    // this implementation's stylesheet execution and output serialization.
+    if !xmlsec1::is_available() {
+        eprintln!("{}", xmlsec1::skip_reason());
+        return;
+    }
+    let template = xslt_signing_builder()
+        .build_template()
+        .expect("XSLT interop template must build");
+    let xml = xml_sec::xmldsig::mutation::append_signature_to_root(xslt_payload_xml(), &template)
+        .expect("XSLT interop template must append")
+        .replace(
+            "<ds:KeyInfo/>",
+            "<ds:KeyInfo><ds:KeyName>TestKeyName-rsa-2048</ds:KeyName></ds:KeyInfo>",
+        );
+    let template_file = TemporaryXmlFile::write("xmlsec1-xslt-template", &xml);
+    let signed = sign_with_xmlsec1(
+        &template_file.path,
+        "TestKeyName-rsa-2048",
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        Path::new("tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+    );
+    let public_key = fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem")
+        .expect("RSA public-key fixture must load");
+
+    let verified = xml_sec::xmldsig::verify_signature_with_pem_key(&signed, &public_key, true)
+        .expect("xml-sec must process the xmlsec1 XSLT signature");
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(
+        verified.signed_info_references[0]
+            .pre_digest_data
+            .as_deref(),
+        Some(
+            concat!(
+                "<?xml version=\"1.0\"?>\n",
+                "<summary count=\"2\"><entry>a &amp; c</entry><entry>b</entry></summary>\n"
+            )
+            .as_bytes()
+        )
     );
 }
 

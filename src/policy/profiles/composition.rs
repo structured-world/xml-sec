@@ -352,7 +352,11 @@ fn resources(a: &ResourcePolicy, b: &ResourcePolicy) -> ResourcePolicy {
         max_node_set_owned_string_bytes,
         max_node_set_cumulative_owned_string_bytes,
         max_opc_parameter_bytes,
-        max_opc_workspace_bytes
+        max_opc_workspace_bytes,
+        max_xslt_work,
+        max_xslt_workspace_bytes,
+        max_xslt_output_bytes,
+        max_xslt_recursion_depth
     )
 }
 

@@ -3883,6 +3883,7 @@ fn generation_transform_uris<'a>(
             && algorithm != XPATH_TRANSFORM_URI
             && algorithm != XPATH_FILTER2_TRANSFORM_URI
             && algorithm != super::RELATIONSHIP_TRANSFORM_URI
+            && !(cfg!(feature = "xslt") && algorithm == super::XSLT_TRANSFORM_URI)
             && crate::c14n::C14nAlgorithm::from_uri(algorithm).is_none()
         {
             return Err(TransformError::UnsupportedTransform(algorithm.to_owned()).into());
@@ -3896,6 +3897,7 @@ fn generation_chain_produces_binary(initial_binary: bool, algorithms: &[&str]) -
     algorithms.last().map_or(initial_binary, |algorithm| {
         *algorithm == BASE64_TRANSFORM_URI
             || *algorithm == super::RELATIONSHIP_TRANSFORM_URI
+            || (cfg!(feature = "xslt") && *algorithm == super::XSLT_TRANSFORM_URI)
             || crate::c14n::C14nAlgorithm::from_uri(algorithm).is_some()
     })
 }
@@ -3916,6 +3918,24 @@ mod generation_output_tests {
         assert!(transform_chain_produces_binary(
             false,
             &[Transform::Relationship(vec![])]
+        ));
+    }
+
+    #[cfg(feature = "xslt")]
+    #[test]
+    fn xslt_output_classifiers_agree() {
+        // XSLT serializes its result tree, so a terminal XSLT step needs no implicit C14N.
+        assert!(generation_chain_produces_binary(
+            false,
+            &[super::super::XSLT_TRANSFORM_URI]
+        ));
+        let stylesheet = crate::xmldsig::XsltStylesheet::new(
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"/>"#,
+        )
+        .expect("empty stylesheet is valid markup");
+        assert!(transform_chain_produces_binary(
+            false,
+            &[Transform::Xslt(stylesheet)]
         ));
     }
 }

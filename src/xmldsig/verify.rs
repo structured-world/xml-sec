@@ -4930,6 +4930,8 @@ fn transform_preserves_manifest_structure(transform: &Transform) -> bool {
         | Transform::XPathFilter2(_)
         | Transform::Base64Decode
         | Transform::Relationship(_) => false,
+        #[cfg(feature = "xslt")]
+        Transform::Xslt(_) => false,
     }
 }
 

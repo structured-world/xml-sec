@@ -17,6 +17,7 @@ use xml_sec::xmldsig::{
 const PHAOS: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
 const RFC3161: &str = "tests/fixtures/xmldsig/external-data/rfc3161.txt";
 const VERIFY_2009: u64 = 1_230_804_000;
+#[cfg(not(feature = "xslt"))]
 const XSLT_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
 #[cfg(not(feature = "legacy-algorithms"))]
 const MD5_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
@@ -36,11 +37,13 @@ enum Expected {
     Valid {
         manifest_references: usize,
     },
+    #[cfg(not(feature = "xslt"))]
     ValidWithManifestFailure,
     BadDigest,
     #[cfg(feature = "legacy-algorithms")]
     MissingDigestValue,
     UnsupportedSignature(&'static str),
+    #[cfg(not(feature = "xslt"))]
     UnsupportedTransform(&'static str),
     UnsupportedCertificateSignature(&'static str),
     UntrustedCertificateRoot,
@@ -57,7 +60,12 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-big.xml",
         setup: Setup::Rsa,
+        #[cfg(not(feature = "xslt"))]
         expected: Expected::UnsupportedTransform(XSLT_URI),
+        #[cfg(feature = "xslt")]
+        expected: Expected::Valid {
+            manifest_references: 2,
+        },
     },
     Case {
         name: "signature-dsa-detached.xml",
@@ -147,7 +155,12 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-detached-xslt-transform.xml",
         setup: Setup::Rsa,
+        #[cfg(not(feature = "xslt"))]
         expected: Expected::ValidWithManifestFailure,
+        #[cfg(feature = "xslt")]
+        expected: Expected::Valid {
+            manifest_references: 1,
+        },
     },
     Case {
         name: "signature-rsa-detached.xml",
@@ -403,6 +416,7 @@ fn check_expected(
                     .iter()
                     .all(|reference| reference.status == DsigStatus::Valid)
         }
+        #[cfg(not(feature = "xslt"))]
         (Expected::ValidWithManifestFailure, Ok(result)) => {
             result.status == DsigStatus::Valid
                 && result.manifest_references.len() == 1
@@ -438,6 +452,7 @@ fn check_expected(
                 && SignatureAlgorithm::from_uri(uri)
                     .is_some_and(|method| method.requires_explicit_permission())
         }
+        #[cfg(not(feature = "xslt"))]
         (
             Expected::UnsupportedTransform(uri),
             Err(DsigError::ParseSignedInfo(ParseError::Transform(

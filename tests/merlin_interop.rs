@@ -333,8 +333,11 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         ("#reference-1", DsigStatus::Valid),
         (
             "#notaries",
-            // The donor uses an XSLT transform, which this pure-Rust profile
-            // intentionally does not execute; failure occurs before digest comparison.
+            // Without the xslt feature this XSLT transform is unsupported. With it, the
+            // stylesheet fails to compile: its exclude-result-prefixes names `foo`, bound only
+            // on an ancestor outside the stylesheet markup, which XSLT 1.0 section 7.1.1 makes
+            // an error. libxslt reports the same error and continues.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
             DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 2 }),
         ),
     ];

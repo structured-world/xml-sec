@@ -773,6 +773,15 @@ fn write_transform<W: Write>(
             }
             writer.end(&name)
         }
+        #[cfg(feature = "xslt")]
+        Transform::Xslt(stylesheet) => {
+            let name = qualified_name(prefix, "Transform");
+            writer.start(&name, [("Algorithm", super::XSLT_TRANSFORM_URI)])?;
+            // `XsltStylesheet` holds markup that is valid element content; verification
+            // compiles exactly this text, so it is written unchanged.
+            writer.raw(stylesheet.source())?;
+            writer.end(&name)
+        }
         Transform::Enveloped => {
             write_algorithm(writer, prefix, "Transform", ENVELOPED_SIGNATURE_URI)
         }
