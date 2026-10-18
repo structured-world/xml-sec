@@ -37,6 +37,7 @@ members = [
     "crates/xml-sec-xslt",
     "tools/capability-ledger",
     "crates/xml-sec-config",
+    "crates/xml-sec-xades",
     "tools/xmlsec1",
     "vendor/sxd-document-no-unsafe",
     "vendor/sxd-xpath-no-unsafe",

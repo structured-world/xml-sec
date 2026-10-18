@@ -1,0 +1,21 @@
+[package]
+name = "xml-sec-xades"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 AND MIT"
+publish = false
+description = "XAdES baseline validation of signatures verified by xml-sec"
+
+[dependencies]
+xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "c14n"] }
+structured-xades = { version = "0.6.3", default-features = false, features = ["std"] }
+structured-asn1 = { version = "0.6.3", default-features = false, features = ["std"] }
+structured-pkix = { version = "0.6.3", default-features = false, features = ["std"] }
+structured-cms = { version = "0.6.3", default-features = false, features = ["std"] }
+thiserror = "2"
+
+[features]
+default = ["xml-backend-xmloxide"]
+xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
+xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]

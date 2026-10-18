@@ -8,6 +8,8 @@ use structured_asn1::memory::{MemoryError, Work};
 
 mod scalar;
 pub use scalar::*;
+mod tree;
+pub use tree::*;
 
 /// Schema boolean attribute without an invented default for an absent value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

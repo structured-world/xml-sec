@@ -39,7 +39,6 @@ impl X509TrustEvidence {
         verification_time: SystemTime,
         revocation_checked: bool,
     ) -> Result<Self, DsigError> {
-        use sha2::{Digest, Sha256};
         let path_len = certificates.len();
         if path_len == 0 || path_len > crate::hard_limits::X509_CHAIN_DEPTH_CEILING {
             return Err(PolicyViolation::KeyTrust {
@@ -51,7 +50,7 @@ impl X509TrustEvidence {
         // Fixed storage avoids an unmetered post-validation allocation.
         let mut fingerprints = [[0; 32]; crate::hard_limits::X509_CHAIN_DEPTH_CEILING];
         for (fingerprint, certificate) in fingerprints.iter_mut().zip(certificates) {
-            *fingerprint = Sha256::digest(certificate.as_ref()).into();
+            *fingerprint = Self::identity(certificate.as_ref());
         }
         Ok(Self {
             fingerprints,
@@ -59,6 +58,26 @@ impl X509TrustEvidence {
             verification_time,
             revocation_checked,
         })
+    }
+
+    fn identity(certificate: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(certificate).into()
+    }
+
+    /// The path identity of a DER certificate, computed by the same internal
+    /// mechanism as [`Self::certificate_fingerprints`]. This is an identity
+    /// lookup, not a use of a document digest, so the operation's digest
+    /// policy and provider selection do not apply. `work` pays for the input.
+    pub fn certificate_identity_in<W: structured_asn1::memory::Work>(
+        certificate: &[u8],
+        work: &W,
+    ) -> Result<[u8; 32], structured_asn1::memory::MemoryError> {
+        work.charge_work(
+            u64::try_from(certificate.len())
+                .map_err(|_| structured_asn1::memory::MemoryError::WorkExceeded)?,
+        )?;
+        Ok(Self::identity(certificate))
     }
 
     /// SHA-256 identities in leaf-to-anchor order, including the trust anchor.
@@ -74,6 +93,14 @@ impl X509TrustEvidence {
     /// The single time captured for all candidate-path validation in the operation.
     pub fn verification_time(&self) -> SystemTime {
         self.verification_time
+    }
+
+    /// The same validation instant the path processor used, at nanosecond
+    /// precision, for consumers that re-check this exact path.
+    pub fn validation_instant(
+        &self,
+    ) -> Result<structured_pkix::temporal::Instant, super::X509ChainError> {
+        super::pkix::verification_instant(self.verification_time)
     }
 
     /// Whether the policy requested and validation enforced CRL processing.
