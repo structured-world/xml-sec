@@ -27,8 +27,9 @@ use super::xpath::{
     SourceNode, XPathValue, parse_xpath_number, prepare_evaluator_source, xpath_number,
 };
 use super::{
-    Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExpandedName,
-    Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput, Value,
+    Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExecutionUsage,
+    ExpandedName, Namespace, NodeId, NodeKind, NodeReference, Resolver, Result, SerializedOutput,
+    Value,
 };
 
 /// Top-level stylesheet parameters supplied by the caller.
@@ -147,6 +148,7 @@ pub struct TransformResult {
     /// The engine never writes these resources to the filesystem or network.
     pub secondary_outputs: Vec<SecondaryOutput>,
     pub messages: Vec<Message>,
+    pub usage: ExecutionUsage,
 }
 
 /// One secondary result produced by a compatible XSLT extension element.
@@ -249,6 +251,7 @@ impl Stylesheet {
         state.result.finalize_xml_ids(&mut state.meter)?;
         let serialized = serialize(&state.result, &self.output, &mut state.meter)?;
         Ok(TransformResult {
+            usage: state.meter.admitted_work(),
             document: state.result,
             serialized,
             secondary_outputs: state.secondary_outputs,

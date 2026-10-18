@@ -139,6 +139,25 @@ pub struct ExecutionBudget {
     pub owned_bytes: usize,
 }
 
+/// Work admitted by one successful execution.
+///
+/// Each counter is the amount the corresponding [`ExecutionBudget`] limit admitted, so a caller
+/// sharing one allowance across executions can pass the remainder as the next budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionUsage {
+    pub external_documents: usize,
+    pub xpath_evaluations: usize,
+    pub xpath_operations: usize,
+    pub extension_operations: usize,
+    pub pattern_evaluations: usize,
+    pub template_applications: usize,
+    pub sort_comparisons: usize,
+    pub key_entries: usize,
+    pub result_nodes: usize,
+    pub serialized_bytes: usize,
+    pub messages: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct Meter {
     limits: ExecutionBudget,
@@ -291,6 +310,22 @@ impl Meter {
             other => Err(Error::Dynamic(format!(
                 "{other:?} cannot be checked during execution"
             ))),
+        }
+    }
+
+    pub(crate) const fn admitted_work(&self) -> ExecutionUsage {
+        ExecutionUsage {
+            external_documents: self.external_documents,
+            xpath_evaluations: self.xpath_evaluations,
+            xpath_operations: self.xpath_operations,
+            extension_operations: self.extension_operations,
+            pattern_evaluations: self.pattern_evaluations,
+            template_applications: self.template_applications,
+            sort_comparisons: self.sort_comparisons,
+            key_entries: self.key_entries,
+            result_nodes: self.result_nodes,
+            serialized_bytes: self.serialized_bytes,
+            messages: self.messages,
         }
     }
 

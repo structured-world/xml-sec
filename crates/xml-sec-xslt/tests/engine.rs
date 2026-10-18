@@ -80,6 +80,92 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
 }
 
 #[test]
+fn reported_usage_is_the_work_the_budget_enforces() {
+    // Callers that share one allowance across executions pass the remainder of the previous
+    // report as the next budget. That is sound only if each reported counter is exactly the
+    // amount the meter admitted: the reported value must fit and one unit less must not.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+             <xsl:template match="/"><out><xsl:apply-templates select="//item"/></out></xsl:template>
+             <xsl:template match="item"><x><xsl:value-of select="."/></x></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+    let xml = "<root><item>a</item><item>b</item></root>";
+    let source = Document::parse(xml, None).expect("source parses");
+    let run = |budget: ExecutionBudget| {
+        stylesheet.execute(
+            &source,
+            &Parameters::new(),
+            Arc::new(NoResolver),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+    };
+    let result = run(execution_budget(xml.len())).expect("transform succeeds");
+    let usage = result.usage;
+    assert_eq!(usage.serialized_bytes, result.serialized.bytes.len());
+    assert_eq!(usage.external_documents, 0);
+    assert_eq!(usage.messages, 0);
+
+    let cases: [(BudgetKind, usize, fn(&mut ExecutionBudget, usize)); 6] = [
+        (
+            BudgetKind::XPathEvaluations,
+            usage.xpath_evaluations,
+            |b, v| {
+                b.xpath_evaluations = v;
+            },
+        ),
+        (
+            BudgetKind::XPathOperations,
+            usage.xpath_operations,
+            |b, v| {
+                b.xpath_operations = v;
+            },
+        ),
+        (
+            BudgetKind::PatternEvaluations,
+            usage.pattern_evaluations,
+            |b, v| {
+                b.pattern_evaluations = v;
+            },
+        ),
+        (
+            BudgetKind::TemplateApplications,
+            usage.template_applications,
+            |b, v| {
+                b.template_applications = v;
+            },
+        ),
+        (BudgetKind::ResultNodes, usage.result_nodes, |b, v| {
+            b.result_nodes = v
+        }),
+        (
+            BudgetKind::SerializedBytes,
+            usage.serialized_bytes,
+            |b, v| {
+                b.serialized_bytes = v;
+            },
+        ),
+    ];
+    for (kind, used, set) in cases {
+        assert!(used > 0, "{kind:?} must be exercised by this transform");
+        let mut exact = execution_budget(xml.len());
+        set(&mut exact, used);
+        let replay = run(exact).expect("the reported amount fits its own limit");
+        assert_eq!(replay.serialized.bytes, result.serialized.bytes);
+        let mut short = execution_budget(xml.len());
+        set(&mut short, used - 1);
+        assert!(
+            matches!(run(short), Err(Error::Budget { kind: refused, .. }) if refused == kind),
+            "{kind:?} must refuse one unit below the reported usage"
+        );
+    }
+}
+
+#[test]
 fn compiled_dependencies_require_execution_authorization() {
     // Compilation permission is not an execution grant: a reusable stylesheet must not let
     // retained include bytes bypass the resolver selected by its next caller.
