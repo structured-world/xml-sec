@@ -9,6 +9,14 @@ description = "Safe Rust XSLT 1.0 compiler and runtime"
 repository = "https://github.com/structured-world/xml-sec"
 readme = "README.md"
 
+[lib]
+name = "xml_sec_xslt"
+# The published xml-sec package compiles the same sources for its XSLT transform.
+path = "../../src/xslt/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded"))'] }
+
 [dependencies]
 encoding_rs = "0.8"
 icu_collator = "2.3.1"
