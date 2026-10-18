@@ -83,6 +83,31 @@ fn isolated_token_operations_and_failures() {
     ));
     assert!(!error.to_string().contains("wrong-pin"));
     provider.login(&pin).unwrap();
+    // Multi-part digests equal the software digest at every split, and an
+    // abandoned digest leaves the serialized session ready for the next one.
+    let data = (0..=255_u8).cycle().take(4_099).collect::<Vec<_>>();
+    let mut digested = 0;
+    for algorithm in DigestAlgorithm::ALL {
+        if !provider.supports(ProviderCapability::Digest(algorithm)) {
+            continue;
+        }
+        digested += 1;
+        let expected = RustCryptoProvider.digest(algorithm, &data).unwrap();
+        let mut state = provider.begin_digest(algorithm).unwrap();
+        for part in data.chunks(7) {
+            state.update(part).unwrap();
+        }
+        assert_eq!(state.finalize().unwrap(), expected, "{algorithm:?}");
+        let mut abandoned = provider.begin_digest(algorithm).unwrap();
+        abandoned.update(&data).unwrap();
+        drop(abandoned);
+        assert_eq!(
+            provider.digest(algorithm, &data).unwrap(),
+            expected,
+            "{algorithm:?}"
+        );
+    }
+    assert!(digested > 0, "the test token advertises no digest");
     let session = module.open_rw_session(slot).unwrap();
     session
         .generate_key_pair(

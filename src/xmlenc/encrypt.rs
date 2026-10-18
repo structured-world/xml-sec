@@ -1958,16 +1958,12 @@ mod tests {
         }
 
         #[cfg(feature = "xmldsig")]
-        fn digest(
+        fn begin_digest(
             &self,
             algorithm: crate::xmldsig::DigestAlgorithm,
-            data: &[u8],
-        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
-            crate::provider::CryptoProvider::digest(
-                &crate::provider::RustCryptoProvider,
-                algorithm,
-                data,
-            )
+        ) -> Result<Box<dyn crate::provider::DigestState + '_>, crate::provider::ProviderError>
+        {
+            crate::provider::default_provider().begin_digest(algorithm)
         }
 
         #[cfg(feature = "xmldsig")]

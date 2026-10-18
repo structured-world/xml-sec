@@ -55,8 +55,8 @@ use super::transforms::{
     BASE64_TRANSFORM_URI, ENVELOPED_SIGNATURE_URI, MAX_TRANSFORMS_PER_REFERENCE, Transform,
     TransformExecutionBudget, TransformOptions, XPATH_FILTER2_TRANSFORM_URI, XPATH_TRANSFORM_URI,
     XPathHereSemantics, XPathSignatureParseBudget, execute_transforms_with_dependency_nodes,
-    execute_transforms_with_options_and_budget, map_c14n_resource_policy_violation,
-    parse_transforms_with_budget, validate_signing_transform_policy,
+    map_c14n_resource_policy_violation, parse_transforms_with_budget,
+    validate_signing_transform_policy,
 };
 use super::types::TransformError;
 use super::uri::{
@@ -3490,18 +3490,27 @@ fn compute_signing_reference_digests(
                 execution_budget.node_set_materialization(),
                 execution_budget.xml_base_resolution(),
             )?;
-            let pre_digest = execute_transforms_with_options_and_budget(
+            let digest = super::transforms::digest_reference_transforms_with_budget(
                 signature,
+                Some(signature),
                 initial_data,
                 &reference.transforms,
                 transform_options,
                 execution_budget,
-            )?;
-            let digest = super::compute_digest_with_provider(
-                provider,
-                reference.digest_method,
-                &pre_digest,
-            )?;
+                execution_budget.xml_parse_work(),
+                super::transforms::DigestRequest {
+                    provider,
+                    algorithm: reference.digest_method,
+                    retain_pre_digest: false,
+                },
+            )
+            .map_err(|error| -> SigningDigestError {
+                match error {
+                    super::transforms::ReferenceDigestError::Transform(error) => error.into(),
+                    super::transforms::ReferenceDigestError::Provider(error) => error.into(),
+                }
+            })?
+            .digest;
             let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
             Ok(ComputedReferenceDigest {
                 index,

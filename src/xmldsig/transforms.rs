@@ -1532,6 +1532,232 @@ impl TransformTerminal<Native> for CollectTerminal {
     }
 }
 
+/// Dependency analysis reads which tracked nodes stay visible, which the chain
+/// settles before its terminal; the final output itself is never needed.
+struct DiscardTerminal;
+impl TransformTerminal<Native> for DiscardTerminal {
+    type Output = ();
+    type Error = TransformError;
+    fn finish<D: DomStorage>(
+        self,
+        _: ExecutionData<'_, Native, D>,
+        _: Option<(&C14nAlgorithm, Option<&str>)>,
+        _: &TransformExecutionBudget,
+    ) -> Result<(), TransformError> {
+        Ok(())
+    }
+}
+
+/// Digest of one Reference's final transform output.
+pub(crate) struct ReferenceDigest {
+    pub(crate) digest: Vec<u8>,
+    /// The hashed bytes, kept only when the caller asked for them.
+    pub(crate) pre_digest: Option<Vec<u8>>,
+}
+
+/// A transform failure, or the selected provider's digest failure.
+#[derive(Debug)]
+pub(crate) enum ReferenceDigestError {
+    Transform(TransformError),
+    Provider(crate::provider::ProviderError),
+}
+
+impl From<TransformError> for ReferenceDigestError {
+    fn from(error: TransformError) -> Self {
+        Self::Transform(error)
+    }
+}
+
+/// What the terminal digest computes, and whether its input is retained.
+#[derive(Clone, Copy)]
+pub(crate) struct DigestRequest<'p> {
+    pub(crate) provider: &'p dyn crate::provider::CryptoProvider,
+    pub(crate) algorithm: super::DigestAlgorithm,
+    pub(crate) retain_pre_digest: bool,
+}
+
+/// Digest input is passed to the provider in blocks of this size: the
+/// serializer writes token by token, and each provider update can cross a
+/// dynamic dispatch or, for a token, a module call.
+const DIGEST_BLOCK: usize = 4096;
+
+/// Feeds final bytes to the digest as they are produced. A provider refusal is
+/// kept as the sticky cause; the serializer only sees an I/O stop.
+struct DigestWriter<'p> {
+    state: Box<dyn crate::provider::DigestState + 'p>,
+    block: [u8; DIGEST_BLOCK],
+    pending: usize,
+    retained: Option<Vec<u8>>,
+    written: usize,
+    failure: Option<crate::provider::ProviderError>,
+}
+
+impl<'p> DigestWriter<'p> {
+    fn new(state: Box<dyn crate::provider::DigestState + 'p>, retain: bool) -> Self {
+        Self {
+            state,
+            block: [0; DIGEST_BLOCK],
+            pending: 0,
+            retained: retain.then(Vec::new),
+            written: 0,
+            failure: None,
+        }
+    }
+
+    fn absorb(&mut self, mut bytes: &[u8]) -> Result<(), crate::provider::ProviderError> {
+        if let Some(retained) = &mut self.retained {
+            retained.extend_from_slice(bytes);
+        }
+        // Serializer output is bounded by the remaining canonical budget.
+        self.written += bytes.len();
+        if self.pending > 0 {
+            let taken = bytes.len().min(DIGEST_BLOCK - self.pending);
+            self.block[self.pending..self.pending + taken].copy_from_slice(&bytes[..taken]);
+            self.pending += taken;
+            bytes = &bytes[taken..];
+            if self.pending < DIGEST_BLOCK {
+                return Ok(());
+            }
+            self.pending = 0;
+            self.state.update(&self.block)?;
+        }
+        if bytes.len() >= DIGEST_BLOCK {
+            // A whole block or more is hashed in place, without a copy.
+            return self.state.update(bytes);
+        }
+        self.block[..bytes.len()].copy_from_slice(bytes);
+        self.pending = bytes.len();
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        algorithm: super::DigestAlgorithm,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::provider::ProviderError> {
+        if self.pending > 0 {
+            self.state.update(&self.block[..self.pending])?;
+        }
+        let digest = super::digest::finish_digest(algorithm, self.state)?;
+        Ok((digest, self.retained))
+    }
+}
+
+impl std::io::Write for DigestWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.failure.is_some() {
+            return Err(std::io::ErrorKind::Other.into());
+        }
+        match self.absorb(bytes) {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.failure = Some(error);
+                Err(std::io::ErrorKind::Other.into())
+            }
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Hashes the final transform output without collecting it: a final node set
+/// is canonicalized straight into the digest, final octets are hashed in place.
+struct DigestTerminal<'p>(DigestRequest<'p>);
+
+impl TransformTerminal<Native> for DigestTerminal<'_> {
+    type Output = ReferenceDigest;
+    type Error = ReferenceDigestError;
+    fn finish<D: DomStorage>(
+        self,
+        data: ExecutionData<'_, Native, D>,
+        explicit: Option<(&C14nAlgorithm, Option<&str>)>,
+        budget: &TransformExecutionBudget,
+    ) -> Result<ReferenceDigest, ReferenceDigestError> {
+        let DigestRequest {
+            provider,
+            algorithm,
+            retain_pre_digest,
+        } = self.0;
+        let mut sink = DigestWriter::new(
+            super::digest::begin_digest(provider, algorithm)
+                .map_err(ReferenceDigestError::Provider)?,
+            retain_pre_digest,
+        );
+        if let Some(bytes) = data.binary() {
+            sink.absorb(bytes).map_err(ReferenceDigestError::Provider)?;
+        } else {
+            let nodes = data.nodes().expect("execution has nodes or bytes");
+            let implicit;
+            let algorithm = match explicit {
+                Some(explicit) => explicit,
+                None => {
+                    implicit = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
+                        .expect("constant C14N URI");
+                    (&implicit, None)
+                }
+            };
+            let result = c14n::canonicalize_visible_to_writer_in(
+                nodes.document(),
+                nodes,
+                algorithm,
+                budget.c14n.remaining(),
+                budget.xml_base_resolution(),
+                &mut sink,
+                &Native,
+            );
+            if let Some(error) = sink.failure.take() {
+                return Err(ReferenceDigestError::Provider(error));
+            }
+            result.map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
+            budget
+                .c14n
+                .charge(sink.written)
+                .map_err(TransformError::from)?;
+        }
+        let (digest, pre_digest) = sink
+            .finish(algorithm)
+            .map_err(ReferenceDigestError::Provider)?;
+        Ok(ReferenceDigest { digest, pre_digest })
+    }
+}
+
+/// Execute a Reference in its actual source context and digest its output as
+/// it is produced. Intermediate transforms that need bytes still receive them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn digest_reference_transforms_with_budget<'a>(
+    source_node: Node<'a, 'a>,
+    enveloped_signature: Option<Node<'a, 'a>>,
+    initial_data: TransformData<'a>,
+    transforms: &[Transform],
+    options: TransformOptions<'_>,
+    budget: &TransformExecutionBudget,
+    xml_parse: &XmlParseWorkBudget,
+    request: DigestRequest<'_>,
+) -> Result<ReferenceDigest, ReferenceDigestError> {
+    ensure_transform_count(transforms.len())?;
+    relationship::validate_edition(transforms, options.opc_relationship_edition)?;
+    budget.state.begin_chain();
+    let context = TransformExecutionContext {
+        scratch: &Native,
+        options,
+        budget,
+        state: &budget.state,
+        xml_parse,
+        source_has_signature: enveloped_signature.is_some(),
+    };
+    execute_transform_chain::<true, _, _, _, _, _, _>(
+        source_node,
+        enveloped_signature,
+        initial_data.into(),
+        transforms,
+        None,
+        None,
+        &context,
+        DigestTerminal(request),
+    )
+    .map(|output| output.output)
+}
+
 #[cfg(test)]
 impl<'a> ExecutionData<'a, Native> {
     fn into_native(self) -> TransformData<'a> {
@@ -1616,7 +1842,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         xml_parse: budget.xml_parse_work(),
         source_has_signature: true,
     };
-    let output = execute_transform_chain::<false, _, _, _, _, _, _>(
+    let output = execute_transform_chain::<true, _, _, _, _, _, _>(
         signature_node,
         Some(signature_node),
         initial_data.into(),
@@ -1629,7 +1855,7 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
             canonical_positions: None,
         }),
         &context,
-        CollectTerminal,
+        DiscardTerminal,
     )?;
     Ok(TransformDependencyOutput {
         dependencies: output.dependencies,

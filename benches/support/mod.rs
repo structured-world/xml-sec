@@ -16,7 +16,7 @@ use xml_sec::{
     },
 };
 
-pub const SHAPES: [&str; 8] = [
+pub const SHAPES: [&str; 9] = [
     "saml",
     "namespaces",
     "text",
@@ -25,7 +25,10 @@ pub const SHAPES: [&str; 8] = [
     "nested_manifest",
     "external",
     "adversarial",
+    "bulk",
 ];
+/// Large-output shape for dedicated reference-digest runs, outside `specs()`.
+pub const BULK: usize = SHAPES.len() - 1;
 pub const OPERATIONS: [&str; 8] = [
     "parse",
     "c14n",
@@ -70,7 +73,7 @@ pub fn specs() -> impl Iterator<Item = Spec> {
     ];
     XmlBackend::available().flat_map(move |backend| {
         engines.into_iter().flat_map(move |engine| {
-            (0..SHAPES.len()).flat_map(move |shape| {
+            (0..BULK).flat_map(move |shape| {
                 [16, 256].map(move |units| Spec {
                     shape,
                     units,
@@ -100,6 +103,16 @@ fn body(shape: usize, units: usize) -> String {
         "attributes" => {
             for i in 0..units {
                 xml.push_str(&format!("<v a=\"{i}\" b=\"value\" c=\"&amp;&quot;&#xA;\" d=\"4\" e=\"5\" f=\"6\" g=\"7\" h=\"8\"/>"));
+            }
+        }
+        "bulk" => {
+            // 1 KiB of entity-free text per element: canonical output grows
+            // with `units` while node and entity counts stay small.
+            let block = "deterministic bulk text ".repeat(43);
+            for _ in 0..units {
+                xml.push_str("<v>");
+                xml.push_str(&block);
+                xml.push_str("</v>");
             }
         }
         "adversarial" => {

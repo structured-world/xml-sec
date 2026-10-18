@@ -34,6 +34,55 @@ operation!(verify_reject);
 operation!(encrypt);
 operation!(decrypt);
 
+/// One `#payload` Reference over `units` KiB of text, so the canonical output
+/// dominates: the peak allocation shows whether its bytes are retained.
+fn large_reference(units: usize) -> Fixture {
+    reference_fixture(support::BULK, units)
+}
+
+fn reference_fixture(shape: usize, units: usize) -> Fixture {
+    Fixture::new(Spec {
+        shape,
+        units,
+        backend: xml_sec::XmlBackend::default(),
+        engine: support::Engine::RustCrypto,
+    })
+}
+
+/// Many short serializer writes (eight escaped attributes per element) for
+/// the per-write cost of feeding the Reference digest.
+#[divan::bench]
+fn attribute_reference_verify(bencher: divan::Bencher) {
+    let shape = support::SHAPES
+        .iter()
+        .position(|shape| *shape == "attributes")
+        .expect("attributes shape");
+    let fixture = reference_fixture(shape, 2_048);
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            fixture.input_bytes("verify_retained"),
+        ))
+        .bench_local(|| fixture.run("verify_retained"));
+}
+
+#[divan::bench(args = [256, 4_096])]
+fn large_reference_verify(bencher: divan::Bencher, units: usize) {
+    let fixture = large_reference(units);
+    bencher
+        .counter(divan::counter::BytesCount::new(
+            fixture.input_bytes("verify_retained"),
+        ))
+        .bench_local(|| fixture.run("verify_retained"));
+}
+
+#[divan::bench(args = [256, 4_096])]
+fn large_reference_sign(bencher: divan::Bencher, units: usize) {
+    let fixture = large_reference(units);
+    bencher
+        .counter(divan::counter::BytesCount::new(fixture.input_bytes("sign")))
+        .bench_local(|| fixture.run("sign"));
+}
+
 #[divan::bench(args = specs().filter(|spec| spec.backend != xml_sec::XmlBackend::Differential))]
 fn projection(bencher: divan::Bencher, spec: Spec) {
     let fixture = Fixture::new(spec);

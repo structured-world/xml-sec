@@ -840,6 +840,21 @@ pub trait KeyAgreementKey: Send + Sync {
     fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError>;
 }
 
+/// Incremental message digest owned by one provider operation.
+///
+/// Input is absorbed in order across any number of [`update`](Self::update)
+/// calls; [`finalize`](Self::finalize) consumes the state. A provider may
+/// serialize its other operations while a state is live, so callers finish a
+/// digest before starting another operation on the same provider.
+#[cfg(feature = "xmldsig")]
+pub trait DigestState {
+    /// Absorb the next input bytes.
+    fn update(&mut self, data: &[u8]) -> Result<(), ProviderError>;
+
+    /// Return the digest of all absorbed bytes.
+    fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError>;
+}
+
 /// Provider operations used by the XML Security pipelines.
 pub trait CryptoProvider: Send + Sync {
     /// External execution domain. Different instances of one engine are not interchangeable.
@@ -982,9 +997,21 @@ pub trait CryptoProvider: Send + Sync {
         })
     }
 
-    /// Compute a message digest.
+    /// Start an incremental message digest; streamed input never needs to be
+    /// collected in memory first.
     #[cfg(feature = "xmldsig")]
-    fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError>;
+    fn begin_digest(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Box<dyn DigestState + '_>, ProviderError>;
+
+    /// Compute the message digest of one contiguous input.
+    #[cfg(feature = "xmldsig")]
+    fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
+        let mut state = self.begin_digest(algorithm)?;
+        state.update(data)?;
+        state.finalize()
+    }
 
     /// Sign bytes with an opaque key handle.
     ///
@@ -1272,6 +1299,59 @@ pub trait CryptoProvider: Send + Sync {
 /// Pure-Rust provider backed by RustCrypto crates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustCryptoProvider;
+
+/// Defines the RustCrypto incremental hasher for every compiled algorithm.
+#[cfg(feature = "xmldsig")]
+macro_rules! rust_crypto_digest {
+    ($($(#[$attr:meta])* $variant:ident => $hasher:ty),+ $(,)?) => {
+        enum RustCryptoDigest {
+            $($(#[$attr])* $variant($hasher),)+
+        }
+
+        impl RustCryptoDigest {
+            fn new(algorithm: DigestAlgorithm) -> Self {
+                use sha2::Digest as _;
+                match algorithm {
+                    $($(#[$attr])* DigestAlgorithm::$variant => Self::$variant(<$hasher>::new()),)+
+                }
+            }
+        }
+
+        impl DigestState for RustCryptoDigest {
+            fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+                use sha2::Digest as _;
+                match self {
+                    $($(#[$attr])* Self::$variant(hasher) => hasher.update(data),)+
+                }
+                Ok(())
+            }
+
+            fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
+                use sha2::Digest as _;
+                Ok(match *self {
+                    $($(#[$attr])* Self::$variant(hasher) => hasher.finalize().to_vec(),)+
+                })
+            }
+        }
+    };
+}
+
+#[cfg(feature = "xmldsig")]
+rust_crypto_digest! {
+    #[cfg(feature = "legacy-algorithms")]
+    Md5 => md5::Md5,
+    #[cfg(feature = "legacy-algorithms")]
+    Ripemd160 => ripemd::Ripemd160,
+    Sha1 => sha1::Sha1,
+    Sha224 => sha2::Sha224,
+    Sha256 => sha2::Sha256,
+    Sha384 => sha2::Sha384,
+    Sha512 => sha2::Sha512,
+    Sha3_224 => sha3::Sha3_224,
+    Sha3_256 => sha3::Sha3_256,
+    Sha3_384 => sha3::Sha3_384,
+    Sha3_512 => sha3::Sha3_512,
+}
 
 /// Opaque RSA public-key handle for the built-in RustCrypto provider.
 #[cfg(feature = "xmlenc")]
@@ -1774,25 +1854,11 @@ impl CryptoProvider for RustCryptoProvider {
     }
 
     #[cfg(feature = "xmldsig")]
-    fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
-        use sha1::Sha1;
-        use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
-        use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
-        Ok(match algorithm {
-            #[cfg(feature = "legacy-algorithms")]
-            DigestAlgorithm::Md5 => md5::Md5::digest(data).to_vec(),
-            #[cfg(feature = "legacy-algorithms")]
-            DigestAlgorithm::Ripemd160 => ripemd::Ripemd160::digest(data).to_vec(),
-            DigestAlgorithm::Sha1 => Sha1::digest(data).to_vec(),
-            DigestAlgorithm::Sha224 => Sha224::digest(data).to_vec(),
-            DigestAlgorithm::Sha256 => Sha256::digest(data).to_vec(),
-            DigestAlgorithm::Sha384 => Sha384::digest(data).to_vec(),
-            DigestAlgorithm::Sha512 => Sha512::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_224 => Sha3_224::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_256 => Sha3_256::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_384 => Sha3_384::digest(data).to_vec(),
-            DigestAlgorithm::Sha3_512 => Sha3_512::digest(data).to_vec(),
-        })
+    fn begin_digest(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
+        Ok(Box::new(RustCryptoDigest::new(algorithm)))
     }
 
     #[cfg(feature = "xmldsig")]
@@ -3085,6 +3151,22 @@ mod tests {
         }
     }
 
+    /// A provider defect: one byte more than the algorithm's digest width.
+    #[cfg(feature = "xmldsig")]
+    struct ExtraByteDigest(Box<dyn DigestState>);
+
+    #[cfg(feature = "xmldsig")]
+    impl DigestState for ExtraByteDigest {
+        fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+            self.0.update(data)
+        }
+        fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
+            let mut digest = self.0.finalize()?;
+            digest.push(0);
+            Ok(digest)
+        }
+    }
+
     #[cfg(feature = "xmldsig")]
     struct CountingRandomProvider {
         random_calls: AtomicUsize,
@@ -3116,22 +3198,22 @@ mod tests {
             RUST_CRYPTO_PROVIDER.derive_key(parameters, secret)
         }
 
-        fn digest(
+        fn begin_digest(
             &self,
             algorithm: DigestAlgorithm,
-            data: &[u8],
-        ) -> Result<Vec<u8>, ProviderError> {
+        ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
             if self.reject_digest == Some(algorithm) {
                 return Err(ProviderError::Unsupported {
                     operation: ProviderOperation::Digest,
                     algorithm: Some(algorithm.uri().to_owned()),
                 });
             }
-            let mut digest = RUST_CRYPTO_PROVIDER.digest(algorithm, data)?;
-            if self.extra_digest_byte {
-                digest.push(0);
-            }
-            Ok(digest)
+            let state = RUST_CRYPTO_PROVIDER.begin_digest(algorithm)?;
+            Ok(if self.extra_digest_byte {
+                Box::new(ExtraByteDigest(state))
+            } else {
+                state
+            })
         }
 
         fn sign(

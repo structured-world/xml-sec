@@ -62,6 +62,12 @@ canonicalize. Comparing the two at each
 stride, with allocation runs for peak memory, is how the sparse/dense threshold
 is chosen.
 
+`large_reference_verify` and `large_reference_sign` sign or verify one `#payload`
+Reference over 256 KiB and 4 MiB of entity-free text (the `bulk` shape, kept out
+of the general matrix). The canonical output dominates the input, so the
+allocation run's peak shows whether the Reference digest retains that output;
+with streamed digests the verification peak no longer grows with the payload.
+
 Setup imports keys, generates signatures/ciphertexts and validates verification
 and decryption before measurement. Timed operations retain correctness assertions:
 canonical bytes, deterministic RSA signature output, valid evidence and decrypted

@@ -99,6 +99,28 @@ plain PKCS#8 directly to `AwsLcSigningKey::from_pkcs8_der` or
 The native `xmlsec1` accepts `--crypto aws-lc-fips` when this feature is compiled.
 Without it, that selection is an explicit unavailable-provider error.
 
+## Digests
+
+Every provider implements `CryptoProvider::begin_digest`, which returns a
+provider-owned `DigestState`: input is absorbed in order across any number of
+`update` calls, and `finalize` consumes the state. The one-shot `digest` is a
+provided method built on it, so an engine implements hashing once. Custom
+providers implement `begin_digest`; it replaces the former required `digest`.
+
+XMLDSig Reference processing streams the final transform output into this state
+for both signing and verification: a final node set is canonicalized straight
+into the digest in bounded chunks and final octets are hashed in place, so a
+Reference never holds its whole canonical output unless the caller asked for
+pre-digest data. The facade checks the advertised capability before starting and
+the algorithm's output width after finalizing. An `update` or `finalize` failure
+reaches the caller as the original typed provider error; the canonical output
+limit still refuses at the first byte past the policy ceiling.
+
+A provider may serialize its other operations while a digest is live. PKCS#11
+runs `C_DigestInit`/`C_DigestUpdate`/`C_DigestFinal` on the provider's serialized
+session and holds that session until the digest finishes; an abandoned digest is
+finished when dropped, so the session stays usable for the next operation.
+
 ## Mechanisms
 
 With `experimental-pq`, RustCrypto provides ML-KEM-512/768/1024 through

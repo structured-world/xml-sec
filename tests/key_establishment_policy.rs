@@ -86,8 +86,11 @@ impl CryptoProvider for RecordingProvider {
     fn fill_random(&self, bytes: &mut [u8]) -> Result<(), ProviderError> {
         RUST_CRYPTO_PROVIDER.fill_random(bytes)
     }
-    fn digest(&self, algorithm: DigestAlgorithm, bytes: &[u8]) -> Result<Vec<u8>, ProviderError> {
-        RUST_CRYPTO_PROVIDER.digest(algorithm, bytes)
+    fn begin_digest(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Box<dyn xml_sec::provider::DigestState + '_>, ProviderError> {
+        RUST_CRYPTO_PROVIDER.begin_digest(algorithm)
     }
     fn sign(
         &self,

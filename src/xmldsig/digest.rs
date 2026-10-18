@@ -165,8 +165,27 @@ pub fn compute_digest_with_provider(
     algorithm: DigestAlgorithm,
     data: &[u8],
 ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+    let mut state = begin_digest(provider, algorithm)?;
+    state.update(data)?;
+    finish_digest(algorithm, state)
+}
+
+/// Start an incremental digest after checking the advertised capability.
+pub(crate) fn begin_digest<'p>(
+    provider: &'p dyn crate::provider::CryptoProvider,
+    algorithm: DigestAlgorithm,
+) -> Result<Box<dyn crate::provider::DigestState + 'p>, crate::provider::ProviderError> {
     provider.require_capability(crate::provider::ProviderCapability::Digest(algorithm))?;
-    let digest = provider.digest(algorithm, data)?;
+    provider.begin_digest(algorithm)
+}
+
+/// Finish an incremental digest. The facade, not an interchangeable provider,
+/// owns the output width of each XMLDSig algorithm.
+pub(crate) fn finish_digest(
+    algorithm: DigestAlgorithm,
+    state: Box<dyn crate::provider::DigestState + '_>,
+) -> Result<Vec<u8>, crate::provider::ProviderError> {
+    let digest = state.finalize()?;
     let expected = algorithm.output_len();
     if digest.len() != expected {
         return Err(crate::provider::ProviderError::InvalidOutputSize {
@@ -198,6 +217,18 @@ mod tests {
         output: Option<Vec<u8>>,
     }
 
+    /// Returns caller-chosen bytes whatever it absorbed.
+    struct FixedDigest(Vec<u8>);
+
+    impl crate::provider::DigestState for FixedDigest {
+        fn update(&mut self, _: &[u8]) -> Result<(), crate::provider::ProviderError> {
+            Ok(())
+        }
+        fn finalize(self: Box<Self>) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            Ok(self.0)
+        }
+    }
+
     impl crate::provider::CryptoProvider for RejectingDigestProvider {
         fn name(&self) -> &'static str {
             "rejecting-digest"
@@ -224,13 +255,13 @@ mod tests {
             crate::provider::default_provider().derive_key(parameters, secret)
         }
 
-        fn digest(
+        fn begin_digest(
             &self,
             _algorithm: DigestAlgorithm,
-            _data: &[u8],
-        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+        ) -> Result<Box<dyn crate::provider::DigestState + '_>, crate::provider::ProviderError>
+        {
             if let Some(output) = &self.output {
-                return Ok(output.clone());
+                return Ok(Box::new(FixedDigest(output.clone())));
             }
             panic!("an unavailable digest capability must not be dispatched")
         }

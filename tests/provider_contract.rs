@@ -105,12 +105,11 @@ impl CryptoProvider for ExternalProvider {
         RustCryptoProvider.derive_key(parameters, secret)
     }
 
-    fn digest(
+    fn begin_digest(
         &self,
         algorithm: xml_sec::xmldsig::DigestAlgorithm,
-        data: &[u8],
-    ) -> Result<Vec<u8>, ProviderError> {
-        RustCryptoProvider.digest(algorithm, data)
+    ) -> Result<Box<dyn xml_sec::provider::DigestState + '_>, ProviderError> {
+        xml_sec::provider::default_provider().begin_digest(algorithm)
     }
 
     fn sign(

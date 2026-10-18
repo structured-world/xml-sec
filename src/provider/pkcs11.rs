@@ -2,8 +2,9 @@
 //!
 //! The caller loads and initializes the module and authenticates the session.
 //! No module search, environment discovery, token initialization or PIN persistence
-//! occurs here. One session is serialized across complete primitive operations;
-//! independent provider instances can use independent sessions concurrently.
+//! occurs here. One session is serialized across complete primitive operations,
+//! including an incremental digest from start to finalization; independent
+//! provider instances can use independent sessions concurrently.
 
 pub use cryptoki;
 
@@ -245,6 +246,40 @@ fn oaep_error(error: Error, capability: ProviderCapability<'_>) -> ProviderError
             _,
         ) => unsupported(capability),
         error => map_error(error),
+    }
+}
+
+/// A multi-part digest holding the serialized session from init to final.
+struct Pkcs11Digest<'a> {
+    session: MutexGuard<'a, Session>,
+    active: bool,
+}
+
+impl super::DigestState for Pkcs11Digest<'_> {
+    fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+        // PKCS#11 Base 2.40 §5.10: an erroring C_DigestUpdate terminates the
+        // active digest operation.
+        // https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html
+        self.session.digest_update(data).map_err(|error| {
+            self.active = false;
+            map_error(error)
+        })
+    }
+
+    fn finalize(mut self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
+        self.active = false;
+        self.session.digest_final().map_err(map_error)
+    }
+}
+
+impl Drop for Pkcs11Digest<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            // An abandoned operation would make the next C_DigestInit on this
+            // session fail; finishing it is the only way to end it, and Drop
+            // has no caller to report a failure to.
+            self.session.digest_final().ok();
+        }
     }
 }
 
@@ -733,14 +768,19 @@ impl CryptoProvider for Pkcs11Provider {
             .generate_random_slice(output)
             .map_err(map_error)
     }
-    fn digest(&self, algorithm: DigestAlgorithm, input: &[u8]) -> Result<Vec<u8>, ProviderError> {
+    fn begin_digest(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Box<dyn super::DigestState + '_>, ProviderError> {
         self.require_capability(ProviderCapability::Digest(algorithm))?;
         let mechanism = digest_mechanism(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Digest(algorithm)))?;
-        self.0
-            .session()?
-            .digest(&mechanism, input)
-            .map_err(map_error)
+        let session = self.0.session()?;
+        session.digest_init(&mechanism).map_err(map_error)?;
+        Ok(Box::new(Pkcs11Digest {
+            session,
+            active: true,
+        }))
     }
     fn sign(
         &self,

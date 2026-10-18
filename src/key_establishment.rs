@@ -305,11 +305,10 @@ mod tests {
         ) -> Result<EncapsulatedKey, ProviderError> {
             key.encapsulate_with_provider(self)
         }
-        fn digest(
+        fn begin_digest(
             &self,
             _: crate::xmldsig::DigestAlgorithm,
-            _: &[u8],
-        ) -> Result<Vec<u8>, ProviderError> {
+        ) -> Result<Box<dyn crate::provider::DigestState + '_>, ProviderError> {
             unreachable!("no digest after failed entropy")
         }
         fn sign(

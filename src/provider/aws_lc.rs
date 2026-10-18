@@ -55,6 +55,19 @@ fn digest_algorithm(algorithm: DigestAlgorithm) -> Option<&'static digest::Algor
     })
 }
 
+struct AwsLcDigest(digest::Context);
+
+impl super::DigestState for AwsLcDigest {
+    fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+        self.0.update(data);
+        Ok(())
+    }
+
+    fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
+        Ok(self.0.finish().as_ref().to_vec())
+    }
+}
+
 fn unsupported(capability: ProviderCapability<'_>) -> ProviderError {
     ProviderError::Unsupported {
         operation: capability.operation(),
@@ -181,10 +194,13 @@ impl CryptoProvider for AwsLcFipsProvider {
             .map_err(|_| ProviderError::Random("AWS-LC random generation failed".into()))
     }
 
-    fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
+    fn begin_digest(
+        &self,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Box<dyn super::DigestState + '_>, ProviderError> {
         let native = digest_algorithm(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Digest(algorithm)))?;
-        Ok(digest::digest(native, data).as_ref().to_vec())
+        Ok(Box::new(AwsLcDigest(digest::Context::new(native))))
     }
 
     fn sign(

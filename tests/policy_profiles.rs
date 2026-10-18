@@ -81,11 +81,11 @@ impl CryptoProvider for ProfileTestProvider {
     fn fill_random(&self, _: &mut [u8]) -> Result<(), xml_sec::provider::ProviderError> {
         panic!("compile must not execute crypto")
     }
-    fn digest(
+    fn begin_digest(
         &self,
         _: xml_sec::xmldsig::DigestAlgorithm,
-        _: &[u8],
-    ) -> Result<Vec<u8>, xml_sec::provider::ProviderError> {
+    ) -> Result<Box<dyn xml_sec::provider::DigestState + '_>, xml_sec::provider::ProviderError>
+    {
         panic!("compile must not execute crypto")
     }
     fn sign(

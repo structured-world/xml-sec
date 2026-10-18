@@ -375,6 +375,36 @@ pub(crate) fn canonicalize_visible_to_writer_accounted<
     .map(|_| ())
 }
 
+/// Terminal stream for any scratch and DOM storage; nothing is collected.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn canonicalize_visible_to_writer_in<
+    W: std::io::Write + ?Sized,
+    S: scratch::Scratch,
+    D: DomStorage,
+>(
+    doc: &Document<'_, D>,
+    visibility: &dyn NodeVisibility<D>,
+    (algo, prefix_list): (&C14nAlgorithm, Option<&str>),
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut W,
+    scratch: &S,
+) -> Result<(), C14nError> {
+    canonicalize_writer_with_scratch(
+        doc,
+        Some(visibility),
+        algo,
+        max_output_bytes,
+        xml_base_resolution,
+        output,
+        0,
+        scratch,
+        prefix_list,
+        None,
+    )
+    .map(|_| ())
+}
+
 /// Materialize only when another transform requires bytes, with the same
 /// serializer, storage admission and position provenance as terminal output.
 #[cfg(feature = "xmldsig")]

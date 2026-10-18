@@ -2697,11 +2697,11 @@ mod tests {
             crate::provider::default_provider().derive_key(parameters, secret)
         }
 
-        fn digest(
+        fn begin_digest(
             &self,
             algorithm: super::super::DigestAlgorithm,
-            data: &[u8],
-        ) -> Result<Vec<u8>, crate::provider::ProviderError> {
+        ) -> Result<Box<dyn crate::provider::DigestState + '_>, crate::provider::ProviderError>
+        {
             if algorithm == super::super::DigestAlgorithm::Sha512
                 && self.sha512_calls.fetch_add(1, Ordering::Relaxed) > 0
             {
@@ -2710,7 +2710,7 @@ mod tests {
                     algorithm: Some(algorithm.uri().to_owned()),
                 });
             }
-            crate::provider::default_provider().digest(algorithm, data)
+            crate::provider::default_provider().begin_digest(algorithm)
         }
 
         fn sign(

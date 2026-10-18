@@ -1412,7 +1412,12 @@ fn process_reference_with_options<C: VerificationCapture>(
             execution.transform_budget.charge_node_filter_work(1)
         })
         .map_err(ReferenceProcessingError::Transform)?;
-    let pre_digest_bytes = super::transforms::execute_reference_transforms_with_budget(
+    // 3. Compute the digest while the final transform output is produced;
+    // its bytes are retained only when the caller asked for them.
+    let super::transforms::ReferenceDigest {
+        digest: computed_digest,
+        pre_digest,
+    } = super::transforms::digest_reference_transforms_with_budget(
         source,
         containing_signature,
         initial_data,
@@ -1420,15 +1425,18 @@ fn process_reference_with_options<C: VerificationCapture>(
         execution.transform_options,
         execution.transform_budget,
         execution.transform_budget.xml_parse_work(),
+        super::transforms::DigestRequest {
+            provider: execution.provider,
+            algorithm: reference.digest_method,
+            retain_pre_digest: execution.store_pre_digest,
+        },
     )
-    .map_err(ReferenceProcessingError::Transform)?;
-
-    // 3. Compute digest
-    let computed_digest = super::compute_digest_with_provider(
-        execution.provider,
-        reference.digest_method,
-        &pre_digest_bytes,
-    )?;
+    .map_err(|error| match error {
+        super::transforms::ReferenceDigestError::Transform(error) => {
+            ReferenceProcessingError::Transform(error)
+        }
+        super::transforms::ReferenceDigestError::Provider(error) => error.into(),
+    })?;
     execution
         .capture
         .computed_digest(reference_node.map(|node| node.id()))?;
@@ -1442,13 +1450,12 @@ fn process_reference_with_options<C: VerificationCapture>(
         })
     };
 
-    let pre_digest_data = if execution.store_pre_digest {
-        execution
-            .canonicalized_data_budget
-            .charge(pre_digest_bytes.len())?;
-        Some(pre_digest_bytes)
-    } else {
-        None
+    let pre_digest_data = match pre_digest {
+        Some(bytes) => {
+            execution.canonicalized_data_budget.charge(bytes.len())?;
+            Some(bytes)
+        }
+        None => None,
     };
 
     Ok(ReferenceResult {
