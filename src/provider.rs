@@ -846,6 +846,11 @@ pub trait KeyAgreementKey: Send + Sync {
 /// calls; [`finalize`](Self::finalize) consumes the state. A provider may
 /// serialize its other operations while a state is live, so callers finish a
 /// digest before starting another operation on the same provider.
+///
+/// This is the backend interface of the selected provider (runtime backend,
+/// FIPS selection, token sessions), not a cross-product contract: the shared
+/// streaming digest callbacks of the `signature-primitives` packages are
+/// implemented by adapters on top of it.
 #[cfg(feature = "xmldsig")]
 pub trait DigestState {
     /// Absorb the next input bytes.
