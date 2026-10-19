@@ -3,9 +3,9 @@
 use crate::Error;
 use structured_asn1::Parser;
 use structured_asn1::memory::{HashWork, MemoryError, OwnedVec, Work};
+use structured_ltv::pki::{CheckedPath, PathOutcome};
 use structured_pkix::Certificate;
 use structured_pkix::path::{Anchor, BuildError, Interval, Policy, Truncation, ValidationContext};
-use structured_xades::pki::{CheckedPath, PathOutcome};
 use xml_sec::document::NodeIdentity;
 use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::xmldsig::{KeyTrustEvidence, VerifiedSession, X509ChainError, X509TrustEvidence};
@@ -314,7 +314,7 @@ fn checked<'d, W: Work, Q: Work>(
         watch: &(),
         recognizer: &(),
     };
-    match structured_xades::pki::check_path(&chain, Anchor::from_certificate(anchor), &context) {
+    match structured_ltv::pki::check_path(&chain, Anchor::from_certificate(anchor), &context) {
         Ok(PathOutcome::Accepted(path)) => Ok(Ok(path)),
         Ok(PathOutcome::Rejected(_)) => Ok(Err(PathFailure::Rejected)),
         Ok(PathOutcome::Incomplete(reason)) => Ok(Err(PathFailure::Incomplete(reason))),
