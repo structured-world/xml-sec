@@ -510,6 +510,10 @@ impl SignatureBuilder {
             }
             .into());
         }
+        // Stylesheets are copied into the template verbatim; their sum is bounded by the
+        // document limit before any of them is written.
+        #[cfg(feature = "xslt")]
+        let mut stylesheet_bytes = 0usize;
         for reference in &self.references {
             validate_signing_reference_uri(&reference.uri, policy)?;
             // Bound newly introduced owned parameters before cloning the chain
@@ -577,6 +581,15 @@ impl SignatureBuilder {
                                 xpath_signature_budget,
                             )?;
                         }
+                    }
+                    #[cfg(feature = "xslt")]
+                    Transform::Xslt(stylesheet) => {
+                        // The sum is only compared with the document limit, and one
+                        // clamped at `usize::MAX` exceeds every limit, so it is refused.
+                        stylesheet_bytes = stylesheet_bytes.saturating_add(stylesheet.markup_len());
+                        policy
+                            .resources
+                            .validate_xml_document_len(stylesheet_bytes)?;
                     }
                     _ => {}
                 }
@@ -771,6 +784,15 @@ fn write_transform<W: Write>(
                     ],
                 )?;
             }
+            writer.end(&name)
+        }
+        #[cfg(feature = "xslt")]
+        Transform::Xslt(stylesheet) => {
+            let name = qualified_name(prefix, "Transform");
+            writer.start(&name, [("Algorithm", super::XSLT_TRANSFORM_URI)])?;
+            // Valid element content that depends on nothing outside it: a stylesheet
+            // parsed from another document is written with what it inherited there.
+            writer.raw(&stylesheet.markup())?;
             writer.end(&name)
         }
         Transform::Enveloped => {

@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use super::{Error, Result};
 
 pub(crate) fn is_ncname(value: &str) -> bool {
     let mut chars = value.chars();
@@ -146,7 +146,7 @@ fn invalid_xpointer_utf8() -> Error {
 /// Returns the contents of exactly one XPath 1.0 `Literal` token.
 ///
 /// XPath 1.0 production [29] does not provide quote escaping: the delimiting quote cannot occur
-/// inside the token. https://www.w3.org/TR/1999/REC-xpath-19991116/#NT-Literal
+/// inside the token. <https://www.w3.org/TR/1999/REC-xpath-19991116/#NT-Literal>
 pub(crate) fn xpath_string_literal(value: &str) -> Option<&str> {
     let value = value.trim_matches(is_xml_whitespace);
     let quote @ ('\'' | '"') = value.chars().next()? else {
@@ -159,7 +159,7 @@ pub(crate) fn xpath_string_literal(value: &str) -> Option<&str> {
 /// Removes XPath's abbreviated attribute axis and its permitted `ExprWhitespace`.
 ///
 /// XSLT 1.0 section 5.2 admits `@` as the attribute-axis abbreviation in Pattern steps and
-/// incorporates XPath `ExprWhitespace`. https://www.w3.org/TR/1999/REC-xslt-19991116#patterns
+/// incorporates XPath `ExprWhitespace`. <https://www.w3.org/TR/1999/REC-xslt-19991116#patterns>
 pub(crate) fn strip_xpath_attribute_axis(value: &str) -> Option<&str> {
     value
         .strip_prefix('@')
@@ -226,19 +226,5 @@ pub(crate) fn is_ncname_char(ch: char) -> bool {
         )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::ValidatedXPointerFragment;
-
-    #[test]
-    fn truncated_multibyte_xpointer_escape_is_rejected_without_panicking() {
-        // A complete leading UTF-8 octet still needs encoded continuation octets. The validator
-        // must report a truncated fragment rather than indexing beyond the source buffer.
-        for fragment in ["%C3", "%F0%9F"] {
-            assert!(
-                ValidatedXPointerFragment::new(fragment).is_err(),
-                "accepted truncated XPointer fragment {fragment}"
-            );
-        }
-    }
-}
+#[cfg(all(test, not(feature = "embedded")))]
+mod tests;

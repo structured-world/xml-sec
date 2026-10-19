@@ -4,17 +4,20 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
-use crate::budget::{COMPILE_RECURSION_DEPTH_CEILING, ensure};
-use crate::lexical::{
+#[cfg(feature = "embedded")]
+use crate::{sxd_xpath as sxd_xpath_no_unsafe, xml_input_shared as xml_sec_xml_input};
+
+use super::budget::{COMPILE_RECURSION_DEPTH_CEILING, ParseWork, ensure};
+use super::lexical::{
     ValidatedXPointerFragment, is_ncname, is_ncname_char, is_ncname_start, is_xml_whitespace,
     strip_xpath_attribute_axis, trim_xml_whitespace, unicode_decimal_value, xpath_string_literal,
 };
-use crate::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
-use crate::resolver::decode_resource;
-use crate::{
+use super::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
+use super::resolver::decode_resource;
+use super::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, NodeKind,
-    OutputDefinition, OutputMethod, ResolvePurpose, ResolvedResource, Resolver, ResourceIdentity,
-    Result,
+    OutputDefinition, OutputMethod, ParseBudget, ParseUsage, Reported, ResolvePurpose,
+    ResolvedResource, Resolver, ResourceIdentity, Result,
 };
 
 pub(crate) const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
@@ -26,20 +29,53 @@ const XALAN_REDIRECT_NS: &str = "org.apache.xalan.xslt.extensions.Redirect";
 const LIBXSLT_TEST_NS: &str = "http://xmlsoft.org/XSLT/";
 const LIBXSLT_TEST_PLUGIN_NS: &str = "http://xmlsoft.org/xslt/testplugin";
 
+/// Handling of a prefix without a namespace binding in `exclude-result-prefixes` or
+/// `extension-element-prefixes`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UnboundPrefixLists {
+    /// XSLT 1.0 section 7.1.1 makes such a prefix an error.
+    /// <https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element>
+    #[default]
+    Reject,
+    /// Skip only that prefix, as libxslt does after reporting it as a warning.
+    Ignore,
+}
+
 /// XSLT compiler with an explicit resource boundary and compile budget.
 pub struct Compiler<R> {
     resolver: Arc<R>,
     budget: CompileBudget,
+    prefix_lists: UnboundPrefixLists,
 }
 
 impl<R: Resolver> Compiler<R> {
     #[must_use]
     pub fn new(resolver: Arc<R>, budget: CompileBudget) -> Self {
-        Self { resolver, budget }
+        Self {
+            resolver,
+            budget,
+            prefix_lists: UnboundPrefixLists::Reject,
+        }
+    }
+
+    /// Select how unbound prefixes in namespace prefix lists are handled.
+    #[must_use]
+    pub fn unbound_prefix_lists(mut self, handling: UnboundPrefixLists) -> Self {
+        self.prefix_lists = handling;
+        self
     }
 
     /// Compile a complete stylesheet graph into immutable executable IR.
     pub fn compile(&self, xml: &str, base_uri: Option<&str>) -> Result<Stylesheet> {
+        self.compile_reported(xml, base_uri).outcome
+    }
+
+    /// [`Self::compile`], also reporting the parser work it admitted.
+    pub fn compile_reported(
+        &self,
+        xml: &str,
+        base_uri: Option<&str>,
+    ) -> Reported<Stylesheet, ParseUsage> {
         self.compile_with_workspace(xml, base_uri, 0)
     }
 
@@ -48,28 +84,40 @@ impl<R: Resolver> Compiler<R> {
         xml: &str,
         base_uri: Option<&str>,
         decoded_workspace: usize,
-    ) -> Result<Stylesheet> {
-        ensure(
+    ) -> Reported<Stylesheet, ParseUsage> {
+        if let Err(error) = ensure(
             BudgetKind::StylesheetBytes,
             self.budget.stylesheet_bytes,
             xml.len(),
-        )?;
+        ) {
+            return Reported {
+                outcome: Err(error),
+                usage: ParseUsage::default(),
+            };
+        }
         let mut state = CompileState::new(self.budget, xml.len());
-        state.charge_owned(decoded_workspace)?;
-        self.compile_module(xml, base_uri, None, None, &mut state, 1)?;
-        let principal_document = if let Some(module) = state
-            .module_documents
-            .remove(&StylesheetDocumentId::PRINCIPAL)
-        {
-            module.document
-        } else {
-            parse_semantic_document_metered(xml, base_uri, &mut state)?
-        };
-        let principal_base_uri = clone_compile_string(base_uri, &mut state)?;
-        let mut stylesheet = state.finish()?;
-        stylesheet.principal_document = principal_document;
-        stylesheet.principal_base_uri = principal_base_uri;
-        Ok(stylesheet)
+        let outcome = (|| {
+            state.charge_owned(decoded_workspace)?;
+            self.compile_module(xml, base_uri, None, None, &mut state, 1)?;
+            let principal_document = if let Some(module) = state
+                .module_documents
+                .remove(&StylesheetDocumentId::PRINCIPAL)
+            {
+                module.document
+            } else {
+                parse_semantic_document_metered(xml, base_uri, &mut state)?
+            };
+            let principal_base_uri = clone_compile_string(base_uri, &mut state)?;
+            Ok((principal_document, principal_base_uri))
+        })();
+        let usage = state.parse_work.usage();
+        let outcome = outcome.and_then(|(principal_document, principal_base_uri)| {
+            let mut stylesheet = state.finish()?;
+            stylesheet.principal_document = principal_document;
+            stylesheet.principal_base_uri = principal_base_uri;
+            Ok(stylesheet)
+        });
+        Reported { outcome, usage }
     }
 
     /// Decode and compile a complete stylesheet graph from external XML bytes.
@@ -102,6 +150,7 @@ impl<R: Resolver> Compiler<R> {
             })?;
         let (xml, decoded_workspace) = classify_decoded_workspace(xml);
         self.compile_with_workspace(&xml, base_uri, decoded_workspace)
+            .outcome
     }
 
     fn compile_module(
@@ -140,7 +189,7 @@ impl<R: Resolver> Compiler<R> {
         };
         validate_standard_stylesheet_content(root)?;
         validate_top_level_declaration_attributes(root, forward)?;
-        validate_namespace_prefix_attributes(root, forward)?;
+        validate_namespace_prefix_attributes(root, forward, self.prefix_lists)?;
         let mut saw_non_import = false;
         self.compile_effective_imports(
             root,
@@ -246,7 +295,11 @@ impl<R: Resolver> Compiler<R> {
                                 {
                                     validate_standard_stylesheet_content(target)?;
                                     validate_top_level_declaration_attributes(target, forward)?;
-                                    validate_namespace_prefix_attributes(target, forward)?;
+                                    validate_namespace_prefix_attributes(
+                                        target,
+                                        forward,
+                                        self.prefix_lists,
+                                    )?;
                                     self.compile_effective_imports(
                                         target,
                                         source_xml,
@@ -283,6 +336,7 @@ impl<R: Resolver> Compiler<R> {
                                             validate_namespace_prefix_attributes(
                                                 included_root,
                                                 forward,
+                                                self.prefix_lists,
                                             )?;
                                             self.compile_effective_imports(
                                                 included_root,
@@ -455,8 +509,8 @@ impl<R: Resolver> Compiler<R> {
             purpose,
         };
         if let Some(resource) = state.resolved_requests.get(&request) {
-            self.resolver.authorize(crate::ResourceAccess::Retained {
-                request: crate::ResolveRequest::new(
+            self.resolver.authorize(super::ResourceAccess::Retained {
+                request: super::ResolveRequest::new(
                     resource_href,
                     effective_base.as_deref(),
                     purpose,
@@ -474,12 +528,12 @@ impl<R: Resolver> Compiler<R> {
             state.imported_modules,
         )?;
         self.resolver
-            .authorize(crate::ResourceAccess::Request(crate::ResolveRequest::new(
+            .authorize(super::ResourceAccess::Request(super::ResolveRequest::new(
                 resource_href,
                 effective_base.as_deref(),
                 purpose,
             )))?;
-        let resolved = match self.resolver.resolve(crate::ResolveRequest::new(
+        let resolved = match self.resolver.resolve(super::ResolveRequest::new(
             resource_href,
             effective_base.as_deref(),
             purpose,
@@ -490,8 +544,8 @@ impl<R: Resolver> Compiler<R> {
                 return Err(error);
             }
         };
-        self.resolver.authorize(crate::ResourceAccess::Retained {
-            request: crate::ResolveRequest::new(resource_href, effective_base.as_deref(), purpose),
+        self.resolver.authorize(super::ResourceAccess::Retained {
+            request: super::ResolveRequest::new(resource_href, effective_base.as_deref(), purpose),
             identity: &resolved.identity,
         })?;
         let (resource, document_id, new_identity) =
@@ -653,6 +707,7 @@ impl<R: Resolver> Compiler<R> {
             base_uri,
             state.current_stylesheet_document(),
             state.workspace(),
+            self.prefix_lists,
         )?;
         let body = vec![compile_literal_element(root, context)?].into();
         state.templates.push(Template {
@@ -677,7 +732,7 @@ impl<R: Resolver> Compiler<R> {
         state: &mut CompileState,
         depth: usize,
     ) -> Result<()> {
-        if is_exslt_function_declaration(node)? {
+        if is_exslt_function_declaration(node, self.prefix_lists)? {
             validate_exslt_function_result_structure(node)?;
             let context = CompileContext::new(
                 forward,
@@ -686,6 +741,7 @@ impl<R: Resolver> Compiler<R> {
                 base_uri,
                 state.current_stylesheet_document(),
                 state.workspace(),
+                self.prefix_lists,
             )?
             .inside_function();
             let mut children = node.children().peekable();
@@ -746,7 +802,7 @@ impl<R: Resolver> Compiler<R> {
                 let explicit_priority = node
                     .attribute("priority")
                     .map(|value| {
-                        let priority = crate::xpath::xpath_number(value);
+                        let priority = super::xpath::xpath_number(value);
                         priority.is_finite().then_some(priority).ok_or_else(|| {
                             Error::Static("template priority must be a finite XPath number".into())
                         })
@@ -772,6 +828,7 @@ impl<R: Resolver> Compiler<R> {
                     base_uri,
                     state.current_stylesheet_document(),
                     state.workspace(),
+                    self.prefix_lists,
                 )?;
                 let mut children = node.children().peekable();
                 let mut params = Vec::new();
@@ -829,6 +886,7 @@ impl<R: Resolver> Compiler<R> {
                         base_uri,
                         state.current_stylesheet_document(),
                         state.workspace(),
+                        self.prefix_lists,
                     )?,
                 )?;
                 let order = state.next_order();
@@ -938,6 +996,7 @@ impl<R: Resolver> Compiler<R> {
                     base_uri,
                     state.current_stylesheet_document(),
                     state.workspace(),
+                    self.prefix_lists,
                 )?;
                 let attribute_set = AttributeSet::parse(node, context, precedence, order)?;
                 state.attribute_sets.push(attribute_set)
@@ -1020,6 +1079,7 @@ pub struct Stylesheet {
     pub(crate) functions: Arc<[ExsltFunction]>,
     pub(crate) function_names: Arc<HashSet<ExpandedName>>,
     pub(crate) resource_identities: Arc<[ResourceIdentity]>,
+    pub(crate) retained_bytes: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1043,6 +1103,11 @@ impl Stylesheet {
     #[must_use]
     pub fn resource_identities(&self) -> &[ResourceIdentity] {
         &self.resource_identities
+    }
+    /// Bytes this compiled stylesheet retains, as its compilation charged them.
+    #[must_use]
+    pub const fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 }
 
@@ -1429,7 +1494,7 @@ fn visit_referenced_variables<'a>(
         };
         let mut byte_end = byte_start;
         while let Some(&(offset, character)) = characters.peek() {
-            if !crate::lexical::is_ncname_char(character) && character != ':' {
+            if !super::lexical::is_ncname_char(character) && character != ':' {
                 break;
             }
             byte_end = offset + character.len_utf8();
@@ -1653,7 +1718,7 @@ fn validate_xpath_prefixes(
 pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
     // XPath 1.0 §3.7 defines whitespace as only XML S characters:
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
-    if !source.chars().any(crate::lexical::is_xml_whitespace) && !source.contains('*') {
+    if !source.chars().any(super::lexical::is_xml_whitespace) && !source.contains('*') {
         return Cow::Borrowed(source);
     }
     let mut length = 0usize;
@@ -2124,6 +2189,7 @@ struct CompileState {
     stylesheet_bytes: usize,
     owned_bytes: usize,
     xpath_owned_bytes: Cell<usize>,
+    parse_work: ParseWork,
     precedence: usize,
     order: usize,
 }
@@ -2162,6 +2228,7 @@ impl CompileState {
             stylesheet_bytes,
             owned_bytes: 0,
             xpath_owned_bytes: Cell::new(0),
+            parse_work: ParseWork::new(budget.parse_work_bytes),
             precedence: 0,
             order: 0,
         }
@@ -2496,6 +2563,8 @@ impl CompileState {
             functions: self.functions.into(),
             function_names: Arc::new(function_names),
             resource_identities: self.resources.into(),
+            // Both count live compiled storage admitted against one workspace.
+            retained_bytes: self.owned_bytes + self.xpath_owned_bytes.get(),
         })
     }
 }
@@ -2671,9 +2740,9 @@ fn estimate_compiled_owned_bytes_for_nodes<'nodes, 'input: 'nodes>(
         // Compilation retains both a normalized semantic node and, conservatively, one IR
         // instruction for each frontend node. Child IDs, attributes, and namespaces live in
         // separately allocated containers and therefore need explicit structural accounting.
-        let structural_bytes = std::mem::size_of::<crate::Node>()
+        let structural_bytes = std::mem::size_of::<super::Node>()
             .saturating_add(std::mem::size_of::<Instruction>())
-            .saturating_add(std::mem::size_of::<crate::NodeId>());
+            .saturating_add(std::mem::size_of::<super::NodeId>());
         let node_bytes = if node.is_element() {
             let tag = node.tag_name();
             let name_bytes = tag
@@ -2681,13 +2750,13 @@ fn estimate_compiled_owned_bytes_for_nodes<'nodes, 'input: 'nodes>(
                 .map_or(0, str::len)
                 .saturating_add(tag.name().len());
             let attribute_bytes = node.attributes().fold(0usize, |sum, attribute| {
-                sum.saturating_add(std::mem::size_of::<crate::Attribute>())
+                sum.saturating_add(std::mem::size_of::<super::Attribute>())
                     .saturating_add(attribute.namespace().map_or(0, str::len))
                     .saturating_add(attribute.name().len())
                     .saturating_add(attribute.value().len())
             });
             let namespace_bytes = node.namespaces().fold(0usize, |sum, namespace| {
-                sum.saturating_add(std::mem::size_of::<crate::Namespace>())
+                sum.saturating_add(std::mem::size_of::<super::Namespace>())
                     .saturating_add(namespace.name().map_or(0, str::len))
                     .saturating_add(namespace.uri().len())
             });
@@ -2738,11 +2807,17 @@ fn with_frontend_document<T>(
 ) -> Result<T> {
     let lexical_reserved = parser_workspace_bytes(xml);
     state.charge_owned(lexical_reserved)?;
+    let limit = state.remaining_owned_bytes();
     let prepared = match prepare_xml_frontend_bounded(
         xml,
-        state.remaining_owned_bytes(),
+        limit,
         state.budget.recursion_depth,
-    ) {
+        &mut state.parse_work,
+    )
+    .and_then(|prepared| {
+        state.parse_work.charge(prepared.len())?;
+        Ok(prepared)
+    }) {
         Ok(prepared) => prepared,
         Err(error) => {
             state.release_owned(lexical_reserved);
@@ -3024,6 +3099,7 @@ struct CompileContext<'a> {
     namespace_snapshot: NamespaceSnapshot,
     base_uri_snapshot: BaseUriSnapshot,
     local_bindings: Rc<RefCell<LocalBindingIndex<'a>>>,
+    prefix_lists: UnboundPrefixLists,
 }
 
 type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
@@ -3176,9 +3252,11 @@ impl<'a> CompileContext<'a> {
         static_base_uri: Option<&str>,
         stylesheet_document: StylesheetDocumentId,
         workspace: CompileWorkspace<'a>,
+        prefix_lists: UnboundPrefixLists,
     ) -> Result<Self> {
         ensure(BudgetKind::RecursionDepth, max_depth, depth)?;
         Ok(Self {
+            prefix_lists,
             forward,
             depth,
             max_depth,
@@ -3347,7 +3425,12 @@ fn parse_semantic_document_metered(
     state.charge_owned(projected_bytes)?;
     let parser_workspace = parser_workspace_bytes(xml);
     state.charge_owned(parser_workspace)?;
-    let document = Document::parse(xml, base_uri);
+    let document = Document::parse_iterative_bounded(
+        xml,
+        base_uri,
+        ParseBudget::UNBOUNDED,
+        &mut state.parse_work,
+    );
     state.release_owned(parser_workspace);
     document
 }
@@ -3449,7 +3532,7 @@ fn stylesheet_module_root<'nodes, 'input>(
     Ok(selected)
 }
 
-fn semantic_element_ordinal(document: &Document, owner: crate::NodeId) -> Result<usize> {
+fn semantic_element_ordinal(document: &Document, owner: super::NodeId) -> Result<usize> {
     document
         .nodes()
         .filter(|(_, node)| matches!(node.kind, NodeKind::Element { .. }))
@@ -3474,7 +3557,7 @@ fn stylesheet_version_is_forward_compatible(version: &str) -> Result<bool> {
 fn parse_stylesheet_version(version: &str) -> Result<f64> {
     // XSLT 1.0 sections 2.2 and 2.3 define version as XPath's Number production;
     // host float syntax is wider: https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
-    crate::xpath::parse_xpath_number_token(version)
+    super::xpath::parse_xpath_number_token(version)
         .filter(|value| value.is_finite())
         .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))
 }
@@ -3491,7 +3574,7 @@ fn effective_base_uri(
     ancestors.reverse();
     for ancestor in ancestors {
         if let Some(reference) = ancestor.attribute((XML_NS, "base")) {
-            base = Some(crate::resolver::resolve_uri_reference(
+            base = Some(super::resolver::resolve_uri_reference(
                 base.as_deref(),
                 reference,
             )?);
@@ -3571,7 +3654,7 @@ fn compile_instruction(
         });
     }
     if node.tag_name().namespace() != Some(XSLT_NS) {
-        if is_extension_element(node)? {
+        if is_extension_element(node, context.prefix_lists)? {
             let locator = match (node.tag_name().namespace(), node.tag_name().name()) {
                 (Some(XT_NS), "document") => Some("href"),
                 (Some(SAXON_NS), "output") | (Some(XALAN_REDIRECT_NS), "write") => Some("file"),
@@ -4083,7 +4166,10 @@ fn validate_exslt_function_result_structure(function: roxmltree::Node<'_, '_>) -
     Ok(())
 }
 
-fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
+fn is_extension_element(
+    node: roxmltree::Node<'_, '_>,
+    prefix_lists: UnboundPrefixLists,
+) -> Result<bool> {
     let Some(namespace) = node.tag_name().namespace() else {
         return Ok(false);
     };
@@ -4103,6 +4189,7 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
             ancestor,
             "extension-element-prefixes",
             forward_compatible_at(ancestor)?,
+            prefix_lists,
             |resolved| extension |= resolved == namespace,
         )?;
         if extension {
@@ -4112,8 +4199,12 @@ fn is_extension_element(node: roxmltree::Node<'_, '_>) -> Result<bool> {
     Ok(false)
 }
 
-fn is_exslt_function_declaration(node: roxmltree::Node<'_, '_>) -> Result<bool> {
-    Ok(node.has_tag_name((EXSLT_FUNCTIONS_NS, "function")) && is_extension_element(node)?)
+fn is_exslt_function_declaration(
+    node: roxmltree::Node<'_, '_>,
+    prefix_lists: UnboundPrefixLists,
+) -> Result<bool> {
+    Ok(node.has_tag_name((EXSLT_FUNCTIONS_NS, "function"))
+        && is_extension_element(node, prefix_lists)?)
 }
 
 fn forward_compatible_at(node: roxmltree::Node<'_, '_>) -> Result<bool> {
@@ -4155,7 +4246,7 @@ fn compile_literal_element(
             })
         })
         .collect::<Result<_>>()?;
-    let excluded = excluded_result_namespaces(node)?;
+    let excluded = excluded_result_namespaces(node, context.prefix_lists)?;
     let mut used_prefixes = HashSet::new();
     if node.tag_name().namespace().is_some() {
         used_prefixes.insert(prefix.as_deref());
@@ -4226,7 +4317,10 @@ fn validate_literal_result_attributes(
     Ok(())
 }
 
-fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<String>> {
+fn excluded_result_namespaces(
+    node: roxmltree::Node<'_, '_>,
+    prefix_lists: UnboundPrefixLists,
+) -> Result<HashSet<String>> {
     let mut excluded = HashSet::new();
     if node.ancestors().any(|ancestor| {
         ancestor.has_tag_name((XSLT_NS, "variable")) || ancestor.has_tag_name((XSLT_NS, "param"))
@@ -4235,7 +4329,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
             || ancestor.has_tag_name((XSLT_NS, "transform"))
     }) {
         for function in stylesheet.children() {
-            if !is_exslt_function_declaration(function)? {
+            if !is_exslt_function_declaration(function, prefix_lists)? {
                 continue;
             }
             if let Some((prefix, _)) = function
@@ -4257,7 +4351,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
         if let Some(local) = local_forward_compatible(ancestor)? {
             forward_compatible = local;
         }
-        if is_exslt_function_declaration(ancestor)?
+        if is_exslt_function_declaration(ancestor, prefix_lists)?
             && let Some((prefix, _)) = ancestor
                 .attribute("name")
                 .and_then(|name| name.split_once(':'))
@@ -4273,6 +4367,7 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
                 ancestor,
                 attribute,
                 forward_compatible,
+                prefix_lists,
                 |namespace| {
                     excluded.insert(namespace.to_owned());
                 },
@@ -4285,9 +4380,16 @@ fn excluded_result_namespaces(node: roxmltree::Node<'_, '_>) -> Result<HashSet<S
 fn validate_namespace_prefix_attributes(
     node: roxmltree::Node<'_, '_>,
     forward_compatible: bool,
+    prefix_lists: UnboundPrefixLists,
 ) -> Result<()> {
     for attribute in ["exclude-result-prefixes", "extension-element-prefixes"] {
-        visit_namespace_prefix_attribute(node, attribute, forward_compatible, |_| {})?;
+        visit_namespace_prefix_attribute(
+            node,
+            attribute,
+            forward_compatible,
+            prefix_lists,
+            |_| {},
+        )?;
     }
     Ok(())
 }
@@ -4296,6 +4398,7 @@ fn visit_namespace_prefix_attribute(
     node: roxmltree::Node<'_, '_>,
     attribute: &str,
     forward_compatible: bool,
+    prefix_lists: UnboundPrefixLists,
     mut visit: impl FnMut(&str),
 ) -> Result<()> {
     let value = if node.tag_name().namespace() == Some(XSLT_NS) {
@@ -4325,7 +4428,9 @@ fn visit_namespace_prefix_attribute(
                 )));
             }
             let prefix = (token != "#default").then_some(token);
-            if node.lookup_namespace_uri(prefix).is_none() {
+            if node.lookup_namespace_uri(prefix).is_none()
+                && prefix_lists == UnboundPrefixLists::Reject
+            {
                 return Err(Error::Static(format!(
                     "{attribute} prefix {token} is not bound"
                 )));
@@ -4344,10 +4449,10 @@ fn visit_namespace_prefix_attribute(
     }
     for token in value.split_ascii_whitespace() {
         let prefix = (token != "#default").then_some(token);
-        let namespace = node
-            .lookup_namespace_uri(prefix)
-            .expect("namespace prefix list was validated before visitation");
-        visit(namespace);
+        // Validation admitted an unbound prefix only when it is to be ignored.
+        if let Some(namespace) = node.lookup_namespace_uri(prefix) {
+            visit(namespace);
+        }
     }
     Ok(())
 }
@@ -4798,7 +4903,7 @@ fn validate_key_dependency_expression(
             "xsl:key {attribute} must not contain a variable reference"
         )));
     }
-    if crate::expression::has_unprefixed_function_call(source, "key") {
+    if super::expression::has_unprefixed_function_call(source, "key") {
         return Err(workspace.static_error(format_args!("xsl:key {attribute} must not call key()")));
     }
     Ok(())
@@ -5010,1149 +5115,5 @@ fn optional_yes_no(value: &str, forward_compatible: bool) -> Result<Option<bool>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn principal_base_uri_copy_is_charged_by_retained_capacity() {
-        let budget = CompileBudget::new(4096, 0, 32, 4096);
-        let mut state = CompileState::new(budget, 0);
-        let uri = "memory:principal/".repeat(32);
-
-        let retained = clone_compile_string(Some(&uri), &mut state)
-            .expect("principal URI fits the compiler budget")
-            .expect("principal URI is retained");
-
-        assert_eq!(retained, uri);
-        assert_eq!(state.owned_bytes, retained.capacity());
-    }
-
-    #[test]
-    fn active_module_stack_is_bounded_before_growth() {
-        let slot_bytes = std::mem::size_of::<ActiveResource>();
-        let budget = CompileBudget::new(4096, 0, 32, slot_bytes * 4 - 1);
-        let compiler = Compiler::new(Arc::new(crate::NoResolver), budget);
-        let mut state = CompileState::new(budget, 0);
-        let entered = Cell::new(false);
-
-        let error = compiler
-            .enter_module(
-                StylesheetDocumentId(1),
-                "memory:module.xsl",
-                None,
-                &mut state,
-                |_| {
-                    entered.set(true);
-                    Ok(())
-                },
-            )
-            .expect_err("active module storage must cross the compile-owned budget first");
-
-        assert!(!entered.get());
-        assert!(matches!(
-            error,
-            Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                actual,
-                ..
-            } if actual == slot_bytes * 4
-        ));
-    }
-
-    #[test]
-    fn xpath_diagnostics_reserve_the_exact_formatted_length() {
-        // Prefix diagnostics preserve their text when it fits and fail before formatting otherwise.
-        let source = "missing:item";
-        let expected = "XPath expression `missing:item` uses unbound namespace prefix `missing`";
-        let retained = std::cell::Cell::new(0);
-        for limit in [expected.len() - 1, expected.len()] {
-            let workspace = CompileWorkspace {
-                limit,
-                occupied: 0,
-                retained: &retained,
-            };
-            let error = validate_xpath_prefixes(source, &[], workspace)
-                .expect_err("unbound prefix produces a static or budget error");
-            if limit == expected.len() {
-                assert!(matches!(error, Error::Static(message) if message == expected));
-            } else {
-                assert!(matches!(error, Error::Budget { actual, .. } if actual == expected.len()));
-            }
-        }
-    }
-
-    #[test]
-    fn xpath_parser_diagnostic_accounts_for_owned_token_and_escaping() {
-        // Debug escaping expands a token. Measure the rendered diagnostic, not source length,
-        // and keep the unexpected token's string charged until formatting finishes.
-        let source = "f(1 'a\nb')";
-        let error = sxd_xpath_no_unsafe::Factory::new()
-            .build(source)
-            .expect_err("missing argument separator leaves an unexpected literal token");
-        assert_eq!(error.owned_bytes(), 3);
-        let message = format!("invalid XPath expression `{source}`: {error}");
-        let required = message.len() + error.owned_bytes();
-        let retained = Cell::new(0);
-        let workspace = CompileWorkspace {
-            limit: required - 1,
-            occupied: 0,
-            retained: &retained,
-        };
-        assert!(
-            matches!(workspace.parser_error(error.clone(), source, false),
-            Error::Budget { actual, .. } if actual == required)
-        );
-        let workspace = CompileWorkspace {
-            limit: required,
-            ..workspace
-        };
-        assert!(matches!(workspace.parser_error(error, source, false),
-            Error::Static(actual) if actual == message));
-    }
-
-    #[test]
-    fn xpath_namespace_copies_and_reference_conversion_are_charged() {
-        // Each pattern owns a namespace copy. References duplicate namespace strings, but dedup
-        // frees duplicates before the Vec-to-Arc overlap and retained charge are calculated.
-        let document = roxmltree::Document::parse(r#"<root xmlns:p="urn:namespace"/>"#)
-            .expect("namespace accounting fixture parses");
-        let node = document.root_element();
-        let retained = Cell::new(0);
-        let workspace = CompileWorkspace {
-            limit: 16_384,
-            occupied: 0,
-            retained: &retained,
-        };
-        let namespaces = namespaces(node);
-        let copy_bytes = namespaces.capacity() * std::mem::size_of::<(String, String)>()
-            + namespaces
-                .iter()
-                .map(|(prefix, uri)| prefix.capacity() + uri.capacity())
-                .sum::<usize>();
-        assert_eq!(
-            namespace_copy_bytes(node, false, workspace)
-                .expect("namespace copy size fits the workspace"),
-            copy_bytes
-        );
-        let first =
-            Pattern::new("p:a", node, workspace).expect("first pattern and namespace copy fit");
-        let second = Pattern::new("p:b", node, workspace)
-            .expect("second pattern and namespace copy fit alongside the first");
-        assert_eq!(
-            retained.get(),
-            2 * copy_bytes + first.source.capacity() + second.source.capacity()
-        );
-
-        let names = [("p".to_owned(), "urn:namespace".to_owned())];
-        let unit = std::mem::size_of::<ExpandedName>();
-        let payload = "urn:namespace".len() + 1;
-        let arc = 2 * unit + 2 * std::mem::size_of::<usize>();
-        let peak = (3 * unit + 3 * payload).max(3 * unit + 2 * payload + arc);
-        for limit in [peak - 1, peak] {
-            let retained = Cell::new(0);
-            let workspace = CompileWorkspace {
-                limit,
-                occupied: 0,
-                retained: &retained,
-            };
-            let result = referenced_variables_bounded("$p:a + $p:a + $p:b", &names, workspace);
-            if limit == peak {
-                assert_eq!(
-                    result.expect("exact reference-conversion peak fits").len(),
-                    2
-                );
-                assert_eq!(retained.get(), arc + 2 * payload);
-            } else {
-                assert!(matches!(result, Err(Error::Budget { actual, .. }) if actual == peak));
-            }
-        }
-    }
-
-    #[test]
-    fn included_literal_reuses_future_source_storage_during_validation() {
-        // Import discovery and compilation share one decode. The validation literal and retained
-        // expression source are not live together and must not require a seventh payload copy.
-        let payload = "x".repeat(64 * 1024);
-        let module = format!(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:variable name="payload" select="'{payload}'"/></xsl:stylesheet>"#
-        );
-        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xsl"/></xsl:stylesheet>"#;
-        Compiler::new(
-            Arc::new(RepeatedIncludeResolver {
-                module: module.into_bytes(),
-                encoding: None,
-            }),
-            CompileBudget::new(1 << 20, 8, 256, 450 * 1024),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect("one decoded source and nonoverlapping XPath storage fit");
-    }
-
-    #[test]
-    fn xpath_source_credit_is_limited_to_its_borrowed_attribute_slice() {
-        // Equal text is not proof of precharged storage. Generated defaults and independent
-        // strings cannot borrow another attribute's reservation, even if their values match.
-        let document = roxmltree::Document::parse(r#"<root select="'payload'"/>"#)
-            .expect("source-credit fixture parses");
-        let node = document.root_element();
-        let source = node
-            .attribute("select")
-            .expect("fixture has a select attribute");
-        let retained = Cell::new(0);
-        let workspace = CompileWorkspace {
-            limit: 4096,
-            occupied: source.len(),
-            retained: &retained,
-        };
-        assert_eq!(workspace.pending_source(source, node).occupied, 0);
-        assert_eq!(workspace.pending_source(&source[1..8], node).occupied, 2);
-        let independent = source.to_owned();
-        assert_eq!(
-            workspace.pending_source(&independent, node).occupied,
-            source.len()
-        );
-        assert_eq!(
-            workspace.pending_source("node()", node).occupied,
-            source.len()
-        );
-    }
-
-    #[test]
-    fn xpath_prefix_scan_preserves_unicode_axes_and_literals() {
-        // Byte offsets must remain UTF-8 boundaries; axes and quoted colons are not prefixes.
-        let retained = Cell::new(0);
-        let workspace = CompileWorkspace {
-            limit: 4096,
-            occupied: 0,
-            retained: &retained,
-        };
-        let namespaces = vec![("\u{3c0}".into(), "urn:test".into())];
-        for source in [
-            "child::\u{3c0}:item/@xml:lang",
-            "\u{3c0}:*",
-            "concat('missing:name', \"other:*\")",
-        ] {
-            validate_xpath_prefixes(source, &namespaces, workspace)
-                .expect("bound prefixes are accepted");
-        }
-        let source = "child::\u{3bb}:item";
-        assert!(matches!(
-            validate_xpath_prefixes(source, &namespaces, workspace),
-            Err(Error::Static(message)) if message == format!(
-                "XPath expression `{source}` uses unbound namespace prefix `\u{3bb}`"
-            )
-        ));
-    }
-
-    #[test]
-    fn xpath_normalization_preserves_tokens_and_bounds_capacity() {
-        // Preserve literals and non-XML whitespace while adapting axes, calls and wildcards.
-        for (source, expected) in [
-            ("child \t:: \n\u{3c0}:item", "child::\u{3c0}:item"),
-            ("count \r( * )", "count( child::* )"),
-            ("f(*, *, ' * :: ( ')", "f(child::*, child::*, ' * :: ( ')"),
-            ("2 * 3", "2 * 3"),
-            ("f\u{a0}(*)", "f\u{a0}(child::*)"),
-        ] {
-            let normalized = normalize_xpath_for_sxd(source);
-            assert_eq!(normalized.as_ref(), expected);
-            if let Cow::Owned(output) = normalized {
-                assert_eq!(output.capacity(), expected.len());
-            }
-        }
-        for source in ["\u{3c0}:item", "' * :: ( '", "2 * 3"] {
-            assert!(matches!(normalize_xpath_for_sxd(source), Cow::Borrowed(_)));
-        }
-    }
-
-    #[test]
-    fn large_literal_attributes_do_not_reserve_xpath_grammar_workspace() {
-        // Neither a literal AVT nor one quoted XPath literal represents a million AST nodes.
-        let payload = "x".repeat(1 << 20);
-        for value in [payload.clone(), format!("{{'{payload}'}}")] {
-            let xml = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out value="{value}"/></xsl:template></xsl:stylesheet>"#
-            );
-            Compiler::new(
-                Arc::new(crate::NoResolver),
-                CompileBudget::new(2 << 20, 0, 32, 32 << 20),
-            )
-            .compile(&xml, None)
-            .expect("literal storage fits without fictitious grammar work");
-        }
-    }
-
-    #[test]
-    fn small_compile_budgets_preserve_static_error_contracts() {
-        // This previously failed at the speculative module reservation before syntax checking.
-        let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:apply-templates>invalid</xsl:apply-templates></xsl:template></xsl:stylesheet>"#;
-        assert!(
-            matches!(Compiler::new(Arc::new(crate::NoResolver), CompileBudget::new(4096, 0, 32, 16_384)).compile(xml, None), Err(Error::Static(message)) if message == "xsl:apply-templates accepts only xsl:sort and xsl:with-param")
-        );
-    }
-
-    #[test]
-    fn xpath_compile_workspace_precedes_validation_and_is_released() {
-        // Actual token/AST allocations, not a module estimate, must cross the allocation gate.
-        let retained = Cell::new(0);
-        let workspace = CompileWorkspace {
-            limit: 128,
-            occupied: 128,
-            retained: &retained,
-        };
-        assert!(matches!(
-            workspace.parse_xpath("'payload'", "'payload'", false),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: 128,
-                actual: 135
-            })
-        ));
-        let workspace = CompileWorkspace {
-            limit: 4096,
-            occupied: 128,
-            retained: &retained,
-        };
-        for _ in 0..100 {
-            workspace
-                .parse_xpath("'payload'", "'payload'", false)
-                .expect("dropped AST releases its allowance");
-            assert!(matches!(
-                workspace.parse_xpath("1 +", "1 +", false),
-                Err(Error::Static(_))
-            ));
-        }
-        assert_eq!(workspace.occupied, 128);
-    }
-
-    #[test]
-    fn xpath_compile_workspace_covers_patterns_keys_and_avts() {
-        // Direct Pattern/Expression constructors and context-based AVTs must share the gate.
-        for body in [
-            r#"<xsl:template match="child :: item[count( * )]"/>"#,
-            r#"<xsl:key name="k" match="item" use="count( * )"/>"#,
-            r#"<xsl:template match="/"><out value="{count( * )}"/></xsl:template>"#,
-            r#"<xsl:template match="/"><xsl:number count="child :: item"/></xsl:template>"#,
-        ] {
-            let xml = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{body}</xsl:stylesheet>"#
-            );
-            let document = roxmltree::Document::parse(&xml).expect("XML parses");
-            let required =
-                parser_workspace_bytes(&xml) + estimate_compiled_owned_bytes(&document, None);
-            assert!(matches!(
-                Compiler::new(
-                    Arc::new(crate::NoResolver),
-                    CompileBudget::new(xml.len(), 0, 32, required),
-                ).compile(&xml, None),
-                Err(Error::Budget { kind: BudgetKind::OwnedBytes, actual, .. })
-                    if actual > required
-            ));
-            Compiler::new(
-                Arc::new(crate::NoResolver),
-                CompileBudget::new(xml.len(), 0, 32, 4 << 20),
-            )
-            .compile(&xml, None)
-            .expect("the same source compiles with sufficient workspace");
-        }
-    }
-
-    struct RepeatedIncludeResolver {
-        module: Vec<u8>,
-        encoding: Option<String>,
-    }
-
-    struct FragmentModuleResolver {
-        module: Vec<u8>,
-    }
-
-    impl Resolver for RepeatedIncludeResolver {
-        fn authorize(&self, _: crate::ResourceAccess<'_>) -> Result<()> {
-            // This fixture has a permanent grant for its immutable in-memory module.
-            Ok(())
-        }
-        fn resolve(&self, request: crate::ResolveRequest<'_>) -> Result<ResolvedResource> {
-            let crate::ResolveRequest { uri, purpose, .. } = request;
-            assert_eq!(uri, "module.xsl");
-            assert_eq!(purpose, ResolvePurpose::Include);
-            Ok(ResolvedResource {
-                canonical_uri: "memory:module.xsl".into(),
-                identity: ResourceIdentity("repeated-module".into()),
-                bytes: self.module.clone(),
-                media_type: Some("application/xslt+xml".into()),
-                encoding: self.encoding.clone(),
-            })
-        }
-    }
-
-    impl Resolver for FragmentModuleResolver {
-        fn authorize(&self, _: crate::ResourceAccess<'_>) -> Result<()> {
-            // Fragment variants share the same permanently authorized fixture bytes.
-            Ok(())
-        }
-        fn resolve(&self, request: crate::ResolveRequest<'_>) -> Result<ResolvedResource> {
-            assert_eq!(request.uri, "module.xml");
-            assert!(matches!(
-                request.purpose,
-                ResolvePurpose::Include | ResolvePurpose::Import
-            ));
-            Ok(ResolvedResource {
-                canonical_uri: "memory:module.xml".into(),
-                identity: ResourceIdentity("fragment-module".into()),
-                bytes: self.module.clone(),
-                media_type: Some("application/xml".into()),
-                encoding: Some("UTF-8".into()),
-            })
-        }
-    }
-
-    fn embedded_stylesheet_module(ids: (&str, &str)) -> Vec<u8> {
-        format!(
-            r#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="{}" version="1.0"><xsl:template name="ignored"/></xsl:stylesheet><xsl:stylesheet id="{}" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></bundle>"#,
-            ids.0, ids.1
-        )
-        .into_bytes()
-    }
-
-    #[test]
-    fn many_distinct_local_bindings_compile_with_one_scope_index() {
-        // A wide lexical scope must use the incremental binding index rather than rescanning all
-        // preceding siblings for every declaration.
-        let mut body = String::new();
-        for index in 0..2_048 {
-            use std::fmt::Write as _;
-            write!(body, r#"<xsl:variable name="v{index}" select="{index}"/>"#)
-                .expect("writing to a String succeeds");
-        }
-        let stylesheet = format!(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/">{body}</xsl:template></xsl:stylesheet>"#
-        );
-
-        Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(8 << 20, 4, 32, 16 << 20),
-        )
-        .compile(&stylesheet, None)
-        .expect("distinct bindings compile without repeated sibling scans");
-    }
-
-    #[test]
-    fn local_binding_index_reserves_and_releases_compile_workspace() {
-        // The temporary scope index is attacker-controlled compiler state and must remain charged
-        // for exactly the lifetime of the shared index.
-        let retained = Cell::new(0usize);
-        let workspace = CompileWorkspace {
-            limit: usize::MAX,
-            occupied: 0,
-            retained: &retained,
-        };
-        let document = roxmltree::Document::parse(
-            r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><xsl:template match="/"><xsl:variable name="value"/></xsl:template></xsl:stylesheet>"#,
-        )
-        .expect("stylesheet parses");
-        let variable = document
-            .descendants()
-            .find(|node| node.has_tag_name((XSLT_NS, "variable")))
-            .expect("variable exists");
-        let context = CompileContext::new(
-            false,
-            1,
-            16,
-            None,
-            StylesheetDocumentId::PRINCIPAL,
-            workspace,
-        )
-        .expect("compile context is valid");
-
-        context
-            .register_local_binding(variable, &ExpandedName::new(None::<String>, "value"))
-            .expect("binding index fits the workspace");
-        assert!(retained.get() > 0, "the live index must reserve workspace");
-        drop(context);
-        assert_eq!(retained.get(), 0, "dropping the index releases workspace");
-
-        let constrained_retained = Cell::new(0usize);
-        let constrained = CompileWorkspace {
-            limit: 0,
-            occupied: 0,
-            retained: &constrained_retained,
-        };
-        let context = CompileContext::new(
-            false,
-            1,
-            16,
-            None,
-            StylesheetDocumentId::PRINCIPAL,
-            constrained,
-        )
-        .expect("empty compile context fits");
-        assert!(matches!(
-            context.register_local_binding(variable, &ExpandedName::new(None::<String>, "value")),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-        assert_eq!(constrained_retained.get(), 0);
-    }
-
-    #[test]
-    fn include_and_import_select_the_referenced_embedded_stylesheet() {
-        // XSLT 1.0 sections 2.6 and 2.7 make the fragment identify an embedded stylesheet;
-        // fetching the containing XML resource must not compile its document element instead.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
-        for instruction in ["include", "import"] {
-            let principal = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#target"/></xsl:stylesheet>"#
-            );
-            let stylesheet = Compiler::new(
-                Arc::new(FragmentModuleResolver {
-                    module: embedded_stylesheet_module(("other", "target")),
-                }),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(&principal, Some("memory:main.xsl"))
-            .expect("fragment-targeted module compiles");
-
-            assert!(
-                stylesheet
-                    .named_template_index
-                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
-            );
-            assert!(
-                !stylesheet
-                    .named_template_index
-                    .contains_key(&ExpandedName::new(None::<String>, "ignored"))
-            );
-        }
-    }
-
-    #[test]
-    fn fragment_only_include_and_import_use_the_current_document() {
-        // XSLT 1.0 sections 2.6 and 2.7 allow a fragment to select an embedded stylesheet
-        // in the current resource without another resolver request.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
-        for instruction in ["include", "import"] {
-            let principal = format!(
-                r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext"><xsl:{instruction} href="#target"/><ext:modules><xsl:stylesheet id="target" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></ext:modules></xsl:stylesheet>"##
-            );
-            let stylesheet = Compiler::new(
-                Arc::new(crate::NoResolver),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(&principal, Some("memory:main.xsl"))
-            .expect("fragment-only module compiles without a resolver");
-            assert!(
-                stylesheet
-                    .named_template_index
-                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
-            );
-        }
-    }
-
-    #[test]
-    fn fragment_only_reference_inside_external_module_uses_its_document() {
-        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#a"/></xsl:stylesheet>"#;
-        let module = br##"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="a" version="1.0"><xsl:include href="#b"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></bundle>"##;
-        let stylesheet = Compiler::new(
-            Arc::new(FragmentModuleResolver {
-                module: module.to_vec(),
-            }),
-            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect("fragment-only reference stays within the external module document");
-        assert!(
-            stylesheet
-                .named_template_index
-                .contains_key(&ExpandedName::new(None::<String>, "selected"))
-        );
-    }
-
-    #[test]
-    fn fragment_only_module_uses_declared_id_in_principal_document() {
-        // XML 1.0 section 3.3.1 gives the declared attribute ID semantics; the
-        // frontend's attribute-name fallback must not be the only lookup path.
-        let principal = r##"<!DOCTYPE xsl:stylesheet [
-            <!ATTLIST xsl:stylesheet ext:module-key ID #IMPLIED>
-        ]>
-        <xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext">
-          <xsl:include href="#target"/>
-          <ext:modules><xsl:stylesheet ext:module-key="target" version="1.0">
-            <xsl:template name="selected"/>
-          </xsl:stylesheet></ext:modules>
-        </xsl:stylesheet>"##;
-        let stylesheet = Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect("DTD-declared ID selects a local embedded module");
-        assert!(
-            stylesheet
-                .named_template_index
-                .contains_key(&ExpandedName::new(None::<String>, "selected"))
-        );
-    }
-
-    #[test]
-    fn fragment_only_modules_obey_cycle_and_import_limits() {
-        let principal = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext"><xsl:include href="#a"/><ext:modules><xsl:stylesheet id="a" version="1.0"><xsl:include href="#b"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:include href="#a"/></xsl:stylesheet></ext:modules></xsl:stylesheet>"##;
-        let error = Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(1 << 20, 8, 16, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect_err("local fragment cycle is rejected");
-        assert!(error.to_string().contains("cycle"), "{error}");
-
-        let error = Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(1 << 20, 1, 8, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect_err("local fragment expansion obeys the module limit");
-        assert!(
-            matches!(
-                error,
-                Error::Budget {
-                    kind: BudgetKind::ImportedModules,
-                    ..
-                }
-            ),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn fragment_only_include_counts_once_across_compilation_phases() {
-        let principal = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext"><xsl:include href="#a"/><ext:modules><xsl:stylesheet id="a" version="1.0"><xsl:template name="selected"/></xsl:stylesheet></ext:modules></xsl:stylesheet>"##;
-        Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(1 << 20, 1, 8, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect("one local include counts as one module across both phases");
-    }
-
-    #[test]
-    fn embedded_modules_charge_only_additional_ir_copies() {
-        // The source-document estimate already covers each embedded node once. A second
-        // include retains another IR copy and must consume additional owned-byte budget.
-        let templates = (0..32)
-            .map(|index| format!(r#"<xsl:template match="item[{index}]"><out/></xsl:template>"#))
-            .collect::<String>();
-        let local = |includes: &str| {
-            format!(
-                r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext">{includes}<ext:modules><xsl:stylesheet id="target" version="1.0">{templates}</xsl:stylesheet></ext:modules></xsl:stylesheet>"##
-            )
-        };
-        let one = local(r##"<xsl:include href="#target"/>"##);
-        let two = local(r##"<xsl:include href="#target"/><xsl:include href="#target"/>"##);
-        let baseline = local("");
-        let min_baseline = minimum_owned_compile_budget(|limit| {
-            Compiler::new(
-                Arc::new(crate::NoResolver),
-                CompileBudget::new(1 << 20, 4, 16, limit),
-            )
-            .compile(&baseline, Some("memory:main.xsl"))
-        });
-        let min_local = minimum_owned_compile_budget(|limit| {
-            Compiler::new(
-                Arc::new(crate::NoResolver),
-                CompileBudget::new(1 << 20, 4, 16, limit),
-            )
-            .compile(&one, Some("memory:main.xsl"))
-        });
-        let min_repeated = minimum_owned_compile_budget(|limit| {
-            Compiler::new(
-                Arc::new(crate::NoResolver),
-                CompileBudget::new(1 << 20, 4, 16, limit),
-            )
-            .compile(&two, Some("memory:main.xsl"))
-        });
-        let source = roxmltree::Document::parse(&one).expect("test stylesheet parses");
-        let embedded = source
-            .descendants()
-            .find(|node| node.attribute("id") == Some("target"))
-            .expect("embedded module exists");
-        let additional_ir = estimate_compiled_owned_bytes_for_nodes(
-            embedded.descendants(),
-            Some("memory:main.xsl"),
-        );
-        assert!(
-            min_local - min_baseline < additional_ir / 2,
-            "embedded include needs {min_local} owned bytes, unreferenced source needs {min_baseline}, IR estimate {additional_ir}"
-        );
-        assert!(
-            min_repeated >= min_local + additional_ir / 2,
-            "repeated include needs {min_repeated} owned bytes, first needs {min_local}, extra IR estimate {additional_ir}"
-        );
-    }
-
-    fn minimum_owned_compile_budget(mut compile: impl FnMut(usize) -> Result<Stylesheet>) -> usize {
-        let mut failing = 0;
-        let mut passing = 1 << 20;
-        compile(passing).expect("stylesheet compiles with ample owned-byte budget");
-        while failing + 1 < passing {
-            let limit = failing + (passing - failing) / 2;
-            match compile(limit) {
-                Ok(_) => passing = limit,
-                Err(Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    ..
-                }) => failing = limit,
-                Err(error) => panic!("unexpected compilation error at budget {limit}: {error}"),
-            }
-        }
-        passing
-    }
-
-    #[test]
-    fn embedded_stylesheet_cycles_are_keyed_by_selected_fragment() {
-        // XSLT 1.0 section 2.7 permits multiple embedded stylesheet modules in one resource.
-        // Distinct fragments may include each other, but returning to an active fragment is a
-        // cycle. https://www.w3.org/TR/1999/REC-xslt-19991116#embedded
-        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#a"/></xsl:stylesheet>"#;
-        let acyclic = br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="a" version="1.0"><xsl:include href="module.xml#b"/><xsl:template name="a"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:template name="b"/></xsl:stylesheet></bundle>"#;
-        let stylesheet = Compiler::new(
-            Arc::new(FragmentModuleResolver {
-                module: acyclic.to_vec(),
-            }),
-            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect("distinct embedded modules in one resource are acyclic");
-        assert!(
-            stylesheet
-                .named_template_index
-                .contains_key(&ExpandedName::new(None::<String>, "b"))
-        );
-
-        let cyclic = br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="a" version="1.0"><xsl:include href="module.xml#b"/></xsl:stylesheet><xsl:stylesheet id="b" version="1.0"><xsl:include href="module.xml#a"/></xsl:stylesheet></bundle>"#;
-        let error = Compiler::new(
-            Arc::new(FragmentModuleResolver {
-                module: cyclic.to_vec(),
-            }),
-            CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-        )
-        .compile(principal, Some("memory:main.xsl"))
-        .expect_err("returning to the active embedded module is a cycle");
-        assert!(matches!(error, Error::Static(message) if message.contains("cycle")));
-    }
-
-    #[test]
-    fn include_and_import_resolve_normalized_xml_id_fragments() {
-        // xml:id 1.0 section 4 assigns ID type after ID whitespace normalization, so embedded
-        // stylesheet lookup must not depend on an unqualified compatibility `id` attribute.
-        // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
-        for instruction in ["include", "import"] {
-            let principal = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#target"/></xsl:stylesheet>"#
-            );
-            let module = br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet xml:id="  target  " version="1.0"><xsl:template name="selected"/></xsl:stylesheet></bundle>"#.to_vec();
-            let stylesheet = Compiler::new(
-                Arc::new(FragmentModuleResolver { module }),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(&principal, Some("memory:main.xsl"))
-            .expect("normalized xml:id identifies the embedded stylesheet");
-
-            assert!(
-                stylesheet
-                    .named_template_index
-                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
-            );
-        }
-    }
-
-    #[test]
-    fn include_and_import_resolve_dtd_declared_id_fragments() {
-        // XML 1.0 section 3.3.1 assigns ID semantics through the declared attribute type,
-        // independently of the attribute's lexical name. XPointer shorthand then selects the
-        // element carrying that ID. https://www.w3.org/TR/xml/#id
-        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#shorthand
-        for instruction in ["include", "import"] {
-            let principal = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#target"/></xsl:stylesheet>"#
-            );
-            let module = br#"<!DOCTYPE bundle [
-                <!ATTLIST xsl:stylesheet ext:module-key ID #IMPLIED>
-            ]>
-            <bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"
-                    xmlns:ext="urn:example:module-metadata">
-                <xsl:stylesheet ext:module-key="target" version="1.0">
-                    <xsl:template name="selected"/>
-                </xsl:stylesheet>
-            </bundle>"#
-                .to_vec();
-            let stylesheet = Compiler::new(
-                Arc::new(FragmentModuleResolver { module }),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(&principal, Some("memory:main.xsl"))
-            .expect("a DTD-declared ID identifies the embedded stylesheet");
-
-            assert!(
-                stylesheet
-                    .named_template_index
-                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
-            );
-        }
-    }
-
-    #[test]
-    fn include_and_import_decode_utf8_embedded_stylesheet_fragments() {
-        // XPointer Framework appendix B encodes non-ASCII pointer characters as UTF-8 octets;
-        // module selection must compare the decoded identifier.
-        // https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#escaping
-        for instruction in ["include", "import"] {
-            let principal = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:{instruction} href="module.xml#caf%C3%A9"/></xsl:stylesheet>"#
-            );
-            let stylesheet = Compiler::new(
-                Arc::new(FragmentModuleResolver {
-                    module: embedded_stylesheet_module(("other", "café")),
-                }),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(&principal, Some("memory:main.xsl"))
-            .expect("percent-encoded UTF-8 fragment selects the embedded stylesheet");
-
-            assert!(
-                stylesheet
-                    .named_template_index
-                    .contains_key(&ExpandedName::new(None::<String>, "selected"))
-            );
-        }
-    }
-
-    #[test]
-    fn stylesheet_module_fragments_reject_malformed_percent_encoding() {
-        for (fragment, expected) in [
-            ("truncated%", "truncated percent escape"),
-            ("incomplete%C3%", "truncated percent escape"),
-            ("invalid%GG", "invalid percent escape"),
-            ("%FF", "not valid UTF-8"),
-        ] {
-            let principal = format!(
-                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#{fragment}"/></xsl:stylesheet>"#
-            );
-            let error = Compiler::new(
-                Arc::new(FragmentModuleResolver {
-                    module: embedded_stylesheet_module(("other", "target")),
-                }),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(&principal, Some("memory:main.xsl"))
-            .expect_err("malformed fragment must be rejected");
-            assert!(
-                error.to_string().contains(expected),
-                "fragment {fragment:?} returned unexpected error: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn stylesheet_fragment_must_identify_one_unique_element() {
-        let compile = |module, fragment| {
-            Compiler::new(
-                Arc::new(FragmentModuleResolver { module }),
-                CompileBudget::new(1 << 20, 4, 16, 1 << 20),
-            )
-            .compile(
-                &format!(
-                    r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xml#{fragment}"/></xsl:stylesheet>"#
-                ),
-                Some("memory:main.xsl"),
-            )
-        };
-
-        assert!(matches!(
-            compile(embedded_stylesheet_module(("other", "target")), "missing"),
-            Err(Error::Static(message)) if message.contains("does not identify")
-        ));
-        assert!(matches!(
-            compile(embedded_stylesheet_module(("same", "same")), "same"),
-            Err(Error::Static(message)) if message.contains("not unique")
-        ));
-        assert!(matches!(
-            compile(
-                br#"<bundle xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:stylesheet id="same" version="1.0"/><xsl:stylesheet xml:id="same" version="1.0"/></bundle>"#.to_vec(),
-                "same"
-            ),
-            Err(Error::Static(message)) if message.contains("not unique")
-        ));
-        assert!(matches!(
-            compile(
-                br#"<bundle><not-a-stylesheet id="target"/></bundle>"#.to_vec(),
-                "target"
-            ),
-            Err(Error::Static(message)) if message.contains("does not identify xsl:stylesheet")
-        ));
-    }
-
-    #[test]
-    fn frontend_workspace_accounts_for_every_parser_arena() {
-        // roxmltree preallocates node and attribute vectors from lexical delimiters and retains
-        // depth/namespace workspaces while parsing. The preflight must dominate all of them.
-        let xml = r#"<root xmlns:p="urn:test" a="value"><p:child/></root>"#;
-        let node_slots = xml.bytes().filter(|byte| *byte == b'<').count();
-        let attribute_slots = xml.bytes().filter(|byte| *byte == b'=').count();
-        let lexical_only = xml.len();
-        let nodes_only = lexical_only.saturating_add(node_slots);
-        let attributes_only = nodes_only.saturating_add(attribute_slots);
-
-        assert!(parser_workspace_bytes(xml) > attributes_only);
-    }
-
-    #[test]
-    fn compiled_stylesheets_share_the_function_lookup_index() {
-        // Function declarations are immutable compiled state; executions must not rebuild or clone
-        // their lookup keys under the operation budget.
-        let stylesheet = Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
-        )
-        .compile(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><func:function name="f:value"><func:result select="'ok'"/></func:function></xsl:stylesheet>"#,
-            None,
-        )
-        .expect("function stylesheet compiles");
-        let cloned = stylesheet.clone();
-
-        assert!(
-            stylesheet
-                .function_names
-                .contains(&ExpandedName::new(Some("urn:functions"), "value"))
-        );
-        assert!(Arc::ptr_eq(
-            &stylesheet.function_names,
-            &cloned.function_names
-        ));
-    }
-
-    #[test]
-    fn compiled_stylesheets_index_unique_keys_and_named_templates() {
-        // Runtime dispatch must borrow declarations from immutable compiled state instead of
-        // rebuilding owned name collections for every key() or xsl:call-template invocation.
-        let stylesheet = Compiler::new(
-            Arc::new(crate::NoResolver),
-            CompileBudget::new(1 << 20, 0, 32, 1 << 20),
-        )
-        .compile(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:key name="a" match="a" use="."/><xsl:key name="a" match="b" use="."/><xsl:key name="b" match="b" use="."/><xsl:template name="target"/><xsl:template match="/"/></xsl:stylesheet>"#,
-            None,
-        )
-        .expect("indexed stylesheet compiles");
-        let cloned = stylesheet.clone();
-
-        assert_eq!(stylesheet.key_name_indices.as_ref(), &[0, 2]);
-        let target = ExpandedName::new(None::<String>, "target");
-        assert_eq!(
-            stylesheet.templates[*stylesheet
-                .named_template_index
-                .get(&target)
-                .expect("named template is indexed")]
-            .name
-            .as_ref(),
-            Some(&target)
-        );
-        assert!(Arc::ptr_eq(
-            &stylesheet.named_template_index,
-            &cloned.named_template_index
-        ));
-        assert!(Arc::ptr_eq(
-            &stylesheet.key_name_indices,
-            &cloned.key_name_indices
-        ));
-    }
-
-    #[test]
-    fn expressions_on_one_node_share_their_namespace_snapshot() {
-        // A literal result element can contain many AVTs. Sharing one immutable static namespace
-        // context prevents retained memory from growing as expressions times namespaces.
-        let source = r#"<root xmlns:p="urn:namespace"/>"#;
-        let document = roxmltree::Document::parse(source).expect("stylesheet fragment parses");
-        let root = document.root_element();
-        let retained = Cell::new(0);
-        let context = CompileContext::new(
-            false,
-            0,
-            8,
-            Some("memory:shared-base/"),
-            StylesheetDocumentId::PRINCIPAL,
-            CompileWorkspace {
-                limit: 16_384,
-                occupied: 0,
-                retained: &retained,
-            },
-        )
-        .expect("context is valid");
-        let first = context
-            .expression("p:first", root)
-            .expect("expression compiles");
-        let second = context
-            .expression("p:second", root)
-            .expect("expression compiles");
-
-        assert!(Arc::ptr_eq(&first.namespaces, &second.namespaces));
-        assert!(Arc::ptr_eq(
-            first
-                .static_base_uri
-                .as_ref()
-                .expect("base URI is retained"),
-            second
-                .static_base_uri
-                .as_ref()
-                .expect("base URI is retained"),
-        ));
-    }
-
-    #[test]
-    fn decoded_workspace_uses_live_string_capacity() {
-        let mut decoded = String::with_capacity(4_096);
-        decoded.push_str("<xsl:stylesheet/>");
-        let capacity = decoded.capacity();
-
-        let (decoded, workspace) = classify_decoded_workspace(Cow::Owned(decoded));
-        assert_eq!(workspace, capacity);
-        assert_eq!(decoded.as_ref(), "<xsl:stylesheet/>");
-
-        let (decoded, workspace) = classify_decoded_workspace(Cow::Borrowed("<x/>"));
-        assert_eq!(workspace, 0);
-        assert_eq!(decoded.as_ref(), "<x/>");
-    }
-
-    #[test]
-    fn repeated_includes_charge_each_retained_declaration_expansion() {
-        // XSLT 1.0 section 2.6.1 instantiates included declarations at every include point. A
-        // cached source document therefore cannot make repeated compiled IR free.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#include
-        let body = "x".repeat(32 * 1_024);
-        let module = format!(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="item"><out>{body}</out></xsl:template></xsl:stylesheet>"#
-        );
-        let includes = r#"<xsl:include href="module.xsl"/>"#.repeat(32);
-        let principal = format!(
-            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{includes}</xsl:stylesheet>"#
-        );
-        let compiler = Compiler::new(
-            Arc::new(RepeatedIncludeResolver {
-                module: module.into_bytes(),
-                encoding: Some("UTF-8".into()),
-            }),
-            CompileBudget::new(1 << 20, 64, 16, 768 * 1_024),
-        );
-
-        assert!(matches!(
-            compiler.compile(&principal, Some("memory:main.xsl")),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn imported_modules_apply_stylesheet_budget_after_decoding() {
-        // A single-byte source encoding can expand in UTF-8. The compiled stylesheet budget
-        // measures the decoded XML consumed by the parser, not only resolver wire bytes.
-        let prefix = br#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>"#;
-        let suffix = b"</out></xsl:template></xsl:stylesheet>";
-        let mut module = Vec::from(prefix.as_slice());
-        module.extend(std::iter::repeat_n(0xe9, 64));
-        module.extend_from_slice(suffix);
-        let principal = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:include href="module.xsl"/></xsl:stylesheet>"#;
-        let raw_total = principal.len() + module.len();
-        let compiler = Compiler::new(
-            Arc::new(RepeatedIncludeResolver {
-                module,
-                encoding: Some("windows-1252".into()),
-            }),
-            CompileBudget::new(raw_total, 1, 4, usize::MAX),
-        );
-
-        assert!(matches!(
-            compiler.compile(principal, Some("memory:main.xsl")),
-            Err(Error::Budget {
-                kind: BudgetKind::StylesheetBytes,
-                limit,
-                actual,
-            }) if limit == raw_total && actual > limit
-        ));
-    }
-
-    #[test]
-    fn frontend_workspace_is_rejected_before_parsing() {
-        // A malformed input must still report the exhausted allocation gate first: the frontend
-        // parser is not allowed to allocate merely to discover a later syntax error.
-        let xml = "<stylesheet>";
-        let required = parser_workspace_bytes(xml);
-        let mut state =
-            CompileState::new(CompileBudget::new(xml.len(), 0, 1, required - 1), xml.len());
-
-        assert!(matches!(
-            with_frontend_document(xml, &mut state, |_document, _state| Ok(())),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                actual,
-                ..
-            }) if actual == required
-        ));
-    }
-
-    #[test]
-    fn frontend_workspace_preflights_internal_entity_expansion() {
-        // The compiler must account for the entity-expanded source before constructing the
-        // frontend DOM; otherwise a short lexical input can allocate far beyond owned_bytes.
-        let replacement = "x".repeat(1_024);
-        let references = "&payload;".repeat(64);
-        let xml = format!(
-            r#"<!DOCTYPE xsl:stylesheet [<!ENTITY payload "{replacement}">]><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out>{references}</out></xsl:template></xsl:stylesheet>"#
-        );
-        let lexical_workspace = parser_workspace_bytes(&xml);
-        let mut state = CompileState::new(
-            CompileBudget::new(xml.len(), 0, 8, lexical_workspace + replacement.len()),
-            xml.len(),
-        );
-
-        assert!(matches!(
-            with_frontend_document(&xml, &mut state, |_document, _state| Ok(())),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn semantic_projection_reserves_the_second_parser_workspace() {
-        // The semantic parse overlaps retained compile state, so its transient arena must fit the
-        // remaining peak budget rather than relying on the earlier frontend parse reservation.
-        let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#;
-        let parsed = roxmltree::Document::parse(xml).expect("test stylesheet parses");
-        let retained = xml
-            .len()
-            .saturating_add(estimate_compiled_owned_bytes(&parsed, None));
-        let parser_workspace = parser_workspace_bytes(xml);
-        let mut state = CompileState::new(
-            CompileBudget::new(
-                xml.len(),
-                0,
-                8,
-                retained.saturating_add(parser_workspace).saturating_sub(1),
-            ),
-            xml.len(),
-        );
-
-        assert!(matches!(
-            parse_semantic_document_metered(xml, None, &mut state),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-    }
-}
+#[cfg(all(test, not(feature = "embedded")))]
+mod tests;

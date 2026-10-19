@@ -35,7 +35,7 @@ jobs:
       - name: Install native benchmark tools
         run: |
           sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev perl pkg-config valgrind jq
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config valgrind jq
       - name: Test metric interpretation
         run: node --test scripts/compare-security.test.mjs
       - name: Validate interoperability and compare identical CLI work

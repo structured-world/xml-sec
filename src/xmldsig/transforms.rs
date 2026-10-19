@@ -26,12 +26,16 @@ use std::collections::{BTreeMap, HashSet};
 mod parameters;
 mod relationship;
 mod source;
+#[cfg(feature = "xslt")]
+mod xslt;
 pub(crate) use parameters::ParseStorage;
 pub(super) use parameters::{Diagnostic, current_diagnostic};
 pub(super) use parameters::{Expression as ExpressionParameter, Filter as FilterParameter};
 use parameters::{Instruction, View as InstructionView};
 pub(crate) use relationship::validate_edition as validate_relationship_chain;
 pub use relationship::{RELATIONSHIP_TRANSFORM_URI, RelationshipSelector};
+#[cfg(feature = "xslt")]
+pub use xslt::XsltStylesheet;
 
 use crate::xml::dom::storage::names::NameStorage;
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
@@ -67,6 +71,8 @@ pub const BASE64_TRANSFORM_URI: &str = "http://www.w3.org/2000/09/xmldsig#base64
 pub const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
 /// The algorithm URI for the XPath Filter 2.0 transform.
 pub const XPATH_FILTER2_TRANSFORM_URI: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
+/// The algorithm URI for the XSLT transform, executed when the `xslt` feature is built.
+pub const XSLT_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
 /// The implicit default canonicalization URI applied when no explicit C14N
 /// transform is present in a `<Reference>`.
 pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c14n-20010315";
@@ -122,6 +128,7 @@ pub(crate) struct TransformOptions<'r> {
     xpath_here_semantics: XPathHereSemantics,
     allow_internal_dtd: bool,
     opc_relationship_edition: crate::policy::OpcRelationshipEdition,
+    xslt_stylesheet_semantics: crate::policy::XsltStylesheetSemantics,
     id_attributes: &'r [crate::xml::IdAttributeRegistration],
 }
 
@@ -136,6 +143,8 @@ pub(crate) struct TransformExecutionBudget {
     xml_parse_settings: DocumentParseSettings,
     state: TransformChainState,
     opc_workspace: relationship::WorkspaceBudget,
+    #[cfg(feature = "xslt")]
+    xslt: xslt::Allowance,
 }
 
 impl Default for TransformExecutionBudget {
@@ -339,6 +348,8 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
+            #[cfg(feature = "xslt")]
+            xslt: xslt::Allowance::default(),
         }
     }
 
@@ -359,6 +370,8 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
+            #[cfg(feature = "xslt")]
+            xslt: xslt::Allowance::default(),
         }
     }
 
@@ -376,6 +389,8 @@ impl TransformExecutionBudget {
             ),
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
+            #[cfg(feature = "xslt")]
+            xslt: xslt::Allowance::default(),
         }
     }
 
@@ -415,6 +430,8 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::for_transform_output(resources),
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::new(resources.max_opc_workspace_bytes),
+            #[cfg(feature = "xslt")]
+            xslt: xslt::Allowance::new(resources),
         }
     }
 
@@ -483,6 +500,13 @@ impl<'r> TransformOptions<'r> {
         edition: crate::policy::OpcRelationshipEdition,
     ) -> Self {
         self.opc_relationship_edition = edition;
+        self
+    }
+    pub(crate) fn xslt_stylesheet_semantics(
+        mut self,
+        semantics: crate::policy::XsltStylesheetSemantics,
+    ) -> Self {
+        self.xslt_stylesheet_semantics = semantics;
         self
     }
     /// Select the node returned by the XPath `here()` extension function.
@@ -679,6 +703,7 @@ impl XPathFilter {
 
 /// A single transform in the pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transform {
     /// Enveloped signature: removes the `<Signature>` element subtree
     /// that contains the `<Reference>` being processed.
@@ -720,6 +745,17 @@ pub enum Transform {
     /// Both editions require inclusive C14N 1.0, with or without comments.
     /// Selection semantics come from the operation's typed `TransformPolicy`.
     Relationship(Vec<RelationshipSelector>),
+
+    /// Apply an XSLT 1.0 stylesheet to the octets of its input.
+    ///
+    /// Node-set input is first converted by inclusive C14N 1.0, as for any
+    /// octet-consuming transform. The output is the serialized result tree.
+    /// The stylesheet cannot reach external resources, and every execution in
+    /// an operation shares the XSLT limits of its `ResourcePolicy`.
+    ///
+    /// Input: `NodeSet` or `Binary` → Output: `Binary`
+    #[cfg(feature = "xslt")]
+    Xslt(XsltStylesheet),
 }
 
 impl Transform {
@@ -836,6 +872,7 @@ fn apply_transform_with_context<
                 collected = bytes;
                 &collected
             };
+            check_xml_octets(bytes, budget.xml_parse_settings)?;
             xml_parse.charge_policy(bytes.len())?;
             // Part 2:2012 §9.1.4 / 2021 §6.2.5 constrains Relationships XML
             // independently of generic XML policy, including declaration labels.
@@ -882,6 +919,42 @@ fn apply_transform_with_context<
                 context.scratch,
             )
             .map(ExecutionData::Accounted)
+        }
+        #[cfg(feature = "xslt")]
+        InstructionView::Xslt(stylesheet) => {
+            let collected;
+            let bytes = if let Some(bytes) = input.binary() {
+                bytes
+            } else {
+                // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
+                // node-set input with inclusive C14N 1.0 first.
+                // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
+                let nodes = input.nodes().expect("nodes or bytes");
+                let algorithm =
+                    C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant URI");
+                let (bytes, _) = c14n::canonicalize_buffer_in(
+                    nodes.document(),
+                    nodes,
+                    (&algorithm, None),
+                    None,
+                    budget.c14n.remaining(),
+                    budget.xml_base_resolution(),
+                    context.scratch,
+                )
+                .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
+                budget.c14n.charge(bytes.len())?;
+                collected = bytes;
+                &collected
+            };
+            xslt::execute(
+                stylesheet,
+                bytes,
+                options.xslt_stylesheet_semantics,
+                options.internal_dtd_allowed(),
+                budget,
+                xml_parse,
+                context.scratch,
+            )
         }
         InstructionView::Enveloped => {
             let mut nodes = input.into_nodes()?;
@@ -1165,6 +1238,7 @@ pub fn execute_transforms_with_policy<'a>(
     let options = TransformOptions::default()
         .opc_relationship_edition(policy.transforms.opc_relationship_edition)
         .xpath_here_semantics(policy.transforms.xpath_here_semantics)
+        .xslt_stylesheet_semantics(policy.transforms.xslt_stylesheet_semantics)
         .allow_internal_dtd(policy.xml.allow_internal_dtd);
     let budget = TransformExecutionBudget::from_resources(&policy.resources);
     execute_transforms_with_options_and_budget(
@@ -1382,6 +1456,20 @@ pub(crate) trait TransformScratch: Scratch {
     fn decode_error(
         error: <Self::Decoder as crate::xml_input_shared::DecodeStorage>::Error,
     ) -> TransformError;
+    /// Holds memory admitted for one XSLT step until it is dropped.
+    #[cfg(feature = "xslt")]
+    type Reservation;
+    /// Admit up to `maximum` bytes for one XSLT step; returns the admitted size.
+    #[cfg(feature = "xslt")]
+    fn reserve_workspace(
+        &self,
+        maximum: usize,
+    ) -> Result<(Self::Reservation, usize), TransformError>;
+    /// The work [`Scratch::charge`] would admit now; the ceiling of one XSLT step.
+    #[cfg(feature = "xslt")]
+    fn work_remaining(&self) -> usize;
+    #[cfg(feature = "xslt")]
+    fn xslt_error(&self, error: &crate::xslt::Error) -> TransformError;
 }
 
 impl TransformScratch for Native {
@@ -1405,6 +1493,21 @@ impl TransformScratch for Native {
     }
     fn node_keys(&self) -> NativeKeys {
         NativeKeys
+    }
+    #[cfg(feature = "xslt")]
+    type Reservation = ();
+    #[cfg(feature = "xslt")]
+    fn reserve_workspace(&self, maximum: usize) -> Result<((), usize), TransformError> {
+        Ok(((), maximum))
+    }
+    #[cfg(feature = "xslt")]
+    fn work_remaining(&self) -> usize {
+        // Native execution charges no query account; the policy allowance bounds it.
+        usize::MAX
+    }
+    #[cfg(feature = "xslt")]
+    fn xslt_error(&self, error: &crate::xslt::Error) -> TransformError {
+        TransformError::Xslt(error.to_string())
     }
 }
 
@@ -1442,6 +1545,28 @@ impl<'w, W: structured_asn1::memory::Work> TransformScratch
     }
     fn node_keys(&self) -> Self::NodeKeys {
         PaidKeys::new(self.0)
+    }
+    #[cfg(feature = "xslt")]
+    type Reservation = structured_asn1::memory::MemoryReservation;
+    #[cfg(feature = "xslt")]
+    fn reserve_workspace(
+        &self,
+        maximum: usize,
+    ) -> Result<(Self::Reservation, usize), TransformError> {
+        let memory = self.0.memory();
+        // An account never admits beyond its limit; clamping to zero grants nothing
+        // if that invariant were ever violated.
+        let available = memory.limit().saturating_sub(memory.used());
+        let granted = maximum.min(available);
+        Ok((memory.reserve(granted)?, granted))
+    }
+    #[cfg(feature = "xslt")]
+    fn work_remaining(&self) -> usize {
+        structured_asn1::memory::Work::work_remaining(self.0)
+    }
+    #[cfg(feature = "xslt")]
+    fn xslt_error(&self, error: &crate::xslt::Error) -> TransformError {
+        current_diagnostic(Diagnostic::Xslt, format_args!("{error}"), self.0)
     }
 }
 
@@ -1936,6 +2061,7 @@ where
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
+        check_xml_octets(bytes, context.budget.xml_parse_settings)?;
         // Decoding is a separate input pass, including malformed-input failures. Reserve it
         // before any transcoding; the subsequent parser charges its own decoded-byte passes.
         context
@@ -2225,6 +2351,16 @@ where
         );
     }
 
+    if !transform_requires_node_set(transform)
+        && let (Some(nodes), Some(tracking)) = (data.nodes(), &mut dependency_tracking)
+    {
+        // An octet-consuming transform reads the implicit C14N of the visible nodes
+        // (XMLDSig 1.1 section 4.4.3.2), so excluded fields cannot reach its output,
+        // exactly as for an explicit C14N step.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-ReferenceProcessingModel
+        retain_visible_dependencies(nodes, tracking)?;
+        tracking.dormant_indexes.clear();
+    }
     let data = apply_transform_with_context(source_signature, transform, data, context)?;
     if let Some(tracking) = &mut dependency_tracking {
         match &data {
@@ -2300,6 +2436,22 @@ fn map_transform_xml_parse_error(
     }
 }
 
+/// Refuse transform octets longer than the XML document limit before decoding,
+/// which would otherwise measure only the decoded text: UTF-16 and UTF-32
+/// input decodes to fewer bytes than it occupies.
+fn check_xml_octets(bytes: &[u8], settings: DocumentParseSettings) -> Result<(), TransformError> {
+    if bytes.len() > settings.max_bytes {
+        return Err(map_transform_xml_parse_error(
+            XmlDocumentError::DocumentTooLarge {
+                maximum: settings.max_bytes,
+                actual: bytes.len(),
+            },
+            settings,
+        ));
+    }
+    Ok(())
+}
+
 fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> TransformError {
     match error {
         crate::encoding::XmlEncodingError::DecodedLimit { maximum, actual } => {
@@ -2326,10 +2478,12 @@ fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
 }
 
 fn transform_requires_node_set(transform: &impl Instruction) -> bool {
-    !matches!(
-        transform.view(),
-        InstructionView::Base64 | InstructionView::Relationship(_)
-    )
+    match transform.view() {
+        InstructionView::Base64 | InstructionView::Relationship(_) => false,
+        #[cfg(feature = "xslt")]
+        InstructionView::Xslt(_) => false,
+        _ => true,
+    }
 }
 
 fn map_c14n_limit_error(error: c14n::C14nError, budget: &C14nOutputBudget) -> TransformError {
@@ -2353,12 +2507,16 @@ pub(crate) fn transform_chain_produces_binary<I: Instruction>(
     initial_binary: bool,
     transforms: &[I],
 ) -> bool {
-    transforms.last().map_or(initial_binary, |transform| {
-        matches!(
-            transform.view(),
-            InstructionView::C14n(..) | InstructionView::Base64 | InstructionView::Relationship(_)
-        )
-    })
+    transforms
+        .last()
+        .map_or(initial_binary, |transform| match transform.view() {
+            InstructionView::C14n(..)
+            | InstructionView::Base64
+            | InstructionView::Relationship(_) => true,
+            #[cfg(feature = "xslt")]
+            InstructionView::Xslt(_) => true,
+            _ => false,
+        })
 }
 
 /// Map every C14N resource failure governed by the operation policy.
@@ -2555,6 +2713,8 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
                 None
             };
             scratch.canonicalization(algo, prefixes)
+        } else if let Some(transform) = parse_xslt_transform(uri, child, scratch)? {
+            transform
         } else {
             return Err(scratch.unsupported(format_args!("{uri}")));
         };
@@ -2564,6 +2724,58 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
     scratch.charge(chain.len())?;
     relationship::validate_chain(&chain)?;
     Ok(chain)
+}
+
+#[cfg(feature = "xslt")]
+fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
+    uri: &str,
+    transform_node: Node<'a, 'a>,
+    scratch: &S,
+) -> Result<Option<S::Instruction>, TransformError> {
+    if uri != XSLT_TRANSFORM_URI {
+        return Ok(None);
+    }
+    // XMLDSig 1.1 section 6.6.5: the XSLT namespace-qualified stylesheet element "MUST be
+    // the sole child of the Transform element"; comments, processing instructions and
+    // whitespace around it are not content.
+    // <https://www.w3.org/TR/xmldsig-core1/#sec-XSLT>
+    scratch.charge(transform_node.children().len())?;
+    let mut elements = 0usize;
+    for child in transform_node.children() {
+        if child.is_element() {
+            elements += if xslt::is_stylesheet_element(child) {
+                1
+            } else {
+                2
+            };
+        } else if child.is_text()
+            && let Some(text) = child.text()
+        {
+            scratch.charge(text.len())?;
+            if !is_xml_whitespace_only(text) {
+                elements = usize::MAX;
+                break;
+            }
+        }
+    }
+    if elements != 1 {
+        return Err(scratch.unsupported(format_args!(
+            "XSLT transform requires one stylesheet element as its sole content"
+        )));
+    }
+    let source = xslt::stylesheet_source(transform_node)
+        .ok_or_else(|| scratch.unsupported(format_args!("XSLT transform requires a stylesheet")))?;
+    scratch.charge(source.len())?;
+    Ok(Some(scratch.xslt(transform_node, source)))
+}
+
+#[cfg(not(feature = "xslt"))]
+fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
+    _: &str,
+    _: Node<'a, 'a>,
+    _: &S,
+) -> Result<Option<S::Instruction>, TransformError> {
+    Ok(None)
 }
 
 /// Validate transforms whose XML syntax does not define parameter content.

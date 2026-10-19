@@ -171,6 +171,8 @@ const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
 const XMLSEC_COMPATIBILITY_HERE_SEMANTICS: XPathHereSemantics = XPathHereSemantics::XmlSecLegacy;
+const XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS: xml_sec::policy::XsltStylesheetSemantics =
+    xml_sec::policy::XsltStylesheetSemantics::Libxmlsec1;
 const PRIMARY_COMMANDS: &[Command] = &[
     Command::Sign,
     Command::Verify,
@@ -1018,6 +1020,7 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
             opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
             same_document_id_semantics: same_document_id_semantics(invocation),
+            xslt_stylesheet_semantics: XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS,
             ..TransformPolicy::default()
         },
         hmac: HmacPolicy {
@@ -1516,6 +1519,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
             xpath_here_semantics: XMLSEC_COMPATIBILITY_HERE_SEMANTICS,
             opc_relationship_edition: xml_sec::policy::OpcRelationshipEdition::Ecma2012,
             same_document_id_semantics: same_document_id_semantics(invocation),
+            xslt_stylesheet_semantics: XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS,
             ..TransformPolicy::default()
         },
         ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
@@ -7362,12 +7366,21 @@ mod tests {
         );
         assert!(matches!(
             execute(
-                invocation(&["xmlsec1", "check-transforms", "xslt"]),
+                invocation(&["xmlsec1", "check-transforms", "unknown-transform"]),
                 &mut output,
                 &mut Vec::new()
             ),
             Err(CommandError::CapabilityUnavailable)
         ));
+        assert_eq!(
+            execute(
+                invocation(&["xmlsec1", "check-transforms", "xslt"]),
+                &mut output,
+                &mut Vec::new()
+            )
+            .is_ok(),
+            cfg!(feature = "xslt")
+        );
     }
 
     #[test]

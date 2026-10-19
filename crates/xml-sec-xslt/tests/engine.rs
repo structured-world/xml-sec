@@ -6,9 +6,9 @@ use pretty_assertions::assert_eq;
 use xml_sec_xslt::{
     AccessDenialReason, Attribute, BudgetKind, Clock, CompileBudget, Compiler, Document, Error,
     ErrorKind, ExecutionBudget, ExecutionEnvironment, ExecutionOptions, ExpandedName, FixedClock,
-    NoResolver, NodeKind, NodeReference, Parameters, ResolvePurpose, ResolveRequest,
+    NoResolver, NodeKind, NodeReference, Parameters, ParseBudget, ResolvePurpose, ResolveRequest,
     ResolvedResource, Resolver, ResourceAccess, ResourceIdentity, SystemClock, TransformResult,
-    Value,
+    UnboundPrefixLists, Value,
 };
 
 #[derive(Clone, Copy)]
@@ -76,6 +76,340 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
         serialized_bytes: 1 << 20,
         messages: 100,
         owned_bytes: 8 << 20,
+    }
+}
+
+#[test]
+fn bounded_parsing_charges_each_pass_and_the_retained_tree() {
+    // A caller sharing one parser-work and memory allowance needs every pass charged
+    // before it scans, the tree's size refused before it is allocated, and the work of a
+    // refused parse reported as well.
+    let xml = format!("<root>{}</root>", "<n/>".repeat(20_000));
+    let unbounded = ParseBudget::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    );
+    let parsed = Document::parse_with_budget_reported(&xml, None, unbounded);
+    let document = parsed.outcome.expect("unbounded parse succeeds");
+    // Without an internal subset, one scanner pass reads the text once.
+    assert_eq!(parsed.usage.parse_work_bytes, xml.len());
+    let retained = document.retained_bytes();
+    assert!(
+        retained > 20_000 * std::mem::size_of::<usize>(),
+        "{retained}"
+    );
+
+    let short = Document::parse_with_budget_reported(
+        &xml,
+        None,
+        unbounded.with_parse_work_bytes(xml.len() - 1),
+    );
+    assert!(matches!(
+        short.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::ParseWorkBytes,
+            ..
+        })
+    ));
+    assert_eq!(short.usage.parse_work_bytes, 0);
+
+    let exact =
+        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(retained));
+    assert_eq!(
+        exact
+            .outcome
+            .expect("the retained size fits its own limit")
+            .retained_bytes(),
+        retained
+    );
+    let workspace =
+        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(256 * 1024));
+    assert!(matches!(
+        workspace.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+    assert_eq!(workspace.usage.parse_work_bytes, xml.len());
+}
+
+#[test]
+fn compilation_reports_parser_work_whether_or_not_it_succeeds() {
+    // Every parser pass over the stylesheet text is charged, and a refused compilation
+    // still reports the passes it made.
+    let xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#;
+    let budget = CompileBudget::new(1 << 20, 0, 64, 8 << 20);
+    let compiled = Compiler::new(Arc::new(NoResolver), budget).compile_reported(xml, None);
+    assert!(compiled.outcome.is_ok());
+    let work = compiled.usage.parse_work_bytes;
+    assert!(work >= 2 * xml.len(), "{work}");
+    assert_eq!(work % xml.len(), 0, "every pass reads the whole text");
+    let stylesheet = compiled.outcome.expect("stylesheet compiles");
+    assert!(stylesheet.retained_bytes() > 0);
+
+    let refused = Compiler::new(Arc::new(NoResolver), budget.with_parse_work_bytes(work - 1))
+        .compile_reported(xml, None);
+    assert!(matches!(
+        refused.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::ParseWorkBytes,
+            ..
+        })
+    ));
+    assert_eq!(refused.usage.parse_work_bytes, work - xml.len());
+    assert_eq!(
+        Compiler::new(Arc::new(NoResolver), budget.with_parse_work_bytes(work))
+            .compile_reported(xml, None)
+            .usage
+            .parse_work_bytes,
+        work
+    );
+}
+
+#[test]
+fn the_work_ceiling_bounds_every_kind_together() {
+    // A caller whose own account admits less than the per-kind limits grants passes the
+    // remainder as a ceiling over all work kinds together; the execution is refused when
+    // their sum would cross it, and reports no more than it admitted.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+             <xsl:template match="/"><out><xsl:apply-templates select="//item"/></out></xsl:template>
+             <xsl:template match="item"><x><xsl:value-of select="."/></x></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+    let xml = "<root><item>a</item><item>b</item></root>";
+    let source = Document::parse(xml, None).expect("source parses");
+    let run = |ceiling: usize| {
+        stylesheet.execute_reported(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver)).with_work_ceiling(ceiling),
+            ExecutionOptions {
+                budget: execution_budget(xml.len()),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+    };
+    let unbounded = run(usize::MAX);
+    assert!(unbounded.outcome.is_ok());
+    let usage = unbounded.usage;
+    let total = usage.xpath_evaluations
+        + usage.xpath_operations
+        + usage.extension_operations
+        + usage.pattern_evaluations
+        + usage.template_applications
+        + usage.sort_comparisons
+        + usage.key_entries
+        + usage.result_nodes
+        + usage.messages;
+    assert!(run(total).outcome.is_ok(), "the exact total fits");
+    let refused = run(total - 1);
+    assert!(matches!(
+        refused.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            ..
+        })
+    ));
+    let admitted = refused.usage;
+    assert!(
+        admitted.xpath_evaluations
+            + admitted.xpath_operations
+            + admitted.pattern_evaluations
+            + admitted.template_applications
+            + admitted.result_nodes
+            < total
+    );
+}
+
+#[test]
+fn reported_usage_is_the_work_the_budget_enforces() {
+    // Callers that share one allowance across executions pass the remainder of the previous
+    // report as the next budget. That is sound only if each reported counter is exactly the
+    // amount the meter admitted: the reported value must fit and one unit less must not.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+             <xsl:template match="/"><out><xsl:apply-templates select="//item"/></out></xsl:template>
+             <xsl:template match="item"><x><xsl:value-of select="."/></x></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+    let xml = "<root><item>a</item><item>b</item></root>";
+    let source = Document::parse(xml, None).expect("source parses");
+    let run = |budget: ExecutionBudget| {
+        stylesheet.execute_reported(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver)),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+    };
+    let reported = run(execution_budget(xml.len()));
+    let usage = reported.usage;
+    let result = reported.outcome.expect("transform succeeds");
+    assert_eq!(usage.serialized_bytes, result.serialized.bytes.len());
+    assert_eq!(usage.external_documents, 0);
+    assert_eq!(usage.messages, 0);
+
+    type SetLimit = fn(&mut ExecutionBudget, usize);
+    let cases: [(BudgetKind, usize, SetLimit); 6] = [
+        (
+            BudgetKind::XPathEvaluations,
+            usage.xpath_evaluations,
+            |b, v| {
+                b.xpath_evaluations = v;
+            },
+        ),
+        (
+            BudgetKind::XPathOperations,
+            usage.xpath_operations,
+            |b, v| {
+                b.xpath_operations = v;
+            },
+        ),
+        (
+            BudgetKind::PatternEvaluations,
+            usage.pattern_evaluations,
+            |b, v| {
+                b.pattern_evaluations = v;
+            },
+        ),
+        (
+            BudgetKind::TemplateApplications,
+            usage.template_applications,
+            |b, v| {
+                b.template_applications = v;
+            },
+        ),
+        (BudgetKind::ResultNodes, usage.result_nodes, |b, v| {
+            b.result_nodes = v
+        }),
+        (
+            BudgetKind::SerializedBytes,
+            usage.serialized_bytes,
+            |b, v| {
+                b.serialized_bytes = v;
+            },
+        ),
+    ];
+    for (kind, used, set) in cases {
+        assert!(used > 0, "{kind:?} must be exercised by this transform");
+        let mut exact = execution_budget(xml.len());
+        set(&mut exact, used);
+        let replay = run(exact)
+            .outcome
+            .expect("the reported amount fits its own limit");
+        assert_eq!(replay.serialized.bytes, result.serialized.bytes);
+        let mut short = execution_budget(xml.len());
+        set(&mut short, used - 1);
+        let refused = run(short);
+        assert!(
+            matches!(refused.outcome, Err(Error::Budget { kind: refused, .. }) if refused == kind),
+            "{kind:?} must refuse one unit below the reported usage"
+        );
+        // A failed execution still reports the work it did, never beyond its limits.
+        let mut admitted = execution_budget(xml.len());
+        set(&mut admitted, used - 1);
+        let failed = refused.usage;
+        assert!(failed.xpath_evaluations + failed.template_applications > 0);
+        for (counter, limit) in [
+            (failed.xpath_evaluations, admitted.xpath_evaluations),
+            (failed.xpath_operations, admitted.xpath_operations),
+            (failed.pattern_evaluations, admitted.pattern_evaluations),
+            (failed.template_applications, admitted.template_applications),
+            (failed.result_nodes, admitted.result_nodes),
+            (failed.serialized_bytes, admitted.serialized_bytes),
+        ] {
+            assert!(counter <= limit, "{kind:?}: {counter} exceeds {limit}");
+        }
+    }
+}
+
+#[test]
+fn unbound_prefix_lists_follow_the_selected_handling() {
+    // XSLT 1.0 section 7.1.1 makes an unbound prefix in these lists an error, which stays the
+    // default. libxslt reports it as a warning and skips only that prefix; the expected bytes
+    // are xsltproc 1.1 output for the same stylesheets.
+    let source = Document::parse(
+        r#"<Notaries xmlns:foo="http://example.org/foo"><Notary name="Great, A. T."/></Notaries>"#,
+        None,
+    )
+    .expect("source parses");
+    let cases = [
+        (
+            concat!(
+                r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" "#,
+                r#"xmlns="http://www.w3.org/TR/xhtml1/strict" exclude-result-prefixes="foo" "#,
+                r#"version="1.0"><xsl:output encoding="UTF-8" indent="no" method="xml"/>"#,
+                r#"<xsl:template match="/"><html><xsl:for-each select="Notaries/Notary">"#,
+                r#"<th><xsl:value-of select="@name"/></th></xsl:for-each></html>"#,
+                r#"</xsl:template></xsl:stylesheet>"#
+            ),
+            concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<html xmlns=\"http://www.w3.org/TR/xhtml1/strict\"><th>Great, A. T.</th></html>"
+            ),
+        ),
+        (
+            concat!(
+                r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" "#,
+                r#"extension-element-prefixes="bar" version="1.0">"#,
+                r#"<xsl:template match="/"><out/></xsl:template></xsl:stylesheet>"#
+            ),
+            "<?xml version=\"1.0\"?>\n<out/>\n",
+        ),
+        (
+            // The bound prefix in the same list is still excluded.
+            concat!(
+                r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" "#,
+                r#"xmlns:p="urn:p" exclude-result-prefixes="foo p">"#,
+                r#"<xsl:template match="/"><r/></xsl:template></xsl:stylesheet>"#
+            ),
+            "<?xml version=\"1.0\"?>\n<r/>\n",
+        ),
+    ];
+    for (stylesheet, expected) in cases {
+        let compiler = |handling| {
+            Compiler::new(
+                Arc::new(NoResolver),
+                CompileBudget::new(1 << 20, 16, 256, 4 << 20),
+            )
+            .unbound_prefix_lists(handling)
+            .compile(stylesheet, None)
+        };
+        assert!(
+            matches!(
+                compiler(UnboundPrefixLists::Reject),
+                Err(Error::Static(message)) if message.contains("is not bound")
+            ),
+            "{stylesheet}"
+        );
+        let result = compiler(UnboundPrefixLists::Ignore)
+            .expect("libxslt handling compiles")
+            .execute(
+                &source,
+                &Parameters::new(),
+                Arc::new(NoResolver),
+                ExecutionOptions {
+                    budget: execution_budget(1 << 20),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+            .expect("transform succeeds");
+        assert_eq!(
+            String::from_utf8(result.serialized.bytes).expect("UTF-8 output"),
+            expected
+        );
     }
 }
 

@@ -8,8 +8,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use structured_asn1::digest::Resolution;
 use structured_asn1::memory::{Memory, MemoryAccount};
-use structured_cms::provider::Resolution;
 use structured_xades::binding::BindingError;
 use structured_xades::certificate::{Agreement, CheckError, DigestProvider};
 use structured_xades::hashes::HashClass;

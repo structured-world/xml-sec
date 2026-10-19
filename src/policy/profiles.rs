@@ -238,7 +238,12 @@ fn profile_policies(
         .filter(|a| compatibility || (a.signing_allowed() && a.output_len() >= 32))
         .collect();
     let transforms = if compatibility {
-        TransformPolicy::default()
+        // Signers and verifiers in this profile must agree with libxmlsec1 on the
+        // digested output of XSLT transforms.
+        TransformPolicy {
+            xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
+            ..TransformPolicy::default()
+        }
     } else {
         TransformPolicy {
             allowed_algorithms: Some(

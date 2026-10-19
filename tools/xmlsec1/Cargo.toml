@@ -51,8 +51,8 @@ dsa = { version = "0.7", features = ["hazmat"] }
 md-5 = { version = "0.11", features = ["oid", "zeroize"] }
 pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
 x509-parser = "0.18"
-structured-asn1 = { version = "0.6.2", default-features = false, features = ["alloc", "std"] }
-structured-pkix = { version = "0.6.2", default-features = false, features = ["alloc", "std"] }
+structured-asn1 = { version = "0.8.1", default-features = false, features = ["alloc", "std"] }
+structured-pkix = { version = "0.8.0", default-features = false, features = ["alloc", "std"] }
 zeroize = "1"
 base64 = "0.23"
 thiserror = "2"
@@ -75,6 +75,7 @@ xml-backends-all = ["xml-sec/xml-backends-all", "xml-sec-config/xml-backends-all
 xml-backend-differential = ["xml-sec/xml-backend-differential", "xml-sec-config/xml-backend-differential"]
 legacy-algorithms = ["xml-sec/legacy-algorithms"]
 experimental-pq = ["xmldsig", "xml-sec/experimental-pq"]
+xslt = ["xmldsig", "xml-sec/xslt"]
 aws-lc-fips = ["std", "xmldsig", "xml-sec/aws-lc-fips"]
 pkcs11 = ["std", "xmlenc", "xml-sec/pkcs11"]
 benchmark-internals = ["xml-sec/benchmark-internals"]

@@ -82,6 +82,10 @@ name = "base64_transform_integration"
 required-features = ["xmldsig", "c14n"]
 
 [[test]]
+name = "xslt_transform_integration"
+required-features = ["xslt", "c14n"]
+
+[[test]]
 name = "merlin_interop"
 required-features = ["xmldsig"]
 
@@ -178,12 +182,19 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], opti
 # X.509 certificates
 x509-parser = { version = "0.18", optional = true }
 x509-cert = { version = "0.3", default-features = false, optional = true }
-structured-asn1 = { version = "0.6.3", default-features = false, features = ["alloc"], optional = true }
-structured-pkix = { version = "0.6.3", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.8.1", default-features = false, features = ["alloc"], optional = true }
+structured-pkix = { version = "0.8.0", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 der = { version = "0.8", optional = true }
 crypto-bigint = { version = "0.7", features = ["zeroize"], optional = true }
 crypto-primes = { version = "0.7.2", default-features = false, optional = true }
+
+# Dependencies of the embedded XSLT 1.0 engine (src/xslt).
+icu_collator = { version = "2.3.1", optional = true }
+icu_locale = { version = "2.3.1", optional = true }
+roxmltree = { version = "0.21", features = ["positions"], optional = true }
+time = { version = "0.3.55", features = ["local-offset"], optional = true }
+url = { version = "2", optional = true }
 
 # Base64 encoding/decoding
 base64 = "0.23"
@@ -283,6 +294,8 @@ xmlenc = [             # XML Encryption (encrypt + decrypt)
     "p521/ecdh",
 ]
 c14n = []              # XML Canonicalization (inclusive + exclusive)
+# XMLDSig XSLT transform (http://www.w3.org/TR/1999/REC-xslt-19991116).
+xslt = ["xmldsig", "dep:icu_collator", "dep:icu_locale", "dep:roxmltree", "dep:time", "dep:url"]
 # Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
 experimental-pq = ["xmldsig", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 no-unsafe = []

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{BuildHasher, Hash};
 
-use crate::{Error, Result};
+use super::{Error, Result};
 
 pub(crate) const ENTITY_EXPANSION_DEPTH_CEILING: usize = 256;
 // This is an absolute parser safety ceiling, not a deployment policy default.
@@ -43,6 +43,10 @@ pub enum BudgetKind {
     SerializedBytes,
     Messages,
     OwnedBytes,
+    /// XML text scanned by parser passes, one charge per pass over a text.
+    ParseWorkBytes,
+    /// Every kind of execution work together, against the caller's work ceiling.
+    AggregateWork,
 }
 
 /// Policy-neutral enforcement limits for parsing one caller-supplied XML document.
@@ -60,9 +64,15 @@ pub struct ParseBudget {
     pub entity_expansion_bytes: usize,
     /// Maximum peak bytes used to materialize inherited namespace scopes and their indexes.
     pub namespace_scope_bytes: usize,
+    /// Maximum bytes the parsed tree retains, its namespace scopes included.
+    pub owned_bytes: usize,
+    /// Maximum XML text scanned, one charge per parser pass.
+    pub parse_work_bytes: usize,
 }
 
 impl ParseBudget {
+    /// Limits without a tree-size or parser-work ceiling; see [`Self::with_owned_bytes`]
+    /// and [`Self::with_parse_work_bytes`].
     #[must_use]
     pub const fn new(
         source_bytes: usize,
@@ -79,7 +89,23 @@ impl ParseBudget {
             entity_references,
             entity_expansion_bytes,
             namespace_scope_bytes,
+            owned_bytes: usize::MAX,
+            parse_work_bytes: usize::MAX,
         }
+    }
+
+    /// Bound the bytes the parsed tree retains.
+    #[must_use]
+    pub const fn with_owned_bytes(mut self, owned_bytes: usize) -> Self {
+        self.owned_bytes = owned_bytes;
+        self
+    }
+
+    /// Bound the XML text scanned by every parser pass together.
+    #[must_use]
+    pub const fn with_parse_work_bytes(mut self, parse_work_bytes: usize) -> Self {
+        self.parse_work_bytes = parse_work_bytes;
+        self
     }
 
     pub(crate) const UNBOUNDED: Self = Self::new(
@@ -99,9 +125,12 @@ pub struct CompileBudget {
     pub imported_modules: usize,
     pub recursion_depth: usize,
     pub owned_bytes: usize,
+    /// Maximum stylesheet text scanned, one charge per parser pass.
+    pub parse_work_bytes: usize,
 }
 
 impl CompileBudget {
+    /// Limits without a parser-work ceiling; see [`Self::with_parse_work_bytes`].
     #[must_use]
     pub const fn new(
         stylesheet_bytes: usize,
@@ -114,6 +143,60 @@ impl CompileBudget {
             imported_modules,
             recursion_depth,
             owned_bytes,
+            parse_work_bytes: usize::MAX,
+        }
+    }
+
+    /// Bound the stylesheet text scanned by every parser pass together.
+    #[must_use]
+    pub const fn with_parse_work_bytes(mut self, parse_work_bytes: usize) -> Self {
+        self.parse_work_bytes = parse_work_bytes;
+        self
+    }
+}
+
+/// The outcome of a budgeted operation and what it consumed, reported whether
+/// it succeeded or failed, so a caller sharing one allowance across operations
+/// can debit failed work too.
+#[derive(Debug)]
+pub struct Reported<T, U> {
+    pub outcome: Result<T>,
+    pub usage: U,
+}
+
+/// Parser work one compilation or parse admitted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseUsage {
+    /// Text bytes charged, one charge per parser pass.
+    pub parse_work_bytes: usize,
+}
+
+/// A parser-work meter: each pass is charged before it scans.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ParseWork {
+    limit: usize,
+    used: usize,
+}
+
+impl ParseWork {
+    pub(crate) const fn new(limit: usize) -> Self {
+        Self { limit, used: 0 }
+    }
+
+    pub(crate) fn charge(&mut self, bytes: usize) -> Result<()> {
+        let actual = self.used.checked_add(bytes).ok_or(Error::Budget {
+            kind: BudgetKind::ParseWorkBytes,
+            limit: self.limit,
+            actual: usize::MAX,
+        })?;
+        ensure(BudgetKind::ParseWorkBytes, self.limit, actual)?;
+        self.used = actual;
+        Ok(())
+    }
+
+    pub(crate) const fn usage(&self) -> ParseUsage {
+        ParseUsage {
+            parse_work_bytes: self.used,
         }
     }
 }
@@ -139,6 +222,26 @@ pub struct ExecutionBudget {
     pub owned_bytes: usize,
 }
 
+/// Work admitted by one execution, whether it succeeded or failed.
+///
+/// Each counter is the amount the corresponding [`ExecutionBudget`] limit admitted, never more
+/// than that limit, so a caller sharing one allowance across executions can pass the remainder
+/// as the next budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionUsage {
+    pub external_documents: usize,
+    pub xpath_evaluations: usize,
+    pub xpath_operations: usize,
+    pub extension_operations: usize,
+    pub pattern_evaluations: usize,
+    pub template_applications: usize,
+    pub sort_comparisons: usize,
+    pub key_entries: usize,
+    pub result_nodes: usize,
+    pub serialized_bytes: usize,
+    pub messages: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct Meter {
     limits: ExecutionBudget,
@@ -154,6 +257,27 @@ pub(crate) struct Meter {
     messages: usize,
     owned_bytes: usize,
     external_documents: usize,
+    work: usize,
+    work_ceiling: usize,
+}
+
+impl BudgetKind {
+    /// Whether the kind counts toward an execution's aggregate work ceiling.
+    #[must_use]
+    pub const fn is_execution_work(self) -> bool {
+        matches!(
+            self,
+            Self::XPathEvaluations
+                | Self::XPathOperations
+                | Self::ExtensionOperations
+                | Self::PatternEvaluations
+                | Self::TemplateApplications
+                | Self::SortComparisons
+                | Self::KeyEntries
+                | Self::ResultNodes
+                | Self::Messages
+        )
+    }
 }
 
 impl Meter {
@@ -174,7 +298,29 @@ impl Meter {
             messages: 0,
             owned_bytes: source_bytes,
             external_documents: 0,
+            work: 0,
+            work_ceiling: usize::MAX,
         })
+    }
+
+    /// Bound the kinds of [`BudgetKind::is_execution_work`] together.
+    pub(crate) const fn with_work_ceiling(mut self, ceiling: usize) -> Self {
+        self.work_ceiling = ceiling;
+        self
+    }
+
+    /// The aggregate work total after `amount` more, if the ceiling admits it.
+    fn admit_work(&self, kind: BudgetKind, amount: usize) -> Result<usize> {
+        if !kind.is_execution_work() {
+            return Ok(self.work);
+        }
+        let actual = self.work.checked_add(amount).ok_or(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            limit: self.work_ceiling,
+            actual: usize::MAX,
+        })?;
+        ensure(BudgetKind::AggregateWork, self.work_ceiling, actual)?;
+        Ok(actual)
     }
 
     pub(crate) fn recursion(&self, depth: usize) -> Result<()> {
@@ -194,6 +340,7 @@ impl Meter {
     }
 
     pub(crate) fn charge(&mut self, kind: BudgetKind, amount: usize) -> Result<()> {
+        let work = self.admit_work(kind, amount)?;
         let (used, limit) = match kind {
             BudgetKind::ExternalDocuments => {
                 (&mut self.external_documents, self.limits.external_documents)
@@ -242,10 +389,12 @@ impl Meter {
         };
         ensure(kind, limit, actual)?;
         *used = actual;
+        self.work = work;
         Ok(())
     }
 
     pub(crate) fn check_additional(&self, kind: BudgetKind, amount: usize) -> Result<()> {
+        self.admit_work(kind, amount)?;
         let (used, limit) = self.usage(kind)?;
         ensure(kind, limit, used.saturating_add(amount))
     }
@@ -291,6 +440,31 @@ impl Meter {
             other => Err(Error::Dynamic(format!(
                 "{other:?} cannot be checked during execution"
             ))),
+        }
+    }
+
+    pub(crate) const fn admitted_work(&self) -> ExecutionUsage {
+        // A counter exceeds its limit only after an overflowing charge poisons it; that
+        // refusal admitted the whole limit and nothing beyond it.
+        const fn admitted(used: usize, limit: usize) -> usize {
+            if used > limit { limit } else { used }
+        }
+        let limits = &self.limits;
+        ExecutionUsage {
+            external_documents: admitted(self.external_documents, limits.external_documents),
+            xpath_evaluations: admitted(self.xpath_evaluations, limits.xpath_evaluations),
+            xpath_operations: admitted(self.xpath_operations, limits.xpath_operations),
+            extension_operations: admitted(self.extension_operations, limits.extension_operations),
+            pattern_evaluations: admitted(self.pattern_evaluations, limits.pattern_evaluations),
+            template_applications: admitted(
+                self.template_applications,
+                limits.template_applications,
+            ),
+            sort_comparisons: admitted(self.sort_comparisons, limits.sort_comparisons),
+            key_entries: admitted(self.key_entries, limits.key_entries),
+            result_nodes: admitted(self.result_nodes, limits.result_nodes),
+            serialized_bytes: admitted(self.serialized_bytes, limits.serialized_bytes),
+            messages: admitted(self.messages, limits.messages),
         }
     }
 
@@ -506,137 +680,5 @@ pub(crate) fn ensure(kind: BudgetKind, limit: usize, actual: usize) -> Result<()
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn execution_budget(owned_bytes: usize) -> ExecutionBudget {
-        ExecutionBudget {
-            source_bytes: 64,
-            external_documents: 0,
-            recursion_depth: 1,
-            xpath_evaluations: 0,
-            xpath_operations: 0,
-            extension_operations: 0,
-            pattern_evaluations: 0,
-            template_applications: 0,
-            sort_comparisons: 0,
-            key_entries: 0,
-            result_nodes: 0,
-            serialized_bytes: 0,
-            messages: 0,
-            owned_bytes,
-        }
-    }
-
-    #[test]
-    fn meter_rejects_initial_source_ownership_above_its_limit() {
-        assert!(Meter::new(execution_budget(8), 8).is_ok());
-        assert!(matches!(
-            Meter::new(execution_budget(7), 8),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: 7,
-                actual: 8,
-            })
-        ));
-    }
-
-    #[test]
-    fn failed_vec_replacement_shortfall_rolls_back_accounting() {
-        // An allocator may grant more capacity than Vec::try_reserve_exact requests. Rejecting
-        // that temporary replacement must restore the meter before the replacement is dropped.
-        let mut meter = Meter::new(execution_budget(10), 0).expect("meter initializes");
-        meter
-            .charge(BudgetKind::OwnedBytes, 8)
-            .expect("requested growth fits");
-        assert!(matches!(
-            reconcile_replacement_growth(&mut meter, 8, 12),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: 10,
-                actual: 12,
-            })
-        ));
-        assert_eq!(
-            meter
-                .usage(BudgetKind::OwnedBytes)
-                .expect("owned-byte usage is available"),
-            (0, 10)
-        );
-        meter
-            .charge(BudgetKind::OwnedBytes, 10)
-            .expect("failed replacement leaves the original allowance available");
-    }
-
-    #[test]
-    fn overflowing_replacement_shortfall_releases_the_provisional_charge() {
-        // check_additional saturates at usize::MAX, while charge detects the arithmetic overflow.
-        // The replacement's provisional reservation must still be released on that error path.
-        let mut meter = Meter::new(execution_budget(usize::MAX), 0).expect("meter initializes");
-        meter
-            .charge(BudgetKind::OwnedBytes, usize::MAX - 2)
-            .expect("baseline fits");
-        meter
-            .charge(BudgetKind::OwnedBytes, 1)
-            .expect("provisional replacement charge fits");
-
-        assert!(matches!(
-            reconcile_replacement_growth(&mut meter, 1, 3),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: usize::MAX,
-                actual: usize::MAX,
-            })
-        ));
-        assert_eq!(
-            meter
-                .usage(BudgetKind::OwnedBytes)
-                .expect("owned-byte usage is available"),
-            (usize::MAX - 2, usize::MAX)
-        );
-    }
-
-    #[test]
-    fn metered_string_growth_fails_before_replacing_the_live_buffer() {
-        let mut value = String::with_capacity(8);
-        value.push_str("12345678");
-        let original_capacity = value.capacity();
-        let mut meter =
-            Meter::new(execution_budget(original_capacity + 4), 0).expect("meter initializes");
-        meter
-            .charge(BudgetKind::OwnedBytes, original_capacity)
-            .expect("existing allocation is retained");
-
-        assert!(matches!(
-            append_metered_string(&mut value, "5678", &mut meter),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-        assert_eq!(value, "12345678");
-        assert_eq!(value.capacity(), original_capacity);
-    }
-
-    #[test]
-    fn overflowing_owned_charge_leaves_the_meter_fail_closed() {
-        let mut meter = Meter::new(execution_budget(usize::MAX), 1).expect("meter initializes");
-
-        assert!(matches!(
-            meter.charge(BudgetKind::OwnedBytes, usize::MAX),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: usize::MAX,
-                actual: usize::MAX,
-            })
-        ));
-        assert_eq!(
-            meter
-                .usage(BudgetKind::OwnedBytes)
-                .expect("owned-byte usage is available"),
-            (usize::MAX, usize::MAX)
-        );
-        assert!(meter.charge(BudgetKind::OwnedBytes, 1).is_err());
-    }
-}
+#[cfg(all(test, not(feature = "embedded")))]
+mod tests;

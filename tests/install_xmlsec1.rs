@@ -45,6 +45,33 @@ impl Drop for TestDirectory {
     }
 }
 
+/// The transforms the installer requires of a default (non-modern) oracle.
+const REQUIRED_TRANSFORMS: &str = r#""md5","ripemd160","rsa-md5","rsa-ripemd160","hmac-md5","hmac-ripemd160","ecdsa-ripemd160","xslt""#;
+
+/// A fake `make` whose install step writes an oracle listing `transforms`.
+fn make_tool(transforms: &str) -> String {
+    format!(
+        r#"#!/bin/sh
+for arg in "$@"; do
+  case "$arg" in DESTDIR=*) dest=${{arg#DESTDIR=}} ;; esac
+done
+if [ -n "${{dest:-}}" ]; then
+  mkdir -p "$dest$XMLSEC1_PREFIX/bin"
+  cat > "$dest$XMLSEC1_PREFIX/bin/xmlsec1" <<'ORACLE'
+#!/bin/sh
+if [ "$1" = "--list-transforms" ]; then
+  printf '%s\n' '{transforms}'
+  exit 0
+fi
+printf '%s\n' "${{XMLSEC1_SMOKE_OUTPUT-xmlsec1 1.3.13 (openssl)}}"
+exit "${{XMLSEC1_SMOKE_EXIT:-0}}"
+ORACLE
+  chmod +x "$dest$XMLSEC1_PREFIX/bin/xmlsec1"
+fi
+"#
+    )
+}
+
 struct InstallHarness {
     root: TestDirectory,
     tools: PathBuf,
@@ -78,27 +105,7 @@ impl InstallHarness {
             "#!/bin/sh\nif [ \"$1\" = \"init\" ]; then mkdir -p \"$2\"; exit 0; fi\n[ \"$1\" = \"-C\" ] || exit 2\nsource=$2\nshift 2\ncommand=$1\nshift\ncase \"$command\" in\n  remote) exit 0 ;;\n  fetch)\n    for argument in \"$@\"; do requested=$argument; done\n    printf '%s\\n' \"${GIT_REPORTED_COMMIT:-$requested}\" > \"$GIT_FETCHED_COMMIT_FILE\"\n    printf '#!/bin/sh\\nexit 0\\n' > \"$source/autogen.sh\"\n    chmod +x \"$source/autogen.sh\"\n    ;;\n  rev-parse)\n    if [ \"${1:-}\" = \"--is-inside-work-tree\" ]; then\n      [ -e \"$source/.git\" ] || exit 128\n      printf 'true\\n'\n    elif [ -n \"${XMLSEC1_SOURCE_DIR:-}\" ] && [ \"$source\" = \"$XMLSEC1_SOURCE_DIR\" ]; then\n      printf '%s\\n' \"$GIT_REPORTED_COMMIT\"\n    else\n      cat \"$GIT_FETCHED_COMMIT_FILE\"\n    fi\n    ;;\n  archive) /usr/bin/tar -C \"$source\" -cf - autogen.sh ;;\n  checkout) exit 0 ;;\n  *) exit 2 ;;\nesac\n",
         );
         root.tool("nproc", "#!/bin/sh\nprintf '1\\n'\n");
-        root.tool(
-          "make",
-          r#"#!/bin/sh
-for arg in "$@"; do
-  case "$arg" in DESTDIR=*) dest=${arg#DESTDIR=} ;; esac
-done
-if [ -n "${dest:-}" ]; then
-  mkdir -p "$dest$XMLSEC1_PREFIX/bin"
-  cat > "$dest$XMLSEC1_PREFIX/bin/xmlsec1" <<'ORACLE'
-#!/bin/sh
-if [ "$1" = "--list-transforms" ]; then
-  printf '%s\n' '"md5","ripemd160","rsa-md5","rsa-ripemd160","hmac-md5","hmac-ripemd160","ecdsa-ripemd160"'
-  exit 0
-fi
-printf '%s\n' "${XMLSEC1_SMOKE_OUTPUT-xmlsec1 1.3.13 (openssl)}"
-exit "${XMLSEC1_SMOKE_EXIT:-0}"
-ORACLE
-  chmod +x "$dest$XMLSEC1_PREFIX/bin/xmlsec1"
-fi
-"#,
-        );
+        root.tool("make", &make_tool(REQUIRED_TRANSFORMS));
         root.tool(
             "mv",
             "#!/bin/sh\ncount=0\n[ ! -f \"$MV_COUNT_FILE\" ] || count=$(cat \"$MV_COUNT_FILE\")\ncount=$((count + 1))\nprintf '%s\\n' \"$count\" > \"$MV_COUNT_FILE\"\n[ \"${MV_FAIL_ON:-0}\" -ne \"$count\" ] || exit 23\nexec /bin/mv \"$@\"\n",
@@ -316,6 +323,25 @@ fn exact_version_output_commits_the_new_installation() {
         std::fs::read_to_string(harness.prefix.join(".xmlsec-source-commit"))
             .expect("successful validation must write the source marker"),
         format!("{}\n", DONOR_COMMIT.trim())
+    );
+}
+
+#[test]
+fn oracle_without_the_xslt_transform_is_refused() {
+    // xmlsec1 builds the XSLT transform only with libxslt present; an oracle missing
+    // it must fail installation instead of failing the XSLT interoperability tests.
+    let harness = InstallHarness::new();
+    harness.root.tool(
+        "make",
+        &make_tool(r#""md5","ripemd160","rsa-md5","rsa-ripemd160","hmac-md5","hmac-ripemd160","ecdsa-ripemd160""#),
+    );
+    let status = harness.run(None, None, None, Some("xmlsec1 1.3.13 (openssl)"));
+
+    assert!(!status.success(), "an oracle without XSLT must fail closed");
+    assert_eq!(
+        std::fs::read_to_string(harness.prefix.join("sentinel"))
+            .expect("the refusal must restore the previous installation"),
+        "previous installation"
     );
 }
 

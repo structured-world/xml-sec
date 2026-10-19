@@ -50,11 +50,15 @@
     },
     "xmldsig2ed-tests": {
       "test": "capability_ledger::xmldsig_second_edition_family_is_exhaustively_classified",
-      "description": "The Second Edition suite executes every signed document and generation template through the public API across compiled XML backends, including exact XSLT failure classification."
+      "description": "The Second Edition suite executes every signed document and generation template through the public API across compiled XML backends, with exact XSLT outcomes for builds with and without the xslt feature."
     },
     "xpath-compatibility-tests": {
       "test": "capability_ledger::xpath_claims_record_libxmlsec_here_compatibility",
       "description": "XPath and XPath Filter 2.0 use standards behavior by default; integration tests exercise the explicit libxmlsec1-compatible here() binding."
+    },
+    "xslt-transform-tests": {
+      "test": "capability_ledger::xslt_transform_contract_executes",
+      "description": "With the xslt feature the public pipeline executes the XSLT transform under the operation's transform policy and XSLT resource limits; without it the URI is reported unsupported. Reciprocal xmlsec1 tests and the donor vectors exercise byte-exact libxslt output."
     }
   },
   "classifications": {
@@ -77,6 +81,11 @@
       "outcome": "compatibility-profile-only",
       "rationale": "The legacy-algorithms feature implements this mechanism through RustCrypto. Library defaults deny it; an explicit immutable algorithm allowlist is required. Other providers may report the capability unavailable without fallback.",
       "evidence": "legacy-policy-tests"
+    },
+    "feature-gated-xslt-uri": {
+      "outcome": "compatibility-profile-only",
+      "rationale": "The optional xslt feature executes XSLT 1.0 stylesheets without external resources and within the operation's XSLT resource limits. Secure profiles exclude it from their transform allowlists; the default and libxmlsec1-compatible policies permit it when built. Stylesheets are read as elements of the signed document by default, with every namespace in scope; the libxmlsec1-compatible profile and the CLI compile the Transform content alone and skip unbound prefix-list entries, as libxmlsec1 and libxslt do.",
+      "evidence": "xslt-transform-tests"
     },
     "legacy-rsa-pss-uri": {
       "outcome": "compatibility-profile-only",
@@ -130,7 +139,7 @@
     },
     "phaos-xmldsig-exhaustive": {
       "outcome": "planned",
-      "rationale": "Every signature vector is executable and classified by the native public-pipeline suite; full family parity remains planned until its explicitly reported XSLT, HMAC-MD5, and MD5-signed certificate dependencies are implemented.",
+      "rationale": "Every signature vector is executable and classified by the native public-pipeline suite; full family parity remains planned until its explicitly reported HMAC-MD5 and MD5-signed certificate dependencies are implemented. Its XSLT vectors execute when the optional xslt feature is built.",
       "evidence": "phaos-xmldsig-tests"
     },
     "planned-cli-surface": {
@@ -175,7 +184,7 @@
     },
     "xmldsig2ed-exhaustive": {
       "outcome": "planned",
-      "rationale": "Every signed vector and generation template is executable and classified by the native public-pipeline suite; full family parity remains planned until the separately tracked XSLT engine is implemented.",
+      "rationale": "Every signed vector and generation template is executable and classified by the native public-pipeline suite; its XSLT vectors execute only when the optional xslt feature is built, so family parity is not claimed for the default build.",
       "evidence": "xmldsig2ed-tests"
     }
   },
@@ -5313,7 +5322,7 @@
       "source": "src/strings.c",
       "line": 935,
       "detail": "http://www.w3.org/TR/1999/REC-xslt-19991116",
-      "classification": "remaining-uri-surface"
+      "classification": "feature-gated-xslt-uri"
     },
     {
       "kind": "algorithm-uri",

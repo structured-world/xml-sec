@@ -17,6 +17,7 @@ use xml_sec::xmldsig::{
 const PHAOS: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
 const RFC3161: &str = "tests/fixtures/xmldsig/external-data/rfc3161.txt";
 const VERIFY_2009: u64 = 1_230_804_000;
+#[cfg(not(feature = "xslt"))]
 const XSLT_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
 #[cfg(not(feature = "legacy-algorithms"))]
 const MD5_URI: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
@@ -36,11 +37,13 @@ enum Expected {
     Valid {
         manifest_references: usize,
     },
+    #[cfg(not(feature = "xslt"))]
     ValidWithManifestFailure,
     BadDigest,
     #[cfg(feature = "legacy-algorithms")]
     MissingDigestValue,
     UnsupportedSignature(&'static str),
+    #[cfg(not(feature = "xslt"))]
     UnsupportedTransform(&'static str),
     UnsupportedCertificateSignature(&'static str),
     UntrustedCertificateRoot,
@@ -57,7 +60,12 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-big.xml",
         setup: Setup::Rsa,
+        #[cfg(not(feature = "xslt"))]
         expected: Expected::UnsupportedTransform(XSLT_URI),
+        #[cfg(feature = "xslt")]
+        expected: Expected::Valid {
+            manifest_references: 2,
+        },
     },
     Case {
         name: "signature-dsa-detached.xml",
@@ -147,7 +155,12 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-detached-xslt-transform.xml",
         setup: Setup::Rsa,
+        #[cfg(not(feature = "xslt"))]
         expected: Expected::ValidWithManifestFailure,
+        #[cfg(feature = "xslt")]
+        expected: Expected::Valid {
+            manifest_references: 1,
+        },
     },
     Case {
         name: "signature-rsa-detached.xml",
@@ -280,6 +293,14 @@ fn policy(algorithm: SignatureAlgorithm, verify_x509_chains: bool) -> Verificati
     policy.key_trust.verification_time =
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2009));
     policy.uris.retrieval_methods = UriTypeSet::ALL;
+    // The corpus signer compiled each stylesheet from the `<Transform>` content
+    // alone, as libxmlsec1 does; read as an element of the signed document, its
+    // literal results would also carry the inherited `dsig` namespace.
+    #[cfg(feature = "xslt")]
+    {
+        policy.transforms.xslt_stylesheet_semantics =
+            xml_sec::policy::XsltStylesheetSemantics::Libxmlsec1;
+    }
     policy
 }
 
@@ -403,6 +424,7 @@ fn check_expected(
                     .iter()
                     .all(|reference| reference.status == DsigStatus::Valid)
         }
+        #[cfg(not(feature = "xslt"))]
         (Expected::ValidWithManifestFailure, Ok(result)) => {
             result.status == DsigStatus::Valid
                 && result.manifest_references.len() == 1
@@ -438,6 +460,7 @@ fn check_expected(
                 && SignatureAlgorithm::from_uri(uri)
                     .is_some_and(|method| method.requires_explicit_permission())
         }
+        #[cfg(not(feature = "xslt"))]
         (
             Expected::UnsupportedTransform(uri),
             Err(DsigError::ParseSignedInfo(ParseError::Transform(
@@ -495,6 +518,31 @@ fn executes_every_phaos_signature_through_the_public_pipeline() {
         .filter_map(|case| check_expected(case, execute(case)).err())
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "xslt")]
+#[test]
+fn specification_stylesheets_keep_the_inherited_namespace() {
+    // Read as an element of the signed document, the stylesheet's literal results
+    // copy the `dsig` binding of its `<Signature>` ancestor (XSLT 1.0 section 7.1.1),
+    // which the corpus signer did not include in the digested output.
+    let mut policy = policy(SignatureAlgorithm::RsaSha1, false);
+    policy.transforms.xslt_stylesheet_semantics =
+        xml_sec::policy::XsltStylesheetSemantics::Specification;
+    let key = verification_key();
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .process_manifests(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(&resources())
+        .verify(&document("signature-rsa-detached-xslt-transform.xml"))
+        .expect("verification runs");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(matches!(
+        result.manifest_references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    ));
 }
 
 #[test]

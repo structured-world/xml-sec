@@ -7,7 +7,7 @@ use std::{
 };
 
 use x509_parser::prelude::{FromDer, X509Certificate};
-use xml_sec::policy::KeyTrustPolicy;
+use xml_sec::policy::{KeyTrustPolicy, XsltStylesheetSemantics};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, FailureReason, HmacSha1VerificationKey,
     KeyResolutionError, KeyResolverConfig, ParseError, SignatureAlgorithm, UriTypeSet,
@@ -283,8 +283,22 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
     let mut complex_policy = legacy_policy(SignatureAlgorithm::DsaSha1);
     complex_policy.key_trust.verification_time =
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005));
+    // The donor compiles the #notaries stylesheet with libxslt.
+    complex_policy.transforms.xslt_stylesheet_semantics = XsltStylesheetSemantics::Libxmlsec1;
+    let verify = |policy| {
+        VerifyContext::new()
+            .policy(policy)
+            .key_resolver(&complex)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .process_manifests(true)
+            .allow_internal_dtd(true)
+            .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
+            .verify(&xml("signature"))
+            .expect("complex signature pipeline")
+    };
     let result = VerifyContext::new()
-        .policy(complex_policy)
+        .policy(complex_policy.clone())
         .key_resolver(&complex)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources)
@@ -333,9 +347,12 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         ("#reference-1", DsigStatus::Valid),
         (
             "#notaries",
-            // The donor uses an XSLT transform, which this pure-Rust profile
-            // intentionally does not execute; failure occurs before digest comparison.
-            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 2 }),
+            // Without the xslt feature this XSLT transform is unsupported.
+            if cfg!(feature = "xslt") {
+                DsigStatus::Valid
+            } else {
+                DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 2 })
+            },
         ),
     ];
     assert_eq!(result.manifest_references.len(), expected_manifest.len());
@@ -345,6 +362,23 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         assert_eq!(reference.uri, expected_uri);
         assert_eq!(reference.status, expected_status, "{expected_uri}");
     }
+
+    // Its exclude-result-prefixes names `foo`, declared only on an ancestor of the
+    // stylesheet. libxmlsec1 loses that declaration and libxslt skips the prefix; read as
+    // an element of the signed document, the stylesheet has `foo` in scope and excludes it.
+    // Both readings produce the signed output.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
+    complex_policy.transforms.xslt_stylesheet_semantics = XsltStylesheetSemantics::Specification;
+    let specification = verify(complex_policy);
+    assert_eq!(specification.status, DsigStatus::Valid);
+    assert_eq!(
+        specification.manifest_references[2].status,
+        if cfg!(feature = "xslt") {
+            DsigStatus::Valid
+        } else {
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 2 })
+        }
+    );
 }
 
 #[test]

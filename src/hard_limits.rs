@@ -155,3 +155,15 @@ pub(crate) const OPC_WORKSPACE_BYTE_CEILING: usize = 64 * 1024 * 1024;
 /// Absolute retained OPC selector allocation bound across one signature parse.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const OPC_PARAMETER_BYTE_CEILING: usize = 1024 * 1024;
+/// Absolute XSLT work of each kind across one operation.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XSLT_WORK_CEILING: usize = 16_000_000;
+/// Absolute memory owned at once by one XSLT compilation or execution.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XSLT_WORKSPACE_BYTE_CEILING: usize = 64 * 1024 * 1024;
+/// Absolute serialized XSLT output across one operation; a result may be reparsed as XML.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XSLT_OUTPUT_BYTE_CEILING: usize = XML_DOCUMENT_BYTE_CEILING;
+/// The engine keeps native frames for nested compilation and execution up to this depth.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const XSLT_RECURSION_DEPTH_CEILING: usize = 256;

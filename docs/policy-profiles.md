@@ -6,7 +6,7 @@ conformance, certificate trust deployment or every XAdES signature level.
 
 | Profile | Contract |
 | --- | --- |
-| `XmlSecCompatible` | Explicit inbound compatibility permissions; outbound signing remains modern |
+| `XmlSecCompatible` | Explicit inbound compatibility permissions and libxmlsec1 reading of XSLT stylesheets; outbound signing remains modern |
 | `Modern` | Modern signatures and digests, restricted transforms and authenticated outbound encryption |
 | `SecureSaml` | SAML signature placement, restricted references/transforms and explicit authenticated target coverage |
 | `WsSecurity` | SOAP Security-header placement and explicit authenticated target coverage |

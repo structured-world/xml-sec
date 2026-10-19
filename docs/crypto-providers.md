@@ -386,7 +386,8 @@ than being loaded as UTF-8 strings.
 The key-establishment acceptance tests in `xmlenc_encrypt_xmlsec1` require the
 independent oracle, including local runs: an unavailable oracle is a setup
 failure, not a successful skipped check. Install it with
-`bash scripts/install-xmlsec1.sh`, then set `XMLSEC1_BIN` to the reported
+`bash scripts/install-xmlsec1.sh` (it requires the libxml2 and libxslt development files, so
+the oracle includes the XSLT transform), then set `XMLSEC1_BIN` to the reported
 installation's `bin/xmlsec1`. Set `DYLD_LIBRARY_PATH` (macOS) or
 `LD_LIBRARY_PATH` (Linux) to that installation's `lib` directory when required
 by the dynamic loader. CI provisions the same oracle. Run with

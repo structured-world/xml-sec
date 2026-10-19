@@ -205,7 +205,8 @@ macro_rules! resource_fields {
         max_xpath_context_evaluations, max_xpath_evaluation_work, max_xpath_mirror_string_bytes,
         max_xpath_string_work_bytes, max_xpath_namespace_bindings, max_xpath_namespace_bytes,
         max_xpath_filters, max_node_set_filter_work, max_node_set_entries, max_node_set_owned_string_bytes,
-        max_node_set_cumulative_owned_string_bytes, max_opc_parameter_bytes, max_opc_workspace_bytes
+        max_node_set_cumulative_owned_string_bytes, max_opc_parameter_bytes, max_opc_workspace_bytes,
+        max_xslt_work, max_xslt_workspace_bytes, max_xslt_output_bytes, max_xslt_recursion_depth
     ) };
 }
 macro_rules! update_numbers {
@@ -275,6 +276,14 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     OpcRelationshipEdition::Ecma2012,
                     OpcRelationshipEdition::Ecma2021
+                )
+            }
+            "xslt_stylesheet_semantics" => {
+                p.xslt_stylesheet_semantics = choice!(
+                    value,
+                    key,
+                    XsltStylesheetSemantics::Specification,
+                    XsltStylesheetSemantics::Libxmlsec1
                 )
             }
             _ => return Err(invalid(key)),
@@ -759,6 +768,10 @@ fn transform_snapshot(p: &TransformPolicy) -> Value {
         (
             "opc_relationship_edition".into(),
             named(p.opc_relationship_edition),
+        ),
+        (
+            "xslt_stylesheet_semantics".into(),
+            named(p.xslt_stylesheet_semantics),
         ),
     ]))
 }

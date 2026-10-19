@@ -1,4 +1,7 @@
-use crate::{AccessDenialReason, BudgetKind, ResourceIdentity};
+#[cfg(feature = "embedded")]
+use crate::xml_input_shared as xml_sec_xml_input;
+
+use super::{AccessDenialReason, BudgetKind, ResourceIdentity};
 
 /// Result type returned by the XSLT engine.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -80,24 +83,5 @@ pub(crate) fn decoded_xml_error(error: xml_sec_xml_input::Error) -> Error {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decoded_size_limits_keep_the_budget_error_contract() {
-        let error = decoded_xml_error(xml_sec_xml_input::Error::DecodedLimit {
-            maximum: 8,
-            actual: 9,
-        });
-        assert_eq!(error.kind(), ErrorKind::Budget);
-        assert!(matches!(
-            error,
-            Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: 8,
-                actual: 9,
-            }
-        ));
-    }
-}
+#[cfg(all(test, not(feature = "embedded")))]
+mod tests;

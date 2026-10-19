@@ -689,7 +689,7 @@ pub fn decode_references(value: &str) -> Result<Cow<'_, str>, Error> {
 /// Decode the portion of an XML numeric character reference after `&#`.
 ///
 /// XML 1.0 section 4.1 permits exactly decimal digits or a lowercase `x` followed by
-/// hexadecimal digits: https://www.w3.org/TR/xml/#sec-references
+/// hexadecimal digits: <https://www.w3.org/TR/xml/#sec-references>
 pub fn decode_numeric_character_reference(reference: &str) -> Result<char, Error> {
     let (digits, radix) = reference
         .strip_prefix('x')

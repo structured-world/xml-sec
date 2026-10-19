@@ -450,6 +450,16 @@ pub enum TransformError {
     #[error("OPC relationship transform error: {0}")]
     Relationship(&'static str),
 
+    /// The XSLT stylesheet, its input document, or its execution failed.
+    #[cfg(feature = "xslt")]
+    #[error("XSLT transform error: {0}")]
+    Xslt(String),
+
+    /// XSLT diagnostic whose capacity remains charged to its current query.
+    #[cfg(feature = "xslt")]
+    #[error("XSLT transform error: {0}")]
+    AccountedXslt(structured_asn1::memory::OwnedText),
+
     /// XML octets could not be parsed while adapting binary transform output
     /// to the node-set required by a subsequent transform.
     #[error("XML transform input parse error: {0}")]

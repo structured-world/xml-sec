@@ -65,8 +65,8 @@ impl PqAlgorithm {
     }
 
     /// PKIX OID, with parameters absent (RFC 9881 section 2 / RFC 9909 section 3).
-    /// https://www.rfc-editor.org/rfc/rfc9881.html#section-2
-    /// https://www.rfc-editor.org/rfc/rfc9909.html#section-3
+    /// <https://www.rfc-editor.org/rfc/rfc9881.html#section-2>
+    /// <https://www.rfc-editor.org/rfc/rfc9909.html#section-3>
     pub const fn oid(self) -> &'static str {
         match self {
             Self::MlDsa44 => "2.16.840.1.101.3.4.3.17",

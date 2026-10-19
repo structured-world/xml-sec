@@ -2128,7 +2128,8 @@ impl<'a> SignContext<'a> {
             .id_attributes(self.id_attributes)
             .allow_internal_dtd(self.policy.xml.allow_internal_dtd)
             .xpath_here_semantics(self.policy.transforms.xpath_here_semantics)
-            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition);
+            .opc_relationship_edition(self.policy.transforms.opc_relationship_edition)
+            .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics);
         let external_resources = ExternalResourceContext::new(
             self.external_resources,
             self.policy.resources.max_external_resource_bytes,
@@ -3883,6 +3884,7 @@ fn generation_transform_uris<'a>(
             && algorithm != XPATH_TRANSFORM_URI
             && algorithm != XPATH_FILTER2_TRANSFORM_URI
             && algorithm != super::RELATIONSHIP_TRANSFORM_URI
+            && !(cfg!(feature = "xslt") && algorithm == super::XSLT_TRANSFORM_URI)
             && crate::c14n::C14nAlgorithm::from_uri(algorithm).is_none()
         {
             return Err(TransformError::UnsupportedTransform(algorithm.to_owned()).into());
@@ -3896,29 +3898,13 @@ fn generation_chain_produces_binary(initial_binary: bool, algorithms: &[&str]) -
     algorithms.last().map_or(initial_binary, |algorithm| {
         *algorithm == BASE64_TRANSFORM_URI
             || *algorithm == super::RELATIONSHIP_TRANSFORM_URI
+            || (cfg!(feature = "xslt") && *algorithm == super::XSLT_TRANSFORM_URI)
             || crate::c14n::C14nAlgorithm::from_uri(algorithm).is_some()
     })
 }
 
 #[cfg(test)]
-mod generation_output_tests {
-    use super::*;
-    use crate::xmldsig::transforms::transform_chain_produces_binary;
-
-    #[test]
-    fn relationship_output_classifiers_agree() {
-        // Both generation preflight and the typed executor classify the
-        // algorithm's output, independently of subsequent chain validation.
-        assert!(generation_chain_produces_binary(
-            false,
-            &[super::super::RELATIONSHIP_TRANSFORM_URI]
-        ));
-        assert!(transform_chain_produces_binary(
-            false,
-            &[Transform::Relationship(vec![])]
-        ));
-    }
-}
+mod generation_output_tests;
 
 fn xml_qualifier(prefix: &str) -> String {
     if prefix.is_empty() {

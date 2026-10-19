@@ -961,8 +961,8 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
 
 /// Return whether a label satisfies XML 1.0's `EncName` production.
 ///
-/// See XML 1.0 section 4.3.3, production [81]:
-/// https://www.w3.org/TR/xml/#NT-EncName
+/// See XML 1.0 section 4.3.3, production \[81\]:
+/// <https://www.w3.org/TR/xml/#NT-EncName>
 #[must_use]
 pub fn is_xml_encoding_name(value: &str) -> bool {
     is_xml_encoding_name_bytes(value.as_bytes())

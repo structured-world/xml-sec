@@ -24,6 +24,27 @@ pub enum DigestMethodResolution {
     Malformed,
 }
 
+/// One incremental digest of a verified operation's provider.
+pub struct SessionDigest<'p> {
+    algorithm: DigestAlgorithm,
+    state: Box<dyn crate::provider::DigestState + 'p>,
+}
+
+impl SessionDigest<'_> {
+    /// Absorb `data`, charging its length to `work` first.
+    pub fn update<Q: Work>(&mut self, data: &[u8], work: &Q) -> Result<(), DsigError> {
+        work.charge_work(u64::try_from(data.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
+        self.state.update(data).map_err(DsigError::from)
+    }
+
+    /// The digest of every absorbed byte. A provider output of the wrong width
+    /// is a provider error.
+    pub fn finish(self) -> Result<Vec<u8>, DsigError> {
+        super::super::super::digest::finish_digest(self.algorithm, self.state)
+            .map_err(DsigError::from)
+    }
+}
+
 impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     /// Resolve `#id` through this operation's ID registrations, fragment
     /// unescaping and same-document ID semantics, charging `work`. XMLDSig 1.1
@@ -95,26 +116,13 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         Ok(DigestMethodResolution::Supported(algorithm))
     }
 
-    /// Hash `data` with the selected provider under the compiled digest policy.
-    /// Work covers the input; the output is stored in `work`'s account. A
-    /// provider output of the wrong width is a provider error.
-    pub fn digest_in<Q: Work>(
-        &self,
-        algorithm: DigestAlgorithm,
-        data: &[u8],
-        work: &Q,
-    ) -> Result<OwnedVec<u8, Q>, DsigError> {
+    /// Start an incremental digest with the selected provider under the
+    /// compiled digest policy.
+    pub fn begin_digest(&self, algorithm: DigestAlgorithm) -> Result<SessionDigest<'_>, DsigError> {
         self.context.policy.check_digest_algorithm(algorithm)?;
-        work.charge_work(u64::try_from(data.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
-        let mut output = work.vector();
-        output.try_reserve_exact(algorithm.output_len())?;
-        let mut state = super::super::super::digest::begin_digest(self.context.provider, algorithm)
+        let state = super::super::super::digest::begin_digest(self.context.provider, algorithm)
             .map_err(DsigError::from)?;
-        state.update(data).map_err(DsigError::from)?;
-        let digest = super::super::super::digest::finish_digest(algorithm, state)
-            .map_err(DsigError::from)?;
-        output.try_extend_from_slice(&digest)?;
-        Ok(output)
+        Ok(SessionDigest { algorithm, state })
     }
 
     /// This verified request's own execution. A continuation that funds its

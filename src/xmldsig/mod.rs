@@ -104,11 +104,13 @@ pub use signature::{
     verify_ecdsa_signature_pem_with_encoding, verify_ecdsa_signature_spki,
     verify_ecdsa_signature_spki_with_encoding, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
+#[cfg(feature = "xslt")]
+pub use transforms::XsltStylesheet;
 pub use transforms::{
     BASE64_TRANSFORM_URI, DEFAULT_IMPLICIT_C14N_URI, ENVELOPED_SIGNATURE_URI,
     RELATIONSHIP_TRANSFORM_URI, RelationshipSelector, Transform, XPATH_FILTER2_TRANSFORM_URI,
     XPATH_TRANSFORM_URI, XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
-    execute_transforms, execute_transforms_with_policy, parse_transforms,
+    XSLT_TRANSFORM_URI, execute_transforms, execute_transforms_with_policy, parse_transforms,
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
@@ -118,7 +120,7 @@ pub use verify::{
     FailureReason, HashUseAlgorithm, HashUseCompleteness, HashUseRole, HashUseState, KeyResolver,
     LexicalSource, ReferenceCoverage, ReferenceLocation, ReferenceParent, ReferenceProcessingError,
     ReferenceResolution, ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode,
-    ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod,
+    ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod, SessionDigest,
     SignatureEvidence, SignatureHashUse, SignatureKeyInfoMetadata, SignatureRequirement,
     SignatureSelection, UriTypeSet, VerificationRequest, VerifiedSession, VerifyContext,
     VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,

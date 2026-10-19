@@ -84,6 +84,43 @@ fn base64_reference_round_trips_through_signing_and_verification() {
 }
 
 #[test]
+fn enveloped_base64_reference_does_not_depend_on_its_own_signature_value() {
+    // Base64 reads only the visible text of its node-set input. The enveloped
+    // Signature, including the SignatureValue it will receive, is outside that
+    // set, so signing must not report a dependency cycle through it.
+    let (key, key_info) = signing_material();
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("")
+                .transform(Transform::Enveloped)
+                .transform(Transform::Base64Decode),
+        )
+        .key_info(true);
+    let signed = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(
+            "<root>ZXh0ZXJuYWwgdmVyaWZpZXIgY29udHJhY3Q=</root>",
+            &builder,
+        )
+        .expect("enveloped Base64 reference must sign");
+
+    let resolver = DefaultKeyResolver::default();
+    let verified = cryptographic::context()
+        .key_resolver(&resolver)
+        .store_pre_digest(true)
+        .verify(&signed)
+        .expect("signed enveloped Base64 reference must verify");
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(
+        verified.signed_info_references[0]
+            .pre_digest_data
+            .as_deref(),
+        Some(b"external verifier contract".as_slice())
+    );
+}
+
+#[test]
 fn base64_reference_tampering_is_a_digest_mismatch() {
     // A valid alternate Base64 payload must reach digest comparison and fail
     // there, rather than being misclassified as a transform processing error.

@@ -17,6 +17,10 @@
       "test": "capability_ledger::opc_relationship_contract_executes",
       "description": "The public pipeline executes case-insensitive SourceType selection and canonical relationship normalization under the default 2021 contract. Dedicated integration tests exercise typed editions, MCE, budgets, and reciprocal 2012 interoperability."
     },
+    "xslt-transform-tests": {
+      "test": "capability_ledger::xslt_transform_contract_executes",
+      "description": "With the xslt feature the public pipeline executes the XSLT transform under the operation's transform policy and XSLT resource limits; without it the URI is reported unsupported. Reciprocal xmlsec1 tests and the donor vectors exercise byte-exact libxslt output."
+    },
     "legacy-policy-tests": {
       "test": "capability_ledger::legacy_algorithm_claims_are_policy_gated",
       "description": "Legacy SHA-1 and optional historical mechanisms require explicit compatibility policy permission; optional methods also require the legacy-algorithms build feature."
@@ -39,7 +43,7 @@
     },
     "xmldsig2ed-tests": {
       "test": "capability_ledger::xmldsig_second_edition_family_is_exhaustively_classified",
-      "description": "The Second Edition suite executes every signed document and generation template through the public API across compiled XML backends, including exact XSLT failure classification."
+      "description": "The Second Edition suite executes every signed document and generation template through the public API across compiled XML backends, with exact XSLT outcomes for builds with and without the xslt feature."
     },
     "planned-surface": {
       "test": "capability_ledger::planned_surface_is_never_reported_as_supported",
@@ -114,6 +118,14 @@
       "outcome": "compatibility-profile-only",
       "rationale": "The legacy-algorithms feature implements this mechanism through RustCrypto. Library defaults deny it; an explicit immutable algorithm allowlist is required. Other providers may report the capability unavailable without fallback.",
       "evidence": "legacy-policy-tests"
+    },
+    {
+      "id": "feature-gated-xslt-uri",
+      "kinds": ["algorithm-uri"],
+      "name_regex": "^xmlSecHrefXslt$",
+      "outcome": "compatibility-profile-only",
+      "rationale": "The optional xslt feature executes XSLT 1.0 stylesheets without external resources and within the operation's XSLT resource limits. Secure profiles exclude it from their transform allowlists; the default and libxmlsec1-compatible policies permit it when built. Stylesheets are read as elements of the signed document by default, with every namespace in scope; the libxmlsec1-compatible profile and the CLI compile the Transform content alone and skip unbound prefix-list entries, as libxmlsec1 and libxslt do.",
+      "evidence": "xslt-transform-tests"
     },
     {
       "id": "remaining-uri-surface",
@@ -216,7 +228,7 @@
       "kinds": ["test-family"],
       "name_regex": "^xmldsig2ed-tests$",
       "outcome": "planned",
-      "rationale": "Every signed vector and generation template is executable and classified by the native public-pipeline suite; full family parity remains planned until the separately tracked XSLT engine is implemented.",
+      "rationale": "Every signed vector and generation template is executable and classified by the native public-pipeline suite; its XSLT vectors execute only when the optional xslt feature is built, so family parity is not claimed for the default build.",
       "evidence": "xmldsig2ed-tests"
     },
     {
@@ -224,7 +236,7 @@
       "kinds": ["test-family"],
       "name_regex": "^phaos-xmldsig-three$",
       "outcome": "planned",
-      "rationale": "Every signature vector is executable and classified by the native public-pipeline suite; full family parity remains planned until its explicitly reported XSLT, HMAC-MD5, and MD5-signed certificate dependencies are implemented.",
+      "rationale": "Every signature vector is executable and classified by the native public-pipeline suite; full family parity remains planned until its explicitly reported HMAC-MD5 and MD5-signed certificate dependencies are implemented. Its XSLT vectors execute when the optional xslt feature is built.",
       "evidence": "phaos-xmldsig-tests"
     },
     {

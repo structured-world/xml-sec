@@ -1219,7 +1219,7 @@ impl SymmetricKeyDecryptor {
 
     /// Bind a pre-shared key to its trusted family before reading an algorithm
     /// from the document. XMLEnc 1.1 §6.1.3 recommends key separation:
-    /// https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-backwards-compatibility-attacks
+    /// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-backwards-compatibility-attacks>
     pub fn with_kind(key: impl Into<Vec<u8>>, kind: crate::key_manager::SymmetricKeyKind) -> Self {
         Self {
             key: key.into(),

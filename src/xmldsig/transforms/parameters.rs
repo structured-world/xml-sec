@@ -15,6 +15,8 @@ use structured_asn1::memory::{OwnedText, OwnedVec, Work};
 pub(crate) enum Diagnostic {
     XPath,
     Unsupported,
+    #[cfg(feature = "xslt")]
+    Xslt,
 }
 
 fn current_text<W: Work>(
@@ -40,6 +42,8 @@ pub(crate) fn current_diagnostic<W: Work>(
         Ok(message) => match kind {
             Diagnostic::XPath => TransformError::AccountedXPath(message),
             Diagnostic::Unsupported => TransformError::AccountedUnsupportedTransform(message),
+            #[cfg(feature = "xslt")]
+            Diagnostic::Xslt => TransformError::AccountedXslt(message),
         },
         Err(cause) => cause,
     }
@@ -114,6 +118,8 @@ pub(crate) trait Instruction: Sized {
             View::C14n(algorithm, _) => algorithm.uri(),
             View::Base64 => super::BASE64_TRANSFORM_URI,
             View::Relationship(_) => super::RELATIONSHIP_TRANSFORM_URI,
+            #[cfg(feature = "xslt")]
+            View::Xslt(_) => super::XSLT_TRANSFORM_URI,
         }
     }
 }
@@ -126,6 +132,9 @@ pub(crate) enum View<'a, I: Instruction> {
     C14n(&'a C14nAlgorithm, Option<&'a str>),
     Base64,
     Relationship(&'a [I::Selector]),
+    /// Stylesheet parameter.
+    #[cfg(feature = "xslt")]
+    Xslt(super::xslt::XsltParameter<'a>),
 }
 
 impl Instruction for Transform {
@@ -142,6 +151,10 @@ impl Instruction for Transform {
             Self::C14n(algorithm) => View::C14n(algorithm, None),
             Self::Base64Decode => View::Base64,
             Self::Relationship(selectors) => View::Relationship(selectors),
+            #[cfg(feature = "xslt")]
+            Self::Xslt(stylesheet) => {
+                View::Xslt(super::xslt::XsltParameter::Stylesheet(stylesheet))
+            }
         }
     }
 }
@@ -188,6 +201,9 @@ pub(crate) trait ParseStorage<'a>: Scratch {
         algorithm: C14nAlgorithm,
         prefixes: Option<&'a str>,
     ) -> Self::Instruction;
+    /// The stylesheet of an original `<Transform>`, whose content is `source`.
+    #[cfg(feature = "xslt")]
+    fn xslt(&self, transform: Node<'a, 'a>, source: &'a str) -> Self::Instruction;
 }
 
 impl<'a> ParseStorage<'a> for Native {
@@ -201,6 +217,8 @@ impl<'a> ParseStorage<'a> for Native {
         match kind {
             Diagnostic::XPath => TransformError::XPath(message),
             Diagnostic::Unsupported => TransformError::UnsupportedTransform(message),
+            #[cfg(feature = "xslt")]
+            Diagnostic::Xslt => TransformError::Xslt(message),
         }
     }
 
@@ -280,6 +298,12 @@ impl<'a> ParseStorage<'a> for Native {
         }
         Transform::C14n(algorithm)
     }
+    #[cfg(feature = "xslt")]
+    fn xslt(&self, transform: Node<'a, 'a>, source: &'a str) -> Transform {
+        // The source is the markup of a parsed `<Transform>`, which `XsltStylesheet::new`
+        // would only parse again; keep it as is.
+        Transform::Xslt(super::XsltStylesheet::from_parsed(transform, source))
+    }
 }
 
 pub(crate) struct OriginalExpression<'a> {
@@ -347,6 +371,9 @@ pub(crate) enum OriginalInstruction<'a> {
     Filters(OwnedVec<OriginalFilter<'a>>),
     Relationships(OwnedVec<OriginalSelector<'a>>),
     Canonicalization(C14nAlgorithm, Option<&'a str>),
+    /// The original `<Transform>` element.
+    #[cfg(feature = "xslt")]
+    Xslt(Node<'a, 'a>),
 }
 impl<'a> Instruction for OriginalInstruction<'a> {
     type Expression = OriginalExpression<'a>;
@@ -361,6 +388,8 @@ impl<'a> Instruction for OriginalInstruction<'a> {
             Self::Filters(filters) => View::Filter2(filters),
             Self::Relationships(selectors) => View::Relationship(selectors),
             Self::Canonicalization(algorithm, prefixes) => View::C14n(algorithm, *prefixes),
+            #[cfg(feature = "xslt")]
+            Self::Xslt(transform) => View::Xslt(super::xslt::XsltParameter::Transform(*transform)),
         }
     }
 }
@@ -442,6 +471,11 @@ impl<'a, W: Work> ParseStorage<'a> for Accounted<'_, W> {
         prefixes: Option<&'a str>,
     ) -> Self::Instruction {
         OriginalInstruction::Canonicalization(algorithm, prefixes)
+    }
+    #[cfg(feature = "xslt")]
+    fn xslt(&self, transform: Node<'a, 'a>, _source: &'a str) -> Self::Instruction {
+        // The markup and inherited declarations are read from the element when executed.
+        OriginalInstruction::Xslt(transform)
     }
 }
 

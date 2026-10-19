@@ -111,6 +111,10 @@ pub(crate) mod resource_name {
     pub const NODE_SET_FILTER_WORK: &str = "node-set filter work";
     pub const OPC_WORKSPACE_BYTES: &str = "OPC workspace bytes";
     pub const OPC_PARAMETER_BYTES: &str = "OPC parameter bytes";
+    pub const XSLT_WORK: &str = "XSLT work";
+    pub const XSLT_WORKSPACE_BYTES: &str = "XSLT workspace bytes";
+    pub const XSLT_OUTPUT_BYTES: &str = "XSLT output bytes";
+    pub const XSLT_RECURSION_DEPTH: &str = "XSLT recursion depth";
     pub const NODE_SET_ENTRIES: &str = "node-set entries";
     pub const NODE_SET_OWNED_STRING_BYTES: &str = "node-set owned string bytes";
     pub const NODE_SET_CUMULATIVE_OWNED_STRING_BYTES: &str =
@@ -578,6 +582,16 @@ pub struct ResourcePolicy {
     pub max_opc_parameter_bytes: usize,
     /// Maximum cumulative OPC normalization workspace allocations during execution.
     pub max_opc_workspace_bytes: usize,
+    /// Maximum XSLT work of each kind per operation: XPath evaluations and steps,
+    /// extension calls, pattern tests, template applications, sort comparisons,
+    /// key entries, result nodes and messages.
+    pub max_xslt_work: usize,
+    /// Maximum memory owned at once by one stylesheet compilation or execution.
+    pub max_xslt_workspace_bytes: usize,
+    /// Maximum cumulative bytes serialized by XSLT transforms in one operation.
+    pub max_xslt_output_bytes: usize,
+    /// Maximum XSLT compilation and template recursion depth.
+    pub max_xslt_recursion_depth: usize,
 }
 
 impl Default for ResourcePolicy {
@@ -628,6 +642,10 @@ impl Default for ResourcePolicy {
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
             max_opc_workspace_bytes: crate::hard_limits::OPC_WORKSPACE_BYTE_CEILING,
             max_opc_parameter_bytes: crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
+            max_xslt_work: crate::hard_limits::XSLT_WORK_CEILING,
+            max_xslt_workspace_bytes: crate::hard_limits::XSLT_WORKSPACE_BYTE_CEILING,
+            max_xslt_output_bytes: crate::hard_limits::XSLT_OUTPUT_BYTE_CEILING,
+            max_xslt_recursion_depth: crate::hard_limits::XSLT_RECURSION_DEPTH_CEILING,
         }
     }
 }
@@ -839,6 +857,30 @@ impl ResourcePolicy {
             self.max_opc_parameter_bytes,
             crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
         )?;
+        for (resource, selected, ceiling) in [
+            (
+                resource_name::XSLT_WORK,
+                self.max_xslt_work,
+                crate::hard_limits::XSLT_WORK_CEILING,
+            ),
+            (
+                resource_name::XSLT_WORKSPACE_BYTES,
+                self.max_xslt_workspace_bytes,
+                crate::hard_limits::XSLT_WORKSPACE_BYTE_CEILING,
+            ),
+            (
+                resource_name::XSLT_OUTPUT_BYTES,
+                self.max_xslt_output_bytes,
+                crate::hard_limits::XSLT_OUTPUT_BYTE_CEILING,
+            ),
+            (
+                resource_name::XSLT_RECURSION_DEPTH,
+                self.max_xslt_recursion_depth,
+                crate::hard_limits::XSLT_RECURSION_DEPTH_CEILING,
+            ),
+        ] {
+            Self::within(resource, selected, ceiling)?;
+        }
         Ok(())
     }
 
@@ -974,6 +1016,23 @@ pub enum SameDocumentIdSemantics {
     XmlSecVisa3d,
 }
 
+/// How the stylesheet of an XSLT transform is read from its `<Transform>`.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum XsltStylesheetSemantics {
+    /// The stylesheet is an element of the signed document: every namespace in
+    /// scope at it, including those declared on its ancestors (Namespaces in XML
+    /// section 6.1), applies and is copied into literal result elements, and a
+    /// prefix bound nowhere in `exclude-result-prefixes` or
+    /// `extension-element-prefixes` is a stylesheet error (XSLT 1.0 section 7.1.1).
+    #[default]
+    Specification,
+    /// libxmlsec1: the stylesheet is the serialized `<Transform>` content, so
+    /// namespaces declared on its ancestors are lost, and libxslt skips an
+    /// unbound prefix in a prefix list after a warning.
+    Libxmlsec1,
+}
+
 /// Wire representation used for ECDSA `SignatureValue` bytes.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -997,6 +1056,8 @@ pub struct TransformPolicy {
     pub same_document_id_semantics: SameDocumentIdSemantics,
     /// Trusted normalization edition, not package validation; never inferred from XML.
     pub opc_relationship_edition: OpcRelationshipEdition,
+    /// How XSLT stylesheets are read; applies to builds with `xslt`.
+    pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
 }
 
 /// URI-class decisions shared by XMLDSig reference and key retrieval processing.
@@ -1885,6 +1946,26 @@ mod tests {
                 crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
                 |p| &mut p.max_node_set_cumulative_owned_string_bytes,
             ),
+            (
+                resource_name::XSLT_WORK,
+                crate::hard_limits::XSLT_WORK_CEILING,
+                |p| &mut p.max_xslt_work,
+            ),
+            (
+                resource_name::XSLT_WORKSPACE_BYTES,
+                crate::hard_limits::XSLT_WORKSPACE_BYTE_CEILING,
+                |p| &mut p.max_xslt_workspace_bytes,
+            ),
+            (
+                resource_name::XSLT_OUTPUT_BYTES,
+                crate::hard_limits::XSLT_OUTPUT_BYTE_CEILING,
+                |p| &mut p.max_xslt_output_bytes,
+            ),
+            (
+                resource_name::XSLT_RECURSION_DEPTH,
+                crate::hard_limits::XSLT_RECURSION_DEPTH_CEILING,
+                |p| &mut p.max_xslt_recursion_depth,
+            ),
         ];
 
         for &(resource, ceiling, field) in cases {
@@ -1948,6 +2029,10 @@ mod tests {
             max_node_set_cumulative_owned_string_bytes: 0,
             max_opc_workspace_bytes: 0,
             max_opc_parameter_bytes: 0,
+            max_xslt_work: 0,
+            max_xslt_workspace_bytes: 0,
+            max_xslt_output_bytes: 0,
+            max_xslt_recursion_depth: 0,
         };
 
         assert_eq!(policy.validate(), Ok(()));

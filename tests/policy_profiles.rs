@@ -462,6 +462,31 @@ fn all_named_profiles_compile_and_legacy_requires_auditable_expiry() {
         assert_eq!(compiled.profile(), profile);
         assert!(compiled.verification().is_some());
         assert!(compiled.signing().is_some());
+        // Only the libxmlsec1-compatible profile reads stylesheets as libxmlsec1 does,
+        // for both directions so its signatures match the donor's digests.
+        let expected = if profile == PolicyProfile::XmlSecCompatible {
+            xml_sec::policy::XsltStylesheetSemantics::Libxmlsec1
+        } else {
+            xml_sec::policy::XsltStylesheetSemantics::Specification
+        };
+        assert_eq!(
+            compiled
+                .verification()
+                .unwrap()
+                .transforms
+                .xslt_stylesheet_semantics,
+            expected,
+            "{profile:?}"
+        );
+        assert_eq!(
+            compiled
+                .signing()
+                .unwrap()
+                .transforms
+                .xslt_stylesheet_semantics,
+            expected,
+            "{profile:?}"
+        );
     }
     assert!(PolicyCompiler::new(PolicyProfile::LegacyVerify, &RustCryptoProvider, None).is_err());
     let compiled = PolicyCompiler::new(

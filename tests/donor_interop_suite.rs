@@ -719,7 +719,39 @@ fn complete_second_edition_verification_corpus_is_classified_and_executed() {
                 .xml_backend(backend)
                 .external_resources(&resources)
                 .verify(&xml);
-            if matches!(name, "defCan-2.xml" | "defCan-3.xml") {
+            if cfg!(feature = "xslt") && name == "defCan-3.xml" {
+                // libxmlsec1 disables this vector in its own suite for differences in the
+                // XSLT output. The terminal output here is exactly what libxslt serializes
+                // for the same input (verified with xsltproc 1.1), which this vector's
+                // digest does not cover.
+                let result = VerifyContext::new()
+                    .key(&key)
+                    .policy(policy.clone())
+                    .xml_backend(backend)
+                    .external_resources(&resources)
+                    .store_pre_digest(true)
+                    .verify(&xml)
+                    .unwrap_or_else(|error| {
+                        panic!("{backend:?} {} must execute: {error}", path.display())
+                    });
+                assert_eq!(
+                    result.status,
+                    DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+                );
+                assert_eq!(
+                    result.signed_info_references[0].pre_digest_data.as_deref(),
+                    Some(
+                        concat!(
+                            "<?xml version=\"1.0\"?>\n<ietf:e21 xmlns:ietf=\"http://www.ietf.org\"",
+                            " xmlns:w3c=\"http://www.w3.org\"",
+                            " xml:base=\"http://xmlbase.example.org/xmlbase21/\"/>\n"
+                        )
+                        .as_bytes()
+                    ),
+                    "{backend:?} terminal XSLT output must match libxslt"
+                );
+                rejected_xslt += 1;
+            } else if !cfg!(feature = "xslt") && matches!(name, "defCan-2.xml" | "defCan-3.xml") {
                 assert!(
                     matches!(
                         result,
@@ -740,8 +772,13 @@ fn complete_second_edition_verification_corpus_is_classified_and_executed() {
             }
         }
 
-        assert_eq!(verified, 7, "{backend:?} supported vector count");
-        assert_eq!(rejected_xslt, 2, "{backend:?} XSLT vector count");
+        let xslt_vectors = if cfg!(feature = "xslt") { 1 } else { 2 };
+        assert_eq!(
+            verified,
+            9 - xslt_vectors,
+            "{backend:?} supported vector count"
+        );
+        assert_eq!(rejected_xslt, xslt_vectors, "{backend:?} XSLT vector count");
     }
 }
 
@@ -833,6 +870,8 @@ fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
             .unwrap_or_else(|error| panic!("{backend:?} verification failed: {error}"));
         assert_valid(result.status, Path::new("defCan-1.tmpl"));
 
+        // libxmlsec1's suite signs these templates and verifies the result; their chains
+        // differ from the .xml vectors, whose digests the verification corpus covers.
         for name in ["defCan-2.tmpl", "defCan-3.tmpl"] {
             let xslt_template = fs::read_to_string(format!("{XMLDSIG2ED_DIR}/{name}"))
                 .expect("Second Edition XSLT template must be readable");
@@ -841,6 +880,23 @@ fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
                 .xml_backend(backend)
                 .external_resources(&resources)
                 .sign_template(&xslt_template);
+            if cfg!(feature = "xslt") {
+                let signed =
+                    result.unwrap_or_else(|error| panic!("{backend:?} {name} signing: {error}"));
+                assert!(
+                    signed.contains(r#"Algorithm="http://www.w3.org/TR/1999/REC-xslt-19991116""#),
+                    "{backend:?} {name} must keep its XSLT transform"
+                );
+                let verified = VerifyContext::new()
+                    .key(&verification_key)
+                    .policy(verification_policy.clone())
+                    .xml_backend(backend)
+                    .external_resources(&resources)
+                    .verify(&signed)
+                    .unwrap_or_else(|error| panic!("{backend:?} {name} verification: {error}"));
+                assert_valid(verified.status, Path::new(name));
+                continue;
+            }
             assert!(
                 matches!(
                     result,
