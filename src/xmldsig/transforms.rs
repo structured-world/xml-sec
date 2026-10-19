@@ -1465,6 +1465,9 @@ pub(crate) trait TransformScratch: Scratch {
         &self,
         maximum: usize,
     ) -> Result<(Self::Reservation, usize), TransformError>;
+    /// The work [`Scratch::charge`] would admit now; the ceiling of one XSLT step.
+    #[cfg(feature = "xslt")]
+    fn work_remaining(&self) -> usize;
     #[cfg(feature = "xslt")]
     fn xslt_error(&self, error: &crate::xslt::Error) -> TransformError;
 }
@@ -1496,6 +1499,11 @@ impl TransformScratch for Native {
     #[cfg(feature = "xslt")]
     fn reserve_workspace(&self, maximum: usize) -> Result<((), usize), TransformError> {
         Ok(((), maximum))
+    }
+    #[cfg(feature = "xslt")]
+    fn work_remaining(&self) -> usize {
+        // Native execution charges no query account; the policy allowance bounds it.
+        usize::MAX
     }
     #[cfg(feature = "xslt")]
     fn xslt_error(&self, error: &crate::xslt::Error) -> TransformError {
@@ -1551,6 +1559,10 @@ impl<'w, W: structured_asn1::memory::Work> TransformScratch
         let available = memory.limit().saturating_sub(memory.used());
         let granted = maximum.min(available);
         Ok((memory.reserve(granted)?, granted))
+    }
+    #[cfg(feature = "xslt")]
+    fn work_remaining(&self) -> usize {
+        structured_asn1::memory::Work::work_remaining(self.0)
     }
     #[cfg(feature = "xslt")]
     fn xslt_error(&self, error: &crate::xslt::Error) -> TransformError {

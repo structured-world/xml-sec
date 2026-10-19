@@ -572,26 +572,41 @@ fn reject_document_type(xml: &str, settings: DocumentParseSettings) -> Result<()
     Ok(())
 }
 
-/// Debit the parser work an engine pass admitted; a pass the shared remainder
-/// refused is the operation's parse-work limit, not an engine error.
-fn charge_parse_work<T>(
+/// The parser work an engine pass may do: what both the operation and the query admit.
+fn parse_work_limit<S: TransformScratch>(xml_parse: &XmlParseWorkBudget, scratch: &S) -> usize {
+    xml_parse.remaining().min(scratch.work_remaining())
+}
+
+/// Debit the parser work an engine pass admitted from the operation and the query; a
+/// pass refused at the offered limit is refused by whichever of the two set it.
+fn charge_parse_work<T, S: TransformScratch>(
     reported: Reported<T, ParseUsage>,
     xml_parse: &XmlParseWorkBudget,
+    scratch: &S,
 ) -> Result<Result<T, Error>, TransformError> {
-    // The engine was offered exactly the remainder, so what it admitted fits.
-    xml_parse.charge_policy(reported.usage.parse_work_bytes)?;
+    // The engine was offered the smaller remainder, so what it admitted fits both.
+    let used = reported.usage.parse_work_bytes;
+    xml_parse.charge_policy(used)?;
+    scratch.charge(used)?;
     match reported.outcome {
         Err(Error::Budget {
             kind: BudgetKind::ParseWorkBytes,
             actual,
             ..
-        }) => Err(xml_parse
-            .charge_policy(actual - reported.usage.parse_work_bytes)
-            .err()
-            .map_or_else(
-                || TransformError::Xslt("XSLT parser work exceeded its allowance".into()),
-                TransformError::from,
-            )),
+        }) => {
+            let excess = actual - used;
+            let refused = if excess > xml_parse.remaining() {
+                xml_parse
+                    .charge_policy(excess)
+                    .err()
+                    .map(TransformError::from)
+            } else {
+                scratch.charge(excess).err().map(TransformError::from)
+            };
+            Err(refused.unwrap_or_else(|| {
+                TransformError::Xslt("XSLT parser work exceeded its allowance".into())
+            }))
+        }
         outcome => Ok(outcome),
     }
 }
@@ -648,7 +663,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
                 allowance.max_recursion,
                 compile_workspace,
             )
-            .with_parse_work_bytes(xml_parse.remaining()),
+            .with_parse_work_bytes(parse_work_limit(xml_parse, scratch)),
         )
         .unbound_prefix_lists(match semantics {
             XsltStylesheetSemantics::Specification => UnboundPrefixLists::Reject,
@@ -656,6 +671,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         })
         .compile_reported(&stylesheet, None),
         xml_parse,
+        scratch,
     )?
     .map_err(|error| fail(error, Phase::Stylesheet, assembled))?;
     drop(stylesheet);
@@ -703,9 +719,10 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
                 source_workspace,
             )
             .with_owned_bytes(source_workspace)
-            .with_parse_work_bytes(xml_parse.remaining()),
+            .with_parse_work_bytes(parse_work_limit(xml_parse, scratch)),
         ),
         xml_parse,
+        scratch,
     )?
     .map_err(|error| fail(error, Phase::Input, held))?;
     drop(xml);
@@ -719,7 +736,9 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let reported = compiled.execute_reported(
         &source,
         &Parameters::new(),
-        ExecutionEnvironment::new(Arc::new(NoResolver)),
+        // The query's remainder bounds the work of every kind together, so the engine
+        // stops where the query would refuse it rather than after the policy allows.
+        ExecutionEnvironment::new(Arc::new(NoResolver)).with_work_ceiling(scratch.work_remaining()),
         ExecutionOptions {
             budget: allowance.execution_budget(execution_workspace),
             initial_mode: None,
@@ -732,16 +751,27 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     // of the operation draw on the same allowance. The error reports the totals
     // before this execution's work is admitted.
     let usage = reported.usage;
-    let outcome = reported
-        .outcome
-        .map_err(|error| fail(error, Phase::Execution, held));
-    allowance.admit(&usage);
     let work = WORK_KINDS
         .into_iter()
         .try_fold(0usize, |total, kind| {
             total.checked_add(admitted(&usage, kind))
         })
         .expect("each kind is bounded by the policy work ceiling");
+    let outcome = match reported.outcome {
+        Err(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            actual,
+            ..
+        }) => Err(scratch.charge(actual).err().map_or_else(
+            // The query's remainder was the ceiling, so charging the total the
+            // engine asked for is refused like any other step of the query.
+            || TransformError::Xslt("XSLT work exceeded the query's remainder".into()),
+            TransformError::from,
+        )),
+        outcome => outcome.map_err(|error| fail(error, Phase::Execution, held)),
+    };
+    allowance.admit(&usage);
+    // The ceiling admitted at most the remainder, so this fits.
     scratch.charge(work)?;
     let output = outcome?.serialized.bytes;
     if S::ACCOUNTED {

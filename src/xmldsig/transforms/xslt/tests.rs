@@ -238,6 +238,86 @@ fn workspace_refusals_report_what_every_stage_holds() {
     );
 }
 
+/// Run `stylesheet` in a query whose work account has `remaining` units left; returns the
+/// outcome, the engine work the operation allowance admitted and the work the query paid.
+fn run_in_query(
+    stylesheet: &XsltStylesheet,
+    input: &[u8],
+    remaining: usize,
+) -> (Result<(), TransformError>, usize, usize) {
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
+    let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 26)));
+    work.charge_work((work.work_remaining() - remaining) as u64)
+        .expect("leave the remainder");
+    let before = work.work_used();
+    let scratch = crate::c14n::scratch::Accounted(&work);
+    let outcome = super::execute::<_, crate::xml::dom::storage::Native>(
+        super::XsltParameter::Stylesheet(stylesheet),
+        input,
+        crate::policy::XsltStylesheetSemantics::Specification,
+        false,
+        &budget,
+        budget.xml_parse_work(),
+        &scratch,
+    )
+    .map(drop);
+    let executed = super::WORK_KINDS
+        .into_iter()
+        .map(|kind| budget.xslt.work_used(kind))
+        .sum();
+    (outcome, executed, work.work_used() - before)
+}
+
+#[test]
+fn query_work_bounds_the_engine_while_it_runs() {
+    // A query replaying a reference may have little work left. The engine must stop
+    // when it crosses that remainder, not after doing all the work the policy allows;
+    // parsing the stylesheet and the input is paid from the same remainder first.
+    // The stylesheet evaluates a test per input element and writes almost nothing, so
+    // nearly all the work the query pays for a successful run is the engine's.
+    use structured_asn1::memory::MemoryError;
+    let input = format!("<root>{}</root>", "<n/>".repeat(2000));
+    let scanning = stylesheet(
+        r#"<xsl:template match="/"><out><xsl:for-each select="/root/n"><xsl:if test="@a"><x/></xsl:if></xsl:for-each></out></xsl:template>"#,
+    );
+    let (outcome, ample, paid) = run_in_query(&scanning, input.as_bytes(), 1 << 24);
+    outcome.expect("an ample remainder admits the transform");
+    assert!(ample > 4000);
+    // Everything but the execution, plus a hundred units for it.
+    let remaining = paid - ample + 100;
+    let (outcome, executed, paid) = run_in_query(&scanning, input.as_bytes(), remaining);
+    assert!(
+        matches!(
+            outcome,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+            ))
+        ),
+        "{outcome:?}"
+    );
+    // The hundred units, and what the successful run paid after execution, which this
+    // run never reaches.
+    assert!(
+        executed < ample / 10,
+        "the engine ran {executed} of {ample} units past the query"
+    );
+    assert!(paid <= remaining);
+
+    // Too little for the parser passes: refused before any execution.
+    let (outcome, executed, _) = run_in_query(&scanning, input.as_bytes(), 10);
+    assert!(
+        matches!(
+            outcome,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+            ))
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(executed, 0);
+}
+
 #[test]
 fn failed_executions_consume_the_shared_allowance() {
     // A Manifest keeps verifying after one reference fails. Work a failed execution did
