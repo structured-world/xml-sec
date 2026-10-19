@@ -172,6 +172,85 @@ fn compilation_reports_parser_work_whether_or_not_it_succeeds() {
 }
 
 #[test]
+fn identity_indexes_are_charged_to_the_parse() {
+    // The id() index copies every xml:id and DTD-declared ID value into a map that the
+    // parsed tree retains. A bounded parse counts those copies and the map with the tree,
+    // so a document of IDs holds more than one with ordinary attributes of equal size.
+    let unbounded = ParseBudget::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .with_owned_bytes(usize::MAX);
+    let elements = |attribute: &str| {
+        (0..512)
+            .map(|index| format!(r#"<e {attribute}="identifier-{index:04}"/>"#))
+            .collect::<String>()
+    };
+    let retained = |xml: String| {
+        Document::parse_with_budget(&xml, None, unbounded)
+            .expect("document parses")
+            .retained_bytes()
+    };
+    let values = 512 * "identifier-0000".len();
+    // `xml:lang` is in the same namespace, with a local name two bytes longer.
+    let plain = retained(format!("<r>{}</r>", elements("xml:lang")));
+    let xml_ids = retained(format!("<r>{}</r>", elements("xml:id")));
+    assert!(
+        xml_ids + 512 * 2 >= plain + values,
+        "xml:id {xml_ids} vs plain {plain}"
+    );
+    let dtd = r#"<!DOCTYPE r [<!ATTLIST e i ID #IMPLIED>]>"#;
+    let plain = retained(format!("{dtd}<r>{}</r>", elements("a")));
+    let dtd_ids = retained(format!("{dtd}<r>{}</r>", elements("i")));
+    assert!(
+        dtd_ids >= plain + values,
+        "DTD IDs {dtd_ids} vs plain {plain}"
+    );
+}
+
+#[test]
+fn the_work_ceiling_stops_an_xpath_evaluation_while_it_runs() {
+    // One XPath expression can scan the whole source. Under a small ceiling it is
+    // refused as it crosses it, not after the whole scan has run.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+             <xsl:template match="/"><out><xsl:value-of select="count(//e[@a])"/></out></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+    let xml = format!("<root>{}</root>", r#"<e a="1"/>"#.repeat(2000));
+    let source = Document::parse(&xml, None).expect("source parses");
+    let ceiling = 200;
+    let refused = stylesheet.execute_reported(
+        &source,
+        &Parameters::new(),
+        ExecutionEnvironment::new(Arc::new(NoResolver)).with_work_ceiling(ceiling),
+        ExecutionOptions {
+            budget: execution_budget(xml.len()),
+            initial_mode: None,
+            initial_template: None,
+        },
+    );
+    match refused.outcome {
+        Err(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            limit,
+            actual,
+        }) => {
+            assert_eq!(limit, ceiling);
+            assert!(
+                actual <= ceiling + 64,
+                "the evaluation ran to {actual} units"
+            );
+        }
+        other => panic!("expected the ceiling to refuse the evaluation, got {other:?}"),
+    }
+}
+
+#[test]
 fn the_work_ceiling_bounds_every_kind_together() {
     // A caller whose own account admits less than the per-kind limits grants passes the
     // remainder as a ceiling over all work kinds together; the execution is refused when

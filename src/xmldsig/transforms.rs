@@ -2519,6 +2519,25 @@ pub(crate) fn transform_chain_produces_binary<I: Instruction>(
         })
 }
 
+/// Whether running `transforms` applies the implicit inclusive C14N 1.0: to a
+/// node-set left at the end of the chain, or to one given to an XSLT transform
+/// (XMLDSig 1.1 section 4.4.3.2).
+/// <https://www.w3.org/TR/xmldsig-core1/#sec-ReferenceProcessingModel>
+pub(crate) fn transform_chain_uses_implicit_c14n<I: Instruction>(
+    initial_binary: bool,
+    transforms: &[I],
+) -> bool {
+    let mut binary = initial_binary;
+    for transform in transforms {
+        #[cfg(feature = "xslt")]
+        if !binary && matches!(transform.view(), InstructionView::Xslt(_)) {
+            return true;
+        }
+        binary = transform_chain_produces_binary(binary, std::slice::from_ref(transform));
+    }
+    !binary
+}
+
 /// Map every C14N resource failure governed by the operation policy.
 ///
 /// The output parameters apply only to the bounded-writer case; XML Base
@@ -2582,7 +2601,7 @@ fn validate_transform_policy(
             });
         }
     }
-    if !transform_chain_produces_binary(initial_binary, transforms)
+    if transform_chain_uses_implicit_c14n(initial_binary, transforms)
         && !allowed.contains(DEFAULT_IMPLICIT_C14N_URI)
     {
         return Err(crate::policy::PolicyViolation::Algorithm {

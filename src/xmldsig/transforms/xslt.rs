@@ -129,6 +129,19 @@ pub(crate) enum XsltParameter<'a> {
 }
 
 impl<'a> XsltParameter<'a> {
+    /// Bytes a stylesheet parsed from a signature keeps for the whole operation: its
+    /// markup and its serialization. Markup given to `XsltStylesheet::new` belongs to
+    /// the caller; a `<Transform>` read in place keeps nothing.
+    fn carried_bytes(self) -> usize {
+        match self {
+            Self::Stylesheet(XsltStylesheet {
+                source,
+                parsed: Some(parsed),
+            }) => source.capacity() + parsed.document.capacity() + parsed.inherited.capacity(),
+            _ => 0,
+        }
+    }
+
     /// The stylesheet document `semantics` compiles, allocating at most `limit` bytes.
     fn document(
         self,
@@ -401,53 +414,60 @@ fn own_xml_space<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Option<&'a str> 
 
 /// Prefixes declared on `element` itself, `None` for the default namespace.
 ///
-/// The tree keeps only in-scope bindings, so the declarations are read from the
-/// element's start tag; an element produced by entity replacement has none in
-/// the document text and falls back to the bindings that differ from its parent.
+/// The tree keeps only in-scope bindings. The declarations written in the
+/// element's start tag are read from it, including those that repeat a binding
+/// of the parent; bindings that differ from the parent's are added, which covers
+/// declarations an internal DTD defaults (XML 1.0 section 3.3.2) and elements
+/// produced by entity replacement, which have no start tag of their own.
 fn declared_prefixes<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Vec<Option<&'a str>> {
     let text = element.document().input_text();
-    let lexical = text.get(element.range()).and_then(|markup| {
-        markup.starts_with('<').then_some(())?;
-        match crate::xml_input_shared::lexical::Scanner::new(markup).next_event() {
-            Ok(Some(
-                crate::xml_input_shared::lexical::Event::Start(tag)
-                | crate::xml_input_shared::lexical::Event::Empty(tag),
-            )) => Some(
-                tag.attributes
-                    .iter()
-                    .filter_map(|attribute| {
-                        let name = attribute.name.qualified();
-                        if name == "xmlns" {
-                            Some(None)
-                        } else {
-                            name.strip_prefix("xmlns:")
-                                .and_then(|prefix| {
-                                    element
-                                        .namespaces()
-                                        .find(|namespace| namespace.name() == Some(prefix))
-                                })
-                                .map(|namespace| namespace.name())
-                        }
-                    })
-                    .collect::<Vec<_>>(),
-            ),
-            _ => None,
+    let mut declared = text
+        .get(element.range())
+        .and_then(|markup| {
+            markup.starts_with('<').then_some(())?;
+            match crate::xml_input_shared::lexical::Scanner::new(markup).next_event() {
+                Ok(Some(
+                    crate::xml_input_shared::lexical::Event::Start(tag)
+                    | crate::xml_input_shared::lexical::Event::Empty(tag),
+                )) => Some(
+                    tag.attributes
+                        .iter()
+                        .filter_map(|attribute| {
+                            let name = attribute.name.qualified();
+                            if name == "xmlns" {
+                                Some(None)
+                            } else {
+                                name.strip_prefix("xmlns:")
+                                    .and_then(|prefix| {
+                                        element
+                                            .namespaces()
+                                            .find(|namespace| namespace.name() == Some(prefix))
+                                    })
+                                    .map(|namespace| namespace.name())
+                            }
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            }
+        })
+        .unwrap_or_default();
+    let parent = element.parent();
+    let inherited =
+        |prefix: Option<&str>| parent.and_then(|parent| parent.lookup_namespace_uri(prefix));
+    for namespace in element.namespaces() {
+        let prefix = namespace.name();
+        if inherited(prefix) != Some(namespace.uri()) && !declared.contains(&prefix) {
+            declared.push(prefix);
         }
-    });
-    lexical.unwrap_or_else(|| {
-        let parent = element.parent();
-        let inherited =
-            |prefix: Option<&str>| parent.and_then(|parent| parent.lookup_namespace_uri(prefix));
-        let mut declared: Vec<Option<&'a str>> = element
-            .namespaces()
-            .filter(|namespace| inherited(namespace.name()) != Some(namespace.uri()))
-            .map(|namespace| namespace.name())
-            .collect();
-        if element.lookup_namespace_uri(None).is_none() && inherited(None).is_some() {
-            declared.push(None);
-        }
-        declared
-    })
+    }
+    if element.lookup_namespace_uri(None).is_none()
+        && inherited(None).is_some()
+        && !declared.contains(&None)
+    {
+        declared.push(None);
+    }
+    declared
 }
 
 /// What a serialized stylesheet does with what its element inherits.
@@ -854,14 +874,19 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         limit: workspace,
         actual: needed,
     };
+    // Copies a parsed stylesheet carries stay in the workspace until the transform ends.
+    let carried = parameter.carried_bytes();
+    let available = workspace
+        .checked_sub(carried)
+        .ok_or_else(|| fail(exhausted(carried), Phase::Stylesheet, 0))?;
     // A stylesheet serialized from its parsed tree is text in the workspace.
     let stylesheet = parameter
-        .document(semantics, workspace)
+        .document(semantics, available)
         .map_err(|unavailable| match unavailable {
             Unavailable::Missing => {
                 TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
             }
-            Unavailable::Exceeds(needed) => fail(exhausted(needed), Phase::Stylesheet, 0),
+            Unavailable::Exceeds(needed) => fail(exhausted(needed), Phase::Stylesheet, carried),
         })?;
 
     // The stylesheet is element content, which cannot hold a document type declaration.
@@ -877,9 +902,9 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         std::borrow::Cow::Owned(text) => text.capacity(),
         std::borrow::Cow::Borrowed(_) => 0,
     };
-    let compile_workspace = workspace
+    let compile_workspace = available
         .checked_sub(assembled)
-        .ok_or_else(|| fail(exhausted(assembled), Phase::Stylesheet, 0))?;
+        .ok_or_else(|| fail(exhausted(assembled), Phase::Stylesheet, carried))?;
     let compiled = charge_parse_work(
         Compiler::new(
             Arc::new(NoResolver),
@@ -899,9 +924,10 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         xml_parse,
         scratch,
     )?
-    .map_err(|error| fail(error, Phase::Stylesheet, assembled))?;
+    .map_err(|error| fail(error, Phase::Stylesheet, carried + assembled))?;
     drop(stylesheet);
-    let held = compiled.retained_bytes();
+    // Both fit the workspace, so their sum cannot overflow.
+    let held = carried + compiled.retained_bytes();
 
     let (entity_references, entity_expansion_bytes) = if allow_dtd {
         (

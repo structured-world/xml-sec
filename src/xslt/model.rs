@@ -651,7 +651,7 @@ impl Document {
             }
             mapping.insert(source.id(), id);
         }
-        document.register_xml_ids()?;
+        document.register_xml_ids(None)?;
         Ok(document)
     }
 
@@ -925,7 +925,7 @@ impl Document {
             let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
             document.register_unparsed_entity(name, uri)?;
         }
-        document.register_xml_ids()?;
+        document.register_xml_ids(Some(&mut meter))?;
         document.retained_bytes = meter.retained_bytes();
         Ok(document)
     }
@@ -1317,21 +1317,37 @@ impl Document {
             .map(|((root, name), uri)| (name.as_str(), uri.as_str(), *root))
     }
 
-    fn register_xml_ids(&mut self) -> Result<()> {
-        let attributes = self
+    /// Index every `xml:id`; a bounded parse passes its meter, which admits the
+    /// index's storage and the list of owners before either is allocated.
+    fn register_xml_ids(&mut self, mut meter: Option<&mut StreamParseMeter>) -> Result<()> {
+        let is_xml_id = |attribute: &Attribute| {
+            attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "id"
+        };
+        let owners = self
             .nodes()
-            .filter_map(|(owner, node)| match &node.kind {
+            .filter(|(_, node)| match &node.kind {
+                NodeKind::Element { attributes, .. } => attributes.iter().any(is_xml_id),
+                _ => false,
+            })
+            .count();
+        // One entry per element that already counts as a node, so this cannot overflow.
+        let list_bytes = owners * std::mem::size_of::<(NodeId, usize)>();
+        if let Some(meter) = meter.as_deref_mut() {
+            meter.charge_owned(list_bytes)?;
+        }
+        let mut attributes = Vec::new();
+        attributes.try_reserve_exact(owners).map_err(|error| {
+            Error::Dynamic(format!("failed to reserve xml:id storage: {error}"))
+        })?;
+        attributes.extend(self.nodes().filter_map(|(owner, node)| {
+            match &node.kind {
                 NodeKind::Element { attributes, .. } => attributes
                     .iter()
-                    .position(|attribute| {
-                        attribute.name.namespace.as_deref()
-                            == Some("http://www.w3.org/XML/1998/namespace")
-                            && attribute.name.local == "id"
-                    })
+                    .position(is_xml_id)
                     .map(|index| (owner, index)),
                 _ => None,
-            })
-            .collect::<Vec<_>>();
+            }
+        }));
         for (owner, index) in attributes {
             let value = self
                 .node_mut(owner)
@@ -1344,7 +1360,21 @@ impl Document {
             if value.value != normalized {
                 value.value.clone_from(&normalized);
             }
+            let key_bytes = normalized.capacity();
+            if let Some(meter) = meter.as_deref_mut() {
+                reserve_identity_entry(self, key_bytes, meter)?;
+            }
+            let indexed = self.ids.len();
             self.register_id_value(owner, normalized)?;
+            if let Some(meter) = meter.as_deref_mut()
+                && self.ids.len() == indexed
+            {
+                // The owner already held this ID; the key was dropped.
+                meter.release_owned(key_bytes);
+            }
+        }
+        if let Some(meter) = meter {
+            meter.release_owned(list_bytes);
         }
         Ok(())
     }
@@ -2145,6 +2175,14 @@ impl StreamParseMeter {
         Ok(())
     }
 
+    /// Return `bytes` admitted for storage that was not kept.
+    fn release_owned(&mut self, bytes: usize) {
+        self.owned_bytes = self
+            .owned_bytes
+            .checked_sub(bytes)
+            .expect("released owned bytes were admitted");
+    }
+
     /// Bytes the tree holds so far.
     const fn retained_bytes(&self) -> usize {
         // Both count bytes of live allocations, so their sum fits the address space.
@@ -2190,6 +2228,46 @@ fn push_metered(
     }
     meter.charge_owned(node_payload_bytes(&kind, base_uri.as_deref()))?;
     Ok(document.push(parent, kind, base_uri))
+}
+
+/// Admit one more identity-index entry whose key owns `key_bytes`, growing the index
+/// first when it is full. Storage is counted as `retained_identity_index_bytes` counts it.
+fn reserve_identity_entry(
+    document: &mut Document,
+    key_bytes: usize,
+    meter: &mut StreamParseMeter,
+) -> Result<()> {
+    let limit = meter.budget.owned_bytes;
+    let refused = || Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    if document.ids.len() == document.ids.capacity() {
+        let entry = std::mem::size_of::<((NodeId, String), NodeId)>() + std::mem::size_of::<u64>();
+        let additional = document.ids.capacity().max(4);
+        // A hash table reports a capacity of at least the entries it reserves and at
+        // most twice as many, so this bounds the growth before it is allocated.
+        let bound = additional
+            .checked_mul(2)
+            .and_then(|slots| slots.checked_mul(entry))
+            .ok_or_else(refused)?;
+        meter.charge_owned(bound)?;
+        let before = document.ids.capacity();
+        document
+            .ids
+            .try_reserve(additional)
+            .map_err(|_| refused())?;
+        let granted = (document.ids.capacity() - before)
+            .checked_mul(entry)
+            .ok_or_else(refused)?;
+        if granted > bound {
+            meter.charge_owned(granted - bound)?;
+        } else {
+            meter.release_owned(bound - granted);
+        }
+    }
+    meter.charge_owned(key_bytes)
 }
 
 /// Grow `values` by `additional` slots, charging the requested capacity before
@@ -2432,7 +2510,14 @@ fn push_stream_element(
             })
             .map(|attribute| collapse_xml_whitespace(&attribute.value).into_owned())
             .ok_or_else(|| Error::Xml("DTD ID attribute reference is stale".into()))?;
+        let key_bytes = value.capacity();
+        reserve_identity_entry(document, key_bytes, meter)?;
+        let indexed = document.ids.len();
         document.register_dtd_id_value(projected, value)?;
+        if document.ids.len() == indexed {
+            // A repeated ID keeps its first owner; this key was dropped.
+            meter.release_owned(key_bytes);
+        }
     }
     if !empty {
         elements.push(StreamElementFrame {

@@ -309,6 +309,17 @@ impl Meter {
         self
     }
 
+    /// Work the ceiling still admits, across every kind it bounds.
+    pub(crate) const fn work_remaining(&self) -> usize {
+        // Every admitted total stayed within the ceiling.
+        self.work_ceiling - self.work
+    }
+
+    /// The ceiling over every kind of execution work together.
+    pub(crate) const fn work_ceiling(&self) -> usize {
+        self.work_ceiling
+    }
+
     /// The aggregate work total after `amount` more, if the ceiling admits it.
     fn admit_work(&self, kind: BudgetKind, amount: usize) -> Result<usize> {
         if !kind.is_execution_work() {

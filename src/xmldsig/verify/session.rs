@@ -1047,7 +1047,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
         )
         .map_err(parse_failure)?;
         if matches!(mode, ReplayMode::ReferenceOutput)
-            && !transform_chain_produces_binary(
+            && transform_chain_uses_implicit_c14n(
                 classify_uri(uri) == UriClass::External,
                 &transforms,
             )

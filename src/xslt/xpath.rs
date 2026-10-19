@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::rc::Rc;
@@ -2258,7 +2258,41 @@ impl Evaluator {
         // adapter preflight above, before any of these allocations can occur. Runtime QName
         // lookup is borrowed and allocation-free in the vendored XPath engine.
         let document_access_error = RefCell::new(None);
+        // The evaluator admits each unit of its work before doing it. Its per-kind limits
+        // are set below; this also holds all of it within the execution's work ceiling.
+        let work_remaining = meter.work_remaining();
+        let admitted_work = Cell::new(0usize);
+        let ceiling_crossed = Cell::new(None);
+        let admit_work = |units: usize| -> std::result::Result<(), function::Error> {
+            match admitted_work
+                .get()
+                .checked_add(units)
+                .filter(|total| *total <= work_remaining)
+            {
+                Some(total) => {
+                    admitted_work.set(total);
+                    Ok(())
+                }
+                None => {
+                    if ceiling_crossed.get().is_none() {
+                        // A total past `usize::MAX` is reported as that sentinel.
+                        ceiling_crossed.set(Some(admitted_work.get().saturating_add(units)));
+                    }
+                    Err(function::Error::Other {
+                        what: "XSLT work ceiling exceeded".into(),
+                    })
+                }
+            }
+        };
+        let ceiling_refusal = |meter: &Meter, attempted: usize| Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            limit: meter.work_ceiling(),
+            // Work already admitted plus what this evaluation attempted; `usize::MAX`
+            // stands for a total that cannot be represented.
+            actual: (meter.work_ceiling() - work_remaining).saturating_add(attempted),
+        };
         let mut context = sxd_xpath_no_unsafe::context::ScopedContext::new();
+        context.set_work_admission(&admit_work);
         // XPath 1.0 section 2.2 confines `following` and `preceding` to the same document as the
         // context node. Each projected logical document therefore supplies its wrapper as the
         // evaluator root instead of exposing sibling source/module projections.
@@ -2431,6 +2465,9 @@ impl Evaluator {
                     let nodes = document.node_count();
                     for _ in 0..2 {
                         if context.charge_work(nodes).is_err() {
+                            if let Some(attempted) = ceiling_crossed.get() {
+                                return Err(ceiling_refusal(meter, attempted));
+                            }
                             let attempted = context
                                 .evaluation_work_exceeded()
                                 .expect("failed XPath work charge records its attempted total");
@@ -2502,6 +2539,9 @@ impl Evaluator {
         )?;
         if let Some(error) = document_access_error.borrow_mut().take() {
             return Err(error);
+        }
+        if let Some(attempted) = ceiling_crossed.get() {
+            return Err(ceiling_refusal(meter, attempted));
         }
         if let Some(attempted) = context.evaluation_work_exceeded() {
             return Err(Error::Budget {

@@ -537,6 +537,64 @@ fn the_parsed_input_is_charged_to_the_workspace_once() {
 }
 
 #[test]
+fn parsed_stylesheet_copies_count_against_the_workspace() {
+    // A stylesheet parsed from a signature keeps its markup and its serialization for
+    // the whole transform. With the least workspace in which the same markup given to
+    // `XsltStylesheet::new` runs, the parsed one, which holds those copies, is refused.
+    let filler = "x".repeat(32 * 1024);
+    let body = format!(
+        r#"<xsl:variable name="v" select="'{filler}'"/><xsl:template match="/"><out/></xsl:template>"#
+    );
+    let given = stylesheet(&body);
+    let xml = format!(
+        concat!(
+            r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">"#,
+            r#"<Transform Algorithm="{xslt}">{markup}</Transform></Transforms>"#
+        ),
+        xslt = super::super::XSLT_TRANSFORM_URI,
+        markup = given.source()
+    );
+    let document = Document::parse(&xml).expect("fixed XML parses");
+    let parsed = match super::super::parse_transforms(document.root_element())
+        .expect("the transform parses")
+        .pop()
+    {
+        Some(Transform::Xslt(stylesheet)) => stylesheet,
+        _ => panic!("one XSLT transform"),
+    };
+    let workspace = |bytes| {
+        TransformExecutionBudget::from_resources(&ResourcePolicy {
+            max_xslt_workspace_bytes: bytes,
+            ..ResourcePolicy::default()
+        })
+    };
+    let input = b"<doc/>";
+    let (mut refused, mut admitted) = (0, 1 << 24);
+    while admitted - refused > 1 {
+        let middle = refused + (admitted - refused) / 2;
+        if run(&workspace(middle), &given, input).is_ok() {
+            admitted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    // Room for serialization to differ from the given markup, far less than the
+    // two copies of the filler the parsed stylesheet holds.
+    let error = run(&workspace(admitted + 4096), &parsed, input)
+        .expect_err("the parsed copies do not fit beside the transform");
+    assert!(
+        matches!(
+            error,
+            TransformError::Policy(PolicyViolation::ResourceLimit {
+                resource: resource_name::XSLT_WORKSPACE_BYTES,
+                ..
+            })
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn compatibility_serialization_holds_no_inherited_declarations() {
     // Under libxmlsec1 semantics a stylesheet read from its `<Transform>` keeps only
     // what it declares itself, so the bindings of its ancestors are neither written nor

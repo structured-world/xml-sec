@@ -50,7 +50,7 @@ use super::transforms::BASE64_TRANSFORM_URI;
 use super::transforms::{
     DEFAULT_IMPLICIT_C14N_URI, Transform, TransformExecutionBudget, TransformOptions,
     XPATH_TRANSFORM_URI, XPathHereSemantics, XPathSignatureParseBudget,
-    map_c14n_resource_policy_violation, transform_chain_produces_binary,
+    map_c14n_resource_policy_violation, transform_chain_uses_implicit_c14n,
 };
 use super::types::{NodeSet, TransformError, subtree_node_id_range};
 use super::uri::{ExternalResourceMapError, UriReferenceResolver, validate_external_resource_map};
@@ -5056,11 +5056,10 @@ fn enforce_reference_policies(
             // whether the caller supplied the resource. Every transform then
             // determines the next type, including implicit binary-to-node-set
             // adapters before XML-level transforms.
-            let produces_binary = transform_chain_produces_binary(
+            if transform_chain_uses_implicit_c14n(
                 classify_uri(uri) == UriClass::External,
                 &reference.transforms,
-            );
-            if !produces_binary {
+            ) {
                 enforce_transform_allowed(Some(allowed), DEFAULT_IMPLICIT_C14N_URI)?;
             }
         }

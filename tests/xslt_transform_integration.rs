@@ -299,6 +299,54 @@ fn policy_without_xslt_refuses_signing_and_verification() {
 }
 
 #[test]
+fn node_set_input_to_xslt_needs_the_implicit_c14n_permission() {
+    // XMLDSig 1.1 section 4.4.3.2 converts a node-set given to XSLT with inclusive
+    // C14N 1.0, so that algorithm runs and must be on the transform allowlist even
+    // though the chain ends with octets.
+    let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
+        .uri("")
+        .transform(Transform::Enveloped)
+        .transform(Transform::Xslt(values()));
+    let builder = builder(reference);
+    let allowed = [
+        "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+        "http://www.w3.org/2001/10/xml-exc-c14n#",
+        XSLT_TRANSFORM_URI,
+    ];
+    let mut signing = SigningPolicy::default();
+    signing.transforms.allowed_algorithms = Some(allowed.iter().map(|uri| (*uri).into()).collect());
+    let error = sign_with_policy(ITEMS, &builder, signing).expect_err("inclusive C14N is excluded");
+    assert!(
+        matches!(
+            &error,
+            SigningError::Policy(PolicyViolation::Algorithm { algorithm, .. })
+                if algorithm == xml_sec::xmldsig::DEFAULT_IMPLICIT_C14N_URI
+        ),
+        "{error:?}"
+    );
+
+    let signed = sign(ITEMS, &builder).expect("default policy allows the chain");
+    let mut verification = VerificationPolicy::default();
+    verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+    verification.transforms.allowed_algorithms =
+        Some(allowed.iter().map(|uri| (*uri).into()).collect());
+    let resolver = DefaultKeyResolver::default();
+    let error = xml_sec::xmldsig::VerifyContext::new()
+        .policy(verification)
+        .key_resolver(&resolver)
+        .verify(&signed)
+        .expect_err("inclusive C14N is excluded");
+    assert!(
+        matches!(
+            &error,
+            DsigError::Policy(PolicyViolation::Algorithm { algorithm, .. })
+                if algorithm == xml_sec::xmldsig::DEFAULT_IMPLICIT_C14N_URI
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn stylesheets_cannot_reach_external_resources() {
     // The transform has no resolver: imports and document() are policy refusals,
     // never empty results.
@@ -478,6 +526,58 @@ fn stylesheets_use_the_entities_of_their_document() {
     assert_eq!(
         result.signed_info_references[0].pre_digest_data.as_deref(),
         Some(b"<?xml version=\"1.0\"?>\n<out>a</out>\n".as_slice())
+    );
+}
+
+#[cfg(feature = "xml-backend-xmloxide")]
+#[test]
+fn stylesheets_keep_namespace_declarations_defaulted_by_the_dtd() {
+    // An attribute-list declaration can default an `xmlns:p` attribute (XML 1.0 section
+    // 3.3.2); the stylesheet element then binds `p` as if it were written on it
+    // (Namespaces in XML 1.0 section 3). The xmloxide parser applies such defaults;
+    // roxmltree does not and rejects the document, so the backend is chosen here.
+    let template = format!(
+        concat!(
+            r#"<!DOCTYPE root [<!ATTLIST xsl:stylesheet xmlns:p CDATA "urn:p">]>"#,
+            r#"<root><item>a</item>"#,
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>"#,
+            r#"<ds:Reference URI=""><ds:Transforms>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="{xslt}"><xsl:stylesheet version="1.0" xmlns:xsl="{xsl}" "#,
+            r#"exclude-result-prefixes="ds"><xsl:template match="/"><p:out>"#,
+            r#"<xsl:value-of select="//item"/></p:out></xsl:template></xsl:stylesheet>"#,
+            r#"</ds:Transform></ds:Transforms>"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>"#,
+            r#"</ds:Signature></root>"#
+        ),
+        xsl = XSL,
+        xslt = XSLT_TRANSFORM_URI
+    );
+    let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let mut signing = SigningPolicy::default();
+    signing.xml.allow_internal_dtd = true;
+    let signed = SignContext::new(&signer)
+        .policy(signing)
+        .xml_backend(xml_sec::XmlBackend::Xmloxide)
+        .sign_template(&template)
+        .expect("the defaulted prefix is bound");
+    let mut verification = VerificationPolicy::default();
+    verification.xml.allow_internal_dtd = true;
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .policy(verification)
+        .xml_backend(xml_sec::XmlBackend::Xmloxide)
+        .key(&verifier)
+        .store_pre_digest(true)
+        .verify(&signed)
+        .expect("verification runs");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert_eq!(
+        result.signed_info_references[0].pre_digest_data.as_deref(),
+        Some(b"<?xml version=\"1.0\"?>\n<p:out xmlns:p=\"urn:p\">a</p:out>\n".as_slice())
     );
 }
 
