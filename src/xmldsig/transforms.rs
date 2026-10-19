@@ -2735,14 +2735,19 @@ fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     if uri != XSLT_TRANSFORM_URI {
         return Ok(None);
     }
-    // XMLDSig 1.1 section 6.6.5: the stylesheet "MUST be the sole child of the Transform
-    // element"; comments, processing instructions and whitespace around it are not content.
+    // XMLDSig 1.1 section 6.6.5: the XSLT namespace-qualified stylesheet element "MUST be
+    // the sole child of the Transform element"; comments, processing instructions and
+    // whitespace around it are not content.
     // <https://www.w3.org/TR/xmldsig-core1/#sec-XSLT>
     scratch.charge(transform_node.children().len())?;
     let mut elements = 0usize;
     for child in transform_node.children() {
         if child.is_element() {
-            elements += 1;
+            elements += if xslt::is_stylesheet_element(child) {
+                1
+            } else {
+                2
+            };
         } else if child.is_text()
             && let Some(text) = child.text()
         {

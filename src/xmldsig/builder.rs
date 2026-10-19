@@ -578,6 +578,14 @@ impl SignatureBuilder {
                             )?;
                         }
                     }
+                    // The stylesheet is copied into the template; one larger than the
+                    // document limit is refused before it is.
+                    #[cfg(feature = "xslt")]
+                    Transform::Xslt(stylesheet) => {
+                        policy
+                            .resources
+                            .validate_xml_document_len(stylesheet.markup_len())?;
+                    }
                     _ => {}
                 }
             }

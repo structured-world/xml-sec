@@ -158,13 +158,13 @@ impl XsltStylesheet {
     ///
     /// The markup is written into the `<Transform>` element unchanged and is
     /// compiled as its own document, so it must be valid element content holding
-    /// exactly one root element.
+    /// exactly one `xsl:stylesheet` or `xsl:transform` element.
     ///
     /// # Errors
     ///
     /// [`TransformError::XmlParse`] for markup that is not well-formed element
     /// content, and [`TransformError::UnsupportedTransform`] when it does not
-    /// hold exactly one element outside comments, processing instructions and
+    /// hold exactly that element outside comments, processing instructions and
     /// whitespace.
     ///
     /// # Examples
@@ -187,7 +187,7 @@ impl XsltStylesheet {
         let mut elements = 0usize;
         for child in document.root_element().children() {
             if child.is_element() {
-                elements += 1;
+                elements += if is_stylesheet_element(child) { 1 } else { 2 };
             } else if child.is_text()
                 && !child
                     .text()
@@ -234,6 +234,14 @@ impl XsltStylesheet {
             None => std::borrow::Cow::Borrowed(&self.source),
         }
     }
+
+    /// The length of [`Self::markup`], without materializing it.
+    pub(crate) fn markup_len(&self) -> usize {
+        match &self.parsed {
+            Some(parsed) => parsed.document.len() + parsed.inherited.len(),
+            None => self.source.len(),
+        }
+    }
 }
 
 /// Text whose allocation stays within `limit` bytes, refused before it would exceed it.
@@ -262,6 +270,10 @@ impl Bounded {
             self.text
                 .try_reserve_exact(grown - self.text.len())
                 .map_err(|_| needed)?;
+            // An allocator may grant more than requested; what it granted is what is held.
+            if self.text.capacity() > self.limit {
+                return Err(self.text.capacity());
+            }
         }
         self.text.push_str(piece);
         Ok(())
@@ -270,6 +282,18 @@ impl Bounded {
     fn push(&mut self, character: char) -> Result<(), usize> {
         self.push_str(character.encode_utf8(&mut [0; 4]))
     }
+}
+
+/// Whether `element` is an `xsl:stylesheet` or `xsl:transform` element.
+///
+/// XMLDSig 1.1 section 6.6.5 requires "the mandatory XSLT namespace-qualified
+/// stylesheet element" as the parameter, so a literal result element used as a
+/// simplified stylesheet (XSLT 1.0 section 2.3) is not accepted.
+/// <https://www.w3.org/TR/xmldsig-core1/#sec-XSLT>
+pub(super) fn is_stylesheet_element(element: crate::xml::dom::Node<'_, '_>) -> bool {
+    const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
+    let name = element.tag_name();
+    name.namespace() == Some(XSLT_NS) && matches!(name.name(), "stylesheet" | "transform")
 }
 
 /// Stylesheet markup of one `<Transform>` element: the source text between its
@@ -455,6 +479,7 @@ impl ParsedStylesheet {
             push_attribute(&mut inherited, Some("xml"), "space", "preserve")
                 .map_err(Unavailable::Exceeds)?;
         }
+        // `Bounded` keeps its capacity within its limit.
         let mut document = Bounded::new(limit - inherited.text.capacity());
         let at = serialize_element(root, &mut document, inline.then_some(&inherited.text))
             .map_err(Unavailable::Exceeds)?;

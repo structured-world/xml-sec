@@ -511,9 +511,9 @@ using the XSLT transform is reported as an invalid per-reference result without 
 The optional `xslt` feature executes the XSLT transform
 (`http://www.w3.org/TR/1999/REC-xslt-19991116`, XMLDSig 1.1 section 6.6.5) with the safe-Rust
 XSLT 1.0 engine. `Transform::Xslt` carries an `XsltStylesheet`: the markup of the `<Transform>`
-content. The stylesheet element must be the sole content of its `<Transform>` (comments,
-processing instructions and whitespace aside); anything else is refused when the transform is
-parsed. A parsed signature compiles the stylesheet element as its document parsed it, with
+content. An `xsl:stylesheet` or `xsl:transform` element must be the sole content of its
+`<Transform>` (comments, processing instructions and whitespace aside); anything else,
+including a simplified stylesheet, is refused when the transform is parsed. A parsed signature compiles the stylesheet element as its document parsed it, with
 entity and character references already replaced. Markup given to `XsltStylesheet::new` is
 written into generated signatures unchanged; a stylesheet parsed from another document is
 written with the namespace declarations and `xml:space` it inherited there, so it does not

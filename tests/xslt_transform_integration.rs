@@ -540,6 +540,61 @@ fn the_stylesheet_must_be_the_sole_child_of_its_transform() {
 }
 
 #[test]
+fn the_stylesheet_root_is_an_xslt_stylesheet_element() {
+    // XMLDSig 1.1 section 6.6.5 requires "the mandatory XSLT namespace-qualified
+    // stylesheet element"; a literal result element used as a simplified stylesheet
+    // (XSLT 1.0 section 2.3) is not one.
+    let simplified = format!(r#"<out xsl:version="1.0" xmlns:xsl="{XSL}">x</out>"#);
+    assert!(matches!(
+        XsltStylesheet::new(simplified.clone()),
+        Err(TransformError::UnsupportedTransform(_))
+    ));
+    let xml = format!(
+        concat!(
+            r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">"#,
+            r#"<Transform Algorithm="{xslt}">{content}</Transform></Transforms>"#
+        ),
+        xslt = XSLT_TRANSFORM_URI,
+        content = simplified
+    );
+    let document = xml_sec::Document::parse(&xml).expect("fixed XML parses");
+    assert!(matches!(
+        xml_sec::xmldsig::parse_transforms(document.root_element()),
+        Err(TransformError::UnsupportedTransform(_))
+    ));
+    let transform = format!(r#"<xsl:transform version="1.0" xmlns:xsl="{XSL}"/>"#);
+    assert!(XsltStylesheet::new(transform).is_ok());
+}
+
+#[test]
+fn stylesheet_size_is_checked_before_the_template_is_written() {
+    // A stylesheet larger than the document limit is refused by its own size, before
+    // it is copied into a signature template.
+    let sheet = stylesheet(&format!(
+        r#"<xsl:template match="/"><out>{}</out></xsl:template>"#,
+        "x".repeat(4096)
+    ));
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_xml_document_bytes = 1024;
+    let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
+        .uri("")
+        .transform(Transform::Enveloped)
+        .transform(Transform::Xslt(sheet.clone()));
+    let violation = policy_error(
+        sign_with_policy(ITEMS, &builder(reference), policy)
+            .expect_err("the stylesheet exceeds the document limit"),
+    );
+    assert!(
+        matches!(
+            violation,
+            PolicyViolation::ResourceLimit { maximum: 1024, actual, .. }
+                if actual == sheet.source().len()
+        ),
+        "{violation:?}"
+    );
+}
+
+#[test]
 fn parsed_stylesheets_are_written_without_their_original_document() {
     // A stylesheet parsed from one document may use a prefix declared on an ancestor
     // of its `<Transform>` and an entity of that document's DTD. Written into another
