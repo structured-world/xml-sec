@@ -45,6 +45,8 @@ pub enum BudgetKind {
     OwnedBytes,
     /// XML text scanned by parser passes, one charge per pass over a text.
     ParseWorkBytes,
+    /// Every kind of execution work together, against the caller's work ceiling.
+    AggregateWork,
 }
 
 /// Policy-neutral enforcement limits for parsing one caller-supplied XML document.
@@ -255,6 +257,27 @@ pub(crate) struct Meter {
     messages: usize,
     owned_bytes: usize,
     external_documents: usize,
+    work: usize,
+    work_ceiling: usize,
+}
+
+impl BudgetKind {
+    /// Whether the kind counts toward an execution's aggregate work ceiling.
+    #[must_use]
+    pub const fn is_execution_work(self) -> bool {
+        matches!(
+            self,
+            Self::XPathEvaluations
+                | Self::XPathOperations
+                | Self::ExtensionOperations
+                | Self::PatternEvaluations
+                | Self::TemplateApplications
+                | Self::SortComparisons
+                | Self::KeyEntries
+                | Self::ResultNodes
+                | Self::Messages
+        )
+    }
 }
 
 impl Meter {
@@ -275,7 +298,29 @@ impl Meter {
             messages: 0,
             owned_bytes: source_bytes,
             external_documents: 0,
+            work: 0,
+            work_ceiling: usize::MAX,
         })
+    }
+
+    /// Bound the kinds of [`BudgetKind::is_execution_work`] together.
+    pub(crate) const fn with_work_ceiling(mut self, ceiling: usize) -> Self {
+        self.work_ceiling = ceiling;
+        self
+    }
+
+    /// The aggregate work total after `amount` more, if the ceiling admits it.
+    fn admit_work(&self, kind: BudgetKind, amount: usize) -> Result<usize> {
+        if !kind.is_execution_work() {
+            return Ok(self.work);
+        }
+        let actual = self.work.checked_add(amount).ok_or(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            limit: self.work_ceiling,
+            actual: usize::MAX,
+        })?;
+        ensure(BudgetKind::AggregateWork, self.work_ceiling, actual)?;
+        Ok(actual)
     }
 
     pub(crate) fn recursion(&self, depth: usize) -> Result<()> {
@@ -295,6 +340,7 @@ impl Meter {
     }
 
     pub(crate) fn charge(&mut self, kind: BudgetKind, amount: usize) -> Result<()> {
+        let work = self.admit_work(kind, amount)?;
         let (used, limit) = match kind {
             BudgetKind::ExternalDocuments => {
                 (&mut self.external_documents, self.limits.external_documents)
@@ -343,10 +389,12 @@ impl Meter {
         };
         ensure(kind, limit, actual)?;
         *used = actual;
+        self.work = work;
         Ok(())
     }
 
     pub(crate) fn check_additional(&self, kind: BudgetKind, amount: usize) -> Result<()> {
+        self.admit_work(kind, amount)?;
         let (used, limit) = self.usage(kind)?;
         ensure(kind, limit, used.saturating_add(amount))
     }

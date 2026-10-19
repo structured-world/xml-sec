@@ -196,7 +196,7 @@ impl Stylesheet {
         options: ExecutionOptions,
     ) -> Reported<TransformResult, ExecutionUsage> {
         let mut meter = match Meter::new(options.budget, source.source_bytes()) {
-            Ok(meter) => meter,
+            Ok(meter) => meter.with_work_ceiling(environment.work_ceiling),
             Err(error) => {
                 return Reported {
                     outcome: Err(error),

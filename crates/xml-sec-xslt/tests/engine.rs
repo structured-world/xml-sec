@@ -172,6 +172,63 @@ fn compilation_reports_parser_work_whether_or_not_it_succeeds() {
 }
 
 #[test]
+fn the_work_ceiling_bounds_every_kind_together() {
+    // A caller whose own account admits less than the per-kind limits grants passes the
+    // remainder as a ceiling over all work kinds together; the execution is refused when
+    // their sum would cross it, and reports no more than it admitted.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+             <xsl:template match="/"><out><xsl:apply-templates select="//item"/></out></xsl:template>
+             <xsl:template match="item"><x><xsl:value-of select="."/></x></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+    let xml = "<root><item>a</item><item>b</item></root>";
+    let source = Document::parse(xml, None).expect("source parses");
+    let run = |ceiling: usize| {
+        stylesheet.execute_reported(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver)).with_work_ceiling(ceiling),
+            ExecutionOptions {
+                budget: execution_budget(xml.len()),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+    };
+    let unbounded = run(usize::MAX);
+    assert!(unbounded.outcome.is_ok());
+    let usage = unbounded.usage;
+    let total = usage.xpath_evaluations
+        + usage.xpath_operations
+        + usage.extension_operations
+        + usage.pattern_evaluations
+        + usage.template_applications
+        + usage.sort_comparisons
+        + usage.key_entries
+        + usage.result_nodes
+        + usage.messages;
+    assert!(run(total).outcome.is_ok(), "the exact total fits");
+    let refused = run(total - 1);
+    assert!(matches!(
+        refused.outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            ..
+        })
+    ));
+    let admitted = refused.usage;
+    assert!(
+        admitted.xpath_evaluations
+            + admitted.xpath_operations
+            + admitted.pattern_evaluations
+            + admitted.template_applications
+            + admitted.result_nodes
+            < total
+    );
+}
+
+#[test]
 fn reported_usage_is_the_work_the_budget_enforces() {
     // Callers that share one allowance across executions pass the remainder of the previous
     // report as the next budget. That is sound only if each reported counter is exactly the

@@ -55,6 +55,7 @@ pub struct ExecutionEnvironment<R: Resolver + 'static> {
     pub(crate) resolver: Arc<R>,
     pub(crate) clock: Option<Arc<dyn Clock>>,
     pub(crate) process_xinclude: bool,
+    pub(crate) work_ceiling: usize,
 }
 
 impl<R: Resolver + 'static> ExecutionEnvironment<R> {
@@ -64,7 +65,19 @@ impl<R: Resolver + 'static> ExecutionEnvironment<R> {
             resolver,
             clock: None,
             process_xinclude: false,
+            work_ceiling: usize::MAX,
         }
+    }
+
+    /// Bound every kind of execution work together, on top of each kind's own limit.
+    ///
+    /// The caller's operation may admit less aggregate work than the budget grants per
+    /// kind; that remainder is the ceiling, so the execution is refused before it does
+    /// work the operation cannot pay for.
+    #[must_use]
+    pub const fn with_work_ceiling(mut self, work: usize) -> Self {
+        self.work_ceiling = work;
+        self
     }
 
     #[must_use]
