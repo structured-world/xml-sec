@@ -1020,11 +1020,11 @@ pub enum SameDocumentIdSemantics {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum XsltStylesheetSemantics {
-    /// The stylesheet is an element of the signed document: a prefix it refers
-    /// to without declaring is bound by the declarations on its ancestors
-    /// (Namespaces in XML section 6.1), and a prefix bound nowhere in
-    /// `exclude-result-prefixes` or `extension-element-prefixes` is a stylesheet
-    /// error (XSLT 1.0 section 7.1.1).
+    /// The stylesheet is an element of the signed document: every namespace in
+    /// scope at it, including those declared on its ancestors (Namespaces in XML
+    /// section 6.1), applies and is copied into literal result elements, and a
+    /// prefix bound nowhere in `exclude-result-prefixes` or
+    /// `extension-element-prefixes` is a stylesheet error (XSLT 1.0 section 7.1.1).
     #[default]
     Specification,
     /// libxmlsec1: the stylesheet is the serialized `<Transform>` content, so

@@ -294,7 +294,7 @@ jobs:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         run: |
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev perl pkg-config
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
           scripts/install-xmlsec1.sh
           "$XMLSEC1_BIN" --version
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"

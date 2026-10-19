@@ -511,7 +511,9 @@ using the XSLT transform is reported as an invalid per-reference result without 
 The optional `xslt` feature executes the XSLT transform
 (`http://www.w3.org/TR/1999/REC-xslt-19991116`, XMLDSig 1.1 section 6.6.5) with the safe-Rust
 XSLT 1.0 engine. `Transform::Xslt` carries an `XsltStylesheet`: the markup of the `<Transform>`
-content, written into generated signatures unchanged.
+content, written into generated signatures unchanged. A parsed signature compiles the
+stylesheet element as its document parsed it, with entity and character references already
+replaced.
 
 The transform consumes octets. Node-set input is first converted with inclusive C14N 1.0, binary
 input is used as is, and the serialized result tree (with its XML declaration for the `xml`
@@ -539,13 +541,11 @@ Execution is bounded by the operation's policy:
 
 `TransformPolicy::xslt_stylesheet_semantics` decides how the stylesheet is read:
 
-- `Specification` (the default) reads it as the element of the signed document it is: a
-  prefix it refers to without declaring (in an element or attribute name, a QName in an
-  XPath expression or pattern, or a prefix list), and the default namespace of its
-  unprefixed element names, are bound by the declarations on `<Signature>` or other
-  ancestors (Namespaces in XML 1.0 section 6.1). Bindings it never refers to are not added,
-  so they are not copied into its literal result elements. A prefix bound nowhere in
-  `exclude-result-prefixes` or `extension-element-prefixes` is a stylesheet error.
+- `Specification` (the default) reads it as the element of the signed document it is: every
+  namespace in scope at it applies, including those declared on `<Signature>` or the
+  document's root (Namespaces in XML 1.0 section 6.1), and literal result elements copy them
+  unless `exclude-result-prefixes` names them (XSLT 1.0 section 7.1.1). A prefix bound
+  nowhere in `exclude-result-prefixes` or `extension-element-prefixes` is a stylesheet error.
 - `Libxmlsec1` compiles the `<Transform>` content alone, as libxmlsec1 does, so declarations
   outside it are lost, and skips an unbound prefix in those lists after a warning, as libxslt
   does. The `XmlSecCompatible` profile and the native CLI select it, so their signers and

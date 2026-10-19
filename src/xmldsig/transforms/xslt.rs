@@ -52,16 +52,43 @@ fn admitted(usage: &ExecutionUsage, kind: BudgetKind) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XsltStylesheet {
     source: String,
-    inherited: Option<Inherited>,
+    parsed: Option<ParsedStylesheet>,
 }
 
-/// Namespace declarations in scope at a `<Transform>` that its stylesheet
-/// element does not make itself, serialized as attributes, and the offset in
-/// the stylesheet markup just after that element's name where they belong.
+/// The stylesheet element of a parsed `<Transform>`, serialized from the tree.
+///
+/// Entity references and character references are already replaced, so the
+/// stylesheet compiles without the document's DTD (XML 1.0 section 4.4).
+/// <https://www.w3.org/TR/2008/REC-xml-20081126/#entproc>
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Inherited {
+pub(super) struct ParsedStylesheet {
+    /// The stylesheet with the namespace declarations written on its elements.
+    document: String,
+    /// Declarations in scope at the `<Transform>` that the stylesheet element does
+    /// not make itself, serialized as attributes.
+    inherited: String,
+    /// Offset in `document` just after the stylesheet element's name.
     at: usize,
-    declarations: String,
+}
+
+impl ParsedStylesheet {
+    /// The stylesheet document `semantics` compiles.
+    ///
+    /// The stylesheet is an element of the signed document: every namespace in
+    /// scope at it, including those declared on its ancestors (Namespaces in XML
+    /// 1.0 section 6.1), is a namespace node of its elements that literal result
+    /// elements copy (XSLT 1.0 section 7.1.1). libxmlsec1 compiles the element
+    /// with only the declarations written inside it.
+    /// <https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element>
+    fn text(&self, semantics: XsltStylesheetSemantics) -> std::borrow::Cow<'_, str> {
+        match semantics {
+            XsltStylesheetSemantics::Specification if !self.inherited.is_empty() => {
+                let (head, tail) = self.document.split_at(self.at);
+                std::borrow::Cow::Owned([head, &self.inherited, tail].concat())
+            }
+            _ => std::borrow::Cow::Borrowed(&self.document),
+        }
+    }
 }
 
 /// An XSLT transform parameter as the executor reads it.
@@ -74,19 +101,18 @@ pub(crate) enum XsltParameter<'a> {
 }
 
 impl<'a> XsltParameter<'a> {
-    /// The stylesheet markup and the declarations it inherits.
-    fn parts(self) -> Option<(&'a str, Option<std::borrow::Cow<'a, Inherited>>)> {
+    /// The stylesheet document `semantics` compiles.
+    fn document(self, semantics: XsltStylesheetSemantics) -> Option<std::borrow::Cow<'a, str>> {
         match self {
-            Self::Stylesheet(stylesheet) => Some((
-                &stylesheet.source,
-                stylesheet
-                    .inherited
-                    .as_ref()
-                    .map(std::borrow::Cow::Borrowed),
-            )),
-            Self::Transform(transform) => Some((
-                stylesheet_source(transform)?,
-                inherited_namespaces(transform).map(std::borrow::Cow::Owned),
+            Self::Stylesheet(stylesheet) => Some(match &stylesheet.parsed {
+                Some(parsed) => parsed.text(semantics),
+                // Markup given to `XsltStylesheet::new` has no enclosing document.
+                None => std::borrow::Cow::Borrowed(&stylesheet.source),
+            }),
+            Self::Transform(transform) => Some(std::borrow::Cow::Owned(
+                ParsedStylesheet::from_transform(transform)?
+                    .text(semantics)
+                    .into_owned(),
             )),
         }
     }
@@ -143,7 +169,7 @@ impl XsltStylesheet {
         }
         Ok(Self {
             source,
-            inherited: None,
+            parsed: None,
         })
     }
 
@@ -151,7 +177,7 @@ impl XsltStylesheet {
     pub(super) fn from_parsed(transform: crate::xml::dom::Node<'_, '_>, source: &str) -> Self {
         Self {
             source: source.to_owned(),
-            inherited: inherited_namespaces(transform),
+            parsed: ParsedStylesheet::from_transform(transform),
         }
     }
 
@@ -176,188 +202,187 @@ pub(super) fn stylesheet_source<'a>(transform: crate::xml::dom::Node<'a, 'a>) ->
         .get(first.range().start..last.range().end)
 }
 
-/// Prefixes in a stylesheet's markup that no element of the markup declares
-/// where they are used, and the length of its root element's name. `None`
-/// stands for the default namespace.
-///
-/// A reference is an element or attribute name prefix, an unprefixed element
-/// name (the default namespace), a QName prefix in an attribute value (XPath
-/// expressions, patterns, attribute value templates), or an entry of an
-/// `exclude-result-prefixes` or `extension-element-prefixes` list.
-fn unresolved_references(markup: &str) -> Option<(usize, Vec<Option<String>>)> {
-    use crate::xml_input_shared::lexical::{Event, Scanner};
-    let mut scanner = Scanner::new(markup);
-    let mut scopes: Vec<Vec<Option<String>>> = Vec::new();
-    let mut unresolved: Vec<Option<String>> = Vec::new();
-    let mut root_name = None;
-    while let Ok(Some(event)) = scanner.next_event() {
-        let (tag, empty) = match event {
-            Event::Start(tag) => (tag, false),
-            Event::Empty(tag) => (tag, true),
-            Event::End { .. } => {
-                scopes.pop();
-                continue;
-            }
-            _ => continue,
-        };
-        root_name.get_or_insert(tag.name.qualified().len());
-        let mut declared = Vec::new();
-        for attribute in &tag.attributes {
-            let name = attribute.name.qualified();
-            if name == "xmlns" {
-                declared.push(None);
-            } else if let Some(prefix) = name.strip_prefix("xmlns:") {
-                declared.push(Some(prefix.to_owned()));
-            }
-        }
-        scopes.push(declared);
-        let mut refer = |prefix: Option<&str>| {
-            if prefix == Some("xml") {
-                return;
-            }
-            let prefix = prefix.map(str::to_owned);
-            if !scopes.iter().any(|frame| frame.contains(&prefix)) && !unresolved.contains(&prefix)
-            {
-                unresolved.push(prefix);
-            }
-        };
-        refer(tag.name.prefix());
-        for attribute in &tag.attributes {
-            let name = attribute.name.qualified();
-            if name == "xmlns" || name.starts_with("xmlns:") {
-                continue;
-            }
-            if let Some(prefix) = attribute.name.prefix() {
-                refer(Some(prefix));
-            }
-            // XSLT 1.0 sections 7.1.1 and 14.1: whitespace-separated prefixes, `#default`
-            // naming the default namespace.
-            if matches!(
-                attribute.name.local(),
-                "exclude-result-prefixes" | "extension-element-prefixes"
-            ) {
-                for token in attribute.value.split_ascii_whitespace() {
-                    refer((token != "#default").then_some(token));
-                }
-            } else {
-                qname_prefixes(attribute.value, |prefix| refer(Some(prefix)));
-            }
-        }
-        if empty {
-            scopes.pop();
-        }
-    }
-    Some((root_name?, unresolved))
-}
-
-/// Call `visit` with each QName prefix in `value`, outside quoted literals: an
-/// NCName directly followed by one colon, as in `ds:Object` but not `child::x`.
-fn qname_prefixes(value: &str, mut visit: impl FnMut(&str)) {
-    let is_name = |character: char| {
-        character.is_alphanumeric() || matches!(character, '_' | '-' | '.') || !character.is_ascii()
-    };
-    let bytes = value.as_bytes();
-    let mut quote = None;
-    let mut start = None;
-    for (index, character) in value.char_indices() {
-        if let Some(open) = quote {
-            if character == open {
-                quote = None;
-            }
-            continue;
-        }
+/// Append `value` as the content of a double-quoted attribute.
+fn push_attribute_value(out: &mut String, value: &str) {
+    for character in value.chars() {
         match character {
-            '\'' | '"' => {
-                quote = Some(character);
-                start = None;
-            }
-            ':' => {
-                let next_is_colon = bytes.get(index + 1) == Some(&b':');
-                let previous_is_colon = index > 0 && bytes[index - 1] == b':';
-                if let Some(begin) = start
-                    && !next_is_colon
-                    && !previous_is_colon
-                    && (begin == 0 || bytes[begin - 1] != b':')
-                {
-                    visit(&value[begin..index]);
-                }
-                start = None;
-            }
-            character if is_name(character) => {
-                if start.is_none()
-                    && (character.is_alphabetic() || character == '_' || !character.is_ascii())
-                {
-                    start = Some(index);
-                }
-            }
-            _ => start = None,
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '"' => out.push_str("&quot;"),
+            // Attribute-value normalization would turn these into spaces.
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            character => out.push(character),
         }
     }
 }
 
-/// Declarations the stylesheet element inherits from `transform` and its ancestors.
+/// Append `value` as character data.
+fn push_text(out: &mut String, value: &str) {
+    for character in value.chars() {
+        match character {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            // Line-end normalization would turn a literal carriage return into a line feed.
+            '\r' => out.push_str("&#13;"),
+            character => out.push(character),
+        }
+    }
+}
+
+/// Append ` xmlns[:prefix]="uri"`.
+fn push_declaration(out: &mut String, prefix: Option<&str>, uri: &str) {
+    out.push_str(" xmlns");
+    if let Some(prefix) = prefix {
+        out.push(':');
+        out.push_str(prefix);
+    }
+    out.push_str("=\"");
+    push_attribute_value(out, uri);
+    out.push('"');
+}
+
+/// Prefixes declared on `element` itself, `None` for the default namespace.
 ///
-/// The stylesheet is an element of the signed document, so a prefix it uses
-/// without declaring is bound by the declarations in scope at it (Namespaces in
-/// XML 1.0 section 6.1). Its markup alone carries only the declarations written
-/// inside it. Only bindings the stylesheet refers to are added: a binding it
-/// never uses would otherwise be copied into its literal result elements.
-/// <https://www.w3.org/TR/2009/REC-xml-names-20091208/#scoping>
-fn inherited_namespaces(transform: crate::xml::dom::Node<'_, '_>) -> Option<Inherited> {
-    let first = transform.first_child()?;
-    let root = transform.children().find(|child| child.is_element())?;
-    let markup = transform.document().input_text().get(root.range())?;
-    let (name, unresolved) = unresolved_references(markup)?;
-    let mut declarations = String::new();
-    for namespace in transform.namespaces() {
-        let prefix = namespace.name();
-        if !unresolved
-            .iter()
-            .any(|reference| reference.as_deref() == prefix)
-        {
-            continue;
+/// The tree keeps only in-scope bindings, so the declarations are read from the
+/// element's start tag; an element produced by entity replacement has none in
+/// the document text and falls back to the bindings that differ from its parent.
+fn declared_prefixes<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Vec<Option<&'a str>> {
+    let text = element.document().input_text();
+    let lexical = text.get(element.range()).and_then(|markup| {
+        markup.starts_with('<').then_some(())?;
+        match crate::xml_input_shared::lexical::Scanner::new(markup).next_event() {
+            Ok(Some(
+                crate::xml_input_shared::lexical::Event::Start(tag)
+                | crate::xml_input_shared::lexical::Event::Empty(tag),
+            )) => Some(
+                tag.attributes
+                    .iter()
+                    .filter_map(|attribute| {
+                        let name = attribute.name.qualified();
+                        if name == "xmlns" {
+                            Some(None)
+                        } else {
+                            name.strip_prefix("xmlns:")
+                                .and_then(|prefix| {
+                                    element
+                                        .namespaces()
+                                        .find(|namespace| namespace.name() == Some(prefix))
+                                })
+                                .map(|namespace| namespace.name())
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
         }
-        declarations.push_str(" xmlns");
-        if let Some(prefix) = prefix {
-            declarations.push(':');
-            declarations.push_str(prefix);
+    });
+    lexical.unwrap_or_else(|| {
+        let parent = element.parent();
+        let inherited =
+            |prefix: Option<&str>| parent.and_then(|parent| parent.lookup_namespace_uri(prefix));
+        let mut declared: Vec<Option<&'a str>> = element
+            .namespaces()
+            .filter(|namespace| inherited(namespace.name()) != Some(namespace.uri()))
+            .map(|namespace| namespace.name())
+            .collect();
+        if element.lookup_namespace_uri(None).is_none() && inherited(None).is_some() {
+            declared.push(None);
         }
-        declarations.push_str("=\"");
-        for character in namespace.uri().chars() {
-            match character {
-                '&' => declarations.push_str("&amp;"),
-                '<' => declarations.push_str("&lt;"),
-                '"' => declarations.push_str("&quot;"),
-                // Attribute-value normalization would turn these into spaces.
-                '\t' => declarations.push_str("&#9;"),
-                '\n' => declarations.push_str("&#10;"),
-                '\r' => declarations.push_str("&#13;"),
-                character => declarations.push(character),
-            }
-        }
-        declarations.push('"');
-    }
-    if declarations.is_empty() {
-        return None;
-    }
-    Some(Inherited {
-        at: root.range().start - first.range().start + 1 + name,
-        declarations,
+        declared
     })
 }
 
-/// The stylesheet document `semantics` compiles.
-fn stylesheet_document<'a>(
-    source: &'a str,
-    inherited: Option<&Inherited>,
-    semantics: XsltStylesheetSemantics,
-) -> std::borrow::Cow<'a, str> {
-    match (semantics, inherited) {
-        (XsltStylesheetSemantics::Specification, Some(inherited)) => {
-            let (head, tail) = source.split_at(inherited.at);
-            std::borrow::Cow::Owned([head, &inherited.declarations, tail].concat())
+impl ParsedStylesheet {
+    /// Serialize the stylesheet element of `transform` from the parsed tree.
+    fn from_transform(transform: crate::xml::dom::Node<'_, '_>) -> Option<Self> {
+        enum Step<'a> {
+            Open(crate::xml::dom::Node<'a, 'a>),
+            Close(crate::xml::dom::Node<'a, 'a>),
         }
-        _ => std::borrow::Cow::Borrowed(source),
+        let root = transform.children().find(|child| child.is_element())?;
+        let mut document = String::new();
+        let mut at = None;
+        let mut root_declarations = Vec::new();
+        let push_name = |out: &mut String, prefix: Option<&str>, local: &str| {
+            if let Some(prefix) = prefix {
+                out.push_str(prefix);
+                out.push(':');
+            }
+            out.push_str(local);
+        };
+        // An explicit stack keeps native recursion independent of the stylesheet's depth.
+        let mut steps = vec![Step::Open(root)];
+        while let Some(step) = steps.pop() {
+            match step {
+                Step::Close(element) => {
+                    document.push_str("</");
+                    push_name(&mut document, element.prefix(), element.tag_name().name());
+                    document.push('>');
+                }
+                Step::Open(node) if node.is_element() => {
+                    document.push('<');
+                    push_name(&mut document, node.prefix(), node.tag_name().name());
+                    let declared = declared_prefixes(node);
+                    if at.is_none() {
+                        at = Some(document.len());
+                        root_declarations.clone_from(&declared);
+                    }
+                    for prefix in declared {
+                        push_declaration(
+                            &mut document,
+                            prefix,
+                            node.lookup_namespace_uri(prefix).unwrap_or(""),
+                        );
+                    }
+                    for attribute in node.attributes() {
+                        document.push(' ');
+                        push_name(&mut document, attribute.prefix(), attribute.name());
+                        document.push_str("=\"");
+                        push_attribute_value(&mut document, attribute.value());
+                        document.push('"');
+                    }
+                    if node.first_child().is_none() {
+                        document.push_str("/>");
+                    } else {
+                        document.push('>');
+                        steps.push(Step::Close(node));
+                        steps.extend(node.children().rev().map(Step::Open));
+                    }
+                }
+                Step::Open(node) if node.is_comment() => {
+                    document.push_str("<!--");
+                    document.push_str(node.text().unwrap_or(""));
+                    document.push_str("-->");
+                }
+                Step::Open(node) if node.is_pi() => {
+                    if let Some(pi) = node.pi() {
+                        document.push_str("<?");
+                        document.push_str(pi.target);
+                        if let Some(value) = pi.value {
+                            document.push(' ');
+                            document.push_str(value);
+                        }
+                        document.push_str("?>");
+                    }
+                }
+                Step::Open(node) => push_text(&mut document, node.text().unwrap_or("")),
+            }
+        }
+        let mut inherited = String::new();
+        for namespace in transform.namespaces() {
+            let prefix = namespace.name();
+            if prefix != Some("xml") && !root_declarations.contains(&prefix) {
+                push_declaration(&mut inherited, prefix, namespace.uri());
+            }
+        }
+        Some(Self {
+            document,
+            inherited,
+            at: at?,
+        })
     }
 }
 
@@ -454,6 +479,7 @@ fn uri_refusal() -> TransformError {
 fn map_error<S: TransformScratch>(
     error: Error,
     phase: Phase,
+    held: usize,
     allowance: &Allowance,
     workspace: usize,
     scratch: &S,
@@ -477,7 +503,9 @@ fn map_error<S: TransformScratch>(
             BudgetKind::OwnedBytes | BudgetKind::NamespaceScopeBytes => limit(
                 resource_name::XSLT_WORKSPACE_BYTES,
                 allowance.max_workspace,
-                actual,
+                // The engine reports `usize::MAX` for a total it cannot represent;
+                // adding what earlier stages hold keeps that meaning.
+                held.saturating_add(actual),
             ),
             BudgetKind::StylesheetBytes | BudgetKind::SourceBytes => limit(
                 resource_name::XML_DOCUMENT,
@@ -583,18 +611,19 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     scratch: &S,
 ) -> Result<ExecutionData<'d, S, D>, TransformError> {
     let allowance = &budget.xslt;
-    let (source, inherited) = parameter.parts().ok_or_else(|| {
+    let stylesheet = parameter.document(semantics).ok_or_else(|| {
         TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
     })?;
     let (reservation, workspace) = scratch.reserve_workspace(allowance.max_workspace)?;
-    let fail = |error, phase| map_error(error, phase, allowance, workspace, scratch);
+    // `held` is what earlier stages keep in the workspace while a stage runs; a
+    // refusal reports the workspace total, not the stage's share of it.
+    let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
     let exhausted = |needed: usize| Error::Budget {
         kind: BudgetKind::OwnedBytes,
         limit: workspace,
         actual: needed,
     };
 
-    let stylesheet = stylesheet_document(source, inherited.as_deref(), semantics);
     // The stylesheet is element content, which cannot hold a document type declaration.
     let stylesheet_settings = DocumentParseSettings {
         allow_dtd: false,
@@ -609,7 +638,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     };
     let compile_workspace = workspace
         .checked_sub(assembled)
-        .ok_or_else(|| fail(exhausted(assembled), Phase::Stylesheet))?;
+        .ok_or_else(|| fail(exhausted(assembled), Phase::Stylesheet, 0))?;
     let compiled = charge_parse_work(
         Compiler::new(
             Arc::new(NoResolver),
@@ -628,7 +657,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         .compile_reported(&stylesheet, None),
         xml_parse,
     )?
-    .map_err(|error| fail(error, Phase::Stylesheet))?;
+    .map_err(|error| fail(error, Phase::Stylesheet, assembled))?;
     drop(stylesheet);
     let held = compiled.retained_bytes();
 
@@ -660,7 +689,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     };
     let source_workspace = workspace
         .checked_sub(held)
-        .ok_or_else(|| fail(exhausted(held), Phase::Input))?;
+        .ok_or_else(|| fail(exhausted(held), Phase::Input, 0))?;
     let source = charge_parse_work(
         Document::parse_with_budget_reported(
             xml.as_ref(),
@@ -678,15 +707,15 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         ),
         xml_parse,
     )?
-    .map_err(|error| fail(error, Phase::Input))?;
+    .map_err(|error| fail(error, Phase::Input, held))?;
     drop(xml);
     let held = held
         .checked_add(source.retained_bytes())
-        .ok_or_else(|| fail(exhausted(usize::MAX), Phase::Input))?;
+        .ok_or_else(|| fail(exhausted(usize::MAX), Phase::Input, 0))?;
 
     let execution_workspace = workspace
         .checked_sub(held)
-        .ok_or_else(|| fail(exhausted(held), Phase::Execution))?;
+        .ok_or_else(|| fail(exhausted(held), Phase::Execution, 0))?;
     let reported = compiled.execute_reported(
         &source,
         &Parameters::new(),
@@ -705,7 +734,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let usage = reported.usage;
     let outcome = reported
         .outcome
-        .map_err(|error| fail(error, Phase::Execution));
+        .map_err(|error| fail(error, Phase::Execution, held));
     allowance.admit(&usage);
     let work = WORK_KINDS
         .into_iter()

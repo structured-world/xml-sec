@@ -40,7 +40,9 @@ xmlsec_required_capabilities() {
   output="$(xmlsec_output --list-transforms)" || return 1
   # Historical algorithms are disabled by default upstream. The test oracle
   # must expose them to independently validate our optional compatibility path.
-  for transform in md5 ripemd160 rsa-md5 rsa-ripemd160 hmac-md5 hmac-ripemd160 ecdsa-ripemd160; do
+  # The XSLT interoperability tests need the transform, which xmlsec1 builds
+  # only when libxslt development files are present.
+  for transform in md5 ripemd160 rsa-md5 rsa-ripemd160 hmac-md5 hmac-ripemd160 ecdsa-ripemd160 xslt; do
     [[ "$output" == *"\"$transform\""* ]] || return 1
   done
   [[ "$modern_oracle" == 1 ]] || return 0
@@ -218,7 +220,7 @@ if ! xmlsec_version_is_expected "$version_output"; then
   exit 1
 fi
 if ! xmlsec_required_capabilities; then
-  printf 'xmlsec1 oracle is missing required compatibility, EdDSA, or ML-KEM transforms\n' >&2
+  printf 'xmlsec1 oracle is missing required compatibility, XSLT, EdDSA, or ML-KEM transforms\n' >&2
   exit 1
 fi
 printf '%s\n' "$version_output"

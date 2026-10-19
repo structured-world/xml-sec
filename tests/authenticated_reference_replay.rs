@@ -2005,9 +2005,16 @@ fn current_query_replays_xslt_within_its_memory_account() {
                             match expected {
                                 Ok(()) => {
                                     assert_eq!(result.unwrap(), ReplayOutcome::Complete);
+                                    // The literal result element copies the `ds`
+                                    // namespace in scope at the stylesheet.
                                     assert_eq!(
                                         output,
-                                        b"<?xml version=\"1.0\"?>\n<values><v>a</v><v>b</v></values>\n"
+                                        concat!(
+                                            "<?xml version=\"1.0\"?>\n",
+                                            "<values xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">",
+                                            "<v>a</v><v>b</v></values>\n"
+                                        )
+                                        .as_bytes()
                                     );
                                 }
                                 Err(()) => {

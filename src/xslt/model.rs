@@ -2178,35 +2178,49 @@ fn push_metered(
     base_uri: Option<String>,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
-    let refused = |limit| Error::Budget {
-        kind: BudgetKind::OwnedBytes,
-        limit,
-        actual: usize::MAX,
-    };
     let nodes = &mut document.nodes;
     if nodes.len() == nodes.capacity() {
         let additional = nodes.capacity().max(4);
-        let bytes = additional
-            .checked_mul(std::mem::size_of::<Node>())
-            .ok_or_else(|| refused(meter.budget.owned_bytes))?;
-        meter.charge_owned(bytes)?;
-        nodes
-            .try_reserve_exact(additional)
-            .map_err(|_| refused(meter.budget.owned_bytes))?;
+        reserve_charged(nodes, additional, meter)?;
     }
     let children = &mut nodes[parent.0].children;
     if children.len() == children.capacity() {
         let additional = children.capacity().max(4);
-        let bytes = additional
-            .checked_mul(std::mem::size_of::<NodeId>())
-            .ok_or_else(|| refused(meter.budget.owned_bytes))?;
-        meter.charge_owned(bytes)?;
-        children
-            .try_reserve_exact(additional)
-            .map_err(|_| refused(meter.budget.owned_bytes))?;
+        reserve_charged(children, additional, meter)?;
     }
     meter.charge_owned(node_payload_bytes(&kind, base_uri.as_deref()))?;
     Ok(document.push(parent, kind, base_uri))
+}
+
+/// Grow `values` by `additional` slots, charging the requested capacity before
+/// allocating and any further capacity the allocator granted after it.
+fn reserve_charged<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    meter: &mut StreamParseMeter,
+) -> Result<()> {
+    let limit = meter.budget.owned_bytes;
+    let refused = || Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    let requested = additional
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(refused)?;
+    meter.charge_owned(requested)?;
+    let before = values.capacity();
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| refused())?;
+    // `try_reserve_exact` may allocate more than requested; capacity never shrinks here.
+    let granted = (values.capacity() - before)
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(refused)?;
+    if granted > requested {
+        meter.charge_owned(granted - requested)?;
+    }
+    Ok(())
 }
 
 fn push_stream_element(
@@ -2567,6 +2581,10 @@ fn push_parsed_text(
                     limit: meter.budget.owned_bytes,
                     actual: usize::MAX,
                 })?;
+            // The allocator may grant more than requested; that capacity is retained too.
+            if existing.capacity() > required {
+                meter.charge_owned(existing.capacity() - required)?;
+            }
         }
         existing.push_str(&value);
         return Ok(last_child);

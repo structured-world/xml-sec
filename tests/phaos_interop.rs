@@ -293,6 +293,14 @@ fn policy(algorithm: SignatureAlgorithm, verify_x509_chains: bool) -> Verificati
     policy.key_trust.verification_time =
         Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2009));
     policy.uris.retrieval_methods = UriTypeSet::ALL;
+    // The corpus signer compiled each stylesheet from the `<Transform>` content
+    // alone, as libxmlsec1 does; read as an element of the signed document, its
+    // literal results would also carry the inherited `dsig` namespace.
+    #[cfg(feature = "xslt")]
+    {
+        policy.transforms.xslt_stylesheet_semantics =
+            xml_sec::policy::XsltStylesheetSemantics::Libxmlsec1;
+    }
     policy
 }
 
@@ -510,6 +518,31 @@ fn executes_every_phaos_signature_through_the_public_pipeline() {
         .filter_map(|case| check_expected(case, execute(case)).err())
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[cfg(feature = "xslt")]
+#[test]
+fn specification_stylesheets_keep_the_inherited_namespace() {
+    // Read as an element of the signed document, the stylesheet's literal results
+    // copy the `dsig` binding of its `<Signature>` ancestor (XSLT 1.0 section 7.1.1),
+    // which the corpus signer did not include in the digested output.
+    let mut policy = policy(SignatureAlgorithm::RsaSha1, false);
+    policy.transforms.xslt_stylesheet_semantics =
+        xml_sec::policy::XsltStylesheetSemantics::Specification;
+    let key = verification_key();
+    let result = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .process_manifests(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(&resources())
+        .verify(&document("signature-rsa-detached-xslt-transform.xml"))
+        .expect("verification runs");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert!(matches!(
+        result.manifest_references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    ));
 }
 
 #[test]

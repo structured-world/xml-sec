@@ -381,9 +381,9 @@ fn unbound_prefix_lists_follow_the_operation_policy() {
 #[test]
 fn stylesheets_keep_the_namespaces_in_scope_at_their_transform() {
     // The stylesheet is an element of the signed document: a prefix declared on an
-    // ancestor names the XSLT namespace (Namespaces in XML 1.0 section 6.1). Only the
-    // bindings it refers to are inherited, so the unused `ds` binding is not copied into
-    // its literal result element. libxmlsec1 compiles the `<Transform>` content alone and
+    // ancestor names the XSLT namespace (Namespaces in XML 1.0 section 6.1), and its
+    // literal result element copies every namespace in scope but the XSLT one (XSLT 1.0
+    // section 7.1.1), here `ds`. libxmlsec1 compiles the `<Transform>` content alone and
     // loses the `xsl` declaration.
     let template = format!(
         concat!(
@@ -422,13 +422,63 @@ fn stylesheets_keep_the_namespaces_in_scope_at_their_transform() {
     assert_eq!(result.status, DsigStatus::Valid);
     assert_eq!(
         result.signed_info_references[0].pre_digest_data.as_deref(),
-        Some(b"<?xml version=\"1.0\"?>\n<out>a</out>\n".as_slice())
+        Some(
+            b"<?xml version=\"1.0\"?>\n<out xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">a</out>\n"
+                .as_slice()
+        )
     );
 
     let error = transform_error(
         sign(XsltStylesheetSemantics::Libxmlsec1).expect_err("`xsl` is unbound in the content"),
     );
     assert!(matches!(error, TransformError::Xslt(_)), "{error:?}");
+}
+
+#[test]
+fn stylesheets_use_the_entities_of_their_document() {
+    // An internal entity is replaced where it is referenced (XML 1.0 section 4.4), so a
+    // stylesheet referring to one compiles with its replacement text, not as a fragment
+    // detached from the document's DTD.
+    let template = format!(
+        concat!(
+            r#"<!DOCTYPE root [<!ENTITY path "//item">]><root><item>a</item>"#,
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+            r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+            r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>"#,
+            r#"<ds:Reference URI=""><ds:Transforms>"#,
+            r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+            r#"<ds:Transform Algorithm="{xslt}"><xsl:stylesheet version="1.0" xmlns:xsl="{xsl}" "#,
+            r#"exclude-result-prefixes="ds"><xsl:template match="/"><out>"#,
+            r#"<xsl:value-of select="&path;"/></out></xsl:template></xsl:stylesheet>"#,
+            r#"</ds:Transform></ds:Transforms>"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>"#,
+            r#"</ds:Signature></root>"#
+        ),
+        xsl = XSL,
+        xslt = XSLT_TRANSFORM_URI
+    );
+    let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let mut signing = SigningPolicy::default();
+    signing.xml.allow_internal_dtd = true;
+    let signed = SignContext::new(&signer)
+        .policy(signing)
+        .sign_template(&template)
+        .expect("the stylesheet compiles with the replaced entity");
+    let mut verification = VerificationPolicy::default();
+    verification.xml.allow_internal_dtd = true;
+    let result = xml_sec::xmldsig::VerifyContext::new()
+        .policy(verification)
+        .key(&verifier)
+        .store_pre_digest(true)
+        .verify(&signed)
+        .expect("verification runs");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert_eq!(
+        result.signed_info_references[0].pre_digest_data.as_deref(),
+        Some(b"<?xml version=\"1.0\"?>\n<out>a</out>\n".as_slice())
+    );
 }
 
 #[test]

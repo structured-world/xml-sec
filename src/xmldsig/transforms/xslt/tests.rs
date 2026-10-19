@@ -31,25 +31,43 @@ fn run(
 }
 
 #[test]
-fn unresolved_references_respect_scopes_inside_the_stylesheet() {
-    // Only prefixes used where no element of the stylesheet declares them are inherited.
-    // Axes, quoted literals and inner redeclarations are not references to inherit.
-    let markup = concat!(
-        r#"<xsl:stylesheet version="1.0" exclude-result-prefixes="foo #default">"#,
-        r#"<xsl:template match="ds:Object[@a='q:x']" mode="child::m"><out/>"#,
-        r#"<inner xmlns:in="urn:in" in:attr="{in:f()}"/><in:x xmlns:in="urn:other"/>"#,
-        r#"</xsl:template></xsl:stylesheet>"#
+fn stylesheets_are_serialized_from_the_parsed_tree() {
+    // The stylesheet compiles from the tree: references are replaced, the declarations
+    // written on its elements stay where they are, and every binding in scope at the
+    // `<Transform>` that its element does not make itself is kept apart for insertion.
+    let xml = concat!(
+        r#"<root xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p="urn:p">"#,
+        r#"<Transform xmlns="urn:default"><xsl:stylesheet version="1.0" xmlns:in="urn:in">"#,
+        r#"<xsl:template match="/"><out a="&#112;&lt;&#9;">x&amp;y<!--c--></out>"#,
+        r#"<inner xmlns="" b="1"/></xsl:template></xsl:stylesheet></Transform></root>"#
     );
-    let (name, mut unresolved) = super::unresolved_references(markup).expect("markup scans");
-    assert_eq!(name, "xsl:stylesheet".len());
-    unresolved.sort();
+    let document = Document::parse(xml).expect("fixed XML parses");
+    let transform = document
+        .root_element()
+        .first_child()
+        .expect("the Transform element");
+    let parsed = super::ParsedStylesheet::from_transform(transform).expect("a stylesheet");
     assert_eq!(
-        unresolved,
+        parsed.document,
+        concat!(
+            r#"<xsl:stylesheet xmlns:in="urn:in" version="1.0"><xsl:template match="/">"#,
+            r#"<out a="p&lt;&#9;">x&amp;y<!--c--></out><inner xmlns="" b="1"/>"#,
+            r#"</xsl:template></xsl:stylesheet>"#
+        )
+    );
+    assert_eq!(parsed.at, "<xsl:stylesheet".len());
+    let mut inherited = parsed
+        .inherited
+        .split(' ')
+        .filter(|declaration| !declaration.is_empty())
+        .collect::<Vec<_>>();
+    inherited.sort_unstable();
+    assert_eq!(
+        inherited,
         [
-            None,
-            Some("ds".into()),
-            Some("foo".into()),
-            Some("xsl".into())
+            r#"xmlns:p="urn:p""#,
+            r#"xmlns:xsl="http://www.w3.org/1999/XSL/Transform""#,
+            r#"xmlns="urn:default""#
         ]
     );
 }
@@ -168,7 +186,53 @@ fn the_parsed_input_shares_the_workspace() {
                 resource: resource_name::XSLT_WORKSPACE_BYTES,
                 maximum: 262_144,
                 actual,
-            }) if actual <= 2 * 262_144
+            }) if actual > 262_144 && actual <= 2 * 262_144
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn workspace_refusals_report_what_every_stage_holds() {
+    // Execution receives the workspace less the compiled stylesheet and the parsed
+    // input. When it is refused, the reported total includes what those stages hold,
+    // so it exceeds the workspace limit it names.
+    use crate::xslt::{CompileBudget, Compiler, Document as Tree, NoResolver, ParseBudget};
+    let stylesheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let input = format!("<root>{}</root>", "a".repeat(4096));
+    let compiled = Compiler::new(
+        std::sync::Arc::new(NoResolver),
+        CompileBudget::new(usize::MAX, 0, 64, usize::MAX),
+    )
+    .compile(stylesheet.source(), None)
+    .expect("stylesheet compiles")
+    .retained_bytes();
+    let unbounded = ParseBudget::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    );
+    let tree = Tree::parse_with_budget(&input, None, unbounded.with_owned_bytes(usize::MAX))
+        .expect("input parses")
+        .retained_bytes();
+    // Execution first holds a copy of the input text, which this workspace cannot fit.
+    let workspace = compiled + tree + input.len() / 2;
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy {
+        max_xslt_workspace_bytes: workspace,
+        ..ResourcePolicy::default()
+    });
+    let error = run(&budget, &stylesheet, input.as_bytes()).expect_err("execution is refused");
+    assert!(
+        matches!(
+            error,
+            TransformError::Policy(PolicyViolation::ResourceLimit {
+                resource: resource_name::XSLT_WORKSPACE_BYTES,
+                maximum,
+                actual,
+            }) if maximum == workspace && actual > workspace
         ),
         "{error:?}"
     );
