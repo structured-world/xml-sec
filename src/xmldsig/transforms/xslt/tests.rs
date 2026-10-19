@@ -46,7 +46,8 @@ fn stylesheets_are_serialized_from_the_parsed_tree() {
         .root_element()
         .first_child()
         .expect("the Transform element");
-    let parsed = super::ParsedStylesheet::from_transform(transform).expect("a stylesheet");
+    let parsed = super::ParsedStylesheet::from_transform(transform, usize::MAX, false)
+        .expect("a stylesheet");
     assert_eq!(
         parsed.document,
         concat!(
@@ -69,6 +70,35 @@ fn stylesheets_are_serialized_from_the_parsed_tree() {
             r#"xmlns:xsl="http://www.w3.org/1999/XSL/Transform""#,
             r#"xmlns="urn:default""#
         ]
+    );
+}
+
+#[test]
+fn stylesheet_serialization_stays_within_the_workspace() {
+    // A stylesheet serialized from a parsed `<Transform>` is text in the workspace. It is
+    // refused before its allocation would exceed the bytes granted, not after a full copy.
+    let body = "<xsl:template match=\"/\"><out>x</out></xsl:template>".repeat(100);
+    let xml = format!(
+        r#"<Transform><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{body}</xsl:stylesheet></Transform>"#
+    );
+    let document = Document::parse(&xml).expect("fixed XML parses");
+    let transform = document.root_element();
+    let full = super::ParsedStylesheet::from_transform(transform, usize::MAX, true)
+        .expect("a stylesheet")
+        .document
+        .len();
+    let limit = full / 2;
+    match super::ParsedStylesheet::from_transform(transform, limit, true) {
+        Err(super::Unavailable::Exceeds(needed)) => assert!(needed > limit && needed <= full),
+        _ => panic!("half the serialized size is refused"),
+    }
+
+    let mut text = super::Bounded::new(limit);
+    while text.push_str("<a/>").is_ok() {}
+    assert!(
+        text.text.capacity() <= limit,
+        "capacity {} over {limit}",
+        text.text.capacity()
     );
 }
 
@@ -238,16 +268,27 @@ fn workspace_refusals_report_what_every_stage_holds() {
     );
 }
 
-/// Run `stylesheet` in a query whose work account has `remaining` units left; returns the
-/// outcome, the engine work the operation allowance admitted and the work the query paid.
-fn run_in_query(
+/// What one transform did inside a query.
+struct QueryRun {
+    outcome: Result<(), TransformError>,
+    /// Engine work the operation allowance admitted.
+    executed: usize,
+    /// Work the query paid.
+    paid: usize,
+    /// Parse work the operation was charged.
+    scanned: usize,
+}
+
+/// Run `stylesheet` in a query with `remaining` work units and `memory` bytes left.
+fn query_run(
     stylesheet: &XsltStylesheet,
     input: &[u8],
     remaining: usize,
-) -> (Result<(), TransformError>, usize, usize) {
+    memory: usize,
+) -> QueryRun {
     use structured_asn1::memory::{Memory, MemoryAccount};
     let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
-    let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 26)));
+    let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(memory, 1 << 26)));
     work.charge_work((work.work_remaining() - remaining) as u64)
         .expect("leave the remainder");
     let before = work.work_used();
@@ -262,11 +303,118 @@ fn run_in_query(
         &scratch,
     )
     .map(drop);
-    let executed = super::WORK_KINDS
-        .into_iter()
-        .map(|kind| budget.xslt.work_used(kind))
-        .sum();
-    (outcome, executed, work.work_used() - before)
+    QueryRun {
+        outcome,
+        executed: super::WORK_KINDS
+            .into_iter()
+            .map(|kind| budget.xslt.work_used(kind))
+            .sum(),
+        paid: work.work_used() - before,
+        scanned: budget.xml_parse_work().consumed(),
+    }
+}
+
+/// [`query_run`] with ample memory; returns the outcome, the executed and the paid work.
+fn run_in_query(
+    stylesheet: &XsltStylesheet,
+    input: &[u8],
+    remaining: usize,
+) -> (Result<(), TransformError>, usize, usize) {
+    let run = query_run(stylesheet, input, remaining, 1 << 26);
+    (run.outcome, run.executed, run.paid)
+}
+
+#[test]
+fn adapter_scans_are_paid_by_the_query_before_they_run() {
+    // The adapter checks the stylesheet and the input against the XML input policy in
+    // its own lexical passes. A query with the work to decode the input but not to scan
+    // it is refused before any lexical pass runs: only decoding is charged.
+    use structured_asn1::memory::MemoryError;
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let input = b"<doc/>";
+    let run = query_run(&sheet, input, 10, 1 << 26);
+    assert!(
+        matches!(
+            run.outcome,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+            ))
+        ),
+        "{:?}",
+        run.outcome
+    );
+    assert_eq!(
+        run.scanned,
+        input.len(),
+        "a text was scanned before it was paid for"
+    );
+}
+
+#[test]
+fn decoded_input_is_admitted_before_the_workspace() {
+    // A query whose memory is no more than the workspace limit still decodes UTF-16
+    // input: decoding takes what it needs first and the workspace gets the rest, instead
+    // of the workspace taking everything and decoding being refused.
+    let text = "<doc><item>a</item></doc>";
+    let mut input = vec![0xff, 0xfe];
+    for unit in text.encode_utf16() {
+        input.extend_from_slice(&unit.to_le_bytes());
+    }
+    let memory = 1 << 20;
+    assert!(memory <= ResourcePolicy::default().max_xslt_workspace_bytes);
+    let sheet = stylesheet(
+        r#"<xsl:template match="/"><out><xsl:value-of select="//item"/></out></xsl:template>"#,
+    );
+    let run = query_run(&sheet, &input, 1 << 24, memory);
+    run.outcome
+        .expect("the decoded input and the transform fit the query");
+}
+
+#[test]
+fn inherited_xml_space_preserves_stylesheet_whitespace() {
+    // XSLT 1.0 section 3.4 keeps a whitespace-only text node of the stylesheet when an
+    // ancestor element has xml:space="preserve"; the stylesheet's ancestors in the signed
+    // document count. libxmlsec1 compiles the element alone and strips it.
+    let xml = format!(
+        concat!(
+            r#"<root xml:space="preserve"><Transform><xsl:stylesheet version="1.0" xmlns:xsl="{xsl}">"#,
+            r#"<xsl:template match="/"><out><xsl:value-of select="'a'"/> <xsl:value-of select="'b'"/>"#,
+            r#"</out></xsl:template></xsl:stylesheet></Transform></root>"#
+        ),
+        xsl = XSL
+    );
+    let document = Document::parse(&xml).expect("fixed XML parses");
+    let transform = document
+        .root_element()
+        .first_child()
+        .expect("the Transform element");
+    let output = |semantics| {
+        let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
+        match super::execute::<_, crate::xml::dom::storage::Native>(
+            super::XsltParameter::Transform(transform),
+            b"<doc/>",
+            semantics,
+            false,
+            &budget,
+            budget.xml_parse_work(),
+            &crate::c14n::scratch::Native,
+        )
+        .expect("the transform runs")
+        {
+            super::super::ExecutionData::NativeBinary(bytes) => {
+                String::from_utf8(bytes).expect("serialized output is UTF-8")
+            }
+            _ => panic!("XSLT output is binary"),
+        }
+    };
+    assert_eq!(
+        output(crate::policy::XsltStylesheetSemantics::Specification),
+        "<?xml version=\"1.0\"?>\n<out>a b</out>\n"
+    );
+    assert_eq!(
+        output(crate::policy::XsltStylesheetSemantics::Libxmlsec1),
+        "<?xml version=\"1.0\"?>\n<out>ab</out>\n"
+    );
 }
 
 #[test]

@@ -506,6 +506,78 @@ fn invalid_stylesheets_are_typed_errors() {
 }
 
 #[test]
+fn the_stylesheet_must_be_the_sole_child_of_its_transform() {
+    // XMLDSig 1.1 section 6.6.5: the stylesheet "MUST be the sole child of the
+    // Transform element". Content beside it is refused when the transform is parsed,
+    // not dropped from the stylesheet that is compiled.
+    let parse = |content: &str| {
+        let xml = format!(
+            concat!(
+                r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#">"#,
+                r#"<Transform Algorithm="{xslt}">{content}</Transform></Transforms>"#
+            ),
+            xslt = XSLT_TRANSFORM_URI,
+            content = content
+        );
+        let document = xml_sec::Document::parse(&xml).expect("fixed XML parses");
+        xml_sec::xmldsig::parse_transforms(document.root_element()).map(|chain| chain.len())
+    };
+    let sheet = format!(r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}"/>"#);
+    assert_eq!(parse(&format!("\n {sheet} <!--note-->\n")).ok(), Some(1));
+    for content in [
+        format!("{sheet}<extra/>"),
+        format!("{sheet}text"),
+        format!("text{sheet}"),
+    ] {
+        assert!(
+            matches!(
+                parse(&content),
+                Err(TransformError::UnsupportedTransform(_))
+            ),
+            "{content}"
+        );
+    }
+}
+
+#[test]
+fn parsed_stylesheets_are_written_without_their_original_document() {
+    // A stylesheet parsed from one document may use a prefix declared on an ancestor
+    // of its `<Transform>` and an entity of that document's DTD. Written into another
+    // signature, it must not depend on either.
+    let source = format!(
+        concat!(
+            r#"<!DOCTYPE Transforms [<!ENTITY path "//item">]>"#,
+            r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:xsl="{xsl}">"#,
+            r#"<Transform Algorithm="{xslt}"><xsl:stylesheet version="1.0" xmlns="">"#,
+            r#"<xsl:template match="/"><out><xsl:value-of select="&path;"/></out>"#,
+            r#"</xsl:template></xsl:stylesheet></Transform></Transforms>"#
+        ),
+        xsl = XSL,
+        xslt = XSLT_TRANSFORM_URI
+    );
+    let document = xml_sec::Document::parse_with_options(
+        &source,
+        xml_sec::ParsingOptions {
+            allow_dtd: true,
+            ..Default::default()
+        },
+    )
+    .expect("fixed XML parses");
+    let mut chain =
+        xml_sec::xmldsig::parse_transforms(document.root_element()).expect("the stylesheet parses");
+    let transform = chain.pop().expect("one transform");
+    let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
+        .uri("")
+        .transform(Transform::Enveloped)
+        .transform(transform);
+    let signed = sign(ITEMS, &builder(reference)).expect("the written stylesheet is complete");
+    assert_eq!(
+        verified_pre_digest(&signed),
+        [b"<?xml version=\"1.0\"?>\n<out>b</out>\n".to_vec()]
+    );
+}
+
+#[test]
 fn binary_input_document_type_follows_the_xml_input_policy() {
     // Internal entities and attribute defaults change the transformed data, so a
     // DOCTYPE in decoded input is refused unless the operation allows internal DTDs,

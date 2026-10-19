@@ -2735,6 +2735,29 @@ fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     if uri != XSLT_TRANSFORM_URI {
         return Ok(None);
     }
+    // XMLDSig 1.1 section 6.6.5: the stylesheet "MUST be the sole child of the Transform
+    // element"; comments, processing instructions and whitespace around it are not content.
+    // <https://www.w3.org/TR/xmldsig-core1/#sec-XSLT>
+    scratch.charge(transform_node.children().len())?;
+    let mut elements = 0usize;
+    for child in transform_node.children() {
+        if child.is_element() {
+            elements += 1;
+        } else if child.is_text()
+            && let Some(text) = child.text()
+        {
+            scratch.charge(text.len())?;
+            if !is_xml_whitespace_only(text) {
+                elements = usize::MAX;
+                break;
+            }
+        }
+    }
+    if elements != 1 {
+        return Err(scratch.unsupported(format_args!(
+            "XSLT transform requires one stylesheet element as its sole content"
+        )));
+    }
     let source = xslt::stylesheet_source(transform_node)
         .ok_or_else(|| scratch.unsupported(format_args!("XSLT transform requires a stylesheet")))?;
     scratch.charge(source.len())?;

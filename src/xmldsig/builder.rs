@@ -777,9 +777,9 @@ fn write_transform<W: Write>(
         Transform::Xslt(stylesheet) => {
             let name = qualified_name(prefix, "Transform");
             writer.start(&name, [("Algorithm", super::XSLT_TRANSFORM_URI)])?;
-            // `XsltStylesheet` holds markup that is valid element content; verification
-            // compiles exactly this text, so it is written unchanged.
-            writer.raw(stylesheet.source())?;
+            // Valid element content that depends on nothing outside it: a stylesheet
+            // parsed from another document is written with what it inherited there.
+            writer.raw(&stylesheet.markup())?;
             writer.end(&name)
         }
         Transform::Enveloped => {

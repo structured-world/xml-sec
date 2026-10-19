@@ -511,9 +511,13 @@ using the XSLT transform is reported as an invalid per-reference result without 
 The optional `xslt` feature executes the XSLT transform
 (`http://www.w3.org/TR/1999/REC-xslt-19991116`, XMLDSig 1.1 section 6.6.5) with the safe-Rust
 XSLT 1.0 engine. `Transform::Xslt` carries an `XsltStylesheet`: the markup of the `<Transform>`
-content, written into generated signatures unchanged. A parsed signature compiles the
-stylesheet element as its document parsed it, with entity and character references already
-replaced.
+content. The stylesheet element must be the sole content of its `<Transform>` (comments,
+processing instructions and whitespace aside); anything else is refused when the transform is
+parsed. A parsed signature compiles the stylesheet element as its document parsed it, with
+entity and character references already replaced. Markup given to `XsltStylesheet::new` is
+written into generated signatures unchanged; a stylesheet parsed from another document is
+written with the namespace declarations and `xml:space` it inherited there, so it does not
+depend on that document.
 
 The transform consumes octets. Node-set input is first converted with inclusive C14N 1.0, binary
 input is used as is, and the serialized result tree (with its XML declaration for the `xml`
@@ -530,8 +534,9 @@ Execution is bounded by the operation's policy:
   `max_xslt_output_bytes` bounds their cumulative serialized output.
 - `max_xslt_workspace_bytes` bounds the memory one transform holds at once: the compiled
   stylesheet, the parsed input tree and the execution share it. `max_xslt_recursion_depth`
-  bounds compilation and template recursion. Scoped replay reserves that workspace from the
-  current query's memory account.
+  bounds compilation and template recursion. Scoped replay decodes the input into the current
+  query's memory account and reserves the workspace from what remains; the query's remaining
+  work bounds every pass over the stylesheet and the input and the execution itself.
 - Stylesheet and input documents obey the XML document (encoded input bytes included), node,
   depth and namespace-binding limits, and every parser pass over them is charged to
   `max_xml_parse_work_bytes`. A document type declaration in binary input follows
@@ -544,7 +549,8 @@ Execution is bounded by the operation's policy:
 - `Specification` (the default) reads it as the element of the signed document it is: every
   namespace in scope at it applies, including those declared on `<Signature>` or the
   document's root (Namespaces in XML 1.0 section 6.1), and literal result elements copy them
-  unless `exclude-result-prefixes` names them (XSLT 1.0 section 7.1.1). A prefix bound
+  unless `exclude-result-prefixes` names them (XSLT 1.0 section 7.1.1); an ancestor's
+  `xml:space="preserve"` keeps its whitespace-only text (XSLT 1.0 section 3.4). A prefix bound
   nowhere in `exclude-result-prefixes` or `extension-element-prefixes` is a stylesheet error.
 - `Libxmlsec1` compiles the `<Transform>` content alone, as libxmlsec1 does, so declarations
   outside it are lost, and skips an unbound prefix in those lists after a warning, as libxslt

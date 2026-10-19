@@ -77,8 +77,9 @@ impl ParsedStylesheet {
     /// The stylesheet is an element of the signed document: every namespace in
     /// scope at it, including those declared on its ancestors (Namespaces in XML
     /// 1.0 section 6.1), is a namespace node of its elements that literal result
-    /// elements copy (XSLT 1.0 section 7.1.1). libxmlsec1 compiles the element
-    /// with only the declarations written inside it.
+    /// elements copy (XSLT 1.0 section 7.1.1), and an ancestor's `xml:space`
+    /// applies to its whitespace (XSLT 1.0 section 3.4). libxmlsec1 compiles the
+    /// element with only what is written inside it.
     /// <https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element>
     fn text(&self, semantics: XsltStylesheetSemantics) -> std::borrow::Cow<'_, str> {
         match semantics {
@@ -89,6 +90,33 @@ impl ParsedStylesheet {
             _ => std::borrow::Cow::Borrowed(&self.document),
         }
     }
+
+    /// [`Self::text`], refused before it allocates more than `limit` bytes.
+    fn text_within(
+        &self,
+        semantics: XsltStylesheetSemantics,
+        limit: usize,
+    ) -> Result<std::borrow::Cow<'_, str>, usize> {
+        let joined = match semantics {
+            XsltStylesheetSemantics::Specification if !self.inherited.is_empty() => {
+                self.document.len() + self.inherited.len()
+            }
+            _ => 0,
+        };
+        if joined > limit {
+            return Err(joined);
+        }
+        Ok(self.text(semantics))
+    }
+}
+
+/// Why a parameter yields no stylesheet document.
+#[derive(Debug)]
+enum Unavailable {
+    /// The `<Transform>` holds no stylesheet element.
+    Missing,
+    /// Serializing it needs this many bytes, more than the workspace grants.
+    Exceeds(usize),
 }
 
 /// An XSLT transform parameter as the executor reads it.
@@ -101,19 +129,26 @@ pub(crate) enum XsltParameter<'a> {
 }
 
 impl<'a> XsltParameter<'a> {
-    /// The stylesheet document `semantics` compiles.
-    fn document(self, semantics: XsltStylesheetSemantics) -> Option<std::borrow::Cow<'a, str>> {
+    /// The stylesheet document `semantics` compiles, allocating at most `limit` bytes.
+    fn document(
+        self,
+        semantics: XsltStylesheetSemantics,
+        limit: usize,
+    ) -> Result<std::borrow::Cow<'a, str>, Unavailable> {
         match self {
-            Self::Stylesheet(stylesheet) => Some(match &stylesheet.parsed {
-                Some(parsed) => parsed.text(semantics),
+            Self::Stylesheet(stylesheet) => match &stylesheet.parsed {
+                Some(parsed) => parsed
+                    .text_within(semantics, limit)
+                    .map_err(Unavailable::Exceeds),
                 // Markup given to `XsltStylesheet::new` has no enclosing document.
-                None => std::borrow::Cow::Borrowed(&stylesheet.source),
-            }),
-            Self::Transform(transform) => Some(std::borrow::Cow::Owned(
-                ParsedStylesheet::from_transform(transform)?
-                    .text(semantics)
-                    .into_owned(),
-            )),
+                None => Ok(std::borrow::Cow::Borrowed(&stylesheet.source)),
+            },
+            Self::Transform(transform) => ParsedStylesheet::from_transform(
+                transform,
+                limit,
+                matches!(semantics, XsltStylesheetSemantics::Specification),
+            )
+            .map(|parsed| std::borrow::Cow::Owned(parsed.document)),
         }
     }
 }
@@ -177,7 +212,8 @@ impl XsltStylesheet {
     pub(super) fn from_parsed(transform: crate::xml::dom::Node<'_, '_>, source: &str) -> Self {
         Self {
             source: source.to_owned(),
-            parsed: ParsedStylesheet::from_transform(transform),
+            // Owned transforms are built outside any operation's workspace.
+            parsed: ParsedStylesheet::from_transform(transform, usize::MAX, false).ok(),
         }
     }
 
@@ -185,6 +221,54 @@ impl XsltStylesheet {
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
+    }
+
+    /// Markup that means the same stylesheet in any `<Transform>`.
+    ///
+    /// A parsed stylesheet may use namespaces declared on its original ancestors and
+    /// entities of its original DTD; its serialization carries them, with references
+    /// replaced, so it needs neither.
+    pub(crate) fn markup(&self) -> std::borrow::Cow<'_, str> {
+        match &self.parsed {
+            Some(parsed) => parsed.text(XsltStylesheetSemantics::Specification),
+            None => std::borrow::Cow::Borrowed(&self.source),
+        }
+    }
+}
+
+/// Text whose allocation stays within `limit` bytes, refused before it would exceed it.
+struct Bounded {
+    text: String,
+    limit: usize,
+}
+
+impl Bounded {
+    const fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            limit,
+        }
+    }
+
+    /// Append `piece`; a refusal carries the length that would exceed the limit.
+    fn push_str(&mut self, piece: &str) -> Result<(), usize> {
+        let needed = self.text.len().checked_add(piece.len()).ok_or(usize::MAX)?;
+        if needed > self.limit {
+            return Err(needed);
+        }
+        if needed > self.text.capacity() {
+            // A capacity never exceeds `isize::MAX`, so doubling it cannot overflow.
+            let grown = (self.text.capacity() * 2).clamp(needed, self.limit);
+            self.text
+                .try_reserve_exact(grown - self.text.len())
+                .map_err(|_| needed)?;
+        }
+        self.text.push_str(piece);
+        Ok(())
+    }
+
+    fn push(&mut self, character: char) -> Result<(), usize> {
+        self.push_str(character.encode_utf8(&mut [0; 4]))
     }
 }
 
@@ -202,46 +286,89 @@ pub(super) fn stylesheet_source<'a>(transform: crate::xml::dom::Node<'a, 'a>) ->
         .get(first.range().start..last.range().end)
 }
 
-/// Append `value` as the content of a double-quoted attribute.
-fn push_attribute_value(out: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '"' => out.push_str("&quot;"),
-            // Attribute-value normalization would turn these into spaces.
-            '\t' => out.push_str("&#9;"),
-            '\n' => out.push_str("&#10;"),
-            '\r' => out.push_str("&#13;"),
-            character => out.push(character),
+/// Append `value`, writing each byte `escape` maps as its reference and the runs
+/// between them as they are.
+fn push_escaped(
+    out: &mut Bounded,
+    value: &str,
+    escape: impl Fn(u8) -> Option<&'static str>,
+) -> Result<(), usize> {
+    let mut run = 0;
+    for (index, byte) in value.bytes().enumerate() {
+        // Every escaped character is ASCII, so `index` is a character boundary.
+        if let Some(reference) = escape(byte) {
+            out.push_str(&value[run..index])?;
+            out.push_str(reference)?;
+            run = index + 1;
         }
     }
+    out.push_str(&value[run..])
+}
+
+/// Append `value` as the content of a double-quoted attribute.
+fn push_attribute_value(out: &mut Bounded, value: &str) -> Result<(), usize> {
+    push_escaped(out, value, |byte| match byte {
+        b'&' => Some("&amp;"),
+        b'<' => Some("&lt;"),
+        b'"' => Some("&quot;"),
+        // Attribute-value normalization would turn these into spaces.
+        b'\t' => Some("&#9;"),
+        b'\n' => Some("&#10;"),
+        b'\r' => Some("&#13;"),
+        _ => None,
+    })
 }
 
 /// Append `value` as character data.
-fn push_text(out: &mut String, value: &str) {
-    for character in value.chars() {
-        match character {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            // Line-end normalization would turn a literal carriage return into a line feed.
-            '\r' => out.push_str("&#13;"),
-            character => out.push(character),
-        }
+fn push_text(out: &mut Bounded, value: &str) -> Result<(), usize> {
+    push_escaped(out, value, |byte| match byte {
+        b'&' => Some("&amp;"),
+        b'<' => Some("&lt;"),
+        b'>' => Some("&gt;"),
+        // Line-end normalization would turn a literal carriage return into a line feed.
+        b'\r' => Some("&#13;"),
+        _ => None,
+    })
+}
+
+/// Append `prefix:local`, or `local` without a prefix.
+fn push_name(out: &mut Bounded, prefix: Option<&str>, local: &str) -> Result<(), usize> {
+    if let Some(prefix) = prefix {
+        out.push_str(prefix)?;
+        out.push(':')?;
     }
+    out.push_str(local)
+}
+
+/// Append ` prefix:local="value"`.
+fn push_attribute(
+    out: &mut Bounded,
+    prefix: Option<&str>,
+    local: &str,
+    value: &str,
+) -> Result<(), usize> {
+    out.push(' ')?;
+    push_name(out, prefix, local)?;
+    out.push_str("=\"")?;
+    push_attribute_value(out, value)?;
+    out.push('"')
 }
 
 /// Append ` xmlns[:prefix]="uri"`.
-fn push_declaration(out: &mut String, prefix: Option<&str>, uri: &str) {
-    out.push_str(" xmlns");
-    if let Some(prefix) = prefix {
-        out.push(':');
-        out.push_str(prefix);
+fn push_declaration(out: &mut Bounded, prefix: Option<&str>, uri: &str) -> Result<(), usize> {
+    match prefix {
+        Some(prefix) => push_attribute(out, Some("xmlns"), prefix, uri),
+        None => push_attribute(out, None, "xmlns", uri),
     }
-    out.push_str("=\"");
-    push_attribute_value(out, uri);
-    out.push('"');
+}
+
+/// The `xml:space` value `element` carries itself.
+fn own_xml_space<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Option<&'a str> {
+    const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+    element
+        .attributes()
+        .find(|attribute| attribute.namespace() == Some(XML_NS) && attribute.name() == "space")
+        .map(|attribute| attribute.value())
 }
 
 /// Prefixes declared on `element` itself, `None` for the default namespace.
@@ -296,93 +423,121 @@ fn declared_prefixes<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Vec<Option<&
 }
 
 impl ParsedStylesheet {
-    /// Serialize the stylesheet element of `transform` from the parsed tree.
-    fn from_transform(transform: crate::xml::dom::Node<'_, '_>) -> Option<Self> {
-        enum Step<'a> {
-            Open(crate::xml::dom::Node<'a, 'a>),
-            Close(crate::xml::dom::Node<'a, 'a>),
-        }
-        let root = transform.children().find(|child| child.is_element())?;
-        let mut document = String::new();
-        let mut at = None;
-        let mut root_declarations = Vec::new();
-        let push_name = |out: &mut String, prefix: Option<&str>, local: &str| {
-            if let Some(prefix) = prefix {
-                out.push_str(prefix);
-                out.push(':');
-            }
-            out.push_str(local);
-        };
-        // An explicit stack keeps native recursion independent of the stylesheet's depth.
-        let mut steps = vec![Step::Open(root)];
-        while let Some(step) = steps.pop() {
-            match step {
-                Step::Close(element) => {
-                    document.push_str("</");
-                    push_name(&mut document, element.prefix(), element.tag_name().name());
-                    document.push('>');
-                }
-                Step::Open(node) if node.is_element() => {
-                    document.push('<');
-                    push_name(&mut document, node.prefix(), node.tag_name().name());
-                    let declared = declared_prefixes(node);
-                    if at.is_none() {
-                        at = Some(document.len());
-                        root_declarations.clone_from(&declared);
-                    }
-                    for prefix in declared {
-                        push_declaration(
-                            &mut document,
-                            prefix,
-                            node.lookup_namespace_uri(prefix).unwrap_or(""),
-                        );
-                    }
-                    for attribute in node.attributes() {
-                        document.push(' ');
-                        push_name(&mut document, attribute.prefix(), attribute.name());
-                        document.push_str("=\"");
-                        push_attribute_value(&mut document, attribute.value());
-                        document.push('"');
-                    }
-                    if node.first_child().is_none() {
-                        document.push_str("/>");
-                    } else {
-                        document.push('>');
-                        steps.push(Step::Close(node));
-                        steps.extend(node.children().rev().map(Step::Open));
-                    }
-                }
-                Step::Open(node) if node.is_comment() => {
-                    document.push_str("<!--");
-                    document.push_str(node.text().unwrap_or(""));
-                    document.push_str("-->");
-                }
-                Step::Open(node) if node.is_pi() => {
-                    if let Some(pi) = node.pi() {
-                        document.push_str("<?");
-                        document.push_str(pi.target);
-                        if let Some(value) = pi.value {
-                            document.push(' ');
-                            document.push_str(value);
-                        }
-                        document.push_str("?>");
-                    }
-                }
-                Step::Open(node) => push_text(&mut document, node.text().unwrap_or("")),
-            }
-        }
-        let mut inherited = String::new();
+    /// Serialize the stylesheet element of `transform` from the parsed tree, refusing
+    /// before the text would take more than `limit` bytes. With `inline`, what the
+    /// element inherits is written on it as well.
+    fn from_transform(
+        transform: crate::xml::dom::Node<'_, '_>,
+        limit: usize,
+        inline: bool,
+    ) -> Result<Self, Unavailable> {
+        let root = transform
+            .children()
+            .find(|child| child.is_element())
+            .ok_or(Unavailable::Missing)?;
+        // What the element inherits: the bindings in scope at the `<Transform>` that it
+        // does not make itself, and the nearest ancestor's `xml:space="preserve"`.
+        let root_declarations = declared_prefixes(root);
+        let mut inherited = Bounded::new(limit);
         for namespace in transform.namespaces() {
             let prefix = namespace.name();
             if prefix != Some("xml") && !root_declarations.contains(&prefix) {
-                push_declaration(&mut inherited, prefix, namespace.uri());
+                push_declaration(&mut inherited, prefix, namespace.uri())
+                    .map_err(Unavailable::Exceeds)?;
             }
         }
-        Some(Self {
-            document,
-            inherited,
-            at: at?,
+        if own_xml_space(root).is_none()
+            && std::iter::successors(Some(transform), |node| node.parent())
+                .filter(|node| node.is_element())
+                .find_map(own_xml_space)
+                == Some("preserve")
+        {
+            push_attribute(&mut inherited, Some("xml"), "space", "preserve")
+                .map_err(Unavailable::Exceeds)?;
+        }
+        let mut document = Bounded::new(limit - inherited.text.capacity());
+        let at = serialize_element(root, &mut document, inline.then_some(&inherited.text))
+            .map_err(Unavailable::Exceeds)?;
+        Ok(Self {
+            document: document.text,
+            inherited: inherited.text,
+            at,
         })
+    }
+}
+
+/// Write `root` and its content to `out`; returns the offset just after its name,
+/// where `inherited` is written when given.
+///
+/// The walk follows sibling and parent links, so neither native recursion nor a
+/// stack grows with the stylesheet.
+fn serialize_element(
+    root: crate::xml::dom::Node<'_, '_>,
+    out: &mut Bounded,
+    inherited: Option<&str>,
+) -> Result<usize, usize> {
+    let mut at = 0;
+    let mut node = root;
+    loop {
+        let mut descended = false;
+        if node.is_element() {
+            out.push('<')?;
+            push_name(out, node.prefix(), node.tag_name().name())?;
+            if node == root {
+                at = out.text.len();
+                if let Some(inherited) = inherited {
+                    out.push_str(inherited)?;
+                }
+            }
+            for prefix in declared_prefixes(node) {
+                push_declaration(out, prefix, node.lookup_namespace_uri(prefix).unwrap_or(""))?;
+            }
+            for attribute in node.attributes() {
+                push_attribute(out, attribute.prefix(), attribute.name(), attribute.value())?;
+            }
+            if let Some(child) = node.first_child() {
+                out.push('>')?;
+                node = child;
+                descended = true;
+            } else {
+                out.push_str("/>")?;
+            }
+        } else if node.is_comment() {
+            out.push_str("<!--")?;
+            out.push_str(node.text().unwrap_or(""))?;
+            out.push_str("-->")?;
+        } else if node.is_pi() {
+            if let Some(pi) = node.pi() {
+                out.push_str("<?")?;
+                out.push_str(pi.target)?;
+                if let Some(value) = pi.value {
+                    out.push(' ')?;
+                    out.push_str(value)?;
+                }
+                out.push_str("?>")?;
+            }
+        } else {
+            push_text(out, node.text().unwrap_or(""))?;
+        }
+        if descended {
+            continue;
+        }
+        // Move to the next node, closing every element whose content is complete.
+        loop {
+            if node == root {
+                return Ok(at);
+            }
+            if let Some(next) = node.next_sibling() {
+                node = next;
+                break;
+            }
+            node = node
+                .parent()
+                .expect("a node below the stylesheet has a parent");
+            out.push_str("</")?;
+            push_name(out, node.prefix(), node.tag_name().name())?;
+            out.push('>')?;
+        }
     }
 }
 
@@ -613,8 +768,9 @@ fn charge_parse_work<T, S: TransformScratch>(
 
 /// Apply the stylesheet of `parameter` to the octets `input` and return the serialized result.
 ///
-/// Compilation, the parsed input and execution share one workspace: each stage
-/// receives what the earlier ones still hold subtracted from it.
+/// The input is decoded first, into the query's own account; compilation, the
+/// parsed input and execution then share one workspace from what remains: each
+/// stage receives what the earlier ones still hold subtracted from it.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     parameter: XsltParameter<'_>,
@@ -626,9 +782,27 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     scratch: &S,
 ) -> Result<ExecutionData<'d, S, D>, TransformError> {
     let allowance = &budget.xslt;
-    let stylesheet = parameter.document(semantics).ok_or_else(|| {
-        TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
-    })?;
+    let settings = DocumentParseSettings {
+        allow_dtd,
+        ..budget.xml_parse_settings
+    };
+    super::check_xml_octets(input, settings)?;
+    xml_parse.charge_policy(input.len())?;
+    let xml = crate::xml_input_shared::decode_xml_in(
+        input,
+        settings.max_bytes,
+        |_, _| Ok(()),
+        &scratch.decoder(),
+    )
+    .map_err(S::decode_error)?;
+    // The query pays for the adapter's lexical passes before they run.
+    scratch.charge(xml.as_ref().len())?;
+    reject_document_type(xml.as_ref(), settings)?;
+    // The engine's parser does not count namespace bindings or apply the rest of
+    // the operation's XML input policy itself.
+    crate::document::preflight_xml_limits(xml.as_ref(), settings, xml_parse)
+        .map_err(|error| super::map_transform_xml_parse_error(error, settings))?;
+
     let (reservation, workspace) = scratch.reserve_workspace(allowance.max_workspace)?;
     // `held` is what earlier stages keep in the workspace while a stage runs; a
     // refusal reports the workspace total, not the stage's share of it.
@@ -638,12 +812,22 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         limit: workspace,
         actual: needed,
     };
+    // A stylesheet serialized from its parsed tree is text in the workspace.
+    let stylesheet = parameter
+        .document(semantics, workspace)
+        .map_err(|unavailable| match unavailable {
+            Unavailable::Missing => {
+                TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
+            }
+            Unavailable::Exceeds(needed) => fail(exhausted(needed), Phase::Stylesheet, 0),
+        })?;
 
     // The stylesheet is element content, which cannot hold a document type declaration.
     let stylesheet_settings = DocumentParseSettings {
         allow_dtd: false,
         ..budget.xml_parse_settings
     };
+    scratch.charge(stylesheet.len())?;
     crate::document::preflight_xml_limits(&stylesheet, stylesheet_settings, xml_parse)
         .map_err(|error| super::map_transform_xml_parse_error(error, stylesheet_settings))?;
     // Text assembled with inherited declarations lives in the workspace until compiled.
@@ -677,24 +861,6 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     drop(stylesheet);
     let held = compiled.retained_bytes();
 
-    let settings = DocumentParseSettings {
-        allow_dtd,
-        ..budget.xml_parse_settings
-    };
-    super::check_xml_octets(input, settings)?;
-    xml_parse.charge_policy(input.len())?;
-    let xml = crate::xml_input_shared::decode_xml_in(
-        input,
-        settings.max_bytes,
-        |_, _| Ok(()),
-        &scratch.decoder(),
-    )
-    .map_err(S::decode_error)?;
-    reject_document_type(xml.as_ref(), settings)?;
-    // The engine's parser does not count namespace bindings or apply the rest of
-    // the operation's XML input policy itself.
-    crate::document::preflight_xml_limits(xml.as_ref(), settings, xml_parse)
-        .map_err(|error| super::map_transform_xml_parse_error(error, settings))?;
     let (entity_references, entity_expansion_bytes) = if allow_dtd {
         (
             crate::hard_limits::XML_ENTITY_EXPANSION_CEILING as usize,
