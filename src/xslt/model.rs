@@ -736,10 +736,12 @@ impl Document {
         // constraint; section 5.1 does not require this non-validating parser to enforce it.
         // https://www.w3.org/TR/xml/#sec-prolog-dtd
         let mut saw_doctype = false;
-        let mut elements = vec![StreamElementFrame {
+        let mut elements = Vec::new();
+        reserve_charged(&mut elements, 1, &mut meter)?;
+        elements.push(StreamElementFrame {
             node: document.root,
             lexical_name: None,
-        }];
+        });
         loop {
             lexical_held.set(
                 meter
@@ -811,12 +813,13 @@ impl Document {
                     if elements.len() == 1 {
                         return Err(Error::Xml("unmatched closing element".into()));
                     }
-                    let closing_name = name.qualified();
                     let opening_name = elements
                         .last()
-                        .and_then(|frame| frame.lexical_name.as_deref())
+                        .and_then(|frame| frame.lexical_name)
                         .expect("non-root element frames retain their lexical name");
-                    if closing_name != opening_name {
+                    if name != opening_name {
+                        let closing_name = name.qualified();
+                        let opening_name = opening_name.qualified();
                         return Err(Error::Xml(format!(
                             "closing element `{closing_name}` does not match `{opening_name}`"
                         )));
@@ -960,6 +963,9 @@ impl Document {
         if phase != DocumentPhase::Epilog {
             return Err(Error::Xml("document element is missing".into()));
         }
+        let stack_bytes = elements.capacity() * std::mem::size_of::<StreamElementFrame>();
+        drop(elements);
+        meter.release_owned(stack_bytes);
         for (name, system_identifier) in declarations.unparsed {
             let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
             // Names are unique in `declarations`, so every entry is kept.
@@ -2190,9 +2196,9 @@ fn normalize_xml_attribute_value(value: Cow<'_, str>) -> Cow<'_, str> {
     Cow::Owned(normalized)
 }
 
-struct StreamElementFrame {
+struct StreamElementFrame<'a> {
     node: NodeId,
-    lexical_name: Option<String>,
+    lexical_name: Option<xml_sec_xml_input::lexical::Name<'a>>,
 }
 
 struct StreamParseMeter<'w> {
@@ -2369,7 +2375,7 @@ fn push_stream_element<
     A: std::ops::Deref<Target = [xml_sec_xml_input::lexical::Attribute<'a>]>,
 >(
     document: &mut Document,
-    elements: &mut Vec<StreamElementFrame>,
+    elements: &mut Vec<StreamElementFrame<'a>>,
     start: &xml_sec_xml_input::lexical::StartTag<'a, A>,
     empty: bool,
     declarations: &InternalEntityDeclarations,
@@ -2377,6 +2383,12 @@ fn push_stream_element<
 ) -> Result<NodeId> {
     meter.element_depth(elements.len())?;
     meter.reserve_node()?;
+    // Frames survive semantic staging and borrow QName slices from the input.
+    // Admit replacement capacity while the old stack is still live.
+    if !empty && elements.len() == elements.capacity() {
+        let additional = elements.capacity().max(4);
+        reserve_charged(elements, additional, meter)?;
+    }
     let staging_start = meter.owned_bytes;
     let parent = elements
         .last()
@@ -2519,6 +2531,7 @@ fn push_stream_element<
             "undeclared namespace prefix in element {lexical_name}"
         )));
     }
+    drop(lexical_name);
     let mut first_id_attribute = None;
     let mut additional_id_attributes = Vec::new();
     let mut attributes = Vec::new();
@@ -2642,7 +2655,7 @@ fn push_stream_element<
     if !empty {
         elements.push(StreamElementFrame {
             node: projected,
-            lexical_name: Some(lexical_name.into_owned()),
+            lexical_name: Some(start.name),
         });
     }
     Ok(projected)
@@ -2788,7 +2801,7 @@ fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
 
 fn push_parsed_text(
     document: &mut Document,
-    elements: &[StreamElementFrame],
+    elements: &[StreamElementFrame<'_>],
     value: String,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
@@ -4846,6 +4859,55 @@ mod expansion_workspace_tests {
     use super::*;
     thread_local! { pub(super) static APPENDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
     thread_local! { pub(super) static SCANNED_ATTRIBUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    #[test]
+    fn live_element_stack_capacity_remains_charged() {
+        // The identical projected element needs more live storage when its
+        // closing tag is still pending. Semantic staging must not refund frames.
+        let xml = "<root>";
+        let mut scanner = Scanner::new(xml);
+        let Some(Event::Start(start)) = scanner.next_event().expect("opening tag") else {
+            panic!("expected start element");
+        };
+        let measure = |empty| {
+            let mut document = Document::empty(None);
+            let mut elements = vec![StreamElementFrame {
+                node: document.root(),
+                lexical_name: None,
+            }];
+            let budget = ParseBudget::UNBOUNDED;
+            let mut meter = StreamParseMeter {
+                budget,
+                nodes: 1,
+                entity_references: 0,
+                entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
+                namespace_scope_bytes: 0,
+                owned_bytes: elements.capacity() * std::mem::size_of::<StreamElementFrame>(),
+            };
+            push_stream_element(
+                &mut document,
+                &mut elements,
+                &start,
+                empty,
+                &InternalEntityDeclarations::default(),
+                &mut meter,
+            )
+            .expect("element fits unbounded workspace");
+            (meter.retained_bytes(), elements.capacity())
+        };
+        let (closed_bytes, closed_capacity) = measure(true);
+        let (open_bytes, open_capacity) = measure(false);
+        assert!(
+            open_capacity > closed_capacity,
+            "test exercises frame growth"
+        );
+        assert!(
+            open_bytes
+                >= closed_bytes
+                    + (open_capacity - closed_capacity) * std::mem::size_of::<StreamElementFrame>(),
+            "live frame capacity was refunded with semantic staging"
+        );
+    }
 
     #[test]
     fn lexical_attributes_cannot_materialize_before_workspace_admission() {

@@ -923,32 +923,30 @@ fn apply_transform_with_context<
         #[cfg(feature = "xslt")]
         InstructionView::Xslt(stylesheet) => {
             let collected;
+            let input_storage;
             let bytes = if let Some(bytes) = input.binary() {
+                input_storage = 0;
                 bytes
             } else {
                 // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
                 // node-set input with inclusive C14N 1.0 first.
                 // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
                 let nodes = input.nodes().expect("nodes or bytes");
-                let algorithm =
-                    C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant URI");
-                let (bytes, _) = c14n::canonicalize_buffer_in(
+                let bytes = xslt::canonicalize_input(
+                    stylesheet,
                     nodes.document(),
                     nodes,
-                    (&algorithm, None),
-                    None,
-                    budget.c14n.remaining(),
-                    budget.xml_base_resolution(),
+                    budget,
                     context.scratch,
-                )
-                .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
-                budget.c14n.charge(bytes.len())?;
+                )?;
+                input_storage = bytes.capacity();
                 collected = bytes;
                 &collected
             };
             xslt::execute(
                 stylesheet,
                 bytes,
+                input_storage,
                 options.xslt_stylesheet_semantics,
                 options.internal_dtd_allowed(),
                 budget,

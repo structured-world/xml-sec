@@ -534,9 +534,10 @@ Execution is bounded by the operation's policy:
   nodes and messages) across every XSLT transform of the operation, including native parameter
   parsing before execution, and
   `max_xslt_output_bytes` bounds their cumulative serialized output.
-- `max_xslt_workspace_bytes` bounds the memory one transform holds at once: decoded input,
-  the compiled stylesheet, compiler validation buffers, entity-expansion and attribute-staging workspace, the parsed input tree
-  and the execution share it. Buffer growth admits both old and replacement allocations.
+- `max_xslt_workspace_bytes` bounds the memory one transform holds at once: the retained
+  implicit-C14N input buffer, decoded input, compiled stylesheet, compiler validation buffers,
+  entity expansion, attribute staging, open-element frames, parsed input tree and execution
+  share it. Buffer growth admits both old and replacement allocations.
   `max_xslt_recursion_depth`
   bounds compilation and template recursion. Scoped replay decodes the input into the current
   query's memory account and reserves the workspace from what remains; the query's remaining

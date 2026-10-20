@@ -9,6 +9,136 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn parsed_source_round_trips_inherited_namespaces() {
+    // Public source markup must stand alone, including prefixes that the
+    // original stylesheet inherited from its enclosing signature.
+    let xml = format!(
+        r#"<Transforms xmlns="http://www.w3.org/2000/09/xmldsig#" xmlns:xsl="{XSL}" xmlns:r="urn:result"><Transform Algorithm="{}"><xsl:stylesheet version="1.0"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><r:out/></xsl:template></xsl:stylesheet></Transform></Transforms>"#,
+        super::super::XSLT_TRANSFORM_URI
+    );
+    let document = Document::parse(&xml).expect("valid enclosing namespaces");
+    let parsed = match super::super::parse_transforms(document.root_element())
+        .expect("parse inherited stylesheet")
+        .pop()
+    {
+        Some(Transform::Xslt(sheet)) => sheet,
+        _ => panic!("expected XSLT stylesheet"),
+    };
+    let recreated =
+        XsltStylesheet::new(parsed.source()).expect("public source is self-contained markup");
+    let budget = TransformExecutionBudget::default();
+    assert_eq!(
+        run(&budget, &recreated, b"<doc/>").expect("recreated stylesheet executes"),
+        run(&TransformExecutionBudget::default(), &parsed, b"<doc/>")
+            .expect("original stylesheet executes")
+    );
+}
+
+#[test]
+fn implicit_c14n_input_stays_in_the_xslt_workspace() {
+    // Node-set conversion retains an extra canonicalized buffer while the
+    // identical octet input is borrowed. That buffer must reduce engine space.
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let xml = format!("<root>{}</root>", "x".repeat(64 * 1024));
+    let budget = |bytes| {
+        TransformExecutionBudget::from_resources(&ResourcePolicy {
+            max_xslt_workspace_bytes: bytes,
+            ..Default::default()
+        })
+    };
+    let (mut refused, mut admitted) = (0, 1 << 22);
+    run(&budget(admitted), &sheet, xml.as_bytes()).expect("octets fit upper bound");
+    while admitted - refused > 1 {
+        let middle = refused + (admitted - refused) / 2;
+        if run(&budget(middle), &sheet, xml.as_bytes()).is_ok() {
+            admitted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    let document = Document::parse(&xml).expect("source document parses");
+    let result = execute_transforms_with_options_and_budget(
+        document.root_element(),
+        TransformData::NodeSet(
+            crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
+                .expect("source projection"),
+        ),
+        &[Transform::Xslt(sheet.clone())],
+        TransformOptions::default(),
+        &budget(admitted),
+    );
+    assert!(
+        matches!(
+            result,
+            Err(TransformError::Policy(PolicyViolation::ResourceLimit {
+                resource: resource_name::XSLT_WORKSPACE_BYTES,
+                ..
+            }))
+        ),
+        "conversion buffer must not fit beside the minimum octet workspace: {result:?}"
+    );
+
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 28)));
+    let scratch = crate::c14n::scratch::Accounted(&memory);
+    let nodes = crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
+        .expect("accounted conversion projection");
+    let budget = budget(admitted);
+    let parameter = super::XsltParameter::Stylesheet(&sheet);
+    let collected =
+        super::canonicalize_input(parameter, &document, &nodes.projection, &budget, &scratch)
+            .expect("conversion alone fits");
+    assert!(memory.used() >= collected.capacity());
+    let result = super::execute::<_, crate::xml::dom::storage::Native>(
+        parameter,
+        &collected,
+        collected.capacity(),
+        crate::policy::XsltStylesheetSemantics::Specification,
+        false,
+        &budget,
+        budget.xml_parse_work(),
+        &scratch,
+    );
+    assert!(matches!(
+        result,
+        Err(TransformError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XSLT_WORKSPACE_BYTES,
+            ..
+        }))
+    ));
+    drop(collected);
+    assert_eq!(memory.used(), 0, "refusal releases all query allocations");
+}
+
+#[test]
+fn conversion_buffer_admits_old_and_new_capacity_before_growth() {
+    // Both storage strategies must refuse before replacing a live block, not
+    // after a serializer has already exceeded the XSLT workspace.
+    use crate::c14n::scratch::{Bytes, Scratch};
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    fn check<B: Bytes>(bytes: B) {
+        let mut buffer = super::QueryMarkup { bytes, limit: 96 };
+        buffer.append(&[b'x'; 32]).expect("initial allocation");
+        assert_eq!(buffer.bytes.capacity(), 32);
+        buffer.limit = 95;
+        assert!(matches!(
+            buffer.append(b"y"),
+            Err(super::Unavailable::Exceeds(96))
+        ));
+        assert_eq!(buffer.bytes.capacity(), 32, "refusal precedes growth");
+        assert_eq!(buffer.bytes.len(), 32, "refusal preserves content");
+        buffer.limit = 96;
+        buffer.append(b"y").expect("exact old-plus-new peak fits");
+        assert_eq!(buffer.bytes.capacity(), 64);
+        assert_eq!(&*buffer.bytes, &[&[b'x'; 32][..], b"y"].concat());
+    }
+    check(Vec::new());
+    let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1024, 4096)));
+    check(crate::c14n::scratch::Accounted(&memory).bytes());
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
 fn replay_output_copy_obeys_xslt_workspace_peak() {
     // Escaping expands a compact result tree into a large serialized buffer.
     // Replay must admit that buffer and its accounted copy together, even when
@@ -39,6 +169,7 @@ fn replay_output_copy_obeys_xslt_workspace_peak() {
         let result = super::execute::<_, crate::xml::dom::storage::Native>(
             super::XsltParameter::Stylesheet(&sheet),
             b"<doc/>",
+            0,
             crate::policy::XsltStylesheetSemantics::Specification,
             false,
             &budget,
@@ -127,6 +258,7 @@ fn in_place_stylesheet_preserves_document_siblings() {
         let result = super::execute::<_, crate::xml::dom::storage::Native>(
             super::XsltParameter::Transform(document.root_element()),
             b"<doc/>",
+            0,
             semantics,
             false,
             &budget,
@@ -435,7 +567,7 @@ fn workspace_refusals_report_what_every_stage_holds() {
         std::sync::Arc::new(NoResolver),
         CompileBudget::new(usize::MAX, 0, 64, usize::MAX),
     )
-    .compile(stylesheet.source(), None)
+    .compile(&stylesheet.source(), None)
     .expect("stylesheet compiles")
     .retained_bytes();
     let unbounded = ParseBudget::new(
@@ -512,6 +644,7 @@ fn query_run_with(
     let outcome = super::execute::<_, crate::xml::dom::storage::Native>(
         parameter,
         input,
+        0,
         crate::policy::XsltStylesheetSemantics::Specification,
         false,
         &budget,
@@ -711,6 +844,7 @@ fn entity_preflight_stops_at_the_current_query_remainder() {
     let result = super::execute::<_, crate::xml::dom::storage::Native>(
         super::XsltParameter::Stylesheet(&sheet),
         input.as_bytes(),
+        0,
         crate::policy::XsltStylesheetSemantics::Specification,
         true,
         &budget,
@@ -771,6 +905,7 @@ fn inherited_xml_space_preserves_stylesheet_whitespace() {
         match super::execute::<_, crate::xml::dom::storage::Native>(
             super::XsltParameter::Transform(transform),
             b"<doc/>",
+            0,
             semantics,
             false,
             &budget,
@@ -860,7 +995,7 @@ fn the_parsed_input_is_charged_to_the_workspace_once() {
         std::sync::Arc::new(NoResolver),
         CompileBudget::new(usize::MAX, 0, 64, usize::MAX),
     )
-    .compile(sheet.source(), None)
+    .compile(&sheet.source(), None)
     .expect("stylesheet compiles");
     let unbounded = ParseBudget::new(
         usize::MAX,

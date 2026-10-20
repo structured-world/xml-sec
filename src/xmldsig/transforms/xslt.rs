@@ -221,13 +221,14 @@ impl XsltStylesheet {
         })
     }
 
-    /// Caller-provided markup, or serialized expanded children for a parsed parameter.
+    /// Self-contained stylesheet markup under specification semantics.
+    ///
+    /// Caller-provided markup is borrowed unchanged. Parsed parameters include
+    /// inherited namespace declarations and `xml:space`, so the returned markup
+    /// can be passed to [`Self::new`] outside its original signature document.
     #[must_use]
-    pub fn source(&self) -> &str {
-        match &self.parsed {
-            Some(parsed) => &parsed.document,
-            None => &self.source,
-        }
+    pub fn source(&self) -> std::borrow::Cow<'_, str> {
+        self.markup()
     }
 
     /// Markup that means the same stylesheet in any `<Transform>`.
@@ -319,13 +320,7 @@ impl<B: crate::c14n::scratch::Bytes> QueryMarkup<B> {
         // Only UTF-8 string fragments are appended by Markup.
         std::str::from_utf8(&self.bytes).expect("serialized markup is UTF-8")
     }
-}
-
-impl<B: crate::c14n::scratch::Bytes> Markup for QueryMarkup<B> {
-    fn len(&self) -> usize {
-        self.bytes.len()
-    }
-    fn push_str(&mut self, text: &str) -> Result<(), Unavailable> {
+    fn append(&mut self, text: &[u8]) -> Result<(), Unavailable> {
         let needed = self.bytes.len().checked_add(text.len()).ok_or(usize::MAX)?;
         if needed > self.limit {
             return Err(Unavailable::Exceeds(needed));
@@ -351,11 +346,84 @@ impl<B: crate::c14n::scratch::Bytes> Markup for QueryMarkup<B> {
                 ));
             }
         }
-        self.bytes
-            .append(text.as_bytes())
-            .map_err(TransformError::from)?;
+        self.bytes.append(text).map_err(TransformError::from)?;
         Ok(())
     }
+}
+
+impl<B: crate::c14n::scratch::Bytes> Markup for QueryMarkup<B> {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    fn push_str(&mut self, text: &str) -> Result<(), Unavailable> {
+        self.append(text.as_bytes())
+    }
+}
+
+/// The implicit conversion belongs to this XSLT step, including replacement
+/// blocks during growth. Keep its capacity live through engine execution.
+pub(super) fn canonicalize_input<S: TransformScratch, D: DomStorage>(
+    parameter: XsltParameter<'_>,
+    document: &crate::xml::dom::Document<'_, D>,
+    visibility: &dyn crate::c14n::NodeVisibility<D>,
+    budget: &TransformExecutionBudget,
+    scratch: &S,
+) -> Result<S::Bytes, TransformError> {
+    struct Output<B: crate::c14n::scratch::Bytes> {
+        buffer: QueryMarkup<B>,
+        failure: Option<Unavailable>,
+    }
+    impl<B: crate::c14n::scratch::Bytes> std::io::Write for Output<B> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.failure.is_none() {
+                if let Err(error) = self.buffer.append(bytes) {
+                    self.failure = Some(error);
+                } else {
+                    return Ok(bytes.len());
+                }
+            }
+            Err(std::io::ErrorKind::OutOfMemory.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let carried = parameter.carried_bytes();
+    let limit = budget
+        .xslt
+        .max_workspace
+        .checked_sub(carried)
+        .ok_or_else(|| budget.xslt.workspace_error(carried))?;
+    let mut output = Output {
+        buffer: QueryMarkup {
+            bytes: scratch.bytes(),
+            limit,
+        },
+        failure: None,
+    };
+    let algorithm = crate::c14n::C14nAlgorithm::from_uri(super::DEFAULT_IMPLICIT_C14N_URI)
+        .expect("constant C14N URI");
+    let result = crate::c14n::canonicalize_visible_to_writer_in(
+        document,
+        visibility,
+        (&algorithm, None),
+        budget.c14n.remaining(),
+        budget.xml_base_resolution(),
+        &mut output,
+        scratch,
+    );
+    if let Some(error) = output.failure {
+        return Err(match error {
+            Unavailable::Exceeds(needed) => {
+                budget.xslt.workspace_error(carried.saturating_add(needed))
+            }
+            Unavailable::Refused(error) => error,
+            Unavailable::Missing => unreachable!("byte append cannot lack a stylesheet"),
+        });
+    }
+    result.map_err(|error| super::map_c14n_limit_error(error, &budget.c14n))?;
+    budget.c14n.charge(output.buffer.bytes.len())?;
+    Ok(output.buffer.bytes)
 }
 
 enum QueryStylesheet<'a, B: crate::c14n::scratch::Bytes> {
@@ -1239,6 +1307,7 @@ fn charge_parse_work<T, S: TransformScratch>(
 pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     parameter: XsltParameter<'_>,
     input: &[u8],
+    input_storage: usize,
     semantics: XsltStylesheetSemantics,
     allow_dtd: bool,
     budget: &TransformExecutionBudget,
@@ -1246,7 +1315,10 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     scratch: &S,
 ) -> Result<ExecutionData<'d, S, D>, TransformError> {
     let allowance = &budget.xslt;
-    let carried = parameter.carried_bytes();
+    let carried = parameter
+        .carried_bytes()
+        .checked_add(input_storage)
+        .ok_or_else(|| allowance.workspace_error(usize::MAX))?;
     let available = allowance
         .max_workspace
         .checked_sub(carried)
@@ -1326,10 +1398,14 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let maximum = allowance
         .max_workspace
         .checked_sub(assembled + decoded)
+        .and_then(|remaining| remaining.checked_sub(input_storage))
         .ok_or_else(|| {
             allowance.workspace_error(carried.saturating_add(assembled).saturating_add(decoded))
         })?;
     let (reservation, reserved) = scratch.reserve_workspace(maximum)?;
+    // Accounted input already owns its allocation in the current query. The
+    // opaque engine lease excludes it, while every peak calculation includes it.
+    let reserved = reserved + input_storage;
     let workspace = reserved + assembled + decoded;
     let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
     let exhausted = |needed: usize| Error::Budget {
