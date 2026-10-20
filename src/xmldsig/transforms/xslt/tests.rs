@@ -50,6 +50,7 @@ fn stylesheets_are_serialized_from_the_parsed_tree() {
         transform,
         usize::MAX,
         super::Inheritance::Separate,
+        &mut super::unmetered,
     )
     .expect("a stylesheet");
     assert_eq!(
@@ -87,13 +88,17 @@ fn stylesheet_serialization_stays_within_the_workspace() {
     );
     let document = Document::parse(&xml).expect("fixed XML parses");
     let transform = document.root_element();
-    let full =
-        super::ParsedStylesheet::from_transform(transform, usize::MAX, super::Inheritance::Inline)
-            .expect("a stylesheet")
-            .document
-            .len();
+    let serialize = |limit| {
+        super::ParsedStylesheet::from_transform(
+            transform,
+            limit,
+            super::Inheritance::Inline,
+            &mut super::unmetered,
+        )
+    };
+    let full = serialize(usize::MAX).expect("a stylesheet").document.len();
     let limit = full / 2;
-    match super::ParsedStylesheet::from_transform(transform, limit, super::Inheritance::Inline) {
+    match serialize(limit) {
         Err(super::Unavailable::Exceeds(needed)) => assert!(needed > limit && needed <= full),
         _ => panic!("half the serialized size is refused"),
     }
@@ -291,6 +296,21 @@ fn query_run(
     remaining: usize,
     memory: usize,
 ) -> QueryRun {
+    query_run_with(
+        super::XsltParameter::Stylesheet(stylesheet),
+        input,
+        remaining,
+        memory,
+    )
+}
+
+/// [`query_run`] for any stylesheet parameter.
+fn query_run_with(
+    parameter: super::XsltParameter<'_>,
+    input: &[u8],
+    remaining: usize,
+    memory: usize,
+) -> QueryRun {
     use structured_asn1::memory::{Memory, MemoryAccount};
     let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
     let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(memory, 1 << 26)));
@@ -299,7 +319,7 @@ fn query_run(
     let before = work.work_used();
     let scratch = crate::c14n::scratch::Accounted(&work);
     let outcome = super::execute::<_, crate::xml::dom::storage::Native>(
-        super::XsltParameter::Stylesheet(stylesheet),
+        parameter,
         input,
         crate::policy::XsltStylesheetSemantics::Specification,
         false,
@@ -352,6 +372,78 @@ fn adapter_scans_are_paid_by_the_query_before_they_run() {
         run.scanned,
         input.len(),
         "a text was scanned before it was paid for"
+    );
+}
+
+#[test]
+fn stylesheet_serialization_is_paid_before_it_runs() {
+    // A stylesheet read from its `<Transform>` is serialized from the tree, and each of its
+    // elements compares its in-scope bindings with its parent's. Many bindings and many
+    // elements make that walk far more work than the text it writes, so a query without
+    // the work is refused during the walk instead of paying only for the text afterwards.
+    use structured_asn1::memory::MemoryError;
+    let declarations: String = (0..100)
+        .map(|index| format!(r#" xmlns:p{index}="urn:p{index}""#))
+        .collect();
+    let templates: String = (0..150)
+        .map(|index| format!(r#"<xsl:template name="t{index}"/>"#))
+        .collect();
+    let xml = format!(
+        r#"<root{declarations}><Transform><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{templates}</xsl:stylesheet></Transform></root>"#
+    );
+    let document = Document::parse(&xml).expect("fixed XML parses");
+    let transform = super::XsltParameter::Transform(
+        document
+            .root_element()
+            .first_child()
+            .expect("the Transform element"),
+    );
+    query_run_with(transform, b"<doc/>", 1 << 26, 1 << 26)
+        .outcome
+        .expect("an ample remainder admits the transform");
+
+    // About a hundred comparisons per binding of each of 151 elements, and a few
+    // thousand units of text.
+    let remaining = 1 << 19;
+    let run = query_run_with(transform, b"<doc/>", remaining, 1 << 26);
+    assert!(
+        matches!(
+            run.outcome,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+            ))
+        ),
+        "{:?}",
+        run.outcome
+    );
+    assert!(run.paid <= remaining);
+}
+
+#[test]
+fn each_input_scan_is_paid_before_it_runs() {
+    // Without DTDs the input is scanned twice before the engine parses it: once for a
+    // document type declaration and once against the XML input policy. A query with the
+    // work to decode it and scan it one and a half times is refused before the second
+    // scan, so the policy preflight never charges the operation.
+    use structured_asn1::memory::MemoryError;
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let input = format!("<!--{}--><doc/>", "a".repeat(100_000));
+    let length = input.len();
+    // Decoding admits the octets and then validates them: two input lengths.
+    let run = query_run(&sheet, input.as_bytes(), 3 * length + length / 2, 1 << 26);
+    assert!(
+        matches!(
+            run.outcome,
+            Err(TransformError::C14n(
+                crate::c14n::C14nError::SharedExecution(MemoryError::WorkExceeded)
+            ))
+        ),
+        "{:?}",
+        run.outcome
+    );
+    assert_eq!(
+        run.scanned, length,
+        "the second scan ran before it was paid for"
     );
 }
 
@@ -610,17 +702,24 @@ fn compatibility_serialization_holds_no_inherited_declarations() {
         .root_element()
         .first_child()
         .expect("the Transform element");
-    let own =
-        super::ParsedStylesheet::from_transform(transform, usize::MAX, super::Inheritance::Omit)
-            .expect("a stylesheet")
-            .document
-            .len();
+    let serialize = |limit, inheritance| {
+        super::ParsedStylesheet::from_transform(
+            transform,
+            limit,
+            inheritance,
+            &mut super::unmetered,
+        )
+    };
+    let own = serialize(usize::MAX, super::Inheritance::Omit)
+        .expect("a stylesheet")
+        .document
+        .len();
     assert!(
-        super::ParsedStylesheet::from_transform(transform, own, super::Inheritance::Omit).is_ok(),
+        serialize(own, super::Inheritance::Omit).is_ok(),
         "the stylesheet's own text fits"
     );
     assert!(matches!(
-        super::ParsedStylesheet::from_transform(transform, own, super::Inheritance::Inline),
+        serialize(own, super::Inheritance::Inline),
         Err(super::Unavailable::Exceeds(_))
     ));
 }

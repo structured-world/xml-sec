@@ -536,7 +536,8 @@ Execution is bounded by the operation's policy:
   stylesheet, the parsed input tree and the execution share it. `max_xslt_recursion_depth`
   bounds compilation and template recursion. Scoped replay decodes the input into the current
   query's memory account and reserves the workspace from what remains; the query's remaining
-  work bounds every pass over the stylesheet and the input and the execution itself.
+  work bounds every pass over the stylesheet (its serialization from the signature's tree
+  included) and the input, each paid before it runs, and the execution itself.
 - Stylesheet and input documents obey the XML document (encoded input bytes included), node,
   depth and namespace-binding limits, and every parser pass over them is charged to
   `max_xml_parse_work_bytes`. A document type declaration in binary input follows

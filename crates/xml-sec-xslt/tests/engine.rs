@@ -213,6 +213,42 @@ fn identity_indexes_are_charged_to_the_parse() {
 }
 
 #[test]
+fn unparsed_entities_are_charged_to_the_parse() {
+    // The tree keeps every NDATA entity's name and URI for unparsed-entity-uri(). A
+    // bounded parse counts them with the tree, so a DTD of unparsed entities holds more
+    // than the same declarations of parsed external entities, which the tree drops.
+    let unbounded = ParseBudget::new(
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+        usize::MAX,
+    )
+    .with_owned_bytes(usize::MAX);
+    let declarations = |notation: &str| {
+        (0..256)
+            .map(|index| {
+                format!(r#"<!ENTITY u{index:04} SYSTEM "urn:entity:{index:04}"{notation}>"#)
+            })
+            .collect::<String>()
+    };
+    let retained = |declarations: String| {
+        let xml = format!(r#"<!DOCTYPE r [<!NOTATION n SYSTEM "urn:n">{declarations}]><r/>"#);
+        Document::parse_with_budget(&xml, None, unbounded)
+            .expect("document parses")
+            .retained_bytes()
+    };
+    let values = 256 * ("u0000".len() + "urn:entity:0000".len());
+    let parsed = retained(declarations(""));
+    let unparsed = retained(declarations(" NDATA n"));
+    assert!(
+        unparsed >= parsed + values,
+        "unparsed {unparsed} vs parsed {parsed}"
+    );
+}
+
+#[test]
 fn the_work_ceiling_stops_an_xpath_evaluation_while_it_runs() {
     // One XPath expression can scan the whole source. Under a small ceiling it is
     // refused as it crosses it, not after the whole scan has run.

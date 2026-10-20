@@ -923,6 +923,12 @@ impl Document {
         }
         for (name, system_identifier) in declarations.unparsed {
             let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
+            // Names are unique in `declarations`, so every entry is kept.
+            reserve_index_entry(
+                &mut document.unparsed_entities,
+                name.capacity() + uri.capacity(),
+                &mut meter,
+            )?;
             document.register_unparsed_entity(name, uri)?;
         }
         document.register_xml_ids(Some(&mut meter))?;
@@ -1362,7 +1368,7 @@ impl Document {
             }
             let key_bytes = normalized.capacity();
             if let Some(meter) = meter.as_deref_mut() {
-                reserve_identity_entry(self, key_bytes, meter)?;
+                reserve_index_entry(&mut self.ids, key_bytes, meter)?;
             }
             let indexed = self.ids.len();
             self.register_id_value(owner, normalized)?;
@@ -2230,11 +2236,11 @@ fn push_metered(
     Ok(document.push(parent, kind, base_uri))
 }
 
-/// Admit one more identity-index entry whose key owns `key_bytes`, growing the index
-/// first when it is full. Storage is counted as `retained_identity_index_bytes` counts it.
-fn reserve_identity_entry(
-    document: &mut Document,
-    key_bytes: usize,
+/// Admit one more entry of a retained index whose strings own `owned_bytes`, growing the
+/// index first when it is full. Storage is counted as `estimated_owned_bytes` counts it.
+fn reserve_index_entry<K: Eq + std::hash::Hash, V>(
+    index: &mut HashMap<K, V>,
+    owned_bytes: usize,
     meter: &mut StreamParseMeter,
 ) -> Result<()> {
     let limit = meter.budget.owned_bytes;
@@ -2243,9 +2249,9 @@ fn reserve_identity_entry(
         limit,
         actual: usize::MAX,
     };
-    if document.ids.len() == document.ids.capacity() {
-        let entry = std::mem::size_of::<((NodeId, String), NodeId)>() + std::mem::size_of::<u64>();
-        let additional = document.ids.capacity().max(4);
+    if index.len() == index.capacity() {
+        let entry = std::mem::size_of::<(K, V)>() + std::mem::size_of::<u64>();
+        let additional = index.capacity().max(4);
         // A hash table reports a capacity of at least the entries it reserves and at
         // most twice as many, so this bounds the growth before it is allocated.
         let bound = additional
@@ -2253,12 +2259,9 @@ fn reserve_identity_entry(
             .and_then(|slots| slots.checked_mul(entry))
             .ok_or_else(refused)?;
         meter.charge_owned(bound)?;
-        let before = document.ids.capacity();
-        document
-            .ids
-            .try_reserve(additional)
-            .map_err(|_| refused())?;
-        let granted = (document.ids.capacity() - before)
+        let before = index.capacity();
+        index.try_reserve(additional).map_err(|_| refused())?;
+        let granted = (index.capacity() - before)
             .checked_mul(entry)
             .ok_or_else(refused)?;
         if granted > bound {
@@ -2267,7 +2270,7 @@ fn reserve_identity_entry(
             meter.release_owned(bound - granted);
         }
     }
-    meter.charge_owned(key_bytes)
+    meter.charge_owned(owned_bytes)
 }
 
 /// Grow `values` by `additional` slots, charging the requested capacity before
@@ -2511,7 +2514,7 @@ fn push_stream_element(
             .map(|attribute| collapse_xml_whitespace(&attribute.value).into_owned())
             .ok_or_else(|| Error::Xml("DTD ID attribute reference is stale".into()))?;
         let key_bytes = value.capacity();
-        reserve_identity_entry(document, key_bytes, meter)?;
+        reserve_index_entry(&mut document.ids, key_bytes, meter)?;
         let indexed = document.ids.len();
         document.register_dtd_id_value(projected, value)?;
         if document.ids.len() == indexed {
