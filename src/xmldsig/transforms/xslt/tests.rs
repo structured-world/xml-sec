@@ -9,6 +9,60 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn transcoded_input_refuses_growth_before_consuming_the_document() {
+    // Native decoding must not materialize a document-sized allocation before
+    // discovering that only a much smaller XSLT workspace is permitted.
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let text = format!("<doc>{}</doc>", "x".repeat(1 << 20));
+    let mut input = vec![0xff, 0xfe];
+    for unit in text.encode_utf16() {
+        input.extend_from_slice(&unit.to_le_bytes());
+    }
+    let limit = 1 << 16;
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy {
+        max_xslt_workspace_bytes: limit,
+        ..Default::default()
+    });
+    let error = run(&budget, &sheet, &input).expect_err("decode exceeds workspace");
+    assert!(
+        matches!(error, TransformError::Policy(PolicyViolation::ResourceLimit {
+        resource: resource_name::XSLT_WORKSPACE_BYTES, maximum, actual
+    }) if maximum == limit && actual <= 2 * limit),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn in_place_stylesheet_preserves_document_siblings() {
+    // XSLT 1.0 section 12.1: document('') observes the stylesheet document,
+    // including accepted top-level processing instructions and comments.
+    let xml = format!(
+        r#"<Transform><?before alpha?><!--one--><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="concat(count(document('')/processing-instruction()), ':', count(document('')/comment()))"/></xsl:template></xsl:stylesheet><!--two--><?after beta?></Transform>"#
+    );
+    let document = Document::parse(&xml).expect("stylesheet siblings are well-formed XML");
+    for semantics in [
+        crate::policy::XsltStylesheetSemantics::Specification,
+        crate::policy::XsltStylesheetSemantics::Libxmlsec1,
+    ] {
+        let budget = TransformExecutionBudget::default();
+        let result = super::execute::<_, crate::xml::dom::storage::Native>(
+            super::XsltParameter::Transform(document.root_element()),
+            b"<doc/>",
+            semantics,
+            false,
+            &budget,
+            budget.xml_parse_work(),
+            &crate::c14n::scratch::Native,
+        )
+        .expect("both semantics execute the complete stylesheet document");
+        let super::ExecutionData::NativeBinary(bytes) = result else {
+            panic!("expected bytes")
+        };
+        assert_eq!(bytes, b"2:2", "{semantics:?}");
+    }
+}
+
+#[test]
 fn entity_child_does_not_hide_repeated_namespace_declarations() {
     // XML 1.0 section 4.4.2 includes entity replacement children without
     // moving the containing start tag into that entity's source range.

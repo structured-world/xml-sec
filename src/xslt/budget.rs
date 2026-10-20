@@ -276,6 +276,7 @@ impl BudgetKind {
                 | Self::KeyEntries
                 | Self::ResultNodes
                 | Self::Messages
+                | Self::SerializedBytes
         )
     }
 }

@@ -1448,6 +1448,14 @@ pub(crate) trait TransformScratch: Scratch {
     #[cfg(feature = "xslt")]
     fn dom_storage(&self) -> Self::Dom;
     #[cfg(feature = "xslt")]
+    fn decoded_capacity(
+        text: &<Self::Decoder as crate::xml_input_shared::DecodeStorage>::Text,
+    ) -> usize;
+    #[cfg(feature = "xslt")]
+    fn decoded_text(
+        bytes: Self::Bytes,
+    ) -> Result<<Self::Decoder as crate::xml_input_shared::DecodeStorage>::Text, TransformError>;
+    #[cfg(feature = "xslt")]
     fn lexical_error(
         error: crate::xml_input::lexical::Error<
             <Self::Dom as DomStorage>::Text,
@@ -1488,6 +1496,14 @@ impl TransformScratch for Native {
     #[cfg(feature = "xslt")]
     fn dom_storage(&self) -> Self::Dom {
         NativeDom
+    }
+    #[cfg(feature = "xslt")]
+    fn decoded_capacity(text: &String) -> usize {
+        text.capacity()
+    }
+    #[cfg(feature = "xslt")]
+    fn decoded_text(bytes: Vec<u8>) -> Result<String, TransformError> {
+        Ok(String::from_utf8(bytes).expect("decoder appended valid UTF-8 fragments"))
     }
     #[cfg(feature = "xslt")]
     fn lexical_error(error: crate::xml_input::lexical::Error) -> TransformError {
@@ -1537,6 +1553,21 @@ impl<'w, W: structured_asn1::memory::Work> TransformScratch
     #[cfg(feature = "xslt")]
     fn dom_storage(&self) -> Self::Dom {
         crate::xml::dom::storage::Accounted(self.0)
+    }
+    #[cfg(feature = "xslt")]
+    fn decoded_capacity(text: &structured_asn1::memory::OwnedText<W>) -> usize {
+        text.capacity()
+    }
+    #[cfg(feature = "xslt")]
+    fn decoded_text(
+        bytes: structured_asn1::memory::OwnedVec<u8, W>,
+    ) -> Result<structured_asn1::memory::OwnedText<W>, TransformError> {
+        structured_asn1::memory::OwnedText::from_utf8(bytes).map_err(|error| match error.kind() {
+            structured_asn1::memory::TextErrorKind::Resource(cause) => cause.into(),
+            structured_asn1::memory::TextErrorKind::Utf8(_) => {
+                unreachable!("decoder appended valid UTF-8 fragments")
+            }
+        })
     }
     #[cfg(feature = "xslt")]
     fn lexical_error(

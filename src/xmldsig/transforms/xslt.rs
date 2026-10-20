@@ -392,6 +392,99 @@ impl<B: crate::c14n::scratch::Bytes> QueryStylesheet<'_, B> {
     }
 }
 
+enum DecodeFailure {
+    Encoding(crate::encoding::XmlEncodingError),
+    Refused(TransformError),
+}
+
+impl From<crate::encoding::XmlEncodingError> for DecodeFailure {
+    fn from(error: crate::encoding::XmlEncodingError) -> Self {
+        Self::Encoding(error)
+    }
+}
+
+/// The existing decoder grammar, with the same query storage and a bounded
+/// growth peak. Native and accounted execution use one allocation strategy.
+struct WorkspaceDecoder<'s, S> {
+    scratch: &'s S,
+    limit: usize,
+    held: usize,
+}
+
+impl<S: TransformScratch> WorkspaceDecoder<'_, S> {
+    fn refused(&self, error: Unavailable) -> DecodeFailure {
+        DecodeFailure::Refused(match error {
+            Unavailable::Exceeds(actual) => PolicyViolation::ResourceLimit {
+                resource: resource_name::XSLT_WORKSPACE_BYTES,
+                maximum: self.limit + self.held,
+                actual: self.held.saturating_add(actual),
+            }
+            .into(),
+            Unavailable::Refused(error) => error,
+            Unavailable::Missing => unreachable!("decoding has no stylesheet lookup"),
+        })
+    }
+}
+
+impl<S: TransformScratch> crate::xml_input_shared::DecodeStorage for WorkspaceDecoder<'_, S> {
+    type Text = <S::Decoder as crate::xml_input_shared::DecodeStorage>::Text;
+    type Buffer = QueryMarkup<S::Bytes>;
+    type Error = DecodeFailure;
+    fn label_error(&self, kind: crate::xml_input_shared::LabelError, label: &str) -> DecodeFailure {
+        DecodeFailure::Refused(S::decode_error(
+            self.scratch.decoder().label_error(kind, label),
+        ))
+    }
+    fn charge(&self, bytes: usize) -> Result<(), DecodeFailure> {
+        self.scratch
+            .charge(bytes)
+            .map_err(|error| DecodeFailure::Refused(error.into()))
+    }
+    fn buffer(&self) -> Self::Buffer {
+        QueryMarkup {
+            bytes: self.scratch.bytes(),
+            limit: self.limit,
+        }
+    }
+    fn len(&self, buffer: &Self::Buffer) -> usize {
+        buffer.len()
+    }
+    fn append(&self, buffer: &mut Self::Buffer, text: &str) -> Result<(), DecodeFailure> {
+        buffer.push_str(text).map_err(|error| self.refused(error))
+    }
+    fn finish(&self, buffer: Self::Buffer) -> Result<Self::Text, DecodeFailure> {
+        S::decoded_text(buffer.bytes).map_err(DecodeFailure::Refused)
+    }
+    fn replace(
+        &self,
+        text: Self::Text,
+        range: std::ops::Range<usize>,
+        replacement: &str,
+    ) -> Result<Self::Text, DecodeFailure> {
+        let mut buffer = self.buffer();
+        let held = S::decoded_capacity(&text);
+        buffer.limit = self
+            .limit
+            .checked_sub(held)
+            .ok_or_else(|| self.refused(Unavailable::Exceeds(held)))?;
+        for part in [
+            &text.as_ref()[..range.start],
+            replacement,
+            &text.as_ref()[range.end..],
+        ] {
+            buffer.push_str(part).map_err(|error| {
+                self.refused(match error {
+                    Unavailable::Exceeds(actual) => {
+                        Unavailable::Exceeds(held.saturating_add(actual))
+                    }
+                    error => error,
+                })
+            })?;
+        }
+        self.finish(buffer)
+    }
+}
+
 /// Whether `element` is an `xsl:stylesheet` or `xsl:transform` element.
 ///
 /// XMLDSig 1.1 section 6.6.5 requires "the mandatory XSLT namespace-qualified
@@ -646,7 +739,8 @@ impl ParsedStylesheet {
         // `Bounded` keeps its capacity within its limit.
         let mut document = Bounded::new(limit - inherited.text.capacity());
         let inline = (inheritance == Inheritance::Inline).then_some(inherited.text.as_str());
-        let at = serialize_element(
+        let at = serialize_stylesheet_children(
+            transform,
             root,
             &mut document,
             inline,
@@ -754,11 +848,48 @@ impl<'a> XsltParameter<'a> {
                 }
                 out.limit -= inherited.bytes.capacity();
                 work(inherited.len())?;
-                serialize_element(root, &mut out, Some(inherited.text()), work, scratch)?;
+                serialize_stylesheet_children(
+                    transform,
+                    root,
+                    &mut out,
+                    Some(inherited.text()),
+                    work,
+                    scratch,
+                )?;
             }
         }
         Ok(QueryStylesheet::Owned(out))
     }
+}
+
+fn serialize_stylesheet_children<
+    W: FnMut(usize) -> Result<(), TransformError>,
+    S: TransformScratch,
+>(
+    transform: crate::xml::dom::Node<'_, '_>,
+    root: crate::xml::dom::Node<'_, '_>,
+    out: &mut impl Markup,
+    inherited: Option<&str>,
+    work: &mut W,
+    scratch: &S,
+) -> Result<usize, Unavailable> {
+    // XSLT 1.0 section 12.1: document('') exposes the stylesheet document,
+    // including comments and processing instructions beside its root element.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#document
+    let mut at = 0;
+    for child in transform.children() {
+        let offset = serialize_element(
+            child,
+            out,
+            if child == root { inherited } else { None },
+            work,
+            scratch,
+        )?;
+        if child == root {
+            at = offset;
+        }
+    }
+    Ok(at)
 }
 
 /// Write `root` and its content to `out`; returns the offset just after its name,
@@ -1125,6 +1256,11 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     scratch: &S,
 ) -> Result<ExecutionData<'d, S, D>, TransformError> {
     let allowance = &budget.xslt;
+    let carried = parameter.carried_bytes();
+    let available = allowance
+        .max_workspace
+        .checked_sub(carried)
+        .ok_or_else(|| allowance.workspace_error(carried))?;
     let settings = DocumentParseSettings {
         allow_dtd,
         ..budget.xml_parse_settings
@@ -1135,9 +1271,20 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         input,
         settings.max_bytes,
         |_, _| Ok(()),
-        &scratch.decoder(),
+        &WorkspaceDecoder {
+            scratch,
+            limit: available,
+            held: carried,
+        },
     )
-    .map_err(S::decode_error)?;
+    .map_err(|error| match error {
+        DecodeFailure::Encoding(error) => super::map_transform_xml_decode_error(error),
+        DecodeFailure::Refused(error) => error,
+    })?;
+    let decoded = match &xml {
+        crate::xml_input_shared::Decoded::Borrowed(_) => 0,
+        crate::xml_input_shared::Decoded::Owned(text) => S::decoded_capacity(text),
+    };
     // The query pays for each of the adapter's lexical passes before it runs.
     reject_document_type(xml.as_ref(), settings, scratch)?;
     // The engine's parser does not count namespace bindings or apply the rest of
@@ -1147,11 +1294,10 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         .map_err(|error| super::map_transform_xml_parse_error(error, settings))?;
 
     // Copies a parsed stylesheet carries stay in the workspace until the transform ends.
-    let carried = parameter.carried_bytes();
     let available = allowance
         .max_workspace
-        .checked_sub(carried)
-        .ok_or_else(|| allowance.workspace_error(carried))?;
+        .checked_sub(carried + decoded)
+        .ok_or_else(|| allowance.workspace_error(carried.saturating_add(decoded)))?;
     // Query-owned text and lexical preflight precede the opaque native lease:
     // both allocate and charge through the same current Work, never a new account.
     let stylesheet = parameter
@@ -1189,10 +1335,12 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let assembled = stylesheet.capacity();
     let maximum = allowance
         .max_workspace
-        .checked_sub(assembled)
-        .ok_or_else(|| allowance.workspace_error(carried.saturating_add(assembled)))?;
+        .checked_sub(assembled + decoded)
+        .ok_or_else(|| {
+            allowance.workspace_error(carried.saturating_add(assembled).saturating_add(decoded))
+        })?;
     let (reservation, reserved) = scratch.reserve_workspace(maximum)?;
-    let workspace = reserved + assembled;
+    let workspace = reserved + assembled + decoded;
     let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
     let exhausted = |needed: usize| Error::Budget {
         kind: BudgetKind::OwnedBytes,
@@ -1221,16 +1369,16 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         xml_parse,
         scratch,
     )?
-    .map_err(|error| fail(error, Phase::Stylesheet, carried + assembled))?;
+    .map_err(|error| fail(error, Phase::Stylesheet, carried + assembled + decoded))?;
     // Compilation no longer borrows the text. Release its actual allocation,
     // then admit that capacity for later engine stages while the first lease
     // continues to cover the compiled tree. A competing query may get it first.
     drop(stylesheet);
     let (execution_reservation, reclaimed) = scratch.reserve_workspace(assembled)?;
-    let workspace = reserved + reclaimed;
+    let workspace = reserved + reclaimed + decoded;
     let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
     // Both fit the workspace, so their sum cannot overflow.
-    let held = carried + compiled.retained_bytes();
+    let held = carried + compiled.retained_bytes() + decoded;
 
     let (entity_references, entity_expansion_bytes) = if allow_dtd {
         (
@@ -1263,7 +1411,15 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     )?
     .map_err(|error| fail(error, Phase::Input, held))?;
     drop(xml);
-    let held = held
+    let (input_reservation, reclaimed_input) = if decoded == 0 {
+        (None, 0)
+    } else {
+        let (reservation, reclaimed) = scratch.reserve_workspace(decoded)?;
+        (Some(reservation), reclaimed)
+    };
+    let workspace = workspace - decoded + reclaimed_input;
+    let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
+    let held = (held - decoded)
         .checked_add(source.retained_bytes())
         .ok_or_else(|| fail(exhausted(usize::MAX), Phase::Input, 0))?;
 
@@ -1294,7 +1450,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let usage = reported.usage;
     let work = WORK_KINDS
         .into_iter()
-        .try_fold(0usize, |total, kind| {
+        .try_fold(usage.serialized_bytes, |total, kind| {
             total.checked_add(admitted(&usage, kind))
         })
         .expect("each kind is bounded by the policy work ceiling");
@@ -1332,6 +1488,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     if S::ACCOUNTED {
         // The native output sits inside the workspace reservation. Move its charge to
         // a reservation of its own, so the account sees both copies while it is copied.
+        drop(input_reservation);
         drop(execution_reservation);
         drop(reservation);
         let (output_reservation, granted) = scratch.reserve_workspace(output.capacity())?;
@@ -1344,6 +1501,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         drop(output_reservation);
         Ok(ExecutionData::Accounted(accounted))
     } else {
+        drop(input_reservation);
         drop(execution_reservation);
         drop(reservation);
         Ok(ExecutionData::NativeBinary(output))

@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn serialized_bytes_are_admitted_before_output_work() {
+    // The output quota is independent, but serialization still consumes the
+    // caller's aggregate execution remainder before any bytes are written.
+    let mut limits = execution_budget(1024);
+    limits.serialized_bytes = 128;
+    let mut meter = Meter::new(limits, 0)
+        .expect("empty source fits the budget")
+        .with_work_ceiling(31);
+    assert!(matches!(
+        meter.charge(BudgetKind::SerializedBytes, 32),
+        Err(Error::Budget {
+            kind: BudgetKind::AggregateWork,
+            limit: 31,
+            actual: 32
+        })
+    ));
+    assert_eq!(
+        meter
+            .usage(BudgetKind::SerializedBytes)
+            .expect("serialized bytes have a usage counter")
+            .0,
+        0
+    );
+}
+
 fn execution_budget(owned_bytes: usize) -> ExecutionBudget {
     ExecutionBudget {
         source_bytes: 64,

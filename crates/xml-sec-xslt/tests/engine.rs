@@ -322,7 +322,8 @@ fn the_work_ceiling_bounds_every_kind_together() {
         + usage.sort_comparisons
         + usage.key_entries
         + usage.result_nodes
-        + usage.messages;
+        + usage.messages
+        + usage.serialized_bytes;
     assert!(run(total).outcome.is_ok(), "the exact total fits");
     let refused = run(total - 1);
     assert!(matches!(
@@ -336,9 +337,14 @@ fn the_work_ceiling_bounds_every_kind_together() {
     assert!(
         admitted.xpath_evaluations
             + admitted.xpath_operations
+            + admitted.extension_operations
             + admitted.pattern_evaluations
             + admitted.template_applications
+            + admitted.sort_comparisons
+            + admitted.key_entries
             + admitted.result_nodes
+            + admitted.messages
+            + admitted.serialized_bytes
             < total
     );
 }

@@ -51,8 +51,8 @@ dsa = { version = "0.7", features = ["hazmat"] }
 md-5 = { version = "0.11", features = ["oid", "zeroize"] }
 pkcs8 = { version = "0.11", features = ["encryption", "pem"] }
 x509-parser = "0.18"
-structured-asn1 = { version = "0.8.1", default-features = false, features = ["alloc", "std"] }
-structured-pkix = { version = "0.8.0", default-features = false, features = ["alloc", "std"] }
+structured-asn1 = { version = "0.9.1", default-features = false, features = ["alloc", "std"] }
+structured-pkix = { version = "0.9.1", default-features = false, features = ["alloc", "std"] }
 zeroize = "1"
 base64 = "0.23"
 thiserror = "2"
