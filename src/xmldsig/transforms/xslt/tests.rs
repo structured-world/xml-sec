@@ -9,6 +9,96 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn owned_binary_inputs_share_the_xslt_workspace() {
+    // Every producer leaves its allocation live during the next transform.
+    // A borrowed input's minimum workspace cannot also admit that allocation.
+    use base64::Engine as _;
+    let xml = format!("<root>{}</root>", "x".repeat(64 * 1024));
+    let encoded = base64::engine::general_purpose::STANDARD.encode(xml.as_bytes());
+    let document = Document::parse(&xml).expect("source XML");
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let producer = XsltStylesheet::new(format!(
+        r#"<xsl:stylesheet xmlns:xsl="{XSL}" xmlns:s="http://exslt.org/strings" exclude-result-prefixes="s" version="1.0"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><root><xsl:value-of select="s:padding(65536, 'x')"/></root></xsl:template></xsl:stylesheet>"#
+    )).expect("buffer-producing stylesheet");
+    let budget = |bytes| {
+        TransformExecutionBudget::from_resources(&ResourcePolicy {
+            max_xslt_workspace_bytes: bytes,
+            ..Default::default()
+        })
+    };
+    let expected = run(&budget(1 << 24), &sheet, xml.as_bytes()).expect("borrowed input runs");
+    let (mut refused, mut admitted) = (0, 1 << 24);
+    while admitted - refused > 1 {
+        let middle = refused + (admitted - refused) / 2;
+        if run(&budget(middle), &sheet, xml.as_bytes()).is_ok() {
+            admitted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    // Leave room for producer serialization differences, but not a 64 KiB input.
+    let workspace = admitted + 8192;
+    let mut accepted = Vec::new();
+    for case in ["owned", "base64", "c14n", "xslt"] {
+        for maximum in [workspace, 1 << 24] {
+            let mut transforms = Vec::new();
+            let input = match case {
+                "owned" => TransformData::Binary(xml.as_bytes().to_vec()),
+                "base64" => {
+                    transforms.push(Transform::Base64Decode);
+                    TransformData::BorrowedBinary(encoded.as_bytes())
+                }
+                "c14n" => {
+                    transforms.push(Transform::C14n(
+                        crate::c14n::C14nAlgorithm::from_uri(
+                            super::super::DEFAULT_IMPLICIT_C14N_URI,
+                        )
+                        .expect("constant C14N URI"),
+                    ));
+                    TransformData::NodeSet(
+                        crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
+                            .expect("source projection"),
+                    )
+                }
+                "xslt" => {
+                    transforms.push(Transform::Xslt(producer.clone()));
+                    TransformData::BorrowedBinary(b"<doc/>")
+                }
+                _ => unreachable!("fixed cases"),
+            };
+            transforms.push(Transform::Xslt(sheet.clone()));
+            let result = execute_transforms_with_options_and_budget(
+                document.root_element(),
+                input,
+                &transforms,
+                TransformOptions::default(),
+                &budget(maximum),
+            );
+            if maximum == workspace {
+                match result {
+                    Ok(_) => accepted.push(case),
+                    Err(TransformError::Policy(PolicyViolation::ResourceLimit {
+                        resource: resource_name::XSLT_WORKSPACE_BYTES,
+                        ..
+                    })) => {}
+                    Err(error) => panic!("{case}: unexpected refusal: {error:?}"),
+                }
+            } else {
+                assert_eq!(
+                    result.expect("chain fits generous workspace"),
+                    expected,
+                    "{case}"
+                );
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "owned input was not held in workspace: {accepted:?}"
+    );
+}
+
+#[test]
 fn parsed_source_round_trips_inherited_namespaces() {
     // Public source markup must stand alone, including prefixes that the
     // original stylesheet inherited from its enclosing signature.
@@ -332,7 +422,7 @@ fn run(
     let signature = Document::parse("<Signature/>").expect("fixed XML parses");
     execute_transforms_with_options_and_budget(
         signature.root_element(),
-        TransformData::Binary(input.to_vec()),
+        TransformData::BorrowedBinary(input),
         &[Transform::Xslt(stylesheet.clone())],
         TransformOptions::default(),
         budget,

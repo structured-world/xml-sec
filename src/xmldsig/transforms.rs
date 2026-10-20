@@ -923,25 +923,27 @@ fn apply_transform_with_context<
         #[cfg(feature = "xslt")]
         InstructionView::Xslt(stylesheet) => {
             let collected;
-            let input_storage;
-            let bytes = if let Some(bytes) = input.binary() {
-                input_storage = 0;
-                bytes
-            } else {
-                // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
-                // node-set input with inclusive C14N 1.0 first.
-                // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
-                let nodes = input.nodes().expect("nodes or bytes");
-                let bytes = xslt::canonicalize_input(
-                    stylesheet,
-                    nodes.document(),
-                    nodes,
-                    budget,
-                    context.scratch,
-                )?;
-                input_storage = bytes.capacity();
-                collected = bytes;
-                &collected
+            // A slice does not imply borrowed storage: earlier transforms can
+            // own its allocation, which remains live throughout this XSLT step.
+            let (bytes, input_storage): (&[u8], usize) = match &input {
+                ExecutionData::NativeBinary(bytes) => (bytes, bytes.capacity()),
+                ExecutionData::Accounted(bytes) => (bytes, bytes.capacity()),
+                ExecutionData::BorrowedBinary(bytes) => (bytes, 0),
+                ExecutionData::Nodes(nodes) => {
+                    // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
+                    // node-set input with inclusive C14N 1.0 first.
+                    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
+                    let bytes = xslt::canonicalize_input(
+                        stylesheet,
+                        nodes.document(),
+                        nodes,
+                        budget,
+                        context.scratch,
+                    )?;
+                    let capacity = bytes.capacity();
+                    collected = bytes;
+                    (&collected, capacity)
+                }
             };
             xslt::execute(
                 stylesheet,
