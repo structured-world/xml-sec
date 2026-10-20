@@ -144,7 +144,7 @@ pub(crate) struct TransformExecutionBudget {
     state: TransformChainState,
     opc_workspace: relationship::WorkspaceBudget,
     #[cfg(feature = "xslt")]
-    xslt: xslt::Allowance,
+    xslt: std::rc::Rc<xslt::Allowance>,
 }
 
 impl Default for TransformExecutionBudget {
@@ -349,7 +349,7 @@ impl TransformExecutionBudget {
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
             #[cfg(feature = "xslt")]
-            xslt: xslt::Allowance::default(),
+            xslt: std::rc::Rc::default(),
         }
     }
 
@@ -371,7 +371,7 @@ impl TransformExecutionBudget {
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
             #[cfg(feature = "xslt")]
-            xslt: xslt::Allowance::default(),
+            xslt: std::rc::Rc::default(),
         }
     }
 
@@ -390,7 +390,7 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
             #[cfg(feature = "xslt")]
-            xslt: xslt::Allowance::default(),
+            xslt: std::rc::Rc::default(),
         }
     }
 
@@ -431,7 +431,7 @@ impl TransformExecutionBudget {
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::new(resources.max_opc_workspace_bytes),
             #[cfg(feature = "xslt")]
-            xslt: xslt::Allowance::new(resources),
+            xslt: std::rc::Rc::new(xslt::Allowance::new(resources)),
         }
     }
 
@@ -1445,6 +1445,15 @@ pub(crate) trait TransformScratch: Scratch {
     type NodeKeys: Keys;
     type Decoder: crate::xml_input_shared::DecodeStorage;
     type Dom: NameStorage;
+    #[cfg(feature = "xslt")]
+    fn dom_storage(&self) -> Self::Dom;
+    #[cfg(feature = "xslt")]
+    fn lexical_error(
+        error: crate::xml_input::lexical::Error<
+            <Self::Dom as DomStorage>::Text,
+            <Self::Dom as crate::xml_input::lexical::storage::Storage>::Refusal,
+        >,
+    ) -> TransformError;
     fn parse_xml<'input>(
         &self,
         xml: &'input str,
@@ -1476,6 +1485,14 @@ impl TransformScratch for Native {
     type NodeKeys = NativeKeys;
     type Decoder = crate::xml_input_shared::NativeStorage;
     type Dom = NativeDom;
+    #[cfg(feature = "xslt")]
+    fn dom_storage(&self) -> Self::Dom {
+        NativeDom
+    }
+    #[cfg(feature = "xslt")]
+    fn lexical_error(error: crate::xml_input::lexical::Error) -> TransformError {
+        TransformError::XmlParse(XmlDocumentError::Parse(NativeDom::lexical_error(error)))
+    }
     fn parse_xml<'input>(
         &self,
         xml: &'input str,
@@ -1517,6 +1534,20 @@ impl<'w, W: structured_asn1::memory::Work> TransformScratch
     type NodeKeys = PaidKeys<'w, W>;
     type Decoder = crate::encoding::AccountedDecoder<'w, W>;
     type Dom = crate::xml::dom::storage::Accounted<'w, W>;
+    #[cfg(feature = "xslt")]
+    fn dom_storage(&self) -> Self::Dom {
+        crate::xml::dom::storage::Accounted(self.0)
+    }
+    #[cfg(feature = "xslt")]
+    fn lexical_error(
+        error: crate::xml_input::lexical::Error<
+            structured_asn1::memory::OwnedText<W>,
+            structured_asn1::memory::MemoryError,
+        >,
+    ) -> TransformError {
+        let error = <Self::Dom as DomStorage>::lexical_error(error);
+        TransformError::XmlParse(error.into())
+    }
     fn parse_xml<'input>(
         &self,
         xml: &'input str,
@@ -2732,7 +2763,9 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
                 None
             };
             scratch.canonicalization(algo, prefixes)
-        } else if let Some(transform) = parse_xslt_transform(uri, child, scratch)? {
+        } else if let Some(transform) =
+            parse_xslt_transform(uri, child, xpath_state.signature_budget, scratch)?
+        {
             transform
         } else {
             return Err(scratch.unsupported(format_args!("{uri}")));
@@ -2749,6 +2782,7 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
 fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     uri: &str,
     transform_node: Node<'a, 'a>,
+    budget: &XPathSignatureParseBudget,
     scratch: &S,
 ) -> Result<Option<S::Instruction>, TransformError> {
     if uri != XSLT_TRANSFORM_URI {
@@ -2785,13 +2819,14 @@ fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     let source = xslt::stylesheet_source(transform_node)
         .ok_or_else(|| scratch.unsupported(format_args!("XSLT transform requires a stylesheet")))?;
     scratch.charge(source.len())?;
-    Ok(Some(scratch.xslt(transform_node, source)))
+    Ok(Some(scratch.xslt(transform_node, source, &budget.xslt)?))
 }
 
 #[cfg(not(feature = "xslt"))]
 fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     _: &str,
     _: Node<'a, 'a>,
+    _: &XPathSignatureParseBudget,
     _: &S,
 ) -> Result<Option<S::Instruction>, TransformError> {
     Ok(None)
@@ -3062,6 +3097,8 @@ impl<'a> XPathParseState<'a> {
 /// Parse/compile work shared by every Reference in one Signature, including
 /// repeated Manifest parses required by dependency-ordered signing.
 pub(crate) struct XPathSignatureParseBudget {
+    #[cfg(feature = "xslt")]
+    xslt: std::rc::Rc<xslt::Allowance>,
     opc_workspace: relationship::WorkspaceBudget,
     expressions: usize,
     max_expressions: usize,
@@ -3075,6 +3112,8 @@ pub(crate) struct XPathSignatureParseBudget {
 impl Default for XPathSignatureParseBudget {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "xslt")]
+            xslt: std::rc::Rc::default(),
             opc_workspace: relationship::WorkspaceBudget::parameters(
                 crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
             ),
@@ -3098,7 +3137,20 @@ impl XPathSignatureParseBudget {
     }
 
     pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
+        Self::from_resource_parts(
+            resources,
+            #[cfg(feature = "xslt")]
+            std::rc::Rc::new(xslt::Allowance::new(resources)),
+        )
+    }
+
+    fn from_resource_parts(
+        resources: &crate::policy::ResourcePolicy,
+        #[cfg(feature = "xslt")] xslt: std::rc::Rc<xslt::Allowance>,
+    ) -> Self {
         Self {
+            #[cfg(feature = "xslt")]
+            xslt,
             opc_workspace: relationship::WorkspaceBudget::parameters(
                 resources.max_opc_parameter_bytes,
             ),
@@ -3110,6 +3162,19 @@ impl XPathSignatureParseBudget {
             max_namespace_bytes: resources.max_xpath_namespace_bytes,
             max_filters: resources.max_xpath_filters,
         }
+    }
+
+    pub(crate) fn for_execution(
+        resources: &crate::policy::ResourcePolicy,
+        execution: &TransformExecutionBudget,
+    ) -> Self {
+        #[cfg(not(feature = "xslt"))]
+        let _ = execution;
+        Self::from_resource_parts(
+            resources,
+            #[cfg(feature = "xslt")]
+            std::rc::Rc::clone(&execution.xslt),
+        )
     }
 
     pub(crate) fn charge(&mut self) -> Result<(), TransformError> {

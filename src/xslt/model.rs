@@ -697,13 +697,16 @@ impl Document {
         if subset {
             work.charge(xml.len())?;
         }
+        meter.entity_expansion.parse_work = Some(work);
         let (parameter_expanded_xml, declarations) = internal_general_entities(
             xml,
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
         if subset {
-            work.charge(parameter_expanded_xml.len())?;
+            meter
+                .entity_expansion
+                .charge_parse_work(parameter_expanded_xml.len())?;
         }
         let expanded_xml = expand_document_entities(
             parameter_expanded_xml.as_ref(),
@@ -711,7 +714,9 @@ impl Document {
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
-        work.charge(expanded_xml.len())?;
+        meter
+            .entity_expansion
+            .charge_parse_work(expanded_xml.len())?;
         let mut reader = Scanner::new(expanded_xml.as_ref());
         let mut previous_event_offset = 0usize;
         let mut source_line = 1usize;
@@ -1940,10 +1945,11 @@ pub(crate) fn prepare_xml_frontend_bounded<'a>(
     if subset {
         work.charge(xml.len())?;
     }
+    entity_expansion.parse_work = Some(work);
     let (parameter_expanded_xml, declarations) =
         internal_general_entities(xml, &mut entity_references, &mut entity_expansion)?;
     if subset {
-        work.charge(parameter_expanded_xml.len())?;
+        entity_expansion.charge_parse_work(parameter_expanded_xml.len())?;
     }
     let expanded_xml = expand_document_entities(
         parameter_expanded_xml.as_ref(),
@@ -1957,7 +1963,7 @@ pub(crate) fn prepare_xml_frontend_bounded<'a>(
             Cow::Owned(expanded) => Cow::Owned(expanded),
         });
     };
-    work.charge(expanded_xml.len())?;
+    entity_expansion.charge_parse_work(expanded_xml.len())?;
 
     let mut edits = Vec::<(std::ops::Range<usize>, String)>::new();
     let mut scanner = Scanner::new(expanded_xml.as_ref());
@@ -2155,16 +2161,16 @@ struct StreamElementFrame {
     lexical_name: Option<String>,
 }
 
-struct StreamParseMeter {
+struct StreamParseMeter<'w> {
     budget: ParseBudget,
     nodes: usize,
     entity_references: usize,
-    entity_expansion: EntityExpansionMeter,
+    entity_expansion: EntityExpansionMeter<'w>,
     namespace_scope_bytes: usize,
     owned_bytes: usize,
 }
 
-impl StreamParseMeter {
+impl StreamParseMeter<'_> {
     /// Admit `bytes` more of the tree; namespace scopes share the same ceiling.
     fn charge_owned(&mut self, bytes: usize) -> Result<()> {
         let refused = || Error::Budget {
@@ -2175,6 +2181,7 @@ impl StreamParseMeter {
         let owned = self.owned_bytes.checked_add(bytes).ok_or_else(refused)?;
         let actual = owned
             .checked_add(self.namespace_scope_bytes)
+            .and_then(|actual| actual.checked_add(self.entity_expansion.used))
             .ok_or_else(refused)?;
         ensure(BudgetKind::OwnedBytes, self.budget.owned_bytes, actual)?;
         self.owned_bytes = owned;
@@ -4494,15 +4501,17 @@ fn expand_entity_references_into<'entities>(
     Ok(())
 }
 
-struct EntityExpansionMeter {
+struct EntityExpansionMeter<'w> {
     kind: BudgetKind,
     limit: usize,
     used: usize,
     reference_limit: usize,
     depth_limit: usize,
+    workspace: usize,
+    parse_work: Option<&'w mut ParseWork>,
 }
 
-impl EntityExpansionMeter {
+impl EntityExpansionMeter<'_> {
     #[cfg(test)]
     const fn new(limit: usize) -> Self {
         Self::with_reference_limit(limit, usize::MAX)
@@ -4519,7 +4528,7 @@ impl EntityExpansionMeter {
     }
 
     const fn with_parse_budget(budget: ParseBudget) -> Self {
-        Self::with_limits(
+        let mut meter = Self::with_limits(
             BudgetKind::EntityExpansionBytes,
             if budget.entity_expansion_bytes < ENTITY_EXPANSION_BYTE_CEILING {
                 budget.entity_expansion_bytes
@@ -4532,7 +4541,9 @@ impl EntityExpansionMeter {
             } else {
                 ENTITY_EXPANSION_DEPTH_CEILING
             },
-        )
+        );
+        meter.workspace = budget.owned_bytes;
+        meter
     }
 
     const fn with_limits(
@@ -4547,6 +4558,8 @@ impl EntityExpansionMeter {
             used: 0,
             reference_limit,
             depth_limit,
+            workspace: usize::MAX,
+            parse_work: None,
         }
     }
 
@@ -4570,18 +4583,53 @@ impl EntityExpansionMeter {
 
     fn append(&mut self, output: &mut String, value: &str) -> Result<()> {
         self.charge(value.len())?;
+        #[cfg(test)]
+        expansion_workspace_tests::APPENDED.with(|bytes| bytes.set(bytes.get() + value.len()));
+        let needed = output.len().checked_add(value.len()).ok_or(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: self.workspace,
+            actual: usize::MAX,
+        })?;
+        if needed > output.capacity() {
+            // A growing string can briefly hold its old and replacement blocks.
+            // Admit that peak before asking the allocator, not after materializing it.
+            let capacity = needed.max(output.capacity().saturating_mul(2));
+            ensure(
+                BudgetKind::OwnedBytes,
+                self.workspace,
+                self.used.saturating_add(capacity),
+            )?;
+            output
+                .try_reserve_exact(capacity - output.len())
+                .map_err(|_| Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit: self.workspace,
+                    actual: capacity,
+                })?;
+        }
         output.push_str(value);
         Ok(())
     }
 
     fn check(&self, amount: usize) -> Result<()> {
-        super::budget::ensure(self.kind, self.limit, self.used.saturating_add(amount))
+        let actual = self.used.saturating_add(amount);
+        ensure(BudgetKind::OwnedBytes, self.workspace, actual)?;
+        super::budget::ensure(self.kind, self.limit, actual)
     }
 
     fn charge(&mut self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
+        ensure(BudgetKind::OwnedBytes, self.workspace, actual)?;
         super::budget::ensure(self.kind, self.limit, actual)?;
+        self.charge_parse_work(amount)?;
         self.used = actual;
+        Ok(())
+    }
+
+    fn charge_parse_work(&mut self, amount: usize) -> Result<()> {
+        if let Some(work) = &mut self.parse_work {
+            work.charge(amount)?;
+        }
         Ok(())
     }
 }
@@ -4644,3 +4692,56 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
 
 #[cfg(all(test, not(feature = "embedded")))]
 mod parser_boundary_tests;
+
+#[cfg(test)]
+mod expansion_workspace_tests {
+    use super::*;
+    thread_local! { pub(super) static APPENDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    #[test]
+    fn parser_work_stops_entity_materialization_before_append() {
+        // A later scan refusal cannot pay for strings already materialized.
+        let xml = format!(
+            "<!DOCTYPE doc [<!ENTITY e '{}'>]><doc>{}</doc>",
+            "x".repeat(2000),
+            "&e;".repeat(100)
+        );
+        APPENDED.with(|bytes| bytes.set(0));
+        let report = Document::parse_with_budget_reported(
+            &xml,
+            None,
+            ParseBudget::new(1 << 20, 100, 32, 1000, 1 << 20, 1 << 20)
+                .with_owned_bytes(1 << 20)
+                .with_parse_work_bytes(25_000),
+        );
+        assert!(matches!(
+            report.outcome,
+            Err(Error::Budget {
+                kind: BudgetKind::ParseWorkBytes,
+                ..
+            })
+        ));
+        APPENDED.with(|bytes| {
+            assert!(
+                bytes.get() <= 25_000,
+                "{} bytes appended before work admission",
+                bytes.get()
+            )
+        });
+    }
+
+    #[test]
+    fn entity_expansion_cannot_outgrow_parser_workspace() {
+        // Expansion is temporary parser storage, not merely a limit on the
+        // tree eventually retained after a much larger string was allocated.
+        let budget = ParseBudget::new(4096, 100, 32, 100, 4096, 4096).with_owned_bytes(128);
+        let mut meter = EntityExpansionMeter::with_parse_budget(budget);
+        assert!(matches!(
+            meter.charge(129),
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+    }
+}

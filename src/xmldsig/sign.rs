@@ -2725,11 +2725,13 @@ struct SigningPlanNodes {
 
 impl SigningOperationBudgets {
     fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
+        let transforms = TransformExecutionBudget::from_resources(resources);
+        let xpath_parse = XPathSignatureParseBudget::for_execution(resources, &transforms);
         Self {
             certificates: None,
             key_establishment: Default::default(),
-            transforms: TransformExecutionBudget::from_resources(resources),
-            xpath_parse: XPathSignatureParseBudget::from_resources(resources),
+            transforms,
+            xpath_parse,
         }
     }
 
@@ -2737,12 +2739,14 @@ impl SigningOperationBudgets {
         resources: &crate::policy::ResourcePolicy,
         backend: crate::XmlBackend,
     ) -> Self {
+        let transforms =
+            TransformExecutionBudget::from_resources(resources).with_xml_backend(backend);
+        let xpath_parse = XPathSignatureParseBudget::for_execution(resources, &transforms);
         Self {
             certificates: None,
             key_establishment: Default::default(),
-            transforms: TransformExecutionBudget::from_resources(resources)
-                .with_xml_backend(backend),
-            xpath_parse: XPathSignatureParseBudget::from_resources(resources),
+            transforms,
+            xpath_parse,
         }
     }
 }

@@ -8,6 +8,50 @@ use crate::xml::dom::Document;
 
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
+#[test]
+fn entity_child_does_not_hide_repeated_namespace_declarations() {
+    // XML 1.0 section 4.4.2 includes entity replacement children without
+    // moving the containing start tag into that entity's source range.
+    for backend in [
+        #[cfg(feature = "xml-backend-roxmltree")]
+        crate::XmlBackend::Roxmltree,
+        #[cfg(feature = "xml-backend-xmloxide")]
+        crate::XmlBackend::Xmloxide,
+    ] {
+        for child in ["<!--comment-->", "&comment;"] {
+            let xml = format!(
+                r#"<!DOCTYPE Transform [<!ENTITY comment "<!--comment-->">]><Transform xmlns:xsl="{XSL}"><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}" xmlns:m="urn:meta" m:note="a > b">{child}<xsl:template match="/"><out/></xsl:template></xsl:stylesheet></Transform>"#
+            );
+            let document = Document::parse_with_options_and_backend(
+                &xml,
+                crate::xml::dom::ParsingOptions {
+                    allow_dtd: true,
+                    ..Default::default()
+                },
+                backend,
+            )
+            .expect("entity fixture parses");
+            let parsed = super::ParsedStylesheet::from_transform(
+                document.root_element(),
+                usize::MAX,
+                super::Inheritance::Omit,
+                &mut super::unmetered,
+            )
+            .expect("stylesheet serializes");
+            assert!(
+                parsed.document.contains(&format!(r#"xmlns:xsl="{XSL}""#)),
+                "{backend:?}: {child}"
+            );
+            crate::xslt::Compiler::new(
+                std::sync::Arc::new(crate::xslt::NoResolver),
+                crate::xslt::CompileBudget::new(1 << 20, 0, 64, 1 << 24),
+            )
+            .compile(&parsed.document, None)
+            .expect("explicit stylesheet namespace survives");
+        }
+    }
+}
+
 fn stylesheet(body: &str) -> XsltStylesheet {
     XsltStylesheet::new(format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{body}</xsl:stylesheet>"#
@@ -110,6 +154,20 @@ fn stylesheet_serialization_stays_within_the_workspace() {
         "capacity {} over {limit}",
         text.text.capacity()
     );
+}
+
+#[test]
+fn stylesheet_growth_admits_old_and_new_blocks() {
+    // Reallocation may move a buffer: its replacement must fit while the old
+    // allocation is still live, not merely after realloc releases it.
+    let mut text = super::Bounded::new(100);
+    text.push_str(&"a".repeat(60))
+        .expect("first allocation fits");
+    assert!(
+        text.push_str(&"b".repeat(20)).is_err(),
+        "growth hides its old live block"
+    );
+    assert_eq!(text.text.len(), 60);
 }
 
 #[test]
@@ -420,6 +478,38 @@ fn stylesheet_serialization_is_paid_before_it_runs() {
 }
 
 #[test]
+fn native_stylesheet_capture_obeys_operation_work() {
+    // Namespace fan-out during native parameter capture must be refused before
+    // serialization, even though this path has no replay query account.
+    let declarations: String = (0..100)
+        .map(|index| format!(r#" xmlns:p{index}="urn:p{index}""#))
+        .collect();
+    let templates = "<xsl:template match=\"/\"><out/></xsl:template>";
+    let xml = format!(
+        r#"<ds:Transforms xmlns:ds="{}"{declarations}><ds:Transform Algorithm="{}"><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{templates}</xsl:stylesheet></ds:Transform></ds:Transforms>"#,
+        super::super::XMLDSIG_NS,
+        super::super::XSLT_TRANSFORM_URI,
+    );
+    let document = Document::parse(&xml).expect("fixed XML parses");
+    let resources = ResourcePolicy {
+        max_xslt_work: 1000,
+        ..Default::default()
+    };
+    let mut parse = super::super::XPathSignatureParseBudget::from_resources(&resources);
+    let result = super::super::parse_transforms_with_budget(document.root_element(), &mut parse);
+    assert!(
+        matches!(
+            result,
+            Err(TransformError::Policy(PolicyViolation::ResourceLimit {
+                resource: resource_name::XSLT_WORK,
+                ..
+            }))
+        ),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn each_input_scan_is_paid_before_it_runs() {
     // Without DTDs the input is scanned twice before the engine parses it: once for a
     // document type declaration and once against the XML input policy. A query with the
@@ -444,6 +534,64 @@ fn each_input_scan_is_paid_before_it_runs() {
     assert_eq!(
         run.scanned, length,
         "the second scan ran before it was paid for"
+    );
+}
+
+#[test]
+fn stylesheet_preflight_stops_at_the_current_query_remainder() {
+    // Namespace bookkeeping is part of the current query, not just the later
+    // compiler pass. The namespace-heavy preflight must exhaust the query
+    // before the compiler's three additional text scans can be admitted.
+    let sheet = stylesheet(&format!(
+        "<xsl:template match=\"/\"><out {} /></xsl:template>",
+        (0..1000)
+            .map(|i| format!("xmlns:p{i}=\"urn:{i}\""))
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
+    let run = query_run(&sheet, b"<doc/>", 4 * sheet.source().len() + 1024, 1 << 26);
+    assert!(run.outcome.is_err(), "the query cannot afford preflight");
+    assert_eq!(run.executed, 0);
+    assert!(
+        run.scanned < 2 * sheet.source().len(),
+        "stylesheet preflight ran without query admission: {}, paid {}, outcome {:?}",
+        run.scanned,
+        run.paid,
+        run.outcome
+    );
+}
+
+#[test]
+fn entity_preflight_stops_at_the_current_query_remainder() {
+    // A compact DTD can multiply preflight scans before the engine is entered.
+    // Exhausting this query must stop that expansion, not merely the later parse.
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 25_000)));
+    let scratch = crate::c14n::scratch::Accounted(&memory);
+    let budget = TransformExecutionBudget::default();
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let input = format!(
+        "<!DOCTYPE doc [<!ENTITY e '{}'>]><doc>{}</doc>",
+        "x".repeat(2000),
+        "&e;".repeat(100)
+    );
+    let result = super::execute::<_, crate::xml::dom::storage::Native>(
+        super::XsltParameter::Stylesheet(&sheet),
+        input.as_bytes(),
+        crate::policy::XsltStylesheetSemantics::Specification,
+        true,
+        &budget,
+        budget.xml_parse_work(),
+        &scratch,
+    );
+    assert!(
+        result.is_err(),
+        "the current query cannot afford expanded input"
+    );
+    assert!(
+        budget.xml_parse_work().consumed() < 100_000,
+        "preflight traversed the expansion before query admission: {}",
+        budget.xml_parse_work().consumed()
     );
 }
 
@@ -714,12 +862,15 @@ fn compatibility_serialization_holds_no_inherited_declarations() {
         .expect("a stylesheet")
         .document
         .len();
+    // The old and replacement buffer may coexist during growth. This covers
+    // that peak but remains far smaller than the inherited declarations.
+    let workspace = 2 * own;
     assert!(
-        serialize(own, super::Inheritance::Omit).is_ok(),
+        serialize(workspace, super::Inheritance::Omit).is_ok(),
         "the stylesheet's own text fits"
     );
     assert!(matches!(
-        serialize(own, super::Inheritance::Inline),
+        serialize(workspace, super::Inheritance::Inline),
         Err(super::Unavailable::Exceeds(_))
     ));
 }

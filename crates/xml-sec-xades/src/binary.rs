@@ -145,15 +145,11 @@ impl<'a, W: Work> Digest<'a> for Document<'_, '_, '_, '_, W> {
         state: SessionDigest<'a>,
         execution: &Q,
     ) -> Result<DigestOutput, Error> {
-        let digest = state.finish()?;
-        execution.charge_work(digest.len() as u64)?;
-        // The session checked the width against the algorithm; no XMLDSig
-        // digest is wider than 64 bytes.
         let mut output = DigestOutput {
             bytes: [0; 64],
-            len: digest.len(),
+            len: state.output_len(),
         };
-        output.bytes[..digest.len()].copy_from_slice(&digest);
+        state.finish(&mut output.bytes[..output.len], execution)?;
         Ok(output)
     }
 

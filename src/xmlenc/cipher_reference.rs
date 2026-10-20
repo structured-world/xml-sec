@@ -277,6 +277,9 @@ impl<'a> CipherReferenceContext<'a> {
         id_attributes: &'a [crate::IdAttributeRegistration],
     ) -> Result<Self, XmlEncError> {
         policy.validate()?;
+        let transforms =
+            TransformExecutionBudget::from_resources(&policy.resources).with_xml_backend(backend);
+        let parse = XPathSignatureParseBudget::for_execution(&policy.resources, &transforms);
         Ok(Self {
             policy,
             external: ExternalResourceContext::new(
@@ -284,11 +287,8 @@ impl<'a> CipherReferenceContext<'a> {
                 policy.resources.max_external_resource_bytes,
                 policy.resources.max_external_resource_total_bytes,
             ),
-            transforms: TransformExecutionBudget::from_resources(&policy.resources)
-                .with_xml_backend(backend),
-            parse: std::cell::RefCell::new(XPathSignatureParseBudget::from_resources(
-                &policy.resources,
-            )),
+            transforms,
+            parse: std::cell::RefCell::new(parse),
             id_attributes,
             backend,
             operation: None,

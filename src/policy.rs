@@ -582,7 +582,8 @@ pub struct ResourcePolicy {
     pub max_opc_parameter_bytes: usize,
     /// Maximum cumulative OPC normalization workspace allocations during execution.
     pub max_opc_workspace_bytes: usize,
-    /// Maximum XSLT work of each kind per operation: XPath evaluations and steps,
+    /// Maximum XSLT work of each kind per operation: stylesheet serialization,
+    /// XPath evaluations and steps,
     /// extension calls, pattern tests, template applications, sort comparisons,
     /// key entries, result nodes and messages.
     pub max_xslt_work: usize,

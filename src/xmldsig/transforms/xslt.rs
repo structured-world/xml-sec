@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use super::{ExecutionData, TransformError, TransformExecutionBudget, TransformScratch};
 use crate::c14n::scratch::Bytes as _;
+use crate::c14n::scratch::List as _;
 use crate::document::{DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget};
 use crate::policy::{PolicyViolation, ResourcePolicy, XsltStylesheetSemantics, resource_name};
 use crate::xml::dom::storage::Storage as DomStorage;
@@ -90,24 +91,6 @@ impl ParsedStylesheet {
             _ => std::borrow::Cow::Borrowed(&self.document),
         }
     }
-
-    /// [`Self::text`], refused before it allocates more than `limit` bytes.
-    fn text_within(
-        &self,
-        semantics: XsltStylesheetSemantics,
-        limit: usize,
-    ) -> Result<std::borrow::Cow<'_, str>, usize> {
-        let joined = match semantics {
-            XsltStylesheetSemantics::Specification if !self.inherited.is_empty() => {
-                self.document.len() + self.inherited.len()
-            }
-            _ => 0,
-        };
-        if joined > limit {
-            return Err(joined);
-        }
-        Ok(self.text(semantics))
-    }
 }
 
 /// Why a parameter yields no stylesheet document.
@@ -154,35 +137,6 @@ impl<'a> XsltParameter<'a> {
                 parsed: Some(parsed),
             }) => source.capacity() + parsed.document.capacity() + parsed.inherited.capacity(),
             _ => 0,
-        }
-    }
-
-    /// The stylesheet document `semantics` compiles, allocating at most `limit` bytes;
-    /// `work` pays for serializing a `<Transform>` before each step runs.
-    fn document<W: FnMut(usize) -> Result<(), TransformError>>(
-        self,
-        semantics: XsltStylesheetSemantics,
-        limit: usize,
-        work: &mut W,
-    ) -> Result<std::borrow::Cow<'a, str>, Unavailable> {
-        match self {
-            Self::Stylesheet(stylesheet) => match &stylesheet.parsed {
-                Some(parsed) => parsed
-                    .text_within(semantics, limit)
-                    .map_err(Unavailable::Exceeds),
-                // Markup given to `XsltStylesheet::new` has no enclosing document.
-                None => Ok(std::borrow::Cow::Borrowed(&stylesheet.source)),
-            },
-            Self::Transform(transform) => ParsedStylesheet::from_transform(
-                transform,
-                limit,
-                match semantics {
-                    XsltStylesheetSemantics::Specification => Inheritance::Inline,
-                    XsltStylesheetSemantics::Libxmlsec1 => Inheritance::Omit,
-                },
-                work,
-            )
-            .map(|parsed| std::borrow::Cow::Owned(parsed.document)),
         }
     }
 }
@@ -243,18 +197,39 @@ impl XsltStylesheet {
     }
 
     /// The stylesheet of a parsed `<Transform>`, whose markup is already element content.
-    pub(super) fn from_parsed(transform: crate::xml::dom::Node<'_, '_>, source: &str) -> Self {
-        Self {
-            source: source.to_owned(),
-            // Owned transforms are built outside any operation's workspace.
-            parsed: ParsedStylesheet::from_transform(
-                transform,
-                usize::MAX,
-                Inheritance::Separate,
-                &mut unmetered,
-            )
-            .ok(),
+    pub(super) fn from_parsed(
+        transform: crate::xml::dom::Node<'_, '_>,
+        source: &str,
+        allowance: &Allowance,
+    ) -> Result<Self, TransformError> {
+        let limit = allowance.max_workspace;
+        if source.len() > limit {
+            return Err(allowance.workspace_error(source.len()));
         }
+        allowance.serialize(source.len())?;
+        let mut owned = Bounded::new(limit);
+        owned
+            .push_str(source)
+            .map_err(|needed| allowance.workspace_error(needed))?;
+        let parsed = ParsedStylesheet::from_transform(
+            transform,
+            limit - owned.text.capacity(),
+            Inheritance::Separate,
+            &mut |units| allowance.serialize(units),
+        )
+        .map_err(|error| match error {
+            Unavailable::Exceeds(needed) => {
+                allowance.workspace_error(owned.text.capacity().saturating_add(needed))
+            }
+            Unavailable::Refused(error) => error,
+            Unavailable::Missing => {
+                TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
+            }
+        })?;
+        Ok(Self {
+            source: owned.text,
+            parsed: Some(parsed),
+        })
     }
 
     /// The stylesheet markup.
@@ -305,8 +280,12 @@ impl Bounded {
             return Err(needed);
         }
         if needed > self.text.capacity() {
+            let available = self.limit - self.text.capacity();
+            if needed > available {
+                return Err(self.text.capacity().saturating_add(needed));
+            }
             // A capacity never exceeds `isize::MAX`, so doubling it cannot overflow.
-            let grown = (self.text.capacity() * 2).clamp(needed, self.limit);
+            let grown = (self.text.capacity() * 2).clamp(needed, available);
             self.text
                 .try_reserve_exact(grown - self.text.len())
                 .map_err(|_| needed)?;
@@ -318,9 +297,98 @@ impl Bounded {
         self.text.push_str(piece);
         Ok(())
     }
+}
 
-    fn push(&mut self, character: char) -> Result<(), usize> {
+/// The same serializer targets either captured native markup or query-owned bytes.
+trait Markup {
+    fn len(&self) -> usize;
+    fn push_str(&mut self, text: &str) -> Result<(), Unavailable>;
+    fn push(&mut self, character: char) -> Result<(), Unavailable> {
         self.push_str(character.encode_utf8(&mut [0; 4]))
+    }
+}
+
+impl Markup for Bounded {
+    fn len(&self) -> usize {
+        self.text.len()
+    }
+    fn push_str(&mut self, text: &str) -> Result<(), Unavailable> {
+        Bounded::push_str(self, text).map_err(Unavailable::Exceeds)
+    }
+}
+
+struct QueryMarkup<B: crate::c14n::scratch::Bytes> {
+    bytes: B,
+    limit: usize,
+}
+
+impl<B: crate::c14n::scratch::Bytes> QueryMarkup<B> {
+    fn text(&self) -> &str {
+        // Only UTF-8 string fragments are appended by Markup.
+        std::str::from_utf8(&self.bytes).expect("serialized markup is UTF-8")
+    }
+}
+
+impl<B: crate::c14n::scratch::Bytes> Markup for QueryMarkup<B> {
+    fn len(&self) -> usize {
+        self.bytes.len()
+    }
+    fn push_str(&mut self, text: &str) -> Result<(), Unavailable> {
+        let needed = self.bytes.len().checked_add(text.len()).ok_or(usize::MAX)?;
+        if needed > self.limit {
+            return Err(Unavailable::Exceeds(needed));
+        }
+        if needed > self.bytes.capacity() {
+            let old = self.bytes.capacity();
+            let available = self.limit - old;
+            if needed > available {
+                return Err(Unavailable::Exceeds(old.saturating_add(needed)));
+            }
+            // Vec's native minimum growth is eight bytes; the accounted storage
+            // reserves exactly this target, before calling its allocator.
+            let target = (old * 2).max(needed).max(8);
+            if target > available {
+                return Err(Unavailable::Exceeds(old.saturating_add(target)));
+            }
+            self.bytes
+                .reserve(target - self.bytes.len())
+                .map_err(TransformError::from)?;
+            if self.bytes.capacity() > available {
+                return Err(Unavailable::Exceeds(
+                    old.saturating_add(self.bytes.capacity()),
+                ));
+            }
+        }
+        self.bytes
+            .append(text.as_bytes())
+            .map_err(TransformError::from)?;
+        Ok(())
+    }
+}
+
+enum QueryStylesheet<'a, B: crate::c14n::scratch::Bytes> {
+    Borrowed(&'a str),
+    Owned(QueryMarkup<B>),
+}
+
+impl<B: crate::c14n::scratch::Bytes> QueryStylesheet<'_, B> {
+    fn len(&self) -> usize {
+        match self {
+            Self::Borrowed(text) => text.len(),
+            Self::Owned(text) => text.len(),
+        }
+    }
+    fn text(&self) -> &str {
+        match self {
+            Self::Borrowed(text) => text,
+            Self::Owned(text) => text.text(),
+        }
+    }
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Borrowed(_) => 0,
+            Self::Owned(text) => text.bytes.capacity(),
+        }
     }
 }
 
@@ -353,10 +421,10 @@ pub(super) fn stylesheet_source<'a>(transform: crate::xml::dom::Node<'a, 'a>) ->
 /// Append `value`, writing each byte `escape` maps as its reference and the runs
 /// between them as they are.
 fn push_escaped(
-    out: &mut Bounded,
+    out: &mut impl Markup,
     value: &str,
     escape: impl Fn(u8) -> Option<&'static str>,
-) -> Result<(), usize> {
+) -> Result<(), Unavailable> {
     let mut run = 0;
     for (index, byte) in value.bytes().enumerate() {
         // Every escaped character is ASCII, so `index` is a character boundary.
@@ -370,7 +438,7 @@ fn push_escaped(
 }
 
 /// Append `value` as the content of a double-quoted attribute.
-fn push_attribute_value(out: &mut Bounded, value: &str) -> Result<(), usize> {
+fn push_attribute_value(out: &mut impl Markup, value: &str) -> Result<(), Unavailable> {
     push_escaped(out, value, |byte| match byte {
         b'&' => Some("&amp;"),
         b'<' => Some("&lt;"),
@@ -384,7 +452,7 @@ fn push_attribute_value(out: &mut Bounded, value: &str) -> Result<(), usize> {
 }
 
 /// Append `value` as character data.
-fn push_text(out: &mut Bounded, value: &str) -> Result<(), usize> {
+fn push_text(out: &mut impl Markup, value: &str) -> Result<(), Unavailable> {
     push_escaped(out, value, |byte| match byte {
         b'&' => Some("&amp;"),
         b'<' => Some("&lt;"),
@@ -396,7 +464,7 @@ fn push_text(out: &mut Bounded, value: &str) -> Result<(), usize> {
 }
 
 /// Append `prefix:local`, or `local` without a prefix.
-fn push_name(out: &mut Bounded, prefix: Option<&str>, local: &str) -> Result<(), usize> {
+fn push_name(out: &mut impl Markup, prefix: Option<&str>, local: &str) -> Result<(), Unavailable> {
     if let Some(prefix) = prefix {
         out.push_str(prefix)?;
         out.push(':')?;
@@ -406,11 +474,11 @@ fn push_name(out: &mut Bounded, prefix: Option<&str>, local: &str) -> Result<(),
 
 /// Append ` prefix:local="value"`.
 fn push_attribute(
-    out: &mut Bounded,
+    out: &mut impl Markup,
     prefix: Option<&str>,
     local: &str,
     value: &str,
-) -> Result<(), usize> {
+) -> Result<(), Unavailable> {
     out.push(' ')?;
     push_name(out, prefix, local)?;
     out.push_str("=\"")?;
@@ -419,7 +487,11 @@ fn push_attribute(
 }
 
 /// Append ` xmlns[:prefix]="uri"`.
-fn push_declaration(out: &mut Bounded, prefix: Option<&str>, uri: &str) -> Result<(), usize> {
+fn push_declaration(
+    out: &mut impl Markup,
+    prefix: Option<&str>,
+    uri: &str,
+) -> Result<(), Unavailable> {
     match prefix {
         Some(prefix) => push_attribute(out, Some("xmlns"), prefix, uri),
         None => push_attribute(out, None, "xmlns", uri),
@@ -436,6 +508,7 @@ fn own_xml_space<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Option<&'a str> 
 }
 
 /// Work done outside any query: an owned transform is serialized once, when it is built.
+#[cfg(test)]
 fn unmetered(_: usize) -> Result<(), TransformError> {
     Ok(())
 }
@@ -448,47 +521,71 @@ fn unmetered(_: usize) -> Result<(), TransformError> {
 /// of the parent; bindings that differ from the parent's are added, which covers
 /// declarations an internal DTD defaults (XML 1.0 section 3.3.2) and elements
 /// produced by entity replacement, which have no start tag of their own.
-fn declared_prefixes<'a, W: FnMut(usize) -> Result<(), TransformError>>(
+fn declared_prefixes<'a, W: FnMut(usize) -> Result<(), TransformError>, S: TransformScratch>(
     element: crate::xml::dom::Node<'a, 'a>,
     work: &mut W,
-) -> Result<Vec<Option<&'a str>>, TransformError> {
+    scratch: &S,
+) -> Result<S::Values<Option<&'a str>>, TransformError> {
     let range = element.range();
-    // The start tag ends before the first child begins.
-    let end = element.first_child().map_or(range.end, |child| {
-        child.range().start.clamp(range.start, range.end)
-    });
-    let markup = element
+    // XML 1.0 sections 3.1 and 4.4.2: an included entity's children can
+    // originate in the DTD, so their source ranges cannot delimit this tag.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-starttags
+    let source = element
         .document()
         .input_text()
-        .get(range.start..end)
+        .get(range.clone())
         .filter(|markup| markup.starts_with('<'))
         .unwrap_or("");
+    let mut quote = None;
+    let mut end = 0;
+    for (index, byte) in source.bytes().enumerate() {
+        work(1)?;
+        match (quote, byte) {
+            (Some(delimiter), byte) if delimiter == byte => quote = None,
+            (None, b'\'' | b'"') => quote = Some(byte),
+            (None, b'>') => {
+                end = index + 1;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let markup = &source[..end];
     let scope = element.namespaces().len();
     work(markup.len())?;
-    let tag = match crate::xml_input_shared::lexical::Scanner::new(markup).next_event() {
+    let tag = match crate::xml_input_shared::lexical::Scanner::with_storage(
+        markup,
+        scratch.dom_storage(),
+    )
+    .next_event()
+    {
         Ok(Some(
             crate::xml_input_shared::lexical::Event::Start(tag)
             | crate::xml_input_shared::lexical::Event::Empty(tag),
         )) => Some(tag),
+        Err(error @ crate::xml_input_shared::lexical::Error::Resource(_)) => {
+            return Err(S::lexical_error(error));
+        }
         _ => None,
     };
-    let mut declared = Vec::new();
+    let mut declared = scratch.values();
     if let Some(tag) = tag {
         work(tag.attributes.len() * (scope + 1))?;
-        declared.extend(tag.attributes.iter().filter_map(|attribute| {
-            let name = attribute.name.qualified();
-            if name == "xmlns" {
+        for prefix in tag.attributes.iter().filter_map(|attribute| {
+            let name = attribute.name;
+            if name.prefix().is_none() && name.local() == "xmlns" {
                 Some(None)
-            } else {
-                name.strip_prefix("xmlns:")
-                    .and_then(|prefix| {
-                        element
-                            .namespaces()
-                            .find(|namespace| namespace.name() == Some(prefix))
-                    })
+            } else if name.prefix() == Some("xmlns") {
+                element
+                    .namespaces()
+                    .find(|namespace| namespace.name() == Some(name.local()))
                     .map(|namespace| namespace.name())
+            } else {
+                None
             }
-        }));
+        }) {
+            declared.push(prefix)?;
+        }
     }
     let parent = element.parent();
     let parent_scope = parent.map_or(0, |parent| parent.namespaces().len());
@@ -498,7 +595,7 @@ fn declared_prefixes<'a, W: FnMut(usize) -> Result<(), TransformError>>(
         work(parent_scope + declared.len() + 1)?;
         let prefix = namespace.name();
         if inherited(prefix) != Some(namespace.uri()) && !declared.contains(&prefix) {
-            declared.push(prefix);
+            declared.push(prefix)?;
         }
     }
     work(scope + parent_scope + declared.len() + 1)?;
@@ -506,7 +603,7 @@ fn declared_prefixes<'a, W: FnMut(usize) -> Result<(), TransformError>>(
         && inherited(None).is_some()
         && !declared.contains(&None)
     {
-        declared.push(None);
+        declared.push(None)?;
     }
     Ok(declared)
 }
@@ -536,45 +633,131 @@ impl ParsedStylesheet {
             .children()
             .find(|child| child.is_element())
             .ok_or(Unavailable::Missing)?;
-        // What the element inherits: the bindings in scope at the `<Transform>` that it
-        // does not make itself, and the nearest ancestor's `xml:space="preserve"`.
         let mut inherited = Bounded::new(limit);
         if inheritance != Inheritance::Omit {
-            let root_declarations = declared_prefixes(root, work)?;
-            for namespace in transform.namespaces() {
-                work(root_declarations.len() + namespace.uri().len() + 1)?;
-                let prefix = namespace.name();
-                if prefix != Some("xml") && !root_declarations.contains(&prefix) {
-                    push_declaration(&mut inherited, prefix, namespace.uri())?;
-                }
-            }
-            // The nearest `xml:space`, starting at the root, whose own is written with it.
-            let mut space = None;
-            let mut ancestor = Some(root);
-            while space.is_none()
-                && let Some(node) = ancestor
-            {
-                work(node.attributes().len() + 1)?;
-                space = node
-                    .is_element()
-                    .then(|| own_xml_space(node))
-                    .flatten()
-                    .map(|value| (node == root, value));
-                ancestor = node.parent();
-            }
-            if space == Some((false, "preserve")) {
-                push_attribute(&mut inherited, Some("xml"), "space", "preserve")?;
-            }
+            serialize_inherited(
+                transform,
+                root,
+                &mut inherited,
+                work,
+                &crate::c14n::scratch::Native,
+            )?;
         }
         // `Bounded` keeps its capacity within its limit.
         let mut document = Bounded::new(limit - inherited.text.capacity());
         let inline = (inheritance == Inheritance::Inline).then_some(inherited.text.as_str());
-        let at = serialize_element(root, &mut document, inline, work)?;
+        let at = serialize_element(
+            root,
+            &mut document,
+            inline,
+            work,
+            &crate::c14n::scratch::Native,
+        )?;
         Ok(Self {
             document: document.text,
             inherited: inherited.text,
             at,
         })
+    }
+}
+
+fn serialize_inherited<W: FnMut(usize) -> Result<(), TransformError>, S: TransformScratch>(
+    transform: crate::xml::dom::Node<'_, '_>,
+    root: crate::xml::dom::Node<'_, '_>,
+    out: &mut impl Markup,
+    work: &mut W,
+    scratch: &S,
+) -> Result<(), Unavailable> {
+    let root_declarations = declared_prefixes(root, work, scratch)?;
+    for namespace in transform.namespaces() {
+        work(root_declarations.len() + namespace.uri().len() + 1)?;
+        let prefix = namespace.name();
+        if prefix != Some("xml") && !root_declarations.contains(&prefix) {
+            push_declaration(out, prefix, namespace.uri())?;
+        }
+    }
+    // XSLT 1.0 section 3.4: the nearest inherited xml:space applies to
+    // stylesheet text, not to source-document stripping.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+    let mut space = None;
+    let mut ancestor = Some(root);
+    while space.is_none()
+        && let Some(node) = ancestor
+    {
+        work(node.attributes().len() + 1)?;
+        space = node
+            .is_element()
+            .then(|| own_xml_space(node))
+            .flatten()
+            .map(|value| (node == root, value));
+        ancestor = node.parent();
+    }
+    if space == Some((false, "preserve")) {
+        push_attribute(out, Some("xml"), "space", "preserve")?;
+    }
+    Ok(())
+}
+
+impl<'a> XsltParameter<'a> {
+    /// Serialize directly into current-query storage before the native engine
+    /// lease is admitted. No intermediate native document or ownership copy.
+    fn document_in<S: TransformScratch>(
+        self,
+        semantics: XsltStylesheetSemantics,
+        limit: usize,
+        scratch: &S,
+        work: &mut impl FnMut(usize) -> Result<(), TransformError>,
+    ) -> Result<QueryStylesheet<'a, S::Bytes>, Unavailable> {
+        let mut out = QueryMarkup {
+            bytes: scratch.bytes(),
+            limit,
+        };
+        match self {
+            Self::Stylesheet(stylesheet) => match &stylesheet.parsed {
+                Some(parsed)
+                    if semantics == XsltStylesheetSemantics::Specification
+                        && !parsed.inherited.is_empty() =>
+                {
+                    let size = parsed
+                        .document
+                        .len()
+                        .checked_add(parsed.inherited.len())
+                        .ok_or(usize::MAX)?;
+                    if size > limit {
+                        return Err(Unavailable::Exceeds(size));
+                    }
+                    work(size)?;
+                    // All three fragments are known: reserve the final shape once.
+                    out.bytes.reserve(size).map_err(TransformError::from)?;
+                    if out.bytes.capacity() > limit {
+                        return Err(Unavailable::Exceeds(out.bytes.capacity()));
+                    }
+                    let (head, tail) = parsed.document.split_at(parsed.at);
+                    for part in [head, &parsed.inherited, tail] {
+                        out.push_str(part)?;
+                    }
+                }
+                Some(parsed) => return Ok(QueryStylesheet::Borrowed(&parsed.document)),
+                None => return Ok(QueryStylesheet::Borrowed(&stylesheet.source)),
+            },
+            Self::Transform(transform) => {
+                let root = transform
+                    .children()
+                    .find(|child| child.is_element())
+                    .ok_or(Unavailable::Missing)?;
+                let mut inherited = QueryMarkup {
+                    bytes: scratch.bytes(),
+                    limit,
+                };
+                if semantics == XsltStylesheetSemantics::Specification {
+                    serialize_inherited(transform, root, &mut inherited, work, scratch)?;
+                }
+                out.limit -= inherited.bytes.capacity();
+                work(inherited.len())?;
+                serialize_element(root, &mut out, Some(inherited.text()), work, scratch)?;
+            }
+        }
+        Ok(QueryStylesheet::Owned(out))
     }
 }
 
@@ -584,11 +767,12 @@ impl ParsedStylesheet {
 /// The walk follows sibling and parent links, so neither native recursion nor a
 /// stack grows with the stylesheet. `work` pays for each node before it is written:
 /// its names and values, and the namespace lookups of its declarations.
-fn serialize_element<W: FnMut(usize) -> Result<(), TransformError>>(
+fn serialize_element<W: FnMut(usize) -> Result<(), TransformError>, S: TransformScratch>(
     root: crate::xml::dom::Node<'_, '_>,
-    out: &mut Bounded,
+    out: &mut impl Markup,
     inherited: Option<&str>,
     work: &mut W,
+    scratch: &S,
 ) -> Result<usize, Unavailable> {
     let mut at = 0;
     let mut node = root;
@@ -601,13 +785,13 @@ fn serialize_element<W: FnMut(usize) -> Result<(), TransformError>>(
             out.push('<')?;
             push_name(out, node.prefix(), node.tag_name().name())?;
             if node == root {
-                at = out.text.len();
+                at = out.len();
                 if let Some(inherited) = inherited {
                     out.push_str(inherited)?;
                 }
             }
             let scope = node.namespaces().len();
-            for prefix in declared_prefixes(node, work)? {
+            for prefix in declared_prefixes(node, work, scratch)?.iter().copied() {
                 work(scope + 1)?;
                 push_declaration(out, prefix, node.lookup_namespace_uri(prefix).unwrap_or(""))?;
             }
@@ -672,6 +856,7 @@ fn serialize_element<W: FnMut(usize) -> Result<(), TransformError>>(
 /// One XSLT allowance shared by every execution in an operation.
 pub(crate) struct Allowance {
     work_used: [Cell<usize>; WORK_KINDS.len()],
+    serialization_used: Cell<usize>,
     output_used: Cell<usize>,
     max_work: usize,
     max_output: usize,
@@ -692,6 +877,7 @@ impl Allowance {
     pub(crate) fn new(resources: &ResourcePolicy) -> Self {
         Self {
             work_used: Default::default(),
+            serialization_used: Cell::new(0),
             output_used: Cell::new(0),
             max_work: resources.max_xslt_work,
             max_output: resources.max_xslt_output_bytes,
@@ -701,6 +887,29 @@ impl Allowance {
             max_nodes: resources.max_xml_nodes,
             max_depth: resources.max_xml_depth,
         }
+    }
+
+    fn workspace_error(&self, actual: usize) -> TransformError {
+        PolicyViolation::ResourceLimit {
+            resource: resource_name::XSLT_WORKSPACE_BYTES,
+            maximum: self.max_workspace,
+            actual,
+        }
+        .into()
+    }
+
+    fn serialize(&self, units: usize) -> Result<(), TransformError> {
+        let used = self.serialization_used.get();
+        if units > self.max_work - used {
+            return Err(PolicyViolation::ResourceLimit {
+                resource: resource_name::XSLT_WORK,
+                maximum: self.max_work,
+                actual: used.saturating_add(units),
+            }
+            .into());
+        }
+        self.serialization_used.set(used + units);
+        Ok(())
     }
 
     fn work_used(&self, kind: BudgetKind) -> usize {
@@ -934,33 +1143,29 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     // The engine's parser does not count namespace bindings or apply the rest of
     // the operation's XML input policy itself.
     scratch.charge(xml.as_ref().len())?;
-    crate::document::preflight_xml_limits(xml.as_ref(), settings, xml_parse)
+    crate::document::preflight_xml_limits(xml.as_ref(), settings, xml_parse, scratch.dom_storage())
         .map_err(|error| super::map_transform_xml_parse_error(error, settings))?;
 
-    let (reservation, workspace) = scratch.reserve_workspace(allowance.max_workspace)?;
-    // `held` is what earlier stages keep in the workspace while a stage runs; a
-    // refusal reports the workspace total, not the stage's share of it.
-    let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
-    let exhausted = |needed: usize| Error::Budget {
-        kind: BudgetKind::OwnedBytes,
-        limit: workspace,
-        actual: needed,
-    };
     // Copies a parsed stylesheet carries stay in the workspace until the transform ends.
     let carried = parameter.carried_bytes();
-    let available = workspace
+    let available = allowance
+        .max_workspace
         .checked_sub(carried)
-        .ok_or_else(|| fail(exhausted(carried), Phase::Stylesheet, 0))?;
-    // A stylesheet serialized from its parsed tree is text in the workspace.
+        .ok_or_else(|| allowance.workspace_error(carried))?;
+    // Query-owned text and lexical preflight precede the opaque native lease:
+    // both allocate and charge through the same current Work, never a new account.
     let stylesheet = parameter
-        .document(semantics, available, &mut |units| {
+        .document_in(semantics, available, scratch, &mut |units| {
+            allowance.serialize(units)?;
             scratch.charge(units).map_err(TransformError::from)
         })
         .map_err(|unavailable| match unavailable {
             Unavailable::Missing => {
                 TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
             }
-            Unavailable::Exceeds(needed) => fail(exhausted(needed), Phase::Stylesheet, carried),
+            Unavailable::Exceeds(needed) => {
+                allowance.workspace_error(carried.saturating_add(needed))
+            }
             Unavailable::Refused(error) => error,
         })?;
 
@@ -969,17 +1174,34 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         allow_dtd: false,
         ..budget.xml_parse_settings
     };
+    // Validate constructed UTF-8 once, after admission, and borrow that view
+    // throughout preflight and compilation rather than rescanning on access.
     scratch.charge(stylesheet.len())?;
-    crate::document::preflight_xml_limits(&stylesheet, stylesheet_settings, xml_parse)
-        .map_err(|error| super::map_transform_xml_parse_error(error, stylesheet_settings))?;
+    let stylesheet_text = stylesheet.text();
+    crate::document::preflight_xml_limits(
+        stylesheet_text,
+        stylesheet_settings,
+        xml_parse,
+        scratch.dom_storage(),
+    )
+    .map_err(|error| super::map_transform_xml_parse_error(error, stylesheet_settings))?;
     // Text assembled with inherited declarations lives in the workspace until compiled.
-    let assembled = match &stylesheet {
-        std::borrow::Cow::Owned(text) => text.capacity(),
-        std::borrow::Cow::Borrowed(_) => 0,
-    };
-    let compile_workspace = available
+    let assembled = stylesheet.capacity();
+    let maximum = allowance
+        .max_workspace
         .checked_sub(assembled)
-        .ok_or_else(|| fail(exhausted(assembled), Phase::Stylesheet, carried))?;
+        .ok_or_else(|| allowance.workspace_error(carried.saturating_add(assembled)))?;
+    let (reservation, reserved) = scratch.reserve_workspace(maximum)?;
+    let workspace = reserved + assembled;
+    let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
+    let exhausted = |needed: usize| Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit: workspace,
+        actual: needed,
+    };
+    let compile_workspace = reserved
+        .checked_sub(carried)
+        .ok_or_else(|| fail(exhausted(carried), Phase::Stylesheet, 0))?;
     let compiled = charge_parse_work(
         Compiler::new(
             Arc::new(NoResolver),
@@ -995,12 +1217,18 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
             XsltStylesheetSemantics::Specification => UnboundPrefixLists::Reject,
             XsltStylesheetSemantics::Libxmlsec1 => UnboundPrefixLists::Ignore,
         })
-        .compile_reported(&stylesheet, None),
+        .compile_reported(stylesheet_text, None),
         xml_parse,
         scratch,
     )?
     .map_err(|error| fail(error, Phase::Stylesheet, carried + assembled))?;
+    // Compilation no longer borrows the text. Release its actual allocation,
+    // then admit that capacity for later engine stages while the first lease
+    // continues to cover the compiled tree. A competing query may get it first.
     drop(stylesheet);
+    let (execution_reservation, reclaimed) = scratch.reserve_workspace(assembled)?;
+    let workspace = reserved + reclaimed;
+    let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
     // Both fit the workspace, so their sum cannot overflow.
     let held = carried + compiled.retained_bytes();
 
@@ -1024,7 +1252,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
                 allowance.max_nodes,
                 allowance.max_depth,
                 entity_references,
-                entity_expansion_bytes,
+                entity_expansion_bytes.min(source_workspace),
                 source_workspace,
             )
             .with_owned_bytes(source_workspace)
@@ -1104,6 +1332,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     if S::ACCOUNTED {
         // The native output sits inside the workspace reservation. Move its charge to
         // a reservation of its own, so the account sees both copies while it is copied.
+        drop(execution_reservation);
         drop(reservation);
         let (output_reservation, granted) = scratch.reserve_workspace(output.capacity())?;
         if granted < output.capacity() {
@@ -1115,6 +1344,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         drop(output_reservation);
         Ok(ExecutionData::Accounted(accounted))
     } else {
+        drop(execution_reservation);
         drop(reservation);
         Ok(ExecutionData::NativeBinary(output))
     }

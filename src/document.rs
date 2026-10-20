@@ -2170,12 +2170,13 @@ fn preflight_document_limits(
 /// Enforce every policy limit on `xml` in one charged lexical pass, for a
 /// parser outside this crate's DOM that does not enforce them itself.
 #[cfg(feature = "xslt")]
-pub(crate) fn preflight_xml_limits(
+pub(crate) fn preflight_xml_limits<S: NameStorage>(
     xml: &str,
     settings: DocumentParseSettings,
     budget: &XmlParseWorkBudget,
+    storage: S,
 ) -> Result<(), XmlDocumentError> {
-    preflight_document_limits(xml, settings, Some(budget)).map(drop)
+    preflight_document_limits_in(xml, settings, Some(budget), storage).map(drop)
 }
 
 fn preflight_document_limits_in<S: NameStorage>(

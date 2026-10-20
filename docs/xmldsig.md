@@ -528,12 +528,16 @@ Execution is bounded by the operation's policy:
 
 - `TransformPolicy::allowed_algorithms` decides whether XSLT may run at all; secure profiles
   exclude it, while the default and libxmlsec1-compatible policies permit it when built.
-- `ResourcePolicy::max_xslt_work` bounds each kind of XSLT work (XPath evaluations and steps,
+- `ResourcePolicy::max_xslt_work` bounds each kind of XSLT work (stylesheet capture/serialization,
+  XPath evaluations and steps,
   extension calls, pattern tests, template applications, sort comparisons, key entries, result
-  nodes and messages) across every XSLT execution of the operation, and
+  nodes and messages) across every XSLT transform of the operation, including native parameter
+  parsing before execution, and
   `max_xslt_output_bytes` bounds their cumulative serialized output.
 - `max_xslt_workspace_bytes` bounds the memory one transform holds at once: the compiled
-  stylesheet, the parsed input tree and the execution share it. `max_xslt_recursion_depth`
+  stylesheet, compiler validation buffers, entity-expansion workspace, the parsed input tree
+  and the execution share it. Buffer growth admits both old and replacement allocations.
+  `max_xslt_recursion_depth`
   bounds compilation and template recursion. Scoped replay decodes the input into the current
   query's memory account and reserves the workspace from what remains; the query's remaining
   work bounds every pass over the stylesheet (its serialization from the signature's tree
@@ -687,8 +691,10 @@ for mixed content.
 All implemented transform branches,
 parser/DOM construction, XPath workspaces, binary/XML transitions and terminal
 C14N admit their work and actual capacity before allocation or receiver effects.
-The XSLT transform reserves its workspace from the current query's account before
-compiling the stylesheet.
+XSLT stylesheet serialization and XML preflight use the current query's Work and
+storage before the native engine workspace is reserved. Serialized text is released
+after compilation; subsequent engine stages may admit that freed capacity again
+without releasing the charge covering the compiled tree.
 
 The selected handle's
 `visit_authenticated_references` visitor supplies original Reference identity,

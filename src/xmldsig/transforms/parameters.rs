@@ -203,7 +203,12 @@ pub(crate) trait ParseStorage<'a>: Scratch {
     ) -> Self::Instruction;
     /// The stylesheet of an original `<Transform>`, whose content is `source`.
     #[cfg(feature = "xslt")]
-    fn xslt(&self, transform: Node<'a, 'a>, source: &'a str) -> Self::Instruction;
+    fn xslt(
+        &self,
+        transform: Node<'a, 'a>,
+        source: &'a str,
+        allowance: &super::xslt::Allowance,
+    ) -> Result<Self::Instruction, TransformError>;
 }
 
 impl<'a> ParseStorage<'a> for Native {
@@ -299,10 +304,15 @@ impl<'a> ParseStorage<'a> for Native {
         Transform::C14n(algorithm)
     }
     #[cfg(feature = "xslt")]
-    fn xslt(&self, transform: Node<'a, 'a>, source: &'a str) -> Transform {
+    fn xslt(
+        &self,
+        transform: Node<'a, 'a>,
+        source: &'a str,
+        allowance: &super::xslt::Allowance,
+    ) -> Result<Transform, TransformError> {
         // The source is the markup of a parsed `<Transform>`, which `XsltStylesheet::new`
         // would only parse again; keep it as is.
-        Transform::Xslt(super::XsltStylesheet::from_parsed(transform, source))
+        super::XsltStylesheet::from_parsed(transform, source, allowance).map(Transform::Xslt)
     }
 }
 
@@ -473,9 +483,14 @@ impl<'a, W: Work> ParseStorage<'a> for Accounted<'_, W> {
         OriginalInstruction::Canonicalization(algorithm, prefixes)
     }
     #[cfg(feature = "xslt")]
-    fn xslt(&self, transform: Node<'a, 'a>, _source: &'a str) -> Self::Instruction {
+    fn xslt(
+        &self,
+        transform: Node<'a, 'a>,
+        _source: &'a str,
+        _allowance: &super::xslt::Allowance,
+    ) -> Result<Self::Instruction, TransformError> {
         // The markup and inherited declarations are read from the element when executed.
-        OriginalInstruction::Xslt(transform)
+        Ok(OriginalInstruction::Xslt(transform))
     }
 }
 

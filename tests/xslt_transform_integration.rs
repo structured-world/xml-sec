@@ -207,12 +207,15 @@ fn output_allowance_is_shared_by_every_execution_in_an_operation() {
 }
 
 #[test]
-fn work_limit_refuses_the_execution() {
-    // Template applications, XPath steps and result nodes all count against the work limit.
+fn work_limit_refuses_parameter_capture_before_execution() {
+    // Native stylesheet capture belongs to the operation too; a one-unit
+    // allowance now refuses its first text copy, before compilation/execution.
+    let sheet = values();
+    let capture = sheet.source().len();
     let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
         .uri("")
         .transform(Transform::Enveloped)
-        .transform(Transform::Xslt(values()));
+        .transform(Transform::Xslt(sheet));
     let mut policy = SigningPolicy::default();
     policy.resources.max_xslt_work = 1;
     let error = policy_error(
@@ -223,7 +226,7 @@ fn work_limit_refuses_the_execution() {
         PolicyViolation::ResourceLimit {
             resource: "XSLT work",
             maximum: 1,
-            actual: 2,
+            actual: capture,
         }
     );
 }

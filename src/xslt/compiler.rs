@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::{Arc, Weak};
 
@@ -2539,6 +2539,7 @@ impl CompileState {
             &self.templates,
             &self.globals,
             &self.functions,
+            self.workspace(),
         )?;
         Ok(Stylesheet {
             principal_document: Document::empty(None),
@@ -2574,16 +2575,28 @@ fn validate_attribute_set_references(
     templates: &[Template],
     globals: &[GlobalVariable],
     functions: &[ExsltFunction],
+    mut workspace: CompileWorkspace<'_>,
 ) -> Result<()> {
-    let declarations = sets.iter().map(|set| &set.name).collect::<HashSet<_>>();
+    // One borrowed-name index serves both reference checks and the graph.
+    // Its temporary storage coexists with all retained module IR.
+    let index_bytes = if sets.is_empty() {
+        0
+    } else {
+        sets.len()
+            .max(4)
+            .saturating_mul(hash_entry_storage::<&ExpandedName, usize>())
+    };
+    workspace = workspace.reserve(index_bytes)?;
+    let mut indices = HashMap::<&ExpandedName, usize>::with_capacity(sets.len());
+    for set in sets {
+        let next = indices.len();
+        indices.entry(&set.name).or_insert(next);
+    }
     let validate_name = |name: &ExpandedName| {
-        if declarations.contains(name) {
+        if indices.contains_key(name) {
             Ok(())
         } else {
-            Err(Error::Static(format!(
-                "undefined attribute-set {}",
-                name.local
-            )))
+            Err(workspace.static_error(format_args!("undefined attribute-set {}", name.local)))
         }
     };
 
@@ -2593,7 +2606,7 @@ fn validate_attribute_set_references(
         }
         validate_attribute_sets_in_sequence(&set.attributes, &validate_name)?;
     }
-    validate_attribute_set_cycles(sets)?;
+    validate_attribute_set_cycles(sets, &indices, workspace)?;
     for template in templates {
         for parameter in template.params.iter() {
             validate_attribute_sets_in_sequence(&parameter.content, &validate_name)?;
@@ -2612,34 +2625,79 @@ fn validate_attribute_set_references(
     Ok(())
 }
 
-fn validate_attribute_set_cycles(sets: &[AttributeSet]) -> Result<()> {
-    let mut indices = HashMap::<&ExpandedName, usize>::new();
-    for set in sets {
-        let next = indices.len();
-        indices.entry(&set.name).or_insert(next);
+/// A fixed-capacity validation buffer, admitted before allocation and never grown.
+fn validation_buffer<T>(count: usize, workspace: &mut CompileWorkspace<'_>) -> Result<Vec<T>> {
+    let bytes = count
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| workspace.overflow())?;
+    *workspace = workspace.reserve(bytes)?;
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(count)
+        .map_err(|_| workspace.overflow())?;
+    let extra = (buffer.capacity() - count)
+        .checked_mul(std::mem::size_of::<T>())
+        .ok_or_else(|| workspace.overflow())?;
+    *workspace = workspace.reserve(extra)?;
+    Ok(buffer)
+}
+
+fn validate_attribute_set_cycles(
+    sets: &[AttributeSet],
+    indices: &HashMap<&ExpandedName, usize>,
+    mut workspace: CompileWorkspace<'_>,
+) -> Result<()> {
+    let nodes = indices.len();
+    if nodes == 0 {
+        return Ok(());
     }
-    let mut edges = vec![Vec::new(); indices.len()];
-    let mut incoming = vec![0usize; indices.len()];
+    let edge_count = sets
+        .iter()
+        .try_fold(0usize, |sum, set| sum.checked_add(set.uses.len()))
+        .ok_or_else(|| workspace.overflow())?;
+    if edge_count == 0 {
+        return Ok(());
+    }
+    let mut offsets = validation_buffer::<usize>(nodes + 1, &mut workspace)?;
+    offsets.resize(nodes + 1, 0);
+    let mut incoming = validation_buffer::<usize>(nodes, &mut workspace)?;
+    incoming.resize(nodes, 0);
+    let mut targets = validation_buffer::<usize>(edge_count, &mut workspace)?;
+    targets.resize(edge_count, 0);
+    // This buffer first holds insertion cursors, then the topological frontier.
+    let mut ready = validation_buffer::<usize>(nodes, &mut workspace)?;
+    for set in sets {
+        let source = indices[&set.name];
+        offsets[source + 1] += set.uses.len();
+        for used in &set.uses {
+            let target = indices[used];
+            incoming[target] += 1;
+        }
+    }
+    for index in 1..offsets.len() {
+        offsets[index] += offsets[index - 1];
+    }
+    ready.extend_from_slice(&offsets[..nodes]);
     for set in sets {
         let source = indices[&set.name];
         for used in &set.uses {
-            let target = indices[used];
-            edges[source].push(target);
-            incoming[target] = incoming[target].saturating_add(1);
+            targets[ready[source]] = indices[used];
+            ready[source] += 1;
         }
     }
-    let mut ready = incoming
-        .iter()
-        .enumerate()
-        .filter_map(|(index, count)| (*count == 0).then_some(index))
-        .collect::<VecDeque<_>>();
+    ready.clear();
+    for (index, &count) in incoming.iter().enumerate() {
+        if count == 0 {
+            ready.push(index);
+        }
+    }
     let mut visited = 0usize;
-    while let Some(source) = ready.pop_front() {
+    while let Some(source) = ready.pop() {
         visited += 1;
-        for &target in &edges[source] {
+        for &target in &targets[offsets[source]..offsets[source + 1]] {
             incoming[target] -= 1;
             if incoming[target] == 0 {
-                ready.push_back(target);
+                ready.push(target);
             }
         }
     }
@@ -2647,7 +2705,7 @@ fn validate_attribute_set_cycles(sets: &[AttributeSet]) -> Result<()> {
         // XSLT 1.0 section 7.1.4 makes direct and indirect self-use erroneous even when the
         // attribute set is never reached at runtime.
         // https://www.w3.org/TR/1999/REC-xslt-19991116#attribute-sets
-        return Err(Error::Static("attribute-set cycle".into()));
+        return Err(workspace.static_error(format_args!("attribute-set cycle")));
     }
     Ok(())
 }

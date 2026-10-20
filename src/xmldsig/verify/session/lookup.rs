@@ -31,17 +31,33 @@ pub struct SessionDigest<'p> {
 }
 
 impl SessionDigest<'_> {
+    /// Required digest output width, independent of provider output.
+    pub fn output_len(&self) -> usize {
+        self.algorithm.output_len()
+    }
+
     /// Absorb `data`, charging its length to `work` first.
     pub fn update<Q: Work>(&mut self, data: &[u8], work: &Q) -> Result<(), DsigError> {
         work.charge_work(u64::try_from(data.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
         self.state.update(data).map_err(DsigError::from)
     }
 
-    /// The digest of every absorbed byte. A provider output of the wrong width
-    /// is a provider error.
-    pub fn finish(self) -> Result<Vec<u8>, DsigError> {
-        super::super::super::digest::finish_digest(self.algorithm, self.state)
-            .map_err(DsigError::from)
+    /// Write the digest into an exactly sized caller buffer. Admit finalization
+    /// work and the provider's temporary output before invoking it; the caller
+    /// can keep an inline output without another heap allocation.
+    pub fn finish<Q: Work>(self, output: &mut [u8], work: &Q) -> Result<(), DsigError> {
+        let width = self.algorithm.output_len();
+        if output.len() != width {
+            return Err(DsigError::InvalidRequest {
+                reason: "digest output buffer has the wrong width",
+            });
+        }
+        work.charge_work(width as u64)?;
+        let _temporary = work.memory().reserve(width)?;
+        let digest = super::super::super::digest::finish_digest(self.algorithm, self.state)
+            .map_err(DsigError::from)?;
+        output.copy_from_slice(&digest);
+        Ok(())
     }
 }
 
@@ -161,5 +177,44 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
             chain,
             anchor,
         )
+    }
+}
+
+#[cfg(test)]
+mod digest_admission_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    struct Observed<'a>(&'a Cell<bool>);
+    impl crate::provider::DigestState for Observed<'_> {
+        fn update(&mut self, _: &[u8]) -> Result<(), crate::provider::ProviderError> {
+            Ok(())
+        }
+        fn finalize(self: Box<Self>) -> Result<Vec<u8>, crate::provider::ProviderError> {
+            self.0.set(true);
+            Ok(vec![0; 32])
+        }
+    }
+
+    #[test]
+    fn digest_refusals_never_enter_provider_finalize() {
+        // Wrong output shape and both admission axes fail before the backend,
+        // and a temporary output reservation is released on every path.
+        for (capacity, work, width) in [(31, 100, 32), (32, 31, 32), (32, 100, 31), (32, 100, 32)] {
+            let memory = structured_asn1::memory::Memory::new(std::sync::Arc::new(
+                structured_asn1::memory::MemoryAccount::new(capacity, work),
+            ));
+            let called = Cell::new(false);
+            let state = SessionDigest {
+                algorithm: DigestAlgorithm::Sha256,
+                state: Box::new(Observed(&called)),
+            };
+            let mut output = [0; 32];
+            let result = state.finish(&mut output[..width], &memory);
+            let admitted = capacity == 32 && work == 100 && width == 32;
+            assert_eq!(result.is_ok(), admitted, "{result:?}");
+            assert_eq!(called.get(), admitted);
+            assert_eq!(memory.used(), 0);
+        }
     }
 }

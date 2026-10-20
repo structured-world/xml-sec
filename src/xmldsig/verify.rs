@@ -1131,6 +1131,7 @@ impl<'a> VerificationOperationBudgets<'a> {
             &key_info_parse.certificates,
             utc_facts,
         );
+        let xpath_parse = XPathSignatureParseBudget::for_execution(&policy.resources, &transforms);
         Self {
             key_info_parse: RefCell::new(key_info_parse),
             key_candidates: RefCell::new(key_candidates),
@@ -1139,7 +1140,7 @@ impl<'a> VerificationOperationBudgets<'a> {
             canonicalized: CanonicalizedDataBudget::with_limit(
                 policy.resources.effective_canonicalized_bytes(),
             ),
-            xpath_parse: RefCell::new(XPathSignatureParseBudget::from_resources(&policy.resources)),
+            xpath_parse: RefCell::new(xpath_parse),
             key_info_materialization: RefCell::new(KeyInfoMaterializationState::default()),
             external_resource_identities: RefCell::new(HashMap::new()),
             resolved_reference_resources: RefCell::new(HashMap::new()),
@@ -3992,8 +3993,8 @@ fn inspect_signature_key_info_for_policy<P: KeyInfoReferencePolicy>(
         policy.resources().max_external_resource_bytes,
         policy.resources().max_external_resource_total_bytes,
     );
-    let mut xpath_parse = XPathSignatureParseBudget::from_resources(policy.resources());
     let execution = TransformExecutionBudget::from_resources(policy.resources());
+    let mut xpath_parse = XPathSignatureParseBudget::for_execution(policy.resources(), &execution);
     inspect_signature_key_info_with_budgets(
         node,
         &resolver,
@@ -4067,7 +4068,7 @@ pub fn inspect_pinned_verification_key_info(
     )? {
         return Ok(None);
     }
-    let mut xpath_parse = XPathSignatureParseBudget::from_resources(&policy.resources);
+    let mut xpath_parse = XPathSignatureParseBudget::for_execution(&policy.resources, &execution);
     inspect_signature_key_info_with_budgets(
         node,
         &resolver,
@@ -4098,8 +4099,9 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
         policy.resources().max_external_resource_bytes,
         policy.resources().max_external_resource_total_bytes,
     );
-    let mut xpath_parse_budget = XPathSignatureParseBudget::from_resources(policy.resources());
     let execution_budget = TransformExecutionBudget::from_resources(policy.resources());
+    let mut xpath_parse_budget =
+        XPathSignatureParseBudget::for_execution(policy.resources(), &execution_budget);
     let mut budgets = RetrievalMaterializationBudgets {
         key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(policy.resources())),
         xpath_parse: &mut xpath_parse_budget,

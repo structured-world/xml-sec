@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn attribute_set_validation_requires_workspace_before_allocating() {
+    // Validation runs while compiled IR is retained; no free byte means that
+    // its name index and graph must be refused, even for a valid unused set.
+    let mut state = CompileState::new(CompileBudget::new(4096, 0, 32, 0), 0);
+    state.attribute_sets.push(AttributeSet {
+        name: ExpandedName::new(None::<String>, "a"),
+        uses: vec![],
+        attributes: vec![].into(),
+        precedence: 0,
+        order: 0,
+    });
+    assert!(matches!(
+        state.finish(),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn principal_base_uri_copy_is_charged_by_retained_capacity() {
     let budget = CompileBudget::new(4096, 0, 32, 4096);
     let mut state = CompileState::new(budget, 0);
