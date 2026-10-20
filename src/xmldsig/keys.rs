@@ -16,11 +16,10 @@ use zeroize::Zeroizing;
 
 use super::pkix::X509DataSource;
 use super::signature::{
-    decode_dsa_verifying_key, signature_value_matches_spki,
-    signature_value_matches_spki_with_encoding, validate_dsa_signature_spki_with_minimum,
-    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
-    verify_dsa_signature_spki_with_minimum, verify_rsa_signature_spki_primitive,
-    verify_rsa_signature_spki_with_minimum,
+    signature_value_matches_spki, signature_value_matches_spki_with_encoding,
+    validate_dsa_signature_spki_with_minimum, validate_rsa_signature_spki_with_minimum,
+    verify_dsa_signature_spki_primitive, verify_dsa_signature_spki_with_minimum,
+    verify_rsa_signature_spki_primitive, verify_rsa_signature_spki_with_minimum,
 };
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
@@ -2047,9 +2046,7 @@ fn validate_spki_algorithm(
     // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
     match (algorithm, spki.algorithm.oid) {
         (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256, dsa::OID) => {
-            let _ = decode_dsa_verifying_key(public_key_bytes)
-                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-            Ok(())
+            validate_dsa_spki(session, public_key_bytes)
         }
         (method, pkcs1::ALGORITHM_OID) if method.is_rsa() => {
             validate_rsa_spki(session, public_key_bytes)
@@ -2096,8 +2093,7 @@ pub(crate) fn supported_parsed_spki_is_rsa(
             Ok(true)
         }
         dsa::OID => {
-            let _ = decode_dsa_verifying_key(public_key_bytes)
-                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+            validate_dsa_spki(session, public_key_bytes)?;
             Ok(false)
         }
         oid if oid == p256::elliptic_curve::ALGORITHM_OID => {
@@ -2132,6 +2128,39 @@ fn validate_rsa_spki(
     };
     bounded_rsa_public_components(key.modulus().as_bytes(), key.exponent().as_bytes())?;
     Ok(())
+}
+
+fn validate_dsa_spki(
+    session: &super::pkix::CertificateSession,
+    spki: &[u8],
+) -> Result<(), KeyResolutionError> {
+    let key = session
+        .read_dsa_public_key(spki)
+        .map_err(|error| structured_key_error(session, error))?;
+    // RFC 3279 section 2.3.2: a standalone key needs supplied domain parameters.
+    // Shared inspection preserves absence; it does not invent an inherited group.
+    // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.2
+    let parameters = key
+        .parameters()
+        .ok_or(KeyResolutionError::InvalidPublicKey)?;
+    let [p, q, g, y] = [parameters.p(), parameters.q(), parameters.g(), key.y()]
+        .map(structured_pkix::key::dsa::Component::as_bytes);
+    // These are borrowed magnitudes; the process-safety bound precedes every
+    // allocating bigint conversion. Group/key validity remains with RustCrypto.
+    for component in [p, q, g, y] {
+        if component.len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING {
+            return Err(KeyResolutionError::InvalidPublicKey);
+        }
+    }
+    let components = dsa::Components::from_components(
+        BoxedUint::from_be_slice_vartime(p),
+        BoxedUint::from_be_slice_vartime(q),
+        BoxedUint::from_be_slice_vartime(g),
+    )
+    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    dsa::VerifyingKey::from_components(components, BoxedUint::from_be_slice_vartime(y))
+        .map(|_| ())
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)
 }
 
 fn validate_ec_spki_point(
@@ -2634,6 +2663,33 @@ mod tests {
     }
 
     #[test]
+    fn dsa_spki_structure_preserves_session_work_refusal() {
+        // DSA structure must use the same certificate account as RSA/EC,
+        // before a crypto decoder can turn the exhausted budget into a bad key.
+        let encoded =
+            b"\x30\x11\x30\x09\x06\x07\x2a\x86\x48\xce\x38\x04\x01\x03\x04\x00\x02\x01\x07";
+        let resources = crate::policy::ResourcePolicy {
+            max_x509_work: 0,
+            ..crate::policy::ResourcePolicy::default()
+        };
+        let session = super::super::pkix::CertificateSession::new(&resources);
+        let error = validate_spki_algorithm(&session, encoded, SignatureAlgorithm::DsaSha256)
+            .expect_err("zero work refuses structural parsing");
+        assert!(
+            matches!(
+                error,
+                KeyResolutionError::Chain(super::super::X509ChainError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimitExceeded {
+                        resource: crate::policy::resource_name::X509_WORK,
+                        maximum: 0,
+                    }
+                ))
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn oversized_dsa_spki_parameter_is_rejected_before_bigint_decode() {
         // A bounded SPKI may still contain a parameter much larger than the
         // non-configurable DSA component ceiling.
@@ -2656,7 +2712,7 @@ mod tests {
         };
         let encoded = der::Encode::to_der(&spki).expect("SPKI encodes");
         assert!(matches!(
-            decode_dsa_verifying_key(&encoded),
+            super::super::signature::decode_dsa_verifying_key(&encoded),
             Err(super::super::signature::SignatureVerificationError::InvalidKeyDer)
         ));
         // Ordinary verification must use the same borrowed preflight, not

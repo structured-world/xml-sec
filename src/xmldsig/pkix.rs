@@ -1061,7 +1061,39 @@ impl CertificateSession {
         &'a self,
         spki: &'a [u8],
     ) -> Result<PublicKey<'a>, structured_pkix::Error> {
-        use structured_pkix::key::{PublicKeyInfo, ec, rsa};
+        use structured_pkix::key::{ec, rsa};
+        self.with_public_key_info(spki, |info, execution| {
+            // Each reader repeats the algorithm check, paid; this only dispatches.
+            if info.algorithm().algorithm() == structured_pkix::oid::EC_PUBLIC_KEY {
+                ec::read(structured_pkix::path::WorkingKey::standing(info), execution)
+                    .map(PublicKey::Ec)
+            } else {
+                rsa::read(info, execution).map(PublicKey::Rsa)
+            }
+        })
+    }
+
+    pub(crate) fn read_dsa_public_key<'a>(
+        &'a self,
+        spki: &'a [u8],
+    ) -> Result<structured_pkix::key::dsa::PublicKey<'a>, structured_pkix::Error> {
+        self.with_public_key_info(spki, |info, execution| {
+            structured_pkix::key::dsa::read(
+                structured_pkix::path::WorkingKey::standing(info),
+                execution,
+            )
+        })
+    }
+
+    fn with_public_key_info<'a, T>(
+        &'a self,
+        spki: &'a [u8],
+        inspect: impl FnOnce(
+            structured_pkix::PublicKeyInfo<'a>,
+            &structured_asn1::memory::Execution<'_>,
+        ) -> Result<T, structured_pkix::Error>,
+    ) -> Result<T, structured_pkix::Error> {
+        use structured_pkix::key::PublicKeyInfo;
         use structured_pkix::{Error, ErrorCode};
         const FIELD: &str = "subjectPublicKeyInfo";
         let encoding = |error: structured_asn1::Error| {
@@ -1078,17 +1110,7 @@ impl CertificateSession {
             return Err(Error::new(ErrorCode::TrailingData, FIELD, reader.offset()));
         }
         let execution = reader.execution();
-        // Both readers compare the algorithm identifier again, paid; this only
-        // selects which one to ask.
-        if info.algorithm().algorithm() == structured_pkix::oid::EC_PUBLIC_KEY {
-            ec::read(
-                structured_pkix::path::WorkingKey::standing(info),
-                &execution,
-            )
-            .map(PublicKey::Ec)
-        } else {
-            rsa::read(info, &execution).map(PublicKey::Rsa)
-        }
+        inspect(info, &execution)
     }
 
     pub(crate) fn read_crl<'a>(
@@ -1156,6 +1178,20 @@ impl CertificateSession {
 mod tests {
     use super::*;
     use structured_pkix::path::{Verified, Verify as _, WorkingKey};
+
+    #[test]
+    fn dsa_public_key_keeps_borrowed_components_and_absent_parameters() {
+        // Structural inspection must not allocate bigints or invent parameters
+        // for an isolated DSA key; the resolver requires the latter separately.
+        let bytes =
+            b"\x30\x12\x30\x09\x06\x07\x2a\x86\x48\xce\x38\x04\x01\x03\x05\x00\x02\x02\x00\x80";
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let key = session.read_dsa_public_key(bytes).expect("DSA structure");
+        assert!(key.parameters().is_none());
+        assert_eq!(key.y().as_bytes(), [0x80]);
+        assert_eq!(key.y().integer().as_bytes(), [0, 0x80]);
+        assert_eq!(key.y().as_bytes().as_ptr(), bytes[19..].as_ptr());
+    }
 
     #[test]
     fn algorithm_inspection_faults_never_become_strict_crypto_identifiers() {

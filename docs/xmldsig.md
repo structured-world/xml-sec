@@ -565,6 +565,8 @@ Execution is bounded by the operation's policy:
 
 Both modes preserve comments and processing instructions beside the stylesheet root;
 `document('')` observes them as part of the stylesheet document (XSLT 1.0 section 12.1).
+Whitespace-only siblings are omitted from that document, including decoded carriage
+return references; whitespace inside the stylesheet retains its XSLT meaning.
 
 Stylesheets cannot resolve external resources: `xsl:import`, `xsl:include` and external `document()`
 fail with `PolicyViolation::Uri`. Exhausted limits are `PolicyViolation::ResourceLimit` errors,
