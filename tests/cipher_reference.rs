@@ -18,6 +18,95 @@ fn external_policy() -> DecryptionPolicy {
     policy
 }
 
+#[cfg(feature = "xslt")]
+#[test]
+fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
+    // Capturing and executing the same stylesheet must consume one operation
+    // allowance, whether resolving a reference directly or decrypting its owner.
+    let key = [0x31; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(key)
+        .encrypt_binary(b"one XSLT allowance")
+        .expect("encrypt reference payload");
+    let parsed = xml_sec::xmlenc::parse_encrypted_data(&encrypted.encrypted_data_xml)
+        .expect("parse generated ciphertext");
+    let encoded = parsed
+        .cipher_data
+        .inline_value()
+        .expect("inline ciphertext");
+    let reference = format!(
+        "<xenc:CipherReference URI='urn:source'><xenc:Transforms><ds:Transform xmlns:ds='{DS}' Algorithm='http://www.w3.org/TR/1999/REC-xslt-19991116'><xsl:stylesheet xmlns:xsl='http://www.w3.org/1999/XSL/Transform' version='1.0'><xsl:output method='text'/><xsl:template match='/'><xsl:text>{encoded}</xsl:text></xsl:template></xsl:stylesheet></ds:Transform><ds:Transform xmlns:ds='{DS}' Algorithm='{DS}base64'/></xenc:Transforms></xenc:CipherReference>"
+    );
+    let xml = encrypted.encrypted_data_xml.replace(
+        &format!("<xenc:CipherValue>{encoded}</xenc:CipherValue>"),
+        &reference,
+    );
+    let resources = HashMap::from([("urn:source".into(), b"<source/>".to_vec())]);
+    for backend in xml_sec::XmlBackend::available() {
+        let document = xml_sec::XmlDomDocument::parse_with_options_and_backend(
+            &xml,
+            Default::default(),
+            backend,
+        )
+        .expect("parse CipherReference document");
+        let node = document
+            .descendants()
+            .find(|node| node.has_tag_name((ENC, "CipherReference")))
+            .expect("CipherReference exists");
+        let resolves = |limit| {
+            let mut policy = external_policy();
+            policy.resources.max_xslt_work = limit;
+            xml_sec::xmlenc::CipherReferenceContext::new(&policy, Some(&resources), backend, &[])
+                .expect("valid reference policy")
+                .resolve(node)
+                .is_ok()
+        };
+        let mut lower = 1;
+        let mut upper = external_policy().resources.max_xslt_work;
+        assert!(resolves(upper));
+        while lower < upper {
+            let midpoint = lower + (upper - lower) / 2;
+            if resolves(midpoint) {
+                upper = midpoint;
+            } else {
+                lower = midpoint + 1;
+            }
+        }
+        assert!(lower > 1);
+        let resolver = SymmetricKeyDecryptor::new(key);
+        let mut policy = external_policy();
+        policy.resources.max_xslt_work = lower;
+        assert_eq!(
+            DecryptContext::new(&resolver)
+                .policy(policy.clone())
+                .xml_backend(backend)
+                .external_resources(&resources)
+                .decrypt(&xml)
+                .expect("exact shared allowance fits"),
+            DecryptedContent::Bytes(b"one XSLT allowance".to_vec())
+        );
+        policy.resources.max_xslt_work -= 1;
+        let error = DecryptContext::new(&resolver)
+            .policy(policy)
+            .xml_backend(backend)
+            .external_resources(&resources)
+            .decrypt(&xml)
+            .expect_err("descriptor capture must not receive a fresh allowance");
+        assert!(
+            matches!(
+                error,
+                XmlEncError::Transform(xml_sec::xmldsig::TransformError::Policy(
+                    xml_sec::policy::PolicyViolation::ResourceLimit {
+                        resource: "XSLT work",
+                        ..
+                    }
+                ))
+            ),
+            "{backend:?}: {error:?}"
+        );
+    }
+}
+
 #[test]
 fn cipher_reference_enveloped_transform_uses_its_actual_signature_ancestor() {
     // XMLDSig 1.1 section 6.6.4 removes the Signature containing the transform,

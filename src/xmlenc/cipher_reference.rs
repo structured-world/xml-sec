@@ -144,6 +144,12 @@ impl<'context: 'doc, 'doc> BoundCipherReferenceContext<'context, 'doc> {
 }
 
 impl<'a> CipherReferenceContext<'a> {
+    pub(super) fn transform_parse_budget(&self) -> XPathSignatureParseBudget {
+        // Descriptor capture and execution share the operation's XSLT allowance,
+        // including key retrieval that recursively parses another resource.
+        XPathSignatureParseBudget::for_execution(&self.policy.resources, &self.transforms)
+    }
+
     pub(super) fn preflight_cipher_data(
         &self,
         cipher: &super::CipherData,

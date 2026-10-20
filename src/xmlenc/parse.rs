@@ -66,12 +66,18 @@ struct SharedKeySourceParseBudget<'a> {
 }
 
 impl<'a> SharedKeySourceParseBudget<'a> {
-    fn new(resources: &'a crate::policy::ResourcePolicy) -> Result<Self, XmlEncError> {
+    fn new(
+        resources: &'a crate::policy::ResourcePolicy,
+        references: Option<&super::CipherReferenceContext<'_>>,
+    ) -> Result<Self, XmlEncError> {
         Ok(Self {
             retained_cipher_bytes: 0,
-            transforms: crate::xmldsig::transforms::XPathSignatureParseBudget::from_resources(
-                resources,
-            ),
+            transforms: match references {
+                Some(context) => context.transform_parse_budget(),
+                None => {
+                    crate::xmldsig::transforms::XPathSignatureParseBudget::from_resources(resources)
+                }
+            },
             key_info: crate::xmldsig::parse::KeyInfoParsingSession::new(resources)
                 .map_err(super::agreement::map_key_info_error)?,
             reference_ancestry: Vec::new(),
@@ -514,7 +520,7 @@ fn parse_encrypted_data_node_traced<'doc>(
     xml_parse: Option<&XmlParseWorkBudget>,
 ) -> Result<TracedEncryptedData<'doc>, XmlEncError> {
     require_element(node, XMLENC_NS, "EncryptedData")?;
-    let mut shared = SharedKeySourceParseBudget::new(policy.resources)?;
+    let mut shared = SharedKeySourceParseBudget::new(policy.resources, references)?;
     let mut budget = KeySourceParseBudget::new(policy, registrations, provider, &mut shared);
     budget.references = references;
     budget.xml_parse = xml_parse;
