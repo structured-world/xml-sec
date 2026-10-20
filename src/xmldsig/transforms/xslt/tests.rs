@@ -9,6 +9,67 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn replay_output_copy_obeys_xslt_workspace_peak() {
+    // Escaping expands a compact result tree into a large serialized buffer.
+    // Replay must admit that buffer and its accounted copy together, even when
+    // the general query account has ample room after the engine trees drop.
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    let sheet = XsltStylesheet::new(format!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}" xmlns:s="http://exslt.org/strings" exclude-result-prefixes="s"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out><xsl:value-of select="s:padding(90000, '&amp;')"/></out></xsl:template></xsl:stylesheet>"#
+    ))
+    .expect("valid amplification stylesheet");
+    let native =
+        run(&TransformExecutionBudget::default(), &sheet, b"<doc/>").expect("native execution");
+    let peak = native.capacity() + native.len();
+    let expected = native.clone();
+    drop(native);
+    for limit in [peak - 1, peak] {
+        let resources = ResourcePolicy {
+            max_xslt_workspace_bytes: limit,
+            ..Default::default()
+        };
+        run(
+            &TransformExecutionBudget::from_resources(&resources),
+            &sheet,
+            b"<doc/>",
+        )
+        .expect("the engine itself fits below the copy peak");
+        let budget = TransformExecutionBudget::from_resources(&resources);
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 28)));
+        let result = super::execute::<_, crate::xml::dom::storage::Native>(
+            super::XsltParameter::Stylesheet(&sheet),
+            b"<doc/>",
+            crate::policy::XsltStylesheetSemantics::Specification,
+            false,
+            &budget,
+            budget.xml_parse_work(),
+            &crate::c14n::scratch::Accounted(&memory),
+        );
+        if limit < peak {
+            assert!(
+                result.is_err(),
+                "replay admitted both copies above the XSLT workspace"
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(TransformError::Policy(PolicyViolation::ResourceLimit {
+                        resource: resource_name::XSLT_WORKSPACE_BYTES, maximum, actual,
+                    })) if maximum == limit && actual == peak
+                ),
+                "replay must refuse the simultaneous output copies"
+            );
+        } else {
+            match result.expect("exact copy peak fits") {
+                super::ExecutionData::Accounted(bytes) => assert_eq!(&*bytes, &expected),
+                _ => panic!("expected accounted replay output"),
+            }
+        }
+        assert_eq!(memory.used(), 0, "all temporary output charges released");
+    }
+}
+
+#[test]
 fn replay_accepts_referenced_whitespace_beside_stylesheet() {
     // The in-place query path must apply the same root-node model as native
     // stylesheet capture, without emitting a character reference outside root.

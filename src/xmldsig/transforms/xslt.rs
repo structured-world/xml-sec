@@ -1498,6 +1498,18 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     scratch.charge(work)?;
     let output = outcome?.serialized.bytes;
     if S::ACCOUNTED {
+        // The empty accounted buffer reserves exactly output.len() on append.
+        // Both copies and carried stylesheet storage must fit the XSLT peak,
+        // independently of the query account's remaining memory. Refuse before
+        // allocating the copy; dropping engine leases must not reset this limit.
+        let peak = output
+            .capacity()
+            .checked_add(output.len())
+            .and_then(|bytes| bytes.checked_add(carried))
+            .ok_or_else(|| allowance.workspace_error(usize::MAX))?;
+        if peak > allowance.max_workspace {
+            return Err(allowance.workspace_error(peak));
+        }
         // The native output sits inside the workspace reservation. Move its charge to
         // a reservation of its own, so the account sees both copies while it is copied.
         drop(input_reservation);
