@@ -261,9 +261,10 @@ fn output_allowance_is_shared_by_every_execution_in_an_operation() {
 #[test]
 fn work_limit_refuses_parameter_capture_before_execution() {
     // Native stylesheet capture belongs to the operation too; a one-unit
-    // allowance now refuses its first text copy, before compilation/execution.
+    // allowance refuses the second byte of the start-tag metadata scan,
+    // before serialization/compilation/execution. No raw source
+    // slice is copied before the tree is captured.
     let sheet = values();
-    let capture = sheet.source().len();
     let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
         .uri("")
         .transform(Transform::Enveloped)
@@ -278,8 +279,36 @@ fn work_limit_refuses_parameter_capture_before_execution() {
         PolicyViolation::ResourceLimit {
             resource: "XSLT work",
             maximum: 1,
-            actual: capture,
+            actual: 2,
         }
+    );
+}
+
+#[test]
+fn template_rejects_stylesheet_above_target_workspace() {
+    // A stylesheet accepted by its constructor must still obey the policy of
+    // the generated template, before the builder serializes its markup.
+    let sheet = values();
+    let bytes = sheet.source().len();
+    let template = builder(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("")
+            .transform(Transform::Enveloped)
+            .transform(Transform::Xslt(sheet)),
+    );
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_xslt_workspace_bytes = bytes - 1;
+    let error = template
+        .build_template_with_policy(&policy)
+        .expect_err("target workspace must admit stylesheet markup");
+    assert!(
+        matches!(
+            error,
+            xml_sec::xmldsig::SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                resource: "XSLT workspace bytes", maximum, actual,
+            }) if maximum == bytes - 1 && actual == bytes
+        ),
+        "{error:?}"
     );
 }
 
@@ -535,6 +564,61 @@ fn stylesheets_keep_the_namespaces_in_scope_at_their_transform() {
         sign(XsltStylesheetSemantics::Libxmlsec1).expect_err("`xsl` is unbound in the content"),
     );
     assert!(matches!(error, TransformError::Xslt(_)), "{error:?}");
+}
+
+#[test]
+fn entity_stylesheet_after_literal_misc_uses_expanded_children() {
+    // XML 1.0 section 4.4 replaces entity markup at the reference. Its DOM
+    // source range may precede a literal PI/comment sibling in the document.
+    let sheet = format!(
+        r#"<xsl:stylesheet xmlns:xsl="{XSL}" version="1.0" exclude-result-prefixes="ds"><xsl:template match="/"><out>expanded</out></xsl:template></xsl:stylesheet>"#
+    );
+    for (backend, misc) in xml_sec::XmlBackend::available().flat_map(|backend| {
+        ["<?before stylesheet?>", "<!--before stylesheet-->"].map(|misc| (backend, misc))
+    }) {
+        let template = format!(
+            concat!(
+                r#"<!DOCTYPE root [<!ENTITY sheet '{sheet}'>]><root>"#,
+                r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+                r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+                r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/>"#,
+                r#"<ds:Reference URI=""><ds:Transforms>"#,
+                r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>"#,
+                r#"<ds:Transform Algorithm="{xslt}">{misc}&sheet;</ds:Transform>"#,
+                r#"</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+                r#"<ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>"#,
+                r#"</ds:Signature></root>"#
+            ),
+            sheet = sheet,
+            misc = misc,
+            xslt = XSLT_TRANSFORM_URI
+        );
+        let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+        let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+        let mut policy = SigningPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        let signed = SignContext::new(&signer)
+            .xml_backend(backend)
+            .policy(policy)
+            .sign_template(&template)
+            .expect("entity-supplied stylesheet signs after Misc");
+        let mut policy = VerificationPolicy::default();
+        policy.xml.allow_internal_dtd = true;
+        let verified = xml_sec::xmldsig::VerifyContext::new()
+            .xml_backend(backend)
+            .key(&verifier)
+            .policy(policy)
+            .store_pre_digest(true)
+            .verify(&signed)
+            .expect("expanded stylesheet verifies");
+        assert_eq!(verified.status, DsigStatus::Valid);
+        assert_eq!(
+            verified.signed_info_references[0]
+                .pre_digest_data
+                .as_deref(),
+            Some(b"<?xml version=\"1.0\"?>\n<out>expanded</out>\n".as_slice())
+        );
+    }
 }
 
 #[test]

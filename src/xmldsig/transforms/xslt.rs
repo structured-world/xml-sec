@@ -127,8 +127,8 @@ pub(crate) enum XsltParameter<'a> {
 }
 
 impl<'a> XsltParameter<'a> {
-    /// Bytes a stylesheet parsed from a signature keeps for the whole operation: its
-    /// markup and its serialization. Markup given to `XsltStylesheet::new` belongs to
+    /// Bytes a stylesheet parsed from a signature keeps for the whole operation.
+    /// Markup given to `XsltStylesheet::new` belongs to
     /// the caller; a `<Transform>` read in place keeps nothing.
     fn carried_bytes(self) -> usize {
         match self {
@@ -199,43 +199,35 @@ impl XsltStylesheet {
     /// The stylesheet of a parsed `<Transform>`, whose markup is already element content.
     pub(super) fn from_parsed(
         transform: crate::xml::dom::Node<'_, '_>,
-        source: &str,
         allowance: &Allowance,
     ) -> Result<Self, TransformError> {
         let limit = allowance.max_workspace;
-        if source.len() > limit {
-            return Err(allowance.workspace_error(source.len()));
-        }
-        allowance.serialize(source.len())?;
-        let mut owned = Bounded::new(limit);
-        owned
-            .push_str(source)
-            .map_err(|needed| allowance.workspace_error(needed))?;
         let parsed = ParsedStylesheet::from_transform(
             transform,
-            limit - owned.text.capacity(),
+            limit,
             Inheritance::Separate,
             &mut |units| allowance.serialize(units),
         )
         .map_err(|error| match error {
-            Unavailable::Exceeds(needed) => {
-                allowance.workspace_error(owned.text.capacity().saturating_add(needed))
-            }
+            Unavailable::Exceeds(needed) => allowance.workspace_error(needed),
             Unavailable::Refused(error) => error,
             Unavailable::Missing => {
                 TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
             }
         })?;
         Ok(Self {
-            source: owned.text,
+            source: String::new(),
             parsed: Some(parsed),
         })
     }
 
-    /// The stylesheet markup.
+    /// Caller-provided markup, or serialized expanded children for a parsed parameter.
     #[must_use]
     pub fn source(&self) -> &str {
-        &self.source
+        match &self.parsed {
+            Some(parsed) => &parsed.document,
+            None => &self.source,
+        }
     }
 
     /// Markup that means the same stylesheet in any `<Transform>`.
@@ -495,20 +487,6 @@ pub(super) fn is_stylesheet_element(element: crate::xml::dom::Node<'_, '_>) -> b
     const XSLT_NS: &str = "http://www.w3.org/1999/XSL/Transform";
     let name = element.tag_name();
     name.namespace() == Some(XSLT_NS) && matches!(name.name(), "stylesheet" | "transform")
-}
-
-/// Stylesheet markup of one `<Transform>` element: the source text between its
-/// first and last child.
-///
-/// libxmlsec1 serializes each child with `xmlNodeDump` and parses the result as
-/// a document (`xmlSecXsltReadNode` in its `xslt.c`), which is the same markup.
-pub(super) fn stylesheet_source<'a>(transform: crate::xml::dom::Node<'a, 'a>) -> Option<&'a str> {
-    let first = transform.first_child()?;
-    let last = transform.children().next_back()?;
-    transform
-        .document()
-        .input_text()
-        .get(first.range().start..last.range().end)
 }
 
 /// Append `value`, writing each byte `escape` maps as its reference and the runs

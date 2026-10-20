@@ -64,7 +64,7 @@ pub struct ParseBudget {
     pub entity_expansion_bytes: usize,
     /// Maximum peak bytes used to materialize inherited namespace scopes and their indexes.
     pub namespace_scope_bytes: usize,
-    /// Maximum bytes the parsed tree retains, its namespace scopes included.
+    /// Maximum live bytes of the tree and parser staging, including namespace scopes.
     pub owned_bytes: usize,
     /// Maximum XML text scanned, one charge per parser pass.
     pub parse_work_bytes: usize,
@@ -94,7 +94,7 @@ impl ParseBudget {
         }
     }
 
-    /// Bound the bytes the parsed tree retains.
+    /// Bound live tree and parser staging bytes.
     #[must_use]
     pub const fn with_owned_bytes(mut self, owned_bytes: usize) -> Self {
         self.owned_bytes = owned_bytes;

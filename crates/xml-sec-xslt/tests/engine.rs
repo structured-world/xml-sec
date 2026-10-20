@@ -117,12 +117,40 @@ fn bounded_parsing_charges_each_pass_and_the_retained_tree() {
     ));
     assert_eq!(short.usage.parse_work_bytes, 0);
 
+    // Growth temporarily holds old and replacement arenas together. The
+    // workspace is their peak, not merely the final retained representation.
+    let (mut refused, mut admitted) = (retained, retained * 4);
+    while admitted - refused > 1 {
+        let middle = refused + (admitted - refused) / 2;
+        match Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(middle))
+            .outcome
+        {
+            Ok(_) => admitted = middle,
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            }) => refused = middle,
+            Err(error) => panic!("unexpected parser failure: {error:?}"),
+        }
+    }
+    assert!(
+        admitted > retained,
+        "arena growth must pay its temporary peak"
+    );
+    assert!(matches!(
+        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(admitted - 1))
+            .outcome,
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
     let exact =
-        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(retained));
+        Document::parse_with_budget_reported(&xml, None, unbounded.with_owned_bytes(admitted));
     assert_eq!(
         exact
             .outcome
-            .expect("the retained size fits its own limit")
+            .expect("the exact peak fits its workspace")
             .retained_bytes(),
         retained
     );

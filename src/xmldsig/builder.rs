@@ -529,6 +529,25 @@ impl SignatureBuilder {
                             other => SignatureBuilderError::InvalidTransform(other.to_string()),
                         })?;
                 }
+                #[cfg(feature = "xslt")]
+                if let Transform::Xslt(stylesheet) = transform {
+                    // Validate the target policy before cloning the transform
+                    // chain, not merely before writing the generated template.
+                    let actual = stylesheet.markup_len();
+                    if actual > policy.resources.max_xslt_workspace_bytes {
+                        return Err(PolicyViolation::ResourceLimit {
+                            resource: crate::policy::resource_name::XSLT_WORKSPACE_BYTES,
+                            maximum: policy.resources.max_xslt_workspace_bytes,
+                            actual,
+                        }
+                        .into());
+                    }
+                    // Check aggregate stylesheet markup before copying it.
+                    stylesheet_bytes = stylesheet_bytes.saturating_add(actual);
+                    policy
+                        .resources
+                        .validate_xml_document_len(stylesheet_bytes)?;
+                }
             }
             let generated_transforms = reference_transforms_for_generation(reference);
             super::transforms::validate_relationship_chain(
@@ -581,15 +600,6 @@ impl SignatureBuilder {
                                 xpath_signature_budget,
                             )?;
                         }
-                    }
-                    #[cfg(feature = "xslt")]
-                    Transform::Xslt(stylesheet) => {
-                        // The sum is only compared with the document limit, and one
-                        // clamped at `usize::MAX` exceeds every limit, so it is refused.
-                        stylesheet_bytes = stylesheet_bytes.saturating_add(stylesheet.markup_len());
-                        policy
-                            .resources
-                            .validate_xml_document_len(stylesheet_bytes)?;
                     }
                     _ => {}
                 }

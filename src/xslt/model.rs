@@ -15,6 +15,8 @@ use super::{BudgetKind, Error, ParseBudget, ParseUsage, Reported, Result};
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
+mod lexical_storage;
+
 pub(crate) fn parser_workspace_bytes(xml: &str) -> usize {
     let (node_slots, attribute_slots) =
         xml.bytes()
@@ -239,7 +241,7 @@ fn node_payload_bytes(kind: &NodeKind, base_uri: Option<&str>) -> usize {
             .saturating_add(prefix.as_deref().map_or(0, str::len))
             .saturating_add(
                 attributes
-                    .len()
+                    .capacity()
                     .saturating_mul(std::mem::size_of::<Attribute>()),
             )
             .saturating_add(attributes.iter().fold(0usize, |total, attribute| {
@@ -247,7 +249,7 @@ fn node_payload_bytes(kind: &NodeKind, base_uri: Option<&str>) -> usize {
                     .saturating_add(attribute.name.local.len())
                     .saturating_add(attribute.name.namespace.as_deref().map_or(0, str::len))
                     .saturating_add(attribute.prefix.as_deref().map_or(0, str::len))
-                    .saturating_add(attribute.value.len())
+                    .saturating_add(attribute.value.capacity())
             })),
     })
 }
@@ -717,7 +719,16 @@ impl Document {
         meter
             .entity_expansion
             .charge_parse_work(expanded_xml.len())?;
-        let mut reader = Scanner::new(expanded_xml.as_ref());
+        let lexical_held = std::cell::Cell::new(0);
+        let lexical_temporary = std::cell::Cell::new(0);
+        let mut reader = Scanner::with_storage(
+            expanded_xml.as_ref(),
+            lexical_storage::Storage {
+                limit: budget.owned_bytes,
+                held: &lexical_held,
+                temporary: &lexical_temporary,
+            },
+        );
         let mut previous_event_offset = 0usize;
         let mut source_line = 1usize;
         let mut phase = DocumentPhase::Start;
@@ -729,10 +740,19 @@ impl Document {
             node: document.root,
             lexical_name: None,
         }];
-        while let Some(event) = reader
-            .next_event()
-            .map_err(|error| Error::Xml(error.to_string()))?
-        {
+        loop {
+            lexical_held.set(
+                meter
+                    .retained_bytes()
+                    .saturating_add(meter.entity_expansion.used),
+            );
+            let Some(event) = reader.next_event().map_err(|error| match error {
+                xml_sec_xml_input::lexical::Error::Resource(error) => error,
+                error => Error::Xml(error.to_string()),
+            })?
+            else {
+                break;
+            };
             let event_offset = event_range_start(&event);
             source_line = source_line.saturating_add(xml_line_endings(
                 &expanded_xml.as_bytes()[previous_event_offset..event_offset],
@@ -740,6 +760,11 @@ impl Document {
             previous_event_offset = event_offset;
             match event {
                 Event::Start(start) => {
+                    #[cfg(test)]
+                    expansion_workspace_tests::SCANNED_ATTRIBUTES
+                        .with(|count| count.set(count.get() + start.attributes.len()));
+                    let lexical_bytes = start.attributes.bytes();
+                    meter.charge_owned(lexical_bytes)?;
                     if elements.len() == 1 {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
@@ -755,8 +780,15 @@ impl Document {
                         &mut meter,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
+                    drop(start);
+                    meter.release_owned(lexical_bytes);
                 }
                 Event::Empty(start) => {
+                    #[cfg(test)]
+                    expansion_workspace_tests::SCANNED_ATTRIBUTES
+                        .with(|count| count.set(count.get() + start.attributes.len()));
+                    let lexical_bytes = start.attributes.bytes();
+                    meter.charge_owned(lexical_bytes)?;
                     if elements.len() == 1 {
                         if phase == DocumentPhase::Epilog {
                             return Err(Error::Xml("multiple document elements".into()));
@@ -772,6 +804,8 @@ impl Document {
                         &mut meter,
                     )?;
                     document.nodes[id.0].source_line = Some(source_line);
+                    drop(start);
+                    meter.release_owned(lexical_bytes);
                 }
                 Event::End { name, .. } => {
                     if elements.len() == 1 {
@@ -2229,6 +2263,16 @@ fn push_metered(
     base_uri: Option<String>,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
+    reserve_node_storage(document, parent, meter)?;
+    meter.charge_owned(node_payload_bytes(&kind, base_uri.as_deref()))?;
+    Ok(document.push(parent, kind, base_uri))
+}
+
+fn reserve_node_storage(
+    document: &mut Document,
+    parent: NodeId,
+    meter: &mut StreamParseMeter,
+) -> Result<()> {
     let nodes = &mut document.nodes;
     if nodes.len() == nodes.capacity() {
         let additional = nodes.capacity().max(4);
@@ -2239,8 +2283,7 @@ fn push_metered(
         let additional = children.capacity().max(4);
         reserve_charged(children, additional, meter)?;
     }
-    meter.charge_owned(node_payload_bytes(&kind, base_uri.as_deref()))?;
-    Ok(document.push(parent, kind, base_uri))
+    Ok(())
 }
 
 /// Admit one more entry of a retained index whose strings own `owned_bytes`, growing the
@@ -2293,34 +2336,48 @@ fn reserve_charged<T>(
         limit,
         actual: usize::MAX,
     };
-    let requested = additional
+    let old_bytes = values.capacity() * std::mem::size_of::<T>();
+    let requested = values
+        .len()
+        .checked_add(additional)
+        .ok_or_else(refused)?
         .checked_mul(std::mem::size_of::<T>())
         .ok_or_else(refused)?;
+    // A reallocating vector can hold both blocks until the copy completes.
     meter.charge_owned(requested)?;
     let before = values.capacity();
     values
         .try_reserve_exact(additional)
         .map_err(|_| refused())?;
     // `try_reserve_exact` may allocate more than requested; capacity never shrinks here.
-    let granted = (values.capacity() - before)
+    let granted = values
+        .capacity()
         .checked_mul(std::mem::size_of::<T>())
         .ok_or_else(refused)?;
     if granted > requested {
         meter.charge_owned(granted - requested)?;
+    } else {
+        meter.release_owned(requested - granted);
     }
+    debug_assert!(values.capacity() >= before);
+    meter.release_owned(old_bytes);
     Ok(())
 }
 
-fn push_stream_element(
+fn push_stream_element<
+    'a,
+    A: std::ops::Deref<Target = [xml_sec_xml_input::lexical::Attribute<'a>]>,
+>(
     document: &mut Document,
     elements: &mut Vec<StreamElementFrame>,
-    start: &xml_sec_xml_input::lexical::StartTag<'_>,
+    start: &xml_sec_xml_input::lexical::StartTag<'a, A>,
     empty: bool,
     declarations: &InternalEntityDeclarations,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
     meter.element_depth(elements.len())?;
     meter.reserve_node()?;
+    let staging_start = meter.owned_bytes;
     let parent = elements
         .last()
         .map(|frame| frame.node)
@@ -2340,14 +2397,20 @@ fn push_stream_element(
             .namespace_scope_bytes
             .saturating_add(namespace_index_bytes),
     )?;
+    meter.charge_owned(namespace_index_bytes)?;
     let mut namespace_index = namespace_index(&namespaces);
+    meter
+        .charge_owned(start.name.local().len() + start.name.prefix().map_or(0, |p| p.len() + 1))?;
     let lexical_name = start.name.qualified();
     let declared_attributes = declarations
         .attributes
         .get(lexical_name.as_ref())
         .map_or(&[][..], Vec::as_slice);
     let mut raw_attributes = Vec::new();
-    for attribute in &start.attributes {
+    for attribute in start.attributes.iter() {
+        meter.charge_owned(
+            attribute.name.local().len() + attribute.name.prefix().map_or(0, |p| p.len() + 1),
+        )?;
         let name = attribute.name.qualified();
         let attribute_type = declared_attributes
             .iter()
@@ -2355,13 +2418,12 @@ fn push_stream_element(
             .map_or(InternalAttributeType::Cdata, |declaration| {
                 declaration.attribute_type
             });
-        let value = prepare_attribute_value(
+        let value = prepare_stream_attribute_value(
             name.as_ref(),
             attribute.value,
             &declarations.general,
             attribute_type.is_cdata(),
-            &mut meter.entity_references,
-            &mut meter.entity_expansion,
+            meter,
         )?;
         if name == "xmlns" {
             validate_namespace_binding(None, &value)?;
@@ -2389,6 +2451,10 @@ fn push_stream_element(
                 &mut meter.namespace_scope_bytes,
             )?;
         } else {
+            if raw_attributes.len() == raw_attributes.capacity() {
+                let additional = raw_attributes.capacity().max(4);
+                reserve_charged(&mut raw_attributes, additional, meter)?;
+            }
             raw_attributes.push((name.into_owned(), value, attribute_type));
         }
     }
@@ -2403,13 +2469,13 @@ fn push_stream_element(
         {
             continue;
         }
-        let value = prepare_attribute_value(
+        meter.charge_owned(declaration.name.len())?;
+        let value = prepare_stream_attribute_value(
             &declaration.name,
             default,
             &declarations.general,
             declaration.attribute_type.is_cdata(),
-            &mut meter.entity_references,
-            &mut meter.entity_expansion,
+            meter,
         )?;
         if declaration.name == "xmlns" {
             validate_namespace_binding(None, &value)?;
@@ -2434,11 +2500,19 @@ fn push_stream_element(
                 &mut meter.namespace_scope_bytes,
             )?;
         } else {
+            if raw_attributes.len() == raw_attributes.capacity() {
+                let additional = raw_attributes.capacity().max(4);
+                reserve_charged(&mut raw_attributes, additional, meter)?;
+            }
             raw_attributes.push((declaration.name.clone(), value, declaration.attribute_type));
         }
     }
+    meter.charge_owned(lexical_name.len())?;
     let prefix = start.name.prefix().map(str::to_owned);
     let local = start.name.local().to_owned();
+    if let Some(position) = namespace_index.get(prefix.as_deref().unwrap_or_default()) {
+        meter.charge_owned(namespaces[*position].uri.len())?;
+    }
     let namespace = namespace_for(&namespaces, &namespace_index, prefix.as_deref());
     if prefix.is_some() && namespace.is_none() {
         return Err(Error::Xml(format!(
@@ -2447,43 +2521,71 @@ fn push_stream_element(
     }
     let mut first_id_attribute = None;
     let mut additional_id_attributes = Vec::new();
-    let attributes = raw_attributes
-        .into_iter()
-        .enumerate()
-        .map(|(index, (lexical, value, attribute_type))| {
-            let (prefix, local) = split_lexical_name(&lexical)?;
-            let namespace = prefix
-                .as_deref()
-                .and_then(|prefix| namespace_for(&namespaces, &namespace_index, Some(prefix)));
-            if prefix.is_some() && namespace.is_none() {
-                return Err(Error::Xml(format!(
-                    "undeclared namespace prefix in attribute {lexical}"
-                )));
-            }
-            if attribute_type.is_id() {
-                if first_id_attribute.is_none() {
-                    first_id_attribute = Some(index);
-                } else {
-                    additional_id_attributes.push(index);
+    let mut attributes = Vec::new();
+    reserve_charged(&mut attributes, raw_attributes.len(), meter)?;
+    for (index, (lexical, value, attribute_type)) in raw_attributes.into_iter().enumerate() {
+        meter.charge_owned(lexical.len())?;
+        let (prefix, local) = split_lexical_name(&lexical)?;
+        if let Some(position) = prefix
+            .as_deref()
+            .and_then(|prefix| namespace_index.get(prefix))
+        {
+            meter.charge_owned(namespaces[*position].uri.len())?;
+        }
+        let namespace = prefix
+            .as_deref()
+            .and_then(|prefix| namespace_for(&namespaces, &namespace_index, Some(prefix)));
+        if prefix.is_some() && namespace.is_none() {
+            return Err(Error::Xml(format!(
+                "undeclared namespace prefix in attribute {lexical}"
+            )));
+        }
+        if attribute_type.is_id() {
+            if first_id_attribute.is_none() {
+                first_id_attribute = Some(index);
+            } else {
+                if additional_id_attributes.len() == additional_id_attributes.capacity() {
+                    let additional = additional_id_attributes.capacity().max(4);
+                    reserve_charged(&mut additional_id_attributes, additional, meter)?;
                 }
+                additional_id_attributes.push(index);
             }
-            Ok(Attribute {
-                name: ExpandedName::new(namespace, local),
-                prefix,
-                value,
+        }
+        attributes.push(Attribute {
+            name: ExpandedName::new(namespace, local),
+            prefix,
+            value,
+        });
+    }
+    // Borrow names instead of cloning every namespace/local string into the
+    // duplicate detector. Admit its bucket bound before allocating it.
+    if attributes.len() > 1 {
+        let duplicate_bytes = attributes
+            .len()
+            .max(4)
+            .checked_mul(2)
+            .and_then(|slots| {
+                slots.checked_mul(std::mem::size_of::<&ExpandedName>() + std::mem::size_of::<u64>())
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut expanded_names = HashSet::with_capacity(attributes.len());
-    if let Some(duplicate) = attributes
-        .iter()
-        .find(|attribute| !expanded_names.insert(attribute.name.clone()))
-    {
-        return Err(Error::Xml(format!(
-            "duplicate expanded attribute {{{}}}{}",
-            duplicate.name.namespace.as_deref().unwrap_or(""),
-            duplicate.name.local
-        )));
+            .ok_or(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: meter.budget.owned_bytes,
+                actual: usize::MAX,
+            })?;
+        meter.charge_owned(duplicate_bytes)?;
+        let mut expanded_names = HashSet::with_capacity(attributes.len());
+        if let Some(duplicate) = attributes
+            .iter()
+            .find(|attribute| !expanded_names.insert(&attribute.name))
+        {
+            return Err(Error::Xml(format!(
+                "duplicate expanded attribute {{{}}}{}",
+                duplicate.name.namespace.as_deref().unwrap_or(""),
+                duplicate.name.local
+            )));
+        }
+        drop(expanded_names);
+        meter.release_owned(duplicate_bytes);
     }
     let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
     let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
@@ -2496,18 +2598,25 @@ fn push_stream_element(
     } else {
         inherited_base
     };
-    let projected = push_metered(
-        document,
-        parent,
-        NodeKind::Element {
-            name: ExpandedName::new(namespace, local),
-            prefix,
-            attributes,
-            namespaces,
-        },
-        effective_base,
-        meter,
-    )?;
+    drop(namespace_index);
+    // Keep the admitted payload live while growing the node arena and parent's
+    // child vector. Only dropped staging is released, never the moved strings.
+    let id_bytes = additional_id_attributes.capacity() * std::mem::size_of::<usize>();
+    let kind = NodeKind::Element {
+        name: ExpandedName::new(namespace, local),
+        prefix,
+        attributes,
+        namespaces,
+    };
+    let payload = node_payload_bytes(&kind, effective_base.as_deref());
+    let staged = meter.owned_bytes - staging_start - id_bytes;
+    if staged >= payload {
+        meter.release_owned(staged - payload);
+    } else {
+        meter.charge_owned(payload - staged)?;
+    }
+    reserve_node_storage(document, parent, meter)?;
+    let projected = document.push(parent, kind, effective_base);
     for index in first_id_attribute
         .into_iter()
         .chain(additional_id_attributes)
@@ -2529,6 +2638,7 @@ fn push_stream_element(
             meter.release_owned(key_bytes);
         }
     }
+    meter.release_owned(id_bytes);
     if !empty {
         elements.push(StreamElementFrame {
             node: projected,
@@ -2547,6 +2657,44 @@ fn prepare_attribute_value(
     entity_expansion: &mut EntityExpansionMeter,
 ) -> Result<String> {
     let value = expand_entity_references(raw, entities, 0, entity_references, entity_expansion)?;
+    finish_attribute_value(name, value, is_cdata)
+}
+
+fn prepare_stream_attribute_value(
+    name: &str,
+    raw: &str,
+    entities: &HashMap<String, String>,
+    is_cdata: bool,
+    meter: &mut StreamParseMeter,
+) -> Result<String> {
+    // Entity expansion and attribute staging coexist with the retained tree.
+    // Bound expansion by that remaining space, then admit normalization,
+    // reference decoding and tokenized collapse before any of them allocate.
+    let workspace = meter.entity_expansion.workspace;
+    meter.entity_expansion.workspace = meter
+        .budget
+        .owned_bytes
+        .saturating_sub(meter.owned_bytes)
+        .saturating_sub(meter.namespace_scope_bytes);
+    let expanded = expand_entity_references(
+        raw,
+        entities,
+        0,
+        &mut meter.entity_references,
+        &mut meter.entity_expansion,
+    );
+    meter.entity_expansion.workspace = workspace;
+    let expanded = expanded?;
+    let staging = expanded.len().checked_mul(3).ok_or(Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit: meter.budget.owned_bytes,
+        actual: usize::MAX,
+    })?;
+    meter.charge_owned(staging)?;
+    finish_attribute_value(name, expanded, is_cdata)
+}
+
+fn finish_attribute_value(name: &str, value: Cow<'_, str>, is_cdata: bool) -> Result<String> {
     if value.contains('<') {
         return Err(Error::Xml(format!(
             "attribute `{name}` entity replacement contains a literal `<`"
@@ -2562,7 +2710,7 @@ fn prepare_attribute_value(
     })
 }
 
-fn event_range_start(event: &xml_sec_xml_input::lexical::Event<'_>) -> usize {
+fn event_range_start<A>(event: &xml_sec_xml_input::lexical::Event<'_, A>) -> usize {
     use xml_sec_xml_input::lexical::Event;
     match event {
         Event::Declaration { range, .. }
@@ -4697,6 +4845,104 @@ mod parser_boundary_tests;
 mod expansion_workspace_tests {
     use super::*;
     thread_local! { pub(super) static APPENDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { pub(super) static SCANNED_ATTRIBUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    #[test]
+    fn lexical_attributes_cannot_materialize_before_workspace_admission() {
+        // The lexical event itself owns a vector; refusing semantic staging
+        // afterwards cannot pay for that already-materialized opening tag.
+        let attributes = (0..128).map(|i| format!(" a{i}='v'")).collect::<String>();
+        let xml = format!("<root{attributes}/>");
+        SCANNED_ATTRIBUTES.with(|count| count.set(0));
+        let result =
+            Document::parse_with_budget(&xml, None, ParseBudget::UNBOUNDED.with_owned_bytes(128));
+        assert!(matches!(
+            result,
+            Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                ..
+            })
+        ));
+        SCANNED_ATTRIBUTES.with(|count| {
+            assert_eq!(
+                count.get(),
+                0,
+                "opening-tag vector was materialized before the workspace refusal"
+            )
+        });
+    }
+
+    #[test]
+    fn attribute_staging_is_admitted_before_semantic_processing() {
+        // Ordinary and DTD-defaulted attributes must not reach QName resolution
+        // after constructing attacker-sized staging buffers without workspace.
+        for defaults in [false, true] {
+            let attributes = (0..64)
+                .map(|i| {
+                    if defaults {
+                        format!("a{i} CDATA 'value' ")
+                    } else {
+                        format!("a{i}='value' ")
+                    }
+                })
+                .collect::<String>();
+            let xml = if defaults {
+                format!(
+                    "<!DOCTYPE root [<!ATTLIST root {attributes} missing:last CDATA 'v'>]><root/>"
+                )
+            } else {
+                format!("<root {attributes} missing:last='v'/>")
+            };
+            let mut references = 0;
+            let mut expansion = EntityExpansionMeter::new(1 << 20);
+            let (_, declarations) =
+                internal_general_entities(&xml, &mut references, &mut expansion)
+                    .expect("declarations parse");
+            let mut scanner = Scanner::new(&xml);
+            let start = loop {
+                match scanner
+                    .next_event()
+                    .expect("lexical event")
+                    .expect("root start")
+                {
+                    Event::Empty(start) => break start,
+                    _ => continue,
+                }
+            };
+            let mut document = Document::empty(None);
+            let mut elements = vec![StreamElementFrame {
+                node: document.root(),
+                lexical_name: None,
+            }];
+            let budget = ParseBudget::UNBOUNDED.with_owned_bytes(1024);
+            let mut meter = StreamParseMeter {
+                budget,
+                nodes: 1,
+                entity_references: 0,
+                entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
+                namespace_scope_bytes: 0,
+                owned_bytes: 0,
+            };
+            let result = push_stream_element(
+                &mut document,
+                &mut elements,
+                &start,
+                true,
+                &declarations,
+                &mut meter,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(Error::Budget {
+                        kind: BudgetKind::OwnedBytes,
+                        ..
+                    })
+                ),
+                "defaults={defaults}: {result:?}"
+            );
+        }
+    }
 
     #[test]
     fn parser_work_stops_entity_materialization_before_append() {

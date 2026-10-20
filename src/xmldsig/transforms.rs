@@ -2847,10 +2847,11 @@ fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
             "XSLT transform requires one stylesheet element as its sole content"
         )));
     }
-    let source = xslt::stylesheet_source(transform_node)
-        .ok_or_else(|| scratch.unsupported(format_args!("XSLT transform requires a stylesheet")))?;
-    scratch.charge(source.len())?;
-    Ok(Some(scratch.xslt(transform_node, source, &budget.xslt)?))
+    // XML 1.0 section 4.4 includes entity replacement in the parsed tree.
+    // Child source ranges may point backward into the DTD, so capture/execute
+    // that tree, never a slice between the first and last child's offsets.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#entproc
+    Ok(Some(scratch.xslt(transform_node, &budget.xslt)?))
 }
 
 #[cfg(not(feature = "xslt"))]

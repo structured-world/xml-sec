@@ -911,9 +911,9 @@ fn the_parsed_input_is_charged_to_the_workspace_once() {
 
 #[test]
 fn parsed_stylesheet_copies_count_against_the_workspace() {
-    // A stylesheet parsed from a signature keeps its markup and its serialization for
+    // A stylesheet parsed from a signature keeps its serialization for
     // the whole transform. With the least workspace in which the same markup given to
-    // `XsltStylesheet::new` runs, the parsed one, which holds those copies, is refused.
+    // `XsltStylesheet::new` runs, the parsed one, which owns that copy, is refused.
     let filler = "x".repeat(32 * 1024);
     let body = format!(
         r#"<xsl:variable name="v" select="'{filler}'"/><xsl:template match="/"><out/></xsl:template>"#
@@ -952,7 +952,7 @@ fn parsed_stylesheet_copies_count_against_the_workspace() {
         }
     }
     // Room for serialization to differ from the given markup, far less than the
-    // two copies of the filler the parsed stylesheet holds.
+    // retained copy of the filler the parsed stylesheet holds.
     let error = run(&workspace(admitted + 4096), &parsed, input)
         .expect_err("the parsed copies do not fit beside the transform");
     assert!(
