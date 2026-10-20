@@ -9,6 +9,24 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn replay_accepts_referenced_whitespace_beside_stylesheet() {
+    // The in-place query path must apply the same root-node model as native
+    // stylesheet capture, without emitting a character reference outside root.
+    let xml = format!(
+        r#"<Transform>&#13;<xsl:stylesheet xmlns:xsl="{XSL}" version="1.0"><xsl:template match="/"><out/></xsl:template></xsl:stylesheet>&#13;</Transform>"#
+    );
+    let document = Document::parse(&xml).expect("accepted Transform whitespace");
+    query_run_with(
+        super::XsltParameter::Transform(document.root_element()),
+        b"<doc/>",
+        1 << 24,
+        1 << 28,
+    )
+    .outcome
+    .expect("replay ignores root-level whitespace");
+}
+
+#[test]
 fn transcoded_input_refuses_growth_before_consuming_the_document() {
     // Native decoding must not materialize a document-sized allocation before
     // discovering that only a much smaller XSLT workspace is permitted.

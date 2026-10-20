@@ -113,6 +113,58 @@ fn policy_error(error: SigningError) -> PolicyViolation {
 const ITEMS: &str = r#"<root><item ID="payload">b</item><item>a</item></root>"#;
 
 #[test]
+fn referenced_whitespace_beside_stylesheet_signs_and_verifies() {
+    // XPath 1.0 section 5.1 excludes text children of a document root. CR
+    // references accepted in Transform content must not become document markup.
+    let (key, key_info) = signing_material();
+    for backend in xml_sec::XmlBackend::available() {
+        for semantics in [
+            XsltStylesheetSemantics::Specification,
+            XsltStylesheetSemantics::Libxmlsec1,
+        ] {
+            let sheet = XsltStylesheet::new(format!(
+                r#"&#13;<?before alpha?><!--one--><xsl:stylesheet xmlns:xsl="{XSL}" version="1.0"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="concat(count(document('')/processing-instruction()), ':', count(document('')/comment()), ':', count(document('')/text()))"/></xsl:template></xsl:stylesheet><!--two--><?after beta?>&#13;"#
+            )).expect("CR is permitted whitespace in Transform content");
+            let signature = builder(
+                ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                    .uri("")
+                    .transform(Transform::Enveloped)
+                    .transform(Transform::Xslt(sheet)),
+            );
+            let mut signing = SigningPolicy::default();
+            signing.transforms.xslt_stylesheet_semantics = semantics;
+            let signed = SignContext::new(&key)
+                .key_info_writer(&key_info)
+                .policy(signing)
+                .xml_backend(backend)
+                .sign_with_builder(ITEMS, &signature)
+                .expect("referenced stylesheet whitespace must sign");
+            let mut verification = VerificationPolicy::default();
+            verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
+            verification.transforms.xslt_stylesheet_semantics = semantics;
+            let resolver = DefaultKeyResolver::default();
+            let result = xml_sec::xmldsig::VerifyContext::new()
+                .policy(verification)
+                .xml_backend(backend)
+                .key_resolver(&resolver)
+                .store_pre_digest(true)
+                .verify(&signed)
+                .expect("referenced stylesheet whitespace must verify");
+            assert_eq!(
+                result.status,
+                DsigStatus::Valid,
+                "{backend:?}: {semantics:?}"
+            );
+            assert_eq!(
+                result.signed_info_references[0].pre_digest_data.as_deref(),
+                Some(b"2:2:0".as_slice()),
+                "{backend:?}: {semantics:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn node_set_input_is_canonicalized_and_terminal_output_is_digested() {
     // XMLDSig 1.1 section 4.4.3.2 converts the node-set to octets with inclusive
     // C14N 1.0; the stylesheet then sees the whole document minus the Signature.

@@ -878,6 +878,18 @@ fn serialize_stylesheet_children<
     // https://www.w3.org/TR/1999/REC-xslt-19991116#document
     let mut at = 0;
     for child in transform.children() {
+        if child.is_text() {
+            let text = child.text().unwrap_or("");
+            work(text.len() + 1)?;
+            // XPath 1.0 section 5.1 excludes text children of the root node.
+            // XML 1.0 section 2.8 permits literal Misc whitespace here, not
+            // character references such as the escaped carriage return.
+            // https://www.w3.org/TR/1999/REC-xpath-19991116/#root-node
+            // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-prolog-dtd
+            if super::super::whitespace::is_xml_whitespace_only(text) {
+                continue;
+            }
+        }
         let offset = serialize_element(
             child,
             out,
