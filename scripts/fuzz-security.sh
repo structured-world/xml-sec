@@ -54,15 +54,21 @@ git rev-parse HEAD > "$output/revision.txt"
 git status --short --untracked-files=normal > "$output/worktree.txt"
 rustc +nightly -Vv > "$output/toolchain.txt"
 features=()
+sanitizer=address
 if [[ "${FUZZ_AWS_LC_FIPS:-0}" == 1 ]]; then
   features=(--features aws-lc-fips)
+  # AWS-LC disables FIPS integrity checks in ASAN builds; keep the real FIPS
+  # module here and retain ASAN in the separate RustCrypto campaign.
+  # https://github.com/aws/aws-lc-rs/blob/v1.18.1/aws-lc-rs/src/lib.rs#L443-L447
+  sanitizer=none
 fi
-printf '%q ' cargo +nightly fuzz run "$target" "${build[@]}" "${features[@]}" "$corpus" -- \
+# Bash 3.2 treats an empty array as unset under nounset; preserve zero arguments.
+printf '%q ' cargo +nightly fuzz run "$target" "${build[@]}" ${features[@]+"${features[@]}"} --sanitizer "$sanitizer" "$corpus" -- \
   "${arguments[@]}" -max_len=65536 -timeout=30 -rss_limit_mb=2048 \
   "-artifact_prefix=$crashes/" > "$output/command.txt"
 printf '\n' >> "$output/command.txt"
 # Pipefail preserves crashes/timeouts. Failed runs retain artifacts and build
 # output for diagnosis; successful campaigns immediately remove only this crate's output.
-cargo +nightly fuzz run "$target" "${build[@]}" "${features[@]}" "$corpus" -- \
+cargo +nightly fuzz run "$target" "${build[@]}" ${features[@]+"${features[@]}"} --sanitizer "$sanitizer" "$corpus" -- \
   "${arguments[@]}" -max_len=65536 -timeout=30 -rss_limit_mb=2048 \
   "-artifact_prefix=$crashes/" 2>&1 | tee "$output/run.log"

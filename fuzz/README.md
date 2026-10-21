@@ -74,8 +74,13 @@ suite rather than pretending arbitrary keys are portable token handles.
 Smoke reserves new mutations on top of corpus replay (including libFuzzer's
 initial empty input); restoring a large corpus cannot consume that allowance.
 Smoke/replay builds use cargo-fuzz's development mode; scheduled campaigns use
-optimized builds with 16 codegen units. Both retain AddressSanitizer, coverage
-instrumentation, debug assertions and overflow checks.
+optimized builds with 16 codegen units. Both retain coverage instrumentation,
+debug assertions and overflow checks. Standard campaigns use AddressSanitizer.
+The additional AWS-LC FIPS campaign uses `--sanitizer none`: instrumenting its
+native module breaks the Linux FIPS delocator, while AWS-LC's explicit ASAN
+mode disables FIPS integrity checks. This campaign therefore checks the actual
+FIPS provider rather than an ASAN substitute; the separate RustCrypto campaign
+retains ASAN coverage. The selected mode is recorded in the command evidence.
 
 The standalone XSLT engine is fuzzed through its existing crate. Its private
 XMLDSig embedding is exercised through public transform/signature APIs and the

@@ -36,8 +36,8 @@ if (args[1] === 'fuzz' && args[2] === 'list') {
     writeFileSync(join(root, 'bin', tool), '#!/usr/bin/env node\nconsole.log("test metadata");\n', { mode: 0o755 });
   }
   const log = join(root, 'calls.jsonl');
-  const invoke = mode => {
-    const result = spawnSync('bash', ['scripts/fuzz-security.sh', 'test_target', mode], {
+  const invoke = (mode, shell = 'bash', fips = false) => {
+    const result = spawnSync(shell, ['scripts/fuzz-security.sh', 'test_target', mode], {
       cwd: root,
       encoding: 'utf8',
       timeout: 10_000,
@@ -46,7 +46,7 @@ if (args[1] === 'fuzz' && args[2] === 'list') {
         PATH: `${join(root, 'bin')}${delimiter}${process.env.PATH}`,
         CALLS: log,
         FAKE_FAILURE: failure ? '1' : '0',
-        FUZZ_AWS_LC_FIPS: '0',
+        FUZZ_AWS_LC_FIPS: fips ? '1' : '0',
         FUZZ_OUTPUT: join(root, 'evidence'),
       },
     });
@@ -90,3 +90,21 @@ test('replay is finite and retains the full corpus', t => {
   assert.ok(result.run.includes('-runs=0'));
   assert.equal(readdirSync(join(root, 'fuzz/corpus/test_target')).length, 4);
 });
+
+for (const fips of [false, true]) {
+  test(`system Bash preserves optional feature arguments (FIPS=${fips})`, t => {
+    // macOS /bin/bash is 3.2: nounset must accept an empty features array,
+    // while a populated array must retain both arguments without word loss.
+    const { root, invoke } = fixture(t, 0);
+    const result = invoke('smoke', '/bin/bash', fips);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.run.includes('--features'), fips);
+    assert.equal(result.run.includes('aws-lc-fips'), fips);
+    assert.equal(readFileSync(join(root, 'evidence/command.txt'), 'utf8').includes('--features aws-lc-fips'), fips);
+    const sanitizer = result.run.indexOf('--sanitizer');
+    assert.ok(sanitizer >= 0, 'record an explicit sanitizer mode');
+    assert.equal(result.run[sanitizer + 1], fips ? 'none' : 'address');
+    assert.match(readFileSync(join(root, 'evidence/command.txt'), 'utf8'),
+      fips ? /--sanitizer none/ : /--sanitizer address/);
+  });
+}
