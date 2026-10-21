@@ -2932,6 +2932,51 @@ fn libxslt_case_worker() {
 }
 
 #[test]
+fn recommendation_example_selection_is_complete() {
+    // Pin the REC/REC2 selection independently of unrelated EXSLT and regression
+    // cases. These are libxslt's W3C Recommendation examples, not certification.
+    let cases = cases();
+    let selected = cases
+        .iter()
+        .filter(|case| case.stylesheet.starts_with("REC") || case.stylesheet.starts_with("REC2"))
+        .map(|case| {
+            (
+                case.stylesheet.clone(),
+                case.source.clone(),
+                case.kind.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let mut expected = HashSet::new();
+    for suite in ["REC", "REC2"] {
+        for entry in std::fs::read_dir(upstream_tests().join(suite)).expect("example suite") {
+            let path = entry.expect("example entry").path();
+            if path.extension().is_some_and(|extension| extension == "xsl")
+                && path.with_extension("xml").is_file()
+            {
+                expected.insert((
+                    Path::new(suite).join(path.file_name().unwrap()),
+                    Path::new(suite).join(path.with_extension("xml").file_name().unwrap()),
+                    "transform".to_owned(),
+                ));
+            } else if suite == "REC"
+                && path.extension().is_some_and(|extension| extension == "xml")
+                && path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("stand")
+            {
+                let relative = Path::new(suite).join(path.file_name().unwrap());
+                expected.insert((relative.clone(), relative, "standalone".to_owned()));
+            }
+        }
+    }
+    assert_eq!(selected.len(), 83, "Recommendation example selection drift");
+    assert_eq!(selected, expected, "every selected example must execute");
+}
+
+#[test]
 fn every_registered_libxslt_runtest_case_runs_through_our_engine() {
     let cases = cases();
     assert_eq!(

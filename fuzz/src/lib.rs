@@ -25,6 +25,44 @@ fn payload(data: &[u8]) -> String {
     text
 }
 
+struct InlineXsltModule(Vec<u8>);
+
+const MODULE_URI: &str = "urn:fuzz:module";
+
+impl xml_sec_xslt::Resolver for InlineXsltModule {
+    fn authorize(&self, access: xml_sec_xslt::ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
+        use xml_sec_xslt::ResourceAccess;
+        let granted = match access {
+            ResourceAccess::Request(request) => request.uri == MODULE_URI,
+            ResourceAccess::Retained { request, identity } => {
+                request.uri == MODULE_URI && identity.0 == MODULE_URI
+            }
+            ResourceAccess::Dependency(identity) => identity.0 == MODULE_URI,
+        };
+        if granted {
+            Ok(())
+        } else {
+            Err(access.denied(xml_sec_xslt::AccessDenialReason::NotGranted))
+        }
+    }
+
+    fn resolve(
+        &self,
+        request: xml_sec_xslt::ResolveRequest<'_>,
+    ) -> xml_sec_xslt::Result<xml_sec_xslt::ResolvedResource> {
+        self.authorize(xml_sec_xslt::ResourceAccess::Request(request))?;
+        // A fresh resolver owns immutable bounded bytes for one campaign input.
+        // Its identity is stable within the compilation and execution, never I/O.
+        Ok(xml_sec_xslt::ResolvedResource {
+            canonical_uri: MODULE_URI.into(),
+            identity: xml_sec_xslt::ResourceIdentity(MODULE_URI.into()),
+            bytes: self.0.clone(),
+            media_type: None,
+            encoding: None,
+        })
+    }
+}
+
 pub fn xml_semantics(data: &[u8]) {
     let data = bounded(data);
     for mode in [
@@ -351,6 +389,44 @@ pub fn xslt_execution(data: &[u8]) {
             }
         }
     }
+    // Permission refusals alone do not exercise module graphs. The only granted
+    // URI returns this input, so mutations can reach cycles, module parsing and
+    // runtime document caching without giving the target ambient I/O authority.
+    let resolver = Arc::new(InlineXsltModule(data.to_vec()));
+    let graph_compiler = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(2 * MAX_INPUT, 4, 32, 1024 * 1024),
+    );
+    for body in [
+        "<xsl:include href='urn:fuzz:module'/>",
+        "<xsl:import href='urn:fuzz:module'/>",
+        "<xsl:template match='/'><xsl:copy-of select=\"document('urn:fuzz:module')\"/></xsl:template>",
+    ] {
+        let text = format!(
+            "<xsl:stylesheet xmlns:xsl='http://www.w3.org/1999/XSL/Transform' version='1.0'>{body}</xsl:stylesheet>"
+        );
+        if let Ok(sheet) = graph_compiler.compile(&text, Some("urn:fuzz:graph")) {
+            let execute = || {
+                sheet
+                    .execute_with_environment(
+                        &source,
+                        &Parameters::default(),
+                        ExecutionEnvironment::new(resolver.clone()),
+                        ExecutionOptions {
+                            budget: ExecutionBudget {
+                                external_documents: 1,
+                                ..budget
+                            },
+                            initial_mode: None,
+                            initial_template: None,
+                        },
+                    )
+                    .map(|result| result.serialized.bytes)
+                    .map_err(|error| error.kind())
+            };
+            assert_eq!(execute(), execute(), "module/document graph replay");
+        }
+    }
 }
 
 pub fn provider_operations(data: &[u8]) {
@@ -569,6 +645,22 @@ pub fn policy_compilation(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_graph_seed_reaches_cycle_detection_without_io() {
+        // The granted in-memory module includes itself. A blanket deny would
+        // return Policy instead of proving the graph's static cycle boundary.
+        let data = include_bytes!("../seeds/xslt-module-cycle.xsl");
+        let resolver = std::sync::Arc::new(InlineXsltModule(data.to_vec()));
+        let error = xml_sec_xslt::Compiler::new(
+            resolver,
+            xml_sec_xslt::CompileBudget::new(16 * 1024, 4, 32, 1024 * 1024),
+        )
+        .compile(std::str::from_utf8(data).unwrap(), Some("urn:fuzz:graph"))
+        .expect_err("self-include is cyclic");
+        assert_eq!(error.kind(), xml_sec_xslt::ErrorKind::Static);
+        xslt_execution(data);
+    }
 
     #[test]
     fn deterministic_oracles_reach_success_and_refusal_paths() {

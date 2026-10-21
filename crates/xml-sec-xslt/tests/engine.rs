@@ -2198,6 +2198,65 @@ fn repeated_decimal_formats_require_identical_effective_values() {
 }
 
 #[test]
+fn conformance_fuzz_seeds_preserve_exact_failure_classes() {
+    // A seed that only fails XML parsing does not exercise the promised runtime
+    // boundary. Check each campaign seed at its actual compile/execute stage.
+    let source = Document::parse("<root><item>payload</item></root>", None).unwrap();
+    for (name, text, expected) in [
+        (
+            "malformed",
+            include_str!("../../../fuzz/seeds/xslt-malformed.xsl"),
+            ErrorKind::Static,
+        ),
+        (
+            "recursion",
+            include_str!("../../../fuzz/seeds/xslt-recursion.xsl"),
+            ErrorKind::Budget,
+        ),
+        (
+            "amplification",
+            include_str!("../../../fuzz/seeds/xslt-amplification.xsl"),
+            ErrorKind::Budget,
+        ),
+        (
+            "sandbox",
+            include_str!("../../../fuzz/seeds/xslt-sandbox.xsl"),
+            ErrorKind::Policy,
+        ),
+        (
+            "serializer",
+            include_str!("../../../fuzz/seeds/xslt-serializer.xsl"),
+            ErrorKind::Serialization,
+        ),
+    ] {
+        let compiler = Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(8192, 0, 64, 1 << 20),
+        );
+        let mut budget = execution_budget(8192);
+        budget.recursion_depth = 32;
+        budget.template_applications = 128;
+        budget.result_nodes = 128;
+        let result = compiler
+            .compile(text, Some("urn:conformance:seed"))
+            .and_then(|sheet| {
+                sheet.execute(
+                    &source,
+                    &Parameters::new(),
+                    Arc::new(NoResolver),
+                    ExecutionOptions {
+                        budget,
+                        initial_mode: None,
+                        initial_template: None,
+                    },
+                )
+            });
+        let error = result.expect_err(name);
+        assert_eq!(error.kind(), expected, "{name}: {error}");
+    }
+}
+
+#[test]
 fn malformed_stylesheet_and_budget_exhaustion_are_typed() {
     // Static and resource failures must remain distinguishable to callers.
     let error = Compiler::new(Arc::new(NoResolver), CompileBudget::new(4096, 0, 64, 4096))

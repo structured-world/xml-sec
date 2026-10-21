@@ -12,5 +12,17 @@ key_formats	tests/fixtures/keys/keys.xml
 key_formats	tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der
 policy_compilation	fuzz/seeds/policy.toml
 xslt_execution	fuzz/seeds/identity.xsl
+xslt_execution	fuzz/seeds/xslt-recursion.xsl
+xslt_execution	fuzz/seeds/xslt-amplification.xsl
+xslt_execution	fuzz/seeds/xslt-sandbox.xsl
+xslt_execution	fuzz/seeds/xslt-serializer.xsl
+xslt_execution	fuzz/seeds/xslt-malformed.xsl
+xslt_execution	fuzz/seeds/xslt-module-cycle.xsl
+transform_parameters	fuzz/seeds/xslt-recursion.xsl
+transform_parameters	fuzz/seeds/xslt-amplification.xsl
+transform_parameters	fuzz/seeds/xslt-sandbox.xsl
+transform_parameters	fuzz/seeds/xslt-serializer.xsl
+transform_parameters	fuzz/seeds/xslt-malformed.xsl
+transform_parameters	fuzz/seeds/xslt-module-cycle.xsl
 provider_operations	fuzz/seeds/payload.txt
 xmlsec_oracle	fuzz/seeds/payload.txt

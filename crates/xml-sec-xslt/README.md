@@ -79,9 +79,9 @@ contract.
 
 The crate exposes policy-neutral compile and execution limits. An embedding security protocol
 must derive those limits, source-processing permission, and extension permission from one compiled
-operation-policy snapshot at its adapter boundary; they are not a second policy domain. The main
-`xml-sec` crate intentionally keeps its XSLT transform adapter disconnected until that typed
-policy, resource-identity, and node-set translation is available.
+operation-policy snapshot at its adapter boundary; they are not a second policy domain. The
+optional `xml-sec` XSLT adapter derives these grants from its immutable operation policy and
+preserves resource and node-set identity through the shared transform pipeline.
 
 ## Compatibility oracle
 
@@ -97,6 +97,14 @@ without granting production code implicit filesystem access.
 `files.sha256` accounts for all 2,021 files in the pinned upstream source tree, so
 the importer and CI detect fixture omissions and byte drift independently of
 engine behavior.
+
+The selected Recommendation corpus consists of all 83 REC/REC2 example invocations
+registered by the pinned donor, including standalone stylesheets. Its inventory
+is checked separately from the other regression suites. This is an explicit
+selection of W3C XSLT 1.0 examples, not a complete W3C certification suite.
+
+The combined engine, XMLDSig, negative-path and reciprocal oracle gate is documented
+in [XSLT conformance](../../docs/xslt-conformance.md).
 
 Refresh or verify the snapshot from a matching donor checkout with:
 

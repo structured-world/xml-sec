@@ -522,6 +522,50 @@ fn executes_every_phaos_signature_through_the_public_pipeline() {
 
 #[cfg(feature = "xslt")]
 #[test]
+fn every_phaos_xslt_reference_chain_executes_with_a_caller_key() {
+    // Certificate-policy refusals must not hide unexecuted XSLT reference
+    // chains. Supplying a known key tests cryptography only; the exhaustive
+    // suite above still tests certificate trust and bad RetrievalMethod input.
+    let key = verification_key();
+    let resources = resources();
+    for backend in xml_sec::XmlBackend::available() {
+        for (name, manifests) in [
+            ("signature-big.xml", 2),
+            ("signature-rsa-detached-xslt-transform.xml", 1),
+            (
+                "signature-rsa-detached-xslt-transform-retrieval-method.xml",
+                1,
+            ),
+        ] {
+            let result = VerifyContext::new()
+                .policy(policy(SignatureAlgorithm::RsaSha1, false))
+                .key(&key)
+                .xml_backend(backend)
+                .process_manifests(true)
+                .store_pre_digest(true)
+                .allowed_uri_types(UriTypeSet::ALL)
+                .external_resources(&resources)
+                .verify(&document(name))
+                .unwrap_or_else(|error| panic!("{backend:?} {name}: {error}"));
+            assert_eq!(result.status, DsigStatus::Valid, "{backend:?} {name}");
+            assert_eq!(result.manifest_references.len(), manifests);
+            for reference in result
+                .signed_info_references
+                .iter()
+                .chain(&result.manifest_references)
+            {
+                assert_eq!(reference.status, DsigStatus::Valid, "{backend:?} {name}");
+                assert!(
+                    reference.pre_digest_data.is_some(),
+                    "digest input was requested"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "xslt")]
+#[test]
 fn specification_stylesheets_keep_the_inherited_namespace() {
     // Read as an element of the signed document, the stylesheet's literal results
     // copy the `dsig` binding of its `<Signature>` ancestor (XSLT 1.0 section 7.1.1),

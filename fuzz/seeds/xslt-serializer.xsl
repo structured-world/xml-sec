@@ -1,0 +1,1 @@
+<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><xsl:output method="text" encoding="US-ASCII"/><xsl:template match="/"><xsl:text>&#x20ac;</xsl:text></xsl:template></xsl:stylesheet>

@@ -9,7 +9,7 @@ security audit or proof that every accepted document is interoperable.
 | `xml_semantics` | Exact C14N bytes for common accepted backend inputs; idempotence; stale identity rejection after mutation |
 | `security_roundtrip` | Real HMAC signing, compiled reference execution, cross-backend verification, wrong-key and authenticated-target tamper rejection; XMLenc round trips and malformed ciphertext parsing |
 | `transform_parameters` | Arbitrary XPath AST/evaluation, Filter 2.0, OPC parameters and binary-to-XML/Base64 transitions; deterministic bytes and refusals |
-| `xslt_execution` | Arbitrary compilation, bounded runtime/serializer execution, replay determinism and admitted work ceilings |
+| `xslt_execution` | Arbitrary compilation, bounded runtime/serializer execution, in-memory include/import/document graphs, replay determinism and admitted work ceilings |
 | `key_formats` | DER private/public keys and XML key stores with bounded KDF work; certificate parsing never establishes trust |
 | `policy_compilation` | Strict configuration, immutable compiler, effective-policy round trip, restrictive composition and unknown-field rejection |
 | `provider_operations` | Incremental digest equivalence, enabled-provider digest agreement, GCM authentication and key-wrap integrity |
@@ -20,6 +20,10 @@ operations useful under mutation. This is a campaign bound, not a product
 limit. The verification target accepts the complete input up to libFuzzer's
 64 KiB campaign limit. Core safety ceilings and typed operation policies remain
 unchanged. No fuzz harness performs implicit network or filesystem resolution.
+The XSLT graph resolver grants only `urn:fuzz:module` with immutable input bytes
+for one invocation; every other URI is a typed policy refusal. The cycle seed
+is independently tested to reach static cycle detection rather than being
+stopped by a blanket resolver denial.
 
 ## Run And Replay
 

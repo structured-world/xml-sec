@@ -352,8 +352,20 @@ jobs:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: scripts/import-libxslt-oracle-fixtures.sh --check
       - uses: Swatinem/rust-cache@v2
-      - name: Run Rust engine against pinned libxslt golden corpus
-        run: cargo nextest run -p xml-sec-xslt --test libxslt_oracle --no-fail-fast
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Check conformance admission and failure propagation
+        run: node --test scripts/check-xslt-conformance.test.mjs
+      - name: Provision pinned XML signature oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
+          bash scripts/install-xmlsec1.sh
+      - name: Qualify XSLT engine, signature chains and failure contracts
+        env:
+          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
+        run: bash scripts/check-xslt-conformance.sh
 
   clippy-matrix:
     name: clippy (${{ matrix.xml-backend }})
