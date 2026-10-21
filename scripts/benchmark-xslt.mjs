@@ -57,7 +57,7 @@ function main() {
   const target = JSON.parse(run('cargo', ['metadata', '--no-deps', '--format-version', '1'])).target_directory;
   checkOutputLocation(output, target);
   mkdirSync(output); // Refuse to overwrite evidence.
-  const files = ['Cargo.toml', 'crates/xml-sec-xslt/Cargo.toml', 'src/xslt/lib.rs', 'src/xslt/runtime.rs', 'benches/support/xslt.rs', 'benchmarks/xslt-latency.rs', 'benchmarks/xslt-alloc.rs', 'benchmarks/xslt-oracle.c', 'scripts/benchmark-xslt.mjs'];
+  const files = ['Cargo.toml', 'crates/xml-sec-xslt/Cargo.toml', 'src/xslt/lib.rs', 'src/xslt/runtime.rs', 'benches/support/xslt.rs', 'benchmarks/xslt-latency.rs', 'benchmarks/xslt-alloc.rs', 'benchmarks/xslt-oracle.c', 'benchmarks/cmake/libxml2/LibXml2Config.cmake', 'scripts/benchmark-xslt.mjs'];
   const fingerprint = () => files.map(path => [path, createHash('sha256').update(readFileSync(path)).digest('hex')]);
   const before = fingerprint();
   const diff = run('git', ['diff', '--binary', 'HEAD']);
@@ -71,6 +71,7 @@ function main() {
   const nativeBuild = join(output, 'native-build');
   const nativePrefix = join(output, 'native');
   run('cmake', ['-S', nativeSource, '-B', nativeBuild, '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_INSTALL_PREFIX=' + nativePrefix,
+    '-DLibXml2_DIR=' + resolve('benchmarks/cmake/libxml2'),
     '-DBUILD_SHARED_LIBS=OFF', '-DCMAKE_INSTALL_LIBDIR=lib', '-DLIBXSLT_WITH_PYTHON=OFF', '-DLIBXSLT_WITH_TESTS=OFF', '-DLIBXSLT_WITH_PROGRAMS=OFF']);
   run('cmake', ['--build', nativeBuild, '--parallel', '2']);
   run('cmake', ['--install', nativeBuild]);

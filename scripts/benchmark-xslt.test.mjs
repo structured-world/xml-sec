@@ -4,6 +4,20 @@ import { summary, validate, resources, checkOutputLocation } from './benchmark-x
 import { mkdtempSync, mkdirSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+
+test('native oracle configures with pkg-config libxml2 without a vendor CMake config', t => {
+  // Ubuntu libxml2-dev supplies pkg-config metadata, not LibXml2Config.cmake.
+  const source = process.env.LIBXSLT_SOURCE_DIR;
+  if (!source) return t.skip('requires the pinned LIBXSLT_SOURCE_DIR');
+  const build = mkdtempSync(join(tmpdir(), 'xml-sec-xslt-cmake-'));
+  t.after(() => rmSync(build, { recursive: true, force: true }));
+  const result = spawnSync('cmake', ['-S', source, '-B', build,
+    '-DLibXml2_DIR=' + join(process.cwd(), 'benchmarks/cmake/libxml2'),
+    '-DLIBXSLT_WITH_PYTHON=OFF', '-DLIBXSLT_WITH_TESTS=OFF', '-DLIBXSLT_WITH_PROGRAMS=OFF'],
+  { encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
 
 test('an output symlink alias cannot put evidence inside the cleaned target', t => {
   // A lexical path check loses evidence when an existing parent aliases target.

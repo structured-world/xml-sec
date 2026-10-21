@@ -367,7 +367,10 @@ jobs:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: bash scripts/check-xslt-conformance.sh
       - name: Check XSLT phase and concurrent reuse contracts
+        env:
+          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: |
+          sudo apt-get install --yes valgrind cmake zlib1g-dev liblzma-dev
           node --test scripts/benchmark-xslt.test.mjs
           cargo nextest run -p xml-sec-xslt --all-features --test phase_contract
           cargo clean
@@ -376,7 +379,6 @@ jobs:
           XSLT_BENCH_HEAP: '1'
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: |
-          sudo apt-get install --yes valgrind cmake
           node scripts/benchmark-xslt.mjs "$RUNNER_TEMP/xslt-performance" 1
       - uses: actions/upload-artifact@v7
         if: always()
