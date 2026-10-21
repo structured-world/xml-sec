@@ -1,0 +1,16 @@
+# target<TAB>repository-owned or provenance-tracked seed path
+xmldsig_verify	fuzz/corpus/xmldsig_verify/signature.xml
+xmldsig_verify	tests/fixtures/saml/response_signed_by_idp_ecdsa.xml
+xml_semantics	tests/fixtures/c14n/c14n11/xml-base-input.xml
+xml_semantics	tests/fixtures/c14n/merlin-exc-c14n-one/exc-signature.xml
+security_roundtrip	fuzz/seeds/payload.txt
+transform_parameters	fuzz/seeds/xpath.txt
+transform_parameters	fuzz/seeds/relationships.xml
+transform_parameters	fuzz/seeds/identity.xsl
+transform_parameters	fuzz/seeds/base64.txt
+key_formats	tests/fixtures/keys/keys.xml
+key_formats	tests/fixtures/xmlenc/keys/xdh/xdh-x25519-first-pubkey.der
+policy_compilation	fuzz/seeds/policy.toml
+xslt_execution	fuzz/seeds/identity.xsl
+provider_operations	fuzz/seeds/payload.txt
+xmlsec_oracle	fuzz/seeds/payload.txt

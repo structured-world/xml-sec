@@ -9,7 +9,69 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
-xml-sec = { path = "..", default-features = false, features = ["xmldsig", "xml-backend-differential"] }
+xml-sec = { path = "..", default-features = false, features = ["xmlenc", "xslt", "xml-backends-all"] }
+xml-sec-config = { path = "../crates/xml-sec-config" }
+xml-sec-xslt = { path = "../crates/xml-sec-xslt" }
+tempfile = "3"
+
+[features]
+aws-lc-fips = ["xml-sec/aws-lc-fips"]
+
+[[bin]]
+name = "xmlsec_oracle"
+path = "fuzz_targets/xmlsec_oracle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xslt_execution"
+path = "fuzz_targets/xslt_execution.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "provider_operations"
+path = "fuzz_targets/provider_operations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_semantics"
+path = "fuzz_targets/xml_semantics.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "security_roundtrip"
+path = "fuzz_targets/security_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "transform_parameters"
+path = "fuzz_targets/transform_parameters.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_formats"
+path = "fuzz_targets/key_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "policy_compilation"
+path = "fuzz_targets/policy_compilation.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "xmldsig_verify"

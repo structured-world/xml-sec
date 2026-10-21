@@ -1,0 +1,1 @@
+not(ancestor-or-self::Signature)

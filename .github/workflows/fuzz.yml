@@ -1,0 +1,129 @@
+name: Security fuzzing
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 3 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.92.0'
+          components: clippy
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - name: Check corpus admission, failure propagation and replay
+        run: node --test scripts/fuzz-security.test.mjs
+      - name: Lint every target
+        run: |
+          cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo clean --manifest-path fuzz/Cargo.toml
+      - name: Check executable invariant oracles
+        run: |
+          cargo nextest run --manifest-path fuzz/Cargo.toml --lib
+          cargo clean --manifest-path fuzz/Cargo.toml
+
+  mutation:
+    name: fuzz (${{ matrix.target }}${{ matrix.fips && ', FIPS' || '' }})
+    runs-on: ubuntu-latest
+    needs: harness
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [xmldsig_verify, xml_semantics, security_roundtrip, transform_parameters, xslt_execution, key_formats, policy_compilation, provider_operations]
+        fips: [false]
+        include:
+          - target: provider_operations
+            fips: true
+          - target: xmlsec_oracle
+            fips: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - name: Provision independent signature oracle
+        if: matrix.target == 'xmlsec_oracle'
+        env:
+          XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-fuzz-oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
+          bash scripts/install-xmlsec1.sh
+          {
+            echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
+            echo "LD_LIBRARY_PATH=$XMLSEC1_PREFIX/lib"
+          } >> "$GITHUB_ENV"
+      - name: Restore evolving coverage corpus
+        uses: actions/cache@v6
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ matrix.fips }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            fuzz-corpus-${{ runner.os }}-${{ matrix.target }}-${{ matrix.fips }}-
+      - name: Mutate and replay selected seeds
+        env:
+          FUZZ_AWS_LC_FIPS: ${{ matrix.fips && '1' || '0' }}
+          FUZZ_OUTPUT: ${{ runner.temp }}/fuzz-evidence
+          TARGET: ${{ matrix.target }}
+          MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'campaign' || 'smoke' }}
+        run: bash scripts/fuzz-security.sh "$TARGET" "$MODE"
+      - name: Preserve reproducers, commands and coverage corpus
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-${{ matrix.fips }}
+          path: |
+            ${{ runner.temp }}/fuzz-evidence
+            fuzz/artifacts/${{ matrix.target }}
+            fuzz/corpus/${{ matrix.target }}
+          if-no-files-found: error
+
+  differential:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    name: continuous oracle / provider / backend gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.92.0'
+      - uses: taiki-e/install-action@nextest
+      - name: Provision pinned independent oracle and isolated token
+        env:
+          XMLSEC1_MODERN_ORACLE: '1'
+          XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-fuzz-oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2
+          bash scripts/install-xmlsec1.sh
+          {
+            echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
+            echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl"
+            echo "LD_LIBRARY_PATH=$XMLSEC1_PREFIX/lib"
+          } >> "$GITHUB_ENV"
+      - name: Exercise reciprocal signatures, encryption, transforms and every provider
+        run: |
+          bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --workspace --all-features
+          cargo clean
+      - name: Exercise XSLT-enabled backend and oracle paths
+        run: |
+          cargo nextest run --workspace --features xslt,xml-backends-all
+          cargo clean

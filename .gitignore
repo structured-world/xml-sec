@@ -1,6 +1,7 @@
 /target
 /.tools
 /fuzz/artifacts
+/fuzz/evidence
 /fuzz/corpus/*/*
 !/fuzz/corpus/xmldsig_verify/signature.xml
 /fuzz/target
