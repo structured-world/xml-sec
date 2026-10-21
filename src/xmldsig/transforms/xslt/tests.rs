@@ -9,6 +9,33 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn detached_input_retains_its_entity_declaration_base() {
+    // XSLT 1.0 sections 3.3 and 12.4 resolve an NDATA system identifier
+    // against the resource containing its declaration, not the Signature.
+    let signature = Document::parse("<Signature/>").expect("signature document");
+    let uri = "https://example.org/resources/input.xml";
+    let resources = std::collections::HashMap::from([(
+        uri.to_owned(),
+        br#"<!DOCTYPE root [<!NOTATION image SYSTEM "image"><!ENTITY logo SYSTEM "images/logo.png" NDATA image>]><root/>"#.to_vec(),
+    )]);
+    let resolver = crate::xmldsig::uri::UriReferenceResolver::new(&signature)
+        .with_external_resources(&resources);
+    let sheet = stylesheet(
+        r#"<xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="unparsed-entity-uri('logo')"/></xsl:template>"#,
+    );
+    let initial = resolver.dereference(uri).expect("caller-supplied resource");
+    let output = execute_transforms_with_options_and_budget(
+        signature.root_element(),
+        initial,
+        &[Transform::Xslt(sheet)],
+        TransformOptions::default().allow_internal_dtd(true),
+        &TransformExecutionBudget::default(),
+    )
+    .expect("detached XML XSLT");
+    assert_eq!(output, b"https://example.org/resources/images/logo.png");
+}
+
+#[test]
 fn namespace_prefix_growth_admits_both_blocks() {
     // Prefix metadata must remain inside the same workspace during realloc,
     // with no change to capacity or contents after a refused replacement.
@@ -254,6 +281,7 @@ fn implicit_c14n_input_stays_in_the_xslt_workspace() {
         parameter,
         &collected,
         collected.capacity(),
+        None,
         crate::policy::XsltStylesheetSemantics::Specification,
         false,
         &budget,
@@ -331,6 +359,7 @@ fn replay_output_copy_obeys_xslt_workspace_peak() {
             super::XsltParameter::Stylesheet(&sheet),
             b"<doc/>",
             0,
+            None,
             crate::policy::XsltStylesheetSemantics::Specification,
             false,
             &budget,
@@ -420,6 +449,7 @@ fn in_place_stylesheet_preserves_document_siblings() {
             super::XsltParameter::Transform(document.root_element()),
             b"<doc/>",
             0,
+            None,
             semantics,
             false,
             &budget,
@@ -599,11 +629,12 @@ fn stylesheet_growth_admits_old_and_new_blocks() {
 #[test]
 fn every_parser_pass_is_charged_to_the_operation() {
     // The stylesheet is preflighted, then read by three compiler passes; the input is
-    // decoded, preflighted and scanned once. Charging each text once per operation let a
-    // caller-selected parse-work limit be exceeded several times over.
+    // decoded, preflighted and scanned once. Its text additionally pays for
+    // line-ending normalization and copying into the retained tree.
     let stylesheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
     let input = b"<doc><item>a</item></doc>";
-    let charged = 4 * stylesheet.source().len() + 3 * input.len();
+    let text = b"a";
+    let charged = 4 * stylesheet.source().len() + 3 * input.len() + 2 * text.len();
     let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
     run(&budget, &stylesheet, input).expect("transform succeeds");
     assert_eq!(budget.xml_parse_work().consumed(), charged);
@@ -806,6 +837,7 @@ fn query_run_with(
         parameter,
         input,
         0,
+        None,
         crate::policy::XsltStylesheetSemantics::Specification,
         false,
         &budget,
@@ -1006,6 +1038,7 @@ fn entity_preflight_stops_at_the_current_query_remainder() {
         super::XsltParameter::Stylesheet(&sheet),
         input.as_bytes(),
         0,
+        None,
         crate::policy::XsltStylesheetSemantics::Specification,
         true,
         &budget,
@@ -1067,6 +1100,7 @@ fn inherited_xml_space_preserves_stylesheet_whitespace() {
             super::XsltParameter::Transform(transform),
             b"<doc/>",
             0,
+            None,
             semantics,
             false,
             &budget,

@@ -20,6 +20,32 @@ fn external_policy() -> DecryptionPolicy {
 
 #[cfg(feature = "xslt")]
 #[test]
+fn cipher_reference_xslt_retains_the_detached_entity_base() {
+    // XMLEnc's transform adapter must preserve the same resource identity as
+    // XMLDSig, including NDATA identifiers relative to the containing DTD.
+    let resources = HashMap::from([(
+        "https://example.org/data/input.xml".to_owned(),
+        br#"<!DOCTYPE root [<!NOTATION image SYSTEM "image"><!ENTITY logo SYSTEM "images/logo.png" NDATA image>]><root/>"#.to_vec(),
+    )]);
+    let xml = format!(
+        r#"<xenc:CipherReference xmlns:xenc="{ENC}" URI="input.xml" xml:base="https://example.org/data/"><xenc:Transforms><ds:Transform xmlns:ds="{DS}" Algorithm="http://www.w3.org/TR/1999/REC-xslt-19991116"><xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="unparsed-entity-uri('logo')"/></xsl:template></xsl:stylesheet></ds:Transform></xenc:Transforms></xenc:CipherReference>"#
+    );
+    let mut policy = external_policy();
+    policy.xml.allow_internal_dtd = true;
+    for backend in xml_sec::XmlBackend::available() {
+        let document = xml_sec::Document::parse_with_backend(&xml, backend).unwrap();
+        let context =
+            xml_sec::xmlenc::CipherReferenceContext::new(&policy, Some(&resources), backend, &[])
+                .unwrap();
+        assert_eq!(
+            context.resolve(document.root_element()).unwrap(),
+            b"https://example.org/data/images/logo.png"
+        );
+    }
+}
+
+#[cfg(feature = "xslt")]
+#[test]
 fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
     // Capturing and executing the same stylesheet must consume one operation
     // allowance, whether resolving a reference directly or decrypting its owner.

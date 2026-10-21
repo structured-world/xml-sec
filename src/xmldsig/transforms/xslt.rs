@@ -1405,6 +1405,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     parameter: XsltParameter<'_>,
     input: &[u8],
     input_storage: usize,
+    input_base_uri: Option<&str>,
     semantics: XsltStylesheetSemantics,
     allow_dtd: bool,
     budget: &TransformExecutionBudget,
@@ -1557,7 +1558,10 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let source = charge_parse_work(
         Document::parse_with_budget_reported(
             xml.as_ref(),
-            None,
+            // XSLT 1.0 sections 3.3 and 12.4 require relative NDATA system IDs
+            // to resolve against the resource containing their declaration.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#unparsed-entities
+            input_base_uri,
             ParseBudget::new(
                 allowance.max_document_bytes,
                 allowance.max_nodes,

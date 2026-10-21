@@ -929,6 +929,7 @@ fn apply_transform_with_context<
                 ExecutionData::NativeBinary(bytes) => (bytes, bytes.capacity()),
                 ExecutionData::Accounted(bytes) => (bytes, bytes.capacity()),
                 ExecutionData::BorrowedBinary(bytes) => (bytes, 0),
+                ExecutionData::Resource { bytes, .. } => (bytes, 0),
                 ExecutionData::Nodes(nodes) => {
                     // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
                     // node-set input with inclusive C14N 1.0 first.
@@ -949,6 +950,10 @@ fn apply_transform_with_context<
                 stylesheet,
                 bytes,
                 input_storage,
+                match &input {
+                    ExecutionData::Resource { uri, .. } => Some(*uri),
+                    _ => None,
+                },
                 options.xslt_stylesheet_semantics,
                 options.internal_dtd_allowed(),
                 budget,
@@ -1229,7 +1234,9 @@ pub fn execute_transforms_with_policy<'a>(
     validate_transform_policy(
         matches!(
             &initial_data,
-            TransformData::Binary(_) | TransformData::BorrowedBinary(_)
+            TransformData::Binary(_)
+                | TransformData::BorrowedBinary(_)
+                | TransformData::Resource { .. }
         ),
         transforms,
         policy.transforms.allowed_algorithms.as_ref(),
@@ -1349,7 +1356,9 @@ where
             &budget.node_set_materialization,
             scratch.node_keys(),
         )?),
-        super::uri::ReferenceInput::Binary(bytes) => ExecutionData::BorrowedBinary(bytes),
+        super::uri::ReferenceInput::Binary { bytes, uri } => {
+            ExecutionData::from_resource(bytes, uri)
+        }
     };
     let context = TransformExecutionContext {
         scratch: &scratch,
@@ -1615,6 +1624,11 @@ pub(crate) enum ExecutionData<'a, S: TransformScratch, D: DomStorage = NativeDom
     Nodes(Projection<'a, S::NodeKeys, D>),
     NativeBinary(Vec<u8>),
     BorrowedBinary(&'a [u8]),
+    #[cfg(feature = "xslt")]
+    Resource {
+        bytes: &'a [u8],
+        uri: &'a str,
+    },
     Accounted(S::Bytes),
 }
 
@@ -1624,11 +1638,21 @@ impl<'a> From<TransformData<'a>> for ExecutionData<'a, Native> {
             TransformData::NodeSet(nodes) => Self::Nodes(nodes.projection),
             TransformData::Binary(bytes) => Self::NativeBinary(bytes),
             TransformData::BorrowedBinary(bytes) => Self::BorrowedBinary(bytes),
+            TransformData::Resource { bytes, uri } => Self::from_resource(bytes, uri),
         }
     }
 }
 
 impl<'a, S: TransformScratch, D: DomStorage> ExecutionData<'a, S, D> {
+    #[cfg(feature = "xslt")]
+    fn from_resource(bytes: &'a [u8], uri: &'a str) -> Self {
+        Self::Resource { bytes, uri }
+    }
+    #[cfg(not(feature = "xslt"))]
+    fn from_resource(bytes: &'a [u8], _: &'a str) -> Self {
+        // No enabled transform consumes the document-entity URI.
+        Self::BorrowedBinary(bytes)
+    }
     pub(crate) fn nodes(&self) -> Option<&Projection<'a, S::NodeKeys, D>> {
         match self {
             Self::Nodes(nodes) => Some(nodes),
@@ -1639,6 +1663,8 @@ impl<'a, S: TransformScratch, D: DomStorage> ExecutionData<'a, S, D> {
         match self {
             Self::NativeBinary(bytes) => Some(bytes),
             Self::BorrowedBinary(bytes) => Some(bytes),
+            #[cfg(feature = "xslt")]
+            Self::Resource { bytes, .. } => Some(bytes),
             Self::Accounted(bytes) => Some(bytes),
             Self::Nodes(_) => None,
         }
@@ -1678,6 +1704,8 @@ impl TransformTerminal<Native> for CollectTerminal {
         match data {
             ExecutionData::NativeBinary(bytes) | ExecutionData::Accounted(bytes) => Ok(bytes),
             ExecutionData::BorrowedBinary(bytes) => Ok(bytes.to_vec()),
+            #[cfg(feature = "xslt")]
+            ExecutionData::Resource { bytes, .. } => Ok(bytes.to_vec()),
             ExecutionData::Nodes(nodes) => {
                 let algorithm =
                     C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant C14N URI");
@@ -1931,6 +1959,8 @@ impl<'a> ExecutionData<'a, Native> {
             Self::Nodes(projection) => TransformData::NodeSet(super::types::NodeSet { projection }),
             Self::NativeBinary(bytes) | Self::Accounted(bytes) => TransformData::Binary(bytes),
             Self::BorrowedBinary(bytes) => TransformData::BorrowedBinary(bytes),
+            #[cfg(feature = "xslt")]
+            Self::Resource { bytes, uri } => TransformData::Resource { bytes, uri },
         }
     }
 }
@@ -1985,7 +2015,9 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
         if let Some(node) = signature_node.document().get_node(node_id) {
             let belongs_to_input = match &initial_data {
                 TransformData::NodeSet(nodes) => nodes.contains(node),
-                TransformData::Binary(_) | TransformData::BorrowedBinary(_) => false,
+                TransformData::Binary(_)
+                | TransformData::BorrowedBinary(_)
+                | TransformData::Resource { .. } => false,
             };
             if belongs_to_input {
                 active_nodes.push(TrackedDependencyNode {
@@ -2441,9 +2473,7 @@ where
                 }
                 tracking.active_nodes = active_nodes;
             }
-            ExecutionData::NativeBinary(_)
-            | ExecutionData::BorrowedBinary(_)
-            | ExecutionData::Accounted(_) => {
+            _ => {
                 tracking
                     .opaque_dependencies
                     .extend(tracking.active_nodes.drain(..).map(|tracked| tracked.index));

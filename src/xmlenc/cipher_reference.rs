@@ -415,7 +415,7 @@ impl<'a> CipherReferenceContext<'a> {
         };
         let mut action = || {
             let input = match external {
-                Some(bytes) => crate::xmldsig::TransformData::Binary(bytes.to_vec()),
+                Some(bytes) => crate::xmldsig::TransformData::Resource { bytes, uri },
                 None => resolver
                     .dereference_with_budget(uri, self.transforms.node_set_materialization())?,
             };

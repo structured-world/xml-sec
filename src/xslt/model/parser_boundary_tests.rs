@@ -891,7 +891,7 @@ fn unused_entity_definitions_reject_invalid_grammar() {
         assert!(
             super::collect_internal_entity_declarations(
                 declaration,
-                &EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
+                &mut EntityExpansionMeter::new(ENTITY_EXPANSION_BYTE_CEILING),
             )
             .is_err(),
             "preprocessor accepted {declaration}"
@@ -1174,15 +1174,15 @@ fn predefined_entity_redeclarations_preserve_xml_builtins() {
 fn predefined_amp_and_lt_require_double_escaped_declarations() {
     // XML 1.0 requires the replacement text for amp and lt to remain a character reference
     // after the declaration's first entity-replacement pass.
-    assert!(normalize_predefined_entity_declaration("amp", "&#38;".into()).is_err());
-    assert!(normalize_predefined_entity_declaration("lt", "&#60;".into()).is_err());
+    assert!(normalize_predefined_entity_declaration("amp", "&#38;").is_err());
+    assert!(normalize_predefined_entity_declaration("lt", "&#60;").is_err());
     assert_eq!(
-        normalize_predefined_entity_declaration("amp", "&#38;#38;".into())
+        normalize_predefined_entity_declaration("amp", "&#38;#38;")
             .expect("normative amp declaration"),
         "&#38;"
     );
     assert_eq!(
-        normalize_predefined_entity_declaration("lt", "&#38;#60;".into())
+        normalize_predefined_entity_declaration("lt", "&#38;#60;")
             .expect("normative lt declaration"),
         "&#60;"
     );

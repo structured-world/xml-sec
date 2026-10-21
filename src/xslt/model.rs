@@ -683,6 +683,16 @@ impl Document {
 
         ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
         ensure(BudgetKind::SourceNodes, budget.source_nodes, 1)?;
+        let initial_owned = std::mem::size_of::<Node>()
+            .checked_add(std::mem::size_of::<NodeId>())
+            .and_then(|bytes| bytes.checked_add(base_uri.map_or(0, str::len)))
+            .ok_or(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: budget.owned_bytes,
+                actual: usize::MAX,
+            })?;
+        ensure(BudgetKind::OwnedBytes, budget.owned_bytes, initial_owned)?;
+        work.charge(base_uri.map_or(0, str::len))?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
         document.source_bytes = xml.len();
         let mut meter = StreamParseMeter {
@@ -691,7 +701,7 @@ impl Document {
             entity_references: 0,
             entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
             namespace_scope_bytes: 0,
-            owned_bytes: 0,
+            owned_bytes: initial_owned,
         };
         // Entity declarations and their expansion each take a pass over the
         // document only when an internal subset can declare entities.
@@ -700,7 +710,8 @@ impl Document {
             work.charge(xml.len())?;
         }
         meter.entity_expansion.parse_work = Some(work);
-        let (parameter_expanded_xml, declarations) = internal_general_entities(
+        meter.entity_expansion.workspace = budget.owned_bytes - initial_owned;
+        let (parameter_expanded_xml, mut declarations) = internal_general_entities(
             xml,
             &mut meter.entity_references,
             &mut meter.entity_expansion,
@@ -716,6 +727,7 @@ impl Document {
             &mut meter.entity_references,
             &mut meter.entity_expansion,
         )?;
+        meter.entity_expansion.workspace = budget.owned_bytes;
         meter
             .entity_expansion
             .charge_parse_work(expanded_xml.len())?;
@@ -746,7 +758,8 @@ impl Document {
             lexical_held.set(
                 meter
                     .retained_bytes()
-                    .saturating_add(meter.entity_expansion.used),
+                    .saturating_add(meter.entity_expansion.used)
+                    .saturating_add(meter.entity_expansion.declaration_bytes),
             );
             let Some(event) = reader.next_event().map_err(|error| match error {
                 xml_sec_xml_input::lexical::Error::Resource(error) => error,
@@ -830,16 +843,19 @@ impl Document {
                     }
                 }
                 Event::Text { text, .. } => {
-                    let value = normalize_xml_line_endings(text);
-                    if elements.len() == 1
-                        && !value.trim_matches([' ', '\t', '\r', '\n']).is_empty()
+                    if elements.len() == 1 && !text.trim_matches([' ', '\t', '\r', '\n']).is_empty()
                     {
                         return Err(Error::Xml(
                             "non-whitespace text outside the document element".into(),
                         ));
                     }
-                    if elements.len() > 1 && !value.is_empty() {
-                        let id = push_parsed_text(&mut document, &elements, value, &mut meter)?;
+                    if elements.len() > 1 && !text.is_empty() {
+                        let id = push_parsed_text(
+                            &mut document,
+                            &elements,
+                            ParsedText::Source(text),
+                            &mut meter,
+                        )?;
                         document.nodes[id.0].source_line.get_or_insert(source_line);
                     } else if phase == DocumentPhase::Start {
                         phase = DocumentPhase::Prolog;
@@ -854,7 +870,7 @@ impl Document {
                     let id = push_parsed_text(
                         &mut document,
                         &elements,
-                        normalize_xml_line_endings(text),
+                        ParsedText::Source(text),
                         &mut meter,
                     )?;
                     document.nodes[id.0].source_line.get_or_insert(source_line);
@@ -867,13 +883,13 @@ impl Document {
                         .last()
                         .expect("document frame remains present")
                         .node;
-                    let inherited_base =
-                        document.node(parent).and_then(|node| node.base_uri.clone());
                     meter.reserve_node()?;
+                    let value = copy_parsed_text(ParsedText::Source(text), &mut meter)?;
+                    let inherited_base = copy_base_uri(&document, parent, &mut meter)?;
                     let id = push_metered(
                         &mut document,
                         parent,
-                        NodeKind::Comment(normalize_xml_line_endings(text)),
+                        NodeKind::Comment(value),
                         inherited_base,
                         &mut meter,
                     )?;
@@ -889,16 +905,16 @@ impl Document {
                         .last()
                         .expect("document frame remains present")
                         .node;
-                    let inherited_base =
-                        document.node(parent).and_then(|node| node.base_uri.clone());
                     meter.reserve_node()?;
+                    let target = copy_parsed_literal(target, &mut meter)?;
+                    let value = content
+                        .map(|text| copy_parsed_text(ParsedText::Source(text), &mut meter))
+                        .transpose()?;
+                    let inherited_base = copy_base_uri(&document, parent, &mut meter)?;
                     let id = push_metered(
                         &mut document,
                         parent,
-                        NodeKind::ProcessingInstruction {
-                            target: target.to_owned(),
-                            value: content.map(normalize_xml_line_endings),
-                        },
+                        NodeKind::ProcessingInstruction { target, value },
                         inherited_base,
                         &mut meter,
                     )?;
@@ -914,16 +930,15 @@ impl Document {
                         ));
                     }
                     let value = match reference {
-                        "amp" => "&".into(),
-                        "apos" => "'".into(),
-                        "gt" => ">".into(),
-                        "lt" => "<".into(),
-                        "quot" => "\"".into(),
+                        "amp" => '&',
+                        "apos" => '\'',
+                        "gt" => '>',
+                        "lt" => '<',
+                        "quot" => '"',
                         value if value.starts_with('#') => {
                             xml_sec_xml_input::lexical::decode_numeric_character_reference(
                                 &value[1..],
                             )
-                            .map(String::from)
                             .map_err(|_| Error::Xml("invalid character reference".into()))?
                         }
                         name => {
@@ -932,7 +947,12 @@ impl Document {
                             )));
                         }
                     };
-                    let id = push_parsed_text(&mut document, &elements, value, &mut meter)?;
+                    let id = push_parsed_text(
+                        &mut document,
+                        &elements,
+                        ParsedText::Reference(value),
+                        &mut meter,
+                    )?;
                     document.nodes[id.0].source_line.get_or_insert(source_line);
                 }
                 Event::Declaration { .. } => {
@@ -965,17 +985,30 @@ impl Document {
         }
         let stack_bytes = elements.capacity() * std::mem::size_of::<StreamElementFrame>();
         drop(elements);
+        drop(reader);
+        drop(expanded_xml);
         meter.release_owned(stack_bytes);
-        for (name, system_identifier) in declarations.unparsed {
+        let unparsed = std::mem::take(&mut declarations.unparsed);
+        for (name, system_identifier) in unparsed {
             let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
+            // Transfer the name's existing admission rather than charging its allocation twice.
+            let name_bytes = name.capacity();
+            meter.entity_expansion.release_declarations(name_bytes);
+            declarations.owned_bytes -= name_bytes;
+            meter.charge_owned(name_bytes)?;
             // Names are unique in `declarations`, so every entry is kept.
-            reserve_index_entry(
-                &mut document.unparsed_entities,
-                name.capacity() + uri.capacity(),
-                &mut meter,
-            )?;
+            reserve_index_entry(&mut document.unparsed_entities, uri.capacity(), &mut meter)?;
             document.register_unparsed_entity(name, uri)?;
+            let released = system_identifier.capacity();
+            drop(system_identifier);
+            meter.entity_expansion.release_declarations(released);
+            declarations.owned_bytes -= released;
         }
+        let declaration_bytes = declarations.owned_bytes;
+        drop(declarations);
+        meter
+            .entity_expansion
+            .release_declarations(declaration_bytes);
         document.register_xml_ids(Some(&mut meter))?;
         document.retained_bytes = meter.retained_bytes();
         Ok(document)
@@ -983,6 +1016,8 @@ impl Document {
 
     #[must_use]
     pub fn empty(base_uri: Option<String>) -> Self {
+        #[cfg(test)]
+        expansion_workspace_tests::CREATED_ROOTS.with(|count| count.set(count.get() + 1));
         static NEXT_DOCUMENT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         let identity = NEXT_DOCUMENT_IDENTITY.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -1980,6 +2015,8 @@ pub(crate) fn prepare_xml_frontend_bounded<'a>(
         usize::MAX,
         recursion_depth.min(ENTITY_EXPANSION_DEPTH_CEILING),
     );
+    entity_expansion.workspace = limit;
+    entity_expansion.workspace_maximum = limit;
     // Without an internal subset there are no declarations to read or expand.
     let subset = doctype_span(xml)?.is_some_and(|doctype| doctype.internal_subset.is_some());
     if subset {
@@ -2156,23 +2193,103 @@ fn push_escaped_xml_attribute_value(output: &mut String, value: &str) {
     }
 }
 
-fn normalize_xml_line_endings(value: &str) -> String {
-    if !value.contains('\r') {
-        return value.to_owned();
-    }
-    let mut output = String::with_capacity(value.len());
-    let mut characters = value.chars().peekable();
-    while let Some(character) = characters.next() {
-        if character == '\r' {
-            if characters.peek() == Some(&'\n') {
-                characters.next();
-            }
-            output.push('\n');
-        } else {
-            output.push(character);
+/// XML 1.0 section 2.11 normalizes source CR/CRLF before parsing; character
+/// references are processed later and must retain a referenced CR (section 4.5).
+/// <https://www.w3.org/TR/2008/REC-xml-20081126/#sec-line-ends>
+fn append_normalized_xml_line_endings(output: &mut String, mut value: &str) {
+    #[cfg(test)]
+    expansion_workspace_tests::NORMALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + value.len()));
+    while let Some(index) = value.find('\r') {
+        output.push_str(&value[..index]);
+        output.push('\n');
+        value = &value[index + 1..];
+        if value.starts_with('\n') {
+            value = &value[1..];
         }
     }
-    output
+    output.push_str(value);
+}
+
+#[derive(Clone, Copy)]
+enum ParsedText<'a> {
+    Source(&'a str),
+    Reference(char),
+}
+
+impl ParsedText<'_> {
+    fn maximum_bytes(self) -> usize {
+        match self {
+            Self::Source(text) => text.len(),
+            Self::Reference(character) => character.len_utf8(),
+        }
+    }
+    fn append(self, output: &mut String, meter: &mut StreamParseMeter) -> Result<()> {
+        // A source pass and its copy are admitted before either runs.
+        meter
+            .entity_expansion
+            .charge_parse_work(2 * self.maximum_bytes())?;
+        match self {
+            Self::Source(text) => append_normalized_xml_line_endings(output, text),
+            Self::Reference(character) => output.push(character),
+        }
+        Ok(())
+    }
+}
+
+fn reserve_parsed_string(
+    value: &mut String,
+    additional: usize,
+    meter: &mut StreamParseMeter,
+) -> Result<()> {
+    let limit = meter.budget.owned_bytes;
+    let refused = || Error::Budget {
+        kind: BudgetKind::OwnedBytes,
+        limit,
+        actual: usize::MAX,
+    };
+    let required = value.len().checked_add(additional).ok_or_else(refused)?;
+    let old = value.capacity();
+    if required <= old {
+        return Ok(());
+    }
+    // Geometric growth avoids one realloc per character reference. The old
+    // allocation remains admitted until the replacement and copy complete.
+    let target = required.max(2 * old);
+    meter.charge_owned(target)?;
+    meter.entity_expansion.charge_parse_work(value.len())?;
+    value
+        .try_reserve_exact(target - value.len())
+        .map_err(|_| refused())?;
+    meter.charge_owned(value.capacity() - target)?;
+    meter.release_owned(old);
+    Ok(())
+}
+
+fn copy_parsed_text(value: ParsedText<'_>, meter: &mut StreamParseMeter) -> Result<String> {
+    let mut output = String::new();
+    reserve_parsed_string(&mut output, value.maximum_bytes(), meter)?;
+    value.append(&mut output, meter)?;
+    Ok(output)
+}
+
+fn copy_parsed_literal(value: &str, meter: &mut StreamParseMeter) -> Result<String> {
+    let mut output = String::new();
+    reserve_parsed_string(&mut output, value.len(), meter)?;
+    meter.entity_expansion.charge_parse_work(value.len())?;
+    output.push_str(value);
+    Ok(output)
+}
+
+fn copy_base_uri(
+    document: &Document,
+    parent: NodeId,
+    meter: &mut StreamParseMeter,
+) -> Result<Option<String>> {
+    document
+        .node(parent)
+        .and_then(|node| node.base_uri.as_deref())
+        .map(|uri| copy_parsed_literal(uri, meter))
+        .transpose()
 }
 
 fn normalize_xml_attribute_value(value: Cow<'_, str>) -> Cow<'_, str> {
@@ -2222,6 +2339,7 @@ impl StreamParseMeter<'_> {
         let actual = owned
             .checked_add(self.namespace_scope_bytes)
             .and_then(|actual| actual.checked_add(self.entity_expansion.used))
+            .and_then(|actual| actual.checked_add(self.entity_expansion.declaration_bytes))
             .ok_or_else(refused)?;
         ensure(BudgetKind::OwnedBytes, self.budget.owned_bytes, actual)?;
         self.owned_bytes = owned;
@@ -2258,7 +2376,71 @@ impl StreamParseMeter<'_> {
     }
 }
 
-/// Append a parsed node after charging every byte it adds to the tree.
+trait ParseAllocationBudget {
+    fn owned_limit(&self) -> usize;
+    fn charge_owned(&mut self, bytes: usize) -> Result<()>;
+    fn release_owned(&mut self, bytes: usize);
+}
+
+impl ParseAllocationBudget for StreamParseMeter<'_> {
+    fn owned_limit(&self) -> usize {
+        self.budget.owned_bytes
+    }
+    fn charge_owned(&mut self, bytes: usize) -> Result<()> {
+        StreamParseMeter::charge_owned(self, bytes)
+    }
+    fn release_owned(&mut self, bytes: usize) {
+        StreamParseMeter::release_owned(self, bytes);
+    }
+}
+
+trait ParseIndex {
+    fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn entry_bytes(&self) -> usize;
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError>;
+}
+
+impl<K: Eq + std::hash::Hash, V> ParseIndex for HashMap<K, V> {
+    fn len(&self) -> usize {
+        HashMap::len(self)
+    }
+    fn capacity(&self) -> usize {
+        HashMap::capacity(self)
+    }
+    fn entry_bytes(&self) -> usize {
+        std::mem::size_of::<(K, V)>() + std::mem::size_of::<u64>()
+    }
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        HashMap::try_reserve(self, additional)
+    }
+}
+
+impl<K: Eq + std::hash::Hash> ParseIndex for HashSet<K> {
+    fn len(&self) -> usize {
+        HashSet::len(self)
+    }
+    fn capacity(&self) -> usize {
+        HashSet::capacity(self)
+    }
+    fn entry_bytes(&self) -> usize {
+        std::mem::size_of::<K>() + std::mem::size_of::<u64>()
+    }
+    fn try_reserve(
+        &mut self,
+        additional: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        HashSet::try_reserve(self, additional)
+    }
+}
+
+/// Append a parsed node whose owned payload was admitted before construction.
 ///
 /// The arena and the parent's child list grow by explicit exact reservations,
 /// so their capacity is admitted before it is allocated.
@@ -2270,7 +2452,6 @@ fn push_metered(
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
     reserve_node_storage(document, parent, meter)?;
-    meter.charge_owned(node_payload_bytes(&kind, base_uri.as_deref()))?;
     Ok(document.push(parent, kind, base_uri))
 }
 
@@ -2294,19 +2475,19 @@ fn reserve_node_storage(
 
 /// Admit one more entry of a retained index whose strings own `owned_bytes`, growing the
 /// index first when it is full. Storage is counted as `estimated_owned_bytes` counts it.
-fn reserve_index_entry<K: Eq + std::hash::Hash, V>(
-    index: &mut HashMap<K, V>,
+fn reserve_index_entry(
+    index: &mut impl ParseIndex,
     owned_bytes: usize,
-    meter: &mut StreamParseMeter,
+    meter: &mut impl ParseAllocationBudget,
 ) -> Result<()> {
-    let limit = meter.budget.owned_bytes;
+    let limit = meter.owned_limit();
     let refused = || Error::Budget {
         kind: BudgetKind::OwnedBytes,
         limit,
         actual: usize::MAX,
     };
     if index.len() == index.capacity() {
-        let entry = std::mem::size_of::<(K, V)>() + std::mem::size_of::<u64>();
+        let entry = index.entry_bytes();
         let additional = index.capacity().max(4);
         // A hash table reports a capacity of at least the entries it reserves and at
         // most twice as many, so this bounds the growth before it is allocated.
@@ -2334,9 +2515,9 @@ fn reserve_index_entry<K: Eq + std::hash::Hash, V>(
 fn reserve_charged<T>(
     values: &mut Vec<T>,
     additional: usize,
-    meter: &mut StreamParseMeter,
+    meter: &mut impl ParseAllocationBudget,
 ) -> Result<()> {
-    let limit = meter.budget.owned_bytes;
+    let limit = meter.owned_limit();
     let refused = || Error::Budget {
         kind: BudgetKind::OwnedBytes,
         limit,
@@ -2600,7 +2781,7 @@ fn push_stream_element<
         drop(expanded_names);
         meter.release_owned(duplicate_bytes);
     }
-    let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
+    let inherited_base = copy_base_uri(document, parent, meter)?;
     let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
         attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
     }) {
@@ -2802,7 +2983,7 @@ fn collapse_xml_whitespace(value: &str) -> Cow<'_, str> {
 fn push_parsed_text(
     document: &mut Document,
     elements: &[StreamElementFrame<'_>],
-    value: String,
+    value: ParsedText<'_>,
     meter: &mut StreamParseMeter,
 ) -> Result<NodeId> {
     let parent = elements
@@ -2818,35 +2999,13 @@ fn push_parsed_text(
             disable_output_escaping: false,
         } = &mut document.nodes[last_child.0].kind
     {
-        // Coalescing grows the existing text exactly, after admitting its new capacity.
-        let capacity = existing.capacity();
-        let required = existing
-            .len()
-            .checked_add(value.len())
-            .ok_or(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                limit: meter.budget.owned_bytes,
-                actual: usize::MAX,
-            })?;
-        if required > capacity {
-            meter.charge_owned(required - capacity)?;
-            existing
-                .try_reserve_exact(value.len())
-                .map_err(|_| Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    limit: meter.budget.owned_bytes,
-                    actual: usize::MAX,
-                })?;
-            // The allocator may grant more than requested; that capacity is retained too.
-            if existing.capacity() > required {
-                meter.charge_owned(existing.capacity() - required)?;
-            }
-        }
-        existing.push_str(&value);
+        reserve_parsed_string(existing, value.maximum_bytes(), meter)?;
+        value.append(existing, meter)?;
         return Ok(last_child);
     }
     meter.reserve_node()?;
-    let inherited_base = document.node(parent).and_then(|node| node.base_uri.clone());
+    let value = copy_parsed_text(value, meter)?;
+    let inherited_base = copy_base_uri(document, parent, meter)?;
     push_metered(
         document,
         parent,
@@ -3003,6 +3162,9 @@ fn internal_general_entities<'a>(
         match next {
             Cow::Borrowed(_) => break declarations,
             Cow::Owned(next) => {
+                let held = declarations.owned_bytes;
+                drop(declarations);
+                meter.release_declarations(held);
                 changed = true;
                 rounds += 1;
                 meter.check_depth(rounds)?;
@@ -3232,6 +3394,7 @@ fn parsed_external_reachability<'a>(
 
 #[derive(Default)]
 struct InternalEntityDeclarations {
+    owned_bytes: usize,
     general: HashMap<String, String>,
     parameter: HashMap<String, String>,
     parameter_spans: Vec<(usize, usize)>,
@@ -3245,6 +3408,38 @@ struct InternalAttributeDeclaration {
     name: String,
     attribute_type: InternalAttributeType,
     default: Option<String>,
+}
+
+// Declaration storage is live until expansion and default-attribute processing
+// finish. It shares the parser's workspace, but is not entity expansion output.
+struct DeclarationAllocation<'a, 'w> {
+    expansion: &'a mut EntityExpansionMeter<'w>,
+    owned: &'a mut usize,
+}
+
+impl ParseAllocationBudget for DeclarationAllocation<'_, '_> {
+    fn owned_limit(&self) -> usize {
+        self.expansion.workspace_maximum
+    }
+    fn charge_owned(&mut self, bytes: usize) -> Result<()> {
+        self.expansion.check_workspace(bytes)?;
+        self.expansion.charge_parse_work(bytes)?;
+        self.expansion.declaration_bytes += bytes;
+        *self.owned += bytes;
+        Ok(())
+    }
+    fn release_owned(&mut self, bytes: usize) {
+        self.expansion.release_declarations(bytes);
+        *self.owned = self
+            .owned
+            .checked_sub(bytes)
+            .expect("admitted declaration storage");
+    }
+}
+
+fn declaration_string(value: &str, budget: &mut impl ParseAllocationBudget) -> Result<String> {
+    budget.charge_owned(value.len())?;
+    Ok(value.to_owned())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3266,7 +3461,7 @@ impl InternalAttributeType {
 
 fn collect_internal_entity_declarations(
     subset: &str,
-    meter: &EntityExpansionMeter,
+    meter: &mut EntityExpansionMeter,
 ) -> Result<InternalEntityDeclarations> {
     let mut declarations = InternalEntityDeclarations::default();
     let mut cursor = 0;
@@ -3299,7 +3494,7 @@ fn collect_internal_entity_declarations(
             continue;
         }
         if subset[cursor..].starts_with("<!ATTLIST") {
-            cursor = collect_internal_attribute_list(subset, cursor, &mut declarations.attributes)?;
+            cursor = collect_internal_attribute_list(subset, cursor, &mut declarations, meter)?;
             continue;
         }
         if subset[cursor..].starts_with("<!ELEMENT") {
@@ -3355,13 +3550,25 @@ fn collect_internal_entity_declarations(
         if !matches!(quote, b'\'' | b'"') {
             let (end, system_identifier) =
                 parse_external_entity_declaration(subset, cursor, parameter)?;
-            if !parameter && declarations.declared_general.insert(name.to_owned()) {
+            if !parameter && !declarations.declared_general.contains(name) {
+                let mut allocation = DeclarationAllocation {
+                    expansion: meter,
+                    owned: &mut declarations.owned_bytes,
+                };
+                reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
+                declarations
+                    .declared_general
+                    .insert(declaration_string(name, &mut allocation)?);
                 if let Some(system_identifier) = system_identifier {
-                    declarations
-                        .unparsed
-                        .insert(name.to_owned(), system_identifier.to_owned());
+                    reserve_index_entry(&mut declarations.unparsed, 0, &mut allocation)?;
+                    let name = declaration_string(name, &mut allocation)?;
+                    let identifier = declaration_string(system_identifier, &mut allocation)?;
+                    declarations.unparsed.insert(name, identifier);
                 } else {
-                    declarations.parsed_external.insert(name.to_owned());
+                    reserve_index_entry(&mut declarations.parsed_external, 0, &mut allocation)?;
+                    declarations
+                        .parsed_external
+                        .insert(declaration_string(name, &mut allocation)?);
                 }
             }
             cursor = end;
@@ -3381,9 +3588,9 @@ fn collect_internal_entity_declarations(
                 "unterminated value for internal entity `{name}`"
             )));
         }
-        let mut value = subset[value_start..cursor].to_owned();
+        let raw_value = &subset[value_start..cursor];
         cursor += 1;
-        validate_entity_value(name, &value, parameter)?;
+        validate_entity_value(name, raw_value, parameter)?;
         // XML 1.0 Fifth Edition section 4.2, [70]-[74], permits only XML S before `>`
         // after an internal EntityValue, for both general and parameter entities.
         // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
@@ -3394,34 +3601,83 @@ fn collect_internal_entity_declarations(
             )));
         }
         cursor += 1;
+        let mut allocation = DeclarationAllocation {
+            expansion: meter,
+            owned: &mut declarations.owned_bytes,
+        };
         if parameter {
+            if declarations.parameter_spans.len() == declarations.parameter_spans.capacity() {
+                let additional = declarations.parameter_spans.capacity().max(4);
+                reserve_charged(
+                    &mut declarations.parameter_spans,
+                    additional,
+                    &mut allocation,
+                )?;
+            }
             declarations
                 .parameter_spans
                 .push((declaration_start, cursor));
         }
+        let duplicate = if parameter {
+            declarations.parameter.contains_key(name)
+        } else {
+            declarations.declared_general.contains(name)
+        };
+        let predefined = !parameter && matches!(name, "amp" | "apos" | "gt" | "lt" | "quot");
+        if duplicate && !predefined {
+            continue;
+        }
+        let value;
         if !parameter {
-            if matches!(name, "amp" | "apos" | "gt" | "lt" | "quot") {
-                value = normalize_predefined_entity_declaration(name, value)?;
+            if predefined {
+                let scratch = raw_value.len().checked_mul(2).ok_or(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit: allocation.owned_limit(),
+                    actual: usize::MAX,
+                })?;
+                allocation.charge_owned(scratch)?;
+                value = normalize_predefined_entity_declaration(name, raw_value)?;
+                allocation.release_owned(scratch - value.capacity());
             } else {
                 // XML 1.0 section 4.5 constructs replacement text by expanding character
                 // references, but leaves general references for their eventual context.
                 // https://www.w3.org/TR/xml/#intern-replacement
-                if let Cow::Owned(replacement) =
-                    decode_parameter_character_references(&value, meter)?
-                {
-                    value = replacement;
-                }
+                value = match decode_parameter_character_references_in(raw_value, |bytes| {
+                    allocation.expansion.check(bytes)?;
+                    allocation.charge_owned(bytes)
+                })? {
+                    Cow::Owned(value) => value,
+                    Cow::Borrowed(value) => declaration_string(value, &mut allocation)?,
+                };
             }
+        } else {
+            value = declaration_string(raw_value, &mut allocation)?;
+        }
+        if duplicate {
+            let capacity = value.capacity();
+            drop(value);
+            allocation.release_owned(capacity);
+            continue;
         }
         if parameter {
+            reserve_index_entry(&mut declarations.parameter, 0, &mut allocation)?;
             declarations
                 .parameter
-                .entry(name.to_owned())
+                .entry(declaration_string(name, &mut allocation)?)
                 .or_insert(value);
-        } else if declarations.declared_general.insert(name.to_owned()) {
-            declarations.general.insert(name.to_owned(), value);
+        } else {
+            reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
+            declarations
+                .declared_general
+                .insert(declaration_string(name, &mut allocation)?);
+            reserve_index_entry(&mut declarations.general, 0, &mut allocation)?;
+            declarations
+                .general
+                .insert(declaration_string(name, &mut allocation)?, value);
         }
     }
+    #[cfg(test)]
+    expansion_workspace_tests::observe_declarations(&declarations);
     Ok(declarations)
 }
 
@@ -3722,11 +3978,12 @@ fn parse_dtd_public_identifier(subset: &str, cursor: &mut usize, context: &str) 
 fn collect_internal_attribute_list(
     subset: &str,
     mut cursor: usize,
-    declarations: &mut HashMap<String, Vec<InternalAttributeDeclaration>>,
+    declarations: &mut InternalEntityDeclarations,
+    meter: &mut EntityExpansionMeter,
 ) -> Result<usize> {
     cursor += "<!ATTLIST".len();
     require_dtd_whitespace(subset, &mut cursor, "after <!ATTLIST")?;
-    let element_name = parse_dtd_name(subset, &mut cursor, "ATTLIST element")?.to_owned();
+    let element_name = parse_dtd_name(subset, &mut cursor, "ATTLIST element")?;
     loop {
         let spacing_start = cursor;
         skip_xml_whitespace(subset, &mut cursor);
@@ -3738,16 +3995,36 @@ fn collect_internal_attribute_list(
                 "XML whitespace is required before an ATTLIST attribute".into(),
             ));
         }
-        let name = parse_dtd_name(subset, &mut cursor, "ATTLIST attribute")?.to_owned();
+        let name = parse_dtd_name(subset, &mut cursor, "ATTLIST attribute")?;
         require_dtd_whitespace(subset, &mut cursor, "after ATTLIST attribute name")?;
         let attribute_type = parse_dtd_attribute_type(subset, &mut cursor)?;
         require_dtd_whitespace(subset, &mut cursor, "before ATTLIST default declaration")?;
         let default = parse_dtd_attribute_default(subset, &mut cursor)?;
-        let element_declarations = declarations.entry(element_name.clone()).or_default();
+        let mut allocation = DeclarationAllocation {
+            expansion: meter,
+            owned: &mut declarations.owned_bytes,
+        };
+        if !declarations.attributes.contains_key(element_name) {
+            reserve_index_entry(&mut declarations.attributes, 0, &mut allocation)?;
+            let key = declaration_string(element_name, &mut allocation)?;
+            declarations.attributes.insert(key, Vec::new());
+        }
+        let element_declarations = declarations
+            .attributes
+            .get_mut(element_name)
+            .expect("inserted declaration group");
         if !element_declarations
             .iter()
             .any(|declaration| declaration.name == name)
         {
+            if element_declarations.len() == element_declarations.capacity() {
+                let additional = element_declarations.capacity().max(4);
+                reserve_charged(element_declarations, additional, &mut allocation)?;
+            }
+            let name = declaration_string(name, &mut allocation)?;
+            let default = default
+                .map(|value| declaration_string(value, &mut allocation))
+                .transpose()?;
             element_declarations.push(InternalAttributeDeclaration {
                 name,
                 attribute_type,
@@ -3847,7 +4124,7 @@ fn parse_dtd_nmtoken(subset: &str, cursor: &mut usize) -> Result<()> {
     }
 }
 
-fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Option<String>> {
+fn parse_dtd_attribute_default<'a>(subset: &'a str, cursor: &mut usize) -> Result<Option<&'a str>> {
     if subset[*cursor..].starts_with("#REQUIRED") {
         *cursor += "#REQUIRED".len();
         return Ok(None);
@@ -3867,7 +4144,7 @@ fn parse_dtd_attribute_default(subset: &str, cursor: &mut usize) -> Result<Optio
         ));
     }
     validate_attribute_value_references(value)?;
-    Ok(Some(value.to_owned()))
+    Ok(Some(value))
 }
 
 fn validate_attribute_value_references(value: &str) -> Result<()> {
@@ -4075,16 +4352,16 @@ fn valid_xml_character_reference(reference: &str) -> bool {
     xml_sec_xml_input::lexical::decode_numeric_character_reference(reference).is_ok()
 }
 
-fn normalize_predefined_entity_declaration(name: &str, value: String) -> Result<String> {
+fn normalize_predefined_entity_declaration(name: &str, value: &str) -> Result<String> {
     let (expected, required_replacement) = match name {
         "amp" => ('&', Some("&#38;")),
         "apos" => ('\'', None),
         "gt" => ('>', None),
         "lt" => ('<', Some("&#60;")),
         "quot" => ('"', None),
-        _ => return Ok(value),
+        _ => return Ok(value.to_owned()),
     };
-    let first = xml_sec_xml_input::lexical::decode_references(&value)
+    let first = xml_sec_xml_input::lexical::decode_references(value)
         .map_err(|error| Error::Xml(error.to_string()))?;
     if required_replacement.is_some_and(|required| first.as_ref() != required) {
         return Err(Error::Xml(format!(
@@ -4255,10 +4532,17 @@ fn decode_parameter_character_references<'a>(
     value: &'a str,
     meter: &EntityExpansionMeter,
 ) -> Result<Cow<'a, str>> {
+    decode_parameter_character_references_in(value, |bytes| meter.check(bytes))
+}
+
+fn decode_parameter_character_references_in(
+    value: &str,
+    admit: impl FnOnce(usize) -> Result<()>,
+) -> Result<Cow<'_, str>> {
     if !value.as_bytes().windows(2).any(|bytes| bytes == b"&#") {
         return Ok(Cow::Borrowed(value));
     }
-    meter.check(value.len())?;
+    admit(value.len())?;
     let mut output = String::with_capacity(value.len());
     let mut cursor = 0usize;
     while let Some(relative) = value[cursor..].find("&#") {
@@ -4669,6 +4953,8 @@ struct EntityExpansionMeter<'w> {
     reference_limit: usize,
     depth_limit: usize,
     workspace: usize,
+    workspace_maximum: usize,
+    declaration_bytes: usize,
     parse_work: Option<&'w mut ParseWork>,
 }
 
@@ -4704,6 +4990,7 @@ impl EntityExpansionMeter<'_> {
             },
         );
         meter.workspace = budget.owned_bytes;
+        meter.workspace_maximum = budget.owned_bytes;
         meter
     }
 
@@ -4720,6 +5007,8 @@ impl EntityExpansionMeter<'_> {
             reference_limit,
             depth_limit,
             workspace: usize::MAX,
+            workspace_maximum: usize::MAX,
+            declaration_bytes: 0,
             parse_work: None,
         }
     }
@@ -4729,6 +5018,31 @@ impl EntityExpansionMeter<'_> {
         // caller's recursion budget governs it; the internal clamp only protects native frames.
         // https://www.w3.org/TR/xml/#included
         super::budget::ensure(super::BudgetKind::RecursionDepth, self.depth_limit, actual)
+    }
+
+    fn check_workspace(&self, additional: usize) -> Result<()> {
+        let actual = self
+            .used
+            .saturating_add(self.declaration_bytes)
+            .saturating_add(additional);
+        if actual > self.workspace {
+            return Err(Error::Budget {
+                kind: BudgetKind::OwnedBytes,
+                limit: self.workspace_maximum,
+                actual: self
+                    .workspace_maximum
+                    .saturating_sub(self.workspace)
+                    .saturating_add(actual),
+            });
+        }
+        Ok(())
+    }
+
+    fn release_declarations(&mut self, bytes: usize) {
+        self.declaration_bytes = self
+            .declaration_bytes
+            .checked_sub(bytes)
+            .expect("released declarations were admitted");
     }
 
     fn charge_reference(&self, references: &mut usize) -> Result<()> {
@@ -4755,11 +5069,7 @@ impl EntityExpansionMeter<'_> {
             // A growing string can briefly hold its old and replacement blocks.
             // Admit that peak before asking the allocator, not after materializing it.
             let capacity = needed.max(output.capacity().saturating_mul(2));
-            ensure(
-                BudgetKind::OwnedBytes,
-                self.workspace,
-                self.used.saturating_add(capacity),
-            )?;
+            self.check_workspace(capacity)?;
             output
                 .try_reserve_exact(capacity - output.len())
                 .map_err(|_| Error::Budget {
@@ -4774,13 +5084,13 @@ impl EntityExpansionMeter<'_> {
 
     fn check(&self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
-        ensure(BudgetKind::OwnedBytes, self.workspace, actual)?;
+        self.check_workspace(amount)?;
         super::budget::ensure(self.kind, self.limit, actual)
     }
 
     fn charge(&mut self, amount: usize) -> Result<()> {
         let actual = self.used.saturating_add(amount);
-        ensure(BudgetKind::OwnedBytes, self.workspace, actual)?;
+        self.check_workspace(amount)?;
         super::budget::ensure(self.kind, self.limit, actual)?;
         self.charge_parse_work(amount)?;
         self.used = actual;
@@ -4859,6 +5169,196 @@ mod expansion_workspace_tests {
     use super::*;
     thread_local! { pub(super) static APPENDED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
     thread_local! { pub(super) static SCANNED_ATTRIBUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { pub(super) static NORMALIZED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { pub(super) static CREATED_ROOTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+    thread_local! { static DECLARATION_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+    pub(super) fn observe_declarations(declarations: &InternalEntityDeclarations) {
+        let mut bytes = 0;
+        for map in [
+            &declarations.general,
+            &declarations.parameter,
+            &declarations.unparsed,
+        ] {
+            bytes += map.capacity()
+                * (std::mem::size_of::<(String, String)>() + std::mem::size_of::<u64>());
+            bytes += map
+                .iter()
+                .map(|(name, value)| name.capacity() + value.capacity())
+                .sum::<usize>();
+        }
+        for set in [
+            &declarations.declared_general,
+            &declarations.parsed_external,
+        ] {
+            bytes += set.capacity() * (std::mem::size_of::<String>() + std::mem::size_of::<u64>());
+            bytes += set.iter().map(String::capacity).sum::<usize>();
+        }
+        bytes += declarations.parameter_spans.capacity() * std::mem::size_of::<(usize, usize)>();
+        bytes += declarations.attributes.capacity()
+            * (std::mem::size_of::<(String, Vec<InternalAttributeDeclaration>)>()
+                + std::mem::size_of::<u64>());
+        for (name, attributes) in &declarations.attributes {
+            bytes += name.capacity()
+                + attributes.capacity() * std::mem::size_of::<InternalAttributeDeclaration>();
+            bytes += attributes
+                .iter()
+                .map(|attribute| {
+                    attribute.name.capacity()
+                        + attribute.default.as_ref().map_or(0, String::capacity)
+                })
+                .sum::<usize>();
+        }
+        DECLARATION_BYTES.with(|peak| peak.set(peak.get().max(bytes)));
+    }
+
+    #[test]
+    fn unused_literal_declarations_do_not_spend_expansion_output() {
+        // Retaining a literal declaration is workspace, not expansion output.
+        // No reference is expanded here, even with a zero expansion quota.
+        let mut meter = EntityExpansionMeter::new(0);
+        let declarations =
+            collect_internal_entity_declarations("<!ENTITY unused 'literal'>", &mut meter)
+                .expect("literal declaration needs no expansion output");
+        assert_eq!(declarations.general["unused"], "literal");
+        assert_eq!(meter.used, 0);
+    }
+
+    #[test]
+    fn coalesced_text_keeps_reference_carriage_returns() {
+        // XML 1.0 section 2.11 normalizes literal CR/CRLF, not a CR produced
+        // by a character reference. Text and CDATA still coalesce in one node.
+        let document = Document::parse("<r>a\r\nb\rc&#13;<![CDATA[d\r\ne]]>f</r>", None)
+            .expect("mixed text parses");
+        assert_eq!(document.string_value(document.root()), "a\nb\nc\rd\nef");
+    }
+
+    #[test]
+    fn retained_dtd_declarations_are_admitted_before_materialization() {
+        // Unused values, name indexes, spans and ATTLIST vectors remain live
+        // while the tiny tree is parsed; output expansion limits cannot pay for them.
+        let large = "x".repeat(64 * 1024);
+        let general = (0..128)
+            .map(|i| format!("<!ENTITY e{i} ''>"))
+            .collect::<String>();
+        let parameter = (0..128)
+            .map(|i| format!("<!ENTITY % p{i} ''>"))
+            .collect::<String>();
+        let external = (0..128)
+            .map(|i| format!("<!ENTITY x{i} SYSTEM 'external'>"))
+            .collect::<String>();
+        let unparsed = (0..128)
+            .map(|i| format!("<!ENTITY u{i} SYSTEM 'asset' NDATA n>"))
+            .collect::<String>();
+        let attributes = (0..128)
+            .map(|i| format!(" a{i} CDATA #IMPLIED"))
+            .collect::<String>();
+        let subsets = [
+            format!("<!ENTITY e '{large}'>"),
+            format!("<!ENTITY % p '{large}'>"),
+            format!("<!ATTLIST other a CDATA '{large}'>"),
+            format!("<!NOTATION n SYSTEM 'n'><!ENTITY u SYSTEM '{large}' NDATA n>"),
+            general,
+            parameter,
+            external,
+            format!("<!NOTATION n SYSTEM 'n'>{unparsed}"),
+            format!("<!ATTLIST other{attributes}>"),
+        ];
+        let mut violations = Vec::new();
+        for (case, subset) in subsets.into_iter().enumerate() {
+            let xml = format!("<!DOCTYPE r [{subset}]><r/>");
+            DECLARATION_BYTES.with(|bytes| bytes.set(0));
+            let result = Document::parse_with_budget(
+                &xml,
+                None,
+                ParseBudget::UNBOUNDED.with_owned_bytes(4096),
+            );
+            let peak = DECLARATION_BYTES.with(std::cell::Cell::get);
+            let refused = matches!(
+                result,
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                })
+            );
+            if !refused || peak > 4096 {
+                violations.push((case, peak, refused));
+            }
+            Document::parse_with_budget(
+                &xml,
+                None,
+                ParseBudget::UNBOUNDED.with_owned_bytes(1 << 22),
+            )
+            .expect("the same valid declarations fit sufficient workspace");
+        }
+        assert!(
+            violations.is_empty(),
+            "declarations escaped workspace: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn initial_root_storage_is_admitted_before_construction() {
+        // The initial arena and copied base URI are allocations too, even if
+        // the first opening tag would subsequently refuse the tiny workspace.
+        let long_base = format!("https://example.test/{}", "x".repeat(8192));
+        for (base, limit) in [(None, 0), (Some(long_base.as_str()), 4096)] {
+            CREATED_ROOTS.with(|count| count.set(0));
+            assert!(matches!(
+                Document::parse_with_budget(
+                    "<r/>",
+                    base,
+                    ParseBudget::UNBOUNDED.with_owned_bytes(limit)
+                ),
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                })
+            ));
+            CREATED_ROOTS.with(|count| assert_eq!(count.get(), 0));
+        }
+    }
+
+    #[test]
+    fn scalar_text_is_admitted_before_normalization() {
+        // Text, CDATA, comments and PI content share the same normalization
+        // allocation; none may materialize a large value before workspace admission.
+        let large = "x".repeat(64 * 1024);
+        let mut materialized = Vec::new();
+        for xml in [
+            format!("<r>{large}</r>"),
+            format!("<r><![CDATA[{large}]]></r>"),
+            format!("<r><!--{large}--></r>"),
+            format!("<r><?p {large}?></r>"),
+        ] {
+            NORMALIZED_BYTES.with(|bytes| bytes.set(0));
+            let result = Document::parse_with_budget(
+                &xml,
+                None,
+                ParseBudget::UNBOUNDED.with_owned_bytes(4096),
+            );
+            assert!(matches!(
+                result,
+                Err(Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    ..
+                })
+            ));
+            materialized.push(NORMALIZED_BYTES.with(std::cell::Cell::get));
+        }
+        assert_eq!(materialized, [0; 4], "normalization ran before admission");
+    }
+
+    #[test]
+    fn discarded_misc_whitespace_needs_no_owned_copy() {
+        // XPath's root node has no whitespace text children; ignored XML Misc
+        // must not allocate a document-sized normalization buffer.
+        let xml = format!("{}<r/>{}", " \r\n".repeat(8192), " \r\n".repeat(8192));
+        NORMALIZED_BYTES.with(|bytes| bytes.set(0));
+        Document::parse_with_budget(&xml, None, ParseBudget::UNBOUNDED.with_owned_bytes(4096))
+            .expect("tiny tree fits despite ignored whitespace");
+        NORMALIZED_BYTES.with(|bytes| assert_eq!(bytes.get(), 0));
+    }
 
     #[test]
     fn live_element_stack_capacity_remains_charged() {

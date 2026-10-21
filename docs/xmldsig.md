@@ -521,8 +521,9 @@ depend on that document.
 
 The transform consumes octets. Node-set input is first converted with inclusive C14N 1.0, binary
 input is used as is, and the serialized result tree (with its XML declaration for the `xml`
-output method) is passed to the next transform or digested. A following node-set transform
-reparses it.
+output method) is passed to the next transform or digested. Detached resources carry their
+resolved URI with their borrowed bytes (`TransformData::Resource`), so relative unparsed-entity
+identifiers use the document entity's base URI. A following node-set transform reparses the output.
 
 Execution is bounded by the operation's policy:
 
@@ -536,7 +537,7 @@ Execution is bounded by the operation's policy:
   `max_xslt_output_bytes` bounds their cumulative serialized output.
 - `max_xslt_workspace_bytes` bounds the memory one transform holds at once: owned octet-input
   buffers (including implicit C14N), decoded input, compiled stylesheet, compiler validation buffers,
-  entity expansion, attribute staging, open-element frames, parsed input tree and execution
+  retained DTD declarations, entity expansion, attribute staging, open-element frames, parsed input tree and execution
   share it. Buffer growth admits both old and replacement allocations.
   `max_xslt_recursion_depth`
   bounds compilation and template recursion. Scoped replay decodes the input into the current

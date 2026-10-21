@@ -113,6 +113,91 @@ fn policy_error(error: SigningError) -> PolicyViolation {
 const ITEMS: &str = r#"<root><item ID="payload">b</item><item>a</item></root>"#;
 
 #[test]
+fn detached_entity_uri_survives_sign_verify_and_current_query_replay() {
+    // XSLT's unparsed entity map belongs to the detached XML resource. An
+    // inherited XML Base on Reference resolves its identity before all three paths.
+    use std::{collections::HashMap, sync::Arc};
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    use xml_sec::xmldsig::{
+        HmacSigningKey, HmacVerificationKey, ReplayMode, ReplayOutcome, UriTypeSet,
+        VerificationRequest, VerifyContext, with_verified_request,
+    };
+    let resources = HashMap::from([(
+        "https://example.org/data/input.xml".to_owned(),
+        br#"<!DOCTYPE root [<!NOTATION image SYSTEM "image"><!ENTITY logo SYSTEM "images/logo.png" NDATA image>]><root/>"#.to_vec(),
+    )]);
+    let signing_key = HmacSigningKey::new(vec![0x31; 32]).unwrap();
+    let verifying_key = HmacVerificationKey::new(vec![0x31; 32]).unwrap();
+    let expected = b"https://example.org/data/images/logo.png";
+    let sheet = stylesheet(
+        r#"<xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="unparsed-entity-uri('logo')"/></xsl:template>"#,
+    );
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::HmacSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("input.xml")
+                .transform(Transform::Xslt(sheet)),
+        );
+    let mut signing = SigningPolicy::default();
+    signing.uris.references = UriTypeSet::ALL;
+    signing.xml.allow_internal_dtd = true;
+    let signed = SignContext::new(&signing_key)
+        .policy(signing)
+        .external_resources(&resources)
+        .sign_with_builder(r#"<root xml:base="https://example.org/data/"/>"#, &builder)
+        .unwrap();
+    let mut policy = VerificationPolicy::default();
+    policy.uris.references = UriTypeSet::ALL;
+    policy.xml.allow_internal_dtd = true;
+    let context = VerifyContext::new()
+        .key(&verifying_key)
+        .policy(policy)
+        .store_pre_digest(true);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..Default::default()
+    };
+    let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 30)));
+    for backend in xml_sec::XmlBackend::available() {
+        let document = xml_sec::XmlDocument::parse_with_backend(signed.clone(), backend).unwrap();
+        with_verified_request(&document, &context, &request, &memory, |session| {
+            assert!(session.evidence().all_valid());
+            let evidence = &session.evidence().signatures()[0];
+            assert_eq!(
+                evidence.result().as_ref().unwrap().signed_info_references[0]
+                    .pre_digest_data
+                    .as_deref(),
+                Some(expected.as_slice())
+            );
+            let selected = session.select_signature(evidence.identity())?;
+            selected
+                .visit_authenticated_references(|reference| {
+                    let mut replay = Vec::new();
+                    assert_eq!(
+                        selected
+                            .replay_reference(
+                                reference.identity,
+                                ReplayMode::ReferenceOutput,
+                                &mut |bytes: &[u8]| {
+                                    replay.extend_from_slice(bytes);
+                                    Ok::<_, ()>(())
+                                }
+                            )
+                            .unwrap(),
+                        ReplayOutcome::Complete
+                    );
+                    assert_eq!(replay, expected);
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(memory.used(), 0);
+    }
+}
+
+#[test]
 fn referenced_whitespace_beside_stylesheet_signs_and_verifies() {
     // XPath 1.0 section 5.1 excludes text children of a document root. CR
     // references accepted in Transform content must not become document markup.
