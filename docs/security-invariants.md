@@ -4,6 +4,10 @@ These are implementation assurances, not a claim of an independent security
 audit. Policy permission, provider capability, cryptographic validity, and
 application authorization are separate decisions.
 
+The deterministic [historical attack corpus](historical-security.md) ties
+public-path regressions to their original advisories and specification
+invariants, with positive controls and explicit compatibility boundaries.
+
 ## Secrets and Ownership
 
 HMAC verification, reference-digest equality, and exported recovered-key

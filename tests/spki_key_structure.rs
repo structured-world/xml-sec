@@ -2,6 +2,8 @@
 //! key import: the accepted shapes resolve, and every refused shape keeps the
 //! error kind callers already distinguish.
 
+#![cfg(feature = "xmldsig")]
+
 use xml_sec::key_manager::KeyInventory;
 use xml_sec::policy::{ResourcePolicy, VerificationPolicy, VerificationTrustMode};
 use xml_sec::xmldsig::{
