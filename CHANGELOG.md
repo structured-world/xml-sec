@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/structured-world/xml-sec/compare/v0.1.23...v0.2.0) - 2026-10-21
+
+### Added
+
+- *(xmldsig)* [**breaking**] execute the XSLT transform ([#254](https://github.com/structured-world/xml-sec/pull/254))
+- *(xades)* add XAdES B-B adapter crate ([#245](https://github.com/structured-world/xml-sec/pull/245))
+- *(provider)* [**breaking**] stream canonical bytes into reference digests ([#241](https://github.com/structured-world/xml-sec/pull/241))
+
 ## [0.1.23](https://github.com/structured-world/xml-sec/compare/v0.1.22...v0.1.23) - 2026-10-18
 
 ### Added
