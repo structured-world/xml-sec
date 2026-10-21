@@ -1455,13 +1455,6 @@ pub(crate) trait TransformScratch: Scratch {
     fn decoded_text(
         bytes: Self::Bytes,
     ) -> Result<<Self::Decoder as crate::xml_input_shared::DecodeStorage>::Text, TransformError>;
-    #[cfg(feature = "xslt")]
-    fn lexical_error(
-        error: crate::xml_input::lexical::Error<
-            <Self::Dom as DomStorage>::Text,
-            <Self::Dom as crate::xml_input::lexical::storage::Storage>::Refusal,
-        >,
-    ) -> TransformError;
     fn parse_xml<'input>(
         &self,
         xml: &'input str,
@@ -1504,10 +1497,6 @@ impl TransformScratch for Native {
     #[cfg(feature = "xslt")]
     fn decoded_text(bytes: Vec<u8>) -> Result<String, TransformError> {
         Ok(String::from_utf8(bytes).expect("decoder appended valid UTF-8 fragments"))
-    }
-    #[cfg(feature = "xslt")]
-    fn lexical_error(error: crate::xml_input::lexical::Error) -> TransformError {
-        TransformError::XmlParse(XmlDocumentError::Parse(NativeDom::lexical_error(error)))
     }
     fn parse_xml<'input>(
         &self,
@@ -1568,16 +1557,6 @@ impl<'w, W: structured_asn1::memory::Work> TransformScratch
                 unreachable!("decoder appended valid UTF-8 fragments")
             }
         })
-    }
-    #[cfg(feature = "xslt")]
-    fn lexical_error(
-        error: crate::xml_input::lexical::Error<
-            structured_asn1::memory::OwnedText<W>,
-            structured_asn1::memory::MemoryError,
-        >,
-    ) -> TransformError {
-        let error = <Self::Dom as DomStorage>::lexical_error(error);
-        TransformError::XmlParse(error.into())
     }
     fn parse_xml<'input>(
         &self,

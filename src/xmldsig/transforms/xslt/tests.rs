@@ -9,6 +9,77 @@ use crate::xml::dom::Document;
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 #[test]
+fn namespace_prefix_growth_admits_both_blocks() {
+    // Prefix metadata must remain inside the same workspace during realloc,
+    // with no change to capacity or contents after a refused replacement.
+    use crate::c14n::scratch::{List, Scratch};
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    fn check(mut values: impl List<Option<&'static str>>) {
+        let unit = std::mem::size_of::<Option<&str>>();
+        for _ in 0..4 {
+            super::push_declared_prefix(&mut values, Some("p"), 12 * unit)
+                .expect("initial prefix block fits");
+        }
+        assert_eq!(values.capacity(), 4);
+        assert!(matches!(
+            super::push_declared_prefix(&mut values, Some("q"), 12 * unit - 1),
+            Err(super::Unavailable::Exceeds(actual)) if actual == 12 * unit
+        ));
+        assert_eq!(values.capacity(), 4);
+        assert_eq!(&*values, &[Some("p"); 4]);
+        super::push_declared_prefix(&mut values, Some("q"), 12 * unit)
+            .expect("exact old-plus-new prefix peak fits");
+        assert_eq!(values.capacity(), 8);
+        assert_eq!(values[4], Some("q"));
+    }
+    check(Vec::new());
+    let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(4096, 1 << 20)));
+    check(crate::c14n::scratch::Accounted(&memory).values());
+    assert_eq!(memory.used(), 0);
+}
+
+#[test]
+fn stylesheet_tag_staging_obeys_its_workspace_before_serialization() {
+    // A generous query account must not hide start-tag or namespace-list
+    // staging that already exceeds the much smaller XSLT workspace.
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    for namespaces in [false, true] {
+        let attributes = (0..128)
+            .map(|i| {
+                if namespaces {
+                    format!(" xmlns:n{i}='urn:n{i}'")
+                } else {
+                    format!(" m:a{i}='value'")
+                }
+            })
+            .collect::<String>();
+        let xml = format!(
+            r#"<Transform xmlns:xsl="{XSL}" xmlns:m="urn:metadata"><xsl:stylesheet version="1.0"{attributes}><xsl:template match="/"><out/></xsl:template></xsl:stylesheet></Transform>"#
+        );
+        let document = Document::parse(&xml).expect("valid stylesheet attributes");
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 28)));
+        let scratch = crate::c14n::scratch::Accounted(&memory);
+        let limit = 512;
+        let mut peak = 0;
+        let result = super::XsltParameter::Transform(document.root_element()).document_in(
+            crate::policy::XsltStylesheetSemantics::Specification,
+            limit,
+            &scratch,
+            &mut |_| {
+                peak = peak.max(memory.used());
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(super::Unavailable::Exceeds(_))));
+        assert!(
+            peak <= limit,
+            "namespaces={namespaces}: staging held {peak} bytes before refusing {limit}"
+        );
+        assert_eq!(memory.used(), 0, "refusal releases serialization storage");
+    }
+}
+
+#[test]
 fn owned_binary_inputs_share_the_xslt_workspace() {
     // Every producer leaves its allocation live during the next transform.
     // A borrowed input's minimum workspace cannot also admit that allocation.
