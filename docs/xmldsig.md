@@ -523,7 +523,7 @@ The transform consumes octets. Node-set input is first converted with inclusive 
 input is used as is, and the serialized result tree (with its XML declaration for the `xml`
 output method) is passed to the next transform or digested. Detached resources carry their
 resolved URI with their borrowed bytes (`TransformData::Resource`), so relative unparsed-entity
-identifiers use the document entity's base URI. A following node-set transform reparses the output.
+identifiers use the document entity's base URI. A following node-set transform parses the output again.
 
 Execution is bounded by the operation's policy:
 

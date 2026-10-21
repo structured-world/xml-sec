@@ -567,7 +567,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// | `"#foo"` | Subtree rooted at element with ID `foo`, comments excluded |
     /// | `"#xpointer(/)"` | Entire document, comments included |
     /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo`, comments included |
-    /// | external URI in caller map | A copy of the mapped bytes |
+    /// | external URI in caller map | `TransformData::Resource` borrowing the mapped bytes and their resolved map key |
     /// | other | `Err(UnsupportedUri)` |
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, None)
