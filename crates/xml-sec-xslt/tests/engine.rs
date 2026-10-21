@@ -5232,11 +5232,11 @@ fn numbering_parses_tokens_widths_and_unicode_decimal_patterns() {
 
 #[test]
 fn numbering_preserves_punctuation_and_groups_only_decimal_tokens() {
-    // XSLT 1.0 section 7.7.1 retains a leading punctuation token when it supplies the default
+    // XSLT 1.0 section 7.7.1 retains both punctuation tokens when it supplies the default
     // format token, while grouping-separator/grouping-size apply only to decimal formatting.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
     let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="27" format="("/><xsl:text>|</xsl:text><xsl:number value="27" format="A" grouping-separator="," grouping-size="1"/><xsl:text>|</xsl:text><xsl:number value="9" format="I" grouping-separator="," grouping-size="1"/></xsl:template></xsl:stylesheet>"#;
-    assert_eq!(execute(stylesheet, "<source/>"), "(27|AA|IX");
+    assert_eq!(execute(stylesheet, "<source/>"), "(27(|AA|IX");
 }
 
 #[test]

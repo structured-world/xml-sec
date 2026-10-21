@@ -419,6 +419,19 @@ fn serialize_children<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
 
         match child.node_type() {
             NodeType::Element => {
+                // Canonical XML 1.0 §2.3 requires operation failure on
+                // documents containing relative namespace URIs. Apply before
+                // visibility filtering, including Exclusive C14N subsets.
+                // https://www.w3.org/TR/2001/REC-xml-c14n-20010315#DataModel
+                for namespace in child.namespaces() {
+                    let uri = namespace.uri();
+                    output
+                        .scratch
+                        .charge(uri.len().saturating_mul(2).saturating_add(1))?;
+                    if !uri.is_empty() && !super::xml_base::has_scheme(uri) {
+                        return Err(C14nError::RelativeNamespace);
+                    }
+                }
                 if in_set {
                     serialize_element(
                         child,

@@ -434,7 +434,7 @@ fn resolve_uri_in<S: Scratch>(
 }
 
 /// Check if a URI string has a scheme (e.g., `http:`, `urn:`).
-fn has_scheme(uri: &str) -> bool {
+pub(super) fn has_scheme(uri: &str) -> bool {
     // scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
     // A scheme is followed by ":"
     if let Some(colon_pos) = uri.find(':') {

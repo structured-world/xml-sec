@@ -805,7 +805,7 @@ impl<W: Work> structured_pkix::path::Verify<W> for ProviderVerifier<'_> {
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
         key: structured_pkix::path::WorkingKey<'_>,
         signed: &[u8],
-        signature: structured_asn1::BitString<'_>,
+        signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
     ) -> Result<structured_pkix::path::Verified, Self::Error> {
         self.verify_with_key_check(algorithm, key, signed, signature, execution, |_| Ok(()))
@@ -818,11 +818,10 @@ impl ProviderVerifier<'_> {
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
         key: structured_pkix::path::WorkingKey<'_>,
         signed: &[u8],
-        signature: structured_asn1::BitString<'_>,
+        signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
         check: impl FnOnce(&[u8]) -> Result<(), X509ChainError>,
     ) -> Result<structured_pkix::path::Verified, X509ChainError> {
-        use x509_parser::prelude::FromDer as _;
         let key_algorithm = key.key().algorithm();
         let parameters = key.parameters();
         execution
@@ -838,19 +837,7 @@ impl ProviderVerifier<'_> {
                     0,
                 ))
             })?;
-        let (rest, identifier) = x509_parser::x509::AlgorithmIdentifier::from_der(
-            algorithm.as_bytes(),
-        )
-        .map_err(|error| X509ChainError::InvalidDer {
-            kind: "signature algorithm",
-            message: error.to_string(),
-        })?;
-        if !rest.is_empty() {
-            return Err(X509ChainError::InvalidDer {
-                kind: "signature algorithm",
-                message: "trailing data".into(),
-            });
-        }
+        let original_signature = signature;
         let signature = signature
             .octets()
             .ok_or_else(|| X509ChainError::InvalidDer {
@@ -858,11 +845,28 @@ impl ProviderVerifier<'_> {
                 message: "signature is not octet-aligned".into(),
             })?;
         // Permission and capability checks precede inherited-key allocation.
-        let algorithm = super::x509::authorize_x509_signature_algorithm(
-            &identifier,
-            self.provider,
+        let algorithm = signature_algorithm(*algorithm, execution)?;
+        crate::policy::KeyTrustPolicy::check_certificate_signature_algorithm(
+            algorithm,
             self.allowed,
         )?;
+        self.provider.require_capability(
+            crate::provider::ProviderCapability::VerifyCertificate(algorithm),
+        )?;
+        if matches!(
+            algorithm,
+            crate::provider::X509SignatureAlgorithm::Dsa(_)
+                | crate::provider::X509SignatureAlgorithm::Ecdsa(_)
+        ) {
+            // RFC 3279 §2.2: decode at the original signature offset/depth,
+            // funded by the same source and current operation as the key.
+            // https://www.rfc-editor.org/rfc/rfc3279#section-2.2
+            let mut reader = original_signature
+                .reader_in(execution)
+                .map_err(X509ChainError::Processing)?;
+            structured_pkix::signature::DssValue::read(&mut reader, "certificate.signature")
+                .map_err(X509ChainError::Processing)?;
+        }
         if matches!(algorithm, crate::provider::X509SignatureAlgorithm::Dsa(_))
             && key_algorithm.algorithm().as_bytes() == dsa::OID.as_bytes()
             && parameters.is_none()
@@ -892,6 +896,117 @@ impl ProviderVerifier<'_> {
             structured_pkix::path::Verified::No
         })
     }
+}
+
+fn signature_algorithm<W: Work>(
+    identifier: structured_pkix::algorithm::AlgorithmIdentifier<'_>,
+    execution: &W,
+) -> Result<crate::provider::X509SignatureAlgorithm, X509ChainError> {
+    use crate::provider::X509SignatureAlgorithm as Signature;
+    use structured_asn1::digest::Resolution;
+    use structured_pkix::algorithm::{digest::Algorithm as Hash, signature::Algorithm};
+    let unsupported = || {
+        // Preserve branch-local discovery semantics for unknown identifiers.
+        // This is the existing diagnostic boundary, not a second algorithm
+        // parser: PKIX has already validated the OID's original encoding.
+        X509ChainError::UnsupportedSignatureAlgorithm {
+            oid: x509_parser::oid_registry::Oid::new(std::borrow::Cow::Borrowed(
+                identifier.algorithm().as_bytes(),
+            ))
+            .to_id_string(),
+        }
+    };
+    let hash = |value| {
+        Ok(match value {
+            Hash::Sha1 => super::DigestAlgorithm::Sha1,
+            Hash::Sha224 => super::DigestAlgorithm::Sha224,
+            Hash::Sha256 => super::DigestAlgorithm::Sha256,
+            Hash::Sha384 => super::DigestAlgorithm::Sha384,
+            Hash::Sha512 => super::DigestAlgorithm::Sha512,
+            Hash::Sha3_224 => super::DigestAlgorithm::Sha3_224,
+            Hash::Sha3_256 => super::DigestAlgorithm::Sha3_256,
+            Hash::Sha3_384 => super::DigestAlgorithm::Sha3_384,
+            Hash::Sha3_512 => super::DigestAlgorithm::Sha3_512,
+            _ => return Err(unsupported()),
+        })
+    };
+    // Shared PKIX owns ASN.1 signature syntax and parameters, retaining the
+    // original reader/depth and both source and current Work. The XML adapter
+    // maps only provider capability; it never encodes/reparses the identifier.
+    structured_pkix::algorithm::signature::with_algorithm(identifier, execution, |value| {
+        Ok(match value {
+            Some(Algorithm::RsaPkcs1v15(value)) => Signature::RsaPkcs1v15(hash(value)?),
+            Some(Algorithm::Dsa(value)) => Signature::Dsa(hash(value)?),
+            Some(Algorithm::Ecdsa(value)) => Signature::Ecdsa(hash(value)?),
+            Some(Algorithm::Ed25519) => Signature::Ed25519,
+            Some(Algorithm::Ed448) => Signature::Ed448,
+            Some(Algorithm::MlDsa(set)) => Signature::PostQuantum(match set {
+                structured_pkix::algorithm::ml_dsa::ParameterSet::MlDsa44 => {
+                    super::PqAlgorithm::MlDsa44
+                }
+                structured_pkix::algorithm::ml_dsa::ParameterSet::MlDsa65 => {
+                    super::PqAlgorithm::MlDsa65
+                }
+                structured_pkix::algorithm::ml_dsa::ParameterSet::MlDsa87 => {
+                    super::PqAlgorithm::MlDsa87
+                }
+            }),
+            Some(Algorithm::RsaPss(parameters)) => {
+                let profile = match parameters
+                    .profile(execution)
+                    .map_err(X509ChainError::Processing)?
+                {
+                    Resolution::Supported(profile) => profile,
+                    Resolution::Unsupported | Resolution::Malformed => return Err(unsupported()),
+                };
+                let salt_len = profile
+                    .salt()
+                    .as_u64()
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(unsupported)?;
+                Signature::RsaPss {
+                    digest: hash(profile.hash())?,
+                    mgf_digest: hash(profile.mask_hash())?,
+                    salt_len,
+                }
+            }
+            None => {
+                // Explicit existing compatibility capabilities outside the
+                // shared resolver's documented set, not an engine fallback.
+                let oid = identifier.algorithm().as_bytes();
+                let parameters = identifier.parameters();
+                match oid {
+                    [0x2b, 0x0e, 0x03, 0x02, 0x1d]
+                        if parameters.is_none() || identifier.has_null_parameter() =>
+                    {
+                        Signature::RsaPkcs1v15(super::DigestAlgorithm::Sha1)
+                    }
+                    [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03]
+                        if parameters.is_none() =>
+                    {
+                        Signature::Dsa(super::DigestAlgorithm::Sha384)
+                    }
+                    [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x04]
+                        if parameters.is_none() =>
+                    {
+                        Signature::Dsa(super::DigestAlgorithm::Sha512)
+                    }
+                    _ if parameters.is_none() => Signature::PostQuantum(
+                        super::PqAlgorithm::ALL
+                            .into_iter()
+                            .find(|value| {
+                                der::asn1::ObjectIdentifier::new_unwrap(value.oid()).as_bytes()
+                                    == oid
+                            })
+                            .ok_or_else(unsupported)?,
+                    ),
+                    _ => return Err(unsupported()),
+                }
+            }
+            _ => return Err(unsupported()),
+        })
+    })
+    .map_err(X509ChainError::Processing)?
 }
 
 /// Certificate-path signature checks through the selected provider, under the
@@ -934,7 +1049,7 @@ impl<W: Work> structured_pkix::path::Verify<W> for CertificatePathVerifier<'_, '
         algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
         key: structured_pkix::path::WorkingKey<'_>,
         signed: &[u8],
-        signature: structured_asn1::BitString<'_>,
+        signature: structured_pkix::signature::SignatureValue<'_>,
         execution: &W,
     ) -> Result<structured_pkix::path::Verified, Self::Error> {
         let raw = key.key().as_bytes();
@@ -1178,6 +1293,48 @@ impl CertificateSession {
 mod tests {
     use super::*;
     use structured_pkix::path::{Verified, Verify as _, WorkingKey};
+
+    #[test]
+    fn shared_signature_resolution_preserves_current_work_and_parameters() {
+        // Retained identifiers borrow their source provenance; a new query
+        // cannot reset its own work ceiling or accept ECDSA NULL parameters.
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let bytes = b"\x30\x0a\x06\x08\x2a\x86\x48\xce\x3d\x04\x03\x02";
+        let mut reader = session
+            .parser
+            .read(bytes, 400)
+            .expect("funded original reader");
+        let element = reader
+            .next_element()
+            .expect("encoded sequence")
+            .expect("one identifier");
+        let identifier = structured_pkix::algorithm::read(&reader, &element, "signatureAlgorithm")
+            .expect("valid ECDSA identifier");
+        assert_eq!(
+            signature_algorithm(identifier, session.memory()).expect("supported ECDSA signature"),
+            crate::provider::X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha256)
+        );
+        let refused = Memory::new(std::sync::Arc::new(
+            structured_asn1::memory::MemoryAccount::new(0, 0),
+        ));
+        assert!(
+            matches!(signature_algorithm(identifier, &refused), Err(X509ChainError::Processing(error)) if error.is_resource())
+        );
+        let bad = b"\x30\x0c\x06\x08\x2a\x86\x48\xce\x3d\x04\x03\x02\x05\x00";
+        let mut reader = session
+            .parser
+            .read(bad, 700)
+            .expect("funded malformed-parameter source");
+        let element = reader
+            .next_element()
+            .expect("encoded sequence")
+            .expect("one bad identifier");
+        let identifier = structured_pkix::algorithm::read(&reader, &element, "signatureAlgorithm")
+            .expect("structurally valid identifier");
+        assert!(
+            matches!(signature_algorithm(identifier, session.memory()), Err(X509ChainError::Processing(error)) if !error.is_resource() && error.offset() >= 700)
+        );
+    }
 
     #[test]
     fn dsa_public_key_keeps_borrowed_components_and_absent_parameters() {
@@ -1587,7 +1744,7 @@ mod tests {
                     &parsed.tbs().signature(),
                     WorkingKey::standing(parsed.tbs().public_key()),
                     parsed.signed_bytes(),
-                    parsed.signature(),
+                    parsed.signature_value(),
                     session.memory()
                 )
                 .expect("signature execution succeeds"),
@@ -1601,7 +1758,7 @@ mod tests {
                     &parsed.tbs().signature(),
                     WorkingKey::standing(parsed.tbs().public_key()),
                     &altered,
-                    parsed.signature(),
+                    parsed.signature_value(),
                     session.memory()
                 )
                 .expect("corrupt signature execution succeeds"),
@@ -1641,7 +1798,7 @@ mod tests {
                 &certificate.tbs().signature(),
                 WorkingKey::standing(certificate.tbs().public_key()),
                 certificate.signed_bytes(),
-                certificate.signature(),
+                certificate.signature_value(),
                 &reader.execution(),
             );
             if local == 0 || aggregate == 0 {
@@ -1709,7 +1866,7 @@ mod tests {
             &parsed.tbs().signature(),
             WorkingKey::standing(parsed.tbs().public_key()),
             parsed.signed_bytes(),
-            parsed.signature(),
+            parsed.signature_value(),
             session.memory(),
             |_| {
                 checked.set(true);

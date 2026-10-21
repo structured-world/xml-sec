@@ -5,6 +5,9 @@ synthetic inputs. The cases describe attack **classes**, not a claim that
 every historical CVE has been reproduced or that an independent audit has
 been completed. No production policy is relaxed to make a test pass.
 
+The separate [CVE audit](cve-audit.md) records individual advisory dispositions,
+original upstream payload provenance, and unresolved public-trigger evidence.
+
 ## Sources And Invariants
 
 | Class | Primary source | Executable case and required result |

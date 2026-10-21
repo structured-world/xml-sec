@@ -1,0 +1,319 @@
+// Explicit, reviewed advisory sets. No keyword-based applicability decisions.
+// A shared regression is not claimed to reproduce each native memory defect.
+export const groups = [
+  {
+    status: 'not-applicable', mechanism: 'php-xmlrpc-extension', evidence: 'Cargo.toml',
+    reason: 'These records concern the separate libxmlrpc/PHP XML-RPC extension, including date_from_ISO8601 and xmlrpc_set_type. Neither the protocol implementation nor those extension APIs are part of this product.',
+    ids: 'CVE-2007-1864 CVE-2014-3668',
+  },
+  {
+    status: 'not-applicable', mechanism: 'webkit-native-parser-context', evidence: 'src/document.rs',
+    reason: 'The record requires WebKit misuse of a native libxml parser context during HTML processing. This product has neither that browser context lifecycle nor an HTML input parser.',
+    ids: 'CVE-2010-1415',
+  },
+  {
+    status: 'not-applicable', mechanism: 'php-global-loader-state', evidence: 'src/document.rs',
+    reason: 'PHP RSHUTDOWN/open_basedir/custom stream wrappers and process-global libxml_disable_entity_loader state are absent. Immutable per-operation XML policy is not a process-global parser toggle shared with other extensions.',
+    ids: 'CVE-2012-1171 CVE-2014-2682 CVE-2015-8866 CVE-2023-3823',
+  },
+  {
+    status: 'not-applicable', mechanism: 'javascript-native-node-wrappers', evidence: 'src/xml/dom/tree.rs',
+    reason: 'The affected V8 argument coercion, native attrs/nsDef wrappers, entity _ref property and addon object lifetime are absent. Typed indexed Rust nodes do not expose raw libxml node headers to JavaScript.',
+    ids: 'CVE-2022-21144 CVE-2024-34391 CVE-2024-34392 CVE-2024-34393 CVE-2024-34394 CVE-2025-25341',
+  },
+  {
+    status: 'not-applicable', mechanism: 'php-sanitizer-attribute-lifetime', evidence: 'src/xml/dom/tree.rs',
+    reason: 'The specific trigger needs PHP DOMElement native object ownership and the sanitizer double-removeAttribute path after DTD default rematerialization. Neither that sanitizer nor PHP native DOM wrappers are shipped. This is not a general assertion about SVG sanitization safety.',
+    ids: 'CVE-2026-107379',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'downstream-xxe-configuration', evidence: 'tests/historical_security.rs',
+    reason: 'The downstream application/runtime integrations are absent. Their external-entity/XInclude authority invariant is tested at our secure parser boundary with no ambient acquisition; these are not imported application exploit files.',
+    ids: 'CVE-2014-1439 CVE-2014-2054 CVE-2026-23739 CVE-2026-33737 CVE-2026-40042',
+  },
+  {
+    status: 'insufficient-public-detail', mechanism: 'chromium-integer-overflow', evidence: 'tests/fixtures/security/advisories.json',
+    reason: 'The libxml alias query identifies an additional Chromium integer-overflow advisory, but the retained description does not qualify an exact input or fixing operation. No individual reproducer or non-applicability is claimed.',
+    ids: 'CVE-2026-17705',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'strict-character-decoding', evidence: 'tests/cve_security.rs',
+    reason: 'Original malformed UTF-8/declaration/truncated-input corpus must be rejected by the public byte decoder and strict parser on every backend. These are boundary regressions, not reproductions of each native input-buffer lifetime defect.',
+    ids: 'CVE-2007-6284 CVE-2013-2877 CVE-2015-7498 CVE-2015-7499 CVE-2015-7500 CVE-2015-7941 CVE-2015-7942 CVE-2015-8241 CVE-2015-8317 CVE-2016-1762',
+  },
+  {
+    status: 'bounded-analogue', mechanism: 'large-buffer-overflow', evidence: 'tests/policy_profiles.rs',
+    reason: 'Byte/node/output limits refuse before materializing multi-gigabyte buffers. No XML_PARSE_HUGE override exists. Tests exercise the same admission boundary at small selected limits, not a fabricated 2GB overflow reproducer.',
+    ids: 'CVE-2008-4225 CVE-2008-4226 CVE-2017-5029 CVE-2017-5130 CVE-2019-18853 CVE-2022-29824 CVE-2022-40303 CVE-2025-6021 CVE-2026-86138 CVE-2026-86143',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-string-and-dict-api', evidence: 'src/xml/dom/tree.rs',
+    reason: 'These specific defects require the native xmlStrncat, xmlDict, xmlEncodeEntitiesInternal or xmlBufAttrSerializeTxtContent APIs and raw/invalid UTF-8 strings. Semantic nodes retain validated Rust strings and indexed owned nodes; no corresponding C string/dictionary API is exposed. Original parser regressions remain independently replayed.',
+    ids: 'CVE-2010-4657 CVE-2015-7497 CVE-2016-1834 CVE-2016-1839 CVE-2016-4483 CVE-2016-9598 CVE-2021-3517 CVE-2023-29469',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-oom-unlink', evidence: 'src/xml/dom/tree.rs',
+    reason: 'The reported path requires native xmlUnlinkNode on allocator refusal, followed by raw-node cleanup. Our indexed arena mutation API does not expose or call that ownership/unlink protocol; allocation refusal is tested by the shared account and mutation suites.',
+    ids: 'CVE-2023-45322',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-uri-escaping', evidence: 'src/xmldsig/uri.rs',
+    reason: 'There is no xmlURIEscapeStr routine accepting C strings and signed integer lengths; URI processing uses validated strings and bounded output. Resource acquisition remains an explicit caller capability.',
+    ids: 'CVE-2026-86139',
+  },
+  {
+    status: 'insufficient-public-detail', mechanism: 'trigger-not-qualified', evidence: 'tests/fixtures/security/advisories.json',
+    reason: 'The affected mechanism is named, but an exact public trigger has not yet been qualified against the fixing source. Generic syntax/fuzz tests are not marked as an individual reproducer, and this disposition does not mean non-applicability.',
+    ids: 'CVE-2010-4008 CVE-2010-4494 CVE-2011-2821 CVE-2011-2834 CVE-2025-10911',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'namespace-id-and-pattern-error', evidence: 'crates/xml-sec-xslt/tests/cve_security.rs',
+    reason: 'Chromium fixing reviews 10823168 and 10830177 retain namespace-node ownership until generate-id finishes and stop pattern compilation after an id/key parse error. Namespace ID stability and malformed-pattern static errors are tested; the reviews contain no original exploit file.',
+    ids: 'CVE-2012-2870',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-namespace-struct-layout', evidence: 'https://chromiumcodereview.appspot.com/10824157/diff/1/third_party/libxml/src/include/libxml/tree.h',
+    reason: 'The fixing diff adds dummy_children to the native xmlNs layout so a node cast cannot reinterpret its prefix pointer as children. Indexed typed namespace nodes do not use that struct or raw layout cast. Namespace traversal semantics are independently exercised by the XSLT suite.',
+    ids: 'CVE-2012-2871',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-avt-dictionary-ownership', evidence: 'https://chromiumcodereview.appspot.com/10919019/diff/1/third_party/libxslt/libxslt/templates.c',
+    reason: 'The fixing diff checks xmlDictOwns before sharing attribute-value text with a target document. This native dictionary/non-dictionary deallocator distinction is absent from owned Rust attribute strings; no XML input is included in that review.',
+    ids: 'CVE-2012-2893',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'asymmetric-mac-key-confusion', evidence: 'tests/cve_security.rs',
+    reason: 'The upstream castKey fix (simplesamlphp/saml2 88a9ae848c4b310b1c53b5700893d890999dd930) restricts algorithm conversion to RSA. A genuine HMAC made with public SPKI bytes verifies only under an explicitly symmetric key; the typed RSA key returns AlgorithmMismatch. No original PHP exploit is claimed.',
+    ids: 'CVE-2018-7644',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-dropdtd-xinclude-lifetime',
+    evidence: 'https://github.com/GNOME/libxml2/commit/1098c30a040e72a4654968547f415be4e4c40fe7',
+    reason: 'The fix avoids traversing dangling entity references left by xmllint --dropdtd before XInclude. No dropdtd/raw entity-node mutation API exists here; owned documents and explicit resource grants have a different lifetime contract.',
+    ids: 'CVE-2021-3518',
+  },
+  {
+    status: 'not-applicable', mechanism: 'html-server-side-include-output',
+    evidence: 'https://github.com/GNOME/libxml2/commit/960f0e275616cadc29671a218d7fb9b69eb35588',
+    reason: 'The cited change concerns libxml2 HTMLtree server-side-include serialization. The affected native HTML output branch is absent; this is not a claim that XML escaping sanitizes arbitrary application HTML.',
+    ids: 'CVE-2016-3709',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'explicit-child-pattern',
+    evidence: 'crates/xml-sec-xslt/tests/cve_security.rs',
+    reason: 'The fixing source changes explicit child:: pattern compilation to the ordinary element opcode (503f788e84f1c1f1d769c2c7258d77faee94b5a3). A positive equivalent-output test covers both spellings; no original exploit file accompanies the fix.',
+    ids: 'CVE-2025-27113',
+  },
+  {
+    status: 'mechanism-audited', mechanism: 'xpath-allocation-failure',
+    evidence: 'https://github.com/GNOME/libxml2/commit/d7958b21e7f8c447a26bb2436f08402b2c308be4',
+    reason: 'The fixing source increments native XPath container counts only after successful realloc. No input fixture accompanies it: failure injection, not XML alone, is required. Shared accounted containers own capacity transactionally; this is source evidence, not an original reproducer or a claim that every allocator failure has been injected here.',
+    ids: 'CVE-2011-1944',
+  },
+  {
+    status: 'mechanism-audited', mechanism: 'hash-collision-work',
+    evidence: 'https://github.com/GNOME/libxml2/commit/8973d58b7498fa5100a876815476b81fd1a2412a',
+    reason: 'The upstream remedy randomizes native dict/hash functions. Those functions are not used here; native collision keys do not establish collisions in Rust maps. Original collision inputs are not provided by the fixing commit. This records the mechanism without claiming an equivalent collision reproducer.',
+    ids: 'CVE-2012-0841',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-variadic-format',
+    evidence: 'https://github.com/GNOME/libxml2/commit/4472c3a5a5b516aaf59b89be602fbce52756c3e9',
+    reason: 'The fixes stop passing document-controlled text as a C variadic printf format. Rust diagnostics use static formatting templates; no C variadic error handler is exposed.',
+    ids: 'CVE-2016-4448',
+  },
+  {
+    status: 'not-applicable', mechanism: 'xmllint-html-error-output',
+    evidence: 'https://github.com/GNOME/libxml2/commit/50f06b3efb638efb0abd95dc62dca05ae67882c2',
+    reason: 'The fixing source is xmllint --htmlout diagnostic formatting, not the XML entity processor suggested by older summaries. This product does not ship that command or HTML error handler.',
+    ids: 'CVE-2020-24977',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'duplicate-signed-info',
+    evidence: 'tests/signature_pipeline_integration.rs',
+    reason: 'The xmlseclibs fix requires exactly one SignedInfo. duplicate_signed_info_is_rejected asserts the exact public structural refusal. This is an equivalent regression, not an imported PHP exploit.',
+    ids: 'CVE-2019-3465',
+  },
+  {
+    status: 'upstream-reproducer', mechanism: 'embedded-key-trust', evidence: 'tests/cve_security.rs',
+    reason: 'The three original PySAML2 fixing-commit fixtures run unchanged through all available verification backends. Permitting compatibility algorithms does not authorize embedded attacker keys. Positive trusted-key controls remain in historical_security.rs.',
+    ids: 'CVE-2021-21239',
+  },
+  {
+    status: 'bounded-analogue', mechanism: 'xslt-pattern-admission', evidence: 'crates/xml-sec-xslt/tests/cve_security.rs',
+    reason: 'The selected stylesheet-byte ceiling refuses a long flat pattern before compilation; an admitted short positive control compiles. This is input admission, not a claim that flat pattern length is XML nesting depth or a recreation of the native overflow.',
+    ids: 'CVE-2008-1767',
+  },
+  {
+    status: 'mechanism-audited', mechanism: 'nested-xpath-recursion', evidence: 'src/xslt/xpath.rs',
+    reason: 'evaluate_dynamic retains dynamic_evaluation_depth across nested calls and applies the same execution meter before evaluation. This addresses the depth-reset mechanism, not an original libxml2 reentrant-callback reproducer; no such input is claimed as replayed.',
+    ids: 'CVE-2025-9714',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'xslt-lifetime-and-numbering', evidence: 'crates/xml-sec-xslt/tests/cve_security.rs',
+    reason: 'Explicit semantic counterparts check exact output or static refusal for the described operation, including the retained source-node, namespace, format and context invariants. They are not copies of undisclosed browser exploit payloads.',
+    ids: 'CVE-2008-2935 CVE-2011-0195 CVE-2011-1202 CVE-2012-6139 CVE-2016-1683 CVE-2016-1684 CVE-2019-13117 CVE-2019-13118 CVE-2019-18197 CVE-2019-5815 CVE-2021-30560 CVE-2024-55549 CVE-2025-24855 CVE-2025-7424 CVE-2025-7425',
+  },
+  {
+    status: 'not-applicable', mechanism: 'ambient-random', evidence: 'src/xslt/xpath.rs',
+    reason: 'EXSLT math:random is not registered as an implemented function. Cryptographic randomness is a selected CryptoProvider operation, not the native libxslt startup PRNG.',
+    ids: 'CVE-2015-9019',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'xslt-read-write-authority', evidence: 'crates/xml-sec-xslt/tests/cve_security.rs',
+    reason: 'No ambient read/write capability is granted. Secondary output is returned as caller-owned bytes instead of written, and authorization failure remains an error. Upstream security fixtures test the corresponding capability boundary.',
+    ids: 'CVE-2011-1425 CVE-2011-1774 CVE-2012-0057 CVE-2012-3488 CVE-2019-11068 CVE-2022-47966',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'xinclude-authority-propagation', evidence: 'crates/xml-sec-xslt/tests/engine.rs',
+    reason: 'xinclude_fallback_cannot_swallow_a_policy_refusal and the retained-grant tests require authorization before acquisition under the operation environment. There is no ambient NONET parser flag or native default loader to lose on nested includes. This is an authority-boundary regression, not an original 2.15.4 input.',
+    ids: 'CVE-2026-86144',
+  },
+  {
+    status: 'not-applicable', mechanism: 'document-node-type-confusion', evidence: 'src/xslt/model.rs',
+    reason: 'DTD declarations and document nodes are distinct typed variants, never cast to an Element structure. There is no shared psvi/atype scratch slot between stylesheets, sources and temporary trees. Relevant output/lifetime semantics are tested independently.',
+    ids: 'CVE-2013-4520 CVE-2015-7995 CVE-2025-11731',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'consumer-canonicalization', evidence: 'tests/cve_security.rs',
+    reason: 'The public advisory describes wrapper failure-to-empty handling, without its original exploit input. A relative-namespace canonicalization error is tested against an absolute-namespace positive control. This is a semantic counterpart, not an imported wrapper PoC; valid empty node sets remain legal.',
+    ids: 'CVE-2025-66568 CVE-2025-66578',
+  },
+  {
+    status: 'not-applicable', mechanism: 'nginx-parser-lifecycle', evidence: 'src/document.rs',
+    reason: 'The njs failure path fails to register cleanup of a native libxml2 parser context. There is no njs runtime or native parser context in this product; original malformed XML is still rejected by the separate parser corpus.',
+    ids: 'CVE-2026-101025',
+  },
+  {
+    status: 'semantic-regression', mechanism: 'gcm-tag-width', evidence: 'tests/cve_security.rs',
+    reason: 'A real GCM encrypted control decrypts and shortened authentication tags refuse. Backend failure is not softened into plaintext success.',
+    ids: 'CVE-2026-32313',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-xinclude-node-lifetime', evidence: 'src/xslt/model.rs',
+    reason: 'No xmlXIncludeAddNode raw-node ownership exists. XInclude operates on owned indexed documents with explicit resolver identities and budgets; permission inheritance is checked separately.',
+    ids: 'CVE-2022-49043',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'application-xxe', evidence: 'tests/historical_security.rs',
+    reason: 'TYPO3 configuration is not part of this product; its described external-entity authority invariant is exercised through the secure XML boundary. No TYPO3 exploit is claimed.',
+    ids: 'CVE-2020-26229',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-network-client',
+    evidence: 'src/xslt/resolver.rs',
+    reason: 'No nanoHTTP/nanoFTP client, proxy, redirect or DNS connection implementation exists in the product. Resource acquisition is caller-owned; URI denial is tested separately.',
+    ids: 'CVE-2004-0110 CVE-2004-0989 CVE-2017-7376',
+  },
+  {
+    status: 'not-applicable', mechanism: 'native-loader', evidence: 'Cargo.toml',
+    reason: 'No libltdl/.la plugin discovery, current-directory dynamic loading or PHP extension callback runtime is linked into the XML engine.',
+    ids: 'CVE-2009-3736 CVE-2015-6837 CVE-2015-6838',
+  },
+  {
+    status: 'not-applicable', mechanism: 'compressed-input', evidence: 'src/encoding.rs',
+    reason: 'XML input decodes character encodings; it does not decompress XZ/LZMA streams. The affected xzlib decoder and its retry/memory-limit protocol are absent.',
+    ids: 'CVE-2015-8035 CVE-2017-18258 CVE-2018-14567 CVE-2018-9251',
+  },
+  {
+    status: 'not-applicable', mechanism: 'html-parser', evidence: 'src/document.rs',
+    reason: 'The input path is a strict XML parser, not libxml2 HTML recovery/push parsing. XSLT HTML serialization does not parse HTML input or execute HTMLparser.c.',
+    ids: 'CVE-2015-8242 CVE-2015-8710 CVE-2015-8806 CVE-2016-1833 CVE-2016-1837 CVE-2016-2073 CVE-2017-8872',
+  },
+  {
+    status: 'not-applicable', mechanism: 'schema-validator', evidence: 'src/document.rs',
+    reason: 'No XSD, RelaxNG, Schematron or xmlregexp validator is exposed or called. Parsing an element named schema is not running the affected schema/constraint processor.',
+    ids: 'CVE-2016-1840 CVE-2019-20388 CVE-2023-28484 CVE-2024-56171 CVE-2025-32415 CVE-2025-49794 CVE-2025-49795 CVE-2025-49796 CVE-2026-0989 CVE-2026-6732 CVE-2026-86137 CVE-2026-86141',
+  },
+  {
+    status: 'not-applicable', mechanism: 'xml-catalogue', evidence: 'src/xslt/resolver.rs',
+    reason: 'There is no XML/SGML catalog parser, delegateURI/nextCatalog traversal or xmlcatalog shell. The explicit resolver does not discover catalogs.',
+    ids: 'CVE-2025-8732 CVE-2026-0990 CVE-2026-0992 CVE-2026-11979 CVE-2026-76781',
+  },
+  {
+    status: 'not-applicable', mechanism: 'host-bindings', evidence: 'Cargo.toml',
+    reason: 'The affected libxml2 Python SAX/file callbacks, lxml iterwalk, custom SAX1 API or xmllint interactive/HTML error-output implementation is not shipped. No equivalent raw callback ownership API is exposed.',
+    ids: 'CVE-2021-3516 CVE-2022-2309 CVE-2023-39615 CVE-2024-34459 CVE-2025-32414 CVE-2025-6170 CVE-2026-1757 CVE-2026-74860',
+  },
+  {
+    status: 'not-applicable', mechanism: 'other-product', evidence: 'tests/fixtures/security/advisories.json',
+    reason: 'The record describes another product or binding (HP, ActiveX, ImageMagick, VTK, Anjuta, colord or pam_usb), not a native library defect reachable through this product. Related XML invariants are assessed separately, not discarded with the search hit.',
+    ids: 'CVE-2008-3538 CVE-2011-1036 CVE-2021-3596 CVE-2021-42521 CVE-2021-42522 CVE-2021-42523 CVE-2026-48065',
+  },
+  {
+    status: 'not-applicable', mechanism: 'browser-lifecycle', evidence: 'src/xslt/compiler.rs',
+    reason: 'Blink processing-instruction loading and post-failure recompilation reuse are absent: compilation returns an immutable stylesheet only on success, with no browser loading lifecycle.',
+    ids: 'CVE-2013-2902 CVE-2013-2911',
+  },
+  {
+    status: 'not-applicable', mechanism: 'xpointer-ranges', evidence: 'src/xmldsig/uri.rs',
+    reason: 'The XPointer range-to/location-set extension is not implemented; it is distinct from supported same-document ID and element() resolution. No native range endpoint or namespace-pointer ownership exists.',
+    ids: 'CVE-2016-4658 CVE-2016-5131 CVE-2026-86142',
+  },
+  {
+    status: 'not-applicable', mechanism: 'recovery-validator', evidence: 'src/document.rs',
+    reason: 'The affected recovery-mode/post-validation or xmlTextReader backtracking pipeline is absent. Authentication never accepts a recovered partial XML tree; the original upstream error corpus is replayed separately.',
+    ids: 'CVE-2013-1969 CVE-2015-1819 CVE-2016-3627 CVE-2016-9596 CVE-2017-5969 CVE-2019-19956 CVE-2021-3537 CVE-2022-23308 CVE-2024-25062',
+  },
+  {
+    status: 'not-applicable', mechanism: 'dtd-validation-diagnostic', evidence: 'src/document.rs',
+    reason: 'Internal DTD declaration parsing does not run libxml2 validity checking or render its recursive element-content diagnostic into a fixed C buffer. Neither valid.c diagnostic routine is present.',
+    ids: 'CVE-2017-9047 CVE-2017-9048 CVE-2025-24928 CVE-2026-86140',
+  },
+  {
+    status: 'not-applicable', mechanism: 'xpath-host-stack-corruption', evidence: 'https://github.com/GNOME/libxml2/commit/a436374994c47b12d5de1b8b1d191a098fa23594',
+    reason: 'The fixing commit identifies stack corruption by a misbehaving native extension. Our extension API returns typed values, not a writable libxml2 XPath value stack. A malformed XPath string alone is not this reproducer.',
+    ids: 'CVE-2018-14404',
+  },
+  {
+    status: 'rejected', mechanism: 'invalid-assignment', evidence: 'https://gitlab.gnome.org/GNOME/libxml2/-/issues/1012',
+    reason: 'NVD marks this assignment Rejected. It is retained in the inventory, not counted as an implemented security regression.',
+    ids: 'CVE-2025-12863',
+  },
+  {
+    status: 'upstream-reproducer', mechanism: 'parser-source-lifetime', evidence: 'tests/cve_security.rs',
+    reason: 'Original committed libxml2 error payloads execute through every available public parser boundary, requiring refusal rather than recovery. Upstream introducing/fixing commits are documented in the audit runbook.',
+    ids: 'CVE-2016-1835 CVE-2016-1836 CVE-2016-1838 CVE-2016-4447 CVE-2017-9049 CVE-2017-9050 CVE-2021-3541',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'entity-expansion', evidence: 'tests/cve_security.rs',
+    reason: 'Original recursive/expansion inputs are refused at the secure no-DTD boundary. Compatibility expansion has separate finite work/depth/output contracts. This proves our boundary, not reproduction of each historical C allocation bug.',
+    ids: 'CVE-2003-1564 CVE-2008-3281 CVE-2008-3529 CVE-2008-4409 CVE-2009-2414 CVE-2009-2416 CVE-2012-5134 CVE-2013-0338 CVE-2014-3660 CVE-2015-5312 CVE-2016-3705 CVE-2016-9597 CVE-2017-16931 CVE-2017-16932 CVE-2020-7595 CVE-2022-40304 CVE-2026-6653',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'external-entity-authority', evidence: 'tests/historical_security.rs',
+    reason: 'Secure parser policy refuses DTDs and external references without invoking ambient I/O. The analogous authority invariant applies even for records about downstream applications. Not presented as a reproduction of their application configuration.',
+    ids: 'CVE-2012-3489 CVE-2013-0339 CVE-2014-0191 CVE-2016-4449 CVE-2016-9318 CVE-2017-7375 CVE-2017-1000061 CVE-2024-40896 CVE-2026-48981',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'hmac-truncation', evidence: 'tests/historical_security.rs',
+    reason: 'Real truncated HMAC prefixes refuse with typed output-length policy; a genuine accepted-length signature verifies. CERT VU466161 is the primary historical source.',
+    ids: 'CVE-2009-0217',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'attribute-projection', evidence: 'tests/cve_security.rs',
+    reason: 'The semantic canonicalization view preserves an entity-backed attribute in full under explicit DTD permission. No njs getters exist; this is a projection analogue, not an execution of the affected njs module.',
+    ids: 'CVE-2026-101019',
+  },
+  {
+    status: 'boundary-regression', mechanism: 'signed-target', evidence: 'tests/historical_security.rs',
+    reason: 'Mathematically valid relocated content does not grant coverage to an unsigned lookalike. The application supplies expected targets; the native or downstream application CVE itself is not imported.',
+    ids: 'CVE-2026-100227',
+  },
+  {
+    status: 'insufficient-public-detail', mechanism: 'undisclosed-trigger', evidence: 'tests/fixtures/security/advisories.json',
+    reason: 'The retained public descriptions give no qualifying trigger or reproducer sufficient for an equivalent regression. These are NOT classified as non-applicable or reproduced. Generic fuzz/conformance success is not individual CVE evidence.',
+    ids: 'CVE-2011-0216 CVE-2011-3102 CVE-2011-3905 CVE-2011-3919 CVE-2011-3970 CVE-2012-2807 CVE-2012-2825 CVE-2015-3807 CVE-2015-7115 CVE-2015-7116 CVE-2016-1761 CVE-2016-1841 CVE-2016-4607 CVE-2016-4608 CVE-2016-4609 CVE-2016-4610 CVE-2016-4614 CVE-2016-4615 CVE-2016-4616 CVE-2016-4738 CVE-2017-0663 CVE-2017-15412 CVE-2019-8749 CVE-2019-8750 CVE-2019-8756 CVE-2020-3909 CVE-2020-3910 CVE-2020-3911 CVE-2023-40403 CVE-2023-42869 CVE-2025-26434',
+  },
+];
+
+export function dispositions(records) {
+  const byId = new Map();
+  for (const { ids, ...group } of groups) {
+    for (const id of ids.split(' ')) {
+      if (byId.has(id)) throw new Error(`duplicate disposition: ${id}`);
+      byId.set(id, group);
+    }
+  }
+  return records.map(row => ({ ...row, disposition: byId.get(row.id) ?? null }));
+}

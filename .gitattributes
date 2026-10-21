@@ -5,3 +5,10 @@ tests/fixtures/xmldsig/phaos-xmldsig-three/** -text whitespace=-trailing-space,-
 tests/fixtures/xmldsig/external-data/rfc3161.txt -text
 crates/xml-sec-xslt/tests/fixtures/libxslt-1.1.45/upstream/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof linguist-generated
 vendor/sxd-xpath-no-unsafe/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof
+# Preserve original regression bytes, including malformed encodings and CRLF.
+tests/fixtures/security/libxml2/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof linguist-generated
+tests/fixtures/security/libxslt/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof linguist-generated
+tests/fixtures/security/pysaml2/** -text whitespace=-trailing-space,-space-before-tab,-blank-at-eof linguist-generated
+tests/fixtures/security/*.json text eol=lf
+tests/fixtures/security/*.tsv text eol=lf
+docs/cve-inventory.md text eol=lf

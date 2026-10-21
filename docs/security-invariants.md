@@ -7,6 +7,8 @@ application authorization are separate decisions.
 The deterministic [historical attack corpus](historical-security.md) ties
 public-path regressions to their original advisories and specification
 invariants, with positive controls and explicit compatibility boundaries.
+The separate [CVE inventory](cve-inventory.md) distinguishes original payloads,
+analogous regressions, absent mechanisms, and unqualified public triggers.
 
 ## Secrets and Ownership
 

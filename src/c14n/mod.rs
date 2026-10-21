@@ -162,6 +162,9 @@ pub enum C14nError {
     /// Invalid node reference.
     #[error("invalid node reference")]
     InvalidNode,
+    /// A nonempty namespace name is relative, which canonical XML forbids.
+    #[error("canonicalization requires absolute namespace URIs")]
+    RelativeNamespace,
     /// Algorithm not yet implemented.
     #[error("unsupported algorithm: {0}")]
     UnsupportedAlgorithm(String),

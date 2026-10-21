@@ -2,6 +2,7 @@
 
 use std::{collections::HashSet, time::SystemTime};
 
+#[cfg(test)]
 use x509_parser::x509::AlgorithmIdentifier;
 #[cfg(test)]
 use x509_parser::{
@@ -11,10 +12,9 @@ use x509_parser::{
 
 use super::X509DataInfo;
 use super::pkix::X509DataSource;
-use crate::{
-    policy::{DsaKeyPolicy, ExtendedKeyPurpose, RsaKeyPolicy},
-    provider::X509SignatureAlgorithm,
-};
+use crate::policy::{DsaKeyPolicy, ExtendedKeyPurpose, RsaKeyPolicy};
+#[cfg(test)]
+use crate::provider::X509SignatureAlgorithm;
 
 /// Inputs controlling X.509 certificate-chain validation.
 #[derive(Debug, Clone)]
@@ -1124,7 +1124,7 @@ pub(crate) fn shared_certificate_signature_outcome(
             &certificate.tbs().signature(),
             WorkingKey::standing(issuer.tbs().public_key()),
             certificate.signed_bytes(),
-            certificate.signature(),
+            certificate.signature_value(),
             session.memory(),
         )
         .map_err(|error| match error {
@@ -1197,6 +1197,7 @@ pub(crate) fn verify_x509_signature_with_provider(
         .map_err(Into::into)
 }
 
+#[cfg(test)]
 pub(crate) fn authorize_x509_signature_algorithm(
     algorithm_identifier: &AlgorithmIdentifier<'_>,
     provider: &dyn crate::provider::CryptoProvider,
@@ -1212,6 +1213,7 @@ pub(crate) fn authorize_x509_signature_algorithm(
     Ok(algorithm)
 }
 
+#[cfg(test)]
 fn x509_signature_algorithm(
     identifier: &AlgorithmIdentifier<'_>,
 ) -> Result<X509SignatureAlgorithm, X509ChainError> {
@@ -1289,6 +1291,7 @@ fn x509_signature_algorithm(
     Ok(algorithm)
 }
 
+#[cfg(test)]
 fn require_absent_signature_parameters(
     identifier: &AlgorithmIdentifier<'_>,
 ) -> Result<(), X509ChainError> {
@@ -1301,6 +1304,7 @@ fn require_absent_signature_parameters(
     Ok(())
 }
 
+#[cfg(test)]
 fn require_null_or_absent_signature_parameters(
     identifier: &AlgorithmIdentifier<'_>,
 ) -> Result<(), X509ChainError> {
@@ -1317,6 +1321,7 @@ fn require_null_or_absent_signature_parameters(
     Ok(())
 }
 
+#[cfg(test)]
 fn invalid_signature_parameters(
     identifier: &AlgorithmIdentifier<'_>,
     requirement: &str,
@@ -1327,6 +1332,7 @@ fn invalid_signature_parameters(
     }
 }
 
+#[cfg(test)]
 fn parse_rsa_pss_algorithm(
     identifier: &AlgorithmIdentifier<'_>,
 ) -> Result<X509SignatureAlgorithm, X509ChainError> {
@@ -1373,6 +1379,7 @@ fn parse_rsa_pss_algorithm(
     })
 }
 
+#[cfg(test)]
 fn x509_digest_algorithm(oid: &str) -> Result<super::DigestAlgorithm, X509ChainError> {
     match oid {
         "1.3.14.3.2.26" => Ok(super::DigestAlgorithm::Sha1),
@@ -3293,7 +3300,7 @@ mod tests {
             _: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
             _: structured_pkix::path::WorkingKey<'_>,
             _: &[u8],
-            _: structured_asn1::BitString<'_>,
+            _: structured_pkix::signature::SignatureValue<'_>,
             _: &structured_asn1::memory::Memory,
         ) -> Result<structured_pkix::path::Verified, Self::Error> {
             Ok(structured_pkix::path::Verified::Yes)

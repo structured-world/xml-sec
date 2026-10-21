@@ -6299,6 +6299,10 @@ fn format_number_sequence(
                 }
                 format_number_into(&mut output, *value, "1", separator, size, meter)?;
             }
+            // XSLT 1.0 §7.7.1: the last non-alphanumeric token is a suffix,
+            // even when it is also the first token and the format defaults to 1.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#convert
+            append_metered(&mut output, tokens.suffix, meter)?;
             return Ok(output);
         }
         let mut output = MeteredString::new();
