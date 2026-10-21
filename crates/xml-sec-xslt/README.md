@@ -1,5 +1,7 @@
 # xml-sec-xslt
 
+Opt-in phase and reuse measurements: [runbook](../../docs/xslt-performance.md).
+
 Safe-Rust XSLT 1.0 compiler and runtime for parser-independent XML processing.
 The crate is an independent engine: it has no XMLDSig, XMLEnc, key-provider,
 filesystem, network, environment, or global registry coupling. Pure EXSLT digest

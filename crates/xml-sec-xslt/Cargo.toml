@@ -14,6 +14,20 @@ name = "xml_sec_xslt"
 # The published xml-sec package compiles the same sources for its XSLT transform.
 path = "../../src/xslt/lib.rs"
 
+[features]
+benchmark-internals = []
+
+[[example]]
+name = "xslt_latency"
+path = "../../benchmarks/xslt-latency.rs"
+required-features = ["benchmark-internals"]
+
+[[bench]]
+name = "xslt"
+path = "../../benchmarks/xslt-alloc.rs"
+harness = false
+required-features = ["benchmark-internals"]
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded"))'] }
 
@@ -33,3 +47,5 @@ xml-sec-xml-input = { version = "0.1.0", path = "../xml-sec-xml-input" }
 
 [dev-dependencies]
 pretty_assertions = "1"
+divan = "=0.1.21"
+serde_json = "1"

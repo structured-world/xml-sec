@@ -59,6 +59,9 @@ pub use resolver::{
     AccessDenialReason, NoResolver, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
     ResourceAccess, ResourceIdentity,
 };
+#[cfg(feature = "benchmark-internals")]
+#[doc(hidden)]
+pub use runtime::MeasuredTree;
 pub use runtime::{ExecutionOptions, Message, Parameters, SecondaryOutput, TransformResult};
 pub use serializer::{OutputDefinition, OutputMethod, SerializedOutput};
 pub use value::Value;

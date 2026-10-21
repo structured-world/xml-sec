@@ -1,5 +1,8 @@
 # Reproducible XML Security Benchmarks
 
+XSLT phase, immutable reuse and amplification measurements have a separate
+[reproducible runbook](xslt-performance.md).
+
 The benchmark suite uses Divan 0.1.21, a development-only dependency. It never
 changes the allocator in the published library or disables policy enforcement.
 The default build contains no measurement hooks. `benchmark-internals` enables

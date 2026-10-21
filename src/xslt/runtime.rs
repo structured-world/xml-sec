@@ -195,6 +195,37 @@ impl Stylesheet {
         environment: ExecutionEnvironment<R>,
         options: ExecutionOptions,
     ) -> Reported<TransformResult, ExecutionUsage> {
+        let Reported { outcome, usage } =
+            self.start_execution(source, parameters, environment, &options);
+        let mut state = match outcome {
+            Ok(state) => state,
+            Err(error) => {
+                return Reported {
+                    outcome: Err(error),
+                    usage,
+                };
+            }
+        };
+        let serialized = state.run(&options, &self.output);
+        let usage = state.meter.admitted_work();
+        Reported {
+            outcome: serialized.map(|serialized| TransformResult {
+                document: state.result,
+                serialized,
+                secondary_outputs: state.secondary_outputs,
+                messages: state.messages,
+            }),
+            usage,
+        }
+    }
+
+    fn start_execution<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: &ExecutionOptions,
+    ) -> Reported<Execution<'_>, ExecutionUsage> {
         let mut meter = match Meter::new(options.budget, source.source_bytes()) {
             Ok(meter) => meter.with_work_ceiling(environment.work_ceiling),
             Err(error) => {
@@ -214,7 +245,7 @@ impl Stylesheet {
                 };
             }
         };
-        let mut state = match Execution::start(
+        match Execution::start(
             self,
             prepared,
             parameters,
@@ -223,25 +254,17 @@ impl Stylesheet {
             meter,
             source_options,
         ) {
-            Ok(state) => state,
+            Ok(state) => Reported {
+                usage: state.meter.admitted_work(),
+                outcome: Ok(state),
+            },
             Err(failure) => {
                 let (error, usage) = *failure;
-                return Reported {
+                Reported {
                     outcome: Err(error),
                     usage,
-                };
+                }
             }
-        };
-        let serialized = state.run(&options, &self.output);
-        let usage = state.meter.admitted_work();
-        Reported {
-            outcome: serialized.map(|serialized| TransformResult {
-                document: state.result,
-                serialized,
-                secondary_outputs: state.secondary_outputs,
-                messages: state.messages,
-            }),
-            usage,
         }
     }
 
@@ -304,6 +327,11 @@ impl Execution<'_> {
         options: &ExecutionOptions,
         output: &OutputDefinition,
     ) -> Result<SerializedOutput> {
+        self.run_tree(options)?;
+        serialize(&self.result, output, &mut self.meter)
+    }
+
+    fn run_tree(&mut self, options: &ExecutionOptions) -> Result<()> {
         let root = SourceNode::Node(self.evaluator.source.root());
         if let Some(name) = &options.initial_template {
             self.call_named(
@@ -321,8 +349,57 @@ impl Execution<'_> {
                 ApplyFrame::new(1, 1, 1),
             )?;
         }
-        self.result.finalize_xml_ids(&mut self.meter)?;
-        serialize(&self.result, output, &mut self.meter)
+        self.result.finalize_xml_ids(&mut self.meter)
+    }
+}
+
+/// Measurement-only prepared result. Its original execution meter remains live
+/// so serializing never resets the work or memory allowance.
+#[cfg(feature = "benchmark-internals")]
+pub struct MeasuredTree<'a> {
+    state: Execution<'a>,
+    output: &'a OutputDefinition,
+}
+
+#[cfg(feature = "benchmark-internals")]
+impl Stylesheet {
+    /// Execute through result construction, stopping immediately before the
+    /// production serializer. Includes source preparation and dependency checks.
+    #[doc(hidden)]
+    pub fn measure_tree<R: Resolver + 'static>(
+        &self,
+        source: &Document,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: ExecutionOptions,
+    ) -> Result<MeasuredTree<'_>> {
+        let mut state = self
+            .start_execution(source, parameters, environment, &options)
+            .outcome?;
+        state.run_tree(&options)?;
+        Ok(MeasuredTree {
+            state,
+            output: &self.output,
+        })
+    }
+}
+
+#[cfg(feature = "benchmark-internals")]
+impl MeasuredTree<'_> {
+    /// Accounted result-document storage, not allocator peak or process RSS.
+    pub fn result_tree_bytes(&self) -> usize {
+        self.state.result.estimated_owned_bytes()
+    }
+
+    /// Work already admitted before serialization.
+    pub fn usage(&self) -> ExecutionUsage {
+        self.state.meter.admitted_work()
+    }
+
+    /// Serialize once under the same meter. Preparation is deliberately retained
+    /// until this call returns, exactly as in normal execution.
+    pub fn serialize(mut self) -> Result<SerializedOutput> {
+        serialize(&self.state.result, self.output, &mut self.state.meter)
     }
 }
 
