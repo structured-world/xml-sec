@@ -27,7 +27,8 @@ transforms=$("$XMLSEC1_BIN" --list-transforms)
 unset XML_SEC_LIBXSLT_CASE_RANGE XML_SEC_LIBXSLT_CASE
 bash scripts/import-libxslt-oracle-fixtures.sh --check
 cargo nextest run -p xml-sec-xslt --no-fail-fast
-cargo clean
+# The admitted oracle may live under target; retain it for both parts of this
+# gate so cleanup cannot silently disable reciprocal interoperability checks.
 cargo nextest run -p xml-sec --features xslt,xml-backends-all \
   --test xslt_transform_integration --test xmlsec1_interop \
   --test donor_interop_suite --test merlin_interop --test phaos_interop \
