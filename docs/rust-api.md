@@ -76,7 +76,10 @@ references and the parser selection. Operation contexts retain the existing owne
 policy snapshot at creation; no per-node policy cloning is added. Keys/resolvers,
 external resource maps and writers are borrowed for the operation handle's lifetime.
 Encryption execution also borrows its builder, avoiding secret copies and provider
-reference-count operations. Returned strings/bytes/evidence have their existing
+reference-count operations. Signing, encryption and decryption handles can outlive
+the facade value, including a temporary facade; their policy/provider and request
+inputs must still remain alive. Verification handles borrow the facade as well as
+their request inputs. Returned strings/bytes/evidence have their existing
 ownership contracts. `parse_document` moves an owned `String` into its retained
 document; a borrowed string requires the document's one owning copy. Preparation
 has its own parse budget. The string operation methods instead retain the existing

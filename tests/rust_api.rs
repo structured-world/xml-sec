@@ -126,6 +126,60 @@ impl CryptoProvider for RefusingProvider {
 }
 
 #[test]
+fn request_handles_outlive_the_temporary_facade() {
+    // Handles borrow the actual policy/provider and request inputs, not the
+    // facade value. Using them on the next statement catches an accidental
+    // receiver lifetime constraint at compile time and verifies real execution.
+    let compiled = policies();
+    let provider = RustCryptoProvider;
+    let key = HmacSigningKey::new(vec![7; 32]).unwrap();
+    let signer = XmlSecurity::new(&compiled, &provider)
+        .unwrap()
+        .signer(&key)
+        .unwrap();
+    let signed = signer
+        .sign_xml("<root><p Id='payload'>secret</p></root>", &builder())
+        .unwrap();
+    let verify_key = HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let api = XmlSecurity::new(&compiled, &provider).unwrap();
+    assert_eq!(
+        api.verifier()
+            .unwrap()
+            .key(&verify_key)
+            .verify_signature_xml(&signed)
+            .unwrap()
+            .status,
+        DsigStatus::Valid
+    );
+
+    #[cfg(feature = "xmlenc")]
+    {
+        use xml_sec::xmlenc::{
+            DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataBuilder,
+            SymmetricKeyDecryptor,
+        };
+        let builder =
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).direct_key(vec![9; 16]);
+        let encryptor = XmlSecurity::new(&compiled, &provider)
+            .unwrap()
+            .encryptor(&builder)
+            .unwrap();
+        let encrypted = encryptor
+            .encrypt_xml("<root>secret</root>", DocumentEncryptionOptions::default())
+            .unwrap();
+        let resolver = SymmetricKeyDecryptor::new(vec![9; 16]);
+        let decryptor = XmlSecurity::new(&compiled, &provider)
+            .unwrap()
+            .decryptor(&resolver)
+            .unwrap();
+        assert_eq!(
+            decryptor.decrypt_xml(&encrypted, None).unwrap(),
+            "<root>secret</root>"
+        );
+    }
+}
+
+#[test]
 fn capability_mismatch_is_rejected_when_binding_the_real_provider() {
     // Compilation with one provider cannot authorize an unavailable engine.
     let compiled = policies();

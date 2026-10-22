@@ -120,7 +120,10 @@ impl<'a> XmlSecurity<'a> {
     }
 
     /// Begin signing with an opaque caller-owned key.
-    pub fn signer<'s>(&'s self, key: &'s dyn SigningKey) -> Result<Signer<'s>, XmlSecError> {
+    pub fn signer<'s>(&self, key: &'s dyn SigningKey) -> Result<Signer<'s>, XmlSecError>
+    where
+        'a: 's,
+    {
         let policy = self
             .policies
             .signing()
@@ -151,9 +154,12 @@ impl<'a> XmlSecurity<'a> {
     /// The compiled snapshot overrides any policy/provider stored in the builder.
     #[cfg(feature = "xmlenc")]
     pub fn encryptor<'b>(
-        &'b self,
+        &self,
         builder: &'b crate::xmlenc::EncryptedDataBuilder,
-    ) -> Result<Encryptor<'b>, XmlSecError> {
+    ) -> Result<Encryptor<'b>, XmlSecError>
+    where
+        'a: 'b,
+    {
         let policy = self
             .policies
             .encryption()
@@ -166,9 +172,12 @@ impl<'a> XmlSecurity<'a> {
     /// Begin decryption with a caller-owned resolver; never discover keys or I/O.
     #[cfg(feature = "xmlenc")]
     pub fn decryptor<'s>(
-        &'s self,
+        &self,
         resolver: &'s dyn crate::xmlenc::DecryptionKeyResolver,
-    ) -> Result<Decryptor<'s>, XmlSecError> {
+    ) -> Result<Decryptor<'s>, XmlSecError>
+    where
+        'a: 's,
+    {
         let policy = self
             .policies
             .decryption()
