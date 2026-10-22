@@ -1564,8 +1564,15 @@ mod tests {
     fn verification_time_retains_subseconds_on_both_sides_of_epoch() {
         // A fractional instant must not extend notAfter or shift a pre-epoch
         // validation request forward to the next second.
+        // Windows SystemTime represents 100 ns intervals: use exact multiples
+        // there, while retaining sub-tick coverage on nanosecond platforms.
+        // https://doc.rust-lang.org/std/time/struct.SystemTime.html#platform-specific-behavior
         for (input, seconds, nanos) in [
+            (UNIX_EPOCH + Duration::new(1, 123_400), 1, 123_400),
+            (UNIX_EPOCH - Duration::new(1, 123_400), -2, 999_876_600),
+            #[cfg(not(windows))]
             (UNIX_EPOCH + Duration::new(1, 123), 1, 123),
+            #[cfg(not(windows))]
             (UNIX_EPOCH - Duration::new(1, 123), -2, 999_999_877),
         ] {
             let actual = system_time_to_asn1(input).expect("representable validation time");
