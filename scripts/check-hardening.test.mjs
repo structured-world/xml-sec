@@ -111,6 +111,32 @@ test('unknown phases fail without invoking Cargo', () => {
   assert.equal(result.calls, '');
 });
 
+test('coverage checkout references resolve existing pinned oracle revisions', () => {
+  // Validate the actual setup program, not just YAML syntax: a misspelled
+  // metadata filename otherwise prevents the coverage runner from starting.
+  const workflow = readFileSync(resolve(import.meta.dirname, '../.github/workflows/ci.yml'), 'utf8');
+  const coverage = workflow.match(/^  coverage:\n([\s\S]*?)(?=^  [a-z][a-z0-9-]*:)/m)[1];
+  const script = coverage.match(/id: coverage-oracles\n        run: \|\n((?: {10}.*\n)+)/)[1]
+    .replace(/^ {10}/gm, '');
+  const directory = mkdtempSync(join(tmpdir(), 'xml-sec-oracle-pins-'));
+  try {
+    const output = join(directory, 'output');
+    const result = spawnSync('/bin/bash', ['-e', '-o', 'pipefail', '-c', script], {
+      cwd: resolve(import.meta.dirname, '..'), encoding: 'utf8',
+      env: { ...process.env, GITHUB_OUTPUT: output },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const pins = Object.fromEntries(readFileSync(output, 'utf8').trim().split('\n').map(line => line.split('=')));
+    for (const donor of ['libxmlsec1-1.3.13', 'libxslt-1.1.45']) {
+      assert.equal(pins[donor], readFileSync(resolve(import.meta.dirname,
+        `../compatibility/${donor}-donor-commit.txt`), 'utf8').trim());
+      assert.ok(coverage.includes(`steps.coverage-oracles.outputs['${donor}']`));
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('the required aggregate reaches every job and checks every direct result', () => {
   // These owned workflow blocks use single-line needs; fail on an unconnected
   // job rather than accepting a green subset of the qualification graph.
