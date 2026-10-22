@@ -4,7 +4,7 @@ version = "0.2.0"
 edition = "2024"
 rust-version = "1.92"
 license = "Apache-2.0 AND MIT"
-description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N. Drop-in replacement for libxmlsec1."
+description = "Pure Rust XML Security: XMLDSig, XMLEnc, C14N with explicit policy and providers."
 repository = "https://github.com/structured-world/xml-sec"
 homepage = "https://github.com/structured-world/xml-sec"
 documentation = "https://docs.rs/xml-sec"
@@ -108,6 +108,10 @@ required-features = ["xmldsig", "c14n"]
 [[example]]
 name = "verify"
 required-features = ["xmldsig"]
+
+[[example]]
+name = "policy_roundtrip"
+required-features = ["xmlenc"]
 
 [[bench]]
 name = "security"

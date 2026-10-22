@@ -5,6 +5,9 @@ harnesses that use libxmlsec1 through its process interface. It delegates XML
 Security operations to the same `xml-sec` policy and provider pipelines as the
 library; it does not bind to libxml2, OpenSSL, or the libxmlsec1 C ABI.
 
+See the [migration guide](migration-libxmlsec1.md) for tier-specific adoption,
+and the [deployment runbook](deployment.md) before using compatibility permissions.
+
 ```sh
 cargo install --git https://github.com/structured-world/xml-sec xml-sec-cli
 xmlsec1 version

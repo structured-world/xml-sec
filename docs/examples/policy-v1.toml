@@ -1,0 +1,22 @@
+schema_version = 1
+
+[profiles.system]
+base = "Modern"
+
+[profiles.system.verification.resources]
+max_xml_nodes = 10000
+
+[profiles.application]
+extends = "system"
+
+[profiles.application.verification.resources]
+max_xml_nodes = 5000
+
+[profiles.tenant]
+extends = "application"
+
+[profiles.tenant.verification.resources]
+max_xml_nodes = 1000
+
+[profiles.tenant.signing]
+enabled = false
