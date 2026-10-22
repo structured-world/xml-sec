@@ -40,6 +40,8 @@ compile_error!(
     "compile at least one XML backend: `xml-backend-xmloxide` or `xml-backend-roxmltree`"
 );
 
+#[cfg(feature = "xmldsig")]
+pub mod api;
 #[cfg(feature = "benchmark-internals")]
 #[doc(hidden)]
 pub mod benchmark_support;
@@ -47,6 +49,8 @@ pub mod c14n;
 pub mod document;
 pub mod encoding;
 pub mod error;
+#[cfg(feature = "xmldsig")]
+pub use api::XmlSecurity;
 mod hard_limits;
 // These XML parser kernels are checksum-pinned in scripts/import-xml-backends.sh.
 // Embedding the maintained sources also preserves the patch for package users.

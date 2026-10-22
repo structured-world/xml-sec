@@ -26,6 +26,7 @@ mod derived_key;
 pub(crate) use decrypt::validate_key_len;
 pub use derived_key::DerivedKey;
 mod encrypt;
+pub(crate) use encrypt::BoundEncryption;
 mod hkdf_agreement;
 mod key_derivation;
 pub use hkdf_agreement::{HkdfAgreement, parse_hkdf_agreement_method};

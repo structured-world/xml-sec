@@ -296,11 +296,6 @@ impl EncryptedDataBuilder {
         self
     }
 
-    fn document_parse_settings(&self) -> DocumentParseSettings {
-        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
-            .with_backend(self.xml_backend)
-    }
-
     /// Set whether XML encryption covers one element or its child content.
     pub fn encryption_type(mut self, encrypted_type: EncryptedDataType) -> Self {
         self.encrypted_type = encrypted_type;
@@ -407,13 +402,89 @@ impl EncryptedDataBuilder {
         self.add_recipient(EncryptionRecipient::aes_key_wrap(kek, algorithm))
     }
 
+    pub(crate) fn bind<'a>(
+        &'a self,
+        policy: &'a crate::policy::EncryptionPolicy,
+        provider: &'a dyn crate::provider::CryptoProvider,
+        xml_backend: crate::XmlBackend,
+    ) -> BoundEncryption<'a> {
+        BoundEncryption {
+            builder: self,
+            policy,
+            provider,
+            xml_backend,
+        }
+    }
+
+    fn execution(&self) -> BoundEncryption<'_> {
+        self.bind(&self.policy, self.provider.as_ref(), self.xml_backend)
+    }
+
+    /// Encrypt one complete XML element or XML content fragment.
+    pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
+        self.execution().encrypt_xml(xml)
+    }
+
+    /// Encrypt opaque bytes, preserving an explicit non-XML Type hint.
+    pub fn encrypt_binary(&self, data: &[u8]) -> Result<EncryptionResult, XmlEncError> {
+        self.execution().encrypt_binary(data)
+    }
+
+    /// Encrypt and replace the root or a caller-selected ID in XML text.
+    pub fn encrypt_document(
+        &self,
+        xml: &str,
+        options: DocumentEncryptionOptions<'_>,
+    ) -> Result<String, XmlEncError> {
+        self.execution().encrypt_document(xml, options)
+    }
+
+    /// Encrypt one retained document, committing one generation on success.
+    pub fn encrypt_owned_document(
+        &self,
+        document: &mut XmlDocument,
+        options: DocumentEncryptionOptions<'_>,
+    ) -> Result<(), XmlEncError> {
+        self.execution().encrypt_owned_document(document, options)
+    }
+
+    #[cfg(test)]
+    fn validate_configuration_with_policy(
+        &self,
+        policy: &crate::policy::EncryptionPolicy,
+    ) -> Result<(), XmlEncError> {
+        self.execution().validate_configuration_with_policy(policy)
+    }
+}
+
+/// Borrow request material while fixing the operation's policy and provider.
+pub(crate) struct BoundEncryption<'a> {
+    builder: &'a EncryptedDataBuilder,
+    policy: &'a crate::policy::EncryptionPolicy,
+    provider: &'a dyn crate::provider::CryptoProvider,
+    xml_backend: crate::XmlBackend,
+}
+
+impl std::ops::Deref for BoundEncryption<'_> {
+    type Target = EncryptedDataBuilder;
+    fn deref(&self) -> &Self::Target {
+        self.builder
+    }
+}
+
+impl BoundEncryption<'_> {
+    fn document_parse_settings(&self) -> DocumentParseSettings {
+        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+            .with_backend(self.xml_backend)
+    }
+
     /// Encrypt one complete XML element or an XML content fragment.
     pub fn encrypt_xml(&self, xml: &str) -> Result<EncryptionResult, XmlEncError> {
         self.policy.validate()?;
         self.validate_plaintext_len(xml.len())?;
         let mut operation = OperationExecutionContext::new(
             self.policy.clone(),
-            EncryptionOperationBudgets::from_policy(&self.policy),
+            EncryptionOperationBudgets::from_policy(self.policy),
             None,
         );
         validate_xml_plaintext(
@@ -444,7 +515,7 @@ impl EncryptedDataBuilder {
         self.policy.validate()?;
         let mut operation = OperationExecutionContext::new(
             self.policy.clone(),
-            EncryptionOperationBudgets::from_policy(&self.policy),
+            EncryptionOperationBudgets::from_policy(self.policy),
             None,
         );
         let encrypted_type = match &self.encrypted_type {
@@ -468,7 +539,7 @@ impl EncryptedDataBuilder {
     ) -> Result<String, XmlEncError> {
         self.policy.validate()?;
         self.validate_document_len(xml.len())?;
-        let budgets = EncryptionOperationBudgets::from_policy(&self.policy);
+        let budgets = EncryptionOperationBudgets::from_policy(self.policy);
         let settings = self.document_parse_settings();
         let mut document = XmlDocument::parse_with_settings_and_budget(
             xml.to_owned(),
@@ -492,7 +563,7 @@ impl EncryptedDataBuilder {
         self.encrypt_owned_document_with_budgets(
             document,
             options,
-            EncryptionOperationBudgets::from_policy(&self.policy),
+            EncryptionOperationBudgets::from_policy(self.policy),
         )
     }
 
@@ -692,7 +763,7 @@ impl EncryptedDataBuilder {
                             .borrow_mut()
                             .encapsulate(
                                 &operation.policy().key_establishment,
-                                self.provider.as_ref(),
+                                self.provider,
                                 key.as_ref(),
                             )?;
                         encapsulated_ciphertext = Some(result.ciphertext);
@@ -713,7 +784,7 @@ impl EncryptedDataBuilder {
                             .borrow_mut()
                             .derive_key(
                                 &operation.policy().key_establishment,
-                                self.provider.as_ref(),
+                                self.provider,
                                 &parameters,
                                 secret,
                             )?;
@@ -736,7 +807,7 @@ impl EncryptedDataBuilder {
                             .borrow_mut()
                             .agree_and_derive(
                                 &operation.policy().key_establishment,
-                                self.provider.as_ref(),
+                                self.provider,
                                 key.as_ref(),
                                 &agreement,
                                 &parameters,
@@ -744,7 +815,7 @@ impl EncryptedDataBuilder {
                         OperationContentKey::Owned(content_key)
                     }
                     None => {
-                        let key = random_bytes(self.provider.as_ref(), self.algorithm.key_len())?;
+                        let key = random_bytes(self.provider, self.algorithm.key_len())?;
                         #[cfg(feature = "legacy-algorithms")]
                         let mut key = key;
                         #[cfg(feature = "legacy-algorithms")]
@@ -764,7 +835,7 @@ impl EncryptedDataBuilder {
                     .recipients
                     .iter()
                     .map(|recipient| {
-                        wrap_content_key(self.provider.as_ref(), recipient, content_key.as_ref())
+                        wrap_content_key(self.provider, recipient, content_key.as_ref())
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok::<_, XmlEncError>((content_key, encrypted_keys, encapsulated_ciphertext))
@@ -785,7 +856,7 @@ impl EncryptedDataBuilder {
                 None => None,
             };
             encrypt_content(
-                self.provider.as_ref(),
+                self.provider,
                 self.algorithm,
                 content_key.as_ref(),
                 plaintext,

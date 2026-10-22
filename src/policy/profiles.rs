@@ -93,6 +93,7 @@ pub struct PolicySet {
 /// Caller-owned capabilities promised to operations using the compiled policy.
 /// This is a contract, not permission to discover resources. Actual resource
 /// maps and target identities must still be supplied to each operation.
+#[derive(Debug, Clone, Copy)]
 pub struct PolicyCompileContext {
     /// Caller guarantees an explicit external-resource map on applicable calls.
     pub external_resources: bool,
@@ -106,9 +107,17 @@ pub struct PolicyCompileContext {
 pub struct CompiledPolicies {
     profile: PolicyProfile,
     policies: PolicySet,
+    context: PolicyCompileContext,
 }
 
 impl CompiledPolicies {
+    pub(crate) fn validate_provider(
+        &self,
+        provider: &dyn CryptoProvider,
+    ) -> Result<(), PolicyViolation> {
+        self.policies.validate(&self.context, provider)
+    }
+
     /// Explicit trusted profile identity, not inferred from XML.
     pub const fn profile(&self) -> PolicyProfile {
         self.profile
@@ -195,6 +204,7 @@ impl<'a> PolicyCompiler<'a> {
         Ok(CompiledPolicies {
             profile: self.profile,
             policies: self.policies,
+            context: *context,
         })
     }
 

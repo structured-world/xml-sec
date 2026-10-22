@@ -89,6 +89,15 @@ I/O, malformed encodings, and exhausted budgets return explicit errors. Initial 
 transforms, resolver work, staged mutations, and decryption retries share one operation-wide budget
 instead of resetting limits inside helpers.
 
+## Rust API
+
+Start with [`XmlSecurity`](docs/rust-api.md): bind one caller-compiled policy set
+and an explicit `CryptoProvider`, then create verification, signing, encryption
+or decryption handles. Keys, expected signed targets and external bytes remain
+request data; operation handles cannot replace policy or select a fallback engine.
+Verification returns document/generation-bound evidence, not just a boolean.
+The existing low-level C14N, XMLDSig and XMLEnc APIs remain available.
+
 ## XMLDSig
 
 `examples/sign.rs` creates an enveloped RSA-SHA256 signature and `examples/verify.rs` verifies it
