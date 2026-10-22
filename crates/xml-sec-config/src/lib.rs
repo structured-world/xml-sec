@@ -333,8 +333,11 @@ impl EffectivePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
+    /// Narrows permission or tightens an enforcement constraint.
     Restrictive,
+    /// Changes descriptive metadata without changing effective restrictions.
     Neutral,
+    /// Broadens permission or changes incomparable semantics; requires review.
     Relaxing,
 }
 

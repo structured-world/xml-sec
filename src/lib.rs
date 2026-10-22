@@ -1,6 +1,14 @@
 //! # xml-sec — Pure Rust XML Security
 //!
-//! Drop-in replacement for libxmlsec1. XMLDSig, XMLEnc, C14N — no C dependencies.
+//! XMLDSig, XMLEnc and C14N with explicit policy and cryptographic providers.
+//! The default build is pure Rust. Optional native providers have their own
+//! toolchain requirements. Wire/CLI interoperability does not imply libxmlsec1
+//! C source or binary ABI compatibility.
+//!
+//! With `xmldsig`, start with `XmlSecurity` and its policy-bound operation
+//! handles. Verification acceptance requires expected-target evidence, not just
+//! a valid signature value. Low-level APIs remain in `xmldsig`; C14N-only
+//! builds use [`c14n`] independently.
 //!
 //! ## Features
 //!

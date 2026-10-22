@@ -1,5 +1,31 @@
 # Cryptographic providers
 
+## Capability Summary
+
+This summarizes adapter capabilities, not policy permission or FIPS approval.
+Exact algorithm/parameter and key constraints below still apply. Query
+`CryptoProvider::supports` for the actual operation before admission; an
+unsupported operation never selects another engine.
+
+| Operation | RustCrypto (default) | AWS-LC FIPS (optional) | PKCS#11 (optional) |
+| --- | --- | --- | --- |
+| Streaming digest | Yes | Supported SHA-1/SHA-2/SHA-3 subset | Token mechanisms, serialized session |
+| XML signatures | RSA, DSA, ECDSA, HMAC, EdDSA; opt-in PQ | Restricted RSA/ECDSA parameter sets | Token RSA PKCS#1/PSS parameter sets |
+| Certificate/CRL verification | Implemented signature families | Supported RSA PKCS#1/ECDSA subset | Not advertised |
+| Content encryption | AES; explicit optional compatibility mechanisms | AES-128/256 CBC/GCM | Not advertised |
+| Content decryption | Same implemented cipher families | AES-128/256 CBC/GCM | Token AES-CBC/GCM |
+| Wrap / unwrap | AES and optional compatibility wraps | AES-128/256 | Token AES unwrap; wrapping not advertised |
+| RSA transport / recovery | OAEP and optional legacy RSA-1.5 | Supported matching-digest OAEP | Token OAEP recovery, not transport |
+| Agreement | ECDH, X25519/X448 and bounded finite-field DH | Not advertised by this adapter | Token P-256/P-384/P-521 ECDH |
+| KDF | HKDF, PBKDF2, ConcatKDF, legacy DH KDF | Not advertised by this adapter | Not advertised |
+| KEM | Opt-in ML-KEM | Not advertised | Not advertised |
+
+Protected-container parsing is separate from native operation dispatch and may
+use RustCrypto. The [feature guide](features.md) records the temporary official
+AWS dependency pair constraint and supported build combinations. Neither native
+provider selection nor container import claims an entirely FIPS-approved secret
+processing path. The CLI does not expose PKCS#11 credential/module selection.
+
 ## Optional PKCS#11 external keys
 
 The `pkcs11` feature enables the `cryptoki` adapter. Load and initialize

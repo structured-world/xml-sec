@@ -18,6 +18,28 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/lib
 
 jobs:
+  documentation:
+    name: documentation (${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: ["1.92.0", stable]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@v2
+      - run: node --test scripts/check-documentation.test.mjs
+      - run: bash scripts/check-documentation.sh
+
   feature-contract:
     name: feature contract (${{ matrix.rust }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -401,11 +423,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    needs: [test-matrix, feature-contract, xslt-oracle, pkcs11, benchmark-contract, benchmark-comparison, security-corpus]
+    needs: [test-matrix, feature-contract, documentation, xslt-oracle, pkcs11, benchmark-contract, benchmark-comparison, security-corpus]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
       - run: test "${{ needs.feature-contract.result }}" = "success"
+      - run: test "${{ needs.documentation.result }}" = "success"
       - run: test "${{ needs.xslt-oracle.result }}" = "success"
       - run: test "${{ needs.pkcs11.result }}" = "success"
       - run: test "${{ needs.benchmark-contract.result }}" = "success"

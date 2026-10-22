@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- Add executable policy-bound and low-level API examples, expected-target
+  verification, schema v1 reference, restrictive deployment runbook and
+  libxmlsec1 migration guide.
+- Document provider capability and compatibility boundaries without claiming
+  C source/ABI compatibility or a 1.0 release. The policy-bound facade and typed
+  umbrella error changes after 0.2.0 remain unreleased until publication.
+
 ## [0.2.0](https://github.com/structured-world/xml-sec/compare/v0.1.23...v0.2.0) - 2026-10-21
 
 ### Added

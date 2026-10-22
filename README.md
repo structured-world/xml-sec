@@ -65,11 +65,16 @@ xmlsec1 version
 Applications can build only the capabilities they need:
 
 ```toml
-xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
+xml-sec = { version = "0.2", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
 
 See [feature and provider qualification](docs/features.md) for supported combinations,
 feature implications, native-provider setup and reproducible minimal-build checks.
+
+The [documentation index](docs/README.md) links the policy-bound Rust API,
+executable examples, deployment/schema reference and libxmlsec1 migration guide.
+Source-tree guides identify unreleased APIs; use matching versioned rustdoc for
+a published dependency. C source and binary ABI compatibility are not delivered.
 
 ## Capabilities
 
@@ -101,14 +106,18 @@ request data; operation handles cannot replace policy or select a fallback engin
 Verification returns document/generation-bound evidence, not just a boolean.
 The existing low-level C14N, XMLDSig and XMLEnc APIs remain available.
 
+Run `cargo run --example policy_roundtrip` from the source checkout for
+policy-bound sign/verify/encrypt/decrypt and wrong-target/tamper rejection.
+
 ## XMLDSig
 
-`examples/sign.rs` creates an enveloped RSA-SHA256 signature and `examples/verify.rs` verifies it
-through the embedded X.509 certificate:
+`examples/sign.rs` creates an enveloped RSA-SHA256 signature. `examples/verify.rs`
+uses an explicitly trusted public key and checks the expected signed element:
 
 ```sh
 cargo run --example sign > signed.xml
-cargo run --example verify -- signed.xml
+cargo run --example verify -- signed.xml \
+  tests/fixtures/keys/rsa/rsa-2048-pubkey.pem invoice-2026-07
 ```
 
 The signing and verification pipelines support same-document and caller-provided references,
@@ -129,6 +138,7 @@ agreement, RSA-OAEP/AES Key Wrap recipients, and Element/Content document replac
 use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder};
 
 fn example() -> Result<(), Box<dyn std::error::Error>> {
+    // Demonstration only: provision a fresh/securely managed key in deployments.
     let key = [0x42_u8; 16];
     let encrypted_data = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .direct_key(key)
@@ -158,7 +168,7 @@ Use `xml-backend-roxmltree` for a thin alternative build, or compile `xml-backen
 `Xmloxide`, `Roxmltree`, or fail-closed `Differential` parsing per operation:
 
 ```toml
-xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
+xml-sec = { version = "0.2", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
 ```
 
 ```rust
@@ -198,7 +208,8 @@ decoder remains internal.
 ```sh
 xmlsec1 list-transforms
 xmlsec1 list-key-data
-xmlsec1 verify --xml-backend xmloxide signed.xml
+xmlsec1 verify --xml-backend xmloxide \
+  --pubkey-pem tests/fixtures/keys/rsa/rsa-2048-pubkey.pem signed.xml
 ```
 
 The binary covers sign/verify, template-preserving encrypt/decrypt, AES key generation, capability

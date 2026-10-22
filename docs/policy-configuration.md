@@ -9,6 +9,10 @@ their manifests do not opt into the core's single-package release workflow.
 
 ## Schema Version 1
 
+See the [complete field/type reference](policy-schema-v1.md) and the tested
+[system/application/tenant example](examples/policy-v1.toml). The
+[deployment runbook](deployment.md) covers restrictive composition and rollout.
+
 ```toml
 schema_version = 1
 
