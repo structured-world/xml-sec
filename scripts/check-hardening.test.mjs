@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -23,6 +23,39 @@ test('coverage identities are unique physical sources, not independently selecte
   const invalid = report(['/source.rs']);
   invalid.data[0].totals.lines.covered = 101;
   assert.throws(() => checkReport(invalid, canonical), /totals/);
+});
+
+test('the coverage CLI validates reports through symlinked directories', () => {
+  // A symlinked checkout must not turn an invalid report into a successful no-op.
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'xml-sec-coverage-cli-')));
+  try {
+    const linked = join(directory, 'linked');
+    symlinkSync(import.meta.dirname, linked, 'dir');
+    const source = join(directory, 'source.rs');
+    writeFileSync(source, '');
+    const fixture = join(directory, 'report.json');
+    for (const script of [join(import.meta.dirname, 'check-coverage-report.mjs'),
+      join(linked, 'check-coverage-report.mjs')]) {
+      const invoke = args => spawnSync(process.execPath, [script, ...args], { encoding: 'utf8' });
+      writeFileSync(fixture, JSON.stringify(report([source, source])));
+      const duplicate = invoke([fixture]);
+      assert.notEqual(duplicate.status, 0, `${script} silently accepted duplicate sources`);
+      assert.match(duplicate.stderr, /Duplicate coverage source/);
+      writeFileSync(fixture, '{}');
+      const malformed = invoke([fixture]);
+      assert.notEqual(malformed.status, 0);
+      assert.match(malformed.stderr, /Expected one nonempty LLVM coverage export/);
+      const usage = invoke([]);
+      assert.notEqual(usage.status, 0);
+      assert.match(usage.stderr, /Usage: check-coverage-report/);
+      writeFileSync(fixture, JSON.stringify(report([source])));
+      const valid = invoke([fixture]);
+      assert.equal(valid.status, 0, valid.stderr);
+      assert.deepEqual(JSON.parse(valid.stdout), { sources: 1, count: 100, covered: 85, percent: 85 });
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 function run(phase = 'all', changes = {}) {

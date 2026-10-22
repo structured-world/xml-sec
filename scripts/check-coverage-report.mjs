@@ -1,5 +1,4 @@
 import { readFileSync, realpathSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export function checkReport(report, canonical = realpathSync) {
@@ -26,7 +25,8 @@ export function checkReport(report, canonical = realpathSync) {
   return { sources: seen.size, ...lines };
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+// Symlinked entry paths must execute validation, not silently succeed on import.
+if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
   if (process.argv.length !== 3) throw Error('Usage: check-coverage-report.mjs LLVM_JSON');
   console.log(JSON.stringify(checkReport(JSON.parse(readFileSync(process.argv[2], 'utf8')))));
 }
