@@ -131,7 +131,11 @@ snafu = { version = "0.9", optional = true }
 
 # Crypto
 cryptoki = { version = "0.12.1", optional = true }
-aws-lc-rs = { version = "1.18.1", default-features = false, features = ["fips"], optional = true }
+# Keep the published consumer graph on bindgen 0.72: the newer sys release's
+# bindgen 0.73 can resolve incompatible syn/prettyplease major versions.
+# The sys dependency only constrains resolution; provider calls use aws-lc-rs.
+aws-lc-rs = { version = "=1.18.1", default-features = false, features = ["fips"], optional = true }
+aws-lc-fips-sys = { version = "=0.14.2", default-features = false, optional = true }
 rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
@@ -222,7 +226,7 @@ benchmark-alloc = ["benchmark-internals"]
 legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
 default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["thiserror/std", "xmlparser/std", "structured-asn1?/std", "structured-pkix?/std"]
-aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
+aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs", "dep:aws-lc-fips-sys"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = []
 xml-backend-roxmltree = ["dep:memchr"]

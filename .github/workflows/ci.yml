@@ -18,6 +18,56 @@ env:
   LD_LIBRARY_PATH: ${{ github.workspace }}/.tools/xmlsec1-1.3.13/lib
 
 jobs:
+  feature-contract:
+    name: feature contract (${{ matrix.rust }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rust: "1.92.0"
+            os: ubuntu-latest
+            minimal: true
+          - rust: stable
+            os: ubuntu-latest
+            minimal: true
+          - rust: stable
+            os: macos-latest
+          - rust: stable
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: clippy
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the matrix runner
+        if: runner.os != 'Windows'
+        run: node --test scripts/check-features.test.mjs
+      - name: Qualify actual core defaults
+        shell: bash
+        run: bash scripts/check-features.sh default
+      - name: Provision isolated token provider
+        if: matrix.minimal
+        run: sudo apt-get update && sudo apt-get install -y softhsm2
+      - name: Qualify isolated minimal feature graphs
+        if: matrix.minimal
+        env:
+          PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
+        run: |
+          for profile in dom-xmloxide dom-roxmltree c14n-xmloxide c14n-roxmltree dsig-xmloxide dsig-roxmltree xmlenc-xmloxide xmlenc-roxmltree xslt legacy experimental fips-dsig pkcs11 no-backend; do
+            echo "::group::$profile"
+            bash scripts/check-features.sh "$profile"
+            echo '::endgroup::'
+          done
+
   security-corpus:
     name: security corpus provenance
     runs-on: ubuntu-latest
@@ -220,6 +270,17 @@ jobs:
       matrix:
         include:
           - rust: "1.92.0"
+            xml-backend: all-features
+            all-features: true
+            cargo-args: --all-features
+          - rust: stable
+            xml-backend: all-features
+            all-features: true
+            cargo-args: --all-features
+          - rust: stable
+            xml-backend: default-features
+            cargo-args: ""
+          - rust: "1.92.0"
             xml-backend: experimental-pq-xmloxide
             experimental-pq: true
             cargo-args: --no-default-features --features xmldsig,xmlenc,c14n,xml-backend-xmloxide,legacy-algorithms,experimental-pq
@@ -300,6 +361,9 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Refresh apt package index
         run: sudo apt-get update
+      - name: Provision all-feature token tests
+        if: matrix.all-features
+        run: sudo apt-get install -y softhsm2
       - name: Build pinned xmlsec1 for external-oracle tests
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
@@ -319,17 +383,29 @@ jobs:
       - name: Lint experimental key establishment
         if: matrix.experimental-pq
         run: cargo clippy --all-targets ${{ matrix.cargo-args }} -- -D warnings
-      - run: >-
+      - name: Qualify all-feature build and lint
+        if: matrix.all-features
+        run: |
+          cargo build --workspace --all-features
+          cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Exercise coexisting providers in disposable token storage
+        if: matrix.all-features
+        run: >-
+          bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so
+          --workspace --all-features -E 'not binary(libxslt_oracle)'
+      - if: ${{ !matrix.all-features }}
+        run: >-
           cargo nextest run --workspace ${{ matrix.cargo-args }}
           -E 'not binary(libxslt_oracle)'
       - run: cargo test --doc --workspace ${{ matrix.cargo-args }}
 
   test:
     runs-on: ubuntu-latest
-    needs: [test-matrix, xslt-oracle, pkcs11, benchmark-contract, benchmark-comparison, security-corpus]
+    needs: [test-matrix, feature-contract, xslt-oracle, pkcs11, benchmark-contract, benchmark-comparison, security-corpus]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
+      - run: test "${{ needs.feature-contract.result }}" = "success"
       - run: test "${{ needs.xslt-oracle.result }}" = "success"
       - run: test "${{ needs.pkcs11.result }}" = "success"
       - run: test "${{ needs.benchmark-contract.result }}" = "success"

@@ -68,6 +68,9 @@ Applications can build only the capabilities they need:
 xml-sec = { version = "0.1", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
 
+See [feature and provider qualification](docs/features.md) for supported combinations,
+feature implications, native-provider setup and reproducible minimal-build checks.
+
 ## Capabilities
 
 | Area | Available today |
