@@ -39,7 +39,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: node --test scripts/check-documentation.test.mjs
       - run: bash scripts/check-documentation.sh
-      - run: cargo clean
 
   feature-contract:
     name: feature contract (${{ matrix.rust }}, ${{ matrix.os }})
