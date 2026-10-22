@@ -30,6 +30,7 @@ implied by this documentation.
   and [CVE inventory](cve-inventory.md)
 - [Benchmarks and measurement boundaries](benchmarks.md)
 - [Normative sources](standards-sources.tsv) and [standards audit](standards-audit.md)
+- [Required CI, coverage and dependency gates](ci-hardening.md)
 - [Unreleased and published changes](../CHANGELOG.md)
 
 ## Reproduce Documentation Checks
