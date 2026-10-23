@@ -30,9 +30,6 @@ impl<T> Values<T> {
 
     #[cfg(feature = "embedded")]
     pub(crate) fn try_push<W: Work>(&mut self, value: T, work: &W) -> Result<(), MemoryError> {
-        let Self::Current(values) = self else {
-            unreachable!("current construction requires an execution-owned arena")
-        };
         // Move the actual allocation through the execution boundary, never its
         // bytes. Restore it even if a downstream allocator unwinds.
         struct Restore<'a, T, W: Work> {
@@ -44,6 +41,9 @@ impl<T> Values<T> {
                 *self.target = Some(self.values.take().expect("live arena owner").into_owned());
             }
         }
+        let Self::Current(values) = self else {
+            unreachable!("current construction requires an execution-owned arena")
+        };
         let execution = match values.take() {
             None => work.vector(),
             Some(retained) => match retained.with_execution(work) {

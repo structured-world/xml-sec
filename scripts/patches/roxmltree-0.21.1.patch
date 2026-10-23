@@ -16,7 +16,7 @@
  use alloc::vec::Vec;
  
  mod parse;
-@@ -38,7 +38,10 @@
+@@ -38,11 +38,14 @@
  #[cfg(test)]
  mod tokenizer_tests;
  
@@ -28,6 +28,11 @@
  
  /// The <http://www.w3.org/XML/1998/namespace> URI.
  pub const NS_XML_URI: &str = "http://www.w3.org/XML/1998/namespace";
+-/// The prefix 'xml', which is by definition bound to NS_XML_URI
++/// The prefix 'xml', which is by definition bound to `NS_XML_URI`
+ const NS_XML_PREFIX: &str = "xml";
+ 
+ /// The <http://www.w3.org/2000/xmlns/> URI.
 @@ -95,28 +98,29 @@
  /// [`Node::node_type()`]: struct.Node.html#method.node_type
  /// [`Node::text()`]: struct.Node.html#method.text
@@ -65,16 +70,33 @@
          Node {
              id: NodeId::new(0),
              d: &self.nodes[0],
-@@ -130,7 +134,7 @@
+@@ -124,27 +128,28 @@
+         }
+     }
+ 
+-    /// Returns the node of the tree with the given NodeId.
++    /// Returns the node of the tree with the given `NodeId`.
+     ///
+-    /// Note: NodeId::new(0) represents the root node
++    /// Note: `NodeId::new(0)` represents the root node
      ///
      /// # Examples
      ///
 -    /// ```
 +    /// ```text,xml-sec-example
++    /// use roxmltree::NodeId;
++    ///
      /// let doc = roxmltree::Document::parse("\
      /// <p>
      ///     text
-@@ -144,7 +148,7 @@
+     /// </p>
+     /// ").unwrap();
+     ///
+-    /// use roxmltree::NodeId;
+     /// assert_eq!(doc.get_node(NodeId::new(0)).unwrap(), doc.root());
+     /// assert_eq!(doc.get_node(NodeId::new(1)), doc.descendants().find(|n| n.has_tag_name("p")));
+-    /// assert_eq!(doc.get_node(NodeId::new(2)), doc.descendants().find(|n| n.is_text()));
++    /// assert_eq!(doc.get_node(NodeId::new(2)), doc.descendants().find(roxmltree::Node::is_text));
      /// assert_eq!(doc.get_node(NodeId::new(3)), None);
      /// ```
      #[inline]
@@ -83,7 +105,7 @@
          self.nodes.get(id.get_usize()).map(|data| Node {
              id,
              d: data,
-@@ -160,12 +164,12 @@
+@@ -160,12 +165,12 @@
      ///
      /// # Examples
      ///
@@ -98,7 +120,7 @@
          // `expect` is safe, because the `Document` is guarantee to have at least one element.
          self.root()
              .first_element_child()
-@@ -176,7 +180,7 @@
+@@ -176,7 +181,7 @@
      ///
      /// Shorthand for `doc.root().descendants()`.
      #[inline]
@@ -107,7 +129,7 @@
          self.root().descendants()
      }
  
-@@ -186,7 +190,7 @@
+@@ -186,7 +191,7 @@
      ///
      /// # Examples
      ///
@@ -116,7 +138,7 @@
      /// use roxmltree::*;
      ///
      /// let doc = Document::parse("\
-@@ -206,7 +210,7 @@
+@@ -206,7 +211,7 @@
      ///
      /// # Examples
      ///
@@ -125,16 +147,21 @@
      /// use roxmltree::*;
      ///
      /// let doc = Document::parse("<e/>").unwrap();
-@@ -219,7 +223,7 @@
+@@ -219,12 +224,8 @@
      }
  }
  
 -impl<'input> fmt::Debug for Document<'input> {
-+impl<'input, S: crate::xml::dom::storage::Storage> fmt::Debug for Document<'input, S> {
++impl<S: crate::xml::dom::storage::Storage> fmt::Debug for Document<'_, S> {
      fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-         if !self.root().has_children() {
-             return write!(f, "Document []");
-@@ -260,8 +264,8 @@
+-        if !self.root().has_children() {
+-            return write!(f, "Document []");
+-        }
+-
+         macro_rules! writeln_indented {
+             ($depth:expr, $f:expr, $fmt:expr) => {
+                 for _ in 0..$depth { write!($f, "    ")?; }
+@@ -260,8 +261,8 @@
              Ok(())
          }
  
@@ -145,7 +172,31 @@
              depth: usize,
              f: &mut fmt::Formatter,
          ) -> Result<(), fmt::Error> {
-@@ -368,7 +372,7 @@
+@@ -287,6 +288,9 @@
+             Ok(())
+         }
+ 
++        if !self.root().has_children() {
++            return write!(f, "Document []");
++        }
+         writeln!(f, "Document [")?;
+         print_children(self.root(), 1, f)?;
+         writeln!(f, "]")?;
+@@ -332,9 +336,10 @@
+ impl From<Range<usize>> for ShortRange {
+     #[inline]
+     fn from(range: Range<usize>) -> Self {
+-        debug_assert!(range.start <= u32::MAX as usize);
+-        debug_assert!(range.end <= u32::MAX as usize);
+-        ShortRange::new(range.start as u32, range.end as u32)
++        ShortRange::new(
++            u32::try_from(range.start).expect("range start fits the checked arena limit"),
++            u32::try_from(range.end).expect("range end fits the checked arena limit"),
++        )
+     }
+ }
+ 
+@@ -368,7 +373,7 @@
          debug_assert!(id < u32::MAX);
  
          // We are using `NonZeroU32` to reduce overhead of `Option<NodeId>`.
@@ -154,7 +205,14 @@
      }
  
      /// Returns the `u32` representation of the `NodeId`.
-@@ -401,7 +405,7 @@
+@@ -395,13 +400,12 @@
+     #[inline]
+     fn from(id: usize) -> Self {
+         // We already checked that `id` is limited by u32::MAX.
+-        debug_assert!(id <= u32::MAX as usize);
+-        NodeId::new(id as u32)
++        NodeId::new(u32::try_from(id).expect("node ID fits the checked u32 arena limit"))
+     }
  }
  
  #[derive(Debug)]
@@ -256,12 +314,15 @@
      type Target = str;
  
      fn deref(&self) -> &Self::Target {
-@@ -484,36 +485,185 @@
+@@ -484,36 +485,183 @@
      }
  }
  
 -#[derive(Clone, Debug)]
 -struct AttributeData<'input> {
++#[cfg(test)]
++mod iterator_tests;
++
 +#[cfg(test)]
 +mod owned_text_tests {
 +    use super::*;
@@ -423,6 +484,7 @@
 -pub struct Attribute<'a, 'input: 'a> {
 -    doc: &'a Document<'input>,
 -    data: &'a AttributeData<'input>,
++#[derive(Clone, Copy)]
 +pub struct Attribute<
 +    'a,
 +    'input: 'a,
@@ -430,15 +492,8 @@
 +> {
 +    doc: &'a Document<'input, S>,
 +    data: &'a AttributeData<'input, S>,
-+}
-+
-+impl<S: crate::xml::dom::storage::Storage> Copy for Attribute<'_, '_, S> {}
-+impl<S: crate::xml::dom::storage::Storage> Clone for Attribute<'_, '_, S> {
-+    fn clone(&self) -> Self {
-+        *self
-+    }
  }
--
+ 
 -impl<'a, 'input> Attribute<'a, 'input> {
 +impl<'a, 'input, S: crate::xml::dom::storage::Storage> Attribute<'a, 'input, S> {
      /// Returns attribute's namespace URI.
@@ -456,7 +511,7 @@
      /// assert_eq!(doc.root_element().attributes().nth(1).unwrap().namespace(), Some("http://www.w3.org"));
      /// ```
      #[inline]
-@@ -525,12 +675,12 @@
+@@ -525,12 +673,12 @@
      ///
      /// # Examples
      ///
@@ -471,7 +526,7 @@
      /// assert_eq!(doc.root_element().attributes().nth(1).unwrap().name(), "a");
      /// ```
      #[inline]
-@@ -542,12 +692,12 @@
+@@ -542,12 +690,12 @@
      ///
      /// # Examples
      ///
@@ -486,7 +541,7 @@
      /// assert_eq!(doc.root_element().attributes().nth(1).unwrap().value(), "c");
      /// ```
      #[inline]
-@@ -559,7 +709,7 @@
+@@ -559,22 +707,21 @@
      ///
      /// Useful when you need a more low-level access to an allocated string.
      #[inline]
@@ -495,10 +550,17 @@
          &self.data.value
      }
  
-@@ -573,8 +723,8 @@
+     /// Returns attribute's position in bytes in the original document.
+     ///
+-    /// You can calculate a human-readable text position via [Document::text_pos_at].
++    /// You can calculate a human-readable text position via [`Document::text_pos_at`].
+     ///
+     /// ```text
+     /// <e attr='value'/>
+     ///    ^
      /// ```
      ///
-     /// [Document::text_pos_at]: struct.Document.html#method.text_pos_at
+-    /// [Document::text_pos_at]: struct.Document.html#method.text_pos_at
 -    #[deprecated(note="replaced by `range`")]
 -    #[cfg(feature = "positions")]
 +    #[deprecated(note = "replaced by `range`")]
@@ -506,7 +568,7 @@
      #[inline]
      pub fn position(&self) -> usize {
          self.data.range.start
-@@ -586,7 +736,7 @@
+@@ -586,7 +733,7 @@
      /// <e n:attr='value'/>
      ///    ^^^^^^^^^^^^^^
      /// ```
@@ -515,18 +577,26 @@
      #[inline]
      pub fn range(&self) -> Range<usize> {
          self.data.range.clone()
-@@ -601,7 +751,7 @@
+@@ -599,9 +746,9 @@
+     ///    ^^^^^^
+     /// ```
      ///
-     /// To reduce memory usage the qname length is limited by u16::MAX.
+-    /// To reduce memory usage the qname length is limited by u16::MAX.
++    /// To reduce memory usage the qname length is limited by `u16::MAX`.
      /// If the attribute exceeds that limit then the end of the returned range will be incorrect.
 -    #[cfg(feature = "positions")]
 +    #[cfg(feature = "xml-backend-roxmltree")]
      #[inline]
      pub fn range_qname(&self) -> Range<usize> {
          let end = self.data.range.start + usize::from(self.data.qname_len);
-@@ -620,25 +770,28 @@
-     /// To reduce memory usage the qname length is limited by u16::MAX,
-     /// and the number of spaces around the equal sign is limited by u8::MAX.
+@@ -617,28 +764,31 @@
+     ///            ^^^^^
+     /// ```
+     ///
+-    /// To reduce memory usage the qname length is limited by u16::MAX,
+-    /// and the number of spaces around the equal sign is limited by u8::MAX.
++    /// To reduce memory usage the qname length is limited by `u16::MAX`,
++    /// and the number of spaces around the equal sign is limited by `u8::MAX`.
      /// If the attribute exceeds those limits then the start of the returned range will be incorrect.
 -    #[cfg(feature = "positions")]
 +    #[cfg(feature = "xml-backend-roxmltree")]
@@ -558,7 +628,7 @@
      fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
          write!(
              f,
-@@ -652,31 +805,34 @@
+@@ -652,31 +802,34 @@
  /// A namespace.
  ///
  /// Contains URI and *prefix* pair.
@@ -601,7 +671,7 @@
      /// ```
      #[inline]
      pub fn name(&self) -> Option<&'input str> {
-@@ -687,12 +843,12 @@
+@@ -687,12 +840,12 @@
      ///
      /// # Examples
      ///
@@ -616,7 +686,7 @@
      /// ```
      #[inline]
      pub fn uri(&self) -> &str {
-@@ -700,72 +856,110 @@
+@@ -700,72 +853,109 @@
      }
  }
  
@@ -678,12 +748,15 @@
 +        let idx = match search {
              Ok(sorted_idx) => self.sorted_order[sorted_idx],
              Err(sorted_idx) => {
-                 if self.values.len() > u16::MAX as usize {
-                     return Err(Error::NamespacesLimitReached);
-                 }
-                 let idx = NamespaceIdx(self.values.len() as u16);
+-                if self.values.len() > u16::MAX as usize {
+-                    return Err(Error::NamespacesLimitReached);
+-                }
+-                let idx = NamespaceIdx(self.values.len() as u16);
 -                self.values.push(Namespace { name, uri });
 -                self.sorted_order.insert(sorted_idx, idx);
++                let idx = NamespaceIdx(
++                    u16::try_from(self.values.len()).map_err(|_| Error::NamespacesLimitReached)?,
++                );
 +                self.values.push(Namespace { name, uri })?;
 +                self.storage.charge(
 +                    (self.sorted_order.len() - sorted_idx) * core::mem::size_of::<NamespaceIdx>(),
@@ -751,7 +824,7 @@
  #[derive(Clone, Copy, Debug)]
  #[repr(transparent)]
  struct NamespaceIdx(u16);
-@@ -778,12 +972,18 @@
+@@ -778,12 +968,18 @@
  
  impl<'input> ExpandedNameIndexed<'input> {
      #[inline]
@@ -772,7 +845,7 @@
          ExpandedName {
              uri: self.namespace(doc).map(Namespace::uri),
              name: self.local_name,
-@@ -805,7 +1005,7 @@
+@@ -805,7 +1001,7 @@
      ///
      /// # Examples
      ///
@@ -781,7 +854,7 @@
      /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
      ///
      /// assert_eq!(doc.root_element().tag_name().namespace(), Some("http://www.w3.org"));
-@@ -819,7 +1019,7 @@
+@@ -819,7 +1015,7 @@
      ///
      /// # Examples
      ///
@@ -790,7 +863,7 @@
      /// let doc = roxmltree::Document::parse("<e/>").unwrap();
      ///
      /// assert_eq!(doc.root_element().tag_name().name(), "e");
-@@ -835,7 +1035,7 @@
+@@ -835,7 +1031,7 @@
      ///
      /// # Example
      ///
@@ -799,7 +872,25 @@
      /// use roxmltree::ExpandedName;
      /// const DAV_HREF: ExpandedName =
      ///     ExpandedName::from_static("urn:ietf:params:xml:ns:caldav:", "calendar-data");
-@@ -898,47 +1098,47 @@
+@@ -857,7 +1053,7 @@
+     }
+ }
+ 
+-impl<'a, 'b> From<&'b str> for ExpandedName<'a, 'b> {
++impl<'b> From<&'b str> for ExpandedName<'_, 'b> {
+     #[inline]
+     fn from(v: &'b str) -> Self {
+         ExpandedName { uri: None, name: v }
+@@ -881,7 +1077,7 @@
+ /// The implementation of the `Ord` traits for `Node` is based on the concept of *document-order*.
+ /// In layman's terms, document-order is the order in which one would see each element if
+ /// one opened a document in a text editor or web browser and scrolled down.
+-/// Document-order convention is followed in XPath, CSS Counters, and DOM selectors API
++/// Document-order convention is followed in `XPath`, CSS Counters, and DOM selectors API
+ /// to ensure consistent results from selection.
+ /// One difference in `roxmltree` is that there is the notion of more than one document
+ /// in existence at a time. While Nodes within the same document are in document-order,
+@@ -898,47 +1094,48 @@
  /// The use of document-order in DOM Selectors is described here in the
  /// [W3C Selectors API Level 1](https://www.w3.org/TR/selectors-api/#the-apis)
  #[derive(Clone, Copy)]
@@ -824,7 +915,8 @@
 +impl<S: Storage> PartialEq for Node<'_, '_, S> {
      #[inline]
      fn eq(&self, other: &Self) -> bool {
-         (self.id, self.doc as *const _) == (other.id, other.doc as *const _)
+-        (self.id, self.doc as *const _) == (other.id, other.doc as *const _)
++        (self.id, core::ptr::from_ref(self.doc)) == (other.id, core::ptr::from_ref(other.doc))
      }
  }
  
@@ -838,7 +930,9 @@
 -impl Ord for Node<'_, '_> {
 +impl<S: Storage> Ord for Node<'_, '_, S> {
      fn cmp(&self, other: &Self) -> Ordering {
-         (self.id.0, self.doc as *const _).cmp(&(other.id.0, other.doc as *const _))
+-        (self.id.0, self.doc as *const _).cmp(&(other.id.0, other.doc as *const _))
++        (self.id.0, core::ptr::from_ref(self.doc))
++            .cmp(&(other.id.0, core::ptr::from_ref(other.doc)))
      }
  }
  
@@ -858,7 +952,7 @@
      /// Returns node's type.
      #[inline]
      pub fn node_type(&self) -> NodeType {
-@@ -983,7 +1183,7 @@
+@@ -983,7 +1180,7 @@
  
      /// Returns node's document.
      #[inline]
@@ -867,7 +961,7 @@
          self.doc
      }
  
-@@ -993,7 +1193,7 @@
+@@ -993,7 +1190,7 @@
      ///
      /// # Examples
      ///
@@ -876,7 +970,7 @@
      /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
      ///
      /// assert_eq!(doc.root_element().tag_name().namespace(), Some("http://www.w3.org"));
-@@ -1011,7 +1211,7 @@
+@@ -1011,7 +1208,7 @@
      ///
      /// # Examples
      ///
@@ -885,7 +979,7 @@
      /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
      ///
      /// assert!(doc.root_element().has_tag_name("e"));
-@@ -1039,13 +1239,13 @@
+@@ -1039,13 +1236,13 @@
      ///
      /// # Examples
      ///
@@ -901,7 +995,7 @@
      /// let doc = roxmltree::Document::parse("<e xmlns:n='http://www.w3.org'/>").unwrap();
      ///
      /// assert_eq!(doc.root_element().default_namespace(), None);
-@@ -1060,16 +1260,20 @@
+@@ -1060,16 +1257,20 @@
      ///
      /// # Examples
      ///
@@ -926,7 +1020,16 @@
      /// ```
      pub fn lookup_prefix(&self, uri: &str) -> Option<&'input str> {
          if uri == NS_XML_URI {
-@@ -1086,13 +1290,13 @@
+@@ -1078,21 +1279,20 @@
+ 
+         self.namespaces()
+             .find(|ns| &*ns.uri == uri)
+-            .map(|v| v.name)
+-            .unwrap_or(None)
++            .and_then(|v| v.name)
+     }
+ 
+     /// Returns an URI for a given prefix.
      ///
      /// # Examples
      ///
@@ -942,7 +1045,7 @@
      /// let doc = roxmltree::Document::parse("<e xmlns='http://www.w3.org'/>").unwrap();
      ///
      /// assert_eq!(doc.root_element().lookup_namespace_uri(None), Some("http://www.w3.org"));
-@@ -1107,13 +1311,13 @@
+@@ -1107,13 +1307,13 @@
      ///
      /// # Examples
      ///
@@ -958,7 +1061,7 @@
      /// let doc = roxmltree::Document::parse(
      ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
      /// ).unwrap();
-@@ -1133,15 +1337,19 @@
+@@ -1133,15 +1333,19 @@
      /// The same as [`attribute()`], but returns the `Attribute` itself instead of a value string.
      ///
      /// [`attribute()`]: struct.Node.html#method.attribute
@@ -981,7 +1084,7 @@
          }
      }
  
-@@ -1149,7 +1357,7 @@
+@@ -1149,7 +1353,7 @@
      ///
      /// # Examples
      ///
@@ -990,7 +1093,7 @@
      /// let doc = roxmltree::Document::parse(
      ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
      /// ).unwrap();
-@@ -1171,7 +1379,7 @@
+@@ -1171,7 +1375,7 @@
      ///
      /// # Examples
      ///
@@ -999,7 +1102,7 @@
      /// let doc = roxmltree::Document::parse(
      ///     "<e xmlns:n='http://www.w3.org' a='b' n:a='c'/>"
      /// ).unwrap();
-@@ -1179,7 +1387,7 @@
+@@ -1179,7 +1383,7 @@
      /// assert_eq!(doc.root_element().attributes().len(), 2);
      /// ```
      #[inline]
@@ -1008,7 +1111,7 @@
          Attributes::new(self)
      }
  
-@@ -1187,7 +1395,7 @@
+@@ -1187,7 +1391,7 @@
      ///
      /// # Examples
      ///
@@ -1017,7 +1120,7 @@
      /// let doc = roxmltree::Document::parse(
      ///     "<e xmlns:n='http://www.w3.org'/>"
      /// ).unwrap();
-@@ -1195,7 +1403,7 @@
+@@ -1195,7 +1399,7 @@
      /// assert_eq!(doc.root_element().namespaces().len(), 1);
      /// ```
      #[inline]
@@ -1026,7 +1129,7 @@
          let namespaces = match self.d.kind {
              NodeKind::Element { ref namespaces, .. } => {
                  &self.doc.namespaces.tree_order[namespaces.to_urange()]
-@@ -1217,7 +1425,7 @@
+@@ -1217,7 +1421,7 @@
      ///
      /// # Examples
      ///
@@ -1035,7 +1138,7 @@
      /// let doc = roxmltree::Document::parse("\
      /// <p>
      ///     text
-@@ -1230,7 +1438,7 @@
+@@ -1230,20 +1434,20 @@
      ///            Some("\n    text\n"));
      /// ```
      ///
@@ -1044,7 +1147,13 @@
      /// let doc = roxmltree::Document::parse("<!-- comment --><e/>").unwrap();
      ///
      /// assert_eq!(doc.root().first_child().unwrap().text(), Some(" comment "));
-@@ -1243,7 +1451,7 @@
+     /// ```
+     #[inline]
+     pub fn text(&self) -> Option<&'a str> {
+-        self.text_storage().map(|s| s.as_str())
++        self.text_storage().map(StringStorage::as_str)
+     }
+ 
      /// Returns node's text storage.
      ///
      /// Useful when you need a more low-level access to an allocated string.
@@ -1053,7 +1162,17 @@
          match self.d.kind {
              NodeKind::Element { .. } => match self.first_child() {
                  Some(child) if child.is_text() => match self.doc.nodes[child.id.get_usize()].kind {
-@@ -1262,7 +1470,7 @@
+@@ -1252,8 +1456,7 @@
+                 },
+                 _ => None,
+             },
+-            NodeKind::Comment(ref text) => Some(text),
+-            NodeKind::Text(ref text) => Some(text),
++            NodeKind::Comment(ref text) | NodeKind::Text(ref text) => Some(text),
+             _ => None,
+         }
+     }
+@@ -1262,7 +1465,7 @@
      ///
      /// # Examples
      ///
@@ -1062,7 +1181,14 @@
      /// let doc = roxmltree::Document::parse("\
      /// <root>
      ///     text1
-@@ -1282,7 +1490,7 @@
+@@ -1276,13 +1479,13 @@
+     /// ```
+     #[inline]
+     pub fn tail(&self) -> Option<&'a str> {
+-        self.tail_storage().map(|s| s.as_str())
++        self.tail_storage().map(StringStorage::as_str)
+     }
+ 
      /// Returns element's tail text storage.
      ///
      /// Useful when you need a more low-level access to an allocated string.
@@ -1071,7 +1197,7 @@
          if !self.is_element() {
              return None;
          }
-@@ -1308,7 +1516,9 @@
+@@ -1308,23 +1511,29 @@
      /// Returns the parent of this node.
      #[inline]
      pub fn parent(&self) -> Option<Self> {
@@ -1082,7 +1208,11 @@
      }
  
      /// Returns the parent element of this node.
-@@ -1319,7 +1529,11 @@
+     pub fn parent_element(&self) -> Option<Self> {
+-        self.ancestors().skip(1).find(|n| n.is_element())
++        self.ancestors().skip(1).find(Self::is_element)
+     }
+ 
      /// Returns the previous sibling of this node.
      #[inline]
      pub fn prev_sibling(&self) -> Option<Self> {
@@ -1095,7 +1225,13 @@
      }
  
      /// Returns the previous sibling element of this node.
-@@ -1332,7 +1546,11 @@
+     pub fn prev_sibling_element(&self) -> Option<Self> {
+-        self.prev_siblings().skip(1).find(|n| n.is_element())
++        self.prev_siblings().skip(1).find(Self::is_element)
+     }
+ 
+     /// Returns the next sibling of this node.
+@@ -1332,7 +1541,11 @@
      pub fn next_sibling(&self) -> Option<Self> {
          self.d
              .next_subtree
@@ -1108,7 +1244,14 @@
              .and_then(|node| {
                  let possibly_self = node
                      .d
-@@ -1354,9 +1572,11 @@
+@@ -1348,31 +1561,37 @@
+ 
+     /// Returns the next sibling element of this node.
+     pub fn next_sibling_element(&self) -> Option<Self> {
+-        self.next_siblings().skip(1).find(|n| n.is_element())
++        self.next_siblings().skip(1).find(Self::is_element)
+     }
+ 
      /// Returns the first child of this node.
      #[inline]
      pub fn first_child(&self) -> Option<Self> {
@@ -1123,7 +1266,11 @@
      }
  
      /// Returns the first element child of this node.
-@@ -1367,12 +1587,16 @@
+     pub fn first_element_child(&self) -> Option<Self> {
+-        self.children().find(|n| n.is_element())
++        self.children().find(Self::is_element)
+     }
+ 
      /// Returns the last child of this node.
      #[inline]
      pub fn last_child(&self) -> Option<Self> {
@@ -1138,11 +1285,11 @@
      /// Returns the last element child of this node.
      pub fn last_element_child(&self) -> Option<Self> {
 -        self.children().filter(|n| n.is_element()).next_back()
-+        self.children().rfind(|child| child.is_element())
++        self.children().rfind(Self::is_element)
      }
  
      /// Returns true if this node has siblings.
-@@ -1389,7 +1613,7 @@
+@@ -1389,7 +1608,7 @@
  
      /// Returns an iterator over ancestor nodes starting at this node.
      #[inline]
@@ -1151,7 +1298,7 @@
          AxisIter {
              node: Some(*self),
              next: Node::parent,
-@@ -1398,7 +1622,7 @@
+@@ -1398,7 +1617,7 @@
  
      /// Returns an iterator over previous sibling nodes starting at this node.
      #[inline]
@@ -1160,7 +1307,7 @@
          AxisIter {
              node: Some(*self),
              next: Node::prev_sibling,
-@@ -1407,7 +1631,7 @@
+@@ -1407,7 +1626,7 @@
  
      /// Returns an iterator over next sibling nodes starting at this node.
      #[inline]
@@ -1169,7 +1316,7 @@
          AxisIter {
              node: Some(*self),
              next: Node::next_sibling,
-@@ -1416,7 +1640,7 @@
+@@ -1416,7 +1635,7 @@
  
      /// Returns an iterator over first children nodes starting at this node.
      #[inline]
@@ -1178,7 +1325,7 @@
          AxisIter {
              node: Some(*self),
              next: Node::first_child,
-@@ -1425,7 +1649,7 @@
+@@ -1425,7 +1644,7 @@
  
      /// Returns an iterator over last children nodes starting at this node.
      #[inline]
@@ -1187,7 +1334,7 @@
          AxisIter {
              node: Some(*self),
              next: Node::last_child,
-@@ -1434,7 +1658,7 @@
+@@ -1434,7 +1653,7 @@
  
      /// Returns an iterator over children nodes.
      #[inline]
@@ -1196,7 +1343,7 @@
          Children {
              front: self.first_child(),
              back: self.last_child(),
-@@ -1443,12 +1667,12 @@
+@@ -1443,25 +1662,25 @@
  
      /// Returns an iterator over this node and its descendants.
      #[inline]
@@ -1211,7 +1358,13 @@
      #[inline]
      pub fn range(&self) -> Range<usize> {
          self.d.range.clone()
-@@ -1461,7 +1685,7 @@
+     }
+ 
+-    /// Returns node's NodeId
++    /// Returns node's `NodeId`
+     #[inline]
+     pub fn id(&self) -> NodeId {
+         self.id
      }
  }
  
@@ -1220,7 +1373,7 @@
      fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
          match self.d.kind {
              NodeKind::Root => write!(f, "Root"),
-@@ -1485,14 +1709,14 @@
+@@ -1485,14 +1704,14 @@
  
  /// Iterator over a node's attributes
  #[derive(Clone)]
@@ -1240,7 +1393,7 @@
          let attrs = match node.d.kind {
              NodeKind::Element { ref attributes, .. } => {
                  &node.doc.attributes[attributes.to_urange()]
-@@ -1506,8 +1730,8 @@
+@@ -1506,8 +1725,8 @@
      }
  }
  
@@ -1251,16 +1404,16 @@
  
      #[inline]
      fn next(&mut self) -> Option<Self::Item> {
-@@ -1531,7 +1755,7 @@
+@@ -1531,7 +1750,7 @@
      }
  }
  
 -impl<'a, 'input> DoubleEndedIterator for Attributes<'a, 'input> {
-+impl<'a, 'input, S: Storage> DoubleEndedIterator for Attributes<'a, 'input, S> {
++impl<S: Storage> DoubleEndedIterator for Attributes<'_, '_, S> {
      #[inline]
      fn next_back(&mut self) -> Option<Self::Item> {
          self.attrs.next_back().map(|attr| Attribute {
-@@ -1541,9 +1765,9 @@
+@@ -1541,9 +1760,9 @@
      }
  }
  
@@ -1272,7 +1425,7 @@
      fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
          f.debug_struct("Attributes")
              .field("attrs", &self.attrs)
-@@ -1553,13 +1777,13 @@
+@@ -1553,13 +1772,13 @@
  
  /// Iterator over specified axis.
  #[derive(Clone)]
@@ -1291,7 +1444,7 @@
  
      #[inline]
      fn next(&mut self) -> Option<Self::Item> {
-@@ -1569,7 +1793,7 @@
+@@ -1569,7 +1788,7 @@
      }
  }
  
@@ -1300,7 +1453,7 @@
      fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
          f.debug_struct("AxisIter")
              .field("node", &self.node)
-@@ -1580,13 +1804,13 @@
+@@ -1580,13 +1799,13 @@
  
  /// Iterator over children.
  #[derive(Clone, Debug)]
@@ -1319,7 +1472,7 @@
  
      #[inline]
      fn next(&mut self) -> Option<Self::Item> {
-@@ -1602,7 +1826,7 @@
+@@ -1602,7 +1821,7 @@
      }
  }
  
@@ -1328,7 +1481,7 @@
      #[inline]
      fn next_back(&mut self) -> Option<Self::Item> {
          if self.back == self.front {
-@@ -1619,15 +1843,15 @@
+@@ -1619,22 +1838,21 @@
  
  /// Iterator over a node and its descendants.
  #[derive(Clone)]
@@ -1349,7 +1502,15 @@
          let from = start.id.get_usize();
  
          let until = start
-@@ -1646,8 +1870,8 @@
+             .d
+             .next_subtree
+-            .map(NodeId::get_usize)
+-            .unwrap_or(start.doc.nodes.len());
++            .map_or(start.doc.nodes.len(), NodeId::get_usize);
+ 
+         let nodes = start.doc.nodes[from..until].iter().enumerate();
+ 
+@@ -1646,8 +1864,8 @@
      }
  }
  
@@ -1360,16 +1521,16 @@
  
      #[inline]
      fn next(&mut self) -> Option<Self::Item> {
-@@ -1673,7 +1897,7 @@
+@@ -1673,7 +1891,7 @@
      }
  }
  
 -impl<'a, 'input> DoubleEndedIterator for Descendants<'a, 'input> {
-+impl<'a, 'input, S: Storage> DoubleEndedIterator for Descendants<'a, 'input, S> {
++impl<S: Storage> DoubleEndedIterator for Descendants<'_, '_, S> {
      #[inline]
      fn next_back(&mut self) -> Option<Self::Item> {
          self.nodes.next_back().map(|(idx, data)| Node {
-@@ -1684,9 +1908,9 @@
+@@ -1684,9 +1902,9 @@
      }
  }
  
@@ -1381,7 +1542,7 @@
      fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
          f.debug_struct("Descendants")
              .field("nodes", &self.nodes)
-@@ -1697,13 +1921,13 @@
+@@ -1697,13 +1915,13 @@
  
  /// Iterator over the namespaces attached to a node.
  #[derive(Clone)]
@@ -1399,16 +1560,18 @@
  
      #[inline]
      fn next(&mut self) -> Option<Self::Item> {
-@@ -1725,7 +1949,7 @@
+@@ -1725,18 +1943,18 @@
      }
  }
  
 -impl<'a, 'input> DoubleEndedIterator for NamespaceIter<'a, 'input> {
-+impl<'a, 'input, S: Storage> DoubleEndedIterator for NamespaceIter<'a, 'input, S> {
++impl<S: Storage> DoubleEndedIterator for NamespaceIter<'_, '_, S> {
      #[inline]
      fn next_back(&mut self) -> Option<Self::Item> {
          self.namespaces
-@@ -1734,9 +1958,9 @@
+-            .next()
++            .next_back()
+             .map(|idx| self.doc.namespaces.get(*idx))
      }
  }
  
@@ -1511,6 +1674,15 @@
  
      /// The XML document must have at least one element.
      NoRootNode,
+@@ -128,7 +136,7 @@
+     /// Contains what string was expected.
+     InvalidString(&'static str, TextPos),
+ 
+-    /// An invalid ExternalID in the DTD.
++    /// An invalid `ExternalID` in the DTD.
+     InvalidExternalID(TextPos),
+ 
+     /// The given entity resolved yielded an errror.
 @@ -149,15 +157,75 @@
      ///
      /// Should only appear on invalid input data.
@@ -1588,7 +1760,7 @@
              Error::InvalidElementNamePrefix(pos) => pos,
              Error::DuplicatedNamespace(_, pos) => pos,
              Error::UnknownNamespace(_, pos) => pos,
-@@ -186,16 +254,27 @@
+@@ -186,137 +254,113 @@
              Error::InvalidCharacterData(pos) => pos,
              Error::UnknownToken(pos) => pos,
              Error::UnexpectedEndOfStream => TextPos::new(1, 1),
@@ -1606,56 +1778,169 @@
 +            #[cfg(feature = "xmldsig")]
 +            Error::SharedExecution(error) => write!(f, "XML parser execution: {error}"),
              Error::InvalidXmlPrefixUri(pos) => {
-                 write!(f, "'xml' namespace prefix mapped to wrong URI at {}", pos)
+-                write!(f, "'xml' namespace prefix mapped to wrong URI at {}", pos)
++                write!(f, "'xml' namespace prefix mapped to wrong URI at {pos}")
              }
+-            Error::UnexpectedXmlUri(pos) => {
 +            Error::EmptyPrefixedNamespace(pos) => {
-+                write!(
-+                    f,
-+                    "a namespace prefix cannot be undeclared in XML 1.0 at {pos}"
-+                )
-+            }
-             Error::UnexpectedXmlUri(pos) => {
                  write!(
                      f,
-@@ -217,13 +296,13 @@
-                     pos
+-                    "the 'xml' namespace URI is used for not 'xml' prefix at {}",
+-                    pos
++                    "a namespace prefix cannot be undeclared in XML 1.0 at {pos}"
+                 )
+             }
+-            Error::UnexpectedXmlnsUri(pos) => {
++            Error::UnexpectedXmlUri(pos) => {
+                 write!(
+                     f,
+-                    "the 'xmlns' URI is used at {}, but it must not be declared",
+-                    pos
++                    "the 'xml' namespace URI is used for not 'xml' prefix at {pos}"
+                 )
+             }
+-            Error::InvalidElementNamePrefix(pos) => {
++            Error::UnexpectedXmlnsUri(pos) => {
+                 write!(
+                     f,
+-                    "the 'xmlns' prefix is used at {}, but it must not be",
+-                    pos
++                    "the 'xmlns' URI is used at {pos}, but it must not be declared"
                  )
              }
 -            Error::DuplicatedNamespace(ref name, pos) => {
-+            Error::DuplicatedNamespace(name, pos) => {
-                 write!(f, "namespace '{}' at {} is already defined", name, pos)
+-                write!(f, "namespace '{}' at {} is already defined", name, pos)
++            Error::InvalidElementNamePrefix(pos) => {
++                write!(f, "the 'xmlns' prefix is used at {pos}, but it must not be")
              }
 -            Error::UnknownNamespace(ref name, pos) => {
-+            Error::UnknownNamespace(name, pos) => {
-                 write!(f, "an unknown namespace prefix '{}' at {}", name, pos)
+-                write!(f, "an unknown namespace prefix '{}' at {}", name, pos)
++            Error::DuplicatedNamespace(name, pos) => {
++                write!(f, "namespace '{name}' at {pos} is already defined")
              }
 -            Error::UnexpectedCloseTag(ref expected, ref actual, pos) => {
+-                write!(
+-                    f,
+-                    "expected '{}' tag, not '{}' at {}",
+-                    expected, actual, pos
+-                )
++            Error::UnknownNamespace(name, pos) => {
++                write!(f, "an unknown namespace prefix '{name}' at {pos}")
+             }
+-            Error::UnexpectedEntityCloseTag(pos) => {
+-                write!(f, "unexpected close tag at {}", pos)
 +            Error::UnexpectedCloseTag(expected, actual, pos) => {
-                 write!(
-                     f,
-                     "expected '{}' tag, not '{}' at {}",
-@@ -236,7 +315,7 @@
++                write!(f, "expected '{expected}' tag, not '{actual}' at {pos}")
+             }
++            Error::UnexpectedEntityCloseTag(pos) => write!(f, "unexpected close tag at {pos}"),
              Error::MalformedEntityReference(pos) => {
-                 write!(f, "malformed entity reference at {}", pos)
+-                write!(f, "malformed entity reference at {}", pos)
++                write!(f, "malformed entity reference at {pos}")
              }
 -            Error::UnknownEntityReference(ref name, pos) => {
+-                write!(f, "unknown entity reference '{}' at {}", name, pos)
 +            Error::UnknownEntityReference(name, pos) => {
-                 write!(f, "unknown entity reference '{}' at {}", name, pos)
++                write!(f, "unknown entity reference '{name}' at {pos}")
              }
              Error::EntityReferenceLoop(pos) => {
-@@ -245,7 +324,7 @@
-             Error::InvalidAttributeValue(pos) => {
-                 write!(f, "unescaped '<' found at {}", pos)
-             }
+-                write!(f, "a possible entity reference loop is detected at {}", pos)
+-            }
+-            Error::InvalidAttributeValue(pos) => {
+-                write!(f, "unescaped '<' found at {}", pos)
+-            }
 -            Error::DuplicatedAttribute(ref name, pos) => {
-+            Error::DuplicatedAttribute(name, pos) => {
-                 write!(f, "attribute '{}' at {} is already defined", name, pos)
+-                write!(f, "attribute '{}' at {} is already defined", name, pos)
+-            }
+-            Error::NoRootNode => {
+-                write!(f, "the document does not have a root node")
+-            }
+-            Error::UnclosedRootNode => {
+-                write!(f, "the root node was opened but never closed")
+-            }
+-            Error::UnexpectedDeclaration(pos) => {
+-                write!(f, "unexpected XML declaration at {}", pos)
+-            }
+-            Error::DtdDetected => {
+-                write!(f, "XML with DTD detected")
+-            }
+-            Error::NodesLimitReached => {
+-                write!(f, "nodes limit reached")
+-            }
+-            Error::AttributesLimitReached => {
+-                write!(f, "more than 2^32 attributes were parsed")
++                write!(f, "a possible entity reference loop is detected at {pos}")
              }
-             Error::NoRootNode => {
-@@ -314,8 +393,19 @@
-     }
- }
- 
++            Error::InvalidAttributeValue(pos) => write!(f, "unescaped '<' found at {pos}"),
++            Error::DuplicatedAttribute(name, pos) => {
++                write!(f, "attribute '{name}' at {pos} is already defined")
++            }
++            Error::NoRootNode => f.write_str("the document does not have a root node"),
++            Error::UnclosedRootNode => f.write_str("the root node was opened but never closed"),
++            Error::UnexpectedDeclaration(pos) => write!(f, "unexpected XML declaration at {pos}"),
++            Error::DtdDetected => f.write_str("XML with DTD detected"),
++            Error::NodesLimitReached => f.write_str("nodes limit reached"),
++            Error::AttributesLimitReached => f.write_str("more than 2^32 attributes were parsed"),
+             Error::NamespacesLimitReached => {
+-                write!(f, "more than 2^16 unique namespaces were parsed")
+-            }
+-            Error::InvalidName(pos) => {
+-                write!(f, "invalid name token at {}", pos)
+-            }
+-            Error::NonXmlChar(c, pos) => {
+-                write!(f, "a non-XML character {:?} found at {}", c, pos)
++                f.write_str("more than 2^16 unique namespaces were parsed")
+             }
++            Error::InvalidName(pos) => write!(f, "invalid name token at {pos}"),
++            Error::NonXmlChar(c, pos) => write!(f, "a non-XML character {c:?} found at {pos}"),
+             Error::InvalidChar(expected, actual, pos) => {
+                 write!(
+                     f,
+-                    "expected '{}' not '{}' at {}",
+-                    *expected as char, *actual as char, pos
++                    "expected '{}' not '{}' at {pos}",
++                    *expected as char, *actual as char
+                 )
+             }
+             Error::InvalidChar2(expected, actual, pos) => {
+-                write!(
+-                    f,
+-                    "expected {} not '{}' at {}",
+-                    expected, *actual as char, pos
+-                )
+-            }
+-            Error::InvalidString(expected, pos) => {
+-                write!(f, "expected '{}' at {}", expected, pos)
+-            }
+-            Error::InvalidExternalID(pos) => {
+-                write!(f, "invalid ExternalID at {}", pos)
+-            }
+-            Error::EntityResolver(pos, msg) => {
+-                write!(f, "entity resolver failed at {}: {}", pos, msg)
+-            }
+-            Error::InvalidComment(pos) => {
+-                write!(f, "comment at {} contains '--'", pos)
++                write!(f, "expected {expected} not '{}' at {pos}", *actual as char)
+             }
++            Error::InvalidString(expected, pos) => write!(f, "expected '{expected}' at {pos}"),
++            Error::InvalidExternalID(pos) => write!(f, "invalid ExternalID at {pos}"),
++            Error::EntityResolver(pos, msg) => write!(f, "entity resolver failed at {pos}: {msg}"),
++            Error::InvalidComment(pos) => write!(f, "comment at {pos} contains '--'"),
+             Error::InvalidCharacterData(pos) => {
+-                write!(f, "']]>' at {} is not allowed inside a character data", pos)
+-            }
+-            Error::UnknownToken(pos) => {
+-                write!(f, "unknown token at {}", pos)
+-            }
+-            Error::UnexpectedEndOfStream => {
+-                write!(f, "unexpected end of stream")
++                write!(f, "']]>' at {pos} is not allowed inside a character data")
+             }
++            Error::UnknownToken(pos) => write!(f, "unknown token at {pos}"),
++            Error::UnexpectedEndOfStream => f.write_str("unexpected end of stream"),
++        }
++    }
++}
++
 +impl<E> From<crate::xml::dom::ParseError> for Error<E> {
 +    fn from(error: crate::xml::dom::ParseError) -> Self {
 +        match error {
@@ -1663,17 +1948,28 @@
 +            #[cfg(feature = "xmldsig")]
 +            crate::xml::dom::ParseError::SharedExecution(error) => Self::SharedExecution(error),
 +            _ => unreachable!("XML storage strategy returns only allocation/execution failures"),
-+        }
-+    }
-+}
-+
+         }
+     }
+ }
+ 
  #[cfg(feature = "std")]
 -impl std::error::Error for Error {
+-    fn description(&self) -> &str {
 +impl<E: fmt::Display + fmt::Debug> std::error::Error for Error<E> {
-     fn description(&self) -> &str {
++    fn description(&self) -> &'static str {
          "an XML parsing error"
      }
-@@ -394,14 +484,14 @@
+ }
+@@ -342,7 +386,7 @@
+     ///
+     /// Useful when dealing with random input to limit memory usage.
+     ///
+-    /// Default: u32::MAX (no limit)
++    /// Default: `u32::MAX` (no limit)
+     pub nodes_limit: u32,
+ 
+     /// Function to resolve external entities
+@@ -394,14 +438,14 @@
      }
  }
  
@@ -1692,7 +1988,7 @@
      eq_len: u8,
  }
  
-@@ -415,7 +505,7 @@
+@@ -415,7 +459,7 @@
      ///
      /// # Examples
      ///
@@ -1701,7 +1997,7 @@
      /// let doc = roxmltree::Document::parse("<e/>").unwrap();
      /// assert_eq!(doc.descendants().count(), 2); // root node + `e` element node
      /// ```
-@@ -431,14 +521,24 @@
+@@ -431,14 +475,24 @@
      ///
      /// # Examples
      ///
@@ -1728,7 +2024,16 @@
      }
  }
  
-@@ -506,7 +606,7 @@
+@@ -455,7 +509,7 @@
+     prefix_pos: usize,
+ }
+ 
+-impl<'input> TagNameSpan<'input> {
++impl TagNameSpan<'_> {
+     #[inline]
+     fn new_null() -> Self {
+         Self {
+@@ -506,7 +560,7 @@
  
  impl LoopDetector {
      #[inline]
@@ -1737,7 +2042,7 @@
          if self.depth < 10 {
              self.depth += 1;
              Ok(())
-@@ -528,7 +628,7 @@
+@@ -528,7 +582,7 @@
      }
  
      #[inline]
@@ -1746,7 +2051,7 @@
          if self.depth == 0 {
              // Allow infinite amount of references at zero depth.
              Ok(())
-@@ -543,27 +643,34 @@
+@@ -543,27 +597,34 @@
      }
  }
  
@@ -1791,7 +2096,7 @@
          let _ = range;
  
          let new_child_id = NodeId::from(self.doc.nodes.len());
-@@ -575,22 +682,23 @@
+@@ -575,22 +636,23 @@
              next_subtree: None,
              last_child: None,
              kind,
@@ -1819,7 +2124,7 @@
          }
  
          Ok(new_child_id)
-@@ -598,60 +706,95 @@
+@@ -598,60 +660,94 @@
  
      fn append_text(
          &mut self,
@@ -1834,11 +2139,11 @@
 -            };
 -
 +    ) -> ScopedResult<(), S> {
-+        if !self.after_text {
++        if self.after_text {
++            self.text_fragments.push(text)?;
++        } else {
              self.append_node(NodeKind::Text(text), range)?;
 +            self.after_text = true;
-+        } else {
-+            self.text_fragments.push(text)?;
          }
 -
 -        self.after_text.push(text);
@@ -1850,15 +2155,17 @@
 -    fn merge_text(&mut self) {
 -        let node = &mut self.doc.nodes.last_mut().unwrap();
 +    fn merge_text(&mut self) -> ScopedResult<(), S> {
-+        let node = &mut self
++        let node = self
 +            .doc
 +            .nodes
 +            .last_mut()
 +            .expect("after_text is set only after appending a text node");
  
-         let text = match &mut node.kind {
-             NodeKind::Text(text) => text,
-             _ => unreachable!(),
+-        let text = match &mut node.kind {
+-            NodeKind::Text(text) => text,
+-            _ => unreachable!(),
++        let NodeKind::Text(text) = &mut node.kind else {
++            unreachable!("after_text identifies a text node");
          };
  
 -        *text = StringStorage::new_owned(&self.after_text.join(""));
@@ -1938,7 +2245,7 @@
      };
  
      // Add a root node.
-@@ -661,32 +804,48 @@
+@@ -661,32 +757,48 @@
          next_subtree: None,
          last_child: None,
          kind: NodeKind::Root,
@@ -1995,7 +2302,7 @@
      if !doc.root().children().any(|n| n.is_element()) {
          return Err(Error::NoRootNode);
      }
-@@ -695,34 +854,69 @@
+@@ -695,34 +807,69 @@
          return Err(Error::UnclosedRootNode);
      }
  
@@ -2010,8 +2317,9 @@
  }
  
 -impl<'input> tokenizer::XmlEvents<'input> for Context<'input> {
+-    #[inline(always)]
 +impl<'input, S: Storage> tokenizer::XmlEvents<'input> for Context<'input, S> {
-     #[inline(always)]
++    #[inline]
      fn token(&mut self, token: tokenizer::Token<'input>) -> Result<()> {
 +        if self.failure.is_some() {
 +            return Err(Error::ProcessingStopped);
@@ -2073,7 +2381,7 @@
  
                  if prefix == XMLNS {
                      let pos = self.doc.text_pos_at(start + 1);
-@@ -740,7 +934,7 @@
+@@ -740,7 +887,7 @@
                  process_attribute(range, qname_len, eq_len, prefix, local, value, self)?;
              }
              tokenizer::Token::ElementEnd(end, range) => {
@@ -2082,7 +2390,7 @@
                  process_element(end, range, self)?;
              }
              tokenizer::Token::Text(text, range) => {
-@@ -753,29 +947,30 @@
+@@ -753,29 +900,30 @@
  
          Ok(())
      }
@@ -2124,7 +2432,7 @@
          // The xmlns namespace MUST NOT be declared as the default namespace.
          if value.as_str() == NS_XMLNS_URI {
              let pos = ctx.doc.text_pos_at(range.start);
-@@ -804,10 +999,10 @@
+@@ -804,10 +952,10 @@
          if ctx
              .doc
              .namespaces
@@ -2137,7 +2445,7 @@
          }
  
          // Xml namespace should not be added to the namespaces.
-@@ -829,7 +1024,7 @@
+@@ -829,7 +977,7 @@
  
          ctx.doc.namespaces.push_ns(None, value)?;
      } else {
@@ -2146,7 +2454,7 @@
          let _ = (qname_len, eq_len);
  
          ctx.current_attributes.push(TempAttributeData {
-@@ -837,21 +1032,21 @@
+@@ -837,21 +985,21 @@
              local,
              value,
              range,
@@ -2174,8 +2482,14 @@
      if ctx.tag_name.name.is_empty() {
          // May occur in XML like this:
          // <!DOCTYPE test [ <!ENTITY p '</p>'> ]>
-@@ -866,7 +1061,7 @@
+@@ -861,12 +1009,11 @@
+             return Err(Error::UnexpectedEntityCloseTag(
+                 ctx.doc.text_pos_at(token_range.start),
+             ));
+-        } else {
+-            unreachable!("should be already checked by the tokenizer");
          }
++        unreachable!("should be already checked by the tokenizer");
      }
  
 -    let namespaces = ctx.resolve_namespaces();
@@ -2183,7 +2497,7 @@
      ctx.namespace_start_idx = ctx.doc.namespaces.tree_order.len();
  
      let attributes = resolve_attributes(namespaces, ctx)?;
-@@ -890,29 +1085,32 @@
+@@ -890,29 +1037,32 @@
                  },
                  ctx.tag_name.pos..token_range.end,
              )?;
@@ -2228,7 +2542,7 @@
  
              if let Some(id) = parent_node.parent {
                  ctx.parent_id = id;
-@@ -946,21 +1144,21 @@
+@@ -946,21 +1096,21 @@
                  },
                  ctx.tag_name.pos..token_range.end,
              )?;
@@ -2254,7 +2568,7 @@
              }
  
              for i in parent_ns.to_urange() {
-@@ -970,17 +1168,20 @@
+@@ -970,17 +1120,20 @@
                          .namespaces
                          .get(self.doc.namespaces.tree_order[i])
                          .name,
@@ -2279,7 +2593,7 @@
      if ctx.current_attributes.is_empty() {
          return Ok(ShortRange::new(0, 0));
      }
-@@ -991,7 +1192,7 @@
+@@ -991,7 +1144,7 @@
  
      let start_idx = ctx.doc.attributes.len();
  
@@ -2288,7 +2602,7 @@
          let namespace_idx = if attr.prefix == NS_XML_PREFIX {
              // The prefix 'xml' is by definition bound to the namespace name
              // http://www.w3.org/XML/1998/namespace. This namespace is added
-@@ -1011,60 +1212,74 @@
+@@ -1011,60 +1164,74 @@
          };
  
          // Check for duplicated attributes.
@@ -2382,7 +2696,7 @@
                          is_as_is = true;
                      }
                  }
-@@ -1073,7 +1288,7 @@
+@@ -1073,7 +1240,7 @@
                  is_as_is = false;
  
                  if !text_buffer.is_empty() {
@@ -2391,7 +2705,7 @@
                  }
  
                  ctx.loop_detector.inc_references(&stream)?;
-@@ -1088,7 +1303,9 @@
+@@ -1088,7 +1255,9 @@
                  let mut stream = Stream::from_substr(text, fragment.range());
                  let prev_tag_name = ctx.tag_name;
                  ctx.tag_name = TagNameSpan::new_null();
@@ -2402,7 +2716,7 @@
                  ctx.tag_name = prev_tag_name;
                  text_buffer.clear();
  
-@@ -1098,7 +1315,7 @@
+@@ -1098,7 +1267,7 @@
      }
  
      if !text_buffer.is_empty() {
@@ -2411,7 +2725,7 @@
      }
  
      Ok(())
-@@ -1106,26 +1323,27 @@
+@@ -1106,26 +1275,27 @@
  
  // While the whole purpose of CDATA is to indicate to an XML library that this text
  // has to be stored as is, carriage return (`\r`) is still has to be replaced with `\n`.
@@ -2446,7 +2760,7 @@
  
          text = if rest.as_bytes().get(1) == Some(&b'\n') {
              &rest[2..]
-@@ -1136,9 +1354,9 @@
+@@ -1136,9 +1306,9 @@
          pos = memchr(b'\r', text.as_bytes());
      }
  
@@ -2458,7 +2772,7 @@
      Ok(())
  }
  
-@@ -1148,7 +1366,33 @@
+@@ -1148,7 +1318,33 @@
      Text(StrSpan<'a>),
  }
  
@@ -2493,7 +2807,7 @@
      debug_assert!(!stream.at_end());
  
      // Safe, because we already checked that stream is not at the end.
-@@ -1160,13 +1404,14 @@
+@@ -1160,13 +1356,14 @@
          let start = stream.pos();
          match stream.consume_reference() {
              Some(Reference::Char(ch)) => Ok(NextChunk::Char(ch)),
@@ -2513,7 +2827,7 @@
                  }),
              None => {
                  let pos = stream.gen_text_pos_from(start);
-@@ -1180,22 +1425,31 @@
+@@ -1180,22 +1377,31 @@
  }
  
  // https://www.w3.org/TR/REC-xml/#AVNormalize
@@ -2528,14 +2842,15 @@
      // But in rare cases it can be just an another character.
 -    if memchr2(b'&', b'\t', text.as_str().as_bytes()).is_some() || memchr2(b'\n', b'\r', text.as_str().as_bytes()).is_some() {
 -        let mut text_buffer = TextBuffer::new();
+-        _normalize_attribute(text, &mut text_buffer, ctx)?;
+-        Ok(StringStorage::new_owned(&text_buffer.finish()))
 +    ctx.storage.charge(text.as_str().len())?;
 +    ctx.storage.charge(text.as_str().len())?;
 +    if memchr2(b'&', b'\t', text.as_str().as_bytes()).is_some()
 +        || memchr2(b'\n', b'\r', text.as_str().as_bytes()).is_some()
 +    {
 +        let mut text_buffer = TextBuffer::new(ctx.storage)?;
-         _normalize_attribute(text, &mut text_buffer, ctx)?;
--        Ok(StringStorage::new_owned(&text_buffer.finish()))
++        normalize_attribute_into(text, &mut text_buffer, ctx)?;
 +        Ok(StringStorage::from_owned(text_buffer.finish()?))
      } else {
          Ok(StringStorage::Borrowed(text.as_str()))
@@ -2543,7 +2858,7 @@
  }
  
 -fn _normalize_attribute(text: StrSpan, buffer: &mut TextBuffer, ctx: &mut Context) -> Result<()> {
-+fn _normalize_attribute<S: Storage>(
++fn normalize_attribute_into<S: Storage>(
 +    text: StrSpan,
 +    buffer: &mut TextBuffer<S>,
 +    ctx: &mut Context<'_, S>,
@@ -2552,7 +2867,7 @@
      let mut stream = Stream::from_substr(ctx.doc.text, text.range());
      while !stream.at_end() {
          // Safe, because we already checked that the stream is not at the end.
-@@ -1203,7 +1457,7 @@
+@@ -1203,7 +1409,7 @@
  
          if c != b'&' {
              stream.advance(1);
@@ -2561,38 +2876,45 @@
              continue;
          }
  
-@@ -1221,24 +1475,24 @@
+@@ -1221,26 +1427,26 @@
                              ));
                          }
  
 -                        buffer.push_from_attr(b, None);
 +                        buffer.push_from_attr(b, None)?;
                      } else {
-                         // Characters not from entity should be added as is.
-                         // Not sure why... At least `lxml` produces the same results.
+-                        // Characters not from entity should be added as is.
+-                        // Not sure why... At least `lxml` produces the same results.
 -                        buffer.push_raw(b);
++                        // XML 1.0 §3.3.3 appends a character reference's character
++                        // directly; whitespace replacement applies to literal text.
++                        // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
 +                        buffer.push_raw(b)?;
                      }
                  }
              }
 -            Some(Reference::Entity(name)) => match ctx.entities.iter().find(|e| e.name == name) {
 -                Some(entity) => {
-+            Some(Reference::Entity(name)) => match find_entity(&ctx.entities, name, ctx.storage)? {
-+                Some(value) => {
++            Some(Reference::Entity(name)) => {
++                if let Some(value) = find_entity(&ctx.entities, name, ctx.storage)? {
                      ctx.loop_detector.inc_references(&stream)?;
                      ctx.loop_detector.inc_depth(&stream)?;
 -                    _normalize_attribute(entity.value, buffer, ctx)?;
-+                    _normalize_attribute(value, buffer, ctx)?;
++                    normalize_attribute_into(value, buffer, ctx)?;
                      ctx.loop_detector.dec_depth();
-                 }
-                 None => {
+-                }
+-                None => {
++                } else {
                      let pos = stream.gen_text_pos_from(start);
 -                    return Err(Error::UnknownEntityReference(name.into(), pos));
 +                    return Err(Error::UnknownEntityReference(ctx.storage.text(name)?, pos));
                  }
-             },
+-            },
++            }
              None => {
-@@ -1251,12 +1505,12 @@
+                 let pos = stream.gen_text_pos_from(start);
+                 return Err(Error::MalformedEntityReference(pos));
+@@ -1251,12 +1457,12 @@
      Ok(())
  }
  
@@ -2608,7 +2930,7 @@
      // Prefix CAN be empty when the default namespace was defined.
      //
      // Example:
-@@ -1267,12 +1521,20 @@
+@@ -1267,38 +1473,48 @@
          Some(prefix)
      };
  
@@ -2631,21 +2953,31 @@
 -        Some(idx) => Ok(Some(*idx)),
 +        Some(idx) => Ok(Some(idx)),
          None => {
-             if !prefix.is_empty() {
+-            if !prefix.is_empty() {
++            if prefix.is_empty() {
++                // Without a default declaration, an unprefixed name has no namespace.
++                Ok(None)
++            } else {
                  // If an URI was not found and prefix IS NOT empty than
-@@ -1281,7 +1543,10 @@
+                 // we have an unknown namespace.
+                 //
                  // Example:
                  // <e random:a='b'/>
                  let pos = doc.text_pos_at(prefix_pos);
 -                Err(Error::UnknownNamespace(prefix.to_string(), pos))
+-            } else {
+-                // If an URI was not found and prefix IS empty than
+-                // an element or an attribute doesn't have a namespace.
+-                //
+-                // Example:
+-                // <e a='b'/>
+-                Ok(None)
 +                Err(Error::UnknownNamespace(
 +                    doc.namespaces.storage.text(prefix)?,
 +                    pos,
 +                ))
-             } else {
-                 // If an URI was not found and prefix IS empty than
-                 // an element or an attribute doesn't have a namespace.
-@@ -1294,11 +1559,14 @@
+             }
+         }
      }
  }
  
@@ -2663,7 +2995,22 @@
      }
  }
  
-@@ -1338,27 +1606,29 @@
+@@ -1326,11 +1542,11 @@
+         if self.idx < 4 {
+             let b = self.buf[self.idx as usize];
+ 
+-            if b != 0xFF {
++            if b == 0xFF {
++                self.idx = 4;
++            } else {
+                 self.idx += 1;
+                 return Some(b);
+-            } else {
+-                self.idx = 4;
+             }
+         }
+ 
+@@ -1338,27 +1554,29 @@
      }
  }
  
@@ -2704,7 +3051,7 @@
          }
  
          // \n, \r and \t should be converted into spaces.
-@@ -1367,27 +1637,28 @@
+@@ -1367,27 +1585,28 @@
              _ => current,
          };
  
@@ -2739,7 +3086,7 @@
      }
  
      #[inline]
-@@ -1401,8 +1672,8 @@
+@@ -1401,8 +1620,8 @@
      }
  
      #[inline]
@@ -2766,6 +3113,74 @@
  
  type Result<T> = core::result::Result<T, Error>;
  
+@@ -32,18 +32,18 @@
+         }
+ 
+         matches!(*self as u32,
+-            0x0000C0..=0x0000D6
+-            | 0x0000D8..=0x0000F6
+-            | 0x0000F8..=0x0002FF
+-            | 0x000370..=0x00037D
+-            | 0x00037F..=0x001FFF
+-            | 0x00200C..=0x00200D
+-            | 0x002070..=0x00218F
+-            | 0x002C00..=0x002FEF
+-            | 0x003001..=0x00D7FF
+-            | 0x00F900..=0x00FDCF
+-            | 0x00FDF0..=0x00FFFD
+-            | 0x010000..=0x0EFFFF)
++            0x00C0..=0x00D6
++            | 0x00D8..=0x00F6
++            | 0x00F8..=0x02FF
++            | 0x0370..=0x037D
++            | 0x037F..=0x1FFF
++            | 0x200C..=0x200D
++            | 0x2070..=0x218F
++            | 0x2C00..=0x2FEF
++            | 0x3001..=0xD7FF
++            | 0xF900..=0xFDCF
++            | 0xFDF0..=0xFFFD
++            | 0x0001_0000..=0x000E_FFFF)
+     }
+ 
+     #[inline]
+@@ -53,21 +53,21 @@
+             return (*self as u8).is_xml_name();
+         }
+ 
+-        matches!(*self as u32, 0x0000B7
+-                | 0x0000C0..=0x0000D6
+-                | 0x0000D8..=0x0000F6
+-                | 0x0000F8..=0x0002FF
+-                | 0x000300..=0x00036F
+-                | 0x000370..=0x00037D
+-                | 0x00037F..=0x001FFF
+-                | 0x00200C..=0x00200D
+-                | 0x00203F..=0x002040
+-                | 0x002070..=0x00218F
+-                | 0x002C00..=0x002FEF
+-                | 0x003001..=0x00D7FF
+-                | 0x00F900..=0x00FDCF
+-                | 0x00FDF0..=0x00FFFD
+-                | 0x010000..=0x0EFFFF)
++        matches!(*self as u32, 0x00B7
++                | 0x00C0..=0x00D6
++                | 0x00D8..=0x00F6
++                | 0x00F8..=0x02FF
++                | 0x0300..=0x036F
++                | 0x0370..=0x037D
++                | 0x037F..=0x1FFF
++                | 0x200C..=0x200D
++                | 0x203F..=0x2040
++                | 0x2070..=0x218F
++                | 0x2C00..=0x2FEF
++                | 0x3001..=0xD7FF
++                | 0xF900..=0xFDCF
++                | 0xFDF0..=0xFFFD
++                | 0x0001_0000..=0x000E_FFFF)
+     }
+ 
+     #[inline]
 @@ -128,7 +128,10 @@
      if s.as_bytes().is_ascii() {
          for (i, b) in s.as_bytes().iter().enumerate() {
@@ -2827,15 +3242,38 @@
  }
  
  // document ::= prolog element Misc*
-@@ -301,7 +319,7 @@
-     }
- 
-     if !s.starts_with(b"<?xml ") {
+@@ -295,15 +313,6 @@
+ //
+ // We don't actually return a token for the XML declaration and only validate it.
+ fn parse_declaration(s: &mut Stream) -> Result<()> {
+-    // Skip UTF-8 BOM.
+-    if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
+-        s.advance(3);
+-    }
+-
+-    if !s.starts_with(b"<?xml ") {
 -        return Ok(())
-+        return Ok(());
+-    }
+-
+     fn consume_spaces(s: &mut Stream) -> Result<()> {
+         if s.starts_with_space() {
+             s.skip_spaces();
+@@ -318,6 +327,15 @@
+         Ok(())
      }
  
-     fn consume_spaces(s: &mut Stream) -> Result<()> {
++    // Skip UTF-8 BOM.
++    if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
++        s.advance(3);
++    }
++
++    if !s.starts_with(b"<?xml ") {
++        return Ok(());
++    }
++
+     s.advance(5); // <?xml
+     consume_spaces(s)?;
+ 
 @@ -345,7 +363,10 @@
  }
  
@@ -2848,6 +3286,20 @@
      let start = s.pos();
      s.advance(4);
      let text = s.consume_chars(|s, c| !(c == '-' && s.starts_with(b"-->")))?;
+@@ -377,10 +398,10 @@
+     let target = s.consume_name()?;
+     s.skip_spaces();
+     let content = s.consume_chars(|s, c| !(c == '?' && s.starts_with(b"?>")))?;
+-    let content = if !content.is_empty() {
+-        Some(content)
+-    } else {
++    let content = if content.is_empty() {
+         None
++    } else {
++        Some(content)
+     };
+ 
+     s.skip_string(b"?>")?;
 @@ -390,7 +411,10 @@
      Ok(())
  }
@@ -2929,6 +3381,54 @@
                  (value, 16)
              } else {
                  let value = self.consume_bytes(|c| c.is_ascii_digit());
+@@ -1051,6 +1088,17 @@
+     /// Consumes according to: <https://www.w3.org/TR/xml-names/#ns-qualnames>
+     #[inline(never)]
+     fn consume_qname(&mut self) -> Result<(&'input str, &'input str)> {
++        fn is_xml_name_start(name: &str) -> bool {
++            if let Some(b) = name.as_bytes().first() {
++                if *b < 128 {
++                    return b.is_xml_name_start();
++                } else if let Some(c) = name.chars().next() {
++                    return c.is_xml_name_start();
++                }
++            }
++            false
++        }
++
+         let start = self.pos();
+ 
+         let mut splitter = None;
+@@ -1093,18 +1141,6 @@
+             (self.span.slice_region(start, start), local)
+         };
+ 
+-        fn is_xml_name_start(name: &str) -> bool {
+-            if let Some(b) = name.as_bytes().first() {
+-                if *b < 128 {
+-                    return b.is_xml_name_start();
+-                } else if let Some(c) = name.chars().next() {
+-                    return c.is_xml_name_start();
+-                }
+-            }
+-
+-            false
+-        }
+-
+         // Prefix must be empty or start with a `NameStartChar`.
+         if !prefix.is_empty() && !is_xml_name_start(prefix) {
+             return Err(Error::InvalidName(self.gen_text_pos_from(start)));
+@@ -1175,9 +1211,8 @@
+         for c in text[..end].chars().rev() {
+             if c == '\n' {
+                 break;
+-            } else {
+-                col += 1;
+             }
++            col += 1;
+         }
+ 
+         col
 --- a/roxmltree/src/tokenizer_tests.rs
 +++ b/roxmltree/src/tokenizer_tests.rs
 @@ -2,27 +2,36 @@
@@ -2989,3 +3489,48 @@
          let t = match token {
              xml::Token::ProcessingInstruction(target, content, range) => {
                  Token::PI(target, content, range)
+@@ -954,10 +962,10 @@
+ // 欄 is EF A4 9D. And EF can be mistreated for UTF-8 BOM.
+ test!(
+     text_03,
+-    "<p>欄</p>",
++    "<p>\u{f91d}</p>",
+     Token::ElementStart("", "p", 0),
+     Token::ElementEnd(ElementEnd::Open, 2..3),
+-    Token::Text("欄", 3..6),
++    Token::Text("\u{f91d}", 3..6),
+     Token::ElementEnd(ElementEnd::Close("", "p"), 6..10)
+ );
+ 
+--- a/roxmltree/src/iterator_tests.rs
++++ b/roxmltree/src/iterator_tests.rs
+@@ -0,0 +1,29 @@
++use super::Document;
++
++#[test]
++fn namespace_iteration_consumes_the_same_range_from_both_ends() {
++    // Mixed-ended namespace iteration must meet without repeating any binding.
++    let document = Document::parse("<r xmlns:a='urn:a' xmlns:b='urn:b' xmlns:c='urn:c'/>")
++        .expect("valid namespace declarations");
++    let root = document.root_element();
++    let forward: Vec<_> = root.namespaces().collect();
++    assert!(forward.len() >= 3);
++    assert_eq!(
++        root.namespaces().rev().collect::<Vec<_>>(),
++        forward.iter().rev().copied().collect::<Vec<_>>()
++    );
++    let mut mixed = root.namespaces();
++    let mut front = 0;
++    let mut back = forward.len();
++    while front < back {
++        assert_eq!(mixed.next(), Some(forward[front]));
++        front += 1;
++        if front < back {
++            back -= 1;
++            assert_eq!(mixed.next_back(), Some(forward[back]));
++        }
++    }
++    assert_eq!(mixed.len(), 0);
++    assert_eq!(mixed.next(), None);
++    assert_eq!(mixed.next_back(), None);
++}

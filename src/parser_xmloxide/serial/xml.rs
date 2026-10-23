@@ -154,7 +154,6 @@ fn is_element_only(doc: &Document, id: NodeId) -> bool {
     has_element_child
 }
 
-#[allow(clippy::too_many_lines)]
 fn serialize_node(
     doc: &Document,
     id: NodeId,
@@ -166,86 +165,15 @@ fn serialize_node(
 ) {
     let indent = options.indent;
     match &doc.node(id).kind {
-        NodeKind::Element {
-            name,
-            prefix,
-            attributes,
-            ..
-        } => {
-            if indent && parent_is_element_only {
-                for _ in 0..depth {
-                    out.push_str(&options.indent_str);
-                }
-            }
-            out.push('<');
-            if let Some(pfx) = prefix {
-                out.push_str(pfx);
-                out.push(':');
-            }
-            out.push_str(name);
-
-            for attr in attributes {
-                out.push(' ');
-                if let Some(pfx) = &attr.prefix {
-                    out.push_str(pfx);
-                    out.push(':');
-                }
-                out.push_str(&attr.name);
-                out.push_str("=\"");
-                let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
-                if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
-                    write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
-                } else {
-                    write_escaped_attr(out, &attr.value, reencode_non_ascii);
-                }
-                out.push('"');
-            }
-
-            if doc.first_child(id).is_none() {
-                out.push_str("/>");
-                if indent && parent_is_element_only {
-                    out.push('\n');
-                }
-            } else {
-                out.push('>');
-                let element_only = indent && is_element_only(doc, id);
-                if element_only {
-                    out.push('\n');
-                }
-                for child in doc.children(id) {
-                    if element_only
-                        && let NodeKind::Text { content } = &doc.node(child).kind
-                        && content.trim().is_empty()
-                    {
-                        continue;
-                    }
-                    serialize_node(
-                        doc,
-                        child,
-                        out,
-                        reencode_non_ascii,
-                        options,
-                        depth + 1,
-                        element_only,
-                    );
-                }
-                if element_only {
-                    for _ in 0..depth {
-                        out.push_str(&options.indent_str);
-                    }
-                }
-                out.push_str("</");
-                if let Some(pfx) = prefix {
-                    out.push_str(pfx);
-                    out.push(':');
-                }
-                out.push_str(name);
-                out.push('>');
-                if indent && parent_is_element_only {
-                    out.push('\n');
-                }
-            }
-        }
+        NodeKind::Element { .. } => serialize_element_node(
+            doc,
+            id,
+            out,
+            reencode_non_ascii,
+            options,
+            depth,
+            parent_is_element_only,
+        ),
         NodeKind::Text { content } => {
             write_escaped_text(out, content, reencode_non_ascii);
         }
@@ -322,6 +250,98 @@ fn serialize_node(
         }
         NodeKind::Document => {
             // Should not appear as a child node
+        }
+    }
+}
+
+fn serialize_element_node(
+    doc: &Document,
+    id: NodeId,
+    out: &mut String,
+    reencode_non_ascii: bool,
+    options: &SerializeOptions,
+    depth: usize,
+    parent_is_element_only: bool,
+) {
+    let NodeKind::Element {
+        name,
+        prefix,
+        attributes,
+        ..
+    } = &doc.node(id).kind
+    else {
+        unreachable!("element serialization only receives an element");
+    };
+    let indent = options.indent;
+    if indent && parent_is_element_only {
+        for _ in 0..depth {
+            out.push_str(&options.indent_str);
+        }
+    }
+    out.push('<');
+    if let Some(pfx) = prefix {
+        out.push_str(pfx);
+        out.push(':');
+    }
+    out.push_str(name);
+    for attr in attributes {
+        out.push(' ');
+        if let Some(pfx) = &attr.prefix {
+            out.push_str(pfx);
+            out.push(':');
+        }
+        out.push_str(&attr.name);
+        out.push_str("=\"");
+        let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
+        if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
+            write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
+        } else {
+            write_escaped_attr(out, &attr.value, reencode_non_ascii);
+        }
+        out.push('"');
+    }
+    if doc.first_child(id).is_none() {
+        out.push_str("/>");
+        if indent && parent_is_element_only {
+            out.push('\n');
+        }
+    } else {
+        out.push('>');
+        let element_only = indent && is_element_only(doc, id);
+        if element_only {
+            out.push('\n');
+        }
+        for child in doc.children(id) {
+            if element_only
+                && let NodeKind::Text { content } = &doc.node(child).kind
+                && content.trim().is_empty()
+            {
+                continue;
+            }
+            serialize_node(
+                doc,
+                child,
+                out,
+                reencode_non_ascii,
+                options,
+                depth + 1,
+                element_only,
+            );
+        }
+        if element_only {
+            for _ in 0..depth {
+                out.push_str(&options.indent_str);
+            }
+        }
+        out.push_str("</");
+        if let Some(pfx) = prefix {
+            out.push_str(pfx);
+            out.push(':');
+        }
+        out.push_str(name);
+        out.push('>');
+        if indent && parent_is_element_only {
+            out.push('\n');
         }
     }
 }
@@ -549,6 +569,37 @@ fn write_escaped_attr(out: &mut String, text: &str, reencode_non_ascii: bool) {
 mod tests {
     use super::*;
     use crate::parser_xmloxide::tree::Attribute;
+
+    #[test]
+    fn element_dispatch_preserves_empty_mixed_and_indented_bytes() {
+        // The extracted element branch must keep the same child/indentation
+        // decisions, including the caller's depth and mixed-content boundary.
+        for (source, compact, indented) in [
+            ("<r/>", "<r/>", "    <r/>\n"),
+            (
+                "<r><n/></r>",
+                "<r><n/></r>",
+                "    <r>\n      <n/>\n    </r>\n",
+            ),
+            (
+                "<r>left<n/>right</r>",
+                "<r>left<n/>right</r>",
+                "    <r>left<n/>right</r>\n",
+            ),
+        ] {
+            let doc = Document::parse_str(source).unwrap();
+            let id = doc.root_element().unwrap();
+            for indent in [false, true] {
+                let options = SerializeOptions::default().indent(indent);
+                let mut direct = String::new();
+                serialize_element_node(&doc, id, &mut direct, false, &options, 2, true);
+                let mut dispatched = String::new();
+                serialize_node(&doc, id, &mut dispatched, false, &options, 2, true);
+                assert_eq!(direct, if indent { indented } else { compact });
+                assert_eq!(dispatched, direct);
+            }
+        }
+    }
 
     #[test]
     fn test_serialize_empty_element() {

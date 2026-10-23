@@ -30,26 +30,23 @@ where
 
         let tail = &self.haystack[self.start..];
 
-        match tail.find(&self.chars) {
-            Some(start) => {
-                let start = self.start + start;
-                let end = start + self.haystack[start..].chars().next()?.len_utf8();
-                if self.start == start {
-                    let s = &self.haystack[start..end];
-                    self.start = end;
-                    Some(SplitType::Delimiter(s))
-                } else {
-                    let s = &self.haystack[self.start..start];
-                    self.start = start;
-                    self.saved = Some(end);
-                    Some(SplitType::Match(s))
-                }
-            }
-            None => {
-                let s = &self.haystack[self.start..];
-                self.start = self.haystack.len();
+        if let Some(start) = tail.find(&self.chars) {
+            let start = self.start + start;
+            let end = start + self.haystack[start..].chars().next()?.len_utf8();
+            if self.start == start {
+                let s = &self.haystack[start..end];
+                self.start = end;
+                Some(SplitType::Delimiter(s))
+            } else {
+                let s = &self.haystack[self.start..start];
+                self.start = start;
+                self.saved = Some(end);
                 Some(SplitType::Match(s))
             }
+        } else {
+            let s = &self.haystack[self.start..];
+            self.start = self.haystack.len();
+            Some(SplitType::Match(s))
         }
     }
 }

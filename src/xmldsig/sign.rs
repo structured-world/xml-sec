@@ -1946,7 +1946,7 @@ impl<'a> SignContext<'a> {
     }
 
     fn document_parse_settings(&self) -> DocumentParseSettings {
-        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+        DocumentParseSettings::from_policy(self.policy.xml, &self.policy.resources)
             .with_backend(self.xml_backend)
     }
 
@@ -2080,7 +2080,7 @@ impl<'a> SignContext<'a> {
 
     fn validate_owned_document_input(&self, document: &XmlDocument) -> Result<(), SigningError> {
         self.policy.validate()?;
-        document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
+        document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
         if let Some(resources) = self.external_resources {
             validate_external_resource_map(
                 resources,
@@ -2856,7 +2856,7 @@ fn prepare_reference_digest_input<'a>(
     let default_policy = crate::policy::SigningPolicy::default();
     let effective_policy = policy.unwrap_or(&default_policy);
     let settings =
-        DocumentParseSettings::from_policy(&effective_policy.xml, &effective_policy.resources);
+        DocumentParseSettings::from_policy(effective_policy.xml, &effective_policy.resources);
     let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
         settings,
@@ -3098,7 +3098,7 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
                 document
                     .replace_base64_contents_with_budget(
                         &replacements,
-                        DocumentParseSettings::from_policy(&policy.xml, &policy.resources)
+                        DocumentParseSettings::from_policy(policy.xml, &policy.resources)
                             .with_backend(document.xml_backend()),
                         budgets.transforms.xml_parse_work(),
                     )
@@ -3925,7 +3925,7 @@ fn parse_signing_document<'a>(
     backend: crate::XmlBackend,
 ) -> Result<Document<'a>, SigningDigestError> {
     let settings = policy
-        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
+        .map(|policy| DocumentParseSettings::from_policy(policy.xml, &policy.resources))
         .unwrap_or_default()
         .with_backend(backend);
     super::mutation::parse_with_options_and_budget(xml, settings, Some(budget)).map_err(|error| {
@@ -4649,7 +4649,7 @@ mod error_conversion_tests {
         let mut measured = SigningOperationBudgets::from_resources(&policy.resources);
         let mut staged = source
             .staged_copy_with_budget(
-                DocumentParseSettings::from_policy(&policy.xml, &policy.resources),
+                DocumentParseSettings::from_policy(policy.xml, &policy.resources),
                 measured.transforms.xml_parse_work(),
             )
             .expect("staging must parse");
@@ -4703,7 +4703,7 @@ mod error_conversion_tests {
         let mut measurement_document = XmlDocument::parse_with_settings_and_budget(
             xml.clone(),
             DocumentParseSettings::from_policy(
-                &measurement_policy.xml,
+                measurement_policy.xml,
                 &measurement_policy.resources,
             ),
             measurement_budgets.transforms.xml_parse_work(),

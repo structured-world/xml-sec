@@ -819,7 +819,7 @@ impl<'a> DecryptContext<'a> {
     }
 
     fn document_parse_settings(&self) -> DocumentParseSettings {
-        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+        DocumentParseSettings::from_policy(self.policy.xml, &self.policy.resources)
             .with_backend(self.xml_backend)
     }
 
@@ -1808,7 +1808,7 @@ fn decrypt_owned_document_with_context(
     budgets: DecryptionOperationBudgets,
 ) -> Result<(), XmlEncError> {
     context.policy.resources.validate()?;
-    document.validate_operation_policy(&context.policy.xml, &context.policy.resources)?;
+    document.validate_operation_policy(context.policy.xml, &context.policy.resources)?;
     let (target, target_len, target_start, replacement_type) = document.with_view(|view| {
         let start = match selector {
             DocumentEncryptedDataSelector::UniqueBelowStartNode(Some(id))

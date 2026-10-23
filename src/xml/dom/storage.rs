@@ -242,6 +242,7 @@ impl Storage for Native {
 }
 
 #[cfg(feature = "xmldsig")]
+#[derive(Clone)]
 pub(crate) struct Accounted<'w, W: structured_asn1::memory::Work>(pub &'w W);
 
 #[cfg(feature = "xmldsig")]
@@ -252,13 +253,6 @@ impl<W: structured_asn1::memory::Work> Debug for Accounted<'_, W> {
         formatter.write_str("AccountedXmlStorage")
     }
 }
-#[cfg(feature = "xmldsig")]
-impl<W: structured_asn1::memory::Work> Clone for Accounted<'_, W> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
 #[cfg(feature = "xmldsig")]
 impl<W: structured_asn1::memory::Work> Storage for Accounted<'_, W> {
     type Text = structured_asn1::memory::OwnedText<W>;

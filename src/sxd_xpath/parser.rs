@@ -78,27 +78,6 @@ impl<'a> Parser<'a> {
             .parse(source)
             .map_err(Into::into)
     }
-
-    #[cfg(test)]
-    fn parse_node_test<I>(
-        &self,
-        source: &mut std::iter::Peekable<I>,
-    ) -> Result<Option<SubNodeTest>, Error>
-    where
-        I: Iterator<Item = TokenResult>,
-    {
-        if !matches!(source.peek(), Some(Ok(Token::NodeTest(_)))) {
-            return Ok(None);
-        }
-        match source
-            .next()
-            .expect("peeked token")
-            .map_err(|source| Error::Tokenizer { source })?
-        {
-            Token::NodeTest(test) => Ok(Some(native_test(Test::Kind(test)))),
-            _ => unreachable!(),
-        }
-    }
 }
 
 #[derive(Debug, Snafu, Clone, PartialEq)]
@@ -107,7 +86,7 @@ impl<'a> Parser<'a> {
 pub enum Error {
     /// live parser heap payload would exceed the caller's allowance
     AllocationLimit { limit: usize, actual: usize },
-    /// XPath was empty
+    /// `XPath` was empty
     NoXPath,
     /// empty predicate
     EmptyPredicate,
@@ -153,9 +132,12 @@ impl From<Fault<Token>> for Error {
     }
 }
 
-fn native_failure(error: Error) -> Fault<Token> {
+fn native_failure(error: &Error) -> Fault<Token> {
     match error {
-        Error::AllocationLimit { limit, actual } => Fault::AllocationLimit { limit, actual },
+        Error::AllocationLimit { limit, actual } => Fault::AllocationLimit {
+            limit: *limit,
+            actual: *actual,
+        },
         _ => unreachable!("non-allocation failure from native storage"),
     }
 }
@@ -181,36 +163,41 @@ impl Builder for Parser<'_> {
     }
 
     fn push<T>(&self, list: &mut Vec<T>, value: T) -> Result<(), Fault<Token>> {
-        self.push(list, value).map_err(native_failure)
+        self.push(list, value)
+            .map_err(|error| native_failure(&error))
     }
 
     fn node(&self, node: Node<Self>, _depth: usize) -> Result<SubExpression, Fault<Token>> {
         match node {
-            Node::Context => self.boxed(expression::ContextNode).map_err(native_failure),
-            Node::Root => self.boxed(expression::RootNode).map_err(native_failure),
+            Node::Context => self
+                .boxed(expression::ContextNode)
+                .map_err(|error| native_failure(&error)),
+            Node::Root => self
+                .boxed(expression::RootNode)
+                .map_err(|error| native_failure(&error)),
             Node::Number(value) => self
                 .boxed(expression::Literal::from(Value::Number(value)))
-                .map_err(native_failure),
+                .map_err(|error| native_failure(&error)),
             Node::String(value) => self
                 .boxed(expression::Literal::from(Value::String(value)))
-                .map_err(native_failure),
+                .map_err(|error| native_failure(&error)),
             Node::Variable(name) => self
                 .boxed(expression::Variable { name })
-                .map_err(native_failure),
+                .map_err(|error| native_failure(&error)),
             Node::Function(name, arguments) => self
                 .boxed(expression::Function { name, arguments })
-                .map_err(native_failure),
+                .map_err(|error| native_failure(&error)),
             Node::Negate(expression) => self
                 .boxed(expression::Negation { expression })
-                .map_err(native_failure),
+                .map_err(|error| native_failure(&error)),
             Node::Path(start, steps) => {
                 self.charge(std::mem::size_of::<expression::Path>())
-                    .map_err(native_failure)?;
+                    .map_err(|error| native_failure(&error))?;
                 Ok(expression::Path::new(start, steps))
             }
             Node::Filter(selector, predicate) => {
                 self.charge(std::mem::size_of::<expression::Filter>())
-                    .map_err(native_failure)?;
+                    .map_err(|error| native_failure(&error))?;
                 Ok(expression::Filter::new(selector, predicate))
             }
             Node::Binary(operation, left, right) => {
@@ -269,7 +256,7 @@ impl Builder for Parser<'_> {
                         expression::Union::new,
                     ),
                 };
-                self.charge(size).map_err(native_failure)?;
+                self.charge(size).map_err(|error| native_failure(&error))?;
                 Ok(constructor(left, right))
             }
         }
@@ -300,6 +287,37 @@ impl Builder for Parser<'_> {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn inline_processing_instruction_uses_the_production_ast_budget() {
+        // A targetless PI test must fit the same complete AST allowance as
+        // node(). An extra Box would exceed it; one byte less must still fail.
+        fn parse(
+            source: &str,
+            budget: &crate::ParseBudget,
+        ) -> Result<super::SubExpression, super::Error> {
+            let tokens = crate::tokenizer::Tokenizer::with_budget(source, budget);
+            super::Parser::with_budget(budget)
+                .parse(crate::tokenizer::TokenDeabbreviator::new(tokens))
+        }
+        let baseline = crate::ParseBudget::new(usize::MAX);
+        let reference = parse("node()", &baseline).expect("reference AST");
+        let required = baseline.used.get();
+        assert!(required > 0, "the complete AST owns storage");
+        drop(reference);
+        for limit in [required - 1, required] {
+            let budget = crate::ParseBudget::new(limit);
+            let result = parse("processing-instruction()", &budget);
+            if limit < required {
+                assert!(matches!(result, Err(super::Error::AllocationLimit { .. })));
+            } else {
+                assert!(
+                    result.is_ok(),
+                    "the PI test needs no separate heap owner: {result:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn vector_growth_charges_overlap_then_releases_old_capacity() {
         // The fifth u64 needs an eight-slot buffer beside the existing four-slot buffer.
@@ -341,26 +359,6 @@ mod test {
             ));
         }
         assert_eq!(parser.vector_growth::<u64>(4), Ok((8, 64)));
-    }
-
-    #[test]
-    fn processing_instruction_node_test_has_no_separate_heap_owner() {
-        // A targetless PI test has no string payload. The step stores this
-        // grammar variant inline, so merely parsing it cannot allocate a Box.
-        let budget = crate::ParseBudget::new(0);
-        let parser = super::Parser::with_budget(&budget);
-        let mut tokens = std::iter::once(Ok(Token::NodeTest(NodeTestName::ProcessingInstruction(
-            None,
-        ))))
-        .peekable();
-        assert!(matches!(
-            parser.parse_node_test(&mut tokens),
-            Ok(Some(crate::node_test::SubNodeTest::ProcessingInstruction(
-                _
-            )))
-        ));
-        assert_eq!(budget.used.get(), 0);
-        assert!(tokens.next().is_none());
     }
 
     use snafu::ResultExt;

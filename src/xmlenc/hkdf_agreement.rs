@@ -66,7 +66,7 @@ pub fn parse_hkdf_agreement_method(
     policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let settings =
-        DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
+        DocumentParseSettings::from_policy(policy.xml, &policy.resources).with_backend(backend);
     let budget = XmlParseWorkBudget::from_resources(&policy.resources);
     let document = parse_borrowed_with_settings_and_budget(xml, settings, Some(&budget))
         .map_err(|error| map_document_error(error, settings))?;

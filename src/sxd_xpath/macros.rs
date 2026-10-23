@@ -22,7 +22,7 @@ macro_rules! nodeset(
     ($($e:expr),+,) => ($crate::nodeset!($($e),+))
 );
 
-/// Convenience constructor for an OrderedNodes
+/// Convenience constructor for an `OrderedNodes`
 #[cfg(test)]
 macro_rules! ordered_nodes {
     ( $($val:expr,)* ) => {

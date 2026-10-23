@@ -43,7 +43,7 @@ impl<W: Work> Storage for Accounted<'_, W> {
     }
 }
 
-impl<'a, 'w, W: Work> AttributeBuffer<'a, Accounted<'w, W>> for OwnedVec<Attribute<'a>, W> {
+impl<'a, W: Work> AttributeBuffer<'a, Accounted<'_, W>> for OwnedVec<Attribute<'a>, W> {
     fn push(&mut self, attribute: Attribute<'a>) -> Result<(), MemoryError> {
         self.try_push(attribute)
     }

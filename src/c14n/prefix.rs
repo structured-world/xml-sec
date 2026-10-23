@@ -5,8 +5,8 @@ use crate::xml::dom::{Attribute, Node};
 
 /// Exclusive C14N §4 uses the XML whitespace-delimited NMTOKENS format
 /// (with its explicit #default token), not Unicode word whitespace.
-/// https://www.w3.org/TR/2002/REC-xml-exc-c14n-20020718/#sec-Use
-/// https://www.w3.org/TR/2008/REC-xml-20081126/#NT-S
+/// <https://www.w3.org/TR/2002/REC-xml-exc-c14n-20020718/#sec-Use>
+/// <https://www.w3.org/TR/2008/REC-xml-20081126/#NT-S>
 pub(crate) fn inclusive_tokens(list: &str) -> impl Iterator<Item = &str> {
     list.split([' ', '\t', '\r', '\n'])
         .filter(|token| !token.is_empty())
@@ -26,7 +26,7 @@ pub(crate) fn element_prefix<'a, D: Storage>(node: Node<'a, '_, D>) -> &'a str {
 /// for `xml:lang="en"`).
 pub(crate) fn attribute_prefix<'a, D: Storage>(
     _node: Node<'a, '_, D>,
-    attr: &Attribute<'a, D>,
+    attr: Attribute<'a, D>,
 ) -> &'a str {
     attr.prefix().unwrap_or_default()
 }
@@ -97,7 +97,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let root = doc.root_element();
         let attr = root.attributes().next().expect("attr");
-        assert_eq!(attribute_prefix(root, &attr), "ns");
+        assert_eq!(attribute_prefix(root, attr), "ns");
     }
 
     #[test]
@@ -106,7 +106,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let root = doc.root_element();
         let attr = root.attributes().next().expect("attr");
-        assert_eq!(attribute_prefix(root, &attr), "");
+        assert_eq!(attribute_prefix(root, attr), "");
     }
 
     #[test]
@@ -115,7 +115,7 @@ mod tests {
         let doc = Document::parse(xml).expect("parse");
         let root = doc.root_element();
         let attr = root.attributes().next().expect("attr");
-        assert_eq!(attribute_prefix(root, &attr), "xml");
+        assert_eq!(attribute_prefix(root, attr), "xml");
     }
 
     #[test]
@@ -126,7 +126,7 @@ mod tests {
         let child = doc.root_element().first_element_child().expect("child");
         assert_eq!(element_prefix(child), "b");
         let attr = child.attributes().next().expect("attr");
-        assert_eq!(attribute_prefix(child, &attr), "a");
+        assert_eq!(attribute_prefix(child, attr), "a");
     }
 
     #[test]

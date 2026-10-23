@@ -159,11 +159,12 @@ impl Failure for super::AccountedParseError {
     fn kind(&self) -> FailureKind {
         use super::AccountedParseError;
         match self {
-            AccountedParseError::Semantic(error) => error.kind(),
-            AccountedParseError::Lexical(crate::xml_input::lexical::Error::Resource(_)) => {
-                FailureKind::Execution
-            }
-            AccountedParseError::Roxmltree(crate::parser_roxmltree::Error::SharedExecution(_)) => {
+            AccountedParseError::Semantic(error)
+            | AccountedParseError::Xmloxide(crate::parser_xmloxide::error::ParseError::Resource(
+                error,
+            )) => error.kind(),
+            AccountedParseError::Lexical(crate::xml_input::lexical::Error::Resource(_))
+            | AccountedParseError::Roxmltree(crate::parser_roxmltree::Error::SharedExecution(_)) => {
                 FailureKind::Execution
             }
             AccountedParseError::Roxmltree(crate::parser_roxmltree::Error::AllocationFailed) => {
@@ -175,9 +176,6 @@ impl Failure for super::AccountedParseError {
             AccountedParseError::Roxmltree(crate::parser_roxmltree::Error::NodesLimitReached) => {
                 FailureKind::Nodes
             }
-            AccountedParseError::Xmloxide(crate::parser_xmloxide::error::ParseError::Resource(
-                error,
-            )) => error.kind(),
             AccountedParseError::Divergence(_) => FailureKind::Divergence,
             _ => FailureKind::Malformed,
         }

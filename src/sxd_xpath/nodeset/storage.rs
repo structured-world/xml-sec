@@ -1,6 +1,8 @@
 //! Native compatibility storage and the current query's retained table.
 
-use super::*;
+#[cfg(feature = "embedded")]
+use super::Nodeset;
+use super::{HashSet, Node};
 
 #[derive(Debug)]
 pub(crate) enum Storage<'d> {

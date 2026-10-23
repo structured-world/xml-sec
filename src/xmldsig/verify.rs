@@ -645,7 +645,7 @@ impl<'a> VerifyContext<'a> {
         document: &XmlDocument,
     ) -> Result<Vec<NodeIdentity>, DsigError> {
         self.policy.validate()?;
-        document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
+        document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
         document.with_view(|view| {
             let count = count_signature_nodes(view, self.policy.resources.max_signatures)?;
             let mut identities = Vec::with_capacity(count);
@@ -1854,7 +1854,7 @@ fn verify_signature_with_context(
     ctx.policy.resources.validate_xml_document_len(xml.len())?;
     let execution_budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
         .with_xml_backend(ctx.xml_backend);
-    let settings = DocumentParseSettings::from_policy(&ctx.policy.xml, &ctx.policy.resources)
+    let settings = DocumentParseSettings::from_policy(ctx.policy.xml, &ctx.policy.resources)
         .with_backend(ctx.xml_backend);
     let document = XmlDocument::parse_with_settings_and_budget(
         xml.to_owned(),
@@ -1905,7 +1905,7 @@ fn verify_signature_document_with_context(
     document: &XmlDocument,
     ctx: &VerifyContext<'_>,
 ) -> Result<VerifyResult, SignatureVerificationPipelineError> {
-    document.validate_operation_policy(&ctx.policy.xml, &ctx.policy.resources)?;
+    document.validate_operation_policy(ctx.policy.xml, &ctx.policy.resources)?;
     verify_signature_document_with_context_and_transforms(
         document,
         ctx,
@@ -2121,7 +2121,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
 ) -> Result<R, DsigError> {
     storage.admit_request(document)?;
     ctx.policy.validate()?;
-    document.validate_operation_policy(&ctx.policy.xml, &ctx.policy.resources)?;
+    document.validate_operation_policy(ctx.policy.xml, &ctx.policy.resources)?;
     ctx.policy
         .signature_constraints
         .require_targets(!request.expected_targets.is_empty())?;
@@ -3386,7 +3386,7 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
                 )
                 .map_err(map_key_info_xml_decode_error)?;
                 let settings = DocumentParseSettings::from_policy(
-                    context.policy.xml(),
+                    *context.policy.xml(),
                     context.policy.resources(),
                 )
                 .with_backend(context.budgets.xml_backend);
@@ -3758,7 +3758,7 @@ fn discover_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
                 let xml =
                     crate::encoding::decode_xml_octets(bytes, resources.max_xml_document_bytes)
                         .map_err(map_key_info_xml_decode_error)?;
-                let settings = DocumentParseSettings::from_policy(policy.xml(), resources)
+                let settings = DocumentParseSettings::from_policy(*policy.xml(), resources)
                     .with_backend(backend);
                 let document = XmlDocument::parse_with_settings_and_budget(
                     xml.into_owned(),

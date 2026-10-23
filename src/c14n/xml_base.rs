@@ -74,7 +74,7 @@ impl XmlBaseResolutionBudget {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum XmlBaseResolutionError {
     #[error("XML Base resolution exceeds maximum of {maximum} inherited components: got {actual}")]
     Components { maximum: usize, actual: usize },
@@ -109,14 +109,15 @@ pub(crate) fn compute_effective_xml_base(
         .expect("test XML Base fixtures stay within implementation ceilings")
 }
 
-/// Budgeted form used for attacker-controlled XMLDSig URI resolution.
+/// Budgeted form used for attacker-controlled `XMLDSig` URI resolution.
 #[cfg(test)]
 pub(crate) fn compute_effective_xml_base_with_budget(
     start: Node<'_, '_>,
     visibility: Option<&dyn NodeVisibility>,
     budget: &XmlBaseResolutionBudget,
 ) -> Result<Option<String>, XmlBaseResolutionError> {
-    compute_effective_xml_base_in(start, visibility, budget, &Native).map_err(native_policy_error)
+    compute_effective_xml_base_in(start, visibility, budget, &Native)
+        .map_err(|error| native_policy_error(&error))
 }
 
 pub(super) fn compute_effective_xml_base_in<S: Scratch, D: DomStorage>(
@@ -193,20 +194,20 @@ pub(super) fn resolve_uri_with_budget_in<S: Scratch>(
 }
 
 #[cfg(any(feature = "xmldsig", test))]
-fn native_policy_error(error: C14nError) -> XmlBaseResolutionError {
+fn native_policy_error(error: &C14nError) -> XmlBaseResolutionError {
     // Native scratch cannot refuse execution/storage; the shared kernel can
     // return only these two policy failures for the legacy native entry points.
     match error {
         C14nError::XmlBaseComponentsTooLarge { max, actual } => {
             XmlBaseResolutionError::Components {
-                maximum: max,
-                actual,
+                maximum: *max,
+                actual: *actual,
             }
         }
         C14nError::XmlBaseResolutionTooLarge { max_bytes, actual } => {
             XmlBaseResolutionError::Bytes {
-                maximum: max_bytes,
-                actual,
+                maximum: *max_bytes,
+                actual: *actual,
             }
         }
         _ => unreachable!("native scratch has no fallible resource domain"),
@@ -233,7 +234,7 @@ pub(crate) fn resolve_uri_from_node_with_document_base_with_budget(
     budget: &XmlBaseResolutionBudget,
 ) -> Result<String, XmlBaseResolutionError> {
     resolve_uri_from_node_in(origin, reference, document_base, budget, &Native)
-        .map_err(native_policy_error)
+        .map_err(|error| native_policy_error(&error))
 }
 
 #[cfg(feature = "xmldsig")]
@@ -349,41 +350,36 @@ fn resolve_uri_in<S: Scratch>(
 
     // Parse base URI components
     scratch.charge(base.len().saturating_mul(6))?;
-    let base_parts = match parse_base(base) {
-        Some(parts) => parts,
-        None => {
-            // Schemeless bases include both ordinary relative paths and
-            // network-path references. Preserve the latter's authority while
-            // applying the same RFC 3986 path merge and normalization rules.
-            scratch.charge(reference.len().saturating_mul(2))?;
-            let (ref_path, ref_suffix) = split_path_suffix(reference);
-            if let Some((authority, path)) = parse_network_path(ref_path) {
-                let path = remove_dot_segments_in(path, true, scratch)?;
-                return scratch.text(&["//", authority, path.view()?, ref_suffix]);
-            }
-            scratch.charge(base.len().saturating_mul(2))?;
-            let (base_path_with_authority, _) = split_path_suffix(base);
-            let network_base = parse_network_path(base_path_with_authority);
-            if ref_path.starts_with('/') {
-                let path = remove_dot_segments_in(ref_path, true, scratch)?;
-                return match network_base {
-                    Some((authority, _)) => {
-                        scratch.text(&["//", authority, path.view()?, ref_suffix])
-                    }
-                    None => scratch.text(&[path.view()?, ref_suffix]),
-                };
-            }
-            let (base_path, authority) = match network_base {
-                Some((authority, path)) => (path, Some(authority)),
-                None => (base_path_with_authority, None),
-            };
-            let merged = merge_paths_in(base_path, ref_path, authority.is_some(), scratch)?;
-            let cleaned = remove_dot_segments_in(merged.view()?, true, scratch)?;
-            return match authority {
-                Some(authority) => scratch.text(&["//", authority, cleaned.view()?, ref_suffix]),
-                None => scratch.text(&[cleaned.view()?, ref_suffix]),
+    let Some(base_parts) = parse_base(base) else {
+        // Schemeless bases include both ordinary relative paths and
+        // network-path references. Preserve the latter's authority while
+        // applying the same RFC 3986 path merge and normalization rules.
+        scratch.charge(reference.len().saturating_mul(2))?;
+        let (ref_path, ref_suffix) = split_path_suffix(reference);
+        if let Some((authority, path)) = parse_network_path(ref_path) {
+            let path = remove_dot_segments_in(path, true, scratch)?;
+            return scratch.text(&["//", authority, path.view()?, ref_suffix]);
+        }
+        scratch.charge(base.len().saturating_mul(2))?;
+        let (base_path_with_authority, _) = split_path_suffix(base);
+        let network_base = parse_network_path(base_path_with_authority);
+        if ref_path.starts_with('/') {
+            let path = remove_dot_segments_in(ref_path, true, scratch)?;
+            return match network_base {
+                Some((authority, _)) => scratch.text(&["//", authority, path.view()?, ref_suffix]),
+                None => scratch.text(&[path.view()?, ref_suffix]),
             };
         }
+        let (base_path, authority) = match network_base {
+            Some((authority, path)) => (path, Some(authority)),
+            None => (base_path_with_authority, None),
+        };
+        let merged = merge_paths_in(base_path, ref_path, authority.is_some(), scratch)?;
+        let cleaned = remove_dot_segments_in(merged.view()?, true, scratch)?;
+        return match authority {
+            Some(authority) => scratch.text(&["//", authority, cleaned.view()?, ref_suffix]),
+            None => scratch.text(&[cleaned.view()?, ref_suffix]),
+        };
     };
     let scheme = base_parts.scheme;
     let authority = base_parts.authority;
@@ -1031,7 +1027,7 @@ mod tests {
 
     #[test]
     fn effective_base_none_when_no_xml_base() {
-        let xml = r#"<root><child/></root>"#;
+        let xml = "<root><child/></root>";
         let doc = Document::parse(xml).unwrap();
         let child = doc.root_element().first_element_child().unwrap();
         assert_eq!(

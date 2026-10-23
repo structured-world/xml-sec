@@ -68,7 +68,7 @@ impl structured_asn1::memory::HashWork for NodeIdentity {
     }
 }
 
-/// Identity of one XPath attribute node and its owning element.
+/// Identity of one `XPath` attribute node and its owning element.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AttributeIdentity {
     owner: NodeIdentity,
@@ -76,7 +76,7 @@ pub struct AttributeIdentity {
     local_name: String,
 }
 
-/// Identity of one XPath namespace node and its owning element.
+/// Identity of one `XPath` namespace node and its owning element.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NamespaceIdentity {
     owner: NodeIdentity,
@@ -93,7 +93,7 @@ pub struct SemanticOrder {
 }
 
 impl AttributeIdentity {
-    /// Return the element that owns this XPath attribute node.
+    /// Return the element that owns this `XPath` attribute node.
     #[must_use]
     pub const fn owner(&self) -> NodeIdentity {
         self.owner
@@ -113,7 +113,7 @@ impl AttributeIdentity {
 }
 
 impl NamespaceIdentity {
-    /// Return the element that owns this XPath namespace node.
+    /// Return the element that owns this `XPath` namespace node.
     #[must_use]
     pub const fn owner(&self) -> NodeIdentity {
         self.owner
@@ -193,7 +193,7 @@ impl DocumentParseSettings {
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn from_policy(
-        xml: &crate::policy::XmlInputPolicy,
+        xml: crate::policy::XmlInputPolicy,
         resources: &crate::policy::ResourcePolicy,
     ) -> Self {
         Self {
@@ -648,6 +648,9 @@ impl XmlDocument {
 
     /// Parse and own an XML document using conservative XML input defaults.
     /// Borrowed input is size-checked before it is copied into owned storage.
+    ///
+    /// # Errors
+    /// Returns parsing or byte/node/depth/namespace ceiling failures.
     pub fn parse(xml: impl AsRef<str> + Into<String>) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default();
         let xml = own_bounded_xml(xml, settings.max_bytes)?;
@@ -658,12 +661,18 @@ impl XmlDocument {
     ///
     /// BOMs and XML declarations select the source encoding. Decoding is
     /// strict and bounded before the normalized UTF-8 document is retained.
+    ///
+    /// # Errors
+    /// Returns encoding errors or the parsing/ceiling failures of [`Self::parse`].
     pub fn parse_bytes(bytes: &[u8]) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default();
         Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
     }
 
     /// Decode and parse XML bytes with an explicitly selected semantic backend.
+    ///
+    /// # Errors
+    /// Returns encoding, backend selection/divergence, parsing or input-limit failures.
     pub fn parse_bytes_with_backend(
         bytes: &[u8],
         backend: XmlBackend,
@@ -673,6 +682,9 @@ impl XmlDocument {
     }
 
     /// Parse and own XML with an explicitly selected compiled parser backend.
+    ///
+    /// # Errors
+    /// Returns backend selection/divergence, parsing or input-limit failures.
     pub fn parse_with_backend(
         xml: impl AsRef<str> + Into<String>,
         backend: XmlBackend,
@@ -684,6 +696,9 @@ impl XmlDocument {
 
     /// Parse and own XML under the same immutable policy used by an operation.
     /// The policy's byte ceiling is checked before borrowed input is copied.
+    ///
+    /// # Errors
+    /// Returns invalid-policy, input-limit, decoding, or parsing errors.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy(
         xml: impl AsRef<str> + Into<String>,
@@ -695,12 +710,15 @@ impl XmlDocument {
         let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
             xml,
-            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
+            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources),
             Some(&budget),
         )
     }
 
     /// Decode and parse XML bytes under the operation's immutable policy.
+    ///
+    /// # Errors
+    /// Returns invalid-policy, byte/work-limit, decoding, or parsing errors.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_bytes_with_policy(
         bytes: &[u8],
@@ -712,12 +730,15 @@ impl XmlDocument {
         let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
         Self::parse_with_settings_and_optional_budget(
             xml,
-            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources),
+            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources),
             Some(&budget),
         )
     }
 
     /// Parse and own XML under an operation policy and explicit parser backend.
+    ///
+    /// # Errors
+    /// Returns invalid-policy, input-limit, backend-selection/divergence, or parsing errors.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy_and_backend(
         xml: impl AsRef<str> + Into<String>,
@@ -730,13 +751,16 @@ impl XmlDocument {
         let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
         Self::parse_with_settings_and_optional_budget(
             xml,
-            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
+            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
                 .with_backend(backend),
             Some(&budget),
         )
     }
 
     /// Decode and parse XML bytes under policy with an explicit semantic backend.
+    ///
+    /// # Errors
+    /// Returns invalid-policy, decoding, input-limit, backend-selection/divergence, or parsing errors.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_bytes_with_policy_and_backend(
         bytes: &[u8],
@@ -749,7 +773,7 @@ impl XmlDocument {
         let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
         Self::parse_with_settings_and_optional_budget(
             xml,
-            DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
+            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
                 .with_backend(backend),
             Some(&budget),
         )
@@ -825,7 +849,7 @@ impl XmlDocument {
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn validate_operation_policy(
         &self,
-        xml: &crate::policy::XmlInputPolicy,
+        xml: crate::policy::XmlInputPolicy,
         resources: &crate::policy::ResourcePolicy,
     ) -> Result<(), crate::policy::PolicyViolation> {
         resources.validate()?;
@@ -903,6 +927,11 @@ impl XmlDocument {
     }
 
     /// Replace one complete element with a well-formed element fragment.
+    ///
+    /// # Errors
+    /// Rejects foreign, stale, missing or entity-expanded identities, non-element
+    /// targets, invalid fragments and input-limit failures. Failed replacement
+    /// leaves the retained document and generation unchanged.
     pub fn replace_element(
         &mut self,
         target: NodeIdentity,
@@ -980,8 +1009,12 @@ impl XmlDocument {
 
     /// Replace one complete node with an XML fragment valid in its parent context.
     ///
-    /// This operation is intended for XMLEnc Content replacement, where one
+    /// This operation is intended for `XMLEnc` Content replacement, where one
     /// `EncryptedData` element can expand into multiple sibling nodes.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale mutation identities, invalid parent-context
+    /// fragments and input-limit failures without committing a generation.
     pub fn replace_node_with_fragment(
         &mut self,
         target: NodeIdentity,
@@ -1018,6 +1051,10 @@ impl XmlDocument {
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale or non-element targets, invalid contextual fragments
+    /// and input-limit failures; the document remains unchanged on failure.
     pub fn replace_content(
         &mut self,
         target: NodeIdentity,
@@ -1099,6 +1136,10 @@ impl XmlDocument {
     /// All identities must belong to the current generation. Every boundary is
     /// checked in one validation candidate, then the final candidate is parsed
     /// and either commits as one new generation or leaves the document unchanged.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale, overlapping or non-element targets, invalid
+    /// fragments, and input-limit failures without committing any replacement.
     pub fn replace_contents(
         &mut self,
         replacements: &[(NodeIdentity, String)],
@@ -1324,6 +1365,10 @@ impl XmlDocument {
     }
 
     /// Append a well-formed XML fragment as the last child of an element.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale or non-element targets, invalid fragments and
+    /// input-limit failures without committing a generation.
     pub fn append_child(
         &mut self,
         target: NodeIdentity,
@@ -1788,8 +1833,9 @@ impl XmlDocument {
         candidate.push_str(&self.as_xml()[range.end..]);
         let active_nodes_limit = maximum
             .map(|maximum| maximum.min(settings.nodes_limit as usize))
-            .map(|maximum| u32::try_from(maximum).unwrap_or(u32::MAX))
-            .unwrap_or(settings.nodes_limit);
+            .map_or(settings.nodes_limit, |maximum| {
+                u32::try_from(maximum).unwrap_or(u32::MAX)
+            });
         let parsed = build_cell(
             candidate,
             DocumentParseSettings {
@@ -1914,6 +1960,9 @@ impl<'a> DocumentView<'a> {
     }
 
     /// Return deterministic document order for a current tree-node identity.
+    ///
+    /// # Errors
+    /// Rejects foreign/stale identities or nodes absent from this generation.
     pub fn document_order(self, identity: NodeIdentity) -> Result<usize, XmlDocumentError> {
         self.validate_identity(identity)?;
         self.parsed
@@ -1925,6 +1974,9 @@ impl<'a> DocumentView<'a> {
     }
 
     /// Return a total order key for a current tree node.
+    ///
+    /// # Errors
+    /// Returns identity-resolution failures as in [`Self::document_order`].
     pub fn node_order(self, identity: NodeIdentity) -> Result<SemanticOrder, XmlDocumentError> {
         Ok(SemanticOrder {
             node: self.document_order(identity)?,
@@ -1934,6 +1986,9 @@ impl<'a> DocumentView<'a> {
     }
 
     /// Return a total order key for a current attribute node.
+    ///
+    /// # Errors
+    /// Rejects foreign/stale owners and missing attributes on that owner.
     pub fn attribute_order(
         self,
         identity: &AttributeIdentity,
@@ -1954,6 +2009,9 @@ impl<'a> DocumentView<'a> {
     }
 
     /// Return a total order key for a current namespace node.
+    ///
+    /// # Errors
+    /// Rejects foreign/stale owners and namespace bindings absent from that owner.
     pub fn namespace_order(
         self,
         identity: &NamespaceIdentity,
@@ -2024,6 +2082,9 @@ impl<'a> DocumentView<'a> {
     }
 
     /// Identify an attribute by expanded name on a current owner element.
+    ///
+    /// # Errors
+    /// Rejects foreign/stale or non-element owners and absent expanded names.
     pub fn attribute_identity(
         self,
         owner: NodeIdentity,
@@ -2045,7 +2106,10 @@ impl<'a> DocumentView<'a> {
         })
     }
 
-    /// Return the in-scope XPath namespace nodes owned by one current element.
+    /// Return the in-scope `XPath` namespace nodes owned by one current element.
+    ///
+    /// # Errors
+    /// Rejects foreign/stale, missing or non-element owners.
     pub fn namespace_identities(
         self,
         owner: NodeIdentity,
@@ -2299,6 +2363,106 @@ enum PreflightEvent<S: NameStorage = NativeXmlStorage> {
     Done,
 }
 
+enum FragmentSource<S: NameStorage> {
+    Document,
+    Entity(S::Text),
+}
+
+struct FragmentFrame<S: NameStorage> {
+    source: FragmentSource<S>,
+    offset: usize,
+    collect_doctype: bool,
+    context: FragmentContext,
+    pending_attribute_source: S::Values<u8>,
+    pending_attribute_offset: usize,
+}
+
+impl<S: NameStorage> FragmentFrame<S> {
+    fn next_event(
+        &mut self,
+        xml: &str,
+        dtd: &InternalDtd<S>,
+        state: &mut DocumentPreflightState<S>,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<(PreflightEvent<S>, bool, FragmentContext), XmlDocumentError> {
+        let storage = state.storage;
+        let mut pending =
+            general_references(&self.pending_attribute_source[self.pending_attribute_offset..]);
+        if let Some(name) = pending.next() {
+            self.pending_attribute_offset = self
+                .pending_attribute_offset
+                .saturating_add(pending.consumed());
+            // XML 1.0 4.6: this iterator excludes character and predefined
+            // references, including their normative redeclarations.
+            // https://www.w3.org/TR/xml/#sec-predefined-ent
+            return Ok((
+                PreflightEvent::GeneralRef {
+                    name: Some(storage.text(name)?),
+                    is_character_reference: false,
+                },
+                false,
+                FragmentContext::Attribute,
+            ));
+        }
+        self.pending_attribute_source.clear();
+        self.pending_attribute_offset = 0;
+        let source = match &self.source {
+            FragmentSource::Document => xml,
+            FragmentSource::Entity(name) => dtd
+                .entities
+                .get(name, storage)?
+                .expect("active entity replacement remains registered")
+                .as_ref(),
+        };
+        let (event, consumed) =
+            scan_preflight_event(&source[self.offset..], self.context, dtd, state, budget)?;
+        self.offset = self.offset.saturating_add(consumed);
+        Ok((event, self.collect_doctype, self.context))
+    }
+}
+
+fn enter_preflight_entity<S: NameStorage>(
+    name: S::Text,
+    context: FragmentContext,
+    dtd: &InternalDtd<S>,
+    expansion_stack: &mut S::Names<S::Text, ()>,
+    fragments: &mut S::Values<FragmentFrame<S>>,
+    state: &mut DocumentPreflightState<S>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<(), XmlDocumentError> {
+    let storage = state.storage;
+    if expansion_stack.get(&name, storage)?.is_none() {
+        expansion_stack.insert(storage.text(&name)?, ())?;
+        if let Some(replacement) = dtd.entities.get(&name, storage)? {
+            state.entity_expansions = state.entity_expansions.saturating_add(1);
+            let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_CEILING;
+            if state.entity_expansions > maximum {
+                return Err(XmlDocumentError::Parse(
+                    ParseError::EntityExpansionLimitReached {
+                        maximum,
+                        actual: state.entity_expansions,
+                    },
+                ));
+            }
+            charge_entity_expansion_work(state, budget, replacement.len())?;
+            storage.charge(replacement.len())?;
+            storage.charge(replacement.len())?;
+            storage.charge(replacement.len())?;
+            fragments.push(FragmentFrame {
+                source: FragmentSource::Entity(name),
+                offset: 0,
+                collect_doctype: false,
+                context,
+                pending_attribute_source: storage.values(0)?,
+                pending_attribute_offset: 0,
+            })?;
+        } else {
+            expansion_stack.remove(&name, storage)?;
+        }
+    }
+    Ok(())
+}
+
 fn preflight_xml_fragment<S: NameStorage>(
     xml: &str,
     settings: DocumentParseSettings,
@@ -2308,20 +2472,6 @@ fn preflight_xml_fragment<S: NameStorage>(
     budget: Option<&XmlParseWorkBudget>,
     collect_doctype: bool,
 ) -> Result<(), XmlDocumentError> {
-    enum FragmentSource<S: NameStorage> {
-        Document,
-        Entity(S::Text),
-    }
-
-    struct FragmentFrame<S: NameStorage> {
-        source: FragmentSource<S>,
-        offset: usize,
-        collect_doctype: bool,
-        context: FragmentContext,
-        pending_attribute_source: S::Values<u8>,
-        pending_attribute_offset: usize,
-    }
-
     if state.nodes == 0 {
         // roxmltree exposes its document root as the first semantic node.
         state.nodes = 1;
@@ -2347,41 +2497,7 @@ fn preflight_xml_fragment<S: NameStorage>(
         storage.charge(1)?;
         let (event, collect_doctype, context) = {
             let frame = fragments.last_mut().expect("fragment stack is not empty");
-            let mut pending = general_references(
-                &frame.pending_attribute_source[frame.pending_attribute_offset..],
-            );
-            if let Some(name) = pending.next() {
-                frame.pending_attribute_offset = frame
-                    .pending_attribute_offset
-                    .saturating_add(pending.consumed());
-                // `general_references` excludes numeric and the five predefined entities. XML
-                // 1.0 section 4.6 keeps that classification even for normative redeclarations.
-                // https://www.w3.org/TR/xml/#sec-predefined-ent
-                (
-                    PreflightEvent::GeneralRef {
-                        name: Some(storage.text(name)?),
-                        is_character_reference: false,
-                    },
-                    false,
-                    FragmentContext::Attribute,
-                )
-            } else {
-                frame.pending_attribute_source.clear();
-                frame.pending_attribute_offset = 0;
-                let source = match &frame.source {
-                    FragmentSource::Document => xml,
-                    FragmentSource::Entity(name) => dtd
-                        .entities
-                        .get(name, storage)?
-                        .expect("active entity replacement remains registered")
-                        .as_ref(),
-                };
-                let remaining = &source[frame.offset..];
-                let (event, consumed) =
-                    scan_preflight_event(remaining, frame.context, dtd, state, budget)?;
-                frame.offset = frame.offset.saturating_add(consumed);
-                (event, frame.collect_doctype, frame.context)
-            }
+            frame.next_event(xml, dtd, state, budget)?
         };
 
         match event {
@@ -2408,35 +2524,15 @@ fn preflight_xml_fragment<S: NameStorage>(
                     }
                     continue;
                 }
-                if expansion_stack.get(&name, storage)?.is_none() {
-                    expansion_stack.insert(storage.text(&name)?, ())?;
-                    if let Some(replacement) = dtd.entities.get(&name, storage)? {
-                        state.entity_expansions = state.entity_expansions.saturating_add(1);
-                        let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_CEILING;
-                        if state.entity_expansions > maximum {
-                            return Err(XmlDocumentError::Parse(
-                                ParseError::EntityExpansionLimitReached {
-                                    maximum,
-                                    actual: state.entity_expansions,
-                                },
-                            ));
-                        }
-                        charge_entity_expansion_work(state, budget, replacement.len())?;
-                        storage.charge(replacement.len())?;
-                        storage.charge(replacement.len())?;
-                        storage.charge(replacement.len())?;
-                        fragments.push(FragmentFrame {
-                            source: FragmentSource::Entity(name),
-                            offset: 0,
-                            collect_doctype: false,
-                            context,
-                            pending_attribute_source: storage.values(0)?,
-                            pending_attribute_offset: 0,
-                        })?;
-                    } else {
-                        expansion_stack.remove(&name, storage)?;
-                    }
-                }
+                enter_preflight_entity(
+                    name,
+                    context,
+                    dtd,
+                    expansion_stack,
+                    &mut fragments,
+                    state,
+                    budget,
+                )?;
                 continue;
             }
             PreflightEvent::Done => {
@@ -2477,73 +2573,105 @@ fn preflight_xml_fragment<S: NameStorage>(
             continue;
         }
         state.in_character_data = false;
-        match event {
-            PreflightEvent::Start {
-                attribute_source,
+        observe_preflight_markup(event, settings, &mut fragments, state)?;
+    }
+    Ok(())
+}
+
+fn observe_preflight_markup<S: NameStorage>(
+    event: PreflightEvent<S>,
+    settings: DocumentParseSettings,
+    fragments: &mut S::Values<FragmentFrame<S>>,
+    state: &mut DocumentPreflightState<S>,
+) -> Result<(), XmlDocumentError> {
+    let storage = state.storage;
+    match event {
+        PreflightEvent::Start {
+            attribute_source,
+            namespace_declarations,
+        } => {
+            let frame = fragments
+                .last_mut()
+                .expect("active element frame remains registered");
+            frame.pending_attribute_source = attribute_source;
+            frame.pending_attribute_offset = 0;
+            let changes = apply_preflight_namespace_declarations(
+                state,
                 namespace_declarations,
-            } => {
-                let frame = fragments
-                    .last_mut()
-                    .expect("active element frame remains registered");
-                frame.pending_attribute_source = attribute_source;
-                frame.pending_attribute_offset = 0;
-                let changes = apply_preflight_namespace_declarations(
-                    state,
-                    namespace_declarations,
-                    settings.namespace_bindings_limit,
-                )?;
-                state.namespace_scopes.push(changes)?;
-                observe_preflight_node(state, settings, false)?;
-                state.depth = state.depth.saturating_add(1);
-                if state.depth > settings.depth_limit {
-                    return Err(XmlDocumentError::DocumentTooDeep {
-                        maximum: settings.depth_limit,
-                        actual: state.depth,
-                    });
-                }
+                settings.namespace_bindings_limit,
+            )?;
+            state.namespace_scopes.push(changes)?;
+            observe_preflight_node(state, settings, false)?;
+            state.depth = state.depth.saturating_add(1);
+            if state.depth > settings.depth_limit {
+                return Err(XmlDocumentError::DocumentTooDeep {
+                    maximum: settings.depth_limit,
+                    actual: state.depth,
+                });
             }
-            PreflightEvent::Empty {
-                attribute_source,
+        }
+        PreflightEvent::Empty {
+            attribute_source,
+            namespace_declarations,
+        } => {
+            let frame = fragments
+                .last_mut()
+                .expect("active element frame remains registered");
+            frame.pending_attribute_source = attribute_source;
+            frame.pending_attribute_offset = 0;
+            let changes = apply_preflight_namespace_declarations(
+                state,
                 namespace_declarations,
-            } => {
-                let frame = fragments
-                    .last_mut()
-                    .expect("active element frame remains registered");
-                frame.pending_attribute_source = attribute_source;
-                frame.pending_attribute_offset = 0;
-                let changes = apply_preflight_namespace_declarations(
-                    state,
-                    namespace_declarations,
-                    settings.namespace_bindings_limit,
-                )?;
-                observe_preflight_node(state, settings, false)?;
-                let actual = state.depth.saturating_add(1);
-                if actual > settings.depth_limit {
-                    return Err(XmlDocumentError::DocumentTooDeep {
-                        maximum: settings.depth_limit,
-                        actual,
-                    });
-                }
+                settings.namespace_bindings_limit,
+            )?;
+            observe_preflight_node(state, settings, false)?;
+            let actual = state.depth.saturating_add(1);
+            if actual > settings.depth_limit {
+                return Err(XmlDocumentError::DocumentTooDeep {
+                    maximum: settings.depth_limit,
+                    actual,
+                });
+            }
+            restore_preflight_namespace_bindings(
+                &mut state.active_namespace_bindings,
+                changes,
+                storage,
+            )?;
+        }
+        PreflightEvent::End => {
+            state.depth = state.depth.saturating_sub(1);
+            if let Some(changes) = state.namespace_scopes.pop() {
                 restore_preflight_namespace_bindings(
                     &mut state.active_namespace_bindings,
                     changes,
                     storage,
                 )?;
             }
-            PreflightEvent::End => {
-                state.depth = state.depth.saturating_sub(1);
-                if let Some(changes) = state.namespace_scopes.pop() {
-                    restore_preflight_namespace_bindings(
-                        &mut state.active_namespace_bindings,
-                        changes,
-                        storage,
-                    )?;
-                }
-            }
-            _ => unreachable!("non-structural events continue above"),
         }
+        _ => unreachable!("non-structural events continue above"),
     }
     Ok(())
+}
+
+fn preflight_pi_event<S: NameStorage>(remaining: &str) -> (PreflightEvent<S>, usize) {
+    find_bytes(&remaining.as_bytes()[2..], b"?>").map_or(
+        (PreflightEvent::Done, remaining.len()),
+        |end| {
+            let event = if remaining
+                .get(2..5)
+                .is_some_and(|target| target.eq_ignore_ascii_case("xml"))
+                && remaining
+                    .as_bytes()
+                    .get(5)
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                PreflightEvent::Markup
+            } else {
+                PreflightEvent::Node
+            };
+            (event, 2 + end + 2)
+        },
+    )
 }
 
 fn scan_preflight_event<S: NameStorage>(
@@ -2590,24 +2718,7 @@ fn scan_preflight_event<S: NameStorage>(
         ));
     }
     if remaining.starts_with("<?") {
-        return Ok(find_bytes(&remaining.as_bytes()[2..], b"?>").map_or(
-            (PreflightEvent::Done, remaining.len()),
-            |end| {
-                let event = if remaining
-                    .get(2..5)
-                    .is_some_and(|target| target.eq_ignore_ascii_case("xml"))
-                    && remaining
-                        .as_bytes()
-                        .get(5)
-                        .is_some_and(u8::is_ascii_whitespace)
-                {
-                    PreflightEvent::Markup
-                } else {
-                    PreflightEvent::Node
-                };
-                (event, 2 + end + 2)
-            },
-        ));
+        return Ok(preflight_pi_event(remaining));
     }
     if remaining.starts_with("<!DOCTYPE") {
         if let Some(end) = find_doctype_end(remaining) {
@@ -2625,30 +2736,7 @@ fn scan_preflight_event<S: NameStorage>(
             }));
     }
     if remaining.starts_with('<') {
-        let Some(end) = find_unquoted_byte(remaining.as_bytes(), b'>', 1) else {
-            return Ok((PreflightEvent::Done, remaining.len()));
-        };
-        let opening = &remaining[..=end];
-        let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
-        let attribute_source =
-            element_attribute_reference_source(opening, element_name, &attributes, dtd)?;
-        // This pending attribute/reference window is consumed by a later
-        // frame walk in addition to the current opening-tag scan.
-        storage.charge(attribute_source.len())?;
-        let namespace_declarations =
-            namespace_declarations(element_name, &attributes, dtd, state, budget)?;
-        let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
-            PreflightEvent::Empty {
-                attribute_source,
-                namespace_declarations,
-            }
-        } else {
-            PreflightEvent::Start {
-                attribute_source,
-                namespace_declarations,
-            }
-        };
-        return Ok((event, end + 1));
+        return scan_preflight_opening(remaining, dtd, state, budget);
     }
     if let Some(reference) = remaining.strip_prefix('&') {
         // XML 1.0 sections 4.4.2 and 4.5 require replacement markup to be
@@ -2685,6 +2773,38 @@ fn scan_preflight_event<S: NameStorage>(
         },
         end,
     ))
+}
+
+fn scan_preflight_opening<S: NameStorage>(
+    remaining: &str,
+    dtd: &InternalDtd<S>,
+    state: &mut DocumentPreflightState<S>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<(PreflightEvent<S>, usize), XmlDocumentError> {
+    let storage = state.storage;
+    let Some(end) = find_unquoted_byte(remaining.as_bytes(), b'>', 1) else {
+        return Ok((PreflightEvent::Done, remaining.len()));
+    };
+    let opening = &remaining[..=end];
+    let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
+    let attribute_source =
+        element_attribute_reference_source(opening, element_name, &attributes, dtd)?;
+    // The frame later revisits this attribute/reference window.
+    storage.charge(attribute_source.len())?;
+    let namespace_declarations =
+        namespace_declarations(element_name, &attributes, dtd, state, budget)?;
+    let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
+        PreflightEvent::Empty {
+            attribute_source,
+            namespace_declarations,
+        }
+    } else {
+        PreflightEvent::Start {
+            attribute_source,
+            namespace_declarations,
+        }
+    };
+    Ok((event, end + 1))
 }
 
 fn is_character_reference(name: &str) -> bool {
@@ -3468,7 +3588,7 @@ fn normalize_internal_entity_value<S: XmlStorage>(
 const fn is_xml_character(codepoint: u32) -> bool {
     matches!(
         codepoint,
-        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x10000..=0x10FFFF
+        0x9 | 0xA | 0xD | 0x20..=0xD7FF | 0xE000..=0xFFFD | 0x1_0000..=0x10_FFFF
     )
 }
 
@@ -3488,10 +3608,10 @@ fn find_unquoted_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     None
 }
 
-fn parse_semantic_document<'a>(
-    source: &'a str,
+fn parse_semantic_document(
+    source: &str,
     settings: DocumentParseSettings,
-) -> Result<(Document<'a>, DocumentMetrics), XmlDocumentError> {
+) -> Result<(Document<'_>, DocumentMetrics), XmlDocumentError> {
     let document = Document::parse_after_limit_preflight_with_backend(
         source,
         ParsingOptions {
@@ -3773,6 +3893,18 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
+    // `with_view` requires a late-bound view lifetime; an inherent method item
+    // fixes the impl lifetime too early to satisfy that higher-ranked contract.
+    fn retained_root(view: DocumentView<'_>) -> NodeIdentity {
+        view.root_element()
+    }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn retained_node_count(view: DocumentView<'_>) -> usize {
+        view.node_count()
+    }
 
     #[cfg(feature = "xmldsig")]
     #[test]
@@ -4039,7 +4171,7 @@ mod tests {
         };
         assert!(matches!(
             document
-                .validate_operation_policy(&crate::policy::XmlInputPolicy::default(), &resources),
+                .validate_operation_policy(crate::policy::XmlInputPolicy::default(), &resources),
             Err(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_NAMESPACE_BINDINGS,
                 actual: 2,
@@ -4063,7 +4195,7 @@ mod tests {
         };
         let policy = crate::policy::XmlInputPolicy::default();
         document
-            .validate_operation_policy(&policy, &resources)
+            .validate_operation_policy(policy, &resources)
             .expect("sibling scopes fit a one-binding limit");
         let target =
             document.with_view(|view| view.node_for_id("target", &[]).expect("target is indexed"));
@@ -4074,7 +4206,7 @@ mod tests {
             )
             .expect("replacement fits the original parse settings");
         assert!(matches!(
-            document.validate_operation_policy(&policy, &resources),
+            document.validate_operation_policy(policy, &resources),
             Err(crate::policy::PolicyViolation::ResourceLimit { actual: 2, .. })
         ));
         let target = document.with_view(|view| {
@@ -4085,7 +4217,7 @@ mod tests {
             .replace_element(target, "<a/>")
             .expect("bindings can be removed");
         document
-            .validate_operation_policy(&policy, &resources)
+            .validate_operation_policy(policy, &resources)
             .expect("removed namespace bindings do not remain in the peak metric");
     }
 
@@ -4361,11 +4493,13 @@ mod tests {
         // Entity replacement text becomes part of the document's namespace context, so it must
         // consume the same active-binding ceiling as literal markup before a DOM is allocated.
         let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
-        let declarations = (0..=maximum)
-            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..=maximum {
+            write!(declarations, r#" xmlns:p{index}="urn:{index}""#)
+                .expect("namespace declaration");
+        }
         let xml = format!(
-            r#"<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"#
+            "<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"
         );
         let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
 
@@ -4381,11 +4515,13 @@ mod tests {
     #[test]
     fn namespace_preflight_accepts_entity_replacement_at_exact_ceiling() {
         let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
-        let declarations = (0..maximum)
-            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..maximum {
+            write!(declarations, r#" xmlns:p{index}="urn:{index}""#)
+                .expect("namespace declaration");
+        }
         let xml = format!(
-            r#"<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"#
+            "<!DOCTYPE root [<!ENTITY expanded '<child{declarations}/>'>]><root>&expanded;</root>"
         );
         let settings = DocumentParseSettings::new_with_depth(true, 16, 4, xml.len());
 
@@ -4398,9 +4534,11 @@ mod tests {
         // Namespaces in XML 1.0 section 6.2 applies the normalized attribute value to a default
         // namespace declaration: https://www.w3.org/TR/REC-xml-names/#defaulting
         let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
-        let declarations = (0..maximum)
-            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..maximum {
+            write!(declarations, r#" xmlns:p{index}="urn:{index}""#)
+                .expect("namespace declaration");
+        }
         let xml = format!(
             r#"<!DOCTYPE root [<!ENTITY empty ''>]><root{declarations}><child xmlns="&empty;"/></root>"#
         );
@@ -4413,9 +4551,11 @@ mod tests {
     #[test]
     fn namespace_preflight_counts_literal_active_bindings() {
         let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
-        let declarations = (0..=maximum)
-            .map(|index| format!(r#" xmlns:p{index}="urn:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..=maximum {
+            write!(declarations, r#" xmlns:p{index}="urn:{index}""#)
+                .expect("namespace declaration");
+        }
         let xml = format!("<root{declarations}/>");
         let settings = DocumentParseSettings::new(false, 4, xml.len());
 
@@ -4437,7 +4577,7 @@ mod tests {
             ..crate::policy::ResourcePolicy::default()
         };
         let settings = DocumentParseSettings::from_policy(
-            &crate::policy::XmlInputPolicy::default(),
+            crate::policy::XmlInputPolicy::default(),
             &resources,
         );
 
@@ -4461,7 +4601,8 @@ mod tests {
         for depth in 0..220 {
             xml.push_str("<n");
             for prefix in 0..5 {
-                xml.push_str(&format!(r#" xmlns:p{prefix}="urn:{depth}:{prefix}""#));
+                write!(xml, r#" xmlns:p{prefix}="urn:{depth}:{prefix}""#)
+                    .expect("shadowed namespace");
             }
             xml.push('>');
         }
@@ -4478,9 +4619,11 @@ mod tests {
         // accumulate bindings that are no longer in scope.
         // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
         let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
-        let siblings = (0..=maximum)
-            .map(|index| format!(r#"<child xmlns:p{index}="urn:{index}"/>"#))
-            .collect::<String>();
+        let mut siblings = String::new();
+        for index in 0..=maximum {
+            write!(siblings, r#"<child xmlns:p{index}="urn:{index}"/>"#)
+                .expect("namespace sibling");
+        }
         let xml = format!("<root>{siblings}</root>");
         let settings = DocumentParseSettings::new(false, 2_000, xml.len());
 
@@ -4494,9 +4637,11 @@ mod tests {
         // declaration is measured against the complete in-scope namespace set.
         // https://www.w3.org/TR/REC-xml-names/#scoping-defaulting
         let maximum = crate::hard_limits::XML_NAMESPACE_BINDING_CEILING;
-        let declarations = (0..maximum)
-            .map(|index| format!(r#" xmlns:p{index}="urn:outer:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..maximum {
+            write!(declarations, r#" xmlns:p{index}="urn:outer:{index}""#)
+                .expect("outer namespace");
+        }
         let xml = format!(
             r#"<root{declarations}><shadow xmlns:p0="urn:inner"/><overflow xmlns:extra="urn:extra"/></root>"#
         );
@@ -4557,7 +4702,7 @@ mod tests {
             "<!DOCTYPE root [<!ATTLISTitem Token ID #IMPLIED>]>",
             |element, attribute, kind| declarations.push((element, attribute, kind)),
         );
-        assert!(declarations.is_empty());
+        assert_eq!(declarations.len(), 0);
     }
 
     #[test]
@@ -4774,11 +4919,9 @@ mod tests {
         const ENTITY_COUNT: usize = 4_096;
         let mut xml = String::from("<!DOCTYPE root [\n<!ENTITY e0 \"value\">\n");
         for index in 1..ENTITY_COUNT {
-            use std::fmt::Write as _;
             writeln!(xml, "<!ENTITY e{index} \"&e{};\">", index - 1)
                 .expect("write entity declaration");
         }
-        use std::fmt::Write as _;
         write!(xml, "]><root>&e{};</root>", ENTITY_COUNT - 1).expect("write root reference");
         let settings = DocumentParseSettings::new_with_depth(true, 16, 1, xml.len());
 
@@ -4911,7 +5054,7 @@ mod tests {
     fn identities_cannot_cross_documents() {
         let first = XmlDocument::parse("<root/>").expect("fixture must parse");
         let second = XmlDocument::parse("<root/>").expect("fixture must parse");
-        let root = first.with_view(|view| view.root_element());
+        let root = first.with_view(retained_root);
 
         let error = second
             .with_view(|view| view.resolve_node(root).map(|_| ()))
@@ -4925,7 +5068,7 @@ mod tests {
         // append_child allocates either form of the replacement document.
         for xml in ["<root></root>", "<root/>"] {
             let document = XmlDocument::parse(xml).expect("fixture must parse");
-            let root = document.with_view(|view| view.root_element());
+            let root = document.with_view(retained_root);
             let projected = document
                 .projected_child_append_len(root, "<child/>".len())
                 .expect("append length must project");
@@ -4982,7 +5125,7 @@ mod tests {
     fn content_replacement_uses_parent_namespace_context() {
         let mut document = XmlDocument::parse("<p:root xmlns:p=\"urn:test\"><p:old/></p:root>")
             .expect("fixture must parse");
-        let root = document.with_view(|view| view.root_element());
+        let root = document.with_view(retained_root);
         document
             .replace_content(root, "<p:new/>")
             .expect("in-scope prefix must be accepted");
@@ -5052,7 +5195,7 @@ mod tests {
                 },
             )
             .expect("namespace-free input");
-            let root = document.with_view(|view| view.root_element());
+            let root = document.with_view(retained_root);
             if batch {
                 document
                     .replace_contents(&[(root, "text".into())])
@@ -5063,7 +5206,7 @@ mod tests {
                     .expect("namespace-free replacement");
             }
             assert_eq!(document.as_xml(), "<root>text</root>");
-            let root = document.with_view(|view| view.root_element());
+            let root = document.with_view(retained_root);
             assert!(
                 document
                     .replace_content(root, "<p:e xmlns:p='urn:p'/>")
@@ -5084,7 +5227,7 @@ mod tests {
         for batch in [false, true] {
             let mut document = XmlDocument::parse_with_settings("<root/>".into(), settings)
                 .expect("namespace-free input");
-            let root = document.with_view(|view| view.root_element());
+            let root = document.with_view(retained_root);
             let replacement = "<child xmlns:a='urn:a' xmlns:b='urn:b'/>";
             let error = if batch {
                 document.replace_contents(&[(root, replacement.into())])
@@ -5176,12 +5319,12 @@ mod tests {
         // attribute value; both content replacement and append use that boundary.
         let mut document =
             XmlDocument::parse("<root marker=\">\"><old/></root>").expect("fixture must parse");
-        let root = document.with_view(|view| view.root_element());
+        let root = document.with_view(retained_root);
 
         document
             .replace_content(root, "<first/>")
             .expect("quoted greater-than must not corrupt content replacement");
-        let root = document.with_view(|view| view.root_element());
+        let root = document.with_view(retained_root);
         document
             .append_child(root, "<second/>")
             .expect("quoted greater-than must not corrupt child append");
@@ -5205,7 +5348,7 @@ mod tests {
             ),
         )
         .expect("DTD fixture must parse when explicitly enabled");
-        let root = document.with_view(|view| view.root_element());
+        let root = document.with_view(retained_root);
 
         document
             .replace_content(root, "&custom;")
@@ -5231,7 +5374,7 @@ mod tests {
         // Failed fragment parsing must be transactional: callers can safely
         // retry without observing a partially changed document or stale IDs.
         let mut document = XmlDocument::parse("<root><child/></root>").expect("fixture must parse");
-        let root = document.with_view(|view| view.root_element());
+        let root = document.with_view(retained_root);
         let before = document.as_xml().to_owned();
 
         assert!(document.replace_content(root, "<unclosed>").is_err());
@@ -5250,7 +5393,7 @@ mod tests {
                 DocumentParseSettings::new(false, 64, 64),
             )
             .expect("bounded fixture must parse");
-            let root = document.with_view(|view| view.root_element());
+            let root = document.with_view(retained_root);
             let replacement = "<".repeat(1_024);
 
             assert!(matches!(
@@ -5283,14 +5426,18 @@ mod tests {
                 .expect("target must exist");
             view.node_identity(target)
         });
-        let maximum = document.with_view(|view| view.node_count());
+        let maximum = document.with_view(retained_node_count);
         let before = document.as_xml().to_owned();
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
         let replacement = document.prepare_node_fragment_replacement_with_budget(
             target,
             "<replacement><child/><child/><malformed>",
-            DocumentParseSettings::new(false, maximum as u32, 4_096),
+            DocumentParseSettings::new(
+                false,
+                u32::try_from(maximum).expect("bounded node count"),
+                4_096,
+            ),
             &budget,
         );
         assert!(matches!(
@@ -5568,7 +5715,7 @@ mod tests {
                     .expect("target must exist"),
             )
         });
-        let maximum = document.with_view(|view| view.node_count());
+        let maximum = document.with_view(retained_node_count);
         let before = document.as_xml().to_owned();
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
@@ -5576,7 +5723,7 @@ mod tests {
             document.replace_content_with_budget(
                 target,
                 "value",
-                DocumentParseSettings::new(false, maximum as u32, 1_024),
+                DocumentParseSettings::new(false, u32::try_from(maximum).expect("bounded node count"), 1_024),
                 &budget,
             ),
             Err(XmlDocumentError::ProjectedNodeLimit { maximum: rejected })
@@ -5618,7 +5765,7 @@ mod tests {
             DocumentParseSettings::new(false, 3, 1_024),
         )
         .expect("fixture must fit the exact node ceiling");
-        let root = document.with_view(|view| view.root_element());
+        let root = document.with_view(retained_root);
         let budget = XmlParseWorkBudget::from_resources(&crate::policy::ResourcePolicy::default());
 
         document
@@ -5631,7 +5778,7 @@ mod tests {
             .expect("merged text must not consume another committed node");
 
         assert_eq!(document.as_xml(), "<root>textmore</root>");
-        assert_eq!(document.with_view(|view| view.node_count()), 3);
+        assert_eq!(document.with_view(retained_node_count), 3);
     }
 
     #[cfg(feature = "xmlenc")]
@@ -5664,7 +5811,7 @@ mod tests {
             .expect("prepared replacement must commit atomically");
 
         assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");
-        assert_eq!(document.with_view(|view| view.node_count()), 3);
+        assert_eq!(document.with_view(retained_node_count), 3);
     }
 
     #[test]
@@ -5711,12 +5858,15 @@ mod tests {
         // A wide namespace scope inherited by many descendants must remain in
         // roxmltree's structural representation instead of being cloned into an
         // O(elements * namespaces) eager document index.
-        let declarations = (0..128)
-            .map(|index| format!(r#" xmlns:p{index}="urn:namespace:{index}""#))
-            .collect::<String>();
-        let children = (0..1_024)
-            .map(|index| format!("<child index=\"{index}\"/>"))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..128 {
+            write!(declarations, r#" xmlns:p{index}="urn:namespace:{index}""#)
+                .expect("wide namespace");
+        }
+        let mut children = String::new();
+        for index in 0..1_024 {
+            write!(children, "<child index=\"{index}\"/>").expect("wide children");
+        }
         let document = XmlDocument::parse(format!("<root{declarations}>{children}</root>"))
             .expect("wide namespace fixture must parse");
 

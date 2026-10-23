@@ -27,14 +27,17 @@ impl<'d> Storage<'d> {
         Attribute::wrap(self.storage.create_attribute(name, value), self.identity)
     }
 
+    #[must_use]
     pub fn create_text(&'d self, text: &str) -> Text<'d> {
         Text::wrap(self.storage.create_text(text), self.identity)
     }
 
+    #[must_use]
     pub fn create_comment(&'d self, text: &str) -> Comment<'d> {
         Comment::wrap(self.storage.create_comment(text), self.identity)
     }
 
+    #[must_use]
     pub fn create_processing_instruction(
         &'d self,
         target: &str,
@@ -51,17 +54,17 @@ impl<'d> Storage<'d> {
         N: Into<QName<'n>>,
     {
         element.assert_identity(self.identity);
-        self.storage.element_set_name(element.node, name)
+        self.storage.element_set_name(element.node, name);
     }
 
     pub fn text_set_text(&self, text: Text<'_>, new_text: &str) {
         text.assert_identity(self.identity);
-        self.storage.text_set_text(text.node, new_text)
+        self.storage.text_set_text(text.node, new_text);
     }
 
     pub fn comment_set_text(&self, comment: Comment<'_>, new_text: &str) {
         comment.assert_identity(self.identity);
-        self.storage.comment_set_text(comment.node, new_text)
+        self.storage.comment_set_text(comment.node, new_text);
     }
 
     pub fn processing_instruction_set_target(
@@ -71,7 +74,7 @@ impl<'d> Storage<'d> {
     ) {
         pi.assert_identity(self.identity);
         self.storage
-            .processing_instruction_set_target(pi.node, new_target)
+            .processing_instruction_set_target(pi.node, new_target);
     }
 
     pub fn processing_instruction_set_value(
@@ -81,12 +84,12 @@ impl<'d> Storage<'d> {
     ) {
         pi.assert_identity(self.identity);
         self.storage
-            .processing_instruction_set_value(pi.node, new_value)
+            .processing_instruction_set_value(pi.node, new_value);
     }
 }
 
 pub struct Connections<'d> {
-    connections: &'d raw::Connections,
+    links: &'d raw::Connections,
     storage: &'d raw::Storage,
     identity: usize,
 }
@@ -98,44 +101,45 @@ impl<'d> Connections<'d> {
         identity: usize,
     ) -> Connections<'d> {
         Connections {
-            connections,
+            links: connections,
             storage,
             identity,
         }
     }
 
+    #[must_use]
     pub fn root(&self) -> Root<'d> {
-        Root::wrap(self.connections.root(), self.identity)
+        Root::wrap(self.links.root(), self.identity)
     }
 
+    #[must_use]
     pub fn element_parent(&self, child: Element<'d>) -> Option<ParentOfChild<'d>> {
         child.assert_identity(self.identity);
-        self.connections
-            .element_parent(self.storage, child.node)
+        raw::Connections::element_parent(self.storage, child.node)
             .map(|parent| ParentOfChild::wrap(parent, self.identity))
     }
 
+    #[must_use]
     pub fn text_parent(&self, child: Text<'d>) -> Option<Element<'d>> {
         child.assert_identity(self.identity);
-        self.connections
-            .text_parent(self.storage, child.node)
+        raw::Connections::text_parent(self.storage, child.node)
             .map(|parent| Element::wrap(parent, self.identity))
     }
 
+    #[must_use]
     pub fn comment_parent(&self, child: Comment<'d>) -> Option<ParentOfChild<'d>> {
         child.assert_identity(self.identity);
-        self.connections
-            .comment_parent(self.storage, child.node)
+        raw::Connections::comment_parent(self.storage, child.node)
             .map(|parent| ParentOfChild::wrap(parent, self.identity))
     }
 
+    #[must_use]
     pub fn processing_instruction_parent(
         &self,
         child: ProcessingInstruction<'d>,
     ) -> Option<ParentOfChild<'d>> {
         child.assert_identity(self.identity);
-        self.connections
-            .processing_instruction_parent(self.storage, child.node)
+        raw::Connections::processing_instruction_parent(self.storage, child.node)
             .map(|parent| ParentOfChild::wrap(parent, self.identity))
     }
 
@@ -145,8 +149,7 @@ impl<'d> Connections<'d> {
     {
         let child = child.into();
         child.assert_identity(self.identity);
-        self.connections
-            .append_root_child(self.storage, child.as_raw())
+        self.links.append_root_child(self.storage, child.as_raw());
     }
 
     pub fn append_element_child<C>(&mut self, parent: Element<'d>, child: C)
@@ -156,116 +159,116 @@ impl<'d> Connections<'d> {
         let child = child.into();
         parent.assert_identity(self.identity);
         child.assert_identity(self.identity);
-        self.connections
-            .append_element_child(self.storage, parent.node, child.as_raw())
+        raw::Connections::append_element_child(self.storage, parent.node, child.as_raw());
     }
 
+    #[must_use]
     pub fn root_children(&self) -> Vec<ChildOfRoot<'d>> {
-        self.connections
+        self.links
             .root_children(self.storage)
             .into_iter()
             .map(|child| ChildOfRoot::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn element_children(&self, parent: Element<'_>) -> Vec<ChildOfElement<'d>> {
         parent.assert_identity(self.identity);
-        self.connections
-            .element_children(self.storage, parent.node)
+        raw::Connections::element_children(self.storage, parent.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn element_preceding_siblings(&self, element: Element<'_>) -> Vec<ChildOfElement<'d>> {
         element.assert_identity(self.identity);
-        self.connections
-            .element_preceding_siblings(self.storage, element.node)
+        raw::Connections::element_preceding_siblings(self.storage, element.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn element_following_siblings(&self, element: Element<'_>) -> Vec<ChildOfElement<'d>> {
         element.assert_identity(self.identity);
-        self.connections
-            .element_following_siblings(self.storage, element.node)
+        raw::Connections::element_following_siblings(self.storage, element.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn text_preceding_siblings(&self, text: Text<'_>) -> Vec<ChildOfElement<'d>> {
         text.assert_identity(self.identity);
-        self.connections
-            .text_preceding_siblings(self.storage, text.node)
+        raw::Connections::text_preceding_siblings(self.storage, text.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn text_following_siblings(&self, text: Text<'_>) -> Vec<ChildOfElement<'d>> {
         text.assert_identity(self.identity);
-        self.connections
-            .text_following_siblings(self.storage, text.node)
+        raw::Connections::text_following_siblings(self.storage, text.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn comment_preceding_siblings(&self, comment: Comment<'_>) -> Vec<ChildOfElement<'d>> {
         comment.assert_identity(self.identity);
-        self.connections
-            .comment_preceding_siblings(self.storage, comment.node)
+        raw::Connections::comment_preceding_siblings(self.storage, comment.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn comment_following_siblings(&self, comment: Comment<'_>) -> Vec<ChildOfElement<'d>> {
         comment.assert_identity(self.identity);
-        self.connections
-            .comment_following_siblings(self.storage, comment.node)
+        raw::Connections::comment_following_siblings(self.storage, comment.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn processing_instruction_preceding_siblings(
         &self,
         pi: ProcessingInstruction<'_>,
     ) -> Vec<ChildOfElement<'d>> {
         pi.assert_identity(self.identity);
-        self.connections
-            .processing_instruction_preceding_siblings(self.storage, pi.node)
+        raw::Connections::processing_instruction_preceding_siblings(self.storage, pi.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn processing_instruction_following_siblings(
         &self,
         pi: ProcessingInstruction<'_>,
     ) -> Vec<ChildOfElement<'d>> {
         pi.assert_identity(self.identity);
-        self.connections
-            .processing_instruction_following_siblings(self.storage, pi.node)
+        raw::Connections::processing_instruction_following_siblings(self.storage, pi.node)
             .into_iter()
             .map(|child| ChildOfElement::wrap(child, self.identity))
             .collect()
     }
 
+    #[must_use]
     pub fn attribute_parent(&self, attribute: Attribute<'d>) -> Option<Element<'d>> {
         attribute.assert_identity(self.identity);
-        self.connections
-            .attribute_parent(self.storage, attribute.node)
+        raw::Connections::attribute_parent(self.storage, attribute.node)
             .map(|parent| Element::wrap(parent, self.identity))
     }
 
+    #[must_use]
     pub fn attributes(&self, parent: Element<'d>) -> Vec<Attribute<'d>> {
         parent.assert_identity(self.identity);
-        self.connections
-            .attributes(self.storage, parent.node)
+        raw::Connections::attributes(self.storage, parent.node)
             .into_iter()
             .map(|attribute| Attribute::wrap(attribute, self.identity))
             .collect()
@@ -274,14 +277,13 @@ impl<'d> Connections<'d> {
     pub fn set_attribute(&mut self, parent: Element<'d>, attribute: Attribute<'d>) {
         parent.assert_identity(self.identity);
         attribute.assert_identity(self.identity);
-        self.connections
-            .set_attribute(self.storage, parent.node, attribute.node);
+        raw::Connections::set_attribute(self.storage, parent.node, attribute.node);
     }
 
+    #[must_use]
     pub fn attribute_value(&self, parent: Element<'d>, name: &str) -> Option<InternedString> {
         parent.assert_identity(self.identity);
-        self.connections
-            .attribute(self.storage, parent.node, name)
+        raw::Connections::attribute(self.storage, parent.node, name)
             .map(|a| self.storage.attribute_value(a))
     }
 }
@@ -334,7 +336,7 @@ macro_rules! node(
 
 node!(Root, raw::Root);
 
-impl<'d> fmt::Debug for Root<'d> {
+impl fmt::Debug for Root<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Root")
     }
@@ -342,14 +344,15 @@ impl<'d> fmt::Debug for Root<'d> {
 
 node!(Element, raw::Element);
 
-impl<'d> Element<'d> {
+impl Element<'_> {
+    #[must_use]
     pub fn name(self, storage: &Storage<'_>) -> raw::QNameValue {
         self.assert_identity(storage.identity);
         storage.storage.element_name(self.node)
     }
 }
 
-impl<'d> fmt::Debug for Element<'d> {
+impl fmt::Debug for Element<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Element {{ idx: {:?} }}", self.node)
     }
@@ -357,18 +360,20 @@ impl<'d> fmt::Debug for Element<'d> {
 
 node!(Attribute, raw::Attribute);
 
-impl<'d> Attribute<'d> {
+impl Attribute<'_> {
+    #[must_use]
     pub fn name(&self, storage: &Storage<'_>) -> raw::QNameValue {
         self.assert_identity(storage.identity);
         storage.storage.attribute_name(self.node)
     }
+    #[must_use]
     pub fn value(&self, storage: &Storage<'_>) -> InternedString {
         self.assert_identity(storage.identity);
         storage.storage.attribute_value(self.node)
     }
 }
 
-impl<'d> fmt::Debug for Attribute<'d> {
+impl fmt::Debug for Attribute<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Attribute {{ idx: {:?} }}", self.node)
     }
@@ -376,14 +381,15 @@ impl<'d> fmt::Debug for Attribute<'d> {
 
 node!(Text, raw::Text);
 
-impl<'d> Text<'d> {
+impl Text<'_> {
+    #[must_use]
     pub fn text(&self, storage: &Storage<'_>) -> InternedString {
         self.assert_identity(storage.identity);
         storage.storage.text_text(self.node)
     }
 }
 
-impl<'d> fmt::Debug for Text<'d> {
+impl fmt::Debug for Text<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Text {{ idx: {:?} }}", self.node)
     }
@@ -391,14 +397,15 @@ impl<'d> fmt::Debug for Text<'d> {
 
 node!(Comment, raw::Comment);
 
-impl<'d> Comment<'d> {
+impl Comment<'_> {
+    #[must_use]
     pub fn text(&self, storage: &Storage<'_>) -> InternedString {
         self.assert_identity(storage.identity);
         storage.storage.comment_text(self.node)
     }
 }
 
-impl<'d> fmt::Debug for Comment<'d> {
+impl fmt::Debug for Comment<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Comment {{ idx: {:?} }}", self.node)
     }
@@ -406,18 +413,20 @@ impl<'d> fmt::Debug for Comment<'d> {
 
 node!(ProcessingInstruction, raw::ProcessingInstruction);
 
-impl<'d> ProcessingInstruction<'d> {
+impl ProcessingInstruction<'_> {
+    #[must_use]
     pub fn target(self, storage: &Storage<'_>) -> InternedString {
         self.assert_identity(storage.identity);
         storage.storage.pi_target(self.node)
     }
+    #[must_use]
     pub fn value(self, storage: &Storage<'_>) -> Option<InternedString> {
         self.assert_identity(storage.identity);
         storage.storage.pi_value(self.node)
     }
 }
 
-impl<'d> fmt::Debug for ProcessingInstruction<'d> {
+impl fmt::Debug for ProcessingInstruction<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "ProcessingInstruction {{ idx: {:?} }}", self.node)
     }
@@ -451,6 +460,7 @@ impl<'d> ChildOfRoot<'d> {
         ProcessingInstruction
     );
 
+    #[must_use]
     pub fn wrap(node: raw::ChildOfRoot, identity: usize) -> ChildOfRoot<'d> {
         match node {
             raw::ChildOfRoot::Element(n) => ChildOfRoot::Element(Element::wrap(n, identity)),
@@ -469,6 +479,7 @@ impl<'d> ChildOfRoot<'d> {
         }
     }
 
+    #[must_use]
     pub fn as_raw(&self) -> raw::ChildOfRoot {
         match *self {
             ChildOfRoot::Element(n) => raw::ChildOfRoot::Element(n.node),
@@ -499,6 +510,7 @@ impl<'d> ChildOfElement<'d> {
         ProcessingInstruction
     );
 
+    #[must_use]
     pub fn wrap(node: raw::ChildOfElement, identity: usize) -> ChildOfElement<'d> {
         match node {
             raw::ChildOfElement::Element(n) => ChildOfElement::Element(Element::wrap(n, identity)),
@@ -519,6 +531,7 @@ impl<'d> ChildOfElement<'d> {
         }
     }
 
+    #[must_use]
     pub fn as_raw(&self) -> raw::ChildOfElement {
         match *self {
             ChildOfElement::Element(n) => raw::ChildOfElement::Element(n.node),
@@ -541,6 +554,7 @@ impl<'d> ParentOfChild<'d> {
     unpack!(ParentOfChild, root, Root, Root);
     unpack!(ParentOfChild, element, Element, Element);
 
+    #[must_use]
     pub fn wrap(node: raw::ParentOfChild, identity: usize) -> ParentOfChild<'d> {
         match node {
             raw::ParentOfChild::Root(n) => ParentOfChild::Root(Root::wrap(n, identity)),
@@ -688,8 +702,8 @@ mod test {
         assert_eq!(1, children.len());
         assert_eq!(children[0], ChildOfRoot::Element(beta));
         assert_eq!(None, c.element_parent(alpha));
-        assert!(c.element_preceding_siblings(alpha).is_empty());
-        assert!(c.element_following_siblings(alpha).is_empty());
+        assert_eq!(c.element_preceding_siblings(alpha), []);
+        assert_eq!(c.element_following_siblings(alpha), []);
     }
 
     #[test]
@@ -807,10 +821,10 @@ mod test {
         let package = Package::new();
         let (s, mut c) = package.as_thin_document();
         let element = s.create_element("element");
-        let attr1 = s.create_attribute("name1", "value1");
-        let attr2 = s.create_attribute("name2", "value2");
-        c.set_attribute(element, attr1);
-        c.set_attribute(element, attr2);
+        let first = s.create_attribute("name1", "value1");
+        let second = s.create_attribute("name2", "value2");
+        c.set_attribute(element, first);
+        c.set_attribute(element, second);
         let mut attrs = c.attributes(element);
         attrs.sort_by(|a, b| {
             a.name(&s)

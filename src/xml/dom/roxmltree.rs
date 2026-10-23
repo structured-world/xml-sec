@@ -104,9 +104,9 @@ enum ProjectionFrame<'document, 'input, R: Storage> {
     Exit(NodeId),
 }
 
-fn project_document<'document, 'input, R: Storage, S: Storage, P: Storage>(
+fn project_document<R: Storage, S: Storage, P: Storage>(
     target: &mut TreeBuilder<'_, S>,
-    root: backend::Node<'document, 'input, R>,
+    root: backend::Node<'_, '_, R>,
     doctype: Option<&std::ops::Range<usize>>,
     preflight: &LexicalPreflight<'_, P>,
 ) -> Result<(), ParseError> {
@@ -212,8 +212,8 @@ fn project_document<'document, 'input, R: Storage, S: Storage, P: Storage>(
     Ok(())
 }
 
-fn element_prefix<'document, 'input, R: Storage, S: Storage>(
-    node: backend::Node<'document, 'input, R>,
+fn element_prefix<'input, R: Storage, S: Storage>(
+    node: backend::Node<'_, 'input, R>,
     storage: S,
 ) -> Result<Option<&'input str>, ParseError> {
     let source = node.document().input_text();

@@ -3041,8 +3041,7 @@ impl CompileWorkspace<'_> {
         source: &str,
         pattern: bool,
     ) -> Result<sxd_xpath_no_unsafe::XPath> {
-        sxd_xpath_no_unsafe::Factory::new()
-            .build_bounded(normalized, self.remaining())
+        sxd_xpath_no_unsafe::Factory::build_bounded(normalized, self.remaining())
             .map_err(|error| self.parser_error(error, source, pattern))
     }
 

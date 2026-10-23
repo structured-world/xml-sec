@@ -1,6 +1,10 @@
-//! Fallible construction of a private, read-only XPath mirror.
+//! Fallible construction of a private, read-only `XPath` mirror.
 
-use super::*;
+use super::{
+    Attribute, Bindings, ChildOfElement, ChildOfRoot, Comment, Connections, Element, Index,
+    InternedQName, InternedString, ParentOfChild, ProcessingInstruction, QName, RefCell, Root,
+    Storage, StringPool, Text, Values,
+};
 use crate::sxd_document::string_pool::AccountedStringPool;
 use structured_asn1::memory::{MemoryError, Work};
 
@@ -227,8 +231,7 @@ impl<'d, 'w, W: Work> Builder<'d, 'w, W> {
             .try_push(child, self.work)?;
         // The shared parent-link kernel observes the fresh child's empty old
         // parent and therefore neither scans nor reallocates another edge list.
-        self.connections
-            .replace_element_child_parent(self.storage, parent, child);
+        Connections::replace_element_child_parent(self.storage, parent, child);
         Ok(())
     }
 

@@ -45,6 +45,12 @@ enum Replacement<'a, S: Storage> {
     External(String),
 }
 
+struct ReplacementFrame<'a, S: Storage> {
+    text: Replacement<'a, S>,
+    position: usize,
+    fold_line_ends: bool,
+}
+
 impl<S: Storage> AsRef<str> for Replacement<'_, S> {
     fn as_ref(&self) -> &str {
         match self {
@@ -396,7 +402,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
     }
 
     pub(crate) fn inherit_entity_resolver(&mut self, parent: &Self) {
-        self.entity_resolver = parent.entity_resolver.clone();
+        self.entity_resolver.clone_from(&parent.entity_resolver);
     }
 
     pub fn with_storage(input: &'a str, storage: S) -> Result<Self, ParseError<S>> {
@@ -854,10 +860,8 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
                 }
             }
         } else {
-            #[allow(clippy::cast_possible_truncation)]
-            {
-                self.column += count as u32;
-            }
+            self.column +=
+                u32::try_from(count).expect("XML source windows fit the admitted byte ceiling");
         }
         self.pos = end;
         Ok(())
@@ -1124,7 +1128,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
     }
 }
 
-impl<'a, S: NameStorage> ParserInput<'a, S> {
+impl<S: NameStorage> ParserInput<'_, S> {
     /// Parses an entity or character reference (`&...;`).
     ///
     /// Handles the five built-in XML entities (`amp`, `lt`, `gt`, `apos`,
@@ -1226,13 +1230,172 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
 }
 
 impl<S: NameStorage> ParserInput<'_, S> {
+    fn replacement_character(
+        &self,
+        bytes: &[u8],
+        position: &mut usize,
+    ) -> Result<char, ParseError<S>> {
+        *position += 1; // Skip '#'; the caller has already consumed '&'.
+        let char_val = if *position < bytes.len() && bytes[*position] == b'x' {
+            *position += 1;
+            let start = *position;
+            while *position < bytes.len() && bytes[*position].is_ascii_hexdigit() {
+                *position += 1;
+            }
+            let hex = std::str::from_utf8(&bytes[start..*position])
+                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
+            u32::from_str_radix(hex, 16)
+                .map_err(|_| self.fatal("invalid hex character reference"))?
+        } else {
+            let start = *position;
+            while *position < bytes.len() && bytes[*position].is_ascii_digit() {
+                *position += 1;
+            }
+            let dec = std::str::from_utf8(&bytes[start..*position])
+                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
+            dec.parse::<u32>()
+                .map_err(|_| self.fatal("invalid decimal character reference"))?
+        };
+        if *position >= bytes.len() || bytes[*position] != b';' {
+            return Err(self.fatal("incomplete character reference in entity value"));
+        }
+        *position += 1;
+        let ch = char::from_u32(char_val).ok_or_else(|| {
+            self.fatal(format_args!(
+                "invalid character reference: U+{char_val:04X}"
+            ))
+        })?;
+        if !is_xml_char(ch) {
+            return Err(self.fatal("invalid XML character in entity reference"));
+        }
+        Ok(ch)
+    }
+
+    fn append_builtin_replacement(
+        &self,
+        name: &str,
+        output: &mut S::Text,
+    ) -> Result<bool, ParseError<S>> {
+        let value = match name {
+            "amp" => "&",
+            "lt" => "<",
+            "gt" => ">",
+            "apos" => "'",
+            "quot" => "\"",
+            _ => return Ok(false),
+        };
+        self.storage.append(output, value)?;
+        Ok(true)
+    }
+
+    fn append_replacement_cdata(
+        &self,
+        text: &str,
+        position: &mut usize,
+        output: &mut S::Text,
+    ) -> Result<(), ParseError<S>> {
+        // XML 1.0 2.7: only CDEnd is recognized inside CDATA.
+        // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-cdata-sect
+        let bytes = text.as_bytes();
+        let start = *position;
+        *position += 9;
+        while *position < bytes.len() && !bytes[*position..].starts_with(b"]]>") {
+            *position += 1;
+        }
+        if *position < bytes.len() {
+            *position += 3;
+        }
+        self.storage.append(output, &text[start..*position])?;
+        Ok(())
+    }
+
+    fn append_replacement_literal(
+        &self,
+        text: &str,
+        position: &mut usize,
+        output: &mut S::Text,
+        context: ReferenceContext,
+        fold_line_ends: bool,
+    ) -> Result<(), ParseError<S>> {
+        let bytes = text.as_bytes();
+        let start = *position;
+        *position += 1;
+        while *position < bytes.len() && bytes[*position] != b'&' && bytes[*position] != b'<' {
+            *position += 1;
+        }
+        if context == ReferenceContext::Attribute {
+            if bytes[start] == b'<' {
+                return Err(self
+                    .fatal("'<' not allowed in attribute values (from entity replacement text)"));
+            }
+            append_attribute_literal(
+                self.storage,
+                output,
+                &text[start..*position],
+                fold_line_ends,
+            )?;
+        } else {
+            self.storage.append(output, &text[start..*position])?;
+        }
+        Ok(())
+    }
+
+    fn declared_replacement<'value>(
+        &self,
+        name: &str,
+        declaration: &'value EntityDecl<S>,
+        context: ReferenceContext,
+    ) -> Result<Replacement<'value, S>, ParseError<S>> {
+        match &declaration.kind {
+            EntityKind::External {
+                system_id,
+                public_id,
+            } => {
+                // XML 1.0 3.1 and 4.4.4 forbid external references in attributes,
+                // even when a resolver is installed.
+                // https://www.w3.org/TR/2008/REC-xml-20081126/#CleanAttrVals
+                if context == ReferenceContext::Attribute {
+                    return Err(self.fatal("external entity reference in attribute value"));
+                }
+                if let Some(resolver) = &self.entity_resolver {
+                    let request = ExternalEntityRequest {
+                        name,
+                        system_id,
+                        public_id: public_id.as_deref(),
+                    };
+                    if let Some(resolved) = resolver(request) {
+                        return Ok(Replacement::External(resolved));
+                    }
+                }
+                Err(self.fatal(format_args!(
+                    "reference to external entity '{name}' is not supported"
+                )))
+            }
+            EntityKind::Internal(value) => {
+                self.storage.charge(value.len())?;
+                if context == ReferenceContext::Attribute && value.contains("&#") {
+                    // XML 1.0 4.5 constructs replacement text before 3.3.3
+                    // normalizes its whitespace and checks literal '<'.
+                    // https://www.w3.org/TR/2008/REC-xml-20081126/#intern-replacement
+                    Ok(Replacement::Decoded(
+                        crate::parser_xmloxide::validation::dtd::expand_char_refs_only(
+                            value,
+                            self.storage,
+                        )?,
+                    ))
+                } else {
+                    Ok(Replacement::Borrowed(value.as_ref()))
+                }
+            }
+        }
+    }
+
     /// Expands entity and character references in entity replacement text.
     ///
     /// Per XML 1.0 §4.4, when an entity's replacement text is included,
     /// character references and entity references within it are resolved.
     /// Continuations borrow retained DTD values instead of recursively cloning
     /// each value and constructing an intermediate output for every ancestor.
-    #[allow(clippy::too_many_lines)]
     fn expand_entity_text(&mut self, text: &str) -> Result<S::Text, ParseError<S>> {
         let mut result = self.storage.text("")?;
         self.expand_entity_into(text, &mut result, ReferenceContext::Content)?;
@@ -1250,15 +1413,10 @@ impl<S: NameStorage> ParserInput<'_, S> {
             self.storage.append(output, text)?;
             return Ok(());
         }
-        struct Frame<'a, S: Storage> {
-            text: Replacement<'a, S>,
-            position: usize,
-            fold_line_ends: bool,
-        }
-        let mut frames: S::Values<Frame<'_, S>> = self.storage.values(0)?;
+        let mut frames: S::Values<ReplacementFrame<'_, S>> = self.storage.values(0)?;
         Values::push(
             &mut frames,
-            Frame {
+            ReplacementFrame {
                 text: Replacement::Borrowed(text),
                 position: 0,
                 fold_line_ends: true,
@@ -1276,59 +1434,13 @@ impl<S: NameStorage> ParserInput<'_, S> {
             }
             while i < bytes.len() {
                 if context == ReferenceContext::Content && bytes[i..].starts_with(b"<![CDATA[") {
-                    // XML 1.0 Fifth Edition §2.7: only CDEnd is recognized
-                    // inside CDATA. Preserve the original UTF-8 window.
-                    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-cdata-sect
-                    let start = i;
-                    i += 9;
-                    while i < bytes.len() && !bytes[i..].starts_with(b"]]>") {
-                        i += 1;
-                    }
-                    if i < bytes.len() {
-                        i += 3;
-                    }
-                    self.storage.append(result, &text[start..i])?;
+                    self.append_replacement_cdata(text, &mut i, result)?;
                     continue;
                 }
                 if bytes[i] == b'&' {
                     i += 1;
                     if i < bytes.len() && bytes[i] == b'#' {
-                        // Character reference
-                        i += 1;
-                        let char_val = if i < bytes.len() && bytes[i] == b'x' {
-                            i += 1;
-                            let start = i;
-                            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-                                i += 1;
-                            }
-                            let hex = std::str::from_utf8(&bytes[start..i])
-                                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
-                            u32::from_str_radix(hex, 16)
-                                .map_err(|_| self.fatal("invalid hex character reference"))?
-                        } else {
-                            let start = i;
-                            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                                i += 1;
-                            }
-                            let dec = std::str::from_utf8(&bytes[start..i])
-                                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
-                            dec.parse::<u32>()
-                                .map_err(|_| self.fatal("invalid decimal character reference"))?
-                        };
-                        if i >= bytes.len() || bytes[i] != b';' {
-                            return Err(
-                                self.fatal("incomplete character reference in entity value")
-                            );
-                        }
-                        i += 1;
-                        let ch = char::from_u32(char_val).ok_or_else(|| {
-                            self.fatal(format_args!(
-                                "invalid character reference: U+{char_val:04X}"
-                            ))
-                        })?;
-                        if !is_xml_char(ch) {
-                            return Err(self.fatal("invalid XML character in entity reference"));
-                        }
+                        let ch = self.replacement_character(bytes, &mut i)?;
                         let mut encoded = [0; 4];
                         self.storage.append(result, ch.encode_utf8(&mut encoded))?;
                     } else {
@@ -1353,86 +1465,13 @@ impl<S: NameStorage> ParserInput<'_, S> {
                         }
 
                         // Fast path: builtin entities push directly, no allocation
-                        match name {
-                            "amp" => {
-                                self.storage.append(result, "&")?;
-                                continue;
-                            }
-                            "lt" => {
-                                self.storage.append(result, "<")?;
-                                continue;
-                            }
-                            "gt" => {
-                                self.storage.append(result, ">")?;
-                                continue;
-                            }
-                            "apos" => {
-                                self.storage.append(result, "'")?;
-                                continue;
-                            }
-                            "quot" => {
-                                self.storage.append(result, "\"")?;
-                                continue;
-                            }
-                            _ => {}
+                        if self.append_builtin_replacement(name, result)? {
+                            continue;
                         }
 
                         let declaration = self.entity_map.get(name, self.storage)?;
-                        let replacement = if let Some(EntityDecl {
-                            kind:
-                                EntityKind::External {
-                                    system_id,
-                                    public_id,
-                                },
-                            ..
-                        }) = declaration
-                        {
-                            // XML 1.0 §3.1 (No External Entity References) and
-                            // §4.4.4: forbidden even when a resolver is installed.
-                            // https://www.w3.org/TR/2008/REC-xml-20081126/#CleanAttrVals
-                            if context == ReferenceContext::Attribute {
-                                return Err(
-                                    self.fatal("external entity reference in attribute value")
-                                );
-                            }
-                            if let Some(resolver) = &self.entity_resolver {
-                                let request = ExternalEntityRequest {
-                                    name,
-                                    system_id,
-                                    public_id: public_id.as_deref(),
-                                };
-                                if let Some(resolved) = resolver(request) {
-                                    Replacement::External(resolved)
-                                } else {
-                                    return Err(self.fatal(format_args!(
-                                        "reference to external entity '{name}' is not supported"
-                                    )));
-                                }
-                            } else {
-                                return Err(self.fatal(format_args!(
-                                    "reference to external entity '{name}' is not supported"
-                                )));
-                            }
-                        } else if let Some(EntityDecl {
-                            kind: EntityKind::Internal(value),
-                            ..
-                        }) = declaration
-                        {
-                            self.storage.charge(value.len())?;
-                            if context == ReferenceContext::Attribute && value.contains("&#") {
-                                // §4.5 constructs replacement text first; §3.3.3
-                                // then treats its whitespace and literal '<' as
-                                // replacement text, unlike a direct character ref.
-                                // https://www.w3.org/TR/2008/REC-xml-20081126/#intern-replacement
-                                Replacement::Decoded(
-                                    crate::parser_xmloxide::validation::dtd::expand_char_refs_only(
-                                        value,
-                                        self.storage,
-                                    )?,
-                                )
-                            } else {
-                                Replacement::Borrowed(value.as_ref())
-                            }
+                        let replacement = if let Some(declaration) = declaration {
+                            self.declared_replacement(name, declaration, context)?
                         } else if self.recover || self.has_pe_references || self.has_external_dtd {
                             let diagnostic = ParseDiagnostic {
                                 severity: ErrorSeverity::Warning,
@@ -1453,7 +1492,7 @@ impl<S: NameStorage> ParserInput<'_, S> {
                         let fold_line_ends = !matches!(replacement, Replacement::Decoded(_));
                         Values::push(
                             &mut frames,
-                            Frame {
+                            ReplacementFrame {
                                 text: replacement,
                                 position: 0,
                                 fold_line_ends,
@@ -1463,24 +1502,13 @@ impl<S: NameStorage> ParserInput<'_, S> {
                     }
                 } else {
                     // Scan once and copy literal spans rather than each character.
-                    let start = i;
-                    i += 1;
-                    while i < bytes.len() && bytes[i] != b'&' && bytes[i] != b'<' {
-                        i += 1;
-                    }
-                    if context == ReferenceContext::Attribute {
-                        if bytes[start] == b'<' {
-                            return Err(self.fatal("'<' not allowed in attribute values (from entity replacement text)"));
-                        }
-                        append_attribute_literal(
-                            self.storage,
-                            result,
-                            &text[start..i],
-                            frame.fold_line_ends,
-                        )?;
-                    } else {
-                        self.storage.append(result, &text[start..i])?;
-                    }
+                    self.append_replacement_literal(
+                        text,
+                        &mut i,
+                        result,
+                        context,
+                        frame.fold_line_ends,
+                    )?;
                 }
             }
         }

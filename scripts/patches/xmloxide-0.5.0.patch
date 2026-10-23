@@ -86,7 +86,7 @@
  }
 --- a/xmloxide/src/parser/input.rs
 +++ b/xmloxide/src/parser/input.rs
-@@ -19,10 +19,91 @@
+@@ -19,10 +19,97 @@
  //!
  //! No external entity loading is performed (immune to XXE).
  
@@ -118,6 +118,12 @@
 +    Borrowed(&'a str),
 +    Decoded(S::Text),
 +    External(String),
++}
++
++struct ReplacementFrame<'a, S: Storage> {
++    text: Replacement<'a, S>,
++    position: usize,
++    fold_line_ends: bool,
 +}
 +
 +impl<S: Storage> AsRef<str> for Replacement<'_, S> {
@@ -182,7 +188,7 @@
  
  // -------------------------------------------------------------------------
  // Security defaults
-@@ -177,26 +258,6 @@
+@@ -177,26 +264,6 @@
      }
  }
  
@@ -209,7 +215,7 @@
  /// Validates that a name is a legal `QName` per Namespaces in XML 1.0 §4.
  ///
  /// A `QName` has at most one colon, and neither prefix nor local part may be
-@@ -228,22 +289,6 @@
+@@ -228,22 +295,6 @@
      )
  }
  
@@ -232,7 +238,7 @@
  // -------------------------------------------------------------------------
  // Position checkpointing (for backtracking)
  // -------------------------------------------------------------------------
-@@ -266,22 +311,19 @@
+@@ -266,22 +317,19 @@
  // ParserInput
  // -------------------------------------------------------------------------
  
@@ -262,7 +268,7 @@
      /// The input bytes (must be valid UTF-8).
      input: &'a [u8],
  
-@@ -313,16 +355,11 @@
+@@ -313,16 +361,11 @@
      recover: bool,
  
      /// Accumulated diagnostics (warnings and recoverable errors).
@@ -281,7 +287,7 @@
  
      /// Whether the DTD internal subset contained parameter entity references.
      /// Per XML 1.0 §4.1 WFC: Entity Declared, undeclared entity references
-@@ -336,10 +373,6 @@
+@@ -336,10 +379,6 @@
      /// external DTD subset that was not read.
      pub(crate) has_external_dtd: bool,
  
@@ -292,7 +298,7 @@
      /// Optional callback for resolving external entities.
      entity_resolver: Option<EntityResolver>,
  }
-@@ -347,7 +380,28 @@
+@@ -347,7 +386,28 @@
  impl<'a> ParserInput<'a> {
      /// Creates a new `ParserInput` from a UTF-8 string with default limits.
      pub fn new(input: &'a str) -> Self {
@@ -313,7 +319,7 @@
 +    }
 +
 +    pub(crate) fn inherit_entity_resolver(&mut self, parent: &Self) {
-+        self.entity_resolver = parent.entity_resolver.clone();
++        self.entity_resolver.clone_from(&parent.entity_resolver);
 +    }
 +
 +    pub fn with_storage(input: &'a str, storage: S) -> Result<Self, ParseError<S>> {
@@ -322,7 +328,7 @@
              input: input.as_bytes(),
              pos: 0,
              line: 1,
-@@ -358,19 +412,12 @@
+@@ -358,19 +418,12 @@
              entity_expansions: 0,
              max_entity_expansions: DEFAULT_MAX_ENTITY_EXPANSIONS,
              recover: false,
@@ -345,7 +351,7 @@
      }
  
      /// Sets the maximum nesting depth.
-@@ -398,13 +445,32 @@
+@@ -398,13 +451,32 @@
          self.recover
      }
  
@@ -380,7 +386,7 @@
                  "maximum nesting depth exceeded ({})",
                  self.max_depth
              )));
-@@ -458,7 +524,7 @@
+@@ -458,7 +530,7 @@
      /// Returns a slice of the raw input bytes from `start` to `end`.
      #[allow(dead_code)]
      #[inline]
@@ -389,7 +395,7 @@
          &self.input[start..end]
      }
  
-@@ -537,9 +603,10 @@
+@@ -537,9 +609,10 @@
  
      /// Advances the position by `count` bytes, updating line/column.
      #[inline]
@@ -401,7 +407,7 @@
              if self.pos < self.input.len() {
                  if self.input[self.pos] == b'\n' {
                      self.line += 1;
-@@ -549,15 +616,16 @@
+@@ -549,15 +622,16 @@
                  }
                  self.pos += 1;
              }
@@ -421,7 +427,7 @@
          if ch == '\n' {
              self.line += 1;
              self.column = 1;
-@@ -565,23 +633,25 @@
+@@ -565,23 +639,25 @@
              self.column += 1;
          }
          self.pos += len;
@@ -450,7 +456,7 @@
          if self.pos >= self.input.len() {
              return Err(self.fatal("unexpected end of input"));
          }
-@@ -608,11 +678,11 @@
+@@ -608,11 +684,11 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -465,7 +471,7 @@
                          );
                      }
                  }
-@@ -623,16 +693,16 @@
+@@ -623,16 +699,16 @@
          let ch = self
              .peek_char()
              .ok_or_else(|| self.fatal("unexpected end of input"))?;
@@ -486,7 +492,7 @@
              }
          }
          Ok(ch)
-@@ -640,31 +710,46 @@
+@@ -640,31 +716,46 @@
  
      // -- Bulk scanning --
  
@@ -547,7 +553,7 @@
      }
  
      /// Scans forward to find the next attribute value delimiter: the given
-@@ -672,22 +757,16 @@
+@@ -672,22 +763,16 @@
      /// Returns the number of safe bytes before the delimiter.
      /// Avoids the 256-byte lookup table of `scan_until_any`.
      #[inline]
@@ -575,7 +581,7 @@
      }
  
      /// Scans forward to find the next occurrence of any of the given marker
-@@ -696,63 +775,72 @@
+@@ -696,63 +781,72 @@
      /// Uses a 256-byte lookup table for O(1) per-byte matching instead of
      /// linear `contains()` on the marker slice.
      #[allow(dead_code)]
@@ -675,8 +681,16 @@
          let end = self.pos + count;
          let slice = &self.input[self.pos..end];
          // Fast path: if no newlines in the slice, just bump column
-@@ -772,16 +860,17 @@
+@@ -766,22 +860,21 @@
+                 }
              }
+         } else {
+-            #[allow(clippy::cast_possible_truncation)]
+-            {
+-                self.column += count as u32;
+-            }
++            self.column +=
++                u32::try_from(count).expect("XML source windows fit the admitted byte ceiling");
          }
          self.pos = end;
 +        Ok(())
@@ -695,7 +709,7 @@
                  "expected '{}', found '{}'",
                  expected as char, b as char
              )));
-@@ -791,12 +880,13 @@
+@@ -791,12 +884,13 @@
  
      /// Consumes bytes and asserts they match the `expected` sequence.
      #[inline]
@@ -711,7 +725,7 @@
          } else {
              // Fall back to per-byte for precise error reporting
              for &b in expected {
-@@ -828,51 +918,30 @@
+@@ -828,51 +922,30 @@
  
      /// Skips whitespace characters. Returns `true` if any were consumed.
      #[inline]
@@ -776,7 +790,7 @@
              return Err(self.fatal("whitespace required"));
          }
          Ok(())
-@@ -880,23 +949,18 @@
+@@ -880,23 +953,18 @@
  
      // -- Take while --
  
@@ -809,7 +823,7 @@
      }
  
      // -- Name parsing (XML 1.0 §2.3) --
-@@ -910,7 +974,16 @@
+@@ -910,7 +978,16 @@
      /// Uses an ASCII fast path that scans name characters as bytes,
      /// avoiding per-character UTF-8 decoding for the common case.
      #[inline]
@@ -827,7 +841,7 @@
          let start = self.pos;
          if self.pos >= self.input.len() {
              return Err(self.fatal("expected name, found end of input"));
-@@ -919,26 +992,31 @@
+@@ -919,26 +996,31 @@
          let first = self.input[self.pos];
  
          // ASCII fast path: most XML names are pure ASCII
@@ -866,7 +880,7 @@
              }
              // Fall through: hit a non-ASCII continuation byte, continue
              // with the char-by-char path below.
-@@ -948,16 +1026,22 @@
+@@ -948,16 +1030,22 @@
              let ch = self
                  .peek_char()
                  .ok_or_else(|| self.fatal("expected name"))?;
@@ -894,7 +908,7 @@
              } else {
                  break;
              }
-@@ -965,90 +1049,32 @@
+@@ -965,90 +1053,32 @@
  
          let len = self.pos - start;
          if len > self.max_name_length {
@@ -995,7 +1009,7 @@
      }
  
      /// Parses a name and checks whether it matches the given prefix + local
-@@ -1060,93 +1086,25 @@
+@@ -1060,93 +1090,25 @@
          &mut self,
          prefix: Option<&str>,
          local: &str,
@@ -1102,7 +1116,7 @@
      }
  
      // -- Reference parsing (XML 1.0 §4.1) --
-@@ -1154,17 +1112,19 @@
+@@ -1154,17 +1116,19 @@
      /// Counts one entity expansion against the security limit.
      ///
      /// Returns an error if the configured maximum is exceeded.
@@ -1120,11 +1134,11 @@
      }
 +}
  
-+impl<'a, S: NameStorage> ParserInput<'a, S> {
++impl<S: NameStorage> ParserInput<'_, S> {
      /// Parses an entity or character reference (`&...;`).
      ///
      /// Handles the five built-in XML entities (`amp`, `lt`, `gt`, `apos`,
-@@ -1175,8 +1135,8 @@
+@@ -1175,8 +1139,8 @@
      /// Increments the entity expansion counter and returns an error if the
      /// limit is exceeded.
      #[cfg(test)]
@@ -1135,7 +1149,7 @@
          self.parse_reference_into(&mut buf)?;
          Ok(buf)
      }
-@@ -1190,34 +1150,46 @@
+@@ -1190,34 +1154,46 @@
      ///
      /// Returns the resolved text as a `&str` slice of `buf` (the portion
      /// that was appended), which callers can use for validation.
@@ -1191,7 +1205,7 @@
                  if dec.is_empty() {
                      return Err(self.fatal("empty decimal character reference"));
                  }
-@@ -1226,265 +1198,298 @@
+@@ -1226,68 +1202,191 @@
              };
              self.expect_byte(b';')?;
  
@@ -1219,7 +1233,16 @@
 -            let name = self.parse_name()?;
 +            self.parse_name()?;
              self.expect_byte(b';')?;
--
++            let start = buf.len();
++            self.storage.charge(self.pos - reference_start)?;
++            let reference = std::str::from_utf8(self.slice(reference_start, self.pos))
++                .expect("a parsed reference preserves UTF-8 boundaries");
++            self.expand_entity_into(reference, buf, context)?;
++            Ok(&buf[start..])
++        }
++    }
++}
+ 
 -            let expanded = match name.as_str() {
 -                "amp" | "lt" | "gt" | "apos" | "quot" => {
 -                    unreachable!("builtin entity should be caught by fast path")
@@ -1258,36 +1281,191 @@
 -                        String::new()
 -                    } else {
 -                        return Err(self.fatal(format!("unknown entity reference: &{name};")));
--                    }
--                }
++impl<S: NameStorage> ParserInput<'_, S> {
++    fn replacement_character(
++        &self,
++        bytes: &[u8],
++        position: &mut usize,
++    ) -> Result<char, ParseError<S>> {
++        *position += 1; // Skip '#'; the caller has already consumed '&'.
++        let char_val = if *position < bytes.len() && bytes[*position] == b'x' {
++            *position += 1;
++            let start = *position;
++            while *position < bytes.len() && bytes[*position].is_ascii_hexdigit() {
++                *position += 1;
++            }
++            let hex = std::str::from_utf8(&bytes[start..*position])
++                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
++            u32::from_str_radix(hex, 16)
++                .map_err(|_| self.fatal("invalid hex character reference"))?
++        } else {
++            let start = *position;
++            while *position < bytes.len() && bytes[*position].is_ascii_digit() {
++                *position += 1;
++            }
++            let dec = std::str::from_utf8(&bytes[start..*position])
++                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
++            dec.parse::<u32>()
++                .map_err(|_| self.fatal("invalid decimal character reference"))?
++        };
++        if *position >= bytes.len() || bytes[*position] != b';' {
++            return Err(self.fatal("incomplete character reference in entity value"));
++        }
++        *position += 1;
++        let ch = char::from_u32(char_val).ok_or_else(|| {
++            self.fatal(format_args!(
++                "invalid character reference: U+{char_val:04X}"
++            ))
++        })?;
++        if !is_xml_char(ch) {
++            return Err(self.fatal("invalid XML character in entity reference"));
++        }
++        Ok(ch)
++    }
++
++    fn append_builtin_replacement(
++        &self,
++        name: &str,
++        output: &mut S::Text,
++    ) -> Result<bool, ParseError<S>> {
++        let value = match name {
++            "amp" => "&",
++            "lt" => "<",
++            "gt" => ">",
++            "apos" => "'",
++            "quot" => "\"",
++            _ => return Ok(false),
++        };
++        self.storage.append(output, value)?;
++        Ok(true)
++    }
++
++    fn append_replacement_cdata(
++        &self,
++        text: &str,
++        position: &mut usize,
++        output: &mut S::Text,
++    ) -> Result<(), ParseError<S>> {
++        // XML 1.0 2.7: only CDEnd is recognized inside CDATA.
++        // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-cdata-sect
++        let bytes = text.as_bytes();
++        let start = *position;
++        *position += 9;
++        while *position < bytes.len() && !bytes[*position..].starts_with(b"]]>") {
++            *position += 1;
++        }
++        if *position < bytes.len() {
++            *position += 3;
++        }
++        self.storage.append(output, &text[start..*position])?;
++        Ok(())
++    }
++
++    fn append_replacement_literal(
++        &self,
++        text: &str,
++        position: &mut usize,
++        output: &mut S::Text,
++        context: ReferenceContext,
++        fold_line_ends: bool,
++    ) -> Result<(), ParseError<S>> {
++        let bytes = text.as_bytes();
++        let start = *position;
++        *position += 1;
++        while *position < bytes.len() && bytes[*position] != b'&' && bytes[*position] != b'<' {
++            *position += 1;
++        }
++        if context == ReferenceContext::Attribute {
++            if bytes[start] == b'<' {
++                return Err(self
++                    .fatal("'<' not allowed in attribute values (from entity replacement text)"));
++            }
++            append_attribute_literal(
++                self.storage,
++                output,
++                &text[start..*position],
++                fold_line_ends,
++            )?;
++        } else {
++            self.storage.append(output, &text[start..*position])?;
++        }
++        Ok(())
++    }
++
++    fn declared_replacement<'value>(
++        &self,
++        name: &str,
++        declaration: &'value EntityDecl<S>,
++        context: ReferenceContext,
++    ) -> Result<Replacement<'value, S>, ParseError<S>> {
++        match &declaration.kind {
++            EntityKind::External {
++                system_id,
++                public_id,
++            } => {
++                // XML 1.0 3.1 and 4.4.4 forbid external references in attributes,
++                // even when a resolver is installed.
++                // https://www.w3.org/TR/2008/REC-xml-20081126/#CleanAttrVals
++                if context == ReferenceContext::Attribute {
++                    return Err(self.fatal("external entity reference in attribute value"));
++                }
++                if let Some(resolver) = &self.entity_resolver {
++                    let request = ExternalEntityRequest {
++                        name,
++                        system_id,
++                        public_id: public_id.as_deref(),
++                    };
++                    if let Some(resolved) = resolver(request) {
++                        return Ok(Replacement::External(resolved));
+                     }
+                 }
 -            };
-             let start = buf.len();
+-            let start = buf.len();
 -            buf.push_str(&expanded);
-+            self.storage.charge(self.pos - reference_start)?;
-+            let reference = std::str::from_utf8(self.slice(reference_start, self.pos))
-+                .expect("a parsed reference preserves UTF-8 boundaries");
-+            self.expand_entity_into(reference, buf, context)?;
-             Ok(&buf[start..])
+-            Ok(&buf[start..])
++                Err(self.fatal(format_args!(
++                    "reference to external entity '{name}' is not supported"
++                )))
++            }
++            EntityKind::Internal(value) => {
++                self.storage.charge(value.len())?;
++                if context == ReferenceContext::Attribute && value.contains("&#") {
++                    // XML 1.0 4.5 constructs replacement text before 3.3.3
++                    // normalizes its whitespace and checks literal '<'.
++                    // https://www.w3.org/TR/2008/REC-xml-20081126/#intern-replacement
++                    Ok(Replacement::Decoded(
++                        crate::parser_xmloxide::validation::dtd::expand_char_refs_only(
++                            value,
++                            self.storage,
++                        )?,
++                    ))
++                } else {
++                    Ok(Replacement::Borrowed(value.as_ref()))
++                }
++            }
          }
      }
-+}
  
-+impl<S: NameStorage> ParserInput<'_, S> {
-     /// Expands entity and character references in entity replacement text.
+@@ -1295,196 +1394,130 @@
      ///
      /// Per XML 1.0 §4.4, when an entity's replacement text is included,
      /// character references and entity references within it are resolved.
 -    /// This method performs that resolution recursively, using the entity
 -    /// map populated from the DTD.
-+    /// Continuations borrow retained DTD values instead of recursively cloning
-+    /// each value and constructing an intermediate output for every ancestor.
-     #[allow(clippy::too_many_lines)]
+-    #[allow(clippy::too_many_lines)]
 -    fn expand_entity_text(&mut self, text: &str) -> Result<String, ParseError> {
 -        // Fast path — no references to expand
 -        if !text.contains('&') {
 -            return Ok(text.to_string());
 -        }
--
++    /// Continuations borrow retained DTD values instead of recursively cloning
++    /// each value and constructing an intermediate output for every ancestor.
++    fn expand_entity_text(&mut self, text: &str) -> Result<S::Text, ParseError<S>> {
++        let mut result = self.storage.text("")?;
++        self.expand_entity_into(text, &mut result, ReferenceContext::Content)?;
++        Ok(result)
++    }
+ 
 -        let bytes = text.as_bytes();
 -        let mut result = String::with_capacity(text.len());
 -        let mut i = 0;
@@ -1310,12 +1488,6 @@
 -                } else {
 -                    result.push(bytes[i] as char);
 -                    i += 1;
-+    fn expand_entity_text(&mut self, text: &str) -> Result<S::Text, ParseError<S>> {
-+        let mut result = self.storage.text("")?;
-+        self.expand_entity_into(text, &mut result, ReferenceContext::Content)?;
-+        Ok(result)
-+    }
-+
 +    fn expand_entity_into(
 +        &mut self,
 +        text: &str,
@@ -1327,15 +1499,10 @@
 +            self.storage.append(output, text)?;
 +            return Ok(());
 +        }
-+        struct Frame<'a, S: Storage> {
-+            text: Replacement<'a, S>,
-+            position: usize,
-+            fold_line_ends: bool,
-+        }
-+        let mut frames: S::Values<Frame<'_, S>> = self.storage.values(0)?;
++        let mut frames: S::Values<ReplacementFrame<'_, S>> = self.storage.values(0)?;
 +        Values::push(
 +            &mut frames,
-+            Frame {
++            ReplacementFrame {
 +                text: Replacement::Borrowed(text),
 +                position: 0,
 +                fold_line_ends: true,
@@ -1353,18 +1520,7 @@
 +            }
 +            while i < bytes.len() {
 +                if context == ReferenceContext::Content && bytes[i..].starts_with(b"<![CDATA[") {
-+                    // XML 1.0 Fifth Edition §2.7: only CDEnd is recognized
-+                    // inside CDATA. Preserve the original UTF-8 window.
-+                    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-cdata-sect
-+                    let start = i;
-+                    i += 9;
-+                    while i < bytes.len() && !bytes[i..].starts_with(b"]]>") {
-+                        i += 1;
-+                    }
-+                    if i < bytes.len() {
-+                        i += 3;
-+                    }
-+                    self.storage.append(result, &text[start..i])?;
++                    self.append_replacement_cdata(text, &mut i, result)?;
 +                    continue;
                  }
 -                continue;
@@ -1376,49 +1532,17 @@
 +                if bytes[i] == b'&' {
                      i += 1;
 -                    let char_val = if i < bytes.len() && bytes[i] == b'x' {
-+                    if i < bytes.len() && bytes[i] == b'#' {
-+                        // Character reference
-                         i += 1;
+-                        i += 1;
 -                        let start = i;
 -                        while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-+                        let char_val = if i < bytes.len() && bytes[i] == b'x' {
-                             i += 1;
-+                            let start = i;
-+                            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-+                                i += 1;
-+                            }
-+                            let hex = std::str::from_utf8(&bytes[start..i])
-+                                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
-+                            u32::from_str_radix(hex, 16)
-+                                .map_err(|_| self.fatal("invalid hex character reference"))?
-+                        } else {
-+                            let start = i;
-+                            while i < bytes.len() && bytes[i].is_ascii_digit() {
-+                                i += 1;
-+                            }
-+                            let dec = std::str::from_utf8(&bytes[start..i])
-+                                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
-+                            dec.parse::<u32>()
-+                                .map_err(|_| self.fatal("invalid decimal character reference"))?
-+                        };
-+                        if i >= bytes.len() || bytes[i] != b';' {
-+                            return Err(
-+                                self.fatal("incomplete character reference in entity value")
-+                            );
-                         }
+-                            i += 1;
+-                        }
 -                        let hex = std::str::from_utf8(&bytes[start..i])
 -                            .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
 -                        u32::from_str_radix(hex, 16)
 -                            .map_err(|_| self.fatal("invalid hex character reference"))?
-+                        i += 1;
-+                        let ch = char::from_u32(char_val).ok_or_else(|| {
-+                            self.fatal(format_args!(
-+                                "invalid character reference: U+{char_val:04X}"
-+                            ))
-+                        })?;
-+                        if !is_xml_char(ch) {
-+                            return Err(self.fatal("invalid XML character in entity reference"));
-+                        }
++                    if i < bytes.len() && bytes[i] == b'#' {
++                        let ch = self.replacement_character(bytes, &mut i)?;
 +                        let mut encoded = [0; 4];
 +                        self.storage.append(result, ch.encode_utf8(&mut encoded))?;
                      } else {
@@ -1494,31 +1618,10 @@
                          }
 -                        "quot" => {
 -                            result.push('"');
--                            continue;
 +
 +                        // Fast path: builtin entities push directly, no allocation
-+                        match name {
-+                            "amp" => {
-+                                self.storage.append(result, "&")?;
-+                                continue;
-+                            }
-+                            "lt" => {
-+                                self.storage.append(result, "<")?;
-+                                continue;
-+                            }
-+                            "gt" => {
-+                                self.storage.append(result, ">")?;
-+                                continue;
-+                            }
-+                            "apos" => {
-+                                self.storage.append(result, "'")?;
-+                                continue;
-+                            }
-+                            "quot" => {
-+                                self.storage.append(result, "\"")?;
-+                                continue;
-+                            }
-+                            _ => {}
++                        if self.append_builtin_replacement(name, result)? {
+                             continue;
                          }
 -                        _ => {}
 -                    }
@@ -1529,66 +1632,9 @@
 -                                name,
 -                                system_id: &info.system_id,
 -                                public_id: info.public_id.as_deref(),
--                            };
--                            if let Some(resolved) = resolver(request) {
--                                self.expand_entity_text(&resolved)?
 +                        let declaration = self.entity_map.get(name, self.storage)?;
-+                        let replacement = if let Some(EntityDecl {
-+                            kind:
-+                                EntityKind::External {
-+                                    system_id,
-+                                    public_id,
-+                                },
-+                            ..
-+                        }) = declaration
-+                        {
-+                            // XML 1.0 §3.1 (No External Entity References) and
-+                            // §4.4.4: forbidden even when a resolver is installed.
-+                            // https://www.w3.org/TR/2008/REC-xml-20081126/#CleanAttrVals
-+                            if context == ReferenceContext::Attribute {
-+                                return Err(
-+                                    self.fatal("external entity reference in attribute value")
-+                                );
-+                            }
-+                            if let Some(resolver) = &self.entity_resolver {
-+                                let request = ExternalEntityRequest {
-+                                    name,
-+                                    system_id,
-+                                    public_id: public_id.as_deref(),
-+                                };
-+                                if let Some(resolved) = resolver(request) {
-+                                    Replacement::External(resolved)
-+                                } else {
-+                                    return Err(self.fatal(format_args!(
-+                                        "reference to external entity '{name}' is not supported"
-+                                    )));
-+                                }
-                             } else {
--                                return Err(self.fatal(format!(
-+                                return Err(self.fatal(format_args!(
-                                     "reference to external entity '{name}' is not supported"
-                                 )));
-                             }
-+                        } else if let Some(EntityDecl {
-+                            kind: EntityKind::Internal(value),
-+                            ..
-+                        }) = declaration
-+                        {
-+                            self.storage.charge(value.len())?;
-+                            if context == ReferenceContext::Attribute && value.contains("&#") {
-+                                // §4.5 constructs replacement text first; §3.3.3
-+                                // then treats its whitespace and literal '<' as
-+                                // replacement text, unlike a direct character ref.
-+                                // https://www.w3.org/TR/2008/REC-xml-20081126/#intern-replacement
-+                                Replacement::Decoded(
-+                                    crate::parser_xmloxide::validation::dtd::expand_char_refs_only(
-+                                        value,
-+                                        self.storage,
-+                                    )?,
-+                                )
-+                            } else {
-+                                Replacement::Borrowed(value.as_ref())
-+                            }
++                        let replacement = if let Some(declaration) = declaration {
++                            self.declared_replacement(name, declaration, context)?
 +                        } else if self.recover || self.has_pe_references || self.has_external_dtd {
 +                            let diagnostic = ParseDiagnostic {
 +                                severity: ErrorSeverity::Warning,
@@ -1596,41 +1642,21 @@
 +                                    "unknown entity reference: &{name};"
 +                                ))?),
 +                                location: self.location(),
-+                            };
+                             };
+-                            if let Some(resolved) = resolver(request) {
+-                                self.expand_entity_text(&resolved)?
+-                            } else {
+-                                return Err(self.fatal(format!(
+-                                    "reference to external entity '{name}' is not supported"
+-                                )));
+-                            }
 +                            Values::push(&mut self.diagnostics, diagnostic)?;
 +                            continue;
                          } else {
 -                            return Err(self.fatal(format!(
 -                                "reference to external entity '{name}' is not supported"
 -                            )));
-+                            return Err(
-+                                self.fatal(format_args!("unknown entity reference: &{name};"))
-+                            );
-+                        };
-+                        frame.position = i;
-+                        Values::push(&mut frames, frame)?;
-+                        let fold_line_ends = !matches!(replacement, Replacement::Decoded(_));
-+                        Values::push(
-+                            &mut frames,
-+                            Frame {
-+                                text: replacement,
-+                                position: 0,
-+                                fold_line_ends,
-+                            },
-+                        )?;
-+                        break;
-+                    }
-+                } else {
-+                    // Scan once and copy literal spans rather than each character.
-+                    let start = i;
-+                    i += 1;
-+                    while i < bytes.len() && bytes[i] != b'&' && bytes[i] != b'<' {
-+                        i += 1;
-+                    }
-+                    if context == ReferenceContext::Attribute {
-+                        if bytes[start] == b'<' {
-+                            return Err(self.fatal("'<' not allowed in attribute values (from entity replacement text)"));
-                         }
+-                        }
 -                    } else if let Some(value) = self.entity_map.get(name).cloned() {
 -                        self.expand_entity_text(&value)?
 -                    } else if self.recover || self.has_pe_references || self.has_external_dtd {
@@ -1639,13 +1665,7 @@
 -                            format!("unknown entity reference: &{name};"),
 -                        );
 -                        String::new()
-+                        append_attribute_literal(
-+                            self.storage,
-+                            result,
-+                            &text[start..i],
-+                            frame.fold_line_ends,
-+                        )?;
-                     } else {
+-                    } else {
 -                        return Err(self.fatal(format!("unknown entity reference: &{name};")));
 -                    };
 -                    result.push_str(&expanded);
@@ -1660,8 +1680,32 @@
 -                }
 -                if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
 -                    result.push_str(s);
-+                        self.storage.append(result, &text[start..i])?;
++                            return Err(
++                                self.fatal(format_args!("unknown entity reference: &{name};"))
++                            );
++                        };
++                        frame.position = i;
++                        Values::push(&mut frames, frame)?;
++                        let fold_line_ends = !matches!(replacement, Replacement::Decoded(_));
++                        Values::push(
++                            &mut frames,
++                            ReplacementFrame {
++                                text: replacement,
++                                position: 0,
++                                fold_line_ends,
++                            },
++                        )?;
++                        break;
 +                    }
++                } else {
++                    // Scan once and copy literal spans rather than each character.
++                    self.append_replacement_literal(
++                        text,
++                        &mut i,
++                        result,
++                        context,
++                        frame.fold_line_ends,
++                    )?;
                  }
              }
          }
@@ -1702,7 +1746,7 @@
      // -- Attribute value parsing (XML 1.0 §3.3.3) --
  
      /// Parses a quoted attribute value with entity resolution and
-@@ -1493,18 +1498,22 @@
+@@ -1493,18 +1526,22 @@
      /// Uses bulk scanning to find the next `&`, `<`, or quote character,
      /// then extracts safe chunks with a single `push_str()` instead of
      /// processing character by character.
@@ -1728,7 +1772,7 @@
                  let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
                      .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
                  // Fast byte-level pre-check: only validate when bytes suggest
-@@ -1516,30 +1525,18 @@
+@@ -1516,30 +1553,18 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -1766,7 +1810,7 @@
              }
  
              if self.at_end() {
-@@ -1548,57 +1545,45 @@
+@@ -1548,57 +1573,45 @@
  
              let b = self.input[self.pos];
              if b == quote {
@@ -1838,7 +1882,7 @@
          self.expect_byte(quote)?;
          Ok(value)
      }
-@@ -1606,21 +1591,44 @@
+@@ -1606,21 +1619,44 @@
      // -- Error helpers --
  
      /// Creates a fatal `ParseError` at the current location.
@@ -1891,7 +1935,7 @@
      }
  }
  
-@@ -1630,100 +1638,111 @@
+@@ -1630,100 +1666,111 @@
  
  /// Manages namespace scope for XML parsers.
  ///
@@ -2061,7 +2105,7 @@
      }
  }
  
-@@ -1736,54 +1755,56 @@
+@@ -1736,54 +1783,56 @@
  /// The opening `<!--` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.5 production `[15]`.
@@ -2145,7 +2189,7 @@
                  } else {
                      return Err(input.fatal("'--' not allowed inside comments"));
                  }
-@@ -1793,8 +1814,6 @@
+@@ -1793,8 +1842,6 @@
              }
          }
      }
@@ -2154,7 +2198,7 @@
  }
  
  /// Parses a CDATA section (`<![CDATA[ ... ]]>`), returning the content text.
-@@ -1802,32 +1821,34 @@
+@@ -1802,32 +1849,34 @@
  /// The opening `<![CDATA[` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.7 production `[18]`.
@@ -2206,7 +2250,7 @@
              Ok(content)
          }
          None => Err(input.fatal("unexpected end of input in CDATA section")),
-@@ -1840,9 +1861,9 @@
+@@ -1840,9 +1889,9 @@
  /// The opening `<?` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.6 production `[16]`.
@@ -2219,7 +2263,7 @@
      input.expect_str(b"<?")?;
      let target = input.parse_name()?;
  
-@@ -1852,39 +1873,35 @@
+@@ -1852,39 +1901,35 @@
      }
  
      // Namespaces in XML 1.0 §3: PI targets must be NCNames (no colons).
@@ -2277,7 +2321,7 @@
              }
              None => {
                  return Err(input.fatal("unexpected end of input in processing instruction"));
-@@ -1900,11 +1917,11 @@
+@@ -1900,11 +1945,11 @@
  
  /// Parsed XML declaration data.
  #[derive(Debug, Clone)]
@@ -2292,7 +2336,7 @@
      /// Optional standalone declaration.
      pub standalone: Option<bool>,
  }
-@@ -1916,37 +1933,41 @@
+@@ -1916,37 +1961,41 @@
  /// verified by the caller via `looking_at`).
  ///
  /// See XML 1.0 §2.8 production `[23]`.
@@ -2344,7 +2388,7 @@
          }
  
          Some(enc)
-@@ -1958,17 +1979,17 @@
+@@ -1958,17 +2007,17 @@
      // If encoding was present, we need fresh whitespace before standalone.
      // If encoding was absent, the whitespace consumed when looking for
      // encoding already separates version from standalone.
@@ -2366,7 +2410,7 @@
              "yes" => Some(true),
              "no" => Some(false),
              _ => return Err(input.fatal("standalone must be 'yes' or 'no'")),
-@@ -1977,7 +1998,7 @@
+@@ -1977,7 +2026,7 @@
          None
      };
  
@@ -2375,7 +2419,7 @@
      input.expect_str(b"?>")?;
  
      Ok(XmlDeclaration {
-@@ -2024,9 +2045,9 @@
+@@ -2024,9 +2073,9 @@
          let mut input = ParserInput::new("abc");
          assert_eq!(input.peek(), Some(b'a'));
          assert_eq!(input.peek_at(1), Some(b'b'));
@@ -2387,7 +2431,7 @@
          assert!(input.at_end());
      }
  
-@@ -2035,9 +2056,9 @@
+@@ -2035,9 +2084,9 @@
          let mut input = ParserInput::new("ab\ncd");
          assert_eq!(input.location().line, 1);
          assert_eq!(input.location().column, 1);
@@ -2399,7 +2443,7 @@
          assert_eq!(input.location().line, 2);
          assert_eq!(input.location().column, 1);
      }
-@@ -2058,13 +2079,29 @@
+@@ -2058,13 +2107,29 @@
      }
  
      #[test]
@@ -2430,7 +2474,7 @@
      }
  
      #[test]
-@@ -2145,6 +2182,14 @@
+@@ -2145,6 +2210,14 @@
      }
  
      #[test]
@@ -2445,7 +2489,7 @@
      fn test_parse_quoted_value() {
          let mut input = ParserInput::new("'hello'");
          let value = input.parse_quoted_value().unwrap();
-@@ -2154,7 +2199,7 @@
+@@ -2154,7 +2227,7 @@
      #[test]
      fn test_skip_whitespace() {
          let mut input = ParserInput::new("  \t\n  abc");
@@ -2454,7 +2498,7 @@
          assert_eq!(input.peek(), Some(b'a'));
      }
  
-@@ -2168,12 +2213,211 @@
+@@ -2168,12 +2241,211 @@
      #[test]
      fn test_take_while() {
          let mut input = ParserInput::new("12345abc");
@@ -2667,7 +2711,7 @@
      fn test_split_name() {
          assert_eq!(split_name("foo:bar"), (Some("foo"), "bar"));
          assert_eq!(split_name("bar"), (None, "bar"));
-@@ -2182,37 +2426,94 @@
+@@ -2182,37 +2454,94 @@
  
      #[test]
      fn test_namespace_resolver() {
@@ -2785,7 +2829,7 @@
      }
  
      #[test]
-@@ -2234,7 +2535,7 @@
+@@ -2234,7 +2563,7 @@
          let mut input = ParserInput::new("<?target data?>");
          let (target, data) = parse_pi_content(&mut input).unwrap();
          assert_eq!(target, "target");
@@ -2794,7 +2838,7 @@
      }
  
      #[test]
-@@ -2250,7 +2551,7 @@
+@@ -2250,7 +2579,7 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
          let decl = parse_xml_decl(&mut input).unwrap();
          assert_eq!(decl.version, "1.0");
@@ -2803,7 +2847,7 @@
          assert_eq!(decl.standalone, None);
      }
  
-@@ -2301,7 +2602,10 @@
+@@ -2301,7 +2630,10 @@
          input.set_max_depth(1);
          assert!(input.increment_depth().is_ok()); // depth = 1
          let err = input.increment_depth().unwrap_err();
@@ -2815,7 +2859,7 @@
      }
  
      #[test]
-@@ -2310,7 +2614,10 @@
+@@ -2310,7 +2642,10 @@
          let mut input = ParserInput::new("");
          input.set_max_depth(0);
          let err = input.increment_depth().unwrap_err();
@@ -2827,7 +2871,7 @@
      }
  
      #[test]
-@@ -2351,7 +2658,10 @@
+@@ -2351,7 +2686,10 @@
          assert!(input.parse_reference().is_ok()); // expansion 2
          assert!(input.parse_reference().is_ok()); // expansion 3
          let err = input.parse_reference().unwrap_err();
@@ -2839,7 +2883,7 @@
      }
  
      #[test]
-@@ -2360,7 +2670,10 @@
+@@ -2360,7 +2698,10 @@
          let mut input = ParserInput::new("&amp;");
          input.set_max_entity_expansions(0);
          let err = input.parse_reference().unwrap_err();
@@ -2851,7 +2895,7 @@
      }
  
      #[test]
-@@ -2369,7 +2682,10 @@
+@@ -2369,7 +2710,10 @@
          input.set_max_entity_expansions(1);
          assert!(input.parse_reference().is_ok());
          let err = input.parse_reference().unwrap_err();
@@ -2863,7 +2907,7 @@
      }
  
      #[test]
-@@ -2380,29 +2696,34 @@
+@@ -2380,29 +2724,34 @@
          assert!(input.parse_reference().is_ok()); // &#65; → A
          assert!(input.parse_reference().is_ok()); // &#66; → B
          let err = input.parse_reference().unwrap_err();
@@ -2905,7 +2949,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY greet "Hello">
  ]>
-@@ -2414,7 +2735,7 @@
+@@ -2414,7 +2763,7 @@
  
      #[test]
      fn test_entity_expansion_nested_dtd_entities() {
@@ -2914,7 +2958,7 @@
          // Entity "b" references entity "a". The nested reference is parsed
          // as content (XML 1.0 §4.4), so the entity expansion is visible
          // through text_content.
-@@ -2430,7 +2751,7 @@
+@@ -2430,7 +2779,7 @@
  
      #[test]
      fn test_entity_expansion_limit_nested_dtd_entities_in_attributes() {
@@ -2923,7 +2967,7 @@
          // In attribute values, entity references ARE fully expanded through
          // parse_reference_into + expand_entity_text. Each expansion counts
          // against the limit. Chain: c -> 3*b -> 9*a = 13 total expansions.
-@@ -2443,17 +2764,19 @@
+@@ -2443,17 +2792,19 @@
          let opts = ParseOptions::default().max_entity_expansions(5);
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -2948,7 +2992,7 @@
          // Classic billion laughs pattern in an attribute value where
          // entities ARE fully expanded. Each entity references the
          // previous one multiple times, causing exponential expansion.
-@@ -2470,15 +2793,15 @@
+@@ -2470,15 +2821,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -2967,7 +3011,7 @@
          // When entity replacement text contains '<', the parser must expand
          // it (to validate the markup), which triggers entity expansion
          // counting. This tests the billion laughs pattern for text content
-@@ -2494,9 +2817,9 @@
+@@ -2494,9 +2845,9 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -2979,7 +3023,7 @@
          );
      }
  
-@@ -2504,7 +2827,7 @@
+@@ -2504,7 +2855,7 @@
  
      #[test]
      fn test_xxe_external_entity_rejected_by_default() {
@@ -2988,7 +3032,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/passwd">
  ]>
-@@ -2513,15 +2836,15 @@
+@@ -2513,15 +2864,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3007,7 +3051,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe PUBLIC "-//Evil//EN" "http://evil.com/payload">
  ]>
-@@ -2530,15 +2853,15 @@
+@@ -2530,15 +2881,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3026,7 +3070,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/shadow">
  ]>
-@@ -2549,7 +2872,7 @@
+@@ -2549,7 +2900,7 @@
  
      #[test]
      fn test_xxe_multiple_external_entities_all_rejected() {
@@ -3035,7 +3079,7 @@
          // Even if one entity is internal, the external one should fail
          let xml = r#"<!DOCTYPE r [
  <!ENTITY safe "ok">
-@@ -2568,9 +2891,9 @@
+@@ -2568,9 +2919,9 @@
          let mut input = ParserInput::new("&#0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3047,7 +3091,7 @@
          );
      }
  
-@@ -2579,9 +2902,9 @@
+@@ -2579,9 +2930,9 @@
          let mut input = ParserInput::new("&#x0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3059,7 +3103,7 @@
          );
      }
  
-@@ -2619,17 +2942,17 @@
+@@ -2619,17 +2970,17 @@
          let mut input = ParserInput::new("&#xD800;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3081,7 +3125,7 @@
          );
      }
  
-@@ -2639,17 +2962,17 @@
+@@ -2639,17 +2990,17 @@
          let mut input = ParserInput::new("&#xFFFE;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3103,7 +3147,7 @@
          );
      }
  
-@@ -2668,9 +2991,9 @@
+@@ -2668,9 +3019,9 @@
          let mut input = ParserInput::new("&#x110000;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3115,7 +3159,7 @@
          );
      }
  
-@@ -2680,9 +3003,10 @@
+@@ -2680,9 +3031,10 @@
          let mut input = ParserInput::new("&#99999999999;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3128,7 +3172,7 @@
          );
      }
  
-@@ -2692,9 +3016,10 @@
+@@ -2692,9 +3044,10 @@
          let mut input = ParserInput::new("&#xFFFFFFFFFF;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3141,7 +3185,7 @@
          );
      }
  
-@@ -2703,9 +3028,10 @@
+@@ -2703,9 +3056,10 @@
          let mut input = ParserInput::new("&#;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3154,7 +3198,7 @@
          );
      }
  
-@@ -2714,9 +3040,10 @@
+@@ -2714,9 +3068,10 @@
          let mut input = ParserInput::new("&#x;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3167,7 +3211,7 @@
          );
      }
  
-@@ -2760,7 +3087,7 @@
+@@ -2760,7 +3115,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name();
          assert!(result.is_err());
@@ -3176,7 +3220,7 @@
      }
  
      #[test]
-@@ -2806,7 +3133,7 @@
+@@ -2806,7 +3161,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq("something");
          assert!(result.is_err());
@@ -3185,7 +3229,7 @@
      }
  
      #[test]
-@@ -2817,7 +3144,59 @@
+@@ -2817,7 +3172,59 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq_parts(None, "something");
          assert!(result.is_err());
@@ -3246,7 +3290,7 @@
      }
  
      // -- Comment boundary edge cases --
-@@ -2829,7 +3208,10 @@
+@@ -2829,7 +3236,10 @@
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
          assert!(
@@ -3258,7 +3302,7 @@
              "double dash inside comment should be rejected"
          );
      }
-@@ -2848,10 +3230,12 @@
+@@ -2848,10 +3258,12 @@
          let mut input = ParserInput::new("<!-- no end");
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
@@ -3275,7 +3319,7 @@
      }
  
      #[test]
-@@ -2893,10 +3277,12 @@
+@@ -2893,10 +3305,12 @@
          let mut input = ParserInput::new("<![CDATA[no end");
          let result = parse_cdata_content(&mut input);
          assert!(result.is_err());
@@ -3292,7 +3336,7 @@
      }
  
      #[test]
-@@ -2937,10 +3323,12 @@
+@@ -2937,10 +3351,12 @@
          let mut input = ParserInput::new("<?xml data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3309,7 +3353,7 @@
      }
  
      #[test]
-@@ -2959,10 +3347,12 @@
+@@ -2959,10 +3375,12 @@
          let mut input = ParserInput::new("<?ns:target data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3326,7 +3370,7 @@
      }
  
      #[test]
-@@ -2988,10 +3378,12 @@
+@@ -2988,10 +3406,12 @@
          let mut input = ParserInput::new("\"abc<def\"");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3343,7 +3387,7 @@
      }
  
      #[test]
-@@ -2999,10 +3391,12 @@
+@@ -2999,10 +3419,12 @@
          let mut input = ParserInput::new("\"no closing quote");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3360,7 +3404,7 @@
      }
  
      #[test]
-@@ -3010,10 +3404,12 @@
+@@ -3010,10 +3432,12 @@
          let mut input = ParserInput::new("unquoted");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3377,7 +3421,7 @@
      }
  
      #[test]
-@@ -3024,22 +3420,19 @@
+@@ -3024,22 +3448,19 @@
      }
  
      #[test]
@@ -3409,7 +3453,7 @@
      }
  
      // -- Invalid XML character detection --
-@@ -3076,10 +3469,12 @@
+@@ -3076,10 +3497,12 @@
          let mut input = ParserInput::new(input_bytes);
          let result = input.next_char();
          assert!(result.is_err());
@@ -3426,7 +3470,7 @@
      }
  
      #[test]
-@@ -3101,138 +3496,150 @@
+@@ -3101,138 +3524,150 @@
      fn test_scan_char_data_cdata_end_marker() {
          // `]]>` in character data is not allowed — the scanner should stop before it
          let input = ParserInput::new("text]]>more");
@@ -3633,7 +3677,7 @@
      }
  
      // -- QName validation edge cases --
-@@ -3265,34 +3672,46 @@
+@@ -3265,34 +3700,46 @@
          assert!(result.unwrap().contains("empty prefix or local part"));
      }
  
@@ -3690,7 +3734,7 @@
      }
  
      // -- XML declaration edge cases --
-@@ -3302,10 +3721,12 @@
+@@ -3302,10 +3749,12 @@
          let mut input = ParserInput::new("<?xml version=\"2.0\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3707,7 +3751,7 @@
      }
  
      #[test]
-@@ -3313,10 +3734,12 @@
+@@ -3313,10 +3762,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"123bad\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3724,7 +3768,7 @@
      }
  
      #[test]
-@@ -3324,10 +3747,12 @@
+@@ -3324,10 +3775,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" standalone=\"maybe\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3741,7 +3785,7 @@
      }
  
      #[test]
-@@ -3342,10 +3767,10 @@
+@@ -3342,10 +3795,10 @@
      #[test]
      fn test_save_restore_position() {
          let mut input = ParserInput::new("abcdef");
@@ -3754,7 +3798,7 @@
          assert_eq!(input.peek(), Some(b'f'));
          input.restore_position(saved);
          assert_eq!(input.peek(), Some(b'd'));
-@@ -3357,7 +3782,7 @@
+@@ -3357,7 +3810,7 @@
  
      #[test]
      fn test_depth_limit_via_parse_str_with_options() {
@@ -3763,7 +3807,7 @@
          // 3 levels with limit 3 should succeed
          let xml = "<a><b><c/></b></a>";
          let opts = ParseOptions::default().max_depth(3);
-@@ -3367,7 +3792,7 @@
+@@ -3367,7 +3820,7 @@
          let xml = "<a><b><c><d/></c></b></a>";
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -3772,7 +3816,7 @@
      }
  
      // -- Builtin entity matching edge cases --
-@@ -3403,12 +3828,24 @@
+@@ -3403,12 +3856,24 @@
      fn test_expand_entity_text_counts_against_limit() {
          // Set up a ParserInput with entity_map containing nested references
          let mut input = ParserInput::new("");
@@ -3803,7 +3847,7 @@
          input.set_max_entity_expansions(2);
  
          // Expanding "b" should expand &a; twice, hitting the limit
-@@ -3465,6 +3902,54 @@
+@@ -3465,6 +3930,54 @@
          assert_eq!(result, "<![CDATA[&amp; not expanded]]>");
      }
  
@@ -3946,7 +3990,7 @@
 -    attr_types: HashMap<(String, String), AttributeType>,
 +    ns: NamespaceResolver<S>,
 +    /// Tokenized attribute names indexed by their element name. The complete
-+    /// declarations remain in attr_defaults; reads borrow both lookup keys.
++    /// declarations remain in `attr_defaults`; reads borrow both lookup keys.
 +    attr_types: S::Names<S::Text, S::Names<S::Text, ()>>,
      /// DTD attribute default value declarations, keyed by element name.
      /// Used for applying default/fixed attributes from ATTLIST.
@@ -4090,16 +4134,59 @@
                  self.doc.append_child(parent, ws_node);
              }
              if self.input.at_end() {
-@@ -190,7 +243,7 @@
+@@ -189,8 +242,49 @@
+     // --- DOCTYPE Declaration ---
      // See XML 1.0 §2.8: [28] doctypedecl
  
-     #[allow(clippy::too_many_lines)]
+-    #[allow(clippy::too_many_lines)]
 -    fn parse_doctype(&mut self, parent: NodeId) -> Result<(), ParseError> {
++    fn scan_internal_subset(&mut self) -> Result<&'a str, ParseError<S>> {
++        self.input.advance(1)?;
++        let start = self.input.pos();
++        // Quoted values and comments do not contribute bracket delimiters.
++        let mut depth: u32 = 1;
++        while !self.input.at_end() && depth > 0 {
++            if self.input.looking_at(b"<!--") {
++                self.input.advance(4)?;
++                while !self.input.at_end() && !self.input.looking_at(b"-->") {
++                    self.input.advance(1)?;
++                }
++                if !self.input.at_end() {
++                    self.input.advance(3)?;
++                }
++            } else if let Some(quote @ (b'"' | b'\'')) = self.input.peek() {
++                self.input.advance(1)?;
++                while !self.input.at_end() && self.input.peek() != Some(quote) {
++                    self.input.advance(1)?;
++                }
++                if !self.input.at_end() {
++                    self.input.advance(1)?;
++                }
++            } else if self.input.peek() == Some(b'[') {
++                depth += 1;
++                self.input.advance(1)?;
++            } else if self.input.peek() == Some(b']') {
++                depth -= 1;
++                self.input.advance(1)?;
++            } else {
++                self.input.advance(1)?;
++            }
++        }
++        if depth > 0 {
++            return Err(self
++                .input
++                .fatal("unexpected end of input in internal subset"));
++        }
++        let end = self.input.pos() - 1;
++        std::str::from_utf8(self.input.slice(start, end))
++            .map_err(|_| self.input.fatal("invalid UTF-8 in internal subset"))
++    }
++
 +    fn parse_doctype(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
          // Consume <!DOCTYPE (case-insensitive match already checked by caller)
          self.input.expect_str(b"<!DOCTYPE")?;
          self.input.skip_whitespace_required()?;
-@@ -198,7 +251,7 @@
+@@ -198,7 +292,7 @@
          // Read the root element name
          let name = self.input.parse_name()?;
  
@@ -4108,7 +4195,7 @@
  
          // Check for external ID: SYSTEM or PUBLIC
          let mut system_id = None;
-@@ -208,23 +261,17 @@
+@@ -208,23 +302,17 @@
              self.input.expect_str(b"SYSTEM")?;
              self.input.skip_whitespace_required()?;
              system_id = Some(self.input.parse_quoted_value()?);
@@ -4135,63 +4222,59 @@
          }
  
          // Flag whether there's an external DTD subset. Per XML 1.0 §4.1 WFC:
-@@ -237,7 +284,7 @@
+@@ -237,142 +325,82 @@
          // Parse optional internal subset: [ ... ]
          let mut internal_subset = None;
          if self.input.peek() == Some(b'[') {
 -            self.input.advance(1);
-+            self.input.advance(1)?;
-             let start = self.input.pos();
+-            let start = self.input.pos();
++            let subset_text = self.scan_internal_subset()?;
  
-             // Scan to matching ']', tracking depth for bracket chars inside
-@@ -247,30 +294,30 @@
-             while !self.input.at_end() && depth > 0 {
-                 if self.input.looking_at(b"<!--") {
-                     // Skip XML comments (may contain apostrophes/quotes)
+-            // Scan to matching ']', tracking depth for bracket chars inside
+-            // entity values. Quoted strings and comments are skipped to avoid
+-            // misinterpreting brackets or apostrophes in comments.
+-            let mut depth: u32 = 1;
+-            while !self.input.at_end() && depth > 0 {
+-                if self.input.looking_at(b"<!--") {
+-                    // Skip XML comments (may contain apostrophes/quotes)
 -                    self.input.advance(4);
-+                    self.input.advance(4)?;
-                     while !self.input.at_end() && !self.input.looking_at(b"-->") {
+-                    while !self.input.at_end() && !self.input.looking_at(b"-->") {
 -                        self.input.advance(1);
-+                        self.input.advance(1)?;
-                     }
-                     if !self.input.at_end() {
+-                    }
+-                    if !self.input.at_end() {
 -                        self.input.advance(3); // consume -->
-+                        self.input.advance(3)?; // consume -->
-                     }
-                 } else if let Some(b'"' | b'\'') = self.input.peek() {
-                     let quote = self.input.peek().unwrap_or(b'"');
+-                    }
+-                } else if let Some(b'"' | b'\'') = self.input.peek() {
+-                    let quote = self.input.peek().unwrap_or(b'"');
 -                    self.input.advance(1);
-+                    self.input.advance(1)?;
-                     while !self.input.at_end() && self.input.peek() != Some(quote) {
+-                    while !self.input.at_end() && self.input.peek() != Some(quote) {
 -                        self.input.advance(1);
-+                        self.input.advance(1)?;
-                     }
-                     if !self.input.at_end() {
+-                    }
+-                    if !self.input.at_end() {
 -                        self.input.advance(1); // closing quote
-+                        self.input.advance(1)?; // closing quote
-                     }
-                 } else if self.input.peek() == Some(b'[') {
-                     depth += 1;
+-                    }
+-                } else if self.input.peek() == Some(b'[') {
+-                    depth += 1;
 -                    self.input.advance(1);
-+                    self.input.advance(1)?;
-                 } else if self.input.peek() == Some(b']') {
-                     depth -= 1;
+-                } else if self.input.peek() == Some(b']') {
+-                    depth -= 1;
 -                    self.input.advance(1);
-+                    self.input.advance(1)?;
-                 } else {
+-                } else {
 -                    self.input.advance(1);
-+                    self.input.advance(1)?;
-                 }
-             }
-             if depth > 0 {
-@@ -282,97 +329,82 @@
-             // Extract the internal subset text (between '[' and ']').
-             let end = self.input.pos() - 1; // exclude the closing ']'
-             let subset_text = std::str::from_utf8(self.input.slice(start, end))
+-                }
+-            }
+-            if depth > 0 {
+-                return Err(self
+-                    .input
+-                    .fatal("unexpected end of input in internal subset"));
+-            }
+-
+-            // Extract the internal subset text (between '[' and ']').
+-            let end = self.input.pos() - 1; // exclude the closing ']'
+-            let subset_text = std::str::from_utf8(self.input.slice(start, end))
 -                .ok()
 -                .map(str::to_string);
-+                .map_err(|_| self.input.fatal("invalid UTF-8 in internal subset"))?;
- 
+-
 -            if let Some(subset_text) = subset_text {
 +            {
                  // Detect parameter entity references in the internal subset.
@@ -4323,11 +4406,25 @@
          self.doc.append_child(parent, doctype_id);
          Ok(())
      }
-@@ -381,15 +413,51 @@
+@@ -380,535 +408,506 @@
+     // --- Elements ---
      // See XML 1.0 §3.1: [40] STag, [42] ETag, [44] EmptyElemTag
  
-     #[allow(clippy::too_many_lines)]
+-    #[allow(clippy::too_many_lines)]
 -    fn parse_element(&mut self, parent: NodeId) -> Result<NodeId, ParseError> {
+-        self.input.increment_depth()?;
+-        self.input.expect_byte(b'<')?;
+-        let name = self.input.parse_name()?;
+-        let mut attributes = Vec::new();
+-
+-        // Parse attributes
+-        loop {
+-            let had_ws = self.input.skip_whitespace();
+-            if self.input.peek() == Some(b'>') || self.input.looking_at(b"/>") {
+-                break;
+-            }
+-            if !had_ws {
+-                return Err(self.input.fatal("whitespace required between attributes"));
 +    fn parse_element(&mut self, parent: NodeId) -> Result<NodeId, ParseError<S>> {
 +        let (root, open) = self.parse_element_start(parent)?;
 +        let mut pending = self.storage.values(0)?;
@@ -4356,39 +4453,23 @@
 +                }
 +            } else {
 +                self.parse_char_data(element)?;
-+            }
-+        }
+             }
+-            let attr = self.parse_attribute()?;
+-            attributes.push(attr);
+         }
 +        Ok(root)
 +    }
-+
-+    fn parse_element_start(
+ 
+-        // Check for duplicate attributes (XML 1.0 §3.1 WFC: Unique Att Spec)
+-        // Skip for 0 or 1 attributes (no duplicates possible).
++    fn check_attribute_spellings(
 +        &mut self,
-+        parent: NodeId,
-+    ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
-         self.input.increment_depth()?;
-         self.input.expect_byte(b'<')?;
-         let name = self.input.parse_name()?;
--        let mut attributes = Vec::new();
-+        let mut attributes = self.storage.values(0)?;
- 
-         // Parse attributes
-         loop {
--            let had_ws = self.input.skip_whitespace();
-+            let had_ws = self.input.skip_whitespace()?;
-             if self.input.peek() == Some(b'>') || self.input.looking_at(b"/>") {
-                 break;
-             }
-@@ -397,7 +465,7 @@
-                 return Err(self.input.fatal("whitespace required between attributes"));
-             }
-             let attr = self.parse_attribute()?;
--            attributes.push(attr);
-+            attributes.push(attr)?;
-         }
- 
-         // Check for duplicate attributes (XML 1.0 §3.1 WFC: Unique Att Spec)
-@@ -407,24 +475,24 @@
-             let mut found_dup = false;
++        attributes: &[Attribute<S>],
++    ) -> Result<(), ParseError<S>> {
++        // XML 1.0 §3.1 WFC: Unique Att Spec; retain the first diagnostic.
+         if attributes.len() >= 2 {
+-            // O(n²) comparison avoids HashSet allocation for small attribute lists.
+-            let mut found_dup = false;
              'outer: for i in 1..attributes.len() {
                  for j in 0..i {
 -                    if attributes[i].name == attributes[j].name
@@ -4410,9 +4491,9 @@
                                  ErrorSeverity::Error,
 -                                format!("duplicate attribute: '{full_name}'"),
 -                            );
+-                            found_dup = true;
 +                                format_args!("duplicate attribute: '{full_name}'"),
 +                            )?;
-                             found_dup = true;
                          } else {
                              return Err(self
                                  .input
@@ -4421,23 +4502,44 @@
                          }
                          break 'outer;
                      }
-@@ -443,53 +511,59 @@
-         // canonical form.
-         // Namespace declarations (xmlns, xmlns:prefix) are inserted before
-         // other attributes to match libxml2's attribute ordering.
+                 }
+             }
+-            let _ = found_dup; // suppress unused warning
+         }
++        Ok(())
++    }
+ 
+-        // --- Apply DTD ATTLIST default attributes (#FIXED and #DEFAULT) ---
+-        // Per XML 1.0 §3.3.2, when an attribute declared in an ATTLIST is not
+-        // present on the element, the parser must add it with the declared
+-        // default value. This applies to both `#FIXED "v"` and bare `"v"`
+-        // (so-called #DEFAULT) declarations. libxml2 applies both during
+-        // normal parsing — verifiable via `xmllint --c14n` on a document
+-        // with an ATTLIST default, which emits the default attribute in the
+-        // canonical form.
+-        // Namespace declarations (xmlns, xmlns:prefix) are inserted before
+-        // other attributes to match libxml2's attribute ordering.
 -        if let Some(defaults) = if self.attr_defaults.is_empty() {
++    fn apply_attribute_defaults(
++        &mut self,
++        name: &str,
++        attributes: &mut S::Values<Attribute<S>>,
++    ) -> Result<(), ParseError<S>> {
++        // XML 1.0 §3.3.2 requires both FIXED and ordinary defaults when absent.
++        // Namespace declarations retain their existing leading insertion order.
 +        if let Some(defaults) = if self.attr_defaults.len() == 0 {
              None
          } else {
 -            self.attr_defaults.get(&name).cloned()
 +            self.attr_defaults.get(name, self.storage)?
          } {
-             let mut insert_pos = 0; // insertion point for namespace declarations
+-            let mut insert_pos = 0; // insertion point for namespace declarations
 -            for attr_decl in &defaults {
 -                let (default_value, is_fixed) = match &attr_decl.default {
 -                    crate::validation::dtd::AttributeDefault::Fixed(v) => (Some(v.clone()), true),
 -                    crate::validation::dtd::AttributeDefault::Default(v) => {
 -                        (Some(v.clone()), false)
++            let mut insert_pos = 0;
 +            for attr_decl in &**defaults {
 +                self.storage.charge(1)?;
 +                let default_value = match &attr_decl.default {
@@ -4449,15 +4551,15 @@
 +                    _ => None,
                  };
                  if let Some(value) = default_value {
-                     // Check if the attribute is already present by comparing
-                     // prefix:local components directly, avoiding format!/clone.
+-                    // Check if the attribute is already present by comparing
+-                    // prefix:local components directly, avoiding format!/clone.
                      let attr_name = &attr_decl.attribute_name;
                      let (decl_pfx, decl_local) = split_name(attr_name);
 -                    let already_present = attributes
 -                        .iter()
 -                        .any(|a| a.name == decl_local && a.prefix.as_deref() == decl_pfx);
 +                    let mut already_present = false;
-+                    for attribute in &*attributes {
++                    for attribute in &**attributes {
 +                        self.storage
 +                            .charge(attribute.name.len() + decl_local.len())?;
 +                        if attribute.name.as_ref() == decl_local
@@ -4468,10 +4570,10 @@
 +                        }
 +                    }
                      if !already_present {
-                         // Track expansion for amplification factor check
-                         // (both #FIXED and #DEFAULT contribute to expansion).
+-                        // Track expansion for amplification factor check
+-                        // (both #FIXED and #DEFAULT contribute to expansion).
                          self.expansion_size += attr_name.len() + value.len();
- 
+-
 -                        // Insert both #FIXED and #DEFAULT defaults into the
 -                        // tree. The `is_fixed` flag is no longer used to gate
 -                        // insertion; it would only matter if we additionally
@@ -4490,10 +4592,9 @@
                              raw_value: None,
                          };
 -                        let is_ns_decl = attr_name == "xmlns" || attr_name.starts_with("xmlns:");
-+                        let is_ns_decl =
-+                            attr_name.as_ref() == "xmlns" || attr_name.starts_with("xmlns:");
-                         if is_ns_decl {
+-                        if is_ns_decl {
 -                            attributes.insert(insert_pos, attr);
++                        if attr_name.as_ref() == "xmlns" || attr_name.starts_with("xmlns:") {
 +                            self.storage.charge(attributes.len() - insert_pos)?;
 +                            attributes.push(attr)?;
 +                            attributes[insert_pos..].rotate_right(1);
@@ -4504,25 +4605,42 @@
                          }
                      }
                  }
-@@ -511,22 +585,22 @@
-         // when not needed. Skip the scan entirely when there are no attributes.
-         let has_ns_decls = !attributes.is_empty()
-             && attributes.iter().any(|a| {
--                a.prefix.as_deref() == Some("xmlns") || (a.prefix.is_none() && a.name == "xmlns")
-+                a.prefix.as_deref() == Some("xmlns")
-+                    || (a.prefix.is_none() && a.name.as_ref() == "xmlns")
-             });
-         if has_ns_decls {
--            self.ns.push_scope();
-+            self.ns.push_scope()?;
+             }
+-
+-            // Check amplification factor: reject if default attribute
+-            // expansion would exceed the input size by more than the
+-            // maximum factor (matching libxml2's xmlCtxtSetMaxAmplification).
+             if self.expansion_size > self.input_size.saturating_mul(DEFAULT_MAX_AMPLIFICATION) {
+                 return Err(self
+                     .input
+                     .fatal("maximum entity amplification factor exceeded"));
+             }
          }
++        Ok(())
++    }
  
-         // Split into prefix and local name for namespace processing.
+-        // --- Namespace processing (Namespaces in XML 1.0 section 3) ---
+-
+-        // Check for namespace declarations to skip namespace scope push/pop
+-        // when not needed. Skip the scan entirely when there are no attributes.
+-        let has_ns_decls = !attributes.is_empty()
+-            && attributes.iter().any(|a| {
+-                a.prefix.as_deref() == Some("xmlns") || (a.prefix.is_none() && a.name == "xmlns")
+-            });
+-        if has_ns_decls {
+-            self.ns.push_scope();
+-        }
+-
+-        // Split into prefix and local name for namespace processing.
 -        let (prefix, local_name) = split_name(&name);
-+        let (prefix, local_name) = split_name(name);
- 
-         // Validate QName syntax: check for multiple colons (the local part
-         // should not contain a colon after split_name).
+-
+-        // Validate QName syntax: check for multiple colons (the local part
+-        // should not contain a colon after split_name).
++    fn check_element_qname(
++        &mut self,
++        prefix: Option<&str>,
++        local_name: &str,
++    ) -> Result<(), ParseError<S>> {
          if prefix.is_some() && local_name.contains(':') {
              let msg = "QName contains multiple colons";
              if self.options.recover {
@@ -4532,7 +4650,11 @@
              } else {
                  return Err(self.input.fatal(msg));
              }
-@@ -537,8 +611,8 @@
+         }
+-
+-        // Reject element names with "xmlns" prefix (Namespaces in XML 1.0 §3).
++        // Namespaces in XML 1.0 §3 reserves xmlns for attribute declarations.
+         if prefix == Some("xmlns") {
              if self.options.recover {
                  self.input.push_diagnostic(
                      ErrorSeverity::Error,
@@ -4543,224 +4665,366 @@
              } else {
                  return Err(self
                      .input
-@@ -549,7 +623,7 @@
-         // Scan attributes for namespace declarations and bind them,
-         // with validation of namespace constraints.
-         // In recovery mode, some invalid attributes may be stripped.
+                     .fatal("elements must not have the prefix 'xmlns'"));
+             }
+         }
++        Ok(())
++    }
+ 
+-        // Scan attributes for namespace declarations and bind them,
+-        // with validation of namespace constraints.
+-        // In recovery mode, some invalid attributes may be stripped.
 -        let mut strip_attr_indices: Vec<usize> = Vec::new();
-+        let mut strip_attr_indices = self.storage.values(0)?;
-         if has_ns_decls {
-             for (attr_idx, attr) in attributes.iter().enumerate() {
-                 if attr.prefix.as_deref() == Some("xmlns") {
-@@ -563,8 +637,7 @@
-                     if declared_prefix.is_empty() {
-                         let msg = "namespace prefix must not be empty (invalid QName 'xmlns:')";
-                         if self.options.recover {
+-        if has_ns_decls {
+-            for (attr_idx, attr) in attributes.iter().enumerate() {
+-                if attr.prefix.as_deref() == Some("xmlns") {
+-                    // Prefixed namespace declaration: xmlns:prefix="uri"
+-                    let declared_prefix = &attr.name;
+-
+-                    // Validate QName: the local part (declared_prefix) must be
+-                    // a non-empty NCName (no colon, not empty). An empty local
+-                    // part means the attribute was `xmlns:` with nothing after
+-                    // the colon, which is not a valid QName.
+-                    if declared_prefix.is_empty() {
+-                        let msg = "namespace prefix must not be empty (invalid QName 'xmlns:')";
+-                        if self.options.recover {
 -                            self.input
 -                                .push_diagnostic(ErrorSeverity::Error, msg.to_string());
-+                            self.input.push_diagnostic(ErrorSeverity::Error, msg)?;
-                             continue;
-                         }
-                         return Err(self.input.fatal(msg));
-@@ -572,8 +645,7 @@
-                     if declared_prefix.contains(':') {
-                         let msg = "QName contains multiple colons";
-                         if self.options.recover {
+-                            continue;
+-                        }
+-                        return Err(self.input.fatal(msg));
+-                    }
+-                    if declared_prefix.contains(':') {
+-                        let msg = "QName contains multiple colons";
+-                        if self.options.recover {
 -                            self.input
 -                                .push_diagnostic(ErrorSeverity::Error, msg.to_string());
-+                            self.input.push_diagnostic(ErrorSeverity::Error, msg)?;
-                         } else {
-                             return Err(self.input.fatal(msg));
-                         }
-@@ -583,11 +655,13 @@
-                     // type. For non-CDATA types (e.g., NMTOKEN), whitespace is
-                     // collapsed per XML 1.0 §3.3.3. Construct the full attribute
-                     // name only when attr_types is non-empty (DTD present).
+-                        } else {
+-                            return Err(self.input.fatal(msg));
+-                        }
++    fn resolve_attribute_namespaces(
++        &mut self,
++        attributes: &mut [Attribute<S>],
++    ) -> Result<bool, ParseError<S>> {
++        let has_prefixed_attrs = !attributes.is_empty()
++            && attributes
++                .iter()
++                .any(|a| a.prefix.is_some() && a.prefix.as_deref() != Some("xmlns"));
++        if has_prefixed_attrs {
++            for attr in attributes {
++                if let Some(pfx) = &attr.prefix {
++                    if pfx.as_ref() == "xmlns" {
++                        continue;
+                     }
+-
+-                    // Normalize namespace URI based on DTD-declared attribute
+-                    // type. For non-CDATA types (e.g., NMTOKEN), whitespace is
+-                    // collapsed per XML 1.0 §3.3.3. Construct the full attribute
+-                    // name only when attr_types is non-empty (DTD present).
 -                    let ns_value = if self.attr_types.is_empty() {
 -                        attr.value.clone()
-+                    let ns_value = if self.attr_types.len() == 0 {
-+                        self.storage.text(&attr.value)?
-                     } else {
+-                    } else {
 -                        let attr_qname = format!("xmlns:{declared_prefix}");
 -                        self.normalize_attr_value_by_type(&name, &attr_qname, &attr.value)
-+                        let attr_qname = self
-+                            .storage
-+                            .formatted(format_args!("xmlns:{declared_prefix}"))?;
-+                        self.normalize_attr_value_by_type(name, &attr_qname, &attr.value)?
-                     };
- 
-                     // XML 1.0 Namespaces: cannot unbind a prefix (xmlns:prefix="").
-@@ -595,22 +669,22 @@
+-                    };
+-
+-                    // XML 1.0 Namespaces: cannot unbind a prefix (xmlns:prefix="").
+-                    if ns_value.is_empty() {
++                    let resolved = self
++                        .storage
++                        .optional_text(self.ns.resolve(Some(pfx.as_ref()))?)?;
++                    if pfx.as_ref() != "xml" && resolved.is_none() {
                          if self.options.recover {
                              self.input.push_diagnostic(
                                  ErrorSeverity::Error,
 -                                format!("namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"),
 -                            );
-+                                format_args!("namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"),
++                                format_args!("unbound namespace prefix '{pfx}' on attribute"),
 +                            )?;
                          } else {
 -                            return Err(self.input.fatal(format!(
+-                                "namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"
 +                            return Err(self.input.fatal(format_args!(
-                                 "namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"
++                                "unbound namespace prefix '{pfx}' on attribute"
                              )));
                          }
                      }
++                    attr.namespace = resolved;
++                }
++            }
++        }
++        Ok(has_prefixed_attrs)
++    }
  
-                     // Cannot declare the 'xmlns' prefix itself.
+-                    // Cannot declare the 'xmlns' prefix itself.
 -                    if declared_prefix == "xmlns" {
-+                    if declared_prefix.as_ref() == "xmlns" {
-                         if self.options.recover {
-                             self.input.push_diagnostic(
-                                 ErrorSeverity::Error,
+-                        if self.options.recover {
+-                            self.input.push_diagnostic(
+-                                ErrorSeverity::Error,
 -                                "the 'xmlns' prefix must not be declared".to_string(),
 -                            );
-+                                "the 'xmlns' prefix must not be declared",
-+                            )?;
-                         } else {
-                             return Err(self
-                                 .input
-@@ -619,15 +693,15 @@
-                     }
- 
-                     // 'xml' prefix must map to the XML namespace URI and vice versa.
+-                        } else {
+-                            return Err(self
+-                                .input
+-                                .fatal("the 'xmlns' prefix must not be declared"));
+-                        }
+-                    }
+-
+-                    // 'xml' prefix must map to the XML namespace URI and vice versa.
 -                    if declared_prefix == "xml" && ns_value != XML_NAMESPACE {
-+                    if declared_prefix.as_ref() == "xml" && ns_value.as_ref() != XML_NAMESPACE {
-                         if self.options.recover {
-                             self.input.push_diagnostic(
-                                 ErrorSeverity::Error,
+-                        if self.options.recover {
+-                            self.input.push_diagnostic(
+-                                ErrorSeverity::Error,
 -                                "the 'xml' prefix must be bound to the XML namespace".to_string(),
 -                            );
-+                                "the 'xml' prefix must be bound to the XML namespace",
-+                            )?;
-                             // In recovery mode, strip the invalid rebinding
-                             // (matches libxml2: output is <tst/> not <tst xmlns:xml="..."/>).
+-                            // In recovery mode, strip the invalid rebinding
+-                            // (matches libxml2: output is <tst/> not <tst xmlns:xml="..."/>).
 -                            strip_attr_indices.push(attr_idx);
-+                            strip_attr_indices.push(attr_idx)?;
-                             continue;
-                         }
-                         return Err(self
-@@ -636,13 +710,12 @@
+-                            continue;
+-                        }
+-                        return Err(self
+-                            .input
+-                            .fatal("the 'xml' prefix must be bound to the XML namespace"));
++    fn check_expanded_attributes(
++        &mut self,
++        attributes: &[Attribute<S>],
++    ) -> Result<(), ParseError<S>> {
++        // Namespaces in XML 1.0 §6.3 compares expanded, not lexical, names.
++        let ns_attr_count = attributes.iter().filter(|a| a.namespace.is_some()).count();
++        if ns_attr_count >= 2 {
++            'ns_outer: for i in 1..attributes.len() {
++                if attributes[i].namespace.is_none() {
++                    continue;
++                }
++                for j in 0..i {
++                    admit_attribute_comparison(self.storage, &attributes[i], &attributes[j])?;
++                    if attributes[j].namespace.is_none() {
++                        continue;
                      }
- 
-                     // No other prefix may be bound to the XML namespace URI.
+-
+-                    // No other prefix may be bound to the XML namespace URI.
 -                    if declared_prefix != "xml" && ns_value == XML_NAMESPACE {
-+                    if declared_prefix.as_ref() != "xml" && ns_value.as_ref() == XML_NAMESPACE {
++                    if attributes[i].namespace.as_deref() == attributes[j].namespace.as_deref()
++                        && attributes[i].name.as_ref() == attributes[j].name.as_ref()
++                    {
++                        let ns = attributes[i]
++                            .namespace
++                            .as_deref()
++                            .expect("namespace checked above");
                          if self.options.recover {
                              self.input.push_diagnostic(
                                  ErrorSeverity::Error,
 -                                "only the 'xml' prefix may be bound to the XML namespace"
 -                                    .to_string(),
 -                            );
-+                                "only the 'xml' prefix may be bound to the XML namespace",
++                                format_args!(
++                                    "namespace-aware duplicate attribute: '{{{ns}}}:{}'",
++                                    attributes[i].name
++                                ),
 +                            )?;
                          } else {
-                             return Err(self
-                                 .input
-@@ -651,12 +724,12 @@
+-                            return Err(self
+-                                .input
+-                                .fatal("only the 'xml' prefix may be bound to the XML namespace"));
++                            return Err(self.input.fatal(format_args!(
++                                "namespace-aware duplicate attribute: '{{{ns}}}:{}'",
++                                attributes[i].name
++                            )));
+                         }
++                        break 'ns_outer;
                      }
++                }
++            }
++        }
++        Ok(())
++    }
  
-                     // No prefix may be bound to the xmlns namespace URI.
+-                    // No prefix may be bound to the xmlns namespace URI.
 -                    if ns_value == XMLNS_NAMESPACE {
-+                    if ns_value.as_ref() == XMLNS_NAMESPACE {
-                         if self.options.recover {
-                             self.input.push_diagnostic(
-                                 ErrorSeverity::Error,
+-                        if self.options.recover {
+-                            self.input.push_diagnostic(
+-                                ErrorSeverity::Error,
 -                                "the xmlns namespace must not be bound to any prefix".to_string(),
 -                            );
-+                                "the xmlns namespace must not be bound to any prefix",
-+                            )?;
-                         } else {
-                             return Err(self
-                                 .input
-@@ -664,51 +737,49 @@
-                         }
-                     }
+-                        } else {
+-                            return Err(self
+-                                .input
+-                                .fatal("the xmlns namespace must not be bound to any prefix"));
+-                        }
+-                    }
++    fn namespace_error(&mut self, message: impl std::fmt::Display) -> Result<(), ParseError<S>> {
++        if self.options.recover {
++            self.input.push_diagnostic(ErrorSeverity::Error, message)
++        } else {
++            Err(self.input.fatal(message))
++        }
++    }
  
 -                    self.ns.bind(Some(attr.name.clone()), ns_value);
 -                } else if attr.prefix.is_none() && attr.name == "xmlns" {
-+                    self.ns
-+                        .bind(Some(self.storage.text(&attr.name)?), ns_value)?;
-+                } else if attr.prefix.is_none() && attr.name.as_ref() == "xmlns" {
-                     // Default namespace declaration: xmlns="uri"
- 
-                     // Normalize namespace URI based on DTD-declared attribute type.
+-                    // Default namespace declaration: xmlns="uri"
+-
+-                    // Normalize namespace URI based on DTD-declared attribute type.
 -                    let ns_value = if self.attr_types.is_empty() {
 -                        attr.value.clone()
-+                    let ns_value = if self.attr_types.len() == 0 {
-+                        self.storage.text(&attr.value)?
-                     } else {
+-                    } else {
 -                        self.normalize_attr_value_by_type(&name, "xmlns", &attr.value)
-+                        self.normalize_attr_value_by_type(name, "xmlns", &attr.value)?
-                     };
+-                    };
++    fn bind_prefixed_declaration(
++        &mut self,
++        name: &str,
++        attr: &Attribute<S>,
++        index: usize,
++        stripped: &mut S::Values<usize>,
++    ) -> Result<(), ParseError<S>> {
++        let declared_prefix = &attr.name;
++        if declared_prefix.is_empty() {
++            self.namespace_error("namespace prefix must not be empty (invalid QName 'xmlns:')")?;
++            return Ok(());
++        }
++        if declared_prefix.contains(':') {
++            self.namespace_error("QName contains multiple colons")?;
++        }
++        // XML 1.0 §3.3.3 applies declared non-CDATA normalization to the URI too.
++        let ns_value = if self.attr_types.len() == 0 {
++            self.storage.text(&attr.value)?
++        } else {
++            let attr_qname = self
++                .storage
++                .formatted(format_args!("xmlns:{declared_prefix}"))?;
++            self.normalize_attr_value_by_type(name, &attr_qname, &attr.value)?
++        };
++        if ns_value.is_empty() {
++            self.namespace_error(format_args!(
++                "namespace prefix '{declared_prefix}' cannot be undeclared in XML 1.0"
++            ))?;
++        }
++        if declared_prefix.as_ref() == "xmlns" {
++            self.namespace_error("the 'xmlns' prefix must not be declared")?;
++        }
++        if declared_prefix.as_ref() == "xml" && ns_value.as_ref() != XML_NAMESPACE {
++            self.namespace_error("the 'xml' prefix must be bound to the XML namespace")?;
++            // Recovery removes only this invalid rebinding, after duplicate checks.
++            stripped.push(index)?;
++            return Ok(());
++        }
++        if declared_prefix.as_ref() != "xml" && ns_value.as_ref() == XML_NAMESPACE {
++            self.namespace_error("only the 'xml' prefix may be bound to the XML namespace")?;
++        }
++        if ns_value.as_ref() == XMLNS_NAMESPACE {
++            self.namespace_error("the xmlns namespace must not be bound to any prefix")?;
++        }
++        self.ns
++            .bind(Some(self.storage.text(&attr.name)?), ns_value)?;
++        Ok(())
++    }
  
-                     // Cannot bind default namespace to the XML or xmlns namespace URIs.
+-                    // Cannot bind default namespace to the XML or xmlns namespace URIs.
 -                    if ns_value == XML_NAMESPACE {
-+                    if ns_value.as_ref() == XML_NAMESPACE {
-                         if self.options.recover {
-                             self.input.push_diagnostic(
-                                 ErrorSeverity::Error,
+-                        if self.options.recover {
+-                            self.input.push_diagnostic(
+-                                ErrorSeverity::Error,
 -                                "the xml namespace must not be declared as the default namespace"
 -                                    .to_string(),
 -                            );
-+                                "the xml namespace must not be declared as the default namespace",
-+                            )?;
-                         } else {
-                             return Err(self.input.fatal(
-                                 "the xml namespace must not be declared as the default namespace",
-                             ));
-                         }
-                     }
+-                        } else {
+-                            return Err(self.input.fatal(
+-                                "the xml namespace must not be declared as the default namespace",
+-                            ));
+-                        }
+-                    }
 -                    if ns_value == XMLNS_NAMESPACE {
-+                    if ns_value.as_ref() == XMLNS_NAMESPACE {
-                         if self.options.recover {
-                             self.input.push_diagnostic(
-                                 ErrorSeverity::Error,
+-                        if self.options.recover {
+-                            self.input.push_diagnostic(
+-                                ErrorSeverity::Error,
 -                                "the xmlns namespace must not be declared as the default namespace"
 -                                    .to_string(),
 -                            );
-+                                "the xmlns namespace must not be declared as the default namespace",
-+                            )?;
-                         } else {
-                             return Err(self.input.fatal(
-                                 "the xmlns namespace must not be declared as the default namespace",
-                             ));
-                         }
-                     }
+-                        } else {
+-                            return Err(self.input.fatal(
+-                                "the xmlns namespace must not be declared as the default namespace",
+-                            ));
+-                        }
+-                    }
 -                    self.ns.bind(None, ns_value);
-+                    self.ns.bind(None, ns_value)?;
-                 } else if attr.prefix.is_some() && attr.name.contains(':') {
-                     // Validate QName syntax for prefixed non-namespace attributes.
-                     let msg = "QName contains multiple colons";
-                     if self.options.recover {
+-                } else if attr.prefix.is_some() && attr.name.contains(':') {
+-                    // Validate QName syntax for prefixed non-namespace attributes.
+-                    let msg = "QName contains multiple colons";
+-                    if self.options.recover {
 -                        self.input
 -                            .push_diagnostic(ErrorSeverity::Error, msg.to_string());
-+                        self.input.push_diagnostic(ErrorSeverity::Error, msg)?;
-                     } else {
-                         return Err(self.input.fatal(msg));
-                     }
-@@ -717,12 +788,11 @@
+-                    } else {
+-                        return Err(self.input.fatal(msg));
+-                    }
+-                }
+-            }
++    fn bind_default_declaration(
++        &mut self,
++        name: &str,
++        attr: &Attribute<S>,
++    ) -> Result<(), ParseError<S>> {
++        let ns_value = if self.attr_types.len() == 0 {
++            self.storage.text(&attr.value)?
          } else {
-             // No namespace declarations — only validate QName syntax for
-             // prefixed attributes (checking for multiple colons).
+-            // No namespace declarations — only validate QName syntax for
+-            // prefixed attributes (checking for multiple colons).
 -            for attr in &attributes {
-+            for attr in &*attributes {
-                 if attr.prefix.is_some() && attr.name.contains(':') {
-                     let msg = "QName contains multiple colons";
-                     if self.options.recover {
+-                if attr.prefix.is_some() && attr.name.contains(':') {
+-                    let msg = "QName contains multiple colons";
+-                    if self.options.recover {
 -                        self.input
 -                            .push_diagnostic(ErrorSeverity::Error, msg.to_string());
-+                        self.input.push_diagnostic(ErrorSeverity::Error, msg)?;
-                     } else {
-                         return Err(self.input.fatal(msg));
-                     }
-@@ -731,21 +801,22 @@
+-                    } else {
+-                        return Err(self.input.fatal(msg));
+-                    }
+-                }
++            self.normalize_attr_value_by_type(name, "xmlns", &attr.value)?
++        };
++        if ns_value.as_ref() == XML_NAMESPACE {
++            self.namespace_error(
++                "the xml namespace must not be declared as the default namespace",
++            )?;
++        }
++        if ns_value.as_ref() == XMLNS_NAMESPACE {
++            self.namespace_error(
++                "the xmlns namespace must not be declared as the default namespace",
++            )?;
++        }
++        self.ns.bind(None, ns_value)?;
++        Ok(())
++    }
++
++    fn bind_attribute_declarations(
++        &mut self,
++        name: &str,
++        attributes: &[Attribute<S>],
++        has_ns_decls: bool,
++        stripped: &mut S::Values<usize>,
++    ) -> Result<(), ParseError<S>> {
++        for (index, attr) in attributes.iter().enumerate() {
++            if has_ns_decls && attr.prefix.as_deref() == Some("xmlns") {
++                self.bind_prefixed_declaration(name, attr, index, stripped)?;
++            } else if has_ns_decls && attr.prefix.is_none() && attr.name.as_ref() == "xmlns" {
++                self.bind_default_declaration(name, attr)?;
++            } else if attr.prefix.is_some() && attr.name.contains(':') {
++                self.namespace_error("QName contains multiple colons")?;
+             }
          }
++        Ok(())
++    }
  
-         // Resolve the element's namespace URI from its prefix.
+-        // Resolve the element's namespace URI from its prefix.
 -        let elem_ns = self.ns.resolve(prefix).map(String::from);
-+        let elem_ns = self.storage.optional_text(self.ns.resolve(prefix)?)?;
++    fn parse_element_start(
++        &mut self,
++        parent: NodeId,
++    ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
++        self.input.increment_depth()?;
++        self.input.expect_byte(b'<')?;
++        let name = self.input.parse_name()?;
++        let mut attributes = self.storage.values(0)?;
  
-         // Check for unbound element prefix.
+-        // Check for unbound element prefix.
 -        if let Some(pfx) = prefix {
 -            if pfx != "xml" && elem_ns.is_none() {
 -                if self.options.recover {
@@ -4773,6 +5037,119 @@
 -                        .input
 -                        .fatal(format!("unbound namespace prefix '{pfx}'")));
 -                }
++        // Parse attributes
++        loop {
++            let had_ws = self.input.skip_whitespace()?;
++            if self.input.peek() == Some(b'>') || self.input.looking_at(b"/>") {
++                break;
++            }
++            if !had_ws {
++                return Err(self.input.fatal("whitespace required between attributes"));
+             }
++            let attr = self.parse_attribute()?;
++            attributes.push(attr)?;
+         }
+ 
+-        // Resolve namespace URIs for non-xmlns prefixed attributes.
+-        // Unprefixed attributes do NOT inherit the default namespace (per spec).
+-        // Skip entirely when there are no prefixed non-xmlns attributes.
+-        let has_prefixed_attrs = !attributes.is_empty()
+-            && attributes
+-                .iter()
+-                .any(|a| a.prefix.is_some() && a.prefix.as_deref() != Some("xmlns"));
+-        if has_prefixed_attrs {
+-            for attr in &mut attributes {
+-                if let Some(pfx) = &attr.prefix {
+-                    if pfx == "xmlns" {
+-                        continue; // namespace declaration, not a real attribute prefix
+-                    }
+-                    let resolved = self.ns.resolve(Some(pfx.as_str())).map(String::from);
+-                    if pfx != "xml" && resolved.is_none() {
+-                        if self.options.recover {
+-                            self.input.push_diagnostic(
+-                                ErrorSeverity::Error,
+-                                format!("unbound namespace prefix '{pfx}' on attribute"),
+-                            );
+-                        } else {
+-                            return Err(self
+-                                .input
+-                                .fatal(format!("unbound namespace prefix '{pfx}' on attribute")));
+-                        }
+-                    }
+-                    attr.namespace = resolved;
+-                }
+-            }
++        self.check_attribute_spellings(&attributes)?;
++        self.apply_attribute_defaults(name, &mut attributes)?;
++
++        // --- Namespace processing (Namespaces in XML 1.0 section 3) ---
++
++        // Check for namespace declarations to skip namespace scope push/pop
++        // when not needed. Skip the scan entirely when there are no attributes.
++        let has_ns_decls = !attributes.is_empty()
++            && attributes.iter().any(|a| {
++                a.prefix.as_deref() == Some("xmlns")
++                    || (a.prefix.is_none() && a.name.as_ref() == "xmlns")
++            });
++        if has_ns_decls {
++            self.ns.push_scope()?;
+         }
+ 
+-        // Namespace-aware attribute uniqueness: two attributes with the same
+-        // namespace URI and local name are duplicates, even if they use different
+-        // prefixes (Namespaces in XML 1.0 §6.3).
+-        // Only meaningful when there are 2+ namespaced (non-xmlns) attributes.
+-        // Skip entirely when no prefixed attributes exist (no namespaces were
+-        // resolved, so ns_attr_count is guaranteed to be 0).
+-        if has_prefixed_attrs {
+-            let ns_attr_count = attributes.iter().filter(|a| a.namespace.is_some()).count();
+-            if ns_attr_count >= 2 {
+-                // O(n²) comparison avoids HashSet allocation
+-                'ns_outer: for i in 1..attributes.len() {
+-                    if attributes[i].namespace.is_none() {
+-                        continue;
+-                    }
+-                    for j in 0..i {
+-                        if attributes[j].namespace.is_none() {
+-                            continue;
+-                        }
+-                        if attributes[i].namespace == attributes[j].namespace
+-                            && attributes[i].name == attributes[j].name
+-                        {
+-                            let display = if let Some(ns) = &attributes[i].namespace {
+-                                format!("{{{}}}:{}", ns, attributes[i].name)
+-                            } else {
+-                                attributes[i].name.clone()
+-                            };
+-                            if self.options.recover {
+-                                self.input.push_diagnostic(
+-                                    ErrorSeverity::Error,
+-                                    format!("namespace-aware duplicate attribute: '{display}'"),
+-                                );
+-                            } else {
+-                                return Err(self.input.fatal(format!(
+-                                    "namespace-aware duplicate attribute: '{display}'"
+-                                )));
+-                            }
+-                            break 'ns_outer;
+-                        }
+-                    }
+-                }
++        // Split into prefix and local name for namespace processing.
++        let (prefix, local_name) = split_name(name);
++
++        self.check_element_qname(prefix, local_name)?;
++
++        // Scan attributes for namespace declarations and bind them,
++        // with validation of namespace constraints.
++        // In recovery mode, some invalid attributes may be stripped.
++        let mut strip_attr_indices = self.storage.values(0)?;
++        self.bind_attribute_declarations(name, &attributes, has_ns_decls, &mut strip_attr_indices)?;
++
++        // Resolve the element's namespace URI from its prefix.
++        let elem_ns = self.storage.optional_text(self.ns.resolve(prefix)?)?;
++
++        // Check for unbound element prefix.
 +        if let Some(pfx) = prefix
 +            && pfx != "xml"
 +            && elem_ns.is_none()
@@ -4789,82 +5166,11 @@
              }
          }
  
-@@ -757,22 +828,24 @@
-                 .iter()
-                 .any(|a| a.prefix.is_some() && a.prefix.as_deref() != Some("xmlns"));
-         if has_prefixed_attrs {
--            for attr in &mut attributes {
-+            for attr in &mut *attributes {
-                 if let Some(pfx) = &attr.prefix {
--                    if pfx == "xmlns" {
-+                    if pfx.as_ref() == "xmlns" {
-                         continue; // namespace declaration, not a real attribute prefix
-                     }
--                    let resolved = self.ns.resolve(Some(pfx.as_str())).map(String::from);
--                    if pfx != "xml" && resolved.is_none() {
-+                    let resolved = self
-+                        .storage
-+                        .optional_text(self.ns.resolve(Some(pfx.as_ref()))?)?;
-+                    if pfx.as_ref() != "xml" && resolved.is_none() {
-                         if self.options.recover {
-                             self.input.push_diagnostic(
-                                 ErrorSeverity::Error,
--                                format!("unbound namespace prefix '{pfx}' on attribute"),
--                            );
-+                                format_args!("unbound namespace prefix '{pfx}' on attribute"),
-+                            )?;
-                         } else {
--                            return Err(self
--                                .input
--                                .fatal(format!("unbound namespace prefix '{pfx}' on attribute")));
-+                            return Err(self.input.fatal(format_args!(
-+                                "unbound namespace prefix '{pfx}' on attribute"
-+                            )));
-                         }
-                     }
-                     attr.namespace = resolved;
-@@ -795,25 +868,29 @@
-                         continue;
-                     }
-                     for j in 0..i {
-+                        admit_attribute_comparison(self.storage, &attributes[i], &attributes[j])?;
-                         if attributes[j].namespace.is_none() {
-                             continue;
-                         }
--                        if attributes[i].namespace == attributes[j].namespace
--                            && attributes[i].name == attributes[j].name
-+                        if attributes[i].namespace.as_deref() == attributes[j].namespace.as_deref()
-+                            && attributes[i].name.as_ref() == attributes[j].name.as_ref()
-                         {
--                            let display = if let Some(ns) = &attributes[i].namespace {
--                                format!("{{{}}}:{}", ns, attributes[i].name)
--                            } else {
--                                attributes[i].name.clone()
--                            };
-+                            let ns = attributes[i]
-+                                .namespace
-+                                .as_deref()
-+                                .expect("namespace checked above");
-                             if self.options.recover {
-                                 self.input.push_diagnostic(
-                                     ErrorSeverity::Error,
--                                    format!("namespace-aware duplicate attribute: '{display}'"),
--                                );
-+                                    format_args!(
-+                                        "namespace-aware duplicate attribute: '{{{ns}}}:{}'",
-+                                        attributes[i].name
-+                                    ),
-+                                )?;
-                             } else {
--                                return Err(self.input.fatal(format!(
--                                    "namespace-aware duplicate attribute: '{display}'"
-+                                return Err(self.input.fatal(format_args!(
-+                                    "namespace-aware duplicate attribute: '{{{ns}}}:{}'",
-+                                    attributes[i].name
-                                 )));
-                             }
-                             break 'ns_outer;
-@@ -827,88 +904,86 @@
++        if self.resolve_attribute_namespaces(&mut attributes)? {
++            self.check_expanded_attributes(&attributes)?;
++        }
++
+         // Remove stripped attributes (e.g., invalid xmlns:xml rebindings).
          if !strip_attr_indices.is_empty() {
              // Remove in reverse order to preserve indices.
              for &idx in strip_attr_indices.iter().rev() {
@@ -4986,7 +5292,7 @@
      }
  
      /// Normalizes an attribute value based on its DTD-declared type.
-@@ -921,65 +996,31 @@
+@@ -921,65 +920,30 @@
          element_name: &str,
          attr_name: &str,
          value: &str,
@@ -5052,7 +5358,7 @@
      // --- Character Data ---
      // See XML 1.0 §2.4: [14] CharData
  
-     #[allow(clippy::too_many_lines)]
+-    #[allow(clippy::too_many_lines)]
 -    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError> {
 -        let mut text = String::new();
 +    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
@@ -5066,7 +5372,7 @@
              if safe_len > 0 {
                  let start = self.input.pos();
                  let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
-@@ -987,39 +1028,27 @@
+@@ -987,39 +951,27 @@
                  // Fast byte-level pre-check for invalid XML chars (0x7F,
                  // U+FFFE, U+FFFF). Skips the expensive char-by-char
                  // validation for the 99.9% of chunks that are clean.
@@ -5113,7 +5419,7 @@
                      }
                  }
                  continue;
-@@ -1034,10 +1063,10 @@
+@@ -1034,10 +986,10 @@
                  if self.options.recover {
                      self.input.push_diagnostic(
                          ErrorSeverity::Error,
@@ -5128,7 +5434,7 @@
                      continue;
                  }
                  return Err(self.input.fatal("']]>' not allowed in character data"));
-@@ -1049,15 +1078,13 @@
+@@ -1049,15 +1001,13 @@
                  // node is created and the entity's replacement text is parsed
                  // as content, attached as children of the EntityRef node.
                  // Skip the peek for builtins at byte level to avoid String allocation.
@@ -5149,7 +5455,7 @@
                          self.doc.append_child(parent, text_id);
                      }
                      self.parse_entity_ref_in_content(parent)?;
-@@ -1066,16 +1093,20 @@
+@@ -1066,16 +1016,20 @@
                  self.input.parse_reference_into(&mut text)?;
              } else {
                  let ch = self.input.next_char()?;
@@ -5174,7 +5480,7 @@
              self.doc.append_child(parent, text_id);
          }
  
-@@ -1089,9 +1120,9 @@
+@@ -1089,9 +1043,9 @@
      /// replacement text (XML 1.0 §4.5: character references expanded at
      /// declaration time) as content, attaching the resulting nodes as
      /// children of the `EntityRef` node.
@@ -5186,7 +5492,7 @@
          let name = self.input.parse_name()?;
          self.input.expect_byte(b';')?;
  
-@@ -1099,50 +1130,70 @@
+@@ -1099,50 +1053,70 @@
          self.input.count_entity_expansion()?;
  
          // Resolve the replacement text (XML 1.0 §4.5).
@@ -5295,31 +5601,35 @@
          self.doc.append_child(parent, ref_id);
  
          let Some(replacement) = replacement else {
-@@ -1160,17 +1211,15 @@
+@@ -1160,18 +1134,16 @@
                  .fatal("maximum entity amplification factor exceeded"));
          }
  
 -        if !replacement.contains('<') && !replacement.contains('&') {
-+        self.storage.charge(replacement.len())?;
-+        if !replacement.bytes().any(|byte| byte == b'<' || byte == b'&') {
-             // Fast path: plain character data — no markup, no references.
+-            // Fast path: plain character data — no markup, no references.
 -            let content = if replacement.contains('\r') {
 -                normalize_line_ends(&replacement)
 -            } else {
 -                replacement
 -            };
 -            let text_id = self.doc.create_node(NodeKind::Text { content });
-+            let mut content = self.storage.text("")?;
-+            super::input::append_normalized_line_ends(self.storage, &mut content, &replacement)?;
-+            let text_id = self.doc.try_create_node(NodeKind::Text { content })?;
-             self.doc.append_child(ref_id, text_id);
-         } else {
+-            self.doc.append_child(ref_id, text_id);
+-        } else {
 -            self.parse_replacement_as_content(&name, &replacement, ref_id)?;
++        self.storage.charge(replacement.len())?;
++        if replacement.bytes().any(|byte| byte == b'<' || byte == b'&') {
 +            self.parse_replacement_as_content(name, &replacement, ref_id)?;
++            return Ok(());
          }
++        // Fast path: plain character data, without markup or references.
++        let mut content = self.storage.text("")?;
++        super::input::append_normalized_line_ends(self.storage, &mut content, &replacement)?;
++        let text_id = self.doc.try_create_node(NodeKind::Text { content })?;
++        self.doc.append_child(ref_id, text_id);
          Ok(())
      }
-@@ -1187,14 +1236,15 @@
+ 
+@@ -1187,14 +1159,15 @@
          entity_name: &str,
          replacement: &str,
          ref_id: NodeId,
@@ -5338,7 +5648,7 @@
          sub.entity_depth = self.entity_depth + 1;
          sub.input_size = self.input_size;
          sub.expansion_size = self.expansion_size;
-@@ -1204,51 +1254,51 @@
+@@ -1204,51 +1177,50 @@
          // enough to overflow the stack).
          sub.input.set_depth(self.input.depth());
          // Move shared state into the sub-parser (returned below).
@@ -5392,9 +5702,9 @@
 -            return Err(self.input.fatal(format!(
 +            return Err(self.input.fatal(format_args!(
                  "entity '{entity_name}' replacement text is not well-formed \
-                  XML content: {}",
+-                 XML content: {}",
 -                e.message
-+                message
++                 XML content: {message}"
              )));
          }
  
@@ -5408,7 +5718,7 @@
          Ok(())
      }
  
-@@ -1258,7 +1308,7 @@
+@@ -1258,7 +1230,7 @@
      /// Unlike [`parse_content`](Self::parse_content), end of input is the
      /// normal termination and an end tag (`</`) is an error (it would close
      /// an element opened outside the entity — WFC violation).
@@ -5417,7 +5727,7 @@
          while !self.input.at_end() {
              if self.input.looking_at(b"</") {
                  return Err(self.input.fatal("unbalanced end tag"));
-@@ -1278,20 +1328,9 @@
+@@ -1278,20 +1250,9 @@
          Ok(())
      }
  
@@ -5439,7 +5749,7 @@
      #[inline]
      fn is_looking_at_builtin_entity_ref(&self) -> bool {
          let remaining = self.input.remaining();
-@@ -1306,58 +1345,29 @@
+@@ -1306,58 +1267,29 @@
              || after_amp.starts_with(b"quot;")
      }
  
@@ -5510,7 +5820,7 @@
                      }
                      i = j + 1;
                  } else {
-@@ -1367,17 +1377,17 @@
+@@ -1367,17 +1299,17 @@
                  i += 1;
              }
          }
@@ -5532,7 +5842,7 @@
  
          // Capture raw attribute value text (before entity expansion) so we
          // can preserve entity references during serialization.
-@@ -1390,13 +1400,20 @@
+@@ -1390,13 +1322,20 @@
          // contain no '&' (most attributes have no entity references).
          let raw_value = if raw_end > raw_start + 2 {
              let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
@@ -5555,7 +5865,7 @@
              } else {
                  None
              }
-@@ -1404,12 +1421,12 @@
+@@ -1404,12 +1343,12 @@
              None
          };
  
@@ -5571,7 +5881,7 @@
              namespace: None,
              raw_value,
          })
-@@ -1418,9 +1435,11 @@
+@@ -1418,9 +1357,11 @@
      // --- Comments ---
      // See XML 1.0 §2.5: [15] Comment
  
@@ -5585,7 +5895,7 @@
          self.doc.append_child(parent, comment_id);
          Ok(())
      }
-@@ -1428,9 +1447,11 @@
+@@ -1428,9 +1369,11 @@
      // --- CDATA Sections ---
      // See XML 1.0 §2.7: [18] CDSect
  
@@ -5599,7 +5909,7 @@
          self.doc.append_child(parent, cdata_id);
          Ok(())
      }
-@@ -1438,43 +1459,27 @@
+@@ -1438,43 +1381,27 @@
      // --- Processing Instructions ---
      // See XML 1.0 §2.6: [16] PI
  
@@ -5652,7 +5962,7 @@
      }
      s
  }
-@@ -1488,14 +1493,122 @@
+@@ -1488,14 +1415,122 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -5744,9 +6054,9 @@
 +    fn returning_document_does_not_allocate_a_replacement_arena() {
 +        // Returning the completed tree must move its arena rather than create
 +        // a second 64-node document only to discard that replacement parser.
-+        let before = crate::parser_xmloxide::tree::ARENA_CONSTRUCTIONS.with(|count| count.get());
++        let before = crate::parser_xmloxide::tree::ARENA_CONSTRUCTIONS.with(std::cell::Cell::get);
 +        let document = parse("<root/>");
-+        let after = crate::parser_xmloxide::tree::ARENA_CONSTRUCTIONS.with(|count| count.get());
++        let after = crate::parser_xmloxide::tree::ARENA_CONSTRUCTIONS.with(std::cell::Cell::get);
 +        assert_eq!(after - before, 1);
 +        assert_eq!(
 +            document.node_name(document.root_element().unwrap()),
@@ -5777,7 +6087,7 @@
      fn test_parse_empty_element() {
          let doc = parse("<root/>");
          let root = doc.root_element().unwrap();
-@@ -1660,7 +1773,7 @@
+@@ -1660,7 +1695,7 @@
      fn test_roundtrip_simple() {
          let input = "<root><child>text</child></root>";
          let doc = parse(input);
@@ -5786,7 +6096,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1668,7 +1781,7 @@
+@@ -1668,7 +1703,7 @@
      fn test_roundtrip_attributes() {
          let input = "<root attr=\"value\"><child id=\"1\"/></root>";
          let doc = parse(input);
@@ -5795,7 +6105,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1676,7 +1789,7 @@
+@@ -1676,7 +1711,7 @@
      fn test_roundtrip_entities() {
          let input = "<root>&amp; &lt; &gt;</root>";
          let doc = parse(input);
@@ -5804,7 +6114,7 @@
          // After parsing, entities are resolved to characters.
          // Serialization re-escapes them.
          assert_eq!(output, format!("{DECL}<root>&amp; &lt; &gt;</root>\n"));
-@@ -1686,7 +1799,7 @@
+@@ -1686,7 +1721,7 @@
      fn test_roundtrip_comment() {
          let input = "<root><!-- comment --></root>";
          let doc = parse(input);
@@ -5813,7 +6123,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1694,7 +1807,7 @@
+@@ -1694,7 +1729,7 @@
      fn test_roundtrip_cdata() {
          let input = "<root><![CDATA[data & stuff]]></root>";
          let doc = parse(input);
@@ -5822,7 +6132,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1702,7 +1815,7 @@
+@@ -1702,7 +1737,7 @@
      fn test_roundtrip_pi() {
          let input = "<?target data?><root/>";
          let doc = parse(input);
@@ -5831,7 +6141,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1710,7 +1823,7 @@
+@@ -1710,7 +1745,7 @@
      fn test_roundtrip_xml_declaration() {
          let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
          let doc = parse(input);
@@ -5840,7 +6150,7 @@
          assert_eq!(
              output,
              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root/>\n"
-@@ -1898,13 +2011,13 @@
+@@ -1898,13 +1933,13 @@
          // Simple DOCTYPE (no whitespace between DOCTYPE and root in input)
          let input = "<!DOCTYPE html><html/>";
          let doc = parse(input);
@@ -5856,7 +6166,7 @@
          assert_eq!(
              output,
              format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\"><root/>\n")
-@@ -1914,7 +2027,7 @@
+@@ -1914,7 +1949,7 @@
          let input = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
                        \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>";
          let doc = parse(input);
@@ -5865,7 +6175,7 @@
          assert_eq!(
              output,
              format!(
-@@ -2061,7 +2174,7 @@
+@@ -2061,7 +2096,7 @@
          let element = doc.first_child(entity_ref).unwrap();
          assert_eq!(doc.node_name(element), Some("b"));
          // Serialization re-emits the entity reference, preserving roundtrip.
@@ -5874,7 +6184,7 @@
          assert!(
              out.contains("<d>&e;</d>"),
              "unexpected serialization: {out}"
-@@ -2069,6 +2182,20 @@
+@@ -2069,6 +2104,20 @@
      }
  
      #[test]
@@ -5895,7 +6205,7 @@
      fn test_parse_entity_charref_markup() {
          // "&#60;b>hi&#60;/b>" expands to "<b>hi</b>" at declaration time
          // (§4.5) and must be parsed as markup at reference time.
-@@ -2086,7 +2213,7 @@
+@@ -2086,7 +2135,7 @@
          // inside the entity expansion.
          let input = "<!DOCTYPE d [<!ENTITY e \"<b>hi</b>\">]><d>&e;</d>";
          let doc = parse(input);
@@ -5904,7 +6214,7 @@
          let doc2 = parse(&out);
          let root2 = doc2.root_element().unwrap();
          assert_eq!(doc2.text_content(root2), "hi");
-@@ -2144,9 +2271,9 @@
+@@ -2144,9 +2193,9 @@
              panic!("expected depth-limited parse to fail");
          };
          assert!(
@@ -5916,7 +6226,7 @@
          );
      }
  
-@@ -2169,9 +2296,10 @@
+@@ -2169,9 +2218,10 @@
              panic!("expected amplification attack to be rejected");
          };
          assert!(
@@ -6083,7 +6393,27 @@
  use std::num::NonZeroU32;
  
  /// A typed index into the document's node arena.
-@@ -72,10 +73,10 @@
+@@ -36,11 +37,16 @@
+     ///
+     /// # Panics
+     ///
+-    /// Panics if `index` is 0.
+-    #[allow(clippy::expect_used, clippy::cast_possible_truncation)]
++    /// Panics if `index` is 0 or exceeds the checked arena's `u32` range.
+     #[inline]
+     fn from_index(index: usize) -> Self {
+-        Self(NonZeroU32::new(index as u32).expect("NodeId index must be non-zero"))
++        let Ok(index) = u32::try_from(index) else {
++            panic!("node index fits the checked arena limit");
++        };
++        let Some(index) = NonZeroU32::new(index) else {
++            panic!("NodeId index must be non-zero");
++        };
++        Self(index)
+     }
+ 
+     /// Returns the raw index as a `usize` for indexing into the arena.
+@@ -72,10 +78,10 @@
  /// Each node stores its kind (element, text, comment, etc.) and links to
  /// parent, children, and siblings for tree navigation. Access individual
  /// nodes via [`Document::node`].
@@ -6097,7 +6427,7 @@
      /// Parent node, if any. The document root node has no parent.
      pub parent: Option<NodeId>,
      /// First child node.
-@@ -88,8 +89,8 @@
+@@ -88,8 +94,8 @@
      pub prev_sibling: Option<NodeId>,
  }
  
@@ -6108,7 +6438,7 @@
          Self {
              kind,
              parent: None,
-@@ -101,21 +102,34 @@
+@@ -101,21 +107,34 @@
      }
  }
  
@@ -6149,7 +6479,7 @@
  }
  
  /// An XML document.
-@@ -126,33 +140,53 @@
+@@ -126,33 +145,53 @@
  ///
  /// # Examples
  ///
@@ -6199,7 +6529,7 @@
 +            .field("encoding", &self.encoding)
 +            .field("standalone", &self.standalone)
 +            .field("diagnostics", &&self.diagnostics[..])
-+            .finish()
++            .finish_non_exhaustive()
 +    }
 +}
 +
@@ -6211,7 +6541,7 @@
  }
  
  impl Document {
-@@ -167,21 +201,7 @@
+@@ -167,21 +206,7 @@
      /// Creates a new empty document with pre-allocated capacity for `n` nodes.
      #[must_use]
      pub fn with_capacity(n: usize) -> Self {
@@ -6234,7 +6564,7 @@
      }
  
      /// Parses an XML string into a `Document`.
-@@ -192,7 +212,7 @@
+@@ -192,7 +217,7 @@
      ///
      /// # Examples
      ///
@@ -6243,7 +6573,7 @@
      /// use xmloxide::Document;
      ///
      /// let doc = Document::parse_str("<root><child/></root>").unwrap();
-@@ -208,9 +228,9 @@
+@@ -208,9 +233,9 @@
              let enc_lower = enc.to_ascii_lowercase();
              if had_bom && enc_lower != "utf-8" {
                  // UTF-8 BOM present but encoding is not UTF-8.
@@ -6255,7 +6585,7 @@
                      diagnostics: Vec::new(),
                  });
              }
-@@ -222,11 +242,11 @@
+@@ -222,11 +247,11 @@
                  || enc_lower.starts_with("ucs")
                  || enc_lower == "ebcdic";
              if incompatible {
@@ -6269,7 +6599,7 @@
                      diagnostics: Vec::new(),
                  });
              }
-@@ -237,15 +257,15 @@
+@@ -237,15 +262,15 @@
                  && enc_lower != "ascii"
                  && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
              {
@@ -6288,7 +6618,7 @@
      }
  
      /// Extracts the encoding value from an XML declaration, if present.
-@@ -275,7 +295,7 @@
+@@ -275,7 +300,7 @@
      ///
      /// Uses BOM sniffing and XML declaration inspection to determine the
      /// encoding, then transcodes to UTF-8 before parsing. See
@@ -6297,7 +6627,7 @@
      ///
      /// # Errors
      ///
-@@ -284,7 +304,7 @@
+@@ -284,7 +309,7 @@
      ///
      /// # Examples
      ///
@@ -6306,7 +6636,7 @@
      /// use xmloxide::Document;
      ///
      /// let doc = Document::parse_bytes(b"<root/>").unwrap();
-@@ -292,10 +312,10 @@
+@@ -292,10 +317,10 @@
      /// assert_eq!(doc.node_name(root), Some("root"));
      /// ```
      pub fn parse_bytes(input: &[u8]) -> Result<Self, ParseError> {
@@ -6320,7 +6650,7 @@
              message: e.message,
              location: SourceLocation::default(),
              diagnostics: Vec::new(),
-@@ -304,7 +324,7 @@
+@@ -304,7 +329,7 @@
          // Skip BOM and encoding checks — decode_to_utf8 already handled
          // encoding detection and transcoding. Go directly to the parser.
          let text = utf8.strip_prefix('\u{FEFF}').unwrap_or(&utf8);
@@ -6329,7 +6659,7 @@
      }
  
      /// Parses an XML file from the filesystem.
-@@ -319,21 +339,45 @@
+@@ -319,21 +344,45 @@
      ///
      /// # Examples
      ///
@@ -6378,7 +6708,7 @@
  
      /// Returns the document root `NodeId`.
      ///
-@@ -365,13 +409,13 @@
+@@ -365,13 +414,13 @@
      /// Panics if `id` does not refer to a valid node in this document.
      #[must_use]
      #[inline]
@@ -6394,7 +6724,7 @@
          &mut self.nodes[id.as_index()]
      }
  
-@@ -438,7 +482,9 @@
+@@ -438,7 +487,9 @@
              _ => None,
          }
      }
@@ -6404,7 +6734,7 @@
      /// Returns the concatenated text content of a node and all its descendants.
      ///
      /// Recursively collects text from all descendant text and CDATA nodes.
-@@ -476,14 +522,16 @@
+@@ -476,14 +527,16 @@
              }
          }
      }
@@ -6422,7 +6752,7 @@
          match &self.node(id).kind {
              NodeKind::Element { attributes, .. } => attributes,
              _ => &[],
-@@ -499,10 +547,12 @@
+@@ -499,10 +552,12 @@
      pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
          self.attributes(id)
              .iter()
@@ -6437,7 +6767,7 @@
      // --- ID lookup ---
  
      /// Associates an ID value with an element node.
-@@ -511,7 +561,7 @@
+@@ -511,7 +566,7 @@
      /// Subsequent calls to [`element_by_id`](Document::element_by_id) will
      /// return the associated node.
      pub fn set_id(&mut self, id: &str, node: NodeId) {
@@ -6446,7 +6776,7 @@
      }
  
      /// Looks up an element by its ID attribute value.
-@@ -523,6 +573,36 @@
+@@ -523,6 +578,36 @@
      pub fn element_by_id(&self, id: &str) -> Option<NodeId> {
          self.id_map.get(id).copied()
      }
@@ -6483,7 +6813,7 @@
  
      // --- Navigation ---
  
-@@ -566,7 +646,7 @@
+@@ -566,7 +651,7 @@
      /// Yields each child `NodeId` in document order (first child to last).
      /// For a depth-first traversal that includes nested descendants, use
      /// [`descendants`](Self::descendants).
@@ -6492,7 +6822,7 @@
          Children {
              doc: self,
              next: self.node(id).first_child,
-@@ -578,7 +658,7 @@
+@@ -578,7 +663,7 @@
      ///
      /// The first item yielded is `id` itself, followed by its parent, then
      /// grandparent, and so on up to the document root node.
@@ -6501,7 +6831,7 @@
          Ancestors {
              doc: self,
              next: Some(id),
-@@ -591,14 +671,16 @@
+@@ -591,14 +676,16 @@
      /// Does *not* yield `id` itself — only its children, grandchildren, etc.
      /// For iterating only the direct children, use
      /// [`children`](Self::children).
@@ -6519,7 +6849,7 @@
      // --- Mutation ---
  
      /// Allocates a new node in the arena and returns its `NodeId`.
-@@ -608,9 +690,69 @@
+@@ -608,9 +695,69 @@
      /// [`prepend_child`](Self::prepend_child), or
      /// [`insert_before`](Self::insert_before) to attach it to the tree.
      pub fn create_node(&mut self, kind: NodeKind) -> NodeId {
@@ -6591,7 +6921,7 @@
      }
  
      /// Appends a child node to the end of a parent's child list.
-@@ -723,7 +865,9 @@
+@@ -723,7 +870,9 @@
          self.node_mut(id).prev_sibling = None;
          self.node_mut(id).next_sibling = None;
      }
@@ -6601,7 +6931,7 @@
      /// Deep-copies a node and all its descendants within this document.
      ///
      /// The cloned subtree is detached (has no parent). If `deep` is `false`,
-@@ -731,7 +875,7 @@
+@@ -731,7 +880,7 @@
      ///
      /// # Examples
      ///
@@ -6610,7 +6940,7 @@
      /// use xmloxide::Document;
      ///
      /// let mut doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
-@@ -764,7 +908,7 @@
+@@ -764,7 +913,7 @@
      ///
      /// # Examples
      ///
@@ -6619,7 +6949,7 @@
      /// use xmloxide::Document;
      ///
      /// let mut doc = Document::parse_str("<root>old</root>").unwrap();
-@@ -777,15 +921,9 @@
+@@ -777,15 +926,9 @@
          match &self.node(id).kind {
              NodeKind::Text { .. } | NodeKind::CData { .. } | NodeKind::Comment { .. } => {
                  match &mut self.node_mut(id).kind {
@@ -6638,7 +6968,7 @@
                          *c = content.to_string();
                      }
                      _ => unreachable!(),
-@@ -944,7 +1082,9 @@
+@@ -944,7 +1087,9 @@
              false
          }
      }
@@ -6648,7 +6978,7 @@
      /// Returns the total number of nodes in the document.
      ///
      /// This includes all node types (elements, text, comments, etc.) but
-@@ -968,12 +1108,12 @@
+@@ -968,12 +1113,12 @@
  ///
  /// Created by [`Document::children`]. Yields each child's `NodeId` in
  /// document order by following `next_sibling` links.
@@ -6664,7 +6994,7 @@
      type Item = NodeId;
  
      #[inline]
-@@ -988,12 +1128,12 @@
+@@ -988,12 +1133,12 @@
  ///
  /// Created by [`Document::ancestors`]. The first item yielded is the starting
  /// node itself, followed by its parent, grandparent, etc.
@@ -6680,7 +7010,7 @@
      type Item = NodeId;
  
      #[inline]
-@@ -1008,13 +1148,13 @@
+@@ -1008,13 +1153,13 @@
  ///
  /// Created by [`Document::descendants`]. Yields every node in the subtree
  /// below the starting node, but does *not* yield the starting node itself.
@@ -6697,7 +7027,16 @@
      type Item = NodeId;
  
      #[inline]
-@@ -2033,7 +2173,12 @@
+@@ -1141,7 +1286,7 @@
+     fn test_children_iterator_empty() {
+         let doc = Document::new();
+         let children: Vec<NodeId> = doc.children(doc.root()).collect();
+-        assert!(children.is_empty());
++        assert_eq!(children.len(), 0);
+     }
+ 
+     #[test]
+@@ -2033,7 +2178,12 @@
      fn test_parse_file_nonexistent() {
          let result = Document::parse_file("/nonexistent/path.xml");
          assert!(result.is_err());
@@ -7384,9 +7723,8 @@
 +            content_model: self.content_model.copy_in(storage)?,
 +        })
 +    }
- }
- 
--impl fmt::Display for ContentModel {
++}
++
 +impl<S: Storage> AttributeDecl<S> {
 +    fn copy_in(&self, storage: S) -> Result<Self, crate::xml::dom::ParseError> {
 +        let attribute_type = match &self.attribute_type {
@@ -7434,8 +7772,9 @@
 +            },
 +        })
 +    }
-+}
-+
+ }
+ 
+-impl fmt::Display for ContentModel {
 +impl<S: Storage> NotationDecl<S> {
 +    fn copy_in(&self, storage: S) -> Result<Self, crate::xml::dom::ParseError> {
 +        Ok(Self {
@@ -7622,9 +7961,11 @@
  // ---------------------------------------------------------------------------
  // DTD Serializer
  // ---------------------------------------------------------------------------
-@@ -300,106 +587,111 @@
+@@ -298,108 +585,112 @@
+ /// Each declaration appears on its own line. The output does NOT include
+ /// the surrounding `[` and `]>` — the caller adds those.
  #[must_use]
- #[allow(clippy::too_many_lines)]
+-#[allow(clippy::too_many_lines)]
  pub fn serialize_dtd(dtd: &Dtd) -> String {
 -    let mut out = String::new();
 +    serialize_dtd_in(dtd, Native).expect("native DTD serialization allocation")
@@ -7786,7 +8127,7 @@
                  last_was_comment = false;
              }
          }
-@@ -407,79 +699,85 @@
+@@ -407,79 +698,85 @@
  
      // libxml2 adds a newline before ]> unless the last item was a comment.
      if !last_was_comment && !dtd.declarations.is_empty() {
@@ -7908,7 +8249,7 @@
  }
  
  /// Escapes an entity value for DTD serialization.
-@@ -488,7 +786,15 @@
+@@ -488,7 +785,15 @@
  /// the value are preserved as-is (matching libxml2 behavior). Only standalone
  /// `&` characters are escaped. The quote character is chosen to minimize
  /// escaping: single quotes when the value contains double quotes.
@@ -7925,7 +8266,7 @@
      // Choose quote character: use single quotes if value contains double quotes
      // but not single quotes (avoids escaping). Otherwise use double quotes.
      let quote = if value.contains('"') && !value.contains('\'') {
-@@ -496,7 +802,7 @@
+@@ -496,7 +801,7 @@
      } else {
          '"'
      };
@@ -7934,7 +8275,7 @@
  
      let bytes = value.as_bytes();
      let len = bytes.len();
-@@ -508,27 +814,27 @@
+@@ -508,27 +813,27 @@
              if let Some(ref_end) = find_reference_end(bytes, i) {
                  // Copy the reference as-is
                  let ref_str = std::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
@@ -7968,7 +8309,7 @@
                  i += c.len_utf8();
              } else {
                  i += 1;
-@@ -536,7 +842,8 @@
+@@ -536,7 +841,8 @@
          }
      }
  
@@ -7978,7 +8319,7 @@
  }
  
  /// Finds the end position (inclusive, the `;`) of an entity or character
-@@ -618,49 +925,64 @@
+@@ -618,49 +924,64 @@
  ///
  /// # Examples
  ///
@@ -8066,7 +8407,7 @@
              if self.at_end() {
                  break;
              }
-@@ -681,7 +1003,7 @@
+@@ -681,7 +1002,7 @@
                  // Parameter entity reference — skip it since we don't expand
                  self.skip_pe_reference()?;
              } else {
@@ -8075,7 +8416,7 @@
                      "unexpected character '{}' in DTD",
                      self.peek().map_or('?', |b| b as char)
                  )));
-@@ -690,7 +1012,7 @@
+@@ -690,7 +1011,7 @@
  
          self.post_validate()?;
  
@@ -8084,7 +8425,7 @@
      }
  
      /// Post-parse validation checks that require the complete entity map.
-@@ -698,21 +1020,21 @@
+@@ -698,21 +1019,21 @@
      /// Detects entity recursion (WFC: No Recursion), validates that entity
      /// references in attribute defaults refer to internal parsed entities,
      /// and checks for `<` in entity replacement text used in attributes.
@@ -8113,7 +8454,7 @@
              }
          }
  
-@@ -720,17 +1042,17 @@
+@@ -720,17 +1041,17 @@
          // PE values may contain encoded PE references via &#37; (which is '%').
          // After char ref expansion, if %name; appears in its own value, that's
          // direct or indirect recursion.
@@ -8138,7 +8479,7 @@
              }
          }
  
-@@ -738,9 +1060,9 @@
+@@ -738,9 +1059,9 @@
          // expansion (XML 1.0 §4.5). Character references in entity
          // values are expanded at declaration time. The resulting
          // replacement text must be well-formed when re-parsed.
@@ -8150,7 +8491,7 @@
              }
          }
  
-@@ -757,9 +1079,10 @@
+@@ -757,9 +1078,10 @@
          // Validate entity references in ATTLIST defaults. `checked`
          // memoizes entities already validated so shared references are
          // walked once (the reference graph is acyclic at this point).
@@ -8164,7 +8505,7 @@
                  let (AttributeDefault::Default(default_value)
                  | AttributeDefault::Fixed(default_value)) = &attr.default
                  else {
-@@ -778,7 +1101,7 @@
+@@ -778,7 +1100,7 @@
      /// Per XML 1.0 §4.6: "If the entities lt or amp are declared, they MUST
      /// be declared as internal entities whose replacement text is a character
      /// reference to the respective character."
@@ -8173,7 +8514,7 @@
          // Per XML 1.0 §4.6: lt and amp MUST use character references.
          // gt, apos, and quot may use either the literal character or a
          // character reference.
-@@ -790,13 +1113,16 @@
+@@ -790,13 +1112,16 @@
              ("quot", "\"", &["\"", "&#34;", "&#x22;"]),
          ];
          for &(name, _char_val, valid_refs) in expected {
@@ -8193,7 +8534,7 @@
                                  "predefined entity '{name}' must be declared as \
                                   a character reference (e.g., '{}')",
                                  valid_refs[0]
-@@ -804,7 +1130,7 @@
+@@ -804,7 +1129,7 @@
                          }
                      }
                      EntityKind::External { .. } => {
@@ -8202,7 +8543,7 @@
                              "predefined entity '{name}' must be an internal entity"
                          )));
                      }
-@@ -821,24 +1147,26 @@
+@@ -821,24 +1146,26 @@
      /// references), then checks the resulting replacement text for basic
      /// well-formedness: bare `&` characters from `&#38;` expansion that
      /// don't form valid references are rejected.
@@ -8232,7 +8573,7 @@
                          "entity '{entity_name}' replacement text contains \
                           bare '&' at end of text"
                      )));
-@@ -861,7 +1189,7 @@
+@@ -861,7 +1188,7 @@
                          i > start
                      };
                      if !has_digits || i >= bytes.len() || bytes[i] != b';' {
@@ -8241,7 +8582,7 @@
                              "entity '{entity_name}' replacement text contains \
                               incomplete character reference"
                          )));
-@@ -873,14 +1201,14 @@
+@@ -873,14 +1200,14 @@
                          i += 1;
                      }
                      if i >= bytes.len() {
@@ -8258,7 +8599,7 @@
                          "entity '{entity_name}' replacement text contains \
                           bare '&' not followed by a valid reference"
                      )));
-@@ -892,74 +1220,102 @@
+@@ -892,74 +1219,102 @@
          Ok(())
      }
  
@@ -8407,7 +8748,7 @@
          while i < bytes.len() {
              if bytes[i] == b'%' {
                  i += 1;
-@@ -969,62 +1325,73 @@
+@@ -969,62 +1324,73 @@
                          i += 1;
                      }
                      if i < bytes.len() && bytes[i] == b';' && i > start {
@@ -8500,7 +8841,7 @@
                      }
                  },
              }
-@@ -1036,65 +1403,34 @@
+@@ -1036,65 +1402,34 @@
      ///
      /// Returns an iterator over entity names found in `&name;` patterns,
      /// excluding character references (`&#...;`).
@@ -8574,7 +8915,7 @@
          if self.looking_at(b"EMPTY") {
              self.expect_str(b"EMPTY")?;
              return Ok(ContentModel::Empty);
-@@ -1106,32 +1442,32 @@
+@@ -1106,32 +1441,32 @@
  
          // Must be Mixed or Children, both start with '('
          self.expect_byte(b'(')?;
@@ -8616,7 +8957,7 @@
              }
  
              self.expect_byte(b')')?;
-@@ -1142,137 +1478,141 @@
+@@ -1142,137 +1477,141 @@
  
          // Element-only content: parse as a content spec group. The opening
          // '(' has already been consumed, so we are one level deep.
@@ -8860,7 +9201,7 @@
                  break;
              }
  
-@@ -1283,7 +1623,7 @@
+@@ -1283,7 +1622,7 @@
              let default = self.parse_attribute_default()?;
  
              let decl = AttributeDecl {
@@ -8869,7 +9210,7 @@
                  attribute_name,
                  attribute_type,
                  default,
-@@ -1291,22 +1631,44 @@
+@@ -1291,22 +1630,44 @@
  
              // Per XML 1.0 §3.3, the first attribute declaration is binding;
              // subsequent declarations for the same attribute are ignored.
@@ -8921,7 +9262,7 @@
          if self.looking_at(b"CDATA") {
              self.expect_str(b"CDATA")?;
              Ok(AttributeType::CData)
-@@ -1344,30 +1706,30 @@
+@@ -1344,30 +1705,30 @@
          }
      }
  
@@ -8961,68 +9302,138 @@
          if self.looking_at(b"#REQUIRED") {
              self.expect_str(b"#REQUIRED")?;
              Ok(AttributeDefault::Required)
-@@ -1391,18 +1753,20 @@
+@@ -1390,75 +1751,82 @@
+     // --- ENTITY declaration ---
      // See XML 1.0 §4.2: [70] EntityDecl
  
-     #[allow(clippy::too_many_lines)]
+-    #[allow(clippy::too_many_lines)]
 -    fn parse_entity_decl(&mut self) -> Result<(), ParseError> {
-+    fn parse_entity_decl(&mut self) -> Result<(), DtdError<S>> {
-         self.expect_str(b"<!ENTITY")?;
+-        self.expect_str(b"<!ENTITY")?;
++    fn parse_parameter_entity(&mut self) -> Result<(), DtdError<S>> {
++        self.advance(1)?;
          self.skip_whitespace_required()?;
- 
-         // Parameter entities (% name)
-         if self.peek() == Some(b'%') {
+-
+-        // Parameter entities (% name)
+-        if self.peek() == Some(b'%') {
 -            self.advance(1);
-+            self.advance(1)?;
++        let pe_name = self.parse_name()?;
++        if pe_name.contains(':') {
++            return Err(self.fatal(format_args!(
++                "entity name '{pe_name}' must not contain a colon"
++            )));
++        }
++        self.skip_whitespace_required()?;
++        let pe_kind = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
++            let value = self.parse_quoted_value()?;
++            self.validate_entity_value(&value, true)?;
++            Some(EntityKind::Internal(value))
++        } else if self.looking_at(b"SYSTEM") {
++            self.expect_str(b"SYSTEM")?;
              self.skip_whitespace_required()?;
-             let pe_name = self.parse_name()?;
-             // Namespaces in XML 1.0: entity names must be NCNames (no colons).
-             if pe_name.contains(':') {
+-            let pe_name = self.parse_name()?;
+-            // Namespaces in XML 1.0: entity names must be NCNames (no colons).
+-            if pe_name.contains(':') {
 -                return Err(self.fatal(format!("entity name '{pe_name}' must not contain a colon")));
-+                return Err(self.fatal(format_args!(
-+                    "entity name '{pe_name}' must not contain a colon"
-+                )));
-             }
+-            }
++            let system_id = self.parse_quoted_value()?;
++            Some(EntityKind::External {
++                system_id,
++                public_id: None,
++            })
++        } else if self.looking_at(b"PUBLIC") {
++            self.expect_str(b"PUBLIC")?;
              self.skip_whitespace_required()?;
++            let public_id = self.parse_quoted_value()?;
++            self.validate_public_id(&public_id)?;
++            self.skip_whitespace_required()?;
++            let system_id = self.parse_quoted_value()?;
++            Some(EntityKind::External {
++                system_id,
++                public_id: Some(public_id),
++            })
++        } else {
++            return Err(self.fatal("expected entity value or external ID"));
++        };
++        self.skip_whitespace()?;
++        // XML 1.0 §4.2.2 forbids NDATA on parameter entities.
++        if self.looking_at(b"NDATA") {
++            return Err(self.fatal("NDATA annotation is not allowed on parameter entities"));
++        }
++        self.expect_byte(b'>')?;
++        if let Some(kind) = pe_kind
++            && self
++                .dtd
++                .param_entities
++                .get(&pe_name, self.storage)?
++                .is_none()
++        {
++            Names::insert(
++                &mut self.dtd.param_entities,
++                pe_name,
++                EntityDecl {
++                    name: self.storage.text("")?,
++                    kind,
++                },
++            )?;
++        }
++        Ok(())
++    }
  
-@@ -1435,7 +1799,7 @@
-                 return Err(self.fatal("expected entity value or external ID"));
-             };
- 
+-            let pe_kind = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
+-                // Internal PE — parse and validate the value
+-                let value = self.parse_quoted_value()?;
+-                self.validate_entity_value(&value, true)?;
+-                Some(EntityKind::Internal(value))
+-            } else if self.looking_at(b"SYSTEM") {
+-                // External PE — parse external ID
+-                self.expect_str(b"SYSTEM")?;
+-                self.skip_whitespace_required()?;
+-                let system_id = self.parse_quoted_value()?;
+-                Some(EntityKind::External {
+-                    system_id,
+-                    public_id: None,
+-                })
+-            } else if self.looking_at(b"PUBLIC") {
+-                self.expect_str(b"PUBLIC")?;
+-                self.skip_whitespace_required()?;
+-                let public_id = self.parse_quoted_value()?;
+-                self.validate_public_id(&public_id)?;
+-                self.skip_whitespace_required()?;
+-                let system_id = self.parse_quoted_value()?;
+-                Some(EntityKind::External {
+-                    system_id,
+-                    public_id: Some(public_id),
+-                })
+-            } else {
+-                return Err(self.fatal("expected entity value or external ID"));
+-            };
+-
 -            self.skip_whitespace();
-+            self.skip_whitespace()?;
-             // Reject NDATA on parameter entities (XML 1.0 §4.2.2)
-             if self.looking_at(b"NDATA") {
-                 return Err(self.fatal("NDATA annotation is not allowed on parameter entities"));
-@@ -1443,14 +1807,21 @@
-             self.expect_byte(b'>')?;
+-            // Reject NDATA on parameter entities (XML 1.0 §4.2.2)
+-            if self.looking_at(b"NDATA") {
+-                return Err(self.fatal("NDATA annotation is not allowed on parameter entities"));
+-            }
+-            self.expect_byte(b'>')?;
++    fn parse_entity_decl(&mut self) -> Result<(), DtdError<S>> {
++        self.expect_str(b"<!ENTITY")?;
++        self.skip_whitespace_required()?;
  
-             // Store PE declaration (first declaration wins per XML 1.0 §4.2)
+-            // Store PE declaration (first declaration wins per XML 1.0 §4.2)
 -            if let Some(kind) = pe_kind {
 -                self.dtd
-+            if let Some(kind) = pe_kind
-+                && self
-+                    .dtd
-                     .param_entities
+-                    .param_entities
 -                    .entry(pe_name)
 -                    .or_insert(EntityDecl {
 -                        name: String::new(),
-+                    .get(&pe_name, self.storage)?
-+                    .is_none()
-+            {
-+                Names::insert(
-+                    &mut self.dtd.param_entities,
-+                    pe_name,
-+                    EntityDecl {
-+                        name: self.storage.text("")?,
-                         kind,
+-                        kind,
 -                    });
-+                    },
-+                )?;
-             }
-             return Ok(());
+-            }
+-            return Ok(());
++        // Parameter entities (% name)
++        if self.peek() == Some(b'%') {
++            return self.parse_parameter_entity();
          }
-@@ -1458,7 +1829,9 @@
+ 
          let name = self.parse_name()?;
          // Namespaces in XML 1.0: entity names must be NCNames (no colons).
          if name.contains(':') {
@@ -9033,7 +9444,7 @@
          }
          self.skip_whitespace_required()?;
  
-@@ -1491,7 +1864,7 @@
+@@ -1491,7 +1859,7 @@
              return Err(self.fatal("expected entity value or external ID"));
          };
  
@@ -9042,7 +9453,7 @@
  
          // Handle optional NDATA for unparsed external entities (XML 1.0 §4.2.2)
          if self.looking_at(b"NDATA") {
-@@ -1506,7 +1879,7 @@
+@@ -1506,7 +1874,7 @@
              self.expect_str(b"NDATA")?;
              self.skip_whitespace_required()?;
              let _notation_name = self.parse_name()?;
@@ -9051,7 +9462,7 @@
          }
  
          self.expect_byte(b'>')?;
-@@ -1514,26 +1887,30 @@
+@@ -1514,26 +1882,30 @@
          // Per XML 1.0 §4.2, the first entity declaration is binding;
          // subsequent declarations of the same entity are ignored.
          let decl = EntityDecl {
@@ -9087,7 +9498,7 @@
          }
          self.skip_whitespace_required()?;
  
-@@ -1548,7 +1925,7 @@
+@@ -1548,7 +1920,7 @@
              let pid = self.parse_quoted_value()?;
              self.validate_public_id(&pid)?;
              // System ID is optional for notations with PUBLIC
@@ -9096,7 +9507,7 @@
              let sid = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
                  Some(self.parse_quoted_value()?)
              } else {
-@@ -1559,45 +1936,47 @@
+@@ -1559,45 +1931,47 @@
              return Err(self.fatal("expected SYSTEM or PUBLIC in NOTATION declaration"));
          };
  
@@ -9157,7 +9568,7 @@
          self.expect_str(b"<?")?;
  
          // Parse and validate the PI target name (XML 1.0 §2.6)
-@@ -1610,8 +1989,10 @@
+@@ -1610,8 +1984,10 @@
  
          // If we're immediately at ?>, no data — that's fine
          if self.looking_at(b"?>") {
@@ -9170,7 +9581,7 @@
              return Ok(());
          }
  
-@@ -1623,26 +2004,31 @@
+@@ -1623,26 +1999,31 @@
              return Err(self.fatal("space required between PI target and data"));
          }
  
@@ -9211,7 +9622,7 @@
          self.expect_byte(b'%')?;
          // Read the name
          let _name = self.parse_name()?;
-@@ -1652,94 +2038,12 @@
+@@ -1652,110 +2033,75 @@
  
      // --- Name / token parsing ---
  
@@ -9269,7 +9680,10 @@
 -
 -        let start = self.pos;
 -        let first = self.input[self.pos];
--
++    fn parse_nmtoken(&mut self) -> Result<S::Text, DtdError<S>> {
++        Ok(self.storage.text(self.input.parse_nmtoken()?)?)
++    }
+ 
 -        // ASCII fast path
 -        if is_ascii_name_char(first) {
 -            self.pos += 1;
@@ -9277,14 +9691,30 @@
 -            while self.pos < self.input.len() && is_ascii_name_char(self.input[self.pos]) {
 -                self.pos += 1;
 -                self.column += 1;
--            }
++    /// Validate a numeric reference after `&` per XML 1.0 §4.1 [66].
++    fn validate_numeric_entity_reference(
++        &self,
++        bytes: &[u8],
++        position: &mut usize,
++    ) -> Result<(), DtdError<S>> {
++        let mut i = *position + 1;
++        let char_val = if i < bytes.len() && bytes[i] == b'x' {
++            i += 1;
++            let hex_start = i;
++            if i >= bytes.len() || !bytes[i].is_ascii_hexdigit() {
++                return Err(self.fatal("malformed character reference in entity value"));
+             }
 -            if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
 -                let token = std::str::from_utf8(&self.input[start..self.pos])
 -                    .map_err(|_| self.fatal("invalid UTF-8 in NMTOKEN"))?;
 -                return Ok(token.to_string());
--            }
++            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
++                i += 1;
+             }
 -            // Fall through to slow path
--        } else {
++            let hex_str = std::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
++            u32::from_str_radix(hex_str, 16).unwrap_or(0)
+         } else {
 -            let ch = self
 -                .peek_char()
 -                .ok_or_else(|| self.fatal("expected NMTOKEN"))?;
@@ -9292,25 +9722,51 @@
 -                return Err(self.fatal(format!("invalid NMTOKEN character: '{ch}'")));
 -            }
 -            self.advance_char(ch);
--        }
++            let dec_start = i;
++            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
++                return Err(self.fatal("malformed character reference in entity value"));
++            }
++            while i < bytes.len() && bytes[i].is_ascii_digit() {
++                i += 1;
++            }
++            let dec_str = std::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
++            dec_str.parse::<u32>().unwrap_or(0)
++        };
++        if i >= bytes.len() || bytes[i] != b';' {
++            return Err(self.fatal("incomplete character reference in entity value"));
+         }
 -
 -        while let Some(ch) = self.peek_char() {
 -            if is_name_char(ch) {
 -                self.advance_char(ch);
 -            } else {
 -                break;
--            }
--        }
++        i += 1;
++        if let Some(c) = char::from_u32(char_val) {
++            if !crate::parser_xmloxide::parser::input::is_xml_char(c) {
++                return Err(self.fatal(format_args!(
++                    "character reference &#x{char_val:X}; refers to invalid XML character"
++                )));
+             }
++        } else {
++            return Err(self.fatal(format_args!(
++                "character reference value {char_val} is not a valid Unicode code point"
++            )));
+         }
 -
 -        let token = std::str::from_utf8(&self.input[start..self.pos])
 -            .map_err(|_| self.fatal("invalid UTF-8 in NMTOKEN"))?;
 -        Ok(token.to_string())
-+    fn parse_nmtoken(&mut self) -> Result<S::Text, DtdError<S>> {
-+        Ok(self.storage.text(self.input.parse_nmtoken()?)?)
++        *position = i;
++        Ok(())
      }
  
-     /// Validates an entity value per XML 1.0 §4.3.2 `EntityValue` production.
-@@ -1751,11 +2055,15 @@
+-    /// Validates an entity value per XML 1.0 §4.3.2 `EntityValue` production.
+-    ///
+-    /// Checks that `&` is only used in valid entity/character references,
+-    /// and that `%` is not present in general entity values.
+-    #[allow(clippy::too_many_lines)]
+     fn validate_entity_value(
          &self,
          value: &str,
          is_parameter_entity: bool,
@@ -9330,7 +9786,7 @@
                      "invalid XML character U+{:04X} in entity value",
                      c as u32
                  )));
-@@ -1767,7 +2075,7 @@
+@@ -1767,7 +2113,7 @@
          // of external parsed entities.
          if value.starts_with("<?xml") {
              let after = value.as_bytes().get(5).copied();
@@ -9339,24 +9795,61 @@
                  return Err(self.fatal("text declaration is not allowed in internal entity value"));
              }
          }
-@@ -1819,13 +2127,13 @@
-                         i += 1;
-                         // Validate the referenced character is a valid XML char
-                         if let Some(c) = char::from_u32(char_val) {
+@@ -1783,52 +2129,7 @@
+                         return Err(self.fatal("incomplete reference in entity value: '&' at end"));
+                     }
+                     if bytes[i] == b'#' {
+-                        // Character reference — parse and validate
+-                        i += 1;
+-                        let char_val = if i < bytes.len() && bytes[i] == b'x' {
+-                            i += 1;
+-                            let hex_start = i;
+-                            if i >= bytes.len() || !bytes[i].is_ascii_hexdigit() {
+-                                return Err(
+-                                    self.fatal("malformed character reference in entity value")
+-                                );
+-                            }
+-                            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+-                                i += 1;
+-                            }
+-                            let hex_str = std::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
+-                            u32::from_str_radix(hex_str, 16).unwrap_or(0)
+-                        } else {
+-                            let dec_start = i;
+-                            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+-                                return Err(
+-                                    self.fatal("malformed character reference in entity value")
+-                                );
+-                            }
+-                            while i < bytes.len() && bytes[i].is_ascii_digit() {
+-                                i += 1;
+-                            }
+-                            let dec_str = std::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
+-                            dec_str.parse::<u32>().unwrap_or(0)
+-                        };
+-                        if i >= bytes.len() || bytes[i] != b';' {
+-                            return Err(
+-                                self.fatal("incomplete character reference in entity value")
+-                            );
+-                        }
+-                        i += 1;
+-                        // Validate the referenced character is a valid XML char
+-                        if let Some(c) = char::from_u32(char_val) {
 -                            if !crate::parser::input::is_xml_char(c) {
 -                                return Err(self.fatal(format!(
-+                            if !crate::parser_xmloxide::parser::input::is_xml_char(c) {
-+                                return Err(self.fatal(format_args!(
-                                     "character reference &#x{char_val:X}; refers to invalid XML character"
-                                 )));
-                             }
-                         } else {
+-                                    "character reference &#x{char_val:X}; refers to invalid XML character"
+-                                )));
+-                            }
+-                        } else {
 -                            return Err(self.fatal(format!(
-+                            return Err(self.fatal(format_args!(
-                                 "character reference value {char_val} is not a valid Unicode code point"
-                             )));
-                         }
-@@ -1844,12 +2152,12 @@
+-                                "character reference value {char_val} is not a valid Unicode code point"
+-                            )));
+-                        }
++                        self.validate_numeric_entity_reference(bytes, &mut i)?;
+                     } else {
+                         // Entity reference — must be Name followed by ';'
+                         let start = i;
+@@ -1844,12 +2145,12 @@
                          }
                          // Validate the entity name starts with a NameStartChar
                          let name_str = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
@@ -9375,7 +9868,7 @@
                          }
                          i += 1;
                      }
-@@ -1886,7 +2194,9 @@
+@@ -1886,7 +2187,9 @@
      /// Checks that entity references within the default value refer to
      /// entities that have already been declared (WFC: Entity Declared).
      /// Also rejects `<` in default values (WFC: No `<` in Attribute Values).
@@ -9386,7 +9879,7 @@
          let bytes = value.as_bytes();
          let mut i = 0;
          while i < bytes.len() {
-@@ -1915,8 +2225,8 @@
+@@ -1915,8 +2218,8 @@
                              let name = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
                              // Built-in entities are always available
                              let is_builtin = matches!(name, "amp" | "lt" | "gt" | "apos" | "quot");
@@ -9397,7 +9890,7 @@
                                      "undeclared entity '{name}' in attribute default value"
                                  )));
                              }
-@@ -1936,7 +2246,8 @@
+@@ -1936,7 +2239,8 @@
  
      /// Validates that a public ID string contains only valid `PubidChar`s
      /// per XML 1.0 §2.3 `[13]`.
@@ -9407,7 +9900,7 @@
          for c in pid.chars() {
              let valid = matches!(c,
                  ' ' | '\r' | '\n' |
-@@ -1945,7 +2256,7 @@
+@@ -1945,7 +2249,7 @@
                  '=' | '?' | ';' | '!' | '*' | '#' | '@' | '$' | '_' | '%'
              );
              if !valid {
@@ -9416,7 +9909,7 @@
                      "invalid character in public ID: U+{:04X}",
                      c as u32
                  )));
-@@ -1954,169 +2265,144 @@
+@@ -1954,169 +2258,144 @@
          Ok(())
      }
  
@@ -9572,16 +10065,16 @@
 +// ---------------------------------------------------------------------------
 +// Entity value helper functions (used by DTD parser and XML parser)
 +// ---------------------------------------------------------------------------
- 
--    fn skip_whitespace_required(&mut self) -> Result<(), ParseError> {
--        if !self.skip_whitespace() {
--            return Err(self.fatal("whitespace required"));
++
 +/// Only PE decoding owns text; the initial frame borrows its existing input.
 +enum ReferenceText<'a, S: Storage> {
 +    Borrowed(&'a str),
 +    Decoded(S::Text),
 +}
-+
+ 
+-    fn skip_whitespace_required(&mut self) -> Result<(), ParseError> {
+-        if !self.skip_whitespace() {
+-            return Err(self.fatal("whitespace required"));
 +impl<S: Storage> AsRef<str> for ReferenceText<'_, S> {
 +    fn as_ref(&self) -> &str {
 +        match self {
@@ -9591,12 +10084,7 @@
 -        Ok(())
      }
 +}
- 
--    fn fatal(&self, message: impl Into<String>) -> ParseError {
--        ParseError {
--            message: message.into(),
--            location: self.location(),
--            diagnostics: Vec::new(),
++
 +/// Resumable borrowed references; DFS frames keep a cursor, not a list of edges.
 +struct EntityReferences<'a> {
 +    value: &'a str,
@@ -9605,7 +10093,12 @@
 +
 +impl<'a> Iterator for EntityReferences<'a> {
 +    type Item = &'a str;
-+
+ 
+-    fn fatal(&self, message: impl Into<String>) -> ParseError {
+-        ParseError {
+-            message: message.into(),
+-            location: self.location(),
+-            diagnostics: Vec::new(),
 +    fn next(&mut self) -> Option<Self::Item> {
 +        let bytes = self.value.as_bytes();
 +        while self.cursor < bytes.len() {
@@ -9682,7 +10175,7 @@
              i += 2;
              let char_val = if i < bytes.len() && bytes[i] == b'x' {
                  i += 1;
-@@ -2138,16 +2424,21 @@
+@@ -2138,16 +2417,21 @@
                  i += 1;
              }
              if let Some(ch) = char::from_u32(char_val) {
@@ -9710,7 +10203,7 @@
  }
  
  /// Replaces entity references (`&name;`) with spaces, leaving character
-@@ -2250,7 +2541,7 @@
+@@ -2250,7 +2534,7 @@
  ///
  /// # Examples
  ///
@@ -9719,7 +10212,7 @@
  /// use xmloxide::Document;
  /// use xmloxide::validation::dtd::{parse_dtd, validate};
  ///
-@@ -2311,21 +2602,19 @@
+@@ -2311,21 +2595,19 @@
          }
      });
  
@@ -9754,7 +10247,7 @@
      }
  }
  
-@@ -2347,7 +2636,7 @@
+@@ -2347,7 +2629,7 @@
  
      // Check if element is declared
      let has_element_decls = !dtd.elements.is_empty();
@@ -9763,7 +10256,7 @@
          errors.push(ValidationError {
              message: format!("element '{elem_name}' is not declared in the DTD"),
              line: None,
-@@ -2356,7 +2645,7 @@
+@@ -2356,7 +2638,7 @@
      }
  
      // Check content model
@@ -9772,7 +10265,7 @@
          validate_content_model(doc, node_id, &elem_name, &elem_decl.content_model, errors);
      }
  
-@@ -2455,22 +2744,22 @@
+@@ -2455,22 +2737,22 @@
          ContentModel::Mixed(allowed_names) => {
              // Text is always allowed. Check that element children are in the allowed list.
              for &child_id in &content_children {
@@ -9811,7 +10304,7 @@
                  }
              }
          }
-@@ -2930,7 +3219,167 @@
+@@ -2930,7 +3212,167 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -9980,7 +10473,7 @@
  
      // --- DTD Parsing Tests ---
  
-@@ -3574,15 +4023,18 @@
+@@ -3574,15 +4016,18 @@
  
      #[test]
      fn test_content_model_display() {
@@ -9989,12 +10482,12 @@
 -        assert_eq!(ContentModel::Mixed(vec![]).to_string(), "(#PCDATA)");
 +        assert_eq!(ContentModel::<Native>::Empty.to_string(), "EMPTY");
 +        assert_eq!(ContentModel::<Native>::Any.to_string(), "ANY");
-+        assert_eq!(
+         assert_eq!(
+-            ContentModel::Mixed(vec!["a".to_string(), "b".to_string()]).to_string(),
 +            ContentModel::<Native>::Mixed(vec![]).to_string(),
 +            "(#PCDATA)"
 +        );
-         assert_eq!(
--            ContentModel::Mixed(vec!["a".to_string(), "b".to_string()]).to_string(),
++        assert_eq!(
 +            ContentModel::<Native>::Mixed(vec!["a".to_string(), "b".to_string()]).to_string(),
              "(#PCDATA|a|b)*"
          );
@@ -10004,7 +10497,7 @@
              kind: ContentSpecKind::Seq(vec![
                  ContentSpec {
                      kind: ContentSpecKind::Name("a".to_string()),
-@@ -3715,6 +4167,25 @@
+@@ -3715,6 +4160,25 @@
      }
  
      #[test]
@@ -10030,7 +10523,7 @@
      fn test_content_model_deep_nesting_is_bounded() {
          // Regression test for CVE-2026-61727 (GHSA-7jmw-29gc-ffx4): a content
          // model with deeply nested '(' must return a normal error instead of
-@@ -3731,9 +4202,9 @@
+@@ -3731,9 +4195,9 @@
              panic!("expected deep content model to be rejected, got Ok");
          };
          assert!(
@@ -10042,7 +10535,7 @@
          );
      }
  
-@@ -3750,9 +4221,9 @@
+@@ -3750,9 +4214,9 @@
      fn test_entity_recursion_direct_cycle_rejected() {
          let err = parse_dtd("<!ENTITY x \"&x;\">").unwrap_err();
          assert!(
@@ -10054,7 +10547,7 @@
          );
      }
  
-@@ -3761,9 +4232,9 @@
+@@ -3761,9 +4225,9 @@
          let err =
              parse_dtd("<!ENTITY a \"&b;\"><!ENTITY b \"&c;\"><!ENTITY c \"&a;\">").unwrap_err();
          assert!(
@@ -10066,7 +10559,7 @@
          );
      }
  
-@@ -3779,9 +4250,9 @@
+@@ -3779,9 +4243,9 @@
          )
          .unwrap_err();
          assert!(
@@ -10078,7 +10571,7 @@
          );
      }
  
-@@ -3820,13 +4291,109 @@
+@@ -3820,13 +4284,109 @@
      }
  
      #[test]
@@ -10190,7 +10683,7 @@
          );
      }
  
-@@ -3834,9 +4401,10 @@
+@@ -3834,9 +4394,10 @@
      fn test_pe_recursion_indirect_cycle_rejected() {
          let err = parse_dtd("<!ENTITY % p \"&#37;q;\"><!ENTITY % q \"&#37;p;\">").unwrap_err();
          assert!(
@@ -10251,25 +10744,112 @@
  /// use xmloxide::Document;
  /// use xmloxide::serial::{serialize_with_options, SerializeOptions};
  ///
-@@ -213,12 +213,11 @@
-                     out.push('\n');
-                 }
-                 for child in doc.children(id) {
+@@ -154,7 +154,6 @@
+     has_element_child
+ }
+ 
+-#[allow(clippy::too_many_lines)]
+ fn serialize_node(
+     doc: &Document,
+     id: NodeId,
+@@ -166,87 +165,15 @@
+ ) {
+     let indent = options.indent;
+     match &doc.node(id).kind {
+-        NodeKind::Element {
+-            name,
+-            prefix,
+-            attributes,
+-            ..
+-        } => {
+-            if indent && parent_is_element_only {
+-                for _ in 0..depth {
+-                    out.push_str(&options.indent_str);
+-                }
+-            }
+-            out.push('<');
+-            if let Some(pfx) = prefix {
+-                out.push_str(pfx);
+-                out.push(':');
+-            }
+-            out.push_str(name);
+-
+-            for attr in attributes {
+-                out.push(' ');
+-                if let Some(pfx) = &attr.prefix {
+-                    out.push_str(pfx);
+-                    out.push(':');
+-                }
+-                out.push_str(&attr.name);
+-                out.push_str("=\"");
+-                let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
+-                if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
+-                    write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
+-                } else {
+-                    write_escaped_attr(out, &attr.value, reencode_non_ascii);
+-                }
+-                out.push('"');
+-            }
+-
+-            if doc.first_child(id).is_none() {
+-                out.push_str("/>");
+-                if indent && parent_is_element_only {
+-                    out.push('\n');
+-                }
+-            } else {
+-                out.push('>');
+-                let element_only = indent && is_element_only(doc, id);
+-                if element_only {
+-                    out.push('\n');
+-                }
+-                for child in doc.children(id) {
 -                    if element_only {
 -                        if let NodeKind::Text { content } = &doc.node(child).kind {
 -                            if content.trim().is_empty() {
 -                                continue;
 -                            }
 -                        }
-+                    if element_only
-+                        && let NodeKind::Text { content } = &doc.node(child).kind
-+                        && content.trim().is_empty()
-+                    {
-+                        continue;
-                     }
-                     serialize_node(
-                         doc,
-@@ -313,7 +312,7 @@
+-                    }
+-                    serialize_node(
+-                        doc,
+-                        child,
+-                        out,
+-                        reencode_non_ascii,
+-                        options,
+-                        depth + 1,
+-                        element_only,
+-                    );
+-                }
+-                if element_only {
+-                    for _ in 0..depth {
+-                        out.push_str(&options.indent_str);
+-                    }
+-                }
+-                out.push_str("</");
+-                if let Some(pfx) = prefix {
+-                    out.push_str(pfx);
+-                    out.push(':');
+-                }
+-                out.push_str(name);
+-                out.push('>');
+-                if indent && parent_is_element_only {
+-                    out.push('\n');
+-                }
+-            }
+-        }
++        NodeKind::Element { .. } => serialize_element_node(
++            doc,
++            id,
++            out,
++            reencode_non_ascii,
++            options,
++            depth,
++            parent_is_element_only,
++        ),
+         NodeKind::Text { content } => {
+             write_escaped_text(out, content, reencode_non_ascii);
+         }
+@@ -313,7 +240,7 @@
                  }
                  _ => {}
              }
@@ -10278,12 +10858,142 @@
                  out.push_str(" [");
                  out.push_str(subset);
                  out.push_str("]>");
-@@ -549,7 +548,7 @@
+@@ -327,6 +254,98 @@
+     }
+ }
+ 
++fn serialize_element_node(
++    doc: &Document,
++    id: NodeId,
++    out: &mut String,
++    reencode_non_ascii: bool,
++    options: &SerializeOptions,
++    depth: usize,
++    parent_is_element_only: bool,
++) {
++    let NodeKind::Element {
++        name,
++        prefix,
++        attributes,
++        ..
++    } = &doc.node(id).kind
++    else {
++        unreachable!("element serialization only receives an element");
++    };
++    let indent = options.indent;
++    if indent && parent_is_element_only {
++        for _ in 0..depth {
++            out.push_str(&options.indent_str);
++        }
++    }
++    out.push('<');
++    if let Some(pfx) = prefix {
++        out.push_str(pfx);
++        out.push(':');
++    }
++    out.push_str(name);
++    for attr in attributes {
++        out.push(' ');
++        if let Some(pfx) = &attr.prefix {
++            out.push_str(pfx);
++            out.push(':');
++        }
++        out.push_str(&attr.name);
++        out.push_str("=\"");
++        let is_ns_decl = attr.name == "xmlns" || attr.prefix.as_deref() == Some("xmlns");
++        if let Some(raw) = attr.raw_value.as_ref().filter(|_| !is_ns_decl) {
++            write_escaped_attr_preserve_refs(out, raw, reencode_non_ascii);
++        } else {
++            write_escaped_attr(out, &attr.value, reencode_non_ascii);
++        }
++        out.push('"');
++    }
++    if doc.first_child(id).is_none() {
++        out.push_str("/>");
++        if indent && parent_is_element_only {
++            out.push('\n');
++        }
++    } else {
++        out.push('>');
++        let element_only = indent && is_element_only(doc, id);
++        if element_only {
++            out.push('\n');
++        }
++        for child in doc.children(id) {
++            if element_only
++                && let NodeKind::Text { content } = &doc.node(child).kind
++                && content.trim().is_empty()
++            {
++                continue;
++            }
++            serialize_node(
++                doc,
++                child,
++                out,
++                reencode_non_ascii,
++                options,
++                depth + 1,
++                element_only,
++            );
++        }
++        if element_only {
++            for _ in 0..depth {
++                out.push_str(&options.indent_str);
++            }
++        }
++        out.push_str("</");
++        if let Some(pfx) = prefix {
++            out.push_str(pfx);
++            out.push(':');
++        }
++        out.push_str(name);
++        out.push('>');
++        if indent && parent_is_element_only {
++            out.push('\n');
++        }
++    }
++}
++
+ /// Writes a hexadecimal character reference (`&#xHH;`) for a Unicode code point.
+ fn write_hex_char_ref(out: &mut String, ch: char) {
+     use std::fmt::Write;
+@@ -549,7 +568,38 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
 -    use crate::tree::Attribute;
 +    use crate::parser_xmloxide::tree::Attribute;
++
++    #[test]
++    fn element_dispatch_preserves_empty_mixed_and_indented_bytes() {
++        // The extracted element branch must keep the same child/indentation
++        // decisions, including the caller's depth and mixed-content boundary.
++        for (source, compact, indented) in [
++            ("<r/>", "<r/>", "    <r/>\n"),
++            (
++                "<r><n/></r>",
++                "<r><n/></r>",
++                "    <r>\n      <n/>\n    </r>\n",
++            ),
++            (
++                "<r>left<n/>right</r>",
++                "<r>left<n/>right</r>",
++                "    <r>left<n/>right</r>\n",
++            ),
++        ] {
++            let doc = Document::parse_str(source).unwrap();
++            let id = doc.root_element().unwrap();
++            for indent in [false, true] {
++                let options = SerializeOptions::default().indent(indent);
++                let mut direct = String::new();
++                serialize_element_node(&doc, id, &mut direct, false, &options, 2, true);
++                let mut dispatched = String::new();
++                serialize_node(&doc, id, &mut dispatched, false, &options, 2, true);
++                assert_eq!(direct, if indent { indented } else { compact });
++                assert_eq!(dispatched, direct);
++            }
++        }
++    }
  
      #[test]
      fn test_serialize_empty_element() {

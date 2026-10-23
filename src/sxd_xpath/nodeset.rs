@@ -78,18 +78,23 @@ pub struct Namespace<'d> {
 impl<'d> Copy for Namespace<'d> {}
 
 impl<'d> Namespace<'d> {
+    #[must_use]
     pub fn document(&self) -> dom::Document<'d> {
         self.parent.document()
     }
+    #[must_use]
     pub fn parent(&self) -> dom::Element<'d> {
         self.parent
     }
+    #[must_use]
     pub fn prefix(&self) -> &str {
         sxd_document_no_unsafe::as_str!(self.prefix)
     }
+    #[must_use]
     pub fn uri(&self) -> &str {
         sxd_document_no_unsafe::as_str!(self.uri)
     }
+    #[must_use]
     pub fn expanded_name(&self) -> ExpandedName<'d> {
         to_expanded_name!(QName::new(sxd_document_no_unsafe::as_str!(self.prefix)))
     }
@@ -185,7 +190,7 @@ pub(crate) fn visit_namespace_bindings_in<
             Err(Some(error)) => return Err(error),
             Ok(()) => {}
         }
-        current = element.parent().and_then(|parent| parent.element());
+        current = element.parent().and_then(dom::ParentOfChild::element);
     }
     Ok(())
 }
@@ -285,6 +290,9 @@ impl<'d> Node<'d> {
     }
 
     /// Copy an identity after accounting for owned namespace payloads in the safe backend.
+    ///
+    /// # Errors
+    /// Returns the resource error before copying unshareable namespace labels.
     pub fn clone_with_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
@@ -310,23 +318,25 @@ impl<'d> Node<'d> {
     }
 
     /// The document to which this node belongs.
+    #[must_use]
     pub fn document(&self) -> dom::Document<'d> {
-        use self::Node::*;
         match self {
-            Root(n) => n.document(),
-            Element(n) => n.document(),
-            Attribute(n) => n.document(),
-            Text(n) => n.document(),
-            Comment(n) => n.document(),
-            ProcessingInstruction(n) => n.document(),
-            Namespace(n) => n.document(),
+            Self::Root(n) => n.document(),
+            Self::Element(n) => n.document(),
+            Self::Attribute(n) => n.document(),
+            Self::Text(n) => n.document(),
+            Self::Comment(n) => n.document(),
+            Self::ProcessingInstruction(n) => n.document(),
+            Self::Namespace(n) => n.document(),
         }
     }
 
     /// The name of the node, including a prefix that corresponds to the namespace, if any.
+    ///
+    /// # Panics
+    /// Panics for an attribute detached from its owning element.
+    #[must_use]
     pub fn prefixed_name(&self) -> Option<String> {
-        use self::Node::*;
-
         fn qname_prefixed_name(
             element: dom::Element<'_>,
             name: QName<'_>,
@@ -351,13 +361,13 @@ impl<'d> Node<'d> {
         }
 
         match self {
-            Root(_) => None,
-            Element(n) => Some(qname_prefixed_name(
+            Self::Root(_) | Self::Text(_) | Self::Comment(_) => None,
+            Self::Element(n) => Some(qname_prefixed_name(
                 *n,
                 sxd_document_no_unsafe::as_qname!(n.name()),
                 sxd_document_no_unsafe::as_opt_str!(n.preferred_prefix()),
             )),
-            Attribute(n) => {
+            Self::Attribute(n) => {
                 let parent = n.parent().expect("Cannot process attribute without parent");
                 Some(qname_prefixed_name(
                     parent,
@@ -365,97 +375,99 @@ impl<'d> Node<'d> {
                     sxd_document_no_unsafe::as_opt_str!(n.preferred_prefix()),
                 ))
             }
-            Text(_) => None,
-            Comment(_) => None,
-            ProcessingInstruction(n) => {
+            Self::ProcessingInstruction(n) => {
                 Some(sxd_document_no_unsafe::as_str!(n.target()).to_owned())
             }
-            Namespace(n) => Some(n.prefix().to_owned()),
+            Self::Namespace(n) => Some(n.prefix().to_owned()),
         }
     }
 
     /// Returns the [expanded name][] of the node, if any.
     ///
     /// [expanded name]: https://www.w3.org/TR/xpath/#dt-expanded-name
+    #[must_use]
     pub fn expanded_name(&self) -> Option<ExpandedName<'d>> {
-        use self::Node::*;
         match self {
-            Root(_) => None,
-            Element(n) => Some(to_expanded_name!(sxd_document_no_unsafe::as_qname!(
+            Self::Root(_) | Self::Text(_) | Self::Comment(_) => None,
+            Self::Element(n) => Some(to_expanded_name!(sxd_document_no_unsafe::as_qname!(
                 n.name()
             ))),
-            Attribute(n) => Some(to_expanded_name!(sxd_document_no_unsafe::as_qname!(
+            Self::Attribute(n) => Some(to_expanded_name!(sxd_document_no_unsafe::as_qname!(
                 n.name()
             ))),
-            Text(_) => None,
-            Comment(_) => None,
-            ProcessingInstruction(n) => Some(to_expanded_name!(QName::new(
+            Self::ProcessingInstruction(n) => Some(to_expanded_name!(QName::new(
                 sxd_document_no_unsafe::as_str!(n.target())
             ))),
-            Namespace(n) => Some(n.expanded_name()),
+            Self::Namespace(n) => Some(n.expanded_name()),
         }
     }
 
     /// Returns the parent of the node, if any.
     pub fn parent(&self) -> Option<Node<'d>> {
-        use self::Node::*;
         match self {
-            Root(_) => None,
-            Element(n) => n.parent().map(Into::into),
-            Attribute(n) => n.parent().map(Into::into),
-            Text(n) => n.parent().map(Into::into),
-            Comment(n) => n.parent().map(Into::into),
-            ProcessingInstruction(n) => n.parent().map(Into::into),
-            Namespace(n) => Some(n.parent().into()),
+            Self::Root(_) => None,
+            Self::Element(n) => n.parent().map(Into::into),
+            Self::Attribute(n) => n.parent().map(Into::into),
+            Self::Text(n) => n.parent().map(Into::into),
+            Self::Comment(n) => n.parent().map(Into::into),
+            Self::ProcessingInstruction(n) => n.parent().map(Into::into),
+            Self::Namespace(n) => Some(n.parent().into()),
         }
     }
 
     /// Returns the children of the node, if any.
     pub fn children(&self) -> Vec<Node<'d>> {
-        use self::Node::*;
         match self {
-            Root(n) => n.children().into_iter().map(Into::into).collect(),
-            Element(n) => n.children().into_iter().map(Into::into).collect(),
-            Attribute(_) => Vec::new(),
-            Text(_) => Vec::new(),
-            Comment(_) => Vec::new(),
-            ProcessingInstruction(_) => Vec::new(),
-            Namespace(_) => Vec::new(),
+            Self::Root(n) => n.children().into_iter().map(Into::into).collect(),
+            Self::Element(n) => n.children().into_iter().map(Into::into).collect(),
+            Self::Attribute(_)
+            | Self::Text(_)
+            | Self::Comment(_)
+            | Self::ProcessingInstruction(_)
+            | Self::Namespace(_) => Vec::new(),
         }
     }
 
     /// Returns the number of children without materializing child handles.
+    #[must_use]
     pub fn children_len(&self) -> usize {
-        use self::Node::*;
         match self {
-            Root(node) => node.children_len(),
-            Element(node) => node.children_len(),
-            Attribute(_) | Text(_) | Comment(_) | ProcessingInstruction(_) | Namespace(_) => 0,
+            Self::Root(node) => node.children_len(),
+            Self::Element(node) => node.children_len(),
+            Self::Attribute(_)
+            | Self::Text(_)
+            | Self::Comment(_)
+            | Self::ProcessingInstruction(_)
+            | Self::Namespace(_) => 0,
         }
     }
 
     /// Returns one child without allocating a complete child-handle vector.
     pub fn child_at(&self, index: usize) -> Option<Node<'d>> {
-        use self::Node::*;
         match self {
-            Root(node) => node.child_at(index).map(Into::into),
-            Element(node) => node.child_at(index).map(Into::into),
-            Attribute(_) | Text(_) | Comment(_) | ProcessingInstruction(_) | Namespace(_) => None,
+            Self::Root(node) => node.child_at(index).map(Into::into),
+            Self::Element(node) => node.child_at(index).map(Into::into),
+            Self::Attribute(_)
+            | Self::Text(_)
+            | Self::Comment(_)
+            | Self::ProcessingInstruction(_)
+            | Self::Namespace(_) => None,
         }
     }
 
     /// Returns the nodes with the same parent that occur before this node.
     pub fn preceding_siblings(&self) -> Vec<Node<'d>> {
-        use self::Node::*;
+        use self::Node::{
+            Attribute, Comment, Element, Namespace, ProcessingInstruction, Root, Text,
+        };
         match self {
-            Root(_) => Vec::new(),
+            Root(_) | Attribute(_) | Namespace(_) => Vec::new(),
             Element(n) => n
                 .preceding_siblings()
                 .into_iter()
                 .rev()
                 .map(Into::into)
                 .collect(),
-            Attribute(_) => Vec::new(),
             Text(n) => n
                 .preceding_siblings()
                 .into_iter()
@@ -474,34 +486,37 @@ impl<'d> Node<'d> {
                 .rev()
                 .map(Into::into)
                 .collect(),
-            Namespace(_) => Vec::new(),
         }
     }
 
     /// Returns the nodes with the same parent that occur after this node.
     pub fn following_siblings(&self) -> Vec<Node<'d>> {
-        use self::Node::*;
+        use self::Node::{
+            Attribute, Comment, Element, Namespace, ProcessingInstruction, Root, Text,
+        };
         match self {
-            Root(_) => Vec::new(),
+            Root(_) | Attribute(_) | Namespace(_) => Vec::new(),
             Element(n) => n.following_siblings().into_iter().map(Into::into).collect(),
-            Attribute(_) => Vec::new(),
             Text(n) => n.following_siblings().into_iter().map(Into::into).collect(),
             Comment(n) => n.following_siblings().into_iter().map(Into::into).collect(),
             ProcessingInstruction(n) => {
                 n.following_siblings().into_iter().map(Into::into).collect()
             }
-            Namespace(_) => Vec::new(),
         }
     }
 
     /// Returns the [string value] of this node.
     ///
     /// [string value]: https://www.w3.org/TR/xpath/#dt-string-value
+    #[must_use]
     pub fn string_value(&self) -> String {
         self.string_value_with_capacity(self.string_value_len())
     }
 
     /// Returns the string value after reserving its exact temporary allocation in the evaluator.
+    ///
+    /// # Errors
+    /// Returns the traversal or allocation error before exceeding the current limits.
     pub fn string_value_with_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
@@ -510,6 +525,9 @@ impl<'d> Node<'d> {
     }
 
     /// Returns the string value while charging traversal to extension-internal work.
+    ///
+    /// # Errors
+    /// Returns the extension traversal or allocation error before exceeding its limits.
     pub fn string_value_with_extension_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
@@ -565,8 +583,11 @@ impl<'d> Node<'d> {
     }
 
     /// Returns the UTF-8 byte length of this node's string value without building the value.
+    #[must_use]
     pub fn string_value_len(&self) -> usize {
-        use self::Node::*;
+        use self::Node::{
+            Attribute, Comment, Element, Namespace, ProcessingInstruction, Root, Text,
+        };
 
         match self {
             Root(_) | Element(_) => {
@@ -592,7 +613,7 @@ impl<'d> Node<'d> {
         }
     }
 
-    /// Compare a node string value while charging traversal and compared bytes as XPath work.
+    /// Compare a node string value while charging traversal and compared bytes as `XPath` work.
     pub(crate) fn string_value_eq_with_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
@@ -739,7 +760,9 @@ impl<'d> Node<'d> {
 
     /// Append this node's string value without allocating an intermediate string.
     pub(crate) fn append_string_value(&self, output: &mut String) {
-        use self::Node::*;
+        use self::Node::{
+            Attribute, Comment, Element, Namespace, ProcessingInstruction, Root, Text,
+        };
 
         match self {
             Root(_) | Element(_) => {
@@ -768,6 +791,7 @@ impl<'d> Node<'d> {
         processing_instruction, ProcessingInstruction, dom::ProcessingInstruction
     });
 
+    #[must_use]
     pub fn namespace(&self) -> Option<Namespace<'d>> {
         match self {
             Node::Namespace(n) => Some(n.clone()),
@@ -915,33 +939,30 @@ conversion_trait!(Node, {
 
 impl<'d> From<dom::ChildOfRoot<'d>> for Node<'d> {
     fn from(other: dom::ChildOfRoot<'d>) -> Node<'d> {
-        use self::Node::*;
         match other {
-            dom::ChildOfRoot::Element(n) => Element(n),
-            dom::ChildOfRoot::Comment(n) => Comment(n),
-            dom::ChildOfRoot::ProcessingInstruction(n) => ProcessingInstruction(n),
+            dom::ChildOfRoot::Element(n) => Self::Element(n),
+            dom::ChildOfRoot::Comment(n) => Self::Comment(n),
+            dom::ChildOfRoot::ProcessingInstruction(n) => Self::ProcessingInstruction(n),
         }
     }
 }
 
 impl<'d> From<dom::ChildOfElement<'d>> for Node<'d> {
     fn from(other: dom::ChildOfElement<'d>) -> Node<'d> {
-        use self::Node::*;
         match other {
-            dom::ChildOfElement::Element(n) => Element(n),
-            dom::ChildOfElement::Text(n) => Text(n),
-            dom::ChildOfElement::Comment(n) => Comment(n),
-            dom::ChildOfElement::ProcessingInstruction(n) => ProcessingInstruction(n),
+            dom::ChildOfElement::Element(n) => Self::Element(n),
+            dom::ChildOfElement::Text(n) => Self::Text(n),
+            dom::ChildOfElement::Comment(n) => Self::Comment(n),
+            dom::ChildOfElement::ProcessingInstruction(n) => Self::ProcessingInstruction(n),
         }
     }
 }
 
 impl<'d> From<dom::ParentOfChild<'d>> for Node<'d> {
     fn from(other: dom::ParentOfChild<'d>) -> Self {
-        use self::Node::*;
         match other {
-            dom::ParentOfChild::Root(n) => Root(n),
-            dom::ParentOfChild::Element(n) => Element(n),
+            dom::ParentOfChild::Root(n) => Self::Root(n),
+            dom::ParentOfChild::Element(n) => Self::Element(n),
         }
     }
 }
@@ -953,8 +974,9 @@ pub struct Nodeset<'d> {
 }
 
 impl<'d> Nodeset<'d> {
+    #[must_use]
     pub fn new() -> Nodeset<'d> {
-        Default::default()
+        Self::default()
     }
 
     /// Checks if the node is present in the set
@@ -966,6 +988,7 @@ impl<'d> Nodeset<'d> {
     }
 
     /// Check an existing identity without copying owned namespace data.
+    #[must_use]
     pub fn contains_ref(&self, node: &Node<'d>) -> bool {
         self.nodes.native().contains(node)
     }
@@ -984,6 +1007,9 @@ impl<'d> Nodeset<'d> {
     }
 
     /// Add a unique node after reserving its container storage in the evaluation budget.
+    ///
+    /// # Errors
+    /// Returns the resource error before inserting an inadmissible new identity.
     #[expect(
         clippy::mutable_key_type,
         reason = "node equality/hash use immutable arena/slot identity and retained namespace labels"
@@ -1004,6 +1030,7 @@ impl<'d> Nodeset<'d> {
         Ok(())
     }
 
+    #[must_use]
     pub fn iter<'a>(&'a self) -> Iter<'a, 'd> {
         IntoIterator::into_iter(self)
     }
@@ -1013,6 +1040,10 @@ impl<'d> Nodeset<'d> {
         self.nodes.native().iter()
     }
 
+    /// Clone identities and their set storage under the current evaluation's limits.
+    ///
+    /// # Errors
+    /// Returns the first container or namespace-label admission error.
     pub fn clone_with_context(
         &self,
         context: &crate::context::Evaluation<'_, 'd>,
@@ -1024,6 +1055,7 @@ impl<'d> Nodeset<'d> {
         Ok(result)
     }
 
+    #[must_use]
     pub fn size(&self) -> usize {
         self.nodes.len()
     }
@@ -1031,6 +1063,7 @@ impl<'d> Nodeset<'d> {
     /// Returns the node that occurs first in [document order]
     ///
     /// [document order]: https://www.w3.org/TR/xpath/#dt-document-order
+    #[must_use]
     pub fn document_order_first(&self) -> Option<Node<'d>> {
         let node = self.nodes.native().iter().next()?;
 
@@ -1046,6 +1079,9 @@ impl<'d> Nodeset<'d> {
     }
 
     /// Return the first node while charging document-order key storage to the evaluator.
+    ///
+    /// # Errors
+    /// Returns a key-storage, traversal, comparison, or identity-copy resource error.
     pub fn document_order_first_with_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
@@ -1081,6 +1117,7 @@ impl<'d> Nodeset<'d> {
             .transpose()
     }
 
+    #[must_use]
     pub fn document_order(&self) -> Vec<Node<'d>> {
         let mut keyed: Vec<_> = self
             .iter_ref()
@@ -1091,6 +1128,9 @@ impl<'d> Nodeset<'d> {
     }
 
     /// Return nodes in document order while charging all temporary key storage.
+    ///
+    /// # Errors
+    /// Returns a key-storage, comparison, result-storage, or identity-copy resource error.
     pub fn document_order_with_context(
         &self,
         context: &crate::context::Evaluation<'_, '_>,
@@ -1156,7 +1196,8 @@ impl<'d> Nodeset<'d> {
             .map(|(_, path)| order_path_work(path))
             .max()
             .unwrap_or(0);
-        let levels = (usize::BITS - keyed.len().leading_zeros()) as usize;
+        let leading_zeros = keyed.len().leading_zeros();
+        let levels = (usize::BITS - leading_zeros) as usize;
         context.charge_work(
             keyed
                 .len()
@@ -1180,7 +1221,7 @@ impl<'d> Extend<Node<'d>> for Nodeset<'d> {
     where
         I: IntoIterator<Item = Node<'d>>,
     {
-        self.nodes.native_mut().extend(iter)
+        self.nodes.native_mut().extend(iter);
     }
 }
 
@@ -1200,19 +1241,19 @@ fn order_path_work(path: &[OrderStep<'_>]) -> usize {
     })
 }
 
-fn order_path<'a, 'd>(node: &'a Node<'d>) -> Vec<OrderStep<'a>> {
+fn order_path<'a>(node: &'a Node<'_>) -> Vec<OrderStep<'a>> {
     order_path_with_context(node, None).expect("unmetered document ordering cannot fail")
 }
 
-fn order_path_with_context<'a, 'd>(
-    node: &'a Node<'d>,
+fn order_path_with_context<'a>(
+    node: &'a Node<'_>,
     context: Option<&crate::context::Evaluation<'_, '_>>,
 ) -> Result<Vec<OrderStep<'a>>, crate::function::Error> {
     order_path_in(node, context, crate::runtime::Native)
 }
 
-fn order_path_in<'a, 'd, R: crate::runtime::Runtime>(
-    node: &'a Node<'d>,
+fn order_path_in<'a, R: crate::runtime::Runtime>(
+    node: &'a Node<'_>,
     context: Option<&crate::context::Evaluation<'_, '_>>,
     runtime: R,
 ) -> Result<R::List<OrderStep<'a>>, crate::function::Error> {
@@ -1380,15 +1421,17 @@ impl<'d> Iterator for IntoIter<'d> {
 pub struct OrderedNodes<'d>(Vec<Node<'d>>);
 
 impl<'d> OrderedNodes<'d> {
+    #[must_use]
     pub fn new() -> Self {
-        Default::default()
+        Self::default()
     }
+    #[must_use]
     pub fn size(&self) -> usize {
         self.0.len()
     }
 
     pub fn add(&mut self, node: Node<'d>) {
-        self.0.push(node)
+        self.0.push(node);
     }
 
     #[cfg(test)]
@@ -1446,27 +1489,27 @@ mod test {
         let doc = package.as_document();
         let mut nodes = Nodeset::new();
 
-        let r = doc.root();
-        let e = doc.create_element("element");
-        let a = e.set_attribute_value("name", "value");
-        let t = doc.create_text("text");
-        let c = doc.create_comment("comment");
-        let p = doc.create_processing_instruction("pi", None);
+        let root = doc.root();
+        let element = doc.create_element("element");
+        let attribute = element.set_attribute_value("name", "value");
+        let text = doc.create_text("text");
+        let comment = doc.create_comment("comment");
+        let instruction = doc.create_processing_instruction("pi", None);
 
-        nodes.add(r);
-        nodes.add(e);
-        nodes.add(a);
-        nodes.add(t);
-        nodes.add(c);
-        nodes.add(p);
+        nodes.add(root);
+        nodes.add(element);
+        nodes.add(attribute);
+        nodes.add(text);
+        nodes.add(comment);
+        nodes.add(instruction);
 
         assert_eq!(6, nodes.size());
-        assert!(nodes.contains(Root(r)));
-        assert!(nodes.contains(Element(e)));
-        assert!(nodes.contains(Attribute(a)));
-        assert!(nodes.contains(Text(t)));
-        assert!(nodes.contains(Comment(c)));
-        assert!(nodes.contains(ProcessingInstruction(p)));
+        assert!(nodes.contains(Root(root)));
+        assert!(nodes.contains(Element(element)));
+        assert!(nodes.contains(Attribute(attribute)));
+        assert!(nodes.contains(Text(text)));
+        assert!(nodes.contains(Comment(comment)));
+        assert!(nodes.contains(ProcessingInstruction(instruction)));
     }
 
     #[test]
@@ -1748,7 +1791,7 @@ mod test {
             })
             .expect("second traversal must restart at its own root");
             assert_eq!(text, "nestedtail");
-            assert!(stack.is_empty());
+            assert_eq!(stack, []);
             assert_eq!(stack.capacity(), capacity);
         }
     }

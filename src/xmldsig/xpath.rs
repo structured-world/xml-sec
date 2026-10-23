@@ -1154,7 +1154,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
                         charge_xpath_mirror_bytes(projected_bytes, attribute.value().len())?;
                     projected_bytes = charge_xpath_mirror_bytes(
                         projected_bytes,
-                        attribute_prefix(node, &attribute).len(),
+                        attribute_prefix(node, attribute).len(),
                     )?;
                 }
             } else if node.is_text() || node.is_comment() {
@@ -1238,7 +1238,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
                     mirror
                         .attributes
                         .insert(target_attribute.identity_key(), (source_node.id(), ordinal))?;
-                    let prefix = attribute_prefix(source_node, &attribute);
+                    let prefix = attribute_prefix(source_node, attribute);
                     construction.attribute_prefix(
                         target_attribute,
                         (!prefix.is_empty()).then_some(prefix),

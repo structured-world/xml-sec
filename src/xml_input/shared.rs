@@ -240,11 +240,9 @@ impl IanaSingleByteEncoding {
                     .filter(|byte| !matches!(byte, 0xD0 | 0xDD | 0xDE | 0xF0 | 0xFD | 0xFE)),
             },
             Self::Iso8859_11 | Self::Tis620 => match u32::from(character) {
-                value @ 0x00..=0x7F => Some(value as u8),
+                value @ 0x00..=0x7F => u8::try_from(value).ok(),
                 0xA0 if self == Self::Iso8859_11 => Some(0xA0),
-                value @ 0x0E01..=0x0E3A | value @ 0x0E40..=0x0E5B => {
-                    u8::try_from(value - 0x0D60).ok()
-                }
+                value @ (0x0E01..=0x0E3A | 0x0E40..=0x0E5B) => u8::try_from(value - 0x0D60).ok(),
                 0x0E3F => Some(0xDF),
                 _ => None,
             },
@@ -308,6 +306,10 @@ pub fn legacy_label_matches_encoding(
 /// byte signature and XML declaration rather than silently overriding either.
 /// UTF-8 input is borrowed when no declaration rewrite is required; other
 /// encodings are strictly transcoded and their declaration is normalized.
+///
+/// # Errors
+/// Returns an error for malformed bytes or declarations, unsupported encodings,
+/// conflicting metadata, or a missing required byte-order signature.
 pub fn decode_xml<'a>(
     bytes: &'a [u8],
     explicit_encoding: Option<&str>,
@@ -317,6 +319,11 @@ pub fn decode_xml<'a>(
 
 /// Decode XML while preventing either the transcoded or normalized UTF-8
 /// representation from growing beyond `maximum_decoded_bytes`.
+///
+/// # Errors
+/// Returns an error for malformed bytes or declarations, unsupported encodings,
+/// conflicting metadata, or a missing required byte-order signature. Returns
+/// [`Error::DecodedLimit`] before retaining output beyond the supplied ceiling.
 pub fn decode_xml_bounded<'a>(
     bytes: &'a [u8],
     explicit_encoding: Option<&str>,
@@ -339,11 +346,15 @@ pub fn decode_xml_bounded<'a>(
 /// label, when present, as borrowed strings. It runs before transcoding and again
 /// when a non-ASCII declaration becomes readable, before declaration rewriting.
 /// Returning an error prevents parsing; the ordinary decoder remains unrestricted.
-pub fn decode_xml_bounded_with_encoding_guard<'a>(
-    bytes: &'a [u8],
+///
+/// # Errors
+/// Returns guard refusals unchanged, decoding/declaration errors, or
+/// [`Error::DecodedLimit`] if transcoding or normalization exceeds the ceiling.
+pub fn decode_xml_bounded_with_encoding_guard(
+    bytes: &[u8],
     maximum_decoded_bytes: usize,
     guard: impl Fn(&str, Option<&str>) -> Result<(), Error>,
-) -> Result<Cow<'a, str>, Error> {
+) -> Result<Cow<'_, str>, Error> {
     decode_xml_bounded_inner(
         bytes,
         None,
@@ -368,8 +379,12 @@ pub fn decode_xml_in<'a, S: DecodeStorage>(
 
 /// Detect XML-media-type text encoding without changing the included text's declaration.
 ///
-/// XInclude `parse="text"` uses XML encoding detection for XML media types, but includes the
+/// `XInclude` `parse="text"` uses XML encoding detection for XML media types, but includes the
 /// decoded characters as text rather than reparsing or rewriting an XML declaration.
+///
+/// # Errors
+/// Returns encoding/declaration errors as in [`decode_xml`] or
+/// [`Error::DecodedLimit`] when the decoded text exceeds the ceiling.
 pub fn decode_xml_text_bounded<'a>(
     bytes: &'a [u8],
     explicit_encoding: Option<&str>,
@@ -445,8 +460,7 @@ fn decode_xml_bounded_inner<'a, S: DecodeStorage>(
         selected.name(),
         ascii_declaration.as_ref().map(|(_, label)| *label),
     )?;
-    let mut decoded =
-        decode_selected_in(&bytes[bom_len..], selected, maximum_decoded_bytes, storage)?;
+    let decoded = decode_selected_in(&bytes[bom_len..], selected, maximum_decoded_bytes, storage)?;
     storage.charge(decoded.as_ref().len())?;
     let declaration = declaration_from_text(decoded.as_ref())?;
     if physical.is_some() {
@@ -477,31 +491,55 @@ fn decode_xml_bounded_inner<'a, S: DecodeStorage>(
     }
     if let Some(range) = &declaration {
         let label = &decoded.as_ref()[range.clone()];
-        if is_generic_utf16(label) {
-            let has_utf16_bom = physical.is_some_and(|(encoding, bom_len)| {
-                bom_len > 0
-                    && matches!(encoding, SelectedEncoding::Standard(value)
-                        if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
-            });
-            if !has_utf16_bom {
-                return Err(Error::MissingUtf16ByteOrder.into());
-            }
-        } else if is_generic_utf32(label) {
-            if !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
-                return Err(Error::MissingUtf32ByteOrder.into());
-            }
-        } else {
-            let declared = parse_encoding_in(label, storage)?;
-            if !encodings_compatible(selected, declared, false) {
-                return Err(storage.label_error(LabelError::Conflicting, label));
-            }
-        }
+        validate_declared_encoding(label, selected, physical, storage)?;
     }
 
-    if normalize_declaration
-        && !selected.is_utf8()
-        && let Some(range) = declaration
-    {
+    if normalize_declaration && !selected.is_utf8() {
+        return normalize_encoding_declaration(
+            decoded,
+            declaration,
+            maximum_decoded_bytes,
+            storage,
+        );
+    }
+    Ok(decoded)
+}
+
+fn validate_declared_encoding<S: DecodeStorage>(
+    label: &str,
+    selected: SelectedEncoding,
+    physical: Option<(SelectedEncoding, usize)>,
+    storage: &S,
+) -> Result<(), S::Error> {
+    if is_generic_utf16(label) {
+        let has_utf16_bom = physical.is_some_and(|(encoding, bom_len)| {
+            bom_len > 0
+                && matches!(encoding, SelectedEncoding::Standard(value)
+                    if value == encoding_rs::UTF_16LE || value == encoding_rs::UTF_16BE)
+        });
+        if !has_utf16_bom {
+            return Err(Error::MissingUtf16ByteOrder.into());
+        }
+    } else if is_generic_utf32(label) {
+        if !physical.is_some_and(|(encoding, _)| is_utf32_encoding(encoding)) {
+            return Err(Error::MissingUtf32ByteOrder.into());
+        }
+    } else {
+        let declared = parse_encoding_in(label, storage)?;
+        if !encodings_compatible(selected, declared, false) {
+            return Err(storage.label_error(LabelError::Conflicting, label));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_encoding_declaration<'a, S: DecodeStorage>(
+    decoded: Decoded<'a, S::Text>,
+    declaration: Option<Range<usize>>,
+    maximum_decoded_bytes: usize,
+    storage: &S,
+) -> Result<Decoded<'a, S::Text>, S::Error> {
+    if let Some(range) = declaration {
         let normalized_len = decoded
             .as_ref()
             .len()
@@ -514,7 +552,7 @@ fn decode_xml_bounded_inner<'a, S: DecodeStorage>(
             }
             .into());
         }
-        decoded = Decoded::Owned(match decoded {
+        return Ok(Decoded::Owned(match decoded {
             Decoded::Owned(text) => storage.replace(text, range, "UTF-8")?,
             Decoded::Borrowed(text) => {
                 let mut buffer = storage.buffer();
@@ -523,17 +561,25 @@ fn decode_xml_bounded_inner<'a, S: DecodeStorage>(
                 storage.append(&mut buffer, &text[range.end..])?;
                 storage.finish(buffer)?
             }
-        });
+        }));
     }
     Ok(decoded)
 }
 
 /// Decode a non-XML text resource using an explicit character encoding.
+///
+/// # Errors
+/// Returns an error for unsupported encodings, invalid bytes, or missing or
+/// conflicting byte-order signatures.
 pub fn decode_text<'a>(bytes: &'a [u8], encoding: &str) -> Result<Cow<'a, str>, Error> {
     decode_text_bounded(bytes, encoding, usize::MAX)
 }
 
 /// Decode a non-XML text resource under a retained-byte ceiling.
+///
+/// # Errors
+/// Returns decoding errors as in [`decode_text`] or [`Error::DecodedLimit`]
+/// before retaining text beyond `maximum_decoded_bytes`.
 pub fn decode_text_bounded<'a>(
     bytes: &'a [u8],
     encoding: &str,
@@ -680,11 +726,11 @@ pub fn is_latin1_encoding_label(label: &str) -> bool {
     )
 }
 
-fn decode_selected<'a>(
-    bytes: &'a [u8],
+fn decode_selected(
+    bytes: &[u8],
     encoding: SelectedEncoding,
     maximum: usize,
-) -> Result<Cow<'a, str>, Error> {
+) -> Result<Cow<'_, str>, Error> {
     decode_selected_in(bytes, encoding, maximum, &NativeStorage).map(native_text)
 }
 
@@ -739,7 +785,7 @@ fn decode_selected_in<'a, S: DecodeStorage>(
         return Err(Error::InvalidUtf16Length(encoding.name()).into());
     }
 
-    let mut decoder = encoding.new_decoder_without_bom_handling();
+    let mut transcoder = encoding.new_decoder_without_bom_handling();
     let mut remaining = bytes;
     let mut decoded = storage.buffer();
     let mut buffer = [0_u8; 4096];
@@ -750,7 +796,7 @@ fn decode_selected_in<'a, S: DecodeStorage>(
         let input_length = remaining.len().min(buffer.len());
         let last = input_length == remaining.len();
         storage.charge(input_length)?;
-        let (result, read, written) = decoder.decode_to_utf8_without_replacement(
+        let (result, read, written) = transcoder.decode_to_utf8_without_replacement(
             &remaining[..input_length],
             &mut buffer,
             last,
@@ -770,8 +816,7 @@ fn decode_selected_in<'a, S: DecodeStorage>(
             encoding_rs::DecoderResult::InputEmpty if last => {
                 return storage.finish(decoded).map(Decoded::Owned);
             }
-            encoding_rs::DecoderResult::InputEmpty => {}
-            encoding_rs::DecoderResult::OutputFull => {}
+            encoding_rs::DecoderResult::InputEmpty | encoding_rs::DecoderResult::OutputFull => {}
             encoding_rs::DecoderResult::Malformed(_, _) => {
                 return Err(Error::InvalidBytes(encoding.name()).into());
             }
@@ -815,7 +860,7 @@ fn decode_utf32<S: DecodeStorage>(
     storage.charge(bytes.len())?;
     let mut decoded = storage.buffer();
     let (units, remainder) = bytes.as_chunks::<4>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder, b"");
     for &unit in units {
         let scalar = match encoding {
             SelectedEncoding::Utf32Le => u32::from_le_bytes(unit),
@@ -857,13 +902,13 @@ fn is_utf32_encoding(encoding: SelectedEncoding) -> bool {
 
 // XML 1.0 section 2.3 production [3] defines S as exactly these four bytes.
 // https://www.w3.org/TR/xml/#NT-S
-const fn is_xml_s_byte(byte: &u8) -> bool {
-    matches!(*byte, b' ' | b'\t' | b'\r' | b'\n')
+const fn is_xml_s_byte(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 fn declaration_from_ascii_bytes(bytes: &[u8]) -> Result<Option<(Range<usize>, &str)>, Error> {
     let bytes = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes);
-    if !bytes.starts_with(b"<?xml") || !bytes.get(5).is_some_and(is_xml_s_byte) {
+    if !bytes.starts_with(b"<?xml") || !bytes.get(5).copied().is_some_and(is_xml_s_byte) {
         return Ok(None);
     }
     let end = bytes
@@ -887,7 +932,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
     let Some(rest) = xml.strip_prefix("<?xml") else {
         return Ok(None);
     };
-    if !rest.as_bytes().first().is_some_and(is_xml_s_byte) {
+    if !rest.as_bytes().first().copied().is_some_and(is_xml_s_byte) {
         return Ok(None);
     }
     let end = rest
@@ -897,7 +942,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
     let mut cursor = 0;
     let mut encoding_range = None;
     while cursor < declaration.len() {
-        while declaration.get(cursor).is_some_and(is_xml_s_byte) {
+        while declaration.get(cursor).copied().is_some_and(is_xml_s_byte) {
             cursor += 1;
         }
         if cursor == declaration.len() {
@@ -913,14 +958,14 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
             return Err(Error::MalformedDeclaration("invalid pseudo-attribute"));
         }
         let name = &declaration[name_start..cursor];
-        while declaration.get(cursor).is_some_and(is_xml_s_byte) {
+        while declaration.get(cursor).copied().is_some_and(is_xml_s_byte) {
             cursor += 1;
         }
         if declaration.get(cursor) != Some(&b'=') {
             return Err(Error::MalformedDeclaration("missing `=`"));
         }
         cursor += 1;
-        while declaration.get(cursor).is_some_and(is_xml_s_byte) {
+        while declaration.get(cursor).copied().is_some_and(is_xml_s_byte) {
             cursor += 1;
         }
         let &quote @ (b'\'' | b'"') = declaration
@@ -948,7 +993,7 @@ fn declaration_from_text(xml: &str) -> Result<Option<Range<usize>>, Error> {
         cursor = value_end + 1;
         if declaration
             .get(cursor)
-            .is_some_and(|byte| !is_xml_s_byte(byte))
+            .is_some_and(|&byte| !is_xml_s_byte(byte))
         {
             return Err(Error::MalformedDeclaration("missing whitespace"));
         }
@@ -988,6 +1033,10 @@ fn matches_ascii_case(value: &str, candidates: &[&str]) -> bool {
         .iter()
         .any(|candidate| value.eq_ignore_ascii_case(candidate))
 }
+
+#[cfg(all(test, feature = "std"))]
+#[path = "shared/codec_tests.rs"]
+mod codec_tests;
 
 #[cfg(all(test, feature = "std"))]
 #[allow(clippy::unwrap_used)]

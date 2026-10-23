@@ -45,8 +45,7 @@ pub enum Label<'a> {
 impl<'a> Label<'a> {
     pub fn as_str(self) -> &'a str {
         match self {
-            Self::Borrowed(text) => text,
-            Self::Static(text) => text,
+            Self::Borrowed(text) | Self::Static(text) => text,
             Self::Current(text) => text,
         }
     }
@@ -97,6 +96,7 @@ impl InternedString {
         }
     }
     #[allow(clippy::should_implement_trait)] // We implement FromStr; this is a convenience that returns T directly
+    #[must_use]
     pub fn from_str(s: &str) -> InternedString {
         InternedString(native_text(Rc::<str>::from(s)))
     }
@@ -153,7 +153,7 @@ impl<S: Deref<Target = str>> hash::Hash for InternedString<S> {
     where
         H: hash::Hasher,
     {
-        (*self.0).hash(state)
+        (*self.0).hash(state);
     }
 }
 
@@ -234,6 +234,7 @@ impl Default for StringPool {
 }
 
 impl StringPool {
+    #[must_use]
     pub fn new() -> StringPool {
         StringPool {
             index: RefCell::new(NativePool::default()),
@@ -295,10 +296,17 @@ impl<'w, W: Work> AccountedStringPool<'w, W> {
         }
     }
     /// Finds or creates a canonical string using this pool's current execution.
+    ///
+    /// # Errors
+    /// Returns the pool's work, capacity or allocator refusal before storing
+    /// a new entry; duplicate lookup still pays the current comparison work.
     pub fn intern(&self, text: &str) -> Result<InternedString<SharedString>, MemoryError> {
         intern(&self.index, text)
     }
     /// Reads retained strings using the supplied query, without rebinding growth.
+    ///
+    /// # Errors
+    /// Returns a work refusal if the supplied query cannot fund lookup.
     pub fn find(
         &self,
         text: &str,
@@ -364,7 +372,7 @@ mod test {
         for shift in (0..=12).rev() {
             while work.charge_work(1 << shift).is_ok() {}
         }
-        let _held = memory
+        let held_capacity = memory
             .reserve(memory.limit() - memory.used())
             .expect("hold all remaining capacity");
         let query = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 65536)));
@@ -384,7 +392,7 @@ mod test {
         drop(second);
         drop(first);
         drop(pool);
-        drop(_held);
+        drop(held_capacity);
         assert_eq!(memory.used(), 0);
     }
 
@@ -427,7 +435,7 @@ mod test {
 
     #[test]
     fn can_be_dropped_immediately() {
-        StringPool::new();
+        drop(StringPool::new());
     }
 
     #[test]

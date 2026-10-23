@@ -92,7 +92,7 @@ pub(super) struct AttributeData<S: Storage = Native> {
 /// Non-fatal xml:id constraint diagnostic; ID type assignment is preserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum XmlIdError {
-    /// The normalized value is not an XML NCName.
+    /// The normalized value is not an XML `NCName`.
     InvalidNcName,
     /// A declaration assigns a type other than ID to this xml:id attribute.
     InvalidDeclaredType,
@@ -240,7 +240,7 @@ impl<S: Storage> std::fmt::Debug for NodeData<S> {
             .field("range", &self.range)
             .field("range_actionable", &self.range_actionable)
             .field("subtree_end", &self.subtree_end)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -443,7 +443,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
 /// Parsed backend-neutral XML document.
 ///
 /// The selected parser is used only while constructing this arena. C14N,
-/// XPath, XMLDSig, XMLEnc, and mutation code never branch on the parser.
+/// `XPath`, `XMLDSig`, `XMLEnc`, and mutation code never branch on the parser.
 pub struct Document<'input, S: Storage = Native> {
     input: &'input str,
     nodes: S::Values<NodeData<S>>,
@@ -462,11 +462,17 @@ impl<S: Storage> std::fmt::Debug for Document<'_, S> {
 
 impl<'input> Document<'input> {
     /// Parses XML with default backend-neutral options.
+    ///
+    /// # Errors
+    /// Rejects malformed XML and inputs exceeding parser safety ceilings.
     pub fn parse(input: &'input str) -> Result<Self, ParseError> {
         Self::parse_with_options(input, ParsingOptions::default())
     }
 
     /// Parses XML with the build's default backend.
+    ///
+    /// # Errors
+    /// Rejects malformed XML, disallowed DTDs and inputs exceeding `options`.
     pub fn parse_with_options(
         input: &'input str,
         options: ParsingOptions,
@@ -475,11 +481,17 @@ impl<'input> Document<'input> {
     }
 
     /// Parses XML with an explicitly selected compiled backend.
+    ///
+    /// # Errors
+    /// Returns parse/limit, unavailable-backend or differential-mismatch errors.
     pub fn parse_with_backend(input: &'input str, backend: XmlBackend) -> Result<Self, ParseError> {
         Self::parse_with_options_and_backend(input, ParsingOptions::default(), backend)
     }
 
     /// Parses XML with explicit parser options and backend selection.
+    ///
+    /// # Errors
+    /// Returns parse/limit, unavailable-backend or differential-mismatch errors.
     pub fn parse_with_options_and_backend(
         input: &'input str,
         options: ParsingOptions,
@@ -523,12 +535,18 @@ impl<'input, S: Storage> Document<'input, S> {
     }
 
     /// Returns the synthetic document root.
+    ///
+    /// # Panics
+    /// Panics only if the internally constructed arena lacks its mandatory root.
     pub fn root(&self) -> Node<'_, 'input, S> {
         self.get_node(NodeId(0))
             .expect("parsed document has a root")
     }
 
     /// Returns the document element.
+    ///
+    /// # Panics
+    /// Panics only if the internally validated arena lacks a document element.
     pub fn root_element(&self) -> Node<'_, 'input, S> {
         self.root()
             .children()
@@ -548,13 +566,13 @@ impl<'input, S: Storage> Document<'input, S> {
             .map(|_| Node { document: self, id })
     }
 
-    /// Number of XPath nodes: tree nodes with their attribute and namespace nodes.
+    /// Number of `XPath` nodes: tree nodes with their attribute and namespace nodes.
     #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_node_count(&self) -> u32 {
         self.xpath_nodes
     }
 
-    /// Tree node owning a document-order XPath index (itself for tree nodes).
+    /// Tree node owning a document-order `XPath` index (itself for tree nodes).
     #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_owner(&self, index: u32) -> Option<Node<'_, 'input, S>> {
         if index >= self.xpath_nodes {
@@ -607,17 +625,12 @@ pub(super) fn range_contains(container: &Range<usize>, candidate: &Range<usize>)
 }
 
 /// Copyable handle into a backend-neutral document arena.
+#[derive(Clone, Copy)]
 pub struct Node<'a, 'input, S: Storage = Native> {
     document: &'a Document<'input, S>,
     id: NodeId,
 }
 
-impl<S: Storage> Copy for Node<'_, '_, S> {}
-impl<S: Storage> Clone for Node<'_, '_, S> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
 impl<S: Storage> std::fmt::Debug for Node<'_, '_, S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Node")
@@ -644,14 +657,17 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         &self.document.nodes[self.id.index()]
     }
     /// Returns this node's stable arena ID.
+    #[must_use]
     pub fn id(self) -> NodeId {
         self.id
     }
     /// Returns the owning document.
+    #[must_use]
     pub fn document(self) -> &'a Document<'input, S> {
         self.document
     }
     /// Returns the semantic node kind.
+    #[must_use]
     pub fn node_type(self) -> NodeType {
         match self.data().kind {
             NodeKind::Root => NodeType::Root,
@@ -662,26 +678,32 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         }
     }
     /// Returns whether this is the synthetic document root.
+    #[must_use]
     pub fn is_root(&self) -> bool {
         self.node_type() == NodeType::Root
     }
     /// Returns whether this is an element.
+    #[must_use]
     pub fn is_element(&self) -> bool {
         self.node_type() == NodeType::Element
     }
     /// Returns whether this is text.
+    #[must_use]
     pub fn is_text(&self) -> bool {
         self.node_type() == NodeType::Text
     }
     /// Returns whether this is a comment.
+    #[must_use]
     pub fn is_comment(&self) -> bool {
         self.node_type() == NodeType::Comment
     }
     /// Returns whether this is a processing instruction.
+    #[must_use]
     pub fn is_pi(&self) -> bool {
         self.node_type() == NodeType::PI
     }
     /// Returns the source byte range represented by this node.
+    #[must_use]
     pub fn range(self) -> Range<usize> {
         self.data().range.clone()
     }
@@ -689,15 +711,18 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         self.data().range_actionable
     }
     /// Returns the parent node.
+    #[must_use]
     pub fn parent(self) -> Option<Self> {
         self.data().parent.and_then(|id| self.document.get_node(id))
     }
     /// Returns the parent only when it is an element.
+    #[must_use]
     pub fn parent_element(self) -> Option<Self> {
         self.parent()
             .and_then(|node| node.is_element().then_some(node))
     }
     /// Iterates direct children in document order.
+    #[must_use]
     pub fn children(self) -> Children<'a, 'input, S> {
         Children {
             document: self.document,
@@ -705,30 +730,34 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         }
     }
     /// Returns the first direct child node.
+    #[must_use]
     pub fn first_child(self) -> Option<Self> {
         self.children().next()
     }
     /// Returns the first direct element child.
+    #[must_use]
     pub fn first_element_child(self) -> Option<Self> {
         self.children().find(Node::is_element)
     }
     /// Returns the last direct element child.
+    #[must_use]
     pub fn last_element_child(self) -> Option<Self> {
         self.children().rev().find(Node::is_element)
     }
     /// Iterates this node and its descendants in document order.
+    #[must_use]
     pub fn descendants(self) -> Descendants<'a, 'input, S> {
         Descendants {
             document: self.document,
             ids: self.id.0..self.data().subtree_end,
         }
     }
-    /// Document-order XPath index of this tree node.
+    /// Document-order `XPath` index of this tree node.
     #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_index(self) -> u32 {
         self.data().xpath_start
     }
-    /// End of the contiguous XPath index range covering this subtree and its axes.
+    /// End of the contiguous `XPath` index range covering this subtree and its axes.
     #[cfg(feature = "xmldsig")]
     pub(crate) fn xpath_subtree_end(self) -> u32 {
         self.document
@@ -737,10 +766,12 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             .map_or(self.document.xpath_nodes, |next| next.xpath_start)
     }
     /// Iterates this node and then its ancestors.
+    #[must_use]
     pub fn ancestors(self) -> Ancestors<'a, 'input, S> {
         Ancestors { next: Some(self) }
     }
     /// Returns the preceding sibling.
+    #[must_use]
     pub fn prev_sibling(self) -> Option<Self> {
         let parent = self.parent()?;
         let position = parent
@@ -753,6 +784,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             .and_then(|index| self.document.get_node(parent.data().children[index]))
     }
     /// Returns the following sibling.
+    #[must_use]
     pub fn next_sibling(self) -> Option<Self> {
         let parent = self.parent()?;
         let position = parent
@@ -780,6 +812,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         })
     }
     /// Returns the next sibling that is an element.
+    #[must_use]
     pub fn next_sibling_element(self) -> Option<Self> {
         let mut current = self.next_sibling();
         while let Some(node) = current {
@@ -791,6 +824,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         None
     }
     /// Returns the expanded element name, or an empty name for non-elements.
+    #[must_use]
     pub fn tag_name(self) -> ExpandedName<'a> {
         match &self.data().kind {
             NodeKind::Element {
@@ -812,6 +846,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
     /// A bare string matches any namespace, mirroring roxmltree. Tuple forms
     /// match the namespace exactly, including `(None, name)` for an
     /// unqualified element.
+    #[must_use]
     pub fn has_tag_name<'n, N>(self, name: N) -> bool
     where
         N: Into<ExpandedName<'n>>,
@@ -824,6 +859,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             && (!name.match_namespace || self.tag_name().namespace() == name.namespace())
     }
     /// Returns the element's lexical namespace prefix.
+    #[must_use]
     pub fn prefix(self) -> Option<&'a str> {
         match &self.data().kind {
             NodeKind::Element { prefix, .. } => prefix.as_deref(),
@@ -831,6 +867,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         }
     }
     /// Iterates non-namespace attributes in source order.
+    #[must_use]
     pub fn attributes(self) -> Attributes<'a, S> {
         let values: &[AttributeData<S>] = match &self.data().kind {
             NodeKind::Element { attributes, .. } => &attributes[..],
@@ -841,6 +878,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         }
     }
     /// Looks up an unqualified attribute by local name.
+    #[must_use]
     pub fn attribute<'n, N>(self, name: N) -> Option<&'a str>
     where
         N: Into<ExpandedName<'n>>,
@@ -851,6 +889,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             .map(Attribute::value)
     }
     /// Iterates in-scope namespace bindings.
+    #[must_use]
     pub fn namespaces(self) -> Namespaces<'a, S> {
         let values: &[NamespaceData<S>] = match &self.data().kind {
             NodeKind::Element { namespaces, .. } => &namespaces[..],
@@ -861,6 +900,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
         }
     }
     /// Resolves a namespace prefix in this element's in-scope bindings.
+    #[must_use]
     pub fn lookup_namespace_uri(self, prefix: Option<&str>) -> Option<&'a str> {
         if prefix == Some("xml") {
             return Some(XML_NAMESPACE_URI);
@@ -870,6 +910,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             .map(Namespace::uri)
     }
     /// Finds an in-scope prefix for a namespace URI.
+    #[must_use]
     pub fn lookup_prefix(self, uri: &str) -> Option<&'a str> {
         if uri == XML_NAMESPACE_URI {
             return Some("xml");
@@ -879,6 +920,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             .find_map(Namespace::name)
     }
     /// Returns direct character data, or the first direct text child of an element.
+    #[must_use]
     pub fn text(self) -> Option<&'a str> {
         match &self.data().kind {
             NodeKind::Text(value) | NodeKind::Comment(value) => Some(value),
@@ -889,11 +931,11 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
                         _ => None,
                     })
             }
-            NodeKind::PI { .. } => None,
-            NodeKind::Root => None,
+            NodeKind::PI { .. } | NodeKind::Root => None,
         }
     }
     /// Returns processing-instruction data for a PI node.
+    #[must_use]
     pub fn pi(self) -> Option<PI<'a>> {
         match &self.data().kind {
             NodeKind::PI { target, value } => Some(PI {
@@ -916,10 +958,12 @@ pub struct ExpandedName<'a> {
 }
 impl<'a> ExpandedName<'a> {
     /// Returns the local name.
+    #[must_use]
     pub fn name(self) -> &'a str {
         self.name
     }
     /// Returns the namespace URI.
+    #[must_use]
     pub fn namespace(self) -> Option<&'a str> {
         self.namespace
     }
@@ -959,14 +1003,9 @@ impl<'a> From<(&'a str, &'a str)> for ExpandedName<'a> {
 }
 
 /// Borrowed semantic XML attribute.
+#[derive(Clone, Copy)]
 pub struct Attribute<'a, S: Storage = Native> {
     data: &'a AttributeData<S>,
-}
-impl<S: Storage> Copy for Attribute<'_, S> {}
-impl<S: Storage> Clone for Attribute<'_, S> {
-    fn clone(&self) -> Self {
-        *self
-    }
 }
 impl<'a, S: Storage> Attribute<'a, S> {
     /// Report non-fatal xml:id errors without changing ID type assignment.
@@ -974,26 +1013,32 @@ impl<'a, S: Storage> Attribute<'a, S> {
     /// xml:id 1.0 sections 4 and 6 require assignment even for invalid values;
     /// applications may inspect this diagnostic before relying on an ID.
     /// <https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing>
+    #[must_use]
     pub fn xml_id_error(self) -> Option<XmlIdError> {
         self.data.xml_id_error
     }
     /// Whether XML processing assigned the ID type (DTD or xml:id).
+    #[must_use]
     pub fn is_id(self) -> bool {
         self.data.is_id
     }
     /// Returns the local name.
+    #[must_use]
     pub fn name(self) -> &'a str {
         &self.data.name
     }
     /// Returns the namespace URI.
+    #[must_use]
     pub fn namespace(self) -> Option<&'a str> {
         self.data.namespace.as_deref()
     }
     /// Returns the expanded value.
+    #[must_use]
     pub fn value(self) -> &'a str {
         &self.data.value
     }
     /// Returns the lexical namespace prefix.
+    #[must_use]
     pub fn prefix(self) -> Option<&'a str> {
         self.data.prefix.as_deref()
     }
@@ -1018,21 +1063,18 @@ impl<'a, S: Storage> Iterator for Attributes<'a, S> {
 impl<S: Storage> ExactSizeIterator for Attributes<'_, S> {}
 
 /// Borrowed in-scope namespace binding.
+#[derive(Clone, Copy)]
 pub struct Namespace<'a, S: Storage = Native> {
     data: &'a NamespaceData<S>,
 }
-impl<S: Storage> Copy for Namespace<'_, S> {}
-impl<S: Storage> Clone for Namespace<'_, S> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
 impl<'a, S: Storage> Namespace<'a, S> {
     /// Returns the prefix, or `None` for the default namespace.
+    #[must_use]
     pub fn name(self) -> Option<&'a str> {
         self.data.prefix.as_deref()
     }
     /// Returns the namespace URI.
+    #[must_use]
     pub fn uri(self) -> &'a str {
         &self.data.uri
     }
@@ -1080,7 +1122,7 @@ impl<'a, 'input, S: Storage> Iterator for Children<'a, 'input, S> {
     }
 }
 impl<S: Storage> ExactSizeIterator for Children<'_, '_, S> {}
-impl<'a, 'input, S: Storage> DoubleEndedIterator for Children<'a, 'input, S> {
+impl<S: Storage> DoubleEndedIterator for Children<'_, '_, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.ids
             .next_back()
@@ -1202,7 +1244,7 @@ mod tests {
             .expect("funded lexical preflight");
         let document = super::super::roxmltree::RoxmltreeBackend::parse_in(
             source,
-            Default::default(),
+            ParsingOptions::default(),
             &preflight,
             storage,
         )
@@ -1230,7 +1272,7 @@ mod tests {
                     (&algorithm, None),
                     None,
                     1 << 20,
-                    &Default::default(),
+                    &crate::c14n::xml_base::XmlBaseResolutionBudget::default(),
                     &crate::c14n::scratch::Accounted(&memory),
                 )
                 .expect("funded canonicalization");
@@ -1319,7 +1361,7 @@ mod tests {
         }
     }
 
-    use super::Document;
+    use super::{Document, Node};
     #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
     use super::{NamespaceData, comparison::namespaces_equal};
     use crate::xml::dom::{ParseError, ParsingOptions, XmlBackend};
@@ -1347,11 +1389,14 @@ mod tests {
 
     #[test]
     fn every_backend_enforces_the_same_active_namespace_ceiling() {
+        use std::fmt::Write as _;
         // Backend selection must not change whether an adversarial namespace
         // stack is accepted. The 1024th binding is valid; the 1025th is not.
-        let declarations = (0..1_023)
-            .map(|index| format!(r#" xmlns:n{index}="urn:namespace:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..1_023 {
+            write!(declarations, r#" xmlns:n{index}="urn:namespace:{index}""#)
+                .expect("namespace boundary");
+        }
         let accepted = format!(r#"<root{declarations}><child xmlns:p="urn:p"/></root>"#);
         let rejected = format!(
             r#"<root{declarations} xmlns:overflow="urn:overflow"><child xmlns:p="urn:p"/></root>"#
@@ -1482,10 +1527,7 @@ mod tests {
         // explicit optional namespace represents exact expanded-name intent.
         let document = Document::parse(r#"<r xmlns:p="urn:p"><item/><p:item/></r>"#)
             .expect("namespace matching fixture must parse");
-        let mut items = document
-            .root_element()
-            .children()
-            .filter(|node| node.is_element());
+        let mut items = document.root_element().children().filter(Node::is_element);
         let unqualified = items.next().expect("unqualified item must exist");
         let namespaced = items.next().expect("namespaced item must exist");
 
@@ -1531,7 +1573,7 @@ mod tests {
         let text = document
             .root_element()
             .children()
-            .filter(|node| node.is_text())
+            .filter(Node::is_text)
             .collect::<Vec<_>>();
         assert_eq!(text.len(), 1);
         assert_eq!(text[0].text(), Some("one+twothree"));
@@ -1701,10 +1743,7 @@ mod tests {
         assert_eq!(pi.text(), None);
         assert_eq!(pi.pi().and_then(|value| value.value), Some("hidden"));
         assert_eq!(root.text(), None);
-        assert_eq!(
-            pi.next_sibling().and_then(|node| node.text()),
-            Some("visible")
-        );
+        assert_eq!(pi.next_sibling().and_then(Node::text), Some("visible"));
 
         let nested =
             Document::parse("<r><child>nested</child>later</r>").expect("fixture must parse");
@@ -1758,15 +1797,13 @@ mod tests {
         let root = document.root();
         let comments = root
             .descendants()
-            .filter(|node| node.is_comment())
-            .filter_map(|node| node.text())
+            .filter(Node::is_comment)
+            .filter_map(Node::text)
             .collect::<Vec<_>>();
 
         assert_eq!(comments, ["before", "after"]);
         assert_eq!(
-            root.descendants()
-                .find(|node| node.is_text())
-                .and_then(|node| node.text()),
+            root.descendants().find(Node::is_text).and_then(Node::text),
             Some("ok")
         );
     }
@@ -1786,13 +1823,13 @@ mod tests {
         let root = document.root();
         let comments = root
             .children()
-            .filter(|node| node.is_comment())
-            .filter_map(|node| node.text())
+            .filter(Node::is_comment)
+            .filter_map(Node::text)
             .collect::<Vec<_>>();
         let processing_instructions = root
             .children()
-            .filter(|node| node.is_pi())
-            .filter_map(|node| node.pi())
+            .filter(Node::is_pi)
+            .filter_map(Node::pi)
             .collect::<Vec<_>>();
 
         assert_eq!(comments, [" <!DOCTYPE fake> "]);

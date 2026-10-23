@@ -585,7 +585,6 @@ impl fmt::Debug for DtdDeclaration {
 /// Each declaration appears on its own line. The output does NOT include
 /// the surrounding `[` and `]>` — the caller adds those.
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn serialize_dtd(dtd: &Dtd) -> String {
     serialize_dtd_in(dtd, Native).expect("native DTD serialization allocation")
 }
@@ -1752,78 +1751,74 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
     // --- ENTITY declaration ---
     // See XML 1.0 §4.2: [70] EntityDecl
 
-    #[allow(clippy::too_many_lines)]
+    fn parse_parameter_entity(&mut self) -> Result<(), DtdError<S>> {
+        self.advance(1)?;
+        self.skip_whitespace_required()?;
+        let pe_name = self.parse_name()?;
+        if pe_name.contains(':') {
+            return Err(self.fatal(format_args!(
+                "entity name '{pe_name}' must not contain a colon"
+            )));
+        }
+        self.skip_whitespace_required()?;
+        let pe_kind = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
+            let value = self.parse_quoted_value()?;
+            self.validate_entity_value(&value, true)?;
+            Some(EntityKind::Internal(value))
+        } else if self.looking_at(b"SYSTEM") {
+            self.expect_str(b"SYSTEM")?;
+            self.skip_whitespace_required()?;
+            let system_id = self.parse_quoted_value()?;
+            Some(EntityKind::External {
+                system_id,
+                public_id: None,
+            })
+        } else if self.looking_at(b"PUBLIC") {
+            self.expect_str(b"PUBLIC")?;
+            self.skip_whitespace_required()?;
+            let public_id = self.parse_quoted_value()?;
+            self.validate_public_id(&public_id)?;
+            self.skip_whitespace_required()?;
+            let system_id = self.parse_quoted_value()?;
+            Some(EntityKind::External {
+                system_id,
+                public_id: Some(public_id),
+            })
+        } else {
+            return Err(self.fatal("expected entity value or external ID"));
+        };
+        self.skip_whitespace()?;
+        // XML 1.0 §4.2.2 forbids NDATA on parameter entities.
+        if self.looking_at(b"NDATA") {
+            return Err(self.fatal("NDATA annotation is not allowed on parameter entities"));
+        }
+        self.expect_byte(b'>')?;
+        if let Some(kind) = pe_kind
+            && self
+                .dtd
+                .param_entities
+                .get(&pe_name, self.storage)?
+                .is_none()
+        {
+            Names::insert(
+                &mut self.dtd.param_entities,
+                pe_name,
+                EntityDecl {
+                    name: self.storage.text("")?,
+                    kind,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     fn parse_entity_decl(&mut self) -> Result<(), DtdError<S>> {
         self.expect_str(b"<!ENTITY")?;
         self.skip_whitespace_required()?;
 
         // Parameter entities (% name)
         if self.peek() == Some(b'%') {
-            self.advance(1)?;
-            self.skip_whitespace_required()?;
-            let pe_name = self.parse_name()?;
-            // Namespaces in XML 1.0: entity names must be NCNames (no colons).
-            if pe_name.contains(':') {
-                return Err(self.fatal(format_args!(
-                    "entity name '{pe_name}' must not contain a colon"
-                )));
-            }
-            self.skip_whitespace_required()?;
-
-            let pe_kind = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
-                // Internal PE — parse and validate the value
-                let value = self.parse_quoted_value()?;
-                self.validate_entity_value(&value, true)?;
-                Some(EntityKind::Internal(value))
-            } else if self.looking_at(b"SYSTEM") {
-                // External PE — parse external ID
-                self.expect_str(b"SYSTEM")?;
-                self.skip_whitespace_required()?;
-                let system_id = self.parse_quoted_value()?;
-                Some(EntityKind::External {
-                    system_id,
-                    public_id: None,
-                })
-            } else if self.looking_at(b"PUBLIC") {
-                self.expect_str(b"PUBLIC")?;
-                self.skip_whitespace_required()?;
-                let public_id = self.parse_quoted_value()?;
-                self.validate_public_id(&public_id)?;
-                self.skip_whitespace_required()?;
-                let system_id = self.parse_quoted_value()?;
-                Some(EntityKind::External {
-                    system_id,
-                    public_id: Some(public_id),
-                })
-            } else {
-                return Err(self.fatal("expected entity value or external ID"));
-            };
-
-            self.skip_whitespace()?;
-            // Reject NDATA on parameter entities (XML 1.0 §4.2.2)
-            if self.looking_at(b"NDATA") {
-                return Err(self.fatal("NDATA annotation is not allowed on parameter entities"));
-            }
-            self.expect_byte(b'>')?;
-
-            // Store PE declaration (first declaration wins per XML 1.0 §4.2)
-            if let Some(kind) = pe_kind
-                && self
-                    .dtd
-                    .param_entities
-                    .get(&pe_name, self.storage)?
-                    .is_none()
-            {
-                Names::insert(
-                    &mut self.dtd.param_entities,
-                    pe_name,
-                    EntityDecl {
-                        name: self.storage.text("")?,
-                        kind,
-                    },
-                )?;
-            }
-            return Ok(());
+            return self.parse_parameter_entity();
         }
 
         let name = self.parse_name()?;
@@ -2046,11 +2041,54 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
         Ok(self.storage.text(self.input.parse_nmtoken()?)?)
     }
 
-    /// Validates an entity value per XML 1.0 §4.3.2 `EntityValue` production.
-    ///
-    /// Checks that `&` is only used in valid entity/character references,
-    /// and that `%` is not present in general entity values.
-    #[allow(clippy::too_many_lines)]
+    /// Validate a numeric reference after `&` per XML 1.0 §4.1 [66].
+    fn validate_numeric_entity_reference(
+        &self,
+        bytes: &[u8],
+        position: &mut usize,
+    ) -> Result<(), DtdError<S>> {
+        let mut i = *position + 1;
+        let char_val = if i < bytes.len() && bytes[i] == b'x' {
+            i += 1;
+            let hex_start = i;
+            if i >= bytes.len() || !bytes[i].is_ascii_hexdigit() {
+                return Err(self.fatal("malformed character reference in entity value"));
+            }
+            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                i += 1;
+            }
+            let hex_str = std::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
+            u32::from_str_radix(hex_str, 16).unwrap_or(0)
+        } else {
+            let dec_start = i;
+            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
+                return Err(self.fatal("malformed character reference in entity value"));
+            }
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            let dec_str = std::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
+            dec_str.parse::<u32>().unwrap_or(0)
+        };
+        if i >= bytes.len() || bytes[i] != b';' {
+            return Err(self.fatal("incomplete character reference in entity value"));
+        }
+        i += 1;
+        if let Some(c) = char::from_u32(char_val) {
+            if !crate::parser_xmloxide::parser::input::is_xml_char(c) {
+                return Err(self.fatal(format_args!(
+                    "character reference &#x{char_val:X}; refers to invalid XML character"
+                )));
+            }
+        } else {
+            return Err(self.fatal(format_args!(
+                "character reference value {char_val} is not a valid Unicode code point"
+            )));
+        }
+        *position = i;
+        Ok(())
+    }
+
     fn validate_entity_value(
         &self,
         value: &str,
@@ -2091,52 +2129,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
                         return Err(self.fatal("incomplete reference in entity value: '&' at end"));
                     }
                     if bytes[i] == b'#' {
-                        // Character reference — parse and validate
-                        i += 1;
-                        let char_val = if i < bytes.len() && bytes[i] == b'x' {
-                            i += 1;
-                            let hex_start = i;
-                            if i >= bytes.len() || !bytes[i].is_ascii_hexdigit() {
-                                return Err(
-                                    self.fatal("malformed character reference in entity value")
-                                );
-                            }
-                            while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
-                                i += 1;
-                            }
-                            let hex_str = std::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
-                            u32::from_str_radix(hex_str, 16).unwrap_or(0)
-                        } else {
-                            let dec_start = i;
-                            if i >= bytes.len() || !bytes[i].is_ascii_digit() {
-                                return Err(
-                                    self.fatal("malformed character reference in entity value")
-                                );
-                            }
-                            while i < bytes.len() && bytes[i].is_ascii_digit() {
-                                i += 1;
-                            }
-                            let dec_str = std::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
-                            dec_str.parse::<u32>().unwrap_or(0)
-                        };
-                        if i >= bytes.len() || bytes[i] != b';' {
-                            return Err(
-                                self.fatal("incomplete character reference in entity value")
-                            );
-                        }
-                        i += 1;
-                        // Validate the referenced character is a valid XML char
-                        if let Some(c) = char::from_u32(char_val) {
-                            if !crate::parser_xmloxide::parser::input::is_xml_char(c) {
-                                return Err(self.fatal(format_args!(
-                                    "character reference &#x{char_val:X}; refers to invalid XML character"
-                                )));
-                            }
-                        } else {
-                            return Err(self.fatal(format_args!(
-                                "character reference value {char_val} is not a valid Unicode code point"
-                            )));
-                        }
+                        self.validate_numeric_entity_reference(bytes, &mut i)?;
                     } else {
                         // Entity reference — must be Name followed by ';'
                         let start = i;

@@ -1,5 +1,5 @@
 //! Storage strategy for the one canonicalization kernel. The ordinary API
-//! retains native storage; scoped XMLDSig uses the caller's actual execution.
+//! retains native storage; scoped `XMLDSig` uses the caller's actual execution.
 
 use std::{cmp::Ordering, collections::HashMap, ops::Deref};
 
@@ -11,8 +11,35 @@ pub(crate) struct NamespaceKey<'a> {
     pub utilizer: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NamespaceState<'a> {
+    Absent,
+    Excluded,
+    Bound(&'a str),
+}
+
+impl<'a> NamespaceState<'a> {
+    fn binding(entry: Option<&'a str>) -> Self {
+        match entry {
+            None => Self::Excluded,
+            Some(uri) => Self::Bound(uri),
+        }
+    }
+
+    pub(crate) fn uri(self) -> Option<&'a str> {
+        match self {
+            Self::Bound(uri) => Some(uri),
+            Self::Absent | Self::Excluded => None,
+        }
+    }
+
+    pub(crate) fn is_present(self) -> bool {
+        self != Self::Absent
+    }
+}
+
 pub(crate) trait NamespaceMap<'a>: Sized {
-    fn get(&self, prefix: &str, utilizer: bool) -> Result<Option<Option<&'a str>>, C14nError>;
+    fn get(&self, prefix: &str, utilizer: bool) -> Result<NamespaceState<'a>, C14nError>;
     fn insert(
         &mut self,
         prefix: &'a str,
@@ -197,8 +224,12 @@ impl<'a> NativeNamespaces<'a> {
 }
 
 impl<'a> NamespaceMap<'a> for NativeNamespaces<'a> {
-    fn get(&self, prefix: &str, utilizer: bool) -> Result<Option<Option<&'a str>>, C14nError> {
-        Ok(self.0.get(&NamespaceKey { prefix, utilizer }).copied())
+    fn get(&self, prefix: &str, utilizer: bool) -> Result<NamespaceState<'a>, C14nError> {
+        Ok(self
+            .0
+            .get(&NamespaceKey { prefix, utilizer })
+            .copied()
+            .map_or(NamespaceState::Absent, NamespaceState::binding))
     }
     fn insert(
         &mut self,
@@ -253,7 +284,10 @@ impl Scratch for Native {
 
 #[cfg(feature = "xmldsig")]
 mod accounted {
-    use super::*;
+    use super::{
+        Bytes, C14nError, List, NamespaceKey, NamespaceMap, NamespaceState, Ordering, Scratch,
+        Text, TextBuilder,
+    };
     use structured_asn1::memory::{
         HashWork, MemoryError, OwnedMap, OwnedText, OwnedVec, SortError, TextErrorKind, Work,
     };
@@ -372,11 +406,12 @@ mod accounted {
     }
 
     impl<'a, W: Work> NamespaceMap<'a> for AccountedNamespaces<'_, 'a, W> {
-        fn get(&self, prefix: &str, utilizer: bool) -> Result<Option<Option<&'a str>>, C14nError> {
+        fn get(&self, prefix: &str, utilizer: bool) -> Result<NamespaceState<'a>, C14nError> {
             Ok(self
                 .values
                 .get(&NamespaceKey { prefix, utilizer }, self.work)?
-                .copied())
+                .copied()
+                .map_or(NamespaceState::Absent, NamespaceState::binding))
         }
         fn insert(
             &mut self,
@@ -529,3 +564,6 @@ mod accounted {
 
 #[cfg(feature = "xmldsig")]
 pub(crate) use accounted::Accounted;
+
+#[cfg(test)]
+mod namespace_tests;

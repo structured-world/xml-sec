@@ -1,8 +1,8 @@
 //! Backend-neutral XML semantic tree contract.
 //!
 //! One explicitly selected parser backend builds this tree. All XML Security semantics are
-//! implemented above it, so selecting a backend cannot change C14N, XPath,
-//! XMLDSig, or XMLEnc behavior.
+//! implemented above it, so selecting a backend cannot change C14N, `XPath`,
+//! `XMLDSig`, or `XMLEnc` behavior.
 
 #[cfg(feature = "benchmark-internals")]
 pub(crate) mod benchmark;

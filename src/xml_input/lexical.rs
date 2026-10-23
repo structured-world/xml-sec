@@ -12,6 +12,7 @@ use alloc::{
     vec::Vec,
 };
 use core::ops::Range;
+use xmlparser::{ElementEnd, Token};
 
 #[doc(hidden)]
 #[path = "lexical/storage.rs"]
@@ -41,7 +42,7 @@ pub enum Error<L = String, R = alloc::collections::TryReserveError> {
     /// An owned diagnostic produced by a materializing helper.
     #[error("XML lexical error: {0}")]
     Malformed(L),
-    /// The duplicated lexical QName, retained by the selected storage.
+    /// The duplicated lexical `QName`, retained by the selected storage.
     #[error("XML lexical error: duplicate attribute `{0}`")]
     DuplicateAttribute(L),
     /// Storage or current-work refusal, never a syntax rejection.
@@ -231,8 +232,8 @@ struct PendingText<'a> {
     offset: usize,
 }
 
-fn validate_unique_attributes<'a, S: Storage>(
-    attributes: &mut S::Attributes<'a>,
+fn validate_unique_attributes<S: Storage>(
+    attributes: &mut S::Attributes<'_>,
     storage: S,
 ) -> Result<(), Error<S::Label, S::Refusal>> {
     const SMALL_TAG_ATTRIBUTES: usize = 8;
@@ -314,6 +315,10 @@ impl<'a, S: Storage> Scanner<'a, S> {
     }
 
     /// Return the next event, or `None` at end of input.
+    ///
+    /// # Errors
+    /// Returns lexical syntax/version failures, duplicate attributes, or the
+    /// selected storage's work/allocation refusal without changing its class.
     pub fn next_event(&mut self) -> ScanResult<'a, S> {
         if !self.admitted {
             // Tokenization, QName validation and reference splitting each
@@ -340,14 +345,15 @@ impl<'a, S: Storage> Scanner<'a, S> {
                 return Ok(None);
             };
             let token = token.map_err(Error::tokenizer)?;
-            use xmlparser::{ElementEnd, Token};
             match &token {
                 Token::DtdStart { name, span, .. } => {
                     self.dtd_start = Some((span.range().start, name.as_str()));
                     continue;
                 }
                 Token::DtdEnd { span } if self.dtd_start.is_some() => {
-                    let (start, name) = self.dtd_start.take().expect("DTD start is present");
+                    let Some((start, name)) = self.dtd_start.take() else {
+                        return Err(Error::Static("DOCTYPE end without a start"));
+                    };
                     return Ok(Some(Event::DocType {
                         name,
                         range: start..span.range().end,
@@ -360,143 +366,160 @@ impl<'a, S: Storage> Scanner<'a, S> {
                 }
                 _ => {}
             }
-            match token {
-                Token::Declaration {
-                    version,
+            if let Some(event) = self.token_event(token)? {
+                return Ok(Some(event));
+            }
+        }
+    }
+
+    fn token_event(&mut self, token: Token<'a>) -> ScanResult<'a, S> {
+        match token {
+            Token::Declaration {
+                version,
+                standalone,
+                span,
+                ..
+            } => {
+                // XML 1.0 Fifth Edition section 2.8 allows later 1.x declarations only when
+                // the processor implements that version's complete syntax and character
+                // model. This scanner currently implements XML 1.0, so accepting XML 1.1
+                // here would silently apply the wrong character rules downstream.
+                // https://www.w3.org/TR/xml/#sec-prolog-dtd
+                if version.as_str() != "1.0" {
+                    return Err(Error::Static("unsupported XML version"));
+                }
+                return Ok(Some(Event::Declaration {
+                    version: version.as_str(),
                     standalone,
-                    span,
-                    ..
-                } => {
-                    // XML 1.0 Fifth Edition section 2.8 allows later 1.x declarations only when
-                    // the processor implements that version's complete syntax and character
-                    // model. This scanner currently implements XML 1.0, so accepting XML 1.1
-                    // here would silently apply the wrong character rules downstream.
-                    // https://www.w3.org/TR/xml/#sec-prolog-dtd
-                    if version.as_str() != "1.0" {
-                        return Err(Error::Static("unsupported XML version"));
-                    }
-                    return Ok(Some(Event::Declaration {
-                        version: version.as_str(),
-                        standalone,
-                        range: span.range(),
-                    }));
+                    range: span.range(),
+                }));
+            }
+            Token::ProcessingInstruction {
+                target,
+                content,
+                span,
+            } => {
+                return Ok(Some(Event::ProcessingInstruction {
+                    target: target.as_str(),
+                    content: content.map(|value| value.as_str()),
+                    range: span.range(),
+                }));
+            }
+            Token::Comment { text, span } => {
+                return Ok(Some(Event::Comment {
+                    text: text.as_str(),
+                    range: span.range(),
+                }));
+            }
+            Token::DtdStart { .. } => unreachable!("DTD start is handled above"),
+            Token::EmptyDtd { name, span, .. } => {
+                return Ok(Some(Event::DocType {
+                    name: name.as_str(),
+                    range: span.range(),
+                }));
+            }
+            Token::DtdEnd { .. } => {
+                return Err(Error::Static("DOCTYPE end without a start"));
+            }
+            Token::EntityDeclaration { .. } => {}
+            Token::ElementStart { .. } | Token::Attribute { .. } | Token::ElementEnd { .. } => {
+                return self.tag_event(token);
+            }
+            Token::Text { text } => {
+                self.pending_text = Some(PendingText {
+                    text: text.as_str(),
+                    range: text.range(),
+                    offset: 0,
+                });
+                if let Some(event) = self.next_text_event()? {
+                    return Ok(Some(event));
                 }
-                Token::ProcessingInstruction {
-                    target,
-                    content,
-                    span,
-                } => {
-                    return Ok(Some(Event::ProcessingInstruction {
-                        target: target.as_str(),
-                        content: content.map(|value| value.as_str()),
-                        range: span.range(),
-                    }));
+            }
+            Token::Cdata { text, span } => {
+                return Ok(Some(Event::CData {
+                    text: text.as_str(),
+                    range: span.range(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn tag_event(&mut self, token: Token<'a>) -> ScanResult<'a, S> {
+        match token {
+            Token::ElementStart {
+                prefix,
+                local,
+                span,
+            } => {
+                validate_qualified_lexeme(&self.input[span.range()])?;
+                if self.pending_start.is_some() {
+                    return Err(Error::Static("nested element start tokens"));
                 }
-                Token::Comment { text, span } => {
-                    return Ok(Some(Event::Comment {
-                        text: text.as_str(),
-                        range: span.range(),
-                    }));
-                }
-                Token::DtdStart { .. } => unreachable!("DTD start is handled above"),
-                Token::EmptyDtd { name, span, .. } => {
-                    return Ok(Some(Event::DocType {
-                        name: name.as_str(),
-                        range: span.range(),
-                    }));
-                }
-                Token::DtdEnd { .. } => {
-                    return Err(Error::Static("DOCTYPE end without a start"));
-                }
-                Token::EntityDeclaration { .. } => {}
-                Token::ElementStart {
-                    prefix,
-                    local,
-                    span,
-                } => {
-                    validate_qualified_lexeme(&self.input[span.range()])?;
-                    if self.pending_start.is_some() {
-                        return Err(Error::Static("nested element start tokens"));
-                    }
-                    self.pending_start = Some(PendingStart {
+                self.pending_start = Some(PendingStart {
+                    name: Name {
+                        prefix: prefix.as_str(),
+                        local: local.as_str(),
+                    },
+                    attributes: self.storage.attributes(),
+                    start: span.range().start,
+                });
+                Ok(None)
+            }
+            Token::Attribute {
+                prefix,
+                local,
+                value,
+                span,
+            } => {
+                validate_qualified_lexeme(&self.input[span.range()])?;
+                let start = self
+                    .pending_start
+                    .as_mut()
+                    .ok_or(Error::Static("attribute outside a start tag"))?;
+                start
+                    .attributes
+                    .push(Attribute {
                         name: Name {
                             prefix: prefix.as_str(),
                             local: local.as_str(),
                         },
-                        attributes: self.storage.attributes(),
-                        start: span.range().start,
-                    });
-                }
-                Token::Attribute {
-                    prefix,
-                    local,
-                    value,
-                    span,
-                } => {
-                    validate_qualified_lexeme(&self.input[span.range()])?;
-                    let start = self
-                        .pending_start
-                        .as_mut()
-                        .ok_or(Error::Static("attribute outside a start tag"))?;
-                    let name = Name {
-                        prefix: prefix.as_str(),
-                        local: local.as_str(),
-                    };
-                    start
-                        .attributes
-                        .push(Attribute {
-                            name,
-                            value: value.as_str(),
-                            range: span.range(),
-                        })
-                        .map_err(Error::Resource)?;
-                }
-                Token::ElementEnd { end, span } => match end {
-                    ElementEnd::Open | ElementEnd::Empty => {
-                        let mut start = self
-                            .pending_start
-                            .take()
-                            .ok_or(Error::Static("element end without a start"))?;
-                        validate_unique_attributes(&mut start.attributes, self.storage)?;
-                        let tag = StartTag {
-                            name: start.name,
-                            attributes: start.attributes,
-                            range: start.start..span.range().end,
-                        };
-                        return Ok(Some(if end == ElementEnd::Open {
-                            Event::Start(tag)
-                        } else {
-                            Event::Empty(tag)
-                        }));
-                    }
-                    ElementEnd::Close(prefix, local) => {
-                        validate_qualified_lexeme(&self.input[span.range()])?;
-                        return Ok(Some(Event::End {
-                            name: Name {
-                                prefix: prefix.as_str(),
-                                local: local.as_str(),
-                            },
-                            range: span.range(),
-                        }));
-                    }
-                },
-                Token::Text { text } => {
-                    self.pending_text = Some(PendingText {
-                        text: text.as_str(),
-                        range: text.range(),
-                        offset: 0,
-                    });
-                    if let Some(event) = self.next_text_event()? {
-                        return Ok(Some(event));
-                    }
-                }
-                Token::Cdata { text, span } => {
-                    return Ok(Some(Event::CData {
-                        text: text.as_str(),
+                        value: value.as_str(),
                         range: span.range(),
-                    }));
-                }
+                    })
+                    .map_err(Error::Resource)?;
+                Ok(None)
             }
+            Token::ElementEnd { end, span } => match end {
+                ElementEnd::Open | ElementEnd::Empty => {
+                    let mut start = self
+                        .pending_start
+                        .take()
+                        .ok_or(Error::Static("element end without a start"))?;
+                    validate_unique_attributes(&mut start.attributes, self.storage)?;
+                    let tag = StartTag {
+                        name: start.name,
+                        attributes: start.attributes,
+                        range: start.start..span.range().end,
+                    };
+                    Ok(Some(if end == ElementEnd::Open {
+                        Event::Start(tag)
+                    } else {
+                        Event::Empty(tag)
+                    }))
+                }
+                ElementEnd::Close(prefix, local) => {
+                    validate_qualified_lexeme(&self.input[span.range()])?;
+                    Ok(Some(Event::End {
+                        name: Name {
+                            prefix: prefix.as_str(),
+                            local: local.as_str(),
+                        },
+                        range: span.range(),
+                    }))
+                }
+            },
+            _ => unreachable!("tag_event receives only start, attribute and end tokens"),
         }
     }
 
@@ -631,6 +654,9 @@ impl DeclaredNamespacePrefixes {
 }
 
 /// Parse the namespace prefixes declared directly by one lexical opening tag.
+///
+/// # Errors
+/// Returns scanner errors or a malformed-input error if no opening tag is found.
 pub fn declared_namespace_prefixes(opening: &str) -> Result<DeclaredNamespacePrefixes, Error> {
     let standalone = format!("{} />", opening.trim_end_matches('/'));
     let mut scanner = Scanner::new(&standalone);
@@ -652,6 +678,10 @@ pub fn declared_namespace_prefixes(opening: &str) -> Result<DeclaredNamespacePre
 }
 
 /// Expand the five predefined entities and XML character references.
+///
+/// # Errors
+/// Returns an error for unterminated or unresolved entities and character
+/// references outside XML 1.0's character repertoire.
 pub fn decode_references(value: &str) -> Result<Cow<'_, str>, Error> {
     if !value.contains('&') {
         return Ok(Cow::Borrowed(value));
@@ -690,6 +720,9 @@ pub fn decode_references(value: &str) -> Result<Cow<'_, str>, Error> {
 ///
 /// XML 1.0 section 4.1 permits exactly decimal digits or a lowercase `x` followed by
 /// hexadecimal digits: <https://www.w3.org/TR/xml/#sec-references>
+///
+/// # Errors
+/// Returns an error for empty/invalid digits, overflow, or a non-XML character.
 pub fn decode_numeric_character_reference(reference: &str) -> Result<char, Error> {
     let (digits, radix) = reference
         .strip_prefix('x')
@@ -773,6 +806,10 @@ impl<W: Write> Writer<W> {
     }
 
     /// Write an opening tag and escaped attributes.
+    ///
+    /// # Errors
+    /// Returns invalid-input errors for malformed names, namespace bindings,
+    /// duplicate attributes or invalid characters, and propagates sink errors.
     pub fn start<'a>(
         &mut self,
         name: &str,
@@ -782,6 +819,9 @@ impl<W: Write> Writer<W> {
     }
 
     /// Write an empty-element tag and escaped attributes.
+    ///
+    /// # Errors
+    /// Returns the same validation and sink errors as [`Self::start`].
     pub fn empty<'a>(
         &mut self,
         name: &str,
@@ -819,6 +859,9 @@ impl<W: Write> Writer<W> {
     }
 
     /// Write a closing tag.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid or unmatched name, or a sink failure.
     pub fn end(&mut self, name: &str) -> std::io::Result<()> {
         validate_writer_qname(name)?;
         // XML 1.0 section 3.1 requires the end-tag Name to match the corresponding start-tag:
@@ -841,12 +884,18 @@ impl<W: Write> Writer<W> {
     }
 
     /// Write escaped character data.
+    ///
+    /// # Errors
+    /// Returns an error for invalid XML characters or a sink failure.
     pub fn text(&mut self, value: &str) -> std::io::Result<()> {
         validate_writer_characters(value)?;
         write!(self.output, "{}", escape_text(value))
     }
 
     /// Write caller-validated XML markup unchanged.
+    ///
+    /// # Errors
+    /// Propagates output-sink failures; markup validation belongs to the caller.
     pub fn raw(&mut self, value: &str) -> std::io::Result<()> {
         self.output.write_all(value.as_bytes())
     }
@@ -1183,12 +1232,14 @@ mod tests {
 
     #[test]
     fn scanner_validates_wide_attributes_without_changing_source_order() {
+        use core::fmt::Write as _;
+
         // Wide tags use the allocation-free sorted duplicate check. Restoring source order is part
         // of the public lexical event contract and keeps downstream namespace processing stable.
-        let attributes = (0..4096)
-            .rev()
-            .map(|index| format!(" a{index}='{index}'"))
-            .collect::<String>();
+        let mut attributes = String::new();
+        for index in (0..4096).rev() {
+            write!(attributes, " a{index}='{index}'").expect("String formatting cannot fail");
+        }
         let xml = format!("<root{attributes}/>");
         let Some(Event::Empty(tag)) = Scanner::new(&xml)
             .next_event()
@@ -1200,9 +1251,10 @@ mod tests {
         assert_eq!(tag.attributes[0].name.local(), "a4095");
         assert_eq!(tag.attributes[4095].name.local(), "a0");
 
-        let unique = (0..4096)
-            .map(|index| format!(" a{index}='x'"))
-            .collect::<String>();
+        let mut unique = String::new();
+        for index in 0..4096 {
+            write!(unique, " a{index}='x'").expect("String formatting cannot fail");
+        }
         let duplicate = format!("<root{unique} a0='duplicate'/>");
         assert!(Scanner::new(&duplicate).next_event().is_err());
     }
@@ -1264,7 +1316,7 @@ mod tests {
         // happen before output or stack mutation so the caller can still close the open element.
         let mut orphan = Writer::new(Vec::new());
         assert!(orphan.end("root").is_err());
-        assert!(orphan.into_inner().is_empty());
+        assert_eq!(orphan.into_inner(), []);
 
         let mut writer = Writer::new(Vec::new());
         writer.start("root", []).expect("root opens");
@@ -1300,7 +1352,7 @@ mod tests {
                 .empty("root", [("id", "one"), ("id", "two")])
                 .is_err()
         );
-        assert!(writer.into_inner().is_empty());
+        assert_eq!(writer.into_inner(), []);
     }
 
     #[test]
@@ -1321,7 +1373,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(writer.into_inner().is_empty());
+        assert_eq!(writer.into_inner(), []);
 
         let mut writer = Writer::new(Vec::new());
         writer
@@ -1349,7 +1401,7 @@ mod tests {
         ] {
             let mut writer = Writer::new(Vec::new());
             assert!(writer.empty(name, attributes).is_err(), "accepted {name}");
-            assert!(writer.into_inner().is_empty());
+            assert_eq!(writer.into_inner(), []);
         }
 
         let mut writer = Writer::new(Vec::new());
@@ -1370,7 +1422,7 @@ mod tests {
     fn writer_rejects_characters_forbidden_by_xml_1_0() {
         let mut writer = Writer::new(Vec::new());
         assert!(writer.text("before\0after").is_err());
-        assert!(writer.into_inner().is_empty());
+        assert_eq!(writer.into_inner(), []);
 
         let mut writer = Writer::new(Vec::new());
         assert!(
