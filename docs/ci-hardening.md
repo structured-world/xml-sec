@@ -99,3 +99,8 @@ LTV and XAdES. `scripts/check-shared-pkix.sh` rejects duplicate generations and
 path/git substitutes, then independently checks the PKIX and XAdES alloc graphs
 on bare-metal and WASM targets. Core XMLDSig still requires `std`; the shared
 dependency qualification is not a root alloc-only claim.
+
+Custom resolvers and other consumers using the exposed shared memory or PKIX
+types must upgrade their direct shared dependencies together with xml-sec.
+Different coordinated generations are distinct Rust types, even when the
+individual method signatures remain unchanged.
