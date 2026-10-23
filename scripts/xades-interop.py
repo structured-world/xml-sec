@@ -95,9 +95,14 @@ def command(args, log, env=None, *, timeout=900):
             stdout_log.write(stdout)
             stderr_log.write(stderr)
             raise SystemExit(message) from error
-        except BaseException:
+        except BaseException as error:
             # In particular, do not leave the isolated group behind on Ctrl-C.
-            terminate_group()
+            try:
+                if shared_group:
+                    print(f"command capture failed: {error!r}; inspect {log}.command.json",
+                          file=sys.stderr, flush=True)
+            finally:
+                terminate_group()
             process.communicate()
             raise
     return subprocess.CompletedProcess(arguments, process.returncode,

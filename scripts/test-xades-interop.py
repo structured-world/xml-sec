@@ -214,6 +214,7 @@ class EvidenceTests(unittest.TestCase):
                     log)
             self.assertNotEqual(result.returncode, 0)
             self.assertIn(b'timed out', result.stderr)
+            self.assertIn(str(log.with_suffix('.command.json')).encode(), result.stderr)
             self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'ready\n')
             self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'waiting\n')
 
@@ -230,6 +231,27 @@ class EvidenceTests(unittest.TestCase):
                     interop.command(['silent'], log)
             self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'')
             self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'')
+
+    def test_nested_capture_failure_is_reported_before_group_cancellation(self):
+        # Group cancellation also kills a nested wrapper; an I/O/capture error
+        # must reach its controller before that signal, rather than disappear.
+        with tempfile.TemporaryDirectory() as directory:
+            process = MagicMock()
+            process.__enter__.return_value = process
+            diagnostics = io.StringIO()
+            session = os.getsid(0)
+
+            def cancel(group, sig):
+                self.assertIn('synthetic capture failure', diagnostics.getvalue())
+
+            with (patch.dict(os.environ, {'_XADES_INTEROP_PARENT_SESSION': str(session + 1)}),
+                  patch('os.getpgrp', return_value=session), patch('os.killpg', side_effect=cancel) as cancelled,
+                  patch('subprocess.Popen', return_value=process),
+                  patch.object(interop, '_capture_streams', side_effect=OSError('synthetic capture failure')),
+                  contextlib.redirect_stderr(diagnostics)):
+                with self.assertRaisesRegex(OSError, 'synthetic capture failure'):
+                    interop.command(['synthetic-never-run'], Path(directory) / 'capture')
+            cancelled.assert_called_once()
 
     def test_inventory_rejects_changed_assets_and_tracked_run_outputs(self):
         # CI must catch stale reference data and accidental commits of actual outputs.
