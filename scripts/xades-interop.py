@@ -12,7 +12,9 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
@@ -30,15 +32,53 @@ def command(args, log, env=None, *, timeout=900):
     arguments = [str(x) for x in args]
     log.parent.mkdir(parents=True, exist_ok=True)
     log.with_suffix(".command.json").write_text(json.dumps(arguments, indent=2))
-    try:
-        result = subprocess.run(arguments, cwd=ROOT, env=env, timeout=timeout,
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    except subprocess.TimeoutExpired as error:
-        # TimeoutExpired streams are None when no bytes have been captured.
-        log.with_suffix(".stdout").write_bytes(error.output if error.output is not None else b"")
-        log.with_suffix(".stderr").write_bytes(error.stderr if error.stderr is not None else b"")
-        raise SystemExit(f"command timed out after {timeout}s; inspect {log}.command.json, "
-                         f"{log}.stdout and {log}.stderr") from error
+    session = os.getsid(0)
+    parent_session = os.environ.get("_XADES_INTEROP_PARENT_SESSION")
+    shared_group = (parent_session is not None and parent_session != str(session)
+                    and os.getpgrp() == session)
+    child_env = dict(os.environ if env is None else env)
+    if not shared_group:
+        child_env["_XADES_INTEROP_PARENT_SESSION"] = str(session)
+    else:
+        child_env["_XADES_INTEROP_PARENT_SESSION"] = parent_session
+    # setsid isolates the outer command from its controller. Nested wrappers
+    # inherit that group: detaching again would escape the outer timeout.
+    # https://docs.python.org/3/library/subprocess.html#popen-constructor
+    with subprocess.Popen(arguments, cwd=ROOT, env=child_env,
+                          start_new_session=not shared_group,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        group = os.getpgrp() if shared_group else process.pid
+
+        def terminate_group():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # The group already exited before cancellation.
+
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            message = (f"command timed out after {timeout}s; inspect {log}.command.json, "
+                       f"{log}.stdout and {log}.stderr")
+            try:
+                # Save before signalling: a nested timeout cancels its own
+                # wrapper too, and the outer controller reports its failure.
+                log.with_suffix(".stdout").write_bytes(error.output if error.output is not None else b"")
+                log.with_suffix(".stderr").write_bytes(error.stderr if error.stderr is not None else b"")
+                if shared_group:
+                    print(message, file=sys.stderr, flush=True)
+            finally:
+                terminate_group()
+            stdout, stderr = process.communicate()
+            log.with_suffix(".stdout").write_bytes(stdout)
+            log.with_suffix(".stderr").write_bytes(stderr)
+            raise SystemExit(message) from error
+        except BaseException:
+            # In particular, do not leave the isolated group behind on Ctrl-C.
+            terminate_group()
+            process.communicate()
+            raise
+        result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
     log.with_suffix(".stdout").write_bytes(result.stdout)
     log.with_suffix(".stderr").write_bytes(result.stderr)
     return result

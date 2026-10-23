@@ -103,6 +103,10 @@ No part may skip on a missing oracle. The existing aggregate `test` job requires
 CI publishes actual octets, hashes, first-difference diagnostics and full DSS reports as
 `xades-interop-results` run artifacts. It never updates fixtures or expectations.
 
+The runners require POSIX process groups (Linux/macOS). Commands default to a 900-second
+deadline; nested commands share the enclosing phase's process group. A timeout aborts
+that group and records the command arguments and captured streams for diagnosis.
+
 Individual investigation commands:
 
 ```sh
