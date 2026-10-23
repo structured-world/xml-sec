@@ -1,0 +1,172 @@
+[
+  {
+    "name": "enveloped-control",
+    "file": "fixtures/enveloped-control.xml",
+    "valid": true
+  },
+  {
+    "name": "id-reference",
+    "file": "fixtures/id-reference.xml",
+    "valid": true
+  },
+  {
+    "name": "wrong-properties-type",
+    "file": "fixtures/wrong-properties-type.xml",
+    "valid": true
+  },
+  {
+    "name": "filter2-subtract",
+    "file": "fixtures/filter2-subtract.xml",
+    "valid": true
+  },
+  {
+    "name": "filter2-sequence",
+    "file": "fixtures/filter2-sequence.xml",
+    "valid": true
+  },
+  {
+    "name": "filter2-restored",
+    "file": "fixtures/filter2-restored.xml",
+    "valid": true
+  },
+  {
+    "name": "c14n11-reference",
+    "file": "fixtures/c14n11-reference.xml",
+    "valid": true
+  },
+  {
+    "name": "c14n11-signedinfo",
+    "file": "fixtures/c14n11-signedinfo.xml",
+    "valid": true
+  },
+  {
+    "name": "c14n11-comments",
+    "file": "fixtures/c14n11-comments.xml",
+    "valid": true
+  },
+  {
+    "name": "empty-result",
+    "file": "fixtures/empty-result.xml",
+    "valid": true
+  },
+  {
+    "name": "axis-subset",
+    "file": "fixtures/axis-subset.xml",
+    "valid": true
+  },
+  {
+    "name": "here-legacy",
+    "file": "fixtures/here-legacy.xml",
+    "valid": true
+  },
+  {
+    "name": "tampered-content",
+    "file": "fixtures/tampered-content.xml",
+    "valid": false
+  },
+  {
+    "name": "excluded-signature-object",
+    "file": "fixtures/excluded-signature-object.xml",
+    "valid": true
+  },
+  {
+    "name": "excluded-subtree",
+    "file": "fixtures/excluded-subtree.xml",
+    "valid": true
+  },
+  {
+    "name": "comment-omitted",
+    "file": "fixtures/comment-omitted.xml",
+    "valid": true
+  },
+  {
+    "name": "comment-covered",
+    "file": "fixtures/comment-covered.xml",
+    "valid": false
+  },
+  {
+    "name": "attribute-covered",
+    "file": "fixtures/attribute-covered.xml",
+    "valid": false
+  },
+  {
+    "name": "namespace-covered",
+    "file": "fixtures/namespace-covered.xml",
+    "valid": false
+  },
+  {
+    "name": "xmlbase-covered",
+    "file": "fixtures/xmlbase-covered.xml",
+    "valid": false
+  },
+  {
+    "name": "xmlid-covered",
+    "file": "fixtures/xmlid-covered.xml",
+    "valid": false
+  },
+  {
+    "name": "keyinfo-certificate-substituted",
+    "file": "fixtures/keyinfo-certificate-substituted.xml",
+    "valid": false
+  },
+  {
+    "name": "union-tampered",
+    "file": "fixtures/union-tampered.xml",
+    "valid": false
+  },
+  {
+    "name": "unknown-algorithm",
+    "file": "fixtures/unknown-algorithm.xml",
+    "valid": false
+  },
+  {
+    "name": "malformed-xpath",
+    "file": "fixtures/malformed-xpath.xml",
+    "valid": false
+  },
+  {
+    "name": "external-http",
+    "file": "fixtures/external-http.xml",
+    "valid": false
+  },
+  {
+    "name": "external-file",
+    "file": "fixtures/external-file.xml",
+    "valid": false
+  },
+  {
+    "name": "duplicate-id",
+    "file": "fixtures/duplicate-id.xml",
+    "valid": false
+  },
+  {
+    "name": "signature-value-tampered",
+    "file": "fixtures/signature-value-tampered.xml",
+    "valid": false
+  },
+  {
+    "name": "wrapped-object",
+    "file": "fixtures/wrapped-object.xml",
+    "valid": true
+  },
+  {
+    "name": "baseline-enveloped",
+    "file": "fixtures/baseline/enveloped.xml",
+    "valid": true
+  },
+  {
+    "name": "baseline-wrong-target",
+    "file": "fixtures/baseline/wrong-target.xml",
+    "valid": true
+  },
+  {
+    "name": "baseline-untyped-signed-properties",
+    "file": "fixtures/baseline/untyped-signed-properties.xml",
+    "valid": true
+  },
+  {
+    "name": "baseline-certificate-digest-mismatch",
+    "file": "fixtures/baseline/certificate-digest-mismatch.xml",
+    "valid": true
+  }
+]

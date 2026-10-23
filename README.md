@@ -236,6 +236,11 @@ a system libxmlsec1 installation.
 The generated [compatibility ledger](docs/compatibility-ledger.md) tracks libxmlsec1 1.3.13 public
 surface and operation behavior with source and test evidence.
 
+The [local XAdES interoperability corpus](interop/xades/README.md) compares exact Reference
+and SignedInfo bytes with native libxmlsec1 and checks independent EU DSS profile expectations.
+Its synthetic fixtures and reproducible commands distinguish transform/XMLDSig interoperability,
+XAdES property binding, expected-object coverage, and trust-validation limits.
+
 ## Safe-Rust XSLT
 
 [`xml-sec-xslt`](crates/xml-sec-xslt) is an XML-security-neutral XSLT 1.0 compiler and runtime. It

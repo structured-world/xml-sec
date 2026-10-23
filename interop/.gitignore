@@ -1,0 +1,40 @@
+# Generated bundles duplicate the reviewable corpus and remain local artifacts.
+/*.tar.gz
+# Build/command captures and verbose process diagnostics are local run artifacts.
+/xades/checks/
+/xades/generation/
+/xades/**/*.stdout
+/xades/**/*.stderr
+/xades/**/*.log
+/xades/**/*.command.json
+/xades/**/result.txt
+/xades/**/diagnostic.xml
+/xades/**/detailed.xml
+/xades/**/simple.xml
+/xades/**/binding-facts.txt
+# Only independent expected octets belong in Git; actual/replay data is regenerated.
+/xades/results/**
+!/xades/results/*/
+!/xades/results/*/expected-*.bin
+/xades/dss-evidence/**
+!/xades/dss-evidence/expectations.json
+/xades/dss-investigation/*.json
+!/xades/dss-investigation/expectations.json
+!/xades/dss-investigation/strict-policy-expectations.json
+!/xades/dss-investigation/source-audit.json
+/xades/dss-investigation/*/**
+!/xades/dss-investigation/*/expected-*.bin
+!/xades/dss-investigation/*/signed.xml
+!/xades/dss-investigation/*/template.xml
+# The baseline generator emits a broader suite; this corpus selects four cases.
+/xades/fixtures/baseline/**
+!/xades/fixtures/baseline/enveloped.xml
+!/xades/fixtures/baseline/wrong-target.xml
+!/xades/fixtures/baseline/untyped-signed-properties.xml
+!/xades/fixtures/baseline/certificate-digest-mismatch.xml
+!/xades/fixtures/baseline/root.der
+!/xades/fixtures/baseline/signer.der
+!/xades/fixtures/baseline/intermediate.der
+/xades/fixtures/*.template.xml
+!/xades/fixtures/enveloped-control.template.xml
+/xades/fixtures/wrapped-content.xml

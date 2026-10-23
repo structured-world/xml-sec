@@ -1,0 +1,9 @@
+# Signed input and captured oracle bytes must survive checkout byte-for-byte.
+# Trailing spaces in signed XML are evidence, not source lint.
+fixtures/** -text -whitespace linguist-generated
+*.bin -text -diff -whitespace linguist-generated
+*.der -text -diff -whitespace linguist-generated
+# Collapse byte vectors during review while keeping expected conclusions and prose visible.
+results/** linguist-generated
+dss-investigation/*/** -text -whitespace linguist-generated
+SHA256SUMS linguist-generated
