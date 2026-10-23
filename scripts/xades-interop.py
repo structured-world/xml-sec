@@ -44,6 +44,32 @@ def command(args, log, env=None, *, timeout=900):
     return result
 
 
+def build_probe(log):
+    build = command(["cargo", "build", "-p", "xml-sec-xades", "--example", "interop_probe",
+                     "--message-format=json-render-diagnostics"], log)
+    if build.returncode:
+        raise SystemExit(f"probe build failed; inspect {log}.stderr")
+    # Cargo reports the executable for this build, including cache hits and
+    # CARGO_TARGET_DIR; inferring target/debug can select an older executable.
+    # https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
+    binary = None
+    for line in build.stdout.splitlines():
+        if not line.startswith(b"{"):
+            continue  # build scripts may also write ordinary diagnostic lines
+        message = json.loads(line)
+        if message.get("reason") != "compiler-artifact":
+            continue
+        if (message["target"]["name"] != "interop_probe"
+                or "example" not in message["target"]["kind"] or message["executable"] is None):
+            continue
+        if binary is not None:
+            raise SystemExit(f"probe build must report exactly one example executable; inspect {log}.stdout")
+        binary = Path(message["executable"])
+    if binary is None:
+        raise SystemExit(f"probe build must report exactly one example executable; inspect {log}.stdout")
+    return binary
+
+
 def oracle_args(action, fixture):
     args = [XMLSEC, action, "--enabled-reference-uris", "empty,same-doc",
             "--enabled-retrieval-method-uris", "empty,same-doc",
@@ -245,10 +271,7 @@ def run_all(results):
     if metadata.returncode:
         raise SystemExit("cargo metadata failed")
     versions["resolved_dependencies"] = resolved_versions(json.loads(metadata.stdout))
-    build = command(["cargo", "build", "-p", "xml-sec-xades", "--example", "interop_probe"], results / "build")
-    if build.returncode:
-        raise SystemExit("probe build failed")
-    binary = ROOT / "target/debug/examples/interop_probe"
+    binary = build_probe(results / "build")
     summary = []
     for case in json.loads((PACKAGE / "cases.json").read_text()):
         name = case["name"]

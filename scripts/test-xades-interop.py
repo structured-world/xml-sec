@@ -32,6 +32,74 @@ spec_check.loader.exec_module(check)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_corpus_uses_cargo_reported_probe_instead_of_stale_default(self):
+        # CARGO_TARGET_DIR must select the just-built probe even when the
+        # default target directory contains an older executable.
+        class Probed(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / 'interop/xades'
+            (assets / 'fixtures').mkdir(parents=True)
+            (assets / 'fixtures/case.xml').write_text(f'<Signature xmlns="{interop.DS}"><SignedInfo/></Signature>')
+            (assets / 'cases.json').write_text(json.dumps([
+                dict(name='tampered-content', file='fixtures/case.xml', valid=False)]))
+            stale = root / 'target/debug/examples/interop_probe'
+            expected = root / 'custom-target/debug/examples/interop_probe'
+            for path, data in [(stale, b'stale probe'), (expected, b'just-built probe')]:
+                path.parent.mkdir(parents=True)
+                path.write_bytes(data)
+            native = root / 'native-xmlsec1'
+            native.write_bytes(b'synthetic oracle identity')
+            selected = []
+
+            def capture(arguments, log, env=None):
+                args = [str(a) for a in arguments]
+                output = b''
+                status = 0
+                if args[:2] == ['cargo', 'build']:
+                    output = json.dumps(dict(reason='compiler-artifact', fresh=True,
+                        target=dict(name='interop_probe', kind=['example']), executable=str(expected))).encode()
+                elif args[:2] == ['cargo', 'metadata']:
+                    output = b'{"packages":[],"resolve":{"nodes":[]}}'
+                elif args[1:] == ['--version'] and args[0] == interop.XMLSEC:
+                    output = b'xmlsec1 1.3.13 (openssl)\n'
+                elif '--verify' in args:
+                    status = 1
+                elif Path(args[0]).name == 'interop_probe':
+                    selected.append(args[0])
+                    raise Probed
+                return subprocess.CompletedProcess(args, status, output, b'')
+
+            with patch.object(interop, 'ROOT', root), patch.object(interop, 'PACKAGE', assets), \
+                 patch.object(interop, 'command', side_effect=capture), \
+                 patch.object(interop.shutil, 'which', return_value=str(native)), \
+                 patch.dict(interop.os.environ, CARGO_TARGET_DIR=str(root / 'custom-target')):
+                with self.assertRaises(Probed):
+                    interop.run_all(root / 'output')
+            self.assertEqual(selected, [str(expected)])
+
+    def test_probe_build_requires_one_matching_example_artifact(self):
+        # Do not guess a default binary when Cargo reports no unique executable;
+        # unrelated library artifacts and ordinary build-script output are allowed.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'build'
+            executable = str(Path(directory) / 'custom-target/interop_probe')
+            artifact = json.dumps(dict(reason='compiler-artifact', executable=executable,
+                                       target=dict(name='interop_probe', kind=['example']))).encode() + b'\n'
+            library = json.dumps(dict(reason='compiler-artifact', executable=None,
+                                      target=dict(name='xml_sec_xades', kind=['lib']))).encode() + b'\n'
+            with patch.object(interop, 'command', return_value=subprocess.CompletedProcess(
+                    ['cargo'], 0, b'build-script diagnostic\n' + library + artifact, b'')) as build:
+                self.assertEqual(interop.build_probe(log), Path(executable))
+                self.assertIn('--message-format=json-render-diagnostics', build.call_args.args[0])
+            for output in [library, artifact + artifact]:
+                with self.subTest(output=output), patch.object(interop, 'command', return_value=
+                        subprocess.CompletedProcess(['cargo'], 0, output, b'')):
+                    with self.assertRaisesRegex(SystemExit, 'exactly one.*build.stdout'):
+                        interop.build_probe(log)
+
     def test_commands_bound_execution_and_retain_timeout_diagnostics(self):
         # A stuck compiler/validator must fail with its argv and partial streams,
         # rather than waiting for the CI job timeout or losing its diagnostics.
