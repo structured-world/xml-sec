@@ -212,8 +212,8 @@ def run_all(results):
         raise SystemExit("results already exist; archive them or choose a fresh checkout before rerunning")
     results.mkdir(parents=True)
     oracle_version = subprocess.check_output([XMLSEC, "--version"]).decode().strip()
-    if oracle_version != "xmlsec1 1.3.12 (openssl)":
-        raise SystemExit(f"byte-dump parser is qualified for xmlsec1 1.3.12 (openssl), got: {oracle_version}")
+    if oracle_version not in {"xmlsec1 1.3.12 (openssl)", "xmlsec1 1.3.13 (openssl)"}:
+        raise SystemExit(f"byte-dump parser requires qualified native xmlsec1 1.3.12/1.3.13 (openssl), got: {oracle_version}")
     versions = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
     executable = Path(shutil.which(XMLSEC)).resolve()
     versions["oracle_binary"] = dict(name=executable.name, sha256=digest(executable.read_bytes()))
@@ -361,7 +361,7 @@ def run_all(results):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--generate", action="store_true", help="create new test credentials and signed inputs")
-    parser.add_argument("--results", type=Path, default=PACKAGE / "results", help="new evidence directory; existing evidence is never overwritten")
+    parser.add_argument("--results", type=Path, default=ROOT / "target/xades-interop-results", help="new run directory; existing evidence is never overwritten")
     args = parser.parse_args()
     if args.generate:
         generate()

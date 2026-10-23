@@ -3,8 +3,7 @@
 fixtures/** -text -whitespace linguist-generated
 *.bin -text -diff -whitespace linguist-generated
 *.der -text -diff -whitespace linguist-generated
-# Collapse generated evidence during review while keeping selection and prose visible.
+# Collapse byte vectors during review while keeping expected conclusions and prose visible.
 results/** linguist-generated
-dss-evidence/** linguist-generated
 dss-investigation/*/** -text -whitespace linguist-generated
 SHA256SUMS linguist-generated

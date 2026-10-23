@@ -1,1 +1,0 @@
-<Data xmlns:q="urn:test:attributes" Id="payload" a="1" b="2" xml:id="business" q:flag="yes">Synthetic invoice 123<Keep>signed</Keep><Excluded>mutable</Excluded></Data><Outside Id="wrong">unrelated object</Outside>

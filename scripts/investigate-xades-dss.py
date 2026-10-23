@@ -12,7 +12,7 @@ import xml.etree.ElementTree as ET
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / "interop/xades"
-OUT = PACKAGE / "dss-investigation"
+OUT = ROOT / "target/xades-binding"
 spec = importlib.util.spec_from_file_location("corpus", ROOT / "scripts/xades-interop.py")
 corpus = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(corpus)
@@ -102,6 +102,7 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--analyze", action="store_true", help="check retained native/Rust octets without rerunning engines")
     mode.add_argument("--strict-policy", action="store_true", help="reuse the existing inputs and change only DSS StructuralValidation WARN to FAIL")
+    mode.add_argument("--generate", action="store_true", help="independently sign new minimal inputs instead of testing the retained fixtures")
     args = parser.parse_args()
     OUT = args.output.resolve()
     if args.analyze:
@@ -158,7 +159,12 @@ if __name__ == "__main__":
         source, signed = directory / "template.xml", directory / "signed.xml"
         source.write_text(template(target, cert_names))
         credentials = ','.join(str(PACKAGE / ("fixtures/" + n)) for n in ["signer.key", "signer.pem", "intermediate.pem"])
-        run(corpus.oracle_args("--sign", source) + ["--lax-key-search", "--privkey-pem", credentials, "--output", signed, source], directory / "sign")
+        if args.generate:
+            run(corpus.oracle_args("--sign", source) + ["--lax-key-search", "--privkey-pem", credentials, "--output", signed, source], directory / "sign")
+        else:
+            retained = PACKAGE / 'dss-investigation' / name
+            require(source.read_bytes() == (retained / 'template.xml').read_bytes(), f'template differs from construction source: {name}')
+            signed.write_bytes((retained / 'signed.xml').read_bytes())
         run(corpus.oracle_args("--verify", signed) + [signed], directory / "libxmlsec")
         capture_native_octets(directory)
         run([ROOT / "target/debug/examples/interop_probe", signed, PACKAGE / "fixtures/baseline/root.der", directory / "rust", "spec", "-"], directory / "rust-probe")

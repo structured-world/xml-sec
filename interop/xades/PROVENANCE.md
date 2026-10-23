@@ -19,14 +19,18 @@ The source and synthetic fixture contribution uses the repository's Apache-2.0 A
 license declaration; retain the root LICENSE and LICENSE-THIRD-PARTY. DSS itself is a
 separately downloaded LGPL-2.1-or-later test oracle, not a Rust runtime dependency.
 
-The generation runners encode the signing commands. `results/` records native oracle
-and Rust verification, byte artifacts and comparisons. `dss-evidence/` contains independently
-produced compact conclusions and a portable dependency tree; configuration source is
-under `dss/`. Reports are observations, including indeterminate and differing outcomes.
-Full DSS reports, process stdout/stderr, build logs, command captures and transient check records remain
-local diagnostic artifacts, excluded from Git and the distributable bundle.
+The generation runners encode the signing commands. Only selected signed inputs and
+construction inputs are retained; unrelated output from the broader baseline generator
+is excluded. The `expected-*.bin` files are independently captured libxmlsec1 vectors,
+never Rust outputs. Every retained vector is checked against fresh execution in CI.
+The `*expectations.json` files pin the observed behavior of DSS 6.5.1, including known
+disagreements with the normative profile; they are consumed by the same live check.
+Actual Rust/replay bytes, computed comparisons, tool/dependency snapshots, full DSS
+reports, stdout/stderr, build logs and command captures remain run artifacts, excluded
+from Git and the distributable bundle.
 `dss-investigation/` contains additional synthetic, independently signed minimal
 binding examples and compact DSS observations. They reuse the same public test keys and chain.
 Its source-audit manifest records upstream source URLs and hashes without bundling
 third-party source jars or normative full texts.
-`SHA256SUMS` inventories distributable inputs, tools and evidence at packaging time.
+The corpus `SHA256SUMS` pins its maintained assets. Packaging adds a separate root
+inventory for the complete source overlay and verifies all archived bytes.

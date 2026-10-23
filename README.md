@@ -237,7 +237,7 @@ The generated [compatibility ledger](docs/compatibility-ledger.md) tracks libxml
 surface and operation behavior with source and test evidence.
 
 The [local XAdES interoperability corpus](interop/xades/README.md) compares exact Reference
-and SignedInfo bytes with native libxmlsec1 and retains independent EU DSS profile diagnostics.
+and SignedInfo bytes with native libxmlsec1 and checks independent EU DSS profile expectations.
 Its synthetic fixtures and reproducible commands distinguish transform/XMLDSig interoperability,
 XAdES property binding, expected-object coverage, and trust-validation limits.
 

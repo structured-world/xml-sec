@@ -26,9 +26,59 @@ spec_package.loader.exec_module(package)
 spec_binding = importlib.util.spec_from_file_location("binding", Path(__file__).with_name("investigate-xades-dss.py"))
 binding = importlib.util.module_from_spec(spec_binding)
 spec_binding.loader.exec_module(binding)
+spec_check = importlib.util.spec_from_file_location("check", Path(__file__).with_name("check-xades-interop.py"))
+check = importlib.util.module_from_spec(spec_check)
+spec_check.loader.exec_module(check)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_inventory_rejects_changed_assets_and_tracked_run_outputs(self):
+        # CI must catch stale reference data and accidental commits of actual outputs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root/'interop/xades'
+            fixture = corpus/'fixtures/enveloped-control.xml'
+            fixture.parent.mkdir(parents=True)
+            fixture.write_bytes(b'<synthetic/>')
+            (corpus/'SHA256SUMS').write_text(hashlib.sha256(fixture.read_bytes()).hexdigest() +
+                '  interop/xades/fixtures/enveloped-control.xml\n')
+            tracked = b'interop/xades/fixtures/enveloped-control.xml\0interop/xades/SHA256SUMS\0'
+            with patch.object(check, 'ROOT', root), patch.object(check, 'PACKAGE', corpus), \
+                 patch.object(check, 'load', return_value=package), patch.object(package, 'PACKAGE', corpus), \
+                 patch('subprocess.check_output', return_value=tracked) as listing:
+                check.check_inventory()
+                fixture.write_bytes(b'<changed/>')
+                with self.assertRaisesRegex(SystemExit, 'corpus checksum mismatch'):
+                    check.check_inventory()
+                listing.return_value = tracked + b'interop/xades/results/enveloped-control/spec/reference-0.bin\0'
+                with self.assertRaisesRegex(SystemExit, 'run artifact or undeclared corpus file tracked'):
+                    check.check_inventory()
+
+    def test_goldens_reject_changed_and_missing_live_octets(self):
+        # Fresh oracle results must match the reference corpus, including empty vectors.
+        with tempfile.TemporaryDirectory() as directory:
+            expected, actual = Path(directory)/'expected', Path(directory)/'actual'
+            expected.mkdir(); actual.mkdir()
+            (expected/'expected-reference-0.bin').write_bytes(b'')
+            (actual/'expected-reference-0.bin').write_bytes(b'')
+            self.assertEqual(check.check_goldens(expected, actual), 1)
+            (actual/'expected-reference-0.bin').write_bytes(b'x')
+            with self.assertRaisesRegex(SystemExit, 'golden mismatch:.*first_different_byte'):
+                check.check_goldens(expected, actual)
+            self.assertEqual(json.loads((actual/'golden-comparison.json').read_text())[0]['first_different_byte'], 0)
+            (actual/'expected-reference-0.bin').unlink()
+            with self.assertRaisesRegex(SystemExit, 'golden inventory mismatch'):
+                check.check_goldens(expected, actual)
+
+    def test_dss_expectations_reject_changed_live_conclusions(self):
+        # A passing XMLDSig cannot hide a changed DSS profile or certificate finding.
+        with tempfile.TemporaryDirectory() as directory:
+            expected, actual = Path(directory)/'expected.json', Path(directory)/'actual.json'
+            expected.write_text('{"ISC":"PASSED"}')
+            actual.write_text('{"ISC":"INDETERMINATE"}')
+            with self.assertRaisesRegex(SystemExit, 'DSS expectation mismatch'):
+                check.check_expectations(expected, actual)
+
     def test_binding_summary_preserves_selected_signer_and_digest(self):
         # Keep the evidence for the root-versus-signer discrepancy without raw reports.
         with tempfile.TemporaryDirectory() as directory:
@@ -48,8 +98,12 @@ class EvidenceTests(unittest.TestCase):
             self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
         for name in ["case/diagnostic.xml", "case/detailed.xml", "case/simple.xml", "case/binding-facts.txt"]:
             self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
-        for name in ["fixtures/signed.xml", "fixtures/signer.key", "case/reference-0.bin",
-                     "results/summary.json", "results/versions.json"]:
+        for name in ["results/control/spec/reference-0.bin", "results/control/spec/replay-0.bin",
+                     "dss-investigation/control/rust/signature-0.bin", "results/summary.json",
+                     "results/versions.json", "dss-evidence/dependencies.json", "surprise.tmp"]:
+            self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
+        for name in ["fixtures/enveloped-control.xml", "fixtures/signer.key", "results/enveloped-control/expected-reference-0.bin",
+                     "dss-evidence/expectations.json"]:
             self.assertTrue(package.include_evidence(package.PACKAGE / name), name)
 
     def test_dependency_versions_do_not_export_local_package_ids(self):
@@ -61,7 +115,7 @@ class EvidenceTests(unittest.TestCase):
                          [dict(name="sample", version="1.0.0", features=["std"])])
 
     def test_analyze_uses_retained_octets_without_raw_process_logs(self):
-        # Rechecking a clean checkout must not require ignored stdout captures.
+        # Reanalysis of a run needs its octets, not raw process captures.
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
             case = output / "case"

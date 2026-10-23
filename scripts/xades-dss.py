@@ -76,7 +76,7 @@ def run(args, log):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
-    parser.add_argument("--results", type=Path, default=PACKAGE / "dss-evidence")
+    parser.add_argument("--results", type=Path, default=ROOT / "target/xades-dss-results")
     parser.add_argument("--summarize", action="store_true", help="reanalyze existing reports without running DSS")
     options = parser.parse_args()
     logs = options.results.resolve()
