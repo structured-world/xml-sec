@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """Guard the evidence parser against false positive interoperability reports."""
 import importlib.util
+import base64
+import contextlib
+import hashlib
+import io
+import json
 from pathlib import Path
 import runpy
 import subprocess
@@ -15,9 +20,59 @@ spec.loader.exec_module(interop)
 spec_dss = importlib.util.spec_from_file_location("dss", Path(__file__).with_name("xades-dss.py"))
 dss = importlib.util.module_from_spec(spec_dss)
 spec_dss.loader.exec_module(dss)
+spec_package = importlib.util.spec_from_file_location("package", Path(__file__).with_name("package-xades-interop.py"))
+package = importlib.util.module_from_spec(spec_package)
+spec_package.loader.exec_module(package)
+spec_binding = importlib.util.spec_from_file_location("binding", Path(__file__).with_name("investigate-xades-dss.py"))
+binding = importlib.util.module_from_spec(spec_binding)
+spec_binding.loader.exec_module(binding)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_bundle_excludes_execution_logs(self):
+        # A distributable corpus contains signature evidence, not workstation logs.
+        for name in ["checks/pr-validation.json", "checks/build.log", "generation/sign.command.json",
+                     "results/build.stdout", "results/versions/metadata.stdout", "case/run.stderr",
+                     "case/probe.command.json", "case/rust/result.txt"]:
+            self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
+        for name in ["fixtures/signed.xml", "fixtures/signer.key", "case/reference-0.bin",
+                     "case/diagnostic.xml", "results/summary.json", "results/versions.json"]:
+            self.assertTrue(package.include_evidence(package.PACKAGE / name), name)
+
+    def test_dependency_versions_do_not_export_local_package_ids(self):
+        # Cargo metadata includes absolute package IDs; the public manifest must not.
+        identity = "path+file:///Users/example/private#sample@1.0.0"
+        metadata = dict(packages=[dict(id=identity, name="sample", version="1.0.0")],
+                        resolve=dict(nodes=[dict(id=identity, features=["std"])]))
+        self.assertEqual(interop.resolved_versions(metadata),
+                         [dict(name="sample", version="1.0.0", features=["std"])])
+
+    def test_analyze_uses_retained_octets_without_raw_process_logs(self):
+        # Rechecking a clean checkout must not require ignored stdout captures.
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            case = output / "case"
+            rust = case / "rust"
+            rust.mkdir(parents=True)
+            references = [b"first", b"second"]
+            values = []
+            for index, data in enumerate(references):
+                (case / f"expected-reference-{index}.bin").write_bytes(data)
+                (rust / f"reference-{index}.bin").write_bytes(data)
+                (rust / f"replay-{index}.bin").write_bytes(data)
+                values.append(base64.b64encode(hashlib.sha256(data).digest()).decode())
+            (case / "expected-signedinfo.bin").write_bytes(b"signedinfo")
+            (rust / "signature-0.bin").write_bytes(b"signedinfo")
+            (case / "signed.xml").write_text(f'<Signature xmlns="{interop.DS}"><SignedInfo>' +
+                ''.join(f'<Reference><DigestValue>{value}</DigestValue></Reference>' for value in values) +
+                '</SignedInfo></Signature>')
+            (output / "summary.json").write_text(json.dumps(dict(cases=[dict(name="case")])))
+            with patch.object(binding, "OUT", output), contextlib.redirect_stdout(io.StringIO()):
+                binding.analyze_octets()
+            self.assertFalse((case / "libxmlsec.stdout").exists())
+            self.assertEqual(json.loads((output / "octet-comparison.json").read_text())[0]
+                             ["signed_info"]["status"], "проверено")
+
     def test_evidence_refusal_survives_python_optimization(self):
         # Python -O must not remove the signed-octet or normative outcome gates.
         script = Path(__file__).with_name("investigate-xades-dss.py").resolve()

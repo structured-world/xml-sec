@@ -1,7 +1,0 @@
-[
-  "curl",
-  "--fail",
-  "--silent",
-  "--show-error",
-  "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.12/apache-maven-3.9.12-bin.tar.gz.sha512"
-]

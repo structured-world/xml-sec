@@ -1,2 +1,10 @@
 # Generated bundles duplicate the reviewable corpus and remain local artifacts.
 /*.tar.gz
+# Build/command captures and verbose process diagnostics are local run artifacts.
+/xades/checks/
+/xades/generation/
+/xades/**/*.stdout
+/xades/**/*.stderr
+/xades/**/*.log
+/xades/**/*.command.json
+/xades/**/result.txt

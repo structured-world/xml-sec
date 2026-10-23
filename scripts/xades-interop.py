@@ -175,6 +175,13 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def resolved_versions(metadata):
+    """Keep dependency versions/features without Cargo's absolute package IDs."""
+    nodes = {node["id"]: node["features"] for node in metadata["resolve"]["nodes"]}
+    return sorted([dict(name=package["name"], version=package["version"], features=nodes[package["id"]])
+                   for package in metadata["packages"]], key=lambda item: (item["name"], item["version"]))
+
+
 def debug_buffer(block, kind):
     """libxmlsec1 1.3.12 DebugHexDump, not a text XML serialization.
 
@@ -209,9 +216,9 @@ def run_all(results):
         raise SystemExit(f"byte-dump parser is qualified for xmlsec1 1.3.12 (openssl), got: {oracle_version}")
     versions = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
     executable = Path(shutil.which(XMLSEC)).resolve()
-    versions["oracle_binary"] = dict(path=str(executable), sha256=digest(executable.read_bytes()))
+    versions["oracle_binary"] = dict(name=executable.name, sha256=digest(executable.read_bytes()))
     for name, args in {"rustc": ["rustc", "-Vv"], "cargo": ["cargo", "-V"],
-                       "xmlsec1": [XMLSEC, "--version"], "openssl": ["openssl", "version", "-a"],
+                       "xmlsec1": [XMLSEC, "--version"], "openssl": ["openssl", "version"],
                        "python": ["python3", "--version"]}.items():
         result = command(args, results / "versions" / name)
         versions[name] = (result.stdout + result.stderr).decode()
@@ -223,6 +230,7 @@ def run_all(results):
     metadata = command(["cargo", "metadata", "--format-version", "1"], results / "versions/metadata")
     if metadata.returncode:
         raise SystemExit("cargo metadata failed")
+    versions["resolved_dependencies"] = resolved_versions(json.loads(metadata.stdout))
     build = command(["cargo", "build", "-p", "xml-sec-xades", "--example", "interop_probe"], results / "build")
     if build.returncode:
         raise SystemExit("probe build failed")

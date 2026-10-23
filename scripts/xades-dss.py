@@ -103,7 +103,7 @@ if __name__ == "__main__":
     args = [mvn, "-B", "-f", pom, f"-Dmaven.repo.local={TOOLS / 'repository'}"]
     run(args + ["compile", "dependency:build-classpath", f"-Dmdep.outputFile={TOOLS / 'classpath.txt'}"], logs / "build")
     run([mvn, "-v"], logs / "versions")
-    run(args + ["dependency:tree"], logs / "dependencies")
+    run(args + ["dependency:tree", "-DoutputType=json", f"-DoutputFile={logs / 'dependencies.json'}"], logs / "dependencies")
     # Never feed the deliberately external-URI fixtures to another validator.
     manifest = {case["name"]: case for case in json.loads((PACKAGE / "cases.json").read_text())}
     classpath = str(target / "classes") + ":" + (TOOLS / "classpath.txt").read_text().strip()

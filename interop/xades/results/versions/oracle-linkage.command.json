@@ -1,5 +1,0 @@
-[
-  "otool",
-  "-L",
-  "/opt/homebrew/Cellar/libxmlsec1/1.3.12/bin/xmlsec1"
-]

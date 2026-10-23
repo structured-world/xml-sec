@@ -22,7 +22,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "target-payload",
@@ -46,7 +48,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "target-unresolved",
@@ -70,7 +74,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "target-absent",
@@ -94,7 +100,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "cert-root",
@@ -118,7 +126,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "cert-intermediate",
@@ -141,7 +151,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "cert-unmatched",
@@ -165,7 +177,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "cert-root-then-signer",
@@ -190,7 +204,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     },
     {
       "name": "cert-signer-then-root",
@@ -215,7 +231,9 @@
         "CV": "PASSED",
         "SAV": "PASSED",
         "AOV": "PASSED"
-      }
+      },
+      "rust_xml_dsig_status": "проверено",
+      "native_xml_dsig_status": "проверено"
     }
   ],
   "certificate_sha256": {

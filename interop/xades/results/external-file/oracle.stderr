@@ -1,9 +1,0 @@
-func=xmlSecTransformCtxSetUri:file=transforms.c:line=889:obj=unknown:subj=unknown:error=44:invalid key data size:uri=file:///never-read
-func=xmlSecDSigReferenceCtxProcessNode:file=xmldsig.c:line=1346:obj=unknown:subj=xmlSecTransformCtxSetUri:error=1:xmlsec library function failed:uri=file:///never-read
-func=xmlSecDSigCtxProcessReferences:file=xmldsig.c:line=773:obj=Reference:subj=xmlSecDSigReferenceCtxProcessNode:error=1:xmlsec library function failed: 
-func=xmlSecDSigCtxProcessSignatureNode:file=xmldsig.c:line=538:obj=unknown:subj=xmlSecDSigCtxProcessReferences:error=1:xmlsec library function failed: 
-func=xmlSecDSigCtxVerify:file=xmldsig.c:line=343:obj=unknown:subj=xmlSecDSigCtxProcessSignatureNode:error=1:xmlsec library function failed: 
-Verification status: ERROR
-SignedInfo References (ok/all): 0/1
-Manifests References (ok/all): 0/0
-Error: failed to verify file "/Users/polaz/.codex/worktrees/xades-interop/xml-sec/interop/xades/fixtures/external-file.xml"

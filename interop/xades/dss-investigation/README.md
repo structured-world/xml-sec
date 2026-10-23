@@ -169,9 +169,10 @@ python3 scripts/investigate-xades-dss.py --output target/xades-binding-repro --s
 ```
 
 On another machine, set the path to native libxmlsec1; the Rust CLI is not an oracle.
-The investigation's Maven calls use `-o` after bootstrap. Every `.command.json`
-retains the executed command, alongside stdout/stderr, byte artifacts, digests and DSS
-reports. Authenticated replay uses the existing verified-session API.
+The investigation's Maven calls use `-o` after bootstrap. Process and command captures
+remain local and ignored. The distributed evidence retains byte artifacts, digests,
+verification summaries and DSS reports. Authenticated replay uses the existing
+verified-session API; reanalysis needs no process logs.
 
 Recheck retained octets without running either engine:
 
@@ -191,7 +192,7 @@ Status vocabulary: **проверено** = checked; **не прошло** = did
 
 | Check | Status | Evidence |
 | --- | --- | --- |
-| XMLDSig for all nine cases, native and Rust | проверено | libxmlsec stdout/stderr and rust/result.txt |
+| XMLDSig for all nine cases, native and Rust | проверено | summary.json verification statuses; DSS diagnostic.xml BasicSignature |
 | 18 Reference pairs, digest/DigestValue and replay | проверено | octet-comparison.json; expected-reference-*.bin and rust/*.bin |
 | Nine canonicalized SignedInfo pairs | проверено | octet-comparison.json; expected-signedinfo.bin and rust/signature-0.bin |
 | No first differing byte | проверено | first_different_byte=null throughout these comparisons |

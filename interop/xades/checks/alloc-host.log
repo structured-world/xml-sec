@@ -1,8 +1,0 @@
-    Checking simdutf8 v0.1.5
-    Checking cfg-if v1.0.5
-    Checking scopeguard v1.2.0
-    Checking xmlparser v0.13.6
-   Compiling thiserror v2.0.21
-   Compiling encoding_rs v0.8.42
-    Checking xml-sec-xml-input v0.1.0 (/Users/polaz/.codex/worktrees/xades-interop/xml-sec/crates/xml-sec-xml-input)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.03s

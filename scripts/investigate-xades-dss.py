@@ -50,20 +50,30 @@ def template(target, certificate_names):
     return f'''<r><Data Id="payload">x</Data><ds:Signature xmlns:ds="{DS}" Id="sig"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="{EXC}"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference Id="sig-data" URI="#payload"><ds:Transforms><ds:Transform Algorithm="{EXC}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference><ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp"><ds:Transforms><ds:Transform Algorithm="{EXC}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data>{keyinfo}</ds:X509Data></ds:KeyInfo><ds:Object><x:QualifyingProperties xmlns:x="{XADES}"{target_attribute}><x:SignedProperties Id="sp"><x:SignedSignatureProperties><x:SigningTime>2026-10-18T12:00:00Z</x:SigningTime><x:SigningCertificateV2>{''.join(refs)}</x:SigningCertificateV2></x:SignedSignatureProperties><x:SignedDataObjectProperties><x:DataObjectFormat ObjectReference="#sig-data"><x:MimeType>text/xml</x:MimeType></x:DataObjectFormat></x:SignedDataObjectProperties></x:SignedProperties></x:QualifyingProperties></ds:Object></ds:Signature></r>'''
 
 
+def capture_native_octets(directory):
+    """Retain oracle output bytes independently of ignored stdout captures."""
+    stdout = (directory / 'libxmlsec.stdout').read_bytes()
+    blocks = stdout.split(b'= REFERENCE VERIFICATION CONTEXT\n')[1:]
+    require(len(blocks) == 2, f'incomplete native Reference diagnostics: {directory.name}')
+    for index, block in enumerate(blocks):
+        expected = corpus.debug_buffer(block, b'PreDigest')
+        require(expected is not None, f'missing native Reference octets: {directory.name}/{index}')
+        (directory / f'expected-reference-{index}.bin').write_bytes(expected)
+    signed_info = corpus.debug_buffer(stdout, b'PreSigned')
+    require(signed_info is not None, f'missing native SignedInfo: {directory.name}')
+    (directory / 'expected-signedinfo.bin').write_bytes(signed_info)
+
+
 def analyze_octets():
     """Independent byte checks prevent a bad signature fixture masking binding behavior."""
     evidence = []
     for case in json.loads((OUT / 'summary.json').read_text())['cases']:
         directory = OUT / case['name']
-        stdout = (directory / 'libxmlsec.stdout').read_bytes()
-        blocks = stdout.split(b'= REFERENCE VERIFICATION CONTEXT\n')[1:]
         values = ET.parse(directory / 'signed.xml').findall(f'.//{{{DS}}}SignedInfo/{{{DS}}}Reference/{{{DS}}}DigestValue')
-        require(len(blocks) == len(values) == 2, f'incomplete Reference diagnostics: {case["name"]}')
+        require(len(values) == 2, f'incomplete Reference inputs: {case["name"]}')
         row = dict(name=case['name'], references=[])
-        for index, (block, value) in enumerate(zip(blocks, values)):
-            expected = corpus.debug_buffer(block, b'PreDigest')
-            require(expected is not None, f'missing native Reference octets: {case["name"]}/{index}')
-            (directory / f'expected-reference-{index}.bin').write_bytes(expected)
+        for index, value in enumerate(values):
+            expected = (directory / f'expected-reference-{index}.bin').read_bytes()
             actual = (directory / f'rust/reference-{index}.bin').read_bytes()
             result = corpus.compare(expected, actual)
             written = base64.b64decode(value.text)
@@ -72,9 +82,7 @@ def analyze_octets():
             require(result['status'] == result['replay']['status'] == 'проверено' and result['digest_matches'],
                     f'Reference/digest/replay mismatch: {case["name"]}/{index}')
             row['references'].append(result)
-        expected_si = corpus.debug_buffer(stdout, b'PreSigned')
-        require(expected_si is not None, f'missing native SignedInfo: {case["name"]}')
-        (directory / 'expected-signedinfo.bin').write_bytes(expected_si)
+        expected_si = (directory / 'expected-signedinfo.bin').read_bytes()
         row['signed_info'] = corpus.compare(expected_si, (directory / 'rust/signature-0.bin').read_bytes())
         require(row['signed_info']['status'] == 'проверено', f'SignedInfo mismatch: {case["name"]}')
         evidence.append(row)
@@ -146,6 +154,7 @@ if __name__ == "__main__":
         credentials = ','.join(str(PACKAGE / ("fixtures/" + n)) for n in ["signer.key", "signer.pem", "intermediate.pem"])
         run(corpus.oracle_args("--sign", source) + ["--lax-key-search", "--privkey-pem", credentials, "--output", signed, source], directory / "sign")
         run(corpus.oracle_args("--verify", signed) + [signed], directory / "libxmlsec")
+        capture_native_octets(directory)
         run([ROOT / "target/debug/examples/interop_probe", signed, PACKAGE / "fixtures/baseline/root.der", directory / "rust", "spec", "-"], directory / "rust-probe")
         run(["java", "-cp", classpath, "BindingProbe", signed, PACKAGE / "fixtures/baseline/root.der", directory / "dss"], directory / "dss-probe")
         simple = ET.parse(directory / "dss/simple.xml").getroot().find("{*}Signature")
@@ -157,6 +166,7 @@ if __name__ == "__main__":
         require(rust_bb == expected_bb, f"Rust disagrees with normative case: {name}")
         row = dict(name=name, target=target, cert_references=cert_names, expected_bb=expected_bb,
                    fixture_sha256=sha(signed.read_bytes()), rust_bb=rust_bb,
+                   rust_xml_dsig_status="проверено", native_xml_dsig_status="проверено",
                    rust_finding=next(line for line in rust.splitlines() if line.startswith('xades=')),
                    dss_format=simple.get('SignatureFormat'), dss_indication=simple.findtext('{*}Indication'),
                    dss_subindication=simple.findtext('{*}SubIndication'),

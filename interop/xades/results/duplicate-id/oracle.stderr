@@ -1,9 +1,0 @@
-Error: duplicate ID attribute "payload"
-func=xmlSecDepthFirstTreeWalk:file=xmltree.c:line=1047:obj=unknown:subj=callback:error=1:xmlsec library function failed: 
-Error: xmlSecDepthFirstTreeWalk failed
-Error: failed to add ID attribute "Id" for node "Outside"
-Error: failed to load document "/Users/polaz/.codex/worktrees/xades-interop/xml-sec/interop/xades/fixtures/duplicate-id.xml"
-Verification status: ERROR
-SignedInfo References (ok/all): 0/0
-Manifests References (ok/all): 0/0
-Error: failed to verify file "/Users/polaz/.codex/worktrees/xades-interop/xml-sec/interop/xades/fixtures/duplicate-id.xml"

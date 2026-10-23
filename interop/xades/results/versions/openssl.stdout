@@ -1,9 +1,0 @@
-OpenSSL 4.0.3 29 Sep 2026 (Library: OpenSSL 4.0.3 29 Sep 2026)
-built on: Tue Sep 29 13:44:55 2026 UTC
-platform: darwin64-arm64-cc
-options:  bn(64,64)
-compiler: clang -fPIC -arch arm64 -O3 -Wall -DL_ENDIAN -DOPENSSL_PIC -D_REENTRANT -DNDEBUG
-OPENSSLDIR: "/opt/homebrew/etc/openssl@4"
-MODULESDIR: "/opt/homebrew/Cellar/openssl@4/4.0.3/lib/ossl-modules"
-Seeding source: os-specific
-CPUINFO: OPENSSL_armcap=0x987d

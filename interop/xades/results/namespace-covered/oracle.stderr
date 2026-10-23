@@ -1,6 +1,0 @@
-func=xmlSecOpenSSLEvpDigestVerify:file=digests.c:line=371:obj=sha256:subj=unknown:error=12:invalid data:data and digest do not match
-Verification status: FAILED
-Failure reason: REFERENCE
-SignedInfo References (ok/all): 0/1
-Manifests References (ok/all): 0/0
-Error: failed to verify file "/Users/polaz/.codex/worktrees/xades-interop/xml-sec/interop/xades/fixtures/namespace-covered.xml"

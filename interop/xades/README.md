@@ -12,14 +12,15 @@ All validation runs are local; fixtures are never uploaded to online validators.
 - Probe: `cargo build -p xml-sec-xades --example interop_probe`, default XAdES features.
   Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded,no-unsafe`.
   This probe does not enable XMLEnc, XSLT, FIPS, PKCS#11 or legacy crypto.
-- Rust/cargo 1.99.0, Python 3.11.9; complete dependency resolution and feature tree in
-  `results/versions/`, executable digest and versions in `results/versions.json`.
+- Rust/cargo 1.99.0, Python 3.11.9; the workspace metadata's resolved dependency
+  names, versions and features, plus the executable digest, are in `results/versions.json`.
+  This workspace resolution is distinct from the probe features listed above.
 - Independent oracle: Homebrew **libxmlsec1 1.3.12 (openssl)**, native Mach-O binary.
   This is not this repository's Rust `tools/xmlsec1`. Its linked OpenSSL is **3.6.4**;
   the credential generator's separate `openssl` executable is **4.0.3**.
-  Native linkage is recorded in `results/versions/oracle-linkage.stdout`.
 - Independent profile diagnostics: **EU DSS 6.5.1**, Maven **3.9.12**, OpenJDK **21.0.12.1**.
-  Dependency tree, JVM version, commands and nine XML reports are in `dss-evidence/`.
+  The portable dependency tree is `dss-evidence/dependencies.json`; validation reports
+  are in `dss-evidence/`, with configuration and invocation source in `dss/` and the runners.
 
 The Rust probe uses `with_verified_request`, original `SignatureEvidence`,
 `select_signature`, `visit_authenticated_references`, and
@@ -65,9 +66,9 @@ There is no Rust self-sign/self-verify evidence in this package.
 | B-T/B-LT/B-LTA, TSA/OCSP/CRL, EU Trusted Lists, legal qualification | не запускалось или заблокировано | Outside this corpus; no such evidence or trust service inputs |
 | AL/SignedXml pipeline or direct Rust invocation from AL/SaaS | не запускалось или заблокировано | No Business Central environment; no deployment assumption |
 
-`results/summary.json` is the machine-readable account. Each case directory contains raw
-independent diagnostics, exact `expected-reference-N.bin`, `expected-signedinfo.bin`,
-Rust `reference-N.bin`, `signature-0.bin`, authenticated `replay-N.bin`, and typed results.
+`results/summary.json` records verification outcomes and typed failures. Each case
+directory contains exact independent `expected-reference-N.bin`, `expected-signedinfo.bin`,
+Rust `reference-N.bin`, `signature-0.bin`, and authenticated `replay-N.bin`.
 For each available pair it records lengths, SHA-256 hashes, decoded DigestValue,
 computed digests, first differing byte (zero-based), and 24 preceding / 25 following
 bytes in hexadecimal. Absence is never counted as a byte match. All positive valid
@@ -117,10 +118,12 @@ The distributable archive contains this directory, the probe and runner source o
 and license notices. Extract it over a checkout at the recorded baseline before building.
 Verify its inventory from that checkout with `shasum -a 256 -c interop/xades/SHA256SUMS`.
 Repackage with `python3 scripts/package-xades-interop.py /tmp/xades-interop-new.tar.gz`;
-the packager verifies every archived file against its recorded hash and excludes builds/caches.
+the packager verifies every archived file against its recorded hash and excludes builds,
+caches, process logs, command captures and transient verification records.
 
-Exact per-case oracle and probe commands are beside their stdout/stderr in `.command.json`.
-Local verification commands and results are in `checks/`:
+The runners encode per-case oracle and probe commands. New runs also capture commands
+and stdout/stderr locally for diagnosis; Git and the distributable bundle exclude these
+captures. Verification commands:
 
 ```sh
 cargo nextest run -p xml-sec -p xml-sec-xades --no-fail-fast --status-level fail --final-status-level fail
@@ -131,20 +134,12 @@ cargo +1.92.0 check -p xml-sec-xml-input --no-default-features --target thumbv7e
 cargo clean
 ```
 
-The initial frozen run recorded **3293 tests passed**, probe build/lint/format and
-canonical XML-input alloc checks passed. The existing `xmlsec1_interop` tests require
-libxmlsec1 >=1.3.13 and early-return for this installed 1.3.12: their green runner status
-is not independent-oracle evidence. This package's native-oracle calls are mandatory.
-The XAdES crate's all-features suite also passed **18 tests**, with all-features probe lint
-passing. FIPS/PKCS#11/core all-feature provider matrices were not run for this test-only addition.
 Core XMLDSig and the current XAdES adapter require std; passing XML-input alloc checks
 does not establish alloc-only XMLDSig/XAdES support. No production dependency or policy
 surface was changed. Probe memory/work ceilings are test execution accounts.
-PR-readiness workspace and harness verification is recorded separately in
-`checks/pr-*.log`. Generated `.tar.gz` bundles remain local artifacts; Git contains
+Generated `.tar.gz` bundles remain local artifacts; Git contains
 the reviewable sources, fixtures, byte artifacts, manifests and reports.
-`checks/pr-validation.json` records the successful recheck and its additional workspace
-oracle. The full workspace CLI suite requires native libxmlsec1 1.3.13 and the pinned
+The full workspace CLI suite requires native libxmlsec1 1.3.13 and the pinned
 `donors/xmlsec` checkout, unlike the frozen byte-dump parser's 1.3.12 requirement.
 After checking out the revision in `compatibility/libxmlsec1-1.3.13-donor-commit.txt`,
 the macOS readiness commands are:

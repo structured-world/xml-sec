@@ -13,6 +13,17 @@ SOURCES = ["LICENSE", "LICENSE-THIRD-PARTY", "README.md", "interop/.gitignore", 
            "scripts/investigate-xades-dss.py",
            "scripts/package-xades-interop.py", "crates/xml-sec-xades/examples/interop_probe.rs"]
 
+
+def include_evidence(path):
+    """Publish inputs and comparison evidence; keep process logs local."""
+    relative = path.relative_to(PACKAGE)
+    if relative.parts[0] in {"checks", "generation"}:
+        return False
+    if path.suffix in {".stdout", ".stderr", ".log"}:
+        return False
+    return path.name != "result.txt" and not path.name.endswith(".command.json")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("output", type=Path)
@@ -20,7 +31,7 @@ if __name__ == "__main__":
     if output.exists() or output.is_relative_to(PACKAGE):
         raise SystemExit("choose a new archive path outside the corpus")
     files = [ROOT / name for name in SOURCES]
-    files += sorted(p for p in PACKAGE.rglob("*") if p.is_file() and p.name != "SHA256SUMS")
+    files += sorted(p for p in PACKAGE.rglob("*") if p.is_file() and p.name != "SHA256SUMS" and include_evidence(p))
     if any(p.is_symlink() or set(p.relative_to(ROOT).parts) & {"target", ".tools", "__pycache__"} for p in files):
         raise SystemExit("unexpected link or build output in corpus")
     checksums = PACKAGE / "SHA256SUMS"

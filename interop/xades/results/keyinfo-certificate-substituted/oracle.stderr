@@ -1,6 +1,0 @@
-func=xmlSecOpenSSLEvpSignatureVerify:file=signatures.c:line=1268:obj=rsa-sha256:subj=unknown:error=18:data do not match:details=Signature verification failed
-Verification status: FAILED
-Failure reason: SIGNATURE
-SignedInfo References (ok/all): 2/2
-Manifests References (ok/all): 0/0
-Error: failed to verify file "/Users/polaz/.codex/worktrees/xades-interop/xml-sec/interop/xades/fixtures/keyinfo-certificate-substituted.xml"

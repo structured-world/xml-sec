@@ -1,0 +1,423 @@
+{
+  "groupId": "world.structured.interop",
+  "artifactId": "xades-offline-probe",
+  "version": "1.0",
+  "type": "jar",
+  "scope": "",
+  "classifier": "",
+  "optional": "false",
+  "children": [
+    {
+      "groupId": "eu.europa.ec.joinup.sd-dss",
+      "artifactId": "dss-xades",
+      "version": "6.5.1",
+      "type": "jar",
+      "scope": "compile",
+      "classifier": "",
+      "optional": "false",
+      "children": [
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-document",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-xml-utils",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false",
+          "children": [
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "dss-xml-common",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            },
+            {
+              "groupId": "org.apache.santuario",
+              "artifactId": "xmlsec",
+              "version": "3.0.6",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false",
+              "children": [
+                {
+                  "groupId": "com.fasterxml.woodstox",
+                  "artifactId": "woodstox-core",
+                  "version": "6.5.1",
+                  "type": "jar",
+                  "scope": "runtime",
+                  "classifier": "",
+                  "optional": "false",
+                  "children": [
+                    {
+                      "groupId": "org.codehaus.woodstox",
+                      "artifactId": "stax2-api",
+                      "version": "4.2.1",
+                      "type": "jar",
+                      "scope": "runtime",
+                      "classifier": "",
+                      "optional": "false"
+                    }
+                    ]
+                }
+                ]
+            }
+            ]
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "specs-trusted-list",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false",
+          "children": [
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "specs-xmldsig",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            },
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "specs-xades",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            }
+            ]
+        }
+        ]
+    },
+    {
+      "groupId": "eu.europa.ec.joinup.sd-dss",
+      "artifactId": "dss-validation",
+      "version": "6.5.1",
+      "type": "jar",
+      "scope": "compile",
+      "classifier": "",
+      "optional": "false",
+      "children": [
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-spi",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false",
+          "children": [
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "dss-alert",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            },
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "dss-crl-parser",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false",
+              "children": [
+                {
+                  "groupId": "org.bouncycastle",
+                  "artifactId": "bcprov-jdk18on",
+                  "version": "1.86",
+                  "type": "jar",
+                  "scope": "compile",
+                  "classifier": "",
+                  "optional": "false"
+                }
+                ]
+            },
+            {
+              "groupId": "org.bouncycastle",
+              "artifactId": "bcpkix-jdk18on",
+              "version": "1.86",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false",
+              "children": [
+                {
+                  "groupId": "org.bouncycastle",
+                  "artifactId": "bcutil-jdk18on",
+                  "version": "1.86",
+                  "type": "jar",
+                  "scope": "compile",
+                  "classifier": "",
+                  "optional": "false"
+                }
+                ]
+            }
+            ]
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-diagnostic-jaxb",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-simple-report-jaxb",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-simple-certificate-report-jaxb",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-detailed-report-jaxb",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "specs-validation-report",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false",
+          "children": [
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "specs-trusted-list-v211",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            }
+            ]
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-i18n",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "org.slf4j",
+          "artifactId": "slf4j-api",
+          "version": "2.0.20",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        }
+        ]
+    },
+    {
+      "groupId": "eu.europa.ec.joinup.sd-dss",
+      "artifactId": "dss-policy-jaxb",
+      "version": "6.5.1",
+      "type": "jar",
+      "scope": "compile",
+      "classifier": "",
+      "optional": "false",
+      "children": [
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-jaxb-parsers",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false",
+          "children": [
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "dss-jaxb-common",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            },
+            {
+              "groupId": "jakarta.xml.bind",
+              "artifactId": "jakarta.xml.bind-api",
+              "version": "3.0.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false",
+              "children": [
+                {
+                  "groupId": "com.sun.activation",
+                  "artifactId": "jakarta.activation",
+                  "version": "2.0.1",
+                  "type": "jar",
+                  "scope": "compile",
+                  "classifier": "",
+                  "optional": "false"
+                }
+                ]
+            },
+            {
+              "groupId": "org.glassfish.jaxb",
+              "artifactId": "jaxb-runtime",
+              "version": "3.0.2",
+              "type": "jar",
+              "scope": "runtime",
+              "classifier": "",
+              "optional": "false",
+              "children": [
+                {
+                  "groupId": "org.glassfish.jaxb",
+                  "artifactId": "jaxb-core",
+                  "version": "3.0.2",
+                  "type": "jar",
+                  "scope": "runtime",
+                  "classifier": "",
+                  "optional": "false",
+                  "children": [
+                    {
+                      "groupId": "org.glassfish.jaxb",
+                      "artifactId": "txw2",
+                      "version": "3.0.2",
+                      "type": "jar",
+                      "scope": "runtime",
+                      "classifier": "",
+                      "optional": "false"
+                    },
+                    {
+                      "groupId": "com.sun.istack",
+                      "artifactId": "istack-commons-runtime",
+                      "version": "4.0.1",
+                      "type": "jar",
+                      "scope": "runtime",
+                      "classifier": "",
+                      "optional": "false"
+                    }
+                    ]
+                }
+                ]
+            }
+            ]
+        },
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-model",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false",
+          "children": [
+            {
+              "groupId": "eu.europa.ec.joinup.sd-dss",
+              "artifactId": "dss-enumerations",
+              "version": "6.5.1",
+              "type": "jar",
+              "scope": "compile",
+              "classifier": "",
+              "optional": "false"
+            }
+            ]
+        }
+        ]
+    },
+    {
+      "groupId": "eu.europa.ec.joinup.sd-dss",
+      "artifactId": "dss-utils-apache-commons",
+      "version": "6.5.1",
+      "type": "jar",
+      "scope": "compile",
+      "classifier": "",
+      "optional": "false",
+      "children": [
+        {
+          "groupId": "eu.europa.ec.joinup.sd-dss",
+          "artifactId": "dss-utils",
+          "version": "6.5.1",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "org.apache.commons",
+          "artifactId": "commons-lang3",
+          "version": "3.21.0",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "org.apache.commons",
+          "artifactId": "commons-collections4",
+          "version": "4.6.0",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "commons-codec",
+          "artifactId": "commons-codec",
+          "version": "1.18.0",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        },
+        {
+          "groupId": "commons-io",
+          "artifactId": "commons-io",
+          "version": "2.22.0",
+          "type": "jar",
+          "scope": "compile",
+          "classifier": "",
+          "optional": "false"
+        }
+        ]
+    }
+    ]
+}

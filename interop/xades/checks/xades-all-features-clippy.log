@@ -1,4 +1,0 @@
-    Blocking waiting for file lock on build directory
-    Checking xml-sec v0.2.0 (/Users/polaz/.codex/worktrees/xades-interop/xml-sec)
-    Checking xml-sec-xades v0.1.0 (/Users/polaz/.codex/worktrees/xades-interop/xml-sec/crates/xml-sec-xades)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 22.26s

@@ -1,15 +1,16 @@
 {
   "commit": "834c463798060dca613bb93dd78dcdc7f949c948",
-  "native_xmlsec_path": "/opt/homebrew/Cellar/libxmlsec1/1.3.12/bin/xmlsec1",
   "native_xmlsec_sha256": "5b16375ec3804dd9de4b22ae126870278eb2951e9353eb76d13af9c580ebb94e",
   "native_xmlsec_version": "xmlsec1 1.3.12 (openssl)",
   "dss_version": "6.5.1",
-  "java_maven_versions": "Apache Maven 3.9.12 (848fbb4bf2d427b72bdb2471c22fced7ebd9a7a1)\nMaven home: /Users/polaz/.codex/worktrees/xades-interop/xml-sec/.tools/xades-dss/apache-maven-3.9.12\nJava version: 21.0.12.1, vendor: Homebrew, runtime: /opt/homebrew/Cellar/openjdk@21/21.0.12.1/libexec/openjdk.jdk/Contents/Home\nDefault locale: en_US, platform encoding: UTF-8\nOS name: \"mac os x\", version: \"27.0.1\", arch: \"aarch64\", family: \"mac\"\n",
   "validation_epoch_seconds": 1800000000,
   "network_validation_sources": {
     "AIA": null,
     "OCSP": null,
     "CRL": null
   },
-  "source_scope": "test harness and reports; production code unchanged"
+  "source_scope": "test harness and reports; production code unchanged",
+  "maven_version": "3.9.12",
+  "java_version": "21.0.12.1",
+  "java_vendor": "Homebrew"
 }
