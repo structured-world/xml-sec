@@ -87,3 +87,10 @@ test('each failed process stops its block without a successful later command', (
   execute(commands, () => { completed++; return { status: 0, signal: null }; });
   assert.equal(completed, commands.length);
 });
+
+test('stacked pull requests run the same CI without a base-branch filter', () => {
+  // An empty event configuration intentionally admits feature-branch bases too.
+  const workflow = readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /^  pull_request: \{\}$/m);
+  assert.match(workflow, /^    branches: \[main\]$/m);
+});

@@ -92,6 +92,10 @@ remain isolated. The required `build`, `clippy` and `test` checks fail if any
 constituent block fails, is cancelled or is skipped; existing required check
 names remain unchanged.
 
+Pull-request qualification runs for every base branch, including dependent
+branches in a PR stack. Push qualification remains limited to `main`; PR jobs
+retain read-only repository permissions.
+
 The XML-oracle block runs both the live XMLDSig/XAdES corpus and XSLT conformance
 with their original independent validators and separate evidence artifacts.
 Shared mechanisms are resolved as one registry version across ASN.1, PKIX, CMS,
