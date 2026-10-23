@@ -144,7 +144,7 @@ if __name__ == "__main__":
         ("cert-root-then-signer", "#sig", ["root", "signer"], False),
         ("cert-signer-then-root", "#sig", ["signer", "root"], True),
     ]
-    run(["cargo", "build", "-p", "xml-sec-xades", "--example", "interop_probe"], OUT / "rust-build")
+    binary = corpus.build_probe(OUT / "rust-build")
     tools = ROOT / ".tools/xades-dss"
     mvn = tools / "apache-maven-3.9.12/bin/mvn"
     if not mvn.exists():
@@ -167,7 +167,7 @@ if __name__ == "__main__":
             signed.write_bytes((retained / 'signed.xml').read_bytes())
         run(corpus.oracle_args("--verify", signed) + [signed], directory / "libxmlsec")
         capture_native_octets(directory)
-        run([ROOT / "target/debug/examples/interop_probe", signed, PACKAGE / "fixtures/baseline/root.der", directory / "rust", "spec", "-"], directory / "rust-probe")
+        run([binary, signed, PACKAGE / "fixtures/baseline/root.der", directory / "rust", "spec", "-"], directory / "rust-probe")
         run(["java", "-cp", classpath, "BindingProbe", signed, PACKAGE / "fixtures/baseline/root.der", directory / "dss"], directory / "dss-probe")
         simple = ET.parse(directory / "dss/simple.xml").getroot().find("{*}Signature")
         diag = ET.parse(directory / "dss/diagnostic.xml").getroot().find(".//{*}Signatures/{*}Signature")

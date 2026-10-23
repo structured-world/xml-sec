@@ -103,6 +103,11 @@ No part may skip on a missing oracle. The existing aggregate `test` job requires
 CI publishes actual octets, hashes, first-difference diagnostics and full DSS reports as
 `xades-interop-results` run artifacts. It never updates fixtures or expectations.
 
+The runners require POSIX process groups (Linux/macOS). Commands default to a 900-second
+deadline; nested commands share the enclosing phase's process group. A timeout aborts
+that group. Arguments are recorded before launch and streams are logged as commands run,
+preserving nested diagnostics when an enclosing deadline cancels the phase.
+
 Individual investigation commands:
 
 ```sh
@@ -150,6 +155,7 @@ cargo nextest run -p xml-sec -p xml-sec-xades --no-fail-fast --status-level fail
 cargo clippy -p xml-sec-xades --example interop_probe -- -D warnings
 cargo fmt -p xml-sec-xades --check
 cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
+rustup target add --toolchain 1.92.0 thumbv7em-none-eabihf
 cargo +1.92.0 check -p xml-sec-xml-input --no-default-features --target thumbv7em-none-eabihf
 cargo clean
 ```
