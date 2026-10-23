@@ -11,9 +11,13 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,14 +30,108 @@ SP = "http://uri.etsi.org/01903/v1.3.2#"
 XMLSEC = os.environ.get("XMLSEC1_BIN", "xmlsec1")
 
 
-def command(args, log, env=None):
-    result = subprocess.run([str(x) for x in args], cwd=ROOT, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def _capture_streams(process, stdout, stderr, timeout):
+    # Persist progress before an enclosing runner can cancel this process.
+    # Pipes still keep the deadline active when a descendant outlives its parent.
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        selector.register(process.stderr, selectors.EVENT_READ, stderr)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for key, _ in selector.select(remaining):
+                # This is a read chunk, not a total output limit.
+                data = os.read(key.fd, 65536)
+                if data:
+                    key.data.write(data)
+                    key.data.flush()
+                else:
+                    selector.unregister(key.fileobj)
+    process.wait(timeout=max(0, deadline - time.monotonic()))
+
+
+def command(args, log, env=None, *, timeout=900):
+    arguments = [str(x) for x in args]
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.with_suffix(".command.json").write_text(json.dumps([str(x) for x in args], indent=2))
-    log.with_suffix(".stdout").write_bytes(result.stdout)
-    log.with_suffix(".stderr").write_bytes(result.stderr)
-    return result
+    log.with_suffix(".command.json").write_text(json.dumps(arguments, indent=2))
+    session = os.getsid(0)
+    parent_session = os.environ.get("_XADES_INTEROP_PARENT_SESSION")
+    shared_group = (parent_session is not None and parent_session != str(session)
+                    and os.getpgrp() == session)
+    child_env = dict(os.environ if env is None else env)
+    if not shared_group:
+        child_env["_XADES_INTEROP_PARENT_SESSION"] = str(session)
+    else:
+        child_env["_XADES_INTEROP_PARENT_SESSION"] = parent_session
+    # setsid isolates the outer command from its controller. Nested wrappers
+    # inherit that group: detaching again would escape the outer timeout.
+    # https://docs.python.org/3/library/subprocess.html#popen-constructor
+    with (log.with_suffix(".stdout").open("wb") as stdout_log,
+          log.with_suffix(".stderr").open("wb") as stderr_log,
+          subprocess.Popen(arguments, cwd=ROOT, env=child_env,
+                           start_new_session=not shared_group,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process):
+        group = os.getpgrp() if shared_group else process.pid
+
+        def terminate_group():
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # The group already exited before cancellation.
+
+        try:
+            _capture_streams(process, stdout_log, stderr_log, timeout)
+        except subprocess.TimeoutExpired as error:
+            message = (f"command timed out after {timeout}s; inspect {log}.command.json, "
+                       f"{log}.stdout and {log}.stderr")
+            try:
+                if shared_group:
+                    print(message, file=sys.stderr, flush=True)
+            finally:
+                terminate_group()
+            # Output read before the deadline is already persisted. Do not
+            # wait for EOF from a descendant that left the owned group.
+            # Popen's context closes the pipes and reaps only our direct child.
+            raise SystemExit(message) from error
+        except BaseException as error:
+            # In particular, do not leave the isolated group behind on Ctrl-C.
+            try:
+                if shared_group:
+                    print(f"command capture failed: {error!r}; inspect {log}.command.json",
+                          file=sys.stderr, flush=True)
+            finally:
+                terminate_group()
+            raise
+    return subprocess.CompletedProcess(arguments, process.returncode,
+        log.with_suffix(".stdout").read_bytes(), log.with_suffix(".stderr").read_bytes())
+
+
+def build_probe(log):
+    build = command(["cargo", "build", "-p", "xml-sec-xades", "--example", "interop_probe",
+                     "--message-format=json-render-diagnostics"], log)
+    if build.returncode:
+        raise SystemExit(f"probe build failed; inspect {log}.stderr")
+    # Cargo reports the executable for this build, including cache hits and
+    # CARGO_TARGET_DIR; inferring target/debug can select an older executable.
+    # https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
+    binary = None
+    for line in build.stdout.splitlines():
+        if not line.startswith(b"{"):
+            continue  # build scripts may also write ordinary diagnostic lines
+        message = json.loads(line)
+        if message.get("reason") != "compiler-artifact":
+            continue
+        if (message["target"]["name"] != "interop_probe"
+                or "example" not in message["target"]["kind"] or message["executable"] is None):
+            continue
+        if binary is not None:
+            raise SystemExit(f"probe build must report exactly one example executable; inspect {log}.stdout")
+        binary = Path(message["executable"])
+    if binary is None:
+        raise SystemExit(f"probe build must report exactly one example executable; inspect {log}.stdout")
+    return binary
 
 
 def oracle_args(action, fixture):
@@ -211,14 +309,20 @@ def run_all(results):
     if results.exists():
         raise SystemExit("results already exist; archive them or choose a fresh checkout before rerunning")
     results.mkdir(parents=True)
-    oracle_version = subprocess.check_output([XMLSEC, "--version"]).decode().strip()
+    oracle = command([XMLSEC, "--version"], results / "versions/xmlsec1")
+    if oracle.returncode:
+        raise SystemExit("oracle version query failed; inspect versions/xmlsec1.stderr")
+    oracle_version = oracle.stdout.decode().strip()
     if oracle_version not in {"xmlsec1 1.3.12 (openssl)", "xmlsec1 1.3.13 (openssl)"}:
         raise SystemExit(f"byte-dump parser requires qualified native xmlsec1 1.3.12/1.3.13 (openssl), got: {oracle_version}")
-    versions = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
+    commit = command(["git", "rev-parse", "HEAD"], results / "versions/commit")
+    if commit.returncode:
+        raise SystemExit("commit query failed; inspect versions/commit.stderr")
+    versions = {"commit": commit.stdout.decode().strip(), "xmlsec1": (oracle.stdout + oracle.stderr).decode()}
     executable = Path(shutil.which(XMLSEC)).resolve()
     versions["oracle_binary"] = dict(name=executable.name, sha256=digest(executable.read_bytes()))
     for name, args in {"rustc": ["rustc", "-Vv"], "cargo": ["cargo", "-V"],
-                       "xmlsec1": [XMLSEC, "--version"], "openssl": ["openssl", "version"],
+                       "openssl": ["openssl", "version"],
                        "python": ["python3", "--version"]}.items():
         result = command(args, results / "versions" / name)
         versions[name] = (result.stdout + result.stderr).decode()
@@ -231,10 +335,7 @@ def run_all(results):
     if metadata.returncode:
         raise SystemExit("cargo metadata failed")
     versions["resolved_dependencies"] = resolved_versions(json.loads(metadata.stdout))
-    build = command(["cargo", "build", "-p", "xml-sec-xades", "--example", "interop_probe"], results / "build")
-    if build.returncode:
-        raise SystemExit("probe build failed")
-    binary = ROOT / "target/debug/examples/interop_probe"
+    binary = build_probe(results / "build")
     summary = []
     for case in json.loads((PACKAGE / "cases.json").read_text()):
         name = case["name"]

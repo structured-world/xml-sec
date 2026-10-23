@@ -3,16 +3,19 @@
 import importlib.util
 import base64
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import runpy
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 spec = importlib.util.spec_from_file_location("interop", Path(__file__).with_name("xades-interop.py"))
 interop = importlib.util.module_from_spec(spec)
@@ -32,6 +35,245 @@ spec_check.loader.exec_module(check)
 
 
 class EvidenceTests(unittest.TestCase):
+    def run_isolated_command(self, arguments, log, timeout=2):
+        # Give the test controller its own scope even inside the CI runner.
+        environment = dict(os.environ)
+        environment.pop('_XADES_INTEROP_PARENT_SESSION', None)
+        driver = ("import json,runpy,sys; from pathlib import Path; "
+                  "result=runpy.run_path(sys.argv[1])['command'](json.loads(sys.argv[2]), "
+                  "Path(sys.argv[3]), timeout=float(sys.argv[4])); "
+                  "sys.stdout.buffer.write(result.stdout); sys.stderr.buffer.write(result.stderr); "
+                  "sys.exit(result.returncode)")
+        return subprocess.run([sys.executable, '-c', driver,
+            str(Path(__file__).with_name('xades-interop.py').resolve()),
+            json.dumps([str(a) for a in arguments]), str(log), str(timeout)],
+            env=environment, capture_output=True, timeout=timeout + 10, start_new_session=True)
+
+    def test_timeout_terminates_descendants_across_nested_wrappers(self):
+        # A descendant holds a lock until it exits: unlike kill(pid, 0), this
+        # does not mistake a killed but not-yet-reaped process for a live one.
+        # The stop file cleans up the deliberately failing pre-fix reproduction.
+        child = ("import fcntl,os,sys,time; from pathlib import Path\n"
+                 "if '--new-session' in sys.argv: os.setsid()\n"
+                 "lock=open(sys.argv[1], 'w'); fcntl.flock(lock, fcntl.LOCK_EX); "
+                 "Path(sys.argv[2]).write_text('ready'); deadline=time.monotonic()+20\n"
+                 "while not Path(sys.argv[3]).exists() and time.monotonic()<deadline: time.sleep(.01)\n")
+        parent = ("import subprocess,sys,time; from pathlib import Path; "
+                  "process=subprocess.Popen([sys.executable, '-c', sys.argv[1], *sys.argv[2:]])\n"
+                  "while not Path(sys.argv[3]).exists(): time.sleep(.01)\n"
+                  "print('ready', flush=True); print('waiting', file=sys.stderr, flush=True); process.wait()\n")
+        with tempfile.TemporaryDirectory() as directory:
+            for owner, inner_timeout, timeout in [
+                    ('direct', None, 2), ('exited-parent', None, 2), ('outer', 30, 2),
+                    ('inner', 2, 5), ('escaped', None, 2)]:
+                with self.subTest(timeout_owner=owner):
+                    output = Path(directory) / owner
+                    output.mkdir()
+                    lock, ready, stop = [output / name for name in ['lock', 'ready', 'stop']]
+                    arguments = [sys.executable, '-c', parent, child, lock, ready, stop]
+                    if owner == 'escaped':
+                        arguments.append('--new-session')
+                    if owner == 'exited-parent':
+                        # An exited parent does not end the descendant's output
+                        # lifetime or release its held lock.
+                        arguments[2] = parent.removesuffix('process.wait()\n')
+                    if inner_timeout is not None:
+                        wrapper = ("import json,runpy,sys; from pathlib import Path; "
+                                   "runpy.run_path(sys.argv[1])['command'](json.loads(sys.argv[2]), "
+                                   "Path(sys.argv[3]), timeout=float(sys.argv[4]))")
+                        arguments = [sys.executable, '-c', wrapper,
+                            Path(__file__).with_name('xades-interop.py').resolve(),
+                            json.dumps([str(a) for a in arguments]), output / 'inner', inner_timeout]
+                    try:
+                        result = self.run_isolated_command(arguments, output / 'outer', timeout)
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn(b'timed out', result.stderr)
+                        self.assertTrue(ready.exists(), 'descendant did not reach the reproduction')
+                        captured = output / ('inner' if inner_timeout is not None else 'outer')
+                        self.assertEqual(captured.with_suffix('.stdout').read_bytes(), b'ready\n')
+                        self.assertEqual(captured.with_suffix('.stderr').read_bytes(), b'waiting\n')
+                        if owner == 'escaped':
+                            # This process deliberately left the owned group.
+                            # The controller must fail without waiting for its
+                            # open pipes; the stop file handles test cleanup.
+                            continue
+                        with lock.open() as held:
+                            try:
+                                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            except BlockingIOError:
+                                self.fail('descendant survived command timeout')
+                    finally:
+                        stop.touch()
+                        if ready.exists():
+                            with lock.open() as held:
+                                deadline = time.monotonic() + 5
+                                while True:
+                                    try:
+                                        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                        break
+                                    except BlockingIOError:
+                                        if time.monotonic() >= deadline:
+                                            raise RuntimeError('synthetic descendant did not stop')
+                                        time.sleep(.01)
+
+    def test_corpus_uses_cargo_reported_probe_instead_of_stale_default(self):
+        # CARGO_TARGET_DIR must select the just-built probe even when the
+        # default target directory contains an older executable.
+        class Probed(Exception):
+            pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            assets = root / 'interop/xades'
+            (assets / 'fixtures').mkdir(parents=True)
+            (assets / 'fixtures/case.xml').write_text(f'<Signature xmlns="{interop.DS}"><SignedInfo/></Signature>')
+            (assets / 'cases.json').write_text(json.dumps([
+                dict(name='tampered-content', file='fixtures/case.xml', valid=False)]))
+            stale = root / 'target/debug/examples/interop_probe'
+            expected = root / 'custom-target/debug/examples/interop_probe'
+            for path, data in [(stale, b'stale probe'), (expected, b'just-built probe')]:
+                path.parent.mkdir(parents=True)
+                path.write_bytes(data)
+            native = root / 'native-xmlsec1'
+            native.write_bytes(b'synthetic oracle identity')
+            selected = []
+
+            def capture(arguments, log, env=None):
+                args = [str(a) for a in arguments]
+                output = b''
+                status = 0
+                if args[:2] == ['cargo', 'build']:
+                    output = json.dumps(dict(reason='compiler-artifact', fresh=True,
+                        target=dict(name='interop_probe', kind=['example']), executable=str(expected))).encode()
+                elif args[:2] == ['cargo', 'metadata']:
+                    output = b'{"packages":[],"resolve":{"nodes":[]}}'
+                elif args[1:] == ['--version'] and args[0] == interop.XMLSEC:
+                    output = b'xmlsec1 1.3.13 (openssl)\n'
+                elif '--verify' in args:
+                    status = 1
+                elif Path(args[0]).name == 'interop_probe':
+                    selected.append(args[0])
+                    raise Probed
+                return subprocess.CompletedProcess(args, status, output, b'')
+
+            with patch.object(interop, 'ROOT', root), patch.object(interop, 'PACKAGE', assets), \
+                 patch.object(interop, 'command', side_effect=capture), \
+                 patch.object(interop.shutil, 'which', return_value=str(native)), \
+                 patch.dict(interop.os.environ, CARGO_TARGET_DIR=str(root / 'custom-target')):
+                with self.assertRaises(Probed):
+                    interop.run_all(root / 'output')
+            self.assertEqual(selected, [str(expected)])
+
+    def test_probe_build_requires_one_matching_example_artifact(self):
+        # Do not guess a default binary when Cargo reports no unique executable;
+        # unrelated library artifacts and ordinary build-script output are allowed.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'build'
+            executable = str(Path(directory) / 'custom-target/interop_probe')
+            artifact = json.dumps(dict(reason='compiler-artifact', executable=executable,
+                                       target=dict(name='interop_probe', kind=['example']))).encode() + b'\n'
+            library = json.dumps(dict(reason='compiler-artifact', executable=None,
+                                      target=dict(name='xml_sec_xades', kind=['lib']))).encode() + b'\n'
+            with patch.object(interop, 'command', return_value=subprocess.CompletedProcess(
+                    ['cargo'], 0, b'build-script diagnostic\n' + library + artifact, b'')) as build:
+                self.assertEqual(interop.build_probe(log), Path(executable))
+                self.assertIn('--message-format=json-render-diagnostics', build.call_args.args[0])
+            for output in [library, artifact + artifact]:
+                with self.subTest(output=output), patch.object(interop, 'command', return_value=
+                        subprocess.CompletedProcess(['cargo'], 0, output, b'')):
+                    with self.assertRaisesRegex(SystemExit, 'exactly one.*build.stdout'):
+                        interop.build_probe(log)
+
+    def test_commands_bound_execution_and_retain_timeout_diagnostics(self):
+        # A stuck compiler/validator must fail with its argv and partial streams,
+        # rather than waiting for the CI job timeout or losing its diagnostics.
+        with tempfile.TemporaryDirectory() as directory:
+            for runner, core in [(interop.command, interop), (dss.run, dss.corpus)]:
+                with self.subTest(runner=runner.__module__):
+                    log = Path(directory) / runner.__module__ / 'hung'
+
+                    process = MagicMock()
+                    process.__enter__.return_value = process
+
+                    def launch(arguments, **options):
+                        self.assertEqual(json.loads(log.with_suffix('.command.json').read_text()), arguments)
+                        return process
+
+                    def expired(child, stdout, stderr, timeout):
+                        self.assertGreater(timeout, 0)
+                        stdout.write(b'partial stdout\n'); stdout.flush()
+                        stderr.write(b'partial stderr\n'); stderr.flush()
+                        raise subprocess.TimeoutExpired(['synthetic-never-run'], timeout)
+
+                    process.communicate.return_value = (b'', b'')
+                    with (patch('subprocess.Popen', side_effect=launch), patch('os.killpg') as killed,
+                          patch.object(core, '_capture_streams', side_effect=expired)):
+                        with self.assertRaisesRegex(SystemExit, 'timed out.*hung'):
+                            runner(['synthetic-never-run'], log)
+                    killed.assert_called_once()
+                    self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'partial stdout\n')
+                    self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'partial stderr\n')
+
+    def test_command_terminates_a_real_stuck_child(self):
+        # Exercise the actual subprocess deadline, including flushed diagnostics.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'child'
+            result = self.run_isolated_command([sys.executable, '-u', '-c',
+                    "import sys,time; print('ready'); print('waiting', file=sys.stderr); time.sleep(30)"],
+                    log)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(b'timed out', result.stderr)
+            self.assertIn(str(log.with_suffix('.command.json')).encode(), result.stderr)
+            self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'ready\n')
+            self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'waiting\n')
+
+    def test_timeout_before_first_output_retains_empty_streams(self):
+        # Timing out before the first byte still leaves inspectable stream files.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'silent'
+            process = MagicMock()
+            process.__enter__.return_value = process
+            process.communicate.return_value = (b'', b'')
+            with (patch('subprocess.Popen', return_value=process), patch('os.killpg'),
+                  patch.object(interop, '_capture_streams', side_effect=subprocess.TimeoutExpired(['silent'], 900))):
+                with self.assertRaisesRegex(SystemExit, 'timed out.*silent'):
+                    interop.command(['silent'], log)
+            self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'')
+            self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'')
+
+    def test_nested_capture_failure_is_reported_before_group_cancellation(self):
+        # Group cancellation also kills a nested wrapper; an I/O/capture error
+        # must reach its controller before that signal, rather than disappear.
+        with tempfile.TemporaryDirectory() as directory:
+            process = MagicMock()
+            process.__enter__.return_value = process
+            diagnostics = io.StringIO()
+            session = os.getsid(0)
+
+            def cancel(group, sig):
+                self.assertIn('synthetic capture failure', diagnostics.getvalue())
+
+            with (patch.dict(os.environ, {'_XADES_INTEROP_PARENT_SESSION': str(session + 1)}),
+                  patch('os.getpgrp', return_value=session), patch('os.killpg', side_effect=cancel) as cancelled,
+                  patch('subprocess.Popen', return_value=process),
+                  patch.object(interop, '_capture_streams', side_effect=OSError('synthetic capture failure')),
+                  contextlib.redirect_stderr(diagnostics)):
+                with self.assertRaisesRegex(OSError, 'synthetic capture failure'):
+                    interop.command(['synthetic-never-run'], Path(directory) / 'capture')
+            cancelled.assert_called_once()
+
+    def test_capture_failure_is_not_replaced_by_descendant_pipe_timeout(self):
+        # A secondary drain must not mask the original I/O/capture failure.
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            os.environ.pop('_XADES_INTEROP_PARENT_SESSION', None)
+            process = MagicMock()
+            process.__enter__.return_value = process
+            process.communicate.side_effect = subprocess.TimeoutExpired(['escaped'], 900)
+            with (patch('subprocess.Popen', return_value=process), patch('os.killpg'),
+                  patch.object(interop, '_capture_streams', side_effect=OSError('original capture failure'))):
+                with self.assertRaisesRegex(OSError, 'original capture failure'):
+                    interop.command(['synthetic-never-run'], Path(directory) / 'capture')
+
     def test_inventory_rejects_changed_assets_and_tracked_run_outputs(self):
         # CI must catch stale reference data and accidental commits of actual outputs.
         with tempfile.TemporaryDirectory() as directory:
@@ -158,7 +400,7 @@ class EvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "missing-parent" / "evidence"
             with patch.object(sys, "argv", [str(script), "--results", str(output)]):
-                with patch("subprocess.run", side_effect=SetupComplete):
+                with patch("subprocess.Popen", side_effect=SetupComplete):
                     with self.assertRaises(SetupComplete):
                         runpy.run_path(str(script), run_name="__main__")
             self.assertTrue(output.is_dir())
@@ -191,7 +433,7 @@ class EvidenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "missing-parent" / "evidence"
             with patch.object(sys, "argv", [str(script), "--output", str(output)]):
-                with patch("subprocess.run", side_effect=SetupComplete):
+                with patch("subprocess.Popen", side_effect=SetupComplete):
                     with self.assertRaises(SetupComplete):
                         runpy.run_path(str(script), run_name="__main__")
             self.assertTrue(output.is_dir())
