@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
 };
 
-use self::Content::*;
+use self::Content::{Comment, Element, ElementEnd, ProcessingInstruction, Text};
 
 use super::{
     QName,
@@ -110,16 +110,14 @@ impl PrefixMapping {
         self.scopes
             .iter()
             .rev()
-            .filter_map(|s| s.default_namespace_uri.as_deref())
-            .next()
+            .find_map(|s| s.default_namespace_uri.as_deref())
     }
 
     fn active_namespace_uri_for_prefix(&self, prefix: &str) -> Option<&str> {
         self.scopes
             .iter()
             .rev()
-            .filter_map(|s| s.namespace_uri_for(prefix))
-            .next()
+            .find_map(|s| s.namespace_uri_for(prefix))
     }
 
     fn default_namespace_uri_in_current_scope(&self) -> Option<&str> {
@@ -152,7 +150,7 @@ impl PrefixMapping {
             }
         }
 
-        for attribute in attributes.iter() {
+        for attribute in attributes {
             if let Some(prefix) = attribute.preferred_prefix() {
                 let name = attribute.name();
                 let qn = name.get();
@@ -168,7 +166,7 @@ impl PrefixMapping {
             self.generate_prefix(uri, true);
         }
 
-        for attribute in attributes.iter() {
+        for attribute in attributes {
             let name = attribute.name();
             let qn = name.get();
             if let Some(uri) = qn.namespace_uri {
@@ -258,6 +256,7 @@ impl PrefixMapping {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Content<'d> {
     Element(dom::Element<'d>),
     ElementEnd(dom::Element<'d>),
@@ -281,15 +280,18 @@ impl Default for Writer {
 }
 
 impl Writer {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
+    #[must_use]
     pub fn set_single_quotes(mut self, single_quotes: bool) -> Self {
         self.single_quotes = single_quotes;
         self
     }
 
+    #[must_use]
     pub fn set_write_encoding(mut self, write_encoding: bool) -> Self {
         self.write_encoding = write_encoding;
         self
@@ -302,7 +304,6 @@ impl Writer {
 
 impl Writer {
     fn format_qname<W>(
-        &self,
         q: QName<'_>,
         mapping: &mut PrefixMapping,
         preferred_prefix: Option<&str>,
@@ -320,14 +321,14 @@ impl Writer {
                     writer.write_str(":")?;
                 }
                 NamespaceType::Unknown => {
-                    panic!("No namespace prefix available for {}", namespace_uri);
+                    panic!("No namespace prefix available for {namespace_uri}");
                 }
             }
         }
         writer.write_str(q.local_part)
     }
 
-    fn format_attribute_value<W>(&self, value: &str, writer: &mut W) -> io::Result<()>
+    fn format_attribute_value<W>(value: &str, writer: &mut W) -> io::Result<()>
     where
         W: Write + ?Sized,
     {
@@ -377,23 +378,23 @@ impl Writer {
         writer.write_str("<")?;
         let name = element.name();
         let pref_prefix = element.preferred_prefix();
-        self.format_qname(name.get(), mapping, pref_prefix.as_deref(), false, writer)?;
+        Self::format_qname(name.get(), mapping, pref_prefix.as_deref(), false, writer)?;
 
         for attr in &attrs {
             writer.write_str(" ")?;
             let aname = attr.name();
             let apref = attr.preferred_prefix();
-            self.format_qname(aname.get(), mapping, apref.as_deref(), true, writer)?;
+            Self::format_qname(aname.get(), mapping, apref.as_deref(), true, writer)?;
             write!(writer, "=")?;
             write!(writer, "{}", self.quote_char())?;
             let aval = attr.value();
-            self.format_attribute_value(&aval, writer)?;
+            Self::format_attribute_value(&aval, writer)?;
             write!(writer, "{}", self.quote_char())?;
         }
 
         if let Some(ns_uri) = mapping.default_namespace_uri_in_current_scope() {
             writer.write_str(" xmlns='")?;
-            self.format_attribute_value(ns_uri, writer)?;
+            Self::format_attribute_value(ns_uri, writer)?;
             writer.write_str("'")?;
         }
 
@@ -401,7 +402,7 @@ impl Writer {
             writer.write_str(" xmlns:")?;
             writer.write_str(prefix)?;
             writer.write_str("='")?;
-            self.format_attribute_value(ns_uri, writer)?;
+            Self::format_attribute_value(ns_uri, writer)?;
             writer.write_str("'")?;
         }
 
@@ -428,7 +429,6 @@ impl Writer {
     }
 
     fn format_element_end<W>(
-        &self,
         element: dom::Element<'_>,
         mapping: &mut PrefixMapping,
         writer: &mut W,
@@ -439,11 +439,11 @@ impl Writer {
         writer.write_str("</")?;
         let name = element.name();
         let pref_prefix = element.preferred_prefix();
-        self.format_qname(name.get(), mapping, pref_prefix.as_deref(), false, writer)?;
+        Self::format_qname(name.get(), mapping, pref_prefix.as_deref(), false, writer)?;
         writer.write_str(">")
     }
 
-    fn format_text<W>(&self, text: dom::Text<'_>, writer: &mut W) -> io::Result<()>
+    fn format_text<W>(text: dom::Text<'_>, writer: &mut W) -> io::Result<()>
     where
         W: Write + ?Sized,
     {
@@ -464,7 +464,7 @@ impl Writer {
         Ok(())
     }
 
-    fn format_comment<W>(&self, comment: dom::Comment<'_>, writer: &mut W) -> io::Result<()>
+    fn format_comment<W>(comment: dom::Comment<'_>, writer: &mut W) -> io::Result<()>
     where
         W: Write + ?Sized,
     {
@@ -473,7 +473,6 @@ impl Writer {
     }
 
     fn format_processing_instruction<W>(
-        &self,
         pi: dom::ProcessingInstruction<'_>,
         writer: &mut W,
     ) -> io::Result<()>
@@ -504,13 +503,13 @@ impl Writer {
                 self.format_element(e, todo, mapping, writer)
             }
             ElementEnd(e) => {
-                let r = self.format_element_end(e, mapping, writer);
+                let r = Self::format_element_end(e, mapping, writer);
                 mapping.pop_scope();
                 r
             }
-            Text(t) => self.format_text(t, writer),
-            Comment(c) => self.format_comment(c, writer),
-            ProcessingInstruction(p) => self.format_processing_instruction(p, writer),
+            Text(t) => Self::format_text(t, writer),
+            Comment(c) => Self::format_comment(c, writer),
+            ProcessingInstruction(p) => Self::format_processing_instruction(p, writer),
         }
     }
 
@@ -553,6 +552,10 @@ impl Writer {
         Ok(())
     }
 
+    /// Writes the XML declaration and document nodes in document order.
+    ///
+    /// # Errors
+    /// Returns the writer's first I/O error; output may already be partial.
     pub fn format_document<'d, W>(
         &self,
         doc: &'d dom::Document<'d>,
@@ -563,20 +566,24 @@ impl Writer {
     {
         self.format_declaration(writer)?;
 
-        for child in doc.root().children().into_iter() {
+        for child in doc.root().children() {
             match child {
                 ChildOfRoot::Element(e) => self.format_body(e, writer),
-                ChildOfRoot::Comment(c) => self.format_comment(c, writer),
+                ChildOfRoot::Comment(c) => Self::format_comment(c, writer),
                 ChildOfRoot::ProcessingInstruction(p) => {
-                    self.format_processing_instruction(p, writer)
+                    Self::format_processing_instruction(p, writer)
                 }
-            }?
+            }?;
         }
 
         Ok(())
     }
 }
 
+/// Writes a document using the default XML writer settings.
+///
+/// # Errors
+/// Returns the writer's first I/O error; output may already be partial.
 pub fn format_document<'d, W>(doc: &'d dom::Document<'d>, writer: &mut W) -> io::Result<()>
 where
     W: Write + ?Sized,
@@ -592,10 +599,10 @@ mod test {
     };
 
     fn format_xml(doc: &dom::Document<'_>) -> String {
-        format_xml_writer(Writer::default(), doc)
+        format_xml_writer(&Writer::default(), doc)
     }
 
-    fn format_xml_writer(writer: Writer, doc: &dom::Document<'_>) -> String {
+    fn format_xml_writer(writer: &Writer, doc: &dom::Document<'_>) -> String {
         let mut w = Vec::new();
         writer.format_document(doc, &mut w).expect("Not formatted");
         String::from_utf8(w).expect("Not a string")
@@ -740,7 +747,7 @@ mod test {
         let e = d.create_element("hello");
         e.set_attribute_value("a", "b");
         d.root().append_child(e);
-        let xml = format_xml_writer(Writer::new().set_single_quotes(false), &d);
+        let xml = format_xml_writer(&Writer::new().set_single_quotes(false), &d);
         assert_eq!(xml, r#"<?xml version="1.0"?><hello a="b"/>"#);
     }
 
@@ -990,7 +997,7 @@ mod test {
         let d = p.as_document();
         let e = d.create_element("hello");
         d.root().append_child(e);
-        let xml = format_xml_writer(Writer::new().set_write_encoding(true), &d);
+        let xml = format_xml_writer(&Writer::new().set_write_encoding(true), &d);
         assert_eq!(xml, "<?xml version='1.0' encoding='UTF-8'?><hello/>");
     }
 
@@ -1001,7 +1008,7 @@ mod test {
         let e = d.create_element("hello");
         d.root().append_child(e);
         let xml = format_xml_writer(
-            Writer::new()
+            &Writer::new()
                 .set_write_encoding(true)
                 .set_single_quotes(false),
             &d,

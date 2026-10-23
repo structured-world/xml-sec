@@ -1,6 +1,9 @@
 //! Construction-only access to a current-owned mirror arena.
 
-use super::*;
+use super::{
+    Attribute, ChildOfElement, ChildOfRoot, Comment, Document, Element, ProcessingInstruction,
+    QName, Text, raw,
+};
 use structured_asn1::memory::{MemoryError, Work};
 
 pub(crate) struct Builder<'d, 'w, W: Work> {

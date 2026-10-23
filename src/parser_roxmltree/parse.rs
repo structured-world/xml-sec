@@ -136,7 +136,7 @@ pub enum Error<E = String> {
     /// Contains what string was expected.
     InvalidString(&'static str, TextPos),
 
-    /// An invalid ExternalID in the DTD.
+    /// An invalid `ExternalID` in the DTD.
     InvalidExternalID(TextPos),
 
     /// The given entity resolved yielded an errror.
@@ -267,7 +267,7 @@ impl<E: fmt::Display> core::fmt::Display for Error<E> {
             #[cfg(feature = "xmldsig")]
             Error::SharedExecution(error) => write!(f, "XML parser execution: {error}"),
             Error::InvalidXmlPrefixUri(pos) => {
-                write!(f, "'xml' namespace prefix mapped to wrong URI at {}", pos)
+                write!(f, "'xml' namespace prefix mapped to wrong URI at {pos}")
             }
             Error::EmptyPrefixedNamespace(pos) => {
                 write!(
@@ -278,117 +278,71 @@ impl<E: fmt::Display> core::fmt::Display for Error<E> {
             Error::UnexpectedXmlUri(pos) => {
                 write!(
                     f,
-                    "the 'xml' namespace URI is used for not 'xml' prefix at {}",
-                    pos
+                    "the 'xml' namespace URI is used for not 'xml' prefix at {pos}"
                 )
             }
             Error::UnexpectedXmlnsUri(pos) => {
                 write!(
                     f,
-                    "the 'xmlns' URI is used at {}, but it must not be declared",
-                    pos
+                    "the 'xmlns' URI is used at {pos}, but it must not be declared"
                 )
             }
             Error::InvalidElementNamePrefix(pos) => {
-                write!(
-                    f,
-                    "the 'xmlns' prefix is used at {}, but it must not be",
-                    pos
-                )
+                write!(f, "the 'xmlns' prefix is used at {pos}, but it must not be")
             }
             Error::DuplicatedNamespace(name, pos) => {
-                write!(f, "namespace '{}' at {} is already defined", name, pos)
+                write!(f, "namespace '{name}' at {pos} is already defined")
             }
             Error::UnknownNamespace(name, pos) => {
-                write!(f, "an unknown namespace prefix '{}' at {}", name, pos)
+                write!(f, "an unknown namespace prefix '{name}' at {pos}")
             }
             Error::UnexpectedCloseTag(expected, actual, pos) => {
-                write!(
-                    f,
-                    "expected '{}' tag, not '{}' at {}",
-                    expected, actual, pos
-                )
+                write!(f, "expected '{expected}' tag, not '{actual}' at {pos}")
             }
-            Error::UnexpectedEntityCloseTag(pos) => {
-                write!(f, "unexpected close tag at {}", pos)
-            }
+            Error::UnexpectedEntityCloseTag(pos) => write!(f, "unexpected close tag at {pos}"),
             Error::MalformedEntityReference(pos) => {
-                write!(f, "malformed entity reference at {}", pos)
+                write!(f, "malformed entity reference at {pos}")
             }
             Error::UnknownEntityReference(name, pos) => {
-                write!(f, "unknown entity reference '{}' at {}", name, pos)
+                write!(f, "unknown entity reference '{name}' at {pos}")
             }
             Error::EntityReferenceLoop(pos) => {
-                write!(f, "a possible entity reference loop is detected at {}", pos)
+                write!(f, "a possible entity reference loop is detected at {pos}")
             }
-            Error::InvalidAttributeValue(pos) => {
-                write!(f, "unescaped '<' found at {}", pos)
-            }
+            Error::InvalidAttributeValue(pos) => write!(f, "unescaped '<' found at {pos}"),
             Error::DuplicatedAttribute(name, pos) => {
-                write!(f, "attribute '{}' at {} is already defined", name, pos)
+                write!(f, "attribute '{name}' at {pos} is already defined")
             }
-            Error::NoRootNode => {
-                write!(f, "the document does not have a root node")
-            }
-            Error::UnclosedRootNode => {
-                write!(f, "the root node was opened but never closed")
-            }
-            Error::UnexpectedDeclaration(pos) => {
-                write!(f, "unexpected XML declaration at {}", pos)
-            }
-            Error::DtdDetected => {
-                write!(f, "XML with DTD detected")
-            }
-            Error::NodesLimitReached => {
-                write!(f, "nodes limit reached")
-            }
-            Error::AttributesLimitReached => {
-                write!(f, "more than 2^32 attributes were parsed")
-            }
+            Error::NoRootNode => f.write_str("the document does not have a root node"),
+            Error::UnclosedRootNode => f.write_str("the root node was opened but never closed"),
+            Error::UnexpectedDeclaration(pos) => write!(f, "unexpected XML declaration at {pos}"),
+            Error::DtdDetected => f.write_str("XML with DTD detected"),
+            Error::NodesLimitReached => f.write_str("nodes limit reached"),
+            Error::AttributesLimitReached => f.write_str("more than 2^32 attributes were parsed"),
             Error::NamespacesLimitReached => {
-                write!(f, "more than 2^16 unique namespaces were parsed")
+                f.write_str("more than 2^16 unique namespaces were parsed")
             }
-            Error::InvalidName(pos) => {
-                write!(f, "invalid name token at {}", pos)
-            }
-            Error::NonXmlChar(c, pos) => {
-                write!(f, "a non-XML character {:?} found at {}", c, pos)
-            }
+            Error::InvalidName(pos) => write!(f, "invalid name token at {pos}"),
+            Error::NonXmlChar(c, pos) => write!(f, "a non-XML character {c:?} found at {pos}"),
             Error::InvalidChar(expected, actual, pos) => {
                 write!(
                     f,
-                    "expected '{}' not '{}' at {}",
-                    *expected as char, *actual as char, pos
+                    "expected '{}' not '{}' at {pos}",
+                    *expected as char, *actual as char
                 )
             }
             Error::InvalidChar2(expected, actual, pos) => {
-                write!(
-                    f,
-                    "expected {} not '{}' at {}",
-                    expected, *actual as char, pos
-                )
+                write!(f, "expected {expected} not '{}' at {pos}", *actual as char)
             }
-            Error::InvalidString(expected, pos) => {
-                write!(f, "expected '{}' at {}", expected, pos)
-            }
-            Error::InvalidExternalID(pos) => {
-                write!(f, "invalid ExternalID at {}", pos)
-            }
-            Error::EntityResolver(pos, msg) => {
-                write!(f, "entity resolver failed at {}: {}", pos, msg)
-            }
-            Error::InvalidComment(pos) => {
-                write!(f, "comment at {} contains '--'", pos)
-            }
+            Error::InvalidString(expected, pos) => write!(f, "expected '{expected}' at {pos}"),
+            Error::InvalidExternalID(pos) => write!(f, "invalid ExternalID at {pos}"),
+            Error::EntityResolver(pos, msg) => write!(f, "entity resolver failed at {pos}: {msg}"),
+            Error::InvalidComment(pos) => write!(f, "comment at {pos} contains '--'"),
             Error::InvalidCharacterData(pos) => {
-                write!(f, "']]>' at {} is not allowed inside a character data", pos)
+                write!(f, "']]>' at {pos} is not allowed inside a character data")
             }
-            Error::UnknownToken(pos) => {
-                write!(f, "unknown token at {}", pos)
-            }
-            Error::UnexpectedEndOfStream => {
-                write!(f, "unexpected end of stream")
-            }
+            Error::UnknownToken(pos) => write!(f, "unknown token at {pos}"),
+            Error::UnexpectedEndOfStream => f.write_str("unexpected end of stream"),
         }
     }
 }
@@ -406,7 +360,7 @@ impl<E> From<crate::xml::dom::ParseError> for Error<E> {
 
 #[cfg(feature = "std")]
 impl<E: fmt::Display + fmt::Debug> std::error::Error for Error<E> {
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "an XML parsing error"
     }
 }
@@ -432,7 +386,7 @@ pub struct ParsingOptions<'input> {
     ///
     /// Useful when dealing with random input to limit memory usage.
     ///
-    /// Default: u32::MAX (no limit)
+    /// Default: `u32::MAX` (no limit)
     pub nodes_limit: u32,
 
     /// Function to resolve external entities
@@ -555,7 +509,7 @@ struct TagNameSpan<'input> {
     prefix_pos: usize,
 }
 
-impl<'input> TagNameSpan<'input> {
+impl TagNameSpan<'_> {
     #[inline]
     fn new_null() -> Self {
         Self {
@@ -709,11 +663,11 @@ impl<'input, S: Storage> Context<'input, S> {
         text: StringStorage<'input, S>,
         range: Range<usize>,
     ) -> ScopedResult<(), S> {
-        if !self.after_text {
+        if self.after_text {
+            self.text_fragments.push(text)?;
+        } else {
             self.append_node(NodeKind::Text(text), range)?;
             self.after_text = true;
-        } else {
-            self.text_fragments.push(text)?;
         }
         Ok(())
     }
@@ -721,15 +675,14 @@ impl<'input, S: Storage> Context<'input, S> {
     #[cold]
     #[inline(never)]
     fn merge_text(&mut self) -> ScopedResult<(), S> {
-        let node = &mut self
+        let node = self
             .doc
             .nodes
             .last_mut()
             .expect("after_text is set only after appending a text node");
 
-        let text = match &mut node.kind {
-            NodeKind::Text(text) => text,
-            _ => unreachable!(),
+        let NodeKind::Text(text) = &mut node.kind else {
+            unreachable!("after_text identifies a text node");
         };
 
         self.storage.charge(self.text_fragments.len())?;
@@ -862,7 +815,7 @@ fn parse<'input, S: Storage>(
 }
 
 impl<'input, S: Storage> tokenizer::XmlEvents<'input> for Context<'input, S> {
-    #[inline(always)]
+    #[inline]
     fn token(&mut self, token: tokenizer::Token<'input>) -> Result<()> {
         if self.failure.is_some() {
             return Err(Error::ProcessingStopped);
@@ -1056,9 +1009,8 @@ fn process_element<'input, S: Storage>(
             return Err(Error::UnexpectedEntityCloseTag(
                 ctx.doc.text_pos_at(token_range.start),
             ));
-        } else {
-            unreachable!("should be already checked by the tokenizer");
         }
+        unreachable!("should be already checked by the tokenizer");
     }
 
     let namespaces = ctx.resolve_namespaces()?;
@@ -1437,14 +1389,14 @@ fn normalize_attribute<'input, S: Storage>(
         || memchr2(b'\n', b'\r', text.as_str().as_bytes()).is_some()
     {
         let mut text_buffer = TextBuffer::new(ctx.storage)?;
-        _normalize_attribute(text, &mut text_buffer, ctx)?;
+        normalize_attribute_into(text, &mut text_buffer, ctx)?;
         Ok(StringStorage::from_owned(text_buffer.finish()?))
     } else {
         Ok(StringStorage::Borrowed(text.as_str()))
     }
 }
 
-fn _normalize_attribute<S: Storage>(
+fn normalize_attribute_into<S: Storage>(
     text: StrSpan,
     buffer: &mut TextBuffer<S>,
     ctx: &mut Context<'_, S>,
@@ -1477,24 +1429,24 @@ fn _normalize_attribute<S: Storage>(
 
                         buffer.push_from_attr(b, None)?;
                     } else {
-                        // Characters not from entity should be added as is.
-                        // Not sure why... At least `lxml` produces the same results.
+                        // XML 1.0 §3.3.3 appends a character reference's character
+                        // directly; whitespace replacement applies to literal text.
+                        // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
                         buffer.push_raw(b)?;
                     }
                 }
             }
-            Some(Reference::Entity(name)) => match find_entity(&ctx.entities, name, ctx.storage)? {
-                Some(value) => {
+            Some(Reference::Entity(name)) => {
+                if let Some(value) = find_entity(&ctx.entities, name, ctx.storage)? {
                     ctx.loop_detector.inc_references(&stream)?;
                     ctx.loop_detector.inc_depth(&stream)?;
-                    _normalize_attribute(value, buffer, ctx)?;
+                    normalize_attribute_into(value, buffer, ctx)?;
                     ctx.loop_detector.dec_depth();
-                }
-                None => {
+                } else {
                     let pos = stream.gen_text_pos_from(start);
                     return Err(Error::UnknownEntityReference(ctx.storage.text(name)?, pos));
                 }
-            },
+            }
             None => {
                 let pos = stream.gen_text_pos_from(start);
                 return Err(Error::MalformedEntityReference(pos));
@@ -1536,7 +1488,10 @@ fn get_ns_idx_by_prefix<S: Storage>(
     match idx {
         Some(idx) => Ok(Some(idx)),
         None => {
-            if !prefix.is_empty() {
+            if prefix.is_empty() {
+                // Without a default declaration, an unprefixed name has no namespace.
+                Ok(None)
+            } else {
                 // If an URI was not found and prefix IS NOT empty than
                 // we have an unknown namespace.
                 //
@@ -1547,13 +1502,6 @@ fn get_ns_idx_by_prefix<S: Storage>(
                     doc.namespaces.storage.text(prefix)?,
                     pos,
                 ))
-            } else {
-                // If an URI was not found and prefix IS empty than
-                // an element or an attribute doesn't have a namespace.
-                //
-                // Example:
-                // <e a='b'/>
-                Ok(None)
             }
         }
     }
@@ -1594,11 +1542,11 @@ impl Iterator for CharToBytes {
         if self.idx < 4 {
             let b = self.buf[self.idx as usize];
 
-            if b != 0xFF {
+            if b == 0xFF {
+                self.idx = 4;
+            } else {
                 self.idx += 1;
                 return Some(b);
-            } else {
-                self.idx = 4;
             }
         }
 

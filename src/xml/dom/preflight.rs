@@ -45,7 +45,7 @@ pub struct DtdAttributeInfo {
     pub(super) has_non_id_declaration: bool,
 }
 
-/// XML declaration lookup with a short borrowed QName query.
+/// XML declaration lookup with a short borrowed `QName` query.
 #[doc(hidden)]
 pub trait Declarations<'input, S: Storage> {
     fn lookup(
@@ -187,7 +187,7 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                 Event::Text { range, .. } if !elements.is_empty() => {
                     push_text_position(&mut nodes, range)?;
                 }
-                Event::Text { .. } => {}
+                Event::Text { .. } | Event::Declaration { .. } => {}
                 Event::CData { range, .. } => push_source_position(
                     &mut nodes,
                     SourceNode {
@@ -226,58 +226,16 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                     storage.charge(range.len())?;
                     storage.charge(range.len())?;
                     storage.charge(range.len())?;
-                    let mut failure = None;
-                    crate::document::visit_dtd_attributes(
+                    collect_attribute_declarations(
                         &input[range.clone()],
-                        |element, attribute, kind| {
-                            if failure.is_some() {
-                                return;
-                            }
-                            let result = (|| -> Result<(), ParseError> {
-                                storage.charge(element.len())?;
-                                storage.charge(attribute.len())?;
-                                let (element_prefix, element_local) = split_name(element);
-                                let (attribute_prefix, attribute_local) = split_name(attribute);
-                                // XML 1.0 section 3.3: the first declaration is binding.
-                                // https://www.w3.org/TR/2008/REC-xml-20081126/#attdecls
-                                let key = DtdAttributeName(
-                                    element_prefix,
-                                    element_local,
-                                    attribute_prefix,
-                                    attribute_local,
-                                );
-                                if let Some(info) = attributes.get_mut(&key, storage)? {
-                                    // xml:id section 4 constrains ALL declarations,
-                                    // even those shadowed by the first binding.
-                                    // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
-                                    info.has_non_id_declaration |=
-                                        kind != crate::document::DtdAttributeType::Id;
-                                } else {
-                                    attributes.insert(
-                                        key,
-                                        DtdAttributeInfo {
-                                            kind,
-                                            has_non_id_declaration: kind
-                                                != crate::document::DtdAttributeType::Id,
-                                        },
-                                    )?;
-                                }
-                                Ok(())
-                            })();
-                            if let Err(error) = result {
-                                failure = Some(error);
-                            }
-                        },
-                    );
-                    if let Some(error) = failure {
-                        return Err(error.into());
-                    }
+                        &mut attributes,
+                        storage,
+                    )?;
                     #[cfg(feature = "xml-backend-roxmltree")]
                     {
                         doctype = Some(range);
                     }
                 }
-                _ => {}
             }
         }
         Ok(Self {
@@ -355,6 +313,51 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
             next: 0,
         }
     }
+}
+
+fn collect_attribute_declarations<'input, S: Storage>(
+    doctype: &'input str,
+    attributes: &mut S::Declarations<'input>,
+    storage: S,
+) -> Result<(), ParseError> {
+    let mut failure = None;
+    crate::document::visit_dtd_attributes(doctype, |element, attribute, kind| {
+        if failure.is_some() {
+            return;
+        }
+        let result = (|| -> Result<(), ParseError> {
+            storage.charge(element.len())?;
+            storage.charge(attribute.len())?;
+            let (element_prefix, element_local) = split_name(element);
+            let (attribute_prefix, attribute_local) = split_name(attribute);
+            // XML 1.0 3.3: the first declaration is binding.
+            // https://www.w3.org/TR/2008/REC-xml-20081126/#attdecls
+            let key = DtdAttributeName(
+                element_prefix,
+                element_local,
+                attribute_prefix,
+                attribute_local,
+            );
+            if let Some(info) = attributes.get_mut(&key, storage)? {
+                // xml:id 4 constrains all declarations, even shadowed ones.
+                // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+                info.has_non_id_declaration |= kind != crate::document::DtdAttributeType::Id;
+            } else {
+                attributes.insert(
+                    key,
+                    DtdAttributeInfo {
+                        kind,
+                        has_non_id_declaration: kind != crate::document::DtdAttributeType::Id,
+                    },
+                )?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            failure = Some(error);
+        }
+    });
+    failure.map_or(Ok(()), Err)
 }
 
 fn split_name(name: &str) -> (Option<&str>, &str) {
@@ -481,11 +484,12 @@ mod accounted_tests {
 
     #[test]
     fn scanner_retains_actual_attribute_storage_without_copying_borrowed_values() {
+        use std::fmt::Write as _;
         // Wide tags exercise both in-place sort passes. Attribute order and
         // source borrows must remain identical to the standalone scanner.
         let mut source = String::from("<r");
         for index in (0..64).rev() {
-            source.push_str(&format!(" a{index}='v{index}'"));
+            write!(source, " a{index}='v{index}'").expect("scanner attribute");
         }
         source.push_str("/>");
         let Some(Event::Empty(expected)) = Scanner::new(&source)
@@ -582,7 +586,7 @@ mod accounted_tests {
             .attribute_declaration(None, "r", None, &query)
             .expect("borrowed declaration query")
             .expect("first declaration retained");
-        assert!(declaration.kind == crate::document::DtdAttributeType::Id);
+        assert_eq!(declaration.kind, crate::document::DtdAttributeType::Id);
         assert!(declaration.has_non_id_declaration);
         assert!(memory.used() > 0);
         drop(preflight);

@@ -417,7 +417,7 @@ impl SignatureBuilder {
             .resources
             .validate_xml_document_len(validation_template.len())?;
         let settings =
-            crate::document::DocumentParseSettings::from_policy(&policy.xml, &policy.resources);
+            crate::document::DocumentParseSettings::from_policy(policy.xml, &policy.resources);
         let document = super::mutation::parse_with_options_and_budget(
             &validation_template,
             settings,

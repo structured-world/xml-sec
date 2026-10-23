@@ -962,10 +962,10 @@ test!(
 // 欄 is EF A4 9D. And EF can be mistreated for UTF-8 BOM.
 test!(
     text_03,
-    "<p>欄</p>",
+    "<p>\u{f91d}</p>",
     Token::ElementStart("", "p", 0),
     Token::ElementEnd(ElementEnd::Open, 2..3),
-    Token::Text("欄", 3..6),
+    Token::Text("\u{f91d}", 3..6),
     Token::ElementEnd(ElementEnd::Close("", "p"), 6..10)
 );
 

@@ -1,4 +1,5 @@
-//! Storage-specialized XPath 1.0 core library.
+//! Storage-specialized `XPath` 1.0 core library.
+use super::super::xpath_size_number;
 use super::{Args, Error};
 use crate::{
     Value, context,
@@ -17,7 +18,7 @@ macro_rules! names {
             }
         }
         pub(crate) const CORE_NAMES: &[&str] = &[$($name),*];
-        /// Register the XPath 1.0 core library, replacing same-name overrides.
+        /// Register the `XPath` 1.0 core library, replacing same-name overrides.
         pub fn register_core_functions(context: &mut context::ScopedContext<'_, '_>) {
             $(context.set_function($name, Core::$kind);)*
         }
@@ -54,6 +55,182 @@ fn append_char<R: Runtime>(
     runtime.append_text(context, output, character.encode_utf8(&mut [0; 4]))
 }
 
+fn concatenate<'d, R: Runtime>(
+    context: &context::Evaluation<'_, 'd>,
+    values: &mut [Value<'d>],
+    runtime: R,
+) -> Result<Value<'d>, Error> {
+    Args::new(&mut *values).at_least(2)?;
+    let mut output = runtime.empty_text()?;
+    for value in values {
+        match value {
+            Value::Number(number) => {
+                runtime.append_number(context, &mut output, *number)?;
+            }
+            Value::Nodeset(nodes) => {
+                if let Some(node) = nodes.document_order_first_in(context, runtime)? {
+                    runtime.visit_node_text(context, &node, |chunk| {
+                        runtime.append_text(context, &mut output, chunk)?;
+                        Ok(true)
+                    })?;
+                }
+            }
+            value => {
+                let text = runtime.value_text(context, value)?;
+                runtime.append_text(context, &mut output, &text)?;
+            }
+        }
+    }
+    Ok(runtime.finish_text(output))
+}
+
+fn substring<'d, R: Runtime>(
+    context: &context::Evaluation<'_, 'd>,
+    values: &mut [Value<'d>],
+    runtime: R,
+) -> Result<Value<'d>, Error> {
+    let args = Args::new(&mut *values);
+    args.at_least(2)?;
+    args.at_most(3)?;
+    let length = if values.len() == 3 {
+        Some(super::round_ties_to_positive_infinity(
+            values[2].number_in(context, runtime)?,
+        ))
+    } else {
+        None
+    };
+    let start = super::round_ties_to_positive_infinity(values[1].number_in(context, runtime)?);
+    let source = runtime.value_text(context, &values[0])?;
+    context.charge_work(source.len().saturating_mul(2))?;
+    let mut output = runtime.empty_text()?;
+    for (position, character) in source.chars().enumerate() {
+        let position = xpath_size_number(position + 1);
+        if position >= start && length.is_none_or(|length| position < start + length) {
+            append_char(runtime, context, &mut output, character)?;
+        }
+    }
+    Ok(runtime.finish_text(output))
+}
+
+fn translate<'d, R: Runtime>(
+    context: &context::Evaluation<'_, 'd>,
+    values: &mut [Value<'d>],
+    runtime: R,
+) -> Result<Value<'d>, Error> {
+    Args::new(&mut *values).exactly(3)?;
+    let source = runtime.value_text(context, &values[0])?;
+    let from = runtime.value_text(context, &values[1])?;
+    let to = runtime.value_text(context, &values[2])?;
+    // Keep the leading-zero formulation on the supported Rust 1.92 baseline;
+    // usize::bit_width is only available from Rust 1.97.
+    let leading_zeros = from.len().leading_zeros();
+    let levels = (usize::BITS - leading_zeros) as usize + 1;
+    context.charge_work(
+        from.len()
+            .saturating_add(source.len())
+            .saturating_mul(levels.saturating_mul(2))
+            .saturating_add(to.len()),
+    )?;
+    let mut replacements = runtime.list();
+    runtime.reserve(context, &mut replacements, from.chars().count())?;
+    let mut to = to.chars();
+    for (index, character) in from.chars().enumerate() {
+        replacements.push((character, index, to.next()))?;
+    }
+    replacements.sort_unstable_by_key(|&(character, index, _)| (character, index));
+    let mut retained = 0;
+    for index in 0..replacements.len() {
+        if retained == 0 || replacements[index].0 != replacements[retained - 1].0 {
+            replacements[retained] = replacements[index];
+            retained += 1;
+        }
+    }
+    replacements.truncate(retained);
+    let mut output = runtime.empty_text()?;
+    for character in source.chars() {
+        let mapped = match replacements.binary_search_by_key(&character, |entry| entry.0) {
+            Ok(index) => replacements[index].2,
+            Err(_) => Some(character),
+        };
+        if let Some(character) = mapped {
+            append_char(runtime, context, &mut output, character)?;
+        }
+    }
+    Ok(runtime.finish_text(output))
+}
+
+fn length_or_normalize<'d, R: Runtime>(
+    kind: Core,
+    context: &context::Evaluation<'_, 'd>,
+    values: &mut [Value<'d>],
+    runtime: R,
+) -> Result<Value<'d>, Error> {
+    Args::new(&mut *values).at_most(1)?;
+    let mut length = 0usize;
+    let mut output = runtime.empty_text()?;
+    let mut pending_space = false;
+    let mut consume = |chunk: &str| {
+        context.charge_work(chunk.len())?;
+        for character in chunk.chars() {
+            if matches!(kind, Core::StringLength) {
+                length += 1;
+            } else if matches!(character, ' ' | '\t' | '\r' | '\n') {
+                pending_space = !output.is_empty();
+            } else {
+                if pending_space {
+                    runtime.append_text(context, &mut output, " ")?;
+                    pending_space = false;
+                }
+                append_char(runtime, context, &mut output, character)?;
+            }
+        }
+        Ok(true)
+    };
+    match values.first() {
+        None => runtime.visit_node_text(context, &context.node, &mut consume)?,
+        Some(Value::Nodeset(nodes)) => {
+            if let Some(node) = nodes.document_order_first_in(context, runtime)? {
+                runtime.visit_node_text(context, &node, &mut consume)?;
+            }
+        }
+        Some(value) => {
+            consume(&runtime.value_text(context, value)?)?;
+        }
+    }
+    if matches!(kind, Core::StringLength) {
+        Ok(Value::Number(xpath_size_number(length)))
+    } else {
+        Ok(runtime.finish_text(output))
+    }
+}
+
+fn search_text<'d, R: Runtime>(
+    kind: Core,
+    context: &context::Evaluation<'_, 'd>,
+    values: &mut [Value<'d>],
+    runtime: R,
+) -> Result<Value<'d>, Error> {
+    Args::new(&mut *values).exactly(2)?;
+    let first = runtime.value_text(context, &values[0])?;
+    let second = runtime.value_text(context, &values[1])?;
+    context.charge_work(first.len().saturating_mul(2).saturating_add(second.len()))?;
+    match kind {
+        Core::StartsWith => Ok(Value::Boolean(first.starts_with(&*second))),
+        Core::Contains => Ok(Value::Boolean(first.contains(&*second))),
+        Core::Before => runtime.literal(
+            context,
+            first.find(&*second).map_or("", |offset| &first[..offset]),
+        ),
+        Core::After => runtime.literal(
+            context,
+            first
+                .find(&*second)
+                .map_or("", |offset| &first[offset + second.len()..]),
+        ),
+        _ => unreachable!("search_text receives only the four text-search functions"),
+    }
+}
+
 impl Core {
     pub(crate) fn evaluate_in<'d, R: Runtime>(
         self,
@@ -65,16 +242,18 @@ impl Core {
         match self {
             Self::Last | Self::Position => {
                 args.exactly(0)?;
-                Ok(Value::Number(if matches!(self, Self::Last) {
-                    context.size
-                } else {
-                    context.position
-                } as f64))
+                Ok(Value::Number(xpath_size_number(
+                    if matches!(self, Self::Last) {
+                        context.size
+                    } else {
+                        context.position
+                    },
+                )))
             }
             Self::Count => {
                 args.exactly(1)?;
                 match &values[0] {
-                    Value::Nodeset(nodes) => Ok(Value::Number(nodes.size() as f64)),
+                    Value::Nodeset(nodes) => Ok(Value::Number(xpath_size_number(nodes.size()))),
                     value => Err(Error::not_a_nodeset(value)),
                 }
             }
@@ -107,152 +286,15 @@ impl Core {
                         .map(|text| runtime.finish_text(text))
                 }
             }
-            Self::Concat => {
-                args.at_least(2)?;
-                let mut output = runtime.empty_text()?;
-                for value in values {
-                    match value {
-                        Value::Number(number) => {
-                            runtime.append_number(context, &mut output, *number)?
-                        }
-                        Value::Nodeset(nodes) => {
-                            if let Some(node) = nodes.document_order_first_in(context, runtime)? {
-                                runtime.visit_node_text(context, &node, |chunk| {
-                                    runtime.append_text(context, &mut output, chunk)?;
-                                    Ok(true)
-                                })?;
-                            }
-                        }
-                        value => {
-                            let text = runtime.value_text(context, value)?;
-                            runtime.append_text(context, &mut output, &text)?;
-                        }
-                    }
-                }
-                Ok(runtime.finish_text(output))
-            }
+            Self::Concat => concatenate(context, values, runtime),
             Self::StartsWith | Self::Contains | Self::Before | Self::After => {
-                args.exactly(2)?;
-                let first = runtime.value_text(context, &values[0])?;
-                let second = runtime.value_text(context, &values[1])?;
-                context.charge_work(first.len().saturating_mul(2).saturating_add(second.len()))?;
-                match self {
-                    Self::StartsWith => Ok(Value::Boolean(first.starts_with(&*second))),
-                    Self::Contains => Ok(Value::Boolean(first.contains(&*second))),
-                    Self::Before => runtime.literal(
-                        context,
-                        first.find(&*second).map_or("", |offset| &first[..offset]),
-                    ),
-                    _ => runtime.literal(
-                        context,
-                        first
-                            .find(&*second)
-                            .map_or("", |offset| &first[offset + second.len()..]),
-                    ),
-                }
+                search_text(self, context, values, runtime)
             }
-            Self::Substring => {
-                args.at_least(2)?;
-                args.at_most(3)?;
-                let length = if values.len() == 3 {
-                    Some(super::round_ties_to_positive_infinity(
-                        values[2].number_in(context, runtime)?,
-                    ))
-                } else {
-                    None
-                };
-                let start =
-                    super::round_ties_to_positive_infinity(values[1].number_in(context, runtime)?);
-                let source = runtime.value_text(context, &values[0])?;
-                context.charge_work(source.len().saturating_mul(2))?;
-                let mut output = runtime.empty_text()?;
-                for (position, character) in source.chars().enumerate() {
-                    let position = (position + 1) as f64;
-                    if position >= start && length.is_none_or(|length| position < start + length) {
-                        append_char(runtime, context, &mut output, character)?;
-                    }
-                }
-                Ok(runtime.finish_text(output))
-            }
+            Self::Substring => substring(context, values, runtime),
             Self::StringLength | Self::Normalize => {
-                args.at_most(1)?;
-                let mut length = 0usize;
-                let mut output = runtime.empty_text()?;
-                let mut pending_space = false;
-                let mut consume = |chunk: &str| {
-                    context.charge_work(chunk.len())?;
-                    for character in chunk.chars() {
-                        if matches!(self, Self::StringLength) {
-                            length += 1;
-                        } else if matches!(character, ' ' | '\t' | '\r' | '\n') {
-                            pending_space = !output.is_empty();
-                        } else {
-                            if pending_space {
-                                runtime.append_text(context, &mut output, " ")?;
-                                pending_space = false;
-                            }
-                            append_char(runtime, context, &mut output, character)?;
-                        }
-                    }
-                    Ok(true)
-                };
-                match values.first() {
-                    None => runtime.visit_node_text(context, &context.node, &mut consume)?,
-                    Some(Value::Nodeset(nodes)) => {
-                        if let Some(node) = nodes.document_order_first_in(context, runtime)? {
-                            runtime.visit_node_text(context, &node, &mut consume)?;
-                        }
-                    }
-                    Some(value) => {
-                        consume(&runtime.value_text(context, value)?)?;
-                    }
-                }
-                if matches!(self, Self::StringLength) {
-                    Ok(Value::Number(length as f64))
-                } else {
-                    Ok(runtime.finish_text(output))
-                }
+                length_or_normalize(self, context, values, runtime)
             }
-            Self::Translate => {
-                args.exactly(3)?;
-                let source = runtime.value_text(context, &values[0])?;
-                let from = runtime.value_text(context, &values[1])?;
-                let to = runtime.value_text(context, &values[2])?;
-                let levels = (usize::BITS - from.len().leading_zeros()) as usize + 1;
-                context.charge_work(
-                    from.len()
-                        .saturating_add(source.len())
-                        .saturating_mul(levels.saturating_mul(2))
-                        .saturating_add(to.len()),
-                )?;
-                let mut replacements = runtime.list();
-                runtime.reserve(context, &mut replacements, from.chars().count())?;
-                let mut to = to.chars();
-                for (index, character) in from.chars().enumerate() {
-                    replacements.push((character, index, to.next()))?;
-                }
-                replacements.sort_unstable_by_key(|&(character, index, _)| (character, index));
-                let mut retained = 0;
-                for index in 0..replacements.len() {
-                    if retained == 0 || replacements[index].0 != replacements[retained - 1].0 {
-                        replacements[retained] = replacements[index];
-                        retained += 1;
-                    }
-                }
-                replacements.truncate(retained);
-                let mut output = runtime.empty_text()?;
-                for character in source.chars() {
-                    let mapped =
-                        match replacements.binary_search_by_key(&character, |entry| entry.0) {
-                            Ok(index) => replacements[index].2,
-                            Err(_) => Some(character),
-                        };
-                    if let Some(character) = mapped {
-                        append_char(runtime, context, &mut output, character)?;
-                    }
-                }
-                Ok(runtime.finish_text(output))
-            }
+            Self::Translate => translate(context, values, runtime),
             Self::Boolean | Self::Not => {
                 args.exactly(1)?;
                 let value = values[0].boolean();

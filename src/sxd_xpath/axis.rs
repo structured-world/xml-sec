@@ -21,17 +21,17 @@ pub enum PrincipalNodeType {
 pub trait AxisLike: fmt::Debug {
     /// Applies the given node test to the nodes selected by this axis,
     /// adding matching nodes to the nodeset.
-    fn select_nodes_in<'c, 'd, R: Runtime>(
+    fn select_nodes_in<'d, R: Runtime>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         node_test: &dyn NodeTest,
         runtime: R,
     ) -> Result<R::List<Node<'d>>, Error>;
 
     #[cfg(test)]
-    fn select_nodes<'c, 'd>(
+    fn select_nodes<'d>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         node_test: &dyn NodeTest,
     ) -> Result<OrderedNodes<'d>, Error> {
         self.select_nodes_in(context, node_test, crate::runtime::Native)
@@ -98,24 +98,77 @@ impl<'c, 'd, R: Runtime> CompleteNodeTest<'c, 'd, R> {
         }
         Ok(())
     }
+
+    fn namespaces(&mut self) -> Result<(), Error> {
+        let context = self.context;
+        let runtime = self.runtime;
+        if let Node::Element(ref e) = context.node {
+            nodeset::visit_namespace_bindings_in(*e, context, runtime, |prefix, uri| {
+                if cfg!(feature = "no-unsafe") && !R::ACCOUNTED {
+                    context
+                        .reserve_temporary_allocation(prefix.len().saturating_add(uri.len()))
+                        .map_err(|source| Error::FunctionEvaluation { source })?;
+                }
+                self.run(Node::Namespace(nodeset::Namespace {
+                    parent: *e,
+                    prefix: runtime
+                        .namespace_text(prefix)
+                        .map_err(|source| Error::FunctionEvaluation { source })?,
+                    uri: runtime
+                        .namespace_text(uri)
+                        .map_err(|source| Error::FunctionEvaluation { source })?,
+                }))?;
+                Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
+            })?;
+        }
+        Ok(())
+    }
+
+    fn following(&mut self) -> Result<(), Error> {
+        let context = self.context;
+        let runtime = self.runtime;
+        let document_root = context.document_root_for(context.node.clone());
+        let mut traversal_root = context.node.clone();
+        if matches!(traversal_root, Node::Attribute(_) | Node::Namespace(_))
+            && let Some(owner) = traversal_root.parent()
+        {
+            // XPath 1.0 section 5 orders namespace and attribute nodes before children.
+            // Owner descendants are therefore following, not descendants, of either
+            // non-child context node: https://www.w3.org/TR/xpath/#data-model
+            for index in 0..owner.children_len() {
+                let child = owner
+                    .child_at(index)
+                    .expect("child index is within the observed length");
+                preorder_left_to_right(context, child, runtime, |node| self.run(node))?;
+            }
+            traversal_root = owner;
+        }
+        node_and_each_parent_before(traversal_root, &document_root, |node| {
+            each_following_sibling(context, &node, |sibling| {
+                preorder_left_to_right(context, sibling, runtime, |n| self.run(n))
+            })
+        })
+    }
 }
 
 impl AxisLike for Axis {
     fn principal_node_type(&self) -> PrincipalNodeType {
-        use self::Axis::*;
         match *self {
-            Attribute => PrincipalNodeType::Attribute,
-            Namespace => PrincipalNodeType::Namespace,
+            Self::Attribute => PrincipalNodeType::Attribute,
+            Self::Namespace => PrincipalNodeType::Namespace,
             _ => PrincipalNodeType::Element,
         }
     }
-    fn select_nodes_in<'c, 'd, R: Runtime>(
+    fn select_nodes_in<'d, R: Runtime>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         node_test: &dyn NodeTest,
         runtime: R,
     ) -> Result<R::List<Node<'d>>, Error> {
-        use self::Axis::*;
+        use self::Axis::{
+            Ancestor, AncestorOrSelf, Attribute, Child, Descendant, DescendantOrSelf, Following,
+            FollowingSibling, Namespace, Parent, Preceding, PrecedingSibling, SelfAxis,
+        };
 
         // XPath 1.0 section 2.3 expands a prefixed node-test QName from the expression context;
         // that error is independent of whether this axis happens to contain candidate nodes.
@@ -136,29 +189,7 @@ impl AxisLike for Axis {
                     }
                 }
             }
-            Namespace => {
-                if let Node::Element(ref e) = context.node {
-                    nodeset::visit_namespace_bindings_in(*e, context, runtime, |prefix, uri| {
-                        if cfg!(feature = "no-unsafe") && !R::ACCOUNTED {
-                            context
-                                .reserve_temporary_allocation(
-                                    prefix.len().saturating_add(uri.len()),
-                                )
-                                .map_err(|source| Error::FunctionEvaluation { source })?;
-                        }
-                        node_test.run(Node::Namespace(nodeset::Namespace {
-                            parent: *e,
-                            prefix: runtime
-                                .namespace_text(prefix)
-                                .map_err(|source| Error::FunctionEvaluation { source })?,
-                            uri: runtime
-                                .namespace_text(uri)
-                                .map_err(|source| Error::FunctionEvaluation { source })?,
-                        }))?;
-                        Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
-                    })?;
-                }
-            }
+            Namespace => node_test.namespaces()?,
             Child => {
                 for index in 0..context.node.children_len() {
                     let child = context
@@ -180,7 +211,7 @@ impl AxisLike for Axis {
             DescendantOrSelf => {
                 preorder_left_to_right(context, context.node.clone(), runtime, |n| {
                     node_test.run(n)
-                })?
+                })?;
             }
             Parent => {
                 if let Some(parent) = context.node.parent() {
@@ -195,38 +226,14 @@ impl AxisLike for Axis {
             }
             Preceding => node_and_each_parent_before(
                 context.node.clone(),
-                context.document_root_for(context.node.clone()),
+                &context.document_root_for(context.node.clone()),
                 |node| {
                     each_preceding_sibling(context, &node, |sibling| {
                         postorder_right_to_left(context, sibling, runtime, |n| node_test.run(n))
                     })
                 },
             )?,
-            Following => {
-                let document_root = context.document_root_for(context.node.clone());
-                let mut traversal_root = context.node.clone();
-                if matches!(traversal_root, Node::Attribute(_) | Node::Namespace(_))
-                    && let Some(owner) = traversal_root.parent()
-                {
-                    // XPath 1.0 section 5 orders namespace and attribute nodes before children.
-                    // Owner descendants are therefore following, not descendants, of either
-                    // non-child context node: https://www.w3.org/TR/xpath/#data-model
-                    for index in 0..owner.children_len() {
-                        let child = owner
-                            .child_at(index)
-                            .expect("child index is within the observed length");
-                        preorder_left_to_right(context, child, runtime, |node| {
-                            node_test.run(node)
-                        })?;
-                    }
-                    traversal_root = owner;
-                }
-                node_and_each_parent_before(traversal_root, document_root, |node| {
-                    each_following_sibling(context, &node, |sibling| {
-                        preorder_left_to_right(context, sibling, runtime, |n| node_test.run(n))
-                    })
-                })?;
-            }
+            Following => node_test.following()?,
             SelfAxis => node_test.run(context.node.clone())?,
         }
 
@@ -234,8 +241,8 @@ impl AxisLike for Axis {
     }
 }
 
-fn preorder_left_to_right<'c, 'd, F, R: Runtime>(
-    context: &context::Evaluation<'c, 'd>,
+fn preorder_left_to_right<'d, F, R: Runtime>(
+    context: &context::Evaluation<'_, 'd>,
     node: Node<'d>,
     runtime: R,
     mut f: F,
@@ -263,8 +270,8 @@ where
     Ok(())
 }
 
-fn postorder_right_to_left<'c, 'd, F, R: Runtime>(
-    context: &context::Evaluation<'c, 'd>,
+fn postorder_right_to_left<'d, F, R: Runtime>(
+    context: &context::Evaluation<'_, 'd>,
     node: Node<'d>,
     runtime: R,
     mut f: F,
@@ -360,13 +367,13 @@ where
 
 fn node_and_each_parent_before<'d, F>(
     mut node: Node<'d>,
-    boundary: Node<'d>,
+    boundary: &Node<'d>,
     mut f: F,
 ) -> Result<(), Error>
 where
     F: FnMut(Node<'d>) -> Result<(), Error>,
 {
-    while node != boundary {
+    while &node != boundary {
         f(node.clone())?;
         let Some(parent) = node.parent() else {
             break;

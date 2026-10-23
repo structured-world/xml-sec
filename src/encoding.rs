@@ -120,6 +120,10 @@ fn decode_xml_octets_in<'a, W: structured_asn1::memory::Work>(
 /// strictly and their declaration is normalized to UTF-8 before parsing.
 /// Callers must supply a size ceiling; an implicit unbounded compatibility path
 /// would permit untrusted input to allocate without the operation's budget.
+///
+/// # Errors
+/// Returns an encoding error for invalid or unsupported input, conflicting
+/// declarations, allocation failure, or an exceeded decoded-byte ceiling.
 pub fn decode_xml_octets(
     bytes: &[u8],
     maximum_decoded_bytes: usize,
@@ -182,9 +186,8 @@ mod tests {
         ));
         assert_eq!(denied.used(), 0);
         let admitted = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
-        let error = match decode_xml_octets_in(input.as_bytes(), 1 << 20, &admitted) {
-            Err(error) => error,
-            Ok(_) => panic!("unsupported label must not decode"),
+        let Err(error) = decode_xml_octets_in(input.as_bytes(), 1 << 20, &admitted) else {
+            panic!("unsupported label must not decode");
         };
         assert!(
             matches!(&error, DecodeError::Label(XmlEncodingError::UnsupportedEncoding(text)) if text.as_str() == label)

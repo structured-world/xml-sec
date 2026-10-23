@@ -1,4 +1,4 @@
-//! XPath 1.0 grammar independent of expression ownership.
+//! `XPath` 1.0 grammar independent of expression ownership.
 //!
 //! The builder receives children directly, never an already allocated native
 //! tree. Borrowed lexer payloads can therefore remain original-source slices.
@@ -171,19 +171,23 @@ impl<'b, B: Builder> Grammar<'b, B> {
             .map_err(Fault::Tokenizer)
     }
 
-    fn is<I>(&self, source: &mut Source<I>, token: &Token<B::Name, B::Text>) -> bool
+    fn is<I>(source: &mut Source<I>, token: &Token<B::Name, B::Text>) -> bool
     where
         I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         matches!(source.peek(), Some(Ok(next)) if next == token)
     }
 
-    fn consume<I>(&self, source: &mut Source<I>, expected: Token<B::Name, B::Text>) -> Result<B, ()>
+    fn consume<I>(
+        &self,
+        source: &mut Source<I>,
+        expected: &Token<B::Name, B::Text>,
+    ) -> Result<B, ()>
     where
         I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         let token = self.next(source)?;
-        if token != expected {
+        if &token != expected {
             return Err(Fault::UnexpectedToken(token));
         }
         Ok(())
@@ -239,7 +243,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
         };
         let mut predicates = self.builder.list();
         let mut depth = 0;
-        while self.is(source, &Token::LeftBracket) {
+        while Self::is(source, &Token::LeftBracket) {
             let predicate = self.predicate(source)?;
             depth = depth.max(self.builder.depth(&predicate));
             self.builder
@@ -252,11 +256,11 @@ impl<'b, B: Builder> Grammar<'b, B> {
     where
         I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
-        self.consume(source, Token::LeftBracket)?;
+        self.consume(source, &Token::LeftBracket)?;
         let result = self
             .nested(|| self.binary(source, 0))?
             .ok_or(Fault::EmptyPredicate)?;
-        self.consume(source, Token::RightBracket)?;
+        self.consume(source, &Token::RightBracket)?;
         Ok(result)
     }
 
@@ -275,8 +279,8 @@ impl<'b, B: Builder> Grammar<'b, B> {
             .max(self.builder.step_depth(&first));
         let mut steps = self.builder.list();
         self.builder.push(&mut steps, first)?;
-        while self.is(source, &Token::Slash) {
-            self.consume(source, Token::Slash)?;
+        while Self::is(source, &Token::Slash) {
+            self.consume(source, &Token::Slash)?;
             let step = self.step(source)?.ok_or(Fault::TrailingSlash)?;
             depth = depth.max(self.builder.step_depth(&step));
             self.builder.push(&mut steps, step)?;
@@ -309,23 +313,23 @@ impl<'b, B: Builder> Grammar<'b, B> {
                 Node::Number(value)
             }
             Some(Ok(Token::LeftParen)) => {
-                self.consume(source, Token::LeftParen)?;
+                self.consume(source, &Token::LeftParen)?;
                 let value = self.nested(|| self.binary(source, 0))?;
-                self.consume(source, Token::RightParen)?;
+                self.consume(source, &Token::RightParen)?;
                 return Ok(value);
             }
             Some(Ok(Token::Function(_))) => {
                 let Token::Function(name) = self.next(source)? else {
                     unreachable!()
                 };
-                self.consume(source, Token::LeftParen)?;
+                self.consume(source, &Token::LeftParen)?;
                 let mut arguments = self.builder.list();
                 let mut depth = 0;
                 if let Some(argument) = self.nested(|| self.binary(source, 0))? {
                     depth = self.builder.depth(&argument);
                     self.builder.push(&mut arguments, argument)?;
-                    while self.is(source, &Token::Comma) {
-                        self.consume(source, Token::Comma)?;
+                    while Self::is(source, &Token::Comma) {
+                        self.consume(source, &Token::Comma)?;
                         let argument = self
                             .nested(|| self.binary(source, 0))?
                             .ok_or(Fault::ArgumentMissing)?;
@@ -333,7 +337,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
                         self.builder.push(&mut arguments, argument)?;
                     }
                 }
-                self.consume(source, Token::RightParen)?;
+                self.consume(source, &Token::RightParen)?;
                 return self
                     .make(Node::Function(name, arguments), depth + 1)
                     .map(Some);
@@ -347,8 +351,8 @@ impl<'b, B: Builder> Grammar<'b, B> {
     where
         I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
-        if self.is(source, &Token::Slash) {
-            self.consume(source, Token::Slash)?;
+        if Self::is(source, &Token::Slash) {
+            self.consume(source, &Token::Slash)?;
             let root = self.make(Node::Root, 1)?;
             return match self.step(source)? {
                 Some(step) => self.relative(source, root, step).map(Some),
@@ -362,7 +366,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
         let Some(mut expression) = self.primary(source)? else {
             return Ok(None);
         };
-        while self.is(source, &Token::LeftBracket) {
+        while Self::is(source, &Token::LeftBracket) {
             let predicate = self.predicate(source)?;
             let depth = 1 + self
                 .builder
@@ -370,8 +374,8 @@ impl<'b, B: Builder> Grammar<'b, B> {
                 .max(self.builder.depth(&predicate));
             expression = self.make(Node::Filter(expression, predicate), depth)?;
         }
-        if self.is(source, &Token::Slash) {
-            self.consume(source, Token::Slash)?;
+        if Self::is(source, &Token::Slash) {
+            self.consume(source, &Token::Slash)?;
             let step = self.step(source)?.ok_or(Fault::TrailingSlash)?;
             expression = self.relative(source, expression, step)?;
         }
@@ -384,8 +388,8 @@ impl<'b, B: Builder> Grammar<'b, B> {
     {
         // XPath 1.0 §3.5: UnionExpr binds more tightly than unary minus.
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#numbers
-        if self.is(source, &Token::MinusSign) {
-            self.consume(source, Token::MinusSign)?;
+        if Self::is(source, &Token::MinusSign) {
+            self.consume(source, &Token::MinusSign)?;
             let value = self
                 .nested(|| self.unary(source))?
                 .ok_or(Fault::RightHandSideExpressionMissing)?;
@@ -400,9 +404,8 @@ impl<'b, B: Builder> Grammar<'b, B> {
         I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         self.builder.inspect()?;
-        let mut left = match self.child(source, level)? {
-            Some(value) => value,
-            None => return Ok(None),
+        let Some(mut left) = self.child(source, level)? else {
+            return Ok(None);
         };
         loop {
             self.builder.inspect()?;

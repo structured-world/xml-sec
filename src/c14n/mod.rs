@@ -66,28 +66,32 @@ pub enum C14nMode {
 pub struct C14nAlgorithm {
     mode: C14nMode,
     with_comments: bool,
-    /// For Exclusive C14N: prefixes forced via InclusiveNamespaces PrefixList.
+    /// For Exclusive C14N: prefixes forced via `InclusiveNamespaces PrefixList`.
     /// `"#default"` is normalized to `""` (empty string) by `with_prefix_list()`.
     inclusive_prefixes: HashSet<String>,
 }
 
 impl C14nAlgorithm {
     /// The canonicalization mode.
+    #[must_use]
     pub fn mode(&self) -> C14nMode {
         self.mode
     }
 
     /// Whether comment nodes are preserved.
+    #[must_use]
     pub fn with_comments(&self) -> bool {
         self.with_comments
     }
 
-    /// Prefixes forced via InclusiveNamespaces PrefixList (exclusive C14N).
+    /// Prefixes forced via `InclusiveNamespaces PrefixList` (exclusive C14N).
+    #[must_use]
     pub fn inclusive_prefixes(&self) -> &HashSet<String> {
         &self.inclusive_prefixes
     }
 
     /// Create a new algorithm with the given mode and comments flag.
+    #[must_use]
     pub fn new(mode: C14nMode, with_comments: bool) -> Self {
         Self {
             mode,
@@ -97,6 +101,7 @@ impl C14nAlgorithm {
     }
 
     /// Parse from an algorithm URI. Returns `None` for unrecognized URIs.
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         let (mode, with_comments) = match uri {
             "http://www.w3.org/TR/2001/REC-xml-c14n-20010315" => (C14nMode::Inclusive1_0, false),
@@ -116,11 +121,12 @@ impl C14nAlgorithm {
         })
     }
 
-    /// Set the InclusiveNamespaces PrefixList (exclusive C14N only).
+    /// Set the `InclusiveNamespaces PrefixList` (exclusive C14N only).
     /// `"#default"` is normalized to empty string `""`.
     ///
     /// Only meaningful for [`C14nMode::Exclusive1_0`]. For inclusive modes,
     /// the prefix list is ignored during canonicalization.
+    #[must_use]
     pub fn with_prefix_list(mut self, prefix_list: &str) -> Self {
         self.inclusive_prefixes = prefix::inclusive_tokens(prefix_list)
             .map(|p| {
@@ -135,6 +141,7 @@ impl C14nAlgorithm {
     }
 
     /// Get the algorithm URI for this configuration.
+    #[must_use]
     pub fn uri(&self) -> &'static str {
         match (self.mode, self.with_comments) {
             (C14nMode::Inclusive1_0, false) => "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
@@ -200,11 +207,11 @@ pub(crate) fn is_output_limit_error(error: &C14nError) -> bool {
     matches!(error, C14nError::OutputLimitExceeded { .. })
 }
 
-/// Visibility contract for canonicalizing a precise XPath node-set.
+/// Visibility contract for canonicalizing a precise `XPath` node-set.
 ///
-/// XPath can select attributes and namespace nodes independently from their
+/// `XPath` can select attributes and namespace nodes independently from their
 /// owner element. The public closure API predates that requirement and treats
-/// both categories as visible whenever their owner is visible; XMLDSig uses
+/// both categories as visible whenever their owner is visible; `XMLDSig` uses
 /// this richer crate-private contract for standards-compliant subsets.
 pub(crate) trait NodeVisibility<D: DomStorage = NativeDom> {
     fn contains_node(&self, node: Node<'_, '_, D>) -> Result<bool, C14nError>;
@@ -271,11 +278,15 @@ impl NodeVisibility for ClosureVisibility<'_> {
 
 /// Canonicalize an XML document or document subset.
 ///
-/// - `doc`: parsed roxmltree document (read-only DOM).
+/// - `doc`: parsed backend-neutral semantic document (read-only DOM).
 /// - `node_set`: optional predicate controlling which nodes appear in output.
 ///   `None` means the entire document.
 /// - `algo`: algorithm parameters (mode, comments, prefix list).
 /// - `output`: byte buffer receiving canonical XML.
+///
+/// # Errors
+/// Returns namespace/URI, inherited-base, output-limit or sink failures.
+/// Already emitted bytes remain in `output` on failure.
 pub fn canonicalize(
     doc: &Document,
     node_set: Option<&dyn Fn(Node) -> bool>,
@@ -622,22 +633,7 @@ fn canonicalize_with_visibility_and_position_impl<D: DomStorage>(
     // per §2.4. Exclusive C14N explicitly omits this per Exc-C14N §3.
     // fixup_xml_base: C14N 1.1 resolves relative xml:base URIs via RFC 3986.
     match algo.mode {
-        C14nMode::Inclusive1_0 => {
-            let renderer = InclusiveNsRenderer;
-            let config = C14nConfig::for_mode(algo.mode);
-            serialize_canonical_visible_with_position_dispatch(
-                doc,
-                visibility,
-                algo.with_comments,
-                &renderer,
-                config,
-                tracked_element,
-                max_output_bytes,
-                xml_base_resolution,
-                output,
-            )
-        }
-        C14nMode::Inclusive1_1 => {
+        C14nMode::Inclusive1_0 | C14nMode::Inclusive1_1 => {
             let renderer = InclusiveNsRenderer;
             let config = C14nConfig::for_mode(algo.mode);
             serialize_canonical_visible_with_position_dispatch(
@@ -707,16 +703,21 @@ fn serialize_canonical_visible_with_position_dispatch<D: DomStorage>(
 
 /// Convenience: parse XML bytes and canonicalize the whole document.
 ///
-/// Input must be valid UTF-8 (XML 1.0 documents are UTF-8 or declare their
-/// encoding; roxmltree only accepts UTF-8). DTDs and external entity resolution
+/// Input must be valid UTF-8. DTDs and external entity resolution
 /// are disabled, and the library's absolute XML byte, node, and depth ceilings apply.
+///
+/// # Errors
 /// Returns `C14nError::Parse` for invalid UTF-8, malformed XML, or exceeded
-/// input ceilings.
+/// input ceilings, and canonicalization failures as in [`canonicalize`].
 pub fn canonicalize_xml(xml: &[u8], algo: &C14nAlgorithm) -> Result<Vec<u8>, C14nError> {
     canonicalize_xml_with_backend(xml, algo, crate::XmlBackend::default())
 }
 
 /// Parse and canonicalize a complete XML document with an explicit backend.
+///
+/// # Errors
+/// Returns input/backend failures and canonicalization errors as in
+/// [`canonicalize_xml`].
 pub fn canonicalize_xml_with_backend(
     xml: &[u8],
     algo: &C14nAlgorithm,
@@ -743,6 +744,9 @@ pub fn canonicalize_xml_with_backend(
 }
 
 /// Canonicalize a retained owned document without reparsing it.
+///
+/// # Errors
+/// Returns canonicalization failures as in [`canonicalize`].
 pub fn canonicalize_document(
     document: &crate::XmlDocument,
     algo: &C14nAlgorithm,
@@ -805,10 +809,9 @@ mod tests {
         // The convenience parser accepts untrusted bytes, so allocation bounds
         // must apply before UTF-8 or XML parsing can inspect the payload.
         let xml = vec![b' '; crate::hard_limits::XML_DOCUMENT_BYTE_CEILING + 1];
-        let error = match canonicalize_xml(&xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
-        {
-            Err(error) => error,
-            Ok(_) => panic!("oversized canonicalization input must be rejected"),
+        let Err(error) = canonicalize_xml(&xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
+        else {
+            panic!("oversized canonicalization input must be rejected");
         };
         assert!(matches!(
             error,
@@ -823,12 +826,11 @@ mod tests {
         // parser-node allocation despite staying below the byte ceiling.
         let children = "<n/>".repeat(crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize);
         let xml = format!("<root>{children}</root>");
-        let error = match canonicalize_xml(
+        let Err(error) = canonicalize_xml(
             xml.as_bytes(),
             &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("excessive canonicalization nodes must be rejected"),
+        ) else {
+            panic!("excessive canonicalization nodes must be rejected");
         };
         assert!(matches!(
             error,
@@ -859,7 +861,7 @@ mod tests {
     fn canonicalize_xml_does_not_enable_dtd_or_external_entity_resolution() {
         // Whole-document C14N is a convenience API, not an implicit opt-in to
         // DTD parsing or external resource access.
-        let xml = br#"<!DOCTYPE root [<!ENTITY value 'expanded'>]><root>&value;</root>"#;
+        let xml = b"<!DOCTYPE root [<!ENTITY value 'expanded'>]><root>&value;</root>";
         let error = canonicalize_xml(xml, &C14nAlgorithm::new(C14nMode::Inclusive1_0, false))
             .expect_err("DTD input must remain disabled");
         assert!(matches!(
@@ -959,7 +961,7 @@ mod tests {
         let child = doc.root_element().first_element_child().expect("child");
         let ids = child
             .descendants()
-            .map(|node| node.id())
+            .map(crate::xml::dom::Node::id)
             .collect::<HashSet<_>>();
         let pred = move |node: crate::xml::dom::Node| ids.contains(&node.id());
 

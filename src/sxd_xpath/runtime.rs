@@ -136,7 +136,9 @@ pub(crate) trait Runtime: Copy + fmt::Debug {
             Value::ResultTreeFragment(identity, text) => {
                 Value::ResultTreeFragment(*identity, std::sync::Arc::clone(text))
             }
-            value => return self.literal(context, value.string_text().expect("string value")),
+            Value::String(text) => return self.literal(context, text),
+            #[cfg(feature = "embedded")]
+            Value::AccountedString(text) => return self.literal(context, text.as_str()),
         })
     }
     fn clone_nodes<'d>(
@@ -448,20 +450,19 @@ impl Runtime for Native {
 
 #[cfg(feature = "embedded")]
 mod paid {
-    use super::*;
+    use super::{
+        DerefMut, List, NamespaceSet, Runtime, Set, Value, context, fmt, function,
+        sxd_document_no_unsafe,
+    };
     use std::{cell::Cell, ops::Deref};
     use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, SharedString, Work};
 
+    #[derive(Clone)]
     pub(crate) struct Accounted<'w, W: Work> {
         pub work: &'w W,
         pub failure: &'w Cell<Option<MemoryError>>,
     }
     impl<W: Work> Copy for Accounted<'_, W> {}
-    impl<W: Work> Clone for Accounted<'_, W> {
-        fn clone(&self) -> Self {
-            *self
-        }
-    }
     impl<W: Work> fmt::Debug for Accounted<'_, W> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("CurrentArguments")

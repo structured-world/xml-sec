@@ -10,7 +10,7 @@ case "$backend" in
   roxmltree)
     version=0.21.1
     checksum=f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb
-    files=(lib.rs parse.rs tokenizer.rs tokenizer_tests.rs)
+    files=(lib.rs parse.rs tokenizer.rs tokenizer_tests.rs iterator_tests.rs)
     notices=(README.md LICENSE-APACHE LICENSE-MIT)
     ;;
   xmloxide)
@@ -59,7 +59,7 @@ if [[ "$mode" == --refresh-patch ]]; then
   rustfmt --edition 2024 "$target/documentation_tests.rs"
   : > "$scratch/delta.patch"
   for file in "${files[@]}"; do
-    if diff -u --label "a/$backend/src/$file" --label "b/$backend/src/$file" \
+    if diff -Nu --label "a/$backend/src/$file" --label "b/$backend/src/$file" \
       "$source/src/$file" "$target/$file" >> "$scratch/delta.patch"; then
       :
     else

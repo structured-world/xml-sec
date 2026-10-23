@@ -12,7 +12,7 @@ use crate::xml::dom::Node;
 #[cfg(feature = "xmldsig")]
 use crate::xml::dom::NodeId;
 
-/// Default ID attribute names shared by XMLDSig and XMLEnc selection.
+/// Default ID attribute names shared by `XMLDSig` and `XMLEnc` selection.
 const DEFAULT_ID_ATTRS: &[&str] = &["ID", "Id", "id"];
 
 /// Caller-declared XML ID attribute registration.
@@ -140,7 +140,7 @@ impl IdAttributeRegistration {
     }
 }
 
-/// One ID classification contract for indexes and XPath's projected DOM.
+/// One ID classification contract for indexes and `XPath`'s projected DOM.
 pub(crate) fn is_id_attribute<S: dom::storage::Storage>(
     node: Node<'_, '_, S>,
     attribute: dom::Attribute<'_, S>,
@@ -174,7 +174,7 @@ impl<'a> XmlIdIndex<'a> {
             for value in node
                 .attributes()
                 .filter(|attribute| is_id_attribute(node, *attribute, registrations))
-                .map(|attribute| attribute.value())
+                .map(dom::Attribute::value)
             {
                 if duplicates.contains(value) {
                     continue;
@@ -238,7 +238,7 @@ pub(crate) fn is_xml_1_0_character(character: char) -> bool {
     )
 }
 
-/// Return whether a string is an XML 1.0 NCName.
+/// Return whether a string is an XML 1.0 `NCName`.
 pub(crate) fn is_xml_ncname(value: &str) -> bool {
     // Namespaces in XML 1.0 section 3: NCName is QName without a colon.
     // Reuse the common lexical grammar without allocating or parsing a DOM.

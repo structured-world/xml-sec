@@ -209,7 +209,7 @@ pub(super) fn parse_encrypted_data_with_policy_backend_and_budget(
     policy.validate()?;
     policy.resources.validate_xml_document_len(xml.len())?;
     let settings =
-        DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
+        DocumentParseSettings::from_policy(policy.xml, &policy.resources).with_backend(backend);
     let document = parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
         .map_err(|error| map_document_error(error, settings))?;
     let references = super::CipherReferenceContext::new(policy, None, backend, &[])?;
@@ -478,7 +478,7 @@ fn parse_policy_document<'a>(
     backend: crate::XmlBackend,
 ) -> Result<Document<'a>, XmlEncError> {
     let settings =
-        DocumentParseSettings::from_policy(policy.xml, policy.resources).with_backend(backend);
+        DocumentParseSettings::from_policy(*policy.xml, policy.resources).with_backend(backend);
     parse_borrowed_with_settings_and_budget(xml, settings, Some(parse_budget))
         .map_err(|error| map_document_error(error, settings))
 }
@@ -1146,7 +1146,7 @@ fn with_processed_key_reference<T>(
         .shared
         .reference_ancestry
         .push((base.clone(), fingerprint));
-    let settings = DocumentParseSettings::from_policy(policy.xml, policy.resources)
+    let settings = DocumentParseSettings::from_policy(*policy.xml, policy.resources)
         .with_backend(context.backend());
     let xml = crate::document::decode_xml_with_budget(
         &bytes,

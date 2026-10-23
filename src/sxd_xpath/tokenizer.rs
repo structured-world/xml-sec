@@ -25,15 +25,15 @@ struct XPathMaster<'a> {
 }
 
 impl<'a> XPathMaster<'a> {
-    fn consume<T>(&mut self, progress: XPathProgress<'a, T, Error>) {
-        if let peresil::Status::Failure(error) = progress.status
+    fn consume<T>(&mut self, progress: &XPathProgress<'a, T, Error>) {
+        if let peresil::Status::Failure(error) = &progress.status
             && (!error.recoverable()
                 || self
                     .failure
                     .as_ref()
                     .is_none_or(|(point, _)| progress.point >= *point))
         {
-            self.failure = Some((progress.point, error));
+            self.failure = Some((progress.point, *error));
         }
     }
 
@@ -48,7 +48,7 @@ impl<'a> XPathMaster<'a> {
         if matches!(progress.status, peresil::Status::Success(_)) {
             return progress;
         }
-        self.consume(progress);
+        self.consume(&progress);
         let (point, error) = self
             .failure
             .take()
@@ -70,7 +70,7 @@ impl<'a, T> XPathAlternate<'_, 'a, T> {
         if self.current.as_ref().is_none_or(|progress| matches!(&progress.status, peresil::Status::Failure(error) if error.recoverable())) {
             let next = parser(self.master);
             if let Some(previous) = self.current.take() {
-                self.master.consume(previous);
+                self.master.consume(&previous);
             }
             self.current = Some(next);
         }
@@ -125,11 +125,10 @@ pub enum Error {
 
 impl Recoverable for Error {
     fn recoverable(&self) -> bool {
-        use self::Error::*;
-        match *self {
-            AllocationLimit | MismatchedQuoteCharacters | UnableToCreateToken => false,
-            _ => true,
-        }
+        !matches!(
+            self,
+            Self::AllocationLimit | Self::MismatchedQuoteCharacters | Self::UnableToCreateToken
+        )
     }
 }
 
@@ -226,7 +225,7 @@ fn parse_literal<'a>(
 ) -> XPathProgress<'a, &'a str, Error> {
     fn with_quote<'a>(p: StringPoint<'a>, quote: &str) -> XPathProgress<'a, &'a str, Error> {
         let (p, _) = try_parse!(p.consume_literal(quote).context(ExpectedQuote));
-        let (p, v) = try_parse!(p.consume_quoted_string(quote).map_err(|_| unreachable!()));
+        let (p, v) = try_parse!(p.consume_quoted_string(quote).map_err(|()| unreachable!()));
         let (p, _) = try_parse!(p.consume_literal(quote).context(MismatchedQuoteCharacters));
 
         peresil::Progress::success(p, v)
@@ -273,7 +272,7 @@ fn parse_number<'a>(
 
     let before_p = p;
 
-    let (p, _) = try_parse!({
+    let (p, ()) = try_parse!({
         pm.alternate()
             .one(|_| with_integer(p).context(ExpectedNumber))
             .one(|_| without_integer(p).context(ExpectedNumber))
@@ -493,12 +492,10 @@ impl<'input> BorrowedTokenizer<'input> {
     fn next_token(&mut self) -> BorrowedTokenResult<'input> {
         let token = self.raw_next_token()?;
 
-        if !(token.precedes_node_test() || token.precedes_expression() || token.is_operator()) {
-            // See http://www.w3.org/TR/xpath/#exprlex
-            self.prefer_recognition_of_operator_names = true;
-        } else {
-            self.prefer_recognition_of_operator_names = false;
-        }
+        // XPath 1.0 3.7 lexical disambiguation:
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
+        self.prefer_recognition_of_operator_names =
+            !(token.precedes_node_test() || token.precedes_expression() || token.is_operator());
 
         Ok(token)
     }
@@ -754,21 +751,21 @@ mod test {
         let start = peresil::StringPoint::new("ab");
         let later = start.consume_literal("a").point;
         let mut master = super::XPathMaster { failure: None };
-        master.consume::<()>(peresil::Progress::failure(
+        master.consume::<()>(&peresil::Progress::failure(
             later,
             super::Error::ExpectedNumber,
         ));
-        master.consume::<()>(peresil::Progress::failure(
+        master.consume::<()>(&peresil::Progress::failure(
             start,
             super::Error::ExpectedQuote,
         ));
         assert_eq!(master.failure, Some((later, super::Error::ExpectedNumber)));
-        master.consume::<()>(peresil::Progress::failure(
+        master.consume::<()>(&peresil::Progress::failure(
             later,
             super::Error::ExpectedAxis,
         ));
         assert_eq!(master.failure, Some((later, super::Error::ExpectedAxis)));
-        master.consume::<()>(peresil::Progress::failure(
+        master.consume::<()>(&peresil::Progress::failure(
             start,
             super::Error::MismatchedQuoteCharacters,
         ));
@@ -816,7 +813,7 @@ mod test {
     {
         match all_tokens_raw(tokenizer) {
             Ok(toks) => toks,
-            Err(msg) => panic!("{:?}", msg),
+            Err(msg) => panic!("{msg:?}"),
         }
     }
 

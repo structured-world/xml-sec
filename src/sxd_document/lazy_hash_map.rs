@@ -57,10 +57,10 @@ impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.as_mut().and_then(|i| i.next())
+        self.0.as_mut().and_then(Iterator::next)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.0.as_ref().map_or((0, Some(0)), |i| i.size_hint())
+        self.0.as_ref().map_or((0, Some(0)), Iterator::size_hint)
     }
 }

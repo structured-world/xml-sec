@@ -68,7 +68,7 @@ fn variables_with_qualified_names() {
 
         let result = setup.evaluate(&doc, "$prefix:name");
 
-        assert_eq!(42.0, result);
+        assert_eq!(Value::Number(42.0), result);
     });
 }
 
@@ -83,7 +83,7 @@ fn functions_with_qualified_names() {
 
         let result = setup.evaluate(&doc, "prefix:constant()");
 
-        assert_eq!(42.0, result);
+        assert_eq!(Value::Number(42.0), result);
     });
 }
 
@@ -128,7 +128,7 @@ struct Setup<'d> {
 
 impl<'d> Setup<'d> {
     fn new() -> Setup<'d> {
-        Default::default()
+        Self::default()
     }
 
     fn evaluate(&self, doc: &'d dom::Document<'d>, xpath: &str) -> Value<'d> {
@@ -142,9 +142,9 @@ impl<'d> Setup<'d> {
 struct ConstantValueFunction(f64);
 
 impl function::Function for ConstantValueFunction {
-    fn evaluate<'c, 'd>(
+    fn evaluate<'d>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        _context: &context::Evaluation<'_, 'd>,
         _args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, function::Error> {
         Ok(Value::Number(self.0))

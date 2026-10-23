@@ -15,9 +15,8 @@ impl StrParseExt for &str {
 
         match positions.next() {
             Some((_, c)) if is_first(c) => (),
-            Some((_, _)) => return None,
-            None => return None,
-        };
+            Some((_, _)) | None => return None,
+        }
 
         let mut positions = positions.skip_while(|&(_, c)| is_rest(c));
         match positions.next() {
@@ -32,7 +31,7 @@ pub trait XmlStr {
     fn end_of_attribute(&self, quote: &str) -> Option<usize>;
     /// Find the end of the direct character data
     fn end_of_char_data(&self) -> Option<usize>;
-    /// Find the end of the CData section, not including the ]]>
+    /// Find the end of the CDATA section, not including the `]]>`
     fn end_of_cdata(&self) -> Option<usize>;
     /// Find the end of a run of decimal characters
     fn end_of_decimal_chars(&self) -> Option<usize>;
@@ -96,11 +95,11 @@ impl XmlStr for &str {
     }
 
     fn end_of_decimal_chars(&self) -> Option<usize> {
-        self.end_of_start_rest(|c| c.is_decimal_char(), |c| c.is_decimal_char())
+        self.end_of_start_rest(XmlChar::is_decimal_char, XmlChar::is_decimal_char)
     }
 
     fn end_of_hex_chars(&self) -> Option<usize> {
-        self.end_of_start_rest(|c| c.is_hex_char(), |c| c.is_hex_char())
+        self.end_of_start_rest(XmlChar::is_hex_char, XmlChar::is_hex_char)
     }
 
     fn end_of_comment(&self) -> Option<usize> {
@@ -115,15 +114,15 @@ impl XmlStr for &str {
     }
 
     fn end_of_name(&self) -> Option<usize> {
-        self.end_of_start_rest(|c| c.is_name_start_char(), |c| c.is_name_char())
+        self.end_of_start_rest(XmlChar::is_name_start_char, XmlChar::is_name_char)
     }
 
     fn end_of_ncname(&self) -> Option<usize> {
-        self.end_of_start_rest(|c| c.is_ncname_start_char(), |c| c.is_ncname_char())
+        self.end_of_start_rest(XmlChar::is_ncname_start_char, XmlChar::is_ncname_char)
     }
 
     fn end_of_space(&self) -> Option<usize> {
-        self.end_of_start_rest(|c| c.is_space_char(), |c| c.is_space_char())
+        self.end_of_start_rest(XmlChar::is_space_char, XmlChar::is_space_char)
     }
 
     fn end_of_start_tag(&self) -> Option<usize> {
@@ -132,7 +131,7 @@ impl XmlStr for &str {
         match positions.next() {
             Some((_, '<')) => (),
             _ => return None,
-        };
+        }
 
         match positions.next() {
             Some((offset, c)) => match c {
@@ -145,8 +144,8 @@ impl XmlStr for &str {
 
     fn end_of_encoding(&self) -> Option<usize> {
         self.end_of_start_rest(
-            |c| c.is_encoding_start_char(),
-            |c| c.is_encoding_rest_char(),
+            XmlChar::is_encoding_start_char,
+            XmlChar::is_encoding_rest_char,
         )
     }
 
@@ -283,6 +282,6 @@ mod test {
 
     #[test]
     fn end_of_int_subset_excludes_right_square() {
-        assert_eq!("hello]>world".end_of_int_subset(), Some("hello".len()))
+        assert_eq!("hello]>world".end_of_int_subset(), Some("hello".len()));
     }
 }

@@ -28,7 +28,7 @@ use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
 ///   returns `true` if the binding is a candidate for emission.
 ///   - Inclusive C14N: always returns `true`.
 ///   - Exclusive C14N: returns `true` for visibly-utilized prefixes and
-///     prefixes forced via InclusiveNamespaces PrefixList.
+///     prefixes forced via `InclusiveNamespaces PrefixList`.
 ///
 /// # Returns
 ///
@@ -65,7 +65,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
                 if prefix.is_empty()
                     && parent_rendered
                         .get("", false)?
-                        .flatten()
+                        .uri()
                         .is_some_and(|uri| !uri.is_empty())
                 {
                     decls.push(("", ""))?;
@@ -88,7 +88,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
 
         // Suppress redundant: skip if the nearest output ancestor already
         // rendered the same prefix→URI binding.
-        if parent_rendered.get(prefix, false)?.flatten() == Some(uri) {
+        if parent_rendered.get(prefix, false)?.uri() == Some(uri) {
             continue;
         }
 
@@ -96,7 +96,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
         // in scope. Check the source tree (not just parent_rendered) to handle
         // document subsets where output ancestors may be absent.
         if prefix.is_empty() && uri.is_empty() {
-            let has_rendered_default = parent_rendered.get("", false)?.is_some();
+            let has_rendered_default = parent_rendered.get("", false)?.is_present();
             let has_in_scope_default = has_in_scope_default_namespace(node);
             if !has_rendered_default && !has_in_scope_default {
                 continue;

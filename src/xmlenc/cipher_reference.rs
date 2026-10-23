@@ -308,7 +308,7 @@ impl<'a> CipherReferenceContext<'a> {
         // the operation policy to its source before processing the original
         // node; XPath provenance must not be replaced by the validation parse.
         let settings = crate::document::DocumentParseSettings::from_policy(
-            &self.policy.xml,
+            self.policy.xml,
             &self.policy.resources,
         )
         .with_backend(self.backend);

@@ -45,7 +45,7 @@ pub use crate::parser_roxmltree::parse::*;
 
 /// The <http://www.w3.org/XML/1998/namespace> URI.
 pub const NS_XML_URI: &str = "http://www.w3.org/XML/1998/namespace";
-/// The prefix 'xml', which is by definition bound to NS_XML_URI
+/// The prefix 'xml', which is by definition bound to `NS_XML_URI`
 const NS_XML_PREFIX: &str = "xml";
 
 /// The <http://www.w3.org/2000/xmlns/> URI.
@@ -128,23 +128,24 @@ impl<'input, S: crate::xml::dom::storage::Storage> Document<'input, S> {
         }
     }
 
-    /// Returns the node of the tree with the given NodeId.
+    /// Returns the node of the tree with the given `NodeId`.
     ///
-    /// Note: NodeId::new(0) represents the root node
+    /// Note: `NodeId::new(0)` represents the root node
     ///
     /// # Examples
     ///
     /// ```text,xml-sec-example
+    /// use roxmltree::NodeId;
+    ///
     /// let doc = roxmltree::Document::parse("\
     /// <p>
     ///     text
     /// </p>
     /// ").unwrap();
     ///
-    /// use roxmltree::NodeId;
     /// assert_eq!(doc.get_node(NodeId::new(0)).unwrap(), doc.root());
     /// assert_eq!(doc.get_node(NodeId::new(1)), doc.descendants().find(|n| n.has_tag_name("p")));
-    /// assert_eq!(doc.get_node(NodeId::new(2)), doc.descendants().find(|n| n.is_text()));
+    /// assert_eq!(doc.get_node(NodeId::new(2)), doc.descendants().find(roxmltree::Node::is_text));
     /// assert_eq!(doc.get_node(NodeId::new(3)), None);
     /// ```
     #[inline]
@@ -223,12 +224,8 @@ impl<'input, S: crate::xml::dom::storage::Storage> Document<'input, S> {
     }
 }
 
-impl<'input, S: crate::xml::dom::storage::Storage> fmt::Debug for Document<'input, S> {
+impl<S: crate::xml::dom::storage::Storage> fmt::Debug for Document<'_, S> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        if !self.root().has_children() {
-            return write!(f, "Document []");
-        }
-
         macro_rules! writeln_indented {
             ($depth:expr, $f:expr, $fmt:expr) => {
                 for _ in 0..$depth { write!($f, "    ")?; }
@@ -291,6 +288,9 @@ impl<'input, S: crate::xml::dom::storage::Storage> fmt::Debug for Document<'inpu
             Ok(())
         }
 
+        if !self.root().has_children() {
+            return write!(f, "Document []");
+        }
         writeln!(f, "Document [")?;
         print_children(self.root(), 1, f)?;
         writeln!(f, "]")?;
@@ -336,9 +336,10 @@ struct ShortRange {
 impl From<Range<usize>> for ShortRange {
     #[inline]
     fn from(range: Range<usize>) -> Self {
-        debug_assert!(range.start <= u32::MAX as usize);
-        debug_assert!(range.end <= u32::MAX as usize);
-        ShortRange::new(range.start as u32, range.end as u32)
+        ShortRange::new(
+            u32::try_from(range.start).expect("range start fits the checked arena limit"),
+            u32::try_from(range.end).expect("range end fits the checked arena limit"),
+        )
     }
 }
 
@@ -399,8 +400,7 @@ impl From<usize> for NodeId {
     #[inline]
     fn from(id: usize) -> Self {
         // We already checked that `id` is limited by u32::MAX.
-        debug_assert!(id <= u32::MAX as usize);
-        NodeId::new(id as u32)
+        NodeId::new(u32::try_from(id).expect("node ID fits the checked u32 arena limit"))
     }
 }
 
@@ -484,6 +484,9 @@ impl<S: crate::xml::dom::storage::Storage> core::ops::Deref for StringStorage<'_
         self.as_str()
     }
 }
+
+#[cfg(test)]
+mod iterator_tests;
 
 #[cfg(test)]
 mod owned_text_tests {
@@ -638,6 +641,7 @@ struct AttributeData<
 }
 
 /// An attribute.
+#[derive(Clone, Copy)]
 pub struct Attribute<
     'a,
     'input: 'a,
@@ -647,12 +651,6 @@ pub struct Attribute<
     data: &'a AttributeData<'input, S>,
 }
 
-impl<S: crate::xml::dom::storage::Storage> Copy for Attribute<'_, '_, S> {}
-impl<S: crate::xml::dom::storage::Storage> Clone for Attribute<'_, '_, S> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
 impl<'a, 'input, S: crate::xml::dom::storage::Storage> Attribute<'a, 'input, S> {
     /// Returns attribute's namespace URI.
     ///
@@ -715,14 +713,13 @@ impl<'a, 'input, S: crate::xml::dom::storage::Storage> Attribute<'a, 'input, S> 
 
     /// Returns attribute's position in bytes in the original document.
     ///
-    /// You can calculate a human-readable text position via [Document::text_pos_at].
+    /// You can calculate a human-readable text position via [`Document::text_pos_at`].
     ///
     /// ```text
     /// <e attr='value'/>
     ///    ^
     /// ```
     ///
-    /// [Document::text_pos_at]: struct.Document.html#method.text_pos_at
     #[deprecated(note = "replaced by `range`")]
     #[cfg(feature = "xml-backend-roxmltree")]
     #[inline]
@@ -749,7 +746,7 @@ impl<'a, 'input, S: crate::xml::dom::storage::Storage> Attribute<'a, 'input, S> 
     ///    ^^^^^^
     /// ```
     ///
-    /// To reduce memory usage the qname length is limited by u16::MAX.
+    /// To reduce memory usage the qname length is limited by `u16::MAX`.
     /// If the attribute exceeds that limit then the end of the returned range will be incorrect.
     #[cfg(feature = "xml-backend-roxmltree")]
     #[inline]
@@ -767,8 +764,8 @@ impl<'a, 'input, S: crate::xml::dom::storage::Storage> Attribute<'a, 'input, S> 
     ///            ^^^^^
     /// ```
     ///
-    /// To reduce memory usage the qname length is limited by u16::MAX,
-    /// and the number of spaces around the equal sign is limited by u8::MAX.
+    /// To reduce memory usage the qname length is limited by `u16::MAX`,
+    /// and the number of spaces around the equal sign is limited by `u8::MAX`.
     /// If the attribute exceeds those limits then the start of the returned range will be incorrect.
     #[cfg(feature = "xml-backend-roxmltree")]
     #[inline]
@@ -904,10 +901,9 @@ impl<'input, S: crate::xml::dom::storage::Storage> Namespaces<'input, S> {
         let idx = match search {
             Ok(sorted_idx) => self.sorted_order[sorted_idx],
             Err(sorted_idx) => {
-                if self.values.len() > u16::MAX as usize {
-                    return Err(Error::NamespacesLimitReached);
-                }
-                let idx = NamespaceIdx(self.values.len() as u16);
+                let idx = NamespaceIdx(
+                    u16::try_from(self.values.len()).map_err(|_| Error::NamespacesLimitReached)?,
+                );
                 self.values.push(Namespace { name, uri })?;
                 self.storage.charge(
                     (self.sorted_order.len() - sorted_idx) * core::mem::size_of::<NamespaceIdx>(),
@@ -1057,7 +1053,7 @@ impl fmt::Debug for ExpandedName<'_, '_> {
     }
 }
 
-impl<'a, 'b> From<&'b str> for ExpandedName<'a, 'b> {
+impl<'b> From<&'b str> for ExpandedName<'_, 'b> {
     #[inline]
     fn from(v: &'b str) -> Self {
         ExpandedName { uri: None, name: v }
@@ -1081,7 +1077,7 @@ impl<'a, 'b> From<(&'a str, &'b str)> for ExpandedName<'a, 'b> {
 /// The implementation of the `Ord` traits for `Node` is based on the concept of *document-order*.
 /// In layman's terms, document-order is the order in which one would see each element if
 /// one opened a document in a text editor or web browser and scrolled down.
-/// Document-order convention is followed in XPath, CSS Counters, and DOM selectors API
+/// Document-order convention is followed in `XPath`, CSS Counters, and DOM selectors API
 /// to ensure consistent results from selection.
 /// One difference in `roxmltree` is that there is the notion of more than one document
 /// in existence at a time. While Nodes within the same document are in document-order,
@@ -1114,7 +1110,7 @@ impl<S: Storage> Eq for Node<'_, '_, S> {}
 impl<S: Storage> PartialEq for Node<'_, '_, S> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        (self.id, self.doc as *const _) == (other.id, other.doc as *const _)
+        (self.id, core::ptr::from_ref(self.doc)) == (other.id, core::ptr::from_ref(other.doc))
     }
 }
 
@@ -1126,7 +1122,8 @@ impl<S: Storage> PartialOrd for Node<'_, '_, S> {
 
 impl<S: Storage> Ord for Node<'_, '_, S> {
     fn cmp(&self, other: &Self) -> Ordering {
-        (self.id.0, self.doc as *const _).cmp(&(other.id.0, other.doc as *const _))
+        (self.id.0, core::ptr::from_ref(self.doc))
+            .cmp(&(other.id.0, core::ptr::from_ref(other.doc)))
     }
 }
 
@@ -1282,8 +1279,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
 
         self.namespaces()
             .find(|ns| &*ns.uri == uri)
-            .map(|v| v.name)
-            .unwrap_or(None)
+            .and_then(|v| v.name)
     }
 
     /// Returns an URI for a given prefix.
@@ -1445,7 +1441,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
     /// ```
     #[inline]
     pub fn text(&self) -> Option<&'a str> {
-        self.text_storage().map(|s| s.as_str())
+        self.text_storage().map(StringStorage::as_str)
     }
 
     /// Returns node's text storage.
@@ -1460,8 +1456,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
                 },
                 _ => None,
             },
-            NodeKind::Comment(ref text) => Some(text),
-            NodeKind::Text(ref text) => Some(text),
+            NodeKind::Comment(ref text) | NodeKind::Text(ref text) => Some(text),
             _ => None,
         }
     }
@@ -1484,7 +1479,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
     /// ```
     #[inline]
     pub fn tail(&self) -> Option<&'a str> {
-        self.tail_storage().map(|s| s.as_str())
+        self.tail_storage().map(StringStorage::as_str)
     }
 
     /// Returns element's tail text storage.
@@ -1523,7 +1518,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
 
     /// Returns the parent element of this node.
     pub fn parent_element(&self) -> Option<Self> {
-        self.ancestors().skip(1).find(|n| n.is_element())
+        self.ancestors().skip(1).find(Self::is_element)
     }
 
     /// Returns the previous sibling of this node.
@@ -1538,7 +1533,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
 
     /// Returns the previous sibling element of this node.
     pub fn prev_sibling_element(&self) -> Option<Self> {
-        self.prev_siblings().skip(1).find(|n| n.is_element())
+        self.prev_siblings().skip(1).find(Self::is_element)
     }
 
     /// Returns the next sibling of this node.
@@ -1566,7 +1561,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
 
     /// Returns the next sibling element of this node.
     pub fn next_sibling_element(&self) -> Option<Self> {
-        self.next_siblings().skip(1).find(|n| n.is_element())
+        self.next_siblings().skip(1).find(Self::is_element)
     }
 
     /// Returns the first child of this node.
@@ -1581,7 +1576,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
 
     /// Returns the first element child of this node.
     pub fn first_element_child(&self) -> Option<Self> {
-        self.children().find(|n| n.is_element())
+        self.children().find(Self::is_element)
     }
 
     /// Returns the last child of this node.
@@ -1596,7 +1591,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
 
     /// Returns the last element child of this node.
     pub fn last_element_child(&self) -> Option<Self> {
-        self.children().rfind(|child| child.is_element())
+        self.children().rfind(Self::is_element)
     }
 
     /// Returns true if this node has siblings.
@@ -1678,7 +1673,7 @@ impl<'a, 'input: 'a, S: Storage> Node<'a, 'input, S> {
         self.d.range.clone()
     }
 
-    /// Returns node's NodeId
+    /// Returns node's `NodeId`
     #[inline]
     pub fn id(&self) -> NodeId {
         self.id
@@ -1755,7 +1750,7 @@ impl<'a, 'input, S: Storage> Iterator for Attributes<'a, 'input, S> {
     }
 }
 
-impl<'a, 'input, S: Storage> DoubleEndedIterator for Attributes<'a, 'input, S> {
+impl<S: Storage> DoubleEndedIterator for Attributes<'_, '_, S> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         self.attrs.next_back().map(|attr| Attribute {
@@ -1857,8 +1852,7 @@ impl<'a, 'input, S: Storage> Descendants<'a, 'input, S> {
         let until = start
             .d
             .next_subtree
-            .map(NodeId::get_usize)
-            .unwrap_or(start.doc.nodes.len());
+            .map_or(start.doc.nodes.len(), NodeId::get_usize);
 
         let nodes = start.doc.nodes[from..until].iter().enumerate();
 
@@ -1897,7 +1891,7 @@ impl<'a, 'input, S: Storage> Iterator for Descendants<'a, 'input, S> {
     }
 }
 
-impl<'a, 'input, S: Storage> DoubleEndedIterator for Descendants<'a, 'input, S> {
+impl<S: Storage> DoubleEndedIterator for Descendants<'_, '_, S> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         self.nodes.next_back().map(|(idx, data)| Node {
@@ -1949,11 +1943,11 @@ impl<'a, 'input, S: Storage> Iterator for NamespaceIter<'a, 'input, S> {
     }
 }
 
-impl<'a, 'input, S: Storage> DoubleEndedIterator for NamespaceIter<'a, 'input, S> {
+impl<S: Storage> DoubleEndedIterator for NamespaceIter<'_, '_, S> {
     #[inline]
     fn next_back(&mut self) -> Option<Self::Item> {
         self.namespaces
-            .next()
+            .next_back()
             .map(|idx| self.doc.namespaces.get(*idx))
     }
 }

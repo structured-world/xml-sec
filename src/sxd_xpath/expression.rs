@@ -85,8 +85,8 @@ fn value_into_nodeset(v: Value<'_>) -> Result<Nodeset<'_>, Error> {
 // > order, because the axis that applies to the `[1]` predicate is
 // > the child axis
 //
-fn value_into_ordered_nodes<'c, 'd>(
-    context: &context::Evaluation<'c, 'd>,
+fn value_into_ordered_nodes<'d>(
+    context: &context::Evaluation<'_, 'd>,
     v: Value<'d>,
 ) -> Result<OrderedNodes<'d>, Error> {
     match v {
@@ -99,7 +99,7 @@ fn value_into_ordered_nodes<'c, 'd>(
 }
 
 pub trait Expression: fmt::Debug {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error>;
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error>;
 
     fn ast_depth(&self) -> usize {
         1
@@ -110,7 +110,7 @@ impl<T: ?Sized> Expression for Box<T>
 where
     T: Expression,
 {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         context.admit_expression_step()?;
         (**self).evaluate(context)
     }
@@ -123,7 +123,7 @@ where
 pub type SubExpression = Box<dyn Expression + 'static>;
 
 impl<T: Expression + ?Sized> Expression for &T {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         (**self).evaluate(context)
     }
 
@@ -156,7 +156,7 @@ pub struct And<L = SubExpression, R = L> {
 binary_constructor!(And);
 
 impl<L: Expression, R: Expression> Expression for And<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?.boolean();
         let v = left && self.right.evaluate(context)?.boolean();
         Ok(Boolean(v))
@@ -172,14 +172,13 @@ impl<L: Expression, R: Expression> Expression for And<L, R> {
 pub struct ContextNode;
 
 impl Expression for ContextNode {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        self.evaluate_in(context, crate::runtime::Native)
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
+        Self::evaluate_in(context, crate::runtime::Native)
     }
 }
 
 impl ContextNode {
     fn evaluate_in<'d, R: crate::runtime::Runtime>(
-        &self,
         context: &context::Evaluation<'_, 'd>,
         runtime: R,
     ) -> Result<Value<'d>, Error> {
@@ -206,10 +205,7 @@ pub struct Equal<L = SubExpression, R = L> {
 binary_constructor!(Equal);
 
 impl<L: Expression, R: Expression> Equal<L, R> {
-    fn boolean_evaluate<'c, 'd>(
-        &self,
-        context: &context::Evaluation<'c, 'd>,
-    ) -> Result<bool, Error> {
+    fn boolean_evaluate(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
         let left_val = self.left.evaluate(context)?;
         let right_val = self.right.evaluate(context)?;
 
@@ -218,7 +214,7 @@ impl<L: Expression, R: Expression> Equal<L, R> {
 }
 
 impl<L: Expression, R: Expression> Expression for Equal<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         self.boolean_evaluate(context).map(Boolean)
     }
 
@@ -241,7 +237,7 @@ impl NotEqual {
 }
 
 impl<L: Expression, R: Expression> Expression for NotEqual<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?;
         let right = self.right.evaluate(context)?;
         compare_equality_values(context, &left, &right, Equality::NotEqual).map(Boolean)
@@ -278,10 +274,7 @@ impl Equality {
     }
 
     fn numbers(self, left: f64, right: f64) -> bool {
-        match self {
-            Self::Equal => left == right,
-            Self::NotEqual => left != right,
-        }
+        self.result(super::same_xpath_number(left, right))
     }
 
     fn booleans(self, left: bool, right: bool) -> bool {
@@ -299,8 +292,8 @@ impl Equality {
     }
 }
 
-fn compare_nodesets<'c, 'd, R: crate::runtime::Runtime>(
-    context: &context::Evaluation<'c, 'd>,
+fn compare_nodesets<'d, R: crate::runtime::Runtime>(
+    context: &context::Evaluation<'_, 'd>,
     left: &Nodeset<'d>,
     right: &Nodeset<'d>,
     comparison: Equality,
@@ -349,8 +342,8 @@ fn compare_nodes_with_string<R: crate::runtime::Runtime>(
     Ok(false)
 }
 
-fn compare_equality_values<'c, 'd>(
-    context: &context::Evaluation<'c, 'd>,
+fn compare_equality_values<'d>(
+    context: &context::Evaluation<'_, 'd>,
     left: &Value<'d>,
     right: &Value<'d>,
     comparison: Equality,
@@ -358,8 +351,8 @@ fn compare_equality_values<'c, 'd>(
     compare_equality_values_in(context, left, right, comparison, crate::runtime::Native)
 }
 
-fn compare_equality_values_in<'c, 'd, R: crate::runtime::Runtime>(
-    context: &context::Evaluation<'c, 'd>,
+fn compare_equality_values_in<'d, R: crate::runtime::Runtime>(
+    context: &context::Evaluation<'_, 'd>,
     left: &Value<'d>,
     right: &Value<'d>,
     comparison: Equality,
@@ -417,7 +410,7 @@ pub struct Function {
 }
 
 impl Expression for Function {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         call_function(
             context,
             PrefixedName::with_prefix(self.name.prefix.as_deref(), &self.name.local_part),
@@ -429,7 +422,7 @@ impl Expression for Function {
         1usize.saturating_add(
             self.arguments
                 .iter()
-                .map(|argument| argument.ast_depth())
+                .map(Expression::ast_depth)
                 .max()
                 .unwrap_or(0),
         )
@@ -458,7 +451,7 @@ fn call_function_in<'d, E: Expression, R: crate::runtime::Runtime>(
     let bytes = arguments
         .len()
         .checked_mul(std::mem::size_of::<Value<'_>>())
-        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .filter(|bytes| isize::try_from(*bytes).is_ok())
         .ok_or_else(|| crate::function::Error::Other {
             what: "XPath argument storage exceeds addressable memory".into(),
         })
@@ -491,7 +484,7 @@ impl From<LiteralValue> for Literal {
 }
 
 impl Expression for Literal {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         self.value
             .clone_with_context(context)
             .context(FunctionEvaluation)
@@ -563,7 +556,7 @@ impl Math {
 }
 
 impl<L: Expression, R: Expression> Expression for Math<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         self.evaluate_in(context, crate::runtime::Native)
     }
 
@@ -573,9 +566,9 @@ impl<L: Expression, R: Expression> Expression for Math<L, R> {
 }
 
 impl<L: Expression, R: Expression> Math<L, R> {
-    fn evaluate_in<'c, 'd, S: crate::runtime::Runtime>(
+    fn evaluate_in<'d, S: crate::runtime::Runtime>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         runtime: S,
     ) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?;
@@ -607,7 +600,7 @@ pub struct Negation<E = SubExpression> {
 }
 
 impl<E: Expression> Expression for Negation<E> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         self.evaluate_in(context, crate::runtime::Native)
     }
 
@@ -617,9 +610,9 @@ impl<E: Expression> Expression for Negation<E> {
 }
 
 impl<E: Expression> Negation<E> {
-    fn evaluate_in<'c, 'd, R: crate::runtime::Runtime>(
+    fn evaluate_in<'d, R: crate::runtime::Runtime>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         runtime: R,
     ) -> Result<Value<'d>, Error> {
         let value = self.expression.evaluate(context)?;
@@ -639,7 +632,7 @@ pub struct Or<L = SubExpression, R = L> {
 binary_constructor!(Or);
 
 impl<L: Expression, R: Expression> Expression for Or<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         let left = self.left.evaluate(context)?.boolean();
         let v = left || self.right.evaluate(context)?.boolean();
         Ok(Boolean(v))
@@ -664,12 +657,12 @@ impl Path {
 }
 
 impl Expression for Path {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         let result = self.start_point.evaluate(context)?;
         let mut result = value_into_nodeset(result)?;
 
         for step in &self.steps {
-            result = step.evaluate(context, result)?;
+            result = step.evaluate(context, &result)?;
         }
 
         Ok(Value::Nodeset(result))
@@ -708,7 +701,7 @@ impl Filter {
 }
 
 impl<E: Expression> Expression for Filter<E> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         self.node_selector
             .evaluate(context)
             .and_then(|value| value_into_ordered_nodes(context, value))
@@ -779,7 +772,7 @@ impl Relational {
 }
 
 impl<L: Expression, R: Expression> Expression for Relational<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         let left_val = self.left.evaluate(context)?;
         let right_val = self.right.evaluate(context)?;
         let op = self.operation;
@@ -929,14 +922,13 @@ impl<L: fmt::Debug, R: fmt::Debug> fmt::Debug for Relational<L, R> {
 pub struct RootNode;
 
 impl Expression for RootNode {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        self.evaluate_in(context, crate::runtime::Native)
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
+        Self::evaluate_in(context, crate::runtime::Native)
     }
 }
 
 impl RootNode {
     fn evaluate_in<'d, R: crate::runtime::Runtime>(
-        &self,
         context: &context::Evaluation<'_, 'd>,
         runtime: R,
     ) -> Result<Value<'d>, Error> {
@@ -961,9 +953,9 @@ pub(crate) struct Predicate<E = SubExpression> {
 }
 
 impl<E: Expression> Predicate<E> {
-    fn select<'c, 'd>(
+    fn select<'d>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         nodes: OrderedNodes<'d>,
     ) -> Result<OrderedNodes<'d>, Error> {
         self.select_in::<crate::runtime::Native>(context, Vec::from(nodes))
@@ -1001,7 +993,7 @@ impl<E: Expression> Predicate<E> {
         let value = self.expression.evaluate(context)?;
 
         let v = match value {
-            Number(v) => context.position as f64 == v,
+            Number(v) => super::same_xpath_number(super::xpath_size_number(context.position), v),
             _ => value.boolean(),
         };
 
@@ -1034,10 +1026,10 @@ where
         }
     }
 
-    fn evaluate<'c, 'd>(
+    fn evaluate<'d>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
-        starting_nodes: Nodeset<'d>,
+        context: &context::Evaluation<'_, 'd>,
+        starting_nodes: &Nodeset<'d>,
     ) -> Result<Nodeset<'d>, Error> {
         // For every starting node, we collect new nodes based on the
         // axis and node-test. We evaluate the predicates on each node.
@@ -1049,7 +1041,7 @@ where
             context,
             &self.axis,
             &self.node_test,
-            self.predicates.iter().map(|p| &p.expression),
+            &self.predicates.iter().map(|p| &p.expression),
             starting_nodes,
             crate::runtime::Native,
         )
@@ -1068,19 +1060,19 @@ fn select_step<'d, E: Expression, R: crate::runtime::Runtime>(
     context: &context::Evaluation<'_, 'd>,
     axis: &impl AxisLike,
     test: &impl NodeTest,
-    predicates: impl Iterator<Item = E> + Clone,
-    starting_nodes: Nodeset<'d>,
+    predicates: &(impl Iterator<Item = E> + Clone),
+    starting_nodes: &Nodeset<'d>,
     runtime: R,
 ) -> Result<Nodeset<'d>, Error> {
     use crate::runtime::Set;
     let mut unique = runtime.set();
-    for node in runtime.nodes(&starting_nodes).context(FunctionEvaluation)? {
+    for node in runtime.nodes(starting_nodes).context(FunctionEvaluation)? {
         let node = runtime
             .clone_node(context, node)
             .context(FunctionEvaluation)?;
         let child_context = context.new_context_for(node);
         let mut nodes = axis.select_nodes_in(&child_context, test, runtime)?;
-        for expression in predicates.clone() {
+        for expression in (*predicates).clone() {
             nodes = Predicate { expression }.select_in::<R>(context, nodes)?;
         }
         // Preserve axis order while moving candidates out of admitted slots.
@@ -1102,7 +1094,7 @@ pub struct Union<L = SubExpression, R = L> {
 binary_constructor!(Union);
 
 impl<L: Expression, R: Expression> Expression for Union<L, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         self.evaluate_in(context, crate::runtime::Native)
     }
 
@@ -1170,10 +1162,9 @@ pub struct Variable {
 }
 
 impl Expression for Variable {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        let name = resolve_prefixed_name(context, &self.name)?;
-
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
         use crate::runtime::Runtime as _;
+        let name = resolve_prefixed_name(context, &self.name)?;
         let Some(value) = context.value_of(name) else {
             return Err(crate::runtime::Native.name_error(
                 NameKind::Variable,
@@ -1204,10 +1195,78 @@ impl<R: crate::runtime::Runtime> fmt::Debug for ArenaExpression<'_, '_, R> {
 }
 
 #[cfg(feature = "embedded")]
-impl<R: crate::runtime::Runtime> Expression for ArenaExpression<'_, '_, R> {
-    fn evaluate<'c, 'd>(&self, context: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
-        use super::arena::Entry;
+impl<R: crate::runtime::Runtime> ArenaExpression<'_, '_, R> {
+    fn evaluate_binary<'d>(
+        &self,
+        context: &context::Evaluation<'_, 'd>,
+        operation: super::grammar::Binary,
+        left: super::arena::Handle,
+        right: super::arena::Handle,
+    ) -> Result<Value<'d>, Error> {
         use super::grammar::Binary;
+        let child = |handle| ArenaExpression {
+            program: self.program,
+            handle,
+            runtime: self.runtime,
+        };
+        let left = child(left);
+        let right = child(right);
+        match operation {
+            Binary::Or => Or { left, right }.evaluate(context),
+            Binary::And => And { left, right }.evaluate(context),
+            Binary::Equal | Binary::NotEqual => {
+                let comparison = if operation == Binary::Equal {
+                    Equality::Equal
+                } else {
+                    Equality::NotEqual
+                };
+                let left = left.evaluate(context)?;
+                let right = right.evaluate(context)?;
+                compare_equality_values_in(context, &left, &right, comparison, self.runtime)
+                    .map(Boolean)
+            }
+            Binary::Union => Union { left, right }.evaluate_in(context, self.runtime),
+            Binary::Add
+            | Binary::Subtract
+            | Binary::Multiply
+            | Binary::Divide
+            | Binary::Remainder => {
+                let operation = match operation {
+                    Binary::Add => add,
+                    Binary::Subtract => subtract,
+                    Binary::Multiply => multiply,
+                    Binary::Divide => divide,
+                    Binary::Remainder => modulus,
+                    _ => unreachable!("arithmetic operators are selected above"),
+                };
+                Math {
+                    left,
+                    right,
+                    operation,
+                }
+                .evaluate_in(context, self.runtime)
+            }
+            Binary::Less | Binary::LessEqual | Binary::Greater | Binary::GreaterEqual => {
+                let operation = match operation {
+                    Binary::Less => less_than,
+                    Binary::LessEqual => less_than_or_equal,
+                    Binary::Greater => greater_than,
+                    Binary::GreaterEqual => greater_than_or_equal,
+                    _ => unreachable!("relational operators are selected above"),
+                };
+                let left = left.evaluate(context)?;
+                let right = right.evaluate(context)?;
+                compare_relational_values_in(context, &left, &right, operation, self.runtime)
+                    .map(Boolean)
+            }
+        }
+    }
+}
+
+#[cfg(feature = "embedded")]
+impl<R: crate::runtime::Runtime> Expression for ArenaExpression<'_, '_, R> {
+    fn evaluate<'d>(&self, context: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
+        use super::arena::Entry;
         context.admit_expression_step()?;
         let child = |handle| ArenaExpression {
             program: self.program,
@@ -1215,8 +1274,8 @@ impl<R: crate::runtime::Runtime> Expression for ArenaExpression<'_, '_, R> {
             runtime: self.runtime,
         };
         match &self.program.nodes[self.handle.index] {
-            Entry::Context => ContextNode.evaluate_in(context, self.runtime),
-            Entry::Root => RootNode.evaluate_in(context, self.runtime),
+            Entry::Context => ContextNode::evaluate_in(context, self.runtime),
+            Entry::Root => RootNode::evaluate_in(context, self.runtime),
             Entry::Number(number) => Ok(Number(*number)),
             Entry::String(text) => self
                 .runtime
@@ -1269,81 +1328,15 @@ impl<R: crate::runtime::Runtime> Expression for ArenaExpression<'_, '_, R> {
                         context,
                         &step.axis,
                         &test,
-                        step.predicates.iter().copied().map(child),
-                        nodes,
+                        &step.predicates.iter().copied().map(child),
+                        &nodes,
                         self.runtime,
                     )?;
                 }
                 Ok(Value::Nodeset(nodes))
             }
             Entry::Binary(operation, left, right) => {
-                let left = child(*left);
-                let right = child(*right);
-                match operation {
-                    Binary::Or => Or { left, right }.evaluate(context),
-                    Binary::And => And { left, right }.evaluate(context),
-                    Binary::Equal | Binary::NotEqual => {
-                        let comparison = if *operation == Binary::Equal {
-                            Equality::Equal
-                        } else {
-                            Equality::NotEqual
-                        };
-                        let left = left.evaluate(context)?;
-                        let right = right.evaluate(context)?;
-                        compare_equality_values_in(context, &left, &right, comparison, self.runtime)
-                            .map(Boolean)
-                    }
-                    Binary::Union => Union { left, right }.evaluate_in(context, self.runtime),
-                    Binary::Add => Math {
-                        left,
-                        right,
-                        operation: add,
-                    }
-                    .evaluate_in(context, self.runtime),
-                    Binary::Subtract => Math {
-                        left,
-                        right,
-                        operation: subtract,
-                    }
-                    .evaluate_in(context, self.runtime),
-                    Binary::Multiply => Math {
-                        left,
-                        right,
-                        operation: multiply,
-                    }
-                    .evaluate_in(context, self.runtime),
-                    Binary::Divide => Math {
-                        left,
-                        right,
-                        operation: divide,
-                    }
-                    .evaluate_in(context, self.runtime),
-                    Binary::Remainder => Math {
-                        left,
-                        right,
-                        operation: modulus,
-                    }
-                    .evaluate_in(context, self.runtime),
-                    Binary::Less | Binary::LessEqual | Binary::Greater | Binary::GreaterEqual => {
-                        let operation = match operation {
-                            Binary::Less => less_than,
-                            Binary::LessEqual => less_than_or_equal,
-                            Binary::Greater => greater_than,
-                            Binary::GreaterEqual => greater_than_or_equal,
-                            _ => unreachable!(),
-                        };
-                        let left = left.evaluate(context)?;
-                        let right = right.evaluate(context)?;
-                        compare_relational_values_in(
-                            context,
-                            &left,
-                            &right,
-                            operation,
-                            self.runtime,
-                        )
-                        .map(Boolean)
-                    }
-                }
+                self.evaluate_binary(context, *operation, *left, *right)
             }
         }
     }
@@ -1362,6 +1355,17 @@ mod test {
         // stay in that allocation, including its retained spare capacity.
         use crate::runtime::{List, Runtime};
         use structured_asn1::memory::{Memory, MemoryAccount};
+        #[derive(Debug)]
+        struct Third;
+        impl Expression for Third {
+            fn evaluate<'d>(
+                &self,
+                context: &context::Evaluation<'_, 'd>,
+            ) -> Result<Value<'d>, Error> {
+                assert_eq!(context.size, 3);
+                Ok(Number(3.0))
+            }
+        }
         let package = Package::new();
         let document = package.as_document();
         let nodes = [
@@ -1386,17 +1390,6 @@ mod test {
         let pointer = candidates.as_ptr();
         let capacity = candidates.capacity();
         let used = current.used();
-        #[derive(Debug)]
-        struct Third;
-        impl Expression for Third {
-            fn evaluate<'c, 'd>(
-                &self,
-                context: &context::Evaluation<'c, 'd>,
-            ) -> Result<Value<'d>, Error> {
-                assert_eq!(context.size, 3);
-                Ok(Number(3.0))
-            }
-        }
         let selected = Predicate { expression: Third }
             .select_in::<crate::runtime::Accounted<'_, Memory>>(&evaluation, candidates)
             .expect("third predicate position");
@@ -1642,7 +1635,7 @@ mod test {
     #[derive(Debug)]
     struct FailExpression;
     impl Expression for FailExpression {
-        fn evaluate<'c, 'd>(&self, _: &context::Evaluation<'c, 'd>) -> Result<Value<'d>, Error> {
+        fn evaluate<'d>(&self, _: &context::Evaluation<'_, 'd>) -> Result<Value<'d>, Error> {
             panic!("Should never be called");
         }
     }
@@ -1977,7 +1970,7 @@ mod test {
                 name: "empty".into(),
             }),
             Box::new(Literal {
-                value: Value::String("".to_owned()),
+                value: Value::String(std::string::String::new()),
             }),
         );
 
@@ -2011,9 +2004,9 @@ mod test {
     }
 
     impl function::Function for StubFunction {
-        fn evaluate<'c, 'd>(
+        fn evaluate<'d>(
             &self,
-            _: &context::Evaluation<'c, 'd>,
+            _: &context::Evaluation<'_, 'd>,
             _: Vec<Value<'d>>,
         ) -> Result<Value<'d>, function::Error> {
             Ok(String(self.value.to_owned()))
@@ -2190,9 +2183,9 @@ mod test {
     }
 
     impl AxisLike for MockAxis {
-        fn select_nodes_in<'c, 'd, R: crate::runtime::Runtime>(
+        fn select_nodes_in<'d, R: crate::runtime::Runtime>(
             &self,
-            _context: &context::Evaluation<'c, 'd>,
+            _context: &context::Evaluation<'_, 'd>,
             _node_test: &dyn NodeTest,
             runtime: R,
         ) -> Result<R::List<crate::nodeset::Node<'d>>, Error> {
@@ -2220,7 +2213,7 @@ mod test {
         let expr = ParameterizedStep::from_predicates(axis.clone(), Box::new(node_test), vec![]);
 
         let context = setup.context();
-        expr.evaluate(&context, nodeset![context.node.clone()])
+        expr.evaluate(&context, &nodeset![context.node.clone()])
             .unwrap();
 
         assert_eq!(1, axis.calls());

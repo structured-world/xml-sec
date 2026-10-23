@@ -30,7 +30,7 @@
 //! document and reading an XML document. You may wish to perform
 //! large modifications to your data *before* creating a document.
 //!
-//! ### Namespaces, QNames, and Prefixes
+//! ### Namespaces, Qualified Names, and Prefixes
 //!
 //! The names of elements and attributes may use namespaces. XML
 //! namespacing uses URIs to uniquely distinguish items with the same
@@ -364,20 +364,24 @@ pub struct PrefixedName<'a> {
 
 impl<'a> PrefixedName<'a> {
     /// Create a `PrefixedName` without a prefix
+    #[must_use]
     pub fn new(local_part: &str) -> PrefixedName<'_> {
         PrefixedName::with_prefix(None, local_part)
     }
 
-    /// Create a `PrefixedName` without an optional prefix
+    /// Create a `PrefixedName` with an optional prefix
+    #[must_use]
     pub fn with_prefix(prefix: Option<&'a str>, local_part: &'a str) -> PrefixedName<'a> {
         PrefixedName { prefix, local_part }
     }
 
     /// Borrows the original source, independently of this copied name view.
+    #[must_use]
     pub fn prefix(&self) -> Option<&'a str> {
         self.prefix
     }
     /// Borrows the original source, independently of this copied name view.
+    #[must_use]
     pub fn local_part(&self) -> &'a str {
         self.local_part
     }
@@ -394,11 +398,13 @@ pub struct QName<'s> {
 
 impl<'s> QName<'s> {
     /// Create a `QName` without a namespace
+    #[must_use]
     pub fn new(local_part: &'s str) -> QName<'s> {
         QName::with_namespace_uri(None, local_part)
     }
 
     /// Create a `QName` with an optional namespace
+    #[must_use]
     pub fn with_namespace_uri(namespace_uri: Option<&'s str>, local_part: &'s str) -> QName<'s> {
         QName {
             namespace_uri,
@@ -406,9 +412,11 @@ impl<'s> QName<'s> {
         }
     }
 
+    #[must_use]
     pub fn namespace_uri(&self) -> Option<&'s str> {
         self.namespace_uri
     }
+    #[must_use]
     pub fn local_part(&self) -> &'s str {
         self.local_part
     }
@@ -455,6 +463,7 @@ impl Default for Package {
 }
 
 impl Package {
+    #[must_use]
     pub fn new() -> Package {
         Self::default()
     }

@@ -1,10 +1,10 @@
 //! # SXD-XPath
 //!
-//! This is a pure-Rust implementation of XPath, a language for
+//! This is a pure-Rust implementation of `XPath`, a language for
 //! addressing parts of an XML document. It aims to implement [version
 //! 1.0 of the XPath specification][spec].
 //!
-//! XPath is wonderful for quickly navigating the complicated
+//! `XPath` is wonderful for quickly navigating the complicated
 //! hierarchy that is present in many XML documents while having a
 //! concise syntax.
 //!
@@ -12,7 +12,7 @@
 //!
 //! ### Examples
 //!
-//! The quickest way to evaluate an XPath against an XML document is
+//! The quickest way to evaluate an `XPath` against an XML document is
 //! to use [`evaluate_xpath`][evaluate_xpath].
 //!
 //! ```
@@ -30,13 +30,13 @@
 //! # }
 //! ```
 //!
-//! Evaluating an XPath returns a [`Value`][], representing the
-//! primary XPath types.
+//! Evaluating an `XPath` returns a [`Value`][], representing the
+//! primary `XPath` types.
 //!
-//! For more complex needs, XPath parsing and evaluation can be split
+//! For more complex needs, `XPath` parsing and evaluation can be split
 //! apart. This allows the user to specify namespaces, variables,
 //! extra functions, and which node evaluation should begin with. You
-//! may also compile an XPath once and reuse it multiple times.
+//! may also compile an `XPath` once and reuse it multiple times.
 //!
 //! Parsing is handled with the [`Factory`][] and evaluation relies on
 //! the [`Context`][]. Similar functionality to above can be
@@ -65,7 +65,7 @@
 //! ```
 //!
 //! See [`Context`][] for details on how to customize the
-//! evaluation of the XPath.
+//! evaluation of the `XPath`.
 //!
 //! [evaluate_xpath]: fn.evaluate_xpath.html
 //! [`Value`]: enum.Value.html
@@ -74,7 +74,7 @@
 //!
 //! ### Programmatically-created XML
 //!
-//! The XPath specification assumes certain properties about the XML
+//! The `XPath` specification assumes certain properties about the XML
 //! being processed. If you are processing XML that was parsed from
 //! text, this will be true by construction. If you have
 //! programmatically created XML, please note the following cases.
@@ -82,7 +82,7 @@
 //! #### Namespaces
 //!
 //! If you have programmatically created XML with namespaces but not
-//! defined prefixes, some XPath behavior may be confusing:
+//! defined prefixes, some `XPath` behavior may be confusing:
 //!
 //! 1. The `name` method will not include a prefix, even if the
 //!    element or attribute has a namespace.
@@ -92,7 +92,7 @@
 //! #### Document order
 //!
 //! If you have programmatically created XML but not attached the
-//! nodes to the document, some XPath behavior may be confusing:
+//! nodes to the document, some `XPath` behavior may be confusing:
 //!
 //! 1. These nodes have no [*document order*]. If you create a
 //!    variable containing these nodes and apply a predicate to them,
@@ -182,10 +182,7 @@ impl<'a> From<PrefixedName<'a>> for OwnedPrefixedName {
 
 impl<'a> From<&'a OwnedPrefixedName> for OwnedPrefixedName {
     fn from(name: &'a OwnedPrefixedName) -> Self {
-        OwnedPrefixedName {
-            prefix: name.prefix.to_owned(),
-            local_part: name.local_part.to_owned(),
-        }
+        name.clone()
     }
 }
 
@@ -223,9 +220,11 @@ impl<'a> From<QName<'a>> for OwnedQName {
 }
 
 impl OwnedQName {
+    #[must_use]
     pub fn local_part(&self) -> &str {
         &self.local_part
     }
+    #[must_use]
     pub fn namespace_uri(&self) -> Option<&str> {
         self.namespace_uri.as_deref()
     }
@@ -259,7 +258,7 @@ pub(crate) fn write_xpath_number(
     }
 }
 
-/// The primary types of values that an XPath expression accepts
+/// The primary types of values that an `XPath` expression accepts
 /// as an argument or returns as a result.
 #[derive(Debug)]
 #[cfg_attr(not(feature = "embedded"), derive(Clone))]
@@ -316,6 +315,40 @@ pub(crate) fn str_to_num(s: &str) -> f64 {
     }
 }
 
+#[inline]
+pub(crate) fn xpath_size_number(value: usize) -> f64 {
+    // XPath 1.0 §§3.5, 4.1 projects counts/positions into binary64 Number.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#numbers
+    // Both 32-bit limbs and the multiplication by 2^32 are exact in binary64;
+    // only their sum rounds, to nearest with ties to even, like Rust's integer cast.
+    #[cfg(target_pointer_width = "64")]
+    {
+        let bytes = value.to_le_bytes();
+        let low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let high = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if high == 0 {
+            return f64::from(low);
+        }
+        f64::from(high) * 4_294_967_296.0 + f64::from(low)
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        f64::from(u32::from_le_bytes(value.to_le_bytes()))
+    }
+    #[cfg(target_pointer_width = "16")]
+    {
+        f64::from(u16::from_le_bytes(value.to_le_bytes()))
+    }
+}
+
+#[inline]
+pub(crate) fn same_xpath_number(left: f64, right: f64) -> bool {
+    // XPath 1.0 3.4 and 3.5 require IEEE equality, not a tolerance:
+    // NaN is unequal to itself; the two signed zeros compare equal.
+    // https://www.w3.org/TR/1999/REC-xpath-19991116/#booleans
+    left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
+}
+
 pub(crate) fn node_to_num_with_context(
     context: &context::Evaluation<'_, '_>,
     node: &nodeset::Node<'_>,
@@ -362,7 +395,12 @@ impl<'d> Value<'d> {
         })
     }
 
-    /// Return the UTF-8 byte length of this value's XPath string conversion without allocating it.
+    /// Return the UTF-8 byte length of this value's `XPath` string conversion without allocating it.
+    ///
+    /// # Panics
+    /// Panics for an execution-owned node-set, which requires a current-query
+    /// API, or if the internal numeric formatter violates its infallible sink contract.
+    #[must_use]
     pub fn string_len(&self) -> usize {
         match self {
             Value::Boolean(true) => 4,
@@ -382,24 +420,29 @@ impl<'d> Value<'d> {
         }
     }
 
+    #[must_use]
     pub fn boolean(&self) -> bool {
-        use crate::Value::*;
         match *self {
-            Boolean(val) => val,
-            Number(n) => n != 0.0 && !n.is_nan(),
-            String(ref s) => !s.is_empty(),
+            Self::Boolean(val) => val,
+            Self::Number(n) => n != 0.0 && !n.is_nan(),
+            Self::String(ref s) => !s.is_empty(),
             #[cfg(feature = "embedded")]
-            AccountedString(ref s) => !s.is_empty(),
-            ResultTreeFragment(..) => true,
-            Nodeset(ref nodeset) => nodeset.size() > 0,
+            Self::AccountedString(ref s) => !s.is_empty(),
+            Self::ResultTreeFragment(..) => true,
+            Self::Nodeset(ref nodeset) => nodeset.size() > 0,
         }
     }
 
+    #[must_use]
     pub fn into_boolean(self) -> bool {
         self.boolean()
     }
 
-    /// Convert this value to an XPath number under the evaluator's work and allocation budgets.
+    /// Convert this value to an `XPath` number under the evaluator's work and allocation budgets.
+    ///
+    /// # Errors
+    /// Returns the evaluator's resource refusal if traversal or conversion cannot
+    /// be admitted. Non-numeric text produces NaN under the language contract.
     pub fn number(&self, context: &context::Evaluation<'_, '_>) -> Result<f64, function::Error> {
         self.number_in(context, runtime::Native)
     }
@@ -409,50 +452,54 @@ impl<'d> Value<'d> {
         context: &context::Evaluation<'_, '_>,
         runtime: R,
     ) -> Result<f64, function::Error> {
-        use crate::Value::*;
         let parse_text = |value: &str| {
             context.charge_work(value.len())?;
             Ok(str_to_num(value))
         };
         match self {
-            Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
-            Number(value) => Ok(*value),
-            String(value) => parse_text(value),
+            Self::Boolean(value) => Ok(if *value { 1.0 } else { 0.0 }),
+            Self::Number(value) => Ok(*value),
+            Self::String(value) => parse_text(value),
             #[cfg(feature = "embedded")]
-            AccountedString(value) => parse_text(value),
-            ResultTreeFragment(_, value) => parse_text(value),
-            Nodeset(nodes) => match nodes.document_order_first_in(context, runtime)? {
+            Self::AccountedString(value) => parse_text(value),
+            Self::ResultTreeFragment(_, value) => parse_text(value),
+            Self::Nodeset(nodes) => match nodes.document_order_first_in(context, runtime)? {
                 Some(node) => runtime.node_number(context, &node),
                 None => Ok(f64::NAN),
             },
         }
     }
 
+    /// Materializes the unscoped string conversion.
+    ///
+    /// # Panics
+    /// Panics for an execution-owned node-set, which requires a current-query
+    /// API, or if the internal numeric formatter violates its infallible sink contract.
+    #[must_use]
     pub fn string(&self) -> string::String {
-        use crate::Value::*;
         match *self {
-            Boolean(v) => v.to_string(),
-            Number(n) => {
+            Self::Boolean(v) => v.to_string(),
+            Self::Number(n) => {
                 let mut value = std::string::String::with_capacity(self.string_len());
                 write_xpath_number(&mut value, n).expect("String formatting cannot fail");
                 value
             }
-            String(ref val) => val.clone(),
+            Self::String(ref val) => val.clone(),
             #[cfg(feature = "embedded")]
-            AccountedString(ref val) => val.as_str().to_owned(),
-            ResultTreeFragment(_, ref val) => val.as_ref().clone(),
-            Nodeset(ref ns) => match ns.document_order_first() {
+            Self::AccountedString(ref val) => val.as_str().to_owned(),
+            Self::ResultTreeFragment(_, ref val) => val.as_ref().clone(),
+            Self::Nodeset(ref ns) => match ns.document_order_first() {
                 Some(n) => n.string_value(),
-                None => "".to_owned(),
+                None => string::String::new(),
             },
         }
     }
 
+    #[must_use]
     pub fn into_string(self) -> string::String {
-        use crate::Value::*;
         match self {
-            String(val) => val,
-            ResultTreeFragment(_, val) => {
+            Self::String(val) => val,
+            Self::ResultTreeFragment(_, val) => {
                 std::sync::Arc::try_unwrap(val).unwrap_or_else(|value| value.as_ref().clone())
             }
             other => other.string(),
@@ -531,7 +578,7 @@ impl PartialEq<Value<'_>> for &str {
 }
 partial_eq_impl!(nodeset::Nodeset<'d>, Value::Nodeset(ref v) => v);
 
-/// A compiled XPath. Construct via [`Factory`][].
+/// A compiled `XPath`. Construct via [`Factory`][].
 ///
 /// [`Factory`]: struct.Factory.html
 #[derive(Debug)]
@@ -567,6 +614,10 @@ impl XPath {
     /// ```
     ///
     /// [`Context`]: context/struct.Context.html
+    ///
+    /// # Errors
+    /// Returns evaluation errors, including unresolved functions or variables,
+    /// invalid conversions, and resource refusals from the supplied context.
     pub fn evaluate<'d, N>(
         &self,
         context: &context::ScopedContext<'_, 'd>,
@@ -580,7 +631,7 @@ impl XPath {
     }
 }
 
-/// The primary entrypoint to convert an XPath represented as a string
+/// The primary entrypoint to convert an `XPath` represented as a string
 /// to a structure that can be evaluated.
 pub struct Factory {
     parser: Parser<'static>,
@@ -631,13 +682,17 @@ impl ParseBudget {
 }
 
 impl Factory {
+    #[must_use]
     pub fn new() -> Factory {
         Factory {
             parser: Parser::new(),
         }
     }
 
-    /// Compiles the given string into an XPath structure.
+    /// Compiles the given string into an `XPath` structure.
+    ///
+    /// # Errors
+    /// Returns a syntax error or parser safety-limit refusal.
     pub fn build(&self, xpath: &str) -> Result<XPath, ParserError> {
         let tokenizer = Tokenizer::new(xpath);
         let deabbreviator = TokenDeabbreviator::new(tokenizer);
@@ -654,7 +709,10 @@ impl Factory {
     /// payload. Every owned payload, AST node and vector capacity is checked before allocation;
     /// a failed build does not consume the allowance of subsequent builds. The returned AST
     /// remains owned by the caller; this limit is not an evaluator allocation budget.
-    pub fn build_bounded(&self, xpath: &str, owned_bytes: usize) -> Result<XPath, ParserError> {
+    ///
+    /// # Errors
+    /// Returns syntax, parser safety-limit, allocation, or owned-byte-limit errors.
+    pub fn build_bounded(xpath: &str, owned_bytes: usize) -> Result<XPath, ParserError> {
         let budget = ParseBudget::new(owned_bytes);
         let tokenizer = Tokenizer::with_budget(xpath, &budget);
         let result = Parser::with_budget(&budget).parse(TokenDeabbreviator::new(tokenizer));
@@ -676,7 +734,7 @@ impl Default for Factory {
     }
 }
 
-/// Reports whether a syntactically valid XPath can traverse the attribute axis.
+/// Reports whether a syntactically valid `XPath` can traverse the attribute axis.
 ///
 /// The tokenizer performs the same whitespace handling and abbreviated-axis expansion as
 /// [`Factory`], so callers do not need to infer axis semantics from source substrings.
@@ -688,6 +746,10 @@ pub fn expression_uses_attribute_axis(xpath: &str) -> bool {
 
 /// Inspect the attribute axis with bounded transient token storage. Tokens are discarded after
 /// inspection; their payload allowance is reusable for the next token rather than cumulative.
+///
+/// # Errors
+/// Returns an owned-byte-limit error if a token cannot be admitted. This
+/// inspection does not replace syntax validation with [`Factory::build`].
 pub fn expression_uses_attribute_axis_bounded(
     xpath: &str,
     owned_bytes: usize,
@@ -711,7 +773,7 @@ pub fn expression_uses_attribute_axis_bounded(
     Ok(false)
 }
 
-/// Errors that may occur when parsing an XPath
+/// Errors that may occur when parsing an `XPath`
 #[derive(Debug, Snafu, Clone, PartialEq)]
 pub struct ParserError(parser::Error);
 
@@ -748,30 +810,33 @@ impl ParserError {
     }
 }
 
-/// Errors that may occur when executing an XPath
+/// Errors that may occur when executing an `XPath`
 #[derive(Debug, Snafu, Clone, PartialEq)]
 pub struct ExecutionError(expression::Error);
 
-/// The failure modes of executing an XPath.
+/// The failure modes of executing an `XPath`.
 #[derive(Debug, Snafu, Clone, PartialEq)]
 #[snafu(context(suffix(false)))]
 pub enum Error {
-    /// The XPath was syntactically invalid
+    /// The `XPath` was syntactically invalid
     #[snafu(display("Unable to parse XPath: {}", source))]
     Parsing { source: ParserError },
-    /// The XPath could not be executed
+    /// The `XPath` could not be executed
     #[snafu(display("Unable to execute XPath: {}", source))]
     Executing { source: ExecutionError },
 }
 
-/// Easily evaluate an XPath expression
+/// Easily evaluate an `XPath` expression
 ///
-/// The core XPath 1.0 functions will be available, and no variables
+/// The core `XPath` 1.0 functions will be available, and no variables
 /// or namespaces will be defined. The root of the document is the
 /// context node.
 ///
-/// If you will be evaluating multiple XPaths or the same XPath
+/// If you will be evaluating multiple expressions or the same `XPath`
 /// multiple times, this may not be the most performant solution.
+///
+/// # Errors
+/// Returns the parsing or execution error without hiding its cause.
 ///
 /// # Examples
 ///
@@ -797,6 +862,9 @@ pub fn evaluate_xpath<'d>(document: &'d Document<'d>, xpath: &str) -> Result<Val
         .evaluate(&context, document.root())
         .context(Executing)
 }
+
+#[cfg(test)]
+mod number_tests;
 
 #[cfg(test)]
 mod test {
@@ -861,7 +929,10 @@ mod test {
                 assert!(result.is_err());
                 assert_eq!(failure.get(), Some(MemoryError::LimitExceeded));
             } else {
-                assert_eq!(result.expect("current conversion"), 12.0);
+                assert!(super::same_xpath_number(
+                    result.expect("current conversion"),
+                    12.0
+                ));
                 assert_eq!(failure.get(), None);
             }
             assert_eq!(work.used(), 0);
@@ -892,7 +963,7 @@ mod test {
                     } else {
                         let result = result.expect("exact lexical work fits");
                         if text == " 1.5 " {
-                            assert_eq!(result, 1.5);
+                            assert!(super::same_xpath_number(result, 1.5));
                         } else {
                             assert!(result.is_nan());
                         }
@@ -904,27 +975,33 @@ mod test {
         let mut context = Context::without_core_functions();
         context.set_evaluation_work_limit(0);
         let evaluation = context::Evaluation::new(&context, document.root().into());
-        assert_eq!(Value::Boolean(true).number(&evaluation).unwrap(), 1.0);
-        assert_eq!(Value::Number(2.0).number(&evaluation).unwrap(), 2.0);
+        assert!(super::same_xpath_number(
+            Value::Boolean(true).number(&evaluation).unwrap(),
+            1.0
+        ));
+        assert!(super::same_xpath_number(
+            Value::Number(2.0).number(&evaluation).unwrap(),
+            2.0
+        ));
         assert_eq!(context.evaluation_work_used(), 0);
     }
 
     #[test]
     fn number_of_string_is_ieee_754_number() {
         let v = Value::String("1.5".to_owned());
-        assert_eq!(1.5, number(&v));
+        assert!(super::same_xpath_number(1.5, number(&v)));
     }
 
     #[test]
     fn number_of_string_with_negative_is_negative_number() {
         let v = Value::String("-1.5".to_owned());
-        assert_eq!(-1.5, number(&v));
+        assert!(super::same_xpath_number(-1.5, number(&v)));
     }
 
     #[test]
     fn number_of_string_with_surrounding_whitespace_is_number_without_whitespace() {
         let v = Value::String("\r\n1.5 \t".to_owned());
-        assert_eq!(1.5, number(&v));
+        assert!(super::same_xpath_number(1.5, number(&v)));
     }
 
     #[test]
@@ -944,13 +1021,13 @@ mod test {
     #[test]
     fn number_of_boolean_true_is_1() {
         let v = Value::Boolean(true);
-        assert_eq!(1.0, number(&v));
+        assert!(super::same_xpath_number(1.0, number(&v)));
     }
 
     #[test]
     fn number_of_boolean_false_is_0() {
         let v = Value::Boolean(false);
-        assert_eq!(0.0, number(&v));
+        assert!(super::same_xpath_number(0.0, number(&v)));
     }
 
     #[test]
@@ -964,7 +1041,7 @@ mod test {
         doc.root().append_child(c2);
 
         let v = Value::Nodeset(nodeset![c2, c1]);
-        assert_eq!(42.42, number(&v));
+        assert!(super::same_xpath_number(42.42, number(&v)));
     }
 
     #[test]
@@ -1092,8 +1169,8 @@ mod test {
         let source = format!("'{payload}'");
         let required = payload.len() + std::mem::size_of::<expression::Literal>();
         let factory = Factory::new();
-        assert!(factory.build_bounded(&source, required).is_ok());
-        let error = factory.build_bounded(&source, required - 1).unwrap_err();
+        assert!(Factory::build_bounded(&source, required).is_ok());
+        let error = Factory::build_bounded(&source, required - 1).unwrap_err();
         assert_eq!(error.allocation_limit(), Some((required - 1, required)));
         assert!(factory.build("1").is_ok());
     }
@@ -1112,26 +1189,23 @@ mod test {
             "//a",
         ] {
             assert!(
-                factory
-                    .build_bounded(source, 0)
+                Factory::build_bounded(source, 0)
                     .unwrap_err()
                     .allocation_limit()
                     .is_some()
             );
-            assert!(factory.build_bounded(source, 16_384).is_ok());
+            assert!(Factory::build_bounded(source, 16_384).is_ok());
         }
         for source in ["'unterminated", "f(1,)", "a/", "1 +", "!"] {
             assert_eq!(
                 factory.build(source).unwrap_err(),
-                factory.build_bounded(source, 16_384).unwrap_err()
+                Factory::build_bounded(source, 16_384).unwrap_err()
             );
         }
         // Parentheses allocate no AST nodes and must not accumulate per-rule heap charges.
         let nested = format!("{}1{}", "(".repeat(32), ")".repeat(32));
         assert!(
-            factory
-                .build_bounded(&nested, std::mem::size_of::<expression::Literal>())
-                .is_ok()
+            Factory::build_bounded(&nested, std::mem::size_of::<expression::Literal>()).is_ok()
         );
     }
 

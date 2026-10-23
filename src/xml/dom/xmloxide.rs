@@ -53,7 +53,7 @@ impl XmlBackendImplementation for XmloxideBackend {
         let parsed = xmloxide::parser::parse_str_with_options(input, &backend_options()).map_err(
             |error| match error {
                 xmloxide::error::ParseError::Resource(error) => error,
-                error => ParseError::Backend {
+                error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
                     backend: "xmloxide",
                     message: error.to_string(),
                 },
@@ -159,76 +159,16 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
                                 source,
                                 parent,
                                 namespace_owner,
-                                inherited_range,
+                                inherited_range.as_ref(),
                                 range_actionable,
                             )?;
                         }
-                        XmloxNodeKind::Element {
-                            name,
-                            prefix,
-                            namespace,
-                            attributes,
-                        } => {
-                            self.admit_node()?;
-                            let range = match inherited_range.clone() {
-                                Some(range) => range,
-                                None => self.positions.take(SourceKind::Element)?,
-                            };
-                            let inherited = namespace_owner
-                                .and_then(|owner| self.target.namespaces(owner))
-                                .unwrap_or_default();
-                            let mut namespaces = storage.values(inherited.len())?;
-                            for namespace in inherited {
-                                storage.charge(1)?;
-                                namespaces.push(NamespaceData {
-                                    prefix: storage.optional_text(namespace.prefix.as_deref())?,
-                                    uri: storage.text(namespace.uri.as_ref())?,
-                                })?;
-                            }
-                            let mut semantic_attributes = storage.values(attributes.len())?;
-                            for attribute in &**attributes {
-                                storage.charge(1)?;
-                                if attribute.prefix.as_deref() == Some("xmlns") {
-                                    set_namespace(
-                                        &mut namespaces,
-                                        Some(&attribute.name),
-                                        &attribute.value,
-                                        storage,
-                                    )?;
-                                } else if attribute.prefix.is_none()
-                                    && attribute.name.as_ref() == "xmlns"
-                                {
-                                    set_namespace(
-                                        &mut namespaces,
-                                        None,
-                                        &attribute.value,
-                                        storage,
-                                    )?;
-                                } else {
-                                    semantic_attributes.push(AttributeData {
-                                        name: storage.text(&attribute.name)?,
-                                        namespace: storage
-                                            .optional_text(attribute.namespace.as_deref())?,
-                                        prefix: storage
-                                            .optional_text(attribute.prefix.as_deref())?,
-                                        value: storage.text(&attribute.value)?,
-                                        is_id: false,
-                                        xml_id_error: None,
-                                    })?;
-                                }
-                            }
-                            let node = self.target.push_with_actionability(
-                                Some(parent),
-                                NodeKind::Element {
-                                    name: storage.text(name)?,
-                                    namespace: storage.optional_text(
-                                        namespace.as_deref().filter(|uri| !uri.is_empty()),
-                                    )?,
-                                    prefix: storage.optional_text(prefix.as_deref())?,
-                                    attributes: semantic_attributes,
-                                    namespaces,
-                                },
-                                range,
+                        kind @ XmloxNodeKind::Element { .. } => {
+                            let node = self.project_element(
+                                kind,
+                                parent,
+                                namespace_owner,
+                                inherited_range.as_ref(),
                                 range_actionable,
                             )?;
                             stack.push(ProjectionFrame::Exit(node))?;
@@ -237,63 +177,19 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
                                 source,
                                 node,
                                 Some(node),
+                                inherited_range.as_ref(),
+                                range_actionable,
+                            )?;
+                        }
+                        kind @ (XmloxNodeKind::Text { .. }
+                        | XmloxNodeKind::CData { .. }
+                        | XmloxNodeKind::Comment { .. }
+                        | XmloxNodeKind::ProcessingInstruction { .. }) => {
+                            self.project_leaf(
+                                source,
+                                parent,
+                                kind,
                                 inherited_range,
-                                range_actionable,
-                            )?;
-                        }
-                        XmloxNodeKind::Text { content } => {
-                            if self.source.parent(source) == Some(self.source.root()) {
-                                storage.charge(content.len())?;
-                                if content.chars().all(char::is_whitespace) {
-                                    continue;
-                                }
-                            }
-                            self.admit_text(parent)?;
-                            let range = match inherited_range {
-                                Some(range) => range,
-                                None => self.positions.take(SourceKind::Text)?,
-                            };
-                            self.target
-                                .append_text(parent, content, range, range_actionable)?;
-                        }
-                        XmloxNodeKind::CData { content } => {
-                            self.admit_text(parent)?;
-                            let range = match inherited_range {
-                                Some(range) => range,
-                                None => self.positions.take(SourceKind::CData)?,
-                            };
-                            self.target
-                                .append_text(parent, content, range, range_actionable)?;
-                        }
-                        XmloxNodeKind::Comment { content } => {
-                            self.admit_node()?;
-                            let range = match inherited_range {
-                                Some(range) => range,
-                                None => self.positions.take(SourceKind::Comment)?,
-                            };
-                            self.target.push_with_actionability(
-                                Some(parent),
-                                NodeKind::Comment(storage.text(content)?),
-                                range,
-                                range_actionable,
-                            )?;
-                        }
-                        XmloxNodeKind::ProcessingInstruction {
-                            target: pi_target,
-                            data,
-                        } => {
-                            self.admit_node()?;
-                            let range = match inherited_range {
-                                Some(range) => range,
-                                None => self.positions.take(SourceKind::Pi)?,
-                            };
-                            self.target.push_with_actionability(
-                                Some(parent),
-                                NodeKind::PI {
-                                    target: storage.text(pi_target)?,
-                                    value: storage.optional_text(data.as_deref())?,
-                                },
-                                range,
                                 range_actionable,
                             )?;
                         }
@@ -308,7 +204,7 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
                                     source,
                                     parent,
                                     namespace_owner,
-                                    Some(range),
+                                    Some(&range),
                                     false,
                                 )?;
                             } else if let Some(value) = value {
@@ -323,13 +219,156 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
         Ok(())
     }
 
+    fn project_element(
+        &mut self,
+        kind: &XmloxNodeKind<R>,
+        parent: NodeId,
+        namespace_owner: Option<NodeId>,
+        inherited_range: Option<&Range<usize>>,
+        range_actionable: bool,
+    ) -> Result<NodeId, ParseError> {
+        let XmloxNodeKind::Element {
+            name,
+            prefix,
+            namespace,
+            attributes,
+        } = kind
+        else {
+            unreachable!("element projection requires an element");
+        };
+        let storage = self.target.storage();
+        self.admit_node()?;
+        let range = match inherited_range {
+            Some(range) => range.clone(),
+            None => self.positions.take(SourceKind::Element)?,
+        };
+        let inherited = namespace_owner
+            .and_then(|owner| self.target.namespaces(owner))
+            .unwrap_or_default();
+        let mut namespaces = storage.values(inherited.len())?;
+        for namespace in inherited {
+            storage.charge(1)?;
+            namespaces.push(NamespaceData {
+                prefix: storage.optional_text(namespace.prefix.as_deref())?,
+                uri: storage.text(namespace.uri.as_ref())?,
+            })?;
+        }
+        let mut semantic_attributes = storage.values(attributes.len())?;
+        for attribute in &**attributes {
+            storage.charge(1)?;
+            if attribute.prefix.as_deref() == Some("xmlns") {
+                set_namespace(
+                    &mut namespaces,
+                    Some(&attribute.name),
+                    &attribute.value,
+                    storage,
+                )?;
+            } else if attribute.prefix.is_none() && attribute.name.as_ref() == "xmlns" {
+                set_namespace(&mut namespaces, None, &attribute.value, storage)?;
+            } else {
+                semantic_attributes.push(AttributeData {
+                    name: storage.text(&attribute.name)?,
+                    namespace: storage.optional_text(attribute.namespace.as_deref())?,
+                    prefix: storage.optional_text(attribute.prefix.as_deref())?,
+                    value: storage.text(&attribute.value)?,
+                    is_id: false,
+                    xml_id_error: None,
+                })?;
+            }
+        }
+        self.target.push_with_actionability(
+            Some(parent),
+            NodeKind::Element {
+                name: storage.text(name)?,
+                namespace: storage
+                    .optional_text(namespace.as_deref().filter(|uri| !uri.is_empty()))?,
+                prefix: storage.optional_text(prefix.as_deref())?,
+                attributes: semantic_attributes,
+                namespaces,
+            },
+            range,
+            range_actionable,
+        )
+    }
+
+    fn project_leaf(
+        &mut self,
+        source: XmloxNodeId,
+        parent: NodeId,
+        kind: &XmloxNodeKind<R>,
+        inherited_range: Option<Range<usize>>,
+        range_actionable: bool,
+    ) -> Result<(), ParseError> {
+        let storage = self.target.storage();
+        match kind {
+            XmloxNodeKind::Text { content } => {
+                if self.source.parent(source) == Some(self.source.root()) {
+                    storage.charge(content.len())?;
+                    if content.chars().all(char::is_whitespace) {
+                        return Ok(());
+                    }
+                }
+                self.admit_text(parent)?;
+                let range = match inherited_range {
+                    Some(range) => range,
+                    None => self.positions.take(SourceKind::Text)?,
+                };
+                self.target
+                    .append_text(parent, content, range, range_actionable)?;
+            }
+            XmloxNodeKind::CData { content } => {
+                self.admit_text(parent)?;
+                let range = match inherited_range {
+                    Some(range) => range,
+                    None => self.positions.take(SourceKind::CData)?,
+                };
+                self.target
+                    .append_text(parent, content, range, range_actionable)?;
+            }
+            XmloxNodeKind::Comment { content } => {
+                self.admit_node()?;
+                let range = match inherited_range {
+                    Some(range) => range,
+                    None => self.positions.take(SourceKind::Comment)?,
+                };
+                self.target.push_with_actionability(
+                    Some(parent),
+                    NodeKind::Comment(storage.text(content)?),
+                    range,
+                    range_actionable,
+                )?;
+            }
+            XmloxNodeKind::ProcessingInstruction {
+                target: pi_target,
+                data,
+            } => {
+                self.admit_node()?;
+                let range = match inherited_range {
+                    Some(range) => range,
+                    None => self.positions.take(SourceKind::Pi)?,
+                };
+                self.target.push_with_actionability(
+                    Some(parent),
+                    NodeKind::PI {
+                        target: storage.text(pi_target)?,
+                        value: storage.optional_text(data.as_deref())?,
+                    },
+                    range,
+                    range_actionable,
+                )?;
+            }
+            _ => unreachable!("leaf projection requires a leaf"),
+        }
+        Ok(())
+    }
+
     fn push_children(
         &self,
         stack: &mut S::Values<ProjectionFrame>,
         source: XmloxNodeId,
         parent: NodeId,
         namespace_owner: Option<NodeId>,
-        inherited_range: Option<Range<usize>>,
+        inherited_range: Option<&Range<usize>>,
         range_actionable: bool,
     ) -> Result<(), ParseError> {
         // Walk linked siblings backwards instead of allocating a second child
@@ -340,7 +379,7 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
                 source: current,
                 parent,
                 namespace_owner,
-                inherited_range: inherited_range.clone(),
+                inherited_range: inherited_range.cloned(),
                 range_actionable,
             })?;
             child = self.source.prev_sibling(current);

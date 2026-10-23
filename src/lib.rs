@@ -1,6 +1,6 @@
 //! # xml-sec — Pure Rust XML Security
 //!
-//! XMLDSig, XMLEnc and C14N with explicit policy and cryptographic providers.
+//! `XMLDSig`, `XMLEnc` and C14N with explicit policy and cryptographic providers.
 //! The default build is pure Rust. Optional native providers have their own
 //! toolchain requirements. Wire/CLI interoperability does not imply libxmlsec1
 //! C source or binary ABI compatibility.
@@ -13,8 +13,8 @@
 //! ## Features
 //!
 //! - **C14N** — XML Canonicalization (inclusive + exclusive)
-//! - **XMLDSig** — XML Digital Signatures (sign + verify)
-//! - **XMLEnc** — XML Encryption (encrypt + decrypt)
+//! - **`XMLDSig`**: XML Digital Signatures (sign + verify)
+//! - **`XMLEnc`**: XML Encryption (encrypt + decrypt)
 //! - **X.509** — Certificate-based key extraction
 //!
 //! ## Quick Start

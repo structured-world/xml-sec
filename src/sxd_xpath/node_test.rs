@@ -18,9 +18,9 @@ pub trait NodeTest: fmt::Debug {
     fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error>;
 
     #[cfg(test)]
-    fn test<'c, 'd>(
+    fn test<'d>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         result: &mut OrderedNodes<'d>,
     ) -> Result<(), Error> {
         if self.matches(context)? {
@@ -366,7 +366,7 @@ mod test {
     ) -> OrderedNodes<'d> {
         let mut result = OrderedNodes::new();
         let name = NameTest {
-            prefix: prefix.map(|p| p.to_owned()),
+            prefix: prefix.map(str::to_owned),
             local_part: local.to_owned(),
         };
         let test = Attribute::new(name);
@@ -466,7 +466,7 @@ mod test {
     ) -> OrderedNodes<'d> {
         let mut result = OrderedNodes::new();
         let name = NameTest {
-            prefix: prefix.map(|p| p.to_owned()),
+            prefix: prefix.map(str::to_owned),
             local_part: local.to_owned(),
         };
         let test = Element::new(name);

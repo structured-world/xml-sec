@@ -1,4 +1,4 @@
-//! Support for registering and creating XPath functions.
+//! Support for registering and creating `XPath` functions.
 
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
@@ -26,29 +26,36 @@ impl<'a> Resolved<'a> {
     }
 }
 
-/// Types that can be used as XPath functions.
+/// Types that can be used as `XPath` functions.
 pub trait Function {
     /// Evaluate this function in a specific context with a specific
     /// set of arguments.
-    fn evaluate<'c, 'd>(
+    ///
+    /// # Errors
+    /// Returns arity, type, resource, or extension errors from evaluation.
+    fn evaluate<'d>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         mut args: Vec<Value<'d>>,
     ) -> Result<Value<'d>, Error> {
         self.evaluate_borrowed(context, &mut args)
     }
 
-    /// Borrow admitted slots without copying them into a native Vec.
-    fn evaluate_borrowed<'c, 'd>(
+    /// Borrow admitted slots without copying them into a native `Vec`.
+    ///
+    /// # Errors
+    /// Returns `BorrowedArgumentsUnsupported` unless implemented by the function;
+    /// implementations preserve their arity, type, resource, and extension errors.
+    fn evaluate_borrowed<'d>(
         &self,
-        _context: &context::Evaluation<'c, 'd>,
+        _context: &context::Evaluation<'_, 'd>,
         _args: &mut [Value<'d>],
     ) -> Result<Value<'d>, Error> {
         Err(Error::BorrowedArgumentsUnsupported)
     }
 }
 
-/// Represents the kind of an XPath value without carrying a value.
+/// Represents the kind of an `XPath` value without carrying a value.
 #[derive(Debug, Copy, Clone, PartialEq, Hash)]
 pub enum ArgumentType {
     Boolean,
@@ -134,6 +141,10 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
         Self(values, std::marker::PhantomData)
     }
 
+    /// Remove the last argument without coercion.
+    ///
+    /// # Errors
+    /// Returns `ArgumentMissing` when no argument remains.
     pub fn pop_value(&mut self) -> Result<Value<'d>, Error> {
         self.0.pop().ok_or(Error::ArgumentMissing)
     }
@@ -146,6 +157,9 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
     }
 
     /// Ensures that there are at least the requested number of arguments.
+    ///
+    /// # Errors
+    /// Returns `NotEnoughArguments` when the minimum is not met.
     pub fn at_least(&self, minimum: usize) -> Result<(), Error> {
         let actual = self.0.len();
         if actual < minimum {
@@ -159,6 +173,9 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
     }
 
     /// Ensures that there are no more than the requested number of arguments.
+    ///
+    /// # Errors
+    /// Returns `TooManyArguments` when the maximum is exceeded.
     pub fn at_most(&self, maximum: usize) -> Result<(), Error> {
         let actual = self.0.len();
         if actual > maximum {
@@ -172,19 +189,23 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
     }
 
     /// Ensures that there are exactly the requested number of arguments.
+    ///
+    /// # Errors
+    /// Returns `NotEnoughArguments` or `TooManyArguments` for an arity mismatch.
     pub fn exactly(&self, expected: usize) -> Result<(), Error> {
         let actual = self.0.len();
-        if actual < expected {
-            Err(Error::NotEnoughArguments { expected, actual })
-        } else if actual > expected {
-            Err(Error::TooManyArguments { expected, actual })
-        } else {
-            Ok(())
+        match actual.cmp(&expected) {
+            std::cmp::Ordering::Less => Err(Error::NotEnoughArguments { expected, actual }),
+            std::cmp::Ordering::Greater => Err(Error::TooManyArguments { expected, actual }),
+            std::cmp::Ordering::Equal => Ok(()),
         }
     }
 
     /// Removes the **last** argument and ensures it is a boolean. If
     /// the argument is not a boolean, it is converted to one.
+    ///
+    /// # Errors
+    /// Returns `ArgumentMissing` when no argument remains.
     pub fn pop_boolean(&mut self) -> Result<bool, Error> {
         let v = self.0.pop().ok_or(Error::ArgumentMissing)?;
         Ok(v.into_boolean())
@@ -192,6 +213,9 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
 
     /// Removes the **last** argument and ensures it is a number. If
     /// the argument is not a number, it is converted to one.
+    ///
+    /// # Errors
+    /// Returns `ArgumentMissing` or the traversal/resource error from coercion.
     pub fn pop_number(&mut self, context: &context::Evaluation<'_, '_>) -> Result<f64, Error> {
         let value = self.0.pop().ok_or(Error::ArgumentMissing)?;
         value.number(context)
@@ -199,6 +223,9 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
 
     /// Removes the **last** argument and ensures it is a string. If
     /// the argument is not a string, it is converted to one.
+    ///
+    /// # Errors
+    /// Returns `ArgumentMissing` or the traversal/resource error from coercion.
     pub fn pop_string(&mut self, context: &context::Evaluation<'_, '_>) -> Result<String, Error> {
         match self.0.pop().ok_or(Error::ArgumentMissing)? {
             Value::String(value) => Ok(value),
@@ -230,6 +257,9 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
     /// Removes the **last** argument and ensures it is a nodeset. If
     /// the argument is not a nodeset, a type mismatch error is
     /// returned.
+    ///
+    /// # Errors
+    /// Returns `ArgumentMissing` or `ArgumentNotANodeset` without coercion.
     pub fn pop_nodeset(&mut self) -> Result<Nodeset<'d>, Error> {
         let v = self.0.pop().ok_or(Error::ArgumentMissing)?;
         match v {
@@ -248,9 +278,9 @@ impl<'d, A: ArgumentList<'d>> Index<usize> for Args<'d, A> {
 }
 
 impl Function for core::Core {
-    fn evaluate_borrowed<'c, 'd>(
+    fn evaluate_borrowed<'d>(
         &self,
-        context: &context::Evaluation<'c, 'd>,
+        context: &context::Evaluation<'_, 'd>,
         args: &mut [Value<'d>],
     ) -> Result<Value<'d>, Error> {
         self.evaluate_in(context, args, crate::runtime::Native)
@@ -286,6 +316,9 @@ pub(crate) fn append_metered_string(
 
 /// Borrow existing string values or coerce under the evaluation's traversal and memory limits.
 /// Consumers must additionally charge their own lexical processing of the returned text.
+///
+/// # Errors
+/// Returns the traversal or resource error before an inadmissible coercion.
 pub fn string_argument_view<'a>(
     value: &'a Value<'_>,
     context: &context::Evaluation<'_, '_>,
@@ -307,10 +340,11 @@ pub fn string_argument_view<'a>(
     }
 }
 
-// https://stackoverflow.com/a/28124775/155423
+// XPath 1.0 4.4 preserves signed zero and infinities when already integral.
+// https://www.w3.org/TR/1999/REC-xpath-19991116/#function-round
 fn round_ties_to_positive_infinity(x: f64) -> f64 {
     let y = x.floor();
-    if x == y {
+    if super::same_xpath_number(x, y) {
         x
     } else {
         let z = (2.0 * x - y).floor();
@@ -406,19 +440,22 @@ mod test {
             }
         }
 
-        fn evaluate<N, F>(&self, node: N, f: F, args: Vec<Value<'d>>) -> Result<Value<'d>, Error>
+        fn evaluate<N>(
+            &self,
+            node: N,
+            f: super::core::Core,
+            args: Vec<Value<'d>>,
+        ) -> Result<Value<'d>, Error>
         where
             N: Into<Node<'d>>,
-            F: Function,
         {
             let context = context::Evaluation::new(&self.context, node.into());
             f.evaluate(&context, args)
         }
     }
 
-    fn evaluate_literal<F, F2, T>(f: F, args: Vec<LiteralValue>, rf: F2) -> T
+    fn evaluate_literal<F2, T>(f: super::core::Core, args: Vec<LiteralValue>, rf: F2) -> T
     where
-        F: Function,
         F2: FnOnce(Result<Value<'_>, Error>) -> T,
     {
         let package = Package::new();
@@ -470,7 +507,7 @@ mod test {
     #[test]
     fn local_name_is_empty_for_empty_nodeset() {
         evaluate_literal(LocalName, args![nodeset![]], |r| {
-            assert_eq!(Ok(Value::String("".to_owned())), r);
+            assert_eq!(Ok(Value::String(String::new())), r);
         });
     }
 
@@ -688,7 +725,7 @@ mod test {
     fn substring_test(s: &str, start: f64, len: f64) -> String {
         evaluate_literal(Substring, args![s, start, len], |r| match r {
             Ok(Value::String(s)) => s,
-            r => panic!("substring failed: {:?}", r),
+            r => panic!("substring failed: {r:?}"),
         })
     }
 
@@ -791,7 +828,7 @@ mod test {
     fn translate_test(s: &str, from: &str, to: &str) -> String {
         evaluate_literal(Translate, args![s, from, to], |r| match r {
             Ok(Value::String(s)) => s,
-            r => panic!("translate failed: {:?}", r),
+            r => panic!("translate failed: {r:?}"),
         })
     }
 
@@ -954,7 +991,7 @@ mod test {
 
     #[test]
     fn number_fails_with_nan() {
-        evaluate_literal(NumberFn, args![" nope "], |r| assert_number(f64::NAN, r));
+        evaluate_literal(NumberFn, args![" nope "], |r| assert_number(f64::NAN, &r));
     }
 
     #[test]
@@ -1025,64 +1062,64 @@ mod test {
         }
     }
 
-    fn assert_number(expected: f64, actual: Result<Value<'_>, Error>) {
+    fn assert_number(expected: f64, actual: &Result<Value<'_>, Error>) {
         match actual {
-            Ok(Value::Number(n)) => assert_eq!(PedanticNumber(n), PedanticNumber(expected)),
-            _ => panic!("{:?} did not evaluate correctly", actual),
+            Ok(Value::Number(n)) => assert_eq!(PedanticNumber(*n), PedanticNumber(expected)),
+            _ => panic!("{actual:?} did not evaluate correctly"),
         }
     }
 
     #[test]
     fn floor_rounds_down() {
-        evaluate_literal(floor(), args![199.99], |r| assert_number(199.0, r));
+        evaluate_literal(floor(), args![199.99], |r| assert_number(199.0, &r));
     }
 
     #[test]
     fn ceiling_rounds_up() {
-        evaluate_literal(ceiling(), args![199.99], |r| assert_number(200.0, r));
+        evaluate_literal(ceiling(), args![199.99], |r| assert_number(200.0, &r));
     }
 
     #[test]
     fn round_nan_to_nan() {
-        evaluate_literal(round(), args![f64::NAN], |r| assert_number(f64::NAN, r));
+        evaluate_literal(round(), args![f64::NAN], |r| assert_number(f64::NAN, &r));
     }
 
     #[test]
     fn round_pos_inf_to_pos_inf() {
         evaluate_literal(round(), args![f64::INFINITY], |r| {
-            assert_number(f64::INFINITY, r)
+            assert_number(f64::INFINITY, &r);
         });
     }
 
     #[test]
     fn round_neg_inf_to_neg_inf() {
         evaluate_literal(round(), args![f64::NEG_INFINITY], |r| {
-            assert_number(f64::NEG_INFINITY, r)
+            assert_number(f64::NEG_INFINITY, &r);
         });
     }
 
     #[test]
     fn round_pos_zero_to_pos_zero() {
-        evaluate_literal(round(), args![0.0], |r| assert_number(0.0, r));
+        evaluate_literal(round(), args![0.0], |r| assert_number(0.0, &r));
     }
 
     #[test]
     fn round_neg_zero_to_neg_zero() {
-        evaluate_literal(round(), args![-0.0], |r| assert_number(-0.0, r));
+        evaluate_literal(round(), args![-0.0], |r| assert_number(-0.0, &r));
     }
 
     #[test]
     fn round_neg_zero_point_five_to_neg_zero() {
-        evaluate_literal(round(), args![-0.5], |r| assert_number(-0.0, r));
+        evaluate_literal(round(), args![-0.5], |r| assert_number(-0.0, &r));
     }
 
     #[test]
     fn round_neg_five_to_neg_five() {
-        evaluate_literal(round(), args![-5.0], |r| assert_number(-5.0, r));
+        evaluate_literal(round(), args![-5.0], |r| assert_number(-5.0, &r));
     }
 
     #[test]
     fn round_pos_zero_point_five_to_pos_one() {
-        evaluate_literal(round(), args![0.5], |r| assert_number(1.0, r));
+        evaluate_literal(round(), args![0.5], |r| assert_number(1.0, &r));
     }
 }

@@ -21,7 +21,7 @@ pub trait Storage: Copy {
     fn attributes<'a>(&self) -> Self::Attributes<'a>;
     /// Admit scanner/comparison work before executing it.
     fn admit(&self, units: usize) -> Result<(), Self::Refusal>;
-    /// Retain a diagnostic QName, allocating only on the cold failure path.
+    /// Retain a diagnostic `QName`, allocating only on the cold failure path.
     fn qualified_name(&self, name: Name<'_>) -> Result<Self::Label, Self::Refusal>;
 }
 

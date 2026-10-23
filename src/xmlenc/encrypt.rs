@@ -474,7 +474,7 @@ impl std::ops::Deref for BoundEncryption<'_> {
 
 impl BoundEncryption<'_> {
     fn document_parse_settings(&self) -> DocumentParseSettings {
-        DocumentParseSettings::from_policy(&self.policy.xml, &self.policy.resources)
+        DocumentParseSettings::from_policy(self.policy.xml, &self.policy.resources)
             .with_backend(self.xml_backend)
     }
 
@@ -574,7 +574,7 @@ impl BoundEncryption<'_> {
         budgets: EncryptionOperationBudgets,
     ) -> Result<(), XmlEncError> {
         self.policy.validate()?;
-        document.validate_operation_policy(&self.policy.xml, &self.policy.resources)?;
+        document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
         let document_nodes = document.with_view(|view| view.node_count());
         let (target, source, content_boundaries, selected_nodes) = document.with_view(|view| {
             let selected = select_encryption_target(view.document(), options.element_id)?;
@@ -1254,7 +1254,7 @@ fn count_generated_encrypted_data_nodes(
     // admitting that transient root so exact-fit content replacement remains valid.
     let settings = DocumentParseSettings {
         nodes_limit: maximum_nodes.saturating_add(1),
-        ..DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend)
+        ..DocumentParseSettings::from_policy(policy.xml, &policy.resources).with_backend(backend)
     };
     let generated =
         parse_borrowed_with_settings_and_budget(encrypted_data_xml, settings, Some(parse_budget))
@@ -1747,7 +1747,7 @@ fn validate_xml_plaintext(
     backend: crate::XmlBackend,
 ) -> Result<(), XmlEncError> {
     let settings =
-        DocumentParseSettings::from_policy(&policy.xml, &policy.resources).with_backend(backend);
+        DocumentParseSettings::from_policy(policy.xml, &policy.resources).with_backend(backend);
     match encrypted_type {
         EncryptedDataType::Element => {
             let document =

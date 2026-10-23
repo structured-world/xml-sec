@@ -171,8 +171,8 @@ mod tests {
         // Order should be: xmlns="..." (default), xmlns:a, xmlns:z.
         // find(r#"xmlns=""#) matches the start of xmlns="http://default.com"
         let idx_default = result.find(r#"xmlns=""#).expect("default ns");
-        let idx_a = result.find(r#"xmlns:a="#).expect("a ns");
-        let idx_z = result.find(r#"xmlns:z="#).expect("z ns");
+        let idx_a = result.find("xmlns:a=").expect("a ns");
+        let idx_z = result.find("xmlns:z=").expect("z ns");
         assert!(idx_default < idx_a, "default before a");
         assert!(idx_a < idx_z, "a before z");
     }

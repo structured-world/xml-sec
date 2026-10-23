@@ -1,4 +1,4 @@
-//! Original-source XPath nodes with current-execution construction.
+//! Original-source `XPath` nodes with current-execution construction.
 
 use std::cell::RefCell;
 
@@ -207,9 +207,9 @@ mod tests {
             calls: &'a Cell<usize>,
         }
         impl crate::function::Function for Probe<'_> {
-            fn evaluate_borrowed<'c, 'd>(
+            fn evaluate_borrowed<'d>(
                 &self,
-                _: &crate::context::Evaluation<'c, 'd>,
+                _: &crate::context::Evaluation<'_, 'd>,
                 values: &mut [crate::Value<'d>],
             ) -> Result<crate::Value<'d>, crate::function::Error> {
                 assert_eq!(

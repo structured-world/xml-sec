@@ -32,18 +32,18 @@ impl XmlCharExt for char {
         }
 
         matches!(*self as u32,
-            0x0000C0..=0x0000D6
-            | 0x0000D8..=0x0000F6
-            | 0x0000F8..=0x0002FF
-            | 0x000370..=0x00037D
-            | 0x00037F..=0x001FFF
-            | 0x00200C..=0x00200D
-            | 0x002070..=0x00218F
-            | 0x002C00..=0x002FEF
-            | 0x003001..=0x00D7FF
-            | 0x00F900..=0x00FDCF
-            | 0x00FDF0..=0x00FFFD
-            | 0x010000..=0x0EFFFF)
+            0x00C0..=0x00D6
+            | 0x00D8..=0x00F6
+            | 0x00F8..=0x02FF
+            | 0x0370..=0x037D
+            | 0x037F..=0x1FFF
+            | 0x200C..=0x200D
+            | 0x2070..=0x218F
+            | 0x2C00..=0x2FEF
+            | 0x3001..=0xD7FF
+            | 0xF900..=0xFDCF
+            | 0xFDF0..=0xFFFD
+            | 0x0001_0000..=0x000E_FFFF)
     }
 
     #[inline]
@@ -53,21 +53,21 @@ impl XmlCharExt for char {
             return (*self as u8).is_xml_name();
         }
 
-        matches!(*self as u32, 0x0000B7
-                | 0x0000C0..=0x0000D6
-                | 0x0000D8..=0x0000F6
-                | 0x0000F8..=0x0002FF
-                | 0x000300..=0x00036F
-                | 0x000370..=0x00037D
-                | 0x00037F..=0x001FFF
-                | 0x00200C..=0x00200D
-                | 0x00203F..=0x002040
-                | 0x002070..=0x00218F
-                | 0x002C00..=0x002FEF
-                | 0x003001..=0x00D7FF
-                | 0x00F900..=0x00FDCF
-                | 0x00FDF0..=0x00FFFD
-                | 0x010000..=0x0EFFFF)
+        matches!(*self as u32, 0x00B7
+                | 0x00C0..=0x00D6
+                | 0x00D8..=0x00F6
+                | 0x00F8..=0x02FF
+                | 0x0300..=0x036F
+                | 0x0370..=0x037D
+                | 0x037F..=0x1FFF
+                | 0x200C..=0x200D
+                | 0x203F..=0x2040
+                | 0x2070..=0x218F
+                | 0x2C00..=0x2FEF
+                | 0x3001..=0xD7FF
+                | 0xF900..=0xFDCF
+                | 0xFDF0..=0xFFFD
+                | 0x0001_0000..=0x000E_FFFF)
     }
 
     #[inline]
@@ -313,15 +313,6 @@ fn parse_misc<'input>(s: &mut Stream<'input>, events: &mut impl XmlEvents<'input
 //
 // We don't actually return a token for the XML declaration and only validate it.
 fn parse_declaration(s: &mut Stream) -> Result<()> {
-    // Skip UTF-8 BOM.
-    if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
-        s.advance(3);
-    }
-
-    if !s.starts_with(b"<?xml ") {
-        return Ok(());
-    }
-
     fn consume_spaces(s: &mut Stream) -> Result<()> {
         if s.starts_with_space() {
             s.skip_spaces();
@@ -334,6 +325,15 @@ fn parse_declaration(s: &mut Stream) -> Result<()> {
         }
 
         Ok(())
+    }
+
+    // Skip UTF-8 BOM.
+    if s.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        s.advance(3);
+    }
+
+    if !s.starts_with(b"<?xml ") {
+        return Ok(());
     }
 
     s.advance(5); // <?xml
@@ -398,10 +398,10 @@ fn parse_pi<'input>(s: &mut Stream<'input>, events: &mut impl XmlEvents<'input>)
     let target = s.consume_name()?;
     s.skip_spaces();
     let content = s.consume_chars(|s, c| !(c == '?' && s.starts_with(b"?>")))?;
-    let content = if !content.is_empty() {
-        Some(content)
-    } else {
+    let content = if content.is_empty() {
         None
+    } else {
+        Some(content)
     };
 
     s.skip_string(b"?>")?;
@@ -1088,6 +1088,17 @@ impl<'input> Stream<'input> {
     /// Consumes according to: <https://www.w3.org/TR/xml-names/#ns-qualnames>
     #[inline(never)]
     fn consume_qname(&mut self) -> Result<(&'input str, &'input str)> {
+        fn is_xml_name_start(name: &str) -> bool {
+            if let Some(b) = name.as_bytes().first() {
+                if *b < 128 {
+                    return b.is_xml_name_start();
+                } else if let Some(c) = name.chars().next() {
+                    return c.is_xml_name_start();
+                }
+            }
+            false
+        }
+
         let start = self.pos();
 
         let mut splitter = None;
@@ -1129,18 +1140,6 @@ impl<'input> Stream<'input> {
             // Slice an empty prefix. This way we can preserve attribute start position.
             (self.span.slice_region(start, start), local)
         };
-
-        fn is_xml_name_start(name: &str) -> bool {
-            if let Some(b) = name.as_bytes().first() {
-                if *b < 128 {
-                    return b.is_xml_name_start();
-                } else if let Some(c) = name.chars().next() {
-                    return c.is_xml_name_start();
-                }
-            }
-
-            false
-        }
 
         // Prefix must be empty or start with a `NameStartChar`.
         if !prefix.is_empty() && !is_xml_name_start(prefix) {
@@ -1212,9 +1211,8 @@ impl<'input> Stream<'input> {
         for c in text[..end].chars().rev() {
             if c == '\n' {
                 break;
-            } else {
-                col += 1;
             }
+            col += 1;
         }
 
         col

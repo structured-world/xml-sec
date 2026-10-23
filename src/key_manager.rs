@@ -2215,7 +2215,7 @@ impl KeyInventory {
                 resources.max_external_resource_total_bytes,
             ));
         }
-        let settings = DocumentParseSettings::from_policy(policy.xml_input_policy(), resources)
+        let settings = DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
             .with_backend(backend);
         let text = crate::document::decode_xml_with_budget(
             bytes,

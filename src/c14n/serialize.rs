@@ -173,7 +173,7 @@ impl<'a> CanonicalOutputOptions<'a> {
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
 pub(crate) trait NsRenderer<S: Scratch = Native, D: DomStorage = NativeDom> {
     /// Compute namespace declarations to emit for this element.
-    /// Returns (sorted_ns_decls, updated_rendered_map).
+    /// Returns `(sorted_ns_decls, updated_rendered_map)`.
     ///
     /// `parent_rendered` maps prefix → URI for what the nearest output ancestor
     /// already declared in the canonical form.
@@ -541,7 +541,7 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch,
         if prefix != "xml"
             && ns_renderer.renders_selected_namespace_of_omitted_element(prefix)
             && visibility.contains_namespace_at(owner, ordinal, namespace)?
-            && parent_rendered.get(prefix, false)?.flatten() != Some(namespace.uri())
+            && parent_rendered.get(prefix, false)?.uri() != Some(namespace.uri())
         {
             namespaces.push((prefix, namespace.uri()))?;
         }
@@ -585,7 +585,7 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch,
     })?;
     for attribute in attributes.iter() {
         output.write_all(b" ")?;
-        let prefix = attribute_prefix(owner, attribute);
+        let prefix = attribute_prefix(owner, *attribute);
         if !prefix.is_empty() {
             output.write_all(prefix.as_bytes())?;
             output.write_all(b":")?;
@@ -609,6 +609,37 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
     parent_rendered: &S::Namespaces<'n>,
     output: &mut CanonicalOutput<'_, W, S>,
 ) -> Result<(), C14nError> {
+    let rendered = serialize_start_tag(
+        node,
+        visibility,
+        ns_renderer,
+        config,
+        parent_rendered,
+        output,
+    )?;
+    serialize_children(
+        node,
+        visibility,
+        with_comments,
+        ns_renderer,
+        config,
+        &rendered,
+        output,
+    )?;
+    output.write_all(b"</")?;
+    write_qualified_name(node, output)?;
+    output.write_all(b">")?;
+    Ok(())
+}
+
+fn serialize_start_tag<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    node: Node<'n, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
+    ns_renderer: &dyn NsRenderer<S, D>,
+    config: C14nConfig,
+    parent_rendered: &S::Namespaces<'n>,
+    output: &mut CanonicalOutput<'_, W, S>,
+) -> Result<S::Namespaces<'n>, C14nError> {
     let (ns_decls, rendered) =
         ns_renderer.render_namespaces(node, parent_rendered, visibility, output.scratch)?;
 
@@ -653,27 +684,7 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
     // - parent is not in the node set (otherwise parent renders its own base)
     // The effective base is used for both inherited xml:base values and
     // resolving the element's own xml:base against the ancestor chain.
-    let parent_not_in_set = if let Some(set) = visibility {
-        match node.parent().filter(|p| p.is_element()) {
-            Some(parent) => !set.contains_node(parent)?,
-            None => true,
-        }
-    } else {
-        false
-    };
-    let effective_parent_base = if config.fixup_xml_base && parent_not_in_set {
-        match node.parent() {
-            Some(parent) => super::xml_base::compute_effective_xml_base_in(
-                parent,
-                visibility,
-                output.xml_base_resolution,
-                output.scratch,
-            )?,
-            None => None,
-        }
-    } else {
-        None
-    };
+    let effective_parent_base = effective_parent_base(node, visibility, config, output)?;
 
     // Build unified list: (ns_uri, local_name, prefix, value)
     // Using Cow to avoid allocations when no fixup is needed.
@@ -710,7 +721,7 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
         all_attrs.push((
             attr.namespace().unwrap_or(""),
             attr.name(),
-            attribute_prefix(node, &attr),
+            attribute_prefix(node, attr),
             value,
         ))?;
     }
@@ -753,22 +764,36 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
     // Always use <tag></tag> form, never self-closing.
     output.write_all(b">")?;
 
-    // Children.
-    serialize_children(
-        node,
-        visibility,
-        with_comments,
-        ns_renderer,
-        config,
-        &rendered,
-        output,
-    )?;
+    Ok(rendered)
+}
 
-    // End tag.
-    output.write_all(b"</")?;
-    write_qualified_name(node, output)?;
-    output.write_all(b">")?;
-    Ok(())
+fn effective_parent_base<W: Write + ?Sized, S: Scratch, D: DomStorage>(
+    node: Node<'_, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
+    config: C14nConfig,
+    output: &mut CanonicalOutput<'_, W, S>,
+) -> Result<Option<S::Text>, C14nError> {
+    let parent_not_in_set = if let Some(set) = visibility {
+        match node.parent().filter(Node::is_element) {
+            Some(parent) => !set.contains_node(parent)?,
+            None => true,
+        }
+    } else {
+        false
+    };
+    if config.fixup_xml_base && parent_not_in_set {
+        match node.parent() {
+            Some(parent) => super::xml_base::compute_effective_xml_base_in(
+                parent,
+                visibility,
+                output.xml_base_resolution,
+                output.scratch,
+            ),
+            None => Ok(None),
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 pub(super) fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
@@ -840,9 +865,8 @@ fn collect_inherited_xml_attrs<'a, S: Scratch, D: DomStorage>(
     fixup_xml_base: bool,
     scratch: &S,
 ) -> Result<S::Values<(&'a str, &'a str)>, C14nError> {
-    let set = match visibility {
-        Some(p) => p,
-        None => return Ok(scratch.values()), // Full document — no inheritance needed
+    let Some(set) = visibility else {
+        return Ok(scratch.values()); // Full document needs no inheritance.
     };
 
     // If parent element is in the node set, no inheritance needed — the parent
@@ -903,7 +927,7 @@ fn collect_inherited_xml_attrs<'a, S: Scratch, D: DomStorage>(
                     // node-set. Filtering here would change inherited XML
                     // semantics at an apex element.
                     if is_inheritable_xml_attr(local, inherit_xml_id)
-                        && seen.get(local, false)?.is_none()
+                        && !seen.get(local, false)?.is_present()
                     {
                         seen.insert(local, false, None)?;
                         inherited.push((attr.name(), attr.value()))?;
@@ -984,7 +1008,7 @@ mod tests {
             error,
             C14nError::OutputLimitExceeded { max_bytes: 7 }
         ));
-        assert!(output.is_empty());
+        assert_eq!(output.as_slice(), b"");
     }
 
     #[test]
@@ -1035,7 +1059,7 @@ mod tests {
         .unwrap();
         assert_eq!(sink.position, expected.len());
         assert_eq!(position, None);
-        assert!(tracked.is_empty());
+        assert_eq!(tracked.len(), 0);
         #[cfg(feature = "xmldsig")]
         {
             // Mode/PrefixList selection enters that same serializer. The sink
@@ -1877,7 +1901,7 @@ mod tests {
         let c = b.first_element_child().unwrap();
         let d = c.first_element_child().unwrap();
         let mut included = HashSet::from([a.id(), b.id(), d.id()]);
-        included.extend(d.children().map(|node| node.id()));
+        included.extend(d.children().map(crate::xml::dom::Node::id));
         let visibility = HiddenXmlBaseVisibility {
             included,
             hidden_base_owner: b.id(),
@@ -1915,7 +1939,7 @@ mod tests {
         let c = b.first_element_child().unwrap();
         let d = c.first_element_child().unwrap();
         let mut included = HashSet::from([a.id(), b.id(), d.id()]);
-        included.extend(d.children().map(|node| node.id()));
+        included.extend(d.children().map(crate::xml::dom::Node::id));
         let visibility = HiddenXmlBaseVisibility {
             included,
             hidden_base_owner: b.id(),
@@ -1954,7 +1978,7 @@ mod tests {
         let c = b.first_element_child().unwrap();
         let d = c.first_element_child().unwrap();
         let mut included = HashSet::from([a.id(), b.id(), d.id()]);
-        included.extend(d.children().map(|node| node.id()));
+        included.extend(d.children().map(crate::xml::dom::Node::id));
         let visibility = HiddenXmlBaseVisibility {
             included,
             hidden_base_owner: a.id(),

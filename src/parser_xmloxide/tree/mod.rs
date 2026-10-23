@@ -37,11 +37,16 @@ impl NodeId {
     ///
     /// # Panics
     ///
-    /// Panics if `index` is 0.
-    #[allow(clippy::expect_used, clippy::cast_possible_truncation)]
+    /// Panics if `index` is 0 or exceeds the checked arena's `u32` range.
     #[inline]
     fn from_index(index: usize) -> Self {
-        Self(NonZeroU32::new(index as u32).expect("NodeId index must be non-zero"))
+        let Ok(index) = u32::try_from(index) else {
+            panic!("node index fits the checked arena limit");
+        };
+        let Some(index) = NonZeroU32::new(index) else {
+            panic!("NodeId index must be non-zero");
+        };
+        Self(index)
     }
 
     /// Returns the raw index as a `usize` for indexing into the arena.
@@ -178,7 +183,7 @@ impl<S: NameStorage> std::fmt::Debug for Document<S> {
             .field("encoding", &self.encoding)
             .field("standalone", &self.standalone)
             .field("diagnostics", &&self.diagnostics[..])
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -1281,7 +1286,7 @@ mod tests {
     fn test_children_iterator_empty() {
         let doc = Document::new();
         let children: Vec<NodeId> = doc.children(doc.root()).collect();
-        assert!(children.is_empty());
+        assert_eq!(children.len(), 0);
     }
 
     #[test]

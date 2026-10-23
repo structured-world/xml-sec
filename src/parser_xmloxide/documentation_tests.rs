@@ -154,7 +154,7 @@ fn parser_push_rs_example_10() -> impl std::process::Termination {
     let doc = parser.finish().unwrap();
 }
 
-// tree/mod.rs:143; original runnable example.
+// tree/mod.rs:148; original runnable example.
 #[test]
 fn tree_mod_rs_example_1() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -165,7 +165,7 @@ fn tree_mod_rs_example_1() -> impl std::process::Termination {
     assert_eq!(doc.node_name(root), Some("root"));
 }
 
-// tree/mod.rs:215; original runnable example.
+// tree/mod.rs:220; original runnable example.
 #[test]
 fn tree_mod_rs_example_2() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -174,7 +174,7 @@ fn tree_mod_rs_example_2() -> impl std::process::Termination {
     let doc = Document::parse_str("<root><child/></root>").unwrap();
 }
 
-// tree/mod.rs:307; original runnable example.
+// tree/mod.rs:312; original runnable example.
 #[test]
 fn tree_mod_rs_example_3() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -185,18 +185,18 @@ fn tree_mod_rs_example_3() -> impl std::process::Termination {
     assert_eq!(doc.node_name(root), Some("root"));
 }
 
-// tree/mod.rs:342; original compile-only example.
+// tree/mod.rs:347; original compile-only example.
 #[test]
 fn tree_mod_rs_example_4() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
-    let _compile_only = || {
+    let _ = || {
         use xmloxide::Document;
 
         let doc = Document::parse_file("document.xml").unwrap();
     };
 }
 
-// tree/mod.rs:878; original runnable example.
+// tree/mod.rs:883; original runnable example.
 #[test]
 fn tree_mod_rs_example_5() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -209,7 +209,7 @@ fn tree_mod_rs_example_5() -> impl std::process::Termination {
     doc.append_child(root, cloned);
 }
 
-// tree/mod.rs:911; original runnable example.
+// tree/mod.rs:916; original runnable example.
 #[test]
 fn tree_mod_rs_example_6() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -272,7 +272,7 @@ fn validation_mod_rs_example_1() -> impl std::process::Termination {
     assert!(result.is_valid);
 }
 
-// validation/dtd.rs:928; original runnable example.
+// validation/dtd.rs:927; original runnable example.
 #[test]
 fn validation_dtd_rs_example_1() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -282,7 +282,7 @@ fn validation_dtd_rs_example_1() -> impl std::process::Termination {
     assert!(dtd.elements.contains_key("root"));
 }
 
-// validation/dtd.rs:2544; original runnable example.
+// validation/dtd.rs:2537; original runnable example.
 #[test]
 fn validation_dtd_rs_example_2() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;

@@ -88,7 +88,7 @@ for my $file (@files) {
         $tests .= "\n// $file:$example->{line}; original " . ($example->{no_run} ? 'compile-only' : 'runnable') . " example.\n";
         $tests .= "#[test]\nfn ${name}_example_${ordinal}() -> impl std::process::Termination {\n";
         $tests .= "    use crate::parser_$backend as $backend;\n";
-        $tests .= "    let _compile_only = || {\n" if $example->{no_run};
+        $tests .= "    let _ = || {\n" if $example->{no_run};
         # Leading bytes inside multiline Rust strings are data, not indentation.
         # rustfmt may format tokens afterwards but must see the original bytes.
         $tests .= $example->{body} . "\n";

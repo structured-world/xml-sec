@@ -1,4 +1,4 @@
-//! Support for the various types of contexts before and during XPath
+//! Support for the various types of contexts before and during `XPath`
 //! evaluation.
 
 #[cfg(feature = "embedded")]
@@ -14,9 +14,9 @@ use crate::function;
 use crate::nodeset::{Node, OrderedNodes};
 use crate::{OwnedQName, Value};
 
-/// A mapping of names to XPath functions.
+/// A mapping of names to `XPath` functions.
 type Functions<'f> = QNameMap<Box<dyn function::Function + 'f>>;
-/// A mapping of names to XPath variables.
+/// A mapping of names to `XPath` variables.
 type Variables<'d> = QNameMap<Value<'d>>;
 /// A mapping of namespace prefixes to namespace URIs.
 type Namespaces = HashMap<String, String>;
@@ -97,7 +97,7 @@ impl<V> QNameMap<V> {
     }
 }
 
-/// Contains the context in which XPath expressions are executed. The
+/// Contains the context in which `XPath` expressions are executed. The
 /// context contains functions, variables, and namespace mappings.
 ///
 /// ### Examples
@@ -159,7 +159,7 @@ impl<V> QNameMap<V> {
 ///
 pub type Context<'d> = ScopedContext<'static, 'd>;
 
-/// An XPath context whose function captures and document values have independent lifetimes.
+/// An `XPath` context whose function captures and document values have independent lifetimes.
 /// Borrowed callbacks need only outlive evaluation, not the XML document they inspect.
 pub struct ScopedContext<'f, 'd> {
     functions: Functions<'f>,
@@ -192,7 +192,8 @@ struct WorkBudget {
 }
 
 impl<'f, 'd> ScopedContext<'f, 'd> {
-    /// Registers the core XPath 1.0 functions.
+    /// Registers the core `XPath` 1.0 functions.
+    #[must_use]
     pub fn new() -> Self {
         let mut context = Self::without_core_functions();
         context.core_functions = true;
@@ -200,16 +201,17 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
     }
 
     /// No functions, variables or namespaces will be defined.
+    #[must_use]
     pub fn without_core_functions() -> Self {
         Self {
-            functions: Default::default(),
+            functions: Functions::default(),
             core_functions: false,
             #[cfg(feature = "embedded")]
             function_view: &[],
             #[cfg(feature = "embedded")]
             namespace_lookup: None,
-            variables: Default::default(),
-            namespaces: Default::default(),
+            variables: Variables::default(),
+            namespaces: Namespaces::default(),
             string_allocations: StringAllocationBudget::default(),
             evaluation_work: WorkBudget::default(),
             extension_work: WorkBudget::default(),
@@ -264,7 +266,7 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
 
     /// Admit primitive work in a borrowing embedding execution before running it.
     /// The callback neither allocates a new context nor replaces the independent
-    /// XPath limit. A refusal must retain its original cause in the embedding.
+    /// `XPath` limit. A refusal must retain its original cause in the embedding.
     pub fn set_work_admission(
         &mut self,
         admission: &'f dyn Fn(usize) -> Result<(), function::Error>,
@@ -272,7 +274,11 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
         self.work_admission = Some(admission);
     }
 
-    /// Charge primitive setup work performed while constructing this XPath context.
+    /// Charge primitive setup work performed while constructing this `XPath` context.
+    ///
+    /// # Errors
+    /// Returns the admission callback's refusal or a local work-limit error.
+    /// Work already admitted before a later refusal remains spent.
     pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
         if let Some(admission) = self.work_admission {
             admission(units)?;
@@ -302,6 +308,10 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
     }
 
     /// Reserve bytes in the context-scoped temporary allocation budget.
+    ///
+    /// # Errors
+    /// Returns an allocation-limit error if the attempted total overflows or
+    /// exceeds the configured allowance.
     pub fn reserve_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         reserve_allocation(&self.string_allocations, bytes)
     }
@@ -331,7 +341,7 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
 
     /// Borrows embedding-owned extension objects without boxing or copying
     /// names. Owned overrides still take precedence; duplicate view names use
-    /// the last binding, matching repeated set_function calls.
+    /// the last binding, matching repeated `set_function` calls.
     #[cfg(feature = "embedded")]
     pub(crate) fn set_function_view(&mut self, functions: FunctionView<'f>) {
         self.function_view = functions;
@@ -374,13 +384,13 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
     }
 }
 
-impl<'f, 'd> Default for ScopedContext<'f, 'd> {
+impl Default for ScopedContext<'_, '_> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// The context during evaluation of an XPath expression.
+/// The context during evaluation of an `XPath` expression.
 ///
 /// Clients of this library will use this when implementing custom
 /// functions.
@@ -407,7 +417,7 @@ pub struct Evaluation<'c, 'd> {
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
     string_allocations: &'c StringAllocationBudget,
-    evaluation_work: &'c WorkBudget,
+    work: &'c WorkBudget,
     extension_work: &'c WorkBudget,
     work_admission: Option<&'c dyn Fn(usize) -> Result<(), function::Error>>,
     document_root_resolver: Option<RootResolver>,
@@ -417,7 +427,7 @@ pub struct Evaluation<'c, 'd> {
 impl<'c, 'd> Copy for Evaluation<'c, 'd> {}
 
 impl<'c, 'd> Evaluation<'c, 'd> {
-    /// Prepares the context used while evaluating the XPath expression
+    /// Prepares the context used while evaluating the `XPath` expression
     pub fn new(context: &'c ScopedContext<'_, 'd>, node: Node<'d>) -> Evaluation<'c, 'd> {
         Evaluation {
             node,
@@ -430,7 +440,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             variables: &context.variables,
             namespaces: &context.namespaces,
             string_allocations: &context.string_allocations,
-            evaluation_work: &context.evaluation_work,
+            work: &context.evaluation_work,
             extension_work: &context.extension_work,
             work_admission: context.work_admission,
             document_root_resolver: context.document_root_resolver,
@@ -440,6 +450,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     }
 
     /// Creates a new context node using the provided node
+    #[must_use]
     pub fn new_context_for<N>(&self, node: N) -> Evaluation<'c, 'd>
     where
         N: Into<Node<'d>>,
@@ -470,11 +481,15 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     }
 
     /// Looks up the value of the variable
+    #[must_use]
     pub fn value_of(&self, name: QName<'_>) -> Option<&Value<'d>> {
         self.variables.get(name)
     }
 
     /// Looks up the namespace URI for the given prefix
+    ///
+    /// # Errors
+    /// Returns an embedding namespace resolver's refusal unchanged.
     pub fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error> {
         #[cfg(feature = "embedded")]
         if let Some(lookup) = self.namespace_lookup {
@@ -491,17 +506,26 @@ impl<'c, 'd> Evaluation<'c, 'd> {
         }
     }
 
-    /// Reserve bytes before an extension function allocates an XPath string result.
+    /// Reserve bytes before an extension function allocates an `XPath` string result.
+    ///
+    /// # Errors
+    /// Returns an allocation-limit error if the total overflows or exceeds the allowance.
     pub fn reserve_string_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         self.reserve_temporary_allocation(bytes)
     }
 
     /// Reserve bytes in the context-scoped temporary allocation budget.
+    ///
+    /// # Errors
+    /// Returns an allocation-limit error if the total overflows or exceeds the allowance.
     pub fn reserve_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         reserve_allocation(self.string_allocations, bytes)
     }
 
     /// Release bytes after temporary extension storage is destroyed or superseded.
+    ///
+    /// # Errors
+    /// Returns an accounting error if more bytes are released than were reserved.
     pub fn release_temporary_allocation(&self, bytes: usize) -> Result<(), function::Error> {
         release_allocation(self.string_allocations, bytes)
     }
@@ -517,19 +541,23 @@ impl<'c, 'd> Evaluation<'c, 'd> {
         Ok(())
     }
 
-    /// Charge primitive XPath evaluation work before performing it.
+    /// Charge primitive `XPath` evaluation work before performing it.
+    ///
+    /// # Errors
+    /// Returns the admission callback's refusal or a local work-limit error.
+    /// Work already admitted before a later refusal remains spent.
     pub fn charge_work(&self, units: usize) -> Result<(), function::Error> {
         if let Some(admission) = self.work_admission {
             admission(units)?;
         }
-        charge_work_budget(
-            self.evaluation_work,
-            units,
-            "XPath evaluation work budget exceeded",
-        )
+        charge_work_budget(self.work, units, "XPath evaluation work budget exceeded")
     }
 
     /// Charge extension-internal work before performing it.
+    ///
+    /// # Errors
+    /// Returns the admission callback's refusal or an extension-work-limit error.
+    /// Work already admitted before a later refusal remains spent.
     pub fn charge_extension_work(&self, units: usize) -> Result<(), function::Error> {
         if let Some(admission) = self.work_admission {
             admission(units)?;
@@ -542,6 +570,7 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     }
 
     /// Yields a new `Evaluation` context for each node in the nodeset.
+    #[must_use]
     pub fn new_contexts_for(self, nodes: OrderedNodes<'d>) -> EvaluationNodesetIter<'c, 'd> {
         let sz = nodes.size();
         EvaluationNodesetIter {
@@ -643,9 +672,9 @@ mod tests {
         // overrides must retain the same last-binding lookup/count semantics.
         struct Literal(bool);
         impl crate::function::Function for Literal {
-            fn evaluate<'c, 'd>(
+            fn evaluate<'d>(
                 &self,
-                _: &super::Evaluation<'c, 'd>,
+                _: &super::Evaluation<'_, 'd>,
                 _: Vec<crate::Value<'d>>,
             ) -> Result<crate::Value<'d>, crate::function::Error> {
                 Ok(crate::Value::Boolean(self.0))
@@ -752,9 +781,9 @@ mod tests {
         // them, exactly as with the former eagerly allocated registry.
         struct False;
         impl crate::function::Function for False {
-            fn evaluate<'c, 'd>(
+            fn evaluate<'d>(
                 &self,
-                _: &super::Evaluation<'c, 'd>,
+                _: &super::Evaluation<'_, 'd>,
                 _: Vec<crate::Value<'d>>,
             ) -> Result<crate::Value<'d>, crate::function::Error> {
                 Ok(crate::Value::Boolean(false))
@@ -834,9 +863,9 @@ mod tests {
         // step. Refusal cannot invoke an extension or allocate a string cause.
         struct Observe<'a>(&'a std::cell::Cell<usize>);
         impl crate::function::Function for Observe<'_> {
-            fn evaluate<'c, 'd>(
+            fn evaluate<'d>(
                 &self,
-                _: &super::Evaluation<'c, 'd>,
+                _: &super::Evaluation<'_, 'd>,
                 _: Vec<crate::Value<'d>>,
             ) -> Result<crate::Value<'d>, crate::function::Error> {
                 self.0.set(self.0.get() + 1);
@@ -895,9 +924,9 @@ mod tests {
         // another ownership wrapper on every XPath evaluation.
         struct Borrowed<'a>(&'a std::cell::Cell<usize>);
         impl crate::function::Function for Borrowed<'_> {
-            fn evaluate<'c, 'd>(
+            fn evaluate<'d>(
                 &self,
-                _: &super::Evaluation<'c, 'd>,
+                _: &super::Evaluation<'_, 'd>,
                 _: Vec<crate::Value<'d>>,
             ) -> Result<crate::Value<'d>, crate::function::Error> {
                 self.0.set(self.0.get() + 1);

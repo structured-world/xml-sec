@@ -47,7 +47,7 @@ fn parse_mutation_xml_with_budget<'a>(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<crate::xml::dom::Document<'a>, XmlMutationError> {
     let settings = policy
-        .map(|policy| DocumentParseSettings::from_policy(&policy.xml, &policy.resources))
+        .map(|policy| DocumentParseSettings::from_policy(policy.xml, &policy.resources))
         .unwrap_or_default();
     parse_with_options_and_budget(xml, settings, budget)
         .map_err(|error| map_mutation_parse_error(error, settings))
