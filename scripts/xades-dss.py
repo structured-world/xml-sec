@@ -6,13 +6,18 @@ inputs; no fixture is uploaded. Build dependencies stay outside the corpus.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
-import subprocess
+import sys
 import tarfile
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.dont_write_bytecode = True
+spec = importlib.util.spec_from_file_location("corpus", ROOT / "scripts/xades-interop.py")
+corpus = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(corpus)
 PACKAGE = ROOT / "interop/xades"
 TOOLS = ROOT / ".tools/xades-dss"
 MAVEN = "3.9.12"
@@ -64,11 +69,7 @@ def summarize(logs):
 
 
 def run(args, log):
-    result = subprocess.run([str(a) for a in args], cwd=ROOT, capture_output=True)
-    log.parent.mkdir(parents=True, exist_ok=True)
-    log.with_suffix(".command.json").write_text(json.dumps([str(a) for a in args], indent=2))
-    log.with_suffix(".stdout").write_bytes(result.stdout)
-    log.with_suffix(".stderr").write_bytes(result.stderr)
+    result = corpus.command(args, log)
     if result.returncode:
         raise SystemExit(f"failed ({result.returncode}): inspect {log}")
     return result

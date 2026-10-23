@@ -32,6 +32,47 @@ spec_check.loader.exec_module(check)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_commands_bound_execution_and_retain_timeout_diagnostics(self):
+        # A stuck compiler/validator must fail with its argv and partial streams,
+        # rather than waiting for the CI job timeout or losing its diagnostics.
+        with tempfile.TemporaryDirectory() as directory:
+            for runner in [interop.command, dss.run]:
+                with self.subTest(runner=runner.__module__):
+                    log = Path(directory) / runner.__module__ / 'hung'
+
+                    def expired(arguments, **options):
+                        self.assertGreater(options.get('timeout', 0), 0)
+                        self.assertEqual(json.loads(log.with_suffix('.command.json').read_text()), arguments)
+                        raise subprocess.TimeoutExpired(arguments, options['timeout'],
+                                                        output=b'partial stdout\n', stderr=b'partial stderr\n')
+
+                    with patch('subprocess.run', side_effect=expired):
+                        with self.assertRaisesRegex(SystemExit, 'timed out.*hung'):
+                            runner(['synthetic-never-run'], log)
+                    self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'partial stdout\n')
+                    self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'partial stderr\n')
+
+    def test_command_terminates_a_real_stuck_child(self):
+        # Exercise the actual subprocess deadline, including flushed diagnostics.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'child'
+            with self.assertRaisesRegex(SystemExit, 'timed out.*child'):
+                interop.command([sys.executable, '-u', '-c',
+                    "import sys,time; print('ready'); print('waiting', file=sys.stderr); time.sleep(30)"],
+                    log, timeout=2)
+            self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'ready\n')
+            self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'waiting\n')
+
+    def test_timeout_before_first_output_retains_empty_streams(self):
+        # Timing out before the first byte still leaves inspectable stream files.
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / 'silent'
+            with patch('subprocess.run', side_effect=subprocess.TimeoutExpired(['silent'], 900)):
+                with self.assertRaisesRegex(SystemExit, 'timed out.*silent'):
+                    interop.command(['silent'], log)
+            self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'')
+            self.assertEqual(log.with_suffix('.stderr').read_bytes(), b'')
+
     def test_inventory_rejects_changed_assets_and_tracked_run_outputs(self):
         # CI must catch stale reference data and accidental commits of actual outputs.
         with tempfile.TemporaryDirectory() as directory:

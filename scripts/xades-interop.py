@@ -26,11 +26,19 @@ SP = "http://uri.etsi.org/01903/v1.3.2#"
 XMLSEC = os.environ.get("XMLSEC1_BIN", "xmlsec1")
 
 
-def command(args, log, env=None):
-    result = subprocess.run([str(x) for x in args], cwd=ROOT, env=env,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+def command(args, log, env=None, *, timeout=900):
+    arguments = [str(x) for x in args]
     log.parent.mkdir(parents=True, exist_ok=True)
-    log.with_suffix(".command.json").write_text(json.dumps([str(x) for x in args], indent=2))
+    log.with_suffix(".command.json").write_text(json.dumps(arguments, indent=2))
+    try:
+        result = subprocess.run(arguments, cwd=ROOT, env=env, timeout=timeout,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.TimeoutExpired as error:
+        # TimeoutExpired streams are None when no bytes have been captured.
+        log.with_suffix(".stdout").write_bytes(error.output if error.output is not None else b"")
+        log.with_suffix(".stderr").write_bytes(error.stderr if error.stderr is not None else b"")
+        raise SystemExit(f"command timed out after {timeout}s; inspect {log}.command.json, "
+                         f"{log}.stdout and {log}.stderr") from error
     log.with_suffix(".stdout").write_bytes(result.stdout)
     log.with_suffix(".stderr").write_bytes(result.stderr)
     return result
@@ -211,14 +219,20 @@ def run_all(results):
     if results.exists():
         raise SystemExit("results already exist; archive them or choose a fresh checkout before rerunning")
     results.mkdir(parents=True)
-    oracle_version = subprocess.check_output([XMLSEC, "--version"]).decode().strip()
+    oracle = command([XMLSEC, "--version"], results / "versions/xmlsec1")
+    if oracle.returncode:
+        raise SystemExit("oracle version query failed; inspect versions/xmlsec1.stderr")
+    oracle_version = oracle.stdout.decode().strip()
     if oracle_version not in {"xmlsec1 1.3.12 (openssl)", "xmlsec1 1.3.13 (openssl)"}:
         raise SystemExit(f"byte-dump parser requires qualified native xmlsec1 1.3.12/1.3.13 (openssl), got: {oracle_version}")
-    versions = {"commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()}
+    commit = command(["git", "rev-parse", "HEAD"], results / "versions/commit")
+    if commit.returncode:
+        raise SystemExit("commit query failed; inspect versions/commit.stderr")
+    versions = {"commit": commit.stdout.decode().strip(), "xmlsec1": (oracle.stdout + oracle.stderr).decode()}
     executable = Path(shutil.which(XMLSEC)).resolve()
     versions["oracle_binary"] = dict(name=executable.name, sha256=digest(executable.read_bytes()))
     for name, args in {"rustc": ["rustc", "-Vv"], "cargo": ["cargo", "-V"],
-                       "xmlsec1": [XMLSEC, "--version"], "openssl": ["openssl", "version"],
+                       "openssl": ["openssl", "version"],
                        "python": ["python3", "--version"]}.items():
         result = command(args, results / "versions" / name)
         versions[name] = (result.stdout + result.stderr).decode()
