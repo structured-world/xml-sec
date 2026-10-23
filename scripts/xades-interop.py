@@ -11,11 +11,13 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,28 @@ EXC = "http://www.w3.org/2001/10/xml-exc-c14n#"
 C11 = "http://www.w3.org/2006/12/xml-c14n11"
 SP = "http://uri.etsi.org/01903/v1.3.2#"
 XMLSEC = os.environ.get("XMLSEC1_BIN", "xmlsec1")
+
+
+def _capture_streams(process, stdout, stderr, timeout):
+    # Persist progress before an enclosing runner can cancel this process.
+    # Pipes still keep the deadline active when a descendant outlives its parent.
+    deadline = time.monotonic() + timeout
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ, stdout)
+        selector.register(process.stderr, selectors.EVENT_READ, stderr)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(process.args, timeout)
+            for key, _ in selector.select(remaining):
+                # This is a read chunk, not a total output limit.
+                data = os.read(key.fd, 65536)
+                if data:
+                    key.data.write(data)
+                    key.data.flush()
+                else:
+                    selector.unregister(key.fileobj)
+    process.wait(timeout=max(0, deadline - time.monotonic()))
 
 
 def command(args, log, env=None, *, timeout=900):
@@ -44,9 +68,11 @@ def command(args, log, env=None, *, timeout=900):
     # setsid isolates the outer command from its controller. Nested wrappers
     # inherit that group: detaching again would escape the outer timeout.
     # https://docs.python.org/3/library/subprocess.html#popen-constructor
-    with subprocess.Popen(arguments, cwd=ROOT, env=child_env,
-                          start_new_session=not shared_group,
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+    with (log.with_suffix(".stdout").open("wb") as stdout_log,
+          log.with_suffix(".stderr").open("wb") as stderr_log,
+          subprocess.Popen(arguments, cwd=ROOT, env=child_env,
+                           start_new_session=not shared_group,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process):
         group = os.getpgrp() if shared_group else process.pid
 
         def terminate_group():
@@ -56,32 +82,26 @@ def command(args, log, env=None, *, timeout=900):
                 pass  # The group already exited before cancellation.
 
         try:
-            stdout, stderr = process.communicate(timeout=timeout)
+            _capture_streams(process, stdout_log, stderr_log, timeout)
         except subprocess.TimeoutExpired as error:
             message = (f"command timed out after {timeout}s; inspect {log}.command.json, "
                        f"{log}.stdout and {log}.stderr")
             try:
-                # Save before signalling: a nested timeout cancels its own
-                # wrapper too, and the outer controller reports its failure.
-                log.with_suffix(".stdout").write_bytes(error.output if error.output is not None else b"")
-                log.with_suffix(".stderr").write_bytes(error.stderr if error.stderr is not None else b"")
                 if shared_group:
                     print(message, file=sys.stderr, flush=True)
             finally:
                 terminate_group()
             stdout, stderr = process.communicate()
-            log.with_suffix(".stdout").write_bytes(stdout)
-            log.with_suffix(".stderr").write_bytes(stderr)
+            stdout_log.write(stdout)
+            stderr_log.write(stderr)
             raise SystemExit(message) from error
         except BaseException:
             # In particular, do not leave the isolated group behind on Ctrl-C.
             terminate_group()
             process.communicate()
             raise
-        result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
-    log.with_suffix(".stdout").write_bytes(result.stdout)
-    log.with_suffix(".stderr").write_bytes(result.stderr)
-    return result
+    return subprocess.CompletedProcess(arguments, process.returncode,
+        log.with_suffix(".stdout").read_bytes(), log.with_suffix(".stderr").read_bytes())
 
 
 def build_probe(log):

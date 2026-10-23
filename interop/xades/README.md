@@ -105,7 +105,8 @@ CI publishes actual octets, hashes, first-difference diagnostics and full DSS re
 
 The runners require POSIX process groups (Linux/macOS). Commands default to a 900-second
 deadline; nested commands share the enclosing phase's process group. A timeout aborts
-that group and records the command arguments and captured streams for diagnosis.
+that group. Arguments are recorded before launch and streams are logged as commands run,
+preserving nested diagnostics when an enclosing deadline cancels the phase.
 
 Individual investigation commands:
 

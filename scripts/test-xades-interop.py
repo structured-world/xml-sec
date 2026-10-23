@@ -60,14 +60,19 @@ class EvidenceTests(unittest.TestCase):
         parent = ("import subprocess,sys,time; from pathlib import Path; "
                   "process=subprocess.Popen([sys.executable, '-c', sys.argv[1], *sys.argv[2:]])\n"
                   "while not Path(sys.argv[3]).exists(): time.sleep(.01)\n"
-                  "print('ready', flush=True); process.wait()\n")
+                  "print('ready', flush=True); print('waiting', file=sys.stderr, flush=True); process.wait()\n")
         with tempfile.TemporaryDirectory() as directory:
-            for owner, inner_timeout, timeout in [('direct', None, 2), ('outer', 30, 2), ('inner', 2, 5)]:
+            for owner, inner_timeout, timeout in [
+                    ('direct', None, 2), ('exited-parent', None, 2), ('outer', 30, 2), ('inner', 2, 5)]:
                 with self.subTest(timeout_owner=owner):
                     output = Path(directory) / owner
                     output.mkdir()
                     lock, ready, stop = [output / name for name in ['lock', 'ready', 'stop']]
                     arguments = [sys.executable, '-c', parent, child, lock, ready, stop]
+                    if owner == 'exited-parent':
+                        # An exited parent does not end the descendant's output
+                        # lifetime or release its held lock.
+                        arguments[2] = parent.removesuffix('process.wait()\n')
                     if inner_timeout is not None:
                         wrapper = ("import json,runpy,sys; from pathlib import Path; "
                                    "runpy.run_path(sys.argv[1])['command'](json.loads(sys.argv[2]), "
@@ -80,8 +85,9 @@ class EvidenceTests(unittest.TestCase):
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn(b'timed out', result.stderr)
                         self.assertTrue(ready.exists(), 'descendant did not reach the reproduction')
-                        if owner == 'inner':
+                        if inner_timeout is not None:
                             self.assertEqual((output / 'inner.stdout').read_bytes(), b'ready\n')
+                            self.assertEqual((output / 'inner.stderr').read_bytes(), b'waiting\n')
                         with lock.open() as held:
                             try:
                                 fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -173,7 +179,7 @@ class EvidenceTests(unittest.TestCase):
         # A stuck compiler/validator must fail with its argv and partial streams,
         # rather than waiting for the CI job timeout or losing its diagnostics.
         with tempfile.TemporaryDirectory() as directory:
-            for runner in [interop.command, dss.run]:
+            for runner, core in [(interop.command, interop), (dss.run, dss.corpus)]:
                 with self.subTest(runner=runner.__module__):
                     log = Path(directory) / runner.__module__ / 'hung'
 
@@ -184,15 +190,15 @@ class EvidenceTests(unittest.TestCase):
                         self.assertEqual(json.loads(log.with_suffix('.command.json').read_text()), arguments)
                         return process
 
-                    def expired(timeout=None):
-                        if timeout is None:
-                            return b'partial stdout\n', b'partial stderr\n'
+                    def expired(child, stdout, stderr, timeout):
                         self.assertGreater(timeout, 0)
-                        raise subprocess.TimeoutExpired(['synthetic-never-run'], timeout,
-                            output=b'partial stdout\n', stderr=b'partial stderr\n')
+                        stdout.write(b'partial stdout\n'); stdout.flush()
+                        stderr.write(b'partial stderr\n'); stderr.flush()
+                        raise subprocess.TimeoutExpired(['synthetic-never-run'], timeout)
 
-                    process.communicate.side_effect = expired
-                    with patch('subprocess.Popen', side_effect=launch), patch('os.killpg') as killed:
+                    process.communicate.return_value = (b'', b'')
+                    with (patch('subprocess.Popen', side_effect=launch), patch('os.killpg') as killed,
+                          patch.object(core, '_capture_streams', side_effect=expired)):
                         with self.assertRaisesRegex(SystemExit, 'timed out.*hung'):
                             runner(['synthetic-never-run'], log)
                     killed.assert_called_once()
@@ -217,8 +223,9 @@ class EvidenceTests(unittest.TestCase):
             log = Path(directory) / 'silent'
             process = MagicMock()
             process.__enter__.return_value = process
-            process.communicate.side_effect = [subprocess.TimeoutExpired(['silent'], 900), (b'', b'')]
-            with patch('subprocess.Popen', return_value=process), patch('os.killpg'):
+            process.communicate.return_value = (b'', b'')
+            with (patch('subprocess.Popen', return_value=process), patch('os.killpg'),
+                  patch.object(interop, '_capture_streams', side_effect=subprocess.TimeoutExpired(['silent'], 900))):
                 with self.assertRaisesRegex(SystemExit, 'timed out.*silent'):
                     interop.command(['silent'], log)
             self.assertEqual(log.with_suffix('.stdout').read_bytes(), b'')
