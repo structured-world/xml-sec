@@ -658,16 +658,82 @@ pub(crate) fn validate_supplied_path<'a>(
     }
 }
 
+fn materialize_effective_spki<W: Work>(
+    key: structured_pkix::path::WorkingKey<'_>,
+    execution: &W,
+) -> Result<OwnedVec<u8>, X509ChainError> {
+    use structured_pkix::key::effective::{EffectiveSpki, VisitError};
+
+    // RFC 3279 2.3.2: inheritance cannot repair written DSA NULL. Framing
+    // proves no algorithm-specific validity, so inspect the original key first.
+    // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.2
+    let own = key.key().algorithm();
+    let effective = EffectiveSpki::read(key, execution).map_err(X509ChainError::Processing)?;
+    let source = effective.execution_in(execution);
+    if own.has_null_parameter() {
+        source
+            .charge_work(own.algorithm().as_bytes().len() as u64)
+            .map_err(|reason| {
+                X509ChainError::Processing(structured_pkix::Error::resource(
+                    reason,
+                    "issuer.public_key",
+                    own.offset(),
+                ))
+            })?;
+        if own.algorithm().as_bytes() == dsa::OID.as_bytes() {
+            structured_pkix::key::dsa::read(key, execution).map_err(X509ChainError::Processing)?;
+        }
+    }
+
+    let resource = |reason| {
+        X509ChainError::Processing(structured_pkix::Error::resource(
+            reason,
+            "issuer.public_key",
+            own.offset(),
+        ))
+    };
+    let length = usize::try_from(effective.encoded_len())
+        .map_err(|_| resource(MemoryError::CapacityOverflow))?;
+    let mut bytes = source.vector();
+    bytes.try_reserve_exact(length).map_err(resource)?;
+    let mut output = Some(bytes.into_owned());
+    effective
+        .visit(execution, |_, chunk, work| {
+            // Transfer the same allocation into each part's original/current
+            // execution. OwnedVec pays for the copy once, without losing the
+            // independent inherited-parameter source ceiling or reallocating.
+            let mut bytes = output
+                .take()
+                .expect("previous part completed")
+                .with_execution(work)
+                .expect("EffectiveSpki parts use the current allocation account");
+            bytes.try_extend_from_slice(chunk)?;
+            output = Some(bytes.into_owned());
+            Ok::<_, MemoryError>(())
+        })
+        .map_err(|error| match error {
+            VisitError::Processing { source, .. } => X509ChainError::Processing(source),
+            VisitError::Callback {
+                context, source, ..
+            } => X509ChainError::Processing(structured_pkix::Error::resource(
+                source,
+                "issuer.public_key",
+                context.start,
+            )),
+        })?;
+    Ok(output.expect("all parts completed"))
+}
+
 fn with_effective_spki<T, W: Work>(
-    encoded: &[u8],
-    parameters: Option<&[u8]>,
+    key: structured_pkix::path::WorkingKey<'_>,
     execution: &W,
     verify: impl FnOnce(&[u8]) -> Result<T, X509ChainError>,
 ) -> Result<T, X509ChainError> {
-    let Some(parameters) = parameters else {
-        return verify(encoded);
-    };
-    let effective = encode_effective_spki(encoded, parameters, execution)?;
+    let original = key.key();
+    if key.parameters().is_none() || !original.algorithm().has_no_parameters() {
+        return verify(original.as_bytes());
+    }
+    let effective = materialize_effective_spki(key, execution)?;
     verify(&effective)
 }
 
@@ -689,105 +755,12 @@ pub(crate) fn effective_target_spki(
         });
     }
     match key.parameters() {
-        Some(parameters) => {
-            encode_effective_spki(original.as_bytes(), parameters, execution).map(|spki| {
-                ValidatedX509Key {
-                    effective_spki: Some(spki),
-                }
-            })
-        }
+        Some(_) => materialize_effective_spki(key, execution).map(|spki| ValidatedX509Key {
+            effective_spki: Some(spki),
+        }),
         None => Ok(ValidatedX509Key {
             effective_spki: None,
         }),
-    }
-}
-
-fn encode_effective_spki<W: Work>(
-    encoded: &[u8],
-    parameters: &[u8],
-    execution: &W,
-) -> Result<OwnedVec<u8, W>, X509ChainError> {
-    use der::{Decode as _, Encode as _};
-    execution
-        .charge_work(encoded.len() as u64)
-        .map_err(|reason| {
-            X509ChainError::Processing(structured_pkix::Error::resource(
-                reason,
-                "issuer.public_key",
-                0,
-            ))
-        })?;
-    let key = pkcs8::SubjectPublicKeyInfoRef::from_der(encoded).map_err(|error| {
-        X509ChainError::InvalidDer {
-            kind: "issuer public key",
-            message: error.to_string(),
-        }
-    })?;
-    let parameters =
-        der::asn1::AnyRef::from_der(parameters).map_err(|error| X509ChainError::InvalidDer {
-            kind: "inherited issuer parameters",
-            message: error.to_string(),
-        })?;
-    let effective = pkcs8::SubjectPublicKeyInfoRef {
-        algorithm: pkcs8::AlgorithmIdentifierRef {
-            oid: key.algorithm.oid,
-            parameters: Some(parameters),
-        },
-        subject_public_key: key.subject_public_key,
-    };
-    let length = effective
-        .encoded_len()
-        .map_err(|error| X509ChainError::InvalidDer {
-            kind: "effective issuer public key",
-            message: error.to_string(),
-        })?;
-    let mut writer = AccountedDerWriter {
-        bytes: execution.vector(),
-        failure: None,
-    };
-    writer
-        .bytes
-        .try_reserve_exact(usize::try_from(length).map_err(|_| {
-            X509ChainError::Processing(structured_pkix::Error::resource(
-                MemoryError::CapacityOverflow,
-                "issuer.public_key",
-                0,
-            ))
-        })?)
-        .map_err(|error| {
-            X509ChainError::Processing(structured_pkix::Error::resource(
-                error,
-                "issuer.public_key",
-                0,
-            ))
-        })?;
-    if let Err(error) = effective.encode(&mut writer) {
-        return Err(match writer.failure {
-            Some(reason) => X509ChainError::Processing(structured_pkix::Error::resource(
-                reason,
-                "issuer.public_key",
-                0,
-            )),
-            None => X509ChainError::InvalidDer {
-                kind: "effective issuer public key",
-                message: error.to_string(),
-            },
-        });
-    }
-    Ok(writer.bytes)
-}
-
-struct AccountedDerWriter<W: Work> {
-    bytes: OwnedVec<u8, W>,
-    failure: Option<MemoryError>,
-}
-
-impl<W: Work> der::Writer for AccountedDerWriter<W> {
-    fn write(&mut self, bytes: &[u8]) -> der::Result<()> {
-        self.bytes.try_extend_from_slice(bytes).map_err(|error| {
-            self.failure = Some(error);
-            der::ErrorKind::Failed.into()
-        })
     }
 }
 
@@ -882,14 +855,10 @@ impl ProviderVerifier<'_> {
                 .verify_x509_signature(algorithm, signed, signature, spki)
                 .map_err(X509ChainError::from)
         };
-        let valid = if parameters.is_some() && parameters != key_algorithm.parameters() {
-            // RFC 5280 6.1.4(e): inherit only the effective working-key parameters.
-            // The temporary provider SPKI is accounted; original TBS stays borrowed.
-            // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
-            with_effective_spki(key.key().as_bytes(), parameters, execution, verify)?
-        } else {
-            verify(key.key().as_bytes())?
-        };
+        // RFC 5280 6.1.4(e): inherit only the effective working-key parameters.
+        // Shared framing retains source provenance; the provider buffer is paid.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
+        let valid = with_effective_spki(key, execution, verify)?;
         Ok(if valid {
             structured_pkix::path::Verified::Yes
         } else {
@@ -1294,6 +1263,78 @@ mod tests {
     use super::*;
     use structured_pkix::path::{Verified, Verify as _, WorkingKey};
 
+    fn dsa_projection_sources(written: Option<der::asn1::AnyRef<'_>>) -> (Vec<u8>, Vec<u8>) {
+        use der::{Decode as _, Encode as _};
+        let parameters = der::asn1::AnyRef::from_der(&[0x30, 9, 2, 1, 23, 2, 1, 11, 2, 1, 2])
+            .expect("structural DSA parameters");
+        let spki = |parameters| {
+            pkcs8::SubjectPublicKeyInfoRef {
+                algorithm: pkcs8::AlgorithmIdentifierRef {
+                    oid: dsa::OID,
+                    parameters,
+                },
+                subject_public_key: der::asn1::BitStringRef::new(0, &[2, 1, 1])
+                    .expect("octet-aligned DSA public component"),
+            }
+            .to_der()
+            .expect("test DSA SPKI encoding")
+        };
+        // A small structural certificate, not an authenticated path. Projecting
+        // its WorkingKey tests framing/provenance, never signature acceptance.
+        let algorithm = [0x30, 9, 6, 7, 0x2a, 0x86, 0x48, 0xce, 0x38, 4, 3];
+        let mut tbs = vec![2, 1, 1];
+        tbs.extend_from_slice(&algorithm);
+        let name = [0x30, 12, 0x31, 10, 0x30, 8, 6, 3, 0x55, 4, 3, 12, 1, b'x'];
+        tbs.extend_from_slice(&name);
+        tbs.extend_from_slice(b"\x30\x1e\x17\x0d250101000000Z\x17\x0d270101000000Z");
+        tbs.extend_from_slice(&name);
+        tbs.extend_from_slice(&spki(written));
+        let mut certificate = vec![
+            0x30,
+            u8::try_from(tbs.len() + 2 + algorithm.len() + 4)
+                .expect("test certificate fits short-form length"),
+        ];
+        certificate.extend_from_slice(&[
+            0x30,
+            u8::try_from(tbs.len()).expect("test TBS fits short-form length"),
+        ]);
+        certificate.extend_from_slice(&tbs);
+        certificate.extend_from_slice(&algorithm);
+        certificate.extend_from_slice(&[3, 2, 0, 0]);
+        (spki(Some(parameters)), certificate)
+    }
+
+    fn projected_dsa<'a>(
+        session: &'a CertificateSession,
+        issuer: &'a [u8],
+        subject: &'a Certificate<'a>,
+    ) -> WorkingKey<'a> {
+        session
+            .with_public_key_info(issuer, |info, work| {
+                WorkingKey::standing(info).subject(subject, work)
+            })
+            .expect("project original inherited DSA parameters")
+    }
+
+    #[test]
+    fn shared_effective_spki_preserves_original_sources_and_retained_capacity() {
+        // A projection is one accounted provider buffer, not a rewritten
+        // certificate or a retained parser/operation borrow.
+        let (issuer, certificate) = dsa_projection_sources(None);
+        let original = certificate.clone();
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let subject = session.read(&certificate).expect("structural DSA subject");
+        let key = projected_dsa(&session, &issuer, &subject);
+        let before = session.memory().used();
+        let result = materialize_effective_spki(key, session.memory())
+            .expect("shared effective SPKI framing");
+        assert_eq!(&*result, issuer);
+        assert_eq!(certificate, original);
+        assert_eq!(session.memory().used() - before, result.capacity());
+        drop(result);
+        assert_eq!(session.memory().used(), before);
+    }
+
     #[test]
     fn shared_signature_resolution_preserves_current_work_and_parameters() {
         // Retained identifiers borrow their source provenance; a new query
@@ -1533,24 +1574,44 @@ mod tests {
     }
 
     #[test]
+    fn inherited_parameters_do_not_repair_written_dsa_null() {
+        // RFC 3279 2.3.2 permits omission, not a NULL Dss-Parms value.
+        // A synthesized provider key must not hide that original spelling.
+        // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.2
+        let (issuer, certificate) = dsa_projection_sources(Some(der::asn1::AnyRef::NULL));
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let subject = session
+            .read(&certificate)
+            .expect("retain written NULL for inspection");
+        let key = projected_dsa(&session, &issuer, &subject);
+        let before = session.memory().used();
+        let called = std::cell::Cell::new(false);
+        let result = with_effective_spki(key, session.memory(), |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(matches!(result, Err(X509ChainError::Processing(error))
+            if !error.is_resource() && error.offset() > key.key().algorithm().offset()));
+        assert!(!called.get());
+        assert_eq!(session.memory().used(), before);
+    }
+
+    #[test]
     fn inherited_issuer_parameters_are_provided_without_changing_source() {
         // RFC 5280 6.1.4(e) supplies inherited parameters to the working key only.
         use der::{Decode as _, Encode as _};
         let y = [2, 1, 1];
         let parameters = [0x30, 9, 2, 1, 23, 2, 1, 11, 2, 1, 2];
-        for encoded_parameters in [None, Some(der::asn1::AnyRef::NULL)] {
-            let key = pkcs8::SubjectPublicKeyInfoRef {
-                algorithm: pkcs8::AlgorithmIdentifierRef {
-                    oid: dsa::OID,
-                    parameters: encoded_parameters,
-                },
-                subject_public_key: der::asn1::BitStringRef::new(0, &y).expect("public bits"),
-            }
-            .to_der()
-            .expect("SPKI encoding");
-            let source = key.clone();
+        {
+            let (issuer, certificate) = dsa_projection_sources(None);
+            let source = certificate.clone();
             let session = CertificateSession::new(&ResourcePolicy::default());
-            with_effective_spki(&key, Some(&parameters), session.memory(), |effective| {
+            let subject = session
+                .read(&certificate)
+                .expect("DSA parameter-less subject");
+            let key = projected_dsa(&session, &issuer, &subject);
+            let before = session.memory().used();
+            with_effective_spki(key, session.memory(), |effective| {
                 let parsed =
                     pkcs8::SubjectPublicKeyInfoRef::from_der(effective).expect("effective SPKI");
                 assert_eq!(
@@ -1567,36 +1628,29 @@ mod tests {
                 Ok(())
             })
             .expect("inherited key is supported");
-            assert_eq!(key, source);
-            assert_eq!(session.memory().used(), 0);
+            assert_eq!(certificate, source);
+            assert_eq!(session.memory().used(), before);
         }
     }
 
     #[test]
     fn inherited_key_workspace_is_reserved_before_provider_execution() {
         // No cryptographic callback runs when the effective-key allocation is refused.
-        use der::Encode as _;
-        let key = pkcs8::SubjectPublicKeyInfoRef {
-            algorithm: pkcs8::AlgorithmIdentifierRef {
-                oid: dsa::OID,
-                parameters: None,
-            },
-            subject_public_key: der::asn1::BitStringRef::new(0, &[2, 1, 1]).expect("public bits"),
-        }
-        .to_der()
-        .expect("SPKI encoding");
-        let session = CertificateSession::new(&ResourcePolicy {
-            max_x509_workspace_bytes: 0,
-            ..ResourcePolicy::default()
-        });
+        let (issuer, certificate) = dsa_projection_sources(None);
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let subject = session
+            .read(&certificate)
+            .expect("funded source certificate");
+        let key = projected_dsa(&session, &issuer, &subject);
+        let current = Memory::new(Arc::new(MemoryAccount::new(0, 100_000)));
         let called = std::cell::Cell::new(false);
-        let result = with_effective_spki(&key, Some(&[0x30, 0]), session.memory(), |_| {
+        let result = with_effective_spki(key, &current, |_| {
             called.set(true);
             Ok(())
         });
         assert!(matches!(result, Err(X509ChainError::Processing(error)) if error.is_resource()));
         assert!(!called.get());
-        assert_eq!(session.memory().used(), 0);
+        assert_eq!(current.used(), 0);
     }
 
     #[test]
@@ -1612,19 +1666,160 @@ mod tests {
         }
         .to_der()
         .expect("SPKI encoding");
-        let session = CertificateSession::new(&ResourcePolicy {
-            max_x509_workspace_bytes: 0,
-            max_x509_work: 0,
-            ..ResourcePolicy::default()
-        });
-        with_effective_spki(&key, None, session.memory(), |effective| {
-            assert_eq!(effective.as_ptr(), key.as_ptr());
-            assert_eq!(effective.len(), key.len());
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let current = Memory::new(Arc::new(MemoryAccount::new(0, 0)));
+        session
+            .with_public_key_info(&key, |info, _| {
+                with_effective_spki(WorkingKey::standing(info), &current, |effective| {
+                    assert_eq!(effective.as_ptr(), key.as_ptr());
+                    assert_eq!(effective.len(), key.len());
+                    Ok(())
+                })
+                .expect("ordinary key borrows original DER");
+                Ok(())
+            })
+            .expect("read the original standalone SPKI");
+        assert_eq!(current.used(), 0);
+        assert_eq!(current.work_used(), 0);
+    }
+
+    #[test]
+    fn effective_spki_obeys_exact_current_work_and_releases_failed_output() {
+        // A retained foreign key must not substitute Memory for the current
+        // local ceiling. Refusal after partial copying releases all capacity.
+        let (issuer, certificate) = dsa_projection_sources(None);
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let subject = session.read(&certificate).expect("funded original subject");
+        let key = projected_dsa(&session, &issuer, &subject);
+        let measured = Memory::new(Arc::new(MemoryAccount::new(4096, 100_000)));
+        let measuring_parser = Parser::new(
+            Encoding::Der,
+            Limits {
+                max_work: 100_000,
+                ..Limits::default()
+            },
+            measured.clone(),
+        );
+        let measuring_reader = measuring_parser
+            .read(&[], 0)
+            .expect("measurement execution");
+        let measuring_work = measuring_reader.execution();
+        drop(
+            materialize_effective_spki(key, &measuring_work).expect("measure complete projection"),
+        );
+        let aggregate_required = measured.work_used();
+        let local_required = 100_000 - measuring_work.work_remaining();
+        assert!(aggregate_required > issuer.len());
+        for local in [false, true] {
+            let required = if local {
+                local_required
+            } else {
+                aggregate_required
+            };
+            for limit in [0, required - 1, required] {
+                let current = Memory::new(Arc::new(MemoryAccount::new(
+                    4096,
+                    if local { 100_000 } else { limit },
+                )));
+                let parser = Parser::new(
+                    Encoding::Der,
+                    Limits {
+                        max_work: if local { limit as u64 } else { 100_000 },
+                        ..Limits::default()
+                    },
+                    current.clone(),
+                );
+                let reader = parser.read(&[], 0).expect("bounded current execution");
+                let called = std::cell::Cell::new(false);
+                let result = with_effective_spki(key, &reader.execution(), |bytes| {
+                    called.set(true);
+                    assert_eq!(bytes, issuer);
+                    Ok(())
+                });
+                if limit == required {
+                    result
+                        .unwrap_or_else(|error| panic!("local={local}, limit={limit}: {error:?}"));
+                    assert!(called.get());
+                    assert_eq!(current.work_used(), aggregate_required);
+                } else {
+                    assert!(
+                        matches!(result, Err(X509ChainError::Processing(error)) if error.is_resource())
+                    );
+                    assert!(!called.get());
+                }
+                assert_eq!(current.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn effective_spki_cannot_reset_its_original_source_ceiling() {
+        // A fresh current account cannot buy back the retained key parser's
+        // spent local work, and no provider/output allocation may run first.
+        let (issuer, certificate) = dsa_projection_sources(None);
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let subject = session
+            .read(&certificate)
+            .expect("original source certificate");
+        let key = projected_dsa(&session, &issuer, &subject);
+        let source_reader = session
+            .parser
+            .read(&[], 0)
+            .expect("original source execution");
+        let source_work = source_reader.execution();
+        source_work
+            .charge_work(source_work.work_remaining() as u64)
+            .expect("exhaust the original ceiling exactly");
+        let current = Memory::new(Arc::new(MemoryAccount::new(4096, 100_000)));
+        let called = std::cell::Cell::new(false);
+        let result = with_effective_spki(key, &current, |_| {
+            called.set(true);
             Ok(())
-        })
-        .expect("borrowed key needs no adapter workspace");
-        assert_eq!(session.memory().used(), 0);
-        assert_eq!(session.memory().work_used(), 0);
+        });
+        assert!(matches!(result, Err(X509ChainError::Processing(error)) if error.is_resource()));
+        assert!(!called.get());
+        assert_eq!(current.used(), 0);
+        assert_eq!(current.work_used(), 0);
+    }
+
+    #[test]
+    fn inherited_parameter_copy_keeps_its_independent_source_ceiling() {
+        // Parameter bytes belong to the issuer's parser, not the subject's.
+        // Leave only metadata admission: the subsequent copy must refuse even
+        // though the current account can afford the entire output allocation.
+        let (issuer, certificate) = dsa_projection_sources(None);
+        let parent = CertificateSession::with_account(
+            10_000,
+            4096,
+            Memory::new(Arc::new(MemoryAccount::new(4096, 100_000))),
+        );
+        let target = CertificateSession::new(&ResourcePolicy::default());
+        let subject = target
+            .read(&certificate)
+            .expect("independently parsed subject");
+        let key = projected_dsa(&parent, &issuer, &subject);
+        let parameters = key.parameters().expect("inherited original parameters");
+        let at = (parameters.as_ptr() as usize - issuer.as_ptr() as usize) as u64;
+        let reader = parent.parser.read(&[], 0).expect("issuer source execution");
+        let work = reader.execution();
+        assert!(work.work_remaining() > 1);
+        work.charge_work((work.work_remaining() - 1) as u64)
+            .expect("leave only parameter metadata admission");
+        assert!(parent.memory().work_remaining() > 0);
+        let current = Memory::new(Arc::new(MemoryAccount::new(4096, 100_000)));
+        let called = std::cell::Cell::new(false);
+        let result = with_effective_spki(key, &current, |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(matches!(result, Err(X509ChainError::Processing(error))
+            if error.is_resource() && error.offset() == at));
+        assert!(!called.get());
+        assert!(
+            current.work_used() > 0,
+            "framing and allocation were admitted"
+        );
+        assert_eq!(current.used(), 0, "partial output is released on refusal");
     }
 
     #[test]

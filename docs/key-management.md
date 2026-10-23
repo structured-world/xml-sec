@@ -231,6 +231,13 @@ guessed from its bytes. Display metadata is not a certificate identity.
 When a validated path inherits public-key parameters (RFC 5280 section 6.1.4(e)),
 the effective key reaches the XML signature verifier without rewriting the
 certificate's signed bytes. Verification still uses the selected `CryptoProvider`.
+The provider's contiguous effective SPKI is framed by `structured-pkix` 0.11's
+`EffectiveSpki`, directly over the original working key and parameter sources.
+Its buffer and each copy are admitted under the source and current execution;
+the retained capacity stays charged until release. Keys with their own parameters
+remain borrowed without a projection buffer. Framing does not validate a key:
+invalid written DSA NULL parameters are rejected, not repaired by inheritance
+(RFC 3279 section 2.3.2).
 For multiple XML stores, use `XmlKeyStoreImporter::new(&policy, backend)`, call
 `import(bytes)` for each source, then `finish()` to obtain the inventory. The CLI
 uses this session for repeated `--keys-file`: candidate inspections and XML parsing
