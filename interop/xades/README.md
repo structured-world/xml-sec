@@ -150,6 +150,7 @@ cargo nextest run -p xml-sec -p xml-sec-xades --no-fail-fast --status-level fail
 cargo clippy -p xml-sec-xades --example interop_probe -- -D warnings
 cargo fmt -p xml-sec-xades --check
 cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
+rustup target add --toolchain 1.92.0 thumbv7em-none-eabihf
 cargo +1.92.0 check -p xml-sec-xml-input --no-default-features --target thumbv7em-none-eabihf
 cargo clean
 ```
