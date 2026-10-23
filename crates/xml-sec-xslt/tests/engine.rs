@@ -4353,6 +4353,46 @@ fn named_templates_consume_template_application_budget() {
 }
 
 #[test]
+fn branching_templates_stop_at_the_existing_xpath_budget() {
+    // The retained ASan timeout input repeatedly evaluates function-free comparisons and
+    // subtraction. It must reach the original deterministic budget without partial success.
+    let stylesheet = compile(include_str!(
+        "../../../fuzz/seeds/xslt-branching-comparison.xsl"
+    ));
+    let source = Document::parse("<root><item>payload</item></root>", None).expect("source parses");
+    let mut budget = execution_budget(8192);
+    budget.recursion_depth = 32;
+    budget.xpath_evaluations = 1024;
+    budget.xpath_operations = 100_000;
+    budget.template_applications = 1024;
+    budget.result_nodes = 1024;
+    budget.owned_bytes = 1024 * 1024;
+    for _ in 0..2 {
+        let reported = stylesheet.execute_reported(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver)),
+            ExecutionOptions {
+                budget,
+                initial_mode: None,
+                initial_template: None,
+            },
+        );
+        assert!(matches!(
+            reported.outcome,
+            Err(Error::Budget {
+                kind: BudgetKind::XPathEvaluations,
+                limit: 1024,
+                actual: 1025,
+            })
+        ));
+        assert_eq!(reported.usage.xpath_evaluations, budget.xpath_evaluations);
+        assert!(reported.usage.template_applications <= budget.template_applications);
+        assert!(reported.usage.result_nodes <= budget.result_nodes);
+    }
+}
+
+#[test]
 fn message_content_preserves_constructed_xml_fragments() {
     // xsl:message instantiates a template into a fragment rather than accepting text only.
     let stylesheet = compile(

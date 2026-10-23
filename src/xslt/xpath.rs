@@ -2207,11 +2207,16 @@ impl Evaluator {
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
         let uses_current =
             super::expression::has_unprefixed_function_call(&expression.source, "current");
+        // XPath 1.0 section 3.2 requires '(' in every FunctionCall. Synthesized axis
+        // predicates use only the core functions already supplied by ScopedContext::new().
+        // https://www.w3.org/TR/1999/REC-xpath-19991116/#section-Function-Calls
+        let bind_functions = expression.source.contains('(');
         let context_workspace = xpath_context_workspace_upper_bound(
             expression,
             custom_calls
                 .is_some()
                 .then_some(self.stylesheet_functions.as_ref()),
+            bind_functions,
         );
         let adapter_workspace = xpath_adapter_workspace_upper_bound(expression)
             .saturating_add(context_workspace)
@@ -2331,105 +2336,108 @@ impl Evaluator {
                 },
             );
         }
-        // XPath function objects must own their static namespace context. Share one
-        // materialization across all functions registered for this evaluation.
-        let function_namespaces = Arc::clone(&expression.namespaces);
-        context.set_function(
-            "key",
-            KeyFunction {
-                index: Rc::clone(&self.key_index),
-                namespaces: Arc::clone(&function_namespaces),
-                declarations: Arc::clone(&self.key_declarations),
-                name_indices: Arc::clone(&self.key_name_indices),
-                ready: Rc::clone(&self.ready_key_indexes),
-                pending: Rc::clone(&self.pending_dynamic_key_request),
-            },
-        );
-        context.set_function(
-            "format-number",
-            FormatNumberFunction {
-                formats: Arc::clone(&self.decimal_formats),
-                namespaces: Arc::clone(&function_namespaces),
-            },
-        );
-        context.set_function(
-            "generate-id",
-            GenerateId {
-                assigned: self.generated_ids.clone(),
-            },
-        );
-        context.set_function(
-            "id",
-            IdFunction {
-                nodes_by_document: Rc::clone(&self.id_index),
-            },
-        );
-        context.set_function("name", NodeNameFunction::Qualified);
-        context.set_function("local-name", NodeNameFunction::Local);
-        context.set_function("namespace-uri", NodeNameFunction::NamespaceUri);
-        context.set_function(
-            "system-property",
-            SystemProperty {
-                namespaces: Arc::clone(&function_namespaces),
-            },
-        );
-        context.set_function(
-            "element-available",
-            ElementAvailable {
-                namespaces: Arc::clone(&function_namespaces),
-            },
-        );
-        context.set_function(
-            "unparsed-entity-uri",
-            UnparsedEntityUriFunction {
-                documents: Rc::clone(&self.unparsed_entity_index),
-            },
-        );
-        context.set_function("lang", LangFunction);
-        register_exslt_functions(&mut context, self.clock.as_ref().map(Arc::clone));
-        context.set_function(
-            "function-available",
-            FunctionAvailable {
-                namespaces: function_namespaces,
-                stylesheet_functions: Arc::clone(&self.stylesheet_functions),
-            },
-        );
-        context.set_function(
-            "document",
-            DocumentFunction {
-                resolver: self.resolver.as_ref(),
-                access_error: &document_access_error,
-                static_base_uri: expression.static_base_uri.clone(),
-                static_document: expression.stylesheet_document,
-                roots: Rc::clone(&self.document_roots),
-                pending: Rc::clone(&self.pending_document_requests),
-                node_base_uris: Rc::clone(&self.node_base_uris),
-            },
-        );
-        if let Some(custom_calls) = custom_calls {
-            for name in self.stylesheet_functions.iter() {
-                let qname: sxd_xpath_no_unsafe::OwnedQName = name.namespace.as_deref().map_or_else(
-                    || name.local.as_str().into(),
-                    |namespace| (namespace, name.local.as_str()).into(),
-                );
-                context.set_function(
-                    qname,
-                    DeferredStylesheetFunction {
-                        name: name.clone(),
-                        session: Rc::clone(&custom_calls.state),
-                    },
-                );
+        if bind_functions {
+            // XPath function objects must own their static namespace context. Share one
+            // materialization across all functions registered for this evaluation.
+            let function_namespaces = Arc::clone(&expression.namespaces);
+            context.set_function(
+                "key",
+                KeyFunction {
+                    index: Rc::clone(&self.key_index),
+                    namespaces: Arc::clone(&function_namespaces),
+                    declarations: Arc::clone(&self.key_declarations),
+                    name_indices: Arc::clone(&self.key_name_indices),
+                    ready: Rc::clone(&self.ready_key_indexes),
+                    pending: Rc::clone(&self.pending_dynamic_key_request),
+                },
+            );
+            context.set_function(
+                "format-number",
+                FormatNumberFunction {
+                    formats: Arc::clone(&self.decimal_formats),
+                    namespaces: Arc::clone(&function_namespaces),
+                },
+            );
+            context.set_function(
+                "generate-id",
+                GenerateId {
+                    assigned: self.generated_ids.clone(),
+                },
+            );
+            context.set_function(
+                "id",
+                IdFunction {
+                    nodes_by_document: Rc::clone(&self.id_index),
+                },
+            );
+            context.set_function("name", NodeNameFunction::Qualified);
+            context.set_function("local-name", NodeNameFunction::Local);
+            context.set_function("namespace-uri", NodeNameFunction::NamespaceUri);
+            context.set_function(
+                "system-property",
+                SystemProperty {
+                    namespaces: Arc::clone(&function_namespaces),
+                },
+            );
+            context.set_function(
+                "element-available",
+                ElementAvailable {
+                    namespaces: Arc::clone(&function_namespaces),
+                },
+            );
+            context.set_function(
+                "unparsed-entity-uri",
+                UnparsedEntityUriFunction {
+                    documents: Rc::clone(&self.unparsed_entity_index),
+                },
+            );
+            context.set_function("lang", LangFunction);
+            register_exslt_functions(&mut context, self.clock.as_ref().map(Arc::clone));
+            context.set_function(
+                "function-available",
+                FunctionAvailable {
+                    namespaces: function_namespaces,
+                    stylesheet_functions: Arc::clone(&self.stylesheet_functions),
+                },
+            );
+            context.set_function(
+                "document",
+                DocumentFunction {
+                    resolver: self.resolver.as_ref(),
+                    access_error: &document_access_error,
+                    static_base_uri: expression.static_base_uri.clone(),
+                    static_document: expression.stylesheet_document,
+                    roots: Rc::clone(&self.document_roots),
+                    pending: Rc::clone(&self.pending_document_requests),
+                    node_base_uris: Rc::clone(&self.node_base_uris),
+                },
+            );
+            if let Some(custom_calls) = custom_calls {
+                for name in self.stylesheet_functions.iter() {
+                    let qname: sxd_xpath_no_unsafe::OwnedQName =
+                        name.namespace.as_deref().map_or_else(
+                            || name.local.as_str().into(),
+                            |namespace| (namespace, name.local.as_str()).into(),
+                        );
+                    context.set_function(
+                        qname,
+                        DeferredStylesheetFunction {
+                            name: name.clone(),
+                            session: Rc::clone(&custom_calls.state),
+                        },
+                    );
+                }
             }
+            debug_assert!(
+                context.function_count()
+                    <= 96usize.saturating_add(if custom_calls.is_some() {
+                        self.stylesheet_functions.len()
+                    } else {
+                        0
+                    }),
+                "fixed XPath function registrations exceeded their preflighted representation bound"
+            );
         }
-        debug_assert!(
-            context.function_count()
-                <= 96usize.saturating_add(if custom_calls.is_some() {
-                    self.stylesheet_functions.len()
-                } else {
-                    0
-                }),
-            "fixed XPath function registrations exceeded their preflighted representation bound"
-        );
         let mut variable_projection_error = false;
         for name in expression.variable_references.iter() {
             if variable_projection_error {
@@ -3695,6 +3703,7 @@ fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
 fn xpath_context_workspace_upper_bound(
     expression: &Expression,
     stylesheet_functions: Option<&HashSet<ExpandedName>>,
+    bind_functions: bool,
 ) -> usize {
     // The fixed library currently registers fewer than 96 core, XSLT, and EXSLT functions.
     // Keep representation slack explicit so additions fail the regression below rather than
@@ -3703,8 +3712,12 @@ fn xpath_context_workspace_upper_bound(
     const FIXED_FUNCTION_SLOTS: usize = 96;
     const FIXED_FUNCTION_NAME_BYTES: usize = 8 * 1024;
     const FUNCTION_OBJECT_BYTES: usize = 128;
-    let stylesheet_function_count = stylesheet_functions.map_or(0, HashSet::len);
-    let function_slots = FIXED_FUNCTION_SLOTS.saturating_add(stylesheet_function_count);
+    let stylesheet_functions = stylesheet_functions.filter(|_| bind_functions);
+    let function_slots = if bind_functions {
+        FIXED_FUNCTION_SLOTS.saturating_add(stylesheet_functions.map_or(0, HashSet::len))
+    } else {
+        0
+    };
     let variable_slots = expression.variable_references.len().saturating_add(2);
     let namespace_slots = expression.namespaces.len().saturating_add(2);
     let dynamic_name_bytes = expression
@@ -3739,7 +3752,11 @@ fn xpath_context_workspace_upper_bound(
         .saturating_add(
             namespace_slots.saturating_mul(hash_table_entry_bytes::<(String, String)>()),
         )
-        .saturating_add(FIXED_FUNCTION_NAME_BYTES)
+        .saturating_add(if bind_functions {
+            FIXED_FUNCTION_NAME_BYTES
+        } else {
+            0
+        })
         .saturating_add(dynamic_name_bytes)
         .saturating_add(namespace_bytes)
 }
