@@ -45,9 +45,6 @@ jobs:
           name: xades-interop-results
           path: ${{ runner.temp }}/xades-interop
           if-no-files-found: error
-      - name: Clean reproducible build outputs
-        if: always()
-        run: cargo clean
 
   hardening:
     name: native safety and dependency policy
