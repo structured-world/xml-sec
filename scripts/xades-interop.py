@@ -91,9 +91,9 @@ def command(args, log, env=None, *, timeout=900):
                     print(message, file=sys.stderr, flush=True)
             finally:
                 terminate_group()
-            stdout, stderr = process.communicate()
-            stdout_log.write(stdout)
-            stderr_log.write(stderr)
+            # Output read before the deadline is already persisted. Do not
+            # wait for EOF from a descendant that left the owned group.
+            # Popen's context closes the pipes and reaps only our direct child.
             raise SystemExit(message) from error
         except BaseException as error:
             # In particular, do not leave the isolated group behind on Ctrl-C.
@@ -103,7 +103,6 @@ def command(args, log, env=None, *, timeout=900):
                           file=sys.stderr, flush=True)
             finally:
                 terminate_group()
-            process.communicate()
             raise
     return subprocess.CompletedProcess(arguments, process.returncode,
         log.with_suffix(".stdout").read_bytes(), log.with_suffix(".stderr").read_bytes())

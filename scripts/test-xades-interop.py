@@ -53,7 +53,8 @@ class EvidenceTests(unittest.TestCase):
         # A descendant holds a lock until it exits: unlike kill(pid, 0), this
         # does not mistake a killed but not-yet-reaped process for a live one.
         # The stop file cleans up the deliberately failing pre-fix reproduction.
-        child = ("import fcntl,sys,time; from pathlib import Path; "
+        child = ("import fcntl,os,sys,time; from pathlib import Path\n"
+                 "if '--new-session' in sys.argv: os.setsid()\n"
                  "lock=open(sys.argv[1], 'w'); fcntl.flock(lock, fcntl.LOCK_EX); "
                  "Path(sys.argv[2]).write_text('ready'); deadline=time.monotonic()+20\n"
                  "while not Path(sys.argv[3]).exists() and time.monotonic()<deadline: time.sleep(.01)\n")
@@ -63,12 +64,15 @@ class EvidenceTests(unittest.TestCase):
                   "print('ready', flush=True); print('waiting', file=sys.stderr, flush=True); process.wait()\n")
         with tempfile.TemporaryDirectory() as directory:
             for owner, inner_timeout, timeout in [
-                    ('direct', None, 2), ('exited-parent', None, 2), ('outer', 30, 2), ('inner', 2, 5)]:
+                    ('direct', None, 2), ('exited-parent', None, 2), ('outer', 30, 2),
+                    ('inner', 2, 5), ('escaped', None, 2)]:
                 with self.subTest(timeout_owner=owner):
                     output = Path(directory) / owner
                     output.mkdir()
                     lock, ready, stop = [output / name for name in ['lock', 'ready', 'stop']]
                     arguments = [sys.executable, '-c', parent, child, lock, ready, stop]
+                    if owner == 'escaped':
+                        arguments.append('--new-session')
                     if owner == 'exited-parent':
                         # An exited parent does not end the descendant's output
                         # lifetime or release its held lock.
@@ -85,9 +89,14 @@ class EvidenceTests(unittest.TestCase):
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn(b'timed out', result.stderr)
                         self.assertTrue(ready.exists(), 'descendant did not reach the reproduction')
-                        if inner_timeout is not None:
-                            self.assertEqual((output / 'inner.stdout').read_bytes(), b'ready\n')
-                            self.assertEqual((output / 'inner.stderr').read_bytes(), b'waiting\n')
+                        captured = output / ('inner' if inner_timeout is not None else 'outer')
+                        self.assertEqual(captured.with_suffix('.stdout').read_bytes(), b'ready\n')
+                        self.assertEqual(captured.with_suffix('.stderr').read_bytes(), b'waiting\n')
+                        if owner == 'escaped':
+                            # This process deliberately left the owned group.
+                            # The controller must fail without waiting for its
+                            # open pipes; the stop file handles test cleanup.
+                            continue
                         with lock.open() as held:
                             try:
                                 fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -252,6 +261,18 @@ class EvidenceTests(unittest.TestCase):
                 with self.assertRaisesRegex(OSError, 'synthetic capture failure'):
                     interop.command(['synthetic-never-run'], Path(directory) / 'capture')
             cancelled.assert_called_once()
+
+    def test_capture_failure_is_not_replaced_by_descendant_pipe_timeout(self):
+        # A secondary drain must not mask the original I/O/capture failure.
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            os.environ.pop('_XADES_INTEROP_PARENT_SESSION', None)
+            process = MagicMock()
+            process.__enter__.return_value = process
+            process.communicate.side_effect = subprocess.TimeoutExpired(['escaped'], 900)
+            with (patch('subprocess.Popen', return_value=process), patch('os.killpg'),
+                  patch.object(interop, '_capture_streams', side_effect=OSError('original capture failure'))):
+                with self.assertRaisesRegex(OSError, 'original capture failure'):
+                    interop.command(['synthetic-never-run'], Path(directory) / 'capture')
 
     def test_inventory_rejects_changed_assets_and_tracked_run_outputs(self):
         # CI must catch stale reference data and accidental commits of actual outputs.
