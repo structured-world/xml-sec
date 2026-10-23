@@ -1,0 +1,68 @@
+= VERIFICATION CONTEXT
+== Status: ERROR
+== Failure reason: UNKNOWN
+== flags: 0x0000000e
+== flags2: 0x00000000
+== Key Info Read Ctx:
+= KEY INFO READ CONTEXT
+== flags: 0x00000000
+== flags2: 0x00000000
+== enabled key data: all
+== RetrievalMethod level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== KeyInfoReference level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== EncryptedKey level (cur/max): 0/1
+=== KeyReq:
+==== keyId: NULL
+==== keyType: 0x00000000
+==== keyUsage: 0xffffffff
+==== keyBitsSize: 0
+=== list size: 0
+== Key Info Write Ctx:
+= KEY INFO WRITE CONTEXT
+== flags: 0x00000000
+== flags2: 0x00000000
+== enabled key data: all
+== RetrievalMethod level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== KeyInfoReference level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== EncryptedKey level (cur/max): 0/1
+=== KeyReq:
+==== keyId: NULL
+==== keyType: 0x00000001
+==== keyUsage: 0xffffffff
+==== keyBitsSize: 0
+=== list size: 0
+== Signature Transform Ctx:
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== SignedInfo References List:
+=== list size: 0
+== Manifest References List:
+=== list size: 0

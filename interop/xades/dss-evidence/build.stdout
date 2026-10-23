@@ -1,0 +1,21 @@
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] ------------< world.structured.interop:xades-offline-probe >------------
+[INFO] Building xades-offline-probe 1.0
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- resources:3.3.1:resources (default-resources) @ xades-offline-probe ---
+[INFO] skip non existing resourceDirectory /Users/polaz/.codex/worktrees/xades-interop/xml-sec/interop/xades/dss/src/main/resources
+[INFO] 
+[INFO] --- compiler:3.14.1:compile (default-compile) @ xades-offline-probe ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- dependency:3.8.1:build-classpath (default-cli) @ xades-offline-probe ---
+[INFO] Skipped writing classpath file '/Users/polaz/.codex/worktrees/xades-interop/xml-sec/.tools/xades-dss/classpath.txt'.  No changes found.
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  0.856 s
+[INFO] Finished at: 2026-10-23T11:18:44+03:00
+[INFO] ------------------------------------------------------------------------

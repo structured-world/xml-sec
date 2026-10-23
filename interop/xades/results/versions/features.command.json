@@ -1,0 +1,8 @@
+[
+  "cargo",
+  "tree",
+  "-p",
+  "xml-sec-xades",
+  "-e",
+  "features"
+]

@@ -1,0 +1,15 @@
+here=legacy
+accepted=true
+all_valid=true
+signature.0.status=Valid
+key_trust=ValidatedX509(X509TrustEvidence { fingerprints: [[183, 126, 104, 120, 7, 110, 66, 174, 185, 22, 105, 129, 153, 242, 127, 33, 35, 194, 86, 27, 206, 208, 95, 67, 202, 24, 135, 64, 92, 48, 129, 61], [62, 108, 171, 214, 196, 121, 7, 255, 87, 2, 200, 89, 82, 7, 229, 193, 180, 162, 204, 115, 40, 100, 232, 191, 164, 72, 42, 254, 225, 241, 183, 116], [252, 251, 21, 113, 122, 145, 67, 135, 25, 216, 158, 179, 176, 60, 237, 124, 150, 7, 182, 203, 85, 60, 55, 139, 227, 156, 82, 4, 53, 207, 121, 87], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], path_len: 3, verification_time: SystemTime { tv_sec: 1800000000, tv_nsec: 0 }, revocation_checked: false })
+reference.0.status=Valid
+reference.0.coverage=EnvelopedElementContent
+reference.1.status=Valid
+reference.1.coverage=ElementContent
+replay.0=Ok(Complete)
+replay.1=Ok(Complete)
+catalogue=Ok(Complete)
+xades=Err(Prepare(Binding(Missing { node: NodeIdentity { document: DocumentIdentity(1), generation: 0, semantic_id: SemanticNodeId(63) } })))
+request=Ok(())
+retained_bytes=0

@@ -1,0 +1,80 @@
+    Blocking waiting for file lock on build directory
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.36s
+   Doc-tests xml_sec
+
+running 16 tests
+test src/sxd_xpath/lib.rs - sxd_xpath::XPath::evaluate (line 553) - compile ... ok
+test src/sxd_xpath/lib.rs - sxd_xpath (line 18) ... ok
+test src/sxd_xpath/context.rs - sxd_xpath::context::Context (line 107) ... ok
+test src/sxd_xpath/lib.rs - sxd_xpath (line 45) ... ok
+test src/xmldsig/mod.rs - xmldsig (line 18) - compile ... ok
+test src/api.rs - api (line 14) ... ok
+test src/sxd_xpath/lib.rs - sxd_xpath::evaluate_xpath (line 778) ... ok
+test src/sxd_document/parser.rs - sxd_document::parser (line 5) ... ok
+test src/c14n/mod.rs - c14n (line 10) ... ok
+test src/lib.rs - (line 22) ... ok
+test src/sxd_document/lib.rs - sxd_document (line 2) ... ok
+test src/sxd_xpath/macros.rs - sxd_xpath::macros::nodeset (line 3) ... ok
+test src/xmldsig/mod.rs - xmldsig (line 281) ... ok
+test src/xmldsig/uri.rs - xmldsig::uri::UriReferenceResolver (line 281) ... ok
+test src/xmlenc/mod.rs - xmlenc (line 184) ... ok
+test src/xmlenc/mod.rs - xmlenc (line 92) ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 1 test
+test src/lib.rs - xml_input (line 117) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+all doctests ran in 2.15s; merged doctests compilation took 1.21s
+   Doc-tests xml_sec_config
+
+running 1 test
+test crates/xml-sec-config/src/lib.rs - Configuration (line 61) - compile fail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+   Doc-tests sxd_document_no_unsafe
+
+running 2 tests
+test vendor/sxd-document-no-unsafe/../../src/sxd_document/parser.rs - parser (line 5) ... ok
+test vendor/sxd-document-no-unsafe/../../src/sxd_document/lib.rs - (line 2) ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 1.38s; merged doctests compilation took 0.59s
+   Doc-tests sxd_xpath_no_unsafe
+
+running 6 tests
+test vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/lib.rs - XPath::evaluate (line 553) - compile ... ok
+test vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/macros.rs - macros::nodeset (line 3) ... ok
+test vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/context.rs - context::Context (line 107) ... ok
+test vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/lib.rs - evaluate_xpath (line 778) ... ok
+test vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/lib.rs - (line 18) ... ok
+test vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/lib.rs - (line 45) ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 1.39s; merged doctests compilation took 0.58s
+   Doc-tests xml_sec_xades
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xml_sec_xml_input
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests xml_sec_xslt
+
+running 1 test
+test crates/xml-sec-xslt/../../src/xslt/lib.rs - (line 15) ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+all doctests ran in 1.55s; merged doctests compilation took 0.76s

@@ -1,0 +1,240 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<DiagnosticData xmlns="http://dss.esig.europa.eu/validation/diagnostic">
+    <DocumentName>enveloped-control.xml</DocumentName>
+    <ValidationDate>2027-01-15T08:00:00Z</ValidationDate>
+    <Attestations/>
+    <Signatures>
+        <Signature Id="S-D4C179F207B00D730DC1B993634403871CBC306BFEFAC6061C5DFA36819A1EC4">
+            <DAIdentifier>sig</DAIdentifier>
+            <SignatureFilename>enveloped-control.xml</SignatureFilename>
+            <ClaimedSigningTime>2026-10-18T12:00:00Z</ClaimedSigningTime>
+            <SignatureFormat>XAdES-BASELINE-B</SignatureFormat>
+            <StructuralValidation valid="true"/>
+            <DigestMatchers>
+                <DigestMatcher type="REFERENCE" id="sig-data" uri="">
+                    <DigestMethod>SHA256</DigestMethod>
+                    <DigestValue>bwpwUgCLp1Mr0SAfMf/ZmyS7Pt5/bU6ZR2WhyhB3zDo=</DigestValue>
+                    <DataFound>true</DataFound>
+                    <DataIntact>true</DataIntact>
+                </DigestMatcher>
+                <DigestMatcher type="SIGNED_PROPERTIES" uri="#sp">
+                    <DigestMethod>SHA256</DigestMethod>
+                    <DigestValue>dyPO46uRmxPnytjVy1QQ0/5GNxmYnTol6hcZMdoDV5s=</DigestValue>
+                    <DataFound>true</DataFound>
+                    <DataIntact>true</DataIntact>
+                </DigestMatcher>
+            </DigestMatchers>
+            <BasicSignature>
+                <EncryptionAlgoUsedToSignThisToken>RSA</EncryptionAlgoUsedToSignThisToken>
+                <KeyLengthUsedToSignThisToken>2048</KeyLengthUsedToSignThisToken>
+                <DigestAlgoUsedToSignThisToken>SHA256</DigestAlgoUsedToSignThisToken>
+                <SignatureIntact>true</SignatureIntact>
+                <SignatureValid>true</SignatureValid>
+            </BasicSignature>
+            <SigningCertificate Certificate="C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D"/>
+            <CertificateChain>
+                <ChainItem Certificate="C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D"/>
+                <ChainItem Certificate="C-3E6CABD6C47907FF5702C8595207E5C1B4A2CC732864E8BFA4482AFEE1F1B774"/>
+                <ChainItem Certificate="C-FCFB15717A91438719D89EB3B03CED7C9607B6CB553C378BE39C520435CF7957"/>
+            </CertificateChain>
+            <MimeType>text/xml</MimeType>
+            <CommitmentTypeIndications/>
+            <FoundCertificates>
+                <RelatedCertificate Certificate="C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D">
+                    <Origin>KEY_INFO</Origin>
+                    <CertificateRef>
+                        <Origin>SIGNING_CERTIFICATE</Origin>
+                        <DigestAlgoAndValue match="true">
+                            <DigestMethod>SHA256</DigestMethod>
+                            <DigestValue>t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=</DigestValue>
+                        </DigestAlgoAndValue>
+                    </CertificateRef>
+                </RelatedCertificate>
+                <RelatedCertificate Certificate="C-3E6CABD6C47907FF5702C8595207E5C1B4A2CC732864E8BFA4482AFEE1F1B774">
+                    <Origin>KEY_INFO</Origin>
+                </RelatedCertificate>
+            </FoundCertificates>
+            <FoundRevocations/>
+            <FoundTimestamps/>
+            <FoundEvidenceRecords/>
+            <SignatureScopes>
+                <SignatureScope SignerData="D-698BA66ABE742604BFC2037B5E103C1D4835D1C0B597D9F808AD6279754CCC39">
+                    <Scope>FULL</Scope>
+                    <Name>Full XML File</Name>
+                    <Description>The full XML file with transformations.</Description>
+                    <Transformations>
+                        <Transformation>Enveloped Signature Transform</Transformation>
+                        <Transformation>Exclusive Canonical XML (omits comments)</Transformation>
+                    </Transformations>
+                </SignatureScope>
+            </SignatureScopes>
+            <SignatureDigestReference>
+                <CanonicalizationMethod>http://www.w3.org/2001/10/xml-exc-c14n#</CanonicalizationMethod>
+                <DigestMethod>SHA256</DigestMethod>
+                <DigestValue>ra+HIa2fQagxRRrMsYJuM/q05EFCIqmjSdSox61Ubi8=</DigestValue>
+            </SignatureDigestReference>
+            <DataToBeSignedRepresentation>
+                <DigestMethod>SHA256</DigestMethod>
+                <DigestValue>8GhOdWrT8yvOp/cIPxeNPdGl+XcQdR8HwFlbhdrLNNY=</DigestValue>
+            </DataToBeSignedRepresentation>
+            <SignatureValue>LWY4geoCAEs8mJyxRndrDk9qb9tNOjC06q6qCZPtJP4VomKl82UnZGWHFXujHss/adxfqzxnwOn77jwMyUr6OiDZSIcb07Uem3nVvuKilWeqJLKXKODAzCJq0MMzbI9al0BgE1gpyj580BQzgFWl2xUsXs45x/fxjqPRlXZbruR8XvX+ro5ADsHetbWAatwfKDtzODdlH6PyZYnGGn92+47K1F9nYN5ZnFWVW9Us1xTgAvtMcRIN5Ico9LQ1EmMcZxqt+DFPKWFHNVUCHIpmvZHeUDot8Iu0NhL1IyLwbDmcTjR5Pwwzp4ctZWvG78UZmWcXHHdixeSFldMB8J+WOg==</SignatureValue>
+        </Signature>
+    </Signatures>
+    <EvidenceRecords/>
+    <UsedAttestationRevocationTokens/>
+    <UsedCertificates>
+        <Certificate Id="C-3E6CABD6C47907FF5702C8595207E5C1B4A2CC732864E8BFA4482AFEE1F1B774">
+            <SubjectDistinguishedName Format="CANONICAL">cn=xml-sec xades test intermediate</SubjectDistinguishedName>
+            <SubjectDistinguishedName Format="RFC2253">CN=xml-sec XAdES Test Intermediate</SubjectDistinguishedName>
+            <IssuerDistinguishedName Format="CANONICAL">cn=xml-sec xades test root</IssuerDistinguishedName>
+            <IssuerDistinguishedName Format="RFC2253">CN=xml-sec XAdES Test Root</IssuerDistinguishedName>
+            <SerialNumber>643315693130426073969963188532281080709866699529</SerialNumber>
+            <CommonName>xml-sec XAdES Test Intermediate</CommonName>
+            <Sources>
+                <Source>SIGNATURE</Source>
+            </Sources>
+            <NotAfter>2045-01-01T00:00:00Z</NotAfter>
+            <NotBefore>2026-01-01T00:00:00Z</NotBefore>
+            <PublicKeySize>2048</PublicKeySize>
+            <PublicKeyEncryptionAlgo>RSA</PublicKeyEncryptionAlgo>
+            <EntityKey>EK-069E5E6E45080D14E01E6D57C873AE4618A4D2D1DCBD344027A3F09870AAD1B0</EntityKey>
+            <IssuerEntityKey key="true" subjectName="true">EK-F78A363FE33B950CFF31C1F4D6E1F8FB053FCF93E6EEB11C4BD5ADE744E69ADB</IssuerEntityKey>
+            <BasicSignature>
+                <EncryptionAlgoUsedToSignThisToken>RSA</EncryptionAlgoUsedToSignThisToken>
+                <KeyLengthUsedToSignThisToken>2048</KeyLengthUsedToSignThisToken>
+                <DigestAlgoUsedToSignThisToken>SHA256</DigestAlgoUsedToSignThisToken>
+                <SignatureIntact>true</SignatureIntact>
+                <SignatureValid>true</SignatureValid>
+            </BasicSignature>
+            <SigningCertificate Certificate="C-FCFB15717A91438719D89EB3B03CED7C9607B6CB553C378BE39C520435CF7957"/>
+            <CertificateChain>
+                <ChainItem Certificate="C-FCFB15717A91438719D89EB3B03CED7C9607B6CB553C378BE39C520435CF7957"/>
+            </CertificateChain>
+            <Trusted>false</Trusted>
+            <SelfSigned>false</SelfSigned>
+            <CertificateExtensions>
+                <AuthorityKeyIdentifier OID="2.5.29.35" critical="false">
+                    <keyIdentifier>g5gmyQ/kvR1ixHllWaN60+Ob9xU=</keyIdentifier>
+                </AuthorityKeyIdentifier>
+                <SubjectKeyIdentifier OID="2.5.29.14" critical="false">
+                    <ski>nlskyGa8lz52cmFgTo9lQ4ZMSs4=</ski>
+                </SubjectKeyIdentifier>
+                <BasicConstraints CA="true" pathLenConstraint="0" OID="2.5.29.19" critical="true"/>
+                <KeyUsages OID="2.5.29.15" critical="true">
+                    <keyUsageBit>keyCertSign</keyUsageBit>
+                    <keyUsageBit>crlSign</keyUsageBit>
+                </KeyUsages>
+            </CertificateExtensions>
+            <Revocations/>
+            <DigestAlgoAndValue>
+                <DigestMethod>SHA256</DigestMethod>
+                <DigestValue>Pmyr1sR5B/9XAshZUgflwbSizHMoZOi/pEgq/uHxt3Q=</DigestValue>
+            </DigestAlgoAndValue>
+        </Certificate>
+        <Certificate Id="C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D">
+            <SubjectDistinguishedName Format="CANONICAL">cn=xml-sec xades test signer</SubjectDistinguishedName>
+            <SubjectDistinguishedName Format="RFC2253">CN=xml-sec XAdES Test Signer</SubjectDistinguishedName>
+            <IssuerDistinguishedName Format="CANONICAL">cn=xml-sec xades test intermediate</IssuerDistinguishedName>
+            <IssuerDistinguishedName Format="RFC2253">CN=xml-sec XAdES Test Intermediate</IssuerDistinguishedName>
+            <SerialNumber>522233446491425501878110623888192037543446034272</SerialNumber>
+            <CommonName>xml-sec XAdES Test Signer</CommonName>
+            <Sources>
+                <Source>SIGNATURE</Source>
+            </Sources>
+            <NotAfter>2045-01-01T00:00:00Z</NotAfter>
+            <NotBefore>2026-01-01T00:00:00Z</NotBefore>
+            <PublicKeySize>2048</PublicKeySize>
+            <PublicKeyEncryptionAlgo>RSA</PublicKeyEncryptionAlgo>
+            <EntityKey>EK-63BDD02314783AC97707FD6FD29E3F0DACA521B5C3534E27965F2CB98411FCBD</EntityKey>
+            <IssuerEntityKey key="true" subjectName="true">EK-069E5E6E45080D14E01E6D57C873AE4618A4D2D1DCBD344027A3F09870AAD1B0</IssuerEntityKey>
+            <BasicSignature>
+                <EncryptionAlgoUsedToSignThisToken>RSA</EncryptionAlgoUsedToSignThisToken>
+                <KeyLengthUsedToSignThisToken>2048</KeyLengthUsedToSignThisToken>
+                <DigestAlgoUsedToSignThisToken>SHA256</DigestAlgoUsedToSignThisToken>
+                <SignatureIntact>true</SignatureIntact>
+                <SignatureValid>true</SignatureValid>
+            </BasicSignature>
+            <SigningCertificate Certificate="C-3E6CABD6C47907FF5702C8595207E5C1B4A2CC732864E8BFA4482AFEE1F1B774"/>
+            <CertificateChain>
+                <ChainItem Certificate="C-3E6CABD6C47907FF5702C8595207E5C1B4A2CC732864E8BFA4482AFEE1F1B774"/>
+                <ChainItem Certificate="C-FCFB15717A91438719D89EB3B03CED7C9607B6CB553C378BE39C520435CF7957"/>
+            </CertificateChain>
+            <Trusted>false</Trusted>
+            <SelfSigned>false</SelfSigned>
+            <CertificateExtensions>
+                <AuthorityKeyIdentifier OID="2.5.29.35" critical="false">
+                    <keyIdentifier>nlskyGa8lz52cmFgTo9lQ4ZMSs4=</keyIdentifier>
+                </AuthorityKeyIdentifier>
+                <SubjectKeyIdentifier OID="2.5.29.14" critical="false">
+                    <ski>mhZJBmf6gTjx5L21dr46N+h4C7A=</ski>
+                </SubjectKeyIdentifier>
+                <BasicConstraints CA="false" OID="2.5.29.19" critical="true"/>
+                <KeyUsages OID="2.5.29.15" critical="true">
+                    <keyUsageBit>digitalSignature</keyUsageBit>
+                    <keyUsageBit>nonRepudiation</keyUsageBit>
+                </KeyUsages>
+            </CertificateExtensions>
+            <TrustServiceProviders/>
+            <Revocations/>
+            <DigestAlgoAndValue>
+                <DigestMethod>SHA256</DigestMethod>
+                <DigestValue>t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=</DigestValue>
+            </DigestAlgoAndValue>
+        </Certificate>
+        <Certificate Id="C-FCFB15717A91438719D89EB3B03CED7C9607B6CB553C378BE39C520435CF7957">
+            <SubjectDistinguishedName Format="CANONICAL">cn=xml-sec xades test root</SubjectDistinguishedName>
+            <SubjectDistinguishedName Format="RFC2253">CN=xml-sec XAdES Test Root</SubjectDistinguishedName>
+            <IssuerDistinguishedName Format="CANONICAL">cn=xml-sec xades test root</IssuerDistinguishedName>
+            <IssuerDistinguishedName Format="RFC2253">CN=xml-sec XAdES Test Root</IssuerDistinguishedName>
+            <SerialNumber>359750316794064722112635397343587958756138320080</SerialNumber>
+            <CommonName>xml-sec XAdES Test Root</CommonName>
+            <Sources>
+                <Source>TRUSTED_STORE</Source>
+            </Sources>
+            <NotAfter>2045-01-01T00:00:00Z</NotAfter>
+            <NotBefore>2026-01-01T00:00:00Z</NotBefore>
+            <PublicKeySize>2048</PublicKeySize>
+            <PublicKeyEncryptionAlgo>RSA</PublicKeyEncryptionAlgo>
+            <EntityKey>EK-F78A363FE33B950CFF31C1F4D6E1F8FB053FCF93E6EEB11C4BD5ADE744E69ADB</EntityKey>
+            <IssuerEntityKey key="true" subjectName="true">EK-F78A363FE33B950CFF31C1F4D6E1F8FB053FCF93E6EEB11C4BD5ADE744E69ADB</IssuerEntityKey>
+            <BasicSignature>
+                <EncryptionAlgoUsedToSignThisToken>RSA</EncryptionAlgoUsedToSignThisToken>
+                <KeyLengthUsedToSignThisToken>2048</KeyLengthUsedToSignThisToken>
+                <DigestAlgoUsedToSignThisToken>SHA256</DigestAlgoUsedToSignThisToken>
+                <SignatureIntact>true</SignatureIntact>
+                <SignatureValid>true</SignatureValid>
+            </BasicSignature>
+            <CertificateChain/>
+            <Trusted>true</Trusted>
+            <SelfSigned>true</SelfSigned>
+            <CertificateExtensions>
+                <SubjectKeyIdentifier OID="2.5.29.14" critical="false">
+                    <ski>g5gmyQ/kvR1ixHllWaN60+Ob9xU=</ski>
+                </SubjectKeyIdentifier>
+                <BasicConstraints CA="true" pathLenConstraint="2147483647" OID="2.5.29.19" critical="true"/>
+                <KeyUsages OID="2.5.29.15" critical="true">
+                    <keyUsageBit>keyCertSign</keyUsageBit>
+                    <keyUsageBit>crlSign</keyUsageBit>
+                </KeyUsages>
+            </CertificateExtensions>
+            <TrustServiceProviders/>
+            <DigestAlgoAndValue>
+                <DigestMethod>SHA256</DigestMethod>
+                <DigestValue>/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc=</DigestValue>
+            </DigestAlgoAndValue>
+        </Certificate>
+    </UsedCertificates>
+    <UsedRevocations/>
+    <UsedTimestamps/>
+    <OriginalDocuments>
+        <SignerData Id="D-698BA66ABE742604BFC2037B5E103C1D4835D1C0B597D9F808AD6279754CCC39">
+            <ReferencedName>Full XML File</ReferencedName>
+            <DigestAlgoAndValue>
+                <DigestMethod>SHA256</DigestMethod>
+                <DigestValue>bwpwUgCLp1Mr0SAfMf/ZmyS7Pt5/bU6ZR2WhyhB3zDo=</DigestValue>
+            </DigestAlgoAndValue>
+        </SignerData>
+    </OriginalDocuments>
+    <TrustedLists/>
+    <ListsOfTrustedEntities/>
+</DiagnosticData>

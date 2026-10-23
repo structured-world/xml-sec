@@ -1,0 +1,57 @@
+[INFO] Scanning for projects...
+[INFO] 
+[INFO] ------------< world.structured.interop:xades-offline-probe >------------
+[INFO] Building xades-offline-probe 1.0
+[INFO]   from pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- dependency:3.8.1:tree (default-cli) @ xades-offline-probe ---
+[INFO] world.structured.interop:xades-offline-probe:jar:1.0
+[INFO] +- eu.europa.ec.joinup.sd-dss:dss-xades:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-document:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-xml-utils:jar:6.5.1:compile
+[INFO] |  |  +- eu.europa.ec.joinup.sd-dss:dss-xml-common:jar:6.5.1:compile
+[INFO] |  |  \- org.apache.santuario:xmlsec:jar:3.0.6:compile
+[INFO] |  |     \- com.fasterxml.woodstox:woodstox-core:jar:6.5.1:runtime
+[INFO] |  |        \- org.codehaus.woodstox:stax2-api:jar:4.2.1:runtime
+[INFO] |  \- eu.europa.ec.joinup.sd-dss:specs-trusted-list:jar:6.5.1:compile
+[INFO] |     +- eu.europa.ec.joinup.sd-dss:specs-xmldsig:jar:6.5.1:compile
+[INFO] |     \- eu.europa.ec.joinup.sd-dss:specs-xades:jar:6.5.1:compile
+[INFO] +- eu.europa.ec.joinup.sd-dss:dss-validation:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-spi:jar:6.5.1:compile
+[INFO] |  |  +- eu.europa.ec.joinup.sd-dss:dss-alert:jar:6.5.1:compile
+[INFO] |  |  +- eu.europa.ec.joinup.sd-dss:dss-crl-parser:jar:6.5.1:compile
+[INFO] |  |  |  \- org.bouncycastle:bcprov-jdk18on:jar:1.86:compile
+[INFO] |  |  \- org.bouncycastle:bcpkix-jdk18on:jar:1.86:compile
+[INFO] |  |     \- org.bouncycastle:bcutil-jdk18on:jar:1.86:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-diagnostic-jaxb:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-simple-report-jaxb:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-simple-certificate-report-jaxb:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-detailed-report-jaxb:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:specs-validation-report:jar:6.5.1:compile
+[INFO] |  |  \- eu.europa.ec.joinup.sd-dss:specs-trusted-list-v211:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-i18n:jar:6.5.1:compile
+[INFO] |  \- org.slf4j:slf4j-api:jar:2.0.20:compile
+[INFO] +- eu.europa.ec.joinup.sd-dss:dss-policy-jaxb:jar:6.5.1:compile
+[INFO] |  +- eu.europa.ec.joinup.sd-dss:dss-jaxb-parsers:jar:6.5.1:compile
+[INFO] |  |  +- eu.europa.ec.joinup.sd-dss:dss-jaxb-common:jar:6.5.1:compile
+[INFO] |  |  +- jakarta.xml.bind:jakarta.xml.bind-api:jar:3.0.1:compile
+[INFO] |  |  |  \- com.sun.activation:jakarta.activation:jar:2.0.1:compile
+[INFO] |  |  \- org.glassfish.jaxb:jaxb-runtime:jar:3.0.2:runtime
+[INFO] |  |     \- org.glassfish.jaxb:jaxb-core:jar:3.0.2:runtime
+[INFO] |  |        +- org.glassfish.jaxb:txw2:jar:3.0.2:runtime
+[INFO] |  |        \- com.sun.istack:istack-commons-runtime:jar:4.0.1:runtime
+[INFO] |  \- eu.europa.ec.joinup.sd-dss:dss-model:jar:6.5.1:compile
+[INFO] |     \- eu.europa.ec.joinup.sd-dss:dss-enumerations:jar:6.5.1:compile
+[INFO] \- eu.europa.ec.joinup.sd-dss:dss-utils-apache-commons:jar:6.5.1:compile
+[INFO]    +- eu.europa.ec.joinup.sd-dss:dss-utils:jar:6.5.1:compile
+[INFO]    +- org.apache.commons:commons-lang3:jar:3.21.0:compile
+[INFO]    +- org.apache.commons:commons-collections4:jar:4.6.0:compile
+[INFO]    +- commons-codec:commons-codec:jar:1.18.0:compile
+[INFO]    \- commons-io:commons-io:jar:2.22.0:compile
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  0.712 s
+[INFO] Finished at: 2026-10-23T11:18:47+03:00
+[INFO] ------------------------------------------------------------------------

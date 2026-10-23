@@ -1,0 +1,56 @@
+<?xml version="1.0"?>
+<Document><Data Id="payload">Enveloped baseline payload</Data>
+<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig">
+  <ds:SignedInfo>
+    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+    <ds:Reference Id="sig-data" URI="">
+      <ds:Transforms>
+        <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+        <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+      </ds:Transforms>
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue>PVwfDgi+CsPGTIocwLdIOzXFMNdZ25H5p3lU+4kFSJ0=</ds:DigestValue>
+    </ds:Reference>
+    <ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp">
+      <ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>
+      <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+      <ds:DigestValue>dyPO46uRmxPnytjVy1QQ0/5GNxmYnTol6hcZMdoDV5s=</ds:DigestValue>
+    </ds:Reference>
+  </ds:SignedInfo>
+  <ds:SignatureValue Id="sig-value">VaccQcrJHEEsgKzY2IkG6kn4kwQszpUZYy8fbBlOemjyv6USI/WNwvN7Nd99rnux
+i5YlqEqtQzgLepCmuaQ0TgnwaNfsA80dz6v+VTvuJ2E0PBaq7rub88RYDBCKRz5o
+T4gbTJPIagRBZ72kwqeKm5Hzn+iRUsbNeZI6W2bK9TowjtXSl2x/qWSeEQQT7iRR
+fOBrzC+6TZ+VWKZ//0tatIIcmXUwtbWt5b8HY+w9KIMXBWR8IH+cV0nQIqaHPL8P
+nxhVB4WJvYyfXZKgpT2bcMhMfic5zUCO7R4r9NQ8Ji9ZpACVI3RhtTeKFZIo3SW4
+qdQP7ZfmreruRTqdRQcXgA==</ds:SignatureValue>
+  <ds:KeyInfo><ds:X509Data><ds:X509IssuerSerial>
+<ds:X509IssuerName>CN=xml-sec XAdES Test Intermediate</ds:X509IssuerName>
+<ds:X509SerialNumber>522233446491425501878110623888192037543446034272</ds:X509SerialNumber>
+</ds:X509IssuerSerial></ds:X509Data></ds:KeyInfo>
+  
+  <ds:Object>
+    <xades:QualifyingProperties xmlns:xades="http://uri.etsi.org/01903/v1.3.2#" Target="#sig">
+      <xades:SignedProperties Id="sp">
+        <xades:SignedSignatureProperties>
+          <xades:SigningTime>2026-10-18T12:00:00Z</xades:SigningTime>
+          <xades:SigningCertificateV2>
+            <xades:Cert>
+              <xades:CertDigest>
+                <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+                <ds:DigestValue>t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=</ds:DigestValue>
+              </xades:CertDigest>
+            </xades:Cert>
+          </xades:SigningCertificateV2>
+        </xades:SignedSignatureProperties>
+        <xades:SignedDataObjectProperties>
+          <xades:DataObjectFormat ObjectReference="#sig-data">
+            <xades:MimeType>text/xml</xades:MimeType>
+          </xades:DataObjectFormat>
+        </xades:SignedDataObjectProperties>
+      </xades:SignedProperties>
+      
+    </xades:QualifyingProperties>
+  </ds:Object>
+</ds:Signature>
+</Document>

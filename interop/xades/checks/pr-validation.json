@@ -1,0 +1,61 @@
+{
+  "base_commit": "834c463798060dca613bb93dd78dcdc7f949c948",
+  "gates": {
+    "workspace-default": {
+      "status": "проверено",
+      "log": "pr-workspace-qualified-tests.log"
+    },
+    "workspace-clippy": {
+      "status": "проверено",
+      "log": "pr-clippy.log"
+    },
+    "workspace-format": {
+      "status": "проверено",
+      "log": "pr-fmt.log"
+    },
+    "workspace-doctests": {
+      "status": "проверено",
+      "log": "pr-doctests.log"
+    },
+    "xades-all-features-tests": {
+      "status": "проверено",
+      "log": "pr-xades-all-features-tests.log"
+    },
+    "xades-all-features-clippy": {
+      "status": "проверено",
+      "log": "pr-xades-all-features-clippy.log"
+    },
+    "python-harness": {
+      "status": "проверено",
+      "log": "pr-harness-tests.log"
+    },
+    "xml-input-alloc-host-msrv": {
+      "status": "проверено",
+      "log": "pr-alloc-host.log"
+    },
+    "xml-input-alloc-thumb-msrv": {
+      "status": "проверено",
+      "log": "pr-alloc-thumb.log"
+    }
+  },
+  "frozen_corpus_recheck": {
+    "status": "проверено",
+    "cases": 34,
+    "matching_reference_pairs": 96,
+    "matching_signedinfo_pairs": 41
+  },
+  "minimal_binding_recheck": {
+    "status": "проверено",
+    "cases": 9,
+    "signed_fixtures_and_outcomes_identical_to_frozen": true,
+    "strict_policy_outcomes_identical_to_frozen": true
+  },
+  "workspace_oracle": {
+    "version": "xmlsec1 1.3.13 (openssl)",
+    "openssl": "OpenSSL 3.5.9 29 Sep 2026 (Library: OpenSSL 3.5.9 29 Sep 2026)",
+    "source_commit": "5fdd47dc35753438bdc38b6e96c1a3805c67a483",
+    "binary_sha256": "618589fb5004b092595d94acbd0387a45ea8c4c3a6099efc8df2c79fec0ec7cb",
+    "purpose": "additional workspace qualification; frozen XAdES oracle remains native libxmlsec1 1.3.12"
+  },
+  "remote_ci": "не запускалось или заблокировано"
+}

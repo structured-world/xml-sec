@@ -1,0 +1,4 @@
+selected_certificate=C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D
+selected_certificate_reference_null=false
+reference.0.match=false
+reference.0.digest=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=

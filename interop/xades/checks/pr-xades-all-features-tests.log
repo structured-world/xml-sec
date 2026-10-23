@@ -1,0 +1,8 @@
+   Compiling xml-sec v0.2.0 (/Users/polaz/.codex/worktrees/xades-interop/xml-sec)
+   Compiling xml-sec-xades v0.1.0 (/Users/polaz/.codex/worktrees/xades-interop/xml-sec/crates/xml-sec-xades)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.69s
+────────────
+ Nextest run ID 043f5222-2660-4263-9db0-e2b54c4ea4d7 with nextest profile: default
+    Starting 18 tests across 2 binaries
+────────────
+     Summary [   0.604s] 18 tests run: 18 passed, 0 skipped

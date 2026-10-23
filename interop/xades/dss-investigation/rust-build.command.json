@@ -1,0 +1,8 @@
+[
+  "cargo",
+  "build",
+  "-p",
+  "xml-sec-xades",
+  "--example",
+  "interop_probe"
+]

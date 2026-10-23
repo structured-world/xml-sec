@@ -1,0 +1,7 @@
+here=legacy
+accepted=false
+all_valid=false
+signature.0.error=Policy(Uri { operation: "verification", reason: "reference URI class is not permitted" })
+replay.refused=InvalidRequest { reason: "selected Signature is not authenticated" }
+request=Ok(())
+retained_bytes=0

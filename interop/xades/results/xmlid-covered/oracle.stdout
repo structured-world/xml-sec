@@ -1,0 +1,127 @@
+= VERIFICATION CONTEXT
+== Status: FAILED
+== Failure reason: REFERENCE
+== flags: 0x0000000e
+== flags2: 0x00000000
+== Id: "sig"
+== Key Info Read Ctx:
+= KEY INFO READ CONTEXT
+== flags: 0x00000000
+== flags2: 0x00000000
+== enabled key data: all
+== RetrievalMethod level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== KeyInfoReference level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== EncryptedKey level (cur/max): 0/1
+=== KeyReq:
+==== keyId: rsa
+==== keyType: 0x00000001
+==== keyUsage: 0x00000002
+==== keyBitsSize: 0
+=== list size: 0
+== Key Info Write Ctx:
+= KEY INFO WRITE CONTEXT
+== flags: 0x00000000
+== flags2: 0x00000000
+== enabled key data: all
+== RetrievalMethod level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== KeyInfoReference level (cur/max): 0/1
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+== EncryptedKey level (cur/max): 0/1
+=== KeyReq:
+==== keyId: NULL
+==== keyType: 0x00000001
+==== keyUsage: 0xffffffff
+==== keyBitsSize: 0
+=== list size: 0
+== Signature Transform Ctx:
+== TRANSFORMS CTX (status=0)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+=== Transform: exc-c14n (href=http://www.w3.org/2001/10/xml-exc-c14n#)
+=== Transform: membuf-transform (href=NULL)
+=== Transform: rsa-sha256 (href=http://www.w3.org/2001/04/xmldsig-more#rsa-sha256)
+== Signature Method:
+=== Transform: rsa-sha256 (href=http://www.w3.org/2001/04/xmldsig-more#rsa-sha256)
+== Signature Key:
+== KEY
+=== method: RSAKeyValue
+=== key type: Private
+=== key usage: 4294967295
+=== key not valid before: 1767225600
+=== key not valid after: 2366841600
+=== rsa key: size = 2048
+=== list size: 1
+=== X509 Data:
+==== Key Certificate:
+==== Subject Name: CN=xml-sec XAdES Test Signer
+==== Issuer Name: CN=xml-sec XAdES Test Intermediate
+==== Issuer Serial: 5B79C1F5671E90101D19F751223D0D8E60E3B760
+==== Certificate:
+==== Subject Name: CN=xml-sec XAdES Test Signer
+==== Issuer Name: CN=xml-sec XAdES Test Intermediate
+==== Issuer Serial: 5B79C1F5671E90101D19F751223D0D8E60E3B760
+==== Certificate:
+==== Subject Name: CN=xml-sec XAdES Test Signer
+==== Issuer Name: CN=xml-sec XAdES Test Intermediate
+==== Issuer Serial: 5B79C1F5671E90101D19F751223D0D8E60E3B760
+==== Certificate:
+==== Subject Name: CN=xml-sec XAdES Test Intermediate
+==== Issuer Name: CN=xml-sec XAdES Test Root
+==== Issuer Serial: 70AF45FBACE3C1E8936F9DF14A06DD90FD21BB09
+== SignedInfo References List:
+=== list size: 1
+= REFERENCE VERIFICATION CONTEXT
+== Status: FAILED
+== Id: "sig-data"
+== URI: ""
+== Reference Transform Ctx:
+== TRANSFORMS CTX (status=2)
+== flags: 0x00000000
+== maxDepth: 16
+== enabled transforms: all
+=== uri: NULL
+=== uri xpointer expr: NULL
+=== Transform: xpath2 (href=http://www.w3.org/2002/06/xmldsig-filter2)
+=== Transform: c14n11 (href=http://www.w3.org/2006/12/xml-c14n11)
+=== Transform: membuf-transform (href=NULL)
+=== Transform: sha256 (href=http://www.w3.org/2001/04/xmlenc#sha256)
+=== Transform: membuf-transform (href=NULL)
+== Digest Method:
+=== Transform: sha256 (href=http://www.w3.org/2001/04/xmlenc#sha256)
+== PreDigest data - start buffer:
+3c4461746120786d6c6e733a713d2275726e3a746573743a6174747269627574
+6573222049643d227061796c6f61642220613d22312220623d22322220786d6c
+3a626173653d2268747470733a2f2f6578616d706c652e696e76616c69642f61
+2f622f2220786d6c3a69643d226368616e6765642220786d6c3a6c616e673d22
+656e2220713a666c61673d22796573223e53796e74686574696320696e766f69
+6365203132333c4b6565703e7369676e65643c2f4b6565703e3c4578636c7564
+65643e6d757461626c653c2f4578636c756465643e3c2f446174613e
+== PreDigest data - end buffer
+== Manifest References List:
+=== list size: 0

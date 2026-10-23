@@ -1,0 +1,3 @@
+<Document xml:base="https://example.invalid/a/" xml:id="document" xml:lang="en"><Box xml:base="b/" xml:id="box"><Data xmlns:q="urn:test:attributes" Id="payload" a="1" b="2" xml:id="business" q:flag="yes">Synthetic invoice 999<Keep>signed</Keep><Excluded>mutable</Excluded></Data></Box><Outside Id="wrong">unrelated object</Outside>
+
+</Document>

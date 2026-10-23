@@ -1,0 +1,7 @@
+here=spec
+accepted=false
+all_valid=false
+signature.0.error=KeyResolution(Chain(InvalidKeyUsage { position: 0, required: "digitalSignature or nonRepudiation" }))
+replay.refused=InvalidRequest { reason: "selected Signature is not authenticated" }
+request=Ok(())
+retained_bytes=0

@@ -1,0 +1,190 @@
+[
+  {
+    "artifact": "dss-xades",
+    "version": "6.5.1",
+    "url": "https://repo.maven.apache.org/maven2/eu/europa/ec/joinup/sd-dss/dss-xades/6.5.1/dss-xades-6.5.1-sources.jar",
+    "jar_sha256": "8f92f63e5dbaac836ee11166fbb3769347bcbdb93f8b1d1ee7a79ff4cdf0821e",
+    "files": [
+      {
+        "entry": "eu/europa/esig/dss/xades/definition/xades132/XAdES132Path.java",
+        "sha256": "9070a0704a33b82bf0238805ae7fc88a207512a6bca141a08abf969711946d80",
+        "read_ranges": [
+          [
+            68,
+            81
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-xades/src/main/java/eu/europa/esig/dss/xades/definition/xades132/XAdES132Path.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/xades/validation/XAdESStructureValidator.java",
+        "sha256": "d7edfda8e44cc982c14cde3654af75dd91c1ca473d1c0dc45d20283edbb02605",
+        "read_ranges": [
+          [
+            36,
+            40
+          ],
+          [
+            62,
+            73
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-xades/src/main/java/eu/europa/esig/dss/xades/validation/XAdESStructureValidator.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/xades/validation/XAdESBaselineRequirementsChecker.java",
+        "sha256": "a53a5342e06919177a880a3859e91fbb46296f3378df9aca2c876e032ae8adb3",
+        "read_ranges": [
+          [
+            80,
+            213
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-xades/src/main/java/eu/europa/esig/dss/xades/validation/XAdESBaselineRequirementsChecker.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/xades/validation/XAdESCertificateSource.java",
+        "sha256": "51021f5eb7b210004744ede6073ef62a3932dbf31a413309b63bf12387a9cc14",
+        "read_ranges": [
+          [
+            168,
+            217
+          ],
+          [
+            268,
+            298
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-xades/src/main/java/eu/europa/esig/dss/xades/validation/XAdESCertificateSource.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/xades/validation/XAdESSignature.java",
+        "sha256": "3d386cb696bf3597e1d7b81fbcbd9a11af78996f77705a34fee595e14c43111b",
+        "read_ranges": [
+          [
+            812,
+            825
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-xades/src/main/java/eu/europa/esig/dss/xades/validation/XAdESSignature.java"
+      }
+    ],
+    "validation_target_search": {
+      "java_files": 39,
+      "literal_terms": [
+        "Target",
+        "TARGET"
+      ],
+      "matches": []
+    }
+  },
+  {
+    "artifact": "dss-diagnostic-jaxb",
+    "version": "6.5.1",
+    "url": "https://repo.maven.apache.org/maven2/eu/europa/ec/joinup/sd-dss/dss-diagnostic-jaxb/6.5.1/dss-diagnostic-jaxb-6.5.1-sources.jar",
+    "jar_sha256": "ccc4aa26b000764c272e744fc1c57006bb1193b851adaa77cae3c47558e4baa4",
+    "files": [
+      {
+        "entry": "eu/europa/esig/dss/diagnostic/AbstractTokenProxy.java",
+        "sha256": "d8984757eb499bf7d34a2a6694be37a2622a381969c26c4bb5a5960c47778e06",
+        "read_ranges": [
+          [
+            176,
+            226
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-diagnostic-jaxb/src/main/java/eu/europa/esig/dss/diagnostic/AbstractTokenProxy.java"
+      }
+    ]
+  },
+  {
+    "artifact": "dss-validation",
+    "version": "6.5.1",
+    "url": "https://repo.maven.apache.org/maven2/eu/europa/ec/joinup/sd-dss/dss-validation/6.5.1/dss-validation-6.5.1-sources.jar",
+    "jar_sha256": "64c009e113333675b92b8661498462d0a7c7a4efa2fc85be8043b6b311474f52",
+    "files": [
+      {
+        "entry": "eu/europa/esig/dss/validation/process/bbb/isc/checks/DigestValueMatchCheck.java",
+        "sha256": "3f72d26e1d4c3f380dc9c23adde4822425abb46642a82fbe4deda529a2c985c3",
+        "read_ranges": [
+          [
+            52,
+            68
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-validation/src/main/java/eu/europa/esig/dss/validation/process/bbb/isc/checks/DigestValueMatchCheck.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/validation/process/bbb/isc/IdentificationOfTheSigningCertificate.java",
+        "sha256": "2899c0ae06a59dda2775a104c6bcfd42470dc5f6668a3765ff748805286b217b",
+        "read_ranges": [
+          [
+            82,
+            130
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-validation/src/main/java/eu/europa/esig/dss/validation/process/bbb/isc/IdentificationOfTheSigningCertificate.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/validation/process/bbb/sav/checks/SigningCertificateReferencesValidityCheck.java",
+        "sha256": "c5f61a79bbd6599e870bf663732cc8d59ead230c1fba3e657a1f4fbb043c11cd",
+        "read_ranges": [
+          [
+            65,
+            90
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-validation/src/main/java/eu/europa/esig/dss/validation/process/bbb/sav/checks/SigningCertificateReferencesValidityCheck.java"
+      },
+      {
+        "entry": "eu/europa/esig/dss/validation/SignedDocumentValidator.java",
+        "sha256": "4a420324a57381624079dcb3a2f745f61062437ac5a6f9d8061c733f05d75633",
+        "read_ranges": [
+          [
+            386,
+            412
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-validation/src/main/java/eu/europa/esig/dss/validation/SignedDocumentValidator.java"
+      }
+    ]
+  },
+  {
+    "artifact": "dss-spi",
+    "version": "6.5.1",
+    "url": "https://repo.maven.apache.org/maven2/eu/europa/ec/joinup/sd-dss/dss-spi/6.5.1/dss-spi-6.5.1-sources.jar",
+    "jar_sha256": "d340d718bca8ff07c533cc29e394d2196b9769fa9e449c736cb0be4d6ecaa8bb",
+    "files": [
+      {
+        "entry": "eu/europa/esig/dss/spi/x509/SignatureIntegrityValidator.java",
+        "sha256": "e03bee10e070e0048a17973a6716881547aaeef45aec5bb33cc70cf75320e88f",
+        "read_ranges": [
+          [
+            56,
+            120
+          ]
+        ],
+        "tag_url": "https://github.com/esig/dss/blob/6.5.1/dss-spi/src/main/java/eu/europa/esig/dss/spi/x509/SignatureIntegrityValidator.java"
+      }
+    ]
+  },
+  {
+    "artifact": "dss-policy-jaxb",
+    "version": "6.5.1",
+    "jar_sha256": "a7b6190222f8ed018c4e7305469d26c091a23c635e34b0af611205bf83ae4a71",
+    "entry": "policy/constraint.xml",
+    "entry_sha256": "34b09d3837426997f07dc6c9c7c637d0dea482839c0f652f2c016abd6e685a75",
+    "structural_validation": "WARN",
+    "cert_digest_match": "FAIL",
+    "read_ranges": [
+      [
+        35,
+        44
+      ],
+      [
+        173,
+        181
+      ]
+    ]
+  }
+]

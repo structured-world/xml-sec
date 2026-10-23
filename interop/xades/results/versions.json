@@ -1,0 +1,12 @@
+{
+  "commit": "834c463798060dca613bb93dd78dcdc7f949c948",
+  "oracle_binary": {
+    "path": "/opt/homebrew/Cellar/libxmlsec1/1.3.12/bin/xmlsec1",
+    "sha256": "5b16375ec3804dd9de4b22ae126870278eb2951e9353eb76d13af9c580ebb94e"
+  },
+  "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)\nbinary: rustc\ncommit-hash: b940084d7eb6a299eb4bfeb8e34901bc051e7ac4\ncommit-date: 2026-09-28\nhost: aarch64-apple-darwin\nrelease: 1.99.0\nLLVM version: 23.1.1\n",
+  "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)\n",
+  "xmlsec1": "xmlsec1 1.3.12 (openssl)\n",
+  "openssl": "OpenSSL 4.0.3 29 Sep 2026 (Library: OpenSSL 4.0.3 29 Sep 2026)\nbuilt on: Tue Sep 29 13:44:55 2026 UTC\nplatform: darwin64-arm64-cc\noptions:  bn(64,64)\ncompiler: clang -fPIC -arch arm64 -O3 -Wall -DL_ENDIAN -DOPENSSL_PIC -D_REENTRANT -DNDEBUG\nOPENSSLDIR: \"/opt/homebrew/etc/openssl@4\"\nMODULESDIR: \"/opt/homebrew/Cellar/openssl@4/4.0.3/lib/ossl-modules\"\nSeeding source: os-specific\nCPUINFO: OPENSSL_armcap=0x987d\n",
+  "python": "Python 3.11.9\n"
+}
