@@ -8,11 +8,13 @@
 # properties violate EN 319 132-1.
 #
 # Usage: XMLSEC1_BIN=/path/to/xmlsec1 scripts/generate-xades-fixtures.sh
+# XADES_FIXTURE_OUTPUT optionally selects an absolute output directory.
 # Requires OpenSSL 3.4 or later for fixed certificate validity dates.
 set -euo pipefail
 
 repository="$(cd "$(dirname "$0")/.." && pwd)"
-output="$repository/crates/xml-sec-xades/tests/fixtures"
+output="${XADES_FIXTURE_OUTPUT:-$repository/crates/xml-sec-xades/tests/fixtures}"
+mkdir -p "$output"
 xmlsec1="${XMLSEC1_BIN:-xmlsec1}"
 # XADES_FIXTURE_WORK keeps the keys and templates for inspection.
 if [ -n "${XADES_FIXTURE_WORK:-}" ]; then

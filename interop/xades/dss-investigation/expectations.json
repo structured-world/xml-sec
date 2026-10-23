@@ -1,0 +1,303 @@
+{
+  "cases": [
+    {
+      "name": "control",
+      "target": "#sig",
+      "cert_references": [
+        "signer"
+      ],
+      "expected_bb": true,
+      "fixture_sha256": "6488c1edea665dd52869379a0f6e13b2e078a6e081415b6a1e7a38b8c15d3c98",
+      "rust_bb": true,
+      "rust_finding": "xades=Ok(Assessed((true, true)))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
+    },
+    {
+      "name": "target-payload",
+      "target": "#payload",
+      "cert_references": [
+        "signer"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "9156879dde6e1a8636c3e0f5ab57daec7f4560f8133f9b56112e5369c6963c0f",
+      "rust_bb": false,
+      "rust_finding": "xades=Err(Prepare(Binding(Target { node: NodeIdentity { document: DocumentIdentity(1), generation: 0, semantic_id: SemanticNodeId(29) } })))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
+    },
+    {
+      "name": "target-unresolved",
+      "target": "#absent",
+      "cert_references": [
+        "signer"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "cdf2c6cb00ecafaa47d3ac8b04337987b9155eb410ff25ed59e2f019e5accaed",
+      "rust_bb": false,
+      "rust_finding": "xades=Err(Prepare(Binding(Target { node: NodeIdentity { document: DocumentIdentity(1), generation: 0, semantic_id: SemanticNodeId(29) } })))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
+    },
+    {
+      "name": "target-absent",
+      "target": null,
+      "cert_references": [
+        "signer"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "0b2125db647e8d59ae711345f86b94d89b1ad8a968b6b131780ad86cb243f3c3",
+      "rust_bb": false,
+      "rust_finding": "xades=Err(Prepare(Binding(Target { node: NodeIdentity { document: DocumentIdentity(1), generation: 0, semantic_id: SemanticNodeId(29) } })))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "false",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
+    },
+    {
+      "name": "cert-root",
+      "target": "#sig",
+      "cert_references": [
+        "root"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "4dd96d3e08205e9947eefa5b7f2edeec7288b4649fcc78428ba14e28c0634fc5",
+      "rust_bb": false,
+      "rust_finding": "xades=Ok(Assessed((false, false)))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "true",
+        "reference.0.match": "true",
+        "reference.0.digest": "/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc="
+      }
+    },
+    {
+      "name": "cert-intermediate",
+      "target": "#sig",
+      "cert_references": [
+        "intermediate"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "e2d7cf0aa83c938df951aff8f057dbebfa9eba4a7965bc10cd10c9d873c07f13",
+      "rust_bb": false,
+      "rust_finding": "xades=Ok(Assessed((false, false)))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "NO_SIGNING_CERTIFICATE_FOUND",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "INDETERMINATE",
+        "VCI": "PASSED",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "null",
+        "selected_certificate_reference_null": "true",
+        "reference.0.match": "true",
+        "reference.0.digest": "Pmyr1sR5B/9XAshZUgflwbSizHMoZOi/pEgq/uHxt3Q="
+      }
+    },
+    {
+      "name": "cert-unmatched",
+      "target": "#sig",
+      "cert_references": [
+        "unmatched"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "448f642843667123a11555bef9c686cc8777538b5786000d621ab218f3bda84d",
+      "rust_bb": false,
+      "rust_finding": "xades=Ok(Assessed((false, false)))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "NO_SIGNING_CERTIFICATE_FOUND",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "INDETERMINATE",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "false",
+        "reference.0.digest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      }
+    },
+    {
+      "name": "cert-root-then-signer",
+      "target": "#sig",
+      "cert_references": [
+        "root",
+        "signer"
+      ],
+      "expected_bb": false,
+      "fixture_sha256": "29eb4d43e7b0eed39d09bb4dd92ce82fd96d2f9f83426c7f01959732e46563c5",
+      "rust_bb": false,
+      "rust_finding": "xades=Ok(Assessed((false, false)))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=",
+        "reference.1.match": "true",
+        "reference.1.digest": "/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc="
+      }
+    },
+    {
+      "name": "cert-signer-then-root",
+      "target": "#sig",
+      "cert_references": [
+        "signer",
+        "root"
+      ],
+      "expected_bb": true,
+      "fixture_sha256": "79b64b808c8a91d214b4f2bd607974cb10e738f0572de201b60edacf116d3e98",
+      "rust_bb": true,
+      "rust_finding": "xades=Ok(Assessed((true, true)))",
+      "dss_format": "XAdES-BASELINE-B",
+      "dss_indication": "INDETERMINATE",
+      "dss_subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "dss_structure": "true",
+      "dss_blocks": {
+        "FC": "PASSED",
+        "ISC": "PASSED",
+        "VCI": "PASSED",
+        "XCV": "INDETERMINATE",
+        "CV": "PASSED",
+        "SAV": "PASSED",
+        "AOV": "PASSED"
+      },
+      "rust_xml_dsig_status": "verified",
+      "native_xml_dsig_status": "verified",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=",
+        "reference.1.match": "true",
+        "reference.1.digest": "/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc="
+      }
+    }
+  ],
+  "certificate_sha256": {
+    "signer": "b77e6878076e42aeb916698199f27f2123c2561bced05f43ca1887405c30813d",
+    "intermediate": "3e6cabd6c47907ff5702c8595207e5c1b4a2cc732864e8bfa4482afee1f1b774",
+    "root": "fcfb15717a91438719d89eb3b03ced7c9607b6cb553c378be39c520435cf7957"
+  },
+  "target_only_signature_values_identical": true
+}

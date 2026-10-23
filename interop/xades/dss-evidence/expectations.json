@@ -1,0 +1,356 @@
+[
+  {
+    "name": "enveloped-control",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified"
+  },
+  {
+    "name": "filter2-subtract",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified"
+  },
+  {
+    "name": "filter2-sequence",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified"
+  },
+  {
+    "name": "c14n11-reference",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified"
+  },
+  {
+    "name": "c14n11-signedinfo",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified"
+  },
+  {
+    "name": "empty-result",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified"
+  },
+  {
+    "name": "baseline-wrong-target",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified",
+    "profile_binding": {
+      "status": "not run or blocked",
+      "reason": "FC and format labels do not attest Target binding; see dss-investigation"
+    }
+  },
+  {
+    "name": "baseline-untyped-signed-properties",
+    "reported_format": "XAdES-BES",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "INDETERMINATE",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": "SIG_CONSTRAINTS_FAILURE",
+      "AOV": null
+    },
+    "crypto_status": "verified",
+    "profile_binding": {
+      "status": "verified",
+      "reason": "format classification only; not full profile validation"
+    }
+  },
+  {
+    "name": "baseline-certificate-digest-mismatch",
+    "reported_format": "XAdES-BASELINE-B",
+    "indication": "INDETERMINATE",
+    "subindication": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+    "signature_intact": "true",
+    "digest_matchers": [
+      {
+        "uri": "",
+        "found": "true",
+        "intact": "true"
+      },
+      {
+        "uri": "#sp",
+        "found": "true",
+        "intact": "true"
+      }
+    ],
+    "conclusions": {
+      "FC": "PASSED",
+      "ISC": "PASSED",
+      "VCI": "PASSED",
+      "XCV": "INDETERMINATE",
+      "CV": "PASSED",
+      "SAV": "PASSED",
+      "AOV": "PASSED"
+    },
+    "subindications": {
+      "FC": null,
+      "ISC": null,
+      "VCI": null,
+      "XCV": "CERTIFICATE_CHAIN_GENERAL_FAILURE",
+      "CV": null,
+      "SAV": null,
+      "AOV": null
+    },
+    "crypto_status": "verified",
+    "profile_binding": {
+      "status": "failed",
+      "reason": "root-only CertDigest must not identify the leaf signing certificate"
+    }
+  }
+]

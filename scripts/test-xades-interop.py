@@ -1,0 +1,223 @@
+#!/usr/bin/env python3
+"""Guard the evidence parser against false positive interoperability reports."""
+import importlib.util
+import base64
+import contextlib
+import hashlib
+import io
+import json
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location("interop", Path(__file__).with_name("xades-interop.py"))
+interop = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(interop)
+spec_dss = importlib.util.spec_from_file_location("dss", Path(__file__).with_name("xades-dss.py"))
+dss = importlib.util.module_from_spec(spec_dss)
+spec_dss.loader.exec_module(dss)
+spec_package = importlib.util.spec_from_file_location("package", Path(__file__).with_name("package-xades-interop.py"))
+package = importlib.util.module_from_spec(spec_package)
+spec_package.loader.exec_module(package)
+spec_binding = importlib.util.spec_from_file_location("binding", Path(__file__).with_name("investigate-xades-dss.py"))
+binding = importlib.util.module_from_spec(spec_binding)
+spec_binding.loader.exec_module(binding)
+spec_check = importlib.util.spec_from_file_location("check", Path(__file__).with_name("check-xades-interop.py"))
+check = importlib.util.module_from_spec(spec_check)
+spec_check.loader.exec_module(check)
+
+
+class EvidenceTests(unittest.TestCase):
+    def test_inventory_rejects_changed_assets_and_tracked_run_outputs(self):
+        # CI must catch stale reference data and accidental commits of actual outputs.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root/'interop/xades'
+            fixture = corpus/'fixtures/enveloped-control.xml'
+            fixture.parent.mkdir(parents=True)
+            fixture.write_bytes(b'<synthetic/>')
+            (corpus/'SHA256SUMS').write_text(hashlib.sha256(fixture.read_bytes()).hexdigest() +
+                '  interop/xades/fixtures/enveloped-control.xml\n')
+            tracked = b'interop/xades/fixtures/enveloped-control.xml\0interop/xades/SHA256SUMS\0'
+            with patch.object(check, 'ROOT', root), patch.object(check, 'PACKAGE', corpus), \
+                 patch.object(check, 'load', return_value=package), patch.object(package, 'PACKAGE', corpus), \
+                 patch('subprocess.check_output', return_value=tracked) as listing:
+                check.check_inventory()
+                fixture.write_bytes(b'<changed/>')
+                with self.assertRaisesRegex(SystemExit, 'corpus checksum mismatch'):
+                    check.check_inventory()
+                listing.return_value = tracked + b'interop/xades/results/enveloped-control/spec/reference-0.bin\0'
+                with self.assertRaisesRegex(SystemExit, 'run artifact or undeclared corpus file tracked'):
+                    check.check_inventory()
+
+    def test_goldens_reject_changed_and_missing_live_octets(self):
+        # Fresh oracle results must match the reference corpus, including empty vectors.
+        with tempfile.TemporaryDirectory() as directory:
+            expected, actual = Path(directory)/'expected', Path(directory)/'actual'
+            expected.mkdir(); actual.mkdir()
+            (expected/'expected-reference-0.bin').write_bytes(b'')
+            (actual/'expected-reference-0.bin').write_bytes(b'')
+            self.assertEqual(check.check_goldens(expected, actual), 1)
+            (actual/'expected-reference-0.bin').write_bytes(b'x')
+            with self.assertRaisesRegex(SystemExit, 'golden mismatch:.*first_different_byte'):
+                check.check_goldens(expected, actual)
+            self.assertEqual(json.loads((actual/'golden-comparison.json').read_text())[0]['first_different_byte'], 0)
+            (actual/'expected-reference-0.bin').unlink()
+            with self.assertRaisesRegex(SystemExit, 'golden inventory mismatch'):
+                check.check_goldens(expected, actual)
+
+    def test_dss_expectations_reject_changed_live_conclusions(self):
+        # A passing XMLDSig cannot hide a changed DSS profile or certificate finding.
+        with tempfile.TemporaryDirectory() as directory:
+            expected, actual = Path(directory)/'expected.json', Path(directory)/'actual.json'
+            expected.write_text('{"ISC":"PASSED"}')
+            actual.write_text('{"ISC":"INDETERMINATE"}')
+            with self.assertRaisesRegex(SystemExit, 'DSS expectation mismatch'):
+                check.check_expectations(expected, actual)
+
+    def test_binding_summary_preserves_selected_signer_and_digest(self):
+        # Keep the evidence for the root-versus-signer discrepancy without raw reports.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "binding-facts.txt"
+            path.write_text("structural_policy=WARN\nselected_certificate=leaf\n"
+                            "selected_certificate_reference_null=true\nreference.0.match=true\n"
+                            "reference.0.digest=YWJjZA==\n")
+            self.assertEqual(binding.binding_facts(path), {
+                "selected_certificate": "leaf", "selected_certificate_reference_null": "true",
+                "reference.0.match": "true", "reference.0.digest": "YWJjZA=="})
+
+    def test_bundle_excludes_execution_logs(self):
+        # A distributable corpus contains signature evidence, not workstation logs.
+        for name in ["checks/pr-validation.json", "checks/build.log", "generation/sign.command.json",
+                     "results/build.stdout", "results/versions/metadata.stdout", "case/run.stderr",
+                     "case/probe.command.json", "case/rust/result.txt"]:
+            self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
+        for name in ["case/diagnostic.xml", "case/detailed.xml", "case/simple.xml", "case/binding-facts.txt"]:
+            self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
+        for name in ["results/control/spec/reference-0.bin", "results/control/spec/replay-0.bin",
+                     "dss-investigation/control/rust/signature-0.bin", "results/summary.json",
+                     "results/versions.json", "dss-evidence/dependencies.json", "surprise.tmp"]:
+            self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
+        for name in ["fixtures/enveloped-control.xml", "fixtures/signer.key", "results/enveloped-control/expected-reference-0.bin",
+                     "dss-evidence/expectations.json"]:
+            self.assertTrue(package.include_evidence(package.PACKAGE / name), name)
+
+    def test_dependency_versions_do_not_export_local_package_ids(self):
+        # Cargo metadata includes absolute package IDs; the public manifest must not.
+        identity = "path+file:///Users/example/private#sample@1.0.0"
+        metadata = dict(packages=[dict(id=identity, name="sample", version="1.0.0")],
+                        resolve=dict(nodes=[dict(id=identity, features=["std"])]))
+        self.assertEqual(interop.resolved_versions(metadata),
+                         [dict(name="sample", version="1.0.0", features=["std"])])
+
+    def test_analyze_uses_retained_octets_without_raw_process_logs(self):
+        # Reanalysis of a run needs its octets, not raw process captures.
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory)
+            case = output / "case"
+            rust = case / "rust"
+            rust.mkdir(parents=True)
+            references = [b"first", b"second"]
+            values = []
+            for index, data in enumerate(references):
+                (case / f"expected-reference-{index}.bin").write_bytes(data)
+                (rust / f"reference-{index}.bin").write_bytes(data)
+                (rust / f"replay-{index}.bin").write_bytes(data)
+                values.append(base64.b64encode(hashlib.sha256(data).digest()).decode())
+            (case / "expected-signedinfo.bin").write_bytes(b"signedinfo")
+            (rust / "signature-0.bin").write_bytes(b"signedinfo")
+            (case / "signed.xml").write_text(f'<Signature xmlns="{interop.DS}"><SignedInfo>' +
+                ''.join(f'<Reference><DigestValue>{value}</DigestValue></Reference>' for value in values) +
+                '</SignedInfo></Signature>')
+            (output / "summary.json").write_text(json.dumps(dict(cases=[dict(name="case")])))
+            with patch.object(binding, "OUT", output), contextlib.redirect_stdout(io.StringIO()):
+                binding.analyze_octets()
+            self.assertFalse((case / "libxmlsec.stdout").exists())
+            self.assertEqual(json.loads((output / "octet-comparison.json").read_text())[0]
+                             ["signed_info"]["status"], "verified")
+
+    def test_evidence_refusal_survives_python_optimization(self):
+        # Python -O must not remove the signed-octet or normative outcome gates.
+        script = Path(__file__).with_name("investigate-xades-dss.py").resolve()
+        result = subprocess.run([sys.executable, "-O", "-c",
+            "import runpy,sys; runpy.run_path(sys.argv[1])['require'](False, 'octet-check-failed')",
+            str(script)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stderr.strip(), "octet-check-failed")
+
+    def test_corpus_output_creates_missing_parents(self):
+        # Explicit results must work after cargo clean, before any oracle call.
+        class SetupComplete(Exception):
+            pass
+
+        script = Path(__file__).with_name("xades-interop.py").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "missing-parent" / "evidence"
+            with patch.object(sys, "argv", [str(script), "--results", str(output)]):
+                with patch("subprocess.run", side_effect=SetupComplete):
+                    with self.assertRaises(SetupComplete):
+                        runpy.run_path(str(script), run_name="__main__")
+            self.assertTrue(output.is_dir())
+
+    def test_dss_fc_does_not_attest_target_binding(self):
+        # EN 319 102-1 §5.2.2 excludes profile conformance from base-format FC.
+        # Neither FC=PASSED nor a format label proves semantic Target checking.
+        row = dict(conclusions=dict(FC="PASSED"), reported_format="XAdES-BASELINE-B")
+        result = dss.profile_binding("baseline-wrong-target", row)
+        self.assertEqual(result["status"], "not run or blocked")
+
+    def test_dss_root_digest_requires_signer_identification_failure(self):
+        # EN 319 102-1 §5.2.3.4 requires matching the actual signing certificate.
+        self.assertEqual(dss.profile_binding("baseline-certificate-digest-mismatch",
+            dict(conclusions=dict(ISC="PASSED")))["status"], "failed")
+        self.assertEqual(dss.profile_binding("baseline-certificate-digest-mismatch",
+            dict(conclusions=dict(ISC="INDETERMINATE"),
+                 subindications=dict(ISC="NO_SIGNING_CERTIFICATE_FOUND")))["status"], "verified")
+        self.assertEqual(dss.profile_binding("baseline-certificate-digest-mismatch",
+            dict(conclusions=dict(ISC="INDETERMINATE"),
+                 subindications=dict(ISC="CRYPTO_CONSTRAINTS_FAILURE")))["status"], "failed")
+
+    def test_investigation_output_creates_missing_parents(self):
+        # A clean checkout has no target directory. Explicit output must create
+        # its parents before launching any compiler or validator.
+        class SetupComplete(Exception):
+            pass
+
+        script = Path(__file__).with_name("investigate-xades-dss.py").resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "missing-parent" / "evidence"
+            with patch.object(sys, "argv", [str(script), "--output", str(output)]):
+                with patch("subprocess.run", side_effect=SetupComplete):
+                    with self.assertRaises(SetupComplete):
+                        runpy.run_path(str(script), run_name="__main__")
+            self.assertTrue(output.is_dir())
+
+    def test_hex_dump_preserves_canonical_whitespace(self):
+        # DebugHexDump is hex, not XML text. Final LF and spaces are signed.
+        block = b"== PreDigest data - start buffer:\n3c612f3e20\n0a\n== PreDigest data - end buffer"
+        self.assertEqual(interop.debug_buffer(block, b"PreDigest"), b"<a/> \n")
+
+    def test_absent_buffer_is_not_implicitly_empty(self):
+        # Missing debug output cannot pass byte comparison as empty content.
+        self.assertIsNone(interop.debug_buffer(b"== Status: OK\n", b"PreDigest"))
+
+    def test_malformed_hex_fails(self):
+        # A tool-output format change must stop extraction, never corrupt bytes.
+        with self.assertRaises(ValueError):
+            interop.debug_buffer(b"== PreDigest data - start buffer:\n<XML/>\n== PreDigest data - end buffer", b"PreDigest")
+
+    def test_first_difference_and_prefix_length(self):
+        # Distinguish a changed byte from a truncated but matching prefix.
+        difference = interop.compare(b"abcd", b"abXd")
+        self.assertEqual(difference["first_different_byte"], 2)
+        self.assertEqual(difference["status"], "failed")
+        self.assertEqual(interop.compare(b"abcd", b"abc")["first_different_byte"], 3)
+        self.assertIsNone(interop.compare(b"", b"")["first_different_byte"])
+
+
+if __name__ == "__main__":
+    unittest.main()
