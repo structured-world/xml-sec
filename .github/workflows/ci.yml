@@ -24,6 +24,7 @@ jobs:
     env:
       JAVA_HOME: /usr/lib/jvm/java-21-openjdk-amd64
       PYTHONDONTWRITEBYTECODE: "1"
+      RUSTUP_TOOLCHAIN: "1.92.0"
     steps:
       - uses: actions/checkout@v7
         with:
