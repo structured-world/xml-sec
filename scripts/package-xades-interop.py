@@ -21,7 +21,9 @@ def include_evidence(path):
         return False
     if path.suffix in {".stdout", ".stderr", ".log"}:
         return False
-    return path.name != "result.txt" and not path.name.endswith(".command.json")
+    if path.name in {"result.txt", "diagnostic.xml", "detailed.xml", "simple.xml", "binding-facts.txt"}:
+        return False
+    return not path.name.endswith(".command.json")
 
 
 if __name__ == "__main__":

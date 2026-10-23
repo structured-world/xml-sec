@@ -8,3 +8,7 @@
 /xades/**/*.log
 /xades/**/*.command.json
 /xades/**/result.txt
+/xades/**/diagnostic.xml
+/xades/**/detailed.xml
+/xades/**/simple.xml
+/xades/**/binding-facts.txt

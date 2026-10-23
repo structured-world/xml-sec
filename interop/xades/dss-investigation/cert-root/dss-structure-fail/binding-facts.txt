@@ -1,5 +1,0 @@
-structural_policy=FAIL
-selected_certificate=C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D
-selected_certificate_reference_null=true
-reference.0.match=true
-reference.0.digest=/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc=

@@ -29,14 +29,27 @@ spec_binding.loader.exec_module(binding)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_binding_summary_preserves_selected_signer_and_digest(self):
+        # Keep the evidence for the root-versus-signer discrepancy without raw reports.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "binding-facts.txt"
+            path.write_text("structural_policy=WARN\nselected_certificate=leaf\n"
+                            "selected_certificate_reference_null=true\nreference.0.match=true\n"
+                            "reference.0.digest=YWJjZA==\n")
+            self.assertEqual(binding.binding_facts(path), {
+                "selected_certificate": "leaf", "selected_certificate_reference_null": "true",
+                "reference.0.match": "true", "reference.0.digest": "YWJjZA=="})
+
     def test_bundle_excludes_execution_logs(self):
         # A distributable corpus contains signature evidence, not workstation logs.
         for name in ["checks/pr-validation.json", "checks/build.log", "generation/sign.command.json",
                      "results/build.stdout", "results/versions/metadata.stdout", "case/run.stderr",
                      "case/probe.command.json", "case/rust/result.txt"]:
             self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
+        for name in ["case/diagnostic.xml", "case/detailed.xml", "case/simple.xml", "case/binding-facts.txt"]:
+            self.assertFalse(package.include_evidence(package.PACKAGE / name), name)
         for name in ["fixtures/signed.xml", "fixtures/signer.key", "case/reference-0.bin",
-                     "case/diagnostic.xml", "results/summary.json", "results/versions.json"]:
+                     "results/summary.json", "results/versions.json"]:
             self.assertTrue(package.include_evidence(package.PACKAGE / name), name)
 
     def test_dependency_versions_do_not_export_local_package_ids(self):

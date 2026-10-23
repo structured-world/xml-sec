@@ -21,12 +21,12 @@ separately downloaded LGPL-2.1-or-later test oracle, not a Rust runtime dependen
 
 The generation runners encode the signing commands. `results/` records native oracle
 and Rust verification, byte artifacts and comparisons. `dss-evidence/` contains independently
-produced validation reports and a portable dependency tree; configuration source is
+produced compact conclusions and a portable dependency tree; configuration source is
 under `dss/`. Reports are observations, including indeterminate and differing outcomes.
-Process stdout/stderr, build logs, command captures and transient check records remain
+Full DSS reports, process stdout/stderr, build logs, command captures and transient check records remain
 local diagnostic artifacts, excluded from Git and the distributable bundle.
 `dss-investigation/` contains additional synthetic, independently signed minimal
-binding examples and DSS reports. They reuse the same public test keys and chain.
+binding examples and compact DSS observations. They reuse the same public test keys and chain.
 Its source-audit manifest records upstream source URLs and hashes without bundling
 third-party source jars or normative full texts.
 `SHA256SUMS` inventories distributable inputs, tools and evidence at packaging time.

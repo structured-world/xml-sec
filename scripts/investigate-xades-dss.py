@@ -50,6 +50,12 @@ def template(target, certificate_names):
     return f'''<r><Data Id="payload">x</Data><ds:Signature xmlns:ds="{DS}" Id="sig"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="{EXC}"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference Id="sig-data" URI="#payload"><ds:Transforms><ds:Transform Algorithm="{EXC}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference><ds:Reference Type="http://uri.etsi.org/01903#SignedProperties" URI="#sp"><ds:Transforms><ds:Transform Algorithm="{EXC}"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo><ds:X509Data>{keyinfo}</ds:X509Data></ds:KeyInfo><ds:Object><x:QualifyingProperties xmlns:x="{XADES}"{target_attribute}><x:SignedProperties Id="sp"><x:SignedSignatureProperties><x:SigningTime>2026-10-18T12:00:00Z</x:SigningTime><x:SigningCertificateV2>{''.join(refs)}</x:SigningCertificateV2></x:SignedSignatureProperties><x:SignedDataObjectProperties><x:DataObjectFormat ObjectReference="#sig-data"><x:MimeType>text/xml</x:MimeType></x:DataObjectFormat></x:SignedDataObjectProperties></x:SignedProperties></x:QualifyingProperties></ds:Object></ds:Signature></r>'''
 
 
+def binding_facts(path):
+    """Compact certificate-selection evidence; full DSS reports remain local."""
+    return {key: value for key, value in (line.split('=', 1) for line in path.read_text().splitlines())
+            if key != 'structural_policy'}
+
+
 def capture_native_octets(directory):
     """Retain oracle output bytes independently of ignored stdout captures."""
     stdout = (directory / 'libxmlsec.stdout').read_bytes()
@@ -167,6 +173,7 @@ if __name__ == "__main__":
         row = dict(name=name, target=target, cert_references=cert_names, expected_bb=expected_bb,
                    fixture_sha256=sha(signed.read_bytes()), rust_bb=rust_bb,
                    rust_xml_dsig_status="проверено", native_xml_dsig_status="проверено",
+                   dss_binding_facts=binding_facts(directory / 'dss/binding-facts.txt'),
                    rust_finding=next(line for line in rust.splitlines() if line.startswith('xades=')),
                    dss_format=simple.get('SignatureFormat'), dss_indication=simple.findtext('{*}Indication'),
                    dss_subindication=simple.findtext('{*}SubIndication'),

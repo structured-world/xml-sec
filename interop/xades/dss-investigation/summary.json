@@ -24,7 +24,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
     },
     {
       "name": "target-payload",
@@ -50,7 +56,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
     },
     {
       "name": "target-unresolved",
@@ -76,7 +88,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
     },
     {
       "name": "target-absent",
@@ -102,7 +120,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0="
+      }
     },
     {
       "name": "cert-root",
@@ -128,7 +152,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "true",
+        "reference.0.match": "true",
+        "reference.0.digest": "/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc="
+      }
     },
     {
       "name": "cert-intermediate",
@@ -153,7 +183,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "null",
+        "selected_certificate_reference_null": "true",
+        "reference.0.match": "true",
+        "reference.0.digest": "Pmyr1sR5B/9XAshZUgflwbSizHMoZOi/pEgq/uHxt3Q="
+      }
     },
     {
       "name": "cert-unmatched",
@@ -179,7 +215,13 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "false",
+        "reference.0.digest": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+      }
     },
     {
       "name": "cert-root-then-signer",
@@ -206,7 +248,15 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=",
+        "reference.1.match": "true",
+        "reference.1.digest": "/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc="
+      }
     },
     {
       "name": "cert-signer-then-root",
@@ -233,7 +283,15 @@
         "AOV": "PASSED"
       },
       "rust_xml_dsig_status": "проверено",
-      "native_xml_dsig_status": "проверено"
+      "native_xml_dsig_status": "проверено",
+      "dss_binding_facts": {
+        "selected_certificate": "C-B77E6878076E42AEB916698199F27F2123C2561BCED05F43CA1887405C30813D",
+        "selected_certificate_reference_null": "false",
+        "reference.0.match": "true",
+        "reference.0.digest": "t35oeAduQq65FmmBmfJ/ISPCVhvO0F9DyhiHQFwwgT0=",
+        "reference.1.match": "true",
+        "reference.1.digest": "/PsVcXqRQ4cZ2J6zsDztfJYHtstVPDeL45xSBDXPeVc="
+      }
     }
   ],
   "certificate_sha256": {

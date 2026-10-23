@@ -111,8 +111,8 @@ Changing **only** StructuralValidation from WARN to FAIL gives:
 - target-payload and target-unresolved: structure=true, ISC=PASSED and SAV=PASSED;
 - control and cert-root: ISC/SAV remain PASSED.
 
-See [strict-policy-summary.json](strict-policy-summary.json) and each case's
-`dss-structure-fail/` reports. The stronger constraint detects an XSD violation but
+See [strict-policy-summary.json](strict-policy-summary.json). A new run generates each
+case's local `dss-structure-fail/` reports. The stronger constraint detects an XSD violation but
 does not add semantic Target validation. This is missing XAdES profile coverage in
 the tested DSS path, not evidence that generic FC violates EN 319 102-1.
 
@@ -170,8 +170,8 @@ python3 scripts/investigate-xades-dss.py --output target/xades-binding-repro --s
 
 On another machine, set the path to native libxmlsec1; the Rust CLI is not an oracle.
 The investigation's Maven calls use `-o` after bootstrap. Process and command captures
-remain local and ignored. The distributed evidence retains byte artifacts, digests,
-verification summaries and DSS reports. Authenticated replay uses the existing
+and full DSS reports remain local and ignored. The distributed evidence retains byte
+artifacts, digests and compact verification/certificate-selection summaries. Authenticated replay uses the existing
 verified-session API; reanalysis needs no process logs.
 
 Recheck retained octets without running either engine:
@@ -192,13 +192,13 @@ Status vocabulary: **проверено** = checked; **не прошло** = did
 
 | Check | Status | Evidence |
 | --- | --- | --- |
-| XMLDSig for all nine cases, native and Rust | проверено | summary.json verification statuses; DSS diagnostic.xml BasicSignature |
+| XMLDSig for all nine cases, native and Rust | проверено | summary.json verification statuses |
 | 18 Reference pairs, digest/DigestValue and replay | проверено | octet-comparison.json; expected-reference-*.bin and rust/*.bin |
 | Nine canonicalized SignedInfo pairs | проверено | octet-comparison.json; expected-signedinfo.bin and rust/signature-0.bin |
 | No first differing byte | проверено | first_different_byte=null throughout these comparisons |
 | Our Target and first-certificate-reference outcomes | проверено | summary.json: two positive controls, seven negative cases |
 | DSS semantic Target rejection as an XAdES requirement | не прошло | default and StructuralValidation=FAIL; scope distinction above |
-| DSS ISC refusal of root-only digest instead of signer digest | не прошло | cert-root/dss/binding-facts.txt and detailed.xml; strict-policy-summary.json |
+| DSS ISC refusal of root-only digest instead of signer digest | не прошло | summary.json: cert-root dss_binding_facts and dss_blocks; strict-policy-summary.json |
 | Positive complete DSS validation | не прошло | overall INDETERMINATE; no offline revocation evidence |
 | Trust, revocation, timestamps and legal status | не запускалось или заблокировано | not established by this corpus; only the synthetic root is trusted |
 | Other DSS versions or policies | не запускалось или заблокировано | findings cover this pinned version and the two tested configurations |

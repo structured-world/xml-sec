@@ -19,8 +19,9 @@ All validation runs are local; fixtures are never uploaded to online validators.
   This is not this repository's Rust `tools/xmlsec1`. Its linked OpenSSL is **3.6.4**;
   the credential generator's separate `openssl` executable is **4.0.3**.
 - Independent profile diagnostics: **EU DSS 6.5.1**, Maven **3.9.12**, OpenJDK **21.0.12.1**.
-  The portable dependency tree is `dss-evidence/dependencies.json`; validation reports
-  are in `dss-evidence/`, with configuration and invocation source in `dss/` and the runners.
+  The portable dependency tree and compact conclusions are in `dss-evidence/`,
+  with configuration and invocation source in `dss/` and the runners.
+  Full DSS reports are generated locally and excluded from Git and the bundle.
 
 The Rust probe uses `with_verified_request`, original `SignatureEvidence`,
 `select_signature`, `visit_authenticated_references`, and
@@ -94,6 +95,7 @@ Run from the repository root at the recorded commit, with this package's source 
 XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 python3 scripts/xades-interop.py --results /tmp/xml-sec-xades-recheck
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-xades-interop.py
 python3 scripts/xades-dss.py --results target/xades-dss-recheck
+python3 scripts/xades-dss.py --results target/xades-dss-recheck --summarize
 ```
 
 Set XMLSEC1_BIN to the native **1.3.12 openssl** CLI on another machine; the hex parser
@@ -119,7 +121,7 @@ and license notices. Extract it over a checkout at the recorded baseline before 
 Verify its inventory from that checkout with `shasum -a 256 -c interop/xades/SHA256SUMS`.
 Repackage with `python3 scripts/package-xades-interop.py /tmp/xades-interop-new.tar.gz`;
 the packager verifies every archived file against its recorded hash and excludes builds,
-caches, process logs, command captures and transient verification records.
+caches, process logs, command captures, full DSS reports and transient verification records.
 
 The runners encode per-case oracle and probe commands. New runs also capture commands
 and stdout/stderr locally for diagnosis; Git and the distributable bundle exclude these
@@ -138,7 +140,7 @@ Core XMLDSig and the current XAdES adapter require std; passing XML-input alloc 
 does not establish alloc-only XMLDSig/XAdES support. No production dependency or policy
 surface was changed. Probe memory/work ceilings are test execution accounts.
 Generated `.tar.gz` bundles remain local artifacts; Git contains
-the reviewable sources, fixtures, byte artifacts, manifests and reports.
+the reviewable sources, fixtures, byte artifacts, manifests and compact conclusions.
 The full workspace CLI suite requires native libxmlsec1 1.3.13 and the pinned
 `donors/xmlsec` checkout, unlike the frozen byte-dump parser's 1.3.12 requirement.
 After checking out the revision in `compatibility/libxmlsec1-1.3.13-donor-commit.txt`,
