@@ -18,6 +18,53 @@ fn owned_byte_budget(owned_bytes: usize) -> ExecutionBudget {
 }
 
 #[test]
+fn function_free_xpath_does_not_require_function_registry_workspace() {
+    // Arithmetic and comparisons in branching templates must not rebuild the XSLT/EXSLT
+    // registry. Its repeated setup caused the amplification seed to time out under ASan.
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+    let mut setup = Meter::new(owned_byte_budget(usize::MAX), 0).expect("setup meter");
+    let options = EvaluatorSourceOptions {
+        process_xinclude: false,
+        whitespace: Arc::from([]),
+        clock: None,
+    };
+    let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut setup, &options)
+        .expect("source prepares");
+    let evaluator = Evaluator::new(
+        prepared,
+        &stylesheet,
+        None,
+        &[],
+        Arc::new(crate::NoResolver),
+        &mut setup,
+        options,
+    )
+    .expect("evaluator initializes");
+    let root = SourceNode::Node(evaluator.source.root());
+    let variables = HashMap::from([(ExpandedName::new(None::<String>, "n"), Value::Number(19.0))]);
+    for (source, expected) in [
+        ("$n - 1", XPathValue::Number(18.0)),
+        ("$n > 5", XPathValue::Boolean(true)),
+    ] {
+        let expression = Expression::generated(source, Vec::new());
+        let mut meter = Meter::new(owned_byte_budget(8 * 1024), 0).expect("workspace meter");
+        let value = evaluator
+            .evaluate_core(&expression, &root, 1, 1, &variables, &mut meter, None)
+            .expect("function-free XPath fits without a function registry");
+        match (value, expected) {
+            (XPathValue::Number(value), XPathValue::Number(expected)) => {
+                assert_eq!(value, expected)
+            }
+            (XPathValue::Boolean(value), XPathValue::Boolean(expected)) => {
+                assert_eq!(value, expected)
+            }
+            (other, expected) => panic!("unexpected XPath value: {other:?}, expected {expected:?}"),
+        }
+    }
+}
+
+#[test]
 fn xinclude_line_normalization_replaces_accounted_storage() {
     let mut text = String::with_capacity(8);
     text.push_str("a\r\nb");

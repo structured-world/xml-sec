@@ -14,6 +14,7 @@ policy_compilation	fuzz/seeds/policy.toml
 xslt_execution	fuzz/seeds/identity.xsl
 xslt_execution	fuzz/seeds/xslt-recursion.xsl
 xslt_execution	fuzz/seeds/xslt-amplification.xsl
+xslt_execution	fuzz/seeds/xslt-branching-comparison.xsl
 xslt_execution	fuzz/seeds/xslt-sandbox.xsl
 xslt_execution	fuzz/seeds/xslt-serializer.xsl
 xslt_execution	fuzz/seeds/xslt-malformed.xsl
