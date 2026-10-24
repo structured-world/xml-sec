@@ -947,19 +947,22 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
     ])))
 }
 fn source_snapshot(p: KeySourcePolicy) -> Value {
-    Value::Table(Table::from_iter(KeySourceKind::ALL.into_iter().map(
-        |source| {
-            let name = match source {
-                KeySourceKind::PresetKey => "preset_key",
-                KeySourceKind::KeyName => "key_name",
-                KeySourceKind::KeyValue => "key_value",
-                KeySourceKind::DerEncodedKeyValue => "der_encoded_key_value",
-                KeySourceKind::X509Data => "x509_data",
-                KeySourceKind::KeyInfoReference => "key_info_reference",
-            };
-            (name.into(), Value::Boolean(p.contains(source)))
-        },
-    )))
+    Value::Table(
+        KeySourceKind::ALL
+            .into_iter()
+            .map(|source| {
+                let name = match source {
+                    KeySourceKind::PresetKey => "preset_key",
+                    KeySourceKind::KeyName => "key_name",
+                    KeySourceKind::KeyValue => "key_value",
+                    KeySourceKind::DerEncodedKeyValue => "der_encoded_key_value",
+                    KeySourceKind::X509Data => "x509_data",
+                    KeySourceKind::KeyInfoReference => "key_info_reference",
+                };
+                (name.into(), Value::Boolean(p.contains(source)))
+            })
+            .collect(),
+    )
 }
 macro_rules! signature_snapshot {
     ($p:expr) => {

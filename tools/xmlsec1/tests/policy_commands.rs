@@ -54,16 +54,39 @@ fn policy_commands_validate_print_and_compare_actual_files() {
     assert!(!text.contains("Relaxing:"), "{text}");
 }
 
+/// Recompile `effective` output and require the grant to survive verbatim.
+fn assert_effective_validity(effective: &str, grant: &xml_sec::policy::PolicyValidity) {
+    use xml_sec::{policy::PolicyCompileContext, provider::default_provider};
+    use xml_sec_config::{Configuration, LoadLimits};
+    let restored = Configuration::from_str(effective, LoadLimits::default())
+        .unwrap()
+        .compile(
+            "effective",
+            default_provider(),
+            &PolicyCompileContext {
+                external_resources: false,
+                target_evidence: false,
+            },
+            Some(grant.clone()),
+        )
+        .unwrap();
+    assert_eq!(
+        restored
+            .compiled()
+            .verification()
+            .unwrap()
+            .validity
+            .as_ref(),
+        Some(grant)
+    );
+}
+
 #[test]
 fn policy_commands_accept_pre_epoch_authorization() {
     // The native boundary must accept a currently valid grant whose lower
     // bound precedes epoch, preserve it exactly, and still reject expired grants.
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use xml_sec::{
-        policy::{PolicyCompileContext, PolicyValidity},
-        provider::default_provider,
-    };
-    use xml_sec_config::{Configuration, LoadLimits};
+    use xml_sec::policy::PolicyValidity;
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("policy.toml");
     std::fs::write(&file, "schema_version=1\n[profiles.team]\nbase='Modern'").unwrap();
@@ -112,27 +135,7 @@ fn policy_commands_accept_pre_epoch_authorization() {
         not_before: UNIX_EPOCH - Duration::from_secs(1),
         expires_at: UNIX_EPOCH + Duration::from_secs(expires.parse().unwrap()),
     };
-    let restored = Configuration::from_str(&output, LoadLimits::default())
-        .unwrap()
-        .compile(
-            "effective",
-            default_provider(),
-            &PolicyCompileContext {
-                external_resources: false,
-                target_evidence: false,
-            },
-            Some(grant.clone()),
-        )
-        .unwrap();
-    assert_eq!(
-        restored
-            .compiled()
-            .verification()
-            .unwrap()
-            .validity
-            .as_ref(),
-        Some(&grant)
-    );
+    assert_effective_validity(&output, &grant);
     let diff = run("diff", "-1", &expires)
         .arg("--other-file")
         .arg(&file)
@@ -145,11 +148,11 @@ fn policy_commands_accept_pre_epoch_authorization() {
         String::from_utf8_lossy(&diff.stderr)
     );
     assert_eq!(diff.stdout, b"neutral: effective policies are identical\n");
-    let expired = run("check", "-2", "-1").output().unwrap();
-    assert!(!expired.status.success());
-    assert!(expired.stdout.is_empty());
+    let lapsed = run("check", "-2", "-1").output().unwrap();
+    assert!(!lapsed.status.success());
+    assert_eq!(lapsed.stdout, b"");
     assert!(
-        String::from_utf8_lossy(&expired.stderr)
+        String::from_utf8_lossy(&lapsed.stderr)
             .contains("policy authorization is outside its validity interval")
     );
     // Neither malformed text nor an out-of-i64-range value can wrap into a
@@ -161,7 +164,7 @@ fn policy_commands_accept_pre_epoch_authorization() {
         ] {
             let rejected = run("check", start, end).output().unwrap();
             assert!(!rejected.status.success());
-            assert!(rejected.stdout.is_empty());
+            assert_eq!(rejected.stdout, b"");
             assert!(
                 String::from_utf8_lossy(&rejected.stderr)
                     .contains(&format!("{field} requires signed Unix seconds"))
@@ -188,7 +191,7 @@ fn malformed_cli_configuration_fails_without_stdout_or_xml_work() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.stdout, b"");
     for args in [
         vec!["policy", "bogus"],
         vec!["policy", "check", "--unknown"],
@@ -197,7 +200,7 @@ fn malformed_cli_configuration_fails_without_stdout_or_xml_work() {
     ] {
         let output = cli().args(args).output().unwrap();
         assert!(!output.status.success());
-        assert!(output.stdout.is_empty());
+        assert_eq!(output.stdout, b"");
     }
 }
 

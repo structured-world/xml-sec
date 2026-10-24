@@ -161,15 +161,14 @@ fn list() {
     }
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() == 2 && args[0] == "--export" {
-        return export(std::path::Path::new(&args[1]));
-    }
-    if args == ["--list"] {
-        list();
-        return Ok(());
-    }
+/// One validated measurement request from the command line.
+struct Request<'a> {
+    operation: &'a str,
+    spec: Spec,
+    samples: usize,
+}
+
+fn parse_request(args: &[String]) -> Result<Request<'_>, Box<dyn Error>> {
     if args.len() != 6 {
         return Err("usage: benchmark_latency <operation> <shape> <units> <backend> <provider> <samples> (or --list)".into());
     }
@@ -204,12 +203,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !(1..=100_000).contains(&samples) {
         return Err("samples must be 1..=100000".into());
     }
-    let fixture = Fixture::new(Spec {
-        shape,
-        units,
-        backend,
-        engine,
-    });
+    Ok(Request {
+        operation,
+        spec: Spec {
+            shape,
+            units,
+            backend,
+            engine,
+        },
+        samples,
+    })
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "--export" {
+        return export(std::path::Path::new(&args[1]));
+    }
+    if args == ["--list"] {
+        list();
+        return Ok(());
+    }
+    let Request {
+        operation,
+        spec,
+        samples,
+    } = parse_request(&args)?;
+    let (units, backend) = (spec.units, spec.backend);
+    let fixture = Fixture::new(spec);
     let projection = if operation == "projection" {
         Some(xml_sec::benchmark_support::Projection::new(
             &fixture.unsigned,

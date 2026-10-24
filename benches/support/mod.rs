@@ -175,6 +175,43 @@ fn corrupted_signature(signed: &str, backend: XmlBackend) -> XmlDocument {
     XmlDocument::parse_with_backend(corrupted, backend).expect("corrupted signature remains XML")
 }
 
+/// `unsigned` with the signature template(s) for `shape` appended to its
+/// envelope, and the number of signatures to fill.
+fn signature_template(
+    shape: &str,
+    unsigned: &str,
+    uri: &str,
+    policy: &SigningPolicy,
+) -> (String, usize) {
+    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let signature = SignatureBuilder::new(algorithm, SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .signature_id("signature-0")
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(uri))
+        .build_template_with_policy(policy)
+        .expect("template");
+    let signature = if shape == "nested_manifest" {
+        let reference = |uri| {
+            format!(
+                "<ds:Reference URI=\"{uri}\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue/></ds:Reference>"
+            )
+        };
+        signature.replace("</ds:Signature>", &format!("<ds:Object><ds:Manifest Id=\"outer\">{}</ds:Manifest><ds:Manifest Id=\"inner\">{}</ds:Manifest></ds:Object></ds:Signature>", reference("#inner"), reference("#payload")))
+    } else {
+        signature
+    };
+    let count = if shape == "multi_signature" { 4 } else { 1 };
+    let mut signatures = String::with_capacity(signature.len() * count);
+    signatures.push_str(&signature);
+    for index in 1..count {
+        signatures.push_str(&signature.replace("signature-0", &format!("signature-{index}")));
+    }
+    (
+        unsigned.replace("</Envelope>", &format!("{signatures}</Envelope>")),
+        count,
+    )
+}
+
 pub struct Fixture {
     pub spec: Spec,
     pub unsigned: String,
@@ -241,38 +278,8 @@ impl Fixture {
             }
             _ => "#payload",
         };
-        let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
-        let signature = SignatureBuilder::new(algorithm, SignatureAlgorithm::RsaSha256)
-            .ns_prefix("ds")
-            .signature_id("signature-0")
-            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(uri))
-            .build_template_with_policy(&sign_policy)
-            .expect("template");
-        let signature = if SHAPES[spec.shape] == "nested_manifest" {
-            let reference = |uri| {
-                format!(
-                    "<ds:Reference URI=\"{uri}\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue/></ds:Reference>"
-                )
-            };
-            signature.replace("</ds:Signature>", &format!("<ds:Object><ds:Manifest Id=\"outer\">{}</ds:Manifest><ds:Manifest Id=\"inner\">{}</ds:Manifest></ds:Object></ds:Signature>", reference("#inner"), reference("#payload")))
-        } else {
-            signature
-        };
-        let mut template = unsigned.replace("</Envelope>", &format!("{signature}</Envelope>"));
-        let count = if SHAPES[spec.shape] == "multi_signature" {
-            4
-        } else {
-            1
-        };
-        for index in 1..count {
-            template = template.replace(
-                "</Envelope>",
-                &format!(
-                    "{}</Envelope>",
-                    signature.replace("signature-0", &format!("signature-{index}"))
-                ),
-            );
-        }
+        let (template, count) =
+            signature_template(SHAPES[spec.shape], &unsigned, uri, &sign_policy);
         let mut signed = template.clone();
         for index in 0..count {
             signed = SignContext::new(key.as_ref())

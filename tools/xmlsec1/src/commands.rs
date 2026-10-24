@@ -231,15 +231,15 @@ pub enum CommandError {
 }
 
 pub fn execute(
-    invocation: Invocation,
+    invocation: &Invocation,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<(), CommandError> {
     if invocation.flag("help") {
         return command_help(invocation.command, stdout);
     }
-    validate_provider(&invocation)?;
-    validate_crypto_config(&invocation)?;
+    validate_provider(invocation)?;
+    validate_crypto_config(invocation)?;
     match invocation.command {
         Command::Help => match invocation.help_target {
             Some(HelpTarget::Command(command)) => command_help(command, stdout),
@@ -253,12 +253,12 @@ pub fn execute(
         Command::Version => writeln!(
             stdout,
             "xmlsec1 1.3.13 ({})",
-            selected_provider(&invocation)?.name()
+            selected_provider(invocation)?.name()
         )
         .map_err(stdout_error),
         Command::ListTransforms => {
-            validate_options(&invocation, &[])?;
-            let provider = selected_provider(&invocation)?;
+            validate_options(invocation, &[])?;
+            let provider = selected_provider(invocation)?;
             capabilities::list_available(
                 "transform klasses",
                 TRANSFORMS,
@@ -268,8 +268,8 @@ pub fn execute(
             .map_err(stdout_error)
         }
         Command::CheckTransforms => {
-            validate_options(&invocation, &[])?;
-            let provider = selected_provider(&invocation)?;
+            validate_options(invocation, &[])?;
+            let provider = selected_provider(invocation)?;
             if capabilities::all_requested_available_where(
                 TRANSFORMS,
                 &invocation.positional,
@@ -281,8 +281,8 @@ pub fn execute(
             }
         }
         Command::ListKeyData => {
-            validate_options(&invocation, &[])?;
-            let provider = selected_provider(&invocation)?;
+            validate_options(invocation, &[])?;
+            let provider = selected_provider(invocation)?;
             capabilities::list_available(
                 "key data klasses",
                 KEY_DATA,
@@ -292,8 +292,8 @@ pub fn execute(
             .map_err(stdout_error)
         }
         Command::CheckKeyData => {
-            validate_options(&invocation, &[])?;
-            let provider = selected_provider(&invocation)?;
+            validate_options(invocation, &[])?;
+            let provider = selected_provider(invocation)?;
             if capabilities::all_requested_available_where(
                 KEY_DATA,
                 &invocation.positional,
@@ -304,11 +304,11 @@ pub fn execute(
                 Err(CommandError::CapabilityUnavailable)
             }
         }
-        Command::Keys => keys(&invocation, stdout),
-        Command::Sign => sign(&invocation, stdout),
-        Command::Verify => verify(&invocation, stdout),
-        Command::Encrypt => encrypt(&invocation, stdout),
-        Command::Decrypt => decrypt(&invocation, stdout),
+        Command::Keys => keys(invocation, stdout),
+        Command::Sign => sign(invocation, stdout),
+        Command::Verify => verify(invocation, stdout),
+        Command::Encrypt => encrypt(invocation, stdout),
+        Command::Decrypt => decrypt(invocation, stdout),
     }
 }
 
@@ -826,6 +826,102 @@ fn sign(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
     )
 }
 
+/// Explicit private or symmetric key options accepted by `sign`.
+const SIGNING_KEY_OPTIONS: &[&str] = &[
+    "hmac-key",
+    "privkey-pem",
+    "privkey-der",
+    "pkcs8-pem",
+    "pkcs8-der",
+    "pkcs12",
+];
+
+/// Key options must match the template: an encapsulation template takes a
+/// recipient public key, any other template takes a signing key, and a key
+/// store excludes explicit keys.
+fn validate_sign_key_options(
+    invocation: &Invocation,
+    encapsulation: bool,
+    has_key_store: bool,
+) -> Result<(), CommandError> {
+    if encapsulation {
+        if let Some(option) = invocation.ordered_values(SIGNING_KEY_OPTIONS).next() {
+            return Err(CommandError::Usage(format!(
+                "--{} is inapplicable to sign with EncapsulationMechanism; supply a recipient public key",
+                option.name
+            )));
+        }
+    } else if let Some(option) = invocation
+        .ordered_values(&["pubkey-pem", "pubkey-der"])
+        .next()
+    {
+        return Err(CommandError::Usage(format!(
+            "--{} is inapplicable to sign without EncapsulationMechanism",
+            option.name
+        )));
+    }
+    if has_key_store
+        && invocation
+            .ordered_values(SIGNING_KEY_OPTIONS)
+            .next()
+            .is_some()
+    {
+        return Err(CommandError::Usage(
+            "sign cannot combine --keys-file with explicit key options".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The signing key the template names in the key store, HMAC or asymmetric
+/// by the template's signature method.
+fn store_signing_candidate(
+    invocation: &Invocation,
+    store: &KeyInventory,
+    signature: &key_material::SigningTemplateMetadata,
+    policy: &SigningPolicy,
+) -> Result<SigningKeyCandidate, CommandError> {
+    let lax_candidates = invocation.flag("lax-key-search");
+    let candidates = if signature.algorithm.hmac_output_bits().is_some() {
+        select_store_candidates(
+            store.symmetric_keys().iter().filter(|entry| {
+                entry.kind == SymmetricKeyKind::Hmac
+                    && entry.usages.allows(key_manager::KeyUsage::Sign)
+            }),
+            &signature.key_names,
+            lax_candidates,
+            policy.resources.max_key_candidates,
+            |entry| &entry.name,
+        )?
+        .into_iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>()
+    } else {
+        select_store_candidates(
+            store
+                .private_keys()
+                .iter()
+                .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Sign)),
+            &signature.key_names,
+            lax_candidates,
+            policy.resources.max_key_candidates,
+            |entry| &entry.name,
+        )?
+        .into_iter()
+        .map(|entry| entry.name.as_str())
+        .collect::<Vec<_>>()
+    };
+    select_store_signing_key(
+        store,
+        candidates,
+        signature.algorithm,
+        signature.key_info.as_ref(),
+        policy,
+        lax_candidates,
+        selected_provider(invocation)?,
+    )
+}
+
 fn sign_with_policy(
     invocation: &Invocation,
     stdout: &mut dyn Write,
@@ -849,49 +945,7 @@ fn sign_with_policy(
         selected_provider(invocation)?,
     )?;
     let has_key_store = invocation.values("keys-file").next().is_some();
-    if signature.encapsulation.is_some() {
-        if let Some(option) = invocation
-            .ordered_values(&[
-                "hmac-key",
-                "privkey-pem",
-                "privkey-der",
-                "pkcs8-pem",
-                "pkcs8-der",
-                "pkcs12",
-            ])
-            .next()
-        {
-            return Err(CommandError::Usage(format!(
-                "--{} is inapplicable to sign with EncapsulationMechanism; supply a recipient public key",
-                option.name
-            )));
-        }
-    } else if let Some(option) = invocation
-        .ordered_values(&["pubkey-pem", "pubkey-der"])
-        .next()
-    {
-        return Err(CommandError::Usage(format!(
-            "--{} is inapplicable to sign without EncapsulationMechanism",
-            option.name
-        )));
-    }
-    if has_key_store
-        && invocation
-            .ordered_values(&[
-                "hmac-key",
-                "privkey-pem",
-                "privkey-der",
-                "pkcs8-pem",
-                "pkcs8-der",
-                "pkcs12",
-            ])
-            .next()
-            .is_some()
-    {
-        return Err(CommandError::Usage(
-            "sign cannot combine --keys-file with explicit key options".into(),
-        ));
-    }
+    validate_sign_key_options(invocation, signature.encapsulation.is_some(), has_key_store)?;
     let mut external_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
     let encapsulated = signature
@@ -914,51 +968,13 @@ fn sign_with_policy(
         Some(if has_key_store {
             if signature.key_names.is_empty() && !invocation.flag("lax-key-search") {
                 return Err(CommandError::Usage(
-                "sign with --keys-file requires a template KeyName unless --lax-key-search is set"
-                    .into(),
-            ));
+                    "sign with --keys-file requires a template KeyName unless --lax-key-search is set"
+                        .into(),
+                ));
             }
             let store =
                 load_xml_key_stores(invocation, &policy, xml_backend, &mut external_budget)?;
-            let lax_candidates = invocation.flag("lax-key-search");
-            let candidates = if signature.algorithm.hmac_output_bits().is_some() {
-                select_store_candidates(
-                    store.symmetric_keys().iter().filter(|entry| {
-                        entry.kind == SymmetricKeyKind::Hmac
-                            && entry.usages.allows(key_manager::KeyUsage::Sign)
-                    }),
-                    &signature.key_names,
-                    lax_candidates,
-                    policy.resources.max_key_candidates,
-                    |entry| &entry.name,
-                )?
-                .into_iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>()
-            } else {
-                select_store_candidates(
-                    store
-                        .private_keys()
-                        .iter()
-                        .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Sign)),
-                    &signature.key_names,
-                    lax_candidates,
-                    policy.resources.max_key_candidates,
-                    |entry| &entry.name,
-                )?
-                .into_iter()
-                .map(|entry| entry.name.as_str())
-                .collect::<Vec<_>>()
-            };
-            select_store_signing_key(
-                &store,
-                candidates,
-                signature.algorithm,
-                signature.key_info.as_ref(),
-                &policy,
-                lax_candidates,
-                selected_provider(invocation)?,
-            )?
+            store_signing_candidate(invocation, &store, &signature, &policy)?
         } else {
             select_signing_key(
                 invocation,
@@ -1220,6 +1236,53 @@ struct SigningKeyImport<'a> {
     resources: &'a xml_sec::policy::ResourcePolicy,
 }
 
+/// The PKCS#12 key, with a `KeyInfo` writer for its matching certificate
+/// chain proven to describe that key.
+fn pkcs12_signing_candidate(
+    option: &crate::OptionValue,
+    algorithm: SignatureAlgorithm,
+    policy: &SigningPolicy,
+    password: Option<&[u8]>,
+    import: SigningKeyImport<'_>,
+    provider: &dyn CryptoProvider,
+) -> Result<SigningKeyCandidate, CommandError> {
+    let SigningKeyImport {
+        material_budget,
+        inventory,
+        resources,
+    } = import;
+    let path = Path::new(option.value.as_deref().unwrap_or_default());
+    let bytes = read_key_material_with_budget(path, material_budget)?;
+    let password = password
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
+    let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
+    inventory.add_pkcs12(name.clone(), &bytes, password, resources)?;
+    let key = inventory.signing_key_with_provider(&name, algorithm, policy, provider)?;
+    let imported = inventory
+        .private_keys()
+        .first()
+        .ok_or_else(|| CommandError::Usage("PKCS#12 contains no usable private key".into()))?;
+    let certificate_writer = imported
+        .matching_certificate_chain()
+        .map(X509CertificateKeyInfoWriter::from_der_chain)
+        .transpose()
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
+    if let Some(writer) = &certificate_writer {
+        writer
+            .write_key_info(key.as_ref())
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+    }
+    Ok(SigningKeyCandidate {
+        key,
+        certificate_writer,
+        leaf_certificate_der: imported
+            .matching_certificate_chain()
+            .and_then(|chain| chain.first())
+            .cloned(),
+    })
+}
+
 fn prepare_signing_key_candidate_inner(
     option: &crate::OptionValue,
     algorithm: SignatureAlgorithm,
@@ -1248,36 +1311,18 @@ fn prepare_signing_key_candidate_inner(
         });
     }
     if option.name == "pkcs12" {
-        let path = Path::new(option.value.as_deref().unwrap_or_default());
-        let bytes = read_key_material_with_budget(path, material_budget)?;
-        let password = password
-            .and_then(|value| std::str::from_utf8(value).ok())
-            .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
-        let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
-        inventory.add_pkcs12(name.clone(), &bytes, password, resources)?;
-        let key = inventory.signing_key_with_provider(&name, algorithm, policy, provider)?;
-        let imported = inventory
-            .private_keys()
-            .first()
-            .ok_or_else(|| CommandError::Usage("PKCS#12 contains no usable private key".into()))?;
-        let certificate_writer = imported
-            .matching_certificate_chain()
-            .map(X509CertificateKeyInfoWriter::from_der_chain)
-            .transpose()
-            .map_err(|error| CommandError::Signature(error.to_string()))?;
-        if let Some(writer) = &certificate_writer {
-            writer
-                .write_key_info(key.as_ref())
-                .map_err(|error| CommandError::Signature(error.to_string()))?;
-        }
-        return Ok(SigningKeyCandidate {
-            key,
-            certificate_writer,
-            leaf_certificate_der: imported
-                .matching_certificate_chain()
-                .and_then(|chain| chain.first())
-                .cloned(),
-        });
+        return pkcs12_signing_candidate(
+            option,
+            algorithm,
+            policy,
+            password,
+            SigningKeyImport {
+                material_budget,
+                inventory,
+                resources,
+            },
+            provider,
+        );
     }
     let (path, certificate_paths) =
         split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
@@ -1582,12 +1627,36 @@ fn ecdsa_signature_value_encoding(invocation: &Invocation) -> EcdsaSignatureValu
     }
 }
 
-fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(invocation, VERIFY_OPTIONS)?;
-    let xml_backend = selected_xml_backend(invocation)?;
-    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    reject_unimplemented_verification_policy(invocation)?;
-    let explicit_keys = invocation
+/// Private-key options that select a decapsulation recipient for `verify`.
+const VERIFY_RECIPIENT_OPTIONS: &[&str] = &["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"];
+
+/// The verification key sources requested on the command line.
+struct VerifyKeyOptions<'a> {
+    /// Explicit keys, each flagged when it is a certificate.
+    explicit: Vec<(&'a crate::OptionValue, bool)>,
+    has_key_store: bool,
+    has_recipient_key: bool,
+}
+
+impl VerifyKeyOptions<'_> {
+    /// Document `KeyName`s matter only when they can select among named keys.
+    fn key_name_resolution(
+        &self,
+        lax_key_search: bool,
+    ) -> key_material::VerificationKeyNameResolution {
+        if lax_key_search
+            || (self.explicit.is_empty() && !self.has_key_store && !self.has_recipient_key)
+            || matches!(self.explicit.as_slice(), [(key, _)] if key.parameter.is_none())
+        {
+            key_material::VerificationKeyNameResolution::IgnoreDocumentKeyInfo
+        } else {
+            key_material::VerificationKeyNameResolution::ResolveDocumentKeyInfo
+        }
+    }
+}
+
+fn verify_key_options(invocation: &Invocation) -> Result<VerifyKeyOptions<'_>, CommandError> {
+    let explicit = invocation
         .ordered_values(&[
             "pubkey-pem",
             "pubkey-der",
@@ -1600,22 +1669,221 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
             (option, certificate)
         })
         .collect::<Vec<_>>();
-    // With an explicit public key there is no key-manager search to relax.
-    // Reject the flag on resolver-backed paths until its semantics exist.
-    let lax_key_search = invocation.flag("lax-key-search");
     let has_key_store = invocation.values("keys-file").next().is_some();
-    if has_key_store && !explicit_keys.is_empty() {
+    if has_key_store && !explicit.is_empty() {
         return Err(CommandError::Usage(
             "verify cannot combine --keys-file with explicit key options".into(),
         ));
     }
     let has_recipient_key = invocation
-        .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
+        .ordered_values(VERIFY_RECIPIENT_OPTIONS)
         .next()
         .is_some();
-    if lax_key_search && explicit_keys.is_empty() && !has_key_store && !has_recipient_key {
+    // With an explicit public key there is no key-manager search to relax.
+    // Reject the flag on resolver-backed paths until its semantics exist.
+    if invocation.flag("lax-key-search")
+        && explicit.is_empty()
+        && !has_key_store
+        && !has_recipient_key
+    {
         return Err(CommandError::UnsupportedOption("lax-key-search".into()));
     }
+    Ok(VerifyKeyOptions {
+        explicit,
+        has_key_store,
+        has_recipient_key,
+    })
+}
+
+/// Decode explicit verification keys; lax search keeps going past
+/// recoverable candidate failures and reports the last one if none loads.
+fn explicit_verification_candidates(
+    selected_keys: Vec<(&crate::OptionValue, bool)>,
+    algorithm: SignatureAlgorithm,
+    lax_key_search: bool,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<Vec<ExplicitVerificationCandidate>, CommandError> {
+    let mut candidates = Vec::with_capacity(selected_keys.len());
+    let mut last_load_error = None;
+    for (option, certificate) in selected_keys {
+        let candidate = if option.name == "hmac-key" {
+            (|| {
+                let path = Path::new(option.value.as_deref().unwrap_or_default());
+                let bytes = key_material::read(path)?;
+                budget.charge(bytes.len())?;
+                HmacVerificationKey::new(bytes)
+                    .map(ExplicitVerificationCandidate::Hmac)
+                    .map_err(|error| CommandError::Signature(error.to_string()))
+            })()
+        } else if certificate {
+            load_explicit_certificate_key_info(option, budget)
+                .map(ExplicitVerificationCandidate::Certificate)
+        } else {
+            (|| {
+                let path = Path::new(option.value.as_deref().unwrap_or_default());
+                let bytes = key_material::read(path)?;
+                budget.charge(bytes.len())?;
+                key_material::decode_verification_key(
+                    path,
+                    &bytes,
+                    public_key_encoding(option),
+                    algorithm,
+                )
+                .map_err(CommandError::from)
+                .map(ExplicitVerificationCandidate::Direct)
+            })()
+        };
+        match candidate {
+            Ok(candidate) => candidates.push(candidate),
+            Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
+                last_load_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if candidates.is_empty() {
+        return Err(last_load_error.unwrap_or(CommandError::InvalidSignature));
+    }
+    Ok(candidates)
+}
+
+/// Key-store verification candidates: HMAC keys for an HMAC method,
+/// otherwise public keys with their `KeyInfo`.
+fn stored_verification_candidates(
+    stored_keys: &KeyInventory,
+    key_names: &[String],
+    algorithm: SignatureAlgorithm,
+    lax_key_search: bool,
+    resources: &ResourcePolicy,
+) -> Result<Vec<ExplicitVerificationCandidate>, CommandError> {
+    let mut budget = KeyCandidateBudget::with_limit(resources.max_key_candidates);
+    if algorithm.hmac_output_bits().is_some() {
+        let selected = select_store_candidates(
+            stored_keys.symmetric_keys().iter().filter(|entry| {
+                entry.kind == SymmetricKeyKind::Hmac
+                    && entry.usages.allows(key_manager::KeyUsage::Verify)
+            }),
+            key_names,
+            lax_key_search,
+            resources.max_key_candidates,
+            |entry| &entry.name,
+        )?;
+        budget
+            .consume(selected.len())
+            .map_err(|error| CommandError::Signature(error.to_string()))?;
+        return selected
+            .into_iter()
+            .map(|entry| {
+                HmacVerificationKey::new(entry.bytes.to_vec())
+                    .map(ExplicitVerificationCandidate::Hmac)
+                    .map_err(|error| CommandError::Signature(error.to_string()))
+            })
+            .collect();
+    }
+    let selected = select_store_candidates(
+        stored_keys
+            .public_keys()
+            .iter()
+            .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Verify)),
+        key_names,
+        lax_key_search,
+        resources.max_key_candidates,
+        |entry| &entry.name,
+    )?;
+    budget
+        .consume(selected.len())
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
+    Ok(selected
+        .into_iter()
+        .map(|entry| ExplicitVerificationCandidate::Certificate(entry.key_info.clone()))
+        .collect())
+}
+
+/// Where `verify` obtains its key: a decapsulation recipient, selected
+/// candidates, or the configured certificate resolver.
+enum VerificationKeySource {
+    Decapsulation(std::sync::Arc<dyn xml_sec::provider::KeyDecapsulationKey>),
+    Candidates(CandidateVerificationResolver),
+    Certificates(DefaultKeyResolver),
+}
+
+/// Key material already selected or loaded for one verification.
+struct VerificationKeyInputs<'a> {
+    selected_keys: Vec<(&'a crate::OptionValue, bool)>,
+    has_key_store: bool,
+    stored_keys: &'a KeyInventory,
+    configured_certificates: ConfiguredCertificates,
+}
+
+/// Decapsulation for an encapsulation signature, otherwise explicit keys
+/// before key-store entries, otherwise the configured certificate resolver.
+fn verification_key_source(
+    invocation: &Invocation,
+    signature: &key_material::SignatureMetadata,
+    inputs: VerificationKeyInputs<'_>,
+    policy: &VerificationPolicy,
+    budget: &mut ExternalMaterialBudget,
+) -> Result<VerificationKeySource, CommandError> {
+    let VerificationKeyInputs {
+        selected_keys,
+        has_key_store,
+        stored_keys,
+        configured_certificates,
+    } = inputs;
+    let lax_key_search = invocation.flag("lax-key-search");
+    if let Some(algorithm) = signature.encapsulation {
+        if !selected_keys.is_empty() {
+            return Err(CommandError::Usage("encapsulation verification requires a recipient private key, not --hmac-key or a signing public key".into()));
+        }
+        return Ok(VerificationKeySource::Decapsulation(
+            select_decapsulation_key(
+                invocation,
+                &signature.key_names,
+                algorithm,
+                &policy.key_establishment,
+                policy,
+                budget,
+            )?,
+        ));
+    }
+    if selected_keys.is_empty() && !has_key_store {
+        return Ok(VerificationKeySource::Certificates(
+            DefaultKeyResolver::new(configured_certificates.into_resolver_config()),
+        ));
+    }
+    let candidates = if selected_keys.is_empty() {
+        stored_verification_candidates(
+            stored_keys,
+            &signature.key_names,
+            signature.algorithm,
+            lax_key_search,
+            &policy.resources,
+        )?
+    } else {
+        explicit_verification_candidates(
+            selected_keys,
+            signature.algorithm,
+            lax_key_search,
+            budget,
+        )?
+    };
+    Ok(VerificationKeySource::Candidates(
+        CandidateVerificationResolver::new(
+            candidates,
+            configured_certificates,
+            lax_key_search,
+            policy.key_trust.check_crls,
+        ),
+    ))
+}
+
+fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
+    validate_options(invocation, VERIFY_OPTIONS)?;
+    let xml_backend = selected_xml_backend(invocation)?;
+    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    reject_unimplemented_verification_policy(invocation)?;
+    let key_options = verify_key_options(invocation)?;
+    let lax_key_search = invocation.flag("lax-key-search");
     let policy = xmlsec_compatibility_verification_policy(invocation);
     let mut certificate_budget =
         ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
@@ -1624,14 +1892,12 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    let key_name_resolution = if lax_key_search
-        || (explicit_keys.is_empty() && !has_key_store && !has_recipient_key)
-        || matches!(explicit_keys.as_slice(), [(key, _)] if key.parameter.is_none())
-    {
-        key_material::VerificationKeyNameResolution::IgnoreDocumentKeyInfo
-    } else {
-        key_material::VerificationKeyNameResolution::ResolveDocumentKeyInfo
-    };
+    let key_name_resolution = key_options.key_name_resolution(lax_key_search);
+    let VerifyKeyOptions {
+        explicit: explicit_keys,
+        has_key_store,
+        ..
+    } = key_options;
     let signature = key_material::verification_signature_metadata(
         &xml,
         start_node_id,
@@ -1641,12 +1907,9 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         xml_backend,
         selected_provider(invocation)?,
     )?;
-    let algorithm = signature.algorithm;
-    if signature.encapsulation.is_none() && has_recipient_key {
-        let option = invocation
-            .ordered_values(&["privkey-pem", "privkey-der", "pkcs8-pem", "pkcs8-der"])
-            .next()
-            .expect("recipient option exists");
+    if signature.encapsulation.is_none()
+        && let Some(option) = invocation.ordered_values(VERIFY_RECIPIENT_OPTIONS).next()
+    {
         return Err(CommandError::Usage(format!(
             "--{} is inapplicable to verify without EncapsulationMechanism",
             option.name
@@ -1655,9 +1918,10 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     let selected_keys = if explicit_keys.is_empty() {
         Vec::new()
     } else {
+        let names = &signature.key_names;
         named_candidate_search(
             &explicit_keys,
-            &signature.key_names,
+            names,
             lax_key_search,
             true,
             "verification key",
@@ -1679,181 +1943,35 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
     } else {
         load_xml_key_stores(invocation, &policy, xml_backend, &mut certificate_budget)?
     };
-    let result = if let Some(algorithm) = signature.encapsulation {
-        if !selected_keys.is_empty() {
-            return Err(CommandError::Usage("encapsulation verification requires a recipient private key, not --hmac-key or a signing public key".into()));
-        }
-        let key = select_decapsulation_key(
-            invocation,
-            &signature.key_names,
-            algorithm,
-            &policy.key_establishment,
-            &policy,
-            &mut certificate_budget,
-        )?;
-        verification_context(
-            policy,
-            start_node_id,
-            &id_attributes,
-            xml_backend,
-            utc_table,
-        )
-        .external_resources(&external_resources)
-        .provider(selected_provider(invocation)?)
-        .decapsulation_key(key.as_ref())
-        .verify(&xml)
-        .map_err(|error| CommandError::Signature(error.to_string()))?
-    } else if !selected_keys.is_empty() {
-        let mut candidates = Vec::with_capacity(selected_keys.len());
-        let mut last_load_error = None;
-        for (option, certificate) in selected_keys {
-            let candidate = if option.name == "hmac-key" {
-                (|| {
-                    let path = Path::new(option.value.as_deref().unwrap_or_default());
-                    let bytes = key_material::read(path)?;
-                    certificate_budget.charge(bytes.len())?;
-                    HmacVerificationKey::new(bytes)
-                        .map(ExplicitVerificationCandidate::Hmac)
-                        .map_err(|error| CommandError::Signature(error.to_string()))
-                })()
-            } else if certificate {
-                load_explicit_certificate_key_info(option, &mut certificate_budget)
-                    .map(ExplicitVerificationCandidate::Certificate)
-            } else {
-                (|| {
-                    let path = Path::new(option.value.as_deref().unwrap_or_default());
-                    let bytes = key_material::read(path)?;
-                    certificate_budget.charge(bytes.len())?;
-                    key_material::decode_verification_key(
-                        path,
-                        &bytes,
-                        public_key_encoding(option),
-                        algorithm,
-                    )
-                    .map_err(CommandError::from)
-                    .map(ExplicitVerificationCandidate::Direct)
-                })()
-            };
-            match candidate {
-                Ok(candidate) => candidates.push(candidate),
-                Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
-                    last_load_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if candidates.is_empty() {
-            return Err(last_load_error.unwrap_or(CommandError::InvalidSignature));
-        }
-        let resolver = CandidateVerificationResolver::new(
-            candidates,
+    let key_source = verification_key_source(
+        invocation,
+        &signature,
+        VerificationKeyInputs {
+            selected_keys,
+            has_key_store,
+            stored_keys: &stored_keys,
             configured_certificates,
-            lax_key_search,
-            policy.key_trust.check_crls,
-        );
-        verification_context(
-            policy,
-            start_node_id,
-            &id_attributes,
-            xml_backend,
-            utc_table,
-        )
-        .external_resources(&external_resources)
-        .provider(selected_provider(invocation)?)
-        .key_resolver(&resolver)
-        .verify(&xml)
-        .map_err(|error| CommandError::Signature(error.to_string()))?
-    } else if has_key_store && algorithm.hmac_output_bits().is_some() {
-        let selected = select_store_candidates(
-            stored_keys.symmetric_keys().iter().filter(|entry| {
-                entry.kind == SymmetricKeyKind::Hmac
-                    && entry.usages.allows(key_manager::KeyUsage::Verify)
-            }),
-            &signature.key_names,
-            lax_key_search,
-            policy.resources.max_key_candidates,
-            |entry| &entry.name,
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(selected.len())
-            .map_err(|error| CommandError::Signature(error.to_string()))?;
-        let candidates = selected
-            .into_iter()
-            .map(|entry| {
-                HmacVerificationKey::new(entry.bytes.to_vec())
-                    .map(ExplicitVerificationCandidate::Hmac)
-                    .map_err(|error| CommandError::Signature(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let resolver = CandidateVerificationResolver::new(
-            candidates,
-            configured_certificates,
-            lax_key_search,
-            policy.key_trust.check_crls,
-        );
-        verification_context(
-            policy,
-            start_node_id,
-            &id_attributes,
-            xml_backend,
-            utc_table,
-        )
-        .external_resources(&external_resources)
-        .provider(selected_provider(invocation)?)
-        .key_resolver(&resolver)
-        .verify(&xml)
-        .map_err(|error| CommandError::Signature(error.to_string()))?
-    } else if has_key_store {
-        let selected = select_store_candidates(
-            stored_keys
-                .public_keys()
-                .iter()
-                .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Verify)),
-            &signature.key_names,
-            lax_key_search,
-            policy.resources.max_key_candidates,
-            |entry| &entry.name,
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(selected.len())
-            .map_err(|error| CommandError::Signature(error.to_string()))?;
-        let resolver = CandidateVerificationResolver::new(
-            selected
-                .into_iter()
-                .map(|entry| ExplicitVerificationCandidate::Certificate(entry.key_info.clone()))
-                .collect(),
-            configured_certificates,
-            lax_key_search,
-            policy.key_trust.check_crls,
-        );
-        verification_context(
-            policy,
-            start_node_id,
-            &id_attributes,
-            xml_backend,
-            utc_table,
-        )
-        .external_resources(&external_resources)
-        .provider(selected_provider(invocation)?)
-        .key_resolver(&resolver)
-        .verify(&xml)
-        .map_err(|error| CommandError::Signature(error.to_string()))?
-    } else {
-        let config = configured_certificates.into_resolver_config();
-        let resolver = DefaultKeyResolver::new(config);
-        verification_context(
-            policy,
-            start_node_id,
-            &id_attributes,
-            xml_backend,
-            utc_table,
-        )
-        .external_resources(&external_resources)
-        .provider(selected_provider(invocation)?)
-        .key_resolver(&resolver)
-        .verify(&xml)
-        .map_err(|error| CommandError::Signature(error.to_string()))?
+        },
+        &policy,
+        &mut certificate_budget,
+    )?;
+    let context = verification_context(
+        policy,
+        start_node_id,
+        &id_attributes,
+        xml_backend,
+        utc_table,
+    )
+    .external_resources(&external_resources)
+    .provider(selected_provider(invocation)?);
+    let context = match &key_source {
+        VerificationKeySource::Decapsulation(key) => context.decapsulation_key(key.as_ref()),
+        VerificationKeySource::Candidates(resolver) => context.key_resolver(resolver),
+        VerificationKeySource::Certificates(resolver) => context.key_resolver(resolver),
     };
+    let result = context
+        .verify(&xml)
+        .map_err(|error| CommandError::Signature(error.to_string()))?;
     write_verification_diagnostics(invocation, &result, stdout)?;
     if aggregate_verification_status(&result) != DsigStatus::Valid {
         return Err(CommandError::InvalidSignature);
@@ -1905,13 +2023,14 @@ fn load_mapped_reference_resources(
         let maximum = resources
             .max_external_resource_bytes
             .min(budget.remaining());
-        if length > maximum as u64 {
-            return Err(CommandError::ExternalMaterialTooLarge { maximum });
-        }
+        let length = usize::try_from(length)
+            .ok()
+            .filter(|length| *length <= maximum)
+            .ok_or(CommandError::ExternalMaterialTooLarge { maximum })?;
         // Metadata sizes the normal regular-file path once. It is only a hint:
         // subsequent reads still enforce limits if the file grows concurrently.
-        budget.charge(length as usize)?;
-        bytes.try_reserve_exact(length as usize).map_err(|_| {
+        budget.charge(length)?;
+        bytes.try_reserve_exact(length).map_err(|_| {
             CommandError::Signature("unable to allocate mapped reference bytes".into())
         })?;
         let mut chunk = [0_u8; 8192];
@@ -2144,11 +2263,15 @@ fn lax_candidate_error_is_recoverable(error: &CommandError) -> bool {
         error,
         CommandError::Policy(_)
             | CommandError::ExternalMaterialTooLarge { .. }
-            | CommandError::KeyStore(key_manager::KeyStoreError::ProtectedContainer)
-            | CommandError::KeyStore(key_manager::KeyStoreError::Policy(_))
-            | CommandError::Key(key_material::KeyMaterialError::ProtectedContainer)
-            | CommandError::Key(key_material::KeyMaterialError::PrivateKeyComponents(_))
-            | CommandError::Key(key_material::KeyMaterialError::Policy(_))
+            | CommandError::KeyStore(
+                key_manager::KeyStoreError::ProtectedContainer
+                    | key_manager::KeyStoreError::Policy(_)
+            )
+            | CommandError::Key(
+                key_material::KeyMaterialError::ProtectedContainer
+                    | key_material::KeyMaterialError::PrivateKeyComponents(_)
+                    | key_material::KeyMaterialError::Policy(_)
+            )
     )
 }
 
@@ -2243,11 +2366,11 @@ fn write_reference_diagnostics(
 fn donor_dsig_status(status: DsigStatus) -> (&'static str, &'static str) {
     match status {
         DsigStatus::Valid => ("OK", "UNKNOWN"),
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
-        | DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
-        | DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { .. }) => {
-            ("FAILED", "REFERENCE")
-        }
+        DsigStatus::Invalid(
+            FailureReason::ReferenceDigestMismatch { .. }
+            | FailureReason::ReferencePolicyViolation { .. }
+            | FailureReason::ReferenceProcessingFailure { .. },
+        ) => ("FAILED", "REFERENCE"),
         DsigStatus::Invalid(FailureReason::SignatureMismatch) => ("FAILED", "SIGNATURE"),
         DsigStatus::Invalid(FailureReason::KeyNotFound) => ("FAILED", "KEY-NOT-FOUND"),
         _ => ("ERROR", "UNKNOWN"),
@@ -2400,7 +2523,7 @@ impl CandidateVerificationResolver {
                 match key.validate_policy(&candidate_budget.verification_scope(policy)) {
                     Ok(()) => resolved.push(key),
                     Err(error) if self.lax_key_search && !matches!(error, DsigError::Policy(_)) => {
-                        last_error = Some(error)
+                        last_error = Some(error);
                     }
                     Err(error) => return Err(error),
                 }
@@ -2602,6 +2725,588 @@ fn load_explicit_certificate_key_info(
         .map_err(|error| CommandError::Signature(error.to_string()))
 }
 
+/// One `encrypt` invocation's selected template, policy and backends.
+struct EncryptCommand<'a> {
+    invocation: &'a Invocation,
+    template: &'a str,
+    start_node_id: Option<&'a str>,
+    id_attributes: &'a [IdAttributeRegistration],
+    policy: &'a EncryptionPolicy,
+    xml_backend: XmlBackend,
+    provider: &'a dyn CryptoProvider,
+}
+
+impl EncryptCommand<'_> {
+    fn lax(&self) -> bool {
+        self.invocation.flag("lax-key-search")
+    }
+
+    /// A fresh aggregate budget for one key-selection path's external material.
+    fn material_budget(&self) -> ExternalMaterialBudget {
+        ExternalMaterialBudget::new(self.policy.resources.max_external_resource_total_bytes)
+    }
+
+    /// Charge `count` key candidates against the operation's candidate limit.
+    fn charge_candidates(&self, count: usize) -> Result<(), CommandError> {
+        KeyCandidateBudget::with_limit(self.policy.resources.max_key_candidates)
+            .consume(count)
+            .map_err(|error| CommandError::Encryption(error.to_string()))
+    }
+
+    fn recipient_metadata(
+        &self,
+        recipients: usize,
+        parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
+        recipient_key_metadata(
+            self.template,
+            self.start_node_id,
+            self.id_attributes,
+            self.policy,
+            recipients,
+            CommandBackends {
+                xml: self.xml_backend,
+                crypto: self.provider,
+            },
+            parsing,
+        )
+    }
+}
+
+/// Template recipients, or one unnamed transport recipient for a template
+/// that declares none.
+fn recipients_or_default(
+    recipients: Vec<EncryptionTemplateRecipient>,
+) -> Vec<EncryptionTemplateRecipient> {
+    if recipients.is_empty() {
+        vec![EncryptionTemplateRecipient {
+            key_name: None,
+            transport: None,
+            wrap: None,
+            oaep_parameters: None,
+        }]
+    } else {
+        recipients
+    }
+}
+
+/// The first explicit symmetric key whose kind and length fit the content
+/// algorithm, named as the template's content key requests.
+fn explicit_content_key(
+    command: &EncryptCommand<'_>,
+    builder: EncryptedDataBuilder,
+    keys: &[&crate::OptionValue],
+    names: &[String],
+    algorithm: DataEncryptionAlgorithm,
+) -> Result<EncryptedDataBuilder, CommandError> {
+    let candidates = keys
+        .iter()
+        .copied()
+        .map(|option| (option, ()))
+        .collect::<Vec<_>>();
+    let candidates =
+        named_candidate_search(&candidates, names, command.lax(), true, "symmetric key")?;
+    command.charge_candidates(candidates.len())?;
+    let mut material_budget = command.material_budget();
+    let mut last_error = None;
+    for (option, ()) in candidates {
+        if !symmetric_kind_accepts(symmetric_option_kind(&option.name), algorithm) {
+            last_error = Some(CommandError::Usage(
+                "symmetric key type does not match the content encryption algorithm".into(),
+            ));
+            continue;
+        }
+        match load_symmetric_with_budget(
+            option.value.as_deref().unwrap_or_default(),
+            Some(algorithm.key_len()),
+            &mut material_budget,
+        ) {
+            Ok(key) => {
+                let builder = builder.direct_key(key);
+                return Ok(match option.parameter.as_deref() {
+                    Some(name) => builder.direct_key_name(name),
+                    None => builder,
+                });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| CommandError::Usage("no compatible symmetric key input".into())))
+}
+
+/// The first key-store symmetric key whose kind and length fit the content
+/// algorithm, named as the template's content key requests.
+fn stored_content_key(
+    command: &EncryptCommand<'_>,
+    builder: EncryptedDataBuilder,
+    names: &[String],
+    algorithm: DataEncryptionAlgorithm,
+) -> Result<EncryptedDataBuilder, CommandError> {
+    let store = load_xml_key_stores(
+        command.invocation,
+        command.policy,
+        command.xml_backend,
+        &mut command.material_budget(),
+    )?;
+    let candidates = select_store_candidates(
+        store.symmetric_keys().iter().filter(|entry| {
+            symmetric_kind_accepts(entry.kind, algorithm)
+                && entry.usages.allows(key_manager::KeyUsage::Encrypt)
+        }),
+        names,
+        command.lax(),
+        command.policy.resources.max_key_candidates,
+        |entry| &entry.name,
+    )?;
+    command.charge_candidates(candidates.len())?;
+    let selected = candidates
+        .into_iter()
+        .find(|entry| entry.bytes.len() == algorithm.key_len())
+        .ok_or_else(|| CommandError::Usage("no compatible symmetric key in --keys-file".into()))?;
+    let key = key_material::decode_symmetric(selected.bytes.to_vec(), Some(algorithm.key_len()))?;
+    Ok(builder.direct_key(key).direct_key_name(&selected.name))
+}
+
+/// Encryption-capable key-store public keys by name, with lax-search
+/// reservations and decoded candidates shared across template recipients.
+struct StoreRecipientPool<'s> {
+    store: &'s KeyInventory,
+    available: HashMap<&'s str, AvailableStoreRecipient<'s>>,
+    only_public_key: Option<&'s key_manager::StoredPublicKey>,
+    public_key_count: usize,
+}
+
+impl<'s> StoreRecipientPool<'s> {
+    fn new(store: &'s KeyInventory) -> Self {
+        let mut available = HashMap::new();
+        let mut only_public_key = None;
+        let mut public_key_count = 0;
+        for entry in store
+            .public_keys()
+            .iter()
+            .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Encrypt))
+        {
+            public_key_count += 1;
+            only_public_key = Some(entry);
+            available.insert(
+                entry.name.as_str(),
+                AvailableStoreRecipient {
+                    entry,
+                    reservations: 0,
+                    loaded: None,
+                },
+            );
+        }
+        Self {
+            store,
+            available,
+            only_public_key,
+            public_key_count,
+        }
+    }
+
+    /// Reserve each named recipient's entry before any fallback assignment,
+    /// returning whether each template slot holds a reservation.
+    fn reserve_named(
+        &mut self,
+        command: &EncryptCommand<'_>,
+        recipients: &[EncryptionTemplateRecipient],
+        metadata: &[Option<ParsedRecipientKeyMetadata>],
+        budget: &mut KeyCandidateBudget,
+        parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<Vec<bool>, CommandError> {
+        let mut reserved_slots = Vec::with_capacity(recipients.len());
+        // A stale name contradicted by recipient metadata is not an exact
+        // match. Cache decoded candidates so reservation checks do not
+        // repeat RSA decoding during assignment; names remain borrowed.
+        for (recipient, metadata) in recipients.iter().zip(metadata) {
+            let mut reserved = false;
+            if let Some(name) = recipient.key_name.as_deref()
+                && let Some(available) = self.available.get_mut(name)
+            {
+                if metadata.as_ref().is_some_and(|metadata| {
+                    metadata
+                        .0
+                        .sources
+                        .iter()
+                        .any(|source| !matches!(source, KeyInfoSource::KeyName(_)))
+                }) {
+                    if available.loaded.is_none() {
+                        budget
+                            .consume(1)
+                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                        match load_stored_recipient_candidate(available.entry, command.policy) {
+                            Ok(candidate) => available.loaded = Some(candidate),
+                            Err(
+                                error @ CommandError::KeyStore(key_manager::KeyStoreError::Policy(
+                                    _,
+                                )),
+                            ) => return Err(error),
+                            Err(_) => {}
+                        }
+                    }
+                    if let Some(candidate) = available.loaded.as_ref() {
+                        reserved = match validate_recipient_key_metadata(
+                            metadata.as_ref(),
+                            candidate,
+                            command.provider,
+                            parsing,
+                        ) {
+                            Ok(()) => true,
+                            Err(error) if lax_candidate_error_is_recoverable(&error) => false,
+                            Err(error) => return Err(error),
+                        };
+                    }
+                } else {
+                    reserved = true;
+                }
+                if reserved {
+                    available.reservations += 1;
+                }
+            }
+            reserved_slots.push(reserved);
+        }
+        Ok(reserved_slots)
+    }
+
+    /// The exact entry for one recipient, or under lax search the first
+    /// unreserved entry whose key matches the recipient metadata.
+    fn select(
+        &mut self,
+        command: &EncryptCommand<'_>,
+        key_name: Option<&str>,
+        metadata: Option<&ParsedRecipientKeyMetadata>,
+        reserved: bool,
+        budget: &mut KeyCandidateBudget,
+        parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
+    ) -> Result<
+        (
+            &'s key_manager::StoredPublicKey,
+            RecipientPublicKeyCandidate,
+        ),
+        CommandError,
+    > {
+        let lax = command.lax();
+        let exact = match key_name {
+            Some(name) => self.available.get(name).map(|available| available.entry),
+            None if self.public_key_count == 1 => self.only_public_key.and_then(|entry| {
+                self.available
+                    .get(entry.name.as_str())
+                    .filter(|available| !lax || available.reservations == 0)
+                    .map(|available| available.entry)
+            }),
+            None if !lax && self.public_key_count > 1 => {
+                return Err(CommandError::Usage(
+                    "multiple matching keys in --keys-file".into(),
+                ));
+            }
+            None => None,
+        };
+        if exact.is_none() && !lax {
+            return Err(CommandError::Usage("no matching key in --keys-file".into()));
+        }
+        let fallbacks = self.store.public_keys().iter().filter(|entry| {
+            lax && entry.usages.allows(key_manager::KeyUsage::Encrypt)
+                && !exact.is_some_and(|selected| std::ptr::eq(selected, *entry))
+        });
+        let mut last_error = None;
+        for entry in exact.into_iter().chain(fallbacks) {
+            let is_exact = exact.is_some_and(|selected| std::ptr::eq(selected, entry));
+            if !is_exact
+                && self
+                    .available
+                    .get(entry.name.as_str())
+                    .is_none_or(|available| available.reservations != 0)
+            {
+                continue;
+            }
+            let cached = self
+                .available
+                .get_mut(entry.name.as_str())
+                .and_then(|available| available.loaded.take());
+            // Reservation already charged decoding for a retained candidate.
+            // Charge new inspections before work, not movement out of the cache.
+            let candidate = if let Some(candidate) = cached {
+                Ok(candidate)
+            } else {
+                budget
+                    .consume(1)
+                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
+                load_stored_recipient_candidate(entry, command.policy)
+            }
+            .and_then(|candidate| {
+                // This exact slot was checked against immutable metadata
+                // before reservation. Do not repeat its conversions.
+                if !(lax && reserved && is_exact) {
+                    validate_recipient_key_metadata(
+                        metadata,
+                        &candidate,
+                        command.provider,
+                        parsing,
+                    )?;
+                }
+                Ok(candidate)
+            });
+            match candidate {
+                Ok(candidate) => return Ok((entry, candidate)),
+                Err(error) if !lax_candidate_error_is_recoverable(&error) => return Err(error),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error
+            .unwrap_or_else(|| CommandError::Usage("no compatible RSA key in --keys-file".into())))
+    }
+}
+
+/// RSA transport recipients for every template recipient from the key store.
+fn stored_rsa_recipients(
+    command: &EncryptCommand<'_>,
+    mut builder: EncryptedDataBuilder,
+    recipients: Vec<EncryptionTemplateRecipient>,
+) -> Result<EncryptedDataBuilder, CommandError> {
+    let store = load_xml_key_stores(
+        command.invocation,
+        command.policy,
+        command.xml_backend,
+        &mut command.material_budget(),
+    )?;
+    let mut parsing =
+        xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&command.policy.resources)
+            .map_err(certificate_command_error)?;
+    let recipients = recipients_or_default(recipients);
+    command.charge_candidates(recipients.len())?;
+    let metadata = command.recipient_metadata(recipients.len(), &mut parsing)?;
+    let mut budget = KeyCandidateBudget::with_limit(command.policy.resources.max_key_candidates);
+    let mut pool = StoreRecipientPool::new(&store);
+    let lax = command.lax();
+    let reserved_slots = if lax {
+        pool.reserve_named(command, &recipients, &metadata, &mut budget, &mut parsing)?
+    } else {
+        Vec::new()
+    };
+    for (slot, (recipient, metadata)) in recipients.into_iter().zip(metadata).enumerate() {
+        let reserved = lax && reserved_slots[slot];
+        if reserved
+            && let Some(name) = recipient.key_name.as_deref()
+            && let Some(available) = pool.available.get_mut(name)
+        {
+            available.reservations -= 1;
+        }
+        let (entry, candidate) = pool.select(
+            command,
+            recipient.key_name.as_deref(),
+            metadata.as_ref(),
+            reserved,
+            &mut budget,
+            &mut parsing,
+        )?;
+        // Lax recipient search assigns each available entry once, as the
+        // explicit-key path does. Keep store order for subsequent fallbacks.
+        if lax {
+            pool.available.remove(entry.name.as_str());
+        }
+        let mut configured =
+            configured_template_recipient(candidate.public_key, recipient.transport)
+                .key_name(&entry.name);
+        if let Some(parameters) = recipient.oaep_parameters {
+            configured = configured.oaep_parameters(parameters);
+        }
+        builder = builder.add_recipient(configured);
+    }
+    Ok(builder)
+}
+
+/// Explicit RSA keys and certificates already decoded for this command,
+/// keyed by option identity.
+type LoadedRecipientKeys =
+    HashMap<*const crate::OptionValue, Result<RecipientPublicKeyCandidate, String>>;
+
+/// The first available explicit RSA key, named as the recipient requests,
+/// whose key matches the recipient metadata.
+fn select_explicit_rsa_recipient<'o>(
+    command: &EncryptCommand<'_>,
+    available: &[(&'o crate::OptionValue, bool)],
+    names: &[String],
+    metadata: Option<&ParsedRecipientKeyMetadata>,
+    loaded: &mut LoadedRecipientKeys,
+    budget: &mut ExternalMaterialBudget,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
+) -> Result<(&'o crate::OptionValue, bool, RsaPublicKey), CommandError> {
+    let candidates =
+        named_candidate_search(available, names, command.lax(), true, "RSA recipient key")?;
+    let mut last_error = None;
+    for (option, certificate) in candidates {
+        match cached_rsa_recipient_candidate(loaded, option, certificate, command.policy, budget)
+            .and_then(|key| {
+                validate_recipient_key_metadata(metadata, &key, command.provider, parsing)?;
+                Ok(key)
+            }) {
+            Ok(key) => return Ok((option, certificate, key.public_key)),
+            Err(error) if !lax_candidate_error_is_recoverable(&error) => return Err(error),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| CommandError::Usage("no compatible RSA recipient key input".into())))
+}
+
+/// RSA transport recipients for every template recipient from explicit keys;
+/// lax search assigns each explicit key at most once.
+fn explicit_rsa_recipients(
+    command: &EncryptCommand<'_>,
+    mut builder: EncryptedDataBuilder,
+    recipients: Vec<EncryptionTemplateRecipient>,
+    public_keys: &[(&crate::OptionValue, bool)],
+) -> Result<EncryptedDataBuilder, CommandError> {
+    let mut parsing =
+        xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&command.policy.resources)
+            .map_err(certificate_command_error)?;
+    let recipients = recipients_or_default(recipients);
+    let lax_key_search = command.lax();
+    let mut available = public_keys.to_vec();
+    if lax_key_search {
+        command.charge_candidates(available.len())?;
+    }
+    let mut loaded = LoadedRecipientKeys::new();
+    let mut certificate_budget = command.material_budget();
+    let mut selected_recipients = Vec::with_capacity(recipients.len());
+    let metadata = command.recipient_metadata(recipients.len(), &mut parsing)?;
+    for (recipient, metadata) in recipients.into_iter().zip(metadata) {
+        let (option, certificate, public_key) = select_explicit_rsa_recipient(
+            command,
+            &available,
+            recipient.key_name.as_slice(),
+            metadata.as_ref(),
+            &mut loaded,
+            &mut certificate_budget,
+            &mut parsing,
+        )?;
+        if lax_key_search {
+            let index = available
+                .iter()
+                .position(|(candidate, candidate_certificate)| {
+                    std::ptr::eq(*candidate, option) && *candidate_certificate == certificate
+                })
+                .ok_or_else(|| {
+                    CommandError::Encryption(
+                        "selected recipient key is absent from the candidate set".into(),
+                    )
+                })?;
+            available.remove(index);
+        }
+        let key_name = recipient.key_name.or_else(|| option.parameter.clone());
+        selected_recipients.push((
+            public_key,
+            recipient.transport,
+            recipient.oaep_parameters,
+            key_name,
+        ));
+    }
+    for (public_key, transport, parameters, key_name) in selected_recipients {
+        let mut recipient = configured_template_recipient(public_key, transport);
+        if let Some(parameters) = parameters {
+            recipient = recipient.oaep_parameters(parameters);
+        }
+        if let Some(key_name) = key_name {
+            recipient = recipient.key_name(key_name);
+        }
+        builder = builder.add_recipient(recipient);
+    }
+    Ok(builder)
+}
+
+/// The key requirements a template declares for its content key.
+struct EncryptionKeyRequest {
+    encapsulation: Option<(xml_sec::provider::KeyEncapsulationAlgorithm, Vec<String>)>,
+    has_encrypted_key_recipient: bool,
+    recipients: Vec<EncryptionTemplateRecipient>,
+    content_key_name: Option<String>,
+    algorithm: DataEncryptionAlgorithm,
+}
+
+/// Configure the encapsulation, wrapping, direct or transport keys the
+/// template and the key options together select.
+fn configure_encryption_keys(
+    command: &EncryptCommand<'_>,
+    builder: EncryptedDataBuilder,
+    request: EncryptionKeyRequest,
+) -> Result<EncryptedDataBuilder, CommandError> {
+    let invocation = command.invocation;
+    let aes_keys = invocation
+        .ordered_values(&["aes-key", "des-key"])
+        .collect::<Vec<_>>();
+    let public_keys = invocation
+        .ordered_values(&[
+            "pubkey-pem",
+            "pubkey-der",
+            "pubkey-cert-pem",
+            "pubkey-cert-der",
+        ])
+        .map(|option| {
+            let certificate = matches!(option.name.as_str(), "pubkey-cert-pem" | "pubkey-cert-der");
+            (option, certificate)
+        })
+        .collect::<Vec<_>>();
+    let has_key_store = invocation.values("keys-file").next().is_some();
+    if has_key_store && (!aes_keys.is_empty() || !public_keys.is_empty()) {
+        return Err(CommandError::Usage(
+            "encrypt cannot combine --keys-file with explicit key options".into(),
+        ));
+    }
+    if !aes_keys.is_empty() && !public_keys.is_empty() {
+        return Err(CommandError::Usage(
+            "encrypt cannot combine explicit AES and RSA recipient keys".into(),
+        ));
+    }
+    let names = request.content_key_name.as_slice();
+    if let Some((algorithm, names)) = &request.encapsulation {
+        if !aes_keys.is_empty() || request.has_encrypted_key_recipient {
+            return Err(CommandError::Usage("direct EncapsulationMechanism cannot be combined with raw symmetric keys or EncryptedKey recipients".into()));
+        }
+        let key = select_encapsulation_key(
+            invocation,
+            names,
+            *algorithm,
+            &command.policy.key_establishment,
+            command.policy,
+            command.xml_backend,
+            &mut command.material_budget(),
+        )?;
+        Ok(builder.encapsulation_key(key))
+    } else if request
+        .recipients
+        .iter()
+        .any(|recipient| recipient.wrap.is_some())
+    {
+        configure_wrapping_recipients(
+            builder,
+            &request.recipients,
+            invocation,
+            &aes_keys,
+            command.policy,
+            command.xml_backend,
+        )
+    } else if !aes_keys.is_empty() {
+        if request.has_encrypted_key_recipient {
+            return Err(CommandError::Usage(
+                "direct AES key cannot satisfy an EncryptedKey recipient in the template".into(),
+            ));
+        }
+        explicit_content_key(command, builder, &aes_keys, names, request.algorithm)
+    } else if has_key_store && !request.has_encrypted_key_recipient {
+        stored_content_key(command, builder, names, request.algorithm)
+    } else if has_key_store {
+        stored_rsa_recipients(command, builder, request.recipients)
+    } else if !public_keys.is_empty() {
+        explicit_rsa_recipients(command, builder, request.recipients, &public_keys)
+    } else {
+        Err(CommandError::Usage(
+            "encrypt requires --aes-key, an RSA public key, or an RSA certificate".into(),
+        ))
+    }
+}
+
 fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
     let provider = selected_provider(invocation)?;
     validate_options(invocation, ENCRYPT_OPTIONS)?;
@@ -2643,488 +3348,26 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     if let Some(parameters) = metadata.chacha {
         builder = builder.chacha_parameters(parameters);
     }
-    let aes_keys = invocation
-        .ordered_values(&["aes-key", "des-key"])
-        .collect::<Vec<_>>();
-    let public_keys = invocation
-        .ordered_values(&[
-            "pubkey-pem",
-            "pubkey-der",
-            "pubkey-cert-pem",
-            "pubkey-cert-der",
-        ])
-        .map(|option| {
-            let certificate = matches!(option.name.as_str(), "pubkey-cert-pem" | "pubkey-cert-der");
-            (option, certificate)
-        })
-        .collect::<Vec<_>>();
-    let has_key_store = invocation.values("keys-file").next().is_some();
-    if has_key_store && (!aes_keys.is_empty() || !public_keys.is_empty()) {
-        return Err(CommandError::Usage(
-            "encrypt cannot combine --keys-file with explicit key options".into(),
-        ));
-    }
-    if !aes_keys.is_empty() && !public_keys.is_empty() {
-        return Err(CommandError::Usage(
-            "encrypt cannot combine explicit AES and RSA recipient keys".into(),
-        ));
-    }
-    if let Some((algorithm, names)) = &metadata.encapsulation {
-        if !aes_keys.is_empty() || metadata.has_encrypted_key_recipient {
-            return Err(CommandError::Usage("direct EncapsulationMechanism cannot be combined with raw symmetric keys or EncryptedKey recipients".into()));
-        }
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let key = select_encapsulation_key(
-            invocation,
-            names,
-            *algorithm,
-            &policy.key_establishment,
-            &policy,
-            xml_backend,
-            &mut budget,
-        )?;
-        builder = builder.encapsulation_key(key);
-    } else if metadata
-        .recipients
-        .iter()
-        .any(|recipient| recipient.wrap.is_some())
-    {
-        builder = configure_wrapping_recipients(
-            builder,
-            &metadata.recipients,
-            invocation,
-            &aes_keys,
-            &policy,
-            xml_backend,
-        )?;
-    } else if !aes_keys.is_empty() {
-        if metadata.has_encrypted_key_recipient {
-            return Err(CommandError::Usage(
-                "direct AES key cannot satisfy an EncryptedKey recipient in the template".into(),
-            ));
-        }
-        let candidates = aes_keys
-            .iter()
-            .copied()
-            .map(|option| (option, ()))
-            .collect::<Vec<_>>();
-        let requested_names = metadata
-            .content_key_name
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let candidates = named_candidate_search(
-            &candidates,
-            &requested_names,
-            invocation.flag("lax-key-search"),
-            true,
-            "symmetric key",
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(candidates.len())
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let mut material_budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let mut selected = None;
-        let mut last_error = None;
-        for (option, ()) in candidates {
-            if !symmetric_kind_accepts(symmetric_option_kind(&option.name), algorithm) {
-                last_error = Some(CommandError::Usage(
-                    "symmetric key type does not match the content encryption algorithm".into(),
-                ));
-                continue;
-            }
-            match load_symmetric_with_budget(
-                option.value.as_deref().unwrap_or_default(),
-                Some(algorithm.key_len()),
-                &mut material_budget,
-            ) {
-                Ok(key) => {
-                    selected = Some((option, key));
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        let (option, key) = selected.ok_or_else(|| {
-            last_error
-                .unwrap_or_else(|| CommandError::Usage("no compatible symmetric key input".into()))
-        })?;
-        builder = builder.direct_key(key);
-        if let Some(name) = option.parameter.as_deref() {
-            builder = builder.direct_key_name(name);
-        }
-    } else if has_key_store && !metadata.has_encrypted_key_recipient {
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
-        let requested_names = metadata
-            .content_key_name
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let candidates = select_store_candidates(
-            store.symmetric_keys().iter().filter(|entry| {
-                symmetric_kind_accepts(entry.kind, algorithm)
-                    && entry.usages.allows(key_manager::KeyUsage::Encrypt)
-            }),
-            &requested_names,
-            invocation.flag("lax-key-search"),
-            policy.resources.max_key_candidates,
-            |entry| &entry.name,
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(candidates.len())
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let selected = candidates
-            .into_iter()
-            .find(|entry| entry.bytes.len() == algorithm.key_len())
-            .ok_or_else(|| {
-                CommandError::Usage("no compatible symmetric key in --keys-file".into())
-            })?;
-        let key =
-            key_material::decode_symmetric(selected.bytes.to_vec(), Some(algorithm.key_len()))?;
-        builder = builder.direct_key(key).direct_key_name(&selected.name);
-    } else if has_key_store {
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
-        let mut recipient_parsing =
-            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-                .map_err(certificate_command_error)?;
-        let template_recipients = if metadata.recipients.is_empty() {
-            vec![EncryptionTemplateRecipient {
-                key_name: None,
-                transport: None,
-                wrap: None,
-                oaep_parameters: None,
-            }]
-        } else {
-            metadata.recipients
-        };
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(template_recipients.len())
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let recipient_metadata = recipient_key_metadata(
-            &template,
-            start_node_id,
-            &id_attributes,
-            &policy,
-            template_recipients.len(),
-            CommandBackends {
-                xml: xml_backend,
-                crypto: selected_provider(invocation)?,
-            },
-            &mut recipient_parsing,
-        )?;
-        let mut store_candidate_budget =
-            KeyCandidateBudget::with_limit(policy.resources.max_key_candidates);
-        let mut available_public_keys_by_name = HashMap::new();
-        let mut only_public_key = None;
-        let mut public_key_count = 0;
-        for entry in store
-            .public_keys()
-            .iter()
-            .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Encrypt))
-        {
-            public_key_count += 1;
-            only_public_key = Some(entry);
-            available_public_keys_by_name.insert(
-                entry.name.as_str(),
-                AvailableStoreRecipient {
-                    entry,
-                    reservations: 0,
-                    loaded: None,
-                },
-            );
-        }
-        let lax = invocation.flag("lax-key-search");
-        let mut reserved_slots = Vec::new();
-        if lax {
-            reserved_slots.reserve(template_recipients.len());
-            // A stale name contradicted by recipient metadata is not an exact
-            // match. Cache decoded candidates so reservation checks do not
-            // repeat RSA decoding during assignment; names remain borrowed.
-            for (recipient, metadata) in template_recipients.iter().zip(&recipient_metadata) {
-                let mut reserved = false;
-                if let Some(name) = recipient.key_name.as_deref()
-                    && let Some(available) = available_public_keys_by_name.get_mut(name)
-                {
-                    if metadata.as_ref().is_some_and(|metadata| {
-                        metadata
-                            .0
-                            .sources
-                            .iter()
-                            .any(|source| !matches!(source, KeyInfoSource::KeyName(_)))
-                    }) {
-                        if available.loaded.is_none() {
-                            store_candidate_budget
-                                .consume(1)
-                                .map_err(|error| CommandError::Encryption(error.to_string()))?;
-                            match load_stored_recipient_candidate(available.entry, &policy) {
-                                Ok(candidate) => available.loaded = Some(candidate),
-                                Err(
-                                    error @ CommandError::KeyStore(
-                                        key_manager::KeyStoreError::Policy(_),
-                                    ),
-                                ) => return Err(error),
-                                Err(_) => {}
-                            }
-                        }
-                        if let Some(candidate) = available.loaded.as_ref() {
-                            reserved = match validate_recipient_key_metadata(
-                                metadata.as_ref(),
-                                candidate,
-                                provider,
-                                &mut recipient_parsing,
-                            ) {
-                                Ok(()) => true,
-                                Err(error) if lax_candidate_error_is_recoverable(&error) => false,
-                                Err(error) => return Err(error),
-                            };
-                        }
-                    } else {
-                        reserved = true;
-                    }
-                    if reserved {
-                        available.reservations += 1;
-                    }
-                }
-                reserved_slots.push(reserved);
-            }
-        }
-        for (slot, (recipient, metadata)) in template_recipients
-            .into_iter()
-            .zip(recipient_metadata)
-            .enumerate()
-        {
-            if lax
-                && reserved_slots[slot]
-                && let Some(name) = recipient.key_name.as_deref()
-                && let Some(available) = available_public_keys_by_name.get_mut(name)
-            {
-                available.reservations -= 1;
-            }
-            let exact = match recipient.key_name.as_deref() {
-                Some(name) => available_public_keys_by_name
-                    .get(name)
-                    .map(|available| available.entry),
-                None if public_key_count == 1 => only_public_key.and_then(|entry| {
-                    available_public_keys_by_name
-                        .get(entry.name.as_str())
-                        .filter(|available| !lax || available.reservations == 0)
-                        .map(|available| available.entry)
-                }),
-                None if !lax && public_key_count > 1 => {
-                    return Err(CommandError::Usage(
-                        "multiple matching keys in --keys-file".into(),
-                    ));
-                }
-                None => None,
-            };
-            if exact.is_none() && !lax {
-                return Err(CommandError::Usage("no matching key in --keys-file".into()));
-            }
-            let fallbacks = store.public_keys().iter().filter(|entry| {
-                lax && entry.usages.allows(key_manager::KeyUsage::Encrypt)
-                    && !exact.is_some_and(|selected| std::ptr::eq(selected, *entry))
-            });
-            let mut selected = None;
-            let mut last_error = None;
-            for entry in exact.into_iter().chain(fallbacks) {
-                if !exact.is_some_and(|selected| std::ptr::eq(selected, entry))
-                    && available_public_keys_by_name
-                        .get(entry.name.as_str())
-                        .is_none_or(|available| available.reservations != 0)
-                {
-                    continue;
-                }
-                let cached = available_public_keys_by_name
-                    .get_mut(entry.name.as_str())
-                    .and_then(|available| available.loaded.take());
-                // Reservation already charged decoding for a retained candidate.
-                // Charge new inspections before work, not movement out of the cache.
-                let candidate = match cached {
-                    Some(candidate) => Ok(candidate),
-                    None => {
-                        store_candidate_budget
-                            .consume(1)
-                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-                        load_stored_recipient_candidate(entry, &policy)
-                    }
-                }
-                .and_then(|candidate| {
-                    // This exact slot was checked against immutable metadata
-                    // before reservation. Do not repeat its conversions.
-                    if !(lax
-                        && reserved_slots[slot]
-                        && exact.is_some_and(|selected| std::ptr::eq(selected, entry)))
-                    {
-                        validate_recipient_key_metadata(
-                            metadata.as_ref(),
-                            &candidate,
-                            selected_provider(invocation)?,
-                            &mut recipient_parsing,
-                        )?;
-                    }
-                    Ok(candidate)
-                });
-                match candidate {
-                    Ok(candidate) => {
-                        selected = Some((entry, candidate));
-                        break;
-                    }
-                    Err(error) if !lax_candidate_error_is_recoverable(&error) => {
-                        return Err(error);
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            let (entry, candidate) = selected.ok_or_else(|| {
-                last_error.unwrap_or_else(|| {
-                    CommandError::Usage("no compatible RSA key in --keys-file".into())
-                })
-            })?;
-            // Lax recipient search assigns each available entry once, as the
-            // explicit-key path does. Keep store order for subsequent fallbacks.
-            if lax {
-                available_public_keys_by_name.remove(entry.name.as_str());
-            }
-            let mut configured =
-                configured_template_recipient(candidate.public_key, recipient.transport)
-                    .key_name(&entry.name);
-            if let Some(parameters) = recipient.oaep_parameters {
-                configured = configured.oaep_parameters(parameters);
-            }
-            builder = builder.add_recipient(configured);
-        }
-    } else if !public_keys.is_empty() {
-        let mut recipient_parsing =
-            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-                .map_err(certificate_command_error)?;
-        let template_recipients = if metadata.recipients.is_empty() {
-            vec![EncryptionTemplateRecipient {
-                key_name: None,
-                transport: None,
-                wrap: None,
-                oaep_parameters: None,
-            }]
-        } else {
-            metadata.recipients
-        };
-        let lax_key_search = invocation.flag("lax-key-search");
-        let mut available_public_keys = public_keys.clone();
-        if lax_key_search {
-            KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-                .consume(available_public_keys.len())
-                .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        }
-        let mut loaded_public_keys = HashMap::new();
-        let mut certificate_budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let mut selected_recipients = Vec::with_capacity(template_recipients.len());
-        let recipient_metadata = recipient_key_metadata(
-            &template,
-            start_node_id,
-            &id_attributes,
-            &policy,
-            template_recipients.len(),
-            CommandBackends {
-                xml: xml_backend,
-                crypto: selected_provider(invocation)?,
-            },
-            &mut recipient_parsing,
-        )?;
-        for (template_recipient, metadata) in
-            template_recipients.into_iter().zip(recipient_metadata)
-        {
-            let requested_names = template_recipient
-                .key_name
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>();
-            let candidates = named_candidate_search(
-                &available_public_keys,
-                &requested_names,
-                lax_key_search,
-                true,
-                "RSA recipient key",
-            )?;
-            let mut selected = None;
-            let mut last_error: Option<CommandError> = None;
-            for (option, certificate) in candidates {
-                match cached_rsa_recipient_candidate(
-                    &mut loaded_public_keys,
-                    option,
-                    certificate,
-                    &policy,
-                    &mut certificate_budget,
-                )
-                .and_then(|key| {
-                    validate_recipient_key_metadata(
-                        metadata.as_ref(),
-                        &key,
-                        selected_provider(invocation)?,
-                        &mut recipient_parsing,
-                    )?;
-                    Ok(key)
-                }) {
-                    Ok(key) => {
-                        selected = Some((option, certificate, key.public_key));
-                        break;
-                    }
-                    Err(error) if !lax_candidate_error_is_recoverable(&error) => {
-                        return Err(error);
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            let (selected_option, selected_certificate, public_key) =
-                selected.ok_or_else(|| {
-                    last_error.unwrap_or_else(|| {
-                        CommandError::Usage("no compatible RSA recipient key input".into())
-                    })
-                })?;
-            if lax_key_search {
-                let selected_index = available_public_keys
-                    .iter()
-                    .position(|(option, certificate)| {
-                        std::ptr::eq(*option, selected_option)
-                            && *certificate == selected_certificate
-                    })
-                    .ok_or_else(|| {
-                        CommandError::Encryption(
-                            "selected recipient key is absent from the candidate set".into(),
-                        )
-                    })?;
-                available_public_keys.remove(selected_index);
-            }
-            let key_name = template_recipient
-                .key_name
-                .or_else(|| selected_option.parameter.clone());
-            selected_recipients.push((
-                public_key,
-                template_recipient.transport,
-                template_recipient.oaep_parameters,
-                key_name,
-            ));
-        }
-        for (public_key, transport, parameters, key_name) in selected_recipients {
-            let mut recipient = configured_template_recipient(public_key, transport);
-            if let Some(parameters) = parameters {
-                recipient = recipient.oaep_parameters(parameters);
-            }
-            if let Some(key_name) = key_name {
-                recipient = recipient.key_name(key_name);
-            }
-            builder = builder.add_recipient(recipient);
-        }
-    } else {
-        return Err(CommandError::Usage(
-            "encrypt requires --aes-key, an RSA public key, or an RSA certificate".into(),
-        ));
-    }
+    let command = EncryptCommand {
+        invocation,
+        template: &template,
+        start_node_id,
+        id_attributes: &id_attributes,
+        policy: &policy,
+        xml_backend,
+        provider,
+    };
+    builder = configure_encryption_keys(
+        &command,
+        builder,
+        EncryptionKeyRequest {
+            encapsulation: metadata.encapsulation,
+            has_encrypted_key_recipient: metadata.has_encrypted_key_recipient,
+            recipients: metadata.recipients,
+            content_key_name: metadata.content_key_name,
+            algorithm,
+        },
+    )?;
     builder = builder.encryption_type(encrypted_type.clone());
     let result = if let Some(path) = invocation.last_value("binary-data") {
         if template_placement == EncryptionTemplatePlacement::Embedded {
@@ -3182,7 +3425,7 @@ fn xml_data_plaintext<'a>(
     // xmlSecEncCtxXmlEncrypt. Element serializes that node; Content serializes
     // only its children. The document declaration and boundary nodes therefore
     // never become encrypted replacement plaintext.
-    let document = parse_encryption_document(xml, &policy.xml, &policy.resources, xml_backend)?;
+    let document = parse_encryption_document(xml, policy.xml, &policy.resources, xml_backend)?;
     let root = document.root_element();
     let element = &xml[root.range()];
     match encrypted_type {
@@ -3400,11 +3643,11 @@ fn recipient_key_metadata(
     parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
 ) -> Result<Vec<Option<ParsedRecipientKeyMetadata>>, CommandError> {
     let document =
-        parse_encryption_document(template, &policy.xml, &policy.resources, backends.xml)?;
+        parse_encryption_document(template, policy.xml, &policy.resources, backends.xml)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     let encrypted_keys = direct_child_element(encrypted_data, XMLDSIG_NS, "KeyInfo")
         .into_iter()
-        .flat_map(|key_info| key_info.children())
+        .flat_map(Node::children)
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .collect::<Vec<_>>();
     if encrypted_keys.is_empty() {
@@ -3497,11 +3740,8 @@ fn validate_recipient_key_metadata(
                     })?;
                     rsa_public_keys_match(&selected_key.public_key, &public_key)
                 }
-                KeyInfoSource::KeyValue(_) | KeyInfoSource::RetrievalMethod { .. } => {
-                    return Err(recipient_metadata_error(
-                        "recipient key source cannot be matched to the selected RSA key",
-                    ));
-                }
+                // Non-RSA key values, retrieval methods and every other source
+                // make an identity claim this RSA recipient cannot confirm.
                 _ => {
                     return Err(recipient_metadata_error(
                         "recipient key source cannot be matched to the selected RSA key",
@@ -3597,7 +3837,7 @@ fn direct_simple_text(node: Node<'_, '_>, field: &str) -> Result<String, Command
     Ok(node
         .children()
         .filter(Node::is_text)
-        .filter_map(|child| child.text())
+        .filter_map(Node::text)
         .collect())
 }
 
@@ -3616,12 +3856,12 @@ fn same_direct_simple_text(
     let left_bytes = left
         .children()
         .filter(Node::is_text)
-        .filter_map(|child| child.text())
+        .filter_map(Node::text)
         .flat_map(str::bytes);
     let right_bytes = right
         .children()
         .filter(Node::is_text)
-        .filter_map(|child| child.text())
+        .filter_map(Node::text)
         .flat_map(str::bytes);
     Ok(left_bytes.eq(right_bytes))
 }
@@ -3636,6 +3876,217 @@ fn oaep_mgf_from_uri(uri: &str) -> Result<OaepDigestAlgorithm, CommandError> {
         .ok_or_else(|| CommandError::Encryption(format!("unsupported OAEP MGF: {uri}")))
 }
 
+/// One text substitution in the template source.
+type TemplateReplacement = (std::ops::Range<usize>, String);
+
+/// The caller's template and the core-generated `EncryptedData` it is merged with.
+struct TemplateSources<'a> {
+    template: &'a str,
+    generated: &'a str,
+}
+
+/// Append the generated `ChaCha` nonce to a template method that declares none.
+fn chacha_nonce_replacement(
+    sources: &TemplateSources<'_>,
+    template_data: Node<'_, '_>,
+    generated_data: Node<'_, '_>,
+    maximum_bytes: usize,
+) -> Result<Option<TemplateReplacement>, CommandError> {
+    let Some(method) = direct_child_element(template_data, XMLENC_NS, "EncryptionMethod") else {
+        return Ok(None);
+    };
+    if !matches!(
+        method.attribute("Algorithm"),
+        Some(
+            "http://www.w3.org/2021/04/xmldsig-more#chacha20"
+                | "http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305"
+        )
+    )
+        // RFC 9231 sections 2.6.7-2.6.8 use unqualified Nonce elements; retain
+        // those and the namespaced donor form accepted by the core parser.
+        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.7
+        || method.children().any(|child| {
+            child.is_element()
+                && child.tag_name().name() == "Nonce"
+                && matches!(
+                    child.tag_name().namespace(),
+                    None | Some("http://www.w3.org/2021/04/xmldsig-more#")
+                )
+        })
+    {
+        return Ok(None);
+    }
+    let generated_method = direct_child_element(generated_data, XMLENC_NS, "EncryptionMethod")
+        .ok_or_else(|| CommandError::Encryption("generated ChaCha method is absent".into()))?;
+    let nonce = direct_child_element(
+        generated_method,
+        "http://www.w3.org/2021/04/xmldsig-more#",
+        "Nonce",
+    )
+    .ok_or_else(|| CommandError::Encryption("generated ChaCha nonce is absent".into()))?;
+    let malformed = || CommandError::Encryption("ChaCha template method is malformed".into());
+    let fragment = &sources.template[method.range()];
+    let opening = opening_tag_end(fragment).ok_or_else(malformed)?;
+    let original = if fragment[..opening].trim_end().ends_with('/') {
+        ""
+    } else {
+        &fragment[opening + 1..fragment.rfind("</").ok_or_else(malformed)?]
+    };
+    let mut content = String::new();
+    push_plaintext(&mut content, original, maximum_bytes)?;
+    append_standalone_element(&mut content, sources.generated, nonce, maximum_bytes)?;
+    replace_element_text(sources.template, method, &content).map(Some)
+}
+
+/// Replace the template's encapsulation ciphertext with the generated one,
+/// returning the template's declared mechanisms. A declared mechanism must
+/// have been executed with the same parameter set, and none may appear
+/// unannounced.
+fn merge_template_encapsulation<'i>(
+    sources: &TemplateSources<'_>,
+    (_, generated_key_info): (Node<'_, '_>, Node<'_, '_>),
+    inspected: Option<&'i xml_sec::xmlenc::EncryptedDataTemplate<'_>>,
+    replacements: &mut Vec<TemplateReplacement>,
+) -> Result<&'i [xml_sec::key_establishment::EncapsulationMechanism], CommandError> {
+    let generated_kem = xml_sec::key_establishment::direct_encapsulation(generated_key_info, false)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let template_kem = inspected.map_or(&[][..], |inspected| {
+        inspected.data().encapsulation_methods.as_slice()
+    });
+    if let ([template_mechanism], Some(generated_kem)) = (template_kem, &generated_kem) {
+        if template_mechanism.algorithm != generated_kem.algorithm {
+            return Err(CommandError::Encryption(
+                "generated encapsulation parameter set differs from template".into(),
+            ));
+        }
+        let origin = *inspected
+            .expect("selected template mechanism was inspected")
+            .encapsulation_cipher_values()
+            .first()
+            .ok_or_else(|| {
+                CommandError::Encryption("template encapsulation origin is missing".into())
+            })?;
+        replacements.push(replace_element_text(
+            sources.template,
+            origin,
+            generated_kem.cipher_value.text().unwrap_or_default(),
+        )?);
+    } else if !template_kem.is_empty() || generated_kem.is_some() {
+        return Err(CommandError::Encryption(
+            "template encapsulation was not executed".into(),
+        ));
+    }
+    Ok(template_kem)
+}
+
+/// Merge the generated `KeyName` and `KeyInfo` children into the template: an
+/// empty template takes all children, otherwise only missing element kinds are
+/// appended and existing recipient `CipherValue`s receive the generated ciphertexts.
+fn merge_template_key_info_children(
+    sources: &TemplateSources<'_>,
+    (template_key_info, generated_key_info): (Node<'_, '_>, Node<'_, '_>),
+    template_kem: &[xml_sec::key_establishment::EncapsulationMechanism],
+    replacements: &mut Vec<TemplateReplacement>,
+) -> Result<(), CommandError> {
+    let TemplateSources {
+        template,
+        generated,
+    } = *sources;
+    if let (Some(template_name), Some(generated_name)) = (
+        direct_child_element(template_key_info, XMLDSIG_NS, "KeyName"),
+        direct_child_element(generated_key_info, XMLDSIG_NS, "KeyName"),
+    ) && !same_direct_simple_text(template_name, generated_name, "KeyName")?
+    {
+        replacements.push(replace_element_text(
+            template,
+            template_name,
+            &escape_text(generated_name.text().unwrap_or_default()),
+        )?);
+    }
+    // Both value sets are validated before either merge shape is chosen.
+    let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
+    let generated_values = encrypted_key_cipher_values(generated_key_info, "generated")?;
+    if !template_key_info.children().any(|node| node.is_element()) {
+        let generated_children = generated_key_info
+            .children()
+            .filter(Node::is_element)
+            .map(|node| standalone_element(generated, node))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !generated_children.is_empty() {
+            replacements.push(append_element_children_replacement(
+                template,
+                template_key_info,
+                &generated_children.concat(),
+            )?);
+        }
+        return Ok(());
+    }
+    // Only generated element kinds the template lacks are appended.
+    let mut children_to_append = generated_key_info
+        .children()
+        .filter(|node| node.is_element() && !node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+        .filter(|node| {
+            template_kem.is_empty()
+                || !node.has_tag_name((
+                    xml_sec::key_establishment::ENCAPSULATION_NS,
+                    "EncapsulationMechanism",
+                ))
+        })
+        .filter(|generated_child| {
+            !template_key_info.children().any(|template_child| {
+                template_child.is_element()
+                    && template_child.tag_name() == generated_child.tag_name()
+            })
+        })
+        .map(|node| standalone_element(generated, node))
+        .collect::<Result<Vec<_>, _>>()?;
+    if template_values.is_empty() && !generated_values.is_empty() {
+        let generated_keys = generated_key_info
+            .children()
+            .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
+            .map(|node| standalone_element(generated, node))
+            .collect::<Result<Vec<_>, _>>()?;
+        if generated_keys.len() != generated_values.len() {
+            return Err(CommandError::Encryption(
+                "generated KeyInfo does not contain one direct EncryptedKey per recipient".into(),
+            ));
+        }
+        children_to_append.extend(generated_keys);
+    }
+    if !children_to_append.is_empty() {
+        replacements.push(append_element_children_replacement(
+            template,
+            template_key_info,
+            &children_to_append.concat(),
+        )?);
+    }
+    if template_values.is_empty() {
+        return Ok(());
+    }
+    if template_values.len() != generated_values.len() {
+        return Err(CommandError::Encryption(
+            "template KeyInfo does not contain one CipherValue per generated recipient".into(),
+        ));
+    }
+    let template_keys = direct_encrypted_keys(template_key_info);
+    let generated_keys = direct_encrypted_keys(generated_key_info);
+    for (template_key, generated_key) in template_keys.into_iter().zip(generated_keys) {
+        if let Some(replacement) =
+            merge_generated_recipient_key_name(template, template_key, generated, generated_key)?
+        {
+            replacements.push(replacement);
+        }
+    }
+    for (template_value, generated_value) in template_values.into_iter().zip(generated_values) {
+        replacements.push(replace_element_text(
+            template,
+            template_value,
+            generated_value.text().unwrap_or_default(),
+        )?);
+    }
+    Ok(())
+}
+
 fn apply_encryption_template(
     template: &str,
     generated: &str,
@@ -3645,9 +4096,9 @@ fn apply_encryption_template(
     xml_backend: XmlBackend,
 ) -> Result<String, CommandError> {
     let template_document =
-        parse_encryption_document(template, &policy.xml, &policy.resources, xml_backend)?;
+        parse_encryption_document(template, policy.xml, &policy.resources, xml_backend)?;
     let generated_document =
-        parse_encryption_document(generated, &policy.xml, &policy.resources, xml_backend)?;
+        parse_encryption_document(generated, policy.xml, &policy.resources, xml_backend)?;
     let template_data = select_encrypted_data(&template_document, start_node_id, id_attributes)?;
     let generated_data = generated_document.root_element();
     let inspected = if template_document.descendants().any(|node| {
@@ -3676,58 +4127,17 @@ fn apply_encryption_template(
         template_cipher,
         generated_cipher.text().unwrap_or_default(),
     )?];
-    if let Some(method) = direct_child_element(template_data, XMLENC_NS, "EncryptionMethod")
-        && matches!(
-            method.attribute("Algorithm"),
-            Some(
-                "http://www.w3.org/2021/04/xmldsig-more#chacha20"
-                    | "http://www.w3.org/2021/04/xmldsig-more#chacha20poly1305"
-            )
-        )
-        // RFC 9231 sections 2.6.7-2.6.8 use unqualified Nonce elements; retain
-        // those and the namespaced donor form accepted by the core parser.
-        // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.7
-        && !method.children().any(|child| {
-            child.is_element()
-                && child.tag_name().name() == "Nonce"
-                && matches!(
-                    child.tag_name().namespace(),
-                    None | Some("http://www.w3.org/2021/04/xmldsig-more#")
-                )
-        })
-    {
-        let generated_method = direct_child_element(generated_data, XMLENC_NS, "EncryptionMethod")
-            .ok_or_else(|| CommandError::Encryption("generated ChaCha method is absent".into()))?;
-        let nonce = direct_child_element(
-            generated_method,
-            "http://www.w3.org/2021/04/xmldsig-more#",
-            "Nonce",
-        )
-        .ok_or_else(|| CommandError::Encryption("generated ChaCha nonce is absent".into()))?;
-        let fragment = &template[method.range()];
-        let opening = opening_tag_end(fragment).ok_or_else(|| {
-            CommandError::Encryption("ChaCha template method is malformed".into())
-        })?;
-        let original = if fragment[..opening].trim_end().ends_with('/') {
-            ""
-        } else {
-            &fragment[opening + 1..fragment.rfind("</").ok_or_else(|| {
-                CommandError::Encryption("ChaCha template method is malformed".into())
-            })?]
-        };
-        let mut content = String::new();
-        push_plaintext(
-            &mut content,
-            original,
-            policy.resources.max_xml_document_bytes,
-        )?;
-        append_standalone_element(
-            &mut content,
-            generated,
-            nonce,
-            policy.resources.max_xml_document_bytes,
-        )?;
-        replacements.push(replace_element_text(template, method, &content)?);
+    let sources = TemplateSources {
+        template,
+        generated,
+    };
+    if let Some(replacement) = chacha_nonce_replacement(
+        &sources,
+        template_data,
+        generated_data,
+        policy.resources.max_xml_document_bytes,
+    )? {
+        replacements.push(replacement);
     }
     if template_data.attribute("Type").is_none()
         && let Some(generated_type) = generated_data.attribute("Type")
@@ -3747,136 +4157,14 @@ fn apply_encryption_template(
     let generated_key_info = direct_child_element(generated_data, XMLDSIG_NS, "KeyInfo");
     match (template_key_info, generated_key_info) {
         (Some(template_key_info), Some(generated_key_info)) => {
-            let generated_kem =
-                xml_sec::key_establishment::direct_encapsulation(generated_key_info, false)
-                    .map_err(|error| CommandError::Encryption(error.to_string()))?;
-            let template_kem = inspected.as_ref().map_or(&[][..], |inspected| {
-                inspected.data().encapsulation_methods.as_slice()
-            });
-            if let ([template_kem], Some(generated_kem)) = (template_kem, &generated_kem) {
-                if template_kem.algorithm != generated_kem.algorithm {
-                    return Err(CommandError::Encryption(
-                        "generated encapsulation parameter set differs from template".into(),
-                    ));
-                }
-                replacements.push(replace_element_text(
-                    template,
-                    *inspected
-                        .as_ref()
-                        .expect("selected template mechanism was inspected")
-                        .encapsulation_cipher_values()
-                        .first()
-                        .ok_or_else(|| {
-                            CommandError::Encryption(
-                                "template encapsulation origin is missing".into(),
-                            )
-                        })?,
-                    generated_kem.cipher_value.text().unwrap_or_default(),
-                )?);
-            } else if !template_kem.is_empty() || generated_kem.is_some() {
-                return Err(CommandError::Encryption(
-                    "template encapsulation was not executed".into(),
-                ));
-            }
-            if let (Some(template_name), Some(generated_name)) = (
-                direct_child_element(template_key_info, XMLDSIG_NS, "KeyName"),
-                direct_child_element(generated_key_info, XMLDSIG_NS, "KeyName"),
-            ) && !same_direct_simple_text(template_name, generated_name, "KeyName")?
-            {
-                replacements.push(replace_element_text(
-                    template,
-                    template_name,
-                    &escape_text(generated_name.text().unwrap_or_default()),
-                )?);
-            }
-            let template_keys = direct_encrypted_keys(template_key_info);
-            let generated_keys = direct_encrypted_keys(generated_key_info);
-            let template_values = encrypted_key_cipher_values(template_key_info, "template")?;
-            let generated_values = encrypted_key_cipher_values(generated_key_info, "generated")?;
-            let missing_generated_children = generated_key_info
-                .children()
-                .filter(|node| node.is_element() && !node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-                .filter(|node| {
-                    template_kem.is_empty()
-                        || !node.has_tag_name((
-                            xml_sec::key_establishment::ENCAPSULATION_NS,
-                            "EncapsulationMechanism",
-                        ))
-                })
-                .filter(|generated_child| {
-                    !template_key_info.children().any(|template_child| {
-                        template_child.is_element()
-                            && template_child.tag_name() == generated_child.tag_name()
-                    })
-                })
-                .map(|node| standalone_element(generated, node))
-                .collect::<Result<Vec<_>, _>>()?;
-            if !template_key_info.children().any(|node| node.is_element()) {
-                let generated_children = generated_key_info
-                    .children()
-                    .filter(|node| node.is_element())
-                    .map(|node| standalone_element(generated, node))
-                    .collect::<Result<Vec<_>, _>>()?;
-                if !generated_children.is_empty() {
-                    replacements.push(append_element_children_replacement(
-                        template,
-                        template_key_info,
-                        &generated_children.concat(),
-                    )?);
-                }
-            } else {
-                let mut children_to_append = missing_generated_children;
-                if template_values.is_empty() && !generated_values.is_empty() {
-                    let generated_keys = generated_key_info
-                        .children()
-                        .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-                        .map(|node| standalone_element(generated, node))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    if generated_keys.len() != generated_values.len() {
-                        return Err(CommandError::Encryption(
-                            "generated KeyInfo does not contain one direct EncryptedKey per recipient"
-                                .into(),
-                        ));
-                    }
-                    children_to_append.extend(generated_keys);
-                }
-                if !children_to_append.is_empty() {
-                    replacements.push(append_element_children_replacement(
-                        template,
-                        template_key_info,
-                        &children_to_append.concat(),
-                    )?);
-                }
-                if !template_values.is_empty() {
-                    if template_values.len() != generated_values.len() {
-                        return Err(CommandError::Encryption(
-                            "template KeyInfo does not contain one CipherValue per generated recipient"
-                                .into(),
-                        ));
-                    }
-                    for (template_key, generated_key) in
-                        template_keys.into_iter().zip(generated_keys)
-                    {
-                        if let Some(replacement) = merge_generated_recipient_key_name(
-                            template,
-                            template_key,
-                            generated,
-                            generated_key,
-                        )? {
-                            replacements.push(replacement);
-                        }
-                    }
-                    for (template_value, generated_value) in
-                        template_values.into_iter().zip(generated_values)
-                    {
-                        replacements.push(replace_element_text(
-                            template,
-                            template_value,
-                            generated_value.text().unwrap_or_default(),
-                        )?);
-                    }
-                }
-            }
+            let key_infos = (template_key_info, generated_key_info);
+            let template_kem = merge_template_encapsulation(
+                &sources,
+                key_infos,
+                inspected.as_ref(),
+                &mut replacements,
+            )?;
+            merge_template_key_info_children(&sources, key_infos, template_kem, &mut replacements)?;
         }
         (None, Some(generated_key_info)) => {
             let cipher_data = direct_child_element(template_data, XMLENC_NS, "CipherData")
@@ -3899,7 +4187,7 @@ fn apply_encryption_template(
             "encrypted template output exceeds XML document policy".into(),
         ));
     }
-    parse_encryption_document(&output, &policy.xml, &policy.resources, xml_backend)?;
+    parse_encryption_document(&output, policy.xml, &policy.resources, xml_backend)?;
     Ok(output)
 }
 
@@ -4144,24 +4432,12 @@ fn direct_encrypted_keys<'a, 'input>(key_info: Node<'a, 'input>) -> Vec<Node<'a,
         .collect()
 }
 
-fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
-    validate_options(invocation, DECRYPT_OPTIONS)?;
-    let xml_backend = selected_xml_backend(invocation)?;
-    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
-    let password = invocation.password_bytes();
-    let policy = xmlsec_compatibility_decryption_policy();
-    let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let encrypted_data_id = option_text(invocation, "node-id")?;
-    let id_attributes = id_attribute_registrations(invocation)?;
-    let document = parse_encryption_document(&xml, &policy.xml, &policy.resources, xml_backend)?;
-    let encrypted_data = select_encrypted_data(&document, encrypted_data_id, &id_attributes)?;
-    let standalone = encrypted_data == document.root_element();
-    let content_key_name = encrypted_data_key_name(encrypted_data)?;
-    let recipient_key_names = encrypted_key_recipient_names(encrypted_data)?;
-    let has_wrap_recipients = encrypted_data
+/// Whether any direct `EncryptedKey` recipient wraps its key symmetrically.
+fn has_key_wrap_recipient(encrypted_data: Node<'_, '_>) -> bool {
+    encrypted_data
         .children()
         .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-        .flat_map(|node| node.children())
+        .flat_map(Node::children)
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .any(|node| {
             node.children()
@@ -4171,17 +4447,462 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         .attribute("Algorithm")
                         .is_some_and(|uri| KeyWrapAlgorithm::from_uri(uri).is_ok())
                 })
-        });
-    let requested_symmetric_names = content_key_name
-        .iter()
-        .chain(
-            recipient_key_names
-                .iter()
-                .flatten()
-                .filter(|_| has_wrap_recipients),
+        })
+}
+
+/// One `decrypt` invocation's input document, selected data and backends.
+struct DecryptCommand<'a> {
+    invocation: &'a Invocation,
+    xml: &'a str,
+    encrypted_data_id: Option<&'a str>,
+    standalone: bool,
+    id_attributes: &'a [IdAttributeRegistration],
+    xml_backend: XmlBackend,
+}
+
+impl DecryptCommand<'_> {
+    fn lax(&self) -> bool {
+        self.invocation.flag("lax-key-search")
+    }
+
+    fn decrypt(
+        &self,
+        resolver: &dyn DecryptionKeyResolver,
+        policy: DecryptionPolicy,
+    ) -> Result<Vec<u8>, CommandError> {
+        decrypt_input(
+            resolver,
+            self.xml,
+            self.encrypted_data_id,
+            self.standalone,
+            policy,
+            self.id_attributes,
+            CommandBackends {
+                xml: self.xml_backend,
+                crypto: selected_provider(self.invocation)?,
+            },
         )
-        .cloned()
+    }
+}
+
+/// Symmetric key names the document requests for content and wrapped keys.
+struct SymmetricKeyNames<'a> {
+    content_key_name: Option<&'a str>,
+    requested: Vec<&'a str>,
+    wrapping_only: bool,
+}
+
+/// Certificate companions use the DER or PEM encoding of their private key.
+fn companion_certificate_encoding(
+    format: key_material::PrivateKeyFormat,
+) -> key_material::CertificateEncoding {
+    if matches!(
+        format,
+        key_material::PrivateKeyFormat::Der | key_material::PrivateKeyFormat::Pkcs8Der
+    ) {
+        key_material::CertificateEncoding::Der
+    } else {
+        key_material::CertificateEncoding::Pem
+    }
+}
+
+/// Decrypt through the recipient `EncapsulationMechanism` the inspection found.
+fn decrypt_with_encapsulation(
+    command: &DecryptCommand<'_>,
+    policy: DecryptionPolicy,
+    parsed: xml_sec::xmlenc::EncryptedDataInspection,
+    has_aes_keys: bool,
+) -> Result<Vec<u8>, CommandError> {
+    let invocation = command.invocation;
+    let mechanism = parsed
+        .recipient_encapsulation()
+        .expect("only inspections with a recipient mechanism reach decapsulation");
+    policy
+        .key_establishment
+        .check_encapsulation(mechanism.algorithm)?;
+    if has_aes_keys {
+        return Err(CommandError::Usage(
+            "EncapsulationMechanism requires a recipient private key, not --aes-key".into(),
+        ));
+    }
+    let names = mechanism
+        .key_info
+        .sources
+        .iter()
+        .filter_map(|source| match source {
+            KeyInfoSource::KeyName(name) => Some(name.as_str()),
+            _ => None,
+        })
         .collect::<Vec<_>>();
+    let mut budget =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+    let key = select_decapsulation_key(
+        invocation,
+        &names,
+        mechanism.algorithm,
+        &policy.key_establishment,
+        &policy,
+        &mut budget,
+    )?;
+    let resolver = xml_sec::xmlenc::EncapsulationDecryptor::provider_key(key);
+    if command.standalone && !parsed.requires_document_context() {
+        // Reuse the validated descriptor graph for byte output. Re-reading
+        // the XML would decode and allocate every recipient a second time.
+        return DecryptContext::new(&resolver)
+            .provider(selected_provider(invocation)?)
+            .policy(policy)
+            .decrypt_data(parsed.data())
+            .map(|content| match content {
+                DecryptedContent::Xml(xml) => xml.into_bytes(),
+                DecryptedContent::Bytes(bytes) => bytes,
+            })
+            .map_err(|error| CommandError::Encryption(error.to_string()));
+    }
+    // Associations and CipherReference require the original document's
+    // registered IDs, even for standalone byte output. Keep only the
+    // provider key, not a second live recipient graph.
+    drop(parsed);
+    command.decrypt(&resolver, policy)
+}
+
+/// Decrypt with the explicit symmetric keys the document's names select.
+fn decrypt_with_explicit_symmetric_keys(
+    command: &DecryptCommand<'_>,
+    policy: DecryptionPolicy,
+    aes_keys: &[&crate::OptionValue],
+    names: &SymmetricKeyNames<'_>,
+) -> Result<Vec<u8>, CommandError> {
+    let candidates = aes_keys
+        .iter()
+        .copied()
+        .map(|option| (option, ()))
+        .collect::<Vec<_>>();
+    let lax_key_search = command.lax();
+    let candidates = named_candidate_search(
+        &candidates,
+        &names.requested,
+        lax_key_search,
+        true,
+        "symmetric key",
+    )?;
+    KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+        .consume(candidates.len())
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let mut keys = Vec::with_capacity(candidates.len());
+    let mut last_error = None;
+    for (option, ()) in candidates {
+        match key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None) {
+            Ok(key) => keys.push(SymmetricCandidate {
+                kind: symmetric_option_kind(&option.name),
+                bytes: Cow::Owned(key),
+                name: option.parameter.as_deref().map(Cow::Borrowed),
+            }),
+            Err(error) if lax_key_search => last_error = Some(CommandError::from(error)),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if keys.is_empty() {
+        return Err(last_error
+            .unwrap_or_else(|| CommandError::Usage("no compatible symmetric key input".into())));
+    }
+    let resolver = CandidateSymmetricKeyDecryptor {
+        keys,
+        lax_key_search,
+        content_key_name: names.content_key_name,
+        wrapping_only: names.wrapping_only,
+    };
+    command.decrypt(&resolver, policy)
+}
+
+/// Decrypt with the key store's symmetric keys; it holds no RSA private keys.
+fn decrypt_with_stored_keys(
+    command: &DecryptCommand<'_>,
+    policy: DecryptionPolicy,
+    names: &SymmetricKeyNames<'_>,
+    has_recipient_names: bool,
+) -> Result<Vec<u8>, CommandError> {
+    let mut budget =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+    let store = load_xml_key_stores(
+        command.invocation,
+        &policy,
+        command.xml_backend,
+        &mut budget,
+    )?;
+    let decryption_key = |entry: &&key_manager::StoredSymmetricKey| {
+        entry.kind.is_encryption_key() && entry.usages.allows(key_manager::KeyUsage::Decrypt)
+    };
+    if has_recipient_names
+        && !store
+            .symmetric_keys()
+            .iter()
+            .any(|entry| decryption_key(&entry))
+    {
+        // XMLDSig 1.1 section 4.5.2.2 defines RSAKeyValue as Modulus and
+        // Exponent, not a private-key container:
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-RSAKeyValue
+        return Err(CommandError::Usage(
+            "--keys-file does not supply RSA recipient private keys for decrypt: RSAKeyValue imports are public-only; use --privkey-pem, --privkey-der, or --pkcs12".into(),
+        ));
+    }
+    let selected = select_store_candidates(
+        store.symmetric_keys().iter().filter(decryption_key),
+        &names.requested,
+        command.lax(),
+        policy.resources.max_key_candidates,
+        |entry| &entry.name,
+    )?;
+    KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+        .consume(selected.len())
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let resolver = CandidateSymmetricKeyDecryptor {
+        keys: selected
+            .into_iter()
+            .map(|entry| SymmetricCandidate {
+                kind: entry.kind,
+                bytes: Cow::Borrowed(entry.bytes.as_slice()),
+                name: Some(Cow::Borrowed(entry.name.as_str())),
+            })
+            .collect(),
+        lax_key_search: command.lax(),
+        content_key_name: names.content_key_name,
+        wrapping_only: names.wrapping_only,
+    };
+    command.decrypt(&resolver, policy)
+}
+
+/// A PKCS#12 recipient key, held by the selected provider when it is native.
+fn load_pkcs12_recipient(
+    command: &DecryptCommand<'_>,
+    option: &crate::OptionValue,
+    budget: &mut ExternalMaterialBudget,
+    inventory: &mut KeyInventory,
+    resources: &ResourcePolicy,
+    policy_resources: &ResourcePolicy,
+) -> Result<RecipientPrivateKey, CommandError> {
+    let path = Path::new(option.value.as_deref().unwrap_or_default());
+    let bytes = read_key_material_with_budget(path, budget)?;
+    let password = command
+        .invocation
+        .password_bytes()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
+    let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
+    inventory.add_pkcs12(name, &bytes, password, resources)?;
+    let imported = inventory
+        .private_keys()
+        .first()
+        .ok_or_else(|| CommandError::Usage("PKCS#12 contains no usable private key".into()))?;
+    let provider = selected_provider(command.invocation)?;
+    let inner = if provider.name() == "rustcrypto" {
+        PrivateKeyDecryptor::new(key_material::decode_rsa_private_with_password(
+            path,
+            &imported.pkcs8_der,
+            key_material::PrivateKeyFormat::Pkcs8Der,
+            None,
+            policy_resources,
+        )?)
+    } else {
+        PrivateKeyDecryptor::provider_key(
+            provider
+                .import_recovery_key(&imported.pkcs8_der)
+                .map_err(|error| CommandError::Encryption(error.to_string()))?,
+        )
+    };
+    Ok(RecipientPrivateKey {
+        inner,
+        key_name: option.parameter.clone(),
+    })
+}
+
+/// Import a private key into the native provider, proving any certificate
+/// companion describes the recovered public identity.
+fn load_provider_recipient(
+    command: &DecryptCommand<'_>,
+    option: &crate::OptionValue,
+    (path, bytes, certificate_paths): (&OsStr, &[u8], &[&OsStr]),
+    budget: &mut ExternalMaterialBudget,
+    inventory: &mut KeyInventory,
+    resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
+) -> Result<RecipientPrivateKey, CommandError> {
+    let format = private_key_format(option);
+    import_explicit_private_key(
+        inventory,
+        bytes,
+        &key_material::PrivateKeyImport {
+            path: Path::new(path),
+            name: "explicit",
+            format,
+            password: command.invocation.password_bytes(),
+            usages: key_manager::KeyUsages::DECRYPT,
+            resources,
+        },
+        budget,
+    )?;
+    let imported = inventory
+        .private_keys()
+        .last()
+        .ok_or_else(|| CommandError::Usage("no RSA private key imported".into()))?;
+    let key = selected_provider(command.invocation)?
+        .import_recovery_key(&imported.pkcs8_der)
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    if !certificate_paths.is_empty() {
+        let certificates = load_certificate_companions(
+            certificate_paths,
+            companion_certificate_encoding(format),
+            budget,
+        )?;
+        let spki = key.public_spki().ok_or_else(|| {
+            CommandError::Encryption("recovery key exposes no public identity".into())
+        })?;
+        ensure_leaf_certificate_matches_spki(&certificates[0], spki, parsing)?;
+    }
+    Ok(RecipientPrivateKey {
+        inner: PrivateKeyDecryptor::provider_key(key),
+        key_name: option.parameter.clone(),
+    })
+}
+
+/// Load one explicit recipient private key with its certificate companions.
+fn load_recipient_private_key(
+    command: &DecryptCommand<'_>,
+    option: &crate::OptionValue,
+    budget: &mut ExternalMaterialBudget,
+    inventory: &mut KeyInventory,
+    resources: &ResourcePolicy,
+    policy_resources: &ResourcePolicy,
+    parsing: &mut xml_sec::xmldsig::parse::KeyInfoParsingSession<'_>,
+) -> Result<RecipientPrivateKey, CommandError> {
+    if option.name == "pkcs12" {
+        return load_pkcs12_recipient(
+            command,
+            option,
+            budget,
+            inventory,
+            resources,
+            policy_resources,
+        );
+    }
+    let (path, certificate_paths) =
+        split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
+    let bytes = read_key_material_with_budget(Path::new(path), budget)?;
+    if selected_provider(command.invocation)?.name() != "rustcrypto" {
+        return load_provider_recipient(
+            command,
+            option,
+            (path, &bytes, &certificate_paths),
+            budget,
+            inventory,
+            resources,
+            parsing,
+        );
+    }
+    let private_key = key_material::decode_rsa_private_with_inventory(
+        Path::new(path),
+        &bytes,
+        private_key_format(option),
+        command.invocation.password_bytes(),
+        resources,
+        inventory,
+    )?;
+    if !certificate_paths.is_empty() {
+        let certificates = load_certificate_companions(
+            &certificate_paths,
+            companion_certificate_encoding(private_key_format(option)),
+            budget,
+        )?;
+        ensure_leaf_certificate_matches_rsa_key(&certificates[0], &private_key, parsing)?;
+    }
+    Ok(RecipientPrivateKey {
+        inner: PrivateKeyDecryptor::new(private_key),
+        key_name: option.parameter.clone(),
+    })
+}
+
+/// Decrypt with the explicit RSA private keys the recipient names select.
+fn decrypt_with_private_keys(
+    command: &DecryptCommand<'_>,
+    policy: DecryptionPolicy,
+    private_keys: &[&crate::OptionValue],
+    recipient_key_names: &[Option<String>],
+) -> Result<Vec<u8>, CommandError> {
+    let lax_key_search = command.lax();
+    let selected =
+        select_recipient_private_keys(private_keys, recipient_key_names, lax_key_search)?;
+    KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
+        .consume(selected.len())
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let mut keys = Vec::with_capacity(selected.len());
+    let mut last_load_error = None;
+    let mut certificate_budget =
+        ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
+    let mut certificate_parsing =
+        xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
+            .map_err(certificate_command_error)?;
+    for option in selected {
+        let loaded = certificate_budget.with_key_import(
+            &policy.resources,
+            |budget, inventory, resources| {
+                load_recipient_private_key(
+                    command,
+                    option,
+                    budget,
+                    inventory,
+                    resources,
+                    &policy.resources,
+                    &mut certificate_parsing,
+                )
+            },
+        );
+        match loaded {
+            Ok(key) => keys.push(key),
+            Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
+                last_load_error = Some(error);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if keys.is_empty() {
+        return Err(last_load_error
+            .unwrap_or_else(|| CommandError::Usage("no compatible RSA private key input".into())));
+    }
+    let resolver = NamedRecipientDecryptor {
+        keys,
+        lax_key_search,
+        unnamed_single_key_fallback: private_keys.len() == 1 && private_keys[0].parameter.is_none(),
+    };
+    command.decrypt(&resolver, policy)
+}
+
+fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
+    validate_options(invocation, DECRYPT_OPTIONS)?;
+    let xml_backend = selected_xml_backend(invocation)?;
+    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    let policy = xmlsec_compatibility_decryption_policy();
+    let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
+    let encrypted_data_id = option_text(invocation, "node-id")?;
+    let id_attributes = id_attribute_registrations(invocation)?;
+    let document = parse_encryption_document(&xml, policy.xml, &policy.resources, xml_backend)?;
+    let encrypted_data = select_encrypted_data(&document, encrypted_data_id, &id_attributes)?;
+    let standalone = encrypted_data == document.root_element();
+    let content_key_name = encrypted_data_key_name(encrypted_data)?;
+    let recipient_key_names = encrypted_key_recipient_names(encrypted_data)?;
+    let has_wrap_recipients = has_key_wrap_recipient(encrypted_data);
+    let symmetric_names = SymmetricKeyNames {
+        content_key_name: content_key_name.as_deref(),
+        requested: content_key_name
+            .iter()
+            .chain(
+                recipient_key_names
+                    .iter()
+                    .flatten()
+                    .filter(|_| has_wrap_recipients),
+            )
+            .map(String::as_str)
+            .collect(),
+        wrapping_only: has_wrap_recipients && content_key_name.is_none(),
+    };
     let aes_keys = invocation
         .ordered_values(&["aes-key", "des-key"])
         .collect::<Vec<_>>();
@@ -4227,362 +4948,26 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     } else {
         None
     };
-    let mechanism = parsed
-        .as_ref()
-        .and_then(|parsed| parsed.recipient_encapsulation());
-    let bytes = if let Some(mechanism) = mechanism {
-        policy
-            .key_establishment
-            .check_encapsulation(mechanism.algorithm)?;
-        if !aes_keys.is_empty() {
-            return Err(CommandError::Usage(
-                "EncapsulationMechanism requires a recipient private key, not --aes-key".into(),
-            ));
-        }
-        let names = mechanism
-            .key_info
-            .sources
-            .iter()
-            .filter_map(|source| match source {
-                KeyInfoSource::KeyName(name) => Some(name.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let key = select_decapsulation_key(
-            invocation,
-            &names,
-            mechanism.algorithm,
-            &policy.key_establishment,
-            &policy,
-            &mut budget,
-        )?;
-        let resolver = xml_sec::xmlenc::EncapsulationDecryptor::provider_key(key);
-        if standalone
-            && !parsed
-                .as_ref()
-                .expect("selected mechanism has parsed data")
-                .requires_document_context()
-        {
-            // Reuse the validated descriptor graph for byte output. Re-reading
-            // the XML would decode and allocate every recipient a second time.
-            DecryptContext::new(&resolver)
-                .provider(selected_provider(invocation)?)
-                .policy(policy)
-                .decrypt_data(
-                    parsed
-                        .as_ref()
-                        .expect("selected mechanism has parsed data")
-                        .data(),
-                )
-                .map(|content| match content {
-                    DecryptedContent::Xml(xml) => xml.into_bytes(),
-                    DecryptedContent::Bytes(bytes) => bytes,
-                })
-                .map_err(|error| CommandError::Encryption(error.to_string()))?
-        } else {
-            // Associations and CipherReference require the original document's
-            // registered IDs, even for standalone byte output. Keep only the
-            // provider key, not a second live recipient graph.
-            drop(parsed);
-            decrypt_input(
-                &resolver,
-                &xml,
-                encrypted_data_id,
-                standalone,
-                policy,
-                &id_attributes,
-                CommandBackends {
-                    xml: xml_backend,
-                    crypto: selected_provider(invocation)?,
-                },
-            )?
-        }
+    // Keep the inspected graph only when it carries a recipient mechanism;
+    // other paths re-read the document and must not hold a second copy.
+    let parsed = parsed.filter(|parsed| parsed.recipient_encapsulation().is_some());
+    let command = DecryptCommand {
+        invocation,
+        xml: &xml,
+        encrypted_data_id,
+        standalone,
+        id_attributes: &id_attributes,
+        xml_backend,
+    };
+    let bytes = if let Some(parsed) = parsed {
+        decrypt_with_encapsulation(&command, policy, parsed, !aes_keys.is_empty())?
     } else if !aes_keys.is_empty() {
-        drop(parsed);
-        let candidates = aes_keys
-            .iter()
-            .copied()
-            .map(|option| (option, ()))
-            .collect::<Vec<_>>();
-        let candidates = named_candidate_search(
-            &candidates,
-            &requested_symmetric_names,
-            invocation.flag("lax-key-search"),
-            true,
-            "symmetric key",
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(candidates.len())
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let lax_key_search = invocation.flag("lax-key-search");
-        let mut keys = Vec::with_capacity(candidates.len());
-        let mut last_error = None;
-        for (option, ()) in candidates {
-            match key_material::load_symmetric(option.value.as_deref().unwrap_or_default(), None) {
-                Ok(key) => keys.push(SymmetricCandidate {
-                    kind: symmetric_option_kind(&option.name),
-                    bytes: Cow::Owned(key),
-                    name: option.parameter.as_deref().map(Cow::Borrowed),
-                }),
-                Err(error) if lax_key_search => last_error = Some(CommandError::from(error)),
-                Err(error) => return Err(error.into()),
-            }
-        }
-        if keys.is_empty() {
-            return Err(last_error.unwrap_or_else(|| {
-                CommandError::Usage("no compatible symmetric key input".into())
-            }));
-        }
-        decrypt_input(
-            &CandidateSymmetricKeyDecryptor {
-                keys,
-                lax_key_search,
-                content_key_name: content_key_name.as_deref(),
-                wrapping_only: has_wrap_recipients && content_key_name.is_none(),
-            },
-            &xml,
-            encrypted_data_id,
-            standalone,
-            policy,
-            &id_attributes,
-            CommandBackends {
-                xml: xml_backend,
-                crypto: selected_provider(invocation)?,
-            },
-        )?
+        decrypt_with_explicit_symmetric_keys(&command, policy, &aes_keys, &symmetric_names)?
     } else if has_key_store {
-        drop(parsed);
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let store = load_xml_key_stores(invocation, &policy, xml_backend, &mut budget)?;
-        if !recipient_key_names.is_empty()
-            && !store.symmetric_keys().iter().any(|entry| {
-                entry.kind.is_encryption_key()
-                    && entry.usages.allows(key_manager::KeyUsage::Decrypt)
-            })
-        {
-            // XMLDSig 1.1 section 4.5.2.2 defines RSAKeyValue as Modulus and
-            // Exponent, not a private-key container:
-            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-RSAKeyValue
-            return Err(CommandError::Usage(
-                "--keys-file does not supply RSA recipient private keys for decrypt: RSAKeyValue imports are public-only; use --privkey-pem, --privkey-der, or --pkcs12".into(),
-            ));
-        }
-        let selected = select_store_candidates(
-            store.symmetric_keys().iter().filter(|entry| {
-                entry.kind.is_encryption_key()
-                    && entry.usages.allows(key_manager::KeyUsage::Decrypt)
-            }),
-            &requested_symmetric_names,
-            invocation.flag("lax-key-search"),
-            policy.resources.max_key_candidates,
-            |entry| &entry.name,
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(selected.len())
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let resolver = CandidateSymmetricKeyDecryptor {
-            keys: selected
-                .into_iter()
-                .map(|entry| SymmetricCandidate {
-                    kind: entry.kind,
-                    bytes: Cow::Borrowed(entry.bytes.as_slice()),
-                    name: Some(Cow::Borrowed(entry.name.as_str())),
-                })
-                .collect(),
-            lax_key_search: invocation.flag("lax-key-search"),
-            content_key_name: content_key_name.as_deref(),
-            wrapping_only: has_wrap_recipients && content_key_name.is_none(),
-        };
-        decrypt_input(
-            &resolver,
-            &xml,
-            encrypted_data_id,
-            standalone,
-            policy,
-            &id_attributes,
-            CommandBackends {
-                xml: xml_backend,
-                crypto: selected_provider(invocation)?,
-            },
-        )?
+        let has_recipient_names = !recipient_key_names.is_empty();
+        decrypt_with_stored_keys(&command, policy, &symmetric_names, has_recipient_names)?
     } else if !private_keys.is_empty() {
-        drop(parsed);
-        let selected = select_recipient_private_keys(
-            &private_keys,
-            &recipient_key_names,
-            invocation.flag("lax-key-search"),
-        )?;
-        KeyCandidateBudget::with_limit(policy.resources.max_key_candidates)
-            .consume(selected.len())
-            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-        let mut keys = Vec::with_capacity(selected.len());
-        let lax_key_search = invocation.flag("lax-key-search");
-        let mut last_load_error = None;
-        let mut certificate_budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        let mut certificate_parsing =
-            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources)
-                .map_err(certificate_command_error)?;
-        for option in selected {
-            let loaded = certificate_budget.with_key_import(
-                &policy.resources,
-                |certificate_budget, inventory, resources| {
-                    if option.name == "pkcs12" {
-                        let path = Path::new(option.value.as_deref().unwrap_or_default());
-                        let bytes = read_key_material_with_budget(path, certificate_budget)?;
-                        let password = password
-                            .and_then(|value| std::str::from_utf8(value).ok())
-                            .ok_or(key_manager::KeyStoreError::ProtectedContainer)?;
-                        let name = option.parameter.clone().unwrap_or_else(|| "pkcs12".into());
-                        inventory.add_pkcs12(name.clone(), &bytes, password, resources)?;
-                        let imported = inventory.private_keys().first().ok_or_else(|| {
-                            CommandError::Usage("PKCS#12 contains no usable private key".into())
-                        })?;
-                        if selected_provider(invocation)?.name() != "rustcrypto" {
-                            let key = selected_provider(invocation)?
-                                .import_recovery_key(&imported.pkcs8_der)
-                                .map_err(|error| CommandError::Encryption(error.to_string()))?;
-                            return Ok(RecipientPrivateKey {
-                                inner: PrivateKeyDecryptor::provider_key(key),
-                                key_name: option.parameter.clone(),
-                            });
-                        }
-                        let private_key = key_material::decode_rsa_private_with_password(
-                            path,
-                            &imported.pkcs8_der,
-                            key_material::PrivateKeyFormat::Pkcs8Der,
-                            None,
-                            &policy.resources,
-                        )?;
-                        return Ok(RecipientPrivateKey {
-                            inner: PrivateKeyDecryptor::new(private_key),
-                            key_name: option.parameter.clone(),
-                        });
-                    }
-                    let (path, certificate_paths) =
-                        split_key_and_certificates(option.value.as_deref().unwrap_or_default())?;
-                    let bytes = read_key_material_with_budget(Path::new(path), certificate_budget)?;
-                    if selected_provider(invocation)?.name() != "rustcrypto" {
-                        let format = private_key_format(option);
-                        import_explicit_private_key(
-                            inventory,
-                            &bytes,
-                            &key_material::PrivateKeyImport {
-                                path: Path::new(path),
-                                name: "explicit",
-                                format,
-                                password,
-                                usages: key_manager::KeyUsages::DECRYPT,
-                                resources,
-                            },
-                            certificate_budget,
-                        )?;
-                        let imported = inventory.private_keys().last().ok_or_else(|| {
-                            CommandError::Usage("no RSA private key imported".into())
-                        })?;
-                        let key = selected_provider(invocation)?
-                            .import_recovery_key(&imported.pkcs8_der)
-                            .map_err(|error| CommandError::Encryption(error.to_string()))?;
-                        if !certificate_paths.is_empty() {
-                            let encoding = if matches!(
-                                format,
-                                key_material::PrivateKeyFormat::Der
-                                    | key_material::PrivateKeyFormat::Pkcs8Der
-                            ) {
-                                key_material::CertificateEncoding::Der
-                            } else {
-                                key_material::CertificateEncoding::Pem
-                            };
-                            let certificates = load_certificate_companions(
-                                &certificate_paths,
-                                encoding,
-                                certificate_budget,
-                            )?;
-                            let spki = key.public_spki().ok_or_else(|| {
-                                CommandError::Encryption(
-                                    "recovery key exposes no public identity".into(),
-                                )
-                            })?;
-                            ensure_leaf_certificate_matches_spki(
-                                &certificates[0],
-                                spki,
-                                &mut certificate_parsing,
-                            )?;
-                        }
-                        return Ok(RecipientPrivateKey {
-                            inner: PrivateKeyDecryptor::provider_key(key),
-                            key_name: option.parameter.clone(),
-                        });
-                    }
-                    let private_key = key_material::decode_rsa_private_with_inventory(
-                        Path::new(path),
-                        &bytes,
-                        private_key_format(option),
-                        password,
-                        resources,
-                        inventory,
-                    )?;
-                    if !certificate_paths.is_empty() {
-                        let encoding = if matches!(
-                            private_key_format(option),
-                            key_material::PrivateKeyFormat::Der
-                                | key_material::PrivateKeyFormat::Pkcs8Der
-                        ) {
-                            key_material::CertificateEncoding::Der
-                        } else {
-                            key_material::CertificateEncoding::Pem
-                        };
-                        let certificates = load_certificate_companions(
-                            &certificate_paths,
-                            encoding,
-                            certificate_budget,
-                        )?;
-                        ensure_leaf_certificate_matches_rsa_key(
-                            &certificates[0],
-                            &private_key,
-                            &mut certificate_parsing,
-                        )?;
-                    }
-                    Ok::<_, CommandError>(RecipientPrivateKey {
-                        inner: PrivateKeyDecryptor::new(private_key),
-                        key_name: option.parameter.clone(),
-                    })
-                },
-            );
-            match loaded {
-                Ok(key) => keys.push(key),
-                Err(error) if lax_key_search && lax_candidate_error_is_recoverable(&error) => {
-                    last_load_error = Some(error);
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        if keys.is_empty() {
-            return Err(last_load_error.unwrap_or_else(|| {
-                CommandError::Usage("no compatible RSA private key input".into())
-            }));
-        }
-        let resolver = NamedRecipientDecryptor {
-            keys,
-            lax_key_search,
-            unnamed_single_key_fallback: private_keys.len() == 1
-                && private_keys[0].parameter.is_none(),
-        };
-        decrypt_input(
-            &resolver,
-            &xml,
-            encrypted_data_id,
-            standalone,
-            policy,
-            &id_attributes,
-            CommandBackends {
-                xml: xml_backend,
-                crypto: selected_provider(invocation)?,
-            },
-        )?
+        decrypt_with_private_keys(&command, policy, &private_keys, &recipient_key_names)?
     } else {
         return Err(CommandError::Usage(
             "decrypt requires --aes-key, an RSA private key, or --pkcs12".into(),
@@ -4993,6 +5378,7 @@ impl NamedRecipientDecryptor {
     }
 }
 
+#[derive(Clone, Copy)]
 struct CommandBackends<'a> {
     xml: XmlBackend,
     crypto: &'a dyn CryptoProvider,
@@ -5058,6 +5444,44 @@ fn xmlsec_compatibility_key_establishment_policy() -> xml_sec::policy::KeyEstabl
     policy
 }
 
+/// The first named key-store entry that yields an encapsulation key; lax
+/// search skips only recoverable candidate failures.
+fn stored_encapsulation_key(
+    invocation: &Invocation,
+    store: &KeyInventory,
+    names: &[impl AsRef<str>],
+    provider: &dyn CryptoProvider,
+    algorithm: xml_sec::provider::KeyEncapsulationAlgorithm,
+    establishment: &xml_sec::policy::KeyEstablishmentPolicy,
+    resources: &ResourcePolicy,
+) -> Result<std::sync::Arc<dyn xml_sec::provider::KeyEncapsulationKey>, CommandError> {
+    let entries = select_store_candidates(
+        store
+            .public_keys()
+            .iter()
+            .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Encrypt)),
+        names,
+        invocation.flag("lax-key-search"),
+        resources.max_key_candidates,
+        |entry| &entry.name,
+    )?;
+    let mut last = None;
+    for entry in entries {
+        match entry.encapsulation_key(provider, algorithm, establishment, resources) {
+            Ok(key) => return Ok(key),
+            Err(error) => {
+                let error = CommandError::from(error);
+                if !invocation.flag("lax-key-search") || !lax_candidate_error_is_recoverable(&error)
+                {
+                    return Err(error);
+                }
+                last = Some(error);
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| CommandError::Usage("no recipient public key found".into())))
+}
+
 fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
     invocation: &Invocation,
     names: &[impl AsRef<str>],
@@ -5096,33 +5520,14 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
             ));
         }
         let store = load_xml_key_stores(invocation, policy, backend, budget)?;
-        let entries = select_store_candidates(
-            store
-                .public_keys()
-                .iter()
-                .filter(|entry| entry.usages.allows(key_manager::KeyUsage::Encrypt)),
+        return stored_encapsulation_key(
+            invocation,
+            &store,
             names,
-            invocation.flag("lax-key-search"),
-            resources.max_key_candidates,
-            |entry| &entry.name,
-        )?;
-        let mut last = None;
-        for entry in entries {
-            match entry.encapsulation_key(provider, algorithm, establishment, resources) {
-                Ok(key) => return Ok(key),
-                Err(error) => {
-                    let error = CommandError::from(error);
-                    if !invocation.flag("lax-key-search")
-                        || !lax_candidate_error_is_recoverable(&error)
-                    {
-                        return Err(error);
-                    }
-                    last = Some(error);
-                }
-            }
-        }
-        return Err(
-            last.unwrap_or_else(|| CommandError::Usage("no recipient public key found".into()))
+            provider,
+            algorithm,
+            establishment,
+            resources,
         );
     }
     if options.is_empty() {
@@ -5175,7 +5580,7 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
                 if invocation.flag("lax-key-search")
                     && lax_candidate_error_is_recoverable(&error) =>
             {
-                last = Some(error)
+                last = Some(error);
             }
             Err(error) => return Err(error),
         }
@@ -5263,7 +5668,7 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
                 if invocation.flag("lax-key-search")
                     && lax_candidate_error_is_recoverable(&error) =>
             {
-                last = Some(error)
+                last = Some(error);
             }
             Err(error) => return Err(error),
         }
@@ -5325,6 +5730,66 @@ fn xmlsec_compatibility_encryption_policy() -> EncryptionPolicy {
     }
 }
 
+/// The first explicit symmetric key of `wrap`'s kind and length matching the
+/// requested names. `cache`, present only for batched recipients, keeps decoded
+/// inputs so a key shared by several recipients is read from disk once.
+fn explicit_wrapping_key(
+    invocation: &Invocation,
+    explicit: &[&crate::OptionValue],
+    wrap: KeyWrapAlgorithm,
+    requested: &[String],
+    budget: &mut KeyCandidateBudget,
+    material: &mut ExternalMaterialBudget,
+    mut cache: Option<&mut HashMap<usize, zeroize::Zeroizing<Vec<u8>>>>,
+) -> Result<(Option<String>, Vec<u8>), CommandError> {
+    let candidates = explicit
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|(_, option)| symmetric_option_kind(&option.name) == wrap.key_kind())
+        .map(|(index, option)| (option, index))
+        .collect::<Vec<_>>();
+    let candidates = named_candidate_search(
+        &candidates,
+        requested,
+        invocation.flag("lax-key-search"),
+        true,
+        "wrapping key",
+    )?;
+    budget
+        .consume(candidates.len())
+        .map_err(|error| CommandError::Encryption(error.to_string()))?;
+    let mut last_error = None;
+    for (option, index) in candidates {
+        if let Some(key) = cache.as_deref().and_then(|cache| cache.get(&index)) {
+            if key.len() == wrap.key_len() {
+                return Ok((option.parameter.clone(), key.to_vec()));
+            }
+            last_error = Some(CommandError::Usage(
+                "wrapping key length does not match the template method".into(),
+            ));
+            continue;
+        }
+        match load_symmetric_with_budget(
+            option.value.as_deref().unwrap_or_default(),
+            Some(wrap.key_len()),
+            material,
+        ) {
+            Ok(key) => {
+                // Recipient builders retain their own key bytes; only batched
+                // inputs are cached, so single recipients allocate no cache entry.
+                if let Some(cache) = cache.as_deref_mut() {
+                    cache.insert(index, zeroize::Zeroizing::new(key.clone()));
+                }
+                return Ok((option.parameter.clone(), key));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| CommandError::Usage("no compatible wrapping key input".into())))
+}
+
 fn configure_wrapping_recipients(
     mut builder: EncryptedDataBuilder,
     recipients: &[EncryptionTemplateRecipient],
@@ -5377,59 +5842,15 @@ fn configure_wrapping_recipients(
                 })?;
             (Some(selected.name.clone()), selected.bytes.to_vec())
         } else {
-            let candidates = explicit
-                .iter()
-                .copied()
-                .enumerate()
-                .filter(|(_, option)| symmetric_option_kind(&option.name) == wrap.key_kind())
-                .map(|(index, option)| (option, index))
-                .collect::<Vec<_>>();
-            let candidates = named_candidate_search(
-                &candidates,
+            explicit_wrapping_key(
+                invocation,
+                explicit,
+                wrap,
                 &requested,
-                invocation.flag("lax-key-search"),
-                true,
-                "wrapping key",
-            )?;
-            budget
-                .consume(candidates.len())
-                .map_err(|error| CommandError::Encryption(error.to_string()))?;
-            let mut selected = None;
-            let mut last_error = None;
-            for (option, index) in candidates {
-                if let Some(key) = decoded.get(&index) {
-                    if key.len() == wrap.key_len() {
-                        selected = Some((option.parameter.clone(), key.to_vec()));
-                        break;
-                    }
-                    last_error = Some(CommandError::Usage(
-                        "wrapping key length does not match the template method".into(),
-                    ));
-                    continue;
-                }
-                match load_symmetric_with_budget(
-                    option.value.as_deref().unwrap_or_default(),
-                    Some(wrap.key_len()),
-                    &mut material,
-                ) {
-                    Ok(key) => {
-                        // Recipient builders retain their own key bytes. Cache
-                        // only batched inputs to avoid repeated filesystem I/O;
-                        // single-recipient operations have no cache allocation.
-                        if recipients.len() > 1 {
-                            decoded.insert(index, zeroize::Zeroizing::new(key.clone()));
-                        }
-                        selected = Some((option.parameter.clone(), key));
-                        break;
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            selected.ok_or_else(|| {
-                last_error.unwrap_or_else(|| {
-                    CommandError::Usage("no compatible wrapping key input".into())
-                })
-            })?
+                &mut budget,
+                &mut material,
+                (recipients.len() > 1).then_some(&mut decoded),
+            )?
         };
         let mut configured = EncryptionRecipient::aes_key_wrap(key, wrap);
         if let Some(name) = name {
@@ -5477,6 +5898,15 @@ struct EncryptionTemplateRecipient {
     oaep_parameters: Option<RsaOaepParameters>,
 }
 
+fn has_nested_encapsulation(keys: &[xml_sec::xmlenc::EncryptedKey]) -> bool {
+    // Inspection already enforces the non-configurable key-indirection
+    // ceiling; this borrowed graph walk adds neither allocation nor parsing.
+    keys.iter().any(|key| {
+        !key.sources.encapsulation_methods.is_empty()
+            || has_nested_encapsulation(&key.sources.encrypted_keys)
+    })
+}
+
 fn encryption_template(
     xml: &str,
     start_node_id: Option<&str>,
@@ -5484,7 +5914,7 @@ fn encryption_template(
     policy: &EncryptionPolicy,
     xml_backend: XmlBackend,
 ) -> Result<EncryptionTemplateMetadata, CommandError> {
-    let document = parse_encryption_document(xml, &policy.xml, &policy.resources, xml_backend)?;
+    let document = parse_encryption_document(xml, policy.xml, &policy.resources, xml_backend)?;
     let encrypted_data = select_encrypted_data(&document, start_node_id, id_attributes)?;
     // Templates preserve every non-cipher field. Parse the selected node through
     // the reciprocal core path first so encryption cannot emit a document that
@@ -5498,18 +5928,6 @@ fn encryption_template(
     )
     .map_err(|error| CommandError::Encryption(error.to_string()))?
     .into_data();
-    fn has_nested_encapsulation(keys: &[xml_sec::xmlenc::EncryptedKey]) -> bool {
-        // Inspection already enforces the non-configurable key-indirection
-        // ceiling; this borrowed graph walk adds neither allocation nor parsing.
-        for key in keys {
-            if !key.sources.encapsulation_methods.is_empty()
-                || has_nested_encapsulation(&key.sources.encrypted_keys)
-            {
-                return true;
-            }
-        }
-        false
-    }
     if has_nested_encapsulation(&parsed.encrypted_keys) {
         return Err(CommandError::Encryption(
             "nested EncapsulationMechanism templates are not supported for encryption".into(),
@@ -5695,7 +6113,7 @@ fn encrypted_key_recipient_names(
     )?;
     key_info
         .into_iter()
-        .flat_map(|key_info| key_info.children())
+        .flat_map(Node::children)
         .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
         .map(|encrypted_key| {
             let key_info = singleton_direct_child(
@@ -5771,7 +6189,7 @@ fn select_recipient_private_keys<'a>(
 
 fn parse_encryption_document<'a>(
     xml: &'a str,
-    xml_policy: &XmlInputPolicy,
+    xml_policy: XmlInputPolicy,
     resources: &ResourcePolicy,
     xml_backend: XmlBackend,
 ) -> Result<Document<'a>, CommandError> {
@@ -5813,6 +6231,7 @@ fn select_encrypted_data<'a>(
 }
 
 fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandError> {
+    use std::fmt::Write as _;
     validate_options(invocation, KEYS_OPTIONS)?;
     let generated = invocation.values("gen-key").collect::<Vec<_>>();
     if generated.is_empty() {
@@ -5830,20 +6249,19 @@ fn keys(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), CommandEr
             .fill_random(&mut key)
             .map_err(|error| CommandError::Encryption(error.to_string()))?;
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
-        let key_name = generated
-            .parameter
-            .as_deref()
-            .map_or_else(String::new, |name| {
-                format!("<KeyName>{}</KeyName>\n", escape_text(name))
-            });
-        entries.push_str(&format!(
-            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\n\
-             {key_name}\
-             <KeyValue>\n\
+        entries.push_str("<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\">\n");
+        if let Some(name) = generated.parameter.as_deref() {
+            writeln!(entries, "<KeyName>{}</KeyName>", escape_text(name))
+                .expect("writing to a String cannot fail");
+        }
+        write!(
+            entries,
+            "<KeyValue>\n\
              <AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue>\n\
              </KeyValue>\n\
              </KeyInfo>\n"
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     let document = format!(
         "<?xml version=\"1.0\"?>\n<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">\n\
@@ -5932,2606 +6350,4 @@ fn stdout_error(source: std::io::Error) -> CommandError {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{cell::Cell, ffi::OsString, rc::Rc};
-
-    use base64::Engine as _;
-
-    use super::*;
-
-    fn project_root() -> &'static Path {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-    }
-
-    #[test]
-    fn signing_certificate_failure_has_signature_category() {
-        // A malformed embedded certificate is a signing-input failure, not encryption.
-        let key = xml_sec::xmldsig::RsaSigningKey::from_pkcs8_pem(include_str!(
-            "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-        ))
-        .unwrap();
-        let candidate = SigningKeyCandidate {
-            key: Box::new(key),
-            certificate_writer: None,
-            leaf_certificate_der: None,
-        };
-        let mut info = KeyInfo::default();
-        let mut data = xml_sec::xmldsig::X509DataInfo::default();
-        data.certificates.push(vec![0]);
-        info.sources.push(KeyInfoSource::X509Data(data));
-        let resources = ResourcePolicy::default();
-        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
-        let error =
-            validate_signing_key_info(Some(&info), &candidate, default_provider(), &mut parsing)
-                .unwrap_err();
-        assert!(matches!(error, CommandError::Signature(_)));
-    }
-
-    #[test]
-    fn certificate_work_refusal_is_terminal_for_lax_search() {
-        // A certificate account failure must not be downgraded to candidate mismatch.
-        let der = pem::parse(include_bytes!(
-            "../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
-        ))
-        .unwrap()
-        .into_contents();
-        let resources = ResourcePolicy {
-            max_x509_work: 1,
-            ..Default::default()
-        };
-        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
-        let error = certificate_public_key(&der, &mut parsing, |_| ())
-            .map_err(certificate_command_error)
-            .unwrap_err();
-        assert!(matches!(error, CommandError::Policy(_)));
-        assert!(!lax_candidate_error_is_recoverable(&error));
-    }
-
-    #[test]
-    fn certificate_candidate_matching_retains_spent_work() {
-        // Hash-table equality work can vary across independent accounts.
-        // Test one retained account until its exact work resource refuses admission.
-        let der = pem::parse(include_bytes!(
-            "../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
-        ))
-        .unwrap()
-        .into_contents();
-        let resources = ResourcePolicy {
-            max_x509_work: 50_000,
-            max_key_candidates: 32,
-            ..Default::default()
-        };
-        let mut parsing = xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&resources).unwrap();
-        let mut successful = 0;
-        for _ in 0..resources.max_key_candidates {
-            match certificate_public_key(&der, &mut parsing, |_| ())
-                .map_err(certificate_command_error)
-            {
-                Ok(()) => successful += 1,
-                Err(error) => {
-                    assert!(successful > 0);
-                    assert!(matches!(
-                        error,
-                        CommandError::Policy(
-                            xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
-                                resource: "X.509 work",
-                                maximum: 50_000
-                            }
-                        )
-                    ));
-                    assert!(!lax_candidate_error_is_recoverable(&error));
-                    return;
-                }
-            }
-        }
-        panic!("certificate work was reset between candidates");
-    }
-
-    fn invocation(arguments: &[&str]) -> Invocation {
-        Invocation::parse(arguments.iter().map(OsString::from)).unwrap()
-    }
-
-    #[test]
-    fn signing_material_and_mappings_share_one_budget() {
-        // Reference acquisition must not reset the allowance consumed by signing keys.
-        let directory = tempfile::tempdir().unwrap();
-        let key = directory.path().join("key");
-        let part = directory.path().join("part");
-        let template = directory.path().join("template.xml");
-        fs::write(&key, [7; 32]).unwrap();
-        fs::write(&part, b"abc").unwrap();
-        fs::write(&template, br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><Reference URI="urn:part"><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"#).unwrap();
-        let request = invocation(&[
-            "xmlsec1",
-            "sign",
-            "--hmac-key",
-            key.to_str().unwrap(),
-            "--url-map:urn:part",
-            part.to_str().unwrap(),
-            template.to_str().unwrap(),
-        ]);
-        let mut policy = xmlsec_compatibility_signing_policy(&request);
-        policy.resources.max_external_resource_total_bytes = 34;
-        let result = sign_with_policy(&request, &mut Vec::new(), policy);
-        assert!(
-            matches!(result, Err(CommandError::ExternalMaterialTooLarge { .. })),
-            "{result:?}"
-        );
-        let mut policy = xmlsec_compatibility_signing_policy(&request);
-        policy.resources.max_external_resource_total_bytes = 35;
-        sign_with_policy(&request, &mut Vec::new(), policy).expect("exact combined allowance");
-        let store = directory.path().join("keys.xml");
-        fs::write(&store, br#"<Keys xmlns="http://www.aleksey.com/xmlsec/2002"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>only-key</KeyName><KeyValue><HMACKeyValue xmlns="http://www.aleksey.com/xmlsec/2002">c2VjcmV0</HMACKeyValue></KeyValue></KeyInfo></Keys>"#).unwrap();
-        let request = invocation(&[
-            "xmlsec1",
-            "sign",
-            "--keys-file",
-            store.to_str().unwrap(),
-            "--lax-key-search",
-            "--url-map:urn:part",
-            part.to_str().unwrap(),
-            template.to_str().unwrap(),
-        ]);
-        let mut policy = xmlsec_compatibility_signing_policy(&request);
-        let store_bytes = fs::metadata(&store).unwrap().len() as usize;
-        // Leave headroom for the importer's decoded material, but make the map
-        // exceed the bytes remaining after acquisition of the store itself.
-        policy.resources.max_external_resource_total_bytes = store_bytes * 4;
-        fs::write(&part, vec![0; store_bytes * 3 + 1]).unwrap();
-        let result = sign_with_policy(&request, &mut Vec::new(), policy);
-        assert!(
-            matches!(result, Err(CommandError::ExternalMaterialTooLarge { .. })),
-            "{result:?}"
-        );
-    }
-
-    #[test]
-    fn mapped_references_enforce_individual_and_aggregate_limits() {
-        // Limits apply before file-sized allocations, including existing
-        // invocation material. An exact-boundary file remains usable.
-        let directory = tempfile::tempdir().unwrap();
-        let file = directory.path().join("part");
-        fs::write(&file, b"abc").unwrap();
-        let file = file.to_str().unwrap();
-        let request = invocation(&["xmlsec1", "verify", "--url-map:urn:a", file]);
-        let mut resources = ResourcePolicy {
-            max_external_resource_bytes: 3,
-            ..ResourcePolicy::default()
-        };
-        let mut budget = ExternalMaterialBudget::new(3);
-        let map = load_mapped_reference_resources(&request, &resources, &mut budget).unwrap();
-        assert_eq!(map["urn:a"], b"abc");
-        assert_eq!(budget.remaining(), 0);
-        resources.max_external_resource_bytes = 2;
-        assert!(matches!(
-            load_mapped_reference_resources(
-                &request,
-                &resources,
-                &mut ExternalMaterialBudget::new(10)
-            ),
-            Err(CommandError::ExternalMaterialTooLarge { .. })
-        ));
-        resources.max_external_resource_bytes = 3;
-        let mut budget = ExternalMaterialBudget::new(4);
-        budget.charge(2).unwrap();
-        assert!(matches!(
-            load_mapped_reference_resources(&request, &resources, &mut budget),
-            Err(CommandError::ExternalMaterialTooLarge { .. })
-        ));
-        let request = invocation(&[
-            "xmlsec1",
-            "verify",
-            "--url-map:urn:a",
-            file,
-            "--url-map:urn:b",
-            file,
-        ]);
-        assert!(matches!(
-            load_mapped_reference_resources(
-                &request,
-                &resources,
-                &mut ExternalMaterialBudget::new(5)
-            ),
-            Err(CommandError::ExternalMaterialTooLarge { .. })
-        ));
-    }
-
-    #[test]
-    fn mapped_references_reject_ambiguous_or_missing_uri() {
-        // A duplicate cannot replace bytes already loaded under a trusted URI;
-        // malformed parameters fail before opening their file.
-        let directory = tempfile::tempdir().unwrap();
-        let file = directory.path().join("part");
-        fs::write(&file, []).unwrap();
-        let file = file.to_str().unwrap();
-        let resources = ResourcePolicy::default();
-        for request in [
-            invocation(&["xmlsec1", "verify", "--url-map", "/missing"]),
-            invocation(&["xmlsec1", "verify", "--url-map:", "/missing"]),
-            invocation(&[
-                "xmlsec1",
-                "verify",
-                "--url-map:urn:a",
-                file,
-                "--url-map:urn:a",
-                "/missing",
-            ]),
-        ] {
-            assert!(matches!(
-                load_mapped_reference_resources(
-                    &request,
-                    &resources,
-                    &mut ExternalMaterialBudget::new(10)
-                ),
-                Err(CommandError::Usage(_))
-            ));
-        }
-    }
-
-    #[test]
-    fn recipient_metadata_shares_operation_candidate_preflight() {
-        // Nested recipients must not each receive a fresh policy allowance;
-        // the third candidate is denied before its malformed payload is decoded.
-        let recipient = |value: &str| {
-            format!(
-                "<EncryptedKey><ds:KeyInfo><ds:KeyValue>{value}</ds:KeyValue></ds:KeyInfo></EncryptedKey>"
-            )
-        };
-        let template = |last: &str| {
-            format!(
-                "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyInfo>{}{}{}</ds:KeyInfo></EncryptedData>",
-                recipient("<Unknown/>"),
-                recipient("<Unknown/>"),
-                recipient(last),
-            )
-        };
-        let mut policy = EncryptionPolicy::default();
-        policy.resources.max_key_candidates = 2;
-        let mut parsing =
-            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources).unwrap();
-        let error = recipient_key_metadata(
-            &template(""),
-            None,
-            &[],
-            &policy,
-            3,
-            CommandBackends {
-                xml: XmlBackend::default(),
-                crypto: default_provider(),
-            },
-            &mut parsing,
-        )
-        .err()
-        .expect("aggregate candidate limit");
-        assert!(matches!(
-            error,
-            CommandError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
-                maximum: 2,
-                actual: 3,
-                ..
-            })
-        ));
-        drop(parsing);
-        policy.resources.max_key_candidates = 3;
-        let mut parsing =
-            xml_sec::xmldsig::parse::KeyInfoParsingSession::new(&policy.resources).unwrap();
-        assert!(
-            recipient_key_metadata(
-                &template("<Unknown/>"),
-                None,
-                &[],
-                &policy,
-                3,
-                CommandBackends {
-                    xml: XmlBackend::default(),
-                    crypto: default_provider()
-                },
-                &mut parsing,
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn temporary_private_imports_keep_kdf_work_after_failure() {
-        use der::Encode as _;
-        use pkcs8::{
-            EncryptedPrivateKeyInfoRef,
-            pkcs5::{EncryptionScheme, pbes2},
-        };
-        // A failed decrypt spent work even though its temporary inventory held
-        // no key. A second PEM/DER candidate must see only the remainder.
-        let envelope = EncryptedPrivateKeyInfoRef {
-            encryption_algorithm: EncryptionScheme::Pbes2(pbes2::Parameters {
-                kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
-                    salt: pbes2::Salt::new(b"12345678").unwrap(),
-                    iteration_count: 2,
-                    key_length: None,
-                    prf: pbes2::Pbkdf2Prf::HmacWithSha256,
-                }),
-                encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: [0; 16] },
-            }),
-            encrypted_data: der::asn1::OctetStringRef::new(&[0; 64]).unwrap(),
-        };
-        let der = envelope.to_der().unwrap();
-        let pem = pem::encode(&pem::Pem::new("ENCRYPTED PRIVATE KEY", der.clone()));
-        let resources = xml_sec::policy::ResourcePolicy {
-            max_key_import_kdf_work: 5,
-            ..Default::default()
-        };
-        for (bytes, format) in [
-            (der.as_slice(), key_material::PrivateKeyFormat::Pkcs8Der),
-            (pem.as_bytes(), key_material::PrivateKeyFormat::Pkcs8Pem),
-        ] {
-            let mut budget =
-                ExternalMaterialBudget::new(resources.max_external_resource_total_bytes);
-            let import = |_: &mut ExternalMaterialBudget,
-                          inventory: &mut KeyInventory,
-                          remaining: &xml_sec::policy::ResourcePolicy| {
-                key_material::decode_rsa_private_with_inventory(
-                    Path::new("key"),
-                    bytes,
-                    format,
-                    Some(b"wrong"),
-                    remaining,
-                    inventory,
-                )
-                .map_err(CommandError::from)
-            };
-            assert!(matches!(
-                budget.with_key_import(&resources, import),
-                Err(CommandError::Key(
-                    key_material::KeyMaterialError::ProtectedContainer
-                ))
-            ));
-            assert_eq!(budget.kdf_work, 3);
-            assert!(matches!(
-                budget.with_key_import(&resources, import),
-                Err(CommandError::Key(key_material::KeyMaterialError::Policy(_)))
-            ));
-            assert_eq!(budget.kdf_work, 3, "denial must precede the second KDF");
-        }
-    }
-
-    #[test]
-    fn temporary_pkcs12_imports_keep_aggregate_work() {
-        // Lax candidates use temporary inventories without resetting operation work.
-        let bytes =
-            include_bytes!("../../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
-        let resources = xml_sec::policy::ResourcePolicy {
-            max_key_import_kdf_work: 10_000,
-            ..Default::default()
-        };
-        let mut budget = ExternalMaterialBudget::new(resources.max_external_resource_total_bytes);
-        let import = |_: &mut ExternalMaterialBudget,
-                      inventory: &mut KeyInventory,
-                      remaining: &xml_sec::policy::ResourcePolicy| {
-            inventory
-                .add_pkcs12("key".into(), bytes, "secret", remaining)
-                .map_err(CommandError::from)
-        };
-        budget.with_key_import(&resources, import).unwrap();
-        assert!(budget.kdf_work > 0);
-        assert!(matches!(
-            budget.with_key_import(&resources, import),
-            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                _
-            )))
-        ));
-    }
-
-    #[test]
-    fn key_store_import_includes_prior_external_material() {
-        // Certificate buffers stay live while keys.xml and its decoded key coexist.
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("keys.xml");
-        let xml = "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyInfo><ds:KeyName>a</ds:KeyName><ds:KeyValue><HMACKeyValue>AA==</HMACKeyValue></ds:KeyValue></ds:KeyInfo></Keys>";
-        fs::write(&path, xml).unwrap();
-        let invocation = invocation(&[
-            "xmlsec1",
-            "verify",
-            "--keys-file",
-            path.to_str().unwrap(),
-            "input.xml",
-        ]);
-        let mut policy = xml_sec::policy::VerificationPolicy::default();
-        policy.resources.max_external_resource_total_bytes = xml.len() + 100;
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        budget.charge(99).unwrap();
-        assert!(matches!(
-            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget),
-            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                _
-            )))
-        ));
-        let mut exact =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        exact.charge(97).unwrap();
-        assert_eq!(
-            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut exact)
-                .unwrap()
-                .entry_count(),
-            1
-        );
-    }
-
-    #[test]
-    fn repeated_key_files_share_candidate_and_parser_budgets() {
-        // The third entry must fail the operation budget before its malformed
-        // key is decoded; XML parser work must not reset between files either.
-        let temp = tempfile::tempdir().expect("test directory");
-        let first = temp.path().join("first.xml");
-        let second = temp.path().join("second.xml");
-        let entry = |name: &str, value: &str| {
-            format!(
-                "<ds:KeyInfo><ds:KeyName>{name}</ds:KeyName><ds:KeyValue><HMACKeyValue>{value}</HMACKeyValue></ds:KeyValue></ds:KeyInfo>"
-            )
-        };
-        let store = |entries: String| {
-            format!(
-                "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">{entries}</Keys>"
-            )
-        };
-        let a = store(entry("a", "AA=="));
-        fs::write(&first, &a).expect("first store");
-        fs::write(&second, store(entry("b", "AA==") + &entry("c", "!"))).expect("second store");
-        let invocation = invocation(&[
-            "xmlsec1",
-            "sign",
-            "--keys-file",
-            first.to_str().unwrap(),
-            "--keys-file",
-            second.to_str().unwrap(),
-            "template.xml",
-        ]);
-        let mut policy = xml_sec::policy::VerificationPolicy::default();
-        policy.resources.max_key_candidates = 2;
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        assert!(matches!(
-            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget),
-            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
-                    resource: "key candidates",
-                    maximum: 2
-                }
-            )))
-        ));
-        fs::write(&second, store(entry("b", "AA=="))).expect("valid second store");
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        assert_eq!(
-            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget)
-                .expect("exact candidate boundary")
-                .entry_count(),
-            2
-        );
-        // Enough for either document individually, not both decoding/parsing passes.
-        policy.resources.max_xml_parse_work_bytes = a.len() * 3;
-        let mut budget =
-            ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-        assert!(matches!(
-            load_xml_key_stores(&invocation, &policy, XmlBackend::default(), &mut budget),
-            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                xml_sec::policy::PolicyViolation::ResourceLimit {
-                    resource: "cumulative XML parse-work bytes",
-                    ..
-                }
-            )))
-        ));
-    }
-
-    #[test]
-    fn explicit_pkcs8_signing_enforces_import_kdf_limits() {
-        // Explicit PEM/DER options, including generic private-key aliases, must
-        // reject KDF policy violations before password-dependent decryption.
-        use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng as _};
-        use xml_sec::rsa_encoding::RsaPrivateKeyEncoding as _;
-        let rsa = rsa::RsaPrivateKey::from_pkcs8_pem(include_str!(
-            "../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-        ))
-        .unwrap();
-        let plain = rsa.to_pkcs8_der().unwrap();
-        let encrypted = pkcs8::PrivateKeyInfoRef::try_from(plain.as_bytes())
-            .unwrap()
-            .encrypt_with_rng(&mut ChaCha20Rng::seed_from_u64(42), b"correct")
-            .unwrap();
-        let pem = encrypted
-            .to_pem("ENCRYPTED PRIVATE KEY", der::pem::LineEnding::LF)
-            .unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        for option_name in ["pkcs8-pem", "pkcs8-der", "privkey-pem", "privkey-der"] {
-            let path = temp.path().join(option_name);
-            fs::write(
-                &path,
-                if option_name.ends_with("pem") {
-                    pem.as_bytes()
-                } else {
-                    encrypted.as_bytes()
-                },
-            )
-            .unwrap();
-            let parsed = Invocation::parse([
-                OsString::from("xmlsec1"),
-                OsString::from("sign"),
-                OsString::from(format!("--{option_name}")),
-                path.into_os_string(),
-                OsString::from("template.xml"),
-            ])
-            .unwrap();
-            for memory_limit in [false, true] {
-                let mut policy = SigningPolicy::default();
-                if memory_limit {
-                    policy.resources.max_key_import_kdf_memory_bytes = 1;
-                } else {
-                    policy.resources.max_key_import_kdf_work = 1;
-                }
-                let mut budget =
-                    ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-                let result = prepare_signing_key_candidate(
-                    parsed.values(option_name).next().unwrap(),
-                    SignatureAlgorithm::RsaSha256,
-                    &policy,
-                    Some(b"wrong"),
-                    &mut budget,
-                    default_provider(),
-                );
-                assert!(
-                    matches!(
-                        result,
-                        Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                            _
-                        )))
-                    ),
-                    "{option_name}, memory limit {memory_limit}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn lax_key_search_stops_on_password_and_policy_failures() {
-        // Candidate search may skip incompatible keys, never terminal
-        // authentication or operation-wide policy failures.
-        assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
-            key_material::KeyMaterialError::ProtectedContainer,
-        )));
-        assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
-            key_material::KeyMaterialError::PrivateKeyComponents(
-                key_manager::KeyStoreError::Selection("RSA modulus exceeds safety limit"),
-            ),
-        )));
-        assert!(!lax_candidate_error_is_recoverable(
-            &CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                xml_sec::policy::PolicyViolation::ResourceLimit {
-                    resource: "external resource bytes",
-                    maximum: 1,
-                    actual: 2,
-                },
-            ),)
-        ));
-        assert!(!lax_candidate_error_is_recoverable(&CommandError::Key(
-            key_material::KeyMaterialError::Policy(
-                xml_sec::policy::PolicyViolation::ResourceLimit {
-                    resource: "external resource bytes",
-                    maximum: 1,
-                    actual: 2,
-                },
-            ),
-        )));
-    }
-
-    #[test]
-    fn compatibility_signing_policy_includes_every_implemented_algorithm() {
-        // An explicit allowlist replaces, rather than extends, secure defaults.
-        // Keep the CLI compatibility boundary complete when algorithms evolve.
-        let policy = xmlsec_compatibility_signing_policy(&invocation(&["xmlsec1", "sign"]));
-        assert_eq!(
-            policy.transforms.opc_relationship_edition,
-            xml_sec::policy::OpcRelationshipEdition::Ecma2012
-        );
-        assert_eq!(
-            policy.parameterized_rsa_pss,
-            xml_sec::policy::RsaPssPermission::AllSupported
-        );
-        assert_eq!(
-            policy.signature_algorithms,
-            Some(HashSet::from([
-                #[cfg(feature = "legacy-algorithms")]
-                SignatureAlgorithm::RsaMd5,
-                #[cfg(feature = "legacy-algorithms")]
-                SignatureAlgorithm::RsaRipemd160,
-                #[cfg(feature = "legacy-algorithms")]
-                SignatureAlgorithm::HmacMd5,
-                #[cfg(feature = "legacy-algorithms")]
-                SignatureAlgorithm::HmacRipemd160,
-                #[cfg(feature = "legacy-algorithms")]
-                SignatureAlgorithm::EcdsaRipemd160,
-                SignatureAlgorithm::DsaSha1,
-                SignatureAlgorithm::DsaSha256,
-                SignatureAlgorithm::HmacSha1,
-                SignatureAlgorithm::HmacSha224,
-                SignatureAlgorithm::HmacSha256,
-                SignatureAlgorithm::HmacSha384,
-                SignatureAlgorithm::HmacSha512,
-                SignatureAlgorithm::RsaSha1,
-                SignatureAlgorithm::RsaSha224,
-                SignatureAlgorithm::RsaSha256,
-                SignatureAlgorithm::RsaSha384,
-                SignatureAlgorithm::RsaSha512,
-                SignatureAlgorithm::RsaPssSha1,
-                SignatureAlgorithm::RsaPssSha224,
-                SignatureAlgorithm::RsaPssSha256,
-                SignatureAlgorithm::RsaPssSha384,
-                SignatureAlgorithm::RsaPssSha512,
-                SignatureAlgorithm::RsaPssSha3_224,
-                SignatureAlgorithm::RsaPssSha3_256,
-                SignatureAlgorithm::RsaPssSha3_384,
-                SignatureAlgorithm::RsaPssSha3_512,
-                SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters::DEFAULT),
-                SignatureAlgorithm::EcdsaSha1,
-                SignatureAlgorithm::EcdsaSha224,
-                SignatureAlgorithm::EcdsaSha256,
-                SignatureAlgorithm::EcdsaSha384,
-                SignatureAlgorithm::EcdsaSha512,
-                SignatureAlgorithm::EcdsaSha3_224,
-                SignatureAlgorithm::EcdsaSha3_256,
-                SignatureAlgorithm::EcdsaSha3_384,
-                SignatureAlgorithm::EcdsaSha3_512,
-                SignatureAlgorithm::Ed25519,
-                SignatureAlgorithm::Ed25519Ctx,
-                SignatureAlgorithm::Ed25519Ph,
-                SignatureAlgorithm::Ed448,
-                SignatureAlgorithm::Ed448Ph,
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::MlDsa44),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::MlDsa65),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::MlDsa87),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_128s),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_128f),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_192s),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_192f),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_256s),
-                SignatureAlgorithm::PostQuantum(xml_sec::xmldsig::PqAlgorithm::SlhDsaSha2_256f),
-            ]))
-        );
-        assert_eq!(
-            policy.digest_algorithms,
-            Some(HashSet::from([
-                #[cfg(feature = "legacy-algorithms")]
-                DigestAlgorithm::Md5,
-                #[cfg(feature = "legacy-algorithms")]
-                DigestAlgorithm::Ripemd160,
-                DigestAlgorithm::Sha1,
-                DigestAlgorithm::Sha224,
-                DigestAlgorithm::Sha256,
-                DigestAlgorithm::Sha384,
-                DigestAlgorithm::Sha512,
-                DigestAlgorithm::Sha3_224,
-                DigestAlgorithm::Sha3_256,
-                DigestAlgorithm::Sha3_384,
-                DigestAlgorithm::Sha3_512,
-            ]))
-        );
-        assert_eq!(policy.dsa_keys.minimum_modulus_bits, 1024);
-    }
-
-    fn testdata(name: &str) -> PathBuf {
-        project_root().join("tools/xmlsec1/testdata").join(name)
-    }
-
-    #[test]
-    fn named_store_encryption_falls_back_only_when_lax() {
-        // An absent named key may fall back in lax mode, but an exact match wins.
-        let names = ["fallback", "exact"];
-        let requested = vec!["exact".to_string()];
-        assert_eq!(
-            select_store_candidates(names.iter(), &requested, true, 2, |name| name).unwrap()[0],
-            &"exact"
-        );
-        let absent = vec!["absent".to_string()];
-        assert!(select_store_candidates(names.iter(), &absent, false, 2, |name| name).is_err());
-        assert_eq!(
-            select_store_candidates(names.iter(), &absent, true, 2, |name| name).unwrap()[0],
-            &"fallback"
-        );
-    }
-
-    #[cfg(feature = "legacy-algorithms")]
-    #[test]
-    fn direct_candidates_do_not_cross_aes_and_triple_des_families() {
-        // Equal 24-byte lengths must not turn an AES key into a TDEA key.
-        let resolver = CandidateSymmetricKeyDecryptor {
-            keys: vec![SymmetricCandidate {
-                kind: key_manager::SymmetricKeyKind::Aes,
-                bytes: Cow::Borrowed(&[1; 24]),
-                name: None,
-            }],
-            lax_key_search: false,
-            content_key_name: None,
-            wrapping_only: false,
-        };
-        assert!(matches!(
-            resolver.resolve_key(
-                &xml_sec::provider::RustCryptoProvider,
-                DataEncryptionAlgorithm::TripleDesCbc,
-                None
-            ),
-            Err(XmlEncError::KeyNotFound)
-        ));
-        assert!(
-            resolver
-                .resolve_key(
-                    &xml_sec::provider::RustCryptoProvider,
-                    DataEncryptionAlgorithm::Aes192Cbc,
-                    None
-                )
-                .is_ok()
-        );
-    }
-
-    #[cfg(feature = "legacy-algorithms")]
-    #[test]
-    fn cli_optional_content_round_trips_and_rejects_wrong_key_type() {
-        // Exercise the actual command boundary, including named key selection
-        // and explicit compatibility policy; equal AES/TDEA widths cannot alias.
-        let directory = tempfile::tempdir().expect("temporary CLI files");
-        let template = directory.path().join("template.xml");
-        let input = directory.path().join("input.bin");
-        let key = directory.path().join("key.bin");
-        let encrypted = directory.path().join("encrypted.xml");
-        fs::write(&input, b"legacy CLI plaintext").expect("plaintext file");
-        fs::write(&key, [0x31; 24]).expect("key file");
-        for algorithm in [
-            DataEncryptionAlgorithm::TripleDesCbc,
-            DataEncryptionAlgorithm::Aes192Cbc,
-            DataEncryptionAlgorithm::Aes192Gcm,
-        ] {
-            fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"{}\"/><CipherData><CipherValue/></CipherData></EncryptedData>", algorithm.uri())).expect("template file");
-            let option = if algorithm == DataEncryptionAlgorithm::TripleDesCbc {
-                "--deskey"
-            } else {
-                "--aeskey"
-            };
-            let args = [
-                "xmlsec1",
-                "encrypt",
-                option,
-                key.to_str().unwrap(),
-                "--binary-data",
-                input.to_str().unwrap(),
-                template.to_str().unwrap(),
-            ];
-            let mut output = Vec::new();
-            execute(invocation(&args), &mut output, &mut Vec::new()).expect("CLI encryption");
-            fs::write(&encrypted, output).expect("encrypted file");
-            let args = [
-                "xmlsec1",
-                "decrypt",
-                option,
-                key.to_str().unwrap(),
-                encrypted.to_str().unwrap(),
-            ];
-            let mut plaintext = Vec::new();
-            execute(invocation(&args), &mut plaintext, &mut Vec::new()).expect("CLI decryption");
-            assert_eq!(plaintext, b"legacy CLI plaintext");
-            let wrong_option = if option == "--deskey" {
-                "--aeskey"
-            } else {
-                "--deskey"
-            };
-            let args = [
-                "xmlsec1",
-                "decrypt",
-                wrong_option,
-                key.to_str().unwrap(),
-                encrypted.to_str().unwrap(),
-            ];
-            assert!(execute(invocation(&args), &mut Vec::new(), &mut Vec::new()).is_err());
-        }
-    }
-
-    #[cfg(feature = "legacy-algorithms")]
-    #[test]
-    fn cli_rsa15_template_selects_parameterless_transport() {
-        // Test command wiring, not just the library builder: a template's
-        // RSA-1.5 method must survive staging without acquiring OAEP children.
-        let directory = tempfile::tempdir().expect("CLI files");
-        let template = directory.path().join("template.xml");
-        let input = directory.path().join("input.bin");
-        let encrypted = directory.path().join("encrypted.xml");
-        fs::write(&input, b"RSA15 CLI plaintext").expect("plaintext");
-        fs::write(&template, "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-1_5\"/><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>").expect("template");
-        let root = project_root();
-        let public = root.join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
-        let private = root.join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
-        let args = [
-            "xmlsec1",
-            "encrypt",
-            "--pubkey-pem",
-            public.to_str().unwrap(),
-            "--binary-data",
-            input.to_str().unwrap(),
-            template.to_str().unwrap(),
-        ];
-        let mut output = Vec::new();
-        execute(invocation(&args), &mut output, &mut Vec::new()).expect("CLI RSA-1.5 encrypt");
-        assert!(!String::from_utf8_lossy(&output).contains("OAEPparams"));
-        assert!(!String::from_utf8_lossy(&output).contains("DigestMethod"));
-        fs::write(&encrypted, output).expect("ciphertext");
-        let args = [
-            "xmlsec1",
-            "decrypt",
-            "--privkey-pem",
-            private.to_str().unwrap(),
-            encrypted.to_str().unwrap(),
-        ];
-        let mut output = Vec::new();
-        execute(invocation(&args), &mut output, &mut Vec::new()).expect("CLI RSA-1.5 decrypt");
-        assert_eq!(output, b"RSA15 CLI plaintext");
-    }
-
-    #[test]
-    fn store_selection_bounds_inspected_candidates() {
-        // A name filter cannot make scanning an oversized candidate pool free.
-        let names = ["first", "second"];
-        let requested = vec!["second".to_owned()];
-        assert!(matches!(
-            select_store_candidates(names.iter(), &requested, false, 1, |name| name),
-            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                xml_sec::policy::PolicyViolation::ResourceLimit {
-                    resource: "key candidates",
-                    maximum: 1,
-                    actual: 2,
-                }
-            )))
-        ));
-        assert_eq!(
-            select_store_candidates(names.iter(), &requested, false, 2, |name| name).unwrap(),
-            vec![&"second"]
-        );
-    }
-
-    #[test]
-    fn cli_lax_store_encryption_accepts_missing_template_key_name() {
-        // Exercise the command boundary: a present but unknown KeyName must
-        // fall back only when --lax-key-search was explicitly requested.
-        let temp = tempfile::tempdir().expect("temporary test directory");
-        let template_path = temp.path().join("template.xml");
-        let input_path = temp.path().join("input.bin");
-        let fixture = project_root()
-            .join("tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl");
-        let template = fs::read_to_string(fixture)
-            .expect("encryption template fixture")
-            .replace("test-aes128", "absent");
-        fs::write(&template_path, template).expect("write encryption template");
-        fs::write(&input_path, b"lax fallback payload").expect("write plaintext");
-        let store = project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml");
-        let args = [
-            "xmlsec1",
-            "encrypt",
-            "--keys-file",
-            store.to_str().expect("fixture path is UTF-8"),
-            "--binary-data",
-            input_path.to_str().expect("input path is UTF-8"),
-            template_path.to_str().expect("template path is UTF-8"),
-        ];
-        assert!(execute(invocation(&args), &mut Vec::new(), &mut Vec::new()).is_err());
-        let mut lax_args = vec!["xmlsec1", "encrypt", "--lax-key-search"];
-        lax_args.extend_from_slice(&args[2..]);
-        let mut output = Vec::new();
-        execute(invocation(&lax_args), &mut output, &mut Vec::new())
-            .expect("lax store encryption finds alternate AES key");
-        assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
-    }
-
-    #[test]
-    fn cli_lax_store_encryption_skips_ineligible_aes_key() {
-        // A fallback candidate with the wrong AES length must not hide a later usable key.
-        let temp = tempfile::tempdir().expect("temporary test directory");
-        let template_path = temp.path().join("template.xml");
-        let input_path = temp.path().join("input.bin");
-        let store_path = temp.path().join("keys.xml");
-        let fixture = project_root()
-            .join("tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes128gcm-keyname.tmpl");
-        let template = fs::read_to_string(fixture)
-            .expect("encryption template fixture")
-            .replace("test-aes128", "absent");
-        fs::write(&template_path, template).expect("write encryption template");
-        fs::write(&input_path, b"lax fallback payload").expect("write plaintext");
-        let source =
-            fs::read_to_string(project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml"))
-                .expect("key store fixture");
-        let extra = "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong-aes192</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</AESKeyValue></KeyValue></KeyInfo>";
-        fs::write(
-            &store_path,
-            source.replacen("<KeyInfo", &format!("{extra}<KeyInfo"), 1),
-        )
-        .expect("write key store");
-        let args = [
-            "xmlsec1",
-            "encrypt",
-            "--lax-key-search",
-            "--keys-file",
-            store_path.to_str().expect("store path is UTF-8"),
-            "--binary-data",
-            input_path.to_str().expect("input path is UTF-8"),
-            template_path.to_str().expect("template path is UTF-8"),
-        ];
-        let mut output = Vec::new();
-        execute(invocation(&args), &mut output, &mut Vec::new())
-            .expect("lax search skips AES-192 before AES-128");
-        assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
-    }
-
-    #[test]
-    fn cli_lax_store_encryption_preserves_policy_denial() {
-        // Policy denials are terminal even when a later key is eligible.
-        // A compliant-only inventory must still complete the round-trip.
-        let temp = tempfile::tempdir().expect("temporary test directory");
-        let template_path = temp.path().join("template.xml");
-        let input_path = temp.path().join("input.bin");
-        let store_path = temp.path().join("keys.xml");
-        let fixture = project_root().join(
-            "tests/fixtures/xmlenc/aleksey-xmlenc-01/enc-aes256-kt-rsa_oaep_sha1_mgf1_sha512.tmpl",
-        );
-        let template = fs::read_to_string(fixture)
-            .expect("encryption template fixture")
-            .replace("TestKeyName-rsa-4096", "absent");
-        fs::write(&template_path, template).expect("write encryption template");
-        fs::write(&input_path, b"<root>lax RSA fallback payload</root>").expect("write plaintext");
-        let pem =
-            fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
-                .expect("public key fixture");
-        let public_key = RsaPublicKey::from_public_key_pem(&pem).expect("RSA public key");
-        let encode = |bytes: Vec<u8>| base64::engine::general_purpose::STANDARD.encode(bytes);
-        let extra = format!(
-            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>valid-rsa</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
-            encode(public_key.n().to_be_bytes_trimmed_vartime().into_vec()),
-            encode(public_key.e().to_be_bytes_trimmed_vartime().into_vec())
-        );
-        let source =
-            fs::read_to_string(project_root().join("tests/fixtures/keys/xmlsec/mixed-keys.xml"))
-                .expect("key store fixture");
-        fs::write(
-            &store_path,
-            source.replacen("</Keys>", &format!("{extra}</Keys>"), 1),
-        )
-        .expect("write key store");
-        let args = [
-            "xmlsec1",
-            "encrypt",
-            "--lax-key-search",
-            "--keys-file",
-            store_path.to_str().expect("store path is UTF-8"),
-            "--xml-data",
-            input_path.to_str().expect("input path is UTF-8"),
-            template_path.to_str().expect("template path is UTF-8"),
-        ];
-        let mut output = Vec::new();
-        assert!(matches!(
-            execute(invocation(&args), &mut output, &mut Vec::new()),
-            Err(CommandError::KeyStore(key_manager::KeyStoreError::Policy(
-                xml_sec::policy::PolicyViolation::KeySize {
-                    operation: "encryption",
-                    key_type: "RSA",
-                    minimum_bits: 2048,
-                    maximum_bits: 8192,
-                    actual_bits: 1024,
-                }
-            )))
-        ));
-        assert!(output.is_empty());
-        fs::write(
-            &store_path,
-            format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{extra}</Keys>"),
-        )
-        .expect("compliant-only store");
-        execute(invocation(&args), &mut output, &mut Vec::new())
-            .expect("lax search selects the compliant RSA key");
-        assert!(String::from_utf8_lossy(&output).contains("CipherValue"));
-        let encrypted = temp.path().join("encrypted.xml");
-        fs::write(&encrypted, &output).expect("write encrypted output");
-        let private = project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem");
-        let decrypt_args = [
-            "xmlsec1",
-            "decrypt",
-            "--privkey-pem:valid-rsa",
-            private.to_str().expect("key path is UTF-8"),
-            encrypted.to_str().expect("encrypted path is UTF-8"),
-        ];
-        let mut decrypted = Vec::new();
-        execute(invocation(&decrypt_args), &mut decrypted, &mut Vec::new())
-            .expect("strict decryption uses the fallback recipient name");
-        assert_eq!(decrypted, b"lax RSA fallback payload");
-    }
-
-    #[test]
-    fn store_signing_retries_key_info_mismatch_in_lax_mode() {
-        // An algorithm-compatible key is not a valid match for embedded KeyInfo.
-        let mut inventory = KeyInventory::default();
-        let policy = SigningPolicy::default();
-        let wrong =
-            std::fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
-        let right =
-            std::fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem")).unwrap();
-        for (name, pem) in [("wrong", wrong), ("right", right)] {
-            inventory
-                .add_private_pem(
-                    name.into(),
-                    &pem,
-                    None,
-                    key_manager::KeyUsages::SIGN,
-                    &policy.resources,
-                )
-                .unwrap();
-        }
-        let right_spki = inventory
-            .signing_key("right", SignatureAlgorithm::RsaSha256, &policy)
-            .unwrap()
-            .public_key_info()
-            .unwrap()
-            .spki_der()
-            .unwrap()
-            .to_vec();
-        let mut info = KeyInfo::default();
-        info.sources
-            .push(KeyInfoSource::DerEncodedKeyValue(right_spki));
-        assert!(
-            select_store_signing_key(
-                &inventory,
-                ["wrong"],
-                SignatureAlgorithm::RsaSha256,
-                Some(&info),
-                &policy,
-                false,
-                default_provider(),
-            )
-            .is_err()
-        );
-        assert!(
-            select_store_signing_key(
-                &inventory,
-                ["wrong", "right"],
-                SignatureAlgorithm::RsaSha256,
-                Some(&info),
-                &policy,
-                true,
-                default_provider(),
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
-    fn lax_store_signing_shares_lookup_budget_across_retries() {
-        // Three independent scans cost 1 + 2 + 3 inspections, not three.
-        let mut inventory = KeyInventory::default();
-        let mut policy = SigningPolicy::default();
-        let wrong =
-            fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-2048-key.pem")).unwrap();
-        let right =
-            fs::read(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem")).unwrap();
-        for (name, pem) in [("wrong-a", &wrong), ("wrong-b", &wrong), ("right", &right)] {
-            inventory
-                .add_private_pem(
-                    name.into(),
-                    pem,
-                    None,
-                    key_manager::KeyUsages::SIGN,
-                    &policy.resources,
-                )
-                .unwrap();
-        }
-        let right_spki = inventory
-            .signing_key("right", SignatureAlgorithm::RsaSha256, &policy)
-            .unwrap()
-            .public_key_info()
-            .unwrap()
-            .spki_der()
-            .unwrap()
-            .to_vec();
-        let mut info = KeyInfo::default();
-        info.sources
-            .push(KeyInfoSource::DerEncodedKeyValue(right_spki));
-        policy.resources.max_key_candidates = 3;
-        assert!(
-            select_store_signing_key(
-                &inventory,
-                ["wrong-a", "wrong-b", "right"],
-                SignatureAlgorithm::RsaSha256,
-                Some(&info),
-                &policy,
-                true,
-                default_provider(),
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn strict_store_signing_requires_template_key_name() {
-        // A singleton store must not silently authorize an unnamed template.
-        let temp = tempfile::tempdir().expect("temporary signing template");
-        let template = temp.path().join("unsigned.xml");
-        fs::write(
-            &template,
-            br#"<Signature xmlns="http://www.w3.org/2000/09/xmldsig#"><SignedInfo><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><Reference URI=""><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><DigestValue/></Reference></SignedInfo><SignatureValue/></Signature>"#,
-        )
-        .expect("write template");
-        let template = template.to_str().expect("UTF-8 path");
-        let store = temp.path().join("keys.xml");
-        fs::write(
-            &store,
-            br#"<Keys xmlns="http://www.aleksey.com/xmlsec/2002"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyName>only-key</KeyName><KeyValue><HMACKeyValue xmlns="http://www.aleksey.com/xmlsec/2002">c2VjcmV0</HMACKeyValue></KeyValue></KeyInfo></Keys>"#,
-        )
-        .expect("write singleton store");
-        let store = store.to_str().expect("UTF-8 path");
-        let strict = invocation(&["xmlsec1", "sign", "--keys-file", store, template]);
-        let error = sign(&strict, &mut Vec::new()).expect_err("strict mode requires KeyName");
-        assert!(
-            error.to_string().contains("requires a template KeyName"),
-            "{error}"
-        );
-        let lax = invocation(&[
-            "xmlsec1",
-            "sign",
-            "--lax-key-search",
-            "--keys-file",
-            store,
-            template,
-        ]);
-        let mut signed = Vec::new();
-        sign(&lax, &mut signed).expect("lax mode may select the unnamed singleton");
-        assert!(String::from_utf8_lossy(&signed).contains("DigestValue"));
-    }
-
-    #[test]
-    fn pkcs12_signing_ignores_unrelated_ca_certificate() {
-        // A CA-only bundle still provides its private signing key, without a leaf writer.
-        let bundle = base64::engine::general_purpose::STANDARD
-            .decode(
-                include_str!("../../../tests/fixtures/keys/pkcs12/rsa-key-unrelated-ca.p12.b64")
-                    .trim(),
-            )
-            .unwrap();
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("key.p12");
-        fs::write(&path, bundle).unwrap();
-        let parsed = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("sign"),
-            OsString::from("--pkcs12"),
-            path.into_os_string(),
-            OsString::from("template.xml"),
-        ])
-        .unwrap();
-        let option = parsed.values("pkcs12").next().unwrap();
-        let mut budget = ExternalMaterialBudget::new(usize::MAX);
-        let candidate = prepare_signing_key_candidate(
-            option,
-            SignatureAlgorithm::RsaSha256,
-            &SigningPolicy::default(),
-            Some(b"secret"),
-            &mut budget,
-            default_provider(),
-        )
-        .unwrap();
-        assert!(candidate.certificate_writer.is_none());
-        assert!(candidate.leaf_certificate_der.is_none());
-    }
-
-    struct CountingVerificationKey {
-        accepts: bool,
-        calls: Rc<Cell<usize>>,
-    }
-
-    impl VerifyingKey for CountingVerificationKey {
-        fn verify(
-            &self,
-            _algorithm: SignatureAlgorithm,
-            _signed_data: &[u8],
-            _signature_value: &[u8],
-        ) -> Result<bool, DsigError> {
-            self.calls.set(self.calls.get() + 1);
-            Ok(self.accepts)
-        }
-    }
-
-    struct FailingVerificationKey {
-        reason: &'static str,
-    }
-
-    impl VerifyingKey for FailingVerificationKey {
-        fn verify(
-            &self,
-            _algorithm: SignatureAlgorithm,
-            _signed_data: &[u8],
-            _signature_value: &[u8],
-        ) -> Result<bool, DsigError> {
-            Err(DsigError::InvalidStructure {
-                reason: self.reason,
-            })
-        }
-    }
-
-    #[test]
-    fn candidate_verifier_preserves_mismatch_and_error_precedence() {
-        // A definitive cryptographic mismatch outranks provider errors, while
-        // an all-error candidate set reports the final attempted provider.
-        let mismatch_then_error = CandidateVerifyingKey {
-            candidates: vec![
-                Box::new(CountingVerificationKey {
-                    accepts: false,
-                    calls: Rc::new(Cell::new(0)),
-                }),
-                Box::new(FailingVerificationKey { reason: "last" }),
-            ],
-        };
-        assert!(matches!(
-            mismatch_then_error.verify(SignatureAlgorithm::RsaSha256, b"data", b"signature"),
-            Ok(false)
-        ));
-
-        let errors = CandidateVerifyingKey {
-            candidates: vec![
-                Box::new(FailingVerificationKey { reason: "first" }),
-                Box::new(FailingVerificationKey { reason: "last" }),
-            ],
-        };
-        assert!(matches!(
-            errors.verify(SignatureAlgorithm::RsaSha256, b"data", b"signature"),
-            Err(DsigError::InvalidStructure { reason: "last" })
-        ));
-    }
-
-    #[test]
-    fn candidate_verifier_retries_only_the_signature_primitive() {
-        // The outer VerifyContext sees one verifier, so XML parsing, Reference
-        // transforms and SignedInfo C14N are not repeated per candidate.
-        let first_calls = Rc::new(Cell::new(0));
-        let second_calls = Rc::new(Cell::new(0));
-        let candidates = CandidateVerifyingKey {
-            candidates: vec![
-                Box::new(CountingVerificationKey {
-                    accepts: false,
-                    calls: Rc::clone(&first_calls),
-                }),
-                Box::new(CountingVerificationKey {
-                    accepts: true,
-                    calls: Rc::clone(&second_calls),
-                }),
-            ],
-        };
-        let xml = fs::read_to_string(testdata("enveloping-sha256-rsa-sha256.xml")).unwrap();
-
-        let result = VerifyContext::new()
-            .key(&candidates)
-            .first_document_signature()
-            .verify(&xml)
-            .unwrap();
-        assert_eq!(result.status, DsigStatus::Valid);
-        assert_eq!(first_calls.get(), 1);
-        assert_eq!(second_calls.get(), 1);
-    }
-
-    #[test]
-    fn stored_verification_sources_share_candidate_budget() {
-        // Lax search must not reset source-inspection work per imported entry,
-        // or swallow the denial because an earlier candidate resolved.
-        let mut info = KeyInfo::default();
-        info.sources = vec![
-            KeyInfoSource::KeyName("first".into()),
-            KeyInfoSource::KeyValue(KeyValueInfo::Unsupported {
-                namespace: None,
-                local_name: "unsupported".into(),
-            }),
-        ];
-        let mut inventory = KeyInventory::default();
-        inventory
-            .add_public_pem(
-                "valid".into(),
-                include_bytes!("../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
-                &ResourcePolicy::default(),
-            )
-            .unwrap();
-        let valid = inventory.public_keys()[0].key_info.clone();
-        for info in [info, valid] {
-            let resolver = CandidateVerificationResolver::new(
-                vec![
-                    ExplicitVerificationCandidate::Certificate(info.clone()),
-                    ExplicitVerificationCandidate::Certificate(info),
-                ],
-                ConfiguredCertificates::default(),
-                true,
-                false,
-            );
-            let mut policy = VerificationPolicy::default();
-            policy.resources.max_key_candidates = 3;
-            assert!(matches!(resolver.resolve_with_policy_and_provider(None,
-            SignatureAlgorithm::RsaSha256, &policy, default_provider()),
-            Err(DsigError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource, maximum: 3, ..
-            })) if resource == "key candidates"));
-            policy.resources.max_key_candidates = 4;
-            assert!(
-                resolver
-                    .resolve_with_policy_and_provider(
-                        None,
-                        SignatureAlgorithm::RsaSha256,
-                        &policy,
-                        default_provider()
-                    )
-                    .is_ok()
-            );
-        }
-    }
-
-    #[test]
-    fn verification_candidate_collection_obeys_trust_budget() {
-        // Lax lookup must not turn caller-provided key files into unbounded
-        // public-key verification attempts.
-        let candidate = VerificationKey {
-            algorithm: SignatureAlgorithm::RsaSha256,
-            public_key_bytes: Vec::new(),
-            certificate_der: None,
-            name: None,
-        };
-        let mut policy = VerificationPolicy::default();
-        policy.key_trust.max_x509_candidate_paths = 1;
-        let resolver = CandidateVerificationResolver::new(
-            vec![
-                ExplicitVerificationCandidate::Direct(candidate.clone()),
-                ExplicitVerificationCandidate::Direct(candidate),
-            ],
-            ConfiguredCertificates::default(),
-            true,
-            false,
-        );
-
-        let error = match resolver.resolve_with_policy_and_provider(
-            None,
-            SignatureAlgorithm::RsaSha256,
-            &policy,
-            default_provider(),
-        ) {
-            Err(error) => error,
-            Ok(_) => panic!("candidate count above policy must fail closed"),
-        };
-        assert!(matches!(
-            error,
-            DsigError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "verification key candidates",
-                maximum: 1,
-                actual: 2,
-            })
-        ));
-    }
-
-    #[test]
-    fn raw_recipient_key_is_charged_before_decode() {
-        // Raw keys and certificates share one invocation budget; bytes must be
-        // charged before an asymmetric format decoder receives them.
-        let path = testdata("rsa-2048-cert.pem");
-        let mut budget = ExternalMaterialBudget::new(1);
-        let error = load_rsa_recipient_candidate(
-            path.as_os_str(),
-            RecipientPublicKeySource::Public(key_material::PublicKeyEncoding::Pem),
-            &EncryptionPolicy::default(),
-            &mut budget,
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            CommandError::ExternalMaterialTooLarge { maximum: 1 }
-        ));
-    }
-
-    #[test]
-    fn certificate_recipient_key_is_charged_before_decode() {
-        // Aggregate source accounting must reject certificate bytes before PEM
-        // or X.509 parsing, just as it does for raw public-key candidates.
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("malformed.pem");
-        fs::write(&path, b"xx").unwrap();
-        let mut budget = ExternalMaterialBudget::new(1);
-
-        let error = load_rsa_recipient_candidate(
-            path.as_os_str(),
-            RecipientPublicKeySource::Certificate(key_material::CertificateEncoding::Pem),
-            &EncryptionPolicy::default(),
-            &mut budget,
-        )
-        .unwrap_err();
-
-        assert!(matches!(
-            error,
-            CommandError::ExternalMaterialTooLarge { maximum: 1 }
-        ));
-    }
-
-    #[test]
-    fn capability_checks_reject_unknown_names() {
-        let mut output = Vec::new();
-        assert!(
-            execute(
-                invocation(&["xmlsec1", "check-transforms", "c14n", "rsa-sha256"]),
-                &mut output,
-                &mut Vec::new()
-            )
-            .is_ok()
-        );
-        assert!(matches!(
-            execute(
-                invocation(&["xmlsec1", "check-transforms", "unknown-transform"]),
-                &mut output,
-                &mut Vec::new()
-            ),
-            Err(CommandError::CapabilityUnavailable)
-        ));
-        assert_eq!(
-            execute(
-                invocation(&["xmlsec1", "check-transforms", "xslt"]),
-                &mut output,
-                &mut Vec::new()
-            )
-            .is_ok(),
-            cfg!(feature = "xslt")
-        );
-    }
-
-    #[test]
-    fn unsupported_provider_never_falls_back() {
-        let error = execute(
-            invocation(&["xmlsec1", "version", "--crypto", "openssl"]),
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert!(matches!(error, CommandError::UnsupportedProvider(_)));
-    }
-
-    #[test]
-    fn xml_backend_selector_is_strict_and_build_aware() {
-        // Runtime selection must neither accept unknown names nor fall back
-        // when a thin binary does not contain the requested implementation.
-        let invalid = invocation(&["xmlsec1", "verify", "--xml-backend", "libxml2", "input.xml"]);
-        assert!(matches!(
-            selected_xml_backend(&invalid),
-            Err(CommandError::UnsupportedXmlBackend(name)) if name == "libxml2"
-        ));
-
-        for (name, backend) in [
-            ("xmloxide", XmlBackend::Xmloxide),
-            ("roxmltree", XmlBackend::Roxmltree),
-            ("differential", XmlBackend::Differential),
-        ] {
-            let invocation = invocation(&["xmlsec1", "verify", "--xml-backend", name, "input.xml"]);
-            let selected = selected_xml_backend(&invocation);
-            if backend.is_available() {
-                assert_eq!(selected.unwrap(), backend);
-            } else {
-                assert!(matches!(
-                    selected,
-                    Err(CommandError::UnavailableXmlBackend(rejected)) if rejected == name
-                ));
-            }
-        }
-    }
-
-    #[test]
-    fn command_help_is_an_action_and_semantic_no_ops_fail_closed() {
-        let mut output = Vec::new();
-        execute(
-            invocation(&["xmlsec1", "verify", "--help"]),
-            &mut output,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        let help = String::from_utf8(output).unwrap();
-        assert!(help.starts_with("Usage: xmlsec1 verify"));
-        assert!(help.contains("--pubkey-cert-pem"));
-        assert!(!help.contains("--binary-data"));
-
-        let mut command = Vec::new();
-        execute(
-            invocation(&["xmlsec1", "help-encrypt"]),
-            &mut command,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        let command = String::from_utf8(command).unwrap();
-        assert!(command.contains("Usage: xmlsec1 encrypt"));
-        assert!(command.contains("--binary-data"));
-        assert!(!command.contains("Usage: xmlsec1 decrypt"));
-
-        let error = execute(
-            invocation(&["xmlsec1", "verify", "--lax-key-search", "input.xml"]),
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )
-        .unwrap_err();
-        assert!(matches!(error, CommandError::UnsupportedOption(_)));
-    }
-
-    #[test]
-    fn compatibility_verification_uses_libxmlsec_here_semantics() {
-        // The CLI compatibility boundary must verify the same node set as the
-        // donor when an XPath transform uses its non-standard here() binding.
-        let policy = xmlsec_compatibility_verification_policy(&invocation(&[
-            "xmlsec1",
-            "verify",
-            "input.xml",
-        ]));
-        // Every tuple is authorized by the profile before any XML is parsed.
-        for salt_len in [0, 17, 32, 64] {
-            let method = SignatureAlgorithm::RsaPss(xml_sec::xmldsig::RsaPssParameters {
-                digest: DigestAlgorithm::Sha256,
-                mgf_digest: DigestAlgorithm::Sha1,
-                salt_len,
-            });
-            assert!(policy.check_signature_algorithm(method).is_ok());
-            assert!(
-                !policy
-                    .key_trust
-                    .allowed_legacy_signature_algorithms
-                    .contains(&method)
-            );
-        }
-        assert_eq!(
-            policy.transforms.xpath_here_semantics,
-            xml_sec::xmldsig::XPathHereSemantics::XmlSecLegacy
-        );
-        assert_eq!(
-            policy.transforms.opc_relationship_edition,
-            xml_sec::policy::OpcRelationshipEdition::Ecma2012
-        );
-        assert_eq!(policy.key_trust.dsa_keys.minimum_modulus_bits, 1024);
-        assert_eq!(policy.hmac.minimum_key_bits, 40);
-        assert_eq!(policy.uris.key_info_references, UriTypeSet::SAME_DOCUMENT);
-    }
-
-    #[test]
-    fn openssl_compatibility_strict_check_flag_does_not_weaken_trust_policy() {
-        // The pinned donor uses OpenSSL, where this backend-specific flag is a
-        // no-op; accepting it must not disable Rust certificate/path checks.
-        let baseline = xmlsec_compatibility_verification_policy(&invocation(&[
-            "xmlsec1",
-            "verify",
-            "input.xml",
-        ]));
-        let skipped = xmlsec_compatibility_verification_policy(&invocation(&[
-            "xmlsec1",
-            "verify",
-            "--X509-skip-strict-checks",
-            "input.xml",
-        ]));
-
-        assert_eq!(skipped.key_trust, baseline.key_trust);
-        assert_eq!(skipped.signature_algorithms, baseline.signature_algorithms);
-        assert_eq!(skipped.digest_algorithms, baseline.digest_algorithms);
-        assert_eq!(skipped.transforms, baseline.transforms);
-    }
-
-    #[test]
-    fn help_all_enumerates_the_registered_surface() {
-        let mut output = Vec::new();
-        execute(
-            invocation(&["xmlsec1", "help-all"]),
-            &mut output,
-            &mut Vec::new(),
-        )
-        .unwrap();
-        let help = String::from_utf8(output).unwrap();
-        for command in Command::ALL {
-            assert!(
-                help.contains(command.canonical_name()),
-                "missing command {}",
-                command.canonical_name()
-            );
-            if command_contract(*command).is_some() {
-                let mut command_output = Vec::new();
-                command_help(*command, &mut command_output).unwrap();
-                assert!(
-                    String::from_utf8(command_output)
-                        .unwrap()
-                        .starts_with(&format!("Usage: xmlsec1 {}", command.canonical_name()))
-                );
-            }
-        }
-        assert!(!help.contains("sign-tmpl"));
-        for option in OPTION_SPECS {
-            assert!(
-                help.contains(&format!("--{}", option.canonical)),
-                "missing option --{}",
-                option.canonical
-            );
-        }
-        assert!(help.contains("--gen-key[:name] <value>"));
-        assert!(help.contains("--insecure\n"));
-    }
-
-    #[test]
-    fn injected_key_info_carries_alternate_prefix_bindings() {
-        // Extracting a subtree must preserve namespace bindings inherited from
-        // the generated EncryptedData root, regardless of the chosen prefixes.
-        let template = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
-        );
-        let generated = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\" xmlns:n=\"http://www.w3.org/2009/xmlenc11#\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo><e:EncryptedKey><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"><n:MGF Algorithm=\"http://www.w3.org/2009/xmlenc11#mgf1sha256\"/></e:EncryptionMethod><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
-        );
-
-        let rendered = apply_encryption_template(
-            &template,
-            &generated,
-            None,
-            &[],
-            &EncryptionPolicy::default(),
-            XmlBackend::default(),
-        )
-        .unwrap();
-        let document = Document::parse(&rendered)
-            .expect("injected KeyInfo prefixes must remain namespace-bound");
-        assert!(
-            document
-                .descendants()
-                .any(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-        );
-        assert!(
-            document
-                .descendants()
-                .any(|node| node.has_tag_name(("http://www.w3.org/2009/xmlenc11#", "MGF")))
-        );
-    }
-
-    #[cfg(feature = "experimental-pq")]
-    fn kem_template(mechanism_info: &str, outer_info: &str, sibling: &str) -> String {
-        format!(
-            "<root xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\" xmlns:k=\"{}\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo>{outer_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo>{mechanism_info}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></k:EncapsulationMechanism></d:KeyInfo>{sibling}</root>",
-            xml_sec::key_establishment::ENCAPSULATION_NS,
-            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
-        )
-    }
-
-    #[test]
-    #[cfg(feature = "experimental-pq")]
-    fn kem_recipient_options_fail_before_key_io() {
-        // Missing or unsupported sources are usage errors, not KeyName ambiguity.
-        for (command, option, expected) in [
-            ("encrypt", None, "requires a recipient"),
-            (
-                "encrypt",
-                Some("pubkey-cert-pem"),
-                "--pubkey-cert-pem is inapplicable",
-            ),
-            ("decrypt", None, "requires a recipient"),
-            ("decrypt", Some("pkcs12"), "--pkcs12 is inapplicable"),
-        ] {
-            let mut args = vec![OsString::from("xmlsec1"), OsString::from(command)];
-            if let Some(option) = option {
-                args.push(OsString::from(format!("--{option}")));
-                args.push(OsString::from("missing-recipient-file"));
-            }
-            let invocation = Invocation::parse(args).unwrap();
-            let policy = xmlsec_compatibility_encryption_policy();
-            let mut budget =
-                ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes);
-            let names = ["recipient"];
-            let algorithm = xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512;
-            let error = if command == "encrypt" {
-                select_encapsulation_key(
-                    &invocation,
-                    &names,
-                    algorithm,
-                    &policy.key_establishment,
-                    &policy,
-                    XmlBackend::default(),
-                    &mut budget,
-                )
-                .err()
-                .unwrap()
-            } else {
-                select_decapsulation_key(
-                    &invocation,
-                    &names,
-                    algorithm,
-                    &policy.key_establishment,
-                    &policy,
-                    &mut budget,
-                )
-                .err()
-                .unwrap()
-            };
-            assert!(matches!(error, CommandError::Usage(_)), "{error}");
-            assert!(error.to_string().contains(expected), "{error}");
-            assert!(error.to_string().contains(command), "{error}");
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "experimental-pq")]
-    fn kem_template_rejects_unexecuted_nested_recipient() {
-        // Ordinary AES wrapping cannot preserve an unexecuted KEM instruction.
-        let template = kem_template("<d:KeyName>wanted</d:KeyName>", "", "");
-        let document = Document::parse(&template).unwrap();
-        let mechanism = document
-            .descendants()
-            .find(|node| {
-                node.has_tag_name((
-                    xml_sec::key_establishment::ENCAPSULATION_NS,
-                    "EncapsulationMechanism",
-                ))
-            })
-            .unwrap();
-        let nested = format!(
-            "<x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo>{}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedKey>",
-            &template[mechanism.range()]
-        );
-        for recipient in [
-            &nested,
-            &format!(
-                "<x:EncryptedKey><x:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/><d:KeyInfo>{nested}</d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedKey>"
-            ),
-        ] {
-            let input = template.replacen(
-                "<d:KeyInfo></d:KeyInfo>",
-                &format!("<d:KeyInfo>{recipient}</d:KeyInfo>"),
-                1,
-            );
-            let error = encryption_template(
-                &input,
-                Some("data"),
-                &[],
-                &xmlsec_compatibility_encryption_policy(),
-                XmlBackend::default(),
-            )
-            .err()
-            .expect("unexecuted mechanism must be rejected");
-            assert!(
-                error.to_string().contains("nested EncapsulationMechanism"),
-                "{error}"
-            );
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "experimental-pq")]
-    fn kem_template_resolves_inner_recipient_references() {
-        // A recipient name referenced inside the mechanism must reach selection.
-        let template = kem_template(
-            "<i:KeyInfoReference URI=\"#recipient\"/>",
-            "<i:KeyInfoReference URI=\"#mechanism\"/>",
-            "<d:KeyInfo Id=\"recipient\"><d:KeyName>wanted</d:KeyName></d:KeyInfo>",
-        );
-        let metadata = encryption_template(
-            &template,
-            Some("data"),
-            &[],
-            &xmlsec_compatibility_encryption_policy(),
-            XmlBackend::default(),
-        )
-        .unwrap();
-        assert_eq!(metadata.encapsulation.unwrap().1, ["wanted"]);
-        for invalid in [
-            template.replace("URI=\"#recipient\"", "URI=\"#absent\""),
-            template.replace(
-                "<d:KeyName>wanted</d:KeyName>",
-                "<i:KeyInfoReference URI=\"#mechanism\"/>",
-            ),
-        ] {
-            assert!(
-                encryption_template(
-                    &invalid,
-                    Some("data"),
-                    &[],
-                    &xmlsec_compatibility_encryption_policy(),
-                    XmlBackend::default()
-                )
-                .is_err()
-            );
-        }
-        let custom = template.replace("Id=\"recipient\"", "custom=\"recipient\"");
-        assert!(
-            encryption_template(
-                &custom,
-                Some("data"),
-                &[],
-                &xmlsec_compatibility_encryption_policy(),
-                XmlBackend::default()
-            )
-            .is_err()
-        );
-        let metadata = encryption_template(
-            &custom,
-            Some("data"),
-            &[IdAttributeRegistration::global("custom")],
-            &xmlsec_compatibility_encryption_policy(),
-            XmlBackend::default(),
-        )
-        .unwrap();
-        assert_eq!(metadata.encapsulation.unwrap().1, ["wanted"]);
-    }
-
-    #[test]
-    #[cfg(feature = "experimental-pq")]
-    fn kem_template_updates_referenced_cipher_value() {
-        // Mutate the original referenced mechanism, not a new inline duplicate.
-        use base64::Engine as _;
-        let template = kem_template(
-            "<d:KeyName>wanted</d:KeyName>",
-            "<i:KeyInfoReference URI=\"#mechanism\"/>",
-            "",
-        );
-        let ciphertext = base64::engine::general_purpose::STANDARD.encode([7; 768]);
-        let generated = format!(
-            "<x:EncryptedData xmlns:x=\"{XMLENC_NS}\" xmlns:d=\"{XMLDSIG_NS}\" xmlns:k=\"{}\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo><d:KeyName>wanted</d:KeyName></d:KeyInfo><x:CipherData><x:CipherValue>{ciphertext}</x:CipherValue></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><x:CipherData><x:CipherValue>AA==</x:CipherValue></x:CipherData></x:EncryptedData>",
-            xml_sec::key_establishment::ENCAPSULATION_NS,
-            xml_sec::provider::KeyEncapsulationAlgorithm::MlKem512.uri(),
-        );
-        let rendered = apply_encryption_template(
-            &template,
-            &generated,
-            Some("data"),
-            &[],
-            &xmlsec_compatibility_encryption_policy(),
-            XmlBackend::default(),
-        )
-        .unwrap();
-        let document = Document::parse(&rendered).unwrap();
-        let mechanisms: Vec<_> = document
-            .descendants()
-            .filter(|node| {
-                node.has_tag_name((
-                    xml_sec::key_establishment::ENCAPSULATION_NS,
-                    "EncapsulationMechanism",
-                ))
-            })
-            .collect();
-        assert_eq!(mechanisms.len(), 1);
-        assert_eq!(
-            required_cipher_value(mechanisms[0], "mechanism")
-                .unwrap()
-                .text(),
-            Some(ciphertext.as_str())
-        );
-    }
-
-    #[test]
-    fn generated_recipient_expands_an_empty_key_info_placeholder() {
-        // An empty KeyInfo reserves the schema position but not an EncryptedKey
-        // skeleton; generated recipient metadata must expand it in place.
-        let template = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo/><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
-        );
-        let generated = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
-        );
-
-        let rendered = apply_encryption_template(
-            &template,
-            &generated,
-            None,
-            &[],
-            &EncryptionPolicy::default(),
-            XmlBackend::default(),
-        )
-        .expect("empty KeyInfo must accept a generated recipient");
-        let document = Document::parse(&rendered).expect("merged output must parse");
-
-        assert_eq!(
-            document
-                .descendants()
-                .filter(|node| node.has_tag_name((XMLENC_NS, "EncryptedKey")))
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn generated_recipient_replaces_a_split_stale_key_name() {
-        // A comment may split direct KeyName text without changing its value.
-        // Comparing only the first text child would retain the stale name.
-        let template = format!(
-            "<e:EncryptedKey xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><s:KeyName>valid<!-- split -->-old</s:KeyName></s:KeyInfo><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedKey>"
-        );
-        let generated = format!(
-            "<e:EncryptedKey xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><s:KeyName>valid</s:KeyName></s:KeyInfo><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey>"
-        );
-        let template_doc = Document::parse(&template).expect("template parses");
-        let generated_doc = Document::parse(&generated).expect("generated key parses");
-        let replacement = merge_generated_recipient_key_name(
-            &template,
-            template_doc.root_element(),
-            &generated,
-            generated_doc.root_element(),
-        )
-        .expect("recipient name merge succeeds")
-        .expect("the stale full name must be replaced");
-        let rendered = format!(
-            "{}{}{}",
-            &template[..replacement.0.start],
-            replacement.1,
-            &template[replacement.0.end..]
-        );
-        let document = Document::parse(&rendered).expect("replacement parses");
-        let key_name = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
-            .expect("recipient name remains present");
-        assert_eq!(direct_simple_text(key_name, "KeyName").unwrap(), "valid");
-    }
-
-    #[test]
-    fn recipient_merge_keeps_parent_and_nested_insertions_disjoint() {
-        // Outer key metadata, nested recipient identity, and ciphertext can all
-        // be generated in one pass; their edits must not replace overlapping XML.
-        let template = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><e:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><s:KeyInfo><e:EncryptedKey><s:KeyInfo/><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
-        );
-        let generated = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><s:KeyName>outer</s:KeyName><e:EncryptedKey><s:KeyInfo><s:KeyName>recipient</s:KeyName></s:KeyInfo><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
-        );
-
-        let rendered = apply_encryption_template(
-            &template,
-            &generated,
-            None,
-            &[],
-            &EncryptionPolicy::default(),
-            XmlBackend::default(),
-        )
-        .expect("all generated key metadata must merge without overlapping edits");
-        let document = Document::parse(&rendered).expect("merged output must remain XML");
-        let outer_key_info = document
-            .descendants()
-            .find(|node| {
-                node.has_tag_name((XMLDSIG_NS, "KeyInfo"))
-                    && node
-                        .parent()
-                        .is_some_and(|parent| parent.has_tag_name((XMLENC_NS, "EncryptedData")))
-            })
-            .expect("outer KeyInfo");
-        assert_eq!(
-            direct_child_element(outer_key_info, XMLDSIG_NS, "KeyName")
-                .and_then(|node| node.text()),
-            Some("outer")
-        );
-        let encrypted_key = direct_child_element(outer_key_info, XMLENC_NS, "EncryptedKey")
-            .expect("generated recipient");
-        let recipient_key_info =
-            direct_child_element(encrypted_key, XMLDSIG_NS, "KeyInfo").expect("recipient KeyInfo");
-        assert_eq!(
-            direct_child_element(recipient_key_info, XMLDSIG_NS, "KeyName")
-                .and_then(|node| node.text()),
-            Some("recipient")
-        );
-        let values = document
-            .descendants()
-            .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
-            .filter_map(|node| node.text())
-            .collect::<Vec<_>>();
-        assert_eq!(values, ["a2V5", "ZGF0YQ=="]);
-    }
-
-    #[test]
-    fn encryption_template_preserves_cipher_value_metadata() {
-        // CipherValue is caller-owned: replacing ciphertext must preserve its
-        // prefixes, namespace declarations, and extension attributes.
-        let template = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\" xmlns:x=\"urn:ext\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue x:kind=\"wrapped\">old</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue x:kind=\"content\"/></e:CipherData></e:EncryptedData>"
-        );
-        let generated = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
-        );
-
-        let rendered = apply_encryption_template(
-            &template,
-            &generated,
-            None,
-            &[],
-            &EncryptionPolicy::default(),
-            XmlBackend::default(),
-        )
-        .expect("CipherValue payload replacement must preserve template metadata");
-        let document = Document::parse(&rendered).unwrap();
-        let values = document
-            .descendants()
-            .filter(|node| node.has_tag_name((XMLENC_NS, "CipherValue")))
-            .map(|node| (node.attribute(("urn:ext", "kind")), node.text()))
-            .collect::<Vec<_>>();
-        assert_eq!(
-            values,
-            vec![
-                (Some("wrapped"), Some("a2V5")),
-                (Some("content"), Some("ZGF0YQ=="))
-            ]
-        );
-    }
-
-    #[test]
-    fn encrypted_data_selection_uses_the_first_descendant() {
-        // libxmlsec1 starts a depth-first search at the operation root and
-        // does not impose global EncryptedData cardinality on that subtree.
-        let xml = format!(
-            "<root><group Id=\"selected\"><xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" Id=\"first\"/><xenc:EncryptedData xmlns:xenc=\"{XMLENC_NS}\" Id=\"second\"/></group></root>"
-        );
-        let document = Document::parse(&xml).unwrap();
-
-        let selected = select_encrypted_data(&document, None, &[])
-            .expect("the first document descendant must be selected");
-        assert_eq!(selected.attribute("Id"), Some("first"));
-
-        let selected = select_encrypted_data(&document, Some("selected"), &[])
-            .expect("the first operation-subtree descendant must be selected");
-        assert_eq!(selected.attribute("Id"), Some("first"));
-    }
-
-    #[test]
-    fn merged_encryption_template_obeys_the_aggregate_node_ceiling() {
-        // Template and generated output cross the trust boundary separately,
-        // but the returned document must also fit the same operation policy.
-        let extras = "<extra/>".repeat(24);
-        let template = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\">{extras}<e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
-        );
-        let generated = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
-        );
-        let individual_node_ceiling = [template.as_str(), generated.as_str()]
-            .into_iter()
-            .map(|xml| Document::parse(xml).unwrap().descendants().count())
-            .max()
-            .unwrap();
-        let policy = EncryptionPolicy {
-            resources: xml_sec::policy::ResourcePolicy {
-                max_xml_nodes: individual_node_ceiling,
-                ..xml_sec::policy::ResourcePolicy::default()
-            },
-            ..EncryptionPolicy::default()
-        };
-
-        let error = apply_encryption_template(
-            &template,
-            &generated,
-            None,
-            &[],
-            &policy,
-            XmlBackend::default(),
-        )
-        .expect_err("the aggregate merged document must be reparsed under policy");
-        assert!(error.to_string().contains("nodes limit"), "{error}");
-    }
-
-    #[test]
-    fn merged_encryption_template_checks_bytes_before_reparsing() {
-        // Both inputs fit independently, but adding generated recipient data to
-        // the padded template crosses the document ceiling before a merged DOM
-        // may be allocated.
-        let padding = "x".repeat(256);
-        let template = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" padding=\"{padding}\"><e:CipherData><e:CipherValue/></e:CipherData></e:EncryptedData>"
-        );
-        let generated = format!(
-            "<e:EncryptedData xmlns:e=\"{XMLENC_NS}\" xmlns:s=\"{XMLDSIG_NS}\"><s:KeyInfo><e:EncryptedKey><e:CipherData><e:CipherValue>a2V5</e:CipherValue></e:CipherData></e:EncryptedKey></s:KeyInfo><e:CipherData><e:CipherValue>ZGF0YQ==</e:CipherValue></e:CipherData></e:EncryptedData>"
-        );
-        let maximum = template.len().max(generated.len());
-        let policy = EncryptionPolicy {
-            resources: xml_sec::policy::ResourcePolicy {
-                max_xml_document_bytes: maximum,
-                ..xml_sec::policy::ResourcePolicy::default()
-            },
-            ..EncryptionPolicy::default()
-        };
-
-        let error = apply_encryption_template(
-            &template,
-            &generated,
-            None,
-            &[],
-            &policy,
-            XmlBackend::default(),
-        )
-        .expect_err("merged output must be bounded before reparsing");
-        assert!(
-            matches!(&error, CommandError::Encryption(message) if message.contains("encrypted template output exceeds XML document policy")),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn input_reader_enforces_the_compiled_policy_limit_before_parsing() {
-        // The reader must stop at maximum + 1 rather than allocating an entire
-        // attacker-controlled XML file before the operation policy sees it.
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("oversized.xml");
-        fs::write(&path, b"<root/>").unwrap();
-        let invocation = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("verify"),
-            path.into_os_string(),
-        ])
-        .unwrap();
-        assert!(matches!(
-            read_input(&invocation, 4),
-            Err(CommandError::InputTooLarge { maximum: 4 })
-        ));
-    }
-
-    #[test]
-    fn xml_readers_classify_decoded_expansion_as_input_too_large() {
-        // A declared single-byte document may fit the raw-byte gate but expand after decoding.
-        // Both CLI XML readers must preserve that second boundary as InputTooLarge.
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("expanded.xml");
-        let bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>\xe9\xe9</root>";
-        fs::write(&path, bytes).unwrap();
-        let invocation = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("verify"),
-            path.clone().into_os_string(),
-        ])
-        .unwrap();
-
-        assert!(matches!(
-            read_input(&invocation, bytes.len()),
-            Err(CommandError::InputTooLarge { maximum }) if maximum == bytes.len()
-        ));
-        assert!(matches!(
-            read_xml_data(path.as_os_str(), bytes.len()),
-            Err(CommandError::InputTooLarge { maximum }) if maximum == bytes.len()
-        ));
-    }
-
-    #[test]
-    fn encryption_template_inspection_enforces_the_xml_node_ceiling() {
-        // CLI metadata discovery runs before the core builder, so it must reject
-        // over-budget templates instead of constructing an unrestricted DOM.
-        let mut xml = format!(
-            "<EncryptedData xmlns=\"{XMLENC_NS}\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><CipherData><CipherValue/></CipherData>"
-        );
-        for _ in 0..100_000 {
-            xml.push_str("<Extension/>");
-        }
-        xml.push_str("</EncryptedData>");
-
-        let error = match encryption_template(
-            &xml,
-            None,
-            &[],
-            &EncryptionPolicy::default(),
-            XmlBackend::default(),
-        ) {
-            Ok(_) => panic!("over-budget template must fail"),
-            Err(error) => error,
-        };
-        assert!(
-            matches!(&error, CommandError::Encryption(message) if message.contains("nodes limit")),
-            "expected the parser node ceiling, got: {error}"
-        );
-    }
-
-    #[test]
-    fn plaintext_reader_enforces_the_compiled_policy_limit_before_encryption() {
-        // Payload limits must be enforced by the reader, before the encryption
-        // builder receives an attacker-controlled allocation.
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("oversized.bin");
-        fs::write(&path, b"12345").unwrap();
-        assert!(matches!(
-            read_plaintext(path.as_os_str(), 4),
-            Err(CommandError::PlaintextTooLarge { maximum: 4 })
-        ));
-    }
-
-    #[test]
-    fn configured_certificates_are_deduplicated_and_aggregate_bounded() {
-        // Repeated CLI options must not multiply retained DER, while distinct
-        // trust material must be rejected before crossing the compiled total.
-        let mut certificates = Vec::new();
-        let mut budget = ExternalMaterialBudget::new(5);
-        budget.charge(2).unwrap();
-        push_configured_certificate(&mut certificates, vec![1, 2]);
-        budget.charge(2).unwrap();
-        push_configured_certificate(&mut certificates, vec![1, 2]);
-        assert_eq!(certificates, [vec![1, 2]]);
-        assert_eq!(budget.total_bytes, 4);
-
-        assert!(matches!(
-            budget.charge(2),
-            Err(CommandError::ExternalMaterialTooLarge { maximum: 5 })
-        ));
-        assert_eq!(certificates, [vec![1, 2]]);
-        assert_eq!(budget.total_bytes, 4);
-
-        assert!(matches!(
-            budget.charge(2),
-            Err(CommandError::ExternalMaterialTooLarge { maximum: 5 })
-        ));
-        assert_eq!(budget.total_bytes, 4);
-    }
-
-    #[test]
-    fn signing_key_source_is_charged_before_private_key_decoding() {
-        // Aggregate source limits must stop a candidate before malformed key
-        // bytes reach the comparatively expensive private-key decoders.
-        let temp = tempfile::tempdir().unwrap();
-        let key_path = temp.path().join("malformed.pem");
-        fs::write(&key_path, b"xx").unwrap();
-        let parsed = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("sign"),
-            OsString::from("--privkey-pem"),
-            key_path.into_os_string(),
-            OsString::from("template.xml"),
-        ])
-        .unwrap();
-        let option = parsed.values("privkey-pem").next().unwrap();
-        let mut budget = ExternalMaterialBudget::new(1);
-
-        assert!(matches!(
-            prepare_signing_key_candidate(
-                option,
-                SignatureAlgorithm::RsaSha256,
-                &SigningPolicy::default(),
-                None,
-                &mut budget,
-                default_provider(),
-            ),
-            Err(CommandError::ExternalMaterialTooLarge { maximum: 1 })
-        ));
-    }
-
-    #[test]
-    fn lax_signing_propagates_aggregate_material_exhaustion() {
-        // A malformed candidate is recoverable in lax mode, but a later source
-        // that exhausts the shared budget must stop search before a valid key.
-        let temp = tempfile::tempdir().unwrap();
-        let malformed = temp.path().join("malformed.pem");
-        let oversized = temp.path().join("oversized.pem");
-        let valid = testdata("rsa-2048-key.pem");
-        fs::write(&malformed, b"x").unwrap();
-        let valid_len = fs::metadata(&valid).unwrap().len();
-        fs::File::create(&oversized)
-            .unwrap()
-            .set_len(valid_len + 1)
-            .unwrap();
-        let parsed = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("sign"),
-            OsString::from("--lax-key-search"),
-            OsString::from("--privkey-pem:malformed"),
-            malformed.into_os_string(),
-            OsString::from("--privkey-pem:oversized"),
-            oversized.into_os_string(),
-            OsString::from("--privkey-pem:valid"),
-            valid.into_os_string(),
-            OsString::from("template.xml"),
-        ])
-        .unwrap();
-        let mut policy = SigningPolicy::default();
-        policy.resources.max_external_resource_total_bytes = valid_len as usize + 1;
-
-        assert!(matches!(
-            select_signing_key(
-                &parsed,
-                &[],
-                SignatureAlgorithm::RsaSha256,
-                None,
-                &policy,
-                None,
-                &mut ExternalMaterialBudget::new(policy.resources.max_external_resource_total_bytes),
-            ),
-            Err(CommandError::ExternalMaterialTooLarge { maximum })
-                if maximum == valid_len as usize + 1
-        ));
-    }
-
-    #[test]
-    fn duplicate_configured_certificate_sources_consume_aggregate_budget() {
-        // Deduplicating retained DER must not make repeated external file reads
-        // free: every explicitly supplied source consumes invocation work.
-        let certificate = testdata("rsa-2048-cert.pem");
-        let source_len = fs::read(&certificate).unwrap().len();
-        let invocation = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("verify"),
-            OsString::from("--trusted-pem"),
-            certificate.as_os_str().to_owned(),
-            OsString::from("--trusted-pem"),
-            certificate.as_os_str().to_owned(),
-            OsString::from("signed.xml"),
-        ])
-        .unwrap();
-        let mut budget = ExternalMaterialBudget::new(source_len);
-
-        assert!(matches!(
-            load_configured_certificates(&invocation, false, &mut budget),
-            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == source_len
-        ));
-    }
-
-    #[test]
-    fn certificate_companions_charge_source_bytes_before_retention() {
-        // PEM whitespace is still processed input even though it disappears
-        // from decoded DER, so the source size must drive aggregate charging.
-        let fixture = testdata("rsa-2048-cert.pem");
-        let temp = tempfile::tempdir().unwrap();
-        let padded = temp.path().join("padded-cert.pem");
-        let mut source = fs::read(&fixture).unwrap();
-        source.extend(std::iter::repeat_n(b' ', 4096));
-        fs::write(&padded, &source).unwrap();
-        let der_len = key_material::load_certificate_with_source_len(
-            &padded,
-            key_material::CertificateEncoding::Pem,
-        )
-        .unwrap()
-        .0
-        .len();
-        let mut budget = ExternalMaterialBudget::new(der_len);
-
-        assert!(matches!(
-            load_certificate_companions(
-                &[padded.as_os_str()],
-                key_material::CertificateEncoding::Pem,
-                &mut budget,
-            ),
-            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == der_len
-        ));
-    }
-
-    #[test]
-    fn explicit_verification_certificate_charges_source_bytes() {
-        // Explicit leaf certificates share the invocation budget with trust
-        // inputs, including PEM bytes discarded while decoding the DER value.
-        let fixture = testdata("rsa-2048-cert.pem");
-        let temp = tempfile::tempdir().unwrap();
-        let padded = temp.path().join("padded-explicit-cert.pem");
-        let mut source = fs::read(&fixture).unwrap();
-        source.extend(std::iter::repeat_n(b' ', 4096));
-        fs::write(&padded, &source).unwrap();
-        let der_len = key_material::load_certificate_with_source_len(
-            &padded,
-            key_material::CertificateEncoding::Pem,
-        )
-        .unwrap()
-        .0
-        .len();
-        let option = crate::OptionValue {
-            name: "pubkey-cert-pem".into(),
-            parameter: None,
-            value: Some(padded.into_os_string()),
-        };
-        let mut budget = ExternalMaterialBudget::new(der_len);
-
-        assert!(matches!(
-            load_explicit_certificate_key_info(&option, &mut budget),
-            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == der_len
-        ));
-    }
-
-    #[test]
-    fn recipient_resolver_bounds_applicable_private_keys_before_unwrap() {
-        // Lax lookup must not hide an unbounded RSA-OAEP loop behind the single
-        // content key eventually returned to the core decryption context.
-        let path = testdata("rsa-2048-key.pem");
-        let private_key =
-            key_material::load_rsa_private(&path, key_material::PrivateKeyFormat::Pem).unwrap();
-        let resolver = NamedRecipientDecryptor {
-            keys: vec![
-                RecipientPrivateKey {
-                    inner: PrivateKeyDecryptor::new(private_key.clone()),
-                    key_name: None,
-                },
-                RecipientPrivateKey {
-                    inner: PrivateKeyDecryptor::new(private_key),
-                    key_name: None,
-                },
-            ],
-            lax_key_search: true,
-            unnamed_single_key_fallback: false,
-        };
-        let encrypted_key = EncryptedKey {
-            sources: Default::default(),
-            id: None,
-            recipient: None,
-            key_name: None,
-            encryption_method: EncryptionMethod {
-                chacha: None,
-                algorithm: KeyTransportAlgorithm::RsaOaep11.uri().into(),
-                key_size_bits: None,
-                oaep_digest: None,
-                mgf_algorithm: None,
-                oaep_params: None,
-            },
-            cipher_data: xml_sec::xmlenc::CipherData::Value {
-                value: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    [0_u8; 256],
-                ),
-            },
-            reference_list: None,
-            carried_key_name: None,
-        };
-
-        let mut candidate_budget = KeyCandidateBudget::for_operation();
-        let maximum = candidate_budget.remaining();
-        let reserved = maximum - 1;
-        candidate_budget.consume(reserved).unwrap();
-        let error = resolver
-            .resolve_key_candidates(
-                default_provider(),
-                DataEncryptionAlgorithm::Aes128Gcm,
-                Some(&encrypted_key),
-                &mut candidate_budget,
-            )
-            .expect_err("oversized applicable RSA key sets must fail before unwrap");
-
-        assert!(matches!(
-            error,
-            XmlEncError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
-                resource: "key candidates",
-                maximum: observed_maximum,
-                actual,
-            }) if observed_maximum == maximum && actual == maximum + 1
-        ));
-    }
-
-    #[test]
-    fn recipient_certificate_loader_charges_the_invocation_budget() {
-        // Recipient certificates are external inputs even when used only to
-        // extract an RSA wrapping key, so they share the operation-wide budget.
-        let certificate = testdata("rsa-2048-cert.pem");
-        let mut budget = ExternalMaterialBudget::new(1);
-
-        let error = load_rsa_recipient_candidate(
-            certificate.as_os_str(),
-            RecipientPublicKeySource::Certificate(key_material::CertificateEncoding::Pem),
-            &EncryptionPolicy::default(),
-            &mut budget,
-        )
-        .expect_err("certificate DER must exceed the one-byte aggregate budget");
-
-        assert!(matches!(
-            error,
-            CommandError::ExternalMaterialTooLarge { maximum: 1 }
-        ));
-    }
-
-    #[test]
-    fn recipient_certificate_loader_charges_pem_source_bytes() {
-        // PEM whitespace is processed external input even though decoding drops
-        // it, so recipient certificate accounting must use the source length.
-        let fixture = testdata("rsa-2048-cert.pem");
-        let temp = tempfile::tempdir().unwrap();
-        let padded = temp.path().join("padded-recipient-cert.pem");
-        let mut source = fs::read(&fixture).unwrap();
-        source.extend(std::iter::repeat_n(b' ', 4096));
-        fs::write(&padded, source).unwrap();
-        let der_len = key_material::load_certificate_with_source_len(
-            &padded,
-            key_material::CertificateEncoding::Pem,
-        )
-        .unwrap()
-        .0
-        .len();
-        let mut budget = ExternalMaterialBudget::new(der_len);
-
-        assert!(matches!(
-            load_rsa_recipient_candidate(
-                padded.as_os_str(),
-                RecipientPublicKeySource::Certificate(
-                    key_material::CertificateEncoding::Pem,
-                ),
-                &EncryptionPolicy::default(),
-                &mut budget,
-            ),
-            Err(CommandError::ExternalMaterialTooLarge { maximum }) if maximum == der_len
-        ));
-    }
-
-    #[test]
-    fn recipient_certificate_cache_reuses_one_budget_charge() {
-        // Repeated recipient selection may reuse one CLI option, but external
-        // certificate bytes belong to the invocation and are charged once.
-        let certificate = testdata("rsa-2048-cert.pem");
-        let (_, source_len) = key_material::load_certificate_with_source_len(
-            certificate.as_os_str(),
-            key_material::CertificateEncoding::Pem,
-        )
-        .unwrap();
-        let invocation = Invocation::parse([
-            OsString::from("xmlsec1"),
-            OsString::from("encrypt"),
-            OsString::from("--pubkey-cert-pem"),
-            certificate.as_os_str().to_owned(),
-            OsString::from("--binary-data"),
-            OsString::from("payload.bin"),
-            OsString::from("template.xml"),
-        ])
-        .unwrap();
-        let option = invocation.values("pubkey-cert-pem").next().unwrap();
-        let mut cache = HashMap::new();
-        let mut budget = ExternalMaterialBudget::new(source_len);
-
-        cached_rsa_recipient_candidate(
-            &mut cache,
-            option,
-            true,
-            &EncryptionPolicy::default(),
-            &mut budget,
-        )
-        .unwrap();
-        cached_rsa_recipient_candidate(
-            &mut cache,
-            option,
-            true,
-            &EncryptionPolicy::default(),
-            &mut budget,
-        )
-        .expect("cached selection must not charge the certificate twice");
-    }
-
-    #[test]
-    fn xml_content_serialization_enforces_the_plaintext_limit_while_rendering() {
-        // Inherited namespaces can expand every serialized child. The Content
-        // path must stop at the operation budget rather than constructing the
-        // complete expanded plaintext before the builder checks its length.
-        let xml = r#"<root xmlns:a="urn:one" xmlns:b="urn:two"><a:item/><b:item/></root>"#;
-        let policy = EncryptionPolicy {
-            resources: xml_sec::policy::ResourcePolicy {
-                max_encryption_plaintext_bytes: 32,
-                ..xml_sec::policy::ResourcePolicy::default()
-            },
-            ..EncryptionPolicy::default()
-        };
-
-        assert!(matches!(
-            xml_data_plaintext(
-                xml,
-                &EncryptedDataType::Content,
-                &policy,
-                XmlBackend::default(),
-            ),
-            Err(CommandError::PlaintextTooLarge { maximum: 32 })
-        ));
-    }
-
-    #[test]
-    fn xml_data_reader_decodes_utf16_before_template_use() {
-        // --xml-data has its own file reader and must share the same XML 1.0
-        // encoding contract as the primary command input.
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("payload.xml");
-        let mut bytes = vec![0xfe, 0xff];
-        bytes.extend(
-            "<payload>value</payload>"
-                .encode_utf16()
-                .flat_map(u16::to_be_bytes),
-        );
-        fs::write(&path, &bytes).unwrap();
-
-        assert_eq!(
-            read_xml_data(path.as_os_str(), bytes.len()).unwrap(),
-            "<payload>value</payload>"
-        );
-    }
-
-    #[test]
-    fn verification_diagnostics_aggregate_manifest_failures() {
-        // libxmlsec1 reports the operation as failed when a processed Manifest
-        // reference fails, even though the core SignatureValue remains valid.
-        let aggregate = aggregate_statuses(
-            DsigStatus::Valid,
-            [DsigStatus::Invalid(
-                FailureReason::ReferenceDigestMismatch { ref_index: 0 },
-            )],
-        );
-
-        assert_eq!(donor_dsig_status(aggregate), ("FAILED", "REFERENCE"));
-    }
-}
+mod tests;

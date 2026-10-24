@@ -1,9 +1,15 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[path = "../tools/xmlsec1/src/args.rs"]
+// Loading `args.rs` through a directory module keeps it a non-`mod.rs` file, so
+// its `mod tests;` resolves to `args/tests.rs` exactly as in the CLI crate.
+#[path = "../tools/xmlsec1/src"]
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
-mod cli_args;
+mod cli_src {
+    pub mod args;
+}
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+use cli_src::args as cli_args;
 
 const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
 const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");

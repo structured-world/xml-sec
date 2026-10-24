@@ -2,14 +2,14 @@
 use std::{
     fmt::Write as _,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, KeyResolverConfig, ReplayMode, ReplayOutcome, VerificationRequest,
-    VerifyContext, XPathHereSemantics, with_verified_request,
+    VerifyContext, VerifyResult, XPathHereSemantics, with_verified_request,
 };
 use xml_sec::{XmlDocument, policy::VerificationPolicy};
 use xml_sec_xades::validate_basic;
@@ -26,6 +26,30 @@ fn verification_policy(here: &str) -> Result<VerificationPolicy, Box<dyn std::er
         _ => return Err("here mode must be spec or legacy".into()),
     };
     Ok(policy)
+}
+
+/// Record one signature's status and references and write its pre-digest bytes.
+fn report_signature(report: &mut String, output: &Path, ordinal: usize, result: &VerifyResult) {
+    write!(
+        report,
+        "signature.{ordinal}.status={:?}\nkey_trust={:?}\n",
+        result.status, result.key_trust
+    )
+    .expect("String write");
+    if let Some(bytes) = &result.canonicalized_signed_info {
+        fs::write(output.join(format!("signature-{ordinal}.bin")), bytes).unwrap();
+    }
+    for (index, reference) in result.signed_info_references.iter().enumerate() {
+        write!(
+            report,
+            "reference.{index}.status={:?}\nreference.{index}.coverage={:?}\n",
+            reference.status, reference.coverage
+        )
+        .expect("String write");
+        if let Some(bytes) = &reference.pre_digest_data {
+            fs::write(output.join(format!("reference-{index}.bin")), bytes).unwrap();
+        }
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,29 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => {
                     writeln!(report, "signature.{ordinal}.error={error:?}").expect("String write");
                 }
-                Ok(result) => {
-                    write!(
-                        report,
-                        "signature.{ordinal}.status={:?}\nkey_trust={:?}\n",
-                        result.status, result.key_trust
-                    )
-                    .expect("String write");
-                    if let Some(bytes) = &result.canonicalized_signed_info {
-                        fs::write(output.join(format!("signature-{ordinal}.bin")), bytes).unwrap();
-                    }
-                    for (index, reference) in result.signed_info_references.iter().enumerate() {
-                        write!(
-                            report,
-                            "reference.{index}.status={:?}\nreference.{index}.coverage={:?}\n",
-                            reference.status, reference.coverage
-                        )
-                        .expect("String write");
-                        if let Some(bytes) = &reference.pre_digest_data {
-                            fs::write(output.join(format!("reference-{index}.bin")), bytes)
-                                .unwrap();
-                        }
-                    }
-                }
+                Ok(result) => report_signature(&mut report, &output, ordinal, result),
             }
             // Selection and replay remain gated by original authentication;
             // failed signatures cannot be promoted into authenticated evidence.

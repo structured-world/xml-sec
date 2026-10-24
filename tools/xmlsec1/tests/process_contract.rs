@@ -1,7 +1,8 @@
 use std::{
+    fmt::Write as _,
     fs,
     io::Write as _,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
 };
 
@@ -36,6 +37,17 @@ use xml_sec::{
 
 fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_xmlsec1")
+}
+
+/// Run `command`, require success, and return its standard output.
+fn run_success(command: &mut Command) -> Vec<u8> {
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.stdout
 }
 
 #[test]
@@ -1146,19 +1158,19 @@ struct TraditionalDsaPrivateKey<'a> {
 fn traditional_dsa_private_key_der(key: &dsa::SigningKey) -> Vec<u8> {
     let verifying_key = key.verifying_key();
     let components = verifying_key.components();
-    let p = components.p().to_be_bytes_trimmed_vartime();
-    let q = components.q().to_be_bytes_trimmed_vartime();
-    let g = components.g().to_be_bytes_trimmed_vartime();
-    let y = verifying_key.y().to_be_bytes_trimmed_vartime();
-    let x = key.x().to_be_bytes_trimmed_vartime();
+    let prime = components.p().to_be_bytes_trimmed_vartime();
+    let subprime = components.q().to_be_bytes_trimmed_vartime();
+    let generator = components.g().to_be_bytes_trimmed_vartime();
+    let public = verifying_key.y().to_be_bytes_trimmed_vartime();
+    let secret = key.x().to_be_bytes_trimmed_vartime();
 
     TraditionalDsaPrivateKey {
         version: 0,
-        p: UintRef::new(p.as_ref()).unwrap(),
-        q: UintRef::new(q.as_ref()).unwrap(),
-        g: UintRef::new(g.as_ref()).unwrap(),
-        y: UintRef::new(y.as_ref()).unwrap(),
-        x: UintRef::new(x.as_ref()).unwrap(),
+        p: UintRef::new(prime.as_ref()).unwrap(),
+        q: UintRef::new(subprime.as_ref()).unwrap(),
+        g: UintRef::new(generator.as_ref()).unwrap(),
+        y: UintRef::new(public.as_ref()).unwrap(),
+        x: UintRef::new(secret.as_ref()).unwrap(),
     }
     .to_der()
     .unwrap()
@@ -1679,21 +1691,14 @@ fn lax_key_store_verification_skips_incompatible_family() {
     );
 }
 
-#[test]
-#[expect(
-    deprecated,
-    reason = "the compatibility CLI must retain coverage for legacy DSA 1024/160 keys"
-)]
-fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
-    // The CLI decoder must cover every asymmetric family admitted by its
-    // compatibility policy, not just the historically implemented subset.
-    let temp = tempfile::tempdir().unwrap();
-
+/// Sign and verify with the encrypted PKCS#8 DSA-2048 fixture; a wrong
+/// password must fail without output or echoing the password.
+fn check_encrypted_pkcs8_dsa(temp: &Path, dsa_template: &Path) -> (dsa::SigningKey, PathBuf) {
     let encrypted_dsa =
         fs::read(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
             .unwrap();
     let dsa_key = dsa::SigningKey::from_pkcs8_encrypted_der(&encrypted_dsa, b"secret123").unwrap();
-    let dsa_public = temp.path().join("dsa-public.der");
+    let dsa_public = temp.join("dsa-public.der");
     fs::write(
         &dsa_public,
         dsa_key
@@ -1703,16 +1708,14 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
             .as_bytes(),
     )
     .unwrap();
-    let dsa_template = project_root()
-        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl");
-    let dsa_signed = temp.path().join("dsa-signed.xml");
+    let dsa_signed = temp.join("dsa-signed.xml");
     let dsa_sign = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
         .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
         .args(["--pwd", "secret123"])
         .arg("--output")
         .arg(&dsa_signed)
-        .arg(&dsa_template)
+        .arg(dsa_template)
         .output()
         .unwrap();
     assert!(
@@ -1720,14 +1723,14 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&dsa_sign.stderr)
     );
-    let wrong_password_output = temp.path().join("dsa-wrong-password.xml");
+    let wrong_password_output = temp.join("dsa-wrong-password.xml");
     let wrong_password = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-2048"])
         .arg(project_root().join("tests/fixtures/xmldsig/keys/dsa/dsa-2048-key.p8-der"))
         .args(["--pwd", "not-secret123-sentinel"])
         .arg("--output")
         .arg(&wrong_password_output)
-        .arg(&dsa_template)
+        .arg(dsa_template)
         .output()
         .unwrap();
     assert!(!wrong_password.status.success());
@@ -1744,8 +1747,17 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&dsa_verify.stderr)
     );
+    (dsa_key, dsa_public)
+}
 
-    let traditional_dsa_der = traditional_dsa_private_key_der(&dsa_key);
+/// Traditional (non-PKCS#8) DSA private keys sign in both DER and PEM.
+fn check_traditional_dsa(
+    temp: &Path,
+    dsa_key: &dsa::SigningKey,
+    dsa_public: &Path,
+    dsa_template: &Path,
+) {
+    let traditional_dsa_der = traditional_dsa_private_key_der(dsa_key);
     for (option, extension, contents) in [
         (
             "--privkey-der:TestKeyName-dsa-2048",
@@ -1758,15 +1770,15 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
             traditional_dsa_private_key_pem(&traditional_dsa_der).into_bytes(),
         ),
     ] {
-        let private = temp.path().join(format!("dsa-traditional.{extension}"));
-        let signed = temp.path().join(format!("dsa-traditional-{extension}.xml"));
+        let private = temp.join(format!("dsa-traditional.{extension}"));
+        let signed = temp.join(format!("dsa-traditional-{extension}.xml"));
         fs::write(&private, contents).unwrap();
         let sign = Command::new(binary())
             .args(["sign", option])
             .arg(&private)
             .arg("--output")
             .arg(&signed)
-            .arg(&dsa_template)
+            .arg(dsa_template)
             .output()
             .unwrap();
         assert!(
@@ -1776,7 +1788,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         );
         let verify = Command::new(binary())
             .args(["verify", "--pubkey-der:TestKeyName-dsa-2048"])
-            .arg(&dsa_public)
+            .arg(dsa_public)
             .arg(&signed)
             .output()
             .unwrap();
@@ -1786,47 +1798,66 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
             String::from_utf8_lossy(&verify.stderr)
         );
     }
+}
 
+/// A DSA 1024/160 key written as PKCS#8 private and SPKI public DER files.
+struct Dsa1024 {
+    key: dsa::SigningKey,
+    private: PathBuf,
+    public: PathBuf,
+}
+
+#[expect(
+    deprecated,
+    reason = "the compatibility CLI must retain coverage for legacy DSA 1024/160 keys"
+)]
+fn generate_dsa_1024(temp: &Path) -> Dsa1024 {
     let mut legacy_rng = ChaCha8Rng::seed_from_u64(0xD5A1_1024);
     let legacy_components = dsa::Components::try_generate_from_rng_with_key_size(
         &mut legacy_rng,
         dsa::KeySize::DSA_1024_160,
     )
     .expect("legacy DSA parameters must generate");
-    let legacy_dsa =
+    let key =
         dsa::SigningKey::try_generate_from_rng_with_components(&mut legacy_rng, legacy_components)
             .expect("legacy DSA key must generate");
-    let legacy_private = temp.path().join("dsa-1024-private.der");
-    let legacy_public = temp.path().join("dsa-1024-public.der");
+    let private = temp.join("dsa-1024-private.der");
+    let public = temp.join("dsa-1024-public.der");
+    fs::write(&private, key.to_pkcs8_der().unwrap().as_bytes()).unwrap();
     fs::write(
-        &legacy_private,
-        legacy_dsa.to_pkcs8_der().unwrap().as_bytes(),
+        &public,
+        key.verifying_key().to_public_key_der().unwrap().as_bytes(),
     )
     .unwrap();
-    fs::write(
-        &legacy_public,
-        legacy_dsa
-            .verifying_key()
-            .to_public_key_der()
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
-    let compatible_private = temp.path().join("dsa-2048-private.der");
+    Dsa1024 {
+        key,
+        private,
+        public,
+    }
+}
+
+/// Lax search skips the policy-rejected 1024-bit candidate for a compliant key.
+fn check_lax_dsa_search(
+    temp: &Path,
+    legacy: &Dsa1024,
+    dsa_key: &dsa::SigningKey,
+    dsa_template: &Path,
+) {
+    let compatible_private = temp.join("dsa-2048-private.der");
     fs::write(
         &compatible_private,
         dsa_key.to_pkcs8_der().unwrap().as_bytes(),
     )
     .unwrap();
-    let lax_signed = temp.path().join("dsa-lax-signed.xml");
+    let lax_signed = temp.join("dsa-lax-signed.xml");
     let lax_sign = Command::new(binary())
         .args(["sign", "--lax-key-search", "--pkcs8-der:wrong"])
-        .arg(&legacy_private)
+        .arg(&legacy.private)
         .arg("--pkcs8-der:TestKeyName-dsa-2048")
         .arg(&compatible_private)
         .arg("--output")
         .arg(&lax_signed)
-        .arg(&dsa_template)
+        .arg(dsa_template)
         .output()
         .unwrap();
     assert!(
@@ -1834,12 +1865,21 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&lax_sign.stderr)
     );
+}
+
+fn encode_component(value: &[u8]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(value)
+}
+
+/// Sign the Merlin DSA template with the 1024-bit key and verify it; return
+/// the template and its embedded `DSAKeyValue` for the mismatch checks.
+fn check_dsa_1024_template(temp: &Path, legacy: &Dsa1024) -> (PathBuf, String) {
+    let legacy_private = &legacy.private;
     let donor_legacy_template = project_root()
         .join("tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/signature-enveloping-dsa.tmpl");
-    let legacy_template = temp.path().join("dsa-1024-template.xml");
-    let verifying_key = legacy_dsa.verifying_key();
+    let legacy_template = temp.join("dsa-1024-template.xml");
+    let verifying_key = legacy.key.verifying_key();
     let components = verifying_key.components();
-    let encode_component = |value: &[u8]| base64::engine::general_purpose::STANDARD.encode(value);
     let dsa_key_value = format!(
         "    <KeyValue><DSAKeyValue><P>{}</P><Q>{}</Q><G>{}</G><Y>{}</Y></DSAKeyValue></KeyValue>",
         encode_component(components.p().to_be_bytes_trimmed_vartime().as_ref()),
@@ -1854,10 +1894,10 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
             .replace("    <KeyValue>\n    </KeyValue>", &dsa_key_value),
     )
     .unwrap();
-    let legacy_signed = temp.path().join("dsa-1024-signed.xml");
+    let legacy_signed = temp.join("dsa-1024-signed.xml");
     let legacy_sign = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
-        .arg(&legacy_private)
+        .arg(legacy_private)
         .arg("--output")
         .arg(&legacy_signed)
         .arg(&legacy_template)
@@ -1870,7 +1910,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
     );
     let legacy_verify = Command::new(binary())
         .args(["verify", "--pubkey-der:TestKeyName-dsa-1024"])
-        .arg(&legacy_public)
+        .arg(&legacy.public)
         .arg(&legacy_signed)
         .output()
         .unwrap();
@@ -1879,22 +1919,34 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&legacy_verify.stderr)
     );
+    (legacy_template, dsa_key_value)
+}
 
-    let y_only_template = temp.path().join("dsa-1024-y-only-template.xml");
+/// A template carrying only Y still binds to the key, while a mismatched
+/// complete `DSAKeyValue` is rejected before signing.
+fn check_dsa_1024_key_value_binding(
+    temp: &Path,
+    legacy: &Dsa1024,
+    legacy_template: &Path,
+    dsa_key_value: &str,
+) {
+    let legacy_private = &legacy.private;
+    let verifying_key = legacy.key.verifying_key();
+    let y_only_template = temp.join("dsa-1024-y-only-template.xml");
     let y_only_key_value = format!(
         "    <KeyValue><DSAKeyValue><Y>{}</Y></DSAKeyValue></KeyValue>",
         encode_component(verifying_key.y().to_be_bytes_trimmed_vartime().as_ref()),
     );
     fs::write(
         &y_only_template,
-        fs::read_to_string(&legacy_template)
+        fs::read_to_string(legacy_template)
             .unwrap()
-            .replace(&dsa_key_value, &y_only_key_value),
+            .replace(dsa_key_value, &y_only_key_value),
     )
     .unwrap();
     let y_only_sign = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
-        .arg(&legacy_private)
+        .arg(legacy_private)
         .arg(&y_only_template)
         .output()
         .unwrap();
@@ -1904,7 +1956,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         String::from_utf8_lossy(&y_only_sign.stderr)
     );
 
-    let mismatched_template = temp.path().join("dsa-1024-mismatched-template.xml");
+    let mismatched_template = temp.join("dsa-1024-mismatched-template.xml");
     let mut mismatched_y = verifying_key.y().to_be_bytes_trimmed_vartime().to_vec();
     mismatched_y[0] ^= 1;
     let mismatched_key_value = dsa_key_value.replace(
@@ -1913,14 +1965,14 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
     );
     fs::write(
         &mismatched_template,
-        fs::read_to_string(&legacy_template)
+        fs::read_to_string(legacy_template)
             .unwrap()
-            .replace(&dsa_key_value, &mismatched_key_value),
+            .replace(dsa_key_value, &mismatched_key_value),
     )
     .unwrap();
     let mismatched_sign = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-dsa-1024"])
-        .arg(&legacy_private)
+        .arg(legacy_private)
         .arg(&mismatched_template)
         .output()
         .unwrap();
@@ -1929,8 +1981,11 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         String::from_utf8_lossy(&mismatched_sign.stderr)
             .contains("preserved KeyInfo does not match the selected signing key")
     );
+}
 
-    let p521_template = temp.path().join("p521-template.xml");
+/// The PKCS#8 P-521 key signs and its certificate verifies.
+fn check_p521_pkcs8(temp: &Path) {
+    let p521_template = temp.join("p521-template.xml");
     fs::write(
         &p521_template,
         ecdsa_signature_template().replace(
@@ -1943,7 +1998,7 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p521-key-orig.der");
     let p521_certificate =
         project_root().join("tests/fixtures/xmldsig/xmldsig11-interop-2012/keys/p521-key.crt");
-    let p521_signed = temp.path().join("p521-signed.xml");
+    let p521_signed = temp.join("p521-signed.xml");
     let p521_sign = Command::new(binary())
         .args(["sign", "--pkcs8-der:TestKeyName-ec-prime521v1"])
         .arg(&p521_private)
@@ -1968,6 +2023,23 @@ fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
         "{}",
         String::from_utf8_lossy(&p521_verify.stderr)
     );
+}
+
+#[test]
+fn compatibility_cli_decodes_dsa_and_p521_pkcs8_signing_keys() {
+    // The CLI decoder must cover every asymmetric family admitted by its
+    // compatibility policy, not just the historically implemented subset.
+    let temp = tempfile::tempdir().unwrap();
+    let temp = temp.path();
+    let dsa_template = project_root()
+        .join("tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-dsa2048-sha256.tmpl");
+    let (dsa_key, dsa_public) = check_encrypted_pkcs8_dsa(temp, &dsa_template);
+    check_traditional_dsa(temp, &dsa_key, &dsa_public, &dsa_template);
+    let legacy = generate_dsa_1024(temp);
+    check_lax_dsa_search(temp, &legacy, &dsa_key, &dsa_template);
+    let (legacy_template, dsa_key_value) = check_dsa_1024_template(temp, &legacy);
+    check_dsa_1024_key_value_binding(temp, &legacy, &legacy_template, &dsa_key_value);
+    check_p521_pkcs8(temp);
 }
 
 #[test]
@@ -3973,7 +4045,7 @@ fn ignore_manifests_preserves_signed_info_dependency_checks() {
     let template = temp.path().join("signature-value-cycle.xml");
     fs::write(
         &template,
-        r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##,
+        r#"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"#,
     )
     .unwrap();
     let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
@@ -4145,49 +4217,30 @@ fn verification_node_id_selects_one_signature_subtree() {
     )
     .unwrap();
 
-    let valid = Command::new(binary())
-        .args(["verify", "--pubkey-pem"])
-        .arg(&public_key)
-        .args(["--node-id", "first"])
-        .arg(&document)
-        .output()
-        .unwrap();
-    assert!(
-        valid.status.success(),
-        "{}",
-        String::from_utf8_lossy(&valid.stderr)
-    );
+    let verify_node = |node_id: &str, input: &Path| {
+        Command::new(binary())
+            .args(["verify", "--pubkey-pem"])
+            .arg(&public_key)
+            .args(["--node-id", node_id])
+            .arg(input)
+            .output()
+            .unwrap()
+    };
+    // Both the exact Signature and the first descendant of a start node verify.
+    for node_id in ["first", "both"] {
+        let valid = verify_node(node_id, &document);
+        assert!(
+            valid.status.success(),
+            "{node_id}: {}",
+            String::from_utf8_lossy(&valid.stderr)
+        );
+    }
 
-    let first_descendant = Command::new(binary())
-        .args(["verify", "--pubkey-pem"])
-        .arg(&public_key)
-        .args(["--node-id", "both"])
-        .arg(&document)
-        .output()
-        .unwrap();
-    assert!(
-        first_descendant.status.success(),
-        "{}",
-        String::from_utf8_lossy(&first_descendant.stderr)
-    );
-
-    let invalid = Command::new(binary())
-        .args(["verify", "--pubkey-pem"])
-        .arg(&public_key)
-        .args(["--node-id", "second"])
-        .arg(&document)
-        .output()
-        .unwrap();
+    let invalid = verify_node("second", &document);
     assert!(!invalid.status.success());
     assert!(String::from_utf8_lossy(&invalid.stderr).contains("signature is invalid"));
 
-    let missing = Command::new(binary())
-        .args(["verify", "--pubkey-pem"])
-        .arg(&public_key)
-        .args(["--node-id", "missing"])
-        .arg(&document)
-        .output()
-        .unwrap();
+    let missing = verify_node("missing", &document);
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("selected node"));
 
@@ -4199,13 +4252,7 @@ fn verification_node_id_selects_one_signature_subtree() {
             .replace("Id=\"second\"", "Id=\"first\""),
     )
     .unwrap();
-    let ambiguous = Command::new(binary())
-        .args(["verify", "--pubkey-pem"])
-        .arg(&public_key)
-        .args(["--node-id", "first"])
-        .arg(&duplicate)
-        .output()
-        .unwrap();
+    let ambiguous = verify_node("first", &duplicate);
     assert!(!ambiguous.status.success());
     assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("ambiguous"));
 }
@@ -4259,8 +4306,8 @@ fn signing_node_id_selects_one_signature_subtree() {
         .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
         .map(|node| node.text().unwrap_or_default())
         .collect::<Vec<_>>();
-    assert!(!values[0].trim().is_empty());
-    assert!(values[1].trim().is_empty());
+    assert_ne!(values[0].trim(), "");
+    assert_eq!(values[1].trim(), "");
 
     let missing = Command::new(binary())
         .args(["sign", "--privkey-pem"])
@@ -4324,10 +4371,10 @@ fn signing_without_node_selector_uses_first_signature_template() {
     let values = document
         .descendants()
         .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
-        .map(|node| node.text().unwrap_or_default().trim().to_owned())
+        .map(|node| node.text().unwrap_or_default().trim())
         .collect::<Vec<_>>();
-    assert!(!values[0].is_empty());
-    assert!(values[1].is_empty());
+    assert_ne!(values[0], "");
+    assert_eq!(values[1], "");
 }
 
 #[test]
@@ -4475,33 +4522,23 @@ fn key_store_supplies_aes_key_for_encryption_and_decryption() {
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key);
         fs::write(path, format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>")).unwrap();
     }
-    let encrypt = Command::new(binary())
-        .args(["encrypt", "--keys-file"])
-        .arg(&store)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&encrypted)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(
-        encrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&encrypt.stderr)
+    run_success(
+        Command::new(binary())
+            .args(["encrypt", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template),
     );
-    let decrypt = Command::new(binary())
-        .args(["decrypt", "--keys-file"])
-        .arg(&store)
-        .arg("--output")
-        .arg(&decrypted)
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        decrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&decrypt.stderr)
+    run_success(
+        Command::new(binary())
+            .args(["decrypt", "--keys-file"])
+            .arg(&store)
+            .arg("--output")
+            .arg(&decrypted)
+            .arg(&encrypted),
     );
     assert_eq!(fs::read(&decrypted).unwrap(), fs::read(&plaintext).unwrap());
     // An embedded recipient does not invalidate a separate direct content key.
@@ -4517,30 +4554,21 @@ fn key_store_supplies_aes_key_for_encryption_and_decryption() {
         1,
     );
     fs::write(&with_recipient, encrypted_xml).unwrap();
-    let explicit = Command::new(binary())
-        .args(["decrypt", "--aes-key:content"])
-        .arg(&direct_key)
-        .arg(&with_recipient)
-        .output()
-        .unwrap();
-    assert!(
-        explicit.status.success(),
-        "{}",
-        String::from_utf8_lossy(&explicit.stderr)
+    let expected = fs::read(&plaintext).unwrap();
+    let explicit = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--aes-key:content"])
+            .arg(&direct_key)
+            .arg(&with_recipient),
     );
-    assert_eq!(explicit.stdout, fs::read(&plaintext).unwrap());
-    let stored = Command::new(binary())
-        .args(["decrypt", "--keys-file"])
-        .arg(&store)
-        .arg(&with_recipient)
-        .output()
-        .unwrap();
-    assert!(
-        stored.status.success(),
-        "{}",
-        String::from_utf8_lossy(&stored.stderr)
+    assert_eq!(explicit, expected);
+    let stored = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--keys-file"])
+            .arg(&store)
+            .arg(&with_recipient),
     );
-    assert_eq!(stored.stdout, fs::read(&plaintext).unwrap());
+    assert_eq!(stored, expected);
     let wrong = Command::new(binary())
         .args(["decrypt", "--keys-file"])
         .arg(&wrong_store)
@@ -4563,18 +4591,13 @@ fn key_store_supplies_aes_key_for_encryption_and_decryption() {
         format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{wrong_encoded}</AESKeyValue></KeyValue></KeyInfo><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>content</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{right_encoded}</AESKeyValue></KeyValue></KeyInfo></Keys>"),
     )
     .unwrap();
-    let lax = Command::new(binary())
-        .args(["decrypt", "--lax-key-search", "--keys-file"])
-        .arg(&mixed_store)
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        lax.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lax.stderr)
+    let lax = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--lax-key-search", "--keys-file"])
+            .arg(&mixed_store)
+            .arg(&encrypted),
     );
-    assert_eq!(lax.stdout, fs::read(&plaintext).unwrap());
+    assert_eq!(lax, expected);
 }
 
 #[test]
@@ -4586,18 +4609,10 @@ fn key_store_rsa_recipient_round_trips_with_explicit_private_key() {
     let store = temp.path().join("keys.xml");
     let plaintext = temp.path().join("plaintext.bin");
     let encrypted = temp.path().join("encrypted.xml");
-    let public_pem =
-        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem"))
-            .unwrap();
-    let public = RsaPublicKey::from_public_key_pem(&public_pem).unwrap();
-    let base64 = base64::engine::general_purpose::STANDARD;
+    let recipient = rsa_key_value_key_info("recipient", &rsa_fixture_public_key(4096));
     fs::write(
         &store,
-        format!(
-            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
-            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
-            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
-        ),
+        format!("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{recipient}</Keys>"),
     )
     .unwrap();
     fs::write(
@@ -4606,79 +4621,54 @@ fn key_store_rsa_recipient_round_trips_with_explicit_private_key() {
     )
     .unwrap();
     fs::write(&plaintext, b"named RSA recipient payload").unwrap();
-    let encrypt = Command::new(binary())
-        .args(["encrypt", "--keys-file"])
-        .arg(&store)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&encrypted)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(
-        encrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&encrypt.stderr)
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    run_success(
+        Command::new(binary())
+            .args(["encrypt", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template),
     );
-    let decrypt = Command::new(binary())
-        .args(["decrypt", "--privkey-pem"])
-        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        decrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&decrypt.stderr)
+    let decrypted = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--privkey-pem"])
+            .arg(&private_key)
+            .arg(&encrypted),
     );
-    assert_eq!(decrypt.stdout, fs::read(&plaintext).unwrap());
+    assert_eq!(decrypted, fs::read(&plaintext).unwrap());
 
     // Lax lookup must still prefer the recipient's exact name over an earlier
     // usable-but-wrong RSA key in the same store.
-    let wrong_public_pem =
-        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
-            .unwrap();
-    let wrong_public = RsaPublicKey::from_public_key_pem(&wrong_public_pem).unwrap();
+    let wrong_public = rsa_fixture_public_key(2048);
     fs::write(
         &store,
         format!(
-            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>wrong</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo></Keys>",
-            base64.encode(wrong_public.n().to_be_bytes_trimmed_vartime()),
-            base64.encode(wrong_public.e().to_be_bytes_trimmed_vartime()),
-            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
-            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}{recipient}</Keys>",
+            rsa_key_value_key_info("wrong", &wrong_public)
         ),
     )
     .unwrap();
     let lax_encrypted = temp.path().join("lax-encrypted.xml");
-    let lax_encrypt = Command::new(binary())
-        .args(["encrypt", "--lax-key-search", "--keys-file"])
-        .arg(&store)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&lax_encrypted)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(
-        lax_encrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lax_encrypt.stderr)
+    run_success(
+        Command::new(binary())
+            .args(["encrypt", "--lax-key-search", "--keys-file"])
+            .arg(&store)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&lax_encrypted)
+            .arg(&template),
     );
-    let lax_decrypt = Command::new(binary())
-        .args(["decrypt", "--privkey-pem"])
-        .arg(project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem"))
-        .arg(&lax_encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        lax_decrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lax_decrypt.stderr)
+    let lax_decrypted = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--privkey-pem"])
+            .arg(&private_key)
+            .arg(&lax_encrypted),
     );
-    assert_eq!(lax_decrypt.stdout, fs::read(&plaintext).unwrap());
+    assert_eq!(lax_decrypted, fs::read(&plaintext).unwrap());
 
     let unsupported_store_decrypt = Command::new(binary())
         .args(["decrypt", "--keys-file"])
@@ -4699,10 +4689,7 @@ fn key_store_rsa_recipient_round_trips_with_explicit_private_key() {
         )
     );
 
-    let wrong_public_pem =
-        fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
-            .unwrap();
-    let wrong_public = RsaPublicKey::from_public_key_pem(&wrong_public_pem).unwrap();
+    let base64 = base64::engine::general_purpose::STANDARD;
     let conflicting = format!(
         "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName><ds:KeyValue><ds:RSAKeyValue><ds:Modulus>{}</ds:Modulus><ds:Exponent>{}</ds:Exponent></ds:RSAKeyValue></ds:KeyValue></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
         base64.encode(wrong_public.n().to_be_bytes_trimmed_vartime()),
@@ -4792,47 +4779,39 @@ fn lax_store_rsa_recipients_consume_distinct_candidates() {
     let template = temp.path().join("template.xml");
     let plaintext = temp.path().join("plaintext.bin");
     let encrypted = temp.path().join("encrypted.xml");
-    let base64 = base64::engine::general_purpose::STANDARD;
-    let mut entries = Vec::new();
-    for (name, bits) in [("a", 2048), ("b", 4096)] {
-        let pem = fs::read_to_string(
-            project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-pubkey.pem")),
-        )
-        .unwrap();
-        let public = RsaPublicKey::from_public_key_pem(&pem).unwrap();
-        entries.push(format!(
-            "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
-            base64.encode(public.n().to_be_bytes_trimmed_vartime()),
-            base64.encode(public.e().to_be_bytes_trimmed_vartime()),
-        ));
-    }
+    let entries = [("a", 2048), ("b", 4096)]
+        .map(|(name, bits)| rsa_key_value_key_info(name, &rsa_fixture_public_key(bits)));
     fs::write(
         &store,
         format!(
             "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}</Keys>",
-            entries.join("")
+            entries.concat()
         ),
     )
     .unwrap();
     fs::write(&plaintext, b"distinct store recipients").unwrap();
     let write_template = |names: &[Option<&str>]| {
-        let recipients = names.iter().map(|name| {
-            let key_info = name.map_or_else(String::new, |name| format!("<ds:KeyInfo><ds:KeyName>{name}</ds:KeyName></ds:KeyInfo>"));
-            format!("<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{key_info}<CipherData><CipherValue/></CipherData></EncryptedKey>")
-        }).collect::<String>();
-        fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>")).unwrap();
+        fs::write(
+            &template,
+            rsa_oaep_recipients_template(names.iter().map(|name| {
+                name.map_or_else(String::new, |name| {
+                    format!("<ds:KeyInfo><ds:KeyName>{name}</ds:KeyName></ds:KeyInfo>")
+                })
+            })),
+        )
+        .unwrap();
     };
     let encrypt = |output: &Path| {
-        Command::new(binary())
+        let mut command = Command::new(binary());
+        command
             .args(["encrypt", "--lax-key-search", "--keys-file"])
             .arg(&store)
             .arg("--binary-data")
             .arg(&plaintext)
             .arg("--output")
             .arg(output)
-            .arg(&template)
-            .output()
-            .unwrap()
+            .arg(&template);
+        command
     };
     for names in [
         [None, None],
@@ -4841,76 +4820,33 @@ fn lax_store_rsa_recipients_consume_distinct_candidates() {
         [None, Some("a")],
     ] {
         write_template(&names);
-        let result = encrypt(&encrypted);
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        run_success(&mut encrypt(&encrypted));
         // A fallback cannot steal the key requested by a later named slot.
         if names == [None, Some("a")] {
-            let xml = fs::read_to_string(&encrypted).unwrap();
-            let document = roxmltree::Document::parse(&xml).unwrap();
-            let assigned = document
-                .descendants()
-                .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
-                .map(|node| node.text().unwrap())
-                .collect::<Vec<_>>();
-            assert_eq!(assigned, ["b", "a"]);
+            assert_eq!(dsig_key_names(&encrypted), ["b", "a"]);
         }
-        for bits in [2048, 4096] {
-            let result = Command::new(binary())
-                .args(["decrypt", "--lax-key-search", "--privkey-pem"])
-                .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
-                .arg(&encrypted)
-                .output()
-                .unwrap();
-            assert!(
-                result.status.success(),
-                "recipient {bits}, names {names:?}: {}",
-                String::from_utf8_lossy(&result.stderr)
-            );
-            assert_eq!(result.stdout, b"distinct store recipients");
-        }
+        assert_rsa_fixture_recipients_decrypt(
+            &encrypted,
+            b"distinct store recipients",
+            &format!("names {names:?}"),
+        );
     }
     // A stale later name must not reserve a key contradicted by its RSA
     // metadata: the unnamed first slot needs a, and the later slot needs b.
     let first_info = entries[0].replace("<KeyName>a</KeyName>", "");
     let second_info = entries[1].replace("<KeyName>b</KeyName>", "<KeyName>a</KeyName>");
-    let recipients = [first_info, second_info].into_iter().map(|info| format!(
-        "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{info}<CipherData><CipherValue/></CipherData></EncryptedKey>"
-    )).collect::<String>();
-    fs::write(&template, format!("<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>")).unwrap();
-    let result = encrypt(&encrypted);
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
+    fs::write(
+        &template,
+        rsa_oaep_recipients_template([first_info, second_info]),
+    )
+    .unwrap();
+    run_success(&mut encrypt(&encrypted));
+    assert_eq!(dsig_key_names(&encrypted), ["a", "b"]);
+    assert_rsa_fixture_recipients_decrypt(
+        &encrypted,
+        b"distinct store recipients",
+        "metadata-selected recipients",
     );
-    let xml = fs::read_to_string(&encrypted).unwrap();
-    let document = roxmltree::Document::parse(&xml).unwrap();
-    assert_eq!(
-        document
-            .descendants()
-            .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
-            .map(|node| node.text().unwrap())
-            .collect::<Vec<_>>(),
-        ["a", "b"]
-    );
-    for bits in [2048, 4096] {
-        let decrypted = Command::new(binary())
-            .args(["decrypt", "--lax-key-search", "--privkey-pem"])
-            .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
-            .arg(&encrypted)
-            .output()
-            .unwrap();
-        assert!(
-            decrypted.status.success(),
-            "{}",
-            String::from_utf8_lossy(&decrypted.stderr)
-        );
-        assert_eq!(decrypted.stdout, b"distinct store recipients");
-    }
     for (names, single_key) in [(vec![None, None, None], false), (vec![None, None], true)] {
         if single_key {
             fs::write(
@@ -4928,14 +4864,83 @@ fn lax_store_rsa_recipients_consume_distinct_candidates() {
         } else {
             "exhausted.xml"
         });
-        let result = encrypt(&output);
+        let result = encrypt(&output).output().unwrap();
         assert!(!result.status.success());
         assert!(
             String::from_utf8_lossy(&result.stderr)
                 .contains("no compatible RSA key in --keys-file")
         );
         assert!(!output.exists());
-        assert!(result.stdout.is_empty());
+        assert_eq!(result.stdout, b"");
+    }
+}
+
+fn rsa_fixture_public_key(bits: u16) -> RsaPublicKey {
+    RsaPublicKey::from_public_key_pem(
+        &fs::read_to_string(
+            project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-pubkey.pem")),
+        )
+        .unwrap(),
+    )
+    .unwrap()
+}
+
+/// A `KeyInfo` naming `name` and carrying `public` as an `RSAKeyValue`.
+fn rsa_key_value_key_info(name: &str, public: &RsaPublicKey) -> String {
+    let base64 = base64::engine::general_purpose::STANDARD;
+    format!(
+        "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>",
+        base64.encode(public.n().to_be_bytes_trimmed_vartime()),
+        base64.encode(public.e().to_be_bytes_trimmed_vartime()),
+    )
+}
+
+/// An AES-GCM `EncryptedData` template with one RSA-OAEP `EncryptedKey` per
+/// supplied recipient `KeyInfo` (which may be empty).
+fn rsa_oaep_recipients_template<I>(key_infos: I) -> String
+where
+    I: IntoIterator,
+    I::Item: std::fmt::Display,
+{
+    let mut recipients = String::new();
+    for key_info in key_infos {
+        write!(
+            recipients,
+            "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/>{key_info}<CipherData><CipherValue/></CipherData></EncryptedKey>"
+        )
+        .expect("writing to a String cannot fail");
+    }
+    format!(
+        "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
+    )
+}
+
+/// The `ds:KeyName` values of `path`, in document order.
+fn dsig_key_names(path: &Path) -> Vec<String> {
+    let xml = fs::read_to_string(path).unwrap();
+    roxmltree::Document::parse(&xml)
+        .unwrap()
+        .descendants()
+        .filter(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "KeyName")))
+        .map(|node| node.text().unwrap().to_owned())
+        .collect()
+}
+
+/// Both RSA fixture private keys must recover `expected` under lax search.
+fn assert_rsa_fixture_recipients_decrypt(encrypted: &Path, expected: &[u8], context: &str) {
+    for bits in [2048, 4096] {
+        let result = Command::new(binary())
+            .args(["decrypt", "--lax-key-search", "--privkey-pem"])
+            .arg(project_root().join(format!("tests/fixtures/keys/rsa/rsa-{bits}-key.pem")))
+            .arg(encrypted)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "recipient {bits}, {context}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, expected);
     }
 }
 
@@ -4956,23 +4961,19 @@ fn lax_rsa_recipients_charge_only_attempted_store_keys() {
     let exponent = base64.encode(public.e().to_be_bytes_trimmed_vartime());
     let mut key_store = String::from("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">");
     for index in 0..33 {
-        key_store.push_str(&format!(
+        write!(
+            key_store,
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>recipient-{index}</KeyName><KeyValue><RSAKeyValue><Modulus>{modulus}</Modulus><Exponent>{exponent}</Exponent></RSAKeyValue></KeyValue></KeyInfo>"
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     key_store.push_str("</Keys>");
     fs::write(&store, key_store).unwrap();
-    let mut recipient_nodes = String::new();
-    for index in 0..2 {
-        recipient_nodes.push_str(&format!(
-            "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey>"
-        ));
-    }
     fs::write(
         &template,
-        format!(
-            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipient_nodes}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
-        ),
+        rsa_oaep_recipients_template((0..2).map(|index| {
+            format!("<ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName></ds:KeyInfo>")
+        })),
     )
     .unwrap();
     fs::write(&plaintext, b"two named recipients").unwrap();
@@ -5025,20 +5026,19 @@ fn lax_cached_recipients_charge_decoding_once() {
         let mut key_store = String::from(
             "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">",
         );
-        let mut recipients = String::new();
-        for index in 0..count {
-            key_store.push_str(&format!(
-                "<ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo>"
-            ));
-            recipients.push_str(&format!(
-                "<EncryptedKey><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#rsa-oaep\"/><ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey>"
-            ));
+        let key_infos = (0..count)
+            .map(|index| {
+                format!(
+                    "<ds:KeyInfo><ds:KeyName>recipient-{index}</ds:KeyName>{key_value}</ds:KeyInfo>"
+                )
+            })
+            .collect::<Vec<_>>();
+        for key_info in &key_infos {
+            key_store.push_str(key_info);
         }
         key_store.push_str("</Keys>");
         fs::write(&store, key_store).unwrap();
-        fs::write(&template, format!(
-            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><ds:KeyInfo>{recipients}</ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"
-        )).unwrap();
+        fs::write(&template, rsa_oaep_recipients_template(&key_infos)).unwrap();
         let encrypt = Command::new(binary())
             .args(["encrypt", "--lax-key-search", "--keys-file"])
             .arg(&store)
@@ -5101,28 +5101,22 @@ fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
         )
         .unwrap();
-        let output = Command::new(binary())
-            .args(["encrypt", flag, "--aeskey"])
-            .arg(&key)
-            .arg("--binary-data")
-            .arg(&plaintext)
-            .arg("--output")
-            .arg(&encrypted)
-            .arg(&template)
-            .output()
-            .unwrap();
-
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+        let stdout = run_success(
+            Command::new(binary())
+                .args(["encrypt", flag, "--aeskey"])
+                .arg(&key)
+                .arg("--binary-data")
+                .arg(&plaintext)
+                .arg("--output")
+                .arg(&encrypted)
+                .arg(&template),
         );
         assert!(
             fs::read_to_string(&encrypted)
                 .unwrap()
                 .contains("CipherValue")
         );
-        let diagnostics = String::from_utf8(output.stdout).unwrap();
+        let diagnostics = String::from_utf8(stdout).unwrap();
         assert!(diagnostics.contains(expected), "{diagnostics}");
         if flag == "--print-xml-debug" {
             let document = roxmltree::Document::parse(&diagnostics)
@@ -5134,66 +5128,57 @@ fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
         }
     }
 
-    let malformed = temp.path().join("duplicate-method.xml");
-    let rejected_output = temp.path().join("must-not-exist.xml");
-    fs::write(
-        &malformed,
-        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
-    )
-    .unwrap();
-    let rejected = Command::new(binary())
-        .args(["encrypt", "--aeskey"])
-        .arg(&key)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&rejected_output)
-        .arg(&malformed)
-        .output()
-        .unwrap();
+    check_malformed_encryption_templates_fail_closed(temp.path(), &key, &plaintext);
+}
 
-    assert!(!rejected.status.success());
-    assert!(
-        String::from_utf8_lossy(&rejected.stderr).contains("more than one direct EncryptionMethod")
-    );
-    assert!(!rejected_output.exists());
-
+/// Malformed templates fail before ciphertext or partial output is emitted.
+fn check_malformed_encryption_templates_fail_closed(temp: &Path, key: &Path, plaintext: &Path) {
     let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
-    for (case, malformed_xml, key_args) in [
+    for (case, malformed_xml, key_args, diagnostic) in [
+        (
+            "duplicate-method",
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#aes128-cbc"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+            None,
+            "more than one direct EncryptionMethod",
+        ),
         (
             "duplicate-cipher-data",
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData><CipherData><CipherValue/></CipherData></EncryptedData>"#,
             None,
+            "",
         ),
         (
             "key-info-after-cipher-data",
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData><ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo></EncryptedData>"#,
             None,
+            "",
         ),
         (
             "recipient-without-value",
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/><CipherData/></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
             Some(&public_key),
+            "",
         ),
         (
             "recipient-cipher-reference",
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/><CipherData><CipherReference URI="urn:cipher"/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#,
             Some(&public_key),
+            "",
         ),
     ] {
-        let malformed = temp.path().join(format!("{case}.xml"));
-        let rejected_output = temp.path().join(format!("{case}-output.xml"));
+        let malformed = temp.join(format!("{case}.xml"));
+        let rejected_output = temp.join(format!("{case}-output.xml"));
         fs::write(&malformed, malformed_xml).unwrap();
         let mut command = Command::new(binary());
         command.arg("encrypt");
         if let Some(public_key) = key_args {
             command.arg("--pubkey-pem").arg(public_key);
         } else {
-            command.arg("--aeskey").arg(&key);
+            command.arg("--aeskey").arg(key);
         }
         let rejected = command
             .arg("--binary-data")
-            .arg(&plaintext)
+            .arg(plaintext)
             .arg("--output")
             .arg(&rejected_output)
             .arg(&malformed)
@@ -5201,6 +5186,11 @@ fn encryption_writes_requested_diagnostics_and_rejects_duplicate_methods() {
             .unwrap();
 
         assert!(!rejected.status.success(), "{case} unexpectedly succeeded");
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(diagnostic),
+            "{case}: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
         assert!(!rejected_output.exists(), "{case} emitted partial output");
     }
 }
@@ -5380,9 +5370,9 @@ fn encryption_node_id_selects_one_template_subtree() {
         .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
         .map(|node| node.text().unwrap_or_default())
         .collect::<Vec<_>>();
-    assert!(!values[0].trim().is_empty());
-    assert!(values[1].trim().is_empty());
-    assert!(values[2].trim().is_empty());
+    assert_ne!(values[0].trim(), "");
+    assert_eq!(values[1].trim(), "");
+    assert_eq!(values[2].trim(), "");
 
     let missing = Command::new(binary())
         .args(["encrypt", "--aes-key"])
@@ -5569,10 +5559,7 @@ fn untyped_xml_template_round_trips_when_embedded() {
     );
     fs::write(
         &document,
-        format!(
-            "<root><scope Id=\"selected\">{}</scope></root>",
-            encrypted_xml
-        ),
+        format!("<root><scope Id=\"selected\">{encrypted_xml}</scope></root>"),
     )
     .unwrap();
 
@@ -7373,17 +7360,16 @@ fn lax_stored_rsa_encryption_stops_on_policy_denial() {
     let weak = RsaPrivateKey::new(&mut ChaCha8Rng::from_seed([0x72; 32]), 1024)
         .unwrap()
         .to_public_key();
-    let strong = RsaPublicKey::from_public_key_pem(
-        &fs::read_to_string(project_root().join("tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"))
-            .unwrap(),
+    let strong = rsa_fixture_public_key(2048);
+    fs::write(
+        &store,
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">{}{}</Keys>",
+            rsa_key_value_key_info("weak", &weak),
+            rsa_key_value_key_info("strong", &strong)
+        ),
     )
     .unwrap();
-    let mut xml = String::from("<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\">");
-    for (name, key) in [("weak", weak), ("strong", strong)] {
-        xml.push_str(&format!("<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>{name}</KeyName><KeyValue><RSAKeyValue><Modulus>{}</Modulus><Exponent>{}</Exponent></RSAKeyValue></KeyValue></KeyInfo>", base64::engine::general_purpose::STANDARD.encode(key.n().to_be_bytes_trimmed_vartime()), base64::engine::general_purpose::STANDARD.encode(key.e().to_be_bytes_trimmed_vartime())));
-    }
-    xml.push_str("</Keys>");
-    fs::write(&store, xml).unwrap();
     fs::write(&template, r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><ds:KeyInfo><EncryptedKey><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#rsa-oaep"/><ds:KeyInfo><ds:KeyName>missing</ds:KeyName></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedKey></ds:KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#).unwrap();
     fs::write(&plaintext, b"policy denial is terminal").unwrap();
     let result = Command::new(binary())
@@ -7419,7 +7405,7 @@ fn lax_rsa_encryption_skips_keys_rejected_by_policy() {
         &weak_public_key,
         weak_key
             .to_public_key()
-            .to_public_key_pem(Default::default())
+            .to_public_key_pem(pkcs8::LineEnding::default())
             .unwrap(),
     )
     .unwrap();
@@ -7592,6 +7578,38 @@ fn rsa_encryption_preserves_extension_cipher_values() {
     assert_eq!(decrypt.stdout, b"extension metadata");
 }
 
+/// Strict selection rejects a missing template name and a name bound to two keys.
+fn check_strict_rsa_recipient_options_fail(
+    template: &Path,
+    plaintext: &Path,
+    public_a: &Path,
+    public_b: &Path,
+) {
+    let missing = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:a"])
+        .arg(public_a)
+        .arg("--binary-data")
+        .arg(plaintext)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown KeyName"));
+
+    let duplicate = Command::new(binary())
+        .args(["encrypt", "--pubkey-pem:a"])
+        .arg(public_a)
+        .args(["--pubkey-pem:a"])
+        .arg(public_b)
+        .arg("--binary-data")
+        .arg(plaintext)
+        .arg(template)
+        .output()
+        .unwrap();
+    assert!(!duplicate.status.success());
+    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("multiple RSA recipient key"));
+}
+
 #[test]
 fn rsa_encryption_builds_every_named_recipient() {
     // Repeatable public keys map one-for-one to template recipients. Every
@@ -7612,22 +7630,17 @@ fn rsa_encryption_builds_every_named_recipient() {
     .unwrap();
     fs::write(&plaintext, b"multiple RSA recipients").unwrap();
 
-    let encrypt = Command::new(binary())
-        .args(["encrypt", "--pubkey-pem:a"])
-        .arg(&public_a)
-        .args(["--pubkey-pem:b"])
-        .arg(&public_b)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&encrypted)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(
-        encrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&encrypt.stderr)
+    run_success(
+        Command::new(binary())
+            .args(["encrypt", "--pubkey-pem:a"])
+            .arg(&public_a)
+            .args(["--pubkey-pem:b"])
+            .arg(&public_b)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template),
     );
     let encrypted_xml = fs::read_to_string(&encrypted).unwrap();
     let document = roxmltree::Document::parse(&encrypted_xml).unwrap();
@@ -7640,92 +7653,52 @@ fn rsa_encryption_builds_every_named_recipient() {
     );
 
     for (name, private_key) in [("a", &private_a), ("b", &private_b)] {
-        let decrypt = Command::new(binary())
-            .arg("decrypt")
-            .arg(format!("--privkey-pem:{name}"))
-            .arg(private_key)
-            .arg(&encrypted)
-            .output()
-            .unwrap();
-        assert!(
-            decrypt.status.success(),
-            "{}",
-            String::from_utf8_lossy(&decrypt.stderr)
+        let decrypted = run_success(
+            Command::new(binary())
+                .arg("decrypt")
+                .arg(format!("--privkey-pem:{name}"))
+                .arg(private_key)
+                .arg(&encrypted),
         );
-        assert_eq!(decrypt.stdout, b"multiple RSA recipients");
+        assert_eq!(decrypted, b"multiple RSA recipients");
     }
 
-    let decrypt_with_key_ring = Command::new(binary())
-        .args(["decrypt", "--privkey-pem:a"])
-        .arg(&private_a)
-        .arg("--privkey-pem:b")
-        .arg(&private_b)
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        decrypt_with_key_ring.status.success(),
-        "{}",
-        String::from_utf8_lossy(&decrypt_with_key_ring.stderr)
+    let decrypted_with_key_ring = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--privkey-pem:a"])
+            .arg(&private_a)
+            .arg("--privkey-pem:b")
+            .arg(&private_b)
+            .arg(&encrypted),
     );
-    assert_eq!(decrypt_with_key_ring.stdout, b"multiple RSA recipients");
-
-    let missing = Command::new(binary())
-        .args(["encrypt", "--pubkey-pem:a"])
-        .arg(&public_a)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("unknown KeyName"));
-
-    let duplicate = Command::new(binary())
-        .args(["encrypt", "--pubkey-pem:a"])
-        .arg(&public_a)
-        .args(["--pubkey-pem:a"])
-        .arg(&public_b)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(!duplicate.status.success());
-    assert!(String::from_utf8_lossy(&duplicate.stderr).contains("multiple RSA recipient key"));
+    assert_eq!(decrypted_with_key_ring, b"multiple RSA recipients");
+    check_strict_rsa_recipient_options_fail(&template, &plaintext, &public_a, &public_b);
 
     let lax_encrypted = temp.path().join("lax-encrypted.xml");
-    let lax_encrypt = Command::new(binary())
-        .args(["encrypt", "--lax-key-search", "--pubkey-pem:ignored-a"])
-        .arg(&public_a)
-        .arg("--pubkey-pem:ignored-b")
-        .arg(&public_b)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&lax_encrypted)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(
-        lax_encrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lax_encrypt.stderr)
+    run_success(
+        Command::new(binary())
+            .args(["encrypt", "--lax-key-search", "--pubkey-pem:ignored-a"])
+            .arg(&public_a)
+            .arg("--pubkey-pem:ignored-b")
+            .arg(&public_b)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&lax_encrypted)
+            .arg(&template),
     );
     for (name, private_key) in [("a", &private_a), ("b", &private_b)] {
-        let decrypt = Command::new(binary())
-            .arg("decrypt")
-            .arg(format!("--privkey-pem:{name}"))
-            .arg(private_key)
-            .arg(&lax_encrypted)
-            .output()
-            .unwrap();
-        assert!(
-            decrypt.status.success(),
-            "lax recipient {name}: {}",
-            String::from_utf8_lossy(&decrypt.stderr)
+        let decrypted = run_success(
+            Command::new(binary())
+                .arg("decrypt")
+                .arg(format!("--privkey-pem:{name}"))
+                .arg(private_key)
+                .arg(&lax_encrypted),
         );
-        assert_eq!(decrypt.stdout, b"multiple RSA recipients");
+        assert_eq!(
+            decrypted, b"multiple RSA recipients",
+            "lax recipient {name}"
+        );
     }
 
     let insufficient_output = temp.path().join("insufficient-lax.xml");
@@ -8052,40 +8025,12 @@ fn encrypts_with_rsa_recipient_certificates() {
     }
 }
 
-#[test]
-fn rsa_decryption_accepts_private_key_certificate_companions() {
-    // libxmlsec private-key options permit certificate companions after the
-    // key path; decryption consumes the key while retaining that syntax.
-    let temp = tempfile::tempdir().unwrap();
-    let template = temp.path().join("template.xml");
-    let plaintext = temp.path().join("plaintext.bin");
-    let encrypted = temp.path().join("encrypted.xml");
-    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
-    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
-    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
-    fs::write(
-        &template,
-        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
-    )
-    .unwrap();
-    fs::write(&plaintext, b"certificate companion").unwrap();
-    let encrypt = Command::new(binary())
-        .args(["encrypt", "--pubkey-pem"])
-        .arg(&public_key)
-        .arg("--binary-data")
-        .arg(&plaintext)
-        .arg("--output")
-        .arg(&encrypted)
-        .arg(&template)
-        .output()
-        .unwrap();
-    assert!(encrypt.status.success());
-
-    let compound = format!("{},{}", private_key.display(), certificate.display());
-    // The companion's algorithm is part of SPKI identity (RFC 5280 §4.1.2.7).
-    // Keep the exact RSA bits but change rsaEncryption to RSASSA-PSS; merely
-    // comparing the BIT STRING must not accept this structurally valid certificate.
-    let certificate_pem = pem::parse(fs::read(&certificate).unwrap()).unwrap();
+/// Write `certificate` with its SPKI algorithm changed from rsaEncryption to
+/// RSASSA-PSS while keeping the exact RSA key bits. The algorithm is part of
+/// SPKI identity (RFC 5280 §4.1.2.7), so comparing only the BIT STRING must
+/// not accept this structurally valid certificate.
+fn write_rsa_pss_relabeled_certificate(certificate: &Path, output: &Path) {
+    let certificate_pem = pem::parse(fs::read(certificate).unwrap()).unwrap();
     let mut altered = certificate_pem.contents().to_vec();
     let (_, parsed) = x509_parser::certificate::X509Certificate::from_der(&altered).unwrap();
     let spki = parsed.public_key().raw;
@@ -8107,57 +8052,77 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
         changed.public_key().subject_public_key.data.as_ref(),
         original_bits
     );
-    let altered_certificate = temp.path().join("changed-algorithm.pem");
-    fs::write(
-        &altered_certificate,
-        pem::encode(&pem::Pem::new("CERTIFICATE", altered)),
-    )
-    .unwrap();
-    let check_companion = |provider: &str| {
-        let rejected = Command::new(binary())
-            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
-            .arg(format!(
-                "{},{}",
-                private_key.display(),
-                altered_certificate.display()
-            ))
-            .arg(&encrypted)
-            .output()
-            .unwrap();
-        assert!(
-            !rejected.status.success(),
-            "{provider} accepted a different SPKI algorithm"
-        );
-        assert!(String::from_utf8_lossy(&rejected.stderr).contains("does not match"));
-        assert!(rejected.stdout.is_empty());
-        let accepted = Command::new(binary())
-            .args(["decrypt", "--crypto", provider, "--privkey-pem"])
-            .arg(&compound)
-            .arg(&encrypted)
-            .output()
-            .unwrap();
-        assert!(
-            accepted.status.success(),
-            "{}",
-            String::from_utf8_lossy(&accepted.stderr)
-        );
-        assert_eq!(accepted.stdout, b"certificate companion");
-    };
-    check_companion("rustcrypto");
-    #[cfg(feature = "aws-lc-fips")]
-    check_companion("aws-lc-fips");
-    let decrypt = Command::new(binary())
-        .args(["decrypt", "--privkey-pem"])
-        .arg(compound)
-        .arg(&encrypted)
+    fs::write(output, pem::encode(&pem::Pem::new("CERTIFICATE", altered))).unwrap();
+}
+
+/// `provider` rejects a companion whose SPKI algorithm differs from the key
+/// and accepts the genuine companion.
+fn check_certificate_companion(provider: &str, relabeled: &str, compound: &str, encrypted: &Path) {
+    let rejected = Command::new(binary())
+        .args(["decrypt", "--crypto", provider, "--privkey-pem", relabeled])
+        .arg(encrypted)
         .output()
         .unwrap();
     assert!(
-        decrypt.status.success(),
-        "{}",
-        String::from_utf8_lossy(&decrypt.stderr)
+        !rejected.status.success(),
+        "{provider} accepted a different SPKI algorithm"
     );
-    assert_eq!(decrypt.stdout, b"certificate companion");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("does not match"));
+    assert_eq!(rejected.stdout, b"");
+    let accepted = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--crypto", provider, "--privkey-pem", compound])
+            .arg(encrypted),
+    );
+    assert_eq!(accepted, b"certificate companion");
+}
+
+#[test]
+fn rsa_decryption_accepts_private_key_certificate_companions() {
+    // libxmlsec private-key options permit certificate companions after the
+    // key path; decryption consumes the key while retaining that syntax.
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let plaintext = temp.path().join("plaintext.bin");
+    let encrypted = temp.path().join("encrypted.xml");
+    let private_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-key.pem");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-4096-cert.pem");
+    let public_key = project_root().join("tests/fixtures/keys/rsa/rsa-4096-pubkey.pem");
+    fs::write(
+        &template,
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#,
+    )
+    .unwrap();
+    fs::write(&plaintext, b"certificate companion").unwrap();
+    run_success(
+        Command::new(binary())
+            .args(["encrypt", "--pubkey-pem"])
+            .arg(&public_key)
+            .arg("--binary-data")
+            .arg(&plaintext)
+            .arg("--output")
+            .arg(&encrypted)
+            .arg(&template),
+    );
+
+    let compound = format!("{},{}", private_key.display(), certificate.display());
+    let altered_certificate = temp.path().join("changed-algorithm.pem");
+    write_rsa_pss_relabeled_certificate(&certificate, &altered_certificate);
+    let relabeled = format!(
+        "{},{}",
+        private_key.display(),
+        altered_certificate.display()
+    );
+    check_certificate_companion("rustcrypto", &relabeled, &compound, &encrypted);
+    #[cfg(feature = "aws-lc-fips")]
+    check_certificate_companion("aws-lc-fips", &relabeled, &compound, &encrypted);
+    let decrypted = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--privkey-pem"])
+            .arg(compound)
+            .arg(&encrypted),
+    );
+    assert_eq!(decrypted, b"certificate companion");
 
     let unrelated_certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
     let mismatched_compound = format!(
@@ -8175,20 +8140,15 @@ fn rsa_decryption_accepts_private_key_certificate_companions() {
     assert!(String::from_utf8_lossy(&mismatched.stderr).contains("does not match"));
 
     let valid_compound = format!("{},{}", private_key.display(), certificate.display());
-    let lax = Command::new(binary())
-        .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
-        .arg(mismatched_compound)
-        .args(["--privkey-pem:second"])
-        .arg(valid_compound)
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        lax.status.success(),
-        "{}",
-        String::from_utf8_lossy(&lax.stderr)
+    let lax = run_success(
+        Command::new(binary())
+            .args(["decrypt", "--lax-key-search", "--privkey-pem:first"])
+            .arg(mismatched_compound)
+            .args(["--privkey-pem:second"])
+            .arg(valid_compound)
+            .arg(&encrypted),
     );
-    assert_eq!(lax.stdout, b"certificate companion");
+    assert_eq!(lax, b"certificate companion");
 
     let malformed = temp.path().join("malformed.pem");
     fs::write(&malformed, "not a certificate").unwrap();
@@ -8730,7 +8690,7 @@ fn generated_key_store_uses_the_libxmlsec1_xml_shape() {
     let document = roxmltree::Document::parse(&xml).unwrap();
     let elements = document
         .descendants()
-        .filter(|node| node.is_element())
+        .filter(roxmltree::Node::is_element)
         .map(|node| (node.tag_name().namespace(), node.tag_name().name()))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -9284,11 +9244,10 @@ fn explicit_certificate_verification_honors_embedded_crls() {
     );
 }
 
-#[test]
-fn explicit_certificate_verification_reports_revoked_leaf() {
-    // Exercise the CLI's revoked-serial path with an issuer that is authorized to sign CRLs;
-    // this remains independent from the legacy fixture's cRLSign rejection above.
-    let temp = tempfile::tempdir().unwrap();
+/// Write `root.pem`, `issuer.pem`, `leaf.pem` and `leaf-key.pem` under `temp`
+/// for a chain whose CRL-signing issuer revokes the leaf. Returns the CRL DER
+/// and the instant its validity window is centered on.
+fn write_revoked_leaf_pki(temp: &Path) -> (Vec<u8>, OffsetDateTime) {
     let mut root_params = CertificateParams::new(Vec::new()).unwrap();
     root_params
         .distinguished_name
@@ -9337,18 +9296,27 @@ fn explicit_certificate_verification_reports_revoked_leaf() {
     .signed_by(&issuer)
     .expect("issuer should sign CRL");
 
+    fs::write(temp.join("root.pem"), pem_text("CERTIFICATE", root.der())).unwrap();
+    fs::write(
+        temp.join("issuer.pem"),
+        pem_text("CERTIFICATE", issuer_certificate.der()),
+    )
+    .unwrap();
+    fs::write(temp.join("leaf.pem"), pem_text("CERTIFICATE", leaf.der())).unwrap();
+    fs::write(temp.join("leaf-key.pem"), leaf_key.serialize_pem()).unwrap();
+    (crl.der().to_vec(), verification_window)
+}
+
+#[test]
+fn explicit_certificate_verification_reports_revoked_leaf() {
+    // Exercise the CLI's revoked-serial path with an issuer that is authorized to sign CRLs;
+    // this remains independent from the legacy fixture's cRLSign rejection above.
+    let temp = tempfile::tempdir().unwrap();
+    let (crl, verification_window) = write_revoked_leaf_pki(temp.path());
     let root_path = temp.path().join("root.pem");
     let issuer_path = temp.path().join("issuer.pem");
     let leaf_path = temp.path().join("leaf.pem");
     let leaf_key_path = temp.path().join("leaf-key.pem");
-    fs::write(&root_path, pem_text("CERTIFICATE", root.der())).unwrap();
-    fs::write(
-        &issuer_path,
-        pem_text("CERTIFICATE", issuer_certificate.der()),
-    )
-    .unwrap();
-    fs::write(&leaf_path, pem_text("CERTIFICATE", leaf.der())).unwrap();
-    fs::write(&leaf_key_path, leaf_key.serialize_pem()).unwrap();
 
     let signed = temp.path().join("signed.xml");
     let with_crl = temp.path().join("signed-with-crl.xml");
@@ -9373,7 +9341,7 @@ fn explicit_certificate_verification_reports_revoked_leaf() {
         "</X509Data>",
         &format!(
             "<X509CRL>{}</X509CRL></X509Data>",
-            base64::engine::general_purpose::STANDARD.encode(crl.der())
+            base64::engine::general_purpose::STANDARD.encode(crl)
         ),
         1,
     );
@@ -9516,7 +9484,7 @@ fn lax_signing_skips_keys_rejected_by_the_signing_policy() {
     fs::write(
         &weak_key_path,
         weak_key
-            .to_pkcs8_pem(Default::default())
+            .to_pkcs8_pem(pkcs8::LineEnding::default())
             .unwrap()
             .as_bytes(),
     )
