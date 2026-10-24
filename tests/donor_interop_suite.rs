@@ -1,4 +1,4 @@
-//! XMLDSig 1.1 and Second Edition donor interoperability coverage.
+//! `XMLDSig` 1.1 and Second Edition donor interoperability coverage.
 
 #![cfg(feature = "xmldsig")]
 
@@ -272,7 +272,9 @@ fn key_info_reference_policy_and_structure_fail_closed() {
     ));
 
     let mut source_policy = compatibility_verification_policy();
-    source_policy.key_sources.key_info_reference = false;
+    source_policy
+        .key_sources
+        .remove(xml_sec::policy::KeySourceKind::KeyInfoReference);
     assert!(matches!(
         VerifyContext::new()
             .key_resolver(&resolver)
@@ -369,10 +371,9 @@ fn external_key_info_reference_uses_only_caller_owned_bytes() {
     assert_valid(result.status, Path::new("external KeyInfoReference"));
 }
 
-#[test]
-fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
-    // An external KeyInfo document owns its fragment namespace. Nested external
-    // dereferences remain caller-owned and consume the same aggregate budget.
+/// The donor `KeyInfoReference` signature and the source of the `KeyInfo` it
+/// references by `#KeyInfoID`.
+fn key_info_reference_fixture() -> (String, String) {
     let xml = fs::read_to_string(format!(
         "{XMLDSIG11_DIR}/signature-enveloping-keyinforeference-rsa.xml"
     ))
@@ -384,7 +385,49 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
         .find("</dsig:KeyInfo>")
         .map(|offset| marker_offset + offset + "</dsig:KeyInfo>".len())
         .unwrap();
-    let key_info = &xml[start..end];
+    let key_info = xml[start..end].to_owned();
+    (xml, key_info)
+}
+
+#[test]
+fn external_key_info_documents_obey_the_xml_node_policy() {
+    // Nested documents use the same typed XML resource policy as the initial
+    // signature parse, including the public Policy error classification.
+    let (xml, _) = key_info_reference_fixture();
+    let oversized_nodes = format!(
+        r#"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"><dsig:KeyInfo Id="outer">{}</dsig:KeyInfo></keys>"#,
+        "<node/>".repeat(256)
+    );
+    let oversized_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"oversized.xml#outer\"", 1);
+    let oversized_resources =
+        HashMap::from([("oversized.xml".to_owned(), oversized_nodes.into_bytes())]);
+    let mut node_policy = compatibility_verification_policy();
+    node_policy.uris.key_info_references = UriTypeSet::ALL;
+    node_policy.resources.max_xml_nodes = 128;
+    let error = VerifyContext::new()
+        .key_resolver(&DefaultKeyResolver::default())
+        .external_resources(&oversized_resources)
+        .policy(node_policy)
+        .verify(&oversized_signature)
+        .expect_err("external KeyInfo XML node limits must fail as policy errors");
+    assert!(
+        matches!(
+            error,
+            DsigError::Policy(PolicyViolation::ResourceLimit {
+                resource: "XML nodes",
+                maximum: 128,
+                ..
+            })
+        ),
+        "unexpected external XML policy error: {error:?}"
+    );
+}
+
+#[test]
+fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
+    // An external KeyInfo document owns its fragment namespace. Nested external
+    // dereferences remain caller-owned and consume the same aggregate budget.
+    let (xml, key_info) = key_info_reference_fixture();
     let inner_key_info = key_info.replacen("Id=\"KeyInfoID\"", "ExternalId=\"inner\"", 1);
     let fragment_document = format!(
         r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo ExternalId="outer"><dsig11:KeyInfoReference URI="#inner"/></dsig:KeyInfo>{inner_key_info}</keys>"##
@@ -464,36 +507,6 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
             })
         ),
         "unexpected aggregate budget error: {error:?}"
-    );
-
-    // Nested documents use the same typed XML resource policy as the initial
-    // signature parse, including the public Policy error classification.
-    let oversized_nodes = format!(
-        r##"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#"><dsig:KeyInfo Id="outer">{}</dsig:KeyInfo></keys>"##,
-        "<node/>".repeat(256)
-    );
-    let oversized_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"oversized.xml#outer\"", 1);
-    let oversized_resources =
-        HashMap::from([("oversized.xml".to_owned(), oversized_nodes.into_bytes())]);
-    let mut node_policy = compatibility_verification_policy();
-    node_policy.uris.key_info_references = UriTypeSet::ALL;
-    node_policy.resources.max_xml_nodes = 128;
-    let error = VerifyContext::new()
-        .key_resolver(&resolver)
-        .external_resources(&oversized_resources)
-        .policy(node_policy)
-        .verify(&oversized_signature)
-        .expect_err("external KeyInfo XML node limits must fail as policy errors");
-    assert!(
-        matches!(
-            error,
-            DsigError::Policy(PolicyViolation::ResourceLimit {
-                resource: "XML nodes",
-                maximum: 128,
-                ..
-            })
-        ),
-        "unexpected external XML policy error: {error:?}"
     );
 }
 

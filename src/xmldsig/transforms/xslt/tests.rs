@@ -5,8 +5,26 @@ use super::super::{
 use super::XsltStylesheet;
 use crate::policy::{PolicyViolation, ResourcePolicy, resource_name};
 use crate::xml::dom::Document;
+use std::fmt::Write as _;
 
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
+
+/// Work done outside any query: an owned transform is serialized once, when it is built.
+fn unmetered() -> impl FnMut(usize) -> Result<(), TransformError> {
+    |_| Ok(())
+}
+
+/// Concatenate `count` generated markup fragments.
+fn concat(
+    count: usize,
+    mut fragment: impl FnMut(&mut String, usize) -> std::fmt::Result,
+) -> String {
+    let mut markup = String::new();
+    for index in 0..count {
+        fragment(&mut markup, index).expect("writing to a String cannot fail");
+    }
+    markup
+}
 
 #[test]
 fn detached_input_retains_its_entity_declaration_base() {
@@ -205,12 +223,11 @@ fn parsed_source_round_trips_inherited_namespaces() {
         super::super::XSLT_TRANSFORM_URI
     );
     let document = Document::parse(&xml).expect("valid enclosing namespaces");
-    let parsed = match super::super::parse_transforms(document.root_element())
+    let Some(Transform::Xslt(parsed)) = super::super::parse_transforms(document.root_element())
         .expect("parse inherited stylesheet")
         .pop()
-    {
-        Some(Transform::Xslt(sheet)) => sheet,
-        _ => panic!("expected XSLT stylesheet"),
+    else {
+        panic!("expected XSLT stylesheet");
     };
     let recreated =
         XsltStylesheet::new(parsed.source()).expect("public source is self-contained markup");
@@ -224,6 +241,7 @@ fn parsed_source_round_trips_inherited_namespaces() {
 
 #[test]
 fn implicit_c14n_input_stays_in_the_xslt_workspace() {
+    use structured_asn1::memory::{Memory, MemoryAccount};
     // Node-set conversion retains an extra canonicalized buffer while the
     // identical octet input is borrowed. That buffer must reduce engine space.
     let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
@@ -266,7 +284,6 @@ fn implicit_c14n_input_stays_in_the_xslt_workspace() {
         "conversion buffer must not fit beside the minimum octet workspace: {result:?}"
     );
 
-    use structured_asn1::memory::{Memory, MemoryAccount};
     let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 28)));
     let scratch = crate::c14n::scratch::Accounted(&memory);
     let nodes = crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
@@ -491,7 +508,7 @@ fn entity_child_does_not_hide_repeated_namespace_declarations() {
                 document.root_element(),
                 usize::MAX,
                 super::Inheritance::Omit,
-                &mut super::unmetered,
+                &mut unmetered(),
             )
             .expect("stylesheet serializes");
             assert!(
@@ -550,7 +567,7 @@ fn stylesheets_are_serialized_from_the_parsed_tree() {
         transform,
         usize::MAX,
         super::Inheritance::Separate,
-        &mut super::unmetered,
+        &mut unmetered(),
     )
     .expect("a stylesheet");
     assert_eq!(
@@ -593,7 +610,7 @@ fn stylesheet_serialization_stays_within_the_workspace() {
             transform,
             limit,
             super::Inheritance::Inline,
-            &mut super::unmetered,
+            &mut unmetered(),
         )
     };
     let full = serialize(usize::MAX).expect("a stylesheet").document.len();
@@ -899,12 +916,12 @@ fn stylesheet_serialization_is_paid_before_it_runs() {
     // elements make that walk far more work than the text it writes, so a query without
     // the work is refused during the walk instead of paying only for the text afterwards.
     use structured_asn1::memory::MemoryError;
-    let declarations: String = (0..100)
-        .map(|index| format!(r#" xmlns:p{index}="urn:p{index}""#))
-        .collect();
-    let templates: String = (0..150)
-        .map(|index| format!(r#"<xsl:template name="t{index}"/>"#))
-        .collect();
+    let declarations = concat(100, |out, index| {
+        write!(out, r#" xmlns:p{index}="urn:p{index}""#)
+    });
+    let templates = concat(150, |out, index| {
+        write!(out, r#"<xsl:template name="t{index}"/>"#)
+    });
     let xml = format!(
         r#"<root{declarations}><Transform><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{templates}</xsl:stylesheet></Transform></root>"#
     );
@@ -940,9 +957,9 @@ fn stylesheet_serialization_is_paid_before_it_runs() {
 fn native_stylesheet_capture_obeys_operation_work() {
     // Namespace fan-out during native parameter capture must be refused before
     // serialization, even though this path has no replay query account.
-    let declarations: String = (0..100)
-        .map(|index| format!(r#" xmlns:p{index}="urn:p{index}""#))
-        .collect();
+    let declarations = concat(100, |out, index| {
+        write!(out, r#" xmlns:p{index}="urn:p{index}""#)
+    });
     let templates = "<xsl:template match=\"/\"><out/></xsl:template>";
     let xml = format!(
         r#"<ds:Transforms xmlns:ds="{}"{declarations}><ds:Transform Algorithm="{}"><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}">{templates}</xsl:stylesheet></ds:Transform></ds:Transforms>"#,
@@ -1258,12 +1275,11 @@ fn parsed_stylesheet_copies_count_against_the_workspace() {
         markup = given.source()
     );
     let document = Document::parse(&xml).expect("fixed XML parses");
-    let parsed = match super::super::parse_transforms(document.root_element())
+    let Some(Transform::Xslt(parsed)) = super::super::parse_transforms(document.root_element())
         .expect("the transform parses")
         .pop()
-    {
-        Some(Transform::Xslt(stylesheet)) => stylesheet,
-        _ => panic!("one XSLT transform"),
+    else {
+        panic!("one XSLT transform");
     };
     let workspace = |bytes| {
         TransformExecutionBudget::from_resources(&ResourcePolicy {
@@ -1302,9 +1318,10 @@ fn compatibility_serialization_holds_no_inherited_declarations() {
     // Under libxmlsec1 semantics a stylesheet read from its `<Transform>` keeps only
     // what it declares itself, so the bindings of its ancestors are neither written nor
     // counted against the workspace.
-    let declarations: String = (0..64)
-        .map(|index| format!(r#" xmlns:p{index}="urn:{}""#, "x".repeat(64)))
-        .collect();
+    let namespace = "x".repeat(64);
+    let declarations = concat(64, |out, index| {
+        write!(out, r#" xmlns:p{index}="urn:{namespace}""#)
+    });
     let xml = format!(
         r#"<root{declarations}><Transform><xsl:stylesheet version="1.0" xmlns:xsl="{XSL}"/></Transform></root>"#
     );
@@ -1314,12 +1331,7 @@ fn compatibility_serialization_holds_no_inherited_declarations() {
         .first_child()
         .expect("the Transform element");
     let serialize = |limit, inheritance| {
-        super::ParsedStylesheet::from_transform(
-            transform,
-            limit,
-            inheritance,
-            &mut super::unmetered,
-        )
+        super::ParsedStylesheet::from_transform(transform, limit, inheritance, &mut unmetered())
     };
     let own = serialize(usize::MAX, super::Inheritance::Omit)
         .expect("a stylesheet")

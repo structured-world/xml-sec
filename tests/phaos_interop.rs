@@ -1,4 +1,4 @@
-//! Exhaustive public-pipeline coverage for the Phaos XMLDSig 3 corpus.
+//! Exhaustive public-pipeline coverage for the Phaos `XMLDSig` 3 corpus.
 
 #![cfg(feature = "xmldsig")]
 
@@ -262,7 +262,7 @@ fn certificate(name: &str) -> Vec<u8> {
 fn verification_key() -> VerificationKey {
     let der = certificate("rsa-cert.der");
     let (rest, certificate) = X509Certificate::from_der(&der).expect("Phaos RSA certificate");
-    assert!(rest.is_empty());
+    assert_eq!(rest, []);
     VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha1,
         public_key_bytes: certificate.public_key().raw.to_vec(),
@@ -369,17 +369,7 @@ fn execute(case: Case) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
                 .external_resources(&resources)
                 .verify(&xml)
         }
-        Setup::Hmac => {
-            let key = HmacSha1VerificationKey::new(certificate("hmackey.bin"))
-                .expect("Phaos HMAC key is valid");
-            VerifyContext::new()
-                .policy(policy(SignatureAlgorithm::HmacSha1, false))
-                .key(&key)
-                .allowed_uri_types(UriTypeSet::ALL)
-                .external_resources(&resources)
-                .verify(&xml)
-        }
-        Setup::Hmac80 => {
+        Setup::Hmac | Setup::Hmac80 => {
             let key = HmacSha1VerificationKey::new(certificate("hmackey.bin"))
                 .expect("Phaos HMAC key is valid");
             VerifyContext::new()
@@ -408,9 +398,9 @@ fn execute(case: Case) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
 
 fn check_expected(
     case: Case,
-    result: Result<xml_sec::xmldsig::VerifyResult, DsigError>,
+    result: &Result<xml_sec::xmldsig::VerifyResult, DsigError>,
 ) -> Result<(), String> {
-    let matches = match (case.expected, &result) {
+    let matches = match (case.expected, result) {
         (
             Expected::Valid {
                 manifest_references,
@@ -458,7 +448,7 @@ fn check_expected(
         ) => {
             algorithm == uri
                 && SignatureAlgorithm::from_uri(uri)
-                    .is_some_and(|method| method.requires_explicit_permission())
+                    .is_some_and(xml_sec::xmldsig::SignatureAlgorithm::requires_explicit_permission)
         }
         #[cfg(not(feature = "xslt"))]
         (
@@ -498,7 +488,12 @@ fn every_phaos_signature_is_classified_once() {
         .expect("Phaos fixture directory")
         .map(|entry| entry.expect("Phaos directory entry").file_name())
         .filter_map(|name| name.into_string().ok())
-        .filter(|name| name.starts_with("signature-") && name.ends_with(".xml"))
+        .filter(|name| {
+            name.starts_with("signature-")
+                && std::path::Path::new(name)
+                    .extension()
+                    .is_some_and(|extension| extension == "xml")
+        })
         .collect();
     let classified: BTreeSet<_> = CASES.iter().map(|case| case.name.to_owned()).collect();
     assert_eq!(
@@ -515,7 +510,7 @@ fn executes_every_phaos_signature_through_the_public_pipeline() {
     let failures: Vec<_> = CASES
         .iter()
         .copied()
-        .filter_map(|case| check_expected(case, execute(case)).err())
+        .filter_map(|case| check_expected(case, &execute(case)).err())
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

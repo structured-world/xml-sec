@@ -275,7 +275,7 @@ impl Fixture {
         } else {
             "A"
         };
-        corrupted.replace_range(offset..offset + 1, replacement);
+        corrupted.replace_range(offset..=offset, replacement);
         let rejected_document = XmlDocument::parse_with_backend(corrupted, spec.backend)
             .expect("corrupted signature remains XML");
         let canonical = canonicalize_document(

@@ -1,8 +1,8 @@
-//! Storage-specialized projection of the original XML XPath node identities.
+//! Storage-specialized projection of the original XML `XPath` node identities.
 //!
 //! A whole document or rooted subtree, minus any excluded subtrees, remains a
 //! range of the contiguous preorder arena and stores no per-node entries.
-//! Arbitrary selections are explicit sets over the document-order XPath index:
+//! Arbitrary selections are explicit sets over the document-order `XPath` index:
 //! a sorted index vector while sparse, a bitset once dense.
 
 use super::{NodeSetMaterializationBudget, TransformError, charge_resource_bytes};
@@ -13,7 +13,7 @@ use crate::xml::dom::{Document, Node, NodeId};
 use std::ops::Range;
 use structured_asn1::memory::{HashWork, MemoryError, Work};
 
-/// Sets with at least `1 / DENSE_DIVISOR` of the document's XPath nodes use the
+/// Sets with at least `1 / DENSE_DIVISOR` of the document's `XPath` nodes use the
 /// bitset. Measured with the `node_set_*` benchmarks (16K elements, inclusive
 /// C14N, medians of three runs): at 1/37 density the vector matches the bitset's
 /// peak memory but costs 48% more time; at 1/149 it costs 5% more with half the
@@ -110,7 +110,7 @@ pub(super) fn measure<D: DomStorage>(
     Ok(measured)
 }
 
-/// Name bytes a materialized key for this XPath node would have owned.
+/// Name bytes a materialized key for this `XPath` node would have owned.
 fn node_bytes<D: DomStorage>(owner: Node<'_, '_, D>, offset: u32) -> Result<usize, MemoryError> {
     let Some(axis) = (offset as usize).checked_sub(1) else {
         return Ok(0);
@@ -134,7 +134,7 @@ fn node_bytes<D: DomStorage>(owner: Node<'_, '_, D>, offset: u32) -> Result<usiz
     bytes.ok_or(MemoryError::WorkExceeded)
 }
 
-/// Name bytes of every XPath node owned by `node`.
+/// Name bytes of every `XPath` node owned by `node`.
 fn owned_bytes<D: DomStorage>(node: Node<'_, '_, D>) -> Result<usize, MemoryError> {
     let mut bytes = 0_usize;
     for attribute in node.attributes() {
@@ -152,17 +152,21 @@ fn owned_bytes<D: DomStorage>(node: Node<'_, '_, D>) -> Result<usize, MemoryErro
     Ok(bytes)
 }
 
-/// Every XPath node owned by `node`: itself, then its attributes and namespaces.
+/// Narrow a count or offset inside the document arena, which admits every
+/// node, attribute and namespace into one bounded `u32` index space.
+fn arena_index(value: usize) -> u32 {
+    u32::try_from(value).expect("the document arena indexes within u32")
+}
+
+/// Every `XPath` node owned by `node`: itself, then its attributes and namespaces.
 fn owned_indexes<D: DomStorage>(node: Node<'_, '_, D>) -> Range<u32> {
     let start = node.xpath_index();
-    // The arena admitted these axes into the same bounded u32 index space.
-    let axes = (node.attributes().len() + node.namespaces().len()) as u32;
+    let axes = arena_index(node.attributes().len() + node.namespaces().len());
     start..start + 1 + axes
 }
 
 fn subtree_ids<D: DomStorage>(node: Node<'_, '_, D>) -> Range<u32> {
-    // Descendant counts come from the same bounded u32 arena.
-    node.id().get()..node.id().get() + node.descendants().len() as u32
+    node.id().get()..node.id().get() + arena_index(node.descendants().len())
 }
 
 pub(crate) trait Keys {
@@ -215,7 +219,7 @@ impl Keys for NativeKeys {
     fn empty_like(&self) -> Self {
         Self
     }
-    fn admit(_: (), _: usize) -> Result<(), MemoryError> {
+    fn admit((): (), _: usize) -> Result<(), MemoryError> {
         Ok(())
     }
 }
@@ -265,7 +269,7 @@ impl<'w, W: Work> Keys for PaidKeys<'w, W> {
     }
 }
 
-/// XPath axis of one node owned by a tree node.
+/// `XPath` axis of one node owned by a tree node.
 #[derive(Clone, Copy)]
 enum Axis {
     Tree,
@@ -274,7 +278,7 @@ enum Axis {
 }
 
 enum Members<K: Keys> {
-    /// Every XPath node owned by an arena node in `nodes`, except the owners in
+    /// Every `XPath` node owned by an arena node in `nodes`, except the owners in
     /// `excluded` (sorted, disjoint whole subtrees) and, without `comments`,
     /// comment nodes.
     Subtree {
@@ -283,11 +287,11 @@ enum Members<K: Keys> {
         comments: bool,
     },
     Sparse(SparseIndexes<K>),
-    /// One bit per document-order XPath index.
+    /// One bit per document-order `XPath` index.
     Dense(Values<K, u64>),
 }
 
-/// Sorted document-order XPath indexes with one summary bit per 64-index
+/// Sorted document-order `XPath` indexes with one summary bit per 64-index
 /// block. C14N queries every document node, so a miss in an unoccupied block
 /// must not cost a binary search.
 struct SparseIndexes<K: Keys> {
@@ -508,10 +512,10 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             }
             Axis::Attribute(_) | Axis::Namespace(_) => return None,
         };
-        Some(start + 1 + offset as u32)
+        Some(start + 1 + arena_index(offset))
     }
 
-    /// Owner arena node and name bytes of one document-order XPath index.
+    /// Owner arena node and name bytes of one document-order `XPath` index.
     fn resolve(
         &self,
         index: u32,
@@ -649,10 +653,11 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
             Members::Dense(words) => {
                 for (position, &word) in words.iter().enumerate() {
                     K::admit(execution, 1 + word.count_ones() as usize).map_err(C14nError::from)?;
+                    // The bitset covers the u32 document index space.
+                    let base = arena_index(position * 64);
                     let mut bits = word;
                     while bits != 0 {
-                        // The bitset covers the u32 document index space.
-                        visit((position * 64) as u32 + bits.trailing_zeros())?;
+                        visit(base + bits.trailing_zeros())?;
                         bits &= bits - 1;
                     }
                 }
@@ -677,7 +682,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
         let dense = prefers_dense(self.entries, self.universe());
         let execution = self.keys.execution();
         let members = match (&self.members, dense) {
-            (Members::Subtree { .. }, true) | (Members::Sparse(_), true) => {
+            (Members::Subtree { .. } | Members::Sparse(_), true) => {
                 let mut words = self.dense_words()?;
                 self.for_each_index(execution, |index| {
                     set_bit(&mut words, index);
@@ -685,7 +690,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 })?;
                 Members::Dense(words)
             }
-            (Members::Subtree { .. }, false) | (Members::Dense(_), false) => {
+            (Members::Subtree { .. } | Members::Dense(_), false) => {
                 Members::Sparse(self.sparse_copy()?)
             }
             (Members::Sparse(_), false) | (Members::Dense(_), true) => return Ok(()),
@@ -855,11 +860,12 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
                 for position in 0..words.len() {
                     // The word scan and each member it holds.
                     keys.charge(1 + words[position].count_ones() as usize)?;
+                    let base = arena_index(position * 64);
                     let mut bits = words[position];
                     while bits != 0 {
                         let offset = bits.trailing_zeros();
                         bits &= bits - 1;
-                        let index = (position * 64) as u32 + offset;
+                        let index = base + offset;
                         if !keep(index)? {
                             words[position] &= !(1 << offset);
                             drop_index(index)?;

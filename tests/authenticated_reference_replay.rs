@@ -914,8 +914,8 @@ fn authenticated_manifest_outside_signature_uses_the_same_catalogue_and_replay()
     let xml = manifest_template("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "")
         .replace("<ds:Object>", "</ds:Signature>")
         .replace("</ds:Object></ds:Signature>", "");
-    let signed = SignContext::new(&signer).sign_template(&xml).unwrap();
-    let document = XmlDocument::parse(signed).unwrap();
+    let document =
+        XmlDocument::parse(SignContext::new(&signer).sign_template(&xml).unwrap()).unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     with_verified_request(
         &document,
@@ -1032,7 +1032,7 @@ fn signed_manifest_with_unknown_historical_digest_can_be_replayed() {
                     .unwrap(),
                 ReplayOutcome::Complete
             );
-            assert!(!output.is_empty());
+            assert_ne!(output, b"");
             Ok(())
         },
     )
@@ -1986,7 +1986,10 @@ fn current_query_replays_xslt_within_its_memory_account() {
         with_verified_request(&document, &context, &request, &account(), |session| {
             for (current, expected) in [
                 (account(), Ok(())),
-                (Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24))), Err(())),
+                (
+                    Memory::new(Arc::new(MemoryAccount::new(4096, 1 << 24))),
+                    Err(()),
+                ),
             ] {
                 let mut output = Vec::new();
                 session
@@ -2002,33 +2005,30 @@ fn current_query_replays_xslt_within_its_memory_account() {
                                     Ok::<_, ()>(())
                                 },
                             );
-                            match expected {
-                                Ok(()) => {
-                                    assert_eq!(result.unwrap(), ReplayOutcome::Complete);
-                                    // The literal result element copies the `ds`
-                                    // namespace in scope at the stylesheet.
-                                    assert_eq!(
-                                        output,
-                                        concat!(
-                                            "<?xml version=\"1.0\"?>\n",
-                                            "<values xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">",
-                                            "<v>a</v><v>b</v></values>\n"
-                                        )
-                                        .as_bytes()
-                                    );
-                                }
-                                Err(()) => {
-                                    assert!(
-                                        matches!(
-                                            result,
-                                            Err(ReplayError::Processing(DsigError::SharedExecution(
-                                                structured_asn1::memory::MemoryError::LimitExceeded
-                                            )))
-                                        ),
-                                        "workspace must come from the current account, got {result:?}"
-                                    );
-                                    assert!(output.is_empty());
-                                }
+                            if expected.is_ok() {
+                                assert_eq!(result.unwrap(), ReplayOutcome::Complete);
+                                // The literal result element copies the `ds`
+                                // namespace in scope at the stylesheet.
+                                assert_eq!(
+                                    output,
+                                    concat!(
+                                        "<?xml version=\"1.0\"?>\n",
+                                        "<values xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">",
+                                        "<v>a</v><v>b</v></values>\n"
+                                    )
+                                    .as_bytes()
+                                );
+                            } else {
+                                assert!(
+                                    matches!(
+                                        result,
+                                        Err(ReplayError::Processing(DsigError::SharedExecution(
+                                            structured_asn1::memory::MemoryError::LimitExceeded
+                                        )))
+                                    ),
+                                    "workspace must come from the current account, got {result:?}"
+                                );
+                                assert_eq!(output, b"");
                             }
                             Ok::<_, ()>(())
                         },

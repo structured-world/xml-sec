@@ -38,6 +38,10 @@ impl RustCryptoDhKey {
     /// the supplied operation before allocating big integers or testing primes.
     /// The provider supplies independent random Miller-Rabin bases; failures are
     /// propagated, never replaced with deterministic or biased bases.
+    ///
+    /// # Errors
+    /// Returns an error for invalid domain or private-key parameters, policy or
+    /// resource refusal, or provider randomness failure during primality validation.
     pub fn from_components(
         provider: &dyn CryptoProvider,
         budget: &mut KeyEstablishmentBudget<'_>,
@@ -74,9 +78,10 @@ impl RustCryptoDhKey {
             return Err(invalid().into());
         }
         budget.reserve_dh_import(p_bits, q_bits, twos_minus_one(p), twos_minus_one(q))?;
-        let precision = p_bits.div_ceil(64) as u32 * 64;
+        let precision = u32::try_from(p_bits.div_ceil(64)).map_err(|_| invalid())? * 64;
         let p_value = decode(p, precision)?;
-        let q_small = decode(q, q_bits.div_ceil(64) as u32 * 64)?;
+        let q_precision = u32::try_from(q_bits.div_ceil(64)).map_err(|_| invalid())? * 64;
+        let q_small = decode(q, q_precision)?;
         let order = decode(q, precision)?;
         let one = BoxedUint::one_with_precision(precision);
         let two = decode(&[2], precision)?;
@@ -100,7 +105,7 @@ impl RustCryptoDhKey {
         probable_prime(|bytes| provider.fill_random(bytes), &q_small)?;
         let params = BoxedMontyParams::new_vartime(Odd::new(p_value).ok_or_else(invalid)?);
         if BoxedMontyForm::new(generator.clone(), &params)
-            .pow_bounded_exp(&order, q_bits as u32)
+            .pow_bounded_exp(&order, u32::try_from(q_bits).map_err(|_| invalid())?)
             .retrieve()
             != one
         {
@@ -117,6 +122,7 @@ impl RustCryptoDhKey {
     }
 
     /// Export the public value with the same fixed octet width as p.
+    #[must_use]
     pub fn public_key(&self) -> Vec<u8> {
         let value = Zeroizing::new(
             BoxedMontyForm::new(self.generator.clone(), &self.params).pow(&self.private),

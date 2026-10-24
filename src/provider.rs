@@ -66,6 +66,7 @@ impl RecoveredContentKey {
     /// This constructor itself proves neither ciphertext integrity nor identity.
     /// Do not use this for RSA-v1.5 recovery, whose validity must be
     /// retained separately with `recovery` until content work completes.
+    #[must_use]
     pub fn confirmed(bytes: Vec<u8>) -> Self {
         Self {
             bytes: zeroize::Zeroizing::new(bytes),
@@ -80,6 +81,7 @@ impl RecoveredContentKey {
     /// `bytes` must already contain the fixed-width real-or-fallback candidate;
     /// the caller must not branch on `valid` during recovery. The enclosing
     /// content operation consumes this state only after primitive decryption.
+    #[must_use]
     pub fn recovery(bytes: zeroize::Zeroizing<Vec<u8>>, valid: subtle::Choice) -> Self {
         Self {
             bytes,
@@ -100,6 +102,7 @@ impl RecoveredContentKey {
     }
 
     /// Public content-key width without exposing the key value.
+    #[must_use]
     pub fn key_len(&self) -> usize {
         self.opaque
             .as_ref()
@@ -159,6 +162,8 @@ impl RecoveredContentKey {
         ciphertext: &[u8],
         output_len: usize,
     ) -> Result<Self, ProviderError> {
+        use subtle::ConditionallySelectable;
+
         if self.opaque.is_some() {
             return Err(ProviderError::KeyNotExportable);
         }
@@ -189,7 +194,6 @@ impl RecoveredContentKey {
                     actual: candidate.len(),
                 });
             }
-            use subtle::ConditionallySelectable;
             for (byte, random) in candidate.iter_mut().zip(fallback.iter()) {
                 *byte = u8::conditional_select(random, byte, self.valid);
             }
@@ -212,6 +216,10 @@ impl RecoveredContentKey {
     /// operations must retain the candidate until after primitive decryption.
     /// The returned allocation is caller-owned; the caller is responsible for
     /// zeroizing it when no longer needed (for example with `Zeroizing`).
+    ///
+    /// # Errors
+    /// Returns `KeyNotExportable` for an opaque handle, or `AuthenticationFailed`
+    /// when the retained recovery validity rejects the candidate.
     pub fn into_key(mut self) -> Result<Vec<u8>, ProviderError> {
         if self.opaque.is_some() {
             return Err(ProviderError::KeyNotExportable);
@@ -288,16 +296,16 @@ pub enum ProviderCapability<'a> {
     /// Exact KEM parameter set for private-key decapsulation.
     #[cfg(feature = "xmldsig")]
     Decapsulate(KeyEncapsulationAlgorithm),
-    /// Message digest computation for an XMLDSig digest method.
+    /// Message digest computation for an `XMLDSig` digest method.
     #[cfg(feature = "xmldsig")]
     Digest(DigestAlgorithm),
-    /// Provider dispatch for an XMLDSig signing method.
+    /// Provider dispatch for an `XMLDSig` signing method.
     ///
     /// The opaque signing key remains responsible for accepting the method and
     /// implementing its primitive.
     #[cfg(feature = "xmldsig")]
     Sign(crate::xmldsig::SignatureAlgorithm),
-    /// Provider dispatch for an XMLDSig verification method.
+    /// Provider dispatch for an `XMLDSig` verification method.
     ///
     /// The opaque verification key remains responsible for accepting the
     /// method and implementing its primitive.
@@ -306,10 +314,10 @@ pub enum ProviderCapability<'a> {
     /// X.509 signature verification with complete algorithm parameters.
     #[cfg(feature = "xmldsig")]
     VerifyCertificate(X509SignatureAlgorithm),
-    /// XMLEnc content encryption.
+    /// `XMLEnc` content encryption.
     #[cfg(feature = "xmlenc")]
     Encrypt(DataEncryptionAlgorithm),
-    /// XMLEnc content decryption.
+    /// `XMLEnc` content decryption.
     #[cfg(feature = "xmlenc")]
     Decrypt(DataEncryptionAlgorithm),
     /// RFC 3394 key wrapping.
@@ -420,20 +428,20 @@ pub struct KeyAgreementParameters<'a> {
 /// Provider-neutral context octets or significant bits for key derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KdfContext<'a> {
-    /// XMLEnc 1.1 section 5.6.2.2 legacy DH framing. KeySize is derived from
-    /// output_len; callers cannot supply a contradictory decimal key width.
+    /// `XMLEnc` 1.1 section 5.6.2.2 legacy DH framing. `KeySize` is derived from
+    /// `output_len`; callers cannot supply a contradictory decimal key width.
     LegacyDh {
-        /// URI of the consuming EncryptionMethod, not AgreementMethod.
+        /// URI of the consuming `EncryptionMethod`, not `AgreementMethod`.
         encryption_algorithm: &'a str,
         /// Decoded KA-Nonce octets, empty when the XML element is absent.
         nonce: &'a [u8],
     },
-    /// Complete octets, as used by HKDF info and byte-aligned ConcatKDF.
+    /// Complete octets, as used by HKDF info and byte-aligned `ConcatKDF`.
     Octets(&'a [u8]),
     /// An MSB-first bit string. Its last octet must have zero unused low bits;
     /// the byte slice must have exactly `bit_len.div_ceil(8)` octets.
     Bits {
-        /// Packed bits, without the XMLEnc attribute's padding-count prefix.
+        /// Packed bits, without the `XMLEnc` attribute's padding-count prefix.
         bytes: &'a [u8],
         /// Number of significant bits, not rounded to the next octet.
         bit_len: usize,
@@ -449,7 +457,7 @@ pub struct KdfParameters<'a> {
     pub digest: Option<&'a str>,
     /// Caller-provided salt, when the KDF defines one.
     pub salt: &'a [u8],
-    /// Algorithm-specific context such as ConcatKDF OtherInfo bits or HKDF info octets.
+    /// Algorithm-specific context such as `ConcatKDF` `OtherInfo` bits or HKDF info octets.
     pub info: KdfContext<'a>,
     /// Policy-validated iteration count for iterative KDFs; zero when not applicable.
     pub iterations: u64,
@@ -487,7 +495,7 @@ pub enum X509SignatureAlgorithm {
 
 #[cfg(feature = "xmldsig")]
 impl X509SignatureAlgorithm {
-    /// Return the assigned AlgorithmIdentifier OID, or `None` for unsupported combinations.
+    /// Return the assigned `AlgorithmIdentifier` OID, or `None` for unsupported combinations.
     #[must_use]
     pub const fn oid(self) -> Option<&'static str> {
         Some(match self {
@@ -555,7 +563,7 @@ pub enum ProviderInputError {
     /// A PBKDF2 request has invalid iterations, length, or unrelated context.
     #[error("invalid PBKDF2 parameters")]
     Pbkdf2Parameters,
-    /// A ConcatKDF request violates its bit-string or counter contract.
+    /// A `ConcatKDF` request violates its bit-string or counter contract.
     #[error("invalid ConcatKDF parameters")]
     ConcatKdfParameters,
     /// A legacy DH KDF request has invalid framing or exceeds its byte counter.
@@ -680,6 +688,7 @@ pub struct ProviderBinding(std::sync::Arc<()>);
 
 impl ProviderBinding {
     /// Test identity without copying secret or public key material.
+    #[must_use]
     pub fn matches(&self, other: &Self) -> bool {
         std::sync::Arc::ptr_eq(&self.0, &other.0)
     }
@@ -693,6 +702,10 @@ pub trait ContentDecryptionKey: Send + Sync {
     /// Public key width in bytes.
     fn key_len(&self) -> usize;
     /// Execute within the selected provider's execution domain.
+    ///
+    /// # Errors
+    /// Returns binding, key-usage, framing or authentication failures from the
+    /// selected execution domain; an unavailable mechanism returns `Unsupported`.
     fn decrypt_with_provider(
         &self,
         provider: &dyn CryptoProvider,
@@ -706,7 +719,11 @@ pub trait ContentDecryptionKey: Send + Sync {
 pub trait KeyUnwrappingKey: Send + Sync {
     /// Exact external domain owning this handle.
     fn provider_binding(&self) -> &ProviderBinding;
-    /// Unwrap within the selected execution domain without reading CKA_VALUE.
+    /// Unwrap within the selected execution domain without reading `CKA_VALUE`.
+    ///
+    /// # Errors
+    /// Returns binding/usage failures, invalid wrapping parameters, integrity
+    /// rejection or an unavailable mechanism, without exporting the content key.
     fn unwrap_with_provider(
         &self,
         provider: &dyn CryptoProvider,
@@ -728,6 +745,10 @@ pub trait KeyTransportKey: Send + Sync {
         None
     }
     /// Execute historical transport; unsupported opaque handles never fall back.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations also report invalid key
+    /// or message widths, randomness failures and external-provider failures.
     #[cfg(feature = "legacy-algorithms")]
     fn transport_pkcs1v15(
         &self,
@@ -754,6 +775,10 @@ pub trait KeyTransportKey: Send + Sync {
     fn rsa_exponent(&self) -> Cow<'_, [u8]>;
 
     /// Execute OAEP key transport using the selected provider's randomness.
+    ///
+    /// # Errors
+    /// Returns unsupported parameters, invalid key/message widths, randomness
+    /// failures or an execution-domain failure.
     fn transport_with_provider(
         &self,
         provider: &dyn CryptoProvider,
@@ -769,6 +794,10 @@ pub trait KeyTransportKey: Send + Sync {
 #[cfg(feature = "xmlenc")]
 pub trait KeyRecoveryKey: Send + Sync {
     /// Recover without exporting a CEK when supported by the execution domain.
+    ///
+    /// # Errors
+    /// Propagates OAEP recovery failures, including invalid framing,
+    /// authentication rejection and unsupported parameters or key bindings.
     fn recover_content_with_provider(
         &self,
         provider: &dyn CryptoProvider,
@@ -780,6 +809,10 @@ pub trait KeyRecoveryKey: Send + Sync {
             .map(RecoveredContentKey::confirmed)
     }
     /// Recover a content key of the caller's already validated algorithm width.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations report public framing,
+    /// key and execution failures, retaining secret padding validity in the result.
     #[cfg(feature = "legacy-algorithms")]
     fn recover_pkcs1v15(
         &self,
@@ -817,6 +850,10 @@ pub trait KeyRecoveryKey: Send + Sync {
     fn ciphertext_len(&self) -> usize;
 
     /// Execute OAEP recovery using the selected provider's randomness.
+    ///
+    /// # Errors
+    /// Returns invalid ciphertext/key framing, OAEP authentication rejection,
+    /// unsupported parameters, randomness failure or an execution-domain failure.
     fn recover_with_provider(
         &self,
         provider: &dyn CryptoProvider,
@@ -837,6 +874,10 @@ pub trait KeyAgreementKey: Send + Sync {
         None
     }
     /// Derive the raw shared secret for the supplied peer and parameters.
+    ///
+    /// # Errors
+    /// Returns unsupported agreement parameters, invalid peer/key material,
+    /// an already consumed ephemeral key or an execution-domain failure.
     fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError>;
 }
 
@@ -854,9 +895,15 @@ pub trait KeyAgreementKey: Send + Sync {
 #[cfg(feature = "xmldsig")]
 pub trait DigestState {
     /// Absorb the next input bytes.
+    ///
+    /// # Errors
+    /// Returns the selected provider's digest-update failure.
     fn update(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
     /// Return the digest of all absorbed bytes.
+    ///
+    /// # Errors
+    /// Returns the selected provider's digest-finalization failure.
     fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError>;
 }
 
@@ -868,6 +915,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Recover a candidate without requiring its symmetric value to leave the provider.
+    ///
+    /// # Errors
+    /// Propagates `recover_key` failures by default; opaque implementations also
+    /// report execution-domain binding, usage and unavailable-mechanism errors.
     #[cfg(feature = "xmlenc")]
     fn recover_content_key(
         &self,
@@ -881,6 +932,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Unwrap into an opaque content key. Providers must opt in explicitly.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations report key binding,
+    /// wrapping integrity, parameter and external-operation failures.
     #[cfg(feature = "xmlenc")]
     fn unwrap_content_key(
         &self,
@@ -896,6 +951,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Decrypt with an opaque key; capability remains distinct from policy permission.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations report binding, key
+    /// usage, ciphertext framing, authentication and external-operation failures.
     #[cfg(feature = "xmlenc")]
     fn decrypt_content_key(
         &self,
@@ -913,6 +972,10 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Import original PKCS#8 input into this engine without exporting another
     /// provider's private handle. Policy and input budgets are enforced by the caller.
+    ///
+    /// # Errors
+    /// Returns an unsupported method, malformed or mismatched key encoding,
+    /// or the selected provider's import failure.
     #[cfg(feature = "xmldsig")]
     fn import_signing_key(
         &self,
@@ -927,6 +990,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Import original PKCS#8 input into a provider-owned RSA recovery handle.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default, or an invalid key encoding or import
+    /// failure from an implementing provider.
     #[cfg(feature = "xmlenc")]
     fn import_recovery_key(
         &self,
@@ -947,6 +1014,10 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Import a recipient SPKI into the selected engine. The caller reserves
     /// import work and grants permission; unavailable engines never fall back.
+    ///
+    /// # Errors
+    /// Returns an unavailable parameter set, invalid or mismatched SPKI key
+    /// material, or a provider import failure.
     #[cfg(feature = "xmldsig")]
     fn import_encapsulation_key(
         &self,
@@ -961,6 +1032,10 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Import a recipient PKCS#8 into this engine without exporting another
     /// provider's private handle. The encoded parameter set must match the request.
+    ///
+    /// # Errors
+    /// Returns an unavailable parameter set, invalid or inconsistent private
+    /// key encoding, or a provider import failure.
     #[cfg(feature = "xmldsig")]
     fn import_decapsulation_key(
         &self,
@@ -974,9 +1049,17 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Fill caller-owned output with cryptographically secure random bytes.
+    ///
+    /// # Errors
+    /// Returns an unavailable randomness capability or the selected entropy
+    /// source's failure; callers must not consume the output after an error.
     fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError>;
 
-    /// Encapsulate through this engine; unsupported engines never delegate to RustCrypto.
+    /// Encapsulate through this engine; unsupported engines never delegate to `RustCrypto`.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations report key-domain,
+    /// key-material, randomness and encapsulation-operation failures.
     #[cfg(feature = "xmldsig")]
     fn encapsulate_key(
         &self,
@@ -989,6 +1072,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Decapsulate without revealing implicit-rejection validity.
+    ///
+    /// # Errors
+    /// Returns unsupported parameters, invalid public ciphertext framing, key
+    /// binding or provider-operation failures, not implicit-rejection validity.
     #[cfg(feature = "xmldsig")]
     fn decapsulate_key(
         &self,
@@ -1004,6 +1091,9 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Start an incremental message digest; streamed input never needs to be
     /// collected in memory first.
+    ///
+    /// # Errors
+    /// Returns an unsupported digest or the selected provider's state-creation failure.
     #[cfg(feature = "xmldsig")]
     fn begin_digest(
         &self,
@@ -1011,6 +1101,9 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Box<dyn DigestState + '_>, ProviderError>;
 
     /// Compute the message digest of one contiguous input.
+    ///
+    /// # Errors
+    /// Propagates state creation, update and finalization failures unchanged.
     #[cfg(feature = "xmldsig")]
     fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
         let mut state = self.begin_digest(algorithm)?;
@@ -1023,6 +1116,10 @@ pub trait CryptoProvider: Send + Sync {
     /// Providers that delegate primitive signing to the supplied key must call
     /// [`crate::xmldsig::SigningKey::sign_with_provider`] so randomized
     /// primitives consume this provider's randomness.
+    ///
+    /// # Errors
+    /// Returns an unsupported algorithm/key binding or the key's signing,
+    /// digest or randomness failure.
     #[cfg(feature = "xmldsig")]
     fn sign(
         &self,
@@ -1033,8 +1130,12 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Verify bytes with an opaque key handle.
     ///
-    /// The XMLDSig facade validates algorithm- and key-specific signature
+    /// The `XMLDSig` facade validates algorithm- and key-specific signature
     /// framing before this provider boundary.
+    ///
+    /// # Errors
+    /// Returns unsupported algorithm/key combinations or provider/key execution
+    /// failures. A completed cryptographic mismatch is `Ok(false)`.
     #[cfg(feature = "xmldsig")]
     fn verify(
         &self,
@@ -1045,6 +1146,9 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<bool, crate::xmldsig::DsigError>;
 
     /// Sign with explicit domain separation; unsupported contexts must not be discarded.
+    ///
+    /// # Errors
+    /// Returns an unsupported context or propagates the selected signing failure.
     #[cfg(feature = "xmldsig")]
     fn sign_with_context(
         &self,
@@ -1062,6 +1166,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Verify with explicit domain separation; unsupported contexts fail closed.
+    ///
+    /// # Errors
+    /// Returns an unsupported context or propagates verification execution
+    /// failures; a completed cryptographic mismatch remains `Ok(false)`.
     #[cfg(feature = "xmldsig")]
     fn verify_with_context(
         &self,
@@ -1084,6 +1192,10 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Verify once while reporting the actual successful leaf. Providers that
     /// cannot identify it retain ordinary verification and report no receipt.
+    ///
+    /// # Errors
+    /// Propagates verification and observer failures; inability to produce a
+    /// receipt alone does not turn ordinary verification into an error.
     #[cfg(feature = "xmldsig")]
     fn verify_with_key_receipt(
         &self,
@@ -1104,6 +1216,10 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Compare the successful public receipt with original effective PKIX key
     /// state. Unknown semantics are Unproven, never a second provider fallback.
+    ///
+    /// # Errors
+    /// Implementations propagate work-admission and comparison execution failures.
+    /// Unsupported comparison semantics return `KeyAssociation::Unproven` instead.
     #[cfg(feature = "xmldsig")]
     fn associate_verification_key(
         &self,
@@ -1115,6 +1231,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Verify an X.509 certificate or CRL signature under its issuer SPKI.
+    ///
+    /// # Errors
+    /// Returns unsupported algorithms/parameters, invalid issuer key encoding
+    /// or provider execution failures; a completed mismatch is `Ok(false)`.
     #[cfg(feature = "xmldsig")]
     fn verify_x509_signature(
         &self,
@@ -1130,7 +1250,11 @@ pub trait CryptoProvider: Send + Sync {
         })
     }
 
-    /// Encrypt XMLEnc content bytes, including standard framing.
+    /// Encrypt `XMLEnc` content bytes, including standard framing.
+    ///
+    /// # Errors
+    /// Returns an unsupported cipher, invalid key size or plaintext framing,
+    /// randomness failure or provider encryption failure.
     #[cfg(feature = "xmlenc")]
     fn encrypt_data(
         &self,
@@ -1139,7 +1263,11 @@ pub trait CryptoProvider: Send + Sync {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, ProviderError>;
 
-    /// Decrypt XMLEnc content bytes, including framing validation.
+    /// Decrypt `XMLEnc` content bytes, including framing validation.
+    ///
+    /// # Errors
+    /// Returns an unsupported cipher, invalid key/ciphertext framing or content
+    /// authentication, padding or provider execution failure.
     #[cfg(feature = "xmlenc")]
     fn decrypt_data(
         &self,
@@ -1150,6 +1278,9 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Encrypt while preserving XML-carried cipher parameters. Providers
     /// must implement the profile explicitly, never discard it or fall back.
+    ///
+    /// # Errors
+    /// Returns unsupported explicit parameters or propagates content-encryption failures.
     #[cfg(feature = "xmlenc")]
     fn encrypt_data_with_parameters(
         &self,
@@ -1168,6 +1299,9 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Decrypt with the same explicit parameter contract as encryption.
+    ///
+    /// # Errors
+    /// Returns unsupported explicit parameters or propagates content-decryption failures.
     #[cfg(feature = "xmlenc")]
     fn decrypt_data_with_parameters(
         &self,
@@ -1188,8 +1322,12 @@ pub trait CryptoProvider: Send + Sync {
     /// Wrap a content key with RFC 3394 AES Key Wrap.
     ///
     /// Successful output contains the complete RFC 3394 value and is exactly
-    /// eight bytes longer than `key`. The XMLEnc facade validates that framing
+    /// eight bytes longer than `key`. The `XMLEnc` facade validates that framing
     /// before serializing provider output.
+    ///
+    /// # Errors
+    /// Returns an unsupported wrapping method, invalid KEK/key framing,
+    /// randomness failure where required, or a wrapping-operation failure.
     #[cfg(feature = "xmlenc")]
     fn wrap_key(
         &self,
@@ -1199,6 +1337,10 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, ProviderError>;
 
     /// Unwrap a content key with RFC 3394 AES Key Wrap.
+    ///
+    /// # Errors
+    /// Returns an unsupported method, invalid KEK/wrapped framing or a failed
+    /// integrity check or provider operation.
     #[cfg(feature = "xmlenc")]
     fn unwrap_key(
         &self,
@@ -1208,6 +1350,10 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, ProviderError>;
 
     /// Wrap key bytes using an opaque RSA public-key operation.
+    ///
+    /// # Errors
+    /// Returns unsupported OAEP parameters, invalid key/message widths, key
+    /// binding, randomness or transport-operation failures.
     #[cfg(feature = "xmlenc")]
     fn transport_key(
         &self,
@@ -1217,6 +1363,10 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, ProviderError>;
 
     /// Recover key bytes using an opaque RSA private-key operation.
+    ///
+    /// # Errors
+    /// Returns unsupported OAEP parameters, invalid key/ciphertext framing,
+    /// binding, authentication, randomness or recovery-operation failures.
     #[cfg(feature = "xmlenc")]
     fn recover_key(
         &self,
@@ -1226,6 +1376,10 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, ProviderError>;
 
     /// Transport using RSAES-PKCS1-v1_5; not an OAEP configuration.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations report invalid public
+    /// input widths, key binding, randomness or transport-operation failures.
     #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
     fn transport_pkcs1v15(
         &self,
@@ -1243,6 +1397,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Recover a fixed-width content key without exposing padding validity.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` by default. Implementations report public framing,
+    /// binding, randomness or provider failures, retaining padding validity in the result.
     #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
     fn recover_pkcs1v15(
         &self,
@@ -1261,6 +1419,10 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Perform key agreement with an opaque provider-owned private key.
+    ///
+    /// # Errors
+    /// Returns `Unsupported` for an unavailable capability, `Binding` for a
+    /// mismatched external domain, or the key's agreement failure.
     fn agree_key(
         &self,
         key: &dyn KeyAgreementKey,
@@ -1282,6 +1444,10 @@ pub trait CryptoProvider: Send + Sync {
     /// Implementations that advertise [`ProviderCapability::Kdf`] must perform
     /// the advertised derivation here. This method is required so capability
     /// discovery cannot silently inherit a contradictory unsupported default.
+    ///
+    /// # Errors
+    /// Returns unsupported parameters, invalid framing/iterations/output size
+    /// or the selected provider's derivation failure.
     fn derive_key(
         &self,
         parameters: &KdfParameters<'_>,
@@ -1289,6 +1455,10 @@ pub trait CryptoProvider: Send + Sync {
     ) -> Result<Vec<u8>, ProviderError>;
 
     /// Reject an unavailable exact capability without falling back.
+    ///
+    /// # Errors
+    /// Returns `ProviderError::Unsupported` with the requested operation and
+    /// algorithm identifier when `supports` is false.
     fn require_capability(&self, capability: ProviderCapability<'_>) -> Result<(), ProviderError> {
         if self.supports(capability) {
             Ok(())
@@ -1301,11 +1471,11 @@ pub trait CryptoProvider: Send + Sync {
     }
 }
 
-/// Pure-Rust provider backed by RustCrypto crates.
+/// Pure-Rust provider backed by `RustCrypto` crates.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RustCryptoProvider;
 
-/// Defines the RustCrypto incremental hasher for every compiled algorithm.
+/// Defines the `RustCrypto` incremental hasher for every compiled algorithm.
 #[cfg(feature = "xmldsig")]
 macro_rules! rust_crypto_digest {
     ($($(#[$attr:meta])* $variant:ident => $hasher:ty),+ $(,)?) => {
@@ -1358,7 +1528,7 @@ rust_crypto_digest! {
     Sha3_512 => sha3::Sha3_512,
 }
 
-/// Opaque RSA public-key handle for the built-in RustCrypto provider.
+/// Opaque RSA public-key handle for the built-in `RustCrypto` provider.
 #[cfg(feature = "xmlenc")]
 #[derive(Clone)]
 pub struct RustCryptoRsaPublicKey {
@@ -1369,7 +1539,7 @@ pub struct RustCryptoRsaPublicKey {
 
 #[cfg(feature = "xmlenc")]
 impl RustCryptoRsaPublicKey {
-    /// Wrap an already parsed RustCrypto RSA public key.
+    /// Wrap an already parsed `RustCrypto` RSA public key.
     #[must_use]
     pub fn new(key: rsa::RsaPublicKey) -> Self {
         use rsa::traits::PublicKeyParts as _;
@@ -1448,7 +1618,7 @@ impl KeyTransportKey for rsa::RsaPublicKey {
     }
 }
 
-/// Opaque RSA private-key handle for the built-in RustCrypto provider.
+/// Opaque RSA private-key handle for the built-in `RustCrypto` provider.
 #[cfg(feature = "xmlenc")]
 #[derive(Clone)]
 pub struct RustCryptoRsaPrivateKey {
@@ -1458,7 +1628,7 @@ pub struct RustCryptoRsaPrivateKey {
 
 #[cfg(feature = "xmlenc")]
 impl RustCryptoRsaPrivateKey {
-    /// Wrap an already parsed RustCrypto RSA private key.
+    /// Wrap an already parsed `RustCrypto` RSA private key.
     #[must_use]
     pub fn new(key: rsa::RsaPrivateKey) -> Self {
         use rsa::traits::PublicKeyParts as _;
@@ -1563,7 +1733,7 @@ pub fn default_provider() -> &'static dyn CryptoProvider {
     &RUST_CRYPTO_PROVIDER
 }
 
-/// Adapter used when a RustCrypto primitive requires a fallible RNG object.
+/// Adapter used when a `RustCrypto` primitive requires a fallible RNG object.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) struct ProviderRng<'a>(pub(crate) &'a dyn CryptoProvider);
 
@@ -1731,7 +1901,12 @@ impl CryptoProvider for RustCryptoProvider {
         algorithm: crate::xmldsig::SignatureAlgorithm,
         der: &[u8],
     ) -> Result<Box<dyn crate::xmldsig::SigningKey>, crate::xmldsig::SigningKeyError> {
-        use crate::xmldsig::{SignatureAlgorithm as A, *};
+        #[cfg(feature = "experimental-pq")]
+        use crate::xmldsig::PostQuantumSigningKey;
+        use crate::xmldsig::{
+            DsaSigningKey, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey,
+            EdDsaSigningKey, RsaSigningKey, SignatureAlgorithm as A, SigningKeyError,
+        };
         Ok(match algorithm {
             #[cfg(feature = "experimental-pq")]
             A::PostQuantum(parameter) => {
@@ -2029,16 +2204,10 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
         | X509SignatureAlgorithm::Ed25519
         | X509SignatureAlgorithm::Ed448 => true,
-        X509SignatureAlgorithm::Ecdsa(digest) => rustcrypto_x509::ecdsa_algorithm(digest).is_some(),
+        X509SignatureAlgorithm::Ecdsa(_) | X509SignatureAlgorithm::RsaPkcs1v15(_) => {
+            rustcrypto_x509::xml_signature_algorithm(algorithm).is_some()
+        }
         X509SignatureAlgorithm::PostQuantum(_) => cfg!(feature = "experimental-pq"),
-        X509SignatureAlgorithm::RsaPkcs1v15(digest) => matches!(
-            digest,
-            DigestAlgorithm::Sha1
-                | DigestAlgorithm::Sha224
-                | DigestAlgorithm::Sha256
-                | DigestAlgorithm::Sha384
-                | DigestAlgorithm::Sha512
-        ),
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
         } => {
@@ -2053,9 +2222,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
 
 #[cfg(feature = "xmldsig")]
 pub(crate) mod rustcrypto_x509 {
-    use crate::rsa_encoding::RsaPublicKeyEncoding as _;
     use der::Decode as _;
-    use dsa::pkcs8::DecodePublicKey as _;
     use rsa::{
         RsaPublicKey,
         pss::{Signature as RsaPssSignature, VerifyingKey as RsaPssVerifyingKey},
@@ -2064,7 +2231,6 @@ pub(crate) mod rustcrypto_x509 {
     use sha1::Digest as _;
     use sha2::{Sha256, Sha384, Sha512};
     use signature::{Verifier as _, hazmat::PrehashVerifier as _};
-    use x509_parser::prelude::FromDer as _;
 
     use super::{ProviderError, X509SignatureAlgorithm};
     use crate::xmldsig::signature::verify_ecdsa_signature_spki_asn1_der;
@@ -2093,20 +2259,20 @@ pub(crate) mod rustcrypto_x509 {
                 let digest = sha1::Sha1::digest(signed_data);
                 Ok(key.verify_prehash(&digest, &signature).is_ok())
             }
-            X509SignatureAlgorithm::RsaPkcs1v15(digest) => {
-                let Some(algorithm) = rsa_pkcs1_algorithm(digest) else {
-                    return unsupported(X509SignatureAlgorithm::RsaPkcs1v15(digest));
+            X509SignatureAlgorithm::RsaPkcs1v15(_) => {
+                let Some(xml_algorithm) = xml_signature_algorithm(algorithm) else {
+                    return unsupported(algorithm);
                 };
-                verify_xml_signature(algorithm, signed_data, signature, issuer_spki_der)
+                verify_xml_signature(xml_algorithm, signed_data, signature, issuer_spki_der)
             }
-            X509SignatureAlgorithm::Ecdsa(digest) => {
-                let Some(algorithm) = ecdsa_algorithm(digest) else {
-                    return unsupported(X509SignatureAlgorithm::Ecdsa(digest));
+            X509SignatureAlgorithm::Ecdsa(_) => {
+                let Some(xml_algorithm) = xml_signature_algorithm(algorithm) else {
+                    return unsupported(algorithm);
                 };
                 // RFC 5280 ECDSA certificate signatures are always ASN.1 DER;
                 // XMLDSig's SignatureValue framing policy is irrelevant here.
                 match verify_ecdsa_signature_spki_asn1_der(
-                    algorithm,
+                    xml_algorithm,
                     issuer_spki_der,
                     signed_data,
                     signature,
@@ -2133,7 +2299,7 @@ pub(crate) mod rustcrypto_x509 {
                 verify_rsa_pss(digest, salt_len, signed_data, signature, key)
             }
             X509SignatureAlgorithm::Ed25519 => {
-                let Ok(key) = ed25519_dalek::VerifyingKey::from_public_key_der(issuer_spki_der)
+                let Some(key) = crate::xmldsig::modern::ed25519_verifying_key(issuer_spki_der)
                 else {
                     return Ok(false);
                 };
@@ -2145,8 +2311,7 @@ pub(crate) mod rustcrypto_x509 {
             X509SignatureAlgorithm::Ed448 => {
                 // RFC 8410 sections 3 and 6 select pure Ed448 without context
                 // or external prehash: https://www.rfc-editor.org/rfc/rfc8410.html#section-6
-                let Ok(key) = ed448_goldilocks::VerifyingKey::from_public_key_der(issuer_spki_der)
-                else {
+                let Some(key) = crate::xmldsig::modern::ed448_verifying_key(issuer_spki_der) else {
                     return Ok(false);
                 };
                 let Ok(signature) = ed448_goldilocks::Signature::try_from(signature) else {
@@ -2251,97 +2416,52 @@ pub(crate) mod rustcrypto_x509 {
         spki_der: &[u8],
         signature_algorithm: X509SignatureAlgorithm,
     ) -> Option<RsaPublicKey> {
-        let (rest, spki) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki_der).ok()?;
-        if !rest.is_empty() {
-            return None;
-        }
-        match spki.algorithm.algorithm.to_id_string().as_str() {
-            "1.2.840.113549.1.1.1" => RsaPublicKey::from_public_key_der(spki_der).ok(),
-            "1.2.840.113549.1.1.10" => {
-                // RFC 4055 section 3.3 applies key restrictions only when
-                // RSASSA-PSS-params is present in SubjectPublicKeyInfo.
-                if spki
-                    .algorithm
-                    .parameters
-                    .as_ref()
-                    .is_some_and(|parameters| {
-                        !rsa_pss_key_parameters_allow(parameters, signature_algorithm)
-                    })
-                {
-                    return None;
-                }
-                RsaPublicKey::from_pkcs1_der(&spki.subject_public_key.data).ok()
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn rsa_pss_key_parameters_allow(
-        parameters: &x509_parser::asn1_rs::Any<'_>,
-        signature_algorithm: X509SignatureAlgorithm,
-    ) -> bool {
         let X509SignatureAlgorithm::RsaPss {
             digest,
             mgf_digest,
             salt_len,
         } = signature_algorithm
         else {
-            return false;
+            return None;
         };
-        let Ok(parameters) =
-            x509_parser::signature_algorithm::RsaSsaPssParams::try_from(parameters)
-        else {
-            return false;
-        };
-        let Ok(mask) = parameters.mask_gen_algorithm() else {
-            return false;
-        };
-        parameters.trailer_field() == 1
-            && x509_digest_from_oid(&parameters.hash_algorithm_oid().to_id_string()) == Some(digest)
-            && mask.mgf.to_id_string() == "1.2.840.113549.1.1.8"
-            && x509_digest_from_oid(&mask.hash.to_id_string()) == Some(mgf_digest)
-            && usize::try_from(parameters.salt_length()).is_ok_and(|minimum| salt_len >= minimum)
+        super::rsa_pss::public_key(
+            spki_der,
+            crate::xmldsig::RsaPssParameters {
+                digest,
+                mgf_digest,
+                salt_len,
+            },
+        )
     }
 
-    fn x509_digest_from_oid(oid: &str) -> Option<DigestAlgorithm> {
-        match oid {
-            "1.3.14.3.2.26" => Some(DigestAlgorithm::Sha1),
-            "2.16.840.1.101.3.4.2.4" => Some(DigestAlgorithm::Sha224),
-            "2.16.840.1.101.3.4.2.1" => Some(DigestAlgorithm::Sha256),
-            "2.16.840.1.101.3.4.2.2" => Some(DigestAlgorithm::Sha384),
-            "2.16.840.1.101.3.4.2.3" => Some(DigestAlgorithm::Sha512),
-            "2.16.840.1.101.3.4.2.7" => Some(DigestAlgorithm::Sha3_224),
-            "2.16.840.1.101.3.4.2.8" => Some(DigestAlgorithm::Sha3_256),
-            "2.16.840.1.101.3.4.2.9" => Some(DigestAlgorithm::Sha3_384),
-            "2.16.840.1.101.3.4.2.10" => Some(DigestAlgorithm::Sha3_512),
+    /// The `XMLDSig` algorithm whose verifier also checks this RSA PKCS#1 v1.5
+    /// or ECDSA certificate signature, when the digest has one.
+    pub(super) const fn xml_signature_algorithm(
+        algorithm: X509SignatureAlgorithm,
+    ) -> Option<SignatureAlgorithm> {
+        match algorithm {
+            X509SignatureAlgorithm::RsaPkcs1v15(digest) => match digest {
+                DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::RsaSha1),
+                DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::RsaSha224),
+                DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::RsaSha256),
+                DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::RsaSha384),
+                DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::RsaSha512),
+                _ => None,
+            },
+            X509SignatureAlgorithm::Ecdsa(digest) => match digest {
+                #[cfg(feature = "legacy-algorithms")]
+                DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => None,
+                DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::EcdsaSha1),
+                DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::EcdsaSha224),
+                DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
+                DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::EcdsaSha384),
+                DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::EcdsaSha512),
+                DigestAlgorithm::Sha3_224 => Some(SignatureAlgorithm::EcdsaSha3_224),
+                DigestAlgorithm::Sha3_256 => Some(SignatureAlgorithm::EcdsaSha3_256),
+                DigestAlgorithm::Sha3_384 => Some(SignatureAlgorithm::EcdsaSha3_384),
+                DigestAlgorithm::Sha3_512 => Some(SignatureAlgorithm::EcdsaSha3_512),
+            },
             _ => None,
-        }
-    }
-
-    const fn rsa_pkcs1_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
-        match digest {
-            DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::RsaSha1),
-            DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::RsaSha224),
-            DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::RsaSha256),
-            DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::RsaSha384),
-            DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::RsaSha512),
-            _ => None,
-        }
-    }
-
-    pub(super) const fn ecdsa_algorithm(digest: DigestAlgorithm) -> Option<SignatureAlgorithm> {
-        match digest {
-            #[cfg(feature = "legacy-algorithms")]
-            DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => None,
-            DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::EcdsaSha1),
-            DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::EcdsaSha224),
-            DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
-            DigestAlgorithm::Sha384 => Some(SignatureAlgorithm::EcdsaSha384),
-            DigestAlgorithm::Sha512 => Some(SignatureAlgorithm::EcdsaSha512),
-            DigestAlgorithm::Sha3_224 => Some(SignatureAlgorithm::EcdsaSha3_224),
-            DigestAlgorithm::Sha3_256 => Some(SignatureAlgorithm::EcdsaSha3_256),
-            DigestAlgorithm::Sha3_384 => Some(SignatureAlgorithm::EcdsaSha3_384),
-            DigestAlgorithm::Sha3_512 => Some(SignatureAlgorithm::EcdsaSha3_512),
         }
     }
 
@@ -2492,7 +2612,8 @@ mod rustcrypto {
             let last = padded.len() - 1;
             provider.fill_random(&mut padded[plaintext.len()..last])?;
         }
-        *padded.last_mut().expect("padding is non-empty") = pad_len as u8;
+        *padded.last_mut().expect("padding is non-empty") =
+            u8::try_from(pad_len).expect("CBC block padding fits in one octet");
         Encryptor::<C>::new_from_slices(key, iv)
             .map_err(|_| {
                 ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization("AES-CBC"))
@@ -2831,7 +2952,7 @@ mod rustcrypto {
     ) -> Result<Vec<u8>, ProviderError> {
         rsa::Pkcs1v15Encrypt
             .encrypt(&mut super::ProviderRng(provider), key, plaintext)
-            .map_err(map_rsa_error)
+            .map_err(|error| map_rsa_error(&error))
     }
 
     pub(super) fn transport_key(
@@ -2867,6 +2988,7 @@ mod rustcrypto {
         )
     }
 
+    #[derive(Clone, Copy)]
     enum OaepOperation<'a> {
         Encrypt(&'a rsa::RsaPublicKey),
         Decrypt(&'a rsa::RsaPrivateKey),
@@ -2964,10 +3086,10 @@ mod rustcrypto {
             OaepOperation::Encrypt(key) => padding.encrypt(&mut rng, key, input),
             OaepOperation::Decrypt(key) => padding.decrypt(Some(&mut rng), key, input),
         }
-        .map_err(map_rsa_error)
+        .map_err(|error| map_rsa_error(&error))
     }
 
-    pub(super) fn map_rsa_error(error: rsa::Error) -> ProviderError {
+    pub(super) fn map_rsa_error(error: &rsa::Error) -> ProviderError {
         match error {
             rsa::Error::Rng => ProviderError::Random("RSA randomness failed".into()),
             _ => ProviderError::AuthenticationFailed,
@@ -3096,7 +3218,7 @@ mod tests {
         for algorithm in [KeyWrapAlgorithm::AesKw192, KeyWrapAlgorithm::TripleDes] {
             let kek = [0x37; 24];
             for length in [16, 24, 32] {
-                let key: Vec<_> = (0..length).map(|byte| byte as u8).collect();
+                let key: Vec<_> = (0_u8..length).collect();
                 let mut wrapped = RUST_CRYPTO_PROVIDER
                     .wrap_key(algorithm, &kek, &key)
                     .expect("valid content key must wrap");
@@ -3501,7 +3623,7 @@ mod tests {
             .sign(&key, SignatureAlgorithm::RsaSha256, b"signed info")
             .expect("RSA signing must succeed");
 
-        assert!(!signature.is_empty());
+        assert_ne!(signature, [] as [u8; 0]);
         assert!(provider.random_calls.load(Ordering::Relaxed) > 0);
     }
 
@@ -3678,6 +3800,11 @@ mod tests {
         use sha2::Sha256;
         use signature::{RandomizedSigner, SignatureEncoding};
         use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier};
+        const SHA256_PSS: X509SignatureAlgorithm = X509SignatureAlgorithm::RsaPss {
+            digest: DigestAlgorithm::Sha256,
+            mgf_digest: DigestAlgorithm::Sha256,
+            salt_len: 32,
+        };
 
         // X.509 RSASSA-PSS carries salt and MGF parameters that cannot be
         // represented by the XMLDSig SignatureAlgorithm enum.
@@ -3697,46 +3824,27 @@ mod tests {
 
         assert!(
             RUST_CRYPTO_PROVIDER
-                .verify_x509_signature(
-                    X509SignatureAlgorithm::RsaPss {
-                        digest: DigestAlgorithm::Sha256,
-                        mgf_digest: DigestAlgorithm::Sha256,
-                        salt_len: 32,
-                    },
-                    signed_data,
-                    &signature,
-                    public_key.as_bytes(),
-                )
+                .verify_x509_signature(SHA256_PSS, signed_data, &signature, public_key.as_bytes())
                 .expect("standard RSA-PSS parameters must be supported")
         );
 
-        let mut parameterless_pss_spki =
-            x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())
+        // The same key under the id-RSASSA-PSS identifier with `parameters`.
+        let pss_key = |parameters| {
+            let mut spki = x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())
                 .expect("RSA SPKI must decode");
-        parameterless_pss_spki.algorithm = AlgorithmIdentifierOwned {
-            oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
-            parameters: None,
+            spki.algorithm = AlgorithmIdentifierOwned {
+                oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+                parameters,
+            };
+            spki.to_der().expect("PSS SPKI must encode")
         };
-        let parameterless_pss_spki = parameterless_pss_spki
-            .to_der()
-            .expect("parameterless PSS SPKI must encode");
+        let parameterless_pss_spki = pss_key(None);
         assert!(
             RUST_CRYPTO_PROVIDER
-                .verify_x509_signature(
-                    X509SignatureAlgorithm::RsaPss {
-                        digest: DigestAlgorithm::Sha256,
-                        mgf_digest: DigestAlgorithm::Sha256,
-                        salt_len: 32,
-                    },
-                    signed_data,
-                    &signature,
-                    &parameterless_pss_spki,
-                )
+                .verify_x509_signature(SHA256_PSS, signed_data, &signature, &parameterless_pss_spki)
                 .expect("parameterless PSS keys impose no signature restrictions")
         );
 
-        let mut pss_spki = x509_cert::SubjectPublicKeyInfo::from_der(public_key.as_bytes())
-            .expect("RSA SPKI must decode");
         let pss_parameters = der::asn1::Any::from_der(&[
             0x30, 0x34, 0xa0, 0x0f, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03,
             0x04, 0x02, 0x01, 0x05, 0x00, 0xa1, 0x1c, 0x30, 0x1a, 0x06, 0x09, 0x2a, 0x86, 0x48,
@@ -3744,24 +3852,11 @@ mod tests {
             0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0xa2, 0x03, 0x02, 0x01, 0x20,
         ])
         .expect("standard SHA-256 PSS parameters must decode");
-        pss_spki.algorithm = AlgorithmIdentifierOwned {
-            oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
-            parameters: Some(pss_parameters),
-        };
-        let pss_spki = pss_spki.to_der().expect("PSS SPKI must encode");
+        let pss_spki = pss_key(Some(pss_parameters));
 
         assert!(
             RUST_CRYPTO_PROVIDER
-                .verify_x509_signature(
-                    X509SignatureAlgorithm::RsaPss {
-                        digest: DigestAlgorithm::Sha256,
-                        mgf_digest: DigestAlgorithm::Sha256,
-                        salt_len: 32,
-                    },
-                    signed_data,
-                    &signature,
-                    &pss_spki,
-                )
+                .verify_x509_signature(SHA256_PSS, signed_data, &signature, &pss_spki)
                 .expect("RFC 4055 PSS SubjectPublicKeyInfo must be supported")
         );
 

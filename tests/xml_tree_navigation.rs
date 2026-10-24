@@ -101,11 +101,16 @@ fn sibling_query_outside_the_parent_is_refused() {
     });
 }
 
+// A late-bound view lifetime, as `with_view` requires of its callback.
+fn root_identity(view: xml_sec::DocumentView<'_>) -> xml_sec::NodeIdentity {
+    view.root_element()
+}
+
 #[test]
 fn identities_from_another_document_are_refused() {
     let first = XmlDocument::parse("<r><a/></r>").unwrap();
     let second = XmlDocument::parse("<r><a/></r>").unwrap();
-    let foreign = first.with_view(|view| view.root_element());
+    let foreign = first.with_view(root_identity);
     let work = account();
     second.with_view(|view| {
         assert!(matches!(

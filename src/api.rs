@@ -21,9 +21,9 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Operation {
-    /// XMLDSig verification.
+    /// `XMLDSig` verification.
     Verify,
-    /// XMLDSig signature generation.
+    /// `XMLDSig` signature generation.
     Sign,
     /// XML Encryption generation.
     #[cfg(feature = "xmlenc")]
@@ -49,6 +49,10 @@ pub struct XmlSecurity<'a> {
 impl<'a> XmlSecurity<'a> {
     /// Bind compiled permissions to the actual provider, validating capabilities
     /// before parsing or key selection. No default engine is selected here.
+    ///
+    /// # Errors
+    /// Returns a policy violation if the provider cannot satisfy the compiled
+    /// permissions or an authorization is no longer valid.
     pub fn new(
         policies: &'a CompiledPolicies,
         provider: &'a dyn CryptoProvider,
@@ -73,6 +77,10 @@ impl<'a> XmlSecurity<'a> {
     /// An owned `String` moves into the document. Preparation is a separate
     /// operation; subsequent retained-document calls validate its provenance.
     /// For a single parse+operation budget use the string operation entry points.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled`, or XML parsing, policy and resource failures
+    /// from preparation under the selected operation's snapshot.
     pub fn parse_document(
         &self,
         xml: impl AsRef<str> + Into<String>,
@@ -106,6 +114,9 @@ impl<'a> XmlSecurity<'a> {
     }
 
     /// Begin verification. Caller keys and request targets remain explicit.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled` when the compiled snapshot disables verification.
     pub fn verifier(&self) -> Result<Verifier<'_>, XmlSecError> {
         let policy = self
             .policies
@@ -120,6 +131,9 @@ impl<'a> XmlSecurity<'a> {
     }
 
     /// Begin signing with an opaque caller-owned key.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled` when the compiled snapshot disables signing.
     pub fn signer<'s>(&self, key: &'s dyn SigningKey) -> Result<Signer<'s>, XmlSecError>
     where
         'a: 's,
@@ -137,6 +151,10 @@ impl<'a> XmlSecurity<'a> {
     }
 
     /// Select/import an authorized named key using the same provider and policy.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled`, or inventory selection, key import and
+    /// signing-policy failures without selecting another provider.
     pub fn signing_key(
         &self,
         inventory: &KeyInventory,
@@ -152,6 +170,9 @@ impl<'a> XmlSecurity<'a> {
 
     /// Bind encryption request material without cloning its keys or recipients.
     /// The compiled snapshot overrides any policy/provider stored in the builder.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled` when the compiled snapshot disables encryption.
     #[cfg(feature = "xmlenc")]
     pub fn encryptor<'b>(
         &self,
@@ -170,6 +191,9 @@ impl<'a> XmlSecurity<'a> {
     }
 
     /// Begin decryption with a caller-owned resolver; never discover keys or I/O.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled` when the compiled snapshot disables decryption.
     #[cfg(feature = "xmlenc")]
     pub fn decryptor<'s>(
         &self,
@@ -191,6 +215,10 @@ impl<'a> XmlSecurity<'a> {
     }
 
     /// Select a named recovery key with the bound provider and decryption policy.
+    ///
+    /// # Errors
+    /// Returns `OperationDisabled`, or inventory selection, key import and
+    /// decryption-policy failures without selecting another provider.
     #[cfg(feature = "xmlenc")]
     pub fn decryption_key(
         &self,
@@ -238,6 +266,10 @@ impl<'a> Verifier<'a> {
     /// Verify all selected request requirements against the retained generation.
     /// `Ok` is not acceptance: call `evidence.accepted(document)` and consume only
     /// caller-selected, authenticated targets. Invalid signatures remain evidence.
+    ///
+    /// # Errors
+    /// Propagates request preparation, document provenance, policy and resource
+    /// failures; per-signature failures remain in the returned evidence.
     pub fn verify(
         &self,
         document: &XmlDocument,
@@ -248,6 +280,10 @@ impl<'a> Verifier<'a> {
     /// Verify one signature with the existing borrowed XML pipeline.
     /// This returns mathematical diagnostics, not expected-target authorization;
     /// use `verify` for application acceptance and multiple signatures.
+    ///
+    /// # Errors
+    /// Returns XML/structure, key resolution, policy, resource or provider
+    /// processing failures; a completed signature mismatch is a result status.
     pub fn verify_signature_xml(&self, xml: &str) -> Result<VerifyResult, XmlSecError> {
         Ok(self.context.verify(xml)?)
     }
@@ -259,7 +295,7 @@ pub struct Signer<'a> {
 }
 
 impl<'a> Signer<'a> {
-    /// Fill a template's KeyInfo placeholder through its existing writer.
+    /// Fill a template's `KeyInfo` placeholder through its existing writer.
     /// Builder-based calls must request that placeholder with `key_info(true)`.
     #[must_use]
     pub fn key_info_writer(mut self, writer: &'a dyn KeyInfoWriter) -> Self {
@@ -291,6 +327,10 @@ impl<'a> Signer<'a> {
         self
     }
     /// Stage and commit a signature as one document generation on success.
+    ///
+    /// # Errors
+    /// Returns target/template, provenance, policy, resource, resolver or signing
+    /// failures. A failed operation does not commit its staged mutation.
     pub fn sign(
         &self,
         document: &mut XmlDocument,
@@ -299,14 +339,25 @@ impl<'a> Signer<'a> {
         Ok(self.context.sign_document_with_builder(document, builder)?)
     }
     /// Parse, sign and return XML through the same cumulative-budget pipeline.
+    ///
+    /// # Errors
+    /// Returns parsing, template/target, policy, resource, signing or output
+    /// serialization failures from the operation pipeline.
     pub fn sign_xml(&self, xml: &str, builder: &SignatureBuilder) -> Result<String, XmlSecError> {
         Ok(self.context.sign_with_builder(xml, builder)?)
     }
     /// Fill an existing template in a retained document atomically.
+    ///
+    /// # Errors
+    /// Returns provenance, template, policy, resource, resolver or signing
+    /// failures without committing a partial mutation.
     pub fn sign_template(&self, document: &mut XmlDocument) -> Result<(), XmlSecError> {
         Ok(self.context.sign_document(document)?)
     }
     /// Fill an existing template using the string convenience path.
+    ///
+    /// # Errors
+    /// Returns XML/template, policy, resource, resolver, signing or serialization failures.
     pub fn sign_template_xml(&self, xml: &str) -> Result<String, XmlSecError> {
         Ok(self.context.sign_template(xml)?)
     }
@@ -321,6 +372,10 @@ pub struct Encryptor<'a> {
 #[cfg(feature = "xmlenc")]
 impl Encryptor<'_> {
     /// Encrypt and commit one selected retained-document target.
+    ///
+    /// # Errors
+    /// Returns target/provenance, policy, resource, key establishment, cipher
+    /// or serialization failures without committing a partial replacement.
     pub fn encrypt(
         &self,
         document: &mut XmlDocument,
@@ -329,6 +384,10 @@ impl Encryptor<'_> {
         Ok(self.execution.encrypt_owned_document(document, options)?)
     }
     /// Parse, replace and return a complete encrypted document.
+    ///
+    /// # Errors
+    /// Returns parsing/target, policy, resource, key establishment, cipher
+    /// or serialization failures from the encryption pipeline.
     pub fn encrypt_xml(
         &self,
         xml: &str,
@@ -337,6 +396,10 @@ impl Encryptor<'_> {
         Ok(self.execution.encrypt_document(xml, options)?)
     }
     /// Encrypt a standalone XML element/content fragment without insertion.
+    ///
+    /// # Errors
+    /// Returns fragment parsing, policy, resource, key establishment, cipher
+    /// or encrypted-fragment serialization failures.
     pub fn encrypt_fragment(
         &self,
         xml: &str,
@@ -344,6 +407,10 @@ impl Encryptor<'_> {
         Ok(self.execution.encrypt_xml(xml)?)
     }
     /// Encrypt borrowed opaque bytes, not an XML document.
+    ///
+    /// # Errors
+    /// Returns policy, resource, key establishment, cipher or encrypted-output
+    /// serialization failures; the bytes are not parsed as XML.
     pub fn encrypt_binary(
         &self,
         bytes: &[u8],
@@ -373,16 +440,28 @@ impl<'a> Decryptor<'a> {
         self.context = self.context.id_attributes(attributes);
         self
     }
-    /// Recover and atomically replace one retained EncryptedData target.
+    /// Recover and atomically replace one retained `EncryptedData` target.
     /// `id` optionally selects its schema `Id` attribute, not another ID spelling.
+    ///
+    /// # Errors
+    /// Returns target/provenance, policy, resource, key resolution, ciphertext
+    /// or plaintext-structure failures without committing a partial replacement.
     pub fn decrypt(&self, document: &mut XmlDocument, id: Option<&str>) -> Result<(), XmlSecError> {
         Ok(self.context.decrypt_owned_document(document, id)?)
     }
     /// Parse, recover and return a complete document.
+    ///
+    /// # Errors
+    /// Returns parsing/target, policy, resource, key resolution, ciphertext,
+    /// plaintext-structure or serialization failures.
     pub fn decrypt_xml(&self, xml: &str, id: Option<&str>) -> Result<String, XmlSecError> {
         Ok(self.context.decrypt_document(xml, id)?)
     }
-    /// Recover a standalone EncryptedData fragment without document insertion.
+    /// Recover a standalone `EncryptedData` fragment without document insertion.
+    ///
+    /// # Errors
+    /// Returns malformed encryption metadata, policy, resource, key resolution
+    /// or ciphertext authentication/decryption failures.
     pub fn decrypt_fragment(
         &self,
         xml: &str,

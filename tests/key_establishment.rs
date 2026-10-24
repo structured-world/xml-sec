@@ -25,7 +25,7 @@ fn ecdh_all_nist_curves_preserve_fixed_width_and_validate_peers() {
         };
         assert_eq!(
             RUST_CRYPTO_PROVIDER.agree_key(&key, &parameters).unwrap(),
-            public[1..1 + width]
+            public[1..=width]
         );
         parameters.peer_public_key = &[0];
         assert!(RUST_CRYPTO_PROVIDER.agree_key(&key, &parameters).is_err());
@@ -383,107 +383,106 @@ fn legacy_concat_hashes_match_independent_digest_at_block_boundaries() {
     );
 }
 
-#[test]
-fn agreement_primitives_compose_with_xmlenc_key_wrap_and_authenticated_content() {
-    use xml_sec::provider::{EcdhCurve, KeyAgreementKey, RustCryptoEcdhKey};
+/// Both parties agree the same secret, and every KEK derived from it wraps a
+/// GCM content key that only the matching recipient KEK unwraps.
+fn assert_agreement_wraps_content(
+    sender: &dyn xml_sec::provider::KeyAgreementKey,
+    sender_public: &[u8],
+    recipient: &dyn xml_sec::provider::KeyAgreementKey,
+    recipient_public: &[u8],
+    agreement: &str,
+) {
     use xml_sec::xmlenc::{
         DataEncryptionAlgorithm, DecryptedContent, EncryptedDataBuilder, EncryptionRecipient,
         KekDecryptor, KeyWrapAlgorithm, decrypt,
     };
+    let agree = |key, peer_public_key| {
+        zeroize::Zeroizing::new(
+            RUST_CRYPTO_PROVIDER
+                .agree_key(
+                    key,
+                    &KeyAgreementParameters {
+                        algorithm: agreement,
+                        peer_public_key,
+                    },
+                )
+                .unwrap(),
+        )
+    };
+    let sender_secret = agree(sender, recipient_public);
+    let recipient_secret = agree(recipient, sender_public);
+    assert_eq!(*sender_secret, *recipient_secret);
+    for (content, wrap) in [
+        (
+            DataEncryptionAlgorithm::Aes128Gcm,
+            KeyWrapAlgorithm::AesKw128,
+        ),
+        (
+            DataEncryptionAlgorithm::Aes256Gcm,
+            KeyWrapAlgorithm::AesKw256,
+        ),
+    ] {
+        for (kdf, digest, context) in [
+            (
+                "http://www.w3.org/2021/04/xmldsig-more#hkdf",
+                "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
+                KdfContext::Octets(b"recipient context"),
+            ),
+            (
+                "http://www.w3.org/2009/xmlenc11#ConcatKDF",
+                "http://www.w3.org/2001/04/xmlenc#sha256",
+                KdfContext::Bits {
+                    bytes: &[0xa8],
+                    bit_len: 5,
+                },
+            ),
+        ] {
+            let parameters = KdfParameters {
+                algorithm: kdf,
+                digest: Some(digest),
+                salt: &[],
+                info: context,
+                iterations: 0,
+                output_len: wrap.key_len(),
+            };
+            let sender_kek = RUST_CRYPTO_PROVIDER
+                .derive_key(&parameters, &sender_secret)
+                .unwrap();
+            let recipient_kek = RUST_CRYPTO_PROVIDER
+                .derive_key(&parameters, &recipient_secret)
+                .unwrap();
+            let encrypted = EncryptedDataBuilder::new(content)
+                .add_recipient(EncryptionRecipient::aes_key_wrap(sender_kek, wrap))
+                .encrypt_binary(b"agreement-derived recipient key")
+                .unwrap();
+            assert_eq!(
+                decrypt(
+                    &encrypted.encrypted_data_xml,
+                    &KekDecryptor::new(recipient_kek.clone())
+                )
+                .unwrap(),
+                DecryptedContent::Bytes(b"agreement-derived recipient key".to_vec())
+            );
+            let mut wrong = zeroize::Zeroizing::new(recipient_kek);
+            wrong[0] ^= 1;
+            assert!(
+                decrypt(
+                    &encrypted.encrypted_data_xml,
+                    &KekDecryptor::new(wrong.to_vec())
+                )
+                .is_err()
+            );
+        }
+    }
+}
+
+#[test]
+fn agreement_primitives_compose_with_xmlenc_key_wrap_and_authenticated_content() {
+    use xml_sec::provider::{EcdhCurve, RustCryptoEcdhKey};
     // Check the public primitive-to-XML boundary: both parties independently
     // derive the KEK; it must unwrap the emitted EncryptedKey and authenticate
     // its GCM content. This does NOT claim XML AgreementMethod resolution.
-    let check = |sender: &dyn KeyAgreementKey,
-                 sender_public: &[u8],
-                 recipient: &dyn KeyAgreementKey,
-                 recipient_public: &[u8],
-                 agreement: &str| {
-        let sender_secret = zeroize::Zeroizing::new(
-            RUST_CRYPTO_PROVIDER
-                .agree_key(
-                    sender,
-                    &KeyAgreementParameters {
-                        algorithm: agreement,
-                        peer_public_key: recipient_public,
-                    },
-                )
-                .unwrap(),
-        );
-        let recipient_secret = zeroize::Zeroizing::new(
-            RUST_CRYPTO_PROVIDER
-                .agree_key(
-                    recipient,
-                    &KeyAgreementParameters {
-                        algorithm: agreement,
-                        peer_public_key: sender_public,
-                    },
-                )
-                .unwrap(),
-        );
-        assert_eq!(*sender_secret, *recipient_secret);
-        for (content, wrap) in [
-            (
-                DataEncryptionAlgorithm::Aes128Gcm,
-                KeyWrapAlgorithm::AesKw128,
-            ),
-            (
-                DataEncryptionAlgorithm::Aes256Gcm,
-                KeyWrapAlgorithm::AesKw256,
-            ),
-        ] {
-            for (kdf, digest, context) in [
-                (
-                    "http://www.w3.org/2021/04/xmldsig-more#hkdf",
-                    "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256",
-                    KdfContext::Octets(b"recipient context"),
-                ),
-                (
-                    "http://www.w3.org/2009/xmlenc11#ConcatKDF",
-                    "http://www.w3.org/2001/04/xmlenc#sha256",
-                    KdfContext::Bits {
-                        bytes: &[0xa8],
-                        bit_len: 5,
-                    },
-                ),
-            ] {
-                let parameters = KdfParameters {
-                    algorithm: kdf,
-                    digest: Some(digest),
-                    salt: &[],
-                    info: context,
-                    iterations: 0,
-                    output_len: wrap.key_len(),
-                };
-                let sender_kek = RUST_CRYPTO_PROVIDER
-                    .derive_key(&parameters, &sender_secret)
-                    .unwrap();
-                let recipient_kek = RUST_CRYPTO_PROVIDER
-                    .derive_key(&parameters, &recipient_secret)
-                    .unwrap();
-                let encrypted = EncryptedDataBuilder::new(content)
-                    .add_recipient(EncryptionRecipient::aes_key_wrap(sender_kek, wrap))
-                    .encrypt_binary(b"agreement-derived recipient key")
-                    .unwrap();
-                assert_eq!(
-                    decrypt(
-                        &encrypted.encrypted_data_xml,
-                        &KekDecryptor::new(recipient_kek.clone())
-                    )
-                    .unwrap(),
-                    DecryptedContent::Bytes(b"agreement-derived recipient key".to_vec())
-                );
-                let mut wrong = zeroize::Zeroizing::new(recipient_kek);
-                wrong[0] ^= 1;
-                assert!(
-                    decrypt(
-                        &encrypted.encrypted_data_xml,
-                        &KekDecryptor::new(wrong.to_vec())
-                    )
-                    .is_err()
-                );
-            }
-        }
-    };
+    let check = assert_agreement_wraps_content;
     for (curve, width) in [
         (EcdhCurve::P256, 32),
         (EcdhCurve::P384, 48),
@@ -588,11 +587,11 @@ fn hkdf_all_prfs_enforce_exact_expand_boundary() {
                 .is_err()
         );
         parameters.output_len = 0;
-        assert!(
+        assert_eq!(
             RUST_CRYPTO_PROVIDER
                 .derive_key(&parameters, b"secret")
-                .unwrap()
-                .is_empty()
+                .unwrap(),
+            b""
         );
         parameters.digest = Some(SignatureAlgorithm::RsaSha256.uri());
         assert!(

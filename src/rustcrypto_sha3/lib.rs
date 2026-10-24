@@ -1,4 +1,4 @@
-//! RustCrypto sha3 0.12.0, embedded to preserve the local bit-tail API in
+//! `RustCrypto` sha3 0.12.0, embedded to preserve the local bit-tail API in
 //! published packages. Changes and provenance: docs/sha3-patch.md.
 
 pub use sha2::digest::{self, Digest};

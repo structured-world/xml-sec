@@ -19,6 +19,35 @@ ceilings decrease, and a disabled operation cannot be re-enabled. `None` means
 disabled, not unspecified inheritance. Conflicting interpretation modes and
 protocol constraints are errors, not an implicit precedence rule.
 
+## Key Source Permissions
+
+`KeySourcePolicy` is a typed set of `KeySourceKind` values. The default remains
+`KeySourcePolicy::ALL`; use `NONE` to deny every source or construct an explicit
+set from an array. Source permission does not establish trust in a key.
+
+```rust
+use xml_sec::policy::{KeySourceKind, KeySourcePolicy};
+
+let mut sources = KeySourcePolicy::from([
+    KeySourceKind::PresetKey,
+    KeySourceKind::KeyName,
+    KeySourceKind::X509Data,
+]);
+sources.remove(KeySourceKind::KeyName);
+assert!(sources.contains(KeySourceKind::PresetKey));
+assert!(!sources.contains(KeySourceKind::KeyName));
+```
+
+This replaces the public Boolean fields in Rust: replace a field read with
+`contains(kind)`, an assignment with `set(kind, permitted)`, and explicit
+enable/disable assignments with `insert(kind)`/`remove(kind)`. Restrictive
+composition uses `intersection` and cannot grant a source absent from either
+input. The six TOML keys and their Boolean values are unchanged: `preset_key`,
+`key_name`, `key_value`, `der_encoded_key_value`, `x509_data`, and
+`key_info_reference`. Profile defaults and enforcement order are unchanged.
+
+## Compiling Profiles
+
 ```rust
 use xml_sec::policy::{PolicyCompileContext, PolicyCompiler, PolicyProfile};
 use xml_sec::provider::default_provider;

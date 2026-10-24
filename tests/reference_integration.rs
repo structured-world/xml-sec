@@ -4,7 +4,7 @@
 //! `<Signature>` → `parse_signed_info` → `UriReferenceResolver` → `process_reference`/`process_all_references`
 //!
 //! These tests exercise multi-component interaction:
-//! - `parse_signed_info` (XML → SignedInfo with References)
+//! - `parse_signed_info` (XML → `SignedInfo` with References)
 //! - `UriReferenceResolver` (URI dereference)
 //! - `execute_transforms` (enveloped + C14N pipeline)
 //! - `compute_digest` + `constant_time_eq` (SHA-family digest comparison)
@@ -44,7 +44,7 @@ fn compute_reference_digest_b64(
 #[test]
 fn saml_response_enveloped_reference_valid() {
     // Step 1: Parse document with placeholder digest
-    let xml_template = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+    let xml_template = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
                                      xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
                                      ID="_resp1" InResponseTo="_req1"
                                      IssueInstant="2026-01-15T10:00:00Z">
@@ -76,7 +76,7 @@ fn saml_response_enveloped_reference_valid() {
             </ds:SignedInfo>
             <ds:SignatureValue>fakesig==</ds:SignatureValue>
         </ds:Signature>
-    </samlp:Response>"##;
+    </samlp:Response>"#;
 
     let doc = roxmltree::Document::parse(xml_template).unwrap();
     let sig_node = find_signature_node(&doc).expect("Signature element not found");
@@ -236,7 +236,7 @@ fn saml_assertion_level_enveloped_reference_valid() {
 #[test]
 fn tampered_document_detected() {
     // Create a valid signed document, then tamper with it and verify digest fails.
-    let xml_template = r##"<root>
+    let xml_template = r#"<root>
         <data>original content</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:SignedInfo>
@@ -253,7 +253,7 @@ fn tampered_document_detected() {
             </ds:SignedInfo>
             <ds:SignatureValue>fakesig==</ds:SignatureValue>
         </ds:Signature>
-    </root>"##;
+    </root>"#;
 
     // Step 1: compute correct digest
     let doc = roxmltree::Document::parse(xml_template).unwrap();
@@ -397,7 +397,7 @@ fn multiple_references_fail_fast_on_second() {
 #[test]
 fn reference_with_inclusive_c14n_valid() {
     // Tests that inclusive C14N (not just exclusive) works in the reference pipeline
-    let xml_template = r##"<root xmlns:ns="http://example.com" ns:attr="val">
+    let xml_template = r#"<root xmlns:ns="http://example.com" ns:attr="val">
         <data>content</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:SignedInfo>
@@ -414,7 +414,7 @@ fn reference_with_inclusive_c14n_valid() {
             </ds:SignedInfo>
             <ds:SignatureValue>fakesig==</ds:SignatureValue>
         </ds:Signature>
-    </root>"##;
+    </root>"#;
 
     let doc = roxmltree::Document::parse(xml_template).unwrap();
     let sig_node = find_signature_node(&doc).unwrap();
@@ -453,7 +453,7 @@ fn reference_with_inclusive_c14n_valid() {
 
 #[test]
 fn reference_with_sha384_digest_valid() {
-    let xml_template = r##"<root>
+    let xml_template = r#"<root>
         <data>content</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:SignedInfo>
@@ -469,7 +469,7 @@ fn reference_with_sha384_digest_valid() {
             </ds:SignedInfo>
             <ds:SignatureValue>fakesig==</ds:SignatureValue>
         </ds:Signature>
-    </root>"##;
+    </root>"#;
 
     let doc = roxmltree::Document::parse(xml_template).unwrap();
     let sig_node = find_signature_node(&doc).unwrap();
@@ -512,7 +512,7 @@ fn reference_with_sha384_digest_valid() {
 #[test]
 fn reference_without_transforms_uses_default_c14n() {
     // Per XMLDSig spec: if no explicit C14N transform, default inclusive C14N 1.0 is used
-    let xml_template = r##"<root>
+    let xml_template = r#"<root>
         <data>content</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:SignedInfo>
@@ -528,7 +528,7 @@ fn reference_without_transforms_uses_default_c14n() {
             </ds:SignedInfo>
             <ds:SignatureValue>fakesig==</ds:SignatureValue>
         </ds:Signature>
-    </root>"##;
+    </root>"#;
 
     let doc = roxmltree::Document::parse(xml_template).unwrap();
     let sig_node = find_signature_node(&doc).unwrap();
@@ -570,7 +570,7 @@ fn reference_without_transforms_uses_default_c14n() {
 
 #[test]
 fn process_single_reference_with_pre_digest_valid() {
-    let xml_template = r##"<root>
+    let xml_template = r#"<root>
         <data>important</data>
         <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
             <ds:SignedInfo>
@@ -587,7 +587,7 @@ fn process_single_reference_with_pre_digest_valid() {
             </ds:SignedInfo>
             <ds:SignatureValue>fakesig==</ds:SignatureValue>
         </ds:Signature>
-    </root>"##;
+    </root>"#;
 
     let doc = roxmltree::Document::parse(xml_template).unwrap();
     let sig_node = find_signature_node(&doc).unwrap();

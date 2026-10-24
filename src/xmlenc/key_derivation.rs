@@ -20,14 +20,14 @@ const CONCAT: &str = "http://www.w3.org/2009/xmlenc11#ConcatKDF";
 const PBKDF2: &str = "http://www.w3.org/2009/xmlenc11#pbkdf2";
 const HKDF: &str = "http://www.w3.org/2021/04/xmldsig-more#hkdf";
 
-/// Identity/context field in XMLEnc's ConcatKDF OtherInfo.
+/// Identity/context field in `XMLEnc`'s `ConcatKDF` `OtherInfo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConcatKdfField {
-    /// AlgorithmID, interpreted by the application.
+    /// `AlgorithmID`, interpreted by the application.
     AlgorithmId,
-    /// Originator's PartyUInfo.
+    /// Originator's `PartyUInfo`.
     PartyUInfo,
-    /// Recipient's PartyVInfo.
+    /// Recipient's `PartyVInfo`.
     PartyVInfo,
     /// Supplementary public information.
     SuppPubInfo,
@@ -57,7 +57,11 @@ impl KeyDerivationMethod {
     }
     /// Serialize public KDF parameters without secret key material. The exact
     /// escaped output length is checked before allocating the output buffer.
-    /// Field boundaries and significant ConcatKDF bits survive transport.
+    /// Field boundaries and significant `ConcatKDF` bits survive transport.
+    ///
+    /// # Errors
+    /// Returns an error if metadata or escaped output exceeds the resource limits,
+    /// or the parameters cannot be serialized.
     pub fn to_xml(&self, resources: &crate::policy::ResourcePolicy) -> Result<String, XmlEncError> {
         serialize::serialize(self, resources)
     }
@@ -74,7 +78,11 @@ impl KeyDerivationMethod {
         }
     }
     /// Execute parsed parameters under the enclosing operation's shared
-    /// allowance. Explicit XML KeyLength must match the consuming cipher.
+    /// allowance. Explicit XML `KeyLength` must match the consuming cipher.
+    ///
+    /// # Errors
+    /// Returns an error for a key-width mismatch, policy or resource refusal,
+    /// unsupported provider capability, or provider failure.
     pub fn derive_key(
         &self,
         output_len: usize,
@@ -84,12 +92,13 @@ impl KeyDerivationMethod {
     ) -> Result<zeroize::Zeroizing<Vec<u8>>, XmlEncError> {
         budget.derive_key(provider, &self.parameters(output_len)?, secret)
     }
-    /// Borrow one original ConcatKDF field as significant bits, without copying
+    /// Borrow one original `ConcatKDF` field as significant bits, without copying
     /// its bytes. None distinguishes omission from an explicitly empty field.
     ///
-    /// XMLEnc 1.1 section 5.4.1 requires application-specific validation of the
-    /// algorithm and party identities. Combining OtherInfo must not erase the
+    /// `XMLEnc` 1.1 section 5.4.1 requires application-specific validation of the
+    /// algorithm and party identities. Combining `OtherInfo` must not erase the
     /// boundaries needed for that check.
+    #[must_use]
     pub fn concat_field_bits(
         &self,
         field: ConcatKdfField,
@@ -104,8 +113,11 @@ impl KeyDerivationMethod {
         let (start, length) = self.concat_fields[index]?;
         Some((start..start + length).map(|bit| self.context[bit / 8] & (1 << (7 - bit % 8)) != 0))
     }
-    /// Bind the requested key width supplied by EncryptionMethod. An explicit
-    /// XML KeyLength must agree; it is not an override of the consuming cipher.
+    /// Bind the requested key width supplied by `EncryptionMethod`. An explicit
+    /// XML `KeyLength` must agree; it is not an override of the consuming cipher.
+    ///
+    /// # Errors
+    /// Returns an error if the requested width is zero or differs from `KeyLength`.
     pub fn parameters(&self, output_len: usize) -> Result<KdfParameters<'_>, XmlEncError> {
         if output_len == 0 || self.key_length.is_some_and(|length| length != output_len) {
             return Err(invalid(
@@ -132,6 +144,10 @@ impl KeyDerivationMethod {
 /// Parse a standalone xenc11:KeyDerivationMethod with the same XML and metadata
 /// bounds as the containing decryption operation. No resource is fetched and
 /// no provider or key resolver is invoked by this function.
+///
+/// # Errors
+/// Returns an error for invalid policy, XML or KDF syntax, unsupported algorithms,
+/// or exceeded parsing and metadata limits.
 pub fn parse_key_derivation_method(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
@@ -140,6 +156,10 @@ pub fn parse_key_derivation_method(
 }
 
 /// Parse KDF parameters using the operation-selected XML backend.
+///
+/// # Errors
+/// Returns an error for invalid policy, XML or KDF syntax, unsupported algorithms,
+/// or exceeded parsing and metadata limits.
 pub fn parse_key_derivation_method_with_backend(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
@@ -241,58 +261,59 @@ pub(super) fn parse_node(
                 return Err(invalid("unexpected PBKDF2 parameter"));
             }
         }
-        HKDF => {
-            // libxmlsec1's HKDFParams profile is distinct from RFC 9231
-            // section 2.8.1's AgreementMethod layout and hex encodings.
-            // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.8.1
-            require(parameters, MORE_NS, "HKDFParams")?;
-            let mut children = parameters.children().filter(Node::is_element).peekable();
-            result.digest = algorithm_child(
-                next(&mut children, MORE_NS, "PRF")?,
-                MORE_NS,
-                "PRF",
-                maximum,
-            )?;
-            if children
-                .peek()
-                .is_some_and(|node| node.has_tag_name((MORE_NS, "Salt")))
-            {
-                result.salt = decode_bounded_base64_text(
-                    next(&mut children, MORE_NS, "Salt")?,
-                    "Salt",
-                    maximum,
-                )?;
-            }
-            if children
-                .peek()
-                .is_some_and(|node| node.has_tag_name((MORE_NS, "Info")))
-            {
-                result.context = decode_bounded_base64_text(
-                    next(&mut children, MORE_NS, "Info")?,
-                    "Info",
-                    maximum,
-                )?;
-            }
-            if children
-                .peek()
-                .is_some_and(|node| node.has_tag_name((MORE_NS, "KeyLength")))
-            {
-                result.key_length = Some(
-                    usize::try_from(positive(
-                        next(&mut children, MORE_NS, "KeyLength")?,
-                        "KeyLength",
-                        maximum,
-                    )?)
-                    .map_err(|_| invalid("KeyLength exceeds platform width"))?,
-                );
-            }
-            if children.next().is_some() {
-                return Err(invalid("unexpected HKDF parameter"));
-            }
-        }
+        HKDF => parse_hkdf_parameters(parameters, maximum, &mut result)?,
         _ => return Err(XmlEncError::UnsupportedAlgorithm(algorithm.to_owned())),
     }
     Ok(result)
+}
+
+fn parse_hkdf_parameters(
+    parameters: Node<'_, '_>,
+    maximum: usize,
+    result: &mut KeyDerivationMethod,
+) -> Result<(), XmlEncError> {
+    // libxmlsec1's HKDFParams profile is distinct from RFC 9231
+    // section 2.8.1's AgreementMethod layout and hex encodings.
+    // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.8.1
+    require(parameters, MORE_NS, "HKDFParams")?;
+    let mut children = parameters.children().filter(Node::is_element).peekable();
+    result.digest = algorithm_child(
+        next(&mut children, MORE_NS, "PRF")?,
+        MORE_NS,
+        "PRF",
+        maximum,
+    )?;
+    if children
+        .peek()
+        .is_some_and(|node| node.has_tag_name((MORE_NS, "Salt")))
+    {
+        result.salt =
+            decode_bounded_base64_text(next(&mut children, MORE_NS, "Salt")?, "Salt", maximum)?;
+    }
+    if children
+        .peek()
+        .is_some_and(|node| node.has_tag_name((MORE_NS, "Info")))
+    {
+        result.context =
+            decode_bounded_base64_text(next(&mut children, MORE_NS, "Info")?, "Info", maximum)?;
+    }
+    if children
+        .peek()
+        .is_some_and(|node| node.has_tag_name((MORE_NS, "KeyLength")))
+    {
+        result.key_length = Some(
+            usize::try_from(positive(
+                next(&mut children, MORE_NS, "KeyLength")?,
+                "KeyLength",
+                maximum,
+            )?)
+            .map_err(|_| invalid("KeyLength exceeds platform width"))?,
+        );
+    }
+    if children.next().is_some() {
+        return Err(invalid("unexpected HKDF parameter"));
+    }
+    Ok(())
 }
 
 fn invalid(message: &str) -> XmlEncError {

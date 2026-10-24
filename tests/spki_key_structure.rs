@@ -1,4 +1,4 @@
-//! Structural RSA and EC SubjectPublicKeyInfo checks at key resolution and
+//! Structural RSA and EC `SubjectPublicKeyInfo` checks at key resolution and
 //! key import: the accepted shapes resolve, and every refused shape keeps the
 //! error kind callers already distinguish.
 
@@ -18,12 +18,13 @@ const RSA_2048: &str = include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem");
 fn tlv(tag: u8, contents: &[u8]) -> Vec<u8> {
     let mut out = vec![tag];
     let length = contents.len();
-    if length < 0x80 {
-        out.push(length as u8);
+    if let Ok(short @ 0..0x80) = u8::try_from(length) {
+        out.push(short);
     } else {
         let octets = length.to_be_bytes();
         let skip = octets.iter().take_while(|octet| **octet == 0).count();
-        out.push(0x80 | (octets.len() - skip) as u8);
+        let count = u8::try_from(octets.len() - skip).expect("a usize has at most eight octets");
+        out.push(0x80 | count);
         out.extend_from_slice(&octets[skip..]);
     }
     out.extend_from_slice(contents);

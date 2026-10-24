@@ -1,4 +1,4 @@
-//! Core types for the XMLDSig transform pipeline.
+//! Core types for the `XMLDSig` transform pipeline.
 //!
 //! These types flow between URI dereference, transforms, and digest computation.
 //!
@@ -62,6 +62,9 @@ impl std::fmt::Debug for TransformData<'_> {
 
 impl<'a> TransformData<'a> {
     /// Convert to `NodeSet`, returning an error if this is `Binary` data.
+    ///
+    /// # Errors
+    /// Returns `TypeMismatch` for owned, borrowed or resource binary data.
     pub fn into_node_set(self) -> Result<NodeSet<'a>, TransformError> {
         match self {
             Self::NodeSet(ns) => Ok(ns),
@@ -75,6 +78,9 @@ impl<'a> TransformData<'a> {
     }
 
     /// Convert to binary bytes, returning an error if this is a `NodeSet`.
+    ///
+    /// # Errors
+    /// Returns `TypeMismatch` if the value is a node set.
     pub fn into_binary(self) -> Result<Vec<u8>, TransformError> {
         match self {
             Self::Binary(b) => Ok(b),
@@ -90,11 +96,11 @@ impl<'a> TransformData<'a> {
 
 /// A set of nodes from a roxmltree document.
 ///
-/// Represents the exact XPath nodes included for canonicalization and transforms.
+/// Represents the exact `XPath` nodes included for canonicalization and transforms.
 ///
-/// Attributes and namespace bindings are first-class XPath nodes even though
+/// Attributes and namespace bindings are first-class `XPath` nodes even though
 /// roxmltree exposes them through their owner element. Materializing them here
-/// lets XPath filters independently include or remove those nodes as required
+/// lets `XPath` filters independently include or remove those nodes as required
 /// by canonical XML document-subset processing.
 pub struct NodeSet<'a> {
     pub(crate) projection: projection::Projection<'a, projection::NativeKeys>,
@@ -181,12 +187,11 @@ impl<'a> NodeSet<'a> {
         budget: Option<&NodeSetMaterializationBudget>,
     ) -> Result<Self, TransformError> {
         let default;
-        let budget = match budget {
-            Some(budget) => budget,
-            None => {
-                default = NodeSetMaterializationBudget::default();
-                &default
-            }
+        let budget = if let Some(budget) = budget {
+            budget
+        } else {
+            default = NodeSetMaterializationBudget::default();
+            &default
         };
         Ok(Self {
             projection: projection::Projection::subtree(
@@ -200,7 +205,9 @@ impl<'a> NodeSet<'a> {
 
     /// Project the complete document with comment nodes omitted.
     ///
-    /// XMLDSig 1.1 section 4.4.3.3 excludes comments for an empty Reference URI.
+    /// `XMLDSig` 1.1 section 4.4.3.3 excludes comments for an empty Reference URI.
+    ///
+    /// # Errors
     /// Returns a policy error when the projection allowance is exceeded.
     pub fn entire_document_without_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::projected(doc.root(), false, None)
@@ -220,6 +227,7 @@ impl<'a> NodeSet<'a> {
 
     /// Project the complete document including comments.
     ///
+    /// # Errors
     /// Returns a policy error when the projection allowance is exceeded.
     pub fn entire_document_with_comments(doc: &'a Document<'a>) -> Result<Self, TransformError> {
         Self::projected(doc.root(), true, None)
@@ -227,6 +235,7 @@ impl<'a> NodeSet<'a> {
 
     /// Project a subtree including its attribute, namespace and comment nodes.
     ///
+    /// # Errors
     /// Returns a policy error when the projection allowance is exceeded.
     pub fn subtree(element: Node<'a, 'a>) -> Result<Self, TransformError> {
         Self::projected(element, true, None)
@@ -247,22 +256,31 @@ impl<'a> NodeSet<'a> {
     }
 
     /// Return the original source document.
+    #[must_use]
     pub fn document(&self) -> &'a Document<'a> {
         self.projection.document()
     }
     /// Test tree membership; a node from another document is never included.
+    ///
+    /// # Panics
+    /// Panics only if the internal native projection violates its infallible lookup invariant.
+    #[must_use]
     pub fn contains(&self, node: Node<'_, '_>) -> bool {
         self.projection
             .contains_tree(node)
             .expect("native projection lookup is infallible")
     }
     /// Exclude a subtree and every projected axis owned by its nodes.
+    ///
+    /// # Panics
+    /// Panics only if the internal native projection violates its infallible retention invariant.
     pub fn exclude_subtree(&mut self, node: Node<'_, '_>) {
         self.projection
             .exclude_subtree(node)
             .expect("native projection retention is infallible");
     }
     /// Whether this projection permits comment nodes.
+    #[must_use]
     pub fn with_comments(&self) -> bool {
         self.projection.with_comments()
     }
@@ -337,10 +355,7 @@ pub(super) fn charge_resource_bytes(
 pub(crate) fn subtree_node_id_range<D: crate::xml::dom::storage::Storage>(
     node: Node<'_, '_, D>,
 ) -> RangeInclusive<u32> {
-    let last_id = node
-        .descendants()
-        .next_back()
-        .map_or(node.id(), |descendant| descendant.id());
+    let last_id = node.descendants().next_back().map_or(node.id(), Node::id);
     node.id().get()..=last_id.get()
 }
 
@@ -450,15 +465,15 @@ pub enum TransformError {
     #[error("C14N error: {0}")]
     C14n(#[from] crate::c14n::C14nError),
 
-    /// Base64 decoding failed during the standard XMLDSig Base64 transform.
+    /// Base64 decoding failed during the standard `XMLDSig` Base64 transform.
     #[error("base64 transform decode error: {0}")]
     Base64(#[source] base64::DecodeSliceError),
 
-    /// XPath parsing or evaluation failed.
+    /// `XPath` parsing or evaluation failed.
     #[error("XPath transform error: {0}")]
     XPath(String),
 
-    /// XPath diagnostic whose capacity remains charged to its current query.
+    /// `XPath` diagnostic whose capacity remains charged to its current query.
     #[error("XPath transform error: {0}")]
     AccountedXPath(structured_asn1::memory::OwnedText),
 
@@ -638,7 +653,7 @@ mod tests {
             .expect("fixed fixture must fit the node-set materialization budget");
         let comment = document
             .descendants()
-            .find(|node| node.is_comment())
+            .find(Node::is_comment)
             .expect("fixed fixture contains one comment");
 
         assert!(!nodes.contains(comment));
@@ -804,11 +819,11 @@ mod tests {
             .expect("fixed fixture contains the excluded subtree");
         let trailing_text = excluded
             .children()
-            .find(|node| node.is_text())
+            .find(Node::is_text)
             .expect("fixed fixture contains trailing text");
         let trailing_comment = excluded
             .children()
-            .find(|node| node.is_comment())
+            .find(Node::is_comment)
             .expect("fixed fixture contains a trailing comment");
         let mut nodes = NodeSet::entire_document_with_comments(&document)
             .expect("fixed fixture must fit the node-set materialization budget");

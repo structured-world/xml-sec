@@ -49,6 +49,11 @@ fn charge<W: Work>(work: &W, units: usize) -> Result<(), TreeError> {
 }
 
 /// Inspect one original node. The visitor cannot retain the borrowed names.
+///
+/// # Errors
+///
+/// Returns [`TreeError::Document`] for a foreign or stale identity and
+/// [`TreeError::Resource`] when current work is exhausted.
 pub fn inspect_node<W: Work, R>(
     view: DocumentView<'_>,
     node: NodeIdentity,
@@ -71,6 +76,11 @@ pub fn inspect_node<W: Work, R>(
 }
 
 /// Return the first direct child, including text and non-element children.
+///
+/// # Errors
+///
+/// Returns [`TreeError::Document`] for a foreign or stale identity and
+/// [`TreeError::Resource`] when current work is exhausted.
 pub fn first_child<W: Work>(
     view: DocumentView<'_>,
     parent: NodeIdentity,
@@ -83,6 +93,12 @@ pub fn first_child<W: Work>(
 
 /// Return the next direct sibling within `parent`, in original document order.
 /// A node outside that parent's children is refused rather than followed.
+///
+/// # Errors
+///
+/// Returns [`TreeError::NotChild`] for a node outside `parent`,
+/// [`TreeError::Document`] for a foreign or stale identity and
+/// [`TreeError::Resource`] when current work is exhausted.
 pub fn next_sibling<W: Work>(
     view: DocumentView<'_>,
     parent: NodeIdentity,
@@ -101,6 +117,11 @@ pub fn next_sibling<W: Work>(
 }
 
 /// Whether `node` is `ancestor` itself or one of its descendants.
+///
+/// # Errors
+///
+/// Returns [`TreeError::Document`] for a foreign or stale identity and
+/// [`TreeError::Resource`] when current work is exhausted.
 pub fn subtree_contains<W: Work>(
     view: DocumentView<'_>,
     ancestor: NodeIdentity,
@@ -119,12 +140,21 @@ pub fn subtree_contains<W: Work>(
 /// XML Schema 1.0 Part 2 §3.2.16 fixes the alphabet, padding and the four
 /// XML whitespace characters (`whiteSpace` collapse).
 /// <https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#base64Binary>
+///
+/// # Errors
+///
+/// Returns [`TreeError::NotElement`] for a non-element owner,
+/// [`TreeError::Base64`] for malformed content, [`TreeError::Document`] for a
+/// foreign or stale identity and [`TreeError::Resource`] when current work or
+/// storage is exhausted.
 pub fn with_base64<W: Work, R>(
     view: DocumentView<'_>,
     owner: NodeIdentity,
     work: &W,
     visitor: impl for<'a> FnOnce(&'a [u8]) -> R,
 ) -> Result<R, TreeError> {
+    // Zero-fill source for initialized decode storage, in bounded chunks.
+    const ZEROS: [u8; 512] = [0; 512];
     charge(work, 1)?;
     let node = view.resolve_node(owner)?;
     if !node.is_element() {
@@ -154,7 +184,6 @@ pub fn with_base64<W: Work, R>(
         .map_err(TreeError::Resource)?;
     // The decoder writes into initialized storage; the zero fill is its own
     // admitted pass within the exact capacity reserved above.
-    const ZEROS: [u8; 512] = [0; 512];
     let mut remaining = payload.decoded_len;
     while remaining != 0 {
         let chunk = remaining.min(ZEROS.len());

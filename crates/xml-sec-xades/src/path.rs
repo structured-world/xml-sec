@@ -100,9 +100,9 @@ pub(crate) fn key_info_certificates<W: Work, Q: Work>(
     let (view, work) = (session.view(), session.execution());
     let mut decoded = storage.vector();
     for (signature, _) in signers {
-        for key_info in children(session, *signature, "KeyInfo", work)?.iter() {
-            for data in children(session, *key_info, "X509Data", work)?.iter() {
-                for value in children(session, *data, "X509Certificate", work)?.iter() {
+        for key_info in &children(session, *signature, "KeyInfo", work)? {
+            for data in &children(session, *key_info, "X509Data", work)? {
+                for value in &children(session, *data, "X509Certificate", work)? {
                     let bytes = extension::with_base64(view, *value, work, |bytes| {
                         let mut copy = storage.vector();
                         copy.try_extend_from_slice(bytes)
@@ -182,16 +182,16 @@ pub(crate) fn select<'d, Q: Work>(
                 break;
             };
             work.charge_work(u64::try_from(sources.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
-            let position = match sources.iter().position(|source| *source == index) {
-                Some(position) => position,
-                None => {
+            let position =
+                if let Some(position) = sources.iter().position(|source| *source == index) {
+                    position
+                } else {
                     let certificate = Certificate::read(parser, candidates[index], 0)
                         .map_err(X509ChainError::Processing)?;
                     sources.try_push(index)?;
                     certificates.try_push(certificate)?;
                     certificates.len() - 1
-                }
-            };
+                };
             path.try_push(position)?;
         }
         selected.try_push((
@@ -217,15 +217,14 @@ fn find<Q: Work>(
     work: &Q,
 ) -> Result<Option<usize>, Error> {
     for (index, candidate) in candidates.iter().enumerate() {
-        let identity = match identities[index] {
-            Some(identity) => identity,
-            None => {
-                // The same internal identity the trust evidence recorded,
-                // independent of the document's digest policy.
-                let identity = X509TrustEvidence::certificate_identity_in(candidate, work)?;
-                identities[index] = Some(identity);
-                identity
-            }
+        let identity = if let Some(identity) = identities[index] {
+            identity
+        } else {
+            // The same internal identity the trust evidence recorded,
+            // independent of the document's digest policy.
+            let identity = X509TrustEvidence::certificate_identity_in(candidate, work)?;
+            identities[index] = Some(identity);
+            identity
         };
         work.charge_work(32)?;
         if identity == *fingerprint {
@@ -248,7 +247,7 @@ impl<'d> Paths<'d> {
         signature: NodeIdentity,
         work: &Q,
     ) -> Result<&CheckedPath<'d>, CounterPathError> {
-        for (signer, path) in self.entries.iter() {
+        for (signer, path) in &self.entries {
             work.charge_work(
                 signature
                     .hash_work()
@@ -274,7 +273,7 @@ pub(crate) fn check<'d, W: Work, Q: Work>(
     work: &Q,
 ) -> Result<Paths<'d>, Error> {
     let mut entries = work.vector();
-    for (signature, evidence, path) in selection.signers.iter() {
+    for (signature, evidence, path) in &selection.signers {
         let outcome = match path {
             Ok(path) => checked(session, &selection.certificates, evidence, path, work)?,
             Err(failure) => Err(*failure),

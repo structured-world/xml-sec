@@ -63,7 +63,7 @@ impl<W: Work> BinaryXml for Document<'_, '_, '_, '_, W> {
 /// A resolved XML digest method of a signed certificate reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DigestIdentity {
-    /// MD5, recognized whatever the XMLDSig digest policy and build support,
+    /// MD5, recognized whatever the `XMLDSig` digest policy and build support,
     /// so that EN 319 132-1 §6.2.1 classifies it. It is never computed.
     Md5,
     /// A digest xml-sec implements and the operation policy permits.
@@ -165,7 +165,7 @@ impl<'a, W: Work> Digest<'a> for Document<'_, '_, '_, '_, W> {
     }
 }
 
-impl<'a, W: Work> DigestProvider<'a, Self> for Document<'_, '_, '_, '_, W> {
+impl<W: Work> DigestProvider<'_, Self> for Document<'_, '_, '_, '_, W> {
     fn resolve<Q: Work>(
         &self,
         access: &Access<'_, Self, Q>,

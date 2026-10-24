@@ -1,10 +1,23 @@
-use super::*;
+#[cfg(feature = "xmlenc")]
+use super::OAEP_MGF_DIGESTS;
+use super::{PolicyCompileContext, PolicySet, SignatureConstraints, configuration};
+use crate::policy::{
+    CertificateSignatureAlgorithms, HmacPolicy, KeyTrustPolicy, PolicyViolation, TransformPolicy,
+    UriPolicy,
+};
+#[cfg(feature = "xmlenc")]
+use crate::policy::{
+    DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
+};
+use crate::provider::{CryptoProvider, ProviderCapability};
 use crate::xml::dom::Node;
+use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
+use std::collections::HashSet;
 
 impl PolicySet {
     pub(super) fn validate(
         &self,
-        context: &PolicyCompileContext,
+        context: PolicyCompileContext,
         provider: &dyn CryptoProvider,
     ) -> Result<(), PolicyViolation> {
         if let Some(policy) = &self.verification {
@@ -197,7 +210,7 @@ fn signature_transforms(
     Ok(())
 }
 
-fn uri_contract(uris: UriPolicy, context: &PolicyCompileContext) -> Result<(), PolicyViolation> {
+fn uri_contract(uris: UriPolicy, context: PolicyCompileContext) -> Result<(), PolicyViolation> {
     if !context.external_resources
         && [
             uris.references,
@@ -460,7 +473,7 @@ fn saml(signature: Node<'_, '_>) -> Result<(), PolicyViolation> {
     let transforms = child(reference, DS, "Transforms")
         .ok_or(configuration("SAML requires enveloped-signature transform"))?;
     let mut enveloped = 0;
-    for transform in transforms.children().filter(|node| node.is_element()) {
+    for transform in transforms.children().filter(Node::is_element) {
         if !named(transform, DS, "Transform") {
             return Err(configuration("invalid SAML transform element"));
         }
@@ -568,6 +581,55 @@ fn xades(
     // ETSI EN 319 132-1 V1.3.1 §4.3.2 forbids empty SignedProperties and
     // defines this sequence of optional containers, not arbitrary children.
     // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
+    xades_containers(properties, budget)?;
+    let info = child(signature, DS, "SignedInfo").ok_or(configuration("missing SignedInfo"))?;
+    let mut count = 0;
+    for reference in info.children().filter(|node| named(*node, DS, "Reference")) {
+        if reference.attribute("Type") == Some("http://uri.etsi.org/01903#SignedProperties") {
+            if reference
+                .attribute("URI")
+                .and_then(|uri| uri.strip_prefix('#'))
+                != Some(id)
+            {
+                return Err(configuration(
+                    "SignedProperties Reference must identify the protected properties",
+                ));
+            }
+            count += 1;
+            if let Some(transforms) = child(reference, DS, "Transforms") {
+                for transform in transforms.children().filter(Node::is_element) {
+                    if !named(transform, DS, "Transform") {
+                        return Err(configuration("invalid SignedProperties transform element"));
+                    }
+                    let Some(uri) = transform.attribute("Algorithm") else {
+                        return Err(configuration(
+                            "SignedProperties transform requires Algorithm",
+                        ));
+                    };
+                    if crate::c14n::C14nAlgorithm::from_uri(uri).is_none() {
+                        return Err(configuration(
+                            "SignedProperties protection permits only canonicalization transforms",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if count != 1 {
+        return Err(configuration(
+            "XAdES requires exactly one typed SignedProperties Reference",
+        ));
+    }
+    Ok(())
+}
+
+fn xades_containers(
+    properties: Node<'_, '_>,
+    budget: &crate::xmldsig::transforms::TransformExecutionBudget,
+) -> Result<(), PolicyViolation> {
+    // ETSI EN 319 132-1 V1.3.1 §4.3.2 requires nonempty, ordered containers.
+    // https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
+    const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
     let mut last = 0;
     for node in properties.children() {
         if node.is_element() {
@@ -603,44 +665,6 @@ fn xades(
     if last == 0 {
         return Err(configuration(
             "SignedProperties requires a qualifying-property container",
-        ));
-    }
-    let info = child(signature, DS, "SignedInfo").ok_or(configuration("missing SignedInfo"))?;
-    let mut count = 0;
-    for reference in info.children().filter(|node| named(*node, DS, "Reference")) {
-        if reference.attribute("Type") == Some("http://uri.etsi.org/01903#SignedProperties") {
-            if reference
-                .attribute("URI")
-                .and_then(|uri| uri.strip_prefix('#'))
-                != Some(id)
-            {
-                return Err(configuration(
-                    "SignedProperties Reference must identify the protected properties",
-                ));
-            }
-            count += 1;
-            if let Some(transforms) = child(reference, DS, "Transforms") {
-                for transform in transforms.children().filter(|node| node.is_element()) {
-                    if !named(transform, DS, "Transform") {
-                        return Err(configuration("invalid SignedProperties transform element"));
-                    }
-                    let Some(uri) = transform.attribute("Algorithm") else {
-                        return Err(configuration(
-                            "SignedProperties transform requires Algorithm",
-                        ));
-                    };
-                    if crate::c14n::C14nAlgorithm::from_uri(uri).is_none() {
-                        return Err(configuration(
-                            "SignedProperties protection permits only canonicalization transforms",
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    if count != 1 {
-        return Err(configuration(
-            "XAdES requires exactly one typed SignedProperties Reference",
         ));
     }
     Ok(())

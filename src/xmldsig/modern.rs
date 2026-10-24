@@ -1,7 +1,7 @@
 //! RustCrypto-owned modern key handles used only behind provider dispatch.
 
 use super::{SignatureAlgorithm, SigningKey, SigningKeyError, SigningPublicKeyInfo};
-use pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
+use pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use sha2::digest::Update;
 
 #[expect(
@@ -13,11 +13,14 @@ enum EdDsaPrivateKey {
     Ed448(ed448_goldilocks::SigningKey),
 }
 
-/// Opaque EdDSA private key. Private bytes are zeroized by the primitive on drop.
+/// Opaque `EdDSA` private key. Private bytes are zeroized by the primitive on drop.
 pub struct EdDsaSigningKey(EdDsaPrivateKey);
 
 impl EdDsaSigningKey {
     /// Import a strict RFC 8410 PKCS#8 key for the explicitly selected algorithm.
+    ///
+    /// # Errors
+    /// Returns an error for a non-EdDSA algorithm or invalid private-key encoding.
     pub fn from_pkcs8_der(
         algorithm: SignatureAlgorithm,
         der: &[u8],
@@ -41,6 +44,9 @@ impl EdDsaSigningKey {
     }
 
     /// Export private PKCS#8 DER in a zeroizing secret document.
+    ///
+    /// # Errors
+    /// Returns an error if the primitive cannot encode the private key.
     pub fn to_pkcs8_der(&self) -> Result<pkcs8::SecretDocument, SigningKeyError> {
         match &self.0 {
             EdDsaPrivateKey::Ed25519(key) => key.to_pkcs8_der(),
@@ -99,7 +105,7 @@ impl SigningKey for EdDsaSigningKey {
             EdDsaPrivateKey::Ed25519(_) if context.as_bytes().is_empty() => {
                 self.sign_with_provider(provider, algorithm, message)
             }
-            _ => Err(SigningKeyError::UnsupportedAlgorithm {
+            EdDsaPrivateKey::Ed25519(_) => Err(SigningKeyError::UnsupportedAlgorithm {
                 uri: algorithm.uri().to_owned(),
             }),
         }
@@ -114,13 +120,13 @@ impl SigningKey for EdDsaSigningKey {
 
     fn sign_with_provider(
         &self,
-        _provider: &dyn crate::provider::CryptoProvider,
+        provider: &dyn crate::provider::CryptoProvider,
         algorithm: SignatureAlgorithm,
         message: &[u8],
     ) -> Result<Vec<u8>, SigningKeyError> {
         if algorithm != self.algorithm() {
             return self.sign_with_provider_context(
-                _provider,
+                provider,
                 algorithm,
                 &super::SignatureContext::default(),
                 message,
@@ -168,19 +174,37 @@ pub(crate) fn validate_public_key(
         }
     }
     match algorithm.eddsa_key_algorithm() {
-        Some(SignatureAlgorithm::Ed25519) => {
-            ed25519_dalek::VerifyingKey::from_public_key_der(der).map(|_| ())
-        }
-        Some(SignatureAlgorithm::Ed448) => {
-            ed448_goldilocks::VerifyingKey::from_public_key_der(der).map(|_| ())
-        }
+        Some(SignatureAlgorithm::Ed25519) => ed25519_verifying_key(der).map(|_| ()),
+        Some(SignatureAlgorithm::Ed448) => ed448_verifying_key(der).map(|_| ()),
         _ => {
             return Err(super::SignatureVerificationError::UnsupportedAlgorithm {
                 uri: algorithm.uri().to_owned(),
             });
         }
     }
-    .map_err(|_| super::SignatureVerificationError::InvalidKeyDer)
+    .ok_or(super::SignatureVerificationError::InvalidKeyDer)
+}
+
+/// RFC 8410 Ed25519 SPKI read by the shared PKIX reader, then point-decoded.
+pub(crate) fn ed25519_verifying_key(der: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
+    use structured_pkix::key::rfc8410::Algorithm;
+    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    let key = session.rfc8410_public_key(der)?;
+    if key.algorithm() != Algorithm::Ed25519 {
+        return None;
+    }
+    ed25519_dalek::VerifyingKey::from_bytes(key.as_bytes().try_into().ok()?).ok()
+}
+
+/// RFC 8410 Ed448 SPKI read by the shared PKIX reader, then point-decoded.
+pub(crate) fn ed448_verifying_key(der: &[u8]) -> Option<ed448_goldilocks::VerifyingKey> {
+    use structured_pkix::key::rfc8410::Algorithm;
+    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    let key = session.rfc8410_public_key(der)?;
+    if key.algorithm() != Algorithm::Ed448 {
+        return None;
+    }
+    ed448_goldilocks::VerifyingKey::from_bytes(key.as_bytes().try_into().ok()?).ok()
 }
 
 pub(crate) fn verify(
@@ -222,8 +246,7 @@ pub(crate) fn verify_with_context(
         SignatureAlgorithm::Ed25519
         | SignatureAlgorithm::Ed25519Ctx
         | SignatureAlgorithm::Ed25519Ph => {
-            let key = ed25519_dalek::VerifyingKey::from_public_key_der(der)
-                .map_err(|_| Error::InvalidKeyDer)?;
+            let key = ed25519_verifying_key(der).ok_or(Error::InvalidKeyDer)?;
             let signature = ed25519_dalek::Signature::try_from(signature)
                 .map_err(|_| Error::InvalidSignatureFormat)?;
             Ok(match algorithm {
@@ -250,8 +273,7 @@ pub(crate) fn verify_with_context(
             })
         }
         SignatureAlgorithm::Ed448 | SignatureAlgorithm::Ed448Ph => {
-            let key = ed448_goldilocks::VerifyingKey::from_public_key_der(der)
-                .map_err(|_| Error::InvalidKeyDer)?;
+            let key = ed448_verifying_key(der).ok_or(Error::InvalidKeyDer)?;
             let signature = ed448_goldilocks::Signature::try_from(signature)
                 .map_err(|_| Error::InvalidSignatureFormat)?;
             Ok(if algorithm == SignatureAlgorithm::Ed448 {
@@ -279,7 +301,11 @@ fn ed25519ctx_hash(context: &super::SignatureContext) -> sha2::Sha512 {
     // and challenge hashes, never the private-key expansion hash.
     // https://www.rfc-editor.org/rfc/rfc8032.html#section-5.1.6
     sha2::Sha512::new_with_prefix(b"SigEd25519 no Ed25519 collisions")
-        .chain_update([0, context.as_bytes().len() as u8])
+        .chain_update([
+            0,
+            u8::try_from(context.as_bytes().len())
+                .expect("SignatureContext construction enforces the RFC 8032 octet limit"),
+        ])
         .chain_update(context.as_bytes())
 }
 

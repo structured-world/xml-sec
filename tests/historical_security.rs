@@ -28,7 +28,7 @@ fn profile(name: PolicyProfile) -> CompiledPolicies {
 
 fn template(uri: &str, parameters: &str, key_info: &str) -> String {
     format!(
-        r##"<root><payload ID="target">authenticated</payload><ds:Signature xmlns:ds="{DS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256">{parameters}</ds:SignatureMethod><ds:Reference URI="{uri}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>{key_info}</ds:Signature></root>"##
+        r#"<root><payload ID="target">authenticated</payload><ds:Signature xmlns:ds="{DS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256">{parameters}</ds:SignatureMethod><ds:Reference URI="{uri}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/>{key_info}</ds:Signature></root>"#
     )
 }
 
@@ -340,9 +340,8 @@ fn rsa_oversized_modulus_and_exponent_refuse_before_big_integer_verification() {
             assert!(result.unwrap().is_some());
             continue;
         }
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("unbounded RSA work admitted"),
+        let Err(error) = result else {
+            panic!("unbounded RSA work admitted");
         };
         assert!(
             matches!(
@@ -462,13 +461,6 @@ fn cbc_downgrade_and_padding_probes_have_one_pre_decryption_policy_refusal() {
         DataEncryptionAlgorithm as Data, DecryptContext, DecryptedContent, DecryptionKeyResolver,
         EncryptedDataBuilder, EncryptedKey, SymmetricKeyDecryptor, XmlEncError,
     };
-    // XMLEnc 1.1 §6.1.3: secure profiles must not become CBC padding oracles.
-    // Assert policy-before-decryption, not timing equality of an XML processor.
-    let key = [0x52; 16];
-    let resolver = SymmetricKeyDecryptor::new(key);
-    let modern = profile(PolicyProfile::Modern);
-    let compatibility = profile(PolicyProfile::XmlSecCompatible);
-    let plaintext = b"historical regression control";
     struct ForbiddenKey;
     impl DecryptionKeyResolver for ForbiddenKey {
         fn resolve_key(
@@ -480,6 +472,13 @@ fn cbc_downgrade_and_padding_probes_have_one_pre_decryption_policy_refusal() {
             panic!("denied CBC input must not request a key")
         }
     }
+    // XMLEnc 1.1 §6.1.3: secure profiles must not become CBC padding oracles.
+    // Assert policy-before-decryption, not timing equality of an XML processor.
+    let key = [0x52; 16];
+    let resolver = SymmetricKeyDecryptor::new(key);
+    let modern = profile(PolicyProfile::Modern);
+    let compatibility = profile(PolicyProfile::XmlSecCompatible);
+    let plaintext = b"historical regression control";
     let good = EncryptedDataBuilder::new(Data::Aes128Gcm)
         .direct_key(key.as_slice())
         .policy(modern.encryption().unwrap().clone())

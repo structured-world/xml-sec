@@ -6,19 +6,19 @@
 `EcdsaSha256` and `EcdsaSha384`, because the signature URI selects a digest while
 the key selects P-256, P-384, or P-521. The enum also covers DSA, HMAC, RSA,
 and ECDSA SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 methods implemented by the
-XMLDSig 1.1 interop pipeline. `SignedInfo` reports optional HMAC truncation through
+`XMLDSig` 1.1 interop pipeline. `SignedInfo` reports optional HMAC truncation through
 `hmac_output_length_bits`. Both public types are non-exhaustive; consumers should
 use wildcard match arms and obtain `SignedInfo` through the parser.
 
 The `xmldsig` feature provides signing and verification pipelines for same-document XML
 signatures and detached references whose payloads the caller supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
-Base64, XPath 1.0, and XPath Filter 2.0 transforms, XSLT transforms with the optional `xslt`
+Base64, `XPath` 1.0, and `XPath` Filter 2.0 transforms, XSLT transforms with the optional `xslt`
 feature, RSA PKCS#1 v1.5, RSA-PSS, DSA,
 ECDSA with P-256/P-384/P-521 keys, HMAC truncation, embedded X.509 certificates,
 and configured key resolution.
 
-The complete Phaos XMLDSig 3, 2012 XMLDSig 1.1, and XMLDSig Second Edition
+The complete Phaos `XMLDSig` 3, 2012 `XMLDSig` 1.1, and `XMLDSig` Second Edition
 corpora are checked in for
 deterministic offline interoperability testing. Every signature document is executed through the
 public verification API and must be classified exactly once. Supported vectors
@@ -41,7 +41,7 @@ bypass the mechanism, and conflicting recipient parameter sets are rejected.
 Signing and CLI preflight resolve same-document mechanisms reached through
 `KeyInfoReference`, retaining the original ciphertext element for atomic mutation.
 External KEM signing targets are not mutable caller documents and are rejected.
-This preflight also inspects policy-permitted external KeyInfo references when
+This preflight also inspects policy-permitted external `KeyInfo` references when
 an ordinary signing key is supplied, so it cannot silently preserve a KEM
 instruction. External XML parsing shares the operation budget; unrelated key
 hints do not require decoding their key material.
@@ -93,7 +93,7 @@ Every executable graph node checks its dependencies before entering the closure 
 performs parsing, resolution, canonicalization, or provider work. Nodes bound to a
 document or caller-owned external resource additionally require a freshly observed
 node identity or content fingerprint; the generic execution entry point rejects them.
-XPath document-identity caching is operation-owned but chain-scoped, so cache entries
+`XPath` document-identity caching is operation-owned but chain-scoped, so cache entries
 are reused within one live transform chain and invalidated before another chain or
 after an internal reparse. Controlled mutations verify the expected document
 generation before commit and advance that expectation by exactly one generation
@@ -106,9 +106,9 @@ before their digest execution, while signing analyzes concrete mutable `DigestVa
 and `SignatureValue` targets and rejects cycles before changing the caller's document.
 
 `SigningPolicy::manifest_processing` controls direct `<Object>/<Manifest>`
-reference generation. Processing fills Manifest digests before SignedInfo so a
-SignedInfo reference to the Manifest authenticates the final values; Manifest
-and SignedInfo references share transform work and the aggregate reference
+reference generation. Processing fills Manifest digests before `SignedInfo` so a
+`SignedInfo` reference to the Manifest authenticates the final values; Manifest
+and `SignedInfo` references share transform work and the aggregate reference
 ceiling. Nested Manifest dependencies are filled from leaves to dependants so
 every digest observes finalized content; cycles are rejected before mutation.
 Dependency analysis uses the effective XPath/XPath Filter 2.0 node-set, so a
@@ -117,12 +117,12 @@ a cycle.
 The default core policy leaves application-defined Manifest values
 untouched, while the `xmlsec1` compatibility CLI enables processing unless
 `--ignore-manifests` is present.
-[`XPathHereSemantics::Specification`] follows the XMLDSig `<XPath>` contract; callers
+[`XPathHereSemantics::Specification`] follows the `XMLDSig` `<XPath>` contract; callers
 interoperating with legacy libxmlsec1 `here()` behavior can explicitly select
 [`XPathHereSemantics::XmlSecLegacy`] on both contexts.
 
 `SigningPolicy::transforms` applies to every canonicalization algorithm the signing pipeline
-executes. Verification follows XMLDSig's implicit C14N 1.0 coercion for a Reference chain ending
+executes. Verification follows `XMLDSig`'s implicit C14N 1.0 coercion for a Reference chain ending
 as a node set. Signature generation follows the Second Edition recommendation instead: before
 digest planning it materializes C14N 1.1 as an explicit `Transform` wherever the generated chain
 still produces a node set. The mutation is operation-gated, policy-checked, bounded, and included
@@ -154,7 +154,7 @@ operation provider as reference digests and signature generation. RSA, DSA, P-25
 P-521 signing keys accept plain or password-encrypted PKCS#8 PEM and DER. The ECDSA signing-key
 types also accept traditional SEC1 PEM and DER, which the CLI exposes through its generic
 private-key options. DSA signatures emit
-XMLDSig's fixed-width `r || s` value;
+`XMLDSig`'s fixed-width `r || s` value;
 DSA-SHA1 requires a 160-bit `q`, while DSA-SHA256 requires a 256-bit `q`, so a
 key whose component width cannot be represented by the selected wire format is
 rejected before signing.
@@ -181,7 +181,7 @@ an external resource cannot hide a cycle that returns to that resource.
 `IdAttributeRegistration` supplies immutable request context for non-standard ID attributes.
 `SignContext::id_attributes` and `VerifyContext::id_attributes` apply the same global or
 element-scoped registrations to operation start-node selection, every same-document Reference,
-and XPath `id()` in ordinary and Filter 2.0 transforms.
+and `XPath` `id()` in ordinary and Filter 2.0 transforms.
 `scoped_any_namespace` matches one element local name across namespaces, while `scoped` matches
 one exact expanded name and uses `None` for no namespace. The registration is not stored in policy
 and never comes from document content.
@@ -190,7 +190,7 @@ namespace URI; `None` restricts it to unqualified attributes. Without this restr
 local names match across namespaces, preserving the CLI `--id-attr` contract. Registrations add
 to the built-in `ID`/`Id`/`id` spellings, `xml:id`, and internal-DTD ID declarations; they do not
 remove these defaults. `xml:id` and DTD ID values are normalized in the shared semantic DOM,
-so borrowed and retained-document resolution, XPath, and canonicalization see the same value.
+so borrowed and retained-document resolution, `XPath`, and canonicalization see the same value.
 `Attribute::xml_id_error()` exposes non-fatal invalid-NCName and non-ID-declaration diagnostics.
 As required by [xml:id 1.0 sections 4 and 6](https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing),
 ID assignment is preserved even when a diagnostic is present; callers can inspect it before
@@ -264,13 +264,13 @@ signature validity.
 (`CallerTrusted` or `ValidatedX509`). A matching digest under an invalid signature or an untrusted
 embedded key is insufficient. Authenticated Manifest references contribute only when processing is
 enabled and their own digests pass. Coverage excludes comments and the owning enveloped Signature;
-it is not original-byte equality. Arbitrary XPath projections and binary transforms remain
+it is not original-byte equality. Arbitrary `XPath` projections and binary transforms remain
 indeterminate rather than claiming complete original-subtree coverage, as required by
 [XMLDSig 1.1 §8.1.1](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Signed).
 Any document mutation invalidates earlier coverage proofs. Same-name siblings cannot satisfy an
 identity-based expected-target requirement.
 
-Batch verification retains one parsed document and shares transform, XPath, external-resource,
+Batch verification retains one parsed document and shares transform, `XPath`, external-resource,
 key-materialization, and canonicalization accounting across signatures. Authentication graphs remain
 signature-local, so one signature cannot authorize another signature's Manifest. X.509 validation
 captures one operation time for every candidate path and signature.
@@ -288,7 +288,7 @@ implementation only when the provider has no primitive work to observe.
 reference digests, document signatures, `X509Digest` selector evaluation, X.509 candidate-path
 edges, complete certificate paths, and CRL authentication performed by `DefaultKeyResolver`.
 Certificate authentication uses a separate typed algorithm contract because certificate encodings
-and algorithm permissions are independent of XMLDSig `SignatureMethod`. Unsupported certificate
+and algorithm permissions are independent of `XMLDSig` `SignatureMethod`. Unsupported certificate
 OIDs remain typed path errors rather than ordinary signature mismatches. Every certificate OID
 represented by that contract reaches the selected provider; the built-in provider may reject a
 capability such as ECDSA-SHA512 while a custom provider can implement it. For an
@@ -298,7 +298,7 @@ Custom resolvers that evaluate cryptographic key metadata should override
 `KeyResolver::resolve_with_policy_and_provider`; source-only resolvers can retain the default hook.
 Before document-signature provider dispatch, the facade calls
 `VerifyingKey::validate_signature_value`. Built-in resolved keys enforce the exact RSA modulus or
-EC curve width there, so a permissive custom provider cannot reinterpret malformed XMLDSig wire
+EC curve width there, so a permissive custom provider cannot reinterpret malformed `XMLDSig` wire
 framing. Custom opaque keys must override that hook when their accepted framing depends on key
 metadata unavailable through the generic algorithm URI. Providers that implement policy-selected
 framing must also override `validate_signature_value_with_policy` and `verify_with_policy`; their
@@ -306,7 +306,7 @@ defaults intentionally preserve the standard-only hooks.
 
 ## Verification Policy
 
-ECDSA `SignatureValue` uses the XMLDSig fixed-width `r || s` representation by
+ECDSA `SignatureValue` uses the `XMLDSig` fixed-width `r || s` representation by
 default for both signing and verification. Set
 `SigningPolicy::ecdsa_signature_value_encoding` or
 `VerificationPolicy::ecdsa_signature_value_encoding` to
@@ -322,9 +322,9 @@ The native CLI selects the donor barename mode by default and the direct mode fo
 IDs fail in every mode.
 The standards mode reverses UTF-8 URI percent escaping before resolving a fragment. Explicit
 `xpointer(/)` and single-literal `xpointer(id('...'))` expressions retain comments, while empty
-URIs and bare fragments remove them. XPointer caret escaping (`^(`, `^)`, `^^`) is processed
-before XPath literal matching. Compound XPath arguments, malformed escaping, and unbalanced
-scheme parentheses are rejected. General XPointer expressions are not evaluated.
+URIs and bare fragments remove them. `XPointer` caret escaping (`^(`, `^)`, `^^`) is processed
+before `XPath` literal matching. Compound `XPath` arguments, malformed escaping, and unbalanced
+scheme parentheses are rejected. General `XPointer` expressions are not evaluated.
 
 Verification separates signature correctness from key authorization.
 `VerificationPolicy::key_trust.mode` defaults to `VerificationTrustMode::RequireTrustedKey`:
@@ -371,26 +371,26 @@ validates; neither condition can bypass the configured work bounds or trust anch
 An explicit verification time may come from either boundary; if both boundaries provide one, the
 timestamps must be identical because silently preferring either clock would discard caller policy.
 Path validation excludes self-issued rollover CAs from `pathLenConstraint`, applies supported RFC
-5280 NameConstraints to every subordinate certificate, and rejects critical extensions whose
+5280 `NameConstraints` to every subordinate certificate, and rejects critical extensions whose
 semantics are not implemented. Repeated extension OIDs are rejected certificate-wide before any
-extension-specific interpretation. Issuing certificates must assert BasicConstraints `cA=true`
-and, when KeyUsage is present, `keyCertSign`. RFC 5280 requires conforming issuers to encode CA
-BasicConstraints as critical, but path validation retains OpenSSL/xmlsec1 compatibility with
+extension-specific interpretation. Issuing certificates must assert `BasicConstraints` `cA=true`
+and, when `KeyUsage` is present, `keyCertSign`. RFC 5280 requires conforming issuers to encode CA
+`BasicConstraints` as critical, but path validation retains OpenSSL/xmlsec1 compatibility with
 historical non-critical encodings. Empty certificate subjects require exactly one critical, non-empty
-SubjectAlternativeName, and malformed GeneralName entries fail path validation regardless of whether
+`SubjectAlternativeName`, and malformed `GeneralName` entries fail path validation regardless of whether
 the subject is empty. Invalid DNS-based constraints, including email-domain and URI-host forms,
 malformed IPv4/IPv6 encodings, non-contiguous CIDR masks, nonzero `minimum`, and any `maximum`
 distance fail the path rather than behaving as ordinary name mismatches. Processed critical certificate
-extensions are KeyUsage
-(`2.5.29.15`), SubjectAlternativeName (`2.5.29.17`), BasicConstraints (`2.5.29.19`), and
-NameConstraints (`2.5.29.30`). ExtendedKeyUsage (`2.5.29.37`) is processed whether critical or
+extensions are `KeyUsage`
+(`2.5.29.15`), `SubjectAlternativeName` (`2.5.29.17`), `BasicConstraints` (`2.5.29.19`), and
+`NameConstraints` (`2.5.29.30`). `ExtendedKeyUsage` (`2.5.29.37`) is processed whether critical or
 non-critical on every certificate in the path: absent EKU and `anyExtendedKeyUsage` remain
 unrestricted, while every other EKU must intersect
 `KeyTrustPolicy::allowed_extended_key_usages`. The resolver-local and operation policy sets are
 independent approvals, so a purpose must appear in both when `VerifyContext` composes them. Their
 default empty sets therefore reject TLS-, code-signing-, and other purpose-restricted paths unless
 the deployment explicitly approves that typed purpose at both boundaries. Critical
-CertificatePolicies (`2.5.29.32`) still fails closed because policy-tree processing is not
+`CertificatePolicies` (`2.5.29.32`) still fails closed because policy-tree processing is not
 implemented.
 When `X509Data` supplies multiple selector categories, every
 category must match certificates on the same selected, policy-valid path rather than unrelated
@@ -418,7 +418,7 @@ They also share `ResourcePolicy::max_references` with `<SignedInfo>`: every pars
 reference consumes that operation-wide budget, including entries whose transforms are unsupported
 and retained only as independent failure results.
 
-Malformed XMLDSig structure, unsupported algorithms in core signature processing, disallowed URIs
+Malformed `XMLDSig` structure, unsupported algorithms in core signature processing, disallowed URIs
 in `<SignedInfo>` references, and inconsistent `KeyInfo` metadata are processing errors rather
 than validity statuses. Manifest policy violations and unsupported transforms remain independent
 per-reference statuses as described above. Treat both `Invalid(reason)` and an API error as a
@@ -435,11 +435,11 @@ budget across reparsed document generations. External key retrieval has an indep
 also opt in with `VerifyContext::allowed_retrieval_method_uri_types`. Allowing external signed
 payloads never implicitly allows external key material. `RetrievalMethod` currently accepts
 untransformed external `rawX509Certificate` data, untransformed direct same-document `X509Data`,
-and the Merlin same-document `X509Data` XPath selection. Relative external `Reference` and
+and the Merlin same-document `X509Data` `XPath` selection. Relative external `Reference` and
 `RetrievalMethod` URIs are resolved against the owning element's effective `xml:base` using RFC
 3986 before lookup, so resource-map keys must use that resolved URI. The compiled resource policy
 bounds both inherited `xml:base` components and cumulative URI-resolution bytes across external
-References, `RetrievalMethod`, Reference transforms, and SignedInfo C14N 1.1 fixup; implementation
+References, `RetrievalMethod`, Reference transforms, and `SignedInfo` C14N 1.1 fixup; implementation
 ceilings are 64 components and 1 MiB per operation. Other retrieval transform chains fail closed
 instead of being ignored.
 XMLDSig 1.1 `KeyInfoReference` has separate source and URI policy gates plus a
@@ -474,9 +474,9 @@ Both `HmacVerificationKey` and `HmacSigningKey` own their secret bytes in
 zeroizing storage, so dropping either key overwrites the retained secret before
 releasing its allocation.
 `VerifyContext::allowed_transforms` applies to Reference transforms and implicit C14N,
-the declared SignedInfo canonicalization method, and supported RetrievalMethod transforms.
-Allowing XPath for signed payload processing therefore also explicitly permits the bounded
-Merlin X509Data retrieval selector; omitting XPath rejects that key-retrieval path.
+the declared `SignedInfo` canonicalization method, and supported `RetrievalMethod` transforms.
+Allowing `XPath` for signed payload processing therefore also explicitly permits the bounded
+Merlin `X509Data` retrieval selector; omitting `XPath` rejects that key-retrieval path.
 
 CRL checking is meaningful only inside authenticated X.509 path validation. A policy that enables
 CRLs without enabling certificate-chain validation is rejected during context construction rather
@@ -488,7 +488,7 @@ inside the bounded `thisUpdate` through `nextUpdate` validity window.
 The `removeFromCRL` reason is rejected in complete CRLs because it is meaningful only in a delta
 CRL. URI subject alternative names
 likewise require one RFC 3986 authority, including syntactically valid userinfo, before their host
-can participate in NameConstraints matching.
+can participate in `NameConstraints` matching.
 Critical `NameConstraints` also retain their DER structure during validation: the extension must
 contain at least one permitted or excluded subtree, every present subtree collection must be
 non-empty, and unsupported minimum/maximum distance fields fail closed.
@@ -509,7 +509,7 @@ using the XSLT transform is reported as an invalid per-reference result without 
 ## XSLT Transform
 
 The optional `xslt` feature executes the XSLT transform
-(`http://www.w3.org/TR/1999/REC-xslt-19991116`, XMLDSig 1.1 section 6.6.5) with the safe-Rust
+(`http://www.w3.org/TR/1999/REC-xslt-19991116`, `XMLDSig` 1.1 section 6.6.5) with the safe-Rust
 XSLT 1.0 engine. `Transform::Xslt` carries an `XsltStylesheet`: the markup of the `<Transform>`
 content. An `xsl:stylesheet` or `xsl:transform` element must be the sole content of its
 `<Transform>` (comments, processing instructions and whitespace aside); anything else,
@@ -530,7 +530,7 @@ Execution is bounded by the operation's policy:
 - `TransformPolicy::allowed_algorithms` decides whether XSLT may run at all; secure profiles
   exclude it, while the default and libxmlsec1-compatible policies permit it when built.
 - `ResourcePolicy::max_xslt_work` bounds each kind of XSLT work (stylesheet capture/serialization,
-  XPath evaluations and steps,
+  `XPath` evaluations and steps,
   extension calls, pattern tests, template applications, sort comparisons, key entries, result
   nodes and messages) across every XSLT transform of the operation, including native parameter
   parsing before execution, and
@@ -593,7 +593,7 @@ RSA PKCS#1 v1.5 with SHA-1/SHA224/SHA256/SHA384/SHA512; RSA-PSS with SHA-1,
 SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512; and ECDSA
 SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. ECDSA selects P-256, P-384, or P-521
 from the key independently of the hash identifier. Digest methods include
-SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. EdDSA supports pure Ed25519,
+SHA-1/SHA224/SHA256/SHA384/SHA512 and SHA3-224/256/384/512. `EdDSA` supports pure Ed25519,
 Ed25519ctx, Ed25519ph, Ed448, and Ed448ph with their distinct RFC 8032 domain separation.
 HMAC output can be omitted for full width or explicitly truncated on an octet boundary, subject to
 `HmacPolicy` key and output minima.
@@ -622,12 +622,12 @@ libxmlsec1 extensions, not W3C-standardized XML methods. Compilation alone does 
 permission: signing and verification require an explicit algorithm allowlist in the immutable
 operation policy. PKCS#8 and SPKI use RFC 9881/RFC 9909 encodings. ML-DSA import accepts
 seed-only, expanded-only, and consistent seed-plus-expanded keys; expanded imports are checked
-before signing. See [the maintained RustCrypto patch](ml-dsa-patch.md) for provenance,
+before signing. See [the maintained `RustCrypto` patch](ml-dsa-patch.md) for provenance,
 validation, and reproduction. These key primitives are dispatched through `CryptoProvider`.
 `HMACOutputLength` uses XML Schema integer syntax (including XML whitespace and
-an optional leading plus), not Unicode whitespace. XMLDSig 1.1 requires at least 80 bits and
+an optional leading plus), not Unicode whitespace. `XMLDSig` 1.1 requires at least 80 bits and
 half the hash width; the default policy tightens that floor to at least 128 bits. Arbitrary
-non-octet truncation accepted by some legacy implementations is not XMLDSig 1.1 conformance.
+non-octet truncation accepted by some legacy implementations is not `XMLDSig` 1.1 conformance.
 
 RSA-SHA1, DSA-SHA1, HMAC-SHA1, and ECDSA-SHA1 are legacy algorithms disabled by default.
 Verification requires an independent opt-in: `None` in the general
@@ -655,16 +655,16 @@ permissions come from `KeyTrustPolicy::certificate_signature_algorithms`, indepe
 of the XML signature allowlist. `None` permits supported classical methods but rejects PQ;
 `Some(CertificateSignatureAlgorithms::Allowlist(...))` permits only exact listed methods
 (including RSA-PSS digest, MGF digest and salt length). The compatibility CLI explicitly
-selects `AllSupported`, leaving provider capability and strict AlgorithmIdentifier validation
+selects `AllSupported`, leaving provider capability and strict `AlgorithmIdentifier` validation
 in force without artificially restricting PSS salt lengths. This borrowed permission reaches
 candidate path selection, complete path and CRL
 validation before provider dispatch. Compiling `experimental-pq` alone never grants trust.
 Permission rejection removes only the affected candidate path; another permitted path to an
 explicit trust anchor remains usable. If no permitted path exists, the policy rejection is returned.
-Legal XML Base64 whitespace in context and SignatureValue text consumes the operation's
+Legal XML Base64 whitespace in context and `SignatureValue` text consumes the operation's
 document resource budget; normalized payloads retain their protocol and implementation width limits.
 Signature
-`AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, EdDSA,
+`AlgorithmIdentifier` parameters are validated before provider dispatch: DSA, ECDSA, `EdDSA`,
 and these post-quantum methods
 require absent parameters; RSA PKCS#1 accepts NULL or absent; RSA-PSS requires valid typed
 parameters. An `id-RSASSA-PSS` issuer key with absent parameters imposes no parameter restrictions,
@@ -678,7 +678,7 @@ minimum salt length, and trailer field. Implicit external resource loading is no
 generation, selected provider, immutable policy, captured external resource map,
 authentication state and remaining operation budgets. Additional scoped storage,
 scalar inspection and terminal C14N scratch use the supplied current shared `Work`.
-This does not introduce alloc-only XMLDSig support.
+This does not introduce alloc-only `XMLDSig` support.
 
 Select the exact successful Signature with `select_signature` when continuing
 under the producer's original Work. For an independently funded continuation, use
@@ -697,7 +697,7 @@ of the URI, missing ID, algorithm or element name. Replay charges every
 Reference and timestamp-method text node by its byte length before checking it
 for mixed content.
 All implemented transform branches,
-parser/DOM construction, XPath workspaces, binary/XML transitions and terminal
+parser/DOM construction, `XPath` workspaces, binary/XML transitions and terminal
 C14N admit their work and actual capacity before allocation or receiver effects.
 XSLT stylesheet serialization and XML preflight use the current query's Work and
 storage before the native engine workspace is reserved. Decoding admits buffer growth
@@ -707,7 +707,7 @@ without releasing the charge covering the compiled tree.
 
 The selected handle's
 `visit_authenticated_references` visitor supplies original Reference identity,
-SignedInfo or Manifest parent, original URI/Type, resource provenance and any
+`SignedInfo` or Manifest parent, original URI/Type, resource provenance and any
 historical result. `Complete`, `Unchecked` and `Incomplete` describe discovery,
 not payload digest validity or signer trust. Authenticated Manifests can be nested
 or outside Signature. Unsigned instructions are excluded, and visitor refusal
@@ -724,9 +724,9 @@ count/permissions still apply before execution; Manifest instructions require
 `ManifestProcessing::Process`, otherwise processing returns
 `PolicyViolation::ManifestProcessingDisabled`. An authenticated unchecked
 catalogue entry does not grant permission to execute it.
-`ReferenceOutput` uses XMLDSig's
+`ReferenceOutput` uses `XMLDSig`'s
 implicit C14N 1.0 for a final node set. `Timestamp(original_method)` instead uses
-that original CanonicalizationMethod and PrefixList. An explicit final C14N
+that original `CanonicalizationMethod` and `PrefixList`. An explicit final C14N
 transform or other final octets always takes precedence: octets are not parsed
 or canonicalized merely because timestamp mode was selected. Missing admitted
 external bytes return `Unavailable`, not successful empty output. Empty supplied
@@ -734,7 +734,7 @@ bytes are valid input. No network/filesystem acquisition is implicit.
 
 Enveloped transforms use their actual containing Signature, not necessarily the
 Signature selected by the continuation. With no containing Signature in the source,
-the mandated XPath selects no nodes, as specified by
+the mandated `XPath` selects no nodes, as specified by
 [XMLDSig 1.1 section 6.6.4](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature).
 This source fact stays distinct from a Signature disappearing only from an
 intermediate transform result.
@@ -775,7 +775,7 @@ Temporary joining and XSD whitespace collapse use accounted storage only when
 borrowing cannot suffice, and release it on success or refusal.
 The known linear-pass bound is admitted before joining fragments. If both Work
 and join capacity are insufficient, Work refusal precedes the allocation request;
-OwnedVec independently admits the actual copying and retained capacity.
+`OwnedVec` independently admits the actual copying and retained capacity.
 
 Supported base types are XSD 1.0 `boolean`, `integer`, `QName`, `dateTime`, `ID` and `anyURI`.
 `ScalarType::Integer` returns the marker `ScalarValue::Integer` for a valid
@@ -790,10 +790,10 @@ local_name })`, borrowing the expanded value from the original owner's namespace
 context and the scoped lexical text. Namespace absence is `None`; an empty default
 declaration removes that binding. Prefixes are case-sensitive, are not Unicode
 normalized, and may be inherited or rebound. The `xml` prefix is implicitly bound.
-The default namespace applies to unprefixed QName **values**, including `xsi:type`,
+The default namespace applies to unprefixed `QName` **values**, including `xsi:type`,
 even though it does not apply to unprefixed attribute **names**. This follows
 [XSD 1.0 Structures section 3.15.3](https://www.w3.org/TR/2004/REC-xmlschema-1-20041028/#src-qname).
-Malformed QName syntax is `Malformed`; valid syntax with an undeclared prefix is
+Malformed `QName` syntax is `Malformed`; valid syntax with an undeclared prefix is
 `UnboundPrefix(prefix)`. Neither is a processing exception or a type declaration.
 Contiguous input needs no normalization allocation; split lexical input uses the
 existing accounted join. Namespace lookup is paid through current Work before
@@ -828,7 +828,7 @@ query names its parent; a node outside that parent's children is refused with
 are constant time. `subtree_contains` reports ancestor-or-self containment.
 
 `with_base64` decodes an element's XSD 1.0 `base64Binary` simple content with
-the XMLDSig decoder: the four XML whitespace characters and interleaved comments
+the `XMLDSig` decoder: the four XML whitespace characters and interleaved comments
 are skipped, element children and non-canonical padding are refused. The child
 visits and both linear passes are admitted before the first byte is scanned,
 and the decoded bytes live in storage of the supplied account only while the
@@ -838,7 +838,7 @@ A `VerifiedSession` also answers operation-bound lookups for extension formats:
 
 - `resolve_bare_name_in` resolves a `#id` URI through this operation's ID
   registrations, fragment unescaping and same-document ID semantics, exactly as
-  reference dereferencing does. XPointer and non-fragment forms are reported as
+  reference dereferencing does. `XPointer` and non-fragment forms are reported as
   `NotBareName`, and a missing or ambiguous ID as `Unresolved`.
 - `resolve_digest_method_in` interprets an original `ds:DigestMethod` under the
   compiled digest policy: `Supported`, `Unsupported` (unknown URI) or
@@ -880,7 +880,7 @@ catalogue. The overall completeness result supplements, rather than replaces,
 individual facts and existing verification evidence.
 
 RSA-PSS retains independent message/MGF1 hashes and its original salt length.
-Pure EdDSA and pure post-quantum methods report an intrinsic suite, not a fabricated
+Pure `EdDSA` and pure post-quantum methods report an intrinsic suite, not a fabricated
 external digest. Ed25519ph reports SHA-512; Ed448ph reports SHAKE256 with its
 64-byte output, never SHA3-512 or an identity guessed from output length.
 
@@ -927,18 +927,18 @@ including pairs using different rsaEncryption and id-RSASSA-PSS identifiers.
 Equal components need equal effective restrictions for Same, not merely
 compatibility with the signature method; otherwise they remain Unproven.
 Different encodings alone are not a mismatch.
-The selected RustCrypto provider decodes RFC 8410 Ed25519/Ed448 public keys
+The selected `RustCrypto` provider decodes RFC 8410 Ed25519/Ed448 public keys
 with absent parameters and canonical RFC 8032 point encodings. Different valid
 keys establish Mismatch; invalid encodings remain Unproven. This adds no
-native-to-software fallback and does not re-encode a SubjectPublicKeyInfo.
-When experimental PQ is enabled, the selected RustCrypto provider also compares
+native-to-software fallback and does not re-encode a `SubjectPublicKeyInfo`.
+When experimental PQ is enabled, the selected `RustCrypto` provider also compares
 the fixed-format ML-DSA and supported SLH-DSA public encodings. Both must have
 their parameter-set width and absent original/effective parameters; identical
 malformed encodings remain Unproven. Borrowed backend encoded-key types validate
 the raw format without copies, matrix expansion or another signature check.
-The original parameter field is checked even when WorkingKey's generic effective
-projection treats an explicitly written NULL as absent; this also applies to EdDSA.
-RustCrypto can compare compressed/uncompressed forms on the supported NIST
+The original parameter field is checked even when `WorkingKey`'s generic effective
+projection treats an explicitly written NULL as absent; this also applies to `EdDSA`.
+`RustCrypto` can compare compressed/uncompressed forms on the supported NIST
 curves through its own point decoder. The official AWS safe API cannot establish
 those aliases, so that case remains explicitly unproven without software fallback.
 PKCS11 RSA uses its actual cached public token attributes, without private export.
@@ -949,9 +949,9 @@ unproven association. A custom leaf exposes only its own successful public mater
 through `VerifyingKey::association_spki`; this does not enable native verification
 of an otherwise opaque handle. An ambiguous composite that reports multiple
 successes yields no arbitrary winning-key proof. Producer Work pays retained
-capacity and each copied public-key byte once through OwnedVec; query Work
+capacity and each copied public-key byte once through `OwnedVec`; query Work
 pays later comparisons. Receipt admission failure cannot
-be swallowed by candidate recovery. Ordinary and scoped RustCrypto, AWS-LC and PKCS11 verification
+be swallowed by candidate recovery. Ordinary and scoped `RustCrypto`, AWS-LC and PKCS11 verification
 share the same bounded candidate traversal and leaf verifier; observing a
 successful leaf does not change which candidates are tried.
 Resolution and every exposed sibling/nested candidate share the original
@@ -985,7 +985,7 @@ reading input, never deriving policy from a document's parameters.
 An `id-RSASSA-PSS` public key also enforces its hash, MGF, minimum salt length,
 and trailer restrictions; an unrestricted RSA key does not add those restrictions.
 
-RustCrypto supports independent hashes and exact salts. Other providers expose only their native
+`RustCrypto` supports independent hashes and exact salts. Other providers expose only their native
 capabilities, with no fallback; see [provider capabilities](crypto-providers.md). The narrow
 [local RSA-PSS adaptation](rsa-pss-patch.md) retains the existing RSA arithmetic, blinding, and
 fault checks. Tests cover every pinned xmlsec1 RSA-PSS fixture, reciprocal signing, restricted

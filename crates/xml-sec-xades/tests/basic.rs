@@ -1,8 +1,8 @@
-//! B-B validation of independently signed XAdES fixtures through the public entry.
+//! B-B validation of independently signed `XAdES` fixtures through the public entry.
 //!
 //! The fixtures come from scripts/generate-xades-fixtures.sh: xmlsec1 signs
-//! every template with a real root -> intermediate -> signer path, so XMLDSig
-//! verification succeeds and only the XAdES properties differ.
+//! every template with a real root -> intermediate -> signer path, so `XMLDSig`
+//! verification succeeds and only the `XAdES` properties differ.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -72,7 +72,7 @@ fn verify_in<R>(
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
     policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
     policy.uris.references = UriTypeSet::ALL;
     configure(&mut policy);
     let context = VerifyContext::new().policy(policy).key_resolver(resolver);

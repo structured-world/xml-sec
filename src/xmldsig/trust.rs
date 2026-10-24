@@ -69,6 +69,10 @@ impl X509TrustEvidence {
     /// mechanism as [`Self::certificate_fingerprints`]. This is an identity
     /// lookup, not a use of a document digest, so the operation's digest
     /// policy and provider selection do not apply. `work` pays for the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the memory error when `work` refuses the input's length.
     pub fn certificate_identity_in<W: structured_asn1::memory::Work>(
         certificate: &[u8],
         work: &W,
@@ -81,22 +85,30 @@ impl X509TrustEvidence {
     }
 
     /// SHA-256 identities in leaf-to-anchor order, including the trust anchor.
+    #[must_use]
     pub fn certificate_fingerprints(&self) -> &[[u8; 32]] {
         &self.fingerprints[..self.path_len]
     }
 
     /// SHA-256 identity of the caller-supplied anchor that terminated the path.
+    #[must_use]
     pub fn anchor_fingerprint(&self) -> &[u8; 32] {
         &self.fingerprints[self.path_len - 1]
     }
 
     /// The single time captured for all candidate-path validation in the operation.
+    #[must_use]
     pub fn verification_time(&self) -> SystemTime {
         self.verification_time
     }
 
     /// The same validation instant the path processor used, at nanosecond
     /// precision, for consumers that re-check this exact path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::X509ChainError::CertificateNotValid`] when the captured
+    /// time is outside the representable instant range.
     pub fn validation_instant(
         &self,
     ) -> Result<structured_pkix::temporal::Instant, super::X509ChainError> {
@@ -104,6 +116,7 @@ impl X509TrustEvidence {
     }
 
     /// Whether the policy requested and validation enforced CRL processing.
+    #[must_use]
     pub fn revocation_checked(&self) -> bool {
         self.revocation_checked
     }
@@ -135,6 +148,7 @@ impl TrustedPublicKey {
     }
 
     /// Validated certificate identities and the operation's validation time.
+    #[must_use]
     pub fn evidence(&self) -> &X509TrustEvidence {
         &self.evidence
     }
@@ -235,6 +249,7 @@ pub enum ResolvedVerificationKey<'a> {
 
 impl<'a> ResolvedVerificationKey<'a> {
     /// Extract the mathematical verifier without establishing signer trust.
+    #[must_use]
     pub fn into_key(self) -> Box<dyn VerifyingKey + 'a> {
         match self {
             Self::Candidate(key) | Self::CallerTrusted(key) => key,
@@ -298,7 +313,7 @@ mod tests {
     fn validated_key_is_bound_to_time_purpose_and_policy() {
         // A validated key must not be reusable under another time or purpose,
         // or through a caller policy whose implicit clock has not been captured.
-        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(500_000);
         let evidence =
             X509TrustEvidence::new([b"bounded certificate identity"].into_iter(), time, false)
                 .expect("a one-certificate proof fits the hard path bound");

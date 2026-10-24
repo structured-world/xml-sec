@@ -97,6 +97,9 @@ impl Pkcs11Provider {
     /// Open a read-only session on an explicitly initialized module and slot. Discovering
     /// mechanisms and opening the session through the same module prevents
     /// caller-supplied sessions from being paired with another module's capabilities.
+    ///
+    /// # Errors
+    /// Returns the module's typed session, token or mechanism-discovery failure.
     pub fn new(
         module: &cryptoki::context::Pkcs11,
         slot: cryptoki::slot::Slot,
@@ -105,17 +108,22 @@ impl Pkcs11Provider {
         // sessions; those sessions still allow our CKA_TOKEN=false objects.
         // This adapter never creates or changes persistent token objects.
         // https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html
-        let session = module.open_ro_session(slot).map_err(map_error)?;
-        let random = module.get_token_info(slot).map_err(map_error)?.rng();
+        let session = module
+            .open_ro_session(slot)
+            .map_err(|error| map_error(&error))?;
+        let random = module
+            .get_token_info(slot)
+            .map_err(|error| map_error(&error))?
+            .rng();
         let mechanisms = module
             .get_mechanism_list(slot)
-            .map_err(map_error)?
+            .map_err(|error| map_error(&error))?
             .into_iter()
             .map(|kind| {
                 module
                     .get_mechanism_info(slot, kind)
                     .map(|info| (kind, info))
-                    .map_err(map_error)
+                    .map_err(|error| map_error(&error))
             })
             .collect::<Result<_, _>>()?;
         Ok(Self(Arc::new(Token {
@@ -127,20 +135,32 @@ impl Pkcs11Provider {
     }
 
     /// Authenticate explicitly without retaining or displaying the PIN.
+    ///
+    /// # Errors
+    /// Returns credentials, session or module-operation failure without exposing
+    /// native diagnostics or retaining the supplied PIN.
     pub fn login(&self, pin: &AuthPin) -> Result<(), ProviderError> {
         self.0
             .session()?
             .login(UserType::User, Some(pin))
-            .map_err(map_error)
+            .map_err(|error| map_error(&error))
     }
 
-    /// Resolve one persistent RSA private key by exact binary CKA_ID.
+    /// Resolve one persistent RSA private key by exact binary `CKA_ID`.
     /// Only public RSA attributes are read; private exponents are never queried.
+    ///
+    /// # Errors
+    /// Returns object refusal for an absent/ambiguous ID or invalid public RSA
+    /// attributes, or the original session/module failure.
     pub fn rsa_private_key(&self, id: &[u8]) -> Result<Pkcs11RsaKey, ProviderError> {
         self.rsa_key(id, ObjectClass::PRIVATE_KEY)
     }
 
     /// Resolve one persistent RSA public key for token-side verification/transport.
+    ///
+    /// # Errors
+    /// Returns object refusal for an absent/ambiguous ID or invalid public RSA
+    /// attributes, or the original session/module failure.
     pub fn rsa_public_key(&self, id: &[u8]) -> Result<Pkcs11RsaKey, ProviderError> {
         self.rsa_key(id, ObjectClass::PUBLIC_KEY)
     }
@@ -153,7 +173,7 @@ impl Pkcs11Provider {
                 object,
                 &[AttributeType::Modulus, AttributeType::PublicExponent],
             )
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         let modulus = bytes_attribute(&attributes, AttributeType::Modulus)?;
         let exponent = bytes_attribute(&attributes, AttributeType::PublicExponent)?;
         if modulus.is_empty() || exponent.is_empty() {
@@ -181,12 +201,16 @@ impl Pkcs11Provider {
     }
 
     /// Resolve a non-exportable AES content key or KEK; width is read as metadata.
+    ///
+    /// # Errors
+    /// Returns object refusal for an absent/ambiguous ID or unsupported AES
+    /// width, or the original session/module failure.
     pub fn aes_key(&self, id: &[u8]) -> Result<Pkcs11AesKey, ProviderError> {
         let session = self.0.session()?;
         let object = unique_object(&session, id, ObjectClass::SECRET_KEY, KeyType::AES)?;
         let attributes = session
             .get_attributes(object, &[AttributeType::ValueLen])
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         let length = attributes
             .iter()
             .find_map(|attribute| match attribute {
@@ -206,12 +230,16 @@ impl Pkcs11Provider {
     }
 
     /// Resolve a persistent NIST-curve EC private key for token-side agreement.
+    ///
+    /// # Errors
+    /// Returns object refusal for an absent/ambiguous ID or unsupported curve
+    /// parameters, or the original session/module failure.
     pub fn agreement_key(&self, id: &[u8]) -> Result<Pkcs11AgreementKey, ProviderError> {
         let session = self.0.session()?;
         let object = unique_object(&session, id, ObjectClass::PRIVATE_KEY, KeyType::EC)?;
         let attributes = session
             .get_attributes(object, &[AttributeType::EcParams])
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         let parameters = attributes
             .iter()
             .find_map(|attribute| match attribute {
@@ -245,7 +273,7 @@ fn oaep_error(error: Error, capability: ProviderCapability<'_>) -> ProviderError
             RvError::ArgumentsBad | RvError::MechanismParamInvalid | RvError::MechanismInvalid,
             _,
         ) => unsupported(capability),
-        error => map_error(error),
+        error => map_error(&error),
     }
 }
 
@@ -262,13 +290,15 @@ impl super::DigestState for Pkcs11Digest<'_> {
         // https://docs.oasis-open.org/pkcs11/pkcs11-base/v2.40/os/pkcs11-base-v2.40-os.html
         self.session.digest_update(data).map_err(|error| {
             self.active = false;
-            map_error(error)
+            map_error(&error)
         })
     }
 
     fn finalize(mut self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
         self.active = false;
-        self.session.digest_final().map_err(map_error)
+        self.session
+            .digest_final()
+            .map_err(|error| map_error(&error))
     }
 }
 
@@ -283,7 +313,7 @@ impl Drop for Pkcs11Digest<'_> {
     }
 }
 
-fn map_error(error: Error) -> ProviderError {
+fn map_error(error: &Error) -> ProviderError {
     // PKCS#11 Base 2.40 §§5.1.1, 5.1.6: GENERAL_ERROR/FUNCTION_FAILED
     // do not identify invalid ciphertext. Preserve operational failures even
     // when a particular module uses them for a failed GCM authentication check.
@@ -342,13 +372,18 @@ fn unique_object(
             ],
             std::num::NonZeroUsize::new(2).expect("nonzero cache size"),
         )
-        .map_err(map_error)?;
+        .map_err(|error| map_error(&error))?;
     let first = objects
         .next()
         .transpose()
-        .map_err(map_error)?
+        .map_err(|error| map_error(&error))?
         .ok_or(external(ExternalProviderError::Object))?;
-    if objects.next().transpose().map_err(map_error)?.is_some() {
+    if objects
+        .next()
+        .transpose()
+        .map_err(|error| map_error(&error))?
+        .is_some()
+    {
         return Err(external(ExternalProviderError::Object));
     }
     Ok(first)
@@ -372,7 +407,9 @@ fn require_usage(
     object: ObjectHandle,
     kind: AttributeType,
 ) -> Result<(), ProviderError> {
-    let attributes = session.get_attributes(object, &[kind]).map_err(map_error)?;
+    let attributes = session
+        .get_attributes(object, &[kind])
+        .map_err(|error| map_error(&error))?;
     let enabled = attributes.iter().any(|attribute| {
         matches!(
             attribute,
@@ -517,7 +554,7 @@ impl SigningKey for Pkcs11RsaKey {
         require_usage(&session, self.object, AttributeType::Sign)?;
         Ok(session
             .sign(&mechanism, self.object, data)
-            .map_err(map_error)?)
+            .map_err(|error| map_error(&error))?)
     }
     fn public_key_info(&self) -> Result<SigningPublicKeyInfo, SigningKeyError> {
         Ok(SigningPublicKeyInfo::Rsa {
@@ -560,7 +597,7 @@ impl VerifyingKey for Pkcs11RsaKey {
         require_usage(&session, self.object, AttributeType::Verify)?;
         match session
             .verify(&mechanism, self.object, data, signature)
-            .map_err(map_error)
+            .map_err(|error| map_error(&error))
         {
             Ok(()) => Ok(true),
             Err(ProviderError::AuthenticationFailed) => Ok(false),
@@ -766,7 +803,7 @@ impl CryptoProvider for Pkcs11Provider {
         self.0
             .session()?
             .generate_random_slice(output)
-            .map_err(map_error)
+            .map_err(|error| map_error(&error))
     }
     fn begin_digest(
         &self,
@@ -776,7 +813,9 @@ impl CryptoProvider for Pkcs11Provider {
         let mechanism = digest_mechanism(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Digest(algorithm)))?;
         let session = self.0.session()?;
-        session.digest_init(&mechanism).map_err(map_error)?;
+        session
+            .digest_init(&mechanism)
+            .map_err(|error| map_error(&error))?;
         Ok(Box::new(Pkcs11Digest {
             session,
             active: true,
@@ -985,9 +1024,11 @@ fn import_content_key(
         Attribute::Value(value),
     ];
     // Erase the only owned host copy on success, module failure or a poisoned session.
-    let result = token
-        .session()
-        .and_then(|session| session.create_object(&attributes).map_err(map_error));
+    let result = token.session().and_then(|session| {
+        session
+            .create_object(&attributes)
+            .map_err(|error| map_error(&error))
+    });
     if let Attribute::Value(value) = &mut attributes[6] {
         value.zeroize();
     }
@@ -1041,10 +1082,10 @@ impl ContentDecryptionKey for Pkcs11AesKey {
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&ciphertext[..12]);
             let params = cryptoki::mechanism::aead::GcmParams::new(&mut nonce, &[], 128.into())
-                .map_err(map_error)?;
+                .map_err(|error| map_error(&error))?;
             session
                 .decrypt(&Mechanism::AesGcm(params), self.object, &ciphertext[12..])
-                .map_err(map_error)
+                .map_err(|error| map_error(&error))
         } else {
             if ciphertext.len() < 32 || !ciphertext.len().is_multiple_of(16) {
                 return Err(ProviderError::InvalidInput(
@@ -1055,7 +1096,7 @@ impl ContentDecryptionKey for Pkcs11AesKey {
             iv.copy_from_slice(&ciphertext[..16]);
             let mut plaintext = session
                 .decrypt(&Mechanism::AesCbc(iv), self.object, &ciphertext[16..])
-                .map_err(map_error)?;
+                .map_err(|error| map_error(&error))?;
             // XMLEnc §5.2.1 permits arbitrary padding bytes; PKCS#7 CBC_PAD is not equivalent.
             // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-AES
             let padding = usize::from(
@@ -1115,7 +1156,7 @@ impl super::KeyUnwrappingKey for Pkcs11AesKey {
                     Attribute::Decrypt(true),
                 ],
             )
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         let key = Pkcs11AesKey {
             token: self.token.clone(),
             object,
@@ -1167,15 +1208,18 @@ impl KeyAgreementKey for Pkcs11AgreementKey {
                     Attribute::Sensitive(false),
                     Attribute::Extractable(true),
                     Attribute::ValueLen(
-                        cryptoki::types::Ulong::try_from(self.width).map_err(map_error)?,
+                        cryptoki::types::Ulong::try_from(self.width)
+                            .map_err(|error| map_error(&error))?,
                     ),
                 ],
             )
-            .map_err(map_error)?;
+            .map_err(|error| map_error(&error))?;
         let result = session
             .get_attributes(object, &[AttributeType::Value])
-            .map_err(map_error);
-        let cleanup = session.destroy_object(object).map_err(map_error);
+            .map_err(|error| map_error(&error));
+        let cleanup = session
+            .destroy_object(object)
+            .map_err(|error| map_error(&error));
         let mut attributes = result?;
         let mut value = attributes
             .iter_mut()
@@ -1214,11 +1258,11 @@ mod tests {
             (RvError::TokenNotPresent, ExternalProviderError::Unavailable),
             (RvError::GeneralError, ExternalProviderError::Operation),
         ] {
-            let result = map_error(Error::Pkcs11(native, Function::Decrypt));
+            let result = map_error(&Error::Pkcs11(native, Function::Decrypt));
             assert!(matches!(result, ProviderError::External(actual) if actual == expected));
         }
         assert!(matches!(
-            map_error(Error::Pkcs11(
+            map_error(&Error::Pkcs11(
                 RvError::EncryptedDataInvalid,
                 Function::Decrypt
             )),

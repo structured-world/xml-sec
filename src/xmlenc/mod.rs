@@ -1,4 +1,4 @@
-//! XML Encryption (XMLEnc).
+//! XML Encryption (`XMLEnc`).
 //!
 //! Implements [XML Encryption Syntax and Processing](https://www.w3.org/TR/xmlenc-core1/).
 //!
@@ -9,7 +9,7 @@
 //! inline `CipherValue` profile.
 //!
 //! External `CipherReference` resources are outside this profile. Optional
-//! `legacy-algorithms` adds independently policy-gated RSA-1.5 and TripleDES
+//! `legacy-algorithms` adds independently policy-gated RSA-1.5 and `TripleDES`
 //! mechanisms; it does not grant permission or authenticate CBC content.
 #![doc = include_str!("../../docs/xmlenc.md")]
 
@@ -91,8 +91,6 @@ fn has_single_element_with_boundary_trivia(parent: Node<'_, '_>) -> bool {
             if element_count > 1 {
                 return false;
             }
-        } else if node.is_comment() {
-            continue;
         } else if node.is_text() {
             // XML permits boundary whitespace around a document element; processing
             // instructions and every other node kind are unsafe replacement payloads.
@@ -102,7 +100,7 @@ fn has_single_element_with_boundary_trivia(parent: Node<'_, '_>) -> bool {
             }) {
                 return false;
             }
-        } else {
+        } else if !node.is_comment() {
             return false;
         }
     }

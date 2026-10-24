@@ -1,5 +1,6 @@
 #![cfg(feature = "xmldsig")]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, Work};
 use structured_asn1::{Encoding, Limits, Parser};
@@ -116,7 +117,7 @@ fn qname_uses_original_inherited_shadowed_default_and_undeclared_bindings() {
                     owner,
                     source,
                     ScalarType::QName,
-                    &memory(0, 100000),
+                    &memory(0, 100_000),
                     |read| {
                         assert_eq!(read.fact, expected);
                         Ok::<_, ()>(())
@@ -136,7 +137,7 @@ fn xsi_attribute_selection_and_qname_value_do_not_share_default_namespace_rules(
         "<r Id='r' xmlns='urn:default' xmlns:i='{XSI}' xmlns:f='urn:foreign' i:type=' Type ' f:type='absent:Other' i:nil=' 1 ' i:schemaLocation='urn:remote https://untrusted.invalid/schema.xsd'/>"
     ))
     .unwrap();
-    let work = memory(0, 100000);
+    let work = memory(0, 100_000);
     document.with_view(|view| {
         let owner = view.node_for_id("r", &[]).unwrap();
         with_scalar(
@@ -184,7 +185,7 @@ fn qname_join_preserves_original_spelling_and_releases_on_typed_refusal() {
         "<r Id='r' xmlns:p='urn:p'> p<!--split-->:<![CDATA[Type]]><?ignore x?> </r>",
     )
     .unwrap();
-    let work = memory(10000, 100000);
+    let work = memory(10000, 100_000);
     document.with_view(|view| {
         let owner = view.node_for_id("r", &[]).unwrap();
         for refuse in [false, true] {
@@ -208,7 +209,7 @@ fn qname_join_preserves_original_spelling_and_releases_on_typed_refusal() {
             }
             assert_eq!(work.used(), 0);
         }
-        let no_storage = memory(0, 100000);
+        let no_storage = memory(0, 100_000);
         assert!(matches!(
             with_scalar(
                 view,
@@ -286,7 +287,8 @@ fn qname_namespace_lookup_charges_current_local_and_aggregate_work_exactly_once(
     let uri = format!("urn:{}", "namespace".repeat(256));
     let mut declarations = String::new();
     for index in 0..64 {
-        declarations.push_str(&format!(" xmlns:p{index}='urn:p{index}'"));
+        write!(declarations, " xmlns:p{index}='urn:p{index}'")
+            .expect("writing to a String cannot fail");
     }
     let document = XmlDocument::parse(format!(
         "<r Id='r' {declarations} xmlns:last='{uri}' value='last:Type'/>"
@@ -298,7 +300,7 @@ fn qname_namespace_lookup_charges_current_local_and_aggregate_work_exactly_once(
             namespace: None,
             local_name: "value",
         };
-        let measured = memory(0, 100000);
+        let measured = memory(0, 100_000);
         with_scalar(view, owner, source, ScalarType::QName, &measured, |read| {
             assert_eq!(read.fact, named(Some(&uri), "Type"));
             Ok::<_, ()>(())
@@ -356,7 +358,8 @@ fn qname_uses_retained_namespace_context_across_deep_boundary_inputs() {
     for depth in 126..=130 {
         let mut xml = String::new();
         for index in 0..depth {
-            xml.push_str(&format!("<n xmlns:p{index}='urn:p{index}'>"));
+            write!(xml, "<n xmlns:p{index}='urn:p{index}'>")
+                .expect("writing to a String cannot fail");
         }
         xml.push_str("<leaf Id='leaf' xmlns='urn:leaf' value='p0:Type'/>");
         for _ in 0..depth {
@@ -365,7 +368,7 @@ fn qname_uses_retained_namespace_context_across_deep_boundary_inputs() {
         let document = XmlDocument::parse(xml).unwrap();
         document.with_view(|view| {
             let owner = view.node_for_id("leaf", &[]).unwrap();
-            let work = memory(0, 100000);
+            let work = memory(0, 100_000);
             with_scalar(
                 view,
                 owner,

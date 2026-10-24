@@ -19,7 +19,6 @@ use dsa::{
 use md5::{Digest as _, Md5};
 use pkcs8::{EncodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use x509_parser::prelude::FromDer as _;
 use xml_sec::key_manager::{KeyInventory, KeyUsages};
 use xml_sec::policy::{PolicyViolation, ResourcePolicy, SigningPolicy, VerificationPolicy};
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
@@ -1307,8 +1306,30 @@ pub fn decode_verification_key(
     })
 }
 
+/// A DER parser for one standalone key or certificate input, bounded by the
+/// core's default X.509 work and workspace allowances.
+fn pkix_parser() -> structured_asn1::Parser {
+    let resources = ResourcePolicy::default();
+    structured_asn1::Parser::der(structured_asn1::memory::Memory::new(std::sync::Arc::new(
+        structured_asn1::memory::MemoryAccount::new(
+            resources.max_x509_workspace_bytes,
+            resources.max_x509_work,
+        ),
+    )))
+}
+
+/// Exactly one RFC 5280 4.1.2.7 `SubjectPublicKeyInfo`, read by the shared PKIX reader.
 fn valid_spki(bytes: &[u8]) -> bool {
-    x509_parser::x509::SubjectPublicKeyInfo::from_der(bytes).is_ok_and(|(rest, _)| rest.is_empty())
+    const FIELD: &str = "subjectPublicKeyInfo";
+    let parser = pkix_parser();
+    let Ok(mut reader) = parser.read(bytes, 0) else {
+        return false;
+    };
+    let Ok(Some(element)) = reader.next_element() else {
+        return false;
+    };
+    structured_pkix::PublicKeyInfo::read_element(&reader, &element, FIELD).is_ok()
+        && reader.is_empty()
 }
 
 #[cfg(test)]
@@ -1329,7 +1350,19 @@ pub(crate) fn decode_certificate(
     bytes: &[u8],
     encoding: CertificateEncoding,
 ) -> Result<Vec<u8>, KeyMaterialError> {
-    let der = match encoding {
+    let der = certificate_der(path, bytes, encoding)?;
+    // One certificate and nothing else, as the shared PKIX reader requires.
+    structured_pkix::Certificate::read(&pkix_parser(), &der, 0)
+        .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
+    Ok(der)
+}
+
+fn certificate_der(
+    path: &Path,
+    bytes: &[u8],
+    encoding: CertificateEncoding,
+) -> Result<Vec<u8>, KeyMaterialError> {
+    Ok(match encoding {
         CertificateEncoding::Pem => {
             let text = std::str::from_utf8(bytes)
                 .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
@@ -1337,13 +1370,7 @@ pub(crate) fn decode_certificate(
                 .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?
         }
         CertificateEncoding::Der => bytes.to_vec(),
-    };
-    let (rest, _) = x509_parser::certificate::X509Certificate::from_der(&der)
-        .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
-    if !rest.is_empty() {
-        return Err(KeyMaterialError::InvalidCertificate(path.to_owned()));
-    }
-    Ok(der)
+    })
 }
 
 fn parse_pem(text: &str, expected_label: &str, path: &Path) -> Result<Vec<u8>, KeyMaterialError> {
@@ -1490,11 +1517,14 @@ pub(crate) fn decode_rsa_certificate_public(
     bytes: &[u8],
     encoding: CertificateEncoding,
 ) -> Result<(RsaPublicKey, Vec<u8>), KeyMaterialError> {
-    let der = decode_certificate(path, bytes, encoding)?;
-    let (_, certificate) = x509_parser::certificate::X509Certificate::from_der(&der)
-        .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
-    let public_key = RsaPublicKey::from_public_key_der(certificate.public_key().raw)
-        .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?;
+    let der = certificate_der(path, bytes, encoding)?;
+    let public_key = {
+        let parser = pkix_parser();
+        let certificate = structured_pkix::Certificate::read(&parser, &der, 0)
+            .map_err(|_| KeyMaterialError::InvalidCertificate(path.to_owned()))?;
+        RsaPublicKey::from_public_key_der(certificate.tbs().public_key().as_bytes())
+            .map_err(|_| KeyMaterialError::UnsupportedPublicKey(path.to_owned()))?
+    };
     Ok((public_key, der))
 }
 
@@ -2516,7 +2546,9 @@ mod tests {
         assert_eq!(metadata.key_names, ["wanted"]);
 
         let mut disabled = VerificationPolicy::default();
-        disabled.key_sources.key_info_reference = false;
+        disabled
+            .key_sources
+            .remove(xml_sec::policy::KeySourceKind::KeyInfoReference);
         let error = verification_signature_metadata(
             &xml,
             None,

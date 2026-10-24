@@ -1,6 +1,6 @@
-//! XPath 1.0 evaluation for XMLDSig transform node sets.
+//! `XPath` 1.0 evaluation for `XMLDSig` transform node sets.
 //!
-//! `roxmltree` intentionally has no XPath engine, so transforms are evaluated
+//! `roxmltree` intentionally has no `XPath` engine, so transforms are evaluated
 //! against an equivalent, short-lived SXD document. The mirror keeps a
 //! bidirectional node map so the result can be projected back onto the
 //! original document without serializing and reparsing signed input.
@@ -105,6 +105,21 @@ struct NamespaceResolver<'q, 'source, K: Keys> {
     source: std::marker::PhantomData<&'source str>,
 }
 
+impl<'q, 'source, K: Keys> NamespaceResolver<'q, 'source, K> {
+    fn new(
+        bindings: &'q K::Bindings<'source>,
+        execution: K::Execution,
+        failure: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
+    ) -> Self {
+        Self {
+            bindings,
+            execution,
+            failure,
+            source: std::marker::PhantomData,
+        }
+    }
+}
+
 impl<K: Keys> sxd_xpath_no_unsafe::context::NamespaceLookup for NamespaceResolver<'_, '_, K> {
     fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error> {
         if self.failure.get().is_some() {
@@ -193,7 +208,7 @@ impl<'w, W: structured_asn1::memory::Work> XPathStorage for crate::c14n::scratch
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
     ) -> Result<Self::Values<nodeset::Node<'d>>, sxd_xpath_no_unsafe::ExecutionError> {
-        nodes
+        let ordered = nodes
             .document_order_in(
                 context,
                 sxd_xpath_no_unsafe::runtime::Accounted {
@@ -201,8 +216,8 @@ impl<'w, W: structured_asn1::memory::Work> XPathStorage for crate::c14n::scratch
                     failure,
                 },
             )
-            .map(|nodes| nodes.into_values())
-            .map_err(sxd_xpath_no_unsafe::ExecutionError::from)
+            .map_err(sxd_xpath_no_unsafe::ExecutionError::from)?;
+        Ok(ordered.into_values())
     }
 
     fn compile<'s>(&self, source: &'s str) -> Result<Self::Compiled<'s>, TransformError> {
@@ -240,24 +255,24 @@ impl<'w, W: structured_asn1::memory::Work> XPathStorage for crate::c14n::scratch
 }
 
 const ALL_XPATH_NODES: &str = "//. | //@* | //namespace::*";
-/// Bound ordinary XMLDSig XPath's per-node evaluation loop before user XPath runs.
-/// Absolute ceiling for context-node evaluations in an ordinary XPath filter.
+/// Bound ordinary `XMLDSig` `XPath`'s per-node evaluation loop before user `XPath` runs.
+/// Absolute ceiling for context-node evaluations in an ordinary `XPath` filter.
 ///
 /// The signature-wide work budget is intentionally stricter for larger source
 /// documents: an arbitrary expression can traverse the complete mirrored DOM
-/// for every context node, and the XPath engine exposes no interrupt or step
+/// for every context node, and the `XPath` engine exposes no interrupt or step
 /// counter that could safely distinguish a cheap expression from an expensive one.
 const MAX_XPATH_CONTEXT_EVALUATIONS: usize = crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING;
-/// Bound conservative XPath evaluator node visits across one signature.
+/// Bound conservative `XPath` evaluator node visits across one signature.
 const MAX_XPATH_CUMULATIVE_EVALUATION_WORK: usize =
     crate::hard_limits::XPATH_EVALUATION_WORK_CEILING;
 /// Bound operators, names, literals, and path punctuation in one expression.
 const MAX_XPATH_EXPRESSION_COMPLEXITY: usize =
     crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING;
-/// Bound strings copied into SXD before evaluating untrusted XPath.
+/// Bound strings copied into SXD before evaluating untrusted `XPath`.
 const MAX_XPATH_MIRROR_STRING_BYTES: usize = crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING;
 /// Bound conservative SXD string processing across one signature. The ceiling
-/// accommodates comparison-heavy XMLDSig interoperability vectors while keeping
+/// accommodates comparison-heavy `XMLDSig` interoperability vectors while keeping
 /// repeated non-interruptible source scans finite.
 const MAX_XPATH_CUMULATIVE_STRING_WORK_BYTES: usize =
     crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING;
@@ -431,7 +446,7 @@ impl XPathWorkBudget {
     }
 }
 
-/// SXD's tokenizer rejects otherwise valid whitespace between a function QName
+/// SXD's tokenizer rejects otherwise valid whitespace between a function `QName`
 /// and `(`. Normalize only that token boundary, preserving quoted literals and
 /// all whitespace that can affect string values or operator tokenization.
 pub(super) fn is_xpath_whitespace(character: char) -> bool {
@@ -528,7 +543,7 @@ pub(super) fn xpath_expression_complexity(source: &str) -> usize {
 
 /// Count conservative full-source string passes before entering SXD.
 ///
-/// Linear XPath 1.0 built-ins, numeric coercions, argument separators, and
+/// Linear `XPath` 1.0 built-ins, numeric coercions, argument separators, and
 /// comparison operators each contribute one pass so repeated node-set-to-value
 /// conversions cannot hide behind one expression. Quoted literals are excluded;
 /// unknown coercion paths are covered separately by the mandatory baseline scan.
@@ -635,9 +650,9 @@ pub(super) fn xpath_may_read_node_values(source: &str) -> bool {
     scans != 1 || !is_count_number_comparison(source)
 }
 
-/// Whether XPath value coercion can observe mutable element character data.
+/// Whether `XPath` value coercion can observe mutable element character data.
 ///
-/// Attribute-to-literal comparisons are value reads, but XMLDSig fills neither
+/// Attribute-to-literal comparisons are value reads, but `XMLDSig` fills neither
 /// attributes nor their owners while constructing a signature. Keep those
 /// predicates out of the mutable-node dependency graph; every other coercion
 /// remains conservative because it can consume an element or text string-value.
@@ -801,7 +816,7 @@ fn is_xpath_value_scanning_function(name: &str) -> bool {
     )
 }
 
-/// Estimate one XPath evaluation before entering SXD's non-interruptible engine.
+/// Estimate one `XPath` evaluation before entering SXD's non-interruptible engine.
 ///
 /// One top-level traversal is covered by the baseline document-size charge.
 /// Composed scanning steps gain one document-size factor, while independent
@@ -818,13 +833,16 @@ fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
     use crate::c14n::scratch::List as _;
     scratch.charge(source.len())?;
     let bytes = source.as_bytes();
-    let mut work = document_size;
-    let mut predicate_depth = 0_usize;
-    let mut top_level_path_scans = 0_usize;
-    let mut top_level_path_started = false;
-    let mut top_level_path_branches = 0_usize;
-    let mut predicate_path_scans = scratch.values();
-    let mut predicate_path_started = scratch.values();
+    let mut scan = PathScanWork::<S> {
+        document_size,
+        work: document_size,
+        predicate_depth: 0,
+        top_level_path_scans: 0,
+        top_level_path_started: false,
+        top_level_path_branches: 0,
+        predicate_path_scans: scratch.values(),
+        predicate_path_started: scratch.values(),
+    };
     let mut parent_steps = 0_usize;
     let mut quote = None;
     let mut index = 0_usize;
@@ -845,27 +863,21 @@ fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
             continue;
         }
         if let Some(operator_len) = xpath_word_operator_len(bytes, index) {
-            reset_xpath_path_scan_depth(
-                predicate_depth,
-                &mut top_level_path_scans,
-                &mut predicate_path_scans,
-                &mut top_level_path_started,
-                &mut predicate_path_started,
-            );
+            scan.reset_scan_depth();
             index = index.saturating_add(operator_len);
             continue;
         }
 
         match byte {
             b'[' => {
-                predicate_depth = predicate_depth.saturating_add(1);
-                predicate_path_scans.push(0)?;
-                predicate_path_started.push(false)?;
+                scan.predicate_depth = scan.predicate_depth.saturating_add(1);
+                scan.predicate_path_scans.push(0)?;
+                scan.predicate_path_started.push(false)?;
             }
             b']' => {
-                predicate_depth = predicate_depth.saturating_sub(1);
-                predicate_path_scans.pop();
-                predicate_path_started.pop();
+                scan.predicate_depth = scan.predicate_depth.saturating_sub(1);
+                scan.predicate_path_scans.pop();
+                scan.predicate_path_started.pop();
             }
             b'/' => {
                 let descendant_abbreviation = bytes.get(index + 1) == Some(&b'/');
@@ -875,24 +887,10 @@ fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
                     && xpath_explicit_axis_after(bytes, index.saturating_add(1));
                 if descendant_abbreviation || (!next_step_is_parent && !next_step_has_explicit_axis)
                 {
-                    charge_xpath_path_branch(
-                        &mut work,
-                        document_size,
-                        predicate_depth,
-                        top_level_path_scans,
-                        &mut top_level_path_started,
-                        &mut top_level_path_branches,
-                        &mut predicate_path_started,
-                    );
+                    scan.branch();
                 }
                 if descendant_abbreviation {
-                    charge_xpath_document_scan(
-                        &mut work,
-                        document_size,
-                        predicate_depth,
-                        &mut top_level_path_scans,
-                        &mut predicate_path_scans,
-                    );
+                    scan.document_scan();
                     index += 1;
                 }
             }
@@ -907,43 +905,24 @@ fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
                 }
                 let axis = &source[axis_start..index];
                 if axis == "child" || is_document_scanning_axis(axis) {
-                    charge_xpath_path_branch(
-                        &mut work,
-                        document_size,
-                        predicate_depth,
-                        top_level_path_scans,
-                        &mut top_level_path_started,
-                        &mut top_level_path_branches,
-                        &mut predicate_path_started,
-                    );
+                    scan.branch();
                 }
                 if is_document_scanning_axis(axis) {
-                    charge_xpath_document_scan(
-                        &mut work,
-                        document_size,
-                        predicate_depth,
-                        &mut top_level_path_scans,
-                        &mut predicate_path_scans,
-                    );
+                    scan.document_scan();
                 } else if axis == "parent" {
                     parent_steps = parent_steps.saturating_add(1);
                 }
                 index += 1;
             }
-            b'|' | b',' | b'+' | b'=' | b'<' | b'>' => reset_xpath_path_scan_depth(
-                predicate_depth,
-                &mut top_level_path_scans,
-                &mut predicate_path_scans,
-                &mut top_level_path_started,
-                &mut predicate_path_started,
-            ),
+            b'|' | b',' | b'+' | b'=' | b'<' | b'>' => scan.reset_scan_depth(),
             _ => {}
         }
         index += 1;
     }
 
-    work = work
-        .saturating_add(document_size.saturating_mul(top_level_path_branches.saturating_sub(1)));
+    let mut work = scan.work.saturating_add(
+        document_size.saturating_mul(scan.top_level_path_branches.saturating_sub(1)),
+    );
 
     // Filter2 selects from the document in one evaluation, so every parent step
     // can run for each selected node. XMLDSig XPath evaluates once per input node;
@@ -957,80 +936,93 @@ fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
     Ok(work)
 }
 
-fn charge_xpath_path_branch(
-    work: &mut usize,
+/// Path-scan state of one [`xpath_evaluation_work`] estimate. Saturation
+/// deliberately turns arithmetic overflow into a budget rejection.
+struct PathScanWork<S: crate::c14n::scratch::Scratch> {
     document_size: usize,
+    work: usize,
     predicate_depth: usize,
     top_level_path_scans: usize,
-    top_level_path_started: &mut bool,
-    top_level_path_branches: &mut usize,
-    predicate_path_started: &mut [bool],
-) {
-    if predicate_depth == 0 {
-        if !*top_level_path_started {
-            *top_level_path_started = true;
-            *top_level_path_branches = top_level_path_branches.saturating_add(1);
-        }
-        return;
-    }
-
-    let Some(path_started) = predicate_path_started.get_mut(predicate_depth - 1) else {
-        *work = usize::MAX;
-        return;
-    };
-    if !*path_started {
-        let exponent = top_level_path_scans.max(1).saturating_add(predicate_depth);
-        *work = work.saturating_add(document_traversal_work(document_size, exponent));
-        *path_started = true;
-    }
+    top_level_path_started: bool,
+    top_level_path_branches: usize,
+    predicate_path_scans: S::Values<usize>,
+    predicate_path_started: S::Values<bool>,
 }
 
-fn charge_xpath_document_scan(
-    work: &mut usize,
-    document_size: usize,
-    predicate_depth: usize,
-    top_level_path_scans: &mut usize,
-    predicate_path_scans: &mut [usize],
-) {
-    if predicate_depth == 0 {
-        *top_level_path_scans = top_level_path_scans.saturating_add(1);
-        if *top_level_path_scans > 1 {
-            *work = work.saturating_add(document_traversal_work(
-                document_size,
-                *top_level_path_scans,
-            ));
+impl<S: crate::c14n::scratch::Scratch> PathScanWork<S> {
+    /// Charge a path branch starting at the current predicate depth.
+    fn branch(&mut self) {
+        if self.predicate_depth == 0 {
+            if !self.top_level_path_started {
+                self.top_level_path_started = true;
+                self.top_level_path_branches = self.top_level_path_branches.saturating_add(1);
+            }
+            return;
         }
-        return;
+        let Some(path_started) = self
+            .predicate_path_started
+            .get_mut(self.predicate_depth - 1)
+        else {
+            self.work = usize::MAX;
+            return;
+        };
+        if !*path_started {
+            let exponent = self
+                .top_level_path_scans
+                .max(1)
+                .saturating_add(self.predicate_depth);
+            self.work = self
+                .work
+                .saturating_add(document_traversal_work(self.document_size, exponent));
+            *path_started = true;
+        }
     }
 
-    let Some(predicate_scans) = predicate_path_scans.get_mut(predicate_depth - 1) else {
-        *work = usize::MAX;
-        return;
-    };
-    *predicate_scans = predicate_scans.saturating_add(1);
-    if *predicate_scans > 1 {
-        let exponent = (*top_level_path_scans)
-            .max(1)
-            .saturating_add(predicate_depth)
-            .saturating_add(predicate_scans.saturating_sub(1));
-        *work = work.saturating_add(document_traversal_work(document_size, exponent));
+    /// Charge a document-scanning step composed onto the current path.
+    fn document_scan(&mut self) {
+        if self.predicate_depth == 0 {
+            self.top_level_path_scans = self.top_level_path_scans.saturating_add(1);
+            if self.top_level_path_scans > 1 {
+                self.work = self.work.saturating_add(document_traversal_work(
+                    self.document_size,
+                    self.top_level_path_scans,
+                ));
+            }
+            return;
+        }
+        let Some(predicate_scans) = self.predicate_path_scans.get_mut(self.predicate_depth - 1)
+        else {
+            self.work = usize::MAX;
+            return;
+        };
+        *predicate_scans = predicate_scans.saturating_add(1);
+        if *predicate_scans > 1 {
+            let exponent = self
+                .top_level_path_scans
+                .max(1)
+                .saturating_add(self.predicate_depth)
+                .saturating_add(predicate_scans.saturating_sub(1));
+            self.work = self
+                .work
+                .saturating_add(document_traversal_work(self.document_size, exponent));
+        }
     }
-}
 
-fn reset_xpath_path_scan_depth(
-    predicate_depth: usize,
-    top_level_path_scans: &mut usize,
-    predicate_path_scans: &mut [usize],
-    top_level_path_started: &mut bool,
-    predicate_path_started: &mut [bool],
-) {
-    if predicate_depth == 0 {
-        *top_level_path_scans = 0;
-        *top_level_path_started = false;
-    } else if let Some(predicate_scans) = predicate_path_scans.get_mut(predicate_depth - 1) {
-        *predicate_scans = 0;
-        if let Some(path_started) = predicate_path_started.get_mut(predicate_depth - 1) {
-            *path_started = false;
+    /// An operator ends the current path; the next one starts unscanned.
+    fn reset_scan_depth(&mut self) {
+        if self.predicate_depth == 0 {
+            self.top_level_path_scans = 0;
+            self.top_level_path_started = false;
+        } else if let Some(predicate_scans) =
+            self.predicate_path_scans.get_mut(self.predicate_depth - 1)
+        {
+            *predicate_scans = 0;
+            if let Some(path_started) = self
+                .predicate_path_started
+                .get_mut(self.predicate_depth - 1)
+            {
+                *path_started = false;
+            }
         }
     }
 }
@@ -1169,6 +1161,52 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
         Ok(projected_bytes)
     }
 
+    /// Mirror one source element with its namespace bindings, prefixes and
+    /// attributes, indexing every mirrored binding and attribute by source.
+    fn mirror_element(
+        &mut self,
+        construction: &impl mirror::Construction<'d>,
+        source_node: crate::xml::dom::Node<'source, 'source, D>,
+    ) -> Result<dom::Element<'d>, crate::c14n::C14nError> {
+        let name = QName::with_namespace_uri(
+            source_node.tag_name().namespace(),
+            source_node.tag_name().name(),
+        );
+        let element = construction.element(name)?;
+        construction.declarations(
+            element,
+            source_node
+                .namespaces()
+                .map(|namespace| (namespace.name(), namespace.uri())),
+        )?;
+
+        // SXD's namespaces_in_scope() always injects the predefined
+        // xml binding, even when no prefix was registered explicitly.
+        for (ordinal, namespace) in source_node.namespaces().enumerate() {
+            self.namespaces.insert_namespace(
+                NamespaceKey {
+                    owner: element.identity_key(),
+                    prefix: namespace.name().unwrap_or(""),
+                    uri: namespace.uri(),
+                },
+                ordinal,
+            )?;
+        }
+        let prefix = element_prefix(source_node);
+        construction.element_prefix(element, (!prefix.is_empty()).then_some(prefix))?;
+
+        for (ordinal, attribute) in source_node.attributes().enumerate() {
+            let name = QName::with_namespace_uri(attribute.namespace(), attribute.name());
+            let target_attribute = construction.attribute(element, name, attribute.value())?;
+            self.attributes
+                .insert(target_attribute.identity_key(), (source_node.id(), ordinal))?;
+            let prefix = attribute_prefix(source_node, attribute);
+            construction
+                .attribute_prefix(target_attribute, (!prefix.is_empty()).then_some(prefix))?;
+        }
+        Ok(element)
+    }
+
     fn build_in(
         source: &'source Document<'source, D>,
         target: dom::Document<'d>,
@@ -1204,47 +1242,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
             };
 
             if source_node.is_element() {
-                let name = QName::with_namespace_uri(
-                    source_node.tag_name().namespace(),
-                    source_node.tag_name().name(),
-                );
-                let element = construction.element(name)?;
-                construction.declarations(
-                    element,
-                    source_node
-                        .namespaces()
-                        .map(|namespace| (namespace.name(), namespace.uri())),
-                )?;
-
-                // SXD's namespaces_in_scope() always injects the predefined
-                // xml binding, even when no prefix was registered explicitly.
-                for (ordinal, namespace) in source_node.namespaces().enumerate() {
-                    mirror.namespaces.insert_namespace(
-                        NamespaceKey {
-                            owner: element.identity_key(),
-                            prefix: namespace.name().unwrap_or(""),
-                            uri: namespace.uri(),
-                        },
-                        ordinal,
-                    )?;
-                }
-                let prefix = element_prefix(source_node);
-                construction.element_prefix(element, (!prefix.is_empty()).then_some(prefix))?;
-
-                for (ordinal, attribute) in source_node.attributes().enumerate() {
-                    let name = QName::with_namespace_uri(attribute.namespace(), attribute.name());
-                    let target_attribute =
-                        construction.attribute(element, name, attribute.value())?;
-                    mirror
-                        .attributes
-                        .insert(target_attribute.identity_key(), (source_node.id(), ordinal))?;
-                    let prefix = attribute_prefix(source_node, attribute);
-                    construction.attribute_prefix(
-                        target_attribute,
-                        (!prefix.is_empty()).then_some(prefix),
-                    )?;
-                }
-
+                let element = mirror.mirror_element(&construction, source_node)?;
                 match target_parent {
                     Some(parent) => construction.append_element(parent, element.into())?,
                     None => construction.append_root(element.into())?,
@@ -1278,7 +1276,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
                 let processing_instruction = construction.pi(pi.target, pi.value)?;
                 match target_parent {
                     Some(parent) => {
-                        construction.append_element(parent, processing_instruction.into())?
+                        construction.append_element(parent, processing_instruction.into())?;
                     }
                     None => construction.append_root(processing_instruction.into())?,
                 }
@@ -1319,9 +1317,10 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
         &self,
         source: &'a Document<'a, D>,
         input: &Projection<'a, K, D>,
-        selected: nodeset::Nodeset<'d>,
+        selected: &nodeset::Nodeset<'d>,
         materialization_budget: &NodeSetMaterializationBudget,
     ) -> Result<Projection<'a, K, D>, TransformError> {
+        use sxd_xpath_no_unsafe::runtime::Runtime as _;
         let execution = input.execution();
         let mut result = input.empty_like();
         let mut selected_elements = input.empty_like();
@@ -1332,12 +1331,11 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
         // Projection is set union by original identity, not an ordered XPath
         // sequence. Borrow the entries; document-order keys and namespace
         // copies cannot affect the resulting membership.
-        use sxd_xpath_no_unsafe::runtime::Runtime as _;
         let scratch = K::scratch(execution);
         let failure = Cell::new(None);
         let runtime = scratch.runtime(&failure);
         let entries = runtime
-            .nodes(&selected)
+            .nodes(selected)
             .map_err(|error| match failure.get() {
                 Some(cause) => TransformError::from(cause),
                 None => scratch.diagnostic(format_args!("{error}")),
@@ -1520,6 +1518,28 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
         Ok(())
     }
 
+    /// Keep, in order, only the mirrored nodes whose source belongs to `input`.
+    fn retain_input<'a>(
+        &self,
+        source: &'a Document<'a, D>,
+        input: &Projection<'a, K, D>,
+        nodes: &mut impl crate::c14n::scratch::List<nodeset::Node<'d>>,
+    ) -> Result<(), crate::c14n::C14nError> {
+        let mut kept = 0;
+        for index in 0..nodes.len() {
+            let vacant = nodeset::Node::Root(nodes[index].document().root());
+            let node = std::mem::replace(&mut nodes[index], vacant);
+            if self.input_contains(source, input, &node)? {
+                nodes[kept] = node;
+                kept += 1;
+            }
+        }
+        while nodes.len() > kept {
+            nodes.pop();
+        }
+        Ok(())
+    }
+
     fn input_contains<'a>(
         &self,
         source: &'a Document<'a, D>,
@@ -1599,11 +1619,12 @@ enum HereContext<L> {
 }
 
 impl<L: std::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereFunction<'_, L, K> {
-    fn evaluate_borrowed<'c, 'd>(
+    fn evaluate_borrowed<'d>(
         &self,
-        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: &mut [Value<'d>],
     ) -> Result<Value<'d>, function::Error> {
+        use sxd_xpath_no_unsafe::runtime::{Runtime as _, Set as _};
         function::Args::new(args).exactly(0)?;
         let path = match &self.context {
             HereContext::Path(path) => path,
@@ -1627,7 +1648,6 @@ impl<L: std::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereF
                 what: "here() context node no longer exists",
             })?;
         }
-        use sxd_xpath_no_unsafe::runtime::{Runtime as _, Set as _};
         let scratch = K::scratch(self.execution);
         let runtime = scratch.runtime(self.failure);
         let mut result = runtime.set();
@@ -1636,7 +1656,7 @@ impl<L: std::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereF
     }
 }
 
-/// SXD omits XPath's DTD-aware `id()` function. XMLDSig commonly identifies
+/// SXD omits `XPath`'s DTD-aware `id()` function. `XMLDSig` commonly identifies
 /// elements through `Id`, `ID`, `id`, xml:id, or retained DTD ID type,
 /// matching this crate's semantic DOM without requiring a validating parser.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -1747,24 +1767,19 @@ struct IdFunction<'s, 'i, 'r, K: Keys, D: crate::xml::dom::storage::Storage> {
 impl<K: Keys, D: crate::xml::dom::storage::Storage> function::Function
     for IdFunction<'_, '_, '_, K, D>
 {
-    fn evaluate_borrowed<'c, 'd>(
+    fn evaluate_borrowed<'d>(
         &self,
-        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: &mut [Value<'d>],
     ) -> Result<Value<'d>, function::Error> {
+        use crate::c14n::scratch::{List as _, Scratch as _, TextBuilder as _};
+        use sxd_xpath_no_unsafe::runtime::{Runtime as _, Set as _};
         let mut args = function::Args::new(args);
         args.exactly(1)?;
         let argument = args.pop_value()?;
-        use crate::c14n::scratch::{List as _, Scratch as _, TextBuilder as _};
         let scratch = K::scratch(self.execution);
-        use sxd_xpath_no_unsafe::runtime::{Runtime as _, Set as _};
         let runtime = scratch.runtime(self.failure);
-        let stop = |cause: structured_asn1::memory::MemoryError| {
-            if self.failure.get().is_none() {
-                self.failure.set(Some(cause));
-            }
-            function::Error::ProcessingStopped
-        };
+        let stop = |cause| self.stop(cause);
         let stop_storage = |error: crate::c14n::C14nError| {
             if let crate::c14n::C14nError::SharedExecution(cause) = error {
                 stop(cause)
@@ -1848,46 +1863,60 @@ impl<K: Keys, D: crate::xml::dom::storage::Storage> function::Function
             let source_id = self
                 .elements
                 .lookup(&element.identity_key(), self.execution)
-                .map_err(|error| {
-                    if self.failure.get().is_none() {
-                        self.failure.set(Some(error));
-                    }
-                    function::Error::ProcessingStopped
-                })?;
+                .map_err(|error| self.stop(error))?;
             let Some(source) = source_id.and_then(|id| self.source.get_node(*id)) else {
                 continue;
             };
-            let mut selected = false;
-            for attribute in source.attributes() {
-                K::admit(self.execution, 1).map_err(stop)?;
-                // Match the URI resolver's local-name policy: WS-Security's
-                // namespaced wsu:Id and XML's xml:id are ID attributes too.
-                // XPath 1.0 section 4.1: ID type comes from the source XML
-                // data model, not the temporary evaluator's untyped DOM.
-                // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
-                let recognized = crate::xml::is_id_attribute(source, attribute, self.registrations);
-                let value = attribute.value();
-                if !recognized {
-                    continue;
-                }
-                match requests
-                    .select(value, element.identity_key(), self.execution)
-                    .map_err(stop)?
-                {
-                    IdMatch::Absent | IdMatch::Repeated => {}
-                    IdMatch::First => selected = true,
-                    IdMatch::Ambiguous => {
-                        return Err(function::Error::Static {
-                            what: "id() matched a duplicate identifier",
-                        });
-                    }
-                }
-            }
-            if selected {
+            if self.element_selected(source, &mut requests, element.identity_key())? {
                 result.insert(context, element.into())?;
             }
         }
         Ok(Value::Nodeset(result.finish()))
+    }
+}
+
+impl<K: Keys, D: crate::xml::dom::storage::Storage> IdFunction<'_, '_, '_, K, D> {
+    /// Record the first resource refusal and stop evaluation.
+    fn stop(&self, cause: structured_asn1::memory::MemoryError) -> function::Error {
+        if self.failure.get().is_none() {
+            self.failure.set(Some(cause));
+        }
+        function::Error::ProcessingStopped
+    }
+
+    /// Whether `source` newly carries a requested ID; a value naming two
+    /// different elements is an error.
+    fn element_selected<'a>(
+        &self,
+        source: crate::xml::dom::Node<'a, 'a, D>,
+        requests: &mut IdRequests<'a, K>,
+        identity: (usize, usize, usize),
+    ) -> Result<bool, function::Error> {
+        let mut selected = false;
+        for attribute in source.attributes() {
+            K::admit(self.execution, 1).map_err(|cause| self.stop(cause))?;
+            // Match the URI resolver's local-name policy: WS-Security's
+            // namespaced wsu:Id and XML's xml:id are ID attributes too.
+            // XPath 1.0 section 4.1: ID type comes from the source XML
+            // data model, not the temporary evaluator's untyped DOM.
+            // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
+            if !crate::xml::is_id_attribute(source, attribute, self.registrations) {
+                continue;
+            }
+            match requests
+                .select(attribute.value(), identity, self.execution)
+                .map_err(|cause| self.stop(cause))?
+            {
+                IdMatch::Absent | IdMatch::Repeated => {}
+                IdMatch::First => selected = true,
+                IdMatch::Ambiguous => {
+                    return Err(function::Error::Static {
+                        what: "id() matched a duplicate identifier",
+                    });
+                }
+            }
+        }
+        Ok(selected)
     }
 }
 
@@ -1898,15 +1927,15 @@ struct LangFunction<'s, K: Keys> {
 }
 
 impl<K: Keys> function::Function for LangFunction<'_, K> {
-    fn evaluate_borrowed<'c, 'd>(
+    fn evaluate_borrowed<'d>(
         &self,
-        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: &mut [Value<'d>],
     ) -> Result<Value<'d>, function::Error> {
+        use sxd_xpath_no_unsafe::runtime::Runtime as _;
         let mut args = function::Args::new(args);
         args.exactly(1)?;
         let argument = args.pop_value()?;
-        use sxd_xpath_no_unsafe::runtime::Runtime as _;
         let scratch = K::scratch(self.execution);
         let runtime = scratch.runtime(self.failure);
         let requested = runtime.value_text(context, &argument)?;
@@ -1960,6 +1989,21 @@ impl<K: Keys> function::Function for LangFunction<'_, K> {
         }
         Ok(Value::Boolean(false))
     }
+}
+
+/// The `here()` context: the parameter node's path when the expression came
+/// from this document, otherwise the reason `here()` must fail.
+fn here_context<D: crate::xml::dom::storage::Storage, S: crate::c14n::scratch::Scratch>(
+    relation: XPathDocumentRelation,
+    document: &Document<'_, D>,
+    here_node: Option<NodeId>,
+    scratch: &S,
+) -> Result<HereContext<S::Values<usize>>, TransformError> {
+    Ok(match relation {
+        XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
+        XPathDocumentRelation::SameDocument => here_path(document, here_node, scratch)?
+            .map_or(HereContext::MissingParameterNode, HereContext::Path),
+    })
 }
 
 fn here_path<D: crate::xml::dom::storage::Storage, S: crate::c14n::scratch::Scratch>(
@@ -2040,6 +2084,78 @@ impl From<XPathHereSemantics> for XPathRequestContext<'_> {
     }
 }
 
+/// Admit an expression's size and syntactic complexity before compiling it.
+fn admit_expression<K: Keys>(
+    expression: &str,
+    work_budget: &XPathWorkBudget,
+    execution: K::Execution,
+) -> Result<(), TransformError> {
+    let expression_bytes = expression.len();
+    if expression_bytes > work_budget.limits.expression_bytes {
+        return Err(transform_resource_limit(
+            crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
+            work_budget.limits.expression_bytes,
+            expression_bytes,
+        ));
+    }
+    K::admit(execution, expression_bytes).map_err(crate::c14n::C14nError::from)?;
+    let expression_complexity = xpath_expression_complexity(expression);
+    if expression_complexity > work_budget.limits.expression_complexity {
+        return Err(transform_resource_limit(
+            crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
+            work_budget.limits.expression_complexity,
+            expression_complexity,
+        ));
+    }
+    Ok(())
+}
+
+/// The expression's own namespace bindings plus the implicit `xml` binding.
+///
+/// roxmltree does not expose the XML namespace through element declarations,
+/// so it is enforced at the evaluation boundary for parsed and programmatic
+/// expressions alike.
+fn expression_bindings<K: Keys>(
+    expression: &impl super::transforms::ExpressionParameter,
+    execution: K::Execution,
+) -> Result<K::Bindings<'_>, TransformError> {
+    let mut bindings = K::bindings(execution);
+    for (prefix, uri) in expression.namespaces() {
+        bindings.bind(prefix, uri)?;
+    }
+    bindings.bind("xml", XML_NS)?;
+    Ok(bindings)
+}
+
+/// Estimated per-evaluation work and string scan count, after paying one more
+/// pass over the source like the estimate itself.
+fn xpath_evaluation_cost<S: crate::c14n::scratch::Scratch>(
+    source: &str,
+    document_size: usize,
+    mode: XPathEvaluationMode,
+    scratch: &S,
+) -> Result<(usize, usize), TransformError> {
+    let work = xpath_evaluation_work(source, document_size, mode, scratch)?;
+    scratch.charge(source.len())?;
+    Ok((work, xpath_string_scan_count(source).max(1)))
+}
+
+/// Admit engine work, remembering the first refusal so later calls stop too.
+fn admit_engine_work<K: Keys>(
+    failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
+    execution: K::Execution,
+    units: usize,
+) -> Result<(), function::Error> {
+    if failure.get().is_some() {
+        return Err(function::Error::ProcessingStopped);
+    }
+    if let Err(cause) = K::admit(execution, units) {
+        failure.set(Some(cause));
+        return Err(function::Error::ProcessingStopped);
+    }
+    Ok(())
+}
+
 fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     input: &Projection<'a, K, D>,
     expression: &impl super::transforms::ExpressionParameter,
@@ -2049,25 +2165,8 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     work_budget: &XPathWorkBudget,
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<Projection<'a, K, D>, TransformError> {
-    use crate::c14n::scratch::{List as _, Scratch as _};
     let request = request.into();
-    let expression_bytes = expression.expression().len();
-    if expression_bytes > work_budget.limits.expression_bytes {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
-            work_budget.limits.expression_bytes,
-            expression_bytes,
-        ));
-    }
-    K::admit(input.execution(), expression_bytes).map_err(crate::c14n::C14nError::from)?;
-    let expression_complexity = xpath_expression_complexity(expression.expression());
-    if expression_complexity > work_budget.limits.expression_complexity {
-        return Err(transform_resource_limit(
-            crate::policy::resource_name::XPATH_EXPRESSION_COMPLEXITY,
-            work_budget.limits.expression_complexity,
-            expression_complexity,
-        ));
-    }
+    admit_expression::<K>(expression.expression(), work_budget, input.execution())?;
     let scratch = K::scratch(input.execution());
     let normalized = source::normalize(expression.expression(), &scratch)?;
     let xpath = scratch.compile(normalized.view()?)?;
@@ -2083,56 +2182,33 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     let package = scratch.package()?;
     let target = package.as_document();
     let mirror = Mirror::<K, D>::build_in(document, target, input.execution())?;
+    let execution = input.execution();
     let shared_failure = Cell::new(None);
-    let admit_work = |units| {
-        if shared_failure.get().is_some() {
-            return Err(function::Error::ProcessingStopped);
-        }
-        if let Err(cause) = K::admit(input.execution(), units) {
-            shared_failure.set(Some(cause));
-            return Err(function::Error::ProcessingStopped);
-        }
-        Ok(())
-    };
-    let mut bindings = K::bindings(input.execution());
-    for (prefix, uri) in expression.namespaces() {
-        bindings.bind(prefix, uri)?;
-    }
-    // The XML namespace binding is implicit and roxmltree therefore does not
-    // expose it through element namespace declarations. Enforce it at the
-    // evaluation boundary for both parsed and programmatic expressions.
-    bindings.bind("xml", XML_NS)?;
-    let resolve_namespace = NamespaceResolver::<K> {
-        bindings: &bindings,
-        execution: input.execution(),
-        failure: &shared_failure,
-        source: std::marker::PhantomData,
-    };
+    let admit_work = |units| admit_engine_work::<K>(&shared_failure, execution, units);
+    let bindings = expression_bindings::<K>(expression, execution)?;
+    let resolve_namespace = NamespaceResolver::<K>::new(&bindings, execution, &shared_failure);
     let here_function = HereFunction::<_, K> {
-        execution: input.execution(),
+        execution,
         failure: &shared_failure,
-        context: match document_relation {
-            XPathDocumentRelation::CrossDocument => HereContext::CrossDocument,
-            XPathDocumentRelation::SameDocument => here_path(
-                document,
-                expression.here_context_node(request.here_semantics),
-                &scratch,
-            )?
-            .map_or(HereContext::MissingParameterNode, HereContext::Path),
-        },
+        context: here_context(
+            document_relation,
+            document,
+            expression.here_context_node(request.here_semantics),
+            &scratch,
+        )?,
     };
     let id_function = IdFunction::<K, D> {
         work_budget,
         document_scan_cost: document_size,
         source: document,
         elements: &mirror.elements,
-        execution: input.execution(),
+        execution,
         failure: &shared_failure,
         registrations: request.registrations,
     };
     let lang_function = LangFunction::<K> {
         work_budget,
-        execution: input.execution(),
+        execution,
         failure: &shared_failure,
     };
     let functions: [(QName<'_>, &dyn function::Function); 3] = [
@@ -2147,11 +2223,10 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     context.set_namespace_lookup(&resolve_namespace);
     context.set_function_view(&functions);
 
-    let evaluation_work =
-        xpath_evaluation_work(expression.expression(), document_size, mode, &scratch)?;
-    // One more full pass over the source, paid like the estimate above.
-    scratch.charge(expression_bytes)?;
-    let string_scans = xpath_string_scan_count(expression.expression()).max(1);
+    let (evaluation_work, string_scans) =
+        xpath_evaluation_cost(expression.expression(), document_size, mode, &scratch)?;
+    let evaluation_error =
+        |error| work_budget.map_evaluation_error(error, &shared_failure, &scratch);
 
     if matches!(mode, XPathEvaluationMode::XmlDsigPerNodeFilter) {
         // XMLDSig 1.1 section 6.6.3 requires a fresh context for every input
@@ -2162,7 +2237,7 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
         work_budget.charge(document_size)?;
         let all_nodes = all_nodes_xpath
             .evaluate(&context, target.root(), &shared_failure)
-            .map_err(|error| work_budget.map_evaluation_error(error, &shared_failure, &scratch))?;
+            .map_err(evaluation_error)?;
         let Value::Nodeset(all_nodes) = all_nodes else {
             unreachable!("the fixed all-nodes XPath expression returns a node-set");
         };
@@ -2170,19 +2245,8 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
             sxd_xpath_no_unsafe::context::Evaluation::new(&context, target.root().into());
         let mut ordered_nodes = scratch
             .order_nodes(&all_nodes, &ordering_context, &shared_failure)
-            .map_err(|error| work_budget.map_evaluation_error(error, &shared_failure, &scratch))?;
-        let mut kept = 0;
-        for index in 0..ordered_nodes.len() {
-            let vacant = nodeset::Node::Root(ordered_nodes[index].document().root());
-            let node = std::mem::replace(&mut ordered_nodes[index], vacant);
-            if mirror.input_contains(document, input, &node)? {
-                ordered_nodes[kept] = node;
-                kept += 1;
-            }
-        }
-        while ordered_nodes.len() > kept {
-            ordered_nodes.pop();
-        }
+            .map_err(evaluation_error)?;
+        mirror.retain_input(document, input, &mut ordered_nodes)?;
         work_budget.validate_context_evaluations(ordered_nodes.len())?;
         // SXD has no interrupt hook and XPath coercions can materialize or scan
         // any mirrored string. Charge the complete source string volume for
@@ -2197,9 +2261,7 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
             K::admit(input.execution(), 1)?;
             let include = xpath
                 .evaluate(&context, node.clone(), &shared_failure)
-                .map_err(|error| {
-                    work_budget.map_evaluation_error(error, &shared_failure, &scratch)
-                })?
+                .map_err(evaluation_error)?
                 .into_boolean();
             if include {
                 mirror.project_exact_node(document, &mut selected, node, materialization_budget)?;
@@ -2212,13 +2274,13 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
     work_budget.charge_string_work(mirror_bytes, 1, string_scans)?;
     let value = xpath
         .evaluate(&context, target.root(), &shared_failure)
-        .map_err(|error| work_budget.map_evaluation_error(error, &shared_failure, &scratch))?;
+        .map_err(evaluation_error)?;
     let Value::Nodeset(selected) = value else {
         return Err(scratch.diagnostic(format_args!(
             "XPath Filter 2.0 expression must return a node-set"
         )));
     };
-    mirror.project_expanded(document, input, selected, materialization_budget)
+    mirror.project_expanded(document, input, &selected, materialization_budget)
 }
 
 #[cfg(test)]
@@ -2306,7 +2368,7 @@ pub(super) fn apply_xpath_projection_with_budget<
 
 #[cfg(test)]
 pub(super) fn apply_xpath_filter2<'a>(
-    input: NodeSet<'a>,
+    input: &NodeSet<'a>,
     filters: &[XPathFilter],
 ) -> Result<NodeSet<'a>, TransformError> {
     apply_xpath_filter2_with_semantics(
@@ -2320,7 +2382,7 @@ pub(super) fn apply_xpath_filter2<'a>(
 
 #[cfg(test)]
 pub(super) fn apply_xpath_filter2_with_semantics<'a>(
-    input: NodeSet<'a>,
+    input: &NodeSet<'a>,
     filters: &[XPathFilter],
     here_semantics: XPathHereSemantics,
     document_relation: XPathDocumentRelation,
@@ -2339,7 +2401,7 @@ pub(super) fn apply_xpath_filter2_with_semantics<'a>(
 
 #[cfg(test)]
 pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
-    input: NodeSet<'a>,
+    input: &NodeSet<'a>,
     filters: &[XPathFilter],
     request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
@@ -2348,7 +2410,7 @@ pub(super) fn apply_xpath_filter2_with_semantics_and_budget<'a, 'r>(
     materialization_budget: &NodeSetMaterializationBudget,
 ) -> Result<NodeSet<'a>, TransformError> {
     apply_xpath_projection2_with_budget(
-        input.projection,
+        &input.projection,
         filters,
         request,
         document_relation,
@@ -2365,7 +2427,7 @@ pub(super) fn apply_xpath_projection2_with_budget<
     K: Keys,
     D: crate::xml::dom::storage::Storage,
 >(
-    input: Projection<'a, K, D>,
+    input: &Projection<'a, K, D>,
     filters: &[impl super::transforms::FilterParameter],
     request: impl Into<XPathRequestContext<'r>>,
     document_relation: XPathDocumentRelation,
@@ -2389,7 +2451,7 @@ pub(super) fn apply_xpath_projection2_with_budget<
     let mut result = input.entire_document_like(materialization_budget)?;
     for filter in filters {
         let selected = evaluate_expression(
-            &input,
+            input,
             filter.xpath(),
             XPathEvaluationMode::Filter2NodeSetSelection,
             request,
@@ -2413,7 +2475,7 @@ pub(super) fn apply_xpath_projection2_with_budget<
         }
     }
     node_filter_budget.charge(result.len())?;
-    result.intersect(&input)?;
+    result.intersect(input)?;
     Ok(result)
 }
 
@@ -2978,7 +3040,7 @@ mod tests {
             let materialization_budget =
                 NodeSetMaterializationBudget::with_limits(max_entries, max_owned_bytes, usize::MAX);
 
-            let error = match evaluate_expression(
+            let Err(error) = evaluate_expression(
                 &input.projection,
                 &XPathExpression::new("true()"),
                 XPathEvaluationMode::Filter2NodeSetSelection,
@@ -2986,9 +3048,8 @@ mod tests {
                 XPathDocumentRelation::SameDocument,
                 &work_budget,
                 &materialization_budget,
-            ) {
-                Ok(_) => panic!("node-set policy must reject the source before mirror allocation"),
-                Err(error) => error,
+            ) else {
+                panic!("node-set policy must reject the source before mirror allocation");
             };
 
             assert!(matches!(
@@ -3276,9 +3337,8 @@ mod tests {
             XPathFilter::new(XPathFilterOperation::Intersect, XPathExpression::new(".")),
         ];
 
-        let error = match apply_xpath_filter2(input, &filters) {
-            Ok(_) => panic!("repeated SXD mirrors must exhaust the cumulative byte budget"),
-            Err(error) => error,
+        let Err(error) = apply_xpath_filter2(&input, &filters) else {
+            panic!("repeated SXD mirrors must exhaust the cumulative byte budget");
         };
 
         assert!(matches!(
@@ -3320,7 +3380,7 @@ mod tests {
         let document = Document::parse(&xml).unwrap();
         let budget = XPathWorkBudget::with_limit(70);
         let error = apply_xpath_filter2_with_semantics(
-            NodeSet::entire_document_without_comments(&document).unwrap(),
+            &NodeSet::entire_document_without_comments(&document).unwrap(),
             &[XPathFilter::new(
                 XPathFilterOperation::Intersect,
                 XPathExpression::new("//*[../../..]"),
@@ -3538,7 +3598,7 @@ mod tests {
         let input = NodeSet::entire_document_without_comments(&document).unwrap();
         let budget = XPathWorkBudget::with_limit(15);
         let error = apply_xpath_filter2_with_semantics(
-            input,
+            &input,
             &[XPathFilter::new(
                 XPathFilterOperation::Intersect,
                 XPathExpression::new("id('selected') | id('selected')"),
@@ -3583,7 +3643,7 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("/root/keep"),
         )];
-        let result = apply_xpath_filter2(input, &filters).unwrap();
+        let result = apply_xpath_filter2(&input, &filters).unwrap();
 
         assert_eq!(
             canonicalize(&result),
@@ -3765,7 +3825,7 @@ mod tests {
         // before allocating or partially constructing the result.
         use super::super::types::projection::PaidKeys;
         use std::sync::Arc;
-        use structured_asn1::memory::{Memory, MemoryAccount};
+        use structured_asn1::memory::{Memory, MemoryAccount, Work as _};
         use structured_asn1::{Encoding, Limits, Parser};
 
         let document = Document::parse("<root><a/><b/><c/><d/><e/><f/></root>")
@@ -3795,7 +3855,6 @@ mod tests {
                 .expect("admit selected-table metadata"),
         );
         let selected_scan = memory.work_used() - before_probe;
-        use structured_asn1::memory::Work as _;
         work.charge_work(((1 << 20) - memory.work_used() - allowed - selected_scan) as u64)
             .expect("fund selected metadata but leave one-less than the source walk");
         let before_work = memory.work_used();
@@ -3809,7 +3868,7 @@ mod tests {
             .project_expanded(
                 &document,
                 &input,
-                selected,
+                &selected,
                 &NodeSetMaterializationBudget::default(),
             )
             .err()
@@ -3846,7 +3905,7 @@ mod tests {
         )];
 
         FILTER2_PROJECTION_NODE_VISITS.with(|visits| visits.set(0));
-        apply_xpath_filter2(input, &filters).unwrap();
+        apply_xpath_filter2(&input, &filters).unwrap();
         let visits = FILTER2_PROJECTION_NODE_VISITS.with(Cell::get);
 
         assert!(
@@ -3870,7 +3929,7 @@ mod tests {
         )];
 
         let error = apply_xpath_filter2_with_semantics(
-            input,
+            &input,
             &filters,
             XPathHereSemantics::default(),
             XPathDocumentRelation::SameDocument,
@@ -3889,7 +3948,7 @@ mod tests {
         let document = Document::parse("<root>A<![CDATA[B]]></root>").unwrap();
         let source_text = document
             .descendants()
-            .filter(|node| node.is_text())
+            .filter(crate::xml::dom::Node::is_text)
             .collect::<Vec<_>>();
         assert_eq!(source_text.len(), 1);
         assert_eq!(source_text[0].text(), Some("AB"));
@@ -3914,7 +3973,7 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("/"),
         )];
-        let result = apply_xpath_filter2(input, &filters).unwrap();
+        let result = apply_xpath_filter2(&input, &filters).unwrap();
 
         assert_eq!(canonicalize(&result), "<root><child>covered</child></root>");
     }
@@ -3923,10 +3982,9 @@ mod tests {
     fn filter2_applies_intersect_subtract_and_union_in_order() {
         // Ordered set algebra must permit a later union to restore a subtree
         // removed by an earlier subtraction.
-        let doc = Document::parse(
-            r#"<root><scope><keep/><drop><restore/></drop></scope><other/></root>"#,
-        )
-        .unwrap();
+        let doc =
+            Document::parse(r"<root><scope><keep/><drop><restore/></drop></scope><other/></root>")
+                .unwrap();
         let input = NodeSet::entire_document_with_comments(&doc).unwrap();
         let filters = [
             XPathFilter::new(
@@ -3942,7 +4000,7 @@ mod tests {
                 XPathExpression::new("/root/scope/drop/restore"),
             ),
         ];
-        let result = apply_xpath_filter2(input, &filters).unwrap();
+        let result = apply_xpath_filter2(&input, &filters).unwrap();
 
         assert_eq!(
             canonicalize(&result),
@@ -3959,7 +4017,7 @@ mod tests {
             crate::ParsingOptions { allow_dtd: true, ..Default::default() },
         ).unwrap();
         let result = apply_xpath_filter2(
-            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &NodeSet::entire_document_with_comments(&doc).unwrap(),
             &[XPathFilter::new(
                 XPathFilterOperation::Intersect,
                 XPathExpression::new("id('target')"),
@@ -3981,7 +4039,7 @@ mod tests {
         let registrations = [crate::xml::IdAttributeRegistration::global("Token")
             .with_attribute_namespace(Some("urn:trusted"))];
         let result = apply_xpath_filter2_with_semantics_and_budget(
-            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &NodeSet::entire_document_with_comments(&doc).unwrap(),
             &filters,
             XPathRequestContext::new(XPathHereSemantics::default(), &registrations),
             XPathDocumentRelation::SameDocument,
@@ -4003,7 +4061,7 @@ mod tests {
         let broad = [crate::xml::IdAttributeRegistration::global("Token")];
         assert!(
             apply_xpath_filter2_with_semantics_and_budget(
-                NodeSet::entire_document_with_comments(&doc).unwrap(),
+                &NodeSet::entire_document_with_comments(&doc).unwrap(),
                 &filters,
                 XPathRequestContext::new(XPathHereSemantics::default(), &broad),
                 XPathDocumentRelation::SameDocument,
@@ -4026,7 +4084,7 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("id('target')"),
         )];
-        let result = apply_xpath_filter2(input, &filters).unwrap();
+        let result = apply_xpath_filter2(&input, &filters).unwrap();
 
         assert_eq!(canonicalize(&result), r#"<item Id="target">yes</item>"#);
     }
@@ -4044,7 +4102,7 @@ mod tests {
             XPathExpression::new("id('target')"),
         )];
         let result = apply_xpath_filter2(
-            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &NodeSet::entire_document_with_comments(&doc).unwrap(),
             &filters,
         )
         .unwrap();
@@ -4068,7 +4126,7 @@ mod tests {
             XPathExpression::new("id(/root/ids/id)"),
         )];
         let result = apply_xpath_filter2(
-            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &NodeSet::entire_document_with_comments(&doc).unwrap(),
             &filters,
         )
         .unwrap();
@@ -4093,7 +4151,7 @@ mod tests {
         )];
 
         let error = apply_xpath_filter2(
-            NodeSet::entire_document_with_comments(&doc).unwrap(),
+            &NodeSet::entire_document_with_comments(&doc).unwrap(),
             &filters,
         )
         .err()
@@ -4274,7 +4332,7 @@ mod tests {
             XPathFilterOperation::Intersect,
             XPathExpression::new("true()"),
         )];
-        let error = apply_xpath_filter2(NodeSet::try_entire_document(&doc).unwrap(), &filters)
+        let error = apply_xpath_filter2(&NodeSet::try_entire_document(&doc).unwrap(), &filters)
             .err()
             .unwrap();
 
@@ -4301,7 +4359,7 @@ mod tests {
         // A parameterless Filter 2.0 transform is malformed and must not act
         // as an accidental identity transform.
         let doc = Document::parse("<root/>").unwrap();
-        let error = apply_xpath_filter2(NodeSet::try_entire_document(&doc).unwrap(), &[])
+        let error = apply_xpath_filter2(&NodeSet::try_entire_document(&doc).unwrap(), &[])
             .err()
             .unwrap();
 

@@ -112,7 +112,7 @@ fn ecdh_preflight_rejection_does_not_consume_the_sender() {
         recipient.public_key(),
     );
     let mut policy = xml_sec::policy::EncryptionPolicy::default();
-    policy.key_establishment.agreement_algorithms = Some(Default::default());
+    policy.key_establishment.agreement_algorithms = Some(std::collections::HashSet::default());
     assert!(
         builder
             .clone()

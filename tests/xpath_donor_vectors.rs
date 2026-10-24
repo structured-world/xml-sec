@@ -1,4 +1,4 @@
-//! XPath Filter 2.0 canonicalization vectors derived from Merlin's suite.
+//! `XPath` Filter 2.0 canonicalization vectors derived from Merlin's suite.
 
 #![cfg(feature = "xmldsig")]
 

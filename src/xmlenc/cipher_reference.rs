@@ -1,4 +1,4 @@
-//! Source-anchored XMLEnc CipherReference processing.
+//! Source-anchored `XMLEnc` `CipherReference` processing.
 
 use std::collections::HashMap;
 
@@ -11,8 +11,8 @@ use crate::xmldsig::uri::ExternalResourceContext;
 
 use super::types::{XMLENC_NS, XmlEncError};
 
-pub(super) fn parse_reference<'doc, 'input>(
-    node: Node<'doc, 'input>,
+pub(super) fn parse_reference<'doc>(
+    node: Node<'doc, '_>,
     resources: &crate::policy::ResourcePolicy,
     budget: &mut XPathSignatureParseBudget,
 ) -> Result<(&'doc str, Vec<crate::xmldsig::transforms::Transform>), XmlEncError> {
@@ -232,7 +232,7 @@ impl<'a> CipherReferenceContext<'a> {
         } else {
             document_base.map(str::to_owned)
         };
-        let resolver = self.external.bind(
+        let uri_resolver = self.external.bind(
             node.document(),
             self.id_attributes,
             self.policy.transforms.same_document_id_semantics,
@@ -249,7 +249,7 @@ impl<'a> CipherReferenceContext<'a> {
             },
             transforms,
             xml_parse,
-            &resolver,
+            &uri_resolver,
         )?;
         Ok((bytes, resolved))
     }
@@ -276,6 +276,10 @@ impl<'a> CipherReferenceContext<'a> {
         bound
     }
     /// Bind caller-owned resources and the operation's immutable policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XmlEncError`] when `policy` fails validation.
     pub fn new(
         policy: &'a crate::policy::DecryptionPolicy,
         resources: Option<&'a HashMap<String, Vec<u8>>>,
@@ -302,7 +306,13 @@ impl<'a> CipherReferenceContext<'a> {
     }
 
     /// Resolve an original `xenc:CipherReference` without serializing its
-    /// subtree or discarding inherited namespaces, XML Base, or XPath `here()`.
+    /// subtree or discarding inherited namespaces, XML Base, or `XPath` `here()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XmlEncError`] when the node's document violates the XML input
+    /// policy, the reference or its transforms are malformed or not permitted,
+    /// the target is unavailable, or a resource limit is exceeded.
     pub fn resolve(&self, node: Node<'_, '_>) -> Result<Vec<u8>, XmlEncError> {
         // A public Node does not attest which parser policy produced it. Apply
         // the operation policy to its source before processing the original
@@ -379,7 +389,7 @@ impl<'a> CipherReferenceContext<'a> {
         if uri.is_empty() || uri.starts_with('#') {
             self.execute_resolved_reference(node, uri, transforms, xml_parse, resolver)
         } else {
-            let resolved =
+            let absolute =
                 crate::c14n::xml_base::resolve_uri_from_node_with_document_base_with_budget(
                     node,
                     uri,
@@ -389,7 +399,7 @@ impl<'a> CipherReferenceContext<'a> {
                 .map_err(|error| {
                     XmlEncError::InvalidStructure(format!("cipher reference XML Base: {error}"))
                 })?;
-            self.execute_resolved_reference(node, &resolved, transforms, xml_parse, resolver)
+            self.execute_resolved_reference(node, &absolute, transforms, xml_parse, resolver)
         }
     }
 
@@ -446,7 +456,7 @@ impl<'a> CipherReferenceContext<'a> {
                 let identity = match external {
                     Some(bytes) => OperationResourceIdentity::external(uri, bytes),
                     None => OperationResourceIdentity::BorrowedDocumentNode {
-                        document: node.document() as *const _ as usize,
+                        document: std::ptr::from_ref(node.document()).addr(),
                         node: node.id(),
                     },
                 };
@@ -500,7 +510,7 @@ mod tests {
                 .expect("first resolution"),
             b"ciphertext"
         );
-        let index = bound.resolver.get().expect("initialized index") as *const _;
+        let index = std::ptr::from_ref(bound.resolver.get().expect("initialized index"));
         assert_eq!(
             bound
                 .resolve_parsed(node, "urn:cipher", &[], context.transforms.xml_parse_work())
@@ -508,7 +518,7 @@ mod tests {
             b"ciphertext"
         );
         assert_eq!(
-            bound.resolver.get().expect("retained index") as *const _,
+            std::ptr::from_ref(bound.resolver.get().expect("retained index")),
             index
         );
         let foreign_node = foreign

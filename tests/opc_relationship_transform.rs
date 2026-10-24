@@ -292,7 +292,7 @@ fn public_executor_can_select_2012_policy() {
         )
         .is_err()
     );
-    policy.resources = Default::default();
+    policy.resources = xml_sec::policy::ResourcePolicy::default();
     policy.resources.max_transforms_per_reference = 1;
     assert!(
         xml_sec::xmldsig::execute_transforms_with_policy(
@@ -303,7 +303,7 @@ fn public_executor_can_select_2012_policy() {
         )
         .is_err()
     );
-    policy.resources = Default::default();
+    policy.resources = xml_sec::policy::ResourcePolicy::default();
     policy.resources.max_opc_parameter_bytes = 0;
     assert!(
         xml_sec::xmldsig::execute_transforms_with_policy(
@@ -314,8 +314,8 @@ fn public_executor_can_select_2012_policy() {
         )
         .is_err()
     );
-    policy.resources = Default::default();
-    policy.transforms.allowed_algorithms = Some(Default::default());
+    policy.resources = xml_sec::policy::ResourcePolicy::default();
+    policy.transforms.allowed_algorithms = Some(std::collections::HashSet::default());
     assert!(
         xml_sec::xmldsig::execute_transforms_with_policy(
             document.root_element(),
@@ -393,7 +393,7 @@ fn malformed_parameters_and_canonicalization_chains_fail_before_execution() {
     // Mandatory selector syntax and C14N ordering are parse-time requirements.
     let canonical = "<Transform Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>";
     for (selectors, tail) in [
-        ("".to_owned(), canonical.to_owned()),
+        (String::new(), canonical.to_owned()),
         (
             format!("<RelationshipReference xmlns=\"{PARAM}\"/>"),
             canonical.to_owned(),

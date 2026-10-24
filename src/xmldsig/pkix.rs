@@ -102,7 +102,7 @@ fn xml_name_pieces(
                 // Preserve a historically accepted leading value space by
                 // expressing it as RFC 4514's escaped space, not by deleting it.
                 if index + 1 < input.len() && input[index + 1] == b' ' {
-                    emit(if alias { "=" } else { &segment[..index + 1] })?;
+                    emit(if alias { "=" } else { &segment[..=index] })?;
                     emit("\\")?;
                     emit(&segment[index + 1..])?;
                     return Ok(true);
@@ -131,7 +131,7 @@ fn xml_name_pieces(
                 cut -= 1;
             }
             changed |= piece(&text[segment..cut])?;
-            changed |= piece(&text[at..at + 1])?;
+            changed |= piece(&text[at..=at])?;
             let previous = at + 1;
             at = previous;
             while at < end && xml_whitespace(bytes[at]) {
@@ -269,12 +269,15 @@ pub(crate) fn verification_instant(
 ) -> Result<structured_pkix::temporal::Instant, X509ChainError> {
     use std::time::UNIX_EPOCH;
     let nanos = match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos() as i128,
-        Err(error) => -(error.duration().as_nanos() as i128),
+        Ok(duration) => i128::try_from(duration.as_nanos())
+            .map_err(|_| X509ChainError::CertificateNotValid(0))?,
+        Err(error) => -i128::try_from(error.duration().as_nanos())
+            .map_err(|_| X509ChainError::CertificateNotValid(0))?,
     };
     let seconds = i64::try_from(nanos.div_euclid(1_000_000_000))
         .map_err(|_| X509ChainError::CertificateNotValid(0))?;
-    let fraction = nanos.rem_euclid(1_000_000_000) as u32;
+    let fraction = u32::try_from(nanos.rem_euclid(1_000_000_000))
+        .map_err(|_| X509ChainError::CertificateNotValid(0))?;
     structured_pkix::temporal::Instant::new(seconds, fraction)
         .ok_or(X509ChainError::CertificateNotValid(0))
 }
@@ -295,13 +298,9 @@ pub(crate) fn verify_crls<'a>(
     provider: &dyn crate::provider::CryptoProvider,
     session: &'a CertificateSession,
 ) -> Result<(), X509ChainError> {
-    use structured_pkix::crl::{
-        Authentication, AuthenticationFailure, CompleteEvidence, EntryLookup, Evaluation,
-        Freshness, ScopeOutcome, SourceOrigin,
-    };
+    use structured_pkix::crl::{Authentication, AuthenticationFailure};
     use structured_pkix::error::CallbackError;
     use structured_pkix::path::WorkingKey;
-    use structured_pkix::time::Relation;
 
     if embedded.is_empty() && additional.is_empty() {
         return Ok(());
@@ -310,34 +309,7 @@ pub(crate) fn verify_crls<'a>(
         return Ok(());
     };
     let execution = session.memory();
-    let mut crls = execution.vector();
-    let count = embedded
-        .len()
-        .checked_add(additional.len())
-        .ok_or_else(|| {
-            session.error(structured_pkix::Error::resource(
-                MemoryError::CapacityOverflow,
-                "certificateList.pool",
-                0,
-            ))
-        })?;
-    crls.try_reserve_exact(count).map_err(|reason| {
-        session.error(structured_pkix::Error::resource(
-            reason,
-            "certificateList.pool",
-            0,
-        ))
-    })?;
-    for bytes in embedded.iter().chain(additional) {
-        let crl = session.read_crl(bytes)?;
-        crls.try_push(crl).map_err(|reason| {
-            session.error(structured_pkix::Error::resource(
-                reason,
-                "certificateList.pool",
-                0,
-            ))
-        })?;
-    }
+    let crls = read_crl_pool(embedded, additional, session)?;
     let verifier = ProviderVerifier {
         provider,
         allowed: options.certificate_signature_algorithms,
@@ -360,36 +332,10 @@ pub(crate) fn verify_crls<'a>(
             {
                 continue;
             }
-            let authority = crl
-                .tbs()
-                .extensions()
-                .authority_key_identifier(execution)
-                .map_err(|error| session.error(error))?;
-            let subject = issuer
-                .tbs()
-                .extensions()
-                .subject_key_identifier(execution)
-                .map_err(|error| session.error(error))?;
-            let identified = if let Some((authority, subject)) = authority
-                .as_ref()
-                .and_then(|authority| authority.key_id())
-                .zip(subject.map(|id| id.as_bytes()))
-            {
-                execution
-                    .charge_work(authority.len().max(subject.len()) as u64 + 1)
-                    .map_err(|reason| {
-                        session.error(structured_pkix::Error::resource(
-                            reason,
-                            "certificateList.authorityKeyIdentifier",
-                            crl.span().start,
-                        ))
-                    })?;
-                if authority != subject {
-                    continue;
-                }
-                true
-            } else {
-                false
+            let identified = match crl_key_identifier_match(crl, issuer, session)? {
+                KeyIdentifierMatch::Mismatch => continue,
+                KeyIdentifierMatch::Identified => true,
+                KeyIdentifierMatch::Unidentified => false,
             };
             let proof = crl
                 .authenticate(issuer, issuer_key, &verifier, execution)
@@ -412,77 +358,26 @@ pub(crate) fn verify_crls<'a>(
                     return Err(X509ChainError::InvalidCrl(index));
                 }
             };
-            // UTC history is a caller fact, not an implicit clock/table default.
-            validate_crl_serials(crl, session)?;
-            let utc = match options.utc_facts.as_ref() {
-                Some(utc) => utc,
-                None => {
-                    if matches!(
-                        proof
-                            .scope(target, execution)
-                            .map_err(|error| session.error(error))?,
-                        ScopeOutcome::NotApplicable(_)
-                    ) {
-                        continue;
-                    }
-                    return Err(X509ChainError::MissingUtcFacts);
-                }
+            let Some(covered) = crl_reasons(
+                &proof,
+                crl,
+                target,
+                CrlEvaluation {
+                    utc: options.utc_facts.as_ref(),
+                    now,
+                    index,
+                    position,
+                },
+                session,
+            )?
+            else {
+                continue;
             };
-            let evidence = proof
-                .evaluate(
-                    target,
-                    &Evaluation {
-                        now,
-                        utc,
-                        execution,
-                        origin: SourceOrigin::Cached,
-                    },
-                )
-                .map_err(|error| session.error(error))?;
-            let facts = match evidence {
-                CompleteEvidence::Facts(facts) => facts,
-                CompleteEvidence::NotApplicable(_) => continue,
-                CompleteEvidence::DeltaNeedsBase => return Err(X509ChainError::InvalidCrl(index)),
-            };
-            match facts.freshness() {
-                Freshness::Current | Freshness::AtNextUpdate => (),
-                Freshness::Uncertain(reason) => {
-                    return Err(X509ChainError::CrlTimeUncertain { index, reason });
-                }
-                _ => return Err(X509ChainError::InvalidCrl(index)),
-            }
-            match facts.entry() {
-                EntryLookup::Absent => (),
-                EntryLookup::Found(entry) => {
-                    match entry
-                        .time_relation(now, utc, execution)
-                        .map_err(|error| session.error(error))?
-                    {
-                        Relation::Before | Relation::At => {
-                            return Err(X509ChainError::Revoked(position));
-                        }
-                        Relation::After => (),
-                        Relation::Uncertain(reason) => {
-                            return Err(X509ChainError::CrlTimeUncertain { index, reason });
-                        }
-                    }
-                }
-                EntryLookup::Conflict { .. } | EntryLookup::Unsupported { .. } => {
-                    return Err(X509ChainError::InvalidCrl(index));
-                }
-            }
-            execution.charge_work(1).map_err(|reason| {
-                session.error(structured_pkix::Error::resource(
-                    reason,
-                    "certificateList.reasons",
-                    crl.span().start,
-                ))
-            })?;
             // RFC 5280 §6.3.3(d),(l): partial-list absence cannot establish
             // non-revocation. All contributors share this authenticated path,
             // target and operation time by construction; no new evidence pool.
             // https://www.rfc-editor.org/rfc/rfc5280#section-6.3.3
-            reasons = reasons.union(facts.reasons());
+            reasons = reasons.union(covered);
         }
         // The existing policy validates supplied applicable lists, rather than
         // requiring callers to provide a list for every path certificate.
@@ -492,6 +387,187 @@ pub(crate) fn verify_crls<'a>(
         issuer_key = issuer_key
             .subject(target, execution)
             .map_err(|error| session.error(error))?;
+    }
+    Ok(())
+}
+
+/// How a CRL's authority key identifier relates to a candidate issuer.
+enum KeyIdentifierMatch {
+    /// Both carry key identifiers and they are equal.
+    Identified,
+    /// Either side lacks a key identifier.
+    Unidentified,
+    /// Both carry key identifiers and they differ.
+    Mismatch,
+}
+
+fn crl_key_identifier_match(
+    crl: &structured_pkix::crl::CertificateList<'_>,
+    issuer: &Certificate<'_>,
+    session: &CertificateSession,
+) -> Result<KeyIdentifierMatch, X509ChainError> {
+    let execution = session.memory();
+    let authority = crl
+        .tbs()
+        .extensions()
+        .authority_key_identifier(execution)
+        .map_err(|error| session.error(error))?;
+    let subject = issuer
+        .tbs()
+        .extensions()
+        .subject_key_identifier(execution)
+        .map_err(|error| session.error(error))?;
+    let Some((authority, subject)) = authority
+        .as_ref()
+        .and_then(structured_pkix::identifier::AuthorityKeyIdentifier::key_id)
+        .zip(subject.map(structured_pkix::identifier::SubjectKeyIdentifier::as_bytes))
+    else {
+        return Ok(KeyIdentifierMatch::Unidentified);
+    };
+    execution
+        .charge_work(authority.len().max(subject.len()) as u64 + 1)
+        .map_err(|reason| {
+            session.error(structured_pkix::Error::resource(
+                reason,
+                "certificateList.authorityKeyIdentifier",
+                crl.span().start,
+            ))
+        })?;
+    Ok(if authority == subject {
+        KeyIdentifierMatch::Identified
+    } else {
+        KeyIdentifierMatch::Mismatch
+    })
+}
+
+/// The operation facts one authenticated CRL is evaluated under.
+#[derive(Clone, Copy)]
+struct CrlEvaluation<'u> {
+    utc: Option<&'u structured_pkix::temporal::LeapTable<'u>>,
+    now: structured_pkix::temporal::Reading,
+    index: usize,
+    position: usize,
+}
+
+/// Reason coverage an authenticated CRL contributes for `target`, or `None`
+/// when it does not apply. Revocation and unusable lists are errors.
+fn crl_reasons<'a>(
+    proof: &structured_pkix::crl::Authenticated<'_, 'a>,
+    crl: &structured_pkix::crl::CertificateList<'_>,
+    target: &'a Certificate<'a>,
+    evaluation: CrlEvaluation<'_>,
+    session: &CertificateSession,
+) -> Result<Option<structured_pkix::crl::Reasons>, X509ChainError> {
+    use structured_pkix::crl::{CompleteEvidence, Evaluation, ScopeOutcome, SourceOrigin};
+    let execution = session.memory();
+    validate_crl_serials(crl, session)?;
+    // UTC history is a caller fact, not an implicit clock/table default.
+    let Some(utc) = evaluation.utc else {
+        if matches!(
+            proof
+                .scope(target, execution)
+                .map_err(|error| session.error(error))?,
+            ScopeOutcome::NotApplicable(_)
+        ) {
+            return Ok(None);
+        }
+        return Err(X509ChainError::MissingUtcFacts);
+    };
+    let evidence = proof
+        .evaluate(
+            target,
+            &Evaluation {
+                now: evaluation.now,
+                utc,
+                execution,
+                origin: SourceOrigin::Cached,
+            },
+        )
+        .map_err(|error| session.error(error))?;
+    let facts = match evidence {
+        CompleteEvidence::Facts(facts) => facts,
+        CompleteEvidence::NotApplicable(_) => return Ok(None),
+        CompleteEvidence::DeltaNeedsBase => {
+            return Err(X509ChainError::InvalidCrl(evaluation.index));
+        }
+    };
+    validate_complete_crl(
+        facts,
+        evaluation.now,
+        utc,
+        session,
+        evaluation.index,
+        evaluation.position,
+    )?;
+    execution.charge_work(1).map_err(|reason| {
+        session.error(structured_pkix::Error::resource(
+            reason,
+            "certificateList.reasons",
+            crl.span().start,
+        ))
+    })?;
+    Ok(Some(facts.reasons()))
+}
+
+fn read_crl_pool<'a>(
+    embedded: &'a [Vec<u8>],
+    additional: &'a [Vec<u8>],
+    session: &'a CertificateSession,
+) -> Result<OwnedVec<structured_pkix::crl::CertificateList<'a>>, X509ChainError> {
+    let mut crls = session.memory().vector();
+    let resource_error = |reason| {
+        session.error(structured_pkix::Error::resource(
+            reason,
+            "certificateList.pool",
+            0,
+        ))
+    };
+    let count = embedded
+        .len()
+        .checked_add(additional.len())
+        .ok_or_else(|| resource_error(MemoryError::CapacityOverflow))?;
+    crls.try_reserve_exact(count).map_err(resource_error)?;
+    for bytes in embedded.iter().chain(additional) {
+        let crl = session.read_crl(bytes)?;
+        crls.try_push(crl).map_err(resource_error)?;
+    }
+    Ok(crls)
+}
+
+fn validate_complete_crl(
+    facts: structured_pkix::crl::CompleteFacts<'_, '_, '_>,
+    now: structured_pkix::temporal::Reading,
+    utc: &structured_pkix::temporal::LeapTable<'_>,
+    session: &CertificateSession,
+    index: usize,
+    position: usize,
+) -> Result<(), X509ChainError> {
+    use structured_pkix::crl::{EntryLookup, Freshness};
+    use structured_pkix::time::Relation;
+    match facts.freshness() {
+        Freshness::Current | Freshness::AtNextUpdate => (),
+        Freshness::Uncertain(reason) => {
+            return Err(X509ChainError::CrlTimeUncertain { index, reason });
+        }
+        _ => return Err(X509ChainError::InvalidCrl(index)),
+    }
+    match facts.entry() {
+        EntryLookup::Absent => (),
+        EntryLookup::Found(entry) => {
+            match entry
+                .time_relation(now, utc, session.memory())
+                .map_err(|error| session.error(error))?
+            {
+                Relation::Before | Relation::At => return Err(X509ChainError::Revoked(position)),
+                Relation::After => (),
+                Relation::Uncertain(reason) => {
+                    return Err(X509ChainError::CrlTimeUncertain { index, reason });
+                }
+            }
+        }
+        EntryLookup::Conflict { .. } | EntryLookup::Unsupported { .. } => {
+            return Err(X509ChainError::InvalidCrl(index));
+        }
     }
     Ok(())
 }
@@ -539,8 +615,7 @@ pub(crate) fn validate_supplied_path<'a>(
     session: &CertificateSession,
 ) -> Result<structured_pkix::path::ValidationFacts<'a>, X509ChainError> {
     use structured_pkix::path::{
-        Anchor, BuildError, ConstraintSource, Interval, Policy, RejectionReason, Validation,
-        ValidationContext,
+        Anchor, BuildError, Interval, Policy, Validation, ValidationContext,
     };
     let verifier = CertificatePathVerifier {
         signatures: ProviderVerifier {
@@ -563,99 +638,106 @@ pub(crate) fn validate_supplied_path<'a>(
     };
     let result = structured_pkix::path::validate(chain, Anchor::from_certificate(anchor), &context)
         .map_err(|error| match error {
-            BuildError::Processing(error) => session.error(error),
-            BuildError::Verification(X509ChainError::Processing(error)) => session.error(error),
+            BuildError::Processing(error)
+            | BuildError::Verification(X509ChainError::Processing(error)) => session.error(error),
             BuildError::Verification(error) => error,
             BuildError::Recognition(never) => match never {},
         })?;
-    let position = |source| match source {
-        ConstraintSource::Anchor => chain.len(),
-        ConstraintSource::Certificate(position) => position,
-    };
     match result {
         Validation::Accepted(facts) => Ok(facts),
         Validation::Incomplete(reason) => Err(X509ChainError::PathIncomplete(reason)),
-        Validation::Rejected(rejection) => {
-            let Some(at) = rejection.at.map(position) else {
-                // A whole-input rejection has no certificate position.
-                return Err(X509ChainError::UntrustedRoot);
-            };
-            Err(match rejection.reason {
-                RejectionReason::EmptyPath | RejectionReason::AnchorIncluded => {
-                    X509ChainError::UntrustedRoot
-                }
-                RejectionReason::Validity => X509ChainError::CertificateNotValid(at),
-                RejectionReason::NotAuthority | RejectionReason::EmptyAuthorityName => {
-                    X509ChainError::IssuerNotCa(at)
-                }
-                RejectionReason::KeyCertSign => X509ChainError::InvalidKeyUsage {
-                    position: at,
-                    required: "keyCertSign",
-                },
-                RejectionReason::PathLength { source, limit } => {
-                    X509ChainError::PathLengthExceeded {
-                        position: position(source),
-                        limit,
-                    }
-                }
-                RejectionReason::NameConstraints { source, .. } => {
-                    X509ChainError::NameConstraintViolation {
-                        position: at,
-                        constraining_position: position(source),
-                    }
-                }
-                RejectionReason::NameConstraintsOnNonAuthority => {
-                    X509ChainError::InvalidNameConstraints { position: at }
-                }
-                RejectionReason::CriticalExtension(oid) => {
-                    let text = oid.text(session.memory()).map_err(|reason| {
-                        X509ChainError::Processing(structured_pkix::Error::resource(
-                            reason,
-                            "certificate.extensions",
-                            0,
-                        ))
-                    })?;
-                    X509ChainError::UnsupportedCriticalExtension {
-                        position: at,
-                        oid: text
-                            .as_str(session.memory())
-                            .map_err(|reason| {
-                                X509ChainError::Processing(structured_pkix::Error::resource(
-                                    reason,
-                                    "certificate.extensions",
-                                    0,
-                                ))
-                            })?
-                            .to_owned(),
-                    }
-                }
-                RejectionReason::MalformedExtension { extension, .. }
-                    if extension == structured_pkix::oid::NAME_CONSTRAINTS =>
-                {
-                    X509ChainError::InvalidNameConstraints { position: at }
-                }
-                RejectionReason::MalformedExtension {
-                    code,
-                    field,
-                    offset,
-                    ..
-                } => X509ChainError::Processing(structured_pkix::Error::new(code, field, offset)),
-                RejectionReason::Policies => X509ChainError::CertificatePolicies,
-                RejectionReason::Issuer | RejectionReason::Signature => {
-                    X509ChainError::InvalidSignature(at)
-                }
-                RejectionReason::UnsupportedSignature => X509ChainError::UnsupportedSignature(at),
-                RejectionReason::DuplicateCertificate { .. } => X509ChainError::InvalidDer {
-                    kind: "certificate path",
-                    message: "repeated certificate".into(),
-                },
-                _ => X509ChainError::InvalidDer {
-                    kind: "certificate path",
-                    message: "unhandled static path rejection".into(),
-                },
-            })
-        }
+        Validation::Rejected(rejection) => Err(path_rejection(&rejection, chain.len(), session)?),
     }
+}
+
+/// The chain error for a shared path-processor rejection; the anchor sits
+/// at position `chain_len`.
+fn path_rejection(
+    rejection: &structured_pkix::path::Rejection<'_>,
+    chain_len: usize,
+    session: &CertificateSession,
+) -> Result<X509ChainError, X509ChainError> {
+    use structured_pkix::path::{ConstraintSource, RejectionReason};
+    let position = |source| match source {
+        ConstraintSource::Anchor => chain_len,
+        ConstraintSource::Certificate(position) => position,
+    };
+    let Some(at) = rejection.at.map(position) else {
+        // A whole-input rejection has no certificate position.
+        return Ok(X509ChainError::UntrustedRoot);
+    };
+    Ok(match rejection.reason {
+        RejectionReason::EmptyPath | RejectionReason::AnchorIncluded => {
+            X509ChainError::UntrustedRoot
+        }
+        RejectionReason::Validity => X509ChainError::CertificateNotValid(at),
+        RejectionReason::NotAuthority | RejectionReason::EmptyAuthorityName => {
+            X509ChainError::IssuerNotCa(at)
+        }
+        RejectionReason::KeyCertSign => X509ChainError::InvalidKeyUsage {
+            position: at,
+            required: "keyCertSign",
+        },
+        RejectionReason::PathLength { source, limit } => X509ChainError::PathLengthExceeded {
+            position: position(source),
+            limit,
+        },
+        RejectionReason::NameConstraints { source, .. } => {
+            X509ChainError::NameConstraintViolation {
+                position: at,
+                constraining_position: position(source),
+            }
+        }
+        RejectionReason::NameConstraintsOnNonAuthority => {
+            X509ChainError::InvalidNameConstraints { position: at }
+        }
+        RejectionReason::CriticalExtension(oid) => X509ChainError::UnsupportedCriticalExtension {
+            position: at,
+            oid: critical_extension_text(oid, session)?,
+        },
+        RejectionReason::MalformedExtension { extension, .. }
+            if extension == structured_pkix::oid::NAME_CONSTRAINTS =>
+        {
+            X509ChainError::InvalidNameConstraints { position: at }
+        }
+        RejectionReason::MalformedExtension {
+            code,
+            field,
+            offset,
+            ..
+        } => X509ChainError::Processing(structured_pkix::Error::new(code, field, offset)),
+        RejectionReason::Policies => X509ChainError::CertificatePolicies,
+        RejectionReason::Issuer | RejectionReason::Signature => {
+            X509ChainError::InvalidSignature(at)
+        }
+        RejectionReason::UnsupportedSignature => X509ChainError::UnsupportedSignature(at),
+        RejectionReason::DuplicateCertificate { .. } => X509ChainError::InvalidDer {
+            kind: "certificate path",
+            message: "repeated certificate".into(),
+        },
+        _ => X509ChainError::InvalidDer {
+            kind: "certificate path",
+            message: "unhandled static path rejection".into(),
+        },
+    })
+}
+
+fn critical_extension_text(
+    oid: structured_asn1::Oid<'_>,
+    session: &CertificateSession,
+) -> Result<String, X509ChainError> {
+    let resource_error = |reason| {
+        X509ChainError::Processing(structured_pkix::Error::resource(
+            reason,
+            "certificate.extensions",
+            0,
+        ))
+    };
+    let text = oid.text(session.memory()).map_err(resource_error)?;
+    Ok(text
+        .as_str(session.memory())
+        .map_err(resource_error)?
+        .to_owned())
 }
 
 fn materialize_effective_spki<W: Work>(
@@ -765,6 +847,7 @@ pub(crate) fn effective_target_spki(
 }
 
 /// Certificate signatures use the same selected engine and permissions as CRLs.
+#[derive(Clone, Copy)]
 pub(crate) struct ProviderVerifier<'a> {
     pub(crate) provider: &'a dyn crate::provider::CryptoProvider,
     pub(crate) allowed: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
@@ -867,6 +950,25 @@ impl ProviderVerifier<'_> {
     }
 }
 
+/// Digests this crate implements, by their shared PKIX identity.
+fn digest_algorithm(
+    value: structured_pkix::algorithm::digest::Algorithm,
+) -> Option<super::DigestAlgorithm> {
+    use structured_pkix::algorithm::digest::Algorithm as Hash;
+    Some(match value {
+        Hash::Sha1 => super::DigestAlgorithm::Sha1,
+        Hash::Sha224 => super::DigestAlgorithm::Sha224,
+        Hash::Sha256 => super::DigestAlgorithm::Sha256,
+        Hash::Sha384 => super::DigestAlgorithm::Sha384,
+        Hash::Sha512 => super::DigestAlgorithm::Sha512,
+        Hash::Sha3_224 => super::DigestAlgorithm::Sha3_224,
+        Hash::Sha3_256 => super::DigestAlgorithm::Sha3_256,
+        Hash::Sha3_384 => super::DigestAlgorithm::Sha3_384,
+        Hash::Sha3_512 => super::DigestAlgorithm::Sha3_512,
+        _ => return None,
+    })
+}
+
 fn signature_algorithm<W: Work>(
     identifier: structured_pkix::algorithm::AlgorithmIdentifier<'_>,
     execution: &W,
@@ -876,29 +978,27 @@ fn signature_algorithm<W: Work>(
     use structured_pkix::algorithm::{digest::Algorithm as Hash, signature::Algorithm};
     let unsupported = || {
         // Preserve branch-local discovery semantics for unknown identifiers.
-        // This is the existing diagnostic boundary, not a second algorithm
-        // parser: PKIX has already validated the OID's original encoding.
-        X509ChainError::UnsupportedSignatureAlgorithm {
-            oid: x509_parser::oid_registry::Oid::new(std::borrow::Cow::Borrowed(
-                identifier.algorithm().as_bytes(),
+        // PKIX has already validated the OID's original encoding; its dotted
+        // text is rendered under the current operation's account.
+        let memory = execution.memory();
+        let resource = |reason| {
+            X509ChainError::Processing(structured_pkix::Error::resource(
+                reason,
+                "certificate.signature",
+                identifier.offset(),
             ))
-            .to_id_string(),
+        };
+        match identifier.algorithm().text(memory) {
+            Ok(text) => match text.as_str(memory) {
+                Ok(oid) => X509ChainError::UnsupportedSignatureAlgorithm {
+                    oid: oid.to_owned(),
+                },
+                Err(reason) => resource(reason),
+            },
+            Err(reason) => resource(reason),
         }
     };
-    let hash = |value| {
-        Ok(match value {
-            Hash::Sha1 => super::DigestAlgorithm::Sha1,
-            Hash::Sha224 => super::DigestAlgorithm::Sha224,
-            Hash::Sha256 => super::DigestAlgorithm::Sha256,
-            Hash::Sha384 => super::DigestAlgorithm::Sha384,
-            Hash::Sha512 => super::DigestAlgorithm::Sha512,
-            Hash::Sha3_224 => super::DigestAlgorithm::Sha3_224,
-            Hash::Sha3_256 => super::DigestAlgorithm::Sha3_256,
-            Hash::Sha3_384 => super::DigestAlgorithm::Sha3_384,
-            Hash::Sha3_512 => super::DigestAlgorithm::Sha3_512,
-            _ => return Err(unsupported()),
-        })
-    };
+    let hash = |value: Hash| digest_algorithm(value).ok_or_else(unsupported);
     // Shared PKIX owns ASN.1 signature syntax and parameters, retaining the
     // original reader/depth and both source and current Work. The XML adapter
     // maps only provider capability; it never encodes/reparses the identifier.
@@ -1062,6 +1162,19 @@ impl<W: Work> structured_pkix::path::Verify<W> for CertificatePathVerifier<'_, '
     }
 }
 
+/// Key family of a standalone `SubjectPublicKeyInfo` algorithm identifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpkiAlgorithm {
+    RsaEncryption,
+    RsaPss,
+    Dsa,
+    Ec,
+    Ed25519,
+    Ed448,
+    PostQuantum(super::PqAlgorithm),
+    Other,
+}
+
 /// Structure of an RSA or EC public key, borrowed from its SPKI encoding.
 pub(crate) enum PublicKey<'a> {
     Rsa(structured_pkix::key::rsa::PublicKey<'a>),
@@ -1169,7 +1282,133 @@ impl CertificateSession {
         })
     }
 
-    fn with_public_key_info<'a, T>(
+    /// RSA key of a standalone SPKI whose algorithm admits the signature
+    /// scheme: PKCS#1 v1.5 when `pss` is `None`, otherwise RSASSA-PSS with
+    /// `pss`. `None` is a non-matching or malformed key.
+    ///
+    /// `rsaEncryption` keys (NULL or absent parameters, as RFC 3279 2.3.1
+    /// readers accept) admit both schemes. RFC 4055 section 3.3: an
+    /// `id-RSASSA-PSS` key admits only PSS; its parameters, when present, fix
+    /// both digests and the trailer and set a minimum salt. Readable written
+    /// DEFAULT fields are recognized as RFC 4055 section 3.1 requires.
+    /// <https://www.rfc-editor.org/rfc/rfc4055.html#section-3.3>
+    pub(crate) fn rsa_public_key<'a>(
+        &'a self,
+        spki: &'a [u8],
+        pss: Option<super::RsaPssParameters>,
+    ) -> Option<structured_pkix::key::rsa::PublicKey<'a>> {
+        use structured_asn1::digest::Resolution;
+        self.admitted_rsa_public_key(spki, |identifier, execution| {
+            let algorithm = identifier.algorithm();
+            if algorithm == structured_pkix::oid::RSA_ENCRYPTION {
+                return Ok(identifier.has_null_parameter() || identifier.has_no_parameters());
+            }
+            let Some(signature) = pss else {
+                return Ok(false);
+            };
+            if algorithm != structured_pkix::oid::RSASSA_PSS {
+                return Ok(false);
+            }
+            let Some(reading) = structured_pkix::algorithm::pss::inspect(identifier, execution)?
+            else {
+                return Ok(true);
+            };
+            let Resolution::Supported(profile) = reading.parameters().profile(execution)? else {
+                return Ok(false);
+            };
+            let minimum_salt = profile
+                .salt()
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok());
+            Ok(digest_algorithm(profile.hash()) == Some(signature.digest)
+                && digest_algorithm(profile.mask_hash()) == Some(signature.mgf_digest)
+                && minimum_salt.is_some_and(|minimum| signature.salt_len >= minimum))
+        })
+    }
+
+    /// RFC 8410 raw public key of a standalone SPKI, or `None` for another
+    /// algorithm, present parameters or a wrong key width.
+    pub(crate) fn rfc8410_public_key<'a>(
+        &'a self,
+        spki: &'a [u8],
+    ) -> Option<structured_pkix::key::rfc8410::PublicKey<'a>> {
+        self.with_public_key_info(spki, |info, execution| {
+            structured_pkix::key::rfc8410::read(info, execution)
+        })
+        .ok()
+    }
+
+    /// Key family named by a standalone SPKI's algorithm identifier.
+    ///
+    /// # Errors
+    /// The shared reader's refusal, keeping resource exhaustion distinct.
+    pub(crate) fn spki_algorithm(
+        &self,
+        spki: &[u8],
+    ) -> Result<SpkiAlgorithm, structured_pkix::Error> {
+        self.with_public_key_info(spki, |info, _| {
+            let algorithm = info.algorithm().algorithm();
+            Ok(if algorithm == structured_pkix::oid::RSA_ENCRYPTION {
+                SpkiAlgorithm::RsaEncryption
+            } else if algorithm == structured_pkix::oid::RSASSA_PSS {
+                SpkiAlgorithm::RsaPss
+            } else if algorithm == structured_pkix::oid::EC_PUBLIC_KEY {
+                SpkiAlgorithm::Ec
+            } else if algorithm.as_bytes() == dsa::OID.as_bytes() {
+                SpkiAlgorithm::Dsa
+            } else if algorithm == structured_pkix::oid::ED25519 {
+                SpkiAlgorithm::Ed25519
+            } else if algorithm == structured_pkix::oid::ED448 {
+                SpkiAlgorithm::Ed448
+            } else if let Some(parameter) = super::PqAlgorithm::from_oid(algorithm.as_bytes()) {
+                SpkiAlgorithm::PostQuantum(parameter)
+            } else {
+                SpkiAlgorithm::Other
+            })
+        })
+    }
+
+    /// Supported named curve and range of the SEC1 point inside a standalone
+    /// EC SPKI; `None` for another key, curve choice or malformed encoding.
+    pub(crate) fn ec_named_point(
+        &self,
+        spki: &[u8],
+    ) -> Option<(super::signature::EcCurve, core::ops::Range<usize>)> {
+        let PublicKey::Ec(key) = self.read_public_key(spki).ok()? else {
+            return None;
+        };
+        let structured_pkix::key::ec::Curve::Named(curve) = key.curve() else {
+            return None;
+        };
+        let curve = super::signature::EcCurve::from_oid_bytes(curve.as_bytes())?;
+        // The SPKI is read at document offset zero, so source offsets index it.
+        let start = usize::try_from(key.offset()).ok()?;
+        Some((curve, start..start.checked_add(key.as_bytes().len())?))
+    }
+
+    /// RSA key of a standalone SPKI whose algorithm identifier `admit` accepts.
+    /// `None` is a refused identifier or a malformed key.
+    pub(crate) fn admitted_rsa_public_key<'a>(
+        &'a self,
+        spki: &'a [u8],
+        admit: impl FnOnce(
+            structured_pkix::AlgorithmIdentifier<'a>,
+            &structured_asn1::memory::Execution<'_>,
+        ) -> Result<bool, structured_pkix::Error>,
+    ) -> Option<structured_pkix::key::rsa::PublicKey<'a>> {
+        self.with_public_key_info(spki, |info, execution| {
+            if !admit(info.algorithm(), execution)? {
+                return Ok(None);
+            }
+            structured_pkix::key::rsa::read(info, execution).map(Some)
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Reads exactly one standalone SPKI under this session's work and hands
+    /// its borrowed structure to `inspect`.
+    pub(crate) fn with_public_key_info<'a, T>(
         &'a self,
         spki: &'a [u8],
         inspect: impl FnOnce(
@@ -1205,12 +1444,9 @@ impl CertificateSession {
             .map_err(|error| self.error(error))
     }
 
-    pub(crate) fn parse_error(&self, error: X509ChainError) -> super::ParseError {
-        match error {
-            X509ChainError::Policy(error) => super::ParseError::Policy(error),
-            X509ChainError::Processing(error) => super::ParseError::Certificate(error),
-            error => super::ParseError::InvalidStructure(error.to_string()),
-        }
+    /// A shared-reader failure under this session's limits, as a parse error.
+    pub(crate) fn parse_failure(&self, error: structured_pkix::Error) -> super::ParseError {
+        self.error(error).into()
     }
 
     #[cfg(test)]
@@ -1978,7 +2214,7 @@ mod tests {
             provider: crate::provider::default_provider(),
             allowed: None,
         };
-        for (local, aggregate) in [(0, 100000), (100000, 0), (100000, 100000)] {
+        for (local, aggregate) in [(0, 100_000), (100_000, 0), (100_000, 100_000)] {
             let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, aggregate)));
             let operation = Parser::new(
                 Encoding::Der,
@@ -2006,12 +2242,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn discovery_defers_a_dsa_key_whose_parameters_need_inheritance() {
-        // RFC 5280 6.1.4(e) cannot be evaluated from this isolated pool edge.
-        // Missing parameters are not a proved bad signature; path validation
-        // must get a chance to supply the effective key before the provider.
-        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
+    /// A self-issued DSA-SHA1 certificate whose DSA key omits its parameters.
+    fn parameterless_dsa_certificate() -> Vec<u8> {
         use der::{Decode as _, Encode as _};
         let pair = rcgen::KeyPair::generate().expect("test key");
         let cert = rcgen::CertificateParams::new(Vec::<String>::new())
@@ -2046,10 +2278,19 @@ mod tests {
         let mut body = tbs.to_der().expect("test TBS");
         body.extend(algorithm.to_der().expect("test outer algorithm"));
         body.extend(source.signature().to_der().expect("test signature"));
-        let bytes = der::asn1::Any::new(der::Tag::Sequence, body)
+        der::asn1::Any::new(der::Tag::Sequence, body)
             .expect("certificate sequence")
             .to_der()
-            .expect("test encoding");
+            .expect("test encoding")
+    }
+
+    #[test]
+    fn discovery_defers_a_dsa_key_whose_parameters_need_inheritance() {
+        // RFC 5280 6.1.4(e) cannot be evaluated from this isolated pool edge.
+        // Missing parameters are not a proved bad signature; path validation
+        // must get a chance to supply the effective key before the provider.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
+        let bytes = parameterless_dsa_certificate();
         let session = CertificateSession::new(&ResourcePolicy::default());
         let parsed = session.read(&bytes).expect("DSA certificate");
         let verifier = ProviderVerifier {

@@ -388,10 +388,10 @@ fn ignored_and_unsupported_historical_digests_are_not_empty_success() {
                 assert_eq!(inner, 1);
                 match state {
                     HashUseState::Unsupported => {
-                        assert_eq!(completeness, HashUseCompleteness::Unsupported(original))
+                        assert_eq!(completeness, HashUseCompleteness::Unsupported(original));
                     }
                     HashUseState::Unprocessed => {
-                        assert_eq!(completeness, HashUseCompleteness::Unprocessed(original))
+                        assert_eq!(completeness, HashUseCompleteness::Unprocessed(original));
                     }
                     HashUseState::Complete => unreachable!(),
                 }
@@ -604,14 +604,14 @@ fn independently_parameterized_pss_hashes_come_from_the_original_method() {
                     .uri("")
                     .transform(Transform::Enveloped),
             );
-    let signed = SignContext::new(&signer)
+    let xml = SignContext::new(&signer)
         .policy(xml_sec::policy::SigningPolicy {
             parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
             ..Default::default()
         })
         .sign_with_builder("<root/>", &builder)
         .unwrap();
-    let document = XmlDocument::parse(signed).unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
     let key = VerificationKey {
         algorithm,
         public_key_bytes: pem::parse(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem"))

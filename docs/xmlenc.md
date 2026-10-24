@@ -15,7 +15,7 @@ Dependency and resource checks run before the closure that performs each phase. 
 controlled replacement must start at the context's expected generation, commit exactly
 one new generation, and advance that expectation before any later node can execute;
 stale or foreign document state is therefore rejected before mutation work begins.
-Compiled graph failures are reported as `XmlEncError::OperationPlan`; malformed XMLEnc
+Compiled graph failures are reported as `XmlEncError::OperationPlan`; malformed `XMLEnc`
 element order or namespaces remain `XmlEncError::InvalidStructure`.
 
 ## Experimental ML-KEM
@@ -38,7 +38,7 @@ and exposes the sole applicable KEM recipient using decryption's `DataReference`
 `CarriedKeyName` and nested `KeyReference` predicates. When
 `requires_document_context()` is false, its `data()` can be reused by `decrypt_data`
 without decoding recipient ciphertexts again. Otherwise decrypt the original XML
-with the same ID registrations to preserve association and CipherReference
+with the same ID registrations to preserve association and `CipherReference`
 semantics. References inside the mechanism's own `KeyInfo` are expanded before
 recipient-name selection, with the same ID registrations, ancestry checks and
 operation-wide parsing allowances. Policy-permitted external `KeyInfoReference`
@@ -63,7 +63,7 @@ permission. `key_establishment.kem_content_authentication` must explicitly be
 `KemContentAuthentication::ExternalAuthenticated` to enable compatibility with
 the donor's CBC vectors. The caller must authenticate the complete encrypted
 input before decryption and bind external integrity protection of generated
-ciphertext to its encryption key (XMLEnc 1.1 §6.1.1). This grant
+ciphertext to its encryption key (`XMLEnc` 1.1 §6.1.1). This grant
 does not validate that authentication: CBC padding can succeed for an ML-KEM
 implicit-rejection secret and must never be treated as ciphertext validity.
 FIPS 203 §6.3 forbids returning the rejection flag; this default is a product
@@ -101,7 +101,7 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 For embedded decryption, `DecryptContext::id_attributes` accepts the same immutable global or
-element-scoped `IdAttributeRegistration` request context as XMLDSig. Element scope can match a
+element-scoped `IdAttributeRegistration` request context as `XMLDSig`. Element scope can match a
 local name in any namespace or one exact expanded name. It affects only operation start-node
 lookup; policy remains a separate compiled snapshot.
 
@@ -112,12 +112,12 @@ content key through `CryptoProvider::fill_random` and wraps it once per recipien
 together with the cryptographic primitives. The crate's secure RSA-OAEP default is
 SHA-256/MGF1-SHA-256 and generated recipients serialize those choices explicitly. When consuming
 templates or encrypted input, both RSA-OAEP URIs default an omitted `ds:DigestMethod` and
-`xenc11:MGF` to SHA-1/MGF1-SHA-1. libxmlsec1 1.3.13 also accepts an explicit XMLEnc 1.1
+`xenc11:MGF` to SHA-1/MGF1-SHA-1. libxmlsec1 1.3.13 also accepts an explicit `XMLEnc` 1.1
 `xenc11:MGF` child under the legacy `rsa-oaep-mgf1p` URI; `xml-sec` parses, executes, and preserves
 that interoperable form. Serializing the legacy URI omits only a default MGF1-SHA1 choice and emits
 the child for every non-default MGF.
 `recipient_key_transport` accepts an opaque `KeyTransportKey` for provider-owned public keys;
-the RSA convenience constructor wraps a RustCrypto key into the same contract. The handle exposes
+the RSA convenience constructor wraps a `RustCrypto` key into the same contract. The handle exposes
 only normalized public modulus/exponent metadata required by encryption policy and framing checks.
 On decryption, `PrivateKeyDecryptor::provider_key` accepts an opaque `KeyRecoveryKey`; private key
 material never enters XML orchestration. Exact modulus bit length and public exponent
@@ -128,13 +128,13 @@ label parameters. Key transport and key recovery are independent capabilities, s
 provider can advertise recovery without public-key wrapping support. An unsupported provider fails
 without invoking the key or falling back.
 `validate_key_transport_recipient` gives provider-owned key registries the same policy preflight;
-the existing `validate_rsa_recipient_key` remains the RustCrypto convenience form.
+the existing `validate_rsa_recipient_key` remains the `RustCrypto` convenience form.
 `EncryptionPolicy::rsa_keys` validates every recipient modulus and exponent before provider
 dispatch. New output defaults to 2048-8192-bit RSA keys; callers can explicitly tighten or relax
 the minimum for a deployment profile, but cannot exceed the implementation ceiling.
 Decryption uses the same default range through `DecryptionPolicy::rsa_keys`.
 A caller can explicitly lower its minimum for legacy input; this is application
-security policy, not an XMLEnc validity constraint. RSA resolver wrappers must forward
+security policy, not an `XMLEnc` validity constraint. RSA resolver wrappers must forward
 the operation snapshot through `resolve_key_candidates_with_policy`; the standalone
 `resolve_key` API uses the default policy.
 The trait's default policy-aware method resolves only direct content keys. It
@@ -196,20 +196,20 @@ backend while revalidating the containing document; the shorter entry points use
 
 `PrivateKeyDecryptor` unwraps embedded RSA-OAEP `EncryptedKey` values and `KekDecryptor`
 unwraps AES-KW values. With `legacy-algorithms`, these resolvers additionally support parameterless
-RSA PKCS#1 v1.5 transport, AES-192 key wrap, and RFC 3217 TripleDES key wrap.
-`CipherReference` uses caller-supplied resource bytes and the bounded XMLDSig
-transform engine, retaining original-node namespaces, XML Base and XPath
+RSA PKCS#1 v1.5 transport, AES-192 key wrap, and RFC 3217 `TripleDES` key wrap.
+`CipherReference` uses caller-supplied resource bytes and the bounded `XMLDSig`
+transform engine, retaining original-node namespaces, XML Base and `XPath`
 `here()` context. URI and transform permissions come from `DecryptionPolicy`;
 there is no implicit filesystem or network loading. Same-document
 `RetrievalMethod` and `KeyInfoReference` retain detached key origins, reject
 cycles and ambiguous IDs, and share the nested key-indirection budget.
 `RetrievalMethod` can also process caller-owned external resources and its
 `ds:Transforms`, including encoded or non-UTF-8 key documents. External key
-documents retain their resource URI as the base for relative CipherReference
+documents retain their resource URI as the base for relative `CipherReference`
 resolution. Parsing and transform budgets are shared across these documents;
 each selected resource joins the same execution graph before processing.
 Containing syntax, identifiers and content-algorithm policy are checked before
-key retrieval. Repeated key references charge each retained CipherValue copy
+key retrieval. Repeated key references charge each retained `CipherValue` copy
 against the operation's aggregate allowance, before allocation.
 Detached encrypted keys can also be associated through `CarriedKeyName` or
 `ReferenceList/DataReference`; detached derived-key descriptors use
@@ -220,7 +220,7 @@ index, including caller-registered attributes and ambiguity checks, rather than
 comparing only the unqualified `Id` field. Typed-only `decrypt_data` requests
 have no source DOM and can compare references only with their explicit `Id`.
 Derived-key retrieval accepts the canonical `http://www.w3.org/2009/xmlenc11#DerivedKey`
-identifier from XMLEnc 1.1 §3.5.2 and the `http://www.w3.org/2001/04/xmlenc#DerivedKey`
+identifier from `XMLEnc` 1.1 §3.5.2 and the `http://www.w3.org/2001/04/xmlenc#DerivedKey`
 spelling printed in §3.5.3 as an interoperability alias. Both require an
 `xenc11:DerivedKey` target, also after retrieval transforms.
 Agreement roles support DH public values with optional complete domain parameters;
@@ -236,26 +236,26 @@ algorithm URI, key name, OAEP label, and reference URI, and rechecks caller-cons
 ## Optional Compatibility Mechanisms
 
 The `legacy-algorithms` feature compiles AES-192-CBC/GCM, TripleDES-CBC, AES-192-KW,
-TripleDES CMS wrap, and RSA-1.5 transport. Compilation is not permission: explicitly put each
+`TripleDES` CMS wrap, and RSA-1.5 transport. Compilation is not permission: explicitly put each
 required method into `EncryptionPolicy` and `DecryptionPolicy`'s `data_algorithms`,
 `key_wrap_algorithms`, or `key_transport_algorithms` allowlist. Default operations reject all of
 these optional methods. AES-192 is included for compatibility completeness, not because its key
-size is cryptographically weak. TripleDES and RSA-1.5 should be restricted to required legacy
+size is cryptographically weak. `TripleDES` and RSA-1.5 should be restricted to required legacy
 integrations; prefer authenticated AES-GCM and RSA-OAEP for new output.
 
 Use `EncryptionRecipient::rsa_pkcs1v15` (or `provider_pkcs1v15`) for RSA-1.5, not
-`rsa_oaep` with altered parameters. XMLEnc 1.1 §5.5.1 defines no OAEP children for this method;
+`rsa_oaep` with altered parameters. `XMLEnc` 1.1 §5.5.1 defines no OAEP children for this method;
 the parser rejects them. Fixed-width recovery retains its padding-validity mask alongside a
 zeroized content-key candidate; invalid padding selects a random fallback key. Content decryption
 runs before the operation checks that mask, and an invalid recovery can never release plaintext,
 even when CBC padding happens to succeed. This does not authenticate CBC or eliminate its
-chosen-ciphertext risks (XMLEnc 1.1 §6.1.2); use CBC only with a separately authenticated boundary.
+chosen-ciphertext risks (`XMLEnc` 1.1 §6.1.2); use CBC only with a separately authenticated boundary.
 `DecryptionKeyResolver` wrappers must forward `resolve_content_keys_with_policy` to preserve
 this state. The low-level byte-returning resolver APIs reject invalid recovery rather than
 exposing fallback key bytes. See [the RSA recovery adaptation](rsa-recovery-patch.md).
-TripleDES wrapping follows RFC 3217 §§2–3, including its SHA-1 checksum and fixed outer IV;
+`TripleDES` wrapping follows RFC 3217 §§2–3, including its SHA-1 checksum and fixed outer IV;
 it does not reinterpret arbitrary AES key bytes as DES parity-normalized bytes.
-`SymmetricKeyDecryptor::new` and `KekDecryptor::new` bind keys to AES, irrespective of length. For TripleDES, explicitly
+`SymmetricKeyDecryptor::new` and `KekDecryptor::new` bind keys to AES, irrespective of length. For `TripleDES`, explicitly
 use `with_kind(key, SymmetricKeyKind::Des)`; the family is trusted request input, never inferred
 from an untrusted algorithm URI. Borrowed KEKs use `KekDecryptor::borrowed_with_kind` to retain
 the same family boundary without copying key material. Both families may supply CLI KEKs through `--aes-key:name`,

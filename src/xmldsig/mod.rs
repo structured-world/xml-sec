@@ -1,4 +1,4 @@
-//! XML Digital Signatures (XMLDSig).
+//! XML Digital Signatures (`XMLDSig`).
 //!
 //! Implements [XML Signature Syntax and Processing](https://www.w3.org/TR/xmldsig-core1/).
 //!
@@ -7,7 +7,7 @@
 //! - URI dereference: same-document references (`""`, `#id`, `#xpointer(/)`, `#xpointer(id('...'))`)
 //! - ID attribute resolution with configurable attribute names
 //! - Exact element, attribute, and namespace node sets for transform processing
-//! - Enveloped, canonicalization, Base64, XPath 1.0, and XPath Filter 2.0 transforms
+//! - Enveloped, canonicalization, Base64, `XPath` 1.0, and `XPath` Filter 2.0 transforms
 //!
 //! ## Signing and verification
 //!
@@ -56,7 +56,7 @@ pub mod builder;
 pub mod digest;
 pub mod extension;
 pub mod keys;
-mod modern;
+pub(crate) mod modern;
 #[cfg(feature = "experimental-pq")]
 pub(crate) mod post_quantum;
 mod pq_algorithm;

@@ -1,42 +1,61 @@
-use super::*;
+use super::{PolicySet, PolicyValidity, SignatureConstraints, configuration};
+use crate::policy::{
+    CertificateSignatureAlgorithms, DsaKeyPolicy, HmacPolicy, KemContentAuthentication,
+    KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy,
+    ManifestProcessing, PolicyViolation, ResourcePolicy, RsaKeyPolicy, RsaPssPermission,
+    SigningPolicy, TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode,
+    XmlInputPolicy,
+};
+#[cfg(feature = "xmlenc")]
+use crate::policy::{
+    DecryptionPolicy, EncryptionPolicy, KeyTransportAlgorithm, KeyWrapAlgorithm,
+    OaepDigestAlgorithm, check_content_algorithm,
+};
+use crate::xmldsig::UriTypeSet;
 use std::hash::Hash;
+use std::{collections::HashSet, time::SystemTime};
 
 impl PolicySet {
     pub(super) fn intersect(&self, other: &Self) -> Result<Self, PolicyViolation> {
         Ok(Self {
             verification: intersect_operation(
-                &self.verification,
-                &other.verification,
+                self.verification.as_ref(),
+                other.verification.as_ref(),
                 verification,
             )?,
-            signing: intersect_operation(&self.signing, &other.signing, signing)?,
+            signing: intersect_operation(self.signing.as_ref(), other.signing.as_ref(), signing)?,
             #[cfg(feature = "xmlenc")]
-            encryption: intersect_operation(&self.encryption, &other.encryption, encryption)?,
+            encryption: intersect_operation(
+                self.encryption.as_ref(),
+                other.encryption.as_ref(),
+                encryption,
+            )?,
             #[cfg(feature = "xmlenc")]
-            decryption: intersect_operation(&self.decryption, &other.decryption, decryption)?,
+            decryption: intersect_operation(
+                self.decryption.as_ref(),
+                other.decryption.as_ref(),
+                decryption,
+            )?,
         })
     }
 
     pub(super) fn bind_authorization(
         &mut self,
-        grant: PolicyValidity,
+        grant: &PolicyValidity,
         prior: &Self,
     ) -> Result<(), PolicyViolation> {
         fn bind<T>(
             policy: &mut Option<T>,
-            prior: &Option<T>,
+            prior: Option<&T>,
             grant: &PolicyValidity,
             field: impl Fn(&mut T) -> &mut Option<PolicyValidity>,
             read: impl Fn(&T) -> &Option<PolicyValidity>,
         ) -> Result<(), PolicyViolation> {
             if let Some(policy) = policy {
                 let mut validity = grant.clone();
-                for inherited in [
-                    read(policy).as_ref(),
-                    prior.as_ref().and_then(|p| read(p).as_ref()),
-                ]
-                .into_iter()
-                .flatten()
+                for inherited in [read(policy).as_ref(), prior.and_then(|p| read(p).as_ref())]
+                    .into_iter()
+                    .flatten()
                 {
                     validity.not_before = validity.not_before.max(inherited.not_before);
                     validity.expires_at = validity.expires_at.min(inherited.expires_at);
@@ -48,15 +67,15 @@ impl PolicySet {
         }
         bind(
             &mut self.verification,
-            &prior.verification,
-            &grant,
+            prior.verification.as_ref(),
+            grant,
             |p| &mut p.validity,
             |p| &p.validity,
         )?;
         bind(
             &mut self.signing,
-            &prior.signing,
-            &grant,
+            prior.signing.as_ref(),
+            grant,
             |p| &mut p.validity,
             |p| &p.validity,
         )?;
@@ -64,15 +83,15 @@ impl PolicySet {
         {
             bind(
                 &mut self.encryption,
-                &prior.encryption,
-                &grant,
+                prior.encryption.as_ref(),
+                grant,
                 |p| &mut p.validity,
                 |p| &p.validity,
             )?;
             bind(
                 &mut self.decryption,
-                &prior.decryption,
-                &grant,
+                prior.decryption.as_ref(),
+                grant,
                 |p| &mut p.validity,
                 |p| &p.validity,
             )?;
@@ -82,8 +101,8 @@ impl PolicySet {
 }
 
 fn intersect_operation<T>(
-    a: &Option<T>,
-    b: &Option<T>,
+    a: Option<&T>,
+    b: Option<&T>,
     merge: impl Fn(&T, &T) -> Result<T, PolicyViolation>,
 ) -> Result<Option<T>, PolicyViolation> {
     match (a, b) {
@@ -96,8 +115,8 @@ fn intersect_operation<T>(
 // every legacy/experimental method. Ask the existing enforcement core instead
 // of maintaining another algorithm permission table here.
 fn algorithms<T: Copy + Eq + Hash>(
-    a: &Option<HashSet<T>>,
-    b: &Option<HashSet<T>>,
+    a: Option<&HashSet<T>>,
+    b: Option<&HashSet<T>>,
     accepts_a: impl Fn(T) -> bool,
     accepts_b: impl Fn(T) -> bool,
 ) -> Option<HashSet<T>> {
@@ -105,7 +124,7 @@ fn algorithms<T: Copy + Eq + Hash>(
         return None;
     }
     Some(
-        a.iter()
+        a.into_iter()
             .chain(b)
             .flat_map(|set| set.iter())
             .copied()
@@ -119,8 +138,8 @@ fn set<T: Clone + Eq + Hash>(a: &HashSet<T>, b: &HashSet<T>) -> HashSet<T> {
 }
 
 fn optional_set<T: Clone + Eq + Hash>(
-    a: &Option<HashSet<T>>,
-    b: &Option<HashSet<T>>,
+    a: Option<&HashSet<T>>,
+    b: Option<&HashSet<T>>,
 ) -> Option<HashSet<T>> {
     match (a, b) {
         (Some(a), Some(b)) => Some(set(a, b)),
@@ -151,11 +170,11 @@ fn signature_constraints(
 }
 
 fn validity(
-    a: &Option<PolicyValidity>,
-    b: &Option<PolicyValidity>,
+    a: Option<&PolicyValidity>,
+    b: Option<&PolicyValidity>,
 ) -> Result<Option<PolicyValidity>, PolicyViolation> {
     match (a, b) {
-        (None, value) | (value, None) => Ok(value.clone()),
+        (None, value) | (value, None) => Ok(value.cloned()),
         (Some(a), Some(b)) => {
             if a.authorization_id != b.authorization_id
                 || a.authority != b.authority
@@ -187,7 +206,7 @@ fn family(a: RsaPssPermission, b: RsaPssPermission) -> RsaPssPermission {
 }
 
 fn effective_family<T>(
-    algorithms: &Option<HashSet<T>>,
+    algorithms: Option<&HashSet<T>>,
     explicit: RsaPssPermission,
     default: RsaPssPermission,
 ) -> RsaPssPermission {
@@ -234,7 +253,10 @@ fn transforms(
     b: &TransformPolicy,
 ) -> Result<TransformPolicy, PolicyViolation> {
     Ok(TransformPolicy {
-        allowed_algorithms: optional_set(&a.allowed_algorithms, &b.allowed_algorithms),
+        allowed_algorithms: optional_set(
+            a.allowed_algorithms.as_ref(),
+            b.allowed_algorithms.as_ref(),
+        ),
         xpath_here_semantics: equal(a.xpath_here_semantics, b.xpath_here_semantics)?,
         same_document_id_semantics: equal(
             a.same_document_id_semantics,
@@ -272,14 +294,14 @@ fn key_establishment(
             KemContentAuthentication::ExternalAuthenticated
         },
         agreement_algorithms: algorithms(
-            &a.agreement_algorithms,
-            &b.agreement_algorithms,
+            a.agreement_algorithms.as_ref(),
+            b.agreement_algorithms.as_ref(),
             |v| a.check_agreement(v).is_ok(),
             |v| b.check_agreement(v).is_ok(),
         ),
         derivation_algorithms: algorithms(
-            &a.derivation_algorithms,
-            &b.derivation_algorithms,
+            a.derivation_algorithms.as_ref(),
+            b.derivation_algorithms.as_ref(),
             |v| {
                 a.derivation_algorithms
                     .as_ref()
@@ -292,8 +314,8 @@ fn key_establishment(
             },
         ),
         digest_algorithms: algorithms(
-            &a.digest_algorithms,
-            &b.digest_algorithms,
+            a.digest_algorithms.as_ref(),
+            b.digest_algorithms.as_ref(),
             |v| a.check_derivation_digest(v).is_ok(),
             |v| b.check_derivation_digest(v).is_ok(),
         ),
@@ -362,18 +384,11 @@ fn resources(a: &ResourcePolicy, b: &ResourcePolicy) -> ResourcePolicy {
 }
 
 fn key_sources(a: KeySourcePolicy, b: KeySourcePolicy) -> KeySourcePolicy {
-    KeySourcePolicy {
-        preset_key: a.preset_key && b.preset_key,
-        key_name: a.key_name && b.key_name,
-        key_value: a.key_value && b.key_value,
-        der_encoded_key_value: a.der_encoded_key_value && b.der_encoded_key_value,
-        x509_data: a.x509_data && b.x509_data,
-        key_info_reference: a.key_info_reference && b.key_info_reference,
-    }
+    a.intersection(b)
 }
 fn certificate_algorithms(
-    a: &Option<CertificateSignatureAlgorithms>,
-    b: &Option<CertificateSignatureAlgorithms>,
+    a: Option<&CertificateSignatureAlgorithms>,
+    b: Option<&CertificateSignatureAlgorithms>,
 ) -> Option<CertificateSignatureAlgorithms> {
     match (a, b) {
         (Some(CertificateSignatureAlgorithms::Allowlist(values)), other)
@@ -383,8 +398,7 @@ fn certificate_algorithms(
                     .iter()
                     .copied()
                     .filter(|v| {
-                        KeyTrustPolicy::check_certificate_signature_algorithm(*v, other.as_ref())
-                            .is_ok()
+                        KeyTrustPolicy::check_certificate_signature_algorithm(*v, other).is_ok()
                     })
                     .collect(),
             ))
@@ -425,8 +439,8 @@ fn key_trust(a: &KeyTrustPolicy, b: &KeyTrustPolicy) -> Result<KeyTrustPolicy, P
             .collect(),
         parameterized_rsa_pss: family(a.parameterized_rsa_pss, b.parameterized_rsa_pss),
         certificate_signature_algorithms: certificate_algorithms(
-            &a.certificate_signature_algorithms,
-            &b.certificate_signature_algorithms,
+            a.certificate_signature_algorithms.as_ref(),
+            b.certificate_signature_algorithms.as_ref(),
         ),
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
         dsa_keys: dsa(a.dsa_keys, b.dsa_keys),
@@ -444,7 +458,7 @@ fn verification(
     b: &VerificationPolicy,
 ) -> Result<VerificationPolicy, PolicyViolation> {
     Ok(VerificationPolicy {
-        validity: validity(&a.validity, &b.validity)?,
+        validity: validity(a.validity.as_ref(), b.validity.as_ref())?,
         signature_constraints: signature_constraints(
             a.signature_constraints,
             b.signature_constraints,
@@ -452,25 +466,25 @@ fn verification(
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
         parameterized_rsa_pss: family(
             effective_family(
-                &a.signature_algorithms,
+                a.signature_algorithms.as_ref(),
                 a.parameterized_rsa_pss,
                 RsaPssPermission::AllSupported,
             ),
             effective_family(
-                &b.signature_algorithms,
+                b.signature_algorithms.as_ref(),
                 b.parameterized_rsa_pss,
                 RsaPssPermission::AllSupported,
             ),
         ),
         signature_algorithms: algorithms(
-            &a.signature_algorithms,
-            &b.signature_algorithms,
+            a.signature_algorithms.as_ref(),
+            b.signature_algorithms.as_ref(),
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
         digest_algorithms: algorithms(
-            &a.digest_algorithms,
-            &b.digest_algorithms,
+            a.digest_algorithms.as_ref(),
+            b.digest_algorithms.as_ref(),
             |v| a.check_digest_algorithm(v).is_ok(),
             |v| b.check_digest_algorithm(v).is_ok(),
         ),
@@ -490,7 +504,7 @@ fn verification(
 }
 fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, PolicyViolation> {
     Ok(SigningPolicy {
-        validity: validity(&a.validity, &b.validity)?,
+        validity: validity(a.validity.as_ref(), b.validity.as_ref())?,
         signature_constraints: signature_constraints(
             a.signature_constraints,
             b.signature_constraints,
@@ -498,25 +512,25 @@ fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, Policy
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
         parameterized_rsa_pss: family(
             effective_family(
-                &a.signature_algorithms,
+                a.signature_algorithms.as_ref(),
                 a.parameterized_rsa_pss,
                 RsaPssPermission::SecureSupported,
             ),
             effective_family(
-                &b.signature_algorithms,
+                b.signature_algorithms.as_ref(),
                 b.parameterized_rsa_pss,
                 RsaPssPermission::SecureSupported,
             ),
         ),
         signature_algorithms: algorithms(
-            &a.signature_algorithms,
-            &b.signature_algorithms,
+            a.signature_algorithms.as_ref(),
+            b.signature_algorithms.as_ref(),
             |v| a.check_signature_algorithm(v).is_ok(),
             |v| b.check_signature_algorithm(v).is_ok(),
         ),
         digest_algorithms: algorithms(
-            &a.digest_algorithms,
-            &b.digest_algorithms,
+            a.digest_algorithms.as_ref(),
+            b.digest_algorithms.as_ref(),
             |v| a.check_digest_algorithm(v).is_ok(),
             |v| b.check_digest_algorithm(v).is_ok(),
         ),
@@ -541,30 +555,30 @@ fn encryption(
     b: &EncryptionPolicy,
 ) -> Result<EncryptionPolicy, PolicyViolation> {
     Ok(EncryptionPolicy {
-        validity: validity(&a.validity, &b.validity)?,
+        validity: validity(a.validity.as_ref(), b.validity.as_ref())?,
         data_algorithms: algorithms(
-            &a.data_algorithms,
-            &b.data_algorithms,
+            a.data_algorithms.as_ref(),
+            b.data_algorithms.as_ref(),
             |v| check_content_algorithm(a.data_algorithms.as_ref(), v, "encryption").is_ok(),
             |v| check_content_algorithm(b.data_algorithms.as_ref(), v, "encryption").is_ok(),
         ),
         key_transport_algorithms: algorithms(
-            &a.key_transport_algorithms,
-            &b.key_transport_algorithms,
-            |v| transport_allowed(&a.key_transport_algorithms, v),
-            |v| transport_allowed(&b.key_transport_algorithms, v),
+            a.key_transport_algorithms.as_ref(),
+            b.key_transport_algorithms.as_ref(),
+            |v| transport_allowed(a.key_transport_algorithms.as_ref(), v),
+            |v| transport_allowed(b.key_transport_algorithms.as_ref(), v),
         ),
         key_wrap_algorithms: algorithms(
-            &a.key_wrap_algorithms,
-            &b.key_wrap_algorithms,
-            |v| wrap_allowed(&a.key_wrap_algorithms, v),
-            |v| wrap_allowed(&b.key_wrap_algorithms, v),
+            a.key_wrap_algorithms.as_ref(),
+            b.key_wrap_algorithms.as_ref(),
+            |v| wrap_allowed(a.key_wrap_algorithms.as_ref(), v),
+            |v| wrap_allowed(b.key_wrap_algorithms.as_ref(), v),
         ),
         oaep_digests: algorithms(
-            &a.oaep_digests,
-            &b.oaep_digests,
-            |v| oaep_allowed(&a.oaep_digests, v),
-            |v| oaep_allowed(&b.oaep_digests, v),
+            a.oaep_digests.as_ref(),
+            b.oaep_digests.as_ref(),
+            |v| oaep_allowed(a.oaep_digests.as_ref(), v),
+            |v| oaep_allowed(b.oaep_digests.as_ref(), v),
         ),
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
@@ -579,30 +593,30 @@ fn decryption(
     b: &DecryptionPolicy,
 ) -> Result<DecryptionPolicy, PolicyViolation> {
     Ok(DecryptionPolicy {
-        validity: validity(&a.validity, &b.validity)?,
+        validity: validity(a.validity.as_ref(), b.validity.as_ref())?,
         data_algorithms: algorithms(
-            &a.data_algorithms,
-            &b.data_algorithms,
+            a.data_algorithms.as_ref(),
+            b.data_algorithms.as_ref(),
             |v| check_content_algorithm(a.data_algorithms.as_ref(), v, "decryption").is_ok(),
             |v| check_content_algorithm(b.data_algorithms.as_ref(), v, "decryption").is_ok(),
         ),
         key_transport_algorithms: algorithms(
-            &a.key_transport_algorithms,
-            &b.key_transport_algorithms,
-            |v| transport_allowed(&a.key_transport_algorithms, v),
-            |v| transport_allowed(&b.key_transport_algorithms, v),
+            a.key_transport_algorithms.as_ref(),
+            b.key_transport_algorithms.as_ref(),
+            |v| transport_allowed(a.key_transport_algorithms.as_ref(), v),
+            |v| transport_allowed(b.key_transport_algorithms.as_ref(), v),
         ),
         key_wrap_algorithms: algorithms(
-            &a.key_wrap_algorithms,
-            &b.key_wrap_algorithms,
-            |v| wrap_allowed(&a.key_wrap_algorithms, v),
-            |v| wrap_allowed(&b.key_wrap_algorithms, v),
+            a.key_wrap_algorithms.as_ref(),
+            b.key_wrap_algorithms.as_ref(),
+            |v| wrap_allowed(a.key_wrap_algorithms.as_ref(), v),
+            |v| wrap_allowed(b.key_wrap_algorithms.as_ref(), v),
         ),
         oaep_digests: algorithms(
-            &a.oaep_digests,
-            &b.oaep_digests,
-            |v| oaep_allowed(&a.oaep_digests, v),
-            |v| oaep_allowed(&b.oaep_digests, v),
+            a.oaep_digests.as_ref(),
+            b.oaep_digests.as_ref(),
+            |v| oaep_allowed(a.oaep_digests.as_ref(), v),
+            |v| oaep_allowed(b.oaep_digests.as_ref(), v),
         ),
         rsa_keys: rsa(a.rsa_keys, b.rsa_keys),
         key_establishment: key_establishment(&a.key_establishment, &b.key_establishment),
@@ -615,32 +629,30 @@ fn decryption(
 
 #[cfg(feature = "xmlenc")]
 fn transport_allowed(
-    set: &Option<HashSet<KeyTransportAlgorithm>>,
+    set: Option<&HashSet<KeyTransportAlgorithm>>,
     value: KeyTransportAlgorithm,
 ) -> bool {
-    set.as_ref()
-        .map_or(!value.requires_explicit_permission(), |s| {
-            s.contains(&value)
-        })
+    set.map_or(!value.requires_explicit_permission(), |s| {
+        s.contains(&value)
+    })
 }
 #[cfg(feature = "xmlenc")]
-fn wrap_allowed(set: &Option<HashSet<KeyWrapAlgorithm>>, value: KeyWrapAlgorithm) -> bool {
-    set.as_ref()
-        .map_or(!value.requires_explicit_permission(), |s| {
-            s.contains(&value)
-        })
+fn wrap_allowed(set: Option<&HashSet<KeyWrapAlgorithm>>, value: KeyWrapAlgorithm) -> bool {
+    set.map_or(!value.requires_explicit_permission(), |s| {
+        s.contains(&value)
+    })
 }
 #[cfg(feature = "xmlenc")]
-fn oaep_allowed(set: &Option<HashSet<OaepDigestAlgorithm>>, value: OaepDigestAlgorithm) -> bool {
-    set.as_ref()
-        .map_or(!value.requires_explicit_permission(), |s| {
-            s.contains(&value)
-        })
+fn oaep_allowed(set: Option<&HashSet<OaepDigestAlgorithm>>, value: OaepDigestAlgorithm) -> bool {
+    set.map_or(!value.requires_explicit_permission(), |s| {
+        s.contains(&value)
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 
     #[test]
     fn unrestricted_pss_intersection_keeps_nondefault_secure_tuples() {

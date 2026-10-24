@@ -1,4 +1,4 @@
-//! XMLDSig XSLT transform through the public signing and verification API.
+//! `XMLDSig` XSLT transform through the public signing and verification API.
 
 use std::fs;
 
@@ -22,7 +22,7 @@ use xml_sec::xmldsig::{
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
 /// A stylesheet whose literal result elements have no namespace: it undeclares the
-/// XMLDSig default namespace that the signature puts in scope at its `<Transform>`.
+/// `XMLDSig` default namespace that the signature puts in scope at its `<Transform>`.
 fn stylesheet(body: &str) -> XsltStylesheet {
     XsltStylesheet::new(format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="{XSL}" xmlns="">{body}</xsl:stylesheet>"#
@@ -76,7 +76,7 @@ fn sign_with_policy(
         .sign_with_builder(document, builder)
 }
 
-/// Verify `signed` and return the pre-digest bytes of every SignedInfo reference.
+/// Verify `signed` and return the pre-digest bytes of every `SignedInfo` reference.
 fn verified_pre_digest(signed: &str) -> Vec<Vec<u8>> {
     let resolver = DefaultKeyResolver::default();
     let result = cryptographic::context()
@@ -620,19 +620,19 @@ fn stylesheets_keep_the_namespaces_in_scope_at_their_transform() {
         xsl = XSL,
         xslt = XSLT_TRANSFORM_URI
     );
-    let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
-    let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let signing_key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let verification_key = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
     let sign = |semantics| {
         let mut policy = SigningPolicy::default();
         policy.transforms.xslt_stylesheet_semantics = semantics;
-        SignContext::new(&signer)
+        SignContext::new(&signing_key)
             .policy(policy)
             .sign_template(&template)
     };
 
     let signed = sign(XsltStylesheetSemantics::Specification).expect("the stylesheet compiles");
     let result = xml_sec::xmldsig::VerifyContext::new()
-        .key(&verifier)
+        .key(&verification_key)
         .store_pre_digest(true)
         .verify(&signed)
         .expect("verification runs");
@@ -678,11 +678,11 @@ fn entity_stylesheet_after_literal_misc_uses_expanded_children() {
             misc = misc,
             xslt = XSLT_TRANSFORM_URI
         );
-        let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
-        let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+        let signing_key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+        let verification_key = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
         let mut policy = SigningPolicy::default();
         policy.xml.allow_internal_dtd = true;
-        let signed = SignContext::new(&signer)
+        let signed = SignContext::new(&signing_key)
             .xml_backend(backend)
             .policy(policy)
             .sign_template(&template)
@@ -691,7 +691,7 @@ fn entity_stylesheet_after_literal_misc_uses_expanded_children() {
         policy.xml.allow_internal_dtd = true;
         let verified = xml_sec::xmldsig::VerifyContext::new()
             .xml_backend(backend)
-            .key(&verifier)
+            .key(&verification_key)
             .policy(policy)
             .store_pre_digest(true)
             .verify(&signed)
@@ -730,11 +730,11 @@ fn stylesheets_use_the_entities_of_their_document() {
         xsl = XSL,
         xslt = XSLT_TRANSFORM_URI
     );
-    let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
-    let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let signing_key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let verification_key = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
     let mut signing = SigningPolicy::default();
     signing.xml.allow_internal_dtd = true;
-    let signed = SignContext::new(&signer)
+    let signed = SignContext::new(&signing_key)
         .policy(signing)
         .sign_template(&template)
         .expect("the stylesheet compiles with the replaced entity");
@@ -742,7 +742,7 @@ fn stylesheets_use_the_entities_of_their_document() {
     verification.xml.allow_internal_dtd = true;
     let result = xml_sec::xmldsig::VerifyContext::new()
         .policy(verification)
-        .key(&verifier)
+        .key(&verification_key)
         .store_pre_digest(true)
         .verify(&signed)
         .expect("verification runs");
@@ -780,11 +780,11 @@ fn stylesheets_keep_namespace_declarations_defaulted_by_the_dtd() {
         xsl = XSL,
         xslt = XSLT_TRANSFORM_URI
     );
-    let signer = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
-    let verifier = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
+    let signing_key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
+    let verification_key = xml_sec::xmldsig::HmacVerificationKey::new(vec![7; 32]).unwrap();
     let mut signing = SigningPolicy::default();
     signing.xml.allow_internal_dtd = true;
-    let signed = SignContext::new(&signer)
+    let signed = SignContext::new(&signing_key)
         .policy(signing)
         .xml_backend(xml_sec::XmlBackend::Xmloxide)
         .sign_template(&template)
@@ -794,7 +794,7 @@ fn stylesheets_keep_namespace_declarations_defaulted_by_the_dtd() {
     let result = xml_sec::xmldsig::VerifyContext::new()
         .policy(verification)
         .xml_backend(xml_sec::XmlBackend::Xmloxide)
-        .key(&verifier)
+        .key(&verification_key)
         .store_pre_digest(true)
         .verify(&signed)
         .expect("verification runs");

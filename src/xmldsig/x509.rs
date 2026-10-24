@@ -30,7 +30,7 @@ pub struct X509ChainOptions<'a> {
     pub max_chain_depth: usize,
     /// Whether parsed `<X509CRL>` entries are enforced.
     pub check_crls: bool,
-    /// Purposes accepted when any path certificate carries ExtendedKeyUsage.
+    /// Purposes accepted when any path certificate carries `ExtendedKeyUsage`.
     pub allowed_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
     /// RSA strength requirements for every issuer key used by the path.
     pub rsa_keys: RsaKeyPolicy,
@@ -110,7 +110,7 @@ pub enum X509ChainError {
     NameConstraintViolation {
         /// Position of the subordinate certificate.
         position: usize,
-        /// Position of the CA carrying NameConstraints.
+        /// Position of the CA carrying `NameConstraints`.
         constraining_position: usize,
     },
     /// A critical certificate extension is not implemented by path validation.
@@ -121,7 +121,7 @@ pub enum X509ChainError {
         /// Extension object identifier.
         oid: String,
     },
-    /// NameConstraints is not a critical CA extension as required by RFC 5280.
+    /// `NameConstraints` is not a critical CA extension as required by RFC 5280.
     #[error("certificate at chain position {position} has invalid NameConstraints placement")]
     InvalidNameConstraints {
         /// Position of the certificate carrying the invalid extension.
@@ -149,7 +149,7 @@ pub enum X509ChainError {
     /// The certificate or CRL declares an algorithm this build cannot verify.
     #[error("unsupported X.509 signature algorithm: {oid}")]
     UnsupportedSignatureAlgorithm {
-        /// AlgorithmIdentifier object identifier.
+        /// `AlgorithmIdentifier` object identifier.
         oid: String,
     },
     /// A CRL is not valid for the selected verification time or issuer.
@@ -182,8 +182,9 @@ impl X509ChainError {
                 crate::policy::PolicyViolation::ResourceLimit { .. }
                 | crate::policy::PolicyViolation::ResourceLimitExceeded { .. },
             ) => true,
-            Self::Provider(crate::provider::ProviderError::Unsupported { .. }) => false,
-            Self::Provider(_) => true,
+            Self::Provider(error) => {
+                !matches!(error, crate::provider::ProviderError::Unsupported { .. })
+            }
             Self::PathIncomplete(reason) => !matches!(
                 reason,
                 structured_pkix::path::Truncation::Depth
@@ -197,6 +198,11 @@ impl X509ChainError {
 
 /// Verify a path with the default standalone resource allowance.
 /// Use [`verify_x509_certificate_chain_with_resources`] with the operation's resource snapshot.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] when no supplied path reaches a trusted anchor
+/// or any path certificate, revocation fact or resource limit fails validation.
 pub fn verify_x509_certificate_chain(
     info: &X509DataInfo,
     options: &X509ChainOptions<'_>,
@@ -212,6 +218,11 @@ pub fn verify_x509_certificate_chain(
 /// Validate supplied evidence under explicit borrowed resource limits.
 /// XML operations pass their immutable policy's `resources` snapshot; other
 /// path constraints, trust anchors, time and UTC history come from `options`.
+///
+/// # Errors
+///
+/// Returns [`X509ChainError`] for invalid `resources`, evidence beyond the
+/// external-resource byte limits, or any path validation failure.
 pub fn verify_x509_certificate_chain_with_resources(
     info: &X509DataInfo,
     options: &X509ChainOptions<'_>,
@@ -305,22 +316,13 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
             .copied()
             .ok_or(X509ChainError::UntrustedRoot)?,
     )?;
-    let trusted_anchors =
-        session
-            .read_pool(options.trusted_certs)
-            .map_err(|error| match error {
-                X509ChainError::Processing(error) if !error.is_resource() => {
-                    X509ChainError::InvalidDer {
-                        kind: "certificate",
-                        message: error.to_string(),
-                    }
-                }
-                error => error,
-            })?;
-    let embedded_anchor = trusted_anchors
+    let trusted_anchors = session
+        .read_pool(options.trusted_certs)
+        .map_err(malformed_anchor)?;
+    if trusted_anchors
         .iter()
-        .any(|cert| cert.as_bytes() == last.as_bytes());
-    if embedded_anchor {
+        .any(|cert| cert.as_bytes() == last.as_bytes())
+    {
         return validate_path(
             &path_der,
             info,
@@ -330,35 +332,12 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
         );
     }
 
-    // Root replacement requires a proved self-signature and child signature;
-    // a merely prospective edge cannot authorize discarding a certificate.
-    let replace_untrusted_root = if path_der.len() > 1
-        && session.source_names_equal(last.tbs().subject(), last.tbs().issuer())?
-        && shared_certificate_signature_outcome(
-            &last,
-            &last,
-            provider,
-            options.certificate_signature_algorithms,
-            session,
-        )? == structured_pkix::path::Verified::Yes
-    {
-        let child = session.read(path_der[path_der.len() - 2])?;
-        session.source_names_equal(child.tbs().issuer(), last.tbs().subject())?
-            && shared_certificate_signature_outcome(
-                &child,
-                &last,
-                provider,
-                options.certificate_signature_algorithms,
-                session,
-            )? == structured_pkix::path::Verified::Yes
-    } else {
-        false
-    };
-    let candidate_base = if replace_untrusted_root {
-        &path_der[..path_der.len() - 1]
-    } else {
-        &path_der[..]
-    };
+    let candidate_base =
+        if replaceable_untrusted_root(&path_der, &last, options, provider, session)? {
+            &path_der[..path_der.len() - 1]
+        } else {
+            &path_der[..]
+        };
     let candidate_child = session.read(
         candidate_base
             .last()
@@ -405,6 +384,54 @@ pub(crate) fn verify_x509_certificate_chain_in_session(
     Err(first_validation_error.unwrap_or(X509ChainError::UntrustedRoot))
 }
 
+/// A malformed caller anchor is invalid DER; resource exhaustion stays itself.
+fn malformed_anchor(error: X509ChainError) -> X509ChainError {
+    match error {
+        X509ChainError::Processing(error) if !error.is_resource() => X509ChainError::InvalidDer {
+            kind: "certificate",
+            message: error.to_string(),
+        },
+        error => error,
+    }
+}
+
+/// Whether the supplied path ends in a self-signed root that a trusted anchor
+/// may replace.
+///
+/// Root replacement requires a proved self-signature and child signature;
+/// a merely prospective edge cannot authorize discarding a certificate.
+fn replaceable_untrusted_root(
+    path_der: &[&[u8]],
+    last: &structured_pkix::Certificate<'_>,
+    options: &X509ChainOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    session: &super::pkix::CertificateSession,
+) -> Result<bool, X509ChainError> {
+    if path_der.len() < 2
+        || !session.source_names_equal(last.tbs().subject(), last.tbs().issuer())?
+        || shared_certificate_signature_outcome(
+            last,
+            last,
+            provider,
+            options.certificate_signature_algorithms,
+            session,
+        )? != structured_pkix::path::Verified::Yes
+    {
+        return Ok(false);
+    }
+    let child = session.read(path_der[path_der.len() - 2])?;
+    Ok(
+        session.source_names_equal(child.tbs().issuer(), last.tbs().subject())?
+            && shared_certificate_signature_outcome(
+                &child,
+                last,
+                provider,
+                options.certificate_signature_algorithms,
+                session,
+            )? == structured_pkix::path::Verified::Yes,
+    )
+}
+
 fn validate_path(
     path_der: &[&[u8]],
     info: &impl X509DataSource,
@@ -441,6 +468,61 @@ fn validate_path(
         })?;
     }
 
+    let anchor_limit = validate_path_profile(&decoded, options, session)?;
+    let mut effective_key = super::pkix::ValidatedX509Key {
+        effective_spki: None,
+    };
+    if path_der.len() > 1 {
+        let anchor = decoded.last().expect("nonempty path");
+        let mut chain = session.memory().vector();
+        for certificate in &decoded[..decoded.len() - 1] {
+            chain.try_push(certificate).map_err(|reason| {
+                X509ChainError::Processing(structured_pkix::Error::resource(
+                    reason,
+                    "certificate.path",
+                    0,
+                ))
+            })?;
+        }
+        let facts =
+            super::pkix::validate_supplied_path(&chain, anchor, options, provider, session)?;
+        // The anchor is a caller input, excluded by RFC 5280 6.1. Our existing
+        // certificate-anchor profile additionally honors its pathLenConstraint.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
+        if let Some(limit) = anchor_limit
+            && facts.non_self_issued_intermediates > limit
+        {
+            return Err(X509ChainError::PathLengthExceeded {
+                position: decoded.len() - 1,
+                limit,
+            });
+        }
+        // RFC 5280 6.1.4(e): keep the target's authenticated working key for
+        // subsequent data verification; never rewrite the certificate's TBS.
+        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
+        effective_key = super::pkix::effective_target_spki(facts.key, session.memory())?;
+    }
+
+    if options.check_crls {
+        super::pkix::verify_crls(
+            &decoded,
+            info.crls(),
+            additional_crls,
+            options,
+            provider,
+            session,
+        )?;
+    }
+    Ok(effective_key)
+}
+
+/// Apply this profile's per-certificate rules along a target-first path;
+/// returns the anchor's pathLenConstraint.
+fn validate_path_profile(
+    decoded: &[structured_pkix::Certificate<'_>],
+    options: &X509ChainOptions<'_>,
+    session: &super::pkix::CertificateSession,
+) -> Result<Option<u32>, X509ChainError> {
     let mut effective_extended_key_usages = session.memory().vector();
     if let Some(purposes) = options.allowed_extended_key_usages {
         for purpose in purposes {
@@ -490,7 +572,9 @@ fn validate_path(
                 .map_err(|error| session.error(error))?
                 .filter(|basic| basic.is_authority())
                 .ok_or(X509ChainError::IssuerNotCa(position))?;
-            anchor_limit = basic.path_length().and_then(|limit| limit.certificates());
+            anchor_limit = basic
+                .path_length()
+                .and_then(structured_pkix::constraints::CertificateCount::certificates);
             if let Some(usage) = shared_key_usage(cert, position, session)?
                 && !usage.key_cert_sign()
             {
@@ -521,51 +605,7 @@ fn validate_path(
             return Err(X509ChainError::InvalidNameConstraints { position });
         }
     }
-    let mut effective_key = super::pkix::ValidatedX509Key {
-        effective_spki: None,
-    };
-    if path_der.len() > 1 {
-        let anchor = decoded.last().expect("nonempty path");
-        let mut chain = session.memory().vector();
-        for certificate in &decoded[..decoded.len() - 1] {
-            chain.try_push(certificate).map_err(|reason| {
-                X509ChainError::Processing(structured_pkix::Error::resource(
-                    reason,
-                    "certificate.path",
-                    0,
-                ))
-            })?;
-        }
-        let facts =
-            super::pkix::validate_supplied_path(&chain, anchor, options, provider, session)?;
-        // The anchor is a caller input, excluded by RFC 5280 6.1. Our existing
-        // certificate-anchor profile additionally honors its pathLenConstraint.
-        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
-        if let Some(limit) = anchor_limit
-            && facts.non_self_issued_intermediates > limit
-        {
-            return Err(X509ChainError::PathLengthExceeded {
-                position: decoded.len() - 1,
-                limit,
-            });
-        }
-        // RFC 5280 6.1.4(e): keep the target's authenticated working key for
-        // subsequent data verification; never rewrite the certificate's TBS.
-        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
-        effective_key = super::pkix::effective_target_spki(facts.key, session.memory())?;
-    }
-
-    if options.check_crls {
-        super::pkix::verify_crls(
-            &decoded,
-            info.crls(),
-            additional_crls,
-            options,
-            provider,
-            session,
-        )?;
-    }
-    Ok(effective_key)
+    Ok(anchor_limit)
 }
 
 fn shared_key_usage<'a>(
@@ -667,7 +707,7 @@ fn shared_usage_contains(
                 let mut arcs = kind.arcs();
                 let mut matches = true;
                 for &expected in expected {
-                    if arcs.next().and_then(|arc| arc.as_u64()) != Some(expected) {
+                    if arcs.next().and_then(structured_asn1::value::Arc::as_u64) != Some(expected) {
                         matches = false;
                         break;
                     }
@@ -862,46 +902,45 @@ pub(crate) fn validate_issuer_spki_policy(
     rsa_keys: RsaKeyPolicy,
     dsa_keys: DsaKeyPolicy,
 ) -> Result<(), X509ChainError> {
-    use der::Decode as _;
-    let key = pkcs8::SubjectPublicKeyInfoRef::from_der(encoded).map_err(|error| {
-        X509ChainError::InvalidDer {
-            kind: "issuer SubjectPublicKeyInfo",
-            message: error.to_string(),
-        }
-    })?;
+    use super::pkix::SpkiAlgorithm;
+    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    let malformed = |message: &str| X509ChainError::InvalidDer {
+        kind: "issuer SubjectPublicKeyInfo",
+        message: message.into(),
+    };
+    let family = session
+        .spki_algorithm(encoded)
+        .map_err(|_| malformed("malformed SubjectPublicKeyInfo"))?;
     // RFC 5280 4.1.2.7 makes key encoding algorithm-specific. An opaque
     // algorithm's BIT STRING must not acquire RSA's octet-alignment rule.
     // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
-    match key.algorithm.oid {
+    match family {
         // RFC 4055 1.2/3.1: rsaEncryption and id-RSASSA-PSS identify RSA
         // public-key material. PSS restrictions never bypass the RSA minimum.
         // https://www.rfc-editor.org/rfc/rfc4055.html#section-1.2
-        oid if oid == pkcs1::ALGORITHM_OID
-            || oid.as_bytes() == structured_pkix::oid::RSASSA_PSS.as_bytes() =>
-        {
-            let octets =
-                key.subject_public_key
-                    .as_bytes()
-                    .ok_or_else(|| X509ChainError::InvalidDer {
-                        kind: "issuer SubjectPublicKeyInfo",
-                        message: "RSA public key is not octet-aligned".into(),
-                    })?;
-            let key = pkcs1::RsaPublicKeyRef::from_der(octets).map_err(|error| {
-                X509ChainError::InvalidDer {
+        SpkiAlgorithm::RsaEncryption | SpkiAlgorithm::RsaPss => {
+            if !session
+                .with_public_key_info(encoded, |info, _| Ok(info.key_octets().is_some()))
+                .unwrap_or(false)
+            {
+                return Err(malformed("RSA public key is not octet-aligned"));
+            }
+            let key = session
+                .admitted_rsa_public_key(encoded, |_, _| Ok(true))
+                .ok_or_else(|| X509ChainError::InvalidDer {
                     kind: "RSA issuer SubjectPublicKeyInfo",
-                    message: error.to_string(),
-                }
-            })?;
+                    message: "malformed RSA public key".into(),
+                })?;
             rsa_keys
                 .validate_components(
                     "X.509 issuer verification",
-                    key.modulus.as_bytes(),
-                    key.public_exponent.as_bytes(),
+                    key.modulus().as_bytes(),
+                    key.exponent().as_bytes(),
                 )
                 .map(|_| ())
                 .map_err(|source| X509ChainError::KeyPolicy { position, source })
         }
-        dsa::OID => {
+        SpkiAlgorithm::Dsa => {
             match super::signature::validate_dsa_signature_spki_with_minimum(
                 encoded,
                 dsa_keys.minimum_modulus_bits,
@@ -1764,7 +1803,7 @@ mod tests {
     }
 
     fn verify_generated_constraints(
-        constraints: x509_cert::ext::pkix::NameConstraints,
+        constraints: &x509_cert::ext::pkix::NameConstraints,
         name: x509_cert::ext::pkix::name::GeneralName,
     ) -> Result<(), X509ChainError> {
         use der::Encode as _;
@@ -2413,7 +2452,7 @@ mod tests {
         ];
         let (rest, identifier) = AlgorithmIdentifier::from_der(&der)
             .expect("standard SHA-256 RSA-PSS AlgorithmIdentifier must parse");
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
 
         assert_eq!(
             x509_signature_algorithm(&identifier),
@@ -2438,7 +2477,7 @@ mod tests {
         ];
         let (rest, identifier) = AlgorithmIdentifier::from_der(&der)
             .expect("standard SHA-224 RSA-PSS AlgorithmIdentifier must parse");
-        assert!(rest.is_empty());
+        assert_eq!(rest, b"");
 
         assert_eq!(
             x509_signature_algorithm(&identifier),
@@ -2476,7 +2515,7 @@ mod tests {
         };
         let options = X509ChainOptions {
             trusted_certs: &anchors,
-            verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+            verification_time: UNIX_EPOCH + Duration::from_hours(306_828),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,
@@ -2509,7 +2548,7 @@ mod tests {
         };
         let options = X509ChainOptions {
             trusted_certs: &anchors,
-            verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+            verification_time: UNIX_EPOCH + Duration::from_hours(306_828),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,
@@ -2730,7 +2769,7 @@ mod tests {
             ),
         ] {
             let result = verify_generated_constraints(
-                Constraints {
+                &Constraints {
                     permitted_subtrees: Some(vec![GeneralSubtree {
                         base,
                         minimum: 0,
@@ -2753,7 +2792,7 @@ mod tests {
             }
         }
         let result = verify_generated_constraints(
-            Constraints {
+            &Constraints {
                 permitted_subtrees: Some(vec![GeneralSubtree {
                     base: uri(".example.com"),
                     minimum: 0,
@@ -2772,7 +2811,7 @@ mod tests {
             "a second userinfo delimiter must not expose a constraint-matchable host"
         );
         let result = verify_generated_constraints(
-            Constraints {
+            &Constraints {
                 permitted_subtrees: Some(vec![GeneralSubtree {
                     base: ip(&[192, 0, 2, 0, 255, 0, 255, 0]),
                     minimum: 0,
@@ -2815,7 +2854,7 @@ mod tests {
                 };
                 assert_eq!(
                     verify_generated_constraints(
-                        constraints,
+                        &constraints,
                         Name::IpAddress(OctetString::new([192, 0, 2, 42]).expect("IP SAN fixture")),
                     ),
                     Err(X509ChainError::InvalidNameConstraints { position: 1 })
@@ -2858,7 +2897,7 @@ mod tests {
                 }]),
             };
             assert_eq!(
-                verify_generated_constraints(constraints, dns("www.example.com")),
+                verify_generated_constraints(&constraints, dns("www.example.com")),
                 Err(X509ChainError::InvalidNameConstraints { position: 1 })
             );
         }
@@ -2878,7 +2917,7 @@ mod tests {
                 }]),
                 excluded_subtrees: None,
             };
-            verify_generated_constraints(constraints, dns("www.example.com"))
+            verify_generated_constraints(&constraints, dns("www.example.com"))
                 .expect("valid string constraints must remain supported");
         }
     }
@@ -2906,7 +2945,7 @@ mod tests {
         ] {
             assert_eq!(
                 verify_generated_constraints(
-                    constraints,
+                    &constraints,
                     x509_cert::ext::pkix::name::GeneralName::DnsName(
                         Ia5String::new("www.example.com").expect("DNS SAN fixture")
                     ),
@@ -3022,7 +3061,7 @@ mod tests {
                 .distinguished_name
                 .push(rcgen::DnType::CommonName, "name-constrained leaf");
             leaf_params.distinguished_name.push(
-                rcgen::DnType::CustomDnType(vec![1, 2, 840, 113549, 1, 9, 1]),
+                rcgen::DnType::CustomDnType(vec![1, 2, 840, 113_549, 1, 9, 1]),
                 rcgen::DnValue::Ia5String(
                     email
                         .try_into()
@@ -3593,7 +3632,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                verify_generated_constraints(constraints, uri()),
+                verify_generated_constraints(&constraints, uri()),
                 Err(X509ChainError::NameConstraintViolation {
                     position: 0,
                     constraining_position: 1,

@@ -48,6 +48,12 @@ pub(super) fn charge_bytes<W: Work>(work: &W, bytes: usize) -> Result<(), Scalar
 /// execution, not a new account; lookup and lexical scans are admitted before
 /// execution. This mechanism does not prove the owner is authenticated and does
 /// not supply profile-specific defaults or permission.
+///
+/// # Errors
+///
+/// Returns [`ScalarError::NotElement`] for a non-element owner,
+/// [`ScalarError::Document`] for a foreign or stale identity and
+/// [`ScalarError::Resource`] when current work is exhausted.
 pub fn boolean_attribute<W: Work>(
     view: DocumentView<'_>,
     owner: NodeIdentity,

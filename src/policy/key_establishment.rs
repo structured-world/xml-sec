@@ -21,6 +21,7 @@ pub enum KeyAgreementAlgorithm {
 
 impl KeyAgreementAlgorithm {
     /// Stable wire identifier; this does not grant algorithm permission.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             Self::EcdhEs => "http://www.w3.org/2009/xmlenc11#ECDH-ES",
@@ -32,6 +33,7 @@ impl KeyAgreementAlgorithm {
     }
 
     /// Recognize the exact URI, without normalizing or aliasing algorithms.
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         [
             Self::EcdhEs,
@@ -48,18 +50,19 @@ impl KeyAgreementAlgorithm {
 /// KDF mechanisms accepted by the shared policy domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyDerivationAlgorithm {
-    /// XMLEnc 1.1 ConcatKDF with bit-string context.
+    /// `XMLEnc` 1.1 `ConcatKDF` with bit-string context.
     ConcatKdf,
     /// RFC 5869 HKDF.
     Hkdf,
     /// RFC 8018 PBKDF2.
     Pbkdf2,
-    /// XMLEnc's legacy DH derivation.
+    /// `XMLEnc`'s legacy DH derivation.
     LegacyDh,
 }
 
 impl KeyDerivationAlgorithm {
     /// Stable wire identifier.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             Self::ConcatKdf => "http://www.w3.org/2009/xmlenc11#ConcatKDF",
@@ -70,6 +73,7 @@ impl KeyDerivationAlgorithm {
     }
 
     /// Recognize the exact URI.
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         [Self::ConcatKdf, Self::Hkdf, Self::Pbkdf2, Self::LegacyDh]
             .into_iter()
@@ -105,7 +109,7 @@ pub struct KeyEstablishmentPolicy {
     pub max_encapsulation_operations: usize,
     /// Exact agreement permissions. None permits only ECDH-ES and X25519.
     pub agreement_algorithms: Option<HashSet<KeyAgreementAlgorithm>>,
-    /// Exact KDF permissions. None permits ConcatKDF/HKDF/PBKDF2, not legacy DH.
+    /// Exact KDF permissions. None permits `ConcatKDF`/HKDF/PBKDF2, not legacy DH.
     pub derivation_algorithms: Option<HashSet<KeyDerivationAlgorithm>>,
     /// Underlying digest permission, including HMAC PRFs. None permits SHA-2.
     /// SHA-1 requires an explicit grant even when required by a legacy profile.
@@ -118,7 +122,7 @@ pub struct KeyEstablishmentPolicy {
     pub max_owned_bytes: usize,
     /// Maximum finite-field modulus width; capability alone grants no permission.
     pub max_dh_modulus_bits: usize,
-    /// Product strength baseline, not XMLEnc's 512-bit wire-format minimum.
+    /// Product strength baseline, not `XMLEnc`'s 512-bit wire-format minimum.
     /// Legacy interoperability requires an explicit caller-selected lower value.
     pub minimum_dh_modulus_bits: usize,
     /// Minimum prime-order subgroup width, independent of the modulus width.
@@ -170,6 +174,10 @@ impl KeyEstablishmentPolicy {
     }
 
     /// Reject configuration exceeding implementation ceilings before any work.
+    ///
+    /// # Errors
+    /// Returns an invalid-resource-limit violation for a ceiling overflow,
+    /// an invalid DH minimum, or a subgroup minimum not below the modulus maximum.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         super::ResourcePolicy::within(
             "key encapsulation operations",
@@ -253,6 +261,9 @@ impl KeyEstablishmentPolicy {
     }
 
     /// Check permission independently of the selected provider's capability.
+    ///
+    /// # Errors
+    /// Returns an algorithm violation if this policy does not permit the mechanism.
     pub fn check_agreement(&self, algorithm: KeyAgreementAlgorithm) -> Result<(), PolicyViolation> {
         let allowed = match &self.agreement_algorithms {
             Some(allowed) => allowed.contains(&algorithm),
@@ -265,6 +276,9 @@ impl KeyEstablishmentPolicy {
     }
 
     /// Capability does not grant experimental key-establishment permission.
+    ///
+    /// # Errors
+    /// Returns an algorithm violation if the exact parameter set is not permitted.
     pub fn check_encapsulation(
         &self,
         algorithm: crate::provider::KeyEncapsulationAlgorithm,
@@ -278,6 +292,9 @@ impl KeyEstablishmentPolicy {
 
     /// Check KDF and its underlying digest independently. An HMAC URI does not
     /// make a digest permission apply to signatures or certificate validation.
+    ///
+    /// # Errors
+    /// Returns an algorithm violation for a denied derivation mechanism or digest.
     pub fn check_derivation(
         &self,
         algorithm: KeyDerivationAlgorithm,
@@ -292,6 +309,9 @@ impl KeyEstablishmentPolicy {
     }
 
     /// Digest permission is independent of the selected derivation mechanism.
+    ///
+    /// # Errors
+    /// Returns an algorithm violation if this policy does not permit the digest.
     pub fn check_derivation_digest(&self, digest: DigestAlgorithm) -> Result<(), PolicyViolation> {
         let allowed = match &self.digest_algorithms {
             Some(allowed) => allowed.contains(&digest),

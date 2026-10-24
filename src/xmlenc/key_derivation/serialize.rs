@@ -89,7 +89,8 @@ pub(super) fn serialize(
             continue;
         };
         let mut encoded = String::with_capacity((bits.div_ceil(8) + 1) * 2);
-        push_hex(&mut encoded, ((8 - bits % 8) % 8) as u8);
+        let padding = u8::try_from((8 - bits % 8) % 8).expect("padding bit count is below eight");
+        push_hex(&mut encoded, padding);
         // XMLEnc 1.1 §5.4.1 encodes each field's padding count separately.
         // Repack from significant bits: the normalized arena is not octet aligned.
         // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ConcatKDF
@@ -104,22 +105,22 @@ pub(super) fn serialize(
         fields.concat[index] = Some(encoded);
     }
     let mut counter = Writer::new(CountingSink { length: 0 });
-    write(method, &fields, &mut counter).map_err(serialize_error)?;
+    write(method, &fields, &mut counter).map_err(|error| serialize_error(&error))?;
     let length = counter.into_inner().length;
     resources.validate_xml_document_len(length)?;
     let mut writer = Writer::new(Vec::with_capacity(length));
-    write(method, &fields, &mut writer).map_err(serialize_error)?;
+    write(method, &fields, &mut writer).map_err(|error| serialize_error(&error))?;
     String::from_utf8(writer.into_inner())
         .map_err(|error| XmlEncError::XmlSerialize(error.to_string()))
 }
 
 fn push_hex(output: &mut String, byte: u8) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    output.push(HEX[(byte >> 4) as usize] as char);
-    output.push(HEX[(byte & 15) as usize] as char);
+    output.push(char::from(HEX[usize::from(byte >> 4)]));
+    output.push(char::from(HEX[usize::from(byte & 15)]));
 }
 
-fn serialize_error(error: io::Error) -> XmlEncError {
+fn serialize_error(error: &io::Error) -> XmlEncError {
     XmlEncError::XmlSerialize(error.to_string())
 }
 

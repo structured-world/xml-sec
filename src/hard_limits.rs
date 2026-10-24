@@ -28,7 +28,7 @@ pub(crate) const XML_BASE_COMPONENT_CEILING: usize = 64;
 /// Maximum cumulative bytes inspected or allocated while resolving XML Base.
 pub(crate) const XML_BASE_RESOLUTION_BYTE_CEILING: usize = 1024 * 1024;
 
-/// Maximum canonicalized SignedInfo plus retained diagnostics for one signature.
+/// Maximum canonicalized `SignedInfo` plus retained diagnostics for one signature.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING: usize = 32 * 1024 * 1024;
 
@@ -116,7 +116,7 @@ pub(crate) const X509_CHAIN_DEPTH_CEILING: usize = 9;
 #[cfg(feature = "xmldsig")]
 pub(crate) const X509_CANDIDATE_PATH_CEILING: usize = 64;
 
-/// Absolute transform and XPath work ceilings. Operation policy may only tighten these.
+/// Absolute transform and `XPath` work ceilings. Operation policy may only tighten these.
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const BASE64_TRANSFORM_INPUT_BYTE_CEILING: usize = 16 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

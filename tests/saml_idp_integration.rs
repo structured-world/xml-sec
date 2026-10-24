@@ -1,7 +1,7 @@
 //! Integration tests for real-world SAML response verification.
 //! Covers PR #44.
 //!
-//! Uses a donor SAML 2.0 IdP response fixture to ensure XMLDSig verification
+//! Uses a donor SAML 2.0 `IdP` response fixture to ensure `XMLDSig` verification
 //! works against non-synthetic assertion payloads.
 
 #![cfg(feature = "xmldsig")]

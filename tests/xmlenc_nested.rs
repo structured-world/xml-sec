@@ -1,6 +1,7 @@
 #![cfg(feature = "xmlenc")]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use xml_sec::policy::DecryptionPolicy;
 use xml_sec::provider::{CryptoProvider, RUST_CRYPTO_PROVIDER};
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptContext, DecryptedContent, EncryptedDataBuilder, KekDecryptor,
@@ -26,7 +27,7 @@ fn retrieval_method_rejects_non_whitespace_text_before_resolution() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     assert!(matches!(
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()),
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default()),
         Err(XmlEncError::InvalidStructure(_))
     ));
 }
@@ -150,7 +151,8 @@ fn retrieval_method_keeps_detached_wrapped_key() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     let parsed =
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .unwrap();
     assert_eq!(parsed.encrypted_keys.len(), 1);
     assert_eq!(parsed.encrypted_keys[0].id.as_deref(), Some("transport"));
 }
@@ -171,8 +173,9 @@ fn retrieval_method_resolves_derived_keys_and_checks_declared_type() {
         .descendants()
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
-    let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
-        .expect("retrieved DerivedKey");
+    let parsed =
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .expect("retrieved DerivedKey");
     assert_eq!(parsed.derived_keys.len(), 1);
     assert_eq!(
         parsed.derived_keys[0].master_key_name.as_deref(),
@@ -188,7 +191,7 @@ fn retrieval_method_resolves_derived_keys_and_checks_declared_type() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     assert!(matches!(
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()),
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default()),
         Err(XmlEncError::InvalidStructure(_))
     ));
 }
@@ -213,14 +216,17 @@ fn derived_retrieval_accepts_both_specification_identifiers() {
             .descendants()
             .find(|node| node.has_tag_name((X, "EncryptedData")))
             .unwrap();
-        let parsed =
-            xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
-                .expect("specified DerivedKey identifier");
+        let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(
+            node,
+            &DecryptionPolicy::default(),
+        )
+        .expect("specified DerivedKey identifier");
         assert_eq!(parsed.derived_keys.len(), 1);
         // Transformed/external retrieval must enforce the same type contract.
         let method_xml = derivation_method_xml();
         let method =
-            xml_sec::xmlenc::parse_key_derivation_method(&method_xml, &Default::default()).unwrap();
+            xml_sec::xmlenc::parse_key_derivation_method(&method_xml, &DecryptionPolicy::default())
+                .unwrap();
         let secret = b"request secret";
         let resolver = xml_sec::xmlenc::DerivedKeyDecryptor::content(
             &method,
@@ -232,7 +238,7 @@ fn derived_retrieval_accepts_both_specification_identifiers() {
             .derive_key(&method.parameters(16).unwrap(), secret)
             .unwrap();
         let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-            .direct_key(content.to_vec())
+            .direct_key(content.clone())
             .encrypt_binary(b"external derived")
             .unwrap();
         let ciphertext = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
@@ -268,76 +274,92 @@ fn derivation_method_xml() -> String {
     )
 }
 
+/// A document holding encrypted `<secret>derived</secret>` and a detached
+/// `DerivedKey` that applies to it by name or by reference, either directly
+/// (content key) or through a wrapping `EncryptedKey` (`nested`); returns the
+/// document and the association markup.
+fn detached_derivation_document(
+    nested: bool,
+    named: bool,
+    method_xml: &str,
+    derived: &[u8],
+) -> (String, String) {
+    let i = "http://www.w3.org/2009/xmlenc11#";
+    let content = if nested {
+        vec![3; 16]
+    } else {
+        derived.to_vec()
+    };
+    let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content.clone())
+        .encrypt_xml("<secret>derived</secret>")
+        .unwrap();
+    let cipher = parse_encrypted_data(&generated.encrypted_data_xml).unwrap();
+    let reference_kind = if nested {
+        "KeyReference"
+    } else {
+        "DataReference"
+    };
+    let association = if named {
+        "<i:DerivedKeyName>content</i:DerivedKeyName>".to_owned()
+    } else {
+        format!("<x:ReferenceList><x:{reference_kind} URI='#payload'/></x:ReferenceList>")
+    };
+    let selected = if named {
+        "<d:KeyName>content</d:KeyName>"
+    } else {
+        ""
+    };
+    let keys = if nested {
+        let wrapped = RUST_CRYPTO_PROVIDER
+            .wrap_key(KeyWrapAlgorithm::AesKw128, derived, &content)
+            .unwrap();
+        key(&format!("<d:KeyInfo>{selected}</d:KeyInfo>"))
+            .replace("<x:EncryptedKey>", "<x:EncryptedKey ID='payload'>")
+            .replace(
+                "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                &STANDARD.encode(wrapped),
+            )
+    } else {
+        selected.to_owned()
+    };
+    let payload = data(&keys)
+        .replace(
+            "<x:EncryptedData ",
+            &format!(
+                "<x:EncryptedData Type='{X}Element' {}",
+                if nested { "" } else { "ID='payload' " }
+            ),
+        )
+        .replace(
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+            cipher.cipher_data.inline_value().unwrap(),
+        );
+    let descriptor = format!(
+        "<i:DerivedKey>{method_xml}{association}<i:MasterKeyName>master</i:MasterKeyName></i:DerivedKey>"
+    );
+    let wire = format!(
+        "<root xmlns:x='{X}' xmlns:d='{D}' xmlns:i='{i}'>{payload}<i:DerivedKey><i:Unknown/></i:DerivedKey>{descriptor}</root>"
+    );
+    (wire, association)
+}
+
 #[test]
 fn detached_derivation_executes_for_content_and_nested_wrapping() {
     // Discovery must reach actual KDF/unwrap/decrypt work for both consumer
     // classes; unrelated malformed descriptors cannot poison the chosen source.
-    let i = "http://www.w3.org/2009/xmlenc11#";
     let method_xml = derivation_method_xml();
     let method =
-        xml_sec::xmlenc::parse_key_derivation_method(&method_xml, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_key_derivation_method(&method_xml, &DecryptionPolicy::default())
+            .unwrap();
     let secret = b"request secret";
     let derived = RUST_CRYPTO_PROVIDER
         .derive_key(&method.parameters(16).unwrap(), secret)
         .unwrap();
     for nested in [false, true] {
         for named in [false, true] {
-            let content = if nested {
-                vec![3; 16]
-            } else {
-                derived.to_vec()
-            };
-            let generated = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-                .direct_key(content.clone())
-                .encrypt_xml("<secret>derived</secret>")
-                .unwrap();
-            let cipher = parse_encrypted_data(&generated.encrypted_data_xml).unwrap();
-            let reference_kind = if nested {
-                "KeyReference"
-            } else {
-                "DataReference"
-            };
-            let association = if named {
-                "<i:DerivedKeyName>content</i:DerivedKeyName>".to_owned()
-            } else {
-                format!("<x:ReferenceList><x:{reference_kind} URI='#payload'/></x:ReferenceList>")
-            };
-            let selected = if named {
-                "<d:KeyName>content</d:KeyName>"
-            } else {
-                ""
-            };
-            let keys = if nested {
-                let wrapped = RUST_CRYPTO_PROVIDER
-                    .wrap_key(KeyWrapAlgorithm::AesKw128, &derived, &content)
-                    .unwrap();
-                key(&format!("<d:KeyInfo>{selected}</d:KeyInfo>"))
-                    .replace("<x:EncryptedKey>", "<x:EncryptedKey ID='payload'>")
-                    .replace(
-                        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-                        &STANDARD.encode(wrapped),
-                    )
-            } else {
-                selected.to_owned()
-            };
-            let payload = data(&keys)
-                .replace(
-                    "<x:EncryptedData ",
-                    &format!(
-                        "<x:EncryptedData Type='{X}Element' {}",
-                        if nested { "" } else { "ID='payload' " }
-                    ),
-                )
-                .replace(
-                    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
-                    cipher.cipher_data.inline_value().unwrap(),
-                );
-            let descriptor = format!(
-                "<i:DerivedKey>{method_xml}{association}<i:MasterKeyName>master</i:MasterKeyName></i:DerivedKey>"
-            );
-            let wire = format!(
-                "<root xmlns:x='{X}' xmlns:d='{D}' xmlns:i='{i}'>{payload}<i:DerivedKey><i:Unknown/></i:DerivedKey>{descriptor}</root>"
-            );
+            let (wire, association) =
+                detached_derivation_document(nested, named, &method_xml, &derived);
             let registrations = [xml_sec::IdAttributeRegistration::global("ID")];
             let resolver = if nested {
                 xml_sec::xmlenc::DerivedKeyDecryptor::wrapping(
@@ -372,9 +394,11 @@ fn detached_derivation_executes_for_content_and_nested_wrapping() {
                 .descendants()
                 .find(|node| node.has_tag_name((X, "EncryptedData")))
                 .unwrap();
-            let parsed =
-                xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
-                    .unwrap();
+            let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(
+                node,
+                &DecryptionPolicy::default(),
+            )
+            .unwrap();
             let sources = if nested {
                 &parsed.encrypted_keys[0].sources.derived_keys
             } else {
@@ -391,7 +415,7 @@ fn detached_derivation_executes_for_content_and_nested_wrapping() {
                     .decrypt_document(&malformed, None),
                 Err(XmlEncError::InvalidStructure(_))
             ));
-            let mut policy = xml_sec::policy::DecryptionPolicy::default();
+            let mut policy = DecryptionPolicy::default();
             policy.resources.max_key_candidates = 1;
             if nested {
                 assert!(matches!(
@@ -434,9 +458,11 @@ fn detached_derived_keys_are_discovered_by_name_and_reference() {
             .descendants()
             .find(|node| node.has_tag_name((X, "EncryptedData")))
             .unwrap();
-        let parsed =
-            xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default())
-                .unwrap();
+        let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(
+            node,
+            &DecryptionPolicy::default(),
+        )
+        .unwrap();
         assert_eq!(parsed.derived_keys.len(), 1, "{selector}");
     }
 }
@@ -597,7 +623,8 @@ fn retrieval_uses_the_operation_same_document_id_semantics() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     assert!(
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).is_err()
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .is_err()
     );
     let mut policy = xml_sec::policy::DecryptionPolicy::default();
     policy.transforms.same_document_id_semantics =
@@ -627,7 +654,8 @@ fn retrieval_cycle_is_rejected_before_key_resolution() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     assert!(
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).is_err()
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .is_err()
     );
 }
 
@@ -646,7 +674,8 @@ fn key_info_reference_retains_the_indirect_transport() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     let parsed =
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .unwrap();
     assert_eq!(parsed.encrypted_keys.len(), 1);
 }
 
@@ -886,7 +915,8 @@ fn carried_key_name_finds_detached_key_without_retrieval_method() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     let parsed =
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .unwrap();
     assert_eq!(parsed.encrypted_keys.len(), 1);
     assert_eq!(
         parsed.encrypted_keys[0].carried_key_name.as_deref(),
@@ -999,7 +1029,7 @@ fn detached_selection_does_not_hide_a_second_relevant_reference_list() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     assert!(matches!(
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()),
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default()),
         Err(XmlEncError::InvalidStructure(_))
     ));
 }
@@ -1019,7 +1049,8 @@ fn data_reference_finds_detached_key_without_key_info() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     let parsed =
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .unwrap();
     assert_eq!(parsed.encrypted_keys.len(), 1);
 }
 
@@ -1042,7 +1073,8 @@ fn key_reference_associates_a_detached_intermediate_transport() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     let parsed =
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .unwrap();
     assert_eq!(parsed.encrypted_keys[0].sources.encrypted_keys.len(), 1);
 }
 
@@ -1063,7 +1095,8 @@ fn shared_detached_transport_is_not_dropped_from_the_second_consumer() {
         .find(|node| node.has_tag_name((X, "EncryptedData")))
         .unwrap();
     let parsed =
-        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &Default::default()).unwrap();
+        xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &DecryptionPolicy::default())
+            .unwrap();
     assert_eq!(parsed.encrypted_keys.len(), 2);
     for key in parsed.encrypted_keys {
         assert_eq!(key.sources.encrypted_keys.len(), 1);

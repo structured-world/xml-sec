@@ -1,6 +1,9 @@
 //! Unforgeable, callback-scoped successful-key association.
 
-use super::*;
+use super::{
+    CatalogueError, DsigError, NodeIdentity, SelectedSignature, VerifiedSession, Work,
+    flatten_catalogue,
+};
 pub use crate::provider::KeyAssociation;
 
 /// Receipt of the original selected provider's successful leaf decision.
@@ -16,17 +19,20 @@ pub struct SelectedKeyReceipt<'a> {
 
 impl SelectedKeyReceipt<'_> {
     /// Original Signature and document generation, not a detached certificate ID.
+    #[must_use]
     pub fn signature(&self) -> NodeIdentity {
         self.signature
     }
 
     /// Exact selected engine name; this is not a trust or FIPS approval claim.
+    #[must_use]
     pub fn provider_name(&self) -> &'static str {
         self.provider.name()
     }
 
     /// Whether the provider supplied public material for this successful key.
     /// False does not mean that an opaque/hardware-backed key failed verification.
+    #[must_use]
     pub fn has_public_evidence(&self) -> bool {
         self.public.is_some()
     }
@@ -41,6 +47,11 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     ///
     /// The original document/generation, policy, provider and terminal capture
     /// cause remain binding. `Same` is key association, not certificate trust.
+    ///
+    /// # Errors
+    /// Returns a processing error for foreign or unauthenticated identities,
+    /// capture failure, account/budget refusal, or provider association failure.
+    /// Preserves the visitor's original error separately.
     pub fn with_key_association_in<Q: Work, R, E>(
         &self,
         signature: NodeIdentity,
@@ -90,8 +101,10 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     ) -> Result<KeyAssociation, DsigError> {
         work.charge_work(1)?;
         let capture = &self.operations[index].capture;
-        if !std::ptr::eq(receipt.seal, &capture.seal)
-            || receipt.signature != self.evidence.signatures()[index].identity
+        if !std::ptr::eq(
+            std::ptr::from_ref(receipt.seal),
+            std::ptr::from_ref(&capture.seal),
+        ) || receipt.signature != self.evidence.signatures()[index].identity
             || !std::ptr::eq(receipt.provider, self.context.provider)
         {
             return Err(DsigError::InvalidRequest {
@@ -125,6 +138,10 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
 impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     /// Borrow the original successful-key receipt using this selection's Work.
     /// A provider unable to report a unique leaf yields an unproven receipt.
+    ///
+    /// # Errors
+    /// Returns a processing error for an invalid selection, retained capture
+    /// refusal, or exhausted query work. Preserves the visitor's error separately.
     pub fn with_key_receipt<R, E>(
         &self,
         visitor: impl for<'a> FnOnce(SelectedKeyReceipt<'a>) -> Result<R, E>,
@@ -138,6 +155,10 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     /// rejected before the provider comparison or the caller's callback.
     /// For a new query execution, use [`VerifiedSession::with_key_association_in`]
     /// directly, without first performing session-billed Signature selection.
+    ///
+    /// # Errors
+    /// Returns a processing error for an invalid selection or receipt, exhausted
+    /// query work, or failed provider comparison. Preserves the visitor's error.
     pub fn associate_key<R, E>(
         &self,
         receipt: &SelectedKeyReceipt<'_>,

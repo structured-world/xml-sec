@@ -53,7 +53,7 @@ fn bit_tail_matches_every_nist_short_message() {
                 hash.update(&message[..bits / 8]);
                 let tail = if bits % 8 == 0 { 0 } else { message[bits / 8] };
                 assert_eq!(
-                    hash.finalize_with_bits(tail, (bits % 8) as u8)
+                    hash.finalize_with_bits(tail, u8::try_from(bits % 8).unwrap())
                         .expect("canonical NIST tail")
                         .as_slice(),
                     expected,

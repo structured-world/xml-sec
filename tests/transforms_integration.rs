@@ -1,6 +1,6 @@
 //! Integration tests: transform pipeline (enveloped signature + C14N).
 //!
-//! Tests the full chain: URI dereference → parse_transforms → execute_transforms
+//! Tests the full chain: URI dereference → `parse_transforms` → `execute_transforms`
 //! → verify canonical output matches expected bytes.
 //!
 //! These tests exercise multi-component interaction:

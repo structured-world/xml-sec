@@ -12,6 +12,7 @@ use crate::xml::dom::NodeId;
 use crate::xmldsig::parse::ParseError;
 use structured_asn1::memory::{OwnedText, OwnedVec, Work};
 
+#[derive(Clone, Copy)]
 pub(crate) enum Diagnostic {
     XPath,
     Unsupported,

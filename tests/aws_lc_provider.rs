@@ -83,7 +83,7 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
     ));
     let mut signing_policy = xml_sec::policy::SigningPolicy::default();
     signing_policy.rsa_keys.minimum_modulus_bits = 1024;
-    let signed = xml_sec::xmldsig::SignContext::new(&signer)
+    let document = xml_sec::xmldsig::SignContext::new(&signer)
         .policy(signing_policy)
         .sign_template(include_str!("fixtures/saml/response_signing_template.xml"))
         .unwrap();
@@ -93,7 +93,7 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
         xml_sec::xmldsig::VerifyContext::new()
             .key(&key)
             .policy(verification_policy.clone())
-            .verify(&signed)
+            .verify(&document)
             .unwrap()
             .status,
         xml_sec::xmldsig::DsigStatus::Valid
@@ -103,7 +103,7 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
             .key(&key)
             .policy(verification_policy)
             .provider(&AwsLcFipsProvider)
-            .verify(&signed),
+            .verify(&document),
         Err(DsigError::Crypto(
             SignatureVerificationError::UnsupportedAlgorithm { .. }
         ))
@@ -112,7 +112,7 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
 
 #[test]
 fn native_primitives_match_published_known_answers() {
-    assert!(!AwsLcFipsProvider.module_version().is_empty());
+    assert_ne!(AwsLcFipsProvider.module_version(), "");
     assert!(AwsLcFipsProvider.fips_module_version().is_some());
     // SHA-256("abc") anchors differential testing to a fixed known answer.
     assert_eq!(
@@ -417,7 +417,7 @@ fn native_rsa_signing_and_backend_binding() {
     let algorithm = SignatureAlgorithm::RsaSha256;
     let key = AwsLcSigningKey::from_pkcs8_der(algorithm, pem.contents()).unwrap();
     let signature = AwsLcFipsProvider.sign(&key, algorithm, b"message").unwrap();
-    assert!(!signature.is_empty());
+    assert_ne!(signature, b"");
     assert!(
         RustCryptoProvider
             .sign(&key, algorithm, b"message")

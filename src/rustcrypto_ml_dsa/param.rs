@@ -110,9 +110,10 @@ pub trait ParameterSet {
     const TAU: usize;
 
     /// Beta = Tau * Eta
-    #[allow(clippy::as_conversions)]
-    #[allow(clippy::cast_possible_truncation)]
-    const BETA: u32 = (Self::TAU as u32) * Self::Eta::U32;
+    const BETA: u32 = {
+        let bytes = Self::TAU.to_le_bytes();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) * Self::Eta::U32
+    };
 }
 
 pub trait SigningKeyParams: ParameterSet {

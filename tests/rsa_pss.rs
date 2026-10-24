@@ -159,7 +159,7 @@ fn pss_family_permission_preserves_independent_legacy_gate() {
     assert!(policy.check_signature_algorithm(method).is_err());
     policy.key_trust.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
     assert!(policy.check_signature_algorithm(method).is_ok());
-    policy.signature_algorithms = Some(Default::default());
+    policy.signature_algorithms = Some(std::collections::HashSet::default());
     assert!(policy.check_signature_algorithm(method).is_ok());
     policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::ExactOnly;
     assert!(policy.check_signature_algorithm(method).is_err());
@@ -178,7 +178,7 @@ fn pss_family_permission_preserves_independent_legacy_gate() {
     ));
     let signing = xml_sec::policy::SigningPolicy {
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
-        signature_algorithms: Some(Default::default()),
+        signature_algorithms: Some(std::collections::HashSet::default()),
         ..Default::default()
     };
     let signed = SignContext::new(&key)
@@ -231,7 +231,7 @@ fn pss_signatures_cross_verify_with_dependency() {
         assert!(verify_rsa_signature_pem(method, PUBLIC, b"PSS message", &signature).unwrap());
         assert!(!verify_rsa_signature_pem(method, PUBLIC, b"tampered", &signature).unwrap());
         let wrong_salt = SignatureAlgorithm::RsaPss(RsaPssParameters {
-            salt_len: if salt_len == 0 { 1 } else { 0 },
+            salt_len: usize::from(salt_len == 0),
             ..RsaPssParameters::DEFAULT
         });
         assert!(!verify_rsa_signature_pem(wrong_salt, PUBLIC, b"PSS message", &signature).unwrap());
@@ -258,8 +258,9 @@ fn pss_rejects_modular_alias_of_valid_signature() {
         let mut carry = 0u16;
         for (byte, modulus_byte) in alias.iter_mut().zip(modulus.iter()).rev() {
             let sum = u16::from(*byte) + u16::from(*modulus_byte) + carry;
-            *byte = sum as u8;
-            carry = sum >> 8;
+            let [high, low] = sum.to_be_bytes();
+            *byte = low;
+            carry = u16::from(high);
         }
         if carry != 0 {
             continue;
@@ -450,10 +451,9 @@ fn pss_key_capacity_is_checked_before_signing_dispatch() {
     );
 }
 
-#[test]
-fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
-    // RFC 4055 section 3.3 permits a larger salt, but never another message
-    // hash/MGF hash or PKCS#1 v1.5 with a PSS-only public key.
+/// The fixture RSA key under id-RSASSA-PSS restricted to SHA-256, MGF1-SHA-256
+/// and a minimum salt of 32 octets.
+fn restricted_pss_spki() -> Vec<u8> {
     use der::{Decode as _, Encode as _};
     use x509_cert::spki::{AlgorithmIdentifierOwned, ObjectIdentifier};
     let plain = pem::parse(PUBLIC).unwrap();
@@ -469,7 +469,13 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
         oid: ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
         parameters: Some(params),
     };
-    let encoded = spki.to_der().unwrap();
+    spki.to_der().unwrap()
+}
+
+/// `KeyInfo` carrying the fixture certificate with its SPKI replaced by `spki`.
+fn certificate_key_info(spki: &[u8]) -> xml_sec::xmldsig::KeyInfo {
+    use base64::Engine as _;
+    use der::{Decode as _, Encode as _};
     let certificate = x509_cert::Certificate::from_der(
         pem::parse(include_str!("fixtures/keys/rsa/rsa-2048-cert.pem"))
             .unwrap()
@@ -490,7 +496,7 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
         .position(|bytes| bytes == old_spki)
         .unwrap();
     let mut tbs_bytes = tbs.value()[..offset].to_vec();
-    tbs_bytes.extend_from_slice(&encoded);
+    tbs_bytes.extend_from_slice(spki);
     tbs_bytes.extend_from_slice(&tbs.value()[offset + old_spki.len()..]);
     let mut certificate_bytes = der::asn1::Any::new(der::Tag::Sequence, tbs_bytes)
         .unwrap()
@@ -499,14 +505,21 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
     certificate_bytes.extend_from_slice(&certificate.signature_algorithm().to_der().unwrap());
     certificate_bytes.extend_from_slice(&certificate.signature().to_der().unwrap());
     let certificate = der::asn1::Any::new(der::Tag::Sequence, certificate_bytes).unwrap();
-    use base64::Engine as _;
     let certificate_info = format!(
         "<KeyInfo xmlns=\"{DS}\"><X509Data><X509Certificate>{}</X509Certificate></X509Data></KeyInfo>",
         base64::engine::general_purpose::STANDARD.encode(certificate.to_der().unwrap())
     );
     let certificate_document = XmlDomDocument::parse(&certificate_info).unwrap();
-    let certificate_info =
-        xml_sec::xmldsig::parse_key_info(certificate_document.root_element()).unwrap();
+    xml_sec::xmldsig::parse_key_info(certificate_document.root_element()).unwrap()
+}
+
+#[test]
+fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
+    // RFC 4055 section 3.3 permits a larger salt, but never another message
+    // hash/MGF hash or PKCS#1 v1.5 with a PSS-only public key.
+    use xml_sec::xmldsig::{KeyInfo, KeyInfoSource, KeyResolver as _, KeyResolverConfig};
+    let encoded = restricted_pss_spki();
+    let certificate_info = certificate_key_info(&encoded);
     let key = RsaSigningKey::from_pkcs8_pem(PRIVATE).unwrap();
     for salt_len in [32, 33] {
         let method = SignatureAlgorithm::RsaPss(RsaPssParameters {
@@ -522,12 +535,11 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
         };
         // Restricted SPKIs must survive both document and caller-store resolution,
         // not merely the direct primitive verifier.
-        use xml_sec::xmldsig::{KeyInfo, KeyInfoSource, KeyResolver as _, KeyResolverConfig};
         let mut config = KeyResolverConfig::default();
         config
             .named_keys
             .insert("restricted".into(), public.clone());
-        let resolver = xml_sec::xmldsig::DefaultKeyResolver::new(config);
+        let key_resolver = xml_sec::xmldsig::DefaultKeyResolver::new(config);
         for source in [
             KeyInfoSource::DerEncodedKeyValue(encoded.clone()),
             KeyInfoSource::KeyName("restricted".into()),
@@ -537,7 +549,7 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
             info.sources.push(source);
             let mut policy = xml_sec::policy::VerificationPolicy::default();
             policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
-            let resolved = resolver
+            let resolved = key_resolver
                 .resolve_with_policy(Some(&info), method, &policy)
                 .expect("restricted PSS key is valid")
                 .expect("restricted PSS key resolves");
@@ -581,7 +593,6 @@ fn pss_restricted_spki_enforces_hashes_and_minimum_salt() {
                 .verify(&public, method, b"restricted", &signature)
                 .is_err()
         );
-        use xml_sec::xmldsig::{KeyInfo, KeyInfoSource, KeyResolver as _};
         let mut info = KeyInfo::default();
         info.sources
             .push(KeyInfoSource::DerEncodedKeyValue(encoded.clone()));

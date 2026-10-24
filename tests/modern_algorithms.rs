@@ -1,4 +1,4 @@
-//! Modern XMLDSig algorithms must work through the public provider and policy paths.
+//! Modern `XMLDSig` algorithms must work through the public provider and policy paths.
 #![cfg(feature = "xmldsig")]
 
 use xml_sec::xmldsig::{DigestAlgorithm, compute_digest};
@@ -536,8 +536,8 @@ fn pq_keys_work_through_inventory_and_named_resolver() {
     let selected = inventory.signing_key("pq", method, &policy).unwrap();
     let mut info = KeyInfo::default();
     info.sources.push(KeyInfoSource::KeyName("public".into()));
-    let resolver = inventory.verification_resolver();
-    let resolved = resolver.resolve(Some(&info), method).unwrap().unwrap();
+    let lookup = inventory.verification_resolver();
+    let resolved = lookup.resolve(Some(&info), method).unwrap().unwrap();
     let signature = xml_sec::provider::default_provider()
         .sign(selected.as_ref(), method, b"inventory")
         .unwrap();
@@ -812,7 +812,7 @@ fn donor_pq_key_pipeline(algorithm: xml_sec::xmldsig::PqAlgorithm, family: &str,
     ))
     .unwrap();
     let (remaining, certificate) = x509_parser::parse_x509_certificate(&der).unwrap();
-    assert!(remaining.is_empty());
+    assert_eq!(remaining, []);
     let private = std::fs::read(format!(
         "tests/fixtures/xmldsig/keys/{family}/{stem}-key.der"
     ))
@@ -890,7 +890,9 @@ fn donor_key_containers(algorithm: xml_sec::xmldsig::SignatureAlgorithm, family:
         ..Default::default()
     };
     for suffix in [".der", ".pem", ".p8-der", ".p8-pem", ".p12", "-win.p12"] {
-        let bytes = std::fs::read(root.join(format!("{stem}-key{suffix}"))).unwrap();
+        let file = root.join(format!("{stem}-key{suffix}"));
+        let bytes = std::fs::read(&file).unwrap();
+        let pkcs12 = file.extension().is_some_and(|extension| extension == "p12");
         let protected = suffix != ".der" && suffix != ".pem";
         for correct_password in [true, false] {
             if !protected && !correct_password {
@@ -902,7 +904,7 @@ fn donor_key_containers(algorithm: xml_sec::xmldsig::SignatureAlgorithm, family:
             } else {
                 "wrong-password"
             };
-            let result = if suffix.ends_with(".p12") {
+            let result = if pkcs12 {
                 inventory.add_pkcs12_with_usages(
                     "key".into(),
                     &bytes,
@@ -990,52 +992,42 @@ mod donor_pq {
     donor_pq_test!(slh256s, SlhDsaSha2_256s, "slh-dsa", "slh-dsa-sha2-256s");
 }
 
+/// P-256, P-384 and P-521 signing keys whose scalars repeat `fill`; the P-521
+/// scalar's leading octet is 1 so it stays below the group order.
+fn ecdsa_curve_keys(fill: u8) -> [Box<dyn xml_sec::xmldsig::SigningKey>; 3] {
+    use pkcs8::EncodePrivateKey;
+    use xml_sec::xmldsig::{EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey};
+    let p256 = p256::SecretKey::from_slice(&[fill; 32])
+        .unwrap()
+        .to_pkcs8_der()
+        .unwrap();
+    let p384 = p384::SecretKey::from_slice(&[fill; 48])
+        .unwrap()
+        .to_pkcs8_der()
+        .unwrap();
+    let mut scalar521 = [fill; 66];
+    scalar521[0] = 1;
+    let p521 = p521::SecretKey::from_slice(&scalar521)
+        .unwrap()
+        .to_pkcs8_der()
+        .unwrap();
+    [
+        Box::new(EcdsaP256SigningKey::from_pkcs8_der(p256.as_bytes()).unwrap()),
+        Box::new(EcdsaP384SigningKey::from_pkcs8_der(p384.as_bytes()).unwrap()),
+        Box::new(EcdsaP521SigningKey::from_pkcs8_der(p521.as_bytes()).unwrap()),
+    ]
+}
+
 #[test]
 fn every_ecdsa_curve_and_modern_digest_runs_the_full_pipeline() {
-    use pkcs8::EncodePrivateKey;
     use xml_sec::xmldsig::{
-        DsigStatus, EcdsaP256SigningKey, EcdsaP384SigningKey, EcdsaP521SigningKey, SignContext,
-        SignatureAlgorithm, SigningKey, VerificationKey, VerifyContext,
+        DsigStatus, SignContext, SignatureAlgorithm, VerificationKey, VerifyContext,
     };
 
     // All curve/hash combinations are legal; short hashes on P-521 must not
     // be rejected by a primitive's prehash representation requirements.
-    let p256 = p256::SecretKey::from_slice(&[1; 32])
-        .unwrap()
-        .to_pkcs8_der()
-        .unwrap();
-    let p384 = p384::SecretKey::from_slice(&[1; 48])
-        .unwrap()
-        .to_pkcs8_der()
-        .unwrap();
-    let p521 = p521::SecretKey::from_slice(&[1; 66])
-        .unwrap()
-        .to_pkcs8_der()
-        .unwrap();
-    let keys: [Box<dyn SigningKey>; 3] = [
-        Box::new(EcdsaP256SigningKey::from_pkcs8_der(p256.as_bytes()).unwrap()),
-        Box::new(EcdsaP384SigningKey::from_pkcs8_der(p384.as_bytes()).unwrap()),
-        Box::new(EcdsaP521SigningKey::from_pkcs8_der(p521.as_bytes()).unwrap()),
-    ];
-    let wrong_p256 = p256::SecretKey::from_slice(&[2; 32])
-        .unwrap()
-        .to_pkcs8_der()
-        .unwrap();
-    let wrong_p384 = p384::SecretKey::from_slice(&[2; 48])
-        .unwrap()
-        .to_pkcs8_der()
-        .unwrap();
-    let mut scalar521 = [2; 66];
-    scalar521[0] = 1;
-    let wrong_p521 = p521::SecretKey::from_slice(&scalar521)
-        .unwrap()
-        .to_pkcs8_der()
-        .unwrap();
-    let wrong_keys: [Box<dyn SigningKey>; 3] = [
-        Box::new(EcdsaP256SigningKey::from_pkcs8_der(wrong_p256.as_bytes()).unwrap()),
-        Box::new(EcdsaP384SigningKey::from_pkcs8_der(wrong_p384.as_bytes()).unwrap()),
-        Box::new(EcdsaP521SigningKey::from_pkcs8_der(wrong_p521.as_bytes()).unwrap()),
-    ];
+    let keys = ecdsa_curve_keys(1);
+    let wrong_keys = ecdsa_curve_keys(2);
     for (curve, key) in keys.iter().enumerate() {
         for algorithm in [
             #[cfg(feature = "legacy-algorithms")]
@@ -1258,7 +1250,7 @@ fn assert_bidirectional_xmlsec1(
         "{algorithm:?}: {}",
         String::from_utf8_lossy(&generated.stderr)
     );
-    let verifier = VerificationKey {
+    let public_key = VerificationKey {
         algorithm,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
         certificate_der: None,
@@ -1267,7 +1259,7 @@ fn assert_bidirectional_xmlsec1(
     let signed = std::fs::read_to_string(&oracle_path).unwrap();
     assert_eq!(
         VerifyContext::new()
-            .key(&verifier)
+            .key(&public_key)
             .policy(xml_sec::policy::VerificationPolicy {
                 signature_algorithms: Some([algorithm].into()),
                 digest_algorithms: Some(xml_sec::xmldsig::DigestAlgorithm::ALL.into()),
@@ -1445,7 +1437,11 @@ fn sha3_digest_uris_have_fips202_known_answers() {
         assert_eq!(algorithm.uri(), uri);
         assert_eq!(algorithm.output_len(), bits / 8);
         let actual = compute_digest(algorithm, b"");
-        let hex: String = actual.iter().map(|byte| format!("{byte:02x}")).collect();
+        let mut hex = String::with_capacity(actual.len() * 2);
+        for byte in &actual {
+            std::fmt::Write::write_fmt(&mut hex, format_args!("{byte:02x}"))
+                .expect("writing to a String cannot fail");
+        }
         assert_eq!(hex, expected);
     }
 }

@@ -1,10 +1,11 @@
-//! Lexical XML mutation helpers for the XMLDSig signing pipeline.
+//! Lexical XML mutation helpers for the `XMLDSig` signing pipeline.
 //!
 //! The selected semantic DOM is immutable. These helpers validate structure
 //! through the backend-neutral DOM contract, then splice validated source ranges.
 
+use crate::xml::dom::Node;
 use crate::xml_input as xml_sec_xml_input;
-use std::ops::Range;
+use std::{fmt::Write as _, ops::Range};
 
 use xml_sec_xml_input::lexical::{escape_attribute, escape_text};
 
@@ -81,7 +82,7 @@ fn order_disjoint_ranges_for_splicing(
     Ok(())
 }
 
-/// Errors produced by XMLDSig XML mutation helpers.
+/// Errors produced by `XMLDSig` XML mutation helpers.
 #[derive(Debug, thiserror::Error)]
 pub enum XmlMutationError {
     /// The compiled signing policy rejected an intermediate XML document.
@@ -96,15 +97,15 @@ pub enum XmlMutationError {
     /// The shared lexical scanner rejected generated XML.
     #[error("XML lexical error: {0}")]
     Lexical(#[from] xml_sec_xml_input::lexical::Error),
-    /// A template did not contain exactly one XMLDSig `<Signature>` root.
+    /// A template did not contain exactly one `XMLDSig` `<Signature>` root.
     #[error("signature template root must be one XMLDSig Signature element")]
     InvalidSignatureTemplate,
     /// A replacement call supplied a different number of values than matching elements.
     #[error("expected {expected} XMLDSig {element} values, got {actual}")]
     ValueCountMismatch {
-        /// XMLDSig element local name.
+        /// `XMLDSig` element local name.
         element: &'static str,
-        /// Number of matching XMLDSig elements in the document.
+        /// Number of matching `XMLDSig` elements in the document.
         expected: usize,
         /// Number of values supplied by the caller.
         actual: usize,
@@ -132,8 +133,12 @@ pub enum XmlMutationError {
     },
 }
 
-/// Append a generated XMLDSig `<Signature>` template as the last child of the
+/// Append a generated `XMLDSig` `<Signature>` template as the last child of the
 /// source document root.
+///
+/// # Errors
+/// Returns an error if either input is invalid XML, the template is not a signature,
+/// the source has no valid append target, or the generated XML cannot be parsed.
 pub fn append_signature_to_root(
     xml: &str,
     signature_template: &str,
@@ -162,7 +167,11 @@ pub(super) fn append_signature_to_root_with_options(
     Ok(output)
 }
 
-/// Fill XMLDSig `<DigestValue>` elements in document order.
+/// Fill `XMLDSig` `<DigestValue>` elements in document order.
+///
+/// # Errors
+/// Returns an error if the input XML is invalid, the replacement count differs
+/// from the selected element count, or the generated XML is invalid.
 pub fn fill_digest_values<I, S>(xml: &str, values: I) -> Result<String, XmlMutationError>
 where
     I: IntoIterator<Item = S>,
@@ -172,6 +181,10 @@ where
 }
 
 /// Fill `<DigestValue>` elements for direct `<SignedInfo>/<Reference>` children.
+///
+/// # Errors
+/// Returns an error if the XML or signature selection is invalid, replacement
+/// counts differ, or the generated XML is invalid.
 pub fn fill_signed_info_digest_values<I, S>(
     xml: &str,
     values: I,
@@ -247,7 +260,7 @@ where
     fill_dsig_text_values_matching(
         xml,
         "DigestValue",
-        values,
+        &values,
         policy,
         budget,
         DsigReplacementScope::SignedInfoReferenceDigest {
@@ -256,7 +269,11 @@ where
     )
 }
 
-/// Fill XMLDSig `<SignatureValue>` elements in document order.
+/// Fill `XMLDSig` `<SignatureValue>` elements in document order.
+///
+/// # Errors
+/// Returns an error if the input XML is invalid, the replacement count differs
+/// from the selected element count, or the generated XML is invalid.
 pub fn fill_signature_values<I, S>(xml: &str, values: I) -> Result<String, XmlMutationError>
 where
     I: IntoIterator<Item = S>,
@@ -266,6 +283,10 @@ where
 }
 
 /// Fill the direct `<Signature>/<SignatureValue>` child for a signing template.
+///
+/// # Errors
+/// Returns an error if XML parsing or signature selection fails, the selected
+/// child count differs, or the generated XML is invalid.
 pub fn fill_signature_value(xml: &str, value: &str) -> Result<String, XmlMutationError> {
     fill_signature_value_with_options(xml, value, None)
 }
@@ -308,7 +329,7 @@ pub(super) fn fill_signature_value_at_index_with_budget(
     fill_dsig_text_values_matching(
         xml,
         "SignatureValue",
-        vec![value.to_owned()],
+        &[value.to_owned()],
         policy,
         budget,
         DsigReplacementScope::DirectSignatureChild {
@@ -431,6 +452,10 @@ fn projected_xml_length_overflow(
 }
 
 /// Fill the direct `<Signature>/<KeyInfo>` child with XML child content.
+///
+/// # Errors
+/// Returns an error if XML parsing, signature selection or namespace reconciliation
+/// fails, or no valid source child can be merged.
 pub fn fill_key_info(xml: &str, key_info_content: &str) -> Result<String, XmlMutationError> {
     fill_key_info_with_options(xml, key_info_content, None)
 }
@@ -508,7 +533,7 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
     let sources = source_document
         .root_element()
         .children()
-        .filter(|node| node.is_element())
+        .filter(Node::is_element)
         .map(|node| {
             Ok((
                 node.tag_name().namespace().map(str::to_owned),
@@ -538,7 +563,7 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
         // Generated key material replaces stale material, while KeyName is
         // replaced only by a generated KeyName; extension elements remain.
         let mut stale_ranges = Vec::new();
-        for node in key_info.children().filter(|node| node.is_element()) {
+        for node in key_info.children().filter(Node::is_element) {
             let replaces_key_material = !generated_key_material_sources.is_empty()
                 && is_cryptographic_key_info_source(
                     node.tag_name().namespace(),
@@ -615,119 +640,64 @@ fn merge_one_key_info_source_at_index_with_options(
 
     let source_is_x509_data =
         is_dsig_x509_data(source.tag_name().namespace(), source.tag_name().name());
-    if let Some(placeholder) = key_info.children().find(|node| {
+    let output = if let Some(placeholder) = key_info.children().find(|node| {
         node.is_element()
             && node.tag_name() == source.tag_name()
             && (is_reusable_placeholder(*node)
                 || (source_is_x509_data && has_x509_mergeable_metadata(*node)))
     }) {
-        let placeholder_fragment = &xml[placeholder.range()];
-        let placeholder_opening_end = element_opening_end(placeholder_fragment)
-            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-        let placeholder_owned_namespaces =
-            owned_namespace_declarations(&placeholder_fragment[..placeholder_opening_end - 1])?;
-        let generated_namespace_attributes =
-            source
-                .namespaces()
-                .try_fold(String::new(), |mut attributes, namespace| {
-                    let prefix = namespace.name().unwrap_or_default();
-                    if placeholder_owned_namespaces.contains(prefix) {
-                        let declared = placeholder
-                            .namespaces()
-                            .find(|declared| declared.name() == namespace.name())
-                            .ok_or(XmlMutationError::InvalidAppendTarget)?;
-                        if declared.uri() != namespace.uri() {
-                            return Err(XmlMutationError::ConflictingKeyInfoNamespace {
-                                prefix: prefix.to_owned(),
-                            });
-                        }
-                        return Ok(attributes);
-                    }
-                    if placeholder
-                        .parent_element()
-                        .and_then(|parent| parent.lookup_namespace_uri(namespace.name()))
-                        == Some(namespace.uri())
-                    {
-                        return Ok(attributes);
-                    }
-                    let attribute = namespace
-                        .name()
-                        .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
-                    attributes.push_str(&format!(
-                        " {attribute}=\"{}\"",
-                        escape_attribute(namespace.uri())
-                    ));
-                    Ok(attributes)
-                })?;
-        let generated_attributes =
-            source
-                .attributes()
-                .try_fold(String::new(), |mut attributes, attribute| {
-                    let existing = placeholder.attributes().find(|candidate| {
-                        candidate.namespace() == attribute.namespace()
-                            && candidate.name() == attribute.name()
-                    });
-                    if let Some(existing) = existing {
-                        if existing.value() != attribute.value() {
-                            return Err(XmlMutationError::ConflictingKeyInfoAttribute {
-                                name: attribute.name().to_owned(),
-                            });
-                        }
-                        return Ok(attributes);
-                    }
-                    let qualified_name = match attribute.namespace() {
-                        None => attribute.name().to_owned(),
-                        Some("http://www.w3.org/XML/1998/namespace") => {
-                            format!("xml:{}", attribute.name())
-                        }
-                        Some(namespace) => {
-                            let prefix = source
-                                .lookup_prefix(namespace)
-                                .ok_or(XmlMutationError::InvalidAppendTarget)?;
-                            format!("{prefix}:{}", attribute.name())
-                        }
-                    };
-                    attributes.push_str(&format!(
-                        " {qualified_name}=\"{}\"",
-                        escape_attribute(attribute.value())
-                    ));
-                    Ok(attributes)
-                })?;
-        let generated_attributes =
-            format!("{generated_namespace_attributes}{generated_attributes}");
-        let output = if is_reusable_placeholder(placeholder) {
-            replace_element_content(
-                xml,
-                placeholder.range(),
-                source_content,
-                &generated_attributes,
-                policy,
-            )?
-        } else {
-            let retained_bindings = source
-                .namespaces()
-                .any(|binding| {
-                    placeholder.lookup_namespace_uri(binding.name()) != Some(binding.uri())
-                })
-                .then(|| preserve_retained_child_namespaces(xml, placeholder, source))
-                .transpose()?
-                .unwrap_or_default();
-            append_element_content(
-                xml,
-                placeholder.range(),
-                source_content,
-                &generated_attributes,
-                &retained_bindings,
-                policy,
-            )?
-        };
-        parse_mutation_xml_with_budget(&output, policy, budget)?;
-        return Ok(output);
-    }
+        merge_key_info_source_into_placeholder(xml, placeholder, source, source_content, policy)?
+    } else {
+        append_key_info_source(xml, key_info, key_info_source, policy)?
+    };
+    parse_mutation_xml_with_budget(&output, policy, budget)?;
+    Ok(output)
+}
 
+fn merge_key_info_source_into_placeholder(
+    xml: &str,
+    placeholder: Node<'_, '_>,
+    source: Node<'_, '_>,
+    source_content: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
+    let generated_namespace_attributes = generated_key_info_namespaces(xml, placeholder, source)?;
+    let generated_attributes = generated_key_info_attributes(placeholder, source)?;
+    let generated_attributes = format!("{generated_namespace_attributes}{generated_attributes}");
+    if is_reusable_placeholder(placeholder) {
+        return replace_element_content(
+            xml,
+            placeholder.range(),
+            source_content,
+            &generated_attributes,
+            policy,
+        );
+    }
+    let retained_bindings = source
+        .namespaces()
+        .any(|binding| placeholder.lookup_namespace_uri(binding.name()) != Some(binding.uri()))
+        .then(|| preserve_retained_child_namespaces(xml, placeholder, source))
+        .transpose()?
+        .unwrap_or_default();
+    append_element_content(
+        xml,
+        placeholder.range(),
+        source_content,
+        &generated_attributes,
+        &retained_bindings,
+        policy,
+    )
+}
+
+fn append_key_info_source(
+    xml: &str,
+    key_info: Node<'_, '_>,
+    key_info_source: &str,
+    policy: Option<&crate::policy::SigningPolicy>,
+) -> Result<String, XmlMutationError> {
     let range = key_info.range();
     let raw_key_info = &xml[range.clone()];
-    let output = if raw_key_info.trim_end().ends_with("/>") {
+    if raw_key_info.trim_end().ends_with("/>") {
         let name_end = raw_key_info[1..]
             .find(|character: char| {
                 character.is_ascii_whitespace() || character == '/' || character == '>'
@@ -754,7 +724,7 @@ fn merge_one_key_info_source_at_index_with_options(
         );
         let mut output = xml.to_owned();
         output.replace_range(range, &expanded);
-        output
+        Ok(output)
     } else {
         let closing = raw_key_info
             .rfind("</")
@@ -763,10 +733,99 @@ fn merge_one_key_info_source_at_index_with_options(
         validate_projected_replacement_len(xml, 0, key_info_source.len(), policy)?;
         let mut output = xml.to_owned();
         output.insert_str(closing, key_info_source);
-        output
-    };
-    parse_mutation_xml_with_budget(&output, policy, budget)?;
-    Ok(output)
+        Ok(output)
+    }
+}
+
+fn generated_key_info_namespaces(
+    xml: &str,
+    placeholder: Node<'_, '_>,
+    source: Node<'_, '_>,
+) -> Result<String, XmlMutationError> {
+    let placeholder_fragment = &xml[placeholder.range()];
+    let placeholder_opening_end =
+        element_opening_end(placeholder_fragment).ok_or(XmlMutationError::InvalidAppendTarget)?;
+    let placeholder_owned_namespaces =
+        owned_namespace_declarations(&placeholder_fragment[..placeholder_opening_end - 1])?;
+    let generated_namespace_attributes =
+        source
+            .namespaces()
+            .try_fold(String::new(), |mut attributes, namespace| {
+                let prefix = namespace.name().unwrap_or_default();
+                if placeholder_owned_namespaces.contains(prefix) {
+                    let declared = placeholder
+                        .namespaces()
+                        .find(|declared| declared.name() == namespace.name())
+                        .ok_or(XmlMutationError::InvalidAppendTarget)?;
+                    if declared.uri() != namespace.uri() {
+                        return Err(XmlMutationError::ConflictingKeyInfoNamespace {
+                            prefix: prefix.to_owned(),
+                        });
+                    }
+                    return Ok(attributes);
+                }
+                if placeholder
+                    .parent_element()
+                    .and_then(|parent| parent.lookup_namespace_uri(namespace.name()))
+                    == Some(namespace.uri())
+                {
+                    return Ok(attributes);
+                }
+                let attribute = namespace
+                    .name()
+                    .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
+                write!(
+                    attributes,
+                    " {attribute}=\"{}\"",
+                    escape_attribute(namespace.uri())
+                )
+                .expect("writing to a String cannot fail");
+                Ok(attributes)
+            })?;
+    Ok(generated_namespace_attributes)
+}
+
+fn generated_key_info_attributes(
+    placeholder: Node<'_, '_>,
+    source: Node<'_, '_>,
+) -> Result<String, XmlMutationError> {
+    let generated_attributes =
+        source
+            .attributes()
+            .try_fold(String::new(), |mut attributes, attribute| {
+                let existing = placeholder.attributes().find(|candidate| {
+                    candidate.namespace() == attribute.namespace()
+                        && candidate.name() == attribute.name()
+                });
+                if let Some(existing) = existing {
+                    if existing.value() != attribute.value() {
+                        return Err(XmlMutationError::ConflictingKeyInfoAttribute {
+                            name: attribute.name().to_owned(),
+                        });
+                    }
+                    return Ok(attributes);
+                }
+                let qualified_name = match attribute.namespace() {
+                    None => attribute.name().to_owned(),
+                    Some("http://www.w3.org/XML/1998/namespace") => {
+                        format!("xml:{}", attribute.name())
+                    }
+                    Some(namespace) => {
+                        let prefix = source
+                            .lookup_prefix(namespace)
+                            .ok_or(XmlMutationError::InvalidAppendTarget)?;
+                        format!("{prefix}:{}", attribute.name())
+                    }
+                };
+                write!(
+                    attributes,
+                    " {qualified_name}=\"{}\"",
+                    escape_attribute(attribute.value())
+                )
+                .expect("writing to a String cannot fail");
+                Ok(attributes)
+            })?;
+    Ok(generated_attributes)
 }
 
 fn wrap_key_info_children(
@@ -808,10 +867,12 @@ fn wrap_key_info_children(
         let declaration = namespace
             .name()
             .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
-        wrapper.push_str(&format!(
+        write!(
+            wrapper,
             " {declaration}=\"{}\"",
             escape_attribute(namespace.uri())
-        ));
+        )
+        .expect("writing to a String cannot fail");
     }
     wrapper.push('>');
     wrapper.push_str(source);
@@ -834,10 +895,12 @@ fn standalone_element(
             .name()
             .map_or_else(|| "xmlns".to_owned(), |prefix| format!("xmlns:{prefix}"));
         if !owned_namespaces.contains(namespace.name().unwrap_or_default()) {
-            output.push_str(&format!(
+            write!(
+                output,
                 " {declaration}=\"{}\"",
                 escape_attribute(namespace.uri())
-            ));
+            )
+            .expect("writing to a String cannot fail");
         }
     }
     output.push_str(&opening[namespace_insertion..]);
@@ -866,16 +929,13 @@ fn has_cryptographic_identity_content(node: crate::xml::dom::Node<'_, '_>) -> bo
         return true;
     }
     match (node.tag_name().namespace(), node.tag_name().name()) {
-        (Some(XMLDSIG_NS), "KeyName") => node
+        (Some(XMLDSIG_NS), "KeyName") | (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => node
             .children()
-            .filter_map(|child| child.text())
+            .filter_map(Node::text)
             .any(|text| !is_xml_whitespace_only(text)),
-        (Some(XMLDSIG_NS), "RetrievalMethod") => node.attribute("URI").is_some(),
-        (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => node
-            .children()
-            .filter_map(|child| child.text())
-            .any(|text| !is_xml_whitespace_only(text)),
-        (Some(XMLDSIG11_NS), "KeyInfoReference") => node.attribute("URI").is_some(),
+        (Some(XMLDSIG_NS), "RetrievalMethod") | (Some(XMLDSIG11_NS), "KeyInfoReference") => {
+            node.attribute("URI").is_some()
+        }
         _ => false,
     }
 }
@@ -1117,7 +1177,7 @@ fn preserve_retained_child_namespaces(
     source: crate::xml::dom::Node<'_, '_>,
 ) -> Result<Vec<(usize, String)>, XmlMutationError> {
     let mut insertions = Vec::new();
-    for child in placeholder.children().filter(|child| child.is_element()) {
+    for child in placeholder.children().filter(Node::is_element) {
         let child_range = child.range();
         let child_opening_end = child_range.start
             + element_opening_end(&xml[child_range.clone()])
@@ -1142,14 +1202,20 @@ fn preserve_retained_child_namespaces(
             }
             if let Some(prefix) = name {
                 if let Some(uri) = original {
-                    declarations
-                        .push_str(&format!(" xmlns:{prefix}=\"{}\"", escape_attribute(uri)));
+                    write!(
+                        declarations,
+                        " xmlns:{prefix}=\"{}\"",
+                        escape_attribute(uri)
+                    )
+                    .expect("writing to a String cannot fail");
                 }
             } else {
-                declarations.push_str(&format!(
+                write!(
+                    declarations,
                     " xmlns=\"{}\"",
                     escape_attribute(original.unwrap_or_default())
-                ));
+                )
+                .expect("writing to a String cannot fail");
             }
         }
         if !declarations.is_empty() {
@@ -1208,7 +1274,7 @@ where
     fill_dsig_text_values_matching(
         xml,
         local_name,
-        values,
+        &values,
         None,
         None,
         DsigReplacementScope::Any,
@@ -1249,7 +1315,7 @@ impl DsigReplacementScope {
 fn fill_dsig_text_values_matching(
     xml: &str,
     local_name: &'static str,
-    values: Vec<String>,
+    values: &[String],
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
     scope: DsigReplacementScope,
@@ -1294,7 +1360,7 @@ fn fill_dsig_contents_matching(
     let ranges = document
         .descendants()
         .filter(|node| is_dsig_node(*node, local_name) && scope.includes(*node, signature))
-        .map(|node| actionable_node_range(node))
+        .map(actionable_node_range)
         .collect::<Result<Vec<_>, XmlMutationError>>()?;
     if ranges.len() != contents.len() {
         return Err(XmlMutationError::ValueCountMismatch {
@@ -1384,12 +1450,12 @@ fn is_direct_signed_info_reference_digest(
             .is_some_and(|parent| is_dsig_node(parent, "Reference"))
         && node
             .parent()
-            .and_then(|parent| parent.parent())
+            .and_then(Node::parent)
             .is_some_and(|grandparent| is_dsig_node(grandparent, "SignedInfo"))
         && node
             .parent()
-            .and_then(|parent| parent.parent())
-            .and_then(|grandparent| grandparent.parent())
+            .and_then(Node::parent)
+            .and_then(Node::parent)
             .is_some_and(|parent| parent == signature)
 }
 
@@ -1637,7 +1703,7 @@ mod tests {
         let values: Vec<_> = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
-            .map(|node| node.text())
+            .map(Node::text)
             .collect();
         assert_eq!(values, [Some("digest-one"), Some("digest-two")]);
     }
@@ -1713,9 +1779,11 @@ mod tests {
     fn mutation_enforces_the_backend_neutral_namespace_ceiling() {
         // The shared preflight and semantic parser must enforce the same
         // active-binding ceiling rather than diverging during mutation.
-        let declarations = (0..1_023)
-            .map(|index| format!(r#" xmlns:n{index}="urn:namespace:{index}""#))
-            .collect::<String>();
+        let mut declarations = String::new();
+        for index in 0..1_023 {
+            write!(declarations, r#" xmlns:n{index}="urn:namespace:{index}""#)
+                .expect("writing to a String cannot fail");
+        }
         let xml = format!(
             r#"<root{declarations}><ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo/><ds:SignatureValue/></ds:Signature></root>"#
         );
@@ -1823,7 +1891,7 @@ mod tests {
         let values = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
-            .filter_map(|node| node.text())
+            .filter_map(Node::text)
             .collect::<Vec<_>>();
 
         assert_eq!(values, ["outer-new", "inner-keep"]);
@@ -1849,7 +1917,7 @@ mod tests {
             x509_data
                 .children()
                 .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
-                .and_then(|node| node.text()),
+                .and_then(Node::text),
             Some("Y2VydA==")
         );
         assert!(
@@ -1984,7 +2052,7 @@ mod tests {
         let key_names = document
             .descendants()
             .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyName")))
-            .filter_map(|node| node.text())
+            .filter_map(Node::text)
             .collect::<Vec<_>>();
 
         assert_eq!(key_names, ["generated"]);
@@ -2012,7 +2080,7 @@ mod tests {
             x509_data
                 .children()
                 .find(|node| node.has_tag_name((XMLDSIG_NS, "X509Certificate")))
-                .and_then(|node| node.text()),
+                .and_then(Node::text),
             Some("Z2VuZXJhdGVk")
         );
         assert!(!merged.contains("c3RhbGU="));
@@ -2021,14 +2089,14 @@ mod tests {
             x509_data
                 .children()
                 .find(|node| node.has_tag_name((XMLDSIG_NS, "X509CRL")))
-                .and_then(|node| node.text()),
+                .and_then(Node::text),
             Some("Y3Js")
         );
         assert_eq!(
             x509_data
                 .children()
                 .find(|node| node.has_tag_name(("urn:example:x509", "Policy")))
-                .and_then(|node| node.text()),
+                .and_then(Node::text),
             Some("keep")
         );
     }

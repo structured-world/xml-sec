@@ -164,7 +164,7 @@ fn exact_datetime_retains_unbounded_year_fraction_zone_and_end_of_day() {
                     Ok::<_, ()>(())
                 },
             )
-            .unwrap()
+            .unwrap();
         });
     }
 }
@@ -205,7 +205,7 @@ fn datetime_schema_boundaries_are_not_rfc3339_or_xsd11() {
                     Ok::<_, ()>(())
                 },
             )
-            .unwrap()
+            .unwrap();
         });
     }
 }
@@ -370,7 +370,7 @@ fn anyuri_applies_schema_escaping_not_url_policy() {
                     Ok::<_, ()>(())
                 },
             )
-            .unwrap()
+            .unwrap();
         });
     }
 }
@@ -380,8 +380,11 @@ fn scalar_refuses_both_live_work_ceilings_and_join_memory_before_callback() {
     // Retained XML is not prepayment for future scalar reads; either current
     // local or aggregate Work and actual join storage can refuse the callback.
     let document = XmlDocument::parse("<r Id='r'>a<!--split--><![CDATA[b]]>c</r>").unwrap();
-    for (local, aggregate, memory) in [(0, 100000, 10000), (100000, 0, 10000), (100000, 100000, 0)]
-    {
+    for (local, aggregate, memory) in [
+        (0, 100_000, 10000),
+        (100_000, 0, 10000),
+        (100_000, 100_000, 0),
+    ] {
         let account = Arc::new(MemoryAccount::new(memory, aggregate));
         let parser = Parser::new(
             Encoding::Der,
@@ -453,7 +456,7 @@ fn scalar_join_admits_trailing_child_visits_before_requesting_capacity() {
         "<!--tail-->".repeat(64)
     ))
     .unwrap();
-    for (local, aggregate) in [(100, 100000), (100000, 100)] {
+    for (local, aggregate) in [(100, 100_000), (100_000, 100)] {
         let memory = Memory::new(Arc::new(MemoryAccount::new(0, aggregate)));
         let parser = Parser::new(
             Encoding::Der,
@@ -523,7 +526,7 @@ fn borrowed_inspection_needs_no_owned_memory() {
     // Original contiguous text, attributes and namespace bindings are borrowed;
     // inspection must not allocate merely to visit already retained XML.
     let document = XmlDocument::parse("<r Id='r'>2000-02-29T00:00:00Z</r>").unwrap();
-    let work = Memory::new(Arc::new(MemoryAccount::new(0, 100000)));
+    let work = Memory::new(Arc::new(MemoryAccount::new(0, 100_000)));
     document.with_view(|view| {
         let owner = view.node_for_id("r", &[]).unwrap();
         visit_direct_attributes(view, owner, &work, |_| Ok::<_, ()>(())).unwrap();
@@ -553,7 +556,7 @@ fn unsupported_schema_does_not_allocate_unused_normalization() {
     // No schema value is produced for an unknown datatype. Its original
     // retained spelling must not be copied into a discarded collapsed value.
     let document = XmlDocument::parse("<r Id='r' a='one  two'/>").unwrap();
-    let work = Memory::new(Arc::new(MemoryAccount::new(0, 100000)));
+    let work = Memory::new(Arc::new(MemoryAccount::new(0, 100_000)));
     document.with_view(|view| {
         with_scalar(
             view,
@@ -583,7 +586,7 @@ fn malformed_simple_content_does_not_allocate_a_partial_join() {
     // A nested element is a structural fact, not a reason to build a text
     // prefix and fail its memory allocation before reporting complex content.
     let document = XmlDocument::parse("<r Id='r'>a<!--split-->b<child/></r>").unwrap();
-    let work = Memory::new(Arc::new(MemoryAccount::new(0, 100000)));
+    let work = Memory::new(Arc::new(MemoryAccount::new(0, 100_000)));
     document.with_view(|view| {
         with_scalar(
             view,
@@ -596,7 +599,7 @@ fn malformed_simple_content_does_not_allocate_a_partial_join() {
                 Ok::<_, ()>(())
             },
         )
-        .unwrap()
+        .unwrap();
     });
 }
 

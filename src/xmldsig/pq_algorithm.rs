@@ -38,6 +38,7 @@ impl PqAlgorithm {
     ];
 
     /// Experimental XML URI used by libxmlsec1 1.3.13.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             Self::MlDsa44 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-dsa-44",
@@ -67,6 +68,7 @@ impl PqAlgorithm {
     /// PKIX OID, with parameters absent (RFC 9881 section 2 / RFC 9909 section 3).
     /// <https://www.rfc-editor.org/rfc/rfc9881.html#section-2>
     /// <https://www.rfc-editor.org/rfc/rfc9909.html#section-3>
+    #[must_use]
     pub const fn oid(self) -> &'static str {
         match self {
             Self::MlDsa44 => "2.16.840.1.101.3.4.3.17",
@@ -85,13 +87,15 @@ impl PqAlgorithm {
         pkcs8::der::asn1::ObjectIdentifier::new_unwrap(self.oid())
     }
 
-    pub(crate) fn from_oid(oid: pkcs8::der::asn1::ObjectIdentifier) -> Option<Self> {
+    /// Parameter set named by the contents octets of an OBJECT IDENTIFIER.
+    pub(crate) fn from_oid(oid: &[u8]) -> Option<Self> {
         Self::ALL
             .into_iter()
-            .find(|algorithm| algorithm.object_oid() == oid)
+            .find(|algorithm| algorithm.object_oid().as_bytes() == oid)
     }
 
     /// Exact signature wire width (FIPS 204 table 2 / FIPS 205 table 2).
+    #[must_use]
     pub const fn signature_len(self) -> usize {
         match self {
             Self::MlDsa44 => 2420,

@@ -1,6 +1,6 @@
-//! Integration tests: URI dereference → NodeSet → C14N canonicalization.
+//! Integration tests: URI dereference → `NodeSet` → C14N canonicalization.
 //!
-//! Verifies that dereferencing a URI produces a NodeSet that, when used as
+//! Verifies that dereferencing a URI produces a `NodeSet` that, when used as
 //! a predicate for C14N, produces the correct canonical output.
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
@@ -206,7 +206,7 @@ fn dtd_id_generation_is_rebuilt_after_controlled_mutation() {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-/// Dereference `uri`, build a C14N predicate from the resulting NodeSet,
+/// Dereference `uri`, build a C14N predicate from the resulting `NodeSet`,
 /// canonicalize with inclusive C14N 1.0, and return the canonical string.
 fn deref_and_canonicalize(xml: &str, uri: &str) -> String {
     deref_and_canonicalize_impl(xml, uri, false)
@@ -262,13 +262,22 @@ fn empty_uri_with_namespaces() {
     );
 }
 
+/// 257 distinct namespace declarations for one start tag.
+fn dense_namespaces() -> String {
+    use std::fmt::Write as _;
+    let mut namespaces = String::new();
+    for index in 0..257 {
+        write!(namespaces, r#" xmlns:n{index}="urn:{index}""#)
+            .expect("writing to a String cannot fail");
+    }
+    namespaces
+}
+
 #[test]
 fn empty_uri_accepts_a_node_set_above_the_old_ceiling() {
     // A dense namespace projection with more than 65,536 entries must fit the
     // low-level hard ceiling; previously that ceiling rejected it.
-    let namespaces = (0..257)
-        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
-        .collect::<String>();
+    let namespaces = dense_namespaces();
     let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(257));
     let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
     let set = NodeSet::entire_document_without_comments(&document)
@@ -280,14 +289,11 @@ fn empty_uri_accepts_a_node_set_above_the_old_ceiling() {
 fn empty_uri_rejects_quadratic_namespace_materialization() {
     // In-scope namespace nodes are projected for every owner element. Bound the
     // declarations-by-elements product before allocating the backing set.
-    let namespaces = (0..257)
-        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
-        .collect::<String>();
+    let namespaces = dense_namespaces();
     let xml = format!("<root{namespaces}>{}</root>", "<item/>".repeat(2048));
     let document = roxmltree::Document::parse(&xml).expect("generated XML must parse");
-    let error = match UriReferenceResolver::new(&document).dereference("") {
-        Err(error) => error,
-        Ok(_) => panic!("oversized namespace projection must fail before materialization"),
+    let Err(error) = UriReferenceResolver::new(&document).dereference("") else {
+        panic!("oversized namespace projection must fail before materialization");
     };
 
     assert!(matches!(
@@ -299,9 +305,8 @@ fn empty_uri_rejects_quadratic_namespace_materialization() {
         })
     ));
 
-    let direct_error = match NodeSet::entire_document_without_comments(&document) {
-        Err(error) => error,
-        Ok(_) => panic!("public constructors must enforce the materialization budget"),
+    let Err(direct_error) = NodeSet::entire_document_without_comments(&document) else {
+        panic!("public constructors must enforce the materialization budget");
     };
     assert!(matches!(
         direct_error,

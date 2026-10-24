@@ -101,18 +101,13 @@ fn every_behavior_names_control_and_bidirectional_evidence() {
         }
         let evidence_id = behavior["evidence"].as_str().expect("evidence id");
         let item = evidence.get(evidence_id).expect("referenced evidence");
-        assert!(
-            !item["positive"]
-                .as_array()
-                .expect("positive tests")
-                .is_empty()
-        );
-        assert!(
-            !item["negative"]
-                .as_array()
-                .expect("negative tests")
-                .is_empty()
-        );
+        for polarity in ["positive", "negative"] {
+            assert_ne!(
+                item[polarity].as_array().expect("evidence test list").len(),
+                0,
+                "{evidence_id} has no {polarity} tests"
+            );
+        }
     }
 }
 

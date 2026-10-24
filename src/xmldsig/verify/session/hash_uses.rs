@@ -1,11 +1,14 @@
 //! Paid projection of original selected signature and digest decisions.
 
-use super::*;
+use super::{
+    CatalogueCompleteness, CatalogueError, DigestAlgorithm, DsigError, NodeIdentity,
+    ReferenceParent, SelectedSignature, SelectedSignatureMethod, SignatureAlgorithm, Work,
+};
 
 /// The instruction's exact hash role, independent of payload acceptance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HashUseRole {
-    /// External digest of canonical SignedInfo, or an intrinsic signature suite.
+    /// External digest of canonical `SignedInfo`, or an intrinsic signature suite.
     SignatureMessage,
     /// RSA-PSS's separately selected MGF1 hash.
     MaskGeneration,
@@ -14,21 +17,7 @@ pub enum HashUseRole {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_advertised_method_has_explicit_message_hash_semantics() {
-        // A newly advertised signature method must not silently disappear from
-        // algorithm projection, including pure experimental suites.
-        for algorithm in SignatureAlgorithm::ALL {
-            assert!(
-                !matches!(message_hash(algorithm), HashUseAlgorithm::Unsupported(_)),
-                "{algorithm:?}"
-            );
-        }
-    }
-}
+mod tests;
 
 /// Declared hash semantics; output length never determines the algorithm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,7 +26,7 @@ pub enum HashUseAlgorithm<'a> {
     Digest(DigestAlgorithm),
     /// RFC 8032 Ed448ph's SHAKE256 prehash with a 64-byte output.
     Shake256_512,
-    /// No independently selected external digest (e.g. PureEdDSA or pure ML-DSA).
+    /// No independently selected external digest (e.g. `PureEdDSA` or pure ML-DSA).
     Intrinsic(SignatureAlgorithm),
     /// Original unimplemented/malformed instruction, including an absent URI.
     Unsupported(Option<&'a str>),
@@ -59,7 +48,7 @@ pub enum HashUseState {
 pub struct SignatureHashUse<'a> {
     /// Original selected Signature, including document and generation.
     pub signature: NodeIdentity,
-    /// Original SignatureMethod or Reference instruction.
+    /// Original `SignatureMethod` or Reference instruction.
     pub instruction: NodeIdentity,
     /// Original method element, absent only for a malformed Reference layout.
     pub method: Option<NodeIdentity>,
@@ -83,14 +72,15 @@ pub enum HashUseCompleteness {
 }
 
 fn message_hash(algorithm: SignatureAlgorithm) -> HashUseAlgorithm<'static> {
+    use DigestAlgorithm as D;
+    use SignatureAlgorithm as S;
+
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
         return HashUseAlgorithm::Digest(parameters.digest);
     }
     if let Some(digest) = algorithm.ecdsa_digest() {
         return HashUseAlgorithm::Digest(digest);
     }
-    use DigestAlgorithm as D;
-    use SignatureAlgorithm as S;
     let digest = match algorithm {
         S::RsaSha1 | S::DsaSha1 | S::HmacSha1 => D::Sha1,
         S::RsaSha224 | S::HmacSha224 => D::Sha224,
@@ -161,28 +151,20 @@ impl<W: Work, F> ReferenceHashVisitor<'_, W, F> {
 }
 
 impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
-    /// Original typed method captured during the first successful verification.
-    pub fn signature_method(&self) -> Result<SelectedSignatureMethod, DsigError> {
-        self.session.signature_method_in(self.index, self.work)
-    }
-
-    /// Visit declared original roles and their actual original completion state.
-    /// This neither verifies again nor resolves keys or resources again.
-    pub fn visit_hash_uses<E>(
+    fn visit_signature_hash_roles<E>(
         &self,
-        mut visitor: impl for<'a> FnMut(SignatureHashUse<'a>) -> Result<(), E>,
+        method: SelectedSignatureMethod,
+        signature: NodeIdentity,
+        visitor: &mut impl for<'a> FnMut(SignatureHashUse<'a>) -> Result<(), E>,
     ) -> Result<HashUseCompleteness, CatalogueError<E>> {
-        let method = self
-            .signature_method()
-            .map_err(CatalogueError::Processing)?;
-        let signature = self.session.evidence.signatures()[self.index].identity;
-        let mut completeness = HashUseCompleteness::Complete;
         let algorithm = message_hash(method.algorithm);
-        let state = if matches!(algorithm, HashUseAlgorithm::Unsupported(_)) {
-            completeness = HashUseCompleteness::Unsupported(method.identity);
-            HashUseState::Unsupported
+        let (completeness, state) = if matches!(algorithm, HashUseAlgorithm::Unsupported(_)) {
+            (
+                HashUseCompleteness::Unsupported(method.identity),
+                HashUseState::Unsupported,
+            )
         } else {
-            HashUseState::Complete
+            (HashUseCompleteness::Complete, HashUseState::Complete)
         };
         self.work
             .charge_work(1)
@@ -196,9 +178,18 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
             state,
         })
         .map_err(CatalogueError::Visitor)?;
-        // RFC 9231 §2.3.9 and RFC 8017 §9.1: MGF1's digest is independent
-        // of the message digest. Use the originally parsed effective parameters.
-        // https://www.rfc-editor.org/rfc/rfc9231#section-2.3.9
+        self.visit_mask_generation_hash(method, signature, visitor)?;
+        Ok(completeness)
+    }
+
+    fn visit_mask_generation_hash<E>(
+        &self,
+        method: SelectedSignatureMethod,
+        signature: NodeIdentity,
+        visitor: &mut impl for<'a> FnMut(SignatureHashUse<'a>) -> Result<(), E>,
+    ) -> Result<(), CatalogueError<E>> {
+        // RFC 9231 §2.3.9 and RFC 8017 §9.1 select MGF1 independently of
+        // the message digest: https://www.rfc-editor.org/rfc/rfc9231#section-2.3.9
         if let Some(parameters) = method.algorithm.rsa_pss_parameters() {
             self.work
                 .charge_work(1)
@@ -213,6 +204,33 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
             })
             .map_err(CatalogueError::Visitor)?;
         }
+        Ok(())
+    }
+
+    /// Original typed method captured during the first successful verification.
+    ///
+    /// # Errors
+    /// Returns an error for stale document state, exhausted query work,
+    /// retained capture refusal, or a missing original method receipt.
+    pub fn signature_method(&self) -> Result<SelectedSignatureMethod, DsigError> {
+        self.session.signature_method_in(self.index, self.work)
+    }
+
+    /// Visit declared original roles and their actual original completion state.
+    /// This neither verifies again nor resolves keys or resources again.
+    ///
+    /// # Errors
+    /// Returns a processing error for invalid retained state or exhausted query
+    /// resources. Preserves visitor refusals separately from processing failures.
+    pub fn visit_hash_uses<E>(
+        &self,
+        mut visitor: impl for<'a> FnMut(SignatureHashUse<'a>) -> Result<(), E>,
+    ) -> Result<HashUseCompleteness, CatalogueError<E>> {
+        let method = self
+            .signature_method()
+            .map_err(CatalogueError::Processing)?;
+        let signature = self.session.evidence.signatures()[self.index].identity;
+        let mut completeness = self.visit_signature_hash_roles(method, signature, &mut visitor)?;
         let catalogue = self.visit_reference_instructions(|node, parent, method| {
             let reference = self.session.view.node_identity(node);
             let digest_receipt = self.session.operations[self.index]
@@ -302,7 +320,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                         CatalogueCompleteness::Complete => {}
                         CatalogueCompleteness::Incomplete(node)
                         | CatalogueCompleteness::Unchecked(node) => {
-                            completeness = HashUseCompleteness::Unprocessed(node)
+                            completeness = HashUseCompleteness::Unprocessed(node);
                         }
                     }
                 }

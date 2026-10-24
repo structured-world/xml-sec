@@ -1,7 +1,7 @@
 //! End-to-end signing tests for SAML Response XML documents.
 //!
-//! The SAML schema requires an enveloped XMLDSig signature immediately after
-//! the response issuer. These tests ensure the generic XMLDSig signing API can
+//! The SAML schema requires an enveloped `XMLDSig` signature immediately after
+//! the response issuer. These tests ensure the generic `XMLDSig` signing API can
 //! fill a SAML-shaped template without moving that schema-significant element.
 
 #![cfg(feature = "xmldsig")]
@@ -48,7 +48,7 @@ fn signs_saml_response_with_schema_order_and_embedded_certificate() {
 
     let children = response
         .children()
-        .filter(|node| node.is_element())
+        .filter(roxmltree::Node::is_element)
         .collect::<Vec<_>>();
     assert_eq!(
         children.len(),

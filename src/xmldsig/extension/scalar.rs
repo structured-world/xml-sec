@@ -54,6 +54,11 @@ fn element<'a>(
 /// Visit every direct attribute once in source order. Namespace declarations
 /// are excluded (Namespaces in XML 1.0 §6.2), including inherited bindings.
 /// The callback cannot return a borrow into its temporary inspection scope.
+///
+/// # Errors
+///
+/// Returns [`InspectionError::Processing`] for a stale or non-element owner
+/// or exhausted work, and [`InspectionError::Visitor`] with the callback's error.
 pub fn visit_direct_attributes<W: Work, E>(
     view: DocumentView<'_>,
     owner: NodeIdentity,
@@ -80,6 +85,11 @@ pub fn visit_direct_attributes<W: Work, E>(
 
 /// Visit the semantic in-scope namespace axis separately from attributes.
 /// This does not reconstruct which declarations were written on this element.
+///
+/// # Errors
+///
+/// Returns [`InspectionError::Processing`] for a stale or non-element owner
+/// or exhausted work, and [`InspectionError::Visitor`] with the callback's error.
 pub fn visit_in_scope_namespaces<W: Work, E>(
     view: DocumentView<'_>,
     owner: NodeIdentity,
@@ -129,7 +139,7 @@ pub enum ScalarType<'a> {
     Boolean,
     /// XML Schema 1.0 integer validity, without finite-width conversion.
     Integer,
-    /// XML Schema 1.0 QName, expanded in the original owner's namespace scope.
+    /// XML Schema 1.0 `QName`, expanded in the original owner's namespace scope.
     QName,
     /// XML Schema 1.0 dateTime, not RFC 3339 or XSD 1.1.
     DateTime,
@@ -171,7 +181,7 @@ pub struct DateTimeLexical<'a> {
     pub timezone_minutes: Option<i16>,
 }
 
-/// Expanded QName value, not an element/attribute name or a resolved schema type.
+/// Expanded `QName` value, not an element/attribute name or a resolved schema type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QNameValue<'a> {
     /// Original in-scope namespace URI, or None when no default binding exists.
@@ -188,11 +198,11 @@ pub enum ScalarValue<'a> {
     /// Valid arbitrary-precision integer spelling; not a numeric value or a
     /// claim about derived types such as int, nonNegativeInteger or totalDigits.
     Integer,
-    /// Expanded original QName, without type-definition lookup or schema loading.
+    /// Expanded original `QName`, without type-definition lookup or schema loading.
     QName(QNameValue<'a>),
     /// Exact dateTime lexical components, not canonicalized value fields.
     DateTime(DateTimeLexical<'a>),
-    /// Collapsed NCName; no ID registration, uniqueness or authentication claim.
+    /// Collapsed `NCName`; no ID registration, uniqueness or authentication claim.
     Id(&'a str),
     /// Collapsed anyURI spelling; no escaping, absolutization or fetching.
     AnyUri(&'a str),
@@ -207,7 +217,7 @@ pub enum ScalarFact<'a> {
     ComplexContent,
     /// A present lexical value is outside the requested base datatype.
     Malformed,
-    /// A syntactically valid QName uses this prefix without an in-scope binding.
+    /// A syntactically valid `QName` uses this prefix without an in-scope binding.
     /// This is a value-interpretation fact, not a terminal processing failure.
     UnboundPrefix(&'a str),
     /// The requested datatype has no implemented semantics.
@@ -242,9 +252,21 @@ impl<W: Work> Text<'_, W> {
     }
 }
 
+/// The selected original lexical source: present text, absent, or complex.
+enum Source<'a, W: Work> {
+    Text(Text<'a, W>),
+    Absent,
+    Complex,
+}
+
 /// Inspect an original attribute or simple-content source within a paid scope.
 /// Temporary joined/collapsed storage is owned by current Work and released
 /// when the callback returns; R cannot carry a borrowed temporary scalar.
+///
+/// # Errors
+///
+/// Returns [`InspectionError::Processing`] for a stale or non-element owner
+/// or exhausted work, and [`InspectionError::Visitor`] with the callback's error.
 pub fn with_scalar<W: Work, R, E>(
     view: DocumentView<'_>,
     owner: NodeIdentity,
@@ -254,104 +276,29 @@ pub fn with_scalar<W: Work, R, E>(
     consume: impl for<'a> FnOnce(ScalarInspection<'a>) -> Result<R, E>,
 ) -> Result<R, InspectionError<E>> {
     let node = element(view, owner, work).map_err(InspectionError::Processing)?;
-    let read = || -> Result<_, ScalarError> {
-        match source {
-            LexicalSource::Attribute {
-                namespace,
-                local_name,
-            } => {
-                for attribute in node.attributes() {
-                    charge_bytes(work, 1)?;
-                    charge_bytes(work, attribute.name().len())?;
-                    charge_bytes(work, attribute.namespace().map_or(0, str::len))?;
-                    if attribute.name() == local_name && attribute.namespace() == namespace {
-                        admit_scalar_passes(work, attribute.value().len())?;
-                        return Ok(Ok(Some(Text::Borrowed(attribute.value()))));
-                    }
-                }
-                Ok(Ok(None))
-            }
-            LexicalSource::SimpleContent => {
-                // Validate structure before creating any joined prefix. A malformed
-                // simple-content source must not allocate only to discard the text.
-                let mut text_bytes = 0usize;
-                let mut child_visits = 0usize;
-                for child in node.children() {
-                    charge_bytes(work, 1)?;
-                    child_visits = child_visits.checked_add(1).ok_or(ScalarError::Resource(
-                        structured_asn1::memory::MemoryError::WorkExceeded,
-                    ))?;
-                    if child.is_element() {
-                        return Ok(Err(()));
-                    }
-                    if child.is_text() {
-                        let text = child.text().expect("text node has a text value");
-                        text_bytes =
-                            text_bytes
-                                .checked_add(text.len())
-                                .ok_or(ScalarError::Resource(
-                                    structured_asn1::memory::MemoryError::WorkExceeded,
-                                ))?;
-                    }
-                }
-                // Copies have their own OwnedVec work charge, but admit every
-                // subsequent linear pass before constructing a doomed join.
-                admit_scalar_passes(work, text_bytes)?;
-                // The second traversal also visits comments and PIs, even when
-                // no text remains. Admit those visits before the first join.
-                charge_bytes(work, child_visits)?;
-                let mut value = Text::Borrowed("");
-                for child in node.children() {
-                    if child.is_element() {
-                        return Ok(Err(()));
-                    }
-                    if !child.is_text() {
-                        continue;
-                    }
-                    let text = child.text().expect("text node has a text value");
-                    match &mut value {
-                        Text::Borrowed(first) if first.is_empty() => *first = text,
-                        Text::Borrowed(first) => {
-                            let mut bytes = work.vector();
-                            bytes
-                                .try_reserve_exact(text_bytes)
-                                .map_err(ScalarError::Resource)?;
-                            bytes
-                                .try_extend_from_slice(first.as_bytes())
-                                .map_err(ScalarError::Resource)?;
-                            bytes
-                                .try_extend_from_slice(text.as_bytes())
-                                .map_err(ScalarError::Resource)?;
-                            value = Text::Joined(bytes);
-                        }
-                        Text::Joined(bytes) => bytes
-                            .try_extend_from_slice(text.as_bytes())
-                            .map_err(ScalarError::Resource)?,
-                    }
-                }
-                Ok(Ok(Some(value)))
-            }
-        }
-    };
-    let value = read().map_err(InspectionError::Processing)?;
-    let value = match value {
-        Err(()) => {
+    let source = match source {
+        LexicalSource::Attribute {
+            namespace,
+            local_name,
+        } => attribute_text(node, namespace, local_name, work),
+        LexicalSource::SimpleContent => simple_content_text(node, work),
+    }
+    .map_err(InspectionError::Processing)?;
+    let value = match source {
+        Source::Text(value) => value,
+        Source::Absent | Source::Complex => {
+            let fact = if matches!(source, Source::Absent) {
+                ScalarFact::Absent
+            } else {
+                ScalarFact::ComplexContent
+            };
             return consume(ScalarInspection {
                 owner,
                 lexical: None,
-                fact: ScalarFact::ComplexContent,
+                fact,
             })
             .map_err(InspectionError::Visitor);
         }
-        Ok(None) => {
-            return consume(ScalarInspection {
-                owner,
-                lexical: None,
-                fact: ScalarFact::Absent,
-            })
-            .map_err(InspectionError::Visitor);
-        }
-        Ok(Some(value)) => value,
     };
     let lexical = value.view();
     let collapsed = match datatype {
@@ -360,8 +307,99 @@ pub fn with_scalar<W: Work, R, E>(
         }
         _ => collapse(lexical, work).map_err(InspectionError::Processing)?,
     };
-    let text = collapsed.view();
-    let fact = match datatype {
+    let fact =
+        scalar_fact(node, collapsed.view(), datatype, work).map_err(InspectionError::Processing)?;
+    consume(ScalarInspection {
+        owner,
+        lexical: Some(lexical),
+        fact,
+    })
+    .map_err(InspectionError::Visitor)
+}
+
+fn attribute_text<'a, W: Work>(
+    node: crate::xml::dom::Node<'a, 'a>,
+    namespace: Option<&str>,
+    local_name: &str,
+    work: &W,
+) -> Result<Source<'a, W>, ScalarError> {
+    for attribute in node.attributes() {
+        charge_bytes(work, 1)?;
+        charge_bytes(work, attribute.name().len())?;
+        charge_bytes(work, attribute.namespace().map_or(0, str::len))?;
+        if attribute.name() == local_name && attribute.namespace() == namespace {
+            admit_scalar_passes(work, attribute.value().len())?;
+            return Ok(Source::Text(Text::Borrowed(attribute.value())));
+        }
+    }
+    Ok(Source::Absent)
+}
+
+fn simple_content_text<'a, W: Work>(
+    node: crate::xml::dom::Node<'a, 'a>,
+    work: &W,
+) -> Result<Source<'a, W>, ScalarError> {
+    let overflow = || ScalarError::Resource(structured_asn1::memory::MemoryError::WorkExceeded);
+    // Validate structure before creating any joined prefix. A malformed
+    // simple-content source must not allocate only to discard the text.
+    let mut text_bytes = 0usize;
+    let mut child_visits = 0usize;
+    for child in node.children() {
+        charge_bytes(work, 1)?;
+        child_visits = child_visits.checked_add(1).ok_or_else(overflow)?;
+        if child.is_element() {
+            return Ok(Source::Complex);
+        }
+        if child.is_text()
+            && let Some(text) = child.text()
+        {
+            text_bytes = text_bytes.checked_add(text.len()).ok_or_else(overflow)?;
+        }
+    }
+    // Copies have their own OwnedVec work charge, but admit every
+    // subsequent linear pass before constructing a doomed join.
+    admit_scalar_passes(work, text_bytes)?;
+    // The second traversal also visits comments and PIs, even when
+    // no text remains. Admit those visits before the first join.
+    charge_bytes(work, child_visits)?;
+    let mut value = Text::Borrowed("");
+    for child in node.children() {
+        if child.is_element() {
+            return Ok(Source::Complex);
+        }
+        let Some(text) = child.text().filter(|_| child.is_text()) else {
+            continue;
+        };
+        match &mut value {
+            Text::Borrowed(first) if first.is_empty() => *first = text,
+            Text::Borrowed(first) => {
+                let mut bytes = work.vector();
+                bytes
+                    .try_reserve_exact(text_bytes)
+                    .map_err(ScalarError::Resource)?;
+                bytes
+                    .try_extend_from_slice(first.as_bytes())
+                    .map_err(ScalarError::Resource)?;
+                bytes
+                    .try_extend_from_slice(text.as_bytes())
+                    .map_err(ScalarError::Resource)?;
+                value = Text::Joined(bytes);
+            }
+            Text::Joined(bytes) => bytes
+                .try_extend_from_slice(text.as_bytes())
+                .map_err(ScalarError::Resource)?,
+        }
+    }
+    Ok(Source::Text(value))
+}
+
+fn scalar_fact<'a>(
+    node: crate::xml::dom::Node<'a, 'a>,
+    text: &'a str,
+    datatype: ScalarType<'_>,
+    work: &impl Work,
+) -> Result<ScalarFact<'a>, ScalarError> {
+    Ok(match datatype {
         ScalarType::Other { .. } => ScalarFact::Unsupported,
         ScalarType::Boolean => match text {
             "true" | "1" => ScalarFact::Value(ScalarValue::Boolean(true)),
@@ -375,12 +413,10 @@ pub fn with_scalar<W: Work, R, E>(
                 ScalarFact::Malformed
             }
         }
-        ScalarType::QName => {
-            inspect_qname(node, text, work).map_err(InspectionError::Processing)?
-        }
-        ScalarType::DateTime => parse_date_time(text)
-            .map(|value| ScalarFact::Value(ScalarValue::DateTime(value)))
-            .unwrap_or(ScalarFact::Malformed),
+        ScalarType::QName => inspect_qname(node, text, work)?,
+        ScalarType::DateTime => parse_date_time(text).map_or(ScalarFact::Malformed, |value| {
+            ScalarFact::Value(ScalarValue::DateTime(value))
+        }),
         ScalarType::Id => {
             // XSD 1.0 §3.3.8; this is lexical validity, not uniqueness.
             // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#ID
@@ -397,13 +433,7 @@ pub fn with_scalar<W: Work, R, E>(
                 ScalarFact::Malformed
             }
         }
-    };
-    consume(ScalarInspection {
-        owner,
-        lexical: Some(lexical),
-        fact,
     })
-    .map_err(InspectionError::Visitor)
 }
 
 fn whitespace(byte: u8) -> bool {

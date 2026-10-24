@@ -1,4 +1,4 @@
-//! XSLT transform adapter (XMLDSig 1.1 section 6.6.5).
+//! XSLT transform adapter (`XMLDSig` 1.1 section 6.6.5).
 //!
 //! <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT>
 
@@ -135,7 +135,7 @@ pub(crate) enum XsltParameter<'a> {
     Transform(crate::xml::dom::Node<'a, 'a>),
 }
 
-impl<'a> XsltParameter<'a> {
+impl XsltParameter<'_> {
     /// Bytes a stylesheet parsed from a signature keeps for the whole operation.
     /// Markup given to `XsltStylesheet::new` belongs to
     /// the caller; a `<Transform>` read in place keeps nothing.
@@ -592,7 +592,7 @@ impl<S: TransformScratch> crate::xml_input_shared::DecodeStorage for WorkspaceDe
 
 /// Whether `element` is an `xsl:stylesheet` or `xsl:transform` element.
 ///
-/// XMLDSig 1.1 section 6.6.5 requires "the mandatory XSLT namespace-qualified
+/// `XMLDSig` 1.1 section 6.6.5 requires "the mandatory XSLT namespace-qualified
 /// stylesheet element" as the parameter, so a literal result element used as a
 /// simplified stylesheet (XSLT 1.0 section 2.3) is not accepted.
 /// <https://www.w3.org/TR/xmldsig-core1/#sec-XSLT>
@@ -688,13 +688,7 @@ fn own_xml_space<'a>(element: crate::xml::dom::Node<'a, 'a>) -> Option<&'a str> 
     element
         .attributes()
         .find(|attribute| attribute.namespace() == Some(XML_NS) && attribute.name() == "space")
-        .map(|attribute| attribute.value())
-}
-
-/// Work done outside any query: an owned transform is serialized once, when it is built.
-#[cfg(test)]
-fn unmetered(_: usize) -> Result<(), TransformError> {
-    Ok(())
+        .map(crate::xml::dom::Attribute::value)
 }
 
 /// Prefixes declared on `element` itself, `None` for the default namespace; `work`
@@ -758,7 +752,7 @@ fn declared_prefixes<'a, W: FnMut(usize) -> Result<(), TransformError>, S: Trans
                         element
                             .namespaces()
                             .find(|namespace| namespace.name() == Some(local.as_str()))
-                            .map(|namespace| namespace.name())
+                            .map(crate::xml::dom::Namespace::name)
                     } else {
                         None
                     };
@@ -850,7 +844,7 @@ impl ParsedStylesheet {
     ) -> Result<Self, Unavailable> {
         let root = transform
             .children()
-            .find(|child| child.is_element())
+            .find(crate::xml::dom::Node::is_element)
             .ok_or(Unavailable::Missing)?;
         let mut inherited = Bounded::new(limit);
         if inheritance != Inheritance::Omit {
@@ -971,7 +965,7 @@ impl<'a> XsltParameter<'a> {
             Self::Transform(transform) => {
                 let root = transform
                     .children()
-                    .find(|child| child.is_element())
+                    .find(crate::xml::dom::Node::is_element)
                     .ok_or(Unavailable::Missing)?;
                 let mut inherited = QueryMarkup {
                     bytes: scratch.bytes(),
@@ -1395,6 +1389,147 @@ fn charge_parse_work<T, S: TransformScratch>(
     }
 }
 
+/// Why no stylesheet document could be assembled, with `held` workspace bytes
+/// already spent by earlier stages.
+fn stylesheet_unavailable(
+    unavailable: Unavailable,
+    allowance: &Allowance,
+    held: usize,
+) -> TransformError {
+    match unavailable {
+        Unavailable::Missing => {
+            TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
+        }
+        Unavailable::Exceeds(needed) => allowance.workspace_error(held.saturating_add(needed)),
+        Unavailable::Refused(error) => error,
+    }
+}
+
+/// Apply the XML input policy to assembled stylesheet text.
+fn preflight_stylesheet<S: TransformScratch>(
+    text: &str,
+    budget: &TransformExecutionBudget,
+    xml_parse: &XmlParseWorkBudget,
+    scratch: &S,
+) -> Result<(), TransformError> {
+    // The stylesheet is element content, which cannot hold a document type declaration.
+    let settings = DocumentParseSettings {
+        allow_dtd: false,
+        ..budget.xml_parse_settings
+    };
+    crate::document::preflight_xml_limits(text, settings, xml_parse, scratch.dom_storage())
+        .map_err(|error| super::map_transform_xml_parse_error(error, settings))
+}
+
+/// Compile assembled stylesheet text within `workspace` owned bytes.
+fn compile_stylesheet<S: TransformScratch>(
+    text: &str,
+    semantics: XsltStylesheetSemantics,
+    workspace: usize,
+    allowance: &Allowance,
+    xml_parse: &XmlParseWorkBudget,
+    scratch: &S,
+) -> Result<Result<crate::xslt::Stylesheet, Error>, TransformError> {
+    charge_parse_work(
+        Compiler::new(
+            Arc::new(NoResolver),
+            CompileBudget::new(
+                allowance.max_document_bytes,
+                0,
+                allowance.max_recursion,
+                workspace,
+            )
+            .with_parse_work_bytes(parse_work_limit(xml_parse, scratch)),
+        )
+        .unbound_prefix_lists(match semantics {
+            XsltStylesheetSemantics::Specification => UnboundPrefixLists::Reject,
+            XsltStylesheetSemantics::Libxmlsec1 => UnboundPrefixLists::Ignore,
+        })
+        .compile_reported(text, None),
+        xml_parse,
+        scratch,
+    )
+}
+
+/// Parse decoded transform input within `workspace` owned bytes.
+fn parse_source<S: TransformScratch>(
+    xml: &str,
+    base_uri: Option<&str>,
+    allow_dtd: bool,
+    workspace: usize,
+    allowance: &Allowance,
+    xml_parse: &XmlParseWorkBudget,
+    scratch: &S,
+) -> Result<Result<Document, Error>, TransformError> {
+    let (entity_references, entity_expansion_bytes) = if allow_dtd {
+        (
+            crate::hard_limits::XML_ENTITY_EXPANSION_CEILING as usize,
+            crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING,
+        )
+    } else {
+        (0, 0)
+    };
+    charge_parse_work(
+        Document::parse_with_budget_reported(
+            xml,
+            // XSLT 1.0 sections 3.3 and 12.4 require relative NDATA system IDs
+            // to resolve against the resource containing their declaration.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#unparsed-entities
+            base_uri,
+            ParseBudget::new(
+                allowance.max_document_bytes,
+                allowance.max_nodes,
+                allowance.max_depth,
+                entity_references,
+                entity_expansion_bytes.min(workspace),
+                workspace,
+            )
+            .with_owned_bytes(workspace)
+            .with_parse_work_bytes(parse_work_limit(xml_parse, scratch)),
+        ),
+        xml_parse,
+        scratch,
+    )
+}
+
+/// Decoded transform input text.
+type DecodedInput<'i, S> = crate::xml_input_shared::Decoded<
+    'i,
+    <<S as TransformScratch>::Decoder as crate::xml_input_shared::DecodeStorage>::Text,
+>;
+
+/// Decode the transform input into the query's account and apply the XML input
+/// policy the engine's parser does not; returns the text and the workspace
+/// bytes its decoded copy holds.
+fn decode_input<'i, S: TransformScratch>(
+    input: &'i [u8],
+    settings: DocumentParseSettings,
+    storage: &WorkspaceDecoder<'_, S>,
+    xml_parse: &XmlParseWorkBudget,
+) -> Result<(DecodedInput<'i, S>, usize), TransformError> {
+    let scratch = storage.scratch;
+    super::check_xml_octets(input, settings)?;
+    xml_parse.charge_policy(input.len())?;
+    let xml =
+        crate::xml_input_shared::decode_xml_in(input, settings.max_bytes, |_, _| Ok(()), storage)
+            .map_err(|error| match error {
+            DecodeFailure::Encoding(error) => super::map_transform_xml_decode_error(error),
+            DecodeFailure::Refused(error) => error,
+        })?;
+    let held = match &xml {
+        crate::xml_input_shared::Decoded::Borrowed(_) => 0,
+        crate::xml_input_shared::Decoded::Owned(text) => S::decoded_capacity(text),
+    };
+    // The query pays for each of the adapter's lexical passes before it runs.
+    reject_document_type(xml.as_ref(), settings, scratch)?;
+    // The engine's parser does not count namespace bindings or apply the rest of
+    // the operation's XML input policy itself.
+    scratch.charge(xml.as_ref().len())?;
+    crate::document::preflight_xml_limits(xml.as_ref(), settings, xml_parse, scratch.dom_storage())
+        .map_err(|error| super::map_transform_xml_parse_error(error, settings))?;
+    Ok((xml, held))
+}
+
 /// Apply the stylesheet of `parameter` to the octets `input` and return the serialized result.
 ///
 /// The input is decoded first, into the query's own account; compilation, the
@@ -1425,33 +1560,12 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         allow_dtd,
         ..budget.xml_parse_settings
     };
-    super::check_xml_octets(input, settings)?;
-    xml_parse.charge_policy(input.len())?;
-    let xml = crate::xml_input_shared::decode_xml_in(
-        input,
-        settings.max_bytes,
-        |_, _| Ok(()),
-        &WorkspaceDecoder {
-            scratch,
-            limit: available,
-            held: carried,
-        },
-    )
-    .map_err(|error| match error {
-        DecodeFailure::Encoding(error) => super::map_transform_xml_decode_error(error),
-        DecodeFailure::Refused(error) => error,
-    })?;
-    let decoded = match &xml {
-        crate::xml_input_shared::Decoded::Borrowed(_) => 0,
-        crate::xml_input_shared::Decoded::Owned(text) => S::decoded_capacity(text),
+    let storage = WorkspaceDecoder {
+        scratch,
+        limit: available,
+        held: carried,
     };
-    // The query pays for each of the adapter's lexical passes before it runs.
-    reject_document_type(xml.as_ref(), settings, scratch)?;
-    // The engine's parser does not count namespace bindings or apply the rest of
-    // the operation's XML input policy itself.
-    scratch.charge(xml.as_ref().len())?;
-    crate::document::preflight_xml_limits(xml.as_ref(), settings, xml_parse, scratch.dom_storage())
-        .map_err(|error| super::map_transform_xml_parse_error(error, settings))?;
+    let (xml, decoded) = decode_input(input, settings, &storage, xml_parse)?;
 
     // Copies a parsed stylesheet carries stay in the workspace until the transform ends.
     let available = allowance
@@ -1465,32 +1579,14 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
             allowance.serialize(units)?;
             scratch.charge(units).map_err(TransformError::from)
         })
-        .map_err(|unavailable| match unavailable {
-            Unavailable::Missing => {
-                TransformError::UnsupportedTransform("XSLT transform requires a stylesheet".into())
-            }
-            Unavailable::Exceeds(needed) => {
-                allowance.workspace_error(carried.saturating_add(decoded).saturating_add(needed))
-            }
-            Unavailable::Refused(error) => error,
+        .map_err(|unavailable| {
+            stylesheet_unavailable(unavailable, allowance, carried.saturating_add(decoded))
         })?;
-
-    // The stylesheet is element content, which cannot hold a document type declaration.
-    let stylesheet_settings = DocumentParseSettings {
-        allow_dtd: false,
-        ..budget.xml_parse_settings
-    };
     // Validate constructed UTF-8 once, after admission, and borrow that view
     // throughout preflight and compilation rather than rescanning on access.
     scratch.charge(stylesheet.len())?;
     let stylesheet_text = stylesheet.text();
-    crate::document::preflight_xml_limits(
-        stylesheet_text,
-        stylesheet_settings,
-        xml_parse,
-        scratch.dom_storage(),
-    )
-    .map_err(|error| super::map_transform_xml_parse_error(error, stylesheet_settings))?;
+    preflight_stylesheet(stylesheet_text, budget, xml_parse, scratch)?;
     // Text assembled with inherited declarations lives in the workspace until compiled.
     let assembled = stylesheet.capacity();
     let maximum = allowance
@@ -1514,22 +1610,11 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let compile_workspace = reserved
         .checked_sub(carried)
         .ok_or_else(|| fail(exhausted(carried), Phase::Stylesheet, 0))?;
-    let compiled = charge_parse_work(
-        Compiler::new(
-            Arc::new(NoResolver),
-            CompileBudget::new(
-                allowance.max_document_bytes,
-                0,
-                allowance.max_recursion,
-                compile_workspace,
-            )
-            .with_parse_work_bytes(parse_work_limit(xml_parse, scratch)),
-        )
-        .unbound_prefix_lists(match semantics {
-            XsltStylesheetSemantics::Specification => UnboundPrefixLists::Reject,
-            XsltStylesheetSemantics::Libxmlsec1 => UnboundPrefixLists::Ignore,
-        })
-        .compile_reported(stylesheet_text, None),
+    let compiled = compile_stylesheet(
+        stylesheet_text,
+        semantics,
+        compile_workspace,
+        allowance,
         xml_parse,
         scratch,
     )?
@@ -1544,35 +1629,15 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     // Both fit the workspace, so their sum cannot overflow.
     let held = carried + compiled.retained_bytes() + decoded;
 
-    let (entity_references, entity_expansion_bytes) = if allow_dtd {
-        (
-            crate::hard_limits::XML_ENTITY_EXPANSION_CEILING as usize,
-            crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING,
-        )
-    } else {
-        (0, 0)
-    };
     let source_workspace = workspace
         .checked_sub(held)
         .ok_or_else(|| fail(exhausted(held), Phase::Input, 0))?;
-    let source = charge_parse_work(
-        Document::parse_with_budget_reported(
-            xml.as_ref(),
-            // XSLT 1.0 sections 3.3 and 12.4 require relative NDATA system IDs
-            // to resolve against the resource containing their declaration.
-            // https://www.w3.org/TR/1999/REC-xslt-19991116#unparsed-entities
-            input_base_uri,
-            ParseBudget::new(
-                allowance.max_document_bytes,
-                allowance.max_nodes,
-                allowance.max_depth,
-                entity_references,
-                entity_expansion_bytes.min(source_workspace),
-                source_workspace,
-            )
-            .with_owned_bytes(source_workspace)
-            .with_parse_work_bytes(parse_work_limit(xml_parse, scratch)),
-        ),
+    let source = parse_source(
+        xml.as_ref(),
+        input_base_uri,
+        allow_dtd,
+        source_workspace,
+        allowance,
         xml_parse,
         scratch,
     )?
@@ -1590,13 +1655,43 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         .checked_add(source.retained_bytes())
         .ok_or_else(|| fail(exhausted(usize::MAX), Phase::Input, 0))?;
 
+    let output = run_stylesheet(compiled, source, workspace, held, allowance, scratch)?;
+    // The native output sits inside the workspace reservations. An accounted
+    // query moves its charge to a reservation of its own before copying.
+    drop(input_reservation);
+    drop(execution_reservation);
+    drop(reservation);
+    output_data(output, carried, allowance, scratch)
+}
+
+/// Run `compiled` over `source` within `workspace` bytes, `held` of which
+/// earlier stages still hold, and admit the work it spent.
+fn run_stylesheet<S: TransformScratch>(
+    compiled: crate::xslt::Stylesheet,
+    source: Document,
+    workspace: usize,
+    held: usize,
+    allowance: &Allowance,
+    scratch: &S,
+) -> Result<Vec<u8>, TransformError> {
+    let fail = |error, phase, held| map_error(error, phase, held, allowance, workspace, scratch);
     // The engine opens its owned-byte count with the source's text length, which the
     // tree held above already covers; that opening charge is granted on top.
     let opening = source.source_bytes();
     let execution_workspace = workspace
         .checked_sub(held)
         .and_then(|free| free.checked_add(opening))
-        .ok_or_else(|| fail(exhausted(held), Phase::Execution, 0))?;
+        .ok_or_else(|| {
+            fail(
+                Error::Budget {
+                    kind: BudgetKind::OwnedBytes,
+                    limit: workspace,
+                    actual: held,
+                },
+                Phase::Execution,
+                0,
+            )
+        })?;
     let reported = compiled.execute_reported(
         &source,
         &Parameters::new(),
@@ -1651,38 +1746,39 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     allowance.admit(&usage);
     // The ceiling admitted at most the remainder, so this fits.
     scratch.charge(work)?;
-    let output = outcome?.serialized.bytes;
-    if S::ACCOUNTED {
-        // The empty accounted buffer reserves exactly output.len() on append.
-        // Both copies and carried stylesheet storage must fit the XSLT peak,
-        // independently of the query account's remaining memory. Refuse before
-        // allocating the copy; dropping engine leases must not reset this limit.
-        let peak = output
-            .capacity()
-            .checked_add(output.len())
-            .and_then(|bytes| bytes.checked_add(carried))
-            .ok_or_else(|| allowance.workspace_error(usize::MAX))?;
-        if peak > allowance.max_workspace {
-            return Err(allowance.workspace_error(peak));
-        }
-        // The native output sits inside the workspace reservation. Move its charge to
-        // a reservation of its own, so the account sees both copies while it is copied.
-        drop(input_reservation);
-        drop(execution_reservation);
-        drop(reservation);
-        let (output_reservation, granted) = scratch.reserve_workspace(output.capacity())?;
-        if granted < output.capacity() {
-            return Err(structured_asn1::memory::MemoryError::LimitExceeded.into());
-        }
-        let mut accounted = scratch.bytes();
-        accounted.append(&output)?;
-        drop(output);
-        drop(output_reservation);
-        Ok(ExecutionData::Accounted(accounted))
-    } else {
-        drop(input_reservation);
-        drop(execution_reservation);
-        drop(reservation);
-        Ok(ExecutionData::NativeBinary(output))
+    Ok(outcome?.serialized.bytes)
+}
+
+/// Move the engine's native output into the query's storage.
+fn output_data<'d, S: TransformScratch, D: DomStorage>(
+    output: Vec<u8>,
+    carried: usize,
+    allowance: &Allowance,
+    scratch: &S,
+) -> Result<ExecutionData<'d, S, D>, TransformError> {
+    if !S::ACCOUNTED {
+        return Ok(ExecutionData::NativeBinary(output));
     }
+    // The empty accounted buffer reserves exactly output.len() on append.
+    // Both copies and carried stylesheet storage must fit the XSLT peak,
+    // independently of the query account's remaining memory. Refuse before
+    // allocating the copy; dropping engine leases must not reset this limit.
+    let peak = output
+        .capacity()
+        .checked_add(output.len())
+        .and_then(|bytes| bytes.checked_add(carried))
+        .ok_or_else(|| allowance.workspace_error(usize::MAX))?;
+    if peak > allowance.max_workspace {
+        return Err(allowance.workspace_error(peak));
+    }
+    // Reserve the output's own charge so the account sees both copies.
+    let (output_reservation, granted) = scratch.reserve_workspace(output.capacity())?;
+    if granted < output.capacity() {
+        return Err(structured_asn1::memory::MemoryError::LimitExceeded.into());
+    }
+    let mut accounted = scratch.bytes();
+    accounted.append(&output)?;
+    drop(output);
+    drop(output_reservation);
+    Ok(ExecutionData::Accounted(accounted))
 }

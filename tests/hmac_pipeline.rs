@@ -1,4 +1,4 @@
-//! HMAC policy and complete XMLDSig pipeline regression coverage.
+//! HMAC policy and complete `XMLDSig` pipeline regression coverage.
 #![cfg(feature = "xmldsig")]
 
 #[path = "common/xmlsec1.rs"]

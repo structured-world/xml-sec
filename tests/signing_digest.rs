@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
 #[path = "support/cryptographic.rs"]
 mod cryptographic;
@@ -28,6 +29,21 @@ use xml_sec::xmldsig::{
 };
 
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+// A late-bound view lifetime, as `with_view` requires of its callback.
+fn view_node_count(view: xml_sec::DocumentView<'_>) -> usize {
+    view.node_count()
+}
+
+/// The SPKI of an RSA signing key.
+fn rsa_spki(key: &impl SigningKey) -> Vec<u8> {
+    let SigningPublicKeyInfo::Rsa { spki_der, .. } =
+        key.public_key_info().expect("public key info")
+    else {
+        panic!("RSA key must expose RSA public-key info");
+    };
+    spki_der
+}
 
 #[test]
 fn certificate_writer_ingestion_obeys_explicit_resource_snapshot() {
@@ -127,7 +143,7 @@ fn public_xpath_id_uses_request_registration() {
         .unwrap();
     let ids = signed_info
         .descendants()
-        .map(|node| node.id())
+        .map(xml_sec::Node::id)
         .collect::<HashSet<_>>();
     let mut canonical = Vec::new();
     canonicalize(
@@ -226,9 +242,11 @@ fn exclusive_c14n() -> C14nAlgorithm {
 }
 
 fn namespace_dense_document(items: usize) -> String {
-    let namespaces = (0..257)
-        .map(|index| format!(r#" xmlns:n{index}="urn:{index}""#))
-        .collect::<String>();
+    let mut namespaces = String::new();
+    for index in 0..257 {
+        write!(namespaces, r#" xmlns:n{index}="urn:{index}""#)
+            .expect("writing to a String cannot fail");
+    }
     format!(
         "<root{namespaces}><payload ID=\"payload\">{}</payload></root>",
         "<item/>".repeat(items)
@@ -333,7 +351,7 @@ fn owned_builder_signing_rejects_projected_node_limit_atomically() {
         .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(""));
     let mut document =
         XmlDocument::parse("<root><payload/></root>").expect("owned input must parse");
-    let input_nodes = document.with_view(|view| view.node_count());
+    let input_nodes = document.with_view(view_node_count);
     let before = document.as_xml().to_owned();
     let input_policy = SigningPolicy {
         resources: xml_sec::policy::ResourcePolicy {
@@ -430,7 +448,7 @@ fn owned_template_signing_rejects_value_node_growth_atomically() {
     let xml = r##"<root><payload Id="payload"/><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>pending</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
     let mut document = XmlDocument::parse(xml).expect("owned template must parse");
     let before = document.as_xml().to_owned();
-    let input_nodes = document.with_view(|view| view.node_count());
+    let input_nodes = document.with_view(view_node_count);
     let active_node_limit = input_nodes;
     let policy = SigningPolicy {
         resources: xml_sec::policy::ResourcePolicy {
@@ -571,7 +589,7 @@ fn rsa_signing_key_exposes_structured_public_key_info() {
             modulus,
             exponent,
         } => {
-            assert!(!spki_der.is_empty());
+            assert_ne!(spki_der, b"");
             assert_eq!(modulus.len(), 256);
             assert_eq!(exponent, [1, 0, 1]);
         }
@@ -697,7 +715,7 @@ fn ecdsa_signing_keys_expose_curve_public_key_info() {
                 curve_oid,
                 public_key,
             } => {
-                assert!(!spki_der.is_empty());
+                assert_ne!(spki_der, b"");
                 assert_eq!(curve_oid, expected_oid);
                 assert_eq!(public_key.len(), expected_len);
                 assert_eq!(public_key[0], 0x04);
@@ -937,7 +955,7 @@ fn fills_single_same_document_reference_digest() {
     assert_eq!(digests[0].index, 0);
     assert_eq!(digests[0].uri, "#payload");
     assert_eq!(digests[0].digest_method, DigestAlgorithm::Sha256);
-    assert!(!digests[0].digest_value.is_empty());
+    assert_ne!(digests[0].digest_value, "");
 
     let filled = fill_reference_digest_values(&xml).expect("fill digest values");
     assert_reference_digests_verify(&filled);
@@ -1053,7 +1071,7 @@ fn computed_digest_matches_materialized_c14n11_digest() {
     let written = document
         .descendants()
         .find(|node| node.has_tag_name((XMLDSIG_NS, "DigestValue")))
-        .and_then(|node| node.text())
+        .and_then(xml_sec::Node::text)
         .expect("filled DigestValue text");
 
     assert_eq!(computed.len(), 1);
@@ -1099,7 +1117,7 @@ fn public_digest_helpers_target_the_last_signature() {
             .find(|node| {
                 node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue"))
             })
-            .and_then(|node| node.text()),
+            .and_then(xml_sec::Node::text),
         None
     );
     assert_eq!(
@@ -1108,7 +1126,7 @@ fn public_digest_helpers_target_the_last_signature() {
             .find(|node| {
                 node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue"))
             })
-            .and_then(|node| node.text()),
+            .and_then(xml_sec::Node::text),
         Some(digests[0].digest_value.as_str())
     );
 }
@@ -1148,8 +1166,8 @@ fn sign_context_targets_the_last_signature_template_by_default() {
         .map(|node| node.text().unwrap_or_default().trim().to_owned())
         .collect::<Vec<_>>();
 
-    assert!(values[0].is_empty());
-    assert!(!values[1].is_empty());
+    assert_eq!(values[0], "");
+    assert_ne!(values[1], "");
 }
 
 #[test]
@@ -1531,7 +1549,8 @@ fn sign_with_builder_shares_canonicalization_budget_with_signing() {
         .descendants()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
         .expect("filled template contains SignedInfo");
-    let signed_info_subtree: HashSet<_> = signed_info.descendants().map(|node| node.id()).collect();
+    let signed_info_subtree: HashSet<_> =
+        signed_info.descendants().map(xml_sec::Node::id).collect();
     let mut canonical_signed_info = Vec::new();
     canonicalize(
         &document,
@@ -1742,7 +1761,7 @@ fn signing_policy_bounds_key_info_nodes_and_preserves_owned_input() {
         .expect("valid signature template");
     let xml = append_signature_to_root("<root/>", &template).expect("append signature");
     let mut document = XmlDocument::parse(xml.clone()).expect("owned template must parse");
-    let input_nodes = document.with_view(|view| view.node_count());
+    let input_nodes = document.with_view(view_node_count);
     let policy = SigningPolicy {
         resources: xml_sec::policy::ResourcePolicy {
             max_xml_nodes: input_nodes,
@@ -1993,10 +2012,7 @@ fn sign_context_processes_manifests_before_signed_info() {
     let private_key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
-    let spki_der = match private_key.public_key_info().expect("public key info") {
-        SigningPublicKeyInfo::Rsa { spki_der, .. } => spki_der,
-        _ => panic!("RSA key must expose RSA public-key info"),
-    };
+    let spki_der = rsa_spki(&private_key);
     let verification_key = VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
         public_key_bytes: spki_der,
@@ -2034,10 +2050,7 @@ fn sign_context_orders_nested_manifest_dependencies() {
     let private_key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
-    let spki_der = match private_key.public_key_info().expect("public key info") {
-        SigningPublicKeyInfo::Rsa { spki_der, .. } => spki_der,
-        _ => panic!("RSA key must expose RSA public-key info"),
-    };
+    let spki_der = rsa_spki(&private_key);
     let verification_key = VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
         public_key_bytes: spki_der,
@@ -2101,10 +2114,7 @@ fn manifest_signing_allows_xpath_excluded_self_digest() {
         manifest_processing: ManifestProcessing::Process,
         ..SigningPolicy::default()
     };
-    let spki_der = match private_key.public_key_info().expect("public key info") {
-        SigningPublicKeyInfo::Rsa { spki_der, .. } => spki_der,
-        _ => panic!("RSA key must expose RSA public-key info"),
-    };
+    let spki_der = rsa_spki(&private_key);
     let verification_key = VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
         public_key_bytes: spki_der,
@@ -2302,7 +2312,7 @@ fn manifest_signing_rejects_malformed_structure_and_aggregate_overflow() {
     ));
 
     let malformed_overflow = manifest_signing_template()
-        .replace(r##"<ds:Reference URI="#payload">"##, r#"<ds:Reference>"#);
+        .replace(r##"<ds:Reference URI="#payload">"##, r"<ds:Reference>");
     let mut bounded = SigningPolicy {
         manifest_processing: ManifestProcessing::Process,
         ..SigningPolicy::default()
@@ -2329,7 +2339,7 @@ fn ignored_manifests_do_not_disable_signed_info_dependency_checks() {
     let private_key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
-    let template = r##"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest><ds:Reference><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>untouched</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+    let template = r#"<root><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:DigestValue)</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest><ds:Reference><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>untouched</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"#;
 
     let process_error = SignContext::new(&private_key)
         .policy(SigningPolicy {
@@ -3003,7 +3013,7 @@ fn sign_with_builder_appends_and_targets_within_the_selected_start_node() {
         signatures[0]
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
-            .and_then(|node| node.text()),
+            .and_then(xml_sec::Node::text),
         None
     );
     assert_eq!(
@@ -3017,7 +3027,7 @@ fn sign_with_builder_appends_and_targets_within_the_selected_start_node() {
         signatures[1]
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "DigestValue")))
-            .and_then(|node| node.text())
+            .and_then(xml_sec::Node::text)
             .is_some()
     );
     assert!(
@@ -3026,7 +3036,7 @@ fn sign_with_builder_appends_and_targets_within_the_selected_start_node() {
             .find(|node| {
                 node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue"))
             })
-            .and_then(|node| node.text())
+            .and_then(xml_sec::Node::text)
             .is_some()
     );
 }
@@ -3136,7 +3146,7 @@ fn ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline() {
     let encoded = document
         .descendants()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
-        .and_then(|node| node.text())
+        .and_then(xml_sec::Node::text)
         .expect("SignatureValue must have text")
         .chars()
         .filter(|character| !character.is_whitespace())

@@ -17,6 +17,7 @@ pub enum KeyEncapsulationAlgorithm {
 
 impl KeyEncapsulationAlgorithm {
     /// Exact libxmlsec1 experimental wire identifier, not a W3C algorithm URI.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             Self::MlKem512 => "http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#ml-kem-512",
@@ -26,6 +27,7 @@ impl KeyEncapsulationAlgorithm {
     }
 
     /// Recognize only the exact parameter-set URI.
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         [Self::MlKem512, Self::MlKem768, Self::MlKem1024]
             .into_iter()
@@ -33,6 +35,7 @@ impl KeyEncapsulationAlgorithm {
     }
 
     /// Raw encapsulation-key length, RFC 9935 Appendix B.
+    #[must_use]
     pub const fn public_key_len(self) -> usize {
         match self {
             Self::MlKem512 => 800,
@@ -42,6 +45,7 @@ impl KeyEncapsulationAlgorithm {
     }
 
     /// Expanded private-key length, RFC 9935 Appendix B.
+    #[must_use]
     pub const fn expanded_key_len(self) -> usize {
         match self {
             Self::MlKem512 => 1632,
@@ -51,6 +55,7 @@ impl KeyEncapsulationAlgorithm {
     }
 
     /// Fixed ciphertext length, RFC 9935 Appendix B.
+    #[must_use]
     pub const fn ciphertext_len(self) -> usize {
         match self {
             Self::MlKem512 => 768,
@@ -59,7 +64,8 @@ impl KeyEncapsulationAlgorithm {
         }
     }
 
-    /// RFC 9935 section 3 AlgorithmIdentifier OID.
+    /// RFC 9935 section 3 `AlgorithmIdentifier` OID.
+    #[must_use]
     pub const fn oid(self) -> pkcs8::ObjectIdentifier {
         match self {
             Self::MlKem512 => pkcs8::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.4.1"),
@@ -69,16 +75,22 @@ impl KeyEncapsulationAlgorithm {
     }
 
     /// Recognize the RFC 9935 parameter-set OID independently of capability.
+    #[must_use]
     pub fn from_oid(oid: pkcs8::ObjectIdentifier) -> Option<Self> {
+        Self::from_oid_bytes(oid.as_bytes())
+    }
+
+    /// Parameter set named by the contents octets of an OBJECT IDENTIFIER.
+    pub(crate) fn from_oid_bytes(oid: &[u8]) -> Option<Self> {
         [Self::MlKem512, Self::MlKem768, Self::MlKem1024]
             .into_iter()
-            .find(|algorithm| algorithm.oid() == oid)
+            .find(|algorithm| algorithm.oid().as_bytes() == oid)
     }
 }
 
 /// One encapsulation result. The secret is always exactly 32 bytes and erased on drop.
 pub struct EncapsulatedKey {
-    /// Public ciphertext to serialize into EncapsulationMechanism.
+    /// Public ciphertext to serialize into `EncapsulationMechanism`.
     pub ciphertext: Vec<u8>,
     /// Shared secret; callers retain its erasing owner through the consuming operation.
     pub shared_secret: Zeroizing<[u8; 32]>,
@@ -100,7 +112,11 @@ pub trait KeyEncapsulationKey: Send + Sync {
     fn provider_binding(&self) -> Option<&ProviderBinding> {
         None
     }
-    /// Primitive invoked only by its owning CryptoProvider after operation gates.
+    /// Primitive invoked only by its owning `CryptoProvider` after operation gates.
+    ///
+    /// # Errors
+    /// Returns an error for unavailable capabilities, randomness failure,
+    /// incompatible provider ownership, or failure of the primitive operation.
     fn encapsulate_with_provider(
         &self,
         provider: &dyn CryptoProvider,
@@ -116,6 +132,10 @@ pub trait KeyDecapsulationKey: Send + Sync {
         None
     }
     /// FIPS 203 section 7.3: return the real-or-rejection secret without validity metadata.
+    ///
+    /// # Errors
+    /// Returns an error for an incorrect ciphertext width or operational
+    /// provider failure, not for valid-size implicit ciphertext rejection.
     fn decapsulate(&self, ciphertext: &[u8]) -> Result<Zeroizing<[u8; 32]>, ProviderError>;
 }
 

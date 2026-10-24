@@ -1,13 +1,23 @@
 //! Trusted profile selection and compilation; no configuration discovery or I/O.
 
-use super::*;
+#[cfg(feature = "xmlenc")]
+use super::{
+    DataEncryptionAlgorithm, DecryptionPolicy, EncryptionPolicy, KeyTransportAlgorithm,
+    KeyWrapAlgorithm, OaepDigestAlgorithm,
+};
+use super::{
+    DigestAlgorithm, KeySourceKind, KeySourcePolicy, PolicyViolation, RsaPssPermission,
+    SameDocumentIdSemantics, SignatureAlgorithm, SigningPolicy, TransformPolicy, UriPolicy,
+    UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
+};
 use crate::provider::{CryptoProvider, ProviderCapability};
+use std::{collections::HashSet, time::SystemTime};
 
 mod composition;
 mod constraints;
 
 /// XML Security presets, selected only by trusted application code.
-/// These names do not certify full SAML, SOAP or XAdES conformance.
+/// These names do not certify full SAML, SOAP or `XAdES` conformance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyProfile {
     /// Implemented libxmlsec1 mechanisms, with explicit compatibility permission.
@@ -18,7 +28,7 @@ pub enum PolicyProfile {
     SecureSaml,
     /// SOAP Security-header signatures and explicit authenticated target coverage.
     WsSecurity,
-    /// XML signatures with authenticated, typed SignedProperties references.
+    /// XML signatures with authenticated, typed `SignedProperties` references.
     Xades,
     /// Compatibility verification only, requiring expiring authorization.
     LegacyVerify,
@@ -43,6 +53,10 @@ pub struct PolicyValidity {
 
 impl PolicyValidity {
     /// Check metadata and the half-open interval against an explicit time.
+    ///
+    /// # Errors
+    /// Returns a configuration violation for incomplete audit metadata or an
+    /// empty interval, and authorization expiry outside the half-open interval.
     pub fn validate_at(&self, now: SystemTime) -> Result<(), PolicyViolation> {
         if self.authorization_id.trim().is_empty()
             || self.authority.trim().is_empty()
@@ -63,14 +77,14 @@ impl PolicyValidity {
 /// Signature-level XML Security constraints, not application protocol semantics.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SignatureConstraints {
-    /// Generic XMLDSig processing with caller-selected request requirements.
+    /// Generic `XMLDSig` processing with caller-selected request requirements.
     #[default]
     General,
     /// SAML Core §5.4 signature format and coverage requirements.
     Saml,
     /// WS-Security §8.2 Security-header signature placement and target coverage.
     WsSecurity,
-    /// ETSI EN 319 132-1 §4.4.2 SignedProperties protection.
+    /// ETSI EN 319 132-1 §4.4.2 `SignedProperties` protection.
     Xades,
 }
 
@@ -78,14 +92,14 @@ pub enum SignatureConstraints {
 /// layer can disable but never re-enable an operation inherited as disabled.
 #[derive(Debug, Clone, Default)]
 pub struct PolicySet {
-    /// XMLDSig verification policy.
+    /// `XMLDSig` verification policy.
     pub verification: Option<VerificationPolicy>,
-    /// XMLDSig signing policy.
+    /// `XMLDSig` signing policy.
     pub signing: Option<SigningPolicy>,
-    /// XMLEnc encryption policy.
+    /// `XMLEnc` encryption policy.
     #[cfg(feature = "xmlenc")]
     pub encryption: Option<EncryptionPolicy>,
-    /// XMLEnc decryption policy.
+    /// `XMLEnc` decryption policy.
     #[cfg(feature = "xmlenc")]
     pub decryption: Option<DecryptionPolicy>,
 }
@@ -115,28 +129,33 @@ impl CompiledPolicies {
         &self,
         provider: &dyn CryptoProvider,
     ) -> Result<(), PolicyViolation> {
-        self.policies.validate(&self.context, provider)
+        self.policies.validate(self.context, provider)
     }
 
     /// Explicit trusted profile identity, not inferred from XML.
+    #[must_use]
     pub const fn profile(&self) -> PolicyProfile {
         self.profile
     }
     /// Borrow the compiled verification snapshot, if enabled.
+    #[must_use]
     pub fn verification(&self) -> Option<&VerificationPolicy> {
         self.policies.verification.as_ref()
     }
     /// Borrow the compiled signing snapshot, if enabled.
+    #[must_use]
     pub fn signing(&self) -> Option<&SigningPolicy> {
         self.policies.signing.as_ref()
     }
     /// Borrow the compiled encryption snapshot, if enabled.
     #[cfg(feature = "xmlenc")]
+    #[must_use]
     pub fn encryption(&self) -> Option<&EncryptionPolicy> {
         self.policies.encryption.as_ref()
     }
     /// Borrow the compiled decryption snapshot, if enabled.
     #[cfg(feature = "xmlenc")]
+    #[must_use]
     pub fn decryption(&self) -> Option<&DecryptionPolicy> {
         self.policies.decryption.as_ref()
     }
@@ -152,7 +171,11 @@ pub struct PolicyCompiler<'a> {
 
 impl<'a> PolicyCompiler<'a> {
     /// Construct a named profile using this engine's advertised capabilities.
-    /// LegacyVerify requires a valid authorization even before compilation.
+    /// `LegacyVerify` requires a valid authorization even before compilation.
+    ///
+    /// # Errors
+    /// Returns a configuration violation for an absent required authorization,
+    /// or the authorization's metadata/validity refusal.
     pub fn new(
         profile: PolicyProfile,
         provider: &'a dyn CryptoProvider,
@@ -176,6 +199,10 @@ impl<'a> PolicyCompiler<'a> {
 
     /// Intersect another complete layer without granting any new permission.
     /// `None` operation fields mean disabled, not unspecified inheritance.
+    ///
+    /// # Errors
+    /// Returns a configuration violation for incompatible interpretation or
+    /// authorization metadata, or expiry of the composed authorization interval.
     pub fn restrict(mut self, layer: &PolicySet) -> Result<Self, PolicyViolation> {
         self.policies = self.policies.intersect(layer)?;
         Ok(self)
@@ -184,10 +211,13 @@ impl<'a> PolicyCompiler<'a> {
     /// Explicit relaxation path: replace the effective policy and retain the
     /// authenticated grant on every enabled operation. Earlier authorization
     /// lifetimes are intersected, so replacement cannot extend an existing grant.
+    ///
+    /// # Errors
+    /// Returns the supplied or intersected authorization's metadata/validity refusal.
     pub fn authorize_replacement(
         mut self,
         mut replacement: PolicySet,
-        authorization: PolicyValidity,
+        authorization: &PolicyValidity,
     ) -> Result<Self, PolicyViolation> {
         authorization.validate_at(SystemTime::now())?;
         replacement.bind_authorization(authorization, &self.policies)?;
@@ -196,11 +226,15 @@ impl<'a> PolicyCompiler<'a> {
     }
 
     /// Compile contradictions before parsing, resolver calls or cryptography.
+    ///
+    /// # Errors
+    /// Returns policy/configuration violations for invalid limits or authorization,
+    /// unavailable permitted mechanisms, contradictory profiles or missing caller contracts.
     pub fn compile(
         self,
         context: &PolicyCompileContext,
     ) -> Result<CompiledPolicies, PolicyViolation> {
-        self.policies.validate(context, self.provider)?;
+        self.policies.validate(*context, self.provider)?;
         Ok(CompiledPolicies {
             profile: self.profile,
             policies: self.policies,
@@ -209,6 +243,7 @@ impl<'a> PolicyCompiler<'a> {
     }
 
     /// Inspect a layer input for customization before restrictive composition.
+    #[must_use]
     pub fn policies(&self) -> &PolicySet {
         &self.policies
     }
@@ -233,6 +268,31 @@ fn profile_policies(
         PolicyProfile::Xades => SignatureConstraints::Xades,
         _ => SignatureConstraints::General,
     };
+    let (verification, transforms) =
+        verification_profile(provider, compatibility, constraints, validity.as_ref());
+    let legacy = profile == PolicyProfile::LegacyVerify;
+    #[cfg(feature = "xmlenc")]
+    let encryption = (!legacy).then(|| encryption_profile(provider, validity.clone()));
+    #[cfg(feature = "xmlenc")]
+    let decryption =
+        (!legacy).then(|| decryption_profile(provider, compatibility, validity.clone()));
+    let signing = signing_profile(provider, constraints, validity, &verification, transforms);
+    PolicySet {
+        verification: Some(verification),
+        signing: (!legacy).then_some(signing),
+        #[cfg(feature = "xmlenc")]
+        encryption,
+        #[cfg(feature = "xmlenc")]
+        decryption,
+    }
+}
+
+fn verification_profile(
+    provider: &dyn CryptoProvider,
+    compatibility: bool,
+    constraints: SignatureConstraints,
+    validity: Option<&PolicyValidity>,
+) -> (VerificationPolicy, TransformPolicy) {
     let signatures: HashSet<_> = SignatureAlgorithm::ALL
         .into_iter()
         .filter(|a| provider.supports(ProviderCapability::Verify(*a)))
@@ -247,34 +307,9 @@ fn profile_policies(
         .filter(|a| provider.supports(ProviderCapability::Digest(*a)))
         .filter(|a| compatibility || (a.signing_allowed() && a.output_len() >= 32))
         .collect();
-    let transforms = if compatibility {
-        // Signers and verifiers in this profile must agree with libxmlsec1 on the
-        // digested output of XSLT transforms.
-        TransformPolicy {
-            xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
-            ..TransformPolicy::default()
-        }
-    } else {
-        TransformPolicy {
-            allowed_algorithms: Some(
-                [
-                    "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
-                    "http://www.w3.org/2001/10/xml-exc-c14n#",
-                    "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
-                    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
-                    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
-                    "http://www.w3.org/2006/12/xml-c14n11",
-                    "http://www.w3.org/2006/12/xml-c14n11#WithComments",
-                ]
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-            ),
-            ..TransformPolicy::default()
-        }
-    };
+    let transforms = profile_transforms(compatibility);
     let mut verification = VerificationPolicy {
-        validity: validity.clone(),
+        validity: validity.cloned(),
         signature_constraints: constraints,
         signature_algorithms: Some(signatures),
         parameterized_rsa_pss: if compatibility {
@@ -299,14 +334,11 @@ fn profile_policies(
             SameDocumentIdSemantics::XmlSecBarename;
     }
     if constraints != SignatureConstraints::General {
-        verification.key_sources = KeySourcePolicy {
-            preset_key: true,
-            key_name: true,
-            x509_data: true,
-            key_value: false,
-            der_encoded_key_value: false,
-            key_info_reference: false,
-        };
+        verification.key_sources = KeySourcePolicy::from([
+            KeySourceKind::PresetKey,
+            KeySourceKind::KeyName,
+            KeySourceKind::X509Data,
+        ]);
     }
     if constraints == SignatureConstraints::Saml {
         verification.uris.references = UriTypeSet::new(false, true, false);
@@ -321,8 +353,47 @@ fn profile_policies(
             .collect(),
         );
     }
-    let signing = SigningPolicy {
-        validity: validity.clone(),
+    (verification, transforms)
+}
+
+fn profile_transforms(compatibility: bool) -> TransformPolicy {
+    if compatibility {
+        // Signers and verifiers in this profile must agree with libxmlsec1 on the
+        // digested output of XSLT transforms.
+        TransformPolicy {
+            xslt_stylesheet_semantics: XsltStylesheetSemantics::Libxmlsec1,
+            ..TransformPolicy::default()
+        }
+    } else {
+        TransformPolicy {
+            allowed_algorithms: Some(
+                [
+                    "http://www.w3.org/2000/09/xmldsig#enveloped-signature",
+                    "http://www.w3.org/2001/10/xml-exc-c14n#",
+                    "http://www.w3.org/2001/10/xml-exc-c14n#WithComments",
+                    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315",
+                    "http://www.w3.org/TR/2001/REC-xml-c14n-20010315#WithComments",
+                    "http://www.w3.org/2006/12/xml-c14n11",
+                    "http://www.w3.org/2006/12/xml-c14n11#WithComments",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            ),
+            ..TransformPolicy::default()
+        }
+    }
+}
+
+fn signing_profile(
+    provider: &dyn CryptoProvider,
+    constraints: SignatureConstraints,
+    validity: Option<PolicyValidity>,
+    verification: &VerificationPolicy,
+    transforms: TransformPolicy,
+) -> SigningPolicy {
+    SigningPolicy {
+        validity,
         signature_constraints: constraints,
         parameterized_rsa_pss: RsaPssPermission::SecureSupported,
         signature_algorithms: Some(
@@ -351,15 +422,6 @@ fn profile_policies(
             UriPolicy::default()
         },
         ..SigningPolicy::default()
-    };
-    let legacy = profile == PolicyProfile::LegacyVerify;
-    PolicySet {
-        verification: Some(verification),
-        signing: (!legacy).then_some(signing),
-        #[cfg(feature = "xmlenc")]
-        encryption: (!legacy).then(|| encryption_profile(provider, validity.clone())),
-        #[cfg(feature = "xmlenc")]
-        decryption: (!legacy).then(|| decryption_profile(provider, compatibility, validity)),
     }
 }
 

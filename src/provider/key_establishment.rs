@@ -1,4 +1,4 @@
-//! RustCrypto primitives. XML syntax, deployment policy and cumulative operation
+//! `RustCrypto` primitives. XML syntax, deployment policy and cumulative operation
 //! accounting remain in the caller; primitive protocol bounds are checked here.
 
 mod bit_hash;
@@ -40,7 +40,7 @@ enum EcdhSecret {
     P521(p521::SecretKey),
 }
 
-/// Opaque RustCrypto ECDH key with a fixed named-curve domain.
+/// Opaque `RustCrypto` ECDH key with a fixed named-curve domain.
 pub struct RustCryptoEcdhKey(EcdhSecret);
 
 impl core::fmt::Debug for RustCryptoEcdhKey {
@@ -54,6 +54,10 @@ impl core::fmt::Debug for RustCryptoEcdhKey {
 impl RustCryptoEcdhKey {
     /// Import a fixed-width big-endian private scalar. Zero and out-of-range
     /// values are rejected, not reduced modulo the curve order.
+    ///
+    /// # Errors
+    /// Returns an error if the scalar width is incorrect or its value is zero
+    /// or outside the selected curve's scalar range.
     pub fn from_scalar(curve: EcdhCurve, bytes: &[u8]) -> Result<Self, ProviderError> {
         let width = match curve {
             EcdhCurve::P256 => 32,
@@ -81,6 +85,7 @@ impl RustCryptoEcdhKey {
     }
 
     /// Export the public SEC1 uncompressed point, never private material.
+    #[must_use]
     pub fn public_key(&self) -> Vec<u8> {
         match &self.0 {
             EcdhSecret::P256(key) => key.public_key().to_sec1_point(false).as_bytes().to_vec(),
@@ -118,7 +123,7 @@ impl KeyAgreementKey for RustCryptoEcdhKey {
     }
 }
 
-/// Opaque RustCrypto X25519 private key. Its scalar is zeroized on drop and is
+/// Opaque `RustCrypto` X25519 private key. Its scalar is zeroized on drop and is
 /// never exposed through Debug or a byte-export accessor.
 pub struct RustCryptoX25519Key(x25519_dalek::StaticSecret);
 
@@ -132,11 +137,13 @@ impl core::fmt::Debug for RustCryptoX25519Key {
 
 impl RustCryptoX25519Key {
     /// Import the 32-byte scalar encoding; clamping follows RFC 7748 section 5.
+    #[must_use]
     pub fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(x25519_dalek::StaticSecret::from(bytes))
     }
 
     /// Return the public u-coordinate encoding defined by RFC 7748 section 5.
+    #[must_use]
     pub fn public_key(&self) -> [u8; 32] {
         x25519_dalek::PublicKey::from(&self.0).to_bytes()
     }
@@ -171,7 +178,7 @@ impl KeyAgreementKey for RustCryptoX25519Key {
     }
 }
 
-/// Opaque RustCrypto X448 private key, zeroized on drop without secret export.
+/// Opaque `RustCrypto` X448 private key, zeroized on drop without secret export.
 pub struct RustCryptoX448Key(x448::StaticSecret);
 
 impl core::fmt::Debug for RustCryptoX448Key {
@@ -184,12 +191,17 @@ impl core::fmt::Debug for RustCryptoX448Key {
 
 impl RustCryptoX448Key {
     /// Import a 56-byte scalar; clamping follows RFC 7748 section 5.
+    #[must_use]
     pub fn from_bytes(bytes: [u8; 56]) -> Self {
         Self(x448::StaticSecret::from(bytes))
     }
 
     /// Import RFC 8410 PKCS#8, validating any included public-key identity.
     /// DER is borrowed; only the fixed-width scalar enters the zeroizing key.
+    ///
+    /// # Errors
+    /// Returns an error for invalid DER, the wrong algorithm or parameters,
+    /// an incorrect scalar width, or an inconsistent included public key.
     pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
         use der::{Decode, asn1::OctetStringRef};
         use pkcs8::{ObjectIdentifier, PrivateKeyInfoRef};
@@ -222,6 +234,7 @@ impl RustCryptoX448Key {
     }
 
     /// Return the RFC 7748 section 5 little-endian public u-coordinate.
+    #[must_use]
     pub fn public_key(&self) -> [u8; 56] {
         *x448::PublicKey::from(&self.0).as_bytes()
     }
@@ -229,6 +242,7 @@ impl RustCryptoX448Key {
 
 impl KeyAgreementKey for RustCryptoX448Key {
     fn agree(&self, parameters: &KeyAgreementParameters<'_>) -> Result<Vec<u8>, ProviderError> {
+        use subtle::ConstantTimeEq;
         if parameters.algorithm != X448_URI {
             return Err(ProviderError::Unsupported {
                 operation: ProviderOperation::KeyAgreement,
@@ -249,7 +263,6 @@ impl KeyAgreementKey for RustCryptoX448Key {
         // Section 6.2 permits rejecting zero secrets; our agreement contract
         // requires contributory behavior. Examine every byte before branching.
         // https://www.rfc-editor.org/rfc/rfc7748.html#section-6.2
-        use subtle::ConstantTimeEq;
         if bool::from(secret.as_bytes().ct_eq(&[0; 56])) {
             return Err(ProviderError::AuthenticationFailed);
         }
@@ -442,7 +455,7 @@ fn derive_concat(parameters: &KdfParameters<'_>, secret: &[u8]) -> Result<Vec<u8
         return Err(invalid());
     }
     let total_bits = 32 + secret.len() as u128 * 8 + bit_len as u128;
-    if width <= 32 && total_bits > u64::MAX as u128 {
+    if width <= 32 && total_bits > u128::from(u64::MAX) {
         return Err(invalid());
     }
     // XMLEnc 1.1 section 5.4.1 specifies a big-endian counter and unpadded
@@ -464,6 +477,7 @@ fn derive_legacy_dh(
     parameters: &KdfParameters<'_>,
     secret: &[u8],
 ) -> Result<Vec<u8>, ProviderError> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let invalid = || ProviderError::InvalidInput(ProviderInputError::LegacyDhKdfParameters);
     let KdfContext::LegacyDh {
         encryption_algorithm,
@@ -490,7 +504,7 @@ fn derive_legacy_dh(
     let mut start = decimal.len();
     while key_bits != 0 {
         start -= 1;
-        decimal[start] = b'0' + (key_bits % 10) as u8;
+        decimal[start] = b'0' + u8::try_from(key_bits % 10).map_err(|_| invalid())?;
         key_bits /= 10;
     }
     let total_bytes = secret.len() as u128
@@ -498,14 +512,13 @@ fn derive_legacy_dh(
         + encryption_algorithm.len() as u128
         + nonce.len() as u128
         + (decimal.len() - start) as u128;
-    if width <= 32 && total_bytes * 8 > u64::MAX as u128 {
+    if width <= 32 && total_bytes * 8 > u128::from(u64::MAX) {
         return Err(invalid());
     }
     // XMLEnc 1.1 section 5.6.2.2 uses a ONE-BYTE counter encoded as two
     // uppercase ASCII hex digits and an unpadded decimal KeySize in bits.
     // This is neither ConcatKDF's BE32 counter nor the agreement algorithm URI.
     // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DHKeyAgreementLegacyKDF
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut output = zeroize::Zeroizing::new(vec![0; parameters.output_len]);
     for (index, chunk) in output.chunks_mut(width).enumerate() {
         let counter = index + 1;

@@ -36,20 +36,39 @@ fn rsa_encoding_round_trips_both_containers() {
         public
     );
     assert_eq!(
-        RsaPrivateKey::from_pkcs1_pem(&private.to_pkcs1_pem(Default::default()).unwrap()).unwrap(),
+        RsaPrivateKey::from_pkcs1_pem(
+            &private
+                .to_pkcs1_pem(der::pem::LineEnding::default())
+                .unwrap()
+        )
+        .unwrap(),
         private
     );
     assert_eq!(
-        RsaPublicKey::from_pkcs1_pem(&public.to_pkcs1_pem(Default::default()).unwrap()).unwrap(),
+        RsaPublicKey::from_pkcs1_pem(
+            &public
+                .to_pkcs1_pem(der::pem::LineEnding::default())
+                .unwrap()
+        )
+        .unwrap(),
         public
     );
     assert_eq!(
-        RsaPrivateKey::from_pkcs8_pem(&private.to_pkcs8_pem(Default::default()).unwrap()).unwrap(),
+        RsaPrivateKey::from_pkcs8_pem(
+            &private
+                .to_pkcs8_pem(der::pem::LineEnding::default())
+                .unwrap()
+        )
+        .unwrap(),
         private
     );
     assert_eq!(
-        RsaPublicKey::from_public_key_pem(&public.to_public_key_pem(Default::default()).unwrap())
-            .unwrap(),
+        RsaPublicKey::from_public_key_pem(
+            &public
+                .to_public_key_pem(der::pem::LineEnding::default())
+                .unwrap()
+        )
+        .unwrap(),
         public
     );
 }

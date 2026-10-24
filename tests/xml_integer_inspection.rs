@@ -171,9 +171,11 @@ fn integer_admission_enforces_current_local_aggregate_and_join_capacity() {
     // A retained document is not prepayment. Refusal at any current boundary
     // precedes consumer effects, and repeated reads cannot reset local work.
     let document = XmlDocument::parse("<r Id='r'>12<!--split-->34</r>").unwrap();
-    for (local, aggregate, capacity) in
-        [(0, 100000, 10000), (100000, 0, 10000), (100000, 100000, 0)]
-    {
+    for (local, aggregate, capacity) in [
+        (0, 100_000, 10000),
+        (100_000, 0, 10000),
+        (100_000, 100_000, 0),
+    ] {
         let work = memory(capacity, aggregate);
         let parser = Parser::new(
             Encoding::Der,
@@ -203,7 +205,7 @@ fn integer_admission_enforces_current_local_aggregate_and_join_capacity() {
     }
     document.with_view(|view| {
         let owner = view.node_for_id("r", &[]).unwrap();
-        let measured = memory(10000, 100000);
+        let measured = memory(10000, 100_000);
         with_scalar(
             view,
             owner,

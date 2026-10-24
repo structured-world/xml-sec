@@ -1,4 +1,4 @@
-//! Internal XML whitespace helpers shared across XMLDSig parsing and verification.
+//! Internal XML whitespace helpers shared across `XMLDSig` parsing and verification.
 
 /// Borrow XML text and validate its exact decoded size without normalizing it
 /// into a second heap buffer. Callers reserve this size before calling decode.
@@ -116,8 +116,8 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
     fn normalized_bytes(&self) -> impl Iterator<Item = u8> + '_ {
         self.node
             .children()
-            .filter(|child| child.is_text())
-            .filter_map(|child| child.text())
+            .filter(crate::xml::dom::Node::is_text)
+            .filter_map(crate::xml::dom::Node::text)
             .flat_map(str::bytes)
             .filter(|byte| !matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
     }
@@ -186,7 +186,7 @@ pub(crate) struct XmlBase64LengthError {
 /// Append base64 bytes after removing XML whitespace.
 ///
 /// `accept` controls caller-specific alphabet validation. Non-XML ASCII
-/// whitespace is always rejected so every XMLDSig base64 path follows XML's
+/// whitespace is always rejected so every `XMLDSig` base64 path follows XML's
 /// four-character whitespace definition rather than Rust's broader one.
 pub(crate) fn normalize_xml_base64_bytes(
     bytes: &[u8],

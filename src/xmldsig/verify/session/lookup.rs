@@ -1,13 +1,17 @@
 //! Operation-bound lookups for signature-extension formats.
 
-use super::*;
+use super::{
+    DigestAlgorithm, DsigError, MemoryError, NodeIdentity, ReferenceProcessingError,
+    VerifiedSession, Work, XMLDSIG_NS,
+};
+use crate::xmldsig::uri::BareNameNode;
 
 /// Outcome of resolving a same-document bare-name URI (`#id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BareNameTarget {
     /// The fragment names exactly this element under the operation's ID rules.
     Element(NodeIdentity),
-    /// The URI has another form: a non-empty base, no fragment, or an XPointer.
+    /// The URI has another form: a non-empty base, no fragment, or an `XPointer`.
     NotBareName,
     /// No element, or more than one, carries this ID.
     Unresolved,
@@ -32,11 +36,16 @@ pub struct SessionDigest<'p> {
 
 impl SessionDigest<'_> {
     /// Required digest output width, independent of provider output.
+    #[must_use]
     pub fn output_len(&self) -> usize {
         self.algorithm.output_len()
     }
 
     /// Absorb `data`, charging its length to `work` first.
+    ///
+    /// # Errors
+    /// Returns an error for exhausted work or failure of the selected provider's
+    /// streaming update. Resource causes remain distinct from digest mismatch.
     pub fn update<Q: Work>(&mut self, data: &[u8], work: &Q) -> Result<(), DsigError> {
         work.charge_work(u64::try_from(data.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
         self.state.update(data).map_err(DsigError::from)
@@ -45,6 +54,10 @@ impl SessionDigest<'_> {
     /// Write the digest into an exactly sized caller buffer. Admit finalization
     /// work and the provider's temporary output before invoking it; the caller
     /// can keep an inline output without another heap allocation.
+    ///
+    /// # Errors
+    /// Returns an error for the wrong output width, refused work or temporary
+    /// capacity, provider finalization failure, or an invalid provider output size.
     pub fn finish<Q: Work>(self, output: &mut [u8], work: &Q) -> Result<(), DsigError> {
         let width = self.algorithm.output_len();
         if output.len() != width {
@@ -63,10 +76,14 @@ impl SessionDigest<'_> {
 
 impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     /// Resolve `#id` through this operation's ID registrations, fragment
-    /// unescaping and same-document ID semantics, charging `work`. XMLDSig 1.1
-    /// §4.4.3.3 defines the bare-name form; XPointer and non-fragment forms are
+    /// unescaping and same-document ID semantics, charging `work`. `XMLDSig` 1.1
+    /// §4.4.3.3 defines the bare-name form; `XPointer` and non-fragment forms are
     /// reported, never interpreted.
     /// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Same-Document>
+    ///
+    /// # Errors
+    /// Returns an error for exhausted query work, invalid URI encoding, or
+    /// failure of bounded same-document lookup. Missing targets are not errors.
     pub fn resolve_bare_name_in<Q: Work>(
         &self,
         uri: &str,
@@ -84,16 +101,20 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
                 DsigError::Reference(ReferenceProcessingError::UriDereference(error))
             })?;
         Ok(match target {
-            None => BareNameTarget::NotBareName,
-            Some(Some(node)) if node.is_element() => {
+            BareNameNode::NotBareName => BareNameTarget::NotBareName,
+            BareNameNode::Node(node) if node.is_element() => {
                 BareNameTarget::Element(self.view.node_identity(node))
             }
-            Some(_) => BareNameTarget::Unresolved,
+            BareNameNode::Node(_) | BareNameNode::Unresolved => BareNameTarget::Unresolved,
         })
     }
 
     /// Interpret an original `DigestMethod` element. A recognized algorithm
     /// that the operation policy forbids is a policy error, not `Unsupported`.
+    ///
+    /// # Errors
+    /// Returns an error for a foreign/stale identity, the wrong element type,
+    /// exhausted query work, or a recognized digest denied by policy.
     pub fn resolve_digest_method_in<Q: Work>(
         &self,
         method: NodeIdentity,
@@ -134,6 +155,10 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
 
     /// Start an incremental digest with the selected provider under the
     /// compiled digest policy.
+    ///
+    /// # Errors
+    /// Returns an error for a digest denied by policy, an unavailable provider
+    /// capability, or failure to create the provider's incremental state.
     pub fn begin_digest(&self, algorithm: DigestAlgorithm) -> Result<SessionDigest<'_>, DsigError> {
         self.context.policy.check_digest_algorithm(algorithm)?;
         let state = super::super::super::digest::begin_digest(self.context.provider, algorithm)

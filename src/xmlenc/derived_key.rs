@@ -1,4 +1,4 @@
-//! Source-aware DerivedKey processing without implicit master-key discovery.
+//! Source-aware `DerivedKey` processing without implicit master-key discovery.
 
 use crate::xml::dom::Node;
 
@@ -8,7 +8,7 @@ use super::{
     types::{XMLENC_NS, XMLENC11_NS},
 };
 
-/// Public descriptor transported by XML Encryption 1.1 DerivedKey.
+/// Public descriptor transported by XML Encryption 1.1 `DerivedKey`.
 /// It contains no private material and never selects a permissive policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DerivedKey {

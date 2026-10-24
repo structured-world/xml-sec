@@ -10,6 +10,13 @@ fn corpus() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/security/libxml2")
 }
 
+/// Whether a pinned corpus path names an `.xml` file; the corpus is lowercase.
+fn is_xml_file(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .is_some_and(|extension| extension == "xml")
+}
+
 #[test]
 fn upstream_errors_are_not_recovered_into_authenticated_documents() {
     // The upstream error suites include CVE-2016-1835/1836/1838 and
@@ -20,7 +27,7 @@ fn upstream_errors_are_not_recovered_into_authenticated_documents() {
     for line in manifest.lines() {
         let (_, path) = line.split_once('\t').unwrap();
         if !(path.starts_with("test/errors/") || path.starts_with("test/errors10/"))
-            || !path.ends_with(".xml")
+            || !is_xml_file(path)
         {
             continue;
         }
@@ -50,7 +57,7 @@ fn upstream_entity_amplification_cannot_cross_the_secure_boundary() {
         let entry = entry.unwrap();
         let name = entry.file_name();
         let name = name.to_str().unwrap();
-        if !name.starts_with("lol_") || !name.ends_with(".xml") {
+        if !name.starts_with("lol_") || !is_xml_file(name) {
             continue;
         }
         let bytes = std::fs::read(entry.path()).unwrap();

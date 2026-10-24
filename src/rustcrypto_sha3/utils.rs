@@ -27,7 +27,7 @@ pub(crate) fn pad_bits<const PAD: u8, const RATE: usize>(
     state[RATE / 8 - 1] ^= 1 << 63;
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) fn pad<const PAD: u8, const RATE: usize>(
     state: &mut State1600,
     cursor: &SpongeCursor<RATE>,
@@ -41,7 +41,7 @@ pub(crate) fn pad<const PAD: u8, const RATE: usize>(
     state[RATE / 8 - 1] ^= 1 << 63;
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) fn read_state(state: &State1600, dst: &mut [u8]) {
     assert!(size_of_val(dst) <= size_of_val(state));
 
@@ -51,7 +51,7 @@ pub(crate) fn read_state(state: &State1600, dst: &mut [u8]) {
     }
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) fn serialize<const RATE: usize>(
     state: &State1600,
     cursor: &SpongeCursor<RATE>,
@@ -60,7 +60,7 @@ pub(crate) fn serialize<const RATE: usize>(
     let [state_dst @ .., cursor_dst] = &mut ser_state;
 
     let (state_dst_chunks, remainder) = state_dst.as_chunks_mut::<8>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder, b"");
     for (src, dst) in state.iter().zip(state_dst_chunks.iter_mut()) {
         dst.copy_from_slice(&src.to_le_bytes());
     }
@@ -69,7 +69,7 @@ pub(crate) fn serialize<const RATE: usize>(
     ser_state
 }
 
-#[inline(always)]
+#[inline]
 pub(crate) fn deserialize<const RATE: usize>(
     ser_state: &[u8; 201],
 ) -> Option<(State1600, SpongeCursor<RATE>)> {
