@@ -54,10 +54,14 @@ fn function_free_xpath_does_not_require_function_registry_workspace() {
             .expect("function-free XPath fits without a function registry");
         match (value, expected) {
             (XPathValue::Number(value), XPathValue::Number(expected)) => {
-                assert_eq!(value, expected)
+                assert_eq!(
+                    value.partial_cmp(&expected),
+                    Some(std::cmp::Ordering::Equal),
+                    "{value} != {expected}",
+                );
             }
             (XPathValue::Boolean(value), XPathValue::Boolean(expected)) => {
-                assert_eq!(value, expected)
+                assert_eq!(value, expected);
             }
             (other, expected) => panic!("unexpected XPath value: {other:?}, expected {expected:?}"),
         }
@@ -405,7 +409,7 @@ fn string_consumers_gate_nodeset_work_before_allocation() {
         } else {
             one_qname_argument(
                 &evaluation,
-                vec![SxdValue::Nodeset(nodes)],
+                &[SxdValue::Nodeset(nodes)],
                 &[],
                 "system-property",
             )
@@ -979,13 +983,13 @@ fn xinclude_decode_errors_preserve_resource_and_fatal_boundaries() {
     for mode in [XIncludeParseMode::Xml, XIncludeParseMode::Text] {
         assert!(matches!(
             classify_xinclude_decode_error(
-                xml_sec_xml_input::Error::UnsupportedEncoding("unknown".into()),
+                &xml_sec_xml_input::Error::UnsupportedEncoding("unknown".into()),
                 mode,
             ),
             XIncludeFailure::Resource(_)
         ));
         assert!(matches!(
-            classify_xinclude_decode_error(xml_sec_xml_input::Error::InvalidBytes("UTF-8"), mode,),
+            classify_xinclude_decode_error(&xml_sec_xml_input::Error::InvalidBytes("UTF-8"), mode),
             XIncludeFailure::Fatal(_)
         ));
     }
@@ -1055,7 +1059,7 @@ fn small_nodeset_projection_checks_its_vector_capacity() {
     assert!(matches!(
         maps.project_value(
             &source,
-            document.root().into(),
+            &document.root().into(),
             SxdValue::Nodeset(selected),
             &mut meter,
         ),
@@ -1146,7 +1150,7 @@ fn xinclude_text_transfers_decoded_storage_to_the_expanded_document() {
     let mut identities = HashMap::new();
     let expanded = expand_xinclude_document(
         &source,
-        &XIncludeDocumentIdentity::InMemory(&source as *const Document as usize),
+        &XIncludeDocumentIdentity::InMemory(std::ptr::from_ref(&source) as usize),
         &resolver,
         &mut meter,
         &mut identities,
@@ -1278,8 +1282,7 @@ fn node_remap_composition_reuses_the_first_allocation() {
         Some(second),
         second_bytes,
         &mut meter,
-    )
-    .expect("remaps compose");
+    );
     let composed = composed.expect("the first remap remains retained");
     assert_eq!(composed, HashMap::from([(ids[1], ids[3])]));
     assert_eq!(retained_bytes, first_bytes);
@@ -1461,7 +1464,7 @@ fn expanded_xinclude_retains_shared_namespace_arena_reservation() {
     .expect("test meter initializes");
     let expanded = expand_xinclude_document(
         &source,
-        &XIncludeDocumentIdentity::InMemory(&source as *const Document as usize),
+        &XIncludeDocumentIdentity::InMemory(std::ptr::from_ref(&source) as usize),
         &resolver,
         &mut meter,
         &mut HashMap::new(),
@@ -1495,13 +1498,15 @@ fn xpath_parser_distinguishes_div_name_tests_from_operators() {
     ] {
         let expression = Factory::new().build(source).expect("valid XPath");
         let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, node.clone());
+        let actual = expression
+            .evaluate(&context, node)
+            .expect("expression evaluates")
+            .number(&evaluation)
+            .expect("number conversion fits");
         assert_eq!(
-            expression
-                .evaluate(&context, node)
-                .expect("expression evaluates")
-                .number(&evaluation)
-                .expect("number conversion fits"),
-            expected
+            actual.partial_cmp(&expected),
+            Some(std::cmp::Ordering::Equal),
+            "{actual} != {expected}",
         );
     }
 }

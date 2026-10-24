@@ -10,6 +10,10 @@ use super::{Resolver, Result};
 /// functions deterministic across lazy document-loading retries without repeatedly consulting an
 /// ambient clock.
 pub trait Clock: Send + Sync {
+    /// Return the operation's current local time.
+    ///
+    /// # Errors
+    /// Returns the caller's clock failure without replacing it with an ambient clock.
     fn now_local(&self) -> Result<OffsetDateTime>;
 }
 
@@ -48,7 +52,7 @@ impl Clock for FixedClock {
 
 /// Explicit capabilities supplied to one transformation execution.
 ///
-/// The default environment grants neither ambient clock access nor XInclude processing. Embedding
+/// The default environment grants neither ambient clock access nor `XInclude` processing. Embedding
 /// security protocols derive each capability from their operation's compiled policy snapshot and
 /// then supply only the corresponding mechanism capability here.
 pub struct ExecutionEnvironment<R: Resolver + 'static> {
@@ -86,10 +90,10 @@ impl<R: Resolver + 'static> ExecutionEnvironment<R> {
         self
     }
 
-    /// Grant XInclude processing for the principal source and `document()` resources.
+    /// Grant `XInclude` processing for the principal source and `document()` resources.
     ///
     /// A security-protocol adapter must call this only when its compiled operation policy permits
-    /// XInclude. Resolver access alone does not grant same-document XInclude processing.
+    /// `XInclude`. Resolver access alone does not grant same-document `XInclude` processing.
     #[must_use]
     pub const fn with_xinclude(mut self) -> Self {
         self.process_xinclude = true;

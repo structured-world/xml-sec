@@ -32,6 +32,8 @@ use super::{
     Result, SerializedOutput, Value,
 };
 
+const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
+
 /// Top-level stylesheet parameters supplied by the caller.
 pub type Parameters = HashMap<ExpandedName, Value>;
 
@@ -159,6 +161,9 @@ pub struct SecondaryOutput {
 
 impl Stylesheet {
     /// Execute this compiled stylesheet against one explicit source document.
+    ///
+    /// # Errors
+    /// Returns compilation-context, resolver, `XPath`, resource-budget or serialization failures.
     pub fn execute<R: Resolver + 'static>(
         &self,
         source: &Document,
@@ -175,6 +180,9 @@ impl Stylesheet {
     }
 
     /// Execute with an explicit resolver and operation capabilities.
+    ///
+    /// # Errors
+    /// Returns context, resolver, `XPath`, resource-budget or serialization failures.
     pub fn execute_with_environment<R: Resolver + 'static>(
         &self,
         source: &Document,
@@ -187,16 +195,18 @@ impl Stylesheet {
     }
 
     /// [`Self::execute_with_environment`], also reporting the work it admitted,
-    /// including the work of a failed execution.
+    /// including the work of a failed execution. Accepts owned or borrowed options.
+    #[must_use]
     pub fn execute_reported<R: Resolver + 'static>(
         &self,
         source: &Document,
         parameters: &Parameters,
         environment: ExecutionEnvironment<R>,
-        options: ExecutionOptions,
+        options: impl std::borrow::Borrow<ExecutionOptions>,
     ) -> Reported<TransformResult, ExecutionUsage> {
+        let options = options.borrow();
         let Reported { outcome, usage } =
-            self.start_execution(source, parameters, environment, &options);
+            self.start_execution(source, parameters, environment, options);
         let mut state = match outcome {
             Ok(state) => state,
             Err(error) => {
@@ -206,7 +216,7 @@ impl Stylesheet {
                 };
             }
         };
-        let serialized = state.run(&options, &self.output);
+        let serialized = state.run(options, &self.output);
         let usage = state.meter.admitted_work();
         Reported {
             outcome: serialized.map(|serialized| TransformResult {
@@ -364,19 +374,23 @@ pub struct MeasuredTree<'a> {
 #[cfg(feature = "benchmark-internals")]
 impl Stylesheet {
     /// Execute through result construction, stopping immediately before the
-    /// production serializer. Includes source preparation and dependency checks.
+    /// production serializer. Accepts owned or borrowed execution options.
+    ///
+    /// # Errors
+    /// Returns context, resolver, XPath or resource-budget failures before serialization.
     #[doc(hidden)]
     pub fn measure_tree<R: Resolver + 'static>(
         &self,
         source: &Document,
         parameters: &Parameters,
         environment: ExecutionEnvironment<R>,
-        options: ExecutionOptions,
+        options: impl std::borrow::Borrow<ExecutionOptions>,
     ) -> Result<MeasuredTree<'_>> {
+        let options = options.borrow();
         let mut state = self
-            .start_execution(source, parameters, environment, &options)
+            .start_execution(source, parameters, environment, options)
             .outcome?;
-        state.run_tree(&options)?;
+        state.run_tree(options)?;
         Ok(MeasuredTree {
             state,
             output: &self.output,
@@ -398,6 +412,9 @@ impl MeasuredTree<'_> {
 
     /// Serialize once under the same meter. Preparation is deliberately retained
     /// until this call returns, exactly as in normal execution.
+    ///
+    /// # Errors
+    /// Returns output encoding, XML validity, representability or resource-budget failures.
     pub fn serialize(mut self) -> Result<SerializedOutput> {
         serialize(&self.state.result, self.output, &mut self.state.meter)
     }
@@ -506,7 +523,7 @@ fn source_xml_space_preserves_whitespace(
                     // XML 1.0 Fifth Edition section 2.10 permits recovery by ignoring an
                     // erroneous xml:space, leaving the ancestor's intention in effect.
                     // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-white-space
-                    _ => continue,
+                    _ => {}
                 }
             }
         }
@@ -868,6 +885,13 @@ struct ApplyFrame {
     depth: usize,
 }
 
+struct NumberGrouping {
+    separator_value: Option<MeteredString>,
+    separator: Option<char>,
+    size_value: Option<MeteredString>,
+    size: Option<usize>,
+}
+
 enum TemplateTask {
     EnterTemplate {
         program: TemplateProgram,
@@ -1045,7 +1069,6 @@ impl<'a> Execution<'a> {
                 BudgetKind::OwnedBytes,
                 metered_document_owned_bytes(&result),
             )?;
-            let result_root = result.root();
             let mut scopes = Vec::new();
             let mut scopes_reserved_owned_bytes = 0;
             reserve_temporary_vec_slot(&mut scopes, &mut meter, &mut scopes_reserved_owned_bytes)?;
@@ -1064,7 +1087,7 @@ impl<'a> Execution<'a> {
                 &mut meter,
                 &mut output_stack_reserved_owned_bytes,
             )?;
-            output_stack.push(result_root);
+            output_stack.push(result.root());
             Ok((
                 evaluator,
                 result,
@@ -1265,14 +1288,14 @@ impl<'a> Execution<'a> {
                     self.append_key_values(
                         key_slot,
                         declaration,
-                        SourceNode::Node(id),
+                        &SourceNode::Node(id),
                         &variables,
                     )?;
                     for index in 0..attribute_count {
                         self.append_key_values(
                             key_slot,
                             declaration,
-                            SourceNode::Attribute { owner: id, index },
+                            &SourceNode::Attribute { owner: id, index },
                             &variables,
                         )?;
                     }
@@ -1295,15 +1318,15 @@ impl<'a> Execution<'a> {
         &mut self,
         key_slot: usize,
         declaration: &super::compiler::KeyDeclaration,
-        node: SourceNode,
+        node: &SourceNode,
         variables: &HashMap<ExpandedName, Value>,
     ) -> Result<()> {
-        if !self.matches_pattern(&declaration.match_pattern, &node, variables)? {
+        if !self.matches_pattern(&declaration.match_pattern, node, variables)? {
             return Ok(());
         }
-        match self.evaluate(&declaration.use_expression, &node, 1, 1)? {
+        match self.evaluate(&declaration.use_expression, node, 1, 1)? {
             XPathValue::NodeSet(nodes) => {
-                for selected in nodes.iter() {
+                for selected in &nodes {
                     let (value, value_reservation) = self
                         .evaluator
                         .materialize_temporary_string_value(selected, &mut self.meter)?;
@@ -1311,7 +1334,7 @@ impl<'a> Execution<'a> {
                         key_slot,
                         value,
                         value_reservation,
-                        &node,
+                        node,
                         &mut self.meter,
                     )?;
                 }
@@ -1323,7 +1346,7 @@ impl<'a> Execution<'a> {
                     key_slot,
                     value,
                     value_reservation,
-                    &node,
+                    node,
                     &mut self.meter,
                 )?;
             }
@@ -1407,7 +1430,7 @@ impl<'a> Execution<'a> {
         })();
         drop(order);
         self.meter.release_owned_bytes(order_reservation);
-        debug_assert!(self.initializing_globals.is_empty());
+        debug_assert_eq!(self.initializing_globals, [] as [&ExpandedName; 0]);
         self.initializing_globals.clear();
         self.meter
             .release_owned_bytes(self.initializing_globals_reserved_owned_bytes);
@@ -1648,77 +1671,9 @@ impl<'a> Execution<'a> {
                     params,
                     frame,
                 )?,
-                TemplateTask::ApplyBatch {
-                    nodes,
-                    next,
-                    mode,
-                    params,
-                    depth,
-                    reserved_owned_bytes,
-                } => {
-                    let Some(selected) = nodes.get(next).cloned() else {
-                        self.release_parameters_if_last(&params);
-                        self.meter.release_owned_bytes(reserved_owned_bytes);
-                        continue;
-                    };
-                    let total = nodes.len();
-                    let selected_mode = mode.clone();
-                    if let Err(error) = tasks.push(
-                        TemplateTask::ApplyBatch {
-                            nodes,
-                            next: next + 1,
-                            mode,
-                            params: Arc::clone(&params),
-                            depth,
-                            reserved_owned_bytes,
-                        },
-                        &mut self.meter,
-                    ) {
-                        self.meter.release_owned_bytes(reserved_owned_bytes);
-                        self.release_parameters_if_last(&params);
-                        return Err(error);
-                    }
-                    tasks.push(
-                        TemplateTask::ApplyOne {
-                            node: selected,
-                            mode: selected_mode,
-                            mode_reserved_owned_bytes: 0,
-                            params,
-                            frame: ApplyFrame::new(next + 1, total, depth),
-                        },
-                        &mut self.meter,
-                    )?;
-                }
-                TemplateTask::ForEachBatch {
-                    nodes,
-                    next,
-                    body,
-                    depth,
-                    reserved_owned_bytes,
-                } => {
-                    let Some(selected) = nodes.get(next).cloned() else {
-                        self.meter.release_owned_bytes(reserved_owned_bytes);
-                        continue;
-                    };
-                    let total = nodes.len();
-                    tasks.push(
-                        TemplateTask::ForEachBatch {
-                            nodes,
-                            next: next + 1,
-                            body: Arc::clone(&body),
-                            depth,
-                            reserved_owned_bytes,
-                        },
-                        &mut self.meter,
-                    )?;
-                    push_scoped_sequence(
-                        tasks,
-                        &mut self.meter,
-                        body,
-                        selected,
-                        ApplyFrame::new(next + 1, total, depth),
-                        None,
-                    )?;
+                task @ TemplateTask::ApplyBatch { .. } => self.run_apply_batch_task(tasks, task)?,
+                task @ TemplateTask::ForEachBatch { .. } => {
+                    self.run_for_each_batch_task(tasks, task)?;
                 }
                 TemplateTask::RestoreScopes(caller_scopes) => {
                     self.restore_caller_scopes(caller_scopes);
@@ -1733,369 +1688,621 @@ impl<'a> Execution<'a> {
                 TemplateTask::PopScope => {
                     self.pop_scope();
                 }
-                TemplateTask::Sequence {
-                    instructions,
-                    index,
-                    node,
+                task @ TemplateTask::Sequence { .. } => self.run_sequence_task(tasks, task)?,
+            }
+        }
+        Ok(())
+    }
+
+    fn queue_instruction(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        match instruction {
+            Instruction::CallTemplate { .. } => {
+                self.queue_call_template(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::ApplyTemplates { .. } => {
+                self.queue_apply_templates(tasks, instruction, &node, frame, precedence)?;
+            }
+            Instruction::ApplyImports => {
+                self.queue_apply_imports(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::LiteralElement { .. } => {
+                self.queue_literal_element(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::Element { .. } => {
+                self.queue_element(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::Copy { .. } => {
+                self.queue_copy(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::ForEach { .. } => self.queue_for_each(tasks, instruction, &node, frame)?,
+            Instruction::If { .. } => {
+                self.queue_conditional(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::Choose { .. } => {
+                self.queue_choose(tasks, instruction, node, frame, precedence)?;
+            }
+            Instruction::ExtensionFallback { .. } => {
+                self.queue_extension_fallback(tasks, instruction, node, frame, precedence)?;
+            }
+            instruction => self.execute_instruction(
+                instruction,
+                &node,
+                frame.position,
+                frame.size,
+                frame.depth,
+                precedence,
+            )?,
+        }
+        Ok(())
+    }
+
+    fn run_apply_batch_task(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        task: TemplateTask,
+    ) -> Result<()> {
+        let TemplateTask::ApplyBatch {
+            nodes,
+            next,
+            mode,
+            params,
+            depth,
+            reserved_owned_bytes,
+        } = task
+        else {
+            unreachable!("task dispatch selects ApplyBatch")
+        };
+        let Some(selected) = nodes.get(next).cloned() else {
+            self.release_parameters_if_last(&params);
+            self.meter.release_owned_bytes(reserved_owned_bytes);
+            return Ok(());
+        };
+        let total = nodes.len();
+        let selected_mode = mode.clone();
+        if let Err(error) = tasks.push(
+            TemplateTask::ApplyBatch {
+                nodes,
+                next: next + 1,
+                mode,
+                params: Arc::clone(&params),
+                depth,
+                reserved_owned_bytes,
+            },
+            &mut self.meter,
+        ) {
+            self.meter.release_owned_bytes(reserved_owned_bytes);
+            self.release_parameters_if_last(&params);
+            return Err(error);
+        }
+        tasks.push(
+            TemplateTask::ApplyOne {
+                node: selected,
+                mode: selected_mode,
+                mode_reserved_owned_bytes: 0,
+                params,
+                frame: ApplyFrame::new(next + 1, total, depth),
+            },
+            &mut self.meter,
+        )?;
+        Ok(())
+    }
+
+    fn run_for_each_batch_task(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        task: TemplateTask,
+    ) -> Result<()> {
+        let TemplateTask::ForEachBatch {
+            nodes,
+            next,
+            body,
+            depth,
+            reserved_owned_bytes,
+        } = task
+        else {
+            unreachable!("task dispatch selects ForEachBatch")
+        };
+        let Some(selected) = nodes.get(next).cloned() else {
+            self.meter.release_owned_bytes(reserved_owned_bytes);
+            return Ok(());
+        };
+        let total = nodes.len();
+        tasks.push(
+            TemplateTask::ForEachBatch {
+                nodes,
+                next: next + 1,
+                body: Arc::clone(&body),
+                depth,
+                reserved_owned_bytes,
+            },
+            &mut self.meter,
+        )?;
+        push_scoped_sequence(
+            tasks,
+            &mut self.meter,
+            body,
+            selected,
+            ApplyFrame::new(next + 1, total, depth),
+            None,
+        )?;
+        Ok(())
+    }
+
+    fn run_sequence_task(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        task: TemplateTask,
+    ) -> Result<()> {
+        let TemplateTask::Sequence {
+            instructions,
+            index,
+            node,
+            position,
+            size,
+            depth,
+            precedence,
+        } = task
+        else {
+            unreachable!("task dispatch selects Sequence")
+        };
+        self.meter.recursion(depth)?;
+        let Some(instruction) = instructions.get(index) else {
+            return Ok(());
+        };
+        tasks.push(
+            TemplateTask::Sequence {
+                instructions: instructions.clone(),
+                index: index + 1,
+                node: node.clone(),
+                position,
+                size,
+                depth,
+                precedence,
+            },
+            &mut self.meter,
+        )?;
+        self.queue_instruction(
+            tasks,
+            instruction,
+            node,
+            ApplyFrame::new(position, size, depth),
+            precedence,
+        )?;
+        Ok(())
+    }
+
+    fn queue_call_template(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::CallTemplate { name, parameters } = instruction else {
+            unreachable!("instruction dispatch selects CallTemplate")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.meter.charge(BudgetKind::TemplateApplications, 1)?;
+        let supplied =
+            self.evaluate_with_params(parameters, &node, position, size, depth, precedence)?;
+        let target = self
+            .stylesheet
+            .templates
+            .iter()
+            .filter(|candidate| candidate.name.as_ref() == Some(name))
+            .max_by_key(|candidate| (candidate.precedence, candidate.order))
+            .ok_or_else(|| Error::Dynamic(format!("named template {} not found", name.local)))?;
+        tasks.push(
+            TemplateTask::enter_template(
+                target,
+                Arc::new(supplied),
+                node,
+                ApplyFrame::new(position, size, depth + 1),
+                precedence,
+            ),
+            &mut self.meter,
+        )?;
+        Ok(())
+    }
+
+    fn queue_apply_templates(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::ApplyTemplates {
+            select,
+            mode,
+            sorts,
+            parameters,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ApplyTemplates")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let (mut nodes, node_reservation) = self.select_nodes(select, node, position, size)?;
+        if let Err(error) = self.sort_nodes(&mut nodes, sorts, node, position, size) {
+            self.meter.release_owned_bytes(node_reservation);
+            return Err(error);
+        }
+        let supplied =
+            match self.evaluate_with_params(parameters, node, position, size, depth, precedence) {
+                Ok(supplied) => Arc::new(supplied),
+                Err(error) => {
+                    self.meter.release_owned_bytes(node_reservation);
+                    return Err(error);
+                }
+            };
+        let mode_reservation = mode.as_ref().map_or(0, expanded_name_owned_bytes);
+        if let Err(error) = self.meter.charge(BudgetKind::OwnedBytes, mode_reservation) {
+            self.meter.release_owned_bytes(node_reservation);
+            return Err(error);
+        }
+        self.push_apply_batch(
+            tasks,
+            nodes,
+            node_reservation,
+            MeteredMode {
+                name: mode.clone(),
+                reserved_owned_bytes: mode_reservation,
+            },
+            supplied,
+            depth + 1,
+        )?;
+        Ok(())
+    }
+
+    fn queue_apply_imports(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::ApplyImports = instruction else {
+            unreachable!("instruction dispatch selects ApplyImports")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let current_rule_precedence = precedence.ok_or_else(|| {
+            Error::Dynamic("xsl:apply-imports requires a current template rule".into())
+        })?;
+        let mode = self.modes.last().and_then(|mode| mode.name.as_ref());
+        let mode_reserved_owned_bytes = mode.map_or(0, expanded_name_owned_bytes);
+        self.meter
+            .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
+        if let Err(error) = tasks.push(
+            TemplateTask::ApplyOne {
+                node,
+                mode: mode.cloned(),
+                mode_reserved_owned_bytes,
+                params: Arc::new(EvaluatedParameters::default()),
+                frame: ApplyFrame {
+                    max_precedence: Some(current_rule_precedence),
                     position,
                     size,
-                    depth,
-                    precedence,
-                } => {
-                    self.meter.recursion(depth)?;
-                    let Some(instruction) = instructions.get(index) else {
-                        continue;
-                    };
-                    tasks.push(
-                        TemplateTask::Sequence {
-                            instructions: instructions.clone(),
-                            index: index + 1,
-                            node: node.clone(),
-                            position,
-                            size,
-                            depth,
-                            precedence,
-                        },
-                        &mut self.meter,
-                    )?;
-                    match instruction {
-                        Instruction::CallTemplate { name, parameters } => {
-                            self.meter.charge(BudgetKind::TemplateApplications, 1)?;
-                            let supplied = self.evaluate_with_params(
-                                parameters, &node, position, size, depth, precedence,
-                            )?;
-                            let target = self
-                                .stylesheet
-                                .templates
-                                .iter()
-                                .filter(|candidate| candidate.name.as_ref() == Some(name))
-                                .max_by_key(|candidate| (candidate.precedence, candidate.order))
-                                .ok_or_else(|| {
-                                    Error::Dynamic(format!(
-                                        "named template {} not found",
-                                        name.local
-                                    ))
-                                })?;
-                            tasks.push(
-                                TemplateTask::enter_template(
-                                    target,
-                                    Arc::new(supplied),
-                                    node,
-                                    ApplyFrame::new(position, size, depth + 1),
-                                    precedence,
-                                ),
-                                &mut self.meter,
-                            )?;
-                        }
-                        Instruction::ApplyTemplates {
-                            select,
-                            mode,
-                            sorts,
-                            parameters,
-                        } => {
-                            let (mut nodes, node_reservation) =
-                                self.select_nodes(select, &node, position, size)?;
-                            if let Err(error) =
-                                self.sort_nodes(&mut nodes, sorts, &node, position, size)
-                            {
-                                self.meter.release_owned_bytes(node_reservation);
-                                return Err(error);
-                            }
-                            let supplied = match self.evaluate_with_params(
-                                parameters, &node, position, size, depth, precedence,
-                            ) {
-                                Ok(supplied) => Arc::new(supplied),
-                                Err(error) => {
-                                    self.meter.release_owned_bytes(node_reservation);
-                                    return Err(error);
-                                }
-                            };
-                            let mode_reservation =
-                                mode.as_ref().map_or(0, expanded_name_owned_bytes);
-                            if let Err(error) =
-                                self.meter.charge(BudgetKind::OwnedBytes, mode_reservation)
-                            {
-                                self.meter.release_owned_bytes(node_reservation);
-                                return Err(error);
-                            }
-                            self.push_apply_batch(
-                                tasks,
-                                nodes,
-                                node_reservation,
-                                MeteredMode {
-                                    name: mode.clone(),
-                                    reserved_owned_bytes: mode_reservation,
-                                },
-                                supplied,
-                                depth + 1,
-                            )?;
-                        }
-                        Instruction::ApplyImports => {
-                            let current_rule_precedence = precedence.ok_or_else(|| {
-                                Error::Dynamic(
-                                    "xsl:apply-imports requires a current template rule".into(),
-                                )
-                            })?;
-                            let mode = self.modes.last().and_then(|mode| mode.name.as_ref());
-                            let mode_reserved_owned_bytes =
-                                mode.map_or(0, expanded_name_owned_bytes);
-                            self.meter
-                                .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
-                            if let Err(error) = tasks.push(
-                                TemplateTask::ApplyOne {
-                                    node,
-                                    mode: mode.cloned(),
-                                    mode_reserved_owned_bytes,
-                                    params: Arc::new(EvaluatedParameters::default()),
-                                    frame: ApplyFrame {
-                                        max_precedence: Some(current_rule_precedence),
-                                        position,
-                                        size,
-                                        depth: depth + 1,
-                                    },
-                                },
-                                &mut self.meter,
-                            ) {
-                                self.meter.release_owned_bytes(mode_reserved_owned_bytes);
-                                return Err(error);
-                            }
-                        }
-                        Instruction::LiteralElement {
-                            base_uri,
+                    depth: depth + 1,
+                },
+            },
+            &mut self.meter,
+        ) {
+            self.meter.release_owned_bytes(mode_reserved_owned_bytes);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn queue_literal_element(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::LiteralElement { children, .. } = instruction else {
+            unreachable!("instruction dispatch selects LiteralElement")
+        };
+        self.begin_literal_element(instruction, &node, frame, precedence)?;
+        tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
+        push_scoped_sequence(
+            tasks,
+            &mut self.meter,
+            Arc::clone(children),
+            node,
+            ApplyFrame::new(frame.position, frame.size, frame.depth + 1),
+            precedence,
+        )?;
+        Ok(())
+    }
+
+    fn queue_element(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Element { body, .. } = instruction else {
+            unreachable!("instruction dispatch selects Element")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.begin_computed_element(
+            instruction,
+            &node,
+            ApplyFrame::new(position, size, depth),
+            precedence,
+        )?;
+        tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
+        push_scoped_sequence(
+            tasks,
+            &mut self.meter,
+            Arc::clone(body),
+            node,
+            ApplyFrame::new(position, size, depth + 1),
+            precedence,
+        )?;
+        Ok(())
+    }
+
+    fn queue_copy(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Copy {
+            base_uri,
+            body,
+            attribute_sets,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects Copy")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        match &node {
+            SourceNode::Node(source_id) => {
+                let source = self
+                    .evaluator
+                    .source
+                    .node(*source_id)
+                    .ok_or_else(|| Error::Dynamic("stale source node".into()))?;
+                let kind = clone_for_xsl_copy(&source.kind, &self.meter)?;
+                match kind {
+                    NodeKind::Element {
+                        name,
+                        prefix,
+                        namespaces,
+                        ..
+                    } => {
+                        let target = self.push_xsl_copy_element(
                             name,
                             prefix,
-                            attributes,
                             namespaces,
-                            children,
+                            base_uri.as_deref(),
+                        )?;
+                        self.push_output_node(target)?;
+                        self.apply_attribute_sets(
                             attribute_sets,
-                        } => {
-                            self.meter.check_additional(
-                                BudgetKind::OwnedBytes,
-                                self.literal_projection_owned_bytes(
-                                    name,
-                                    prefix.as_deref(),
-                                    namespaces,
-                                    base_uri.as_deref(),
-                                ),
-                            )?;
-                            let (name, prefix, result_namespaces) = self
-                                .alias_literal_name_and_namespaces(
-                                    name,
-                                    prefix.as_deref(),
-                                    namespaces,
-                                )?;
-                            let id = self.push_node_with_base(
-                                self.parent(),
-                                NodeKind::Element {
-                                    name,
-                                    prefix,
-                                    attributes: vec![],
-                                    namespaces: result_namespaces.into(),
-                                },
-                                base_uri.clone(),
-                            )?;
-                            self.push_output_node(id)?;
-                            self.apply_attribute_sets(
-                                attribute_sets,
-                                &node,
-                                ApplyFrame::new(position, size, depth),
-                                precedence,
-                            )?;
-                            for attribute in attributes {
-                                let value =
-                                    self.evaluate_avt(&attribute.value, &node, position, size)?;
-                                let (name, prefix) = self.alias_attribute_name(
-                                    &attribute.name,
-                                    attribute.prefix.as_deref(),
-                                );
-                                let value = value.transfer(&mut self.meter);
-                                self.add_literal_attribute(Attribute {
-                                    name,
-                                    prefix,
-                                    value,
-                                })?;
-                            }
-                            tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
-                            push_scoped_sequence(
-                                tasks,
-                                &mut self.meter,
-                                Arc::clone(children),
-                                node,
-                                ApplyFrame::new(position, size, depth + 1),
-                                precedence,
-                            )?;
-                        }
-                        Instruction::Element { body, .. } => {
-                            self.begin_computed_element(
-                                instruction,
-                                &node,
-                                ApplyFrame::new(position, size, depth),
-                                precedence,
-                            )?;
-                            tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
-                            push_scoped_sequence(
-                                tasks,
-                                &mut self.meter,
-                                Arc::clone(body),
-                                node,
-                                ApplyFrame::new(position, size, depth + 1),
-                                precedence,
-                            )?;
-                        }
-                        Instruction::Copy {
-                            base_uri,
-                            body,
-                            attribute_sets,
-                        } => match &node {
-                            SourceNode::Node(source_id) => {
-                                let source =
-                                    self.evaluator.source.node(*source_id).ok_or_else(|| {
-                                        Error::Dynamic("stale source node".into())
-                                    })?;
-                                let kind = clone_for_xsl_copy(&source.kind, &self.meter)?;
-                                match kind {
-                                    NodeKind::Element {
-                                        name,
-                                        prefix,
-                                        namespaces,
-                                        ..
-                                    } => {
-                                        let target = self.push_xsl_copy_element(
-                                            name,
-                                            prefix,
-                                            namespaces,
-                                            base_uri.as_deref(),
-                                        )?;
-                                        self.push_output_node(target)?;
-                                        self.apply_attribute_sets(
-                                            attribute_sets,
-                                            &node,
-                                            ApplyFrame::new(position, size, depth),
-                                            precedence,
-                                        )?;
-                                        tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
-                                        push_scoped_sequence(
-                                            tasks,
-                                            &mut self.meter,
-                                            Arc::clone(body),
-                                            node,
-                                            ApplyFrame::new(position, size, depth + 1),
-                                            precedence,
-                                        )?;
-                                    }
-                                    NodeKind::Root => push_scoped_sequence(
-                                        tasks,
-                                        &mut self.meter,
-                                        Arc::clone(body),
-                                        node,
-                                        ApplyFrame::new(position, size, depth + 1),
-                                        precedence,
-                                    )?,
-                                    NodeKind::Text { value, .. } => {
-                                        self.append_text(&value, false)?
-                                    }
-                                    NodeKind::Comment(value) => {
-                                        self.push_node(self.parent(), NodeKind::Comment(value))?;
-                                    }
-                                    NodeKind::ProcessingInstruction { target, value } => {
-                                        self.push_node(
-                                            self.parent(),
-                                            NodeKind::ProcessingInstruction { target, value },
-                                        )?;
-                                    }
-                                }
-                            }
-                            SourceNode::Attribute { owner, index } => {
-                                self.copy_source_attribute(*owner, *index)?;
-                            }
-                            SourceNode::Namespace { owner, index } => {
-                                self.copy_source_namespace(*owner, *index)?;
-                            }
-                        },
-                        Instruction::ForEach {
-                            select,
-                            sorts,
-                            body,
-                        } => {
-                            let (mut nodes, node_reservation) =
-                                self.select_nodes(select, &node, position, size)?;
-                            if let Err(error) =
-                                self.sort_nodes(&mut nodes, sorts, &node, position, size)
-                            {
-                                self.meter.release_owned_bytes(node_reservation);
-                                return Err(error);
-                            }
-                            self.push_for_each_batch(
-                                tasks,
-                                nodes,
-                                node_reservation,
-                                Arc::clone(body),
-                                depth + 1,
-                            )?;
-                        }
-                        Instruction::If { test, body } => {
-                            if self.evaluate(test, &node, position, size)?.boolean() {
-                                push_scoped_sequence(
-                                    tasks,
-                                    &mut self.meter,
-                                    Arc::clone(body),
-                                    node,
-                                    ApplyFrame::new(position, size, depth + 1),
-                                    precedence,
-                                )?;
-                            }
-                        }
-                        Instruction::Choose {
-                            branches,
-                            otherwise,
-                        } => {
-                            let mut selected = otherwise;
-                            for (test, body) in branches {
-                                if self.evaluate(test, &node, position, size)?.boolean() {
-                                    selected = body;
-                                    break;
-                                }
-                            }
-                            push_scoped_sequence(
-                                tasks,
-                                &mut self.meter,
-                                Arc::clone(selected),
-                                node,
-                                ApplyFrame::new(position, size, depth + 1),
-                                precedence,
-                            )?;
-                        }
-                        Instruction::ExtensionFallback {
-                            name,
-                            present,
-                            body,
-                        } => {
-                            if !present {
-                                return Err(Error::Unsupported(format!(
-                                    "extension element {name} has no xsl:fallback"
-                                )));
-                            }
-                            push_scoped_sequence(
-                                tasks,
-                                &mut self.meter,
-                                Arc::clone(body),
-                                node,
-                                ApplyFrame::new(position, size, depth + 1),
-                                precedence,
-                            )?;
-                        }
-                        instruction => self.execute_instruction(
-                            instruction,
                             &node,
-                            position,
-                            size,
-                            depth,
+                            ApplyFrame::new(position, size, depth),
                             precedence,
-                        )?,
+                        )?;
+                        tasks.push(TemplateTask::PopOutput, &mut self.meter)?;
+                        push_scoped_sequence(
+                            tasks,
+                            &mut self.meter,
+                            Arc::clone(body),
+                            node,
+                            ApplyFrame::new(position, size, depth + 1),
+                            precedence,
+                        )?;
+                    }
+                    NodeKind::Root => push_scoped_sequence(
+                        tasks,
+                        &mut self.meter,
+                        Arc::clone(body),
+                        node,
+                        ApplyFrame::new(position, size, depth + 1),
+                        precedence,
+                    )?,
+                    NodeKind::Text { value, .. } => {
+                        self.append_text(&value, false)?;
+                    }
+                    NodeKind::Comment(value) => {
+                        self.push_node(self.parent(), NodeKind::Comment(value))?;
+                    }
+                    NodeKind::ProcessingInstruction { target, value } => {
+                        self.push_node(
+                            self.parent(),
+                            NodeKind::ProcessingInstruction { target, value },
+                        )?;
                     }
                 }
             }
+            SourceNode::Attribute { owner, index } => {
+                self.copy_source_attribute(*owner, *index)?;
+            }
+            SourceNode::Namespace { owner, index } => {
+                self.copy_source_namespace(*owner, *index)?;
+            }
         }
+        Ok(())
+    }
+
+    fn queue_for_each(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+    ) -> Result<()> {
+        let Instruction::ForEach {
+            select,
+            sorts,
+            body,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ForEach")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let (mut nodes, node_reservation) = self.select_nodes(select, node, position, size)?;
+        if let Err(error) = self.sort_nodes(&mut nodes, sorts, node, position, size) {
+            self.meter.release_owned_bytes(node_reservation);
+            return Err(error);
+        }
+        self.push_for_each_batch(tasks, nodes, node_reservation, Arc::clone(body), depth + 1)?;
+        Ok(())
+    }
+
+    fn queue_conditional(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::If { test, body } = instruction else {
+            unreachable!("instruction dispatch selects If")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        if self.evaluate(test, &node, position, size)?.boolean() {
+            push_scoped_sequence(
+                tasks,
+                &mut self.meter,
+                Arc::clone(body),
+                node,
+                ApplyFrame::new(position, size, depth + 1),
+                precedence,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn queue_choose(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Choose {
+            branches,
+            otherwise,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects Choose")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let mut selected = otherwise;
+        for (test, body) in branches {
+            if self.evaluate(test, &node, position, size)?.boolean() {
+                selected = body;
+                break;
+            }
+        }
+        push_scoped_sequence(
+            tasks,
+            &mut self.meter,
+            Arc::clone(selected),
+            node,
+            ApplyFrame::new(position, size, depth + 1),
+            precedence,
+        )?;
+        Ok(())
+    }
+
+    fn queue_extension_fallback(
+        &mut self,
+        tasks: &mut TemplateTaskStack,
+        instruction: &Instruction,
+        node: SourceNode,
+        frame: ApplyFrame,
+        precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::ExtensionFallback {
+            name,
+            present,
+            body,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ExtensionFallback")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        if !present {
+            return Err(Error::Unsupported(format!(
+                "extension element {name} has no xsl:fallback"
+            )));
+        }
+        push_scoped_sequence(
+            tasks,
+            &mut self.meter,
+            Arc::clone(body),
+            node,
+            ApplyFrame::new(position, size, depth + 1),
+            precedence,
+        )?;
         Ok(())
     }
 
@@ -2152,7 +2359,7 @@ impl<'a> Execution<'a> {
                     template.precedence > current.precedence
                         || (template.precedence == current.precedence
                             && (template.priority > current.priority
-                                || (template.priority == current.priority
+                                || (super::number::equal(template.priority, current.priority)
                                     && template.order > current.order)))
                 })
             {
@@ -2361,6 +2568,8 @@ impl<'a> Execution<'a> {
                 .insert_retained(&parameter.name, retained, &mut self.meter)?;
         }
         self.release_parameters_if_last(&params);
+        // Retire this owner before task growth can reuse its released storage allowance.
+        drop(params);
         tasks.push(
             TemplateTask::Sequence {
                 instructions: program.body,
@@ -2505,678 +2714,1047 @@ impl<'a> Execution<'a> {
         depth: usize,
         current_precedence: Option<usize>,
     ) -> Result<()> {
+        let frame = ApplyFrame::new(position, size, depth);
         match instruction {
             Instruction::Text(value, disable) => self.append_text(value, *disable),
-            Instruction::LiteralElement {
-                base_uri,
+            Instruction::LiteralElement { .. } => {
+                self.execute_literal_element(instruction, node, frame, current_precedence)
+            }
+            Instruction::ApplyTemplates { .. } => {
+                self.execute_apply_templates(instruction, node, frame, current_precedence)
+            }
+            Instruction::ApplyImports => {
+                self.execute_apply_imports(instruction, node, frame, current_precedence)
+            }
+            Instruction::CallTemplate { .. } => {
+                self.execute_call_template(instruction, node, frame, current_precedence)
+            }
+            Instruction::ForEach { .. } => self.execute_for_each(instruction, node, frame),
+            Instruction::If { .. } => {
+                self.execute_conditional(instruction, node, frame, current_precedence)
+            }
+            Instruction::Choose { .. } => {
+                self.execute_choose(instruction, node, frame, current_precedence)
+            }
+            Instruction::ValueOf { .. } => self.execute_value_of(instruction, node, frame),
+            Instruction::CopyOf { .. } => self.execute_copy_of(instruction, node, frame),
+            Instruction::Copy { .. } => {
+                self.execute_copy(instruction, node, frame, current_precedence)
+            }
+            Instruction::Element { .. } => {
+                self.execute_element(instruction, node, frame, current_precedence)
+            }
+            Instruction::Attribute { .. } => {
+                self.execute_attribute(instruction, node, frame, current_precedence)
+            }
+            Instruction::Comment(..) => {
+                self.execute_comment(instruction, node, frame, current_precedence)
+            }
+            Instruction::Processing { .. } => {
+                self.execute_processing(instruction, node, frame, current_precedence)
+            }
+            Instruction::Number(..) => self.execute_number(instruction, node, frame),
+            Instruction::Variable(..) => {
+                self.execute_variable(instruction, node, frame, current_precedence)
+            }
+            Instruction::Message { .. } => {
+                self.execute_message(instruction, node, frame, current_precedence)
+            }
+            Instruction::SecondaryOutput { .. } => {
+                self.execute_secondary_output(instruction, node, frame, current_precedence)
+            }
+            Instruction::ExtensionFallback { .. } => {
+                self.execute_extension_fallback(instruction, node, frame, current_precedence)
+            }
+            Instruction::CompatibilityComment(value) => {
+                self.push_node(self.parent(), NodeKind::Comment(value.clone()))?;
+                Ok(())
+            }
+            Instruction::FunctionResult { .. } => {
+                self.execute_function_result(instruction, node, frame, current_precedence)
+            }
+        }
+    }
+
+    fn begin_literal_element(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::LiteralElement {
+            base_uri,
+            name,
+            prefix,
+            attributes,
+            namespaces,
+            attribute_sets,
+            ..
+        } = instruction
+        else {
+            unreachable!("literal element construction receives its instruction")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.meter.check_additional(
+            BudgetKind::OwnedBytes,
+            self.literal_projection_owned_bytes(
+                name,
+                prefix.as_deref(),
+                namespaces,
+                base_uri.as_deref(),
+            ),
+        )?;
+        let (name, prefix, result_namespaces) =
+            self.alias_literal_name_and_namespaces(name, prefix.as_deref(), namespaces)?;
+        let parent = self.parent();
+        let id = self.push_node_with_base(
+            parent,
+            NodeKind::Element {
                 name,
                 prefix,
-                attributes,
-                namespaces,
-                children,
-                attribute_sets,
-            } => {
-                self.meter.check_additional(
-                    BudgetKind::OwnedBytes,
-                    self.literal_projection_owned_bytes(
-                        name,
-                        prefix.as_deref(),
-                        namespaces,
-                        base_uri.as_deref(),
-                    ),
-                )?;
-                let (name, prefix, result_namespaces) =
-                    self.alias_literal_name_and_namespaces(name, prefix.as_deref(), namespaces)?;
-                let parent = self.parent();
-                let id = self.push_node_with_base(
-                    parent,
-                    NodeKind::Element {
-                        name,
-                        prefix,
-                        attributes: vec![],
-                        namespaces: result_namespaces.into(),
-                    },
-                    base_uri.clone(),
-                )?;
-                self.push_output_node(id)?;
-                self.apply_attribute_sets(
-                    attribute_sets,
-                    node,
-                    ApplyFrame::new(position, size, depth),
-                    current_precedence,
-                )?;
-                for attribute in attributes {
-                    let value = self.evaluate_avt(&attribute.value, node, position, size)?;
-                    let (name, prefix) =
-                        self.alias_attribute_name(&attribute.name, attribute.prefix.as_deref());
-                    let value = value.transfer(&mut self.meter);
-                    self.add_literal_attribute(Attribute {
-                        name,
-                        prefix,
-                        value,
-                    })?;
+                attributes: vec![],
+                namespaces: result_namespaces.into(),
+            },
+            base_uri.clone(),
+        )?;
+        self.push_output_node(id)?;
+        self.apply_attribute_sets(
+            attribute_sets,
+            node,
+            ApplyFrame::new(position, size, depth),
+            current_precedence,
+        )?;
+        for attribute in attributes {
+            let value = self.evaluate_avt(&attribute.value, node, position, size)?;
+            let (name, prefix) =
+                self.alias_attribute_name(&attribute.name, attribute.prefix.as_deref());
+            let value = value.transfer(&mut self.meter);
+            self.add_literal_attribute(Attribute {
+                name,
+                prefix,
+                value,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn execute_literal_element(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::LiteralElement { children, .. } = instruction else {
+            unreachable!("instruction dispatch selects LiteralElement")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.begin_literal_element(instruction, node, frame, current_precedence)?;
+        let result = self.execute_scoped_sequence(
+            children,
+            node,
+            position,
+            size,
+            depth + 1,
+            current_precedence,
+        );
+        self.output_stack.pop();
+        result
+    }
+
+    fn execute_apply_templates(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::ApplyTemplates {
+            select,
+            mode,
+            sorts,
+            parameters,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ApplyTemplates")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let (mut nodes, node_reservation) = self.select_nodes(select, node, position, size)?;
+        let result = (|| {
+            self.sort_nodes(&mut nodes, sorts, node, position, size)?;
+            let supplied = Arc::new(self.evaluate_with_params(
+                parameters,
+                node,
+                position,
+                size,
+                depth,
+                current_precedence,
+            )?);
+            let total = nodes.len();
+            let applied = (|| {
+                for (index, selected) in nodes.drain(..).enumerate() {
+                    self.apply_one(
+                        selected,
+                        mode.as_ref(),
+                        Arc::clone(&supplied),
+                        ApplyFrame::new(index + 1, total, depth + 1),
+                    )?;
                 }
-                let result = self.execute_scoped_sequence(
-                    children,
+                Ok(())
+            })();
+            self.release_parameters_if_last(&supplied);
+            applied
+        })();
+        self.meter.release_owned_bytes(node_reservation);
+        result
+    }
+
+    fn execute_apply_imports(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::ApplyImports = instruction else {
+            unreachable!("instruction dispatch selects ApplyImports")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let current_rule_precedence = current_precedence.ok_or_else(|| {
+            Error::Dynamic("xsl:apply-imports requires a current template rule".into())
+        })?;
+        let mode = self.modes.last().and_then(|mode| mode.name.as_ref());
+        let mode_reserved_owned_bytes = mode.map_or(0, expanded_name_owned_bytes);
+        self.meter
+            .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
+        self.run_template_tasks(TemplateTask::ApplyOne {
+            node: node.clone(),
+            mode: mode.cloned(),
+            mode_reserved_owned_bytes,
+            params: Arc::new(EvaluatedParameters::default()),
+            frame: ApplyFrame {
+                max_precedence: Some(current_rule_precedence),
+                position,
+                size,
+                depth: depth + 1,
+            },
+        })
+    }
+
+    fn execute_call_template(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::CallTemplate { name, parameters } = instruction else {
+            unreachable!("instruction dispatch selects CallTemplate")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let supplied = Arc::new(self.evaluate_with_params(
+            parameters,
+            node,
+            position,
+            size,
+            depth,
+            current_precedence,
+        )?);
+        self.call_named(
+            name,
+            supplied,
+            node,
+            ApplyFrame::new(position, size, depth + 1),
+            current_precedence,
+        )
+    }
+
+    fn execute_for_each(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+    ) -> Result<()> {
+        let Instruction::ForEach {
+            select,
+            sorts,
+            body,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ForEach")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let (mut nodes, node_reservation) = self.select_nodes(select, node, position, size)?;
+        let result = (|| {
+            self.sort_nodes(&mut nodes, sorts, node, position, size)?;
+            let total = nodes.len();
+            for (index, selected) in nodes.iter().enumerate() {
+                self.push_scope()?;
+                let result =
+                    self.execute_sequence(body, selected, index + 1, total, depth + 1, None);
+                self.pop_scope();
+                result?;
+            }
+            Ok(())
+        })();
+        self.meter.release_owned_bytes(node_reservation);
+        result
+    }
+
+    fn execute_conditional(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::If { test, body } = instruction else {
+            unreachable!("instruction dispatch selects If")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        if self.evaluate(test, node, position, size)?.boolean() {
+            self.execute_scoped_sequence(
+                body,
+                node,
+                position,
+                size,
+                depth + 1,
+                current_precedence,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn execute_choose(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Choose {
+            branches,
+            otherwise,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects Choose")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        for (test, body) in branches {
+            if self.evaluate(test, node, position, size)?.boolean() {
+                return self.execute_scoped_sequence(
+                    body,
                     node,
                     position,
                     size,
                     depth + 1,
                     current_precedence,
                 );
-                self.output_stack.pop();
-                result
             }
-            Instruction::ApplyTemplates {
-                select,
-                mode,
-                sorts,
-                parameters,
-            } => {
-                let (mut nodes, node_reservation) =
-                    self.select_nodes(select, node, position, size)?;
-                let result = (|| {
-                    self.sort_nodes(&mut nodes, sorts, node, position, size)?;
-                    let supplied = Arc::new(self.evaluate_with_params(
-                        parameters,
-                        node,
-                        position,
-                        size,
-                        depth,
-                        current_precedence,
-                    )?);
-                    let total = nodes.len();
-                    let applied = (|| {
-                        for (index, selected) in nodes.drain(..).enumerate() {
-                            self.apply_one(
-                                selected,
-                                mode.as_ref(),
-                                Arc::clone(&supplied),
-                                ApplyFrame::new(index + 1, total, depth + 1),
+        }
+        self.execute_scoped_sequence(
+            otherwise,
+            node,
+            position,
+            size,
+            depth + 1,
+            current_precedence,
+        )
+    }
+
+    fn execute_value_of(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+    ) -> Result<()> {
+        let Instruction::ValueOf {
+            select,
+            disable_output_escaping,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ValueOf")
+        };
+        let ApplyFrame { position, size, .. } = frame;
+        let value = self.evaluate(select, node, position, size)?;
+        self.append_xpath_text(value, *disable_output_escaping)
+    }
+
+    fn execute_copy_of(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+    ) -> Result<()> {
+        let Instruction::CopyOf { select, base_uri } = instruction else {
+            unreachable!("instruction dispatch selects CopyOf")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        match self.evaluate(select, node, position, size)? {
+            XPathValue::NodeSet(nodes) => {
+                for selected in nodes {
+                    self.copy_source(&selected, self.parent(), depth + 1, base_uri.as_deref())?;
+                }
+            }
+            XPathValue::ResultTreeFragment(fragment) => {
+                self.copy_document(
+                    &fragment,
+                    fragment.root(),
+                    self.parent(),
+                    depth + 1,
+                    base_uri.as_deref(),
+                )?;
+            }
+            value => self.append_xpath_text(value, false)?,
+        }
+        Ok(())
+    }
+
+    fn execute_copy(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Copy {
+            base_uri,
+            body,
+            attribute_sets,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects Copy")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        match node {
+            SourceNode::Node(id) => {
+                if let Some(source) = self.evaluator.source.node(*id) {
+                    let kind = clone_for_xsl_copy(&source.kind, &self.meter)?;
+                    match kind {
+                        NodeKind::Element {
+                            name,
+                            prefix,
+                            attributes: _,
+                            namespaces,
+                        } => {
+                            let target = self.push_xsl_copy_element(
+                                name,
+                                prefix,
+                                namespaces,
+                                base_uri.as_deref(),
+                            )?;
+                            self.push_output_node(target)?;
+                            self.apply_attribute_sets(
+                                attribute_sets,
+                                node,
+                                ApplyFrame::new(position, size, depth),
+                                current_precedence,
+                            )?;
+                            let result = self.execute_scoped_sequence(
+                                body,
+                                node,
+                                position,
+                                size,
+                                depth + 1,
+                                current_precedence,
+                            );
+                            self.output_stack.pop();
+                            result?;
+                        }
+                        NodeKind::Text { value, .. } => self.append_text(&value, false)?,
+                        NodeKind::Comment(value) => {
+                            self.push_node(self.parent(), NodeKind::Comment(value))?;
+                        }
+                        NodeKind::ProcessingInstruction { target, value } => {
+                            self.push_node(
+                                self.parent(),
+                                NodeKind::ProcessingInstruction { target, value },
                             )?;
                         }
-                        Ok(())
-                    })();
-                    self.release_parameters_if_last(&supplied);
-                    applied
-                })();
-                self.meter.release_owned_bytes(node_reservation);
-                result
-            }
-            Instruction::ApplyImports => {
-                let current_rule_precedence = current_precedence.ok_or_else(|| {
-                    Error::Dynamic("xsl:apply-imports requires a current template rule".into())
-                })?;
-                let mode = self.modes.last().and_then(|mode| mode.name.as_ref());
-                let mode_reserved_owned_bytes = mode.map_or(0, expanded_name_owned_bytes);
-                self.meter
-                    .charge(BudgetKind::OwnedBytes, mode_reserved_owned_bytes)?;
-                self.run_template_tasks(TemplateTask::ApplyOne {
-                    node: node.clone(),
-                    mode: mode.cloned(),
-                    mode_reserved_owned_bytes,
-                    params: Arc::new(EvaluatedParameters::default()),
-                    frame: ApplyFrame {
-                        max_precedence: Some(current_rule_precedence),
-                        position,
-                        size,
-                        depth: depth + 1,
-                    },
-                })
-            }
-            Instruction::CallTemplate { name, parameters } => {
-                let supplied = Arc::new(self.evaluate_with_params(
-                    parameters,
-                    node,
-                    position,
-                    size,
-                    depth,
-                    current_precedence,
-                )?);
-                self.call_named(
-                    name,
-                    supplied,
-                    node,
-                    ApplyFrame::new(position, size, depth + 1),
-                    current_precedence,
-                )
-            }
-            Instruction::ForEach {
-                select,
-                sorts,
-                body,
-            } => {
-                let (mut nodes, node_reservation) =
-                    self.select_nodes(select, node, position, size)?;
-                let result = (|| {
-                    self.sort_nodes(&mut nodes, sorts, node, position, size)?;
-                    let total = nodes.len();
-                    for (index, selected) in nodes.iter().enumerate() {
-                        self.push_scope()?;
-                        let result = self.execute_sequence(
-                            body,
-                            selected,
-                            index + 1,
-                            total,
-                            depth + 1,
-                            None,
-                        );
-                        self.pop_scope();
-                        result?;
-                    }
-                    Ok(())
-                })();
-                self.meter.release_owned_bytes(node_reservation);
-                result
-            }
-            Instruction::If { test, body } => {
-                if self.evaluate(test, node, position, size)?.boolean() {
-                    self.execute_scoped_sequence(
-                        body,
-                        node,
-                        position,
-                        size,
-                        depth + 1,
-                        current_precedence,
-                    )?
-                }
-                Ok(())
-            }
-            Instruction::Choose {
-                branches,
-                otherwise,
-            } => {
-                for (test, body) in branches {
-                    if self.evaluate(test, node, position, size)?.boolean() {
-                        return self.execute_scoped_sequence(
+                        NodeKind::Root => self.execute_scoped_sequence(
                             body,
                             node,
                             position,
                             size,
                             depth + 1,
                             current_precedence,
-                        );
+                        )?,
                     }
                 }
-                self.execute_scoped_sequence(
-                    otherwise,
-                    node,
-                    position,
-                    size,
-                    depth + 1,
-                    current_precedence,
-                )
             }
-            Instruction::ValueOf {
-                select,
-                disable_output_escaping,
-            } => {
-                let value = self.evaluate(select, node, position, size)?;
-                self.append_xpath_text(value, *disable_output_escaping)
+            SourceNode::Attribute { owner, index } => {
+                self.copy_source_attribute(*owner, *index)?;
             }
-            Instruction::CopyOf { select, base_uri } => {
-                match self.evaluate(select, node, position, size)? {
-                    XPathValue::NodeSet(nodes) => {
-                        for selected in nodes {
-                            self.copy_source(
-                                &selected,
-                                self.parent(),
-                                depth + 1,
-                                base_uri.as_deref(),
-                            )?
-                        }
-                    }
-                    XPathValue::ResultTreeFragment(fragment) => {
-                        self.copy_document(
-                            &fragment,
-                            fragment.root(),
-                            self.parent(),
-                            depth + 1,
-                            base_uri.as_deref(),
-                        )?;
-                    }
-                    value => self.append_xpath_text(value, false)?,
-                }
-                Ok(())
-            }
-            Instruction::Copy {
-                base_uri,
-                body,
-                attribute_sets,
-            } => {
-                match node {
-                    SourceNode::Node(id) => {
-                        if let Some(source) = self.evaluator.source.node(*id) {
-                            let kind = clone_for_xsl_copy(&source.kind, &self.meter)?;
-                            match kind {
-                                NodeKind::Element {
-                                    name,
-                                    prefix,
-                                    attributes: _,
-                                    namespaces,
-                                } => {
-                                    let target = self.push_xsl_copy_element(
-                                        name,
-                                        prefix,
-                                        namespaces,
-                                        base_uri.as_deref(),
-                                    )?;
-                                    self.push_output_node(target)?;
-                                    self.apply_attribute_sets(
-                                        attribute_sets,
-                                        node,
-                                        ApplyFrame::new(position, size, depth),
-                                        current_precedence,
-                                    )?;
-                                    let result = self.execute_scoped_sequence(
-                                        body,
-                                        node,
-                                        position,
-                                        size,
-                                        depth + 1,
-                                        current_precedence,
-                                    );
-                                    self.output_stack.pop();
-                                    result?
-                                }
-                                NodeKind::Text { value, .. } => self.append_text(&value, false)?,
-                                NodeKind::Comment(value) => {
-                                    self.push_node(self.parent(), NodeKind::Comment(value))?;
-                                }
-                                NodeKind::ProcessingInstruction { target, value } => {
-                                    self.push_node(
-                                        self.parent(),
-                                        NodeKind::ProcessingInstruction { target, value },
-                                    )?;
-                                }
-                                NodeKind::Root => self.execute_scoped_sequence(
-                                    body,
-                                    node,
-                                    position,
-                                    size,
-                                    depth + 1,
-                                    current_precedence,
-                                )?,
-                            }
-                        }
-                    }
-                    SourceNode::Attribute { owner, index } => {
-                        self.copy_source_attribute(*owner, *index)?;
-                    }
-                    SourceNode::Namespace { owner, index } => {
-                        self.copy_source_namespace(*owner, *index)?;
-                    }
-                }
-                Ok(())
-            }
-            Instruction::Element { body, .. } => {
-                self.begin_computed_element(
-                    instruction,
-                    node,
-                    ApplyFrame::new(position, size, depth),
-                    current_precedence,
-                )?;
-                let result = self.execute_scoped_sequence(
-                    body,
-                    node,
-                    position,
-                    size,
-                    depth + 1,
-                    current_precedence,
-                );
-                self.output_stack.pop();
-                result
-            }
-            Instruction::Attribute {
-                name,
-                namespace,
-                namespaces: static_namespaces,
-                body,
-            } => {
-                let lexical = self.evaluate_avt(name, node, position, size)?;
-                let (prefix, local) = split_name(&lexical)?;
-                let namespace = namespace
-                    .as_ref()
-                    .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?;
-                let namespace = match namespace {
-                    Some(namespace) => Some(namespace),
-                    None => prefix
-                        .as_deref()
-                        .and_then(|prefix| static_namespace(static_namespaces, prefix))
-                        .map(|uri| MeteredString::from_borrowed(uri, &mut self.meter))
-                        .transpose()?,
-                };
-                let (namespace, namespace_reservation) = match namespace {
-                    Some(namespace) => {
-                        let (namespace, reservation) = namespace.into_parts();
-                        (Some(namespace), reservation)
-                    }
-                    None => (None, 0),
-                };
-                let (prefix, namespace) =
-                    normalize_computed_namespace(prefix, namespace, &lexical)?;
-                validate_computed_attribute_name(prefix.as_deref(), &local, namespace.as_deref())?;
-                require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
-                let value =
-                    self.capture_text(body, node, position, size, depth, current_precedence)?;
-                let value = value.transfer(&mut self.meter);
-                lexical.release(&mut self.meter);
-                self.meter.release_owned_bytes(namespace_reservation);
-                self.add_attribute(Attribute {
-                    name: ExpandedName::new(namespace, local),
-                    prefix,
-                    value,
-                })
-            }
-            Instruction::Comment(body) => {
-                let value =
-                    self.capture_text(body, node, position, size, depth, current_precedence)?;
-                let value = value.transfer(&mut self.meter);
-                if value.contains("--") || value.ends_with('-') {
-                    return Err(Error::Dynamic(
-                        "xsl:comment produced invalid comment content".into(),
-                    ));
-                }
-                self.push_node(self.parent(), NodeKind::Comment(value))?;
-                Ok(())
-            }
-            Instruction::Processing { name, body } => {
-                let target = self.evaluate_avt(name, node, position, size)?;
-                if target.eq_ignore_ascii_case("xml") || !is_ncname(&target) {
-                    return Err(Error::Dynamic(
-                        "invalid processing-instruction target".into(),
-                    ));
-                }
-                let value =
-                    self.capture_text(body, node, position, size, depth, current_precedence)?;
-                // XSLT 1.0 section 7.3 defines PI content as the sequence constructor's
-                // string-value. The serializer supplies the required separator; whitespace in
-                // this value is data and must remain intact.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#section-Creating-Processing-Instructions
-                let value = value.transfer(&mut self.meter);
-                if value.contains("?>") {
-                    return Err(Error::Dynamic("processing instruction contains ?>".into()));
-                }
-                let target = target.transfer(&mut self.meter);
-                self.push_node(
-                    self.parent(),
-                    NodeKind::ProcessingInstruction {
-                        target,
-                        value: (!value.is_empty()).then_some(value),
-                    },
-                )?;
-                Ok(())
-            }
-            Instruction::Number(number) => {
-                let explicit_value = if let Some(expression) = &number.value {
-                    Some(
-                        self.evaluate(expression, node, position, size)?
-                            .into_number(&self.evaluator, &mut self.meter)?,
-                    )
-                } else {
-                    None
-                };
-                let (values, values_owned_bytes) = if explicit_value.is_some() {
-                    (Vec::new(), 0)
-                } else {
-                    self.number_sequence(number, node)?
-                };
-                let values = explicit_value
-                    .as_ref()
-                    .map_or(values.as_slice(), std::slice::from_ref);
-                if values.is_empty() {
-                    self.meter.release_owned_bytes(values_owned_bytes);
-                    return Ok(());
-                }
-                if number.value.is_some()
-                    && let [value] = values
-                    && (!value.is_finite() || *value < 0.5)
-                {
-                    // XSLT 1.0 section 7.7 permits recovery from an invalid explicit value only by
-                    // inserting its XPath string-value, before numbering tokens are considered.
-                    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                    return self.append_text(&super::value::format_xpath_number(*value), false);
-                }
-                let grouping_separator_value = number
-                    .grouping_separator
-                    .as_ref()
-                    .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?;
-                let grouping_separator = grouping_separator_value
-                    .as_ref()
-                    .map(|value| {
-                        let mut characters = value.chars();
-                        let Some(first) = characters.next() else {
-                            // libxslt REC/test-7.7-6 classifies an explicit empty value as
-                            // disabling grouping, distinct from malformed multi-character input.
-                            return Ok(None);
-                        };
-                        if characters.next().is_some() {
-                            // XSLT 1.0 section 2.5 requires an unsupported optional attribute
-                            // value to be ignored while forwards-compatible processing is active.
-                            // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
-                            if number.forward_compatible {
-                                return Ok(None);
-                            }
-                            return Err(Error::Dynamic(
-                                "xsl:number grouping-separator must evaluate to at most one character"
-                                    .into(),
-                            ));
-                        }
-                        Ok(Some(first))
-                    })
-                    .transpose()?
-                    .flatten();
-                // XSLT 1.0 sections 7.7 and 7.7.1 type `grouping-size` as a numeric AVT but
-                // prescribe no error for a fractional or non-positive value. libxslt converts
-                // positive fractions to an integral width and leaves invalid widths ungrouped.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                let grouping_size_value = number
-                    .grouping_size
-                    .as_ref()
-                    .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?;
-                let grouping_size = grouping_size_value
-                    .as_ref()
-                    .and_then(|value| parse_xpath_number(value))
-                    .filter(|value| value.is_finite())
-                    .filter(|value| *value > 0.0)
-                    .map(|value| value as usize)
-                    .filter(|value| *value > 0);
-                let format = self.evaluate_avt(&number.format, node, position, size)?;
-                let lang = number
-                    .lang
-                    .as_ref()
-                    .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?;
-                let letter_value = number
-                    .letter_value
-                    .as_ref()
-                    .map(|value| self.evaluate_avt(value, node, position, size))
-                    .transpose()?;
-                // XSLT 1.0 section 7.7 permits only these two evaluated AVT values. Section 2.5
-                // requires an invalid optional value to be ignored in forwards-compatible mode.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
-                let effective_letter_value = match letter_value.as_deref() {
-                    None | Some("alphabetic" | "traditional") => letter_value.as_deref(),
-                    Some(_) if number.forward_compatible => None,
-                    Some(value) => {
-                        return Err(Error::Dynamic(format!(
-                            "xsl:number letter-value must evaluate to alphabetic or traditional, got `{value}`"
-                        )));
-                    }
-                };
-                let formatted = format_number_sequence(
-                    values,
-                    &format,
-                    lang.as_deref(),
-                    effective_letter_value,
-                    grouping_separator,
-                    grouping_size,
-                    &mut self.meter,
-                );
-                grouping_separator_value
-                    .into_iter()
-                    .for_each(|value| value.release(&mut self.meter));
-                grouping_size_value
-                    .into_iter()
-                    .for_each(|value| value.release(&mut self.meter));
-                format.release(&mut self.meter);
-                lang.into_iter()
-                    .for_each(|value| value.release(&mut self.meter));
-                letter_value
-                    .into_iter()
-                    .for_each(|value| value.release(&mut self.meter));
-                self.meter.release_owned_bytes(values_owned_bytes);
-                let formatted = formatted?;
-                let (formatted, reservation) = formatted.into_parts();
-                self.append_precharged_text(formatted, reservation, false)
-            }
-            Instruction::Variable(variable) => {
-                let retained = self.evaluate_variable(
-                    variable,
-                    node,
-                    position,
-                    size,
-                    depth,
-                    current_precedence,
-                )?;
-                self.scopes
-                    .last_mut()
-                    .ok_or_else(|| Error::Dynamic("missing variable scope".into()))?
-                    .insert_retained(&variable.name, retained, &mut self.meter)?;
-                Ok(())
-            }
-            Instruction::Message { terminate, body } => {
-                self.meter.charge(BudgetKind::Messages, 1)?;
-                let fragment = self.capture_fragment(
-                    body,
-                    node,
-                    ApplyFrame::new(position, size, depth),
-                    current_precedence,
-                    None,
-                )?;
-                let content = self.consume_temporary_fragment(fragment, serialize_fragment)?;
-                if *terminate {
-                    return Err(terminating_message_error(content, &mut self.meter)?);
-                }
-                reserve_retained_vec_slot(&mut self.messages, &mut self.meter)?;
-                self.messages.push(Message {
-                    content,
-                    terminate: false,
-                });
-                Ok(())
-            }
-            Instruction::SecondaryOutput {
-                uri,
-                properties,
-                body,
-            } => {
-                let uri = self.evaluate_avt(uri, node, position, size)?;
-                if uri.is_empty() {
-                    return Err(Error::Dynamic(
-                        "secondary-output URI must not be empty".into(),
-                    ));
-                }
-                if self.secondary_output_uris.contains(&uri.value) {
-                    return Err(Error::Dynamic(format!(
-                        "secondary-output URI `{uri}` was produced more than once"
-                    )));
-                }
-                let uri = uri.transfer(&mut self.meter);
-                let uri_owned_bytes = uri.capacity().saturating_add(
-                    std::mem::size_of::<String>()
-                        .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>())),
-                );
-                self.meter.charge(BudgetKind::OwnedBytes, uri_owned_bytes)?;
-                reserve_retained_hash_set_slot(
-                    &mut self.secondary_output_uris,
-                    &mut self.meter,
-                    &mut self.secondary_output_uri_index_bytes,
-                )?;
-                let uri = Arc::new(uri);
-                self.secondary_output_uris.insert(Arc::clone(&uri));
-                let definition_owned_bytes = self.stylesheet.output.owned_bytes();
-                self.meter
-                    .charge(BudgetKind::OwnedBytes, definition_owned_bytes)?;
-                let mut definition = self.stylesheet.output.clone();
-                let output = (|| {
-                    for (name, value) in properties {
-                        let value = self.evaluate_avt(value, node, position, size)?;
-                        let value = value.transfer(&mut self.meter);
-                        apply_secondary_output_property(
-                            &mut definition,
-                            name,
-                            value,
-                            &mut self.meter,
-                        )?;
-                    }
-                    let fragment = self.capture_output_tree(
-                        body,
-                        node,
-                        ApplyFrame::new(position, size, depth + 1),
-                        current_precedence,
-                        None,
-                    )?;
-                    let serialized = self
-                        .consume_temporary_fragment(fragment, |fragment, meter| {
-                            serialize(fragment, &definition, meter)
-                        })?;
-                    reserve_retained_vec_slot(&mut self.secondary_outputs, &mut self.meter)?;
-                    self.secondary_outputs
-                        .push(SecondaryOutput { uri, serialized });
-                    Ok(())
-                })();
-                self.meter.release_owned_bytes(definition.owned_bytes());
-                output
-            }
-            Instruction::ExtensionFallback {
-                name,
-                present,
-                body,
-            } => {
-                if !present {
-                    return Err(Error::Unsupported(format!(
-                        "extension element {name} has no xsl:fallback"
-                    )));
-                }
-                self.execute_scoped_sequence(
-                    body,
-                    node,
-                    position,
-                    size,
-                    depth + 1,
-                    current_precedence,
-                )
-            }
-            Instruction::CompatibilityComment(value) => {
-                self.push_node(self.parent(), NodeKind::Comment(value.clone()))?;
-                Ok(())
-            }
-            Instruction::FunctionResult {
-                select,
-                content,
-                base_uri,
-            } => {
-                self.ensure_function_result_is_pending()?;
-                let value = if let Some(select) = select {
-                    xpath_to_public(self.evaluate(select, node, position, size)?)
-                } else {
-                    Value::ResultTreeFragment(Arc::new(self.capture_fragment(
-                        content,
-                        node,
-                        ApplyFrame::new(position, size, depth + 1),
-                        current_precedence,
-                        base_uri.as_deref(),
-                    )?))
-                };
-                self.ensure_function_result_is_pending()?;
-                self.exslt_calls.set_result(value);
-                Ok(())
+            SourceNode::Namespace { owner, index } => {
+                self.copy_source_namespace(*owner, *index)?;
             }
         }
+        Ok(())
+    }
+
+    fn execute_element(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Element { body, .. } = instruction else {
+            unreachable!("instruction dispatch selects Element")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.begin_computed_element(
+            instruction,
+            node,
+            ApplyFrame::new(position, size, depth),
+            current_precedence,
+        )?;
+        let result =
+            self.execute_scoped_sequence(body, node, position, size, depth + 1, current_precedence);
+        self.output_stack.pop();
+        result
+    }
+
+    fn execute_attribute(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Attribute {
+            name,
+            namespace,
+            namespaces: static_namespaces,
+            body,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects Attribute")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let lexical = self.evaluate_avt(name, node, position, size)?;
+        let (prefix, local) = split_name(&lexical)?;
+        let namespace = namespace
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, node, position, size))
+            .transpose()?;
+        let namespace = match namespace {
+            Some(namespace) => Some(namespace),
+            None => prefix
+                .as_deref()
+                .and_then(|prefix| static_namespace(static_namespaces, prefix))
+                .map(|uri| MeteredString::from_borrowed(uri, &mut self.meter))
+                .transpose()?,
+        };
+        let (namespace, namespace_reservation) = match namespace {
+            Some(namespace) => {
+                let (namespace, reservation) = namespace.into_parts();
+                (Some(namespace), reservation)
+            }
+            None => (None, 0),
+        };
+        let (prefix, namespace) = normalize_computed_namespace(prefix, namespace, &lexical)?;
+        validate_computed_attribute_name(prefix.as_deref(), &local, namespace.as_deref())?;
+        require_bound_computed_prefix(prefix.as_deref(), namespace.as_deref(), &lexical)?;
+        let value = self.capture_text(body, node, position, size, depth, current_precedence)?;
+        let value = value.transfer(&mut self.meter);
+        lexical.release(&mut self.meter);
+        self.meter.release_owned_bytes(namespace_reservation);
+        self.add_attribute(Attribute {
+            name: ExpandedName::new(namespace, local),
+            prefix,
+            value,
+        })
+    }
+
+    fn execute_comment(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Comment(body) = instruction else {
+            unreachable!("instruction dispatch selects Comment")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let value = self.capture_text(body, node, position, size, depth, current_precedence)?;
+        let value = value.transfer(&mut self.meter);
+        if value.contains("--") || value.ends_with('-') {
+            return Err(Error::Dynamic(
+                "xsl:comment produced invalid comment content".into(),
+            ));
+        }
+        self.push_node(self.parent(), NodeKind::Comment(value))?;
+        Ok(())
+    }
+
+    fn execute_processing(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Processing { name, body } = instruction else {
+            unreachable!("instruction dispatch selects Processing")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let target = self.evaluate_avt(name, node, position, size)?;
+        if target.eq_ignore_ascii_case("xml") || !is_ncname(&target) {
+            return Err(Error::Dynamic(
+                "invalid processing-instruction target".into(),
+            ));
+        }
+        let value = self.capture_text(body, node, position, size, depth, current_precedence)?;
+        // XSLT 1.0 section 7.3 defines PI content as the sequence constructor's
+        // string-value. The serializer supplies the required separator; whitespace in
+        // this value is data and must remain intact.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-Creating-Processing-Instructions
+        let value = value.transfer(&mut self.meter);
+        if value.contains("?>") {
+            return Err(Error::Dynamic("processing instruction contains ?>".into()));
+        }
+        let target = target.transfer(&mut self.meter);
+        self.push_node(
+            self.parent(),
+            NodeKind::ProcessingInstruction {
+                target,
+                value: (!value.is_empty()).then_some(value),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn execute_number(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+    ) -> Result<()> {
+        let Instruction::Number(number) = instruction else {
+            unreachable!("instruction dispatch selects Number")
+        };
+        let ApplyFrame { position, size, .. } = frame;
+        let explicit_value = if let Some(expression) = &number.value {
+            Some(
+                self.evaluate(expression, node, position, size)?
+                    .into_number(&self.evaluator, &mut self.meter)?,
+            )
+        } else {
+            None
+        };
+        let (values, values_owned_bytes) = if explicit_value.is_some() {
+            (Vec::new(), 0)
+        } else {
+            self.number_sequence(number, node)?
+        };
+        let values = explicit_value
+            .as_ref()
+            .map_or(values.as_slice(), std::slice::from_ref);
+        if values.is_empty() {
+            self.meter.release_owned_bytes(values_owned_bytes);
+            return Ok(());
+        }
+        if number.value.is_some()
+            && let [value] = values
+            && (!value.is_finite() || *value < 0.5)
+        {
+            // XSLT 1.0 section 7.7 permits recovery from an invalid explicit value only by
+            // inserting its XPath string-value, before numbering tokens are considered.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+            return self.append_text(&super::value::format_xpath_number(*value), false);
+        }
+        let NumberGrouping {
+            separator_value: grouping_separator_value,
+            separator: grouping_separator,
+            size_value: grouping_size_value,
+            size: grouping_size,
+        } = self.number_grouping(number, node, position, size)?;
+        let format = self.evaluate_avt(&number.format, node, position, size)?;
+        let lang = number
+            .lang
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, node, position, size))
+            .transpose()?;
+        let letter_value = number
+            .letter_value
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, node, position, size))
+            .transpose()?;
+        // XSLT 1.0 section 7.7 permits only these two evaluated AVT values. Section 2.5
+        // requires an invalid optional value to be ignored in forwards-compatible mode.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+        let effective_letter_value = match letter_value.as_deref() {
+            None | Some("alphabetic" | "traditional") => letter_value.as_deref(),
+            Some(_) if number.forward_compatible => None,
+            Some(value) => {
+                return Err(Error::Dynamic(format!(
+                    "xsl:number letter-value must evaluate to alphabetic or traditional, got `{value}`"
+                )));
+            }
+        };
+        let formatted = format_number_sequence(
+            values,
+            &format,
+            lang.as_deref(),
+            effective_letter_value,
+            grouping_separator,
+            grouping_size,
+            &mut self.meter,
+        );
+        if let Some(value) = grouping_separator_value {
+            value.release(&mut self.meter);
+        }
+        if let Some(value) = grouping_size_value {
+            value.release(&mut self.meter);
+        }
+        format.release(&mut self.meter);
+        if let Some(value) = lang {
+            value.release(&mut self.meter);
+        }
+        if let Some(value) = letter_value {
+            value.release(&mut self.meter);
+        }
+        self.meter.release_owned_bytes(values_owned_bytes);
+        let formatted = formatted?;
+        let (formatted, reservation) = formatted.into_parts();
+        self.append_precharged_text(formatted, reservation, false)
+    }
+
+    fn execute_variable(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Variable(variable) = instruction else {
+            unreachable!("instruction dispatch selects Variable")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let retained =
+            self.evaluate_variable(variable, node, position, size, depth, current_precedence)?;
+        self.scopes
+            .last_mut()
+            .ok_or_else(|| Error::Dynamic("missing variable scope".into()))?
+            .insert_retained(&variable.name, retained, &mut self.meter)?;
+        Ok(())
+    }
+
+    fn execute_message(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::Message { terminate, body } = instruction else {
+            unreachable!("instruction dispatch selects Message")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.meter.charge(BudgetKind::Messages, 1)?;
+        let fragment = self.capture_fragment(
+            body,
+            node,
+            ApplyFrame::new(position, size, depth),
+            current_precedence,
+            None,
+        )?;
+        let content = self.consume_temporary_fragment(fragment, serialize_fragment)?;
+        if *terminate {
+            return Err(terminating_message_error(content, &mut self.meter)?);
+        }
+        reserve_retained_vec_slot(&mut self.messages, &mut self.meter)?;
+        self.messages.push(Message {
+            content,
+            terminate: false,
+        });
+        Ok(())
+    }
+
+    fn execute_secondary_output(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::SecondaryOutput {
+            uri,
+            properties,
+            body,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects SecondaryOutput")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        let uri = self.evaluate_avt(uri, node, position, size)?;
+        if uri.is_empty() {
+            return Err(Error::Dynamic(
+                "secondary-output URI must not be empty".into(),
+            ));
+        }
+        if self.secondary_output_uris.contains(&uri.value) {
+            return Err(Error::Dynamic(format!(
+                "secondary-output URI `{uri}` was produced more than once"
+            )));
+        }
+        let uri = uri.transfer(&mut self.meter);
+        let uri_owned_bytes = uri.capacity().saturating_add(
+            std::mem::size_of::<String>()
+                .saturating_add(2usize.saturating_mul(std::mem::size_of::<usize>())),
+        );
+        self.meter.charge(BudgetKind::OwnedBytes, uri_owned_bytes)?;
+        reserve_retained_hash_set_slot(
+            &mut self.secondary_output_uris,
+            &mut self.meter,
+            &mut self.secondary_output_uri_index_bytes,
+        )?;
+        let uri = Arc::new(uri);
+        self.secondary_output_uris.insert(Arc::clone(&uri));
+        let definition_owned_bytes = self.stylesheet.output.owned_bytes();
+        self.meter
+            .charge(BudgetKind::OwnedBytes, definition_owned_bytes)?;
+        let mut definition = self.stylesheet.output.clone();
+        let output = (|| {
+            for (name, value) in properties {
+                let value = self.evaluate_avt(value, node, position, size)?;
+                let value = value.transfer(&mut self.meter);
+                apply_secondary_output_property(&mut definition, name, value, &mut self.meter)?;
+            }
+            let fragment = self.capture_output_tree(
+                body,
+                node,
+                ApplyFrame::new(position, size, depth + 1),
+                current_precedence,
+                None,
+            )?;
+            let serialized = self.consume_temporary_fragment(fragment, |fragment, meter| {
+                serialize(fragment, &definition, meter)
+            })?;
+            reserve_retained_vec_slot(&mut self.secondary_outputs, &mut self.meter)?;
+            self.secondary_outputs
+                .push(SecondaryOutput { uri, serialized });
+            Ok(())
+        })();
+        self.meter.release_owned_bytes(definition.owned_bytes());
+        output
+    }
+
+    fn execute_extension_fallback(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::ExtensionFallback {
+            name,
+            present,
+            body,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects ExtensionFallback")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        if !present {
+            return Err(Error::Unsupported(format!(
+                "extension element {name} has no xsl:fallback"
+            )));
+        }
+        self.execute_scoped_sequence(body, node, position, size, depth + 1, current_precedence)
+    }
+
+    fn execute_function_result(
+        &mut self,
+        instruction: &Instruction,
+        node: &SourceNode,
+        frame: ApplyFrame,
+        current_precedence: Option<usize>,
+    ) -> Result<()> {
+        let Instruction::FunctionResult {
+            select,
+            content,
+            base_uri,
+        } = instruction
+        else {
+            unreachable!("instruction dispatch selects FunctionResult")
+        };
+        let ApplyFrame {
+            position,
+            size,
+            depth,
+            ..
+        } = frame;
+        self.ensure_function_result_is_pending()?;
+        let value = if let Some(select) = select {
+            xpath_to_public(self.evaluate(select, node, position, size)?)
+        } else {
+            Value::ResultTreeFragment(Arc::new(self.capture_fragment(
+                content,
+                node,
+                ApplyFrame::new(position, size, depth + 1),
+                current_precedence,
+                base_uri.as_deref(),
+            )?))
+        };
+        self.ensure_function_result_is_pending()?;
+        self.exslt_calls.set_result(value);
+        Ok(())
+    }
+
+    fn number_grouping(
+        &mut self,
+        number: &super::compiler::NumberInstruction,
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+    ) -> Result<NumberGrouping> {
+        let grouping_separator_value = number
+            .grouping_separator
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, node, position, size))
+            .transpose()?;
+        let grouping_separator = grouping_separator_value
+            .as_ref()
+            .map(|value| {
+                let mut characters = value.chars();
+                let Some(first) = characters.next() else {
+                    // libxslt REC/test-7.7-6 classifies an explicit empty value as
+                    // disabling grouping, distinct from malformed multi-character input.
+                    return Ok(None);
+                };
+                if characters.next().is_some() {
+                    // XSLT 1.0 section 2.5 requires an unsupported optional attribute
+                    // value to be ignored while forwards-compatible processing is active.
+                    // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
+                    if number.forward_compatible {
+                        return Ok(None);
+                    }
+                    return Err(Error::Dynamic(
+                        "xsl:number grouping-separator must evaluate to at most one character"
+                            .into(),
+                    ));
+                }
+                Ok(Some(first))
+            })
+            .transpose()?
+            .flatten();
+        // XSLT 1.0 sections 7.7 and 7.7.1 type `grouping-size` as a numeric AVT but
+        // prescribe no error for a fractional or non-positive value. libxslt converts
+        // positive fractions to an integral width and leaves invalid widths ungrouped.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+        let grouping_size_value = number
+            .grouping_size
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, node, position, size))
+            .transpose()?;
+        let grouping_size = grouping_size_value
+            .as_ref()
+            .and_then(|value| parse_xpath_number(value))
+            .filter(|value| value.is_finite())
+            .filter(|value| *value > 0.0)
+            .map(super::number::truncating_size)
+            .filter(|value| *value > 0);
+        Ok(NumberGrouping {
+            separator_value: grouping_separator_value,
+            separator: grouping_separator,
+            size_value: grouping_size_value,
+            size: grouping_size,
+        })
     }
 
     fn ensure_function_result_is_pending(&self) -> Result<()> {
@@ -3222,7 +3800,7 @@ impl<'a> Execution<'a> {
         }
         match trim_xml_whitespace(&expression.source) {
             "." => {
-                return Ok(XPathValue::NodeSet(self.evaluator.singleton(
+                return Ok(XPathValue::NodeSet(Evaluator::singleton(
                     node,
                     true,
                     &mut self.meter,
@@ -3241,6 +3819,17 @@ impl<'a> Execution<'a> {
         if let Some(value) = self.evaluate_rtf_order(expression, node)? {
             return Ok(XPathValue::Number(value));
         }
+        self.evaluate_bound_expression(expression, node, position, size, uses_key)
+    }
+
+    fn evaluate_bound_expression(
+        &mut self,
+        expression: &Expression,
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+        uses_key: bool,
+    ) -> Result<XPathValue> {
         let (mut variables, mut reserved_owned_bytes) = self.variables()?;
         let custom_calls = CustomCallSession::default();
         loop {
@@ -3477,7 +4066,7 @@ impl<'a> Execution<'a> {
                     preceding += 1;
                 }
             }
-            Ok(Some(union_count as f64))
+            Ok(Some(super::number::size(union_count)))
         })();
         self.meter.release_owned_bytes(reserved_owned_bytes);
         result
@@ -3491,14 +4080,14 @@ impl<'a> Execution<'a> {
         let source = trim_xml_whitespace(&expression.source);
         match source {
             "self::text()" => {
-                return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
+                return Ok(Some(XPathValue::NodeSet(Evaluator::singleton(
                     node,
                     self.evaluator.is_text_node(node),
                     &mut self.meter,
                 )?)));
             }
             "self::*" => {
-                return Ok(Some(XPathValue::NodeSet(self.evaluator.singleton(
+                return Ok(Some(XPathValue::NodeSet(Evaluator::singleton(
                     node,
                     self.evaluator.is_element_node(node),
                     &mut self.meter,
@@ -3566,7 +4155,7 @@ impl<'a> Execution<'a> {
                 return Ok(None);
             };
             let length = number * factor;
-            let take = length.round().max(1.0) as usize - 1;
+            let take = super::number::truncating_size(length.round().max(1.0)) - 1;
             self.meter
                 .charge(BudgetKind::XPathOperations, literal.len())?;
             let end = literal
@@ -3576,12 +4165,20 @@ impl<'a> Execution<'a> {
             self.meter.check_additional(BudgetKind::OwnedBytes, end)?;
             return Ok(Some(XPathValue::String(literal[..end].to_owned())));
         }
+        self.evaluate_string_variable_fast(source, &expression.namespaces)
+    }
+
+    fn evaluate_string_variable_fast(
+        &mut self,
+        source: &str,
+        namespaces: &[(String, String)],
+    ) -> Result<Option<XPathValue>> {
         if let Some(variable) = source
             .strip_prefix("string-length($")
             .and_then(|value| value.strip_suffix(") > 0"))
             && let Some(variable) = lexical_variable_name(variable)
         {
-            let value = self.variable_string(variable, &expression.namespaces, 0)?;
+            let value = self.variable_string(variable, namespaces, 0)?;
             return Ok(Some(XPathValue::Boolean(!value.is_empty())));
         }
         if let Some(arguments) = source
@@ -3591,7 +4188,7 @@ impl<'a> Execution<'a> {
             && let Some(variable) = lexical_variable_name(variable)
             && let Some(delimiter) = xpath_string_literal(delimiter)
         {
-            let value_len = match self.variable_value(variable, &expression.namespaces)? {
+            let value_len = match self.variable_value(variable, namespaces)? {
                 Value::String(value) | Value::StoredExpression(value) => value.len(),
                 Value::Boolean(true) => "true".len(),
                 Value::Boolean(false) => "false".len(),
@@ -3602,7 +4199,7 @@ impl<'a> Execution<'a> {
             self.meter.charge(BudgetKind::XPathOperations, value_len)?;
             self.meter
                 .charge(BudgetKind::XPathOperations, delimiter.len())?;
-            let value = self.variable_string(variable, &expression.namespaces, 0)?;
+            let value = self.variable_string(variable, namespaces, 0)?;
             let head = value.split_once(delimiter).map_or("", |(head, _)| head);
             let value_workspace = if matches!(&value, Cow::Owned(_)) {
                 value.len()
@@ -3625,14 +4222,14 @@ impl<'a> Execution<'a> {
             && let Some(length_variable) = lexical_variable_name(length_variable)
             && let Ok(increment) = trim_xml_whitespace(increment).parse::<usize>()
         {
-            let value = self.variable_string(variable, &expression.namespaces, 0)?;
+            let value = self.variable_string(variable, namespaces, 0)?;
             let value_workspace = if matches!(&value, Cow::Owned(_)) {
                 value.len()
             } else {
                 0
             };
             let length = self
-                .variable_string(length_variable, &expression.namespaces, value_workspace)?
+                .variable_string(length_variable, namespaces, value_workspace)?
                 .chars()
                 .count();
             let start = length.saturating_add(increment).saturating_sub(1);
@@ -3652,7 +4249,7 @@ impl<'a> Execution<'a> {
             .and_then(|value| value.strip_suffix(')'))
             && let Some(variable) = lexical_variable_name(variable)
         {
-            let value = self.variable_value(variable, &expression.namespaces)?;
+            let value = self.variable_value(variable, namespaces)?;
             return Ok(Some(XPathValue::Boolean(value.boolean())));
         }
         Ok(None)
@@ -3822,6 +4419,7 @@ impl<'a> Execution<'a> {
             }
             Ok(())
         })();
+        drop(arguments);
         let execution = parameters.and_then(|()| {
             self.execute_sequence(&function.body, node, position, size, depth + 1, None)
         });
@@ -3858,7 +4456,7 @@ impl<'a> Execution<'a> {
             // are context child-axis expressions, so projecting them through the
             // general XPath engine for every source node is unnecessary work.
             "node()" => self.evaluator.children(node, &mut self.meter)?,
-            "." => self.evaluator.singleton(node, true, &mut self.meter)?,
+            "." => Evaluator::singleton(node, true, &mut self.meter)?,
             "@*" => self.evaluator.attributes(node, &mut self.meter)?,
             "preceding-sibling::node()[normalize-space()][1][self::comment()]" => self
                 .evaluator
@@ -3938,8 +4536,8 @@ impl<'a> Execution<'a> {
             },
         );
         Ok(RetainedValue {
-            retained_owned_bytes,
             value,
+            retained_owned_bytes,
         })
     }
     fn evaluate_with_params(
@@ -4043,98 +4641,8 @@ impl<'a> Execution<'a> {
         let result = (|| {
             let mut specs = Vec::with_capacity(sorts.len());
             for sort in sorts {
-                let case_order = sort
-                    .case_order
-                    .as_ref()
-                    .map(|value| {
-                        self.evaluate_avt(value, context_node, context_position, context_size)
-                    })
-                    .transpose()?;
-                let mut case_order = case_order;
-                if case_order
-                    .as_ref()
-                    .is_some_and(|value| !matches!(value.as_str(), "upper-first" | "lower-first"))
-                {
-                    if sort.forward_compatible {
-                        case_order
-                            .take()
-                            .expect("invalid case-order is present")
-                            .release(&mut self.meter);
-                    } else {
-                        let value = case_order.as_ref().expect("invalid case-order is present");
-                        return Err(Error::Dynamic(format!(
-                            "xsl:sort case-order must evaluate to `upper-first` or `lower-first`, got `{value}`"
-                        )));
-                    }
-                }
-                let lang = sort
-                    .lang
-                    .as_ref()
-                    .map(|value| {
-                        self.evaluate_avt(value, context_node, context_position, context_size)
-                    })
-                    .transpose()?;
-                let mut data_type = self.evaluate_avt(
-                    &sort.data_type,
-                    context_node,
-                    context_position,
-                    context_size,
-                )?;
-                if !matches!(data_type.as_str(), "text" | "number") {
-                    if sort.forward_compatible {
-                        data_type.value.clear();
-                        data_type.push_str("text", &mut self.meter)?;
-                    } else {
-                        return Err(Error::Dynamic(format!(
-                            "xsl:sort data-type must evaluate to `text` or `number`, got `{data_type}`"
-                        )));
-                    }
-                }
-                let collator = match lang.as_deref().filter(|lang| !lang.is_empty()) {
-                    // XSLT 1.0 section 10 gives lang the xml:lang value space; XML 1.0
-                    // section 2.12 defines an empty value as no language information.
-                    // https://www.w3.org/TR/1999/REC-xslt-19991116#sorting
-                    // https://www.w3.org/TR/xml/#sec-lang-tag
-                    Some(lang) => match locale_collator(lang, case_order.as_deref()) {
-                        Ok(collator) => Some(collator),
-                        Err(_) if sort.forward_compatible => None,
-                        Err(error) => return Err(error),
-                    },
-                    None => None,
-                };
-                let mut order =
-                    self.evaluate_avt(&sort.order, context_node, context_position, context_size)?;
-                if !matches!(order.as_str(), "ascending" | "descending") {
-                    if sort.forward_compatible {
-                        order.value.clear();
-                        order.push_str("ascending", &mut self.meter)?;
-                    } else {
-                        return Err(Error::Dynamic(format!(
-                            "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
-                        )));
-                    }
-                }
-                lang.into_iter()
-                    .for_each(|value| value.release(&mut self.meter));
-                let (data_type, data_type_bytes) = data_type.into_parts();
-                let (order, order_bytes) = order.into_parts();
-                let (case_order, case_order_bytes) = case_order.map_or_else(
-                    || (None, 0),
-                    |value| {
-                        let (value, bytes) = value.into_parts();
-                        (Some(value), bytes)
-                    },
-                );
-                let spec = EvaluatedSort {
-                    data_type,
-                    order,
-                    case_order,
-                    collator,
-                };
-                let bytes = data_type_bytes
-                    .saturating_add(order_bytes)
-                    .saturating_add(case_order_bytes);
-                debug_assert_eq!(bytes, spec.owned_bytes());
+                let (spec, bytes) =
+                    self.evaluate_sort(sort, context_node, context_position, context_size)?;
                 retained_bytes = retained_bytes
                     .checked_add(bytes)
                     .expect("charged sort storage fits usize");
@@ -4175,7 +4683,7 @@ impl<'a> Execution<'a> {
                         &mut self.meter,
                     )?;
                     if spec.order == "descending" {
-                        ordering = ordering.reverse()
+                        ordering = ordering.reverse();
                     }
                     if ordering != Ordering::Equal {
                         return Ok(ordering);
@@ -4184,13 +4692,111 @@ impl<'a> Execution<'a> {
                 Ok(left.2.cmp(&right.2))
             })?;
             for (target, index) in nodes.iter_mut().zip(order) {
-                *target = keyed[index].0.clone()
+                *target = keyed[index].0.clone();
             }
             Ok(())
         })();
         self.meter
             .release_owned_bytes(workspace_bytes.saturating_add(retained_bytes));
         result
+    }
+    fn evaluate_sort(
+        &mut self,
+        sort: &Sort,
+        context_node: &SourceNode,
+        context_position: usize,
+        context_size: usize,
+    ) -> Result<(EvaluatedSort, usize)> {
+        let case_order = sort
+            .case_order
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, context_node, context_position, context_size))
+            .transpose()?;
+        let mut case_order = case_order;
+        if case_order
+            .as_ref()
+            .is_some_and(|value| !matches!(value.as_str(), "upper-first" | "lower-first"))
+        {
+            if sort.forward_compatible {
+                case_order
+                    .take()
+                    .expect("invalid case-order is present")
+                    .release(&mut self.meter);
+            } else {
+                let value = case_order.as_ref().expect("invalid case-order is present");
+                return Err(Error::Dynamic(format!(
+                    "xsl:sort case-order must evaluate to `upper-first` or `lower-first`, got `{value}`"
+                )));
+            }
+        }
+        let lang = sort
+            .lang
+            .as_ref()
+            .map(|value| self.evaluate_avt(value, context_node, context_position, context_size))
+            .transpose()?;
+        let mut data_type = self.evaluate_avt(
+            &sort.data_type,
+            context_node,
+            context_position,
+            context_size,
+        )?;
+        if !matches!(data_type.as_str(), "text" | "number") {
+            if sort.forward_compatible {
+                data_type.value.clear();
+                data_type.push_str("text", &mut self.meter)?;
+            } else {
+                return Err(Error::Dynamic(format!(
+                    "xsl:sort data-type must evaluate to `text` or `number`, got `{data_type}`"
+                )));
+            }
+        }
+        let collator = match lang.as_deref().filter(|lang| !lang.is_empty()) {
+            // XSLT 1.0 section 10 gives lang the xml:lang value space; XML 1.0
+            // section 2.12 defines an empty value as no language information.
+            // https://www.w3.org/TR/1999/REC-xslt-19991116#sorting
+            // https://www.w3.org/TR/xml/#sec-lang-tag
+            Some(lang) => match locale_collator(lang, case_order.as_deref()) {
+                Ok(collator) => Some(collator),
+                Err(_) if sort.forward_compatible => None,
+                Err(error) => return Err(error),
+            },
+            None => None,
+        };
+        let mut order =
+            self.evaluate_avt(&sort.order, context_node, context_position, context_size)?;
+        if !matches!(order.as_str(), "ascending" | "descending") {
+            if sort.forward_compatible {
+                order.value.clear();
+                order.push_str("ascending", &mut self.meter)?;
+            } else {
+                return Err(Error::Dynamic(format!(
+                    "xsl:sort order must evaluate to `ascending` or `descending`, got `{order}`"
+                )));
+            }
+        }
+        if let Some(value) = lang {
+            value.release(&mut self.meter);
+        }
+        let (data_type, data_type_bytes) = data_type.into_parts();
+        let (order, order_bytes) = order.into_parts();
+        let (case_order, case_order_bytes) = case_order.map_or_else(
+            || (None, 0),
+            |value| {
+                let (value, bytes) = value.into_parts();
+                (Some(value), bytes)
+            },
+        );
+        let spec = EvaluatedSort {
+            data_type,
+            order,
+            case_order,
+            collator,
+        };
+        let bytes = data_type_bytes
+            .saturating_add(order_bytes)
+            .saturating_add(case_order_bytes);
+        debug_assert_eq!(bytes, spec.owned_bytes());
+        Ok((spec, bytes))
     }
     fn capture_text(
         &mut self,
@@ -4247,6 +4853,7 @@ impl<'a> Execution<'a> {
     ) -> Result<T> {
         let fragment_owned_bytes = metered_document_owned_bytes(&fragment);
         let result = consume(&fragment, &mut self.meter);
+        drop(fragment);
         self.meter.release_owned_bytes(fragment_owned_bytes);
         result
     }
@@ -4445,7 +5052,7 @@ impl<'a> Execution<'a> {
                             .node(current.target_parent)
                             .and_then(|node| node.base_uri.as_deref())
                     };
-                    let base_uri = copied_node_base_uri(&source.kind, inherited_base)?;
+                    let base_uri = copied_node_base_uri(&source.kind, inherited_base);
                     let clone_bytes = node_kind_owned_bytes(&source.kind)
                         .saturating_add(base_uri.as_deref().map_or(0, str::len));
                     self.result
@@ -4576,7 +5183,7 @@ impl<'a> Execution<'a> {
                             ApplyFrame::new(frame.position, frame.size, frame.depth + 1),
                             current_precedence,
                             expansion,
-                        )?
+                        )?;
                     }
                     let previous_position = self.attribute_insert_position.replace(set_start);
                     let execution = self.execute_sequence(
@@ -4762,7 +5369,6 @@ impl<'a> Execution<'a> {
         if protected {
             return Ok(());
         }
-        const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
         let effective_base = if !element_base_includes_attribute
             && attribute.name.namespace.as_deref() == Some(XML_NS)
             && attribute.name.local == "base"
@@ -4777,7 +5383,7 @@ impl<'a> Execution<'a> {
             Some(super::resolver::resolve_uri_reference(
                 inherited,
                 &attribute.value,
-            )?)
+            ))
         } else {
             None
         };
@@ -5155,7 +5761,9 @@ impl<'a> Execution<'a> {
                             &mut self.meter,
                             &mut values_owned_bytes,
                         )?;
-                        values.push(self.sibling_number(&candidate, &mut matches)? as f64);
+                        values.push(super::number::size(
+                            self.sibling_number(&candidate, &mut matches)?,
+                        ));
                         return Ok((values, values_owned_bytes));
                     }
                 }
@@ -5175,91 +5783,14 @@ impl<'a> Execution<'a> {
                             &mut self.meter,
                             &mut values_owned_bytes,
                         )?;
-                        values.push(self.sibling_number(&candidate, &mut matches)? as f64);
+                        values.push(super::number::size(
+                            self.sibling_number(&candidate, &mut matches)?,
+                        ));
                     }
                 }
                 Ok((values, values_owned_bytes))
             }
-            "any" => {
-                let mut count = 0usize;
-                let logical_root = self
-                    .evaluator
-                    .source
-                    .logical_root_for(node)
-                    .ok_or_else(|| Error::Dynamic("numbering node has no logical root".into()))?;
-                let node_bytes = std::mem::size_of::<NodeId>();
-                let mut traversal_bytes = 0usize;
-                let result = (|| {
-                    self.meter.charge(BudgetKind::OwnedBytes, node_bytes)?;
-                    traversal_bytes = node_bytes;
-                    let mut pending = Vec::with_capacity(1);
-                    pending.push(logical_root);
-                    while let Some(id) = pending.pop() {
-                        self.meter.charge(BudgetKind::XPathOperations, 1)?;
-                        if let Some(source) = self.evaluator.source.node(id) {
-                            let required = pending.len().saturating_add(source.children.len());
-                            if required > pending.capacity() {
-                                let growth = required - pending.capacity();
-                                let growth_bytes = growth.saturating_mul(node_bytes);
-                                self.meter.charge(BudgetKind::OwnedBytes, growth_bytes)?;
-                                traversal_bytes = traversal_bytes.saturating_add(growth_bytes);
-                                pending.reserve_exact(source.children.len());
-                            }
-                            pending.extend(source.children.iter().rev().copied());
-                        }
-                        let candidate = SourceNode::Node(id);
-                        if from(self, &candidate)? {
-                            count = 0;
-                        } else if matches(self, &candidate)? {
-                            count += 1;
-                        }
-                        if &candidate == node {
-                            let mut values = Vec::new();
-                            let mut values_owned_bytes = 0;
-                            if count > 0 {
-                                reserve_temporary_vec_slot(
-                                    &mut values,
-                                    &mut self.meter,
-                                    &mut values_owned_bytes,
-                                )?;
-                                values.push(count as f64);
-                            }
-                            return Ok((values, values_owned_bytes));
-                        }
-                        let is_current_owner = matches!(
-                            node,
-                            SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. }
-                                if *owner == id
-                        );
-                        if is_current_owner {
-                            // XSLT 1.0 section 7.7 excludes preceding attribute and namespace nodes;
-                            // only the current non-ordinary node joins preceding/ancestor-or-self.
-                            // https://www.w3.org/TR/1999/REC-xslt-19991116#number
-                            if from(self, node)? {
-                                count = 0;
-                            } else if matches(self, node)? {
-                                count += 1;
-                            }
-                            let mut values = Vec::new();
-                            let mut values_owned_bytes = 0;
-                            if count > 0 {
-                                reserve_temporary_vec_slot(
-                                    &mut values,
-                                    &mut self.meter,
-                                    &mut values_owned_bytes,
-                                )?;
-                                values.push(count as f64);
-                            }
-                            return Ok((values, values_owned_bytes));
-                        }
-                    }
-                    Err(Error::Dynamic(
-                        "numbering node is outside its logical document".into(),
-                    ))
-                })();
-                self.meter.release_owned_bytes(traversal_bytes);
-                result
-            }
+            "any" => self.number_any(node, &mut matches, &from),
             level => Err(Error::Static(format!(
                 "unsupported xsl:number level {level}"
             ))),
@@ -5267,6 +5798,82 @@ impl<'a> Execution<'a> {
         self.meter.release_owned_bytes(lineage_owned_bytes);
         self.meter.release_owned_bytes(reserved_owned_bytes);
         result
+    }
+
+    fn number_any(
+        &mut self,
+        node: &SourceNode,
+        matches: &mut impl FnMut(&mut Self, &SourceNode) -> Result<bool>,
+        from: &impl Fn(&mut Self, &SourceNode) -> Result<bool>,
+    ) -> Result<(Vec<f64>, usize)> {
+        let mut count = 0usize;
+        let logical_root = self
+            .evaluator
+            .source
+            .logical_root_for(node)
+            .ok_or_else(|| Error::Dynamic("numbering node has no logical root".into()))?;
+        let node_bytes = std::mem::size_of::<NodeId>();
+        let mut traversal_bytes = 0usize;
+        let result = (|| {
+            self.meter.charge(BudgetKind::OwnedBytes, node_bytes)?;
+            traversal_bytes = node_bytes;
+            let mut pending = Vec::with_capacity(1);
+            pending.push(logical_root);
+            while let Some(id) = pending.pop() {
+                self.meter.charge(BudgetKind::XPathOperations, 1)?;
+                if let Some(source) = self.evaluator.source.node(id) {
+                    let required = pending.len().saturating_add(source.children.len());
+                    if required > pending.capacity() {
+                        let growth = required - pending.capacity();
+                        let growth_bytes = growth.saturating_mul(node_bytes);
+                        self.meter.charge(BudgetKind::OwnedBytes, growth_bytes)?;
+                        traversal_bytes = traversal_bytes.saturating_add(growth_bytes);
+                        pending.reserve_exact(source.children.len());
+                    }
+                    pending.extend(source.children.iter().rev().copied());
+                }
+                let candidate = SourceNode::Node(id);
+                if from(self, &candidate)? {
+                    count = 0;
+                } else if matches(self, &candidate)? {
+                    count += 1;
+                }
+                if &candidate == node {
+                    return self.number_any_value(count);
+                }
+                let is_current_owner = matches!(
+                    node,
+                    SourceNode::Attribute { owner, .. } | SourceNode::Namespace { owner, .. }
+                        if *owner == id
+                );
+                if is_current_owner {
+                    // XSLT 1.0 section 7.7 excludes preceding attribute and namespace nodes;
+                    // only the current non-ordinary node joins preceding/ancestor-or-self.
+                    // https://www.w3.org/TR/1999/REC-xslt-19991116#number
+                    if from(self, node)? {
+                        count = 0;
+                    } else if matches(self, node)? {
+                        count += 1;
+                    }
+                    return self.number_any_value(count);
+                }
+            }
+            Err(Error::Dynamic(
+                "numbering node is outside its logical document".into(),
+            ))
+        })();
+        self.meter.release_owned_bytes(traversal_bytes);
+        result
+    }
+
+    fn number_any_value(&mut self, count: usize) -> Result<(Vec<f64>, usize)> {
+        let mut values = Vec::new();
+        let mut values_owned_bytes = 0;
+        if count > 0 {
+            reserve_temporary_vec_slot(&mut values, &mut self.meter, &mut values_owned_bytes)?;
+            values.push(super::number::size(count));
+        }
+        Ok((values, values_owned_bytes))
     }
 
     fn sibling_number(
@@ -5538,12 +6145,12 @@ fn try_stable_sort_by<T: Copy>(
             let end = start.saturating_add(step).min(source.len());
             let (mut left, mut right, mut output) = (start, middle, start);
             while left < middle && right < end {
-                if compare(&source[left], &source[right])? != Ordering::Greater {
-                    target[output] = source[left];
-                    left += 1;
-                } else {
+                if compare(&source[left], &source[right])? == Ordering::Greater {
                     target[output] = source[right];
                     right += 1;
+                } else {
+                    target[output] = source[left];
+                    left += 1;
                 }
                 output += 1;
             }
@@ -5828,7 +6435,6 @@ impl SortKey {
                 meter.charge(BudgetKind::XPathOperations, left.len())?;
                 meter.charge(BudgetKind::XPathOperations, right.len())?;
                 Ok(match case_order {
-                    Some("upper-first") => left.cmp(right),
                     Some("lower-first") => right.cmp(left),
                     _ => left.cmp(right),
                 })
@@ -5929,12 +6535,12 @@ fn set_secondary_output_property(
                     )));
                 }
             };
-            definition.method_explicit = true;
+            definition.explicit.method = true;
             definition.method = method;
         }
         "version" => definition.version = Some(value),
         "encoding" => {
-            definition.encoding_explicit = true;
+            definition.explicit.encoding = true;
             definition.encoding = value;
         }
         "omit-xml-declaration" => definition.omit_xml_declaration = yes_no(&value)?,
@@ -5942,7 +6548,7 @@ fn set_secondary_output_property(
         "doctype-public" => definition.doctype_public = Some(value),
         "doctype-system" => definition.doctype_system = Some(value),
         "indent" => {
-            definition.indent_explicit = true;
+            definition.explicit.indent = true;
             definition.indent = yes_no(&value)?;
         }
         "media-type" => definition.media_type = Some(value),
@@ -6202,7 +6808,7 @@ fn normalize_computed_namespace(
     Ok((prefix, namespace))
 }
 
-fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Result<Option<String>> {
+fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Option<String> {
     const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
     let explicit = match kind {
@@ -6212,8 +6818,13 @@ fn copied_node_base_uri(kind: &NodeKind, inherited: Option<&str>) -> Result<Opti
         _ => None,
     };
     explicit.map_or_else(
-        || Ok(inherited.map(str::to_owned)),
-        |attribute| super::resolver::resolve_uri_reference(inherited, &attribute.value).map(Some),
+        || inherited.map(str::to_owned),
+        |attribute| {
+            Some(super::resolver::resolve_uri_reference(
+                inherited,
+                &attribute.value,
+            ))
+        },
     )
 }
 
@@ -6880,7 +7491,7 @@ fn format_number_into(
         }
         "I" | "i" => {
             let value = if rounded <= 3999.0 {
-                roman(rounded as usize, format == "I")
+                roman(super::number::truncating_size(rounded), format == "I")
             } else {
                 super::value::format_xpath_number(rounded)
             };
@@ -7052,11 +7663,11 @@ fn alphabetic_decimal(decimal: &str, upper: bool) -> String {
         let mut remainder = 0u16;
         for digit in &mut digits[start..] {
             let dividend = remainder * 10 + u16::from(*digit);
-            *digit = (dividend / 26) as u8;
+            *digit = u8::try_from(dividend / 26).expect("decimal quotient is at most nine");
             remainder = dividend % 26;
         }
         let base = if upper { b'A' } else { b'a' };
-        reversed.push(base + remainder as u8);
+        reversed.push(base + u8::try_from(remainder).expect("remainder is below 26"));
         while start < digits.len() && digits[start] == 0 {
             start += 1;
         }

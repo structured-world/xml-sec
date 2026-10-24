@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 #[cfg(feature = "embedded")]
@@ -7,11 +8,11 @@ use sxd_xpath_no_unsafe::{Value, context::ScopedContext, function};
 use super::Clock;
 
 pub(crate) const NAMESPACE: &str = "http://exslt.org/dates-and-times";
-pub(crate) fn register(context: &mut ScopedContext<'_, '_>, clock: Option<Arc<dyn Clock>>) {
+pub(crate) fn register(context: &mut ScopedContext<'_, '_>, clock: Option<&Arc<dyn Clock>>) {
     for &(name, operation) in FUNCTIONS {
         context.set_function(
             (NAMESPACE, name),
-            DateFunction(operation, clock.as_ref().map(Arc::clone)),
+            DateFunction(operation, clock.map(Arc::clone)),
         );
     }
 }
@@ -84,13 +85,57 @@ fn xpath_string<'a>(
     super::xpath::extension_string(context, value)
 }
 
+fn evaluate_date(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    args: &[Value<'_>],
+    clock: Option<&dyn Clock>,
+) -> std::result::Result<Value<'static>, function::Error> {
+    let input = match args.first() {
+        Some(value) => xpath_string(context, value)?,
+        None => current_datetime_for_operation(context, clock)?.into(),
+    };
+    let Some(mut date) = DateValue::parse(&input) else {
+        return Ok(Value::String(String::new()));
+    };
+    if !DateKind::COMPLETE_DATE.contains(&date.kind) {
+        return Ok(Value::String(String::new()));
+    }
+    date.kind = DateKind::Date;
+    Ok(Value::String(date.render()))
+}
+
+fn sum_durations(
+    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    argument: &Value<'_>,
+) -> std::result::Result<Value<'static>, function::Error> {
+    let Value::Nodeset(nodes) = argument else {
+        return argument_error("date:sum() requires a node-set");
+    };
+    if nodes.size() == 0 {
+        return Ok(Value::String(String::new()));
+    }
+    let mut total = DurationValue::default();
+    for node in nodes.document_order_with_context(context)? {
+        let text = node.string_value_with_extension_context(context)?;
+        context.charge_extension_work(text.len().max(1))?;
+        let Some(value) = DurationValue::parse(&text) else {
+            return Ok(Value::String(String::new()));
+        };
+        let Some(sum) = total.checked_add(value) else {
+            return Ok(Value::String(String::new()));
+        };
+        total = sum;
+    }
+    Ok(Value::String(total.render()))
+}
+
 impl function::Function for DateFunction {
-    fn evaluate<'c, 'd>(
+    fn evaluate<'d>(
         &self,
-        context: &sxd_xpath_no_unsafe::context::Evaluation<'c, 'd>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: Vec<Value<'d>>,
     ) -> std::result::Result<Value<'d>, function::Error> {
-        use Operation::*;
+        use Operation::{Add, AddDuration, Date, DateTime, Difference, Duration, Seconds, Sum};
         match self.0 {
             DateTime if !args.is_empty() => {
                 return argument_error("date:date-time() requires no arguments");
@@ -108,46 +153,8 @@ impl function::Function for DateFunction {
                 context,
                 self.1.as_deref(),
             )?)),
-            Date => {
-                let current;
-                let input = if let Some(value) = args.first() {
-                    let input = xpath_string(context, value)?;
-                    current = input;
-                    current.as_ref()
-                } else {
-                    current = current_datetime_for_operation(context, self.1.as_deref())?.into();
-                    current.as_ref()
-                };
-                let Some(mut date) = DateValue::parse(input) else {
-                    return Ok(Value::String(String::new()));
-                };
-                if !DateKind::COMPLETE_DATE.contains(&date.kind) {
-                    return Ok(Value::String(String::new()));
-                }
-                date.kind = DateKind::Date;
-                Ok(Value::String(date.render()))
-            }
-            Sum => {
-                let Value::Nodeset(nodes) = &args[0] else {
-                    return argument_error("date:sum() requires a node-set");
-                };
-                if nodes.size() == 0 {
-                    return Ok(Value::String(String::new()));
-                }
-                let mut total = DurationValue::default();
-                for node in nodes.document_order_with_context(context)? {
-                    let text = node.string_value_with_extension_context(context)?;
-                    context.charge_extension_work(text.len().max(1))?;
-                    let Some(value) = DurationValue::parse(&text) else {
-                        return Ok(Value::String(String::new()));
-                    };
-                    let Some(sum) = total.checked_add(value) else {
-                        return Ok(Value::String(String::new()));
-                    };
-                    total = sum;
-                }
-                Ok(Value::String(total.render()))
-            }
+            Date => evaluate_date(context, &args, self.1.as_deref()),
+            Sum => sum_durations(context, &args[0]),
             AddDuration => {
                 let Some(left) = DurationValue::parse(&xpath_string(context, &args[0])?) else {
                     return Ok(Value::String(String::new()));
@@ -227,7 +234,7 @@ impl function::Function for DateFunction {
                     current = current_datetime_for_operation(context, self.1.as_deref())?;
                     &current
                 };
-                evaluate_component(operation, Some(input))
+                Ok(evaluate_component(operation, input))
             }
         }
     }
@@ -246,7 +253,9 @@ fn current_seconds_for_operation(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     clock: Option<&dyn Clock>,
 ) -> std::result::Result<f64, function::Error> {
-    Ok(current_time_for_operation(context, clock)?.unix_timestamp() as f64)
+    Ok(super::number::signed(
+        current_time_for_operation(context, clock)?.unix_timestamp(),
+    ))
 }
 
 fn current_time_for_operation(
@@ -266,8 +275,7 @@ fn current_time_for_operation(
     // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#dateTime-timezones
     if offset_seconds % 60 != 0 || offset_seconds.unsigned_abs() > 14 * 60 * 60 {
         let message = format!(
-            "clock timezone offset {} seconds is not representable by XML Schema dateTime",
-            offset_seconds
+            "clock timezone offset {offset_seconds} seconds is not representable by XML Schema dateTime"
         );
         return argument_error(&message);
     }
@@ -293,23 +301,20 @@ fn render_current_datetime(current: time::OffsetDateTime) -> String {
     )
 }
 
-fn evaluate_component(
-    operation: Operation,
-    input: Option<&str>,
-) -> std::result::Result<Value<'static>, function::Error> {
-    let Some(date) = input.and_then(DateValue::parse) else {
-        return Ok(match operation {
+fn evaluate_component(operation: Operation, input: &str) -> Value<'static> {
+    let Some(date) = DateValue::parse(input) else {
+        return match operation {
             Operation::MonthName
             | Operation::MonthAbbreviation
             | Operation::DayName
             | Operation::DayAbbreviation
             | Operation::Time => Value::String(String::new()),
             _ => Value::Number(f64::NAN),
-        });
+        };
     };
-    let number = |value: Option<i64>| Value::Number(value.map_or(f64::NAN, |value| value as f64));
+    let number = |value: Option<i64>| Value::Number(value.map_or(f64::NAN, super::number::signed));
     let kind_is = |kinds: &[DateKind]| kinds.contains(&date.kind);
-    Ok(match operation {
+    match operation {
         Operation::Year => number(
             kind_is(DateKind::YEAR_BEARING)
                 .then_some(date.year)
@@ -327,23 +332,11 @@ fn evaluate_component(
                 .flatten()
                 .map(i64::from),
         ),
-        Operation::MonthName => Value::String(
-            kind_is(DateKind::MONTH_NAME_BEARING)
-                .then_some(date.month)
-                .flatten()
-                .map(month_name)
-                .unwrap_or_default()
-                .into(),
-        ),
-        Operation::MonthAbbreviation => Value::String(
-            kind_is(DateKind::MONTH_NAME_BEARING)
-                .then_some(date.month)
-                .flatten()
-                .map(month_name)
-                .map(|name| &name[..3])
-                .unwrap_or_default()
-                .into(),
-        ),
+        Operation::MonthName
+        | Operation::MonthAbbreviation
+        | Operation::DayName
+        | Operation::DayAbbreviation
+        | Operation::Time => Value::String(text_component(operation, &date)),
         Operation::WeekInYear => number(
             kind_is(DateKind::COMPLETE_DATE)
                 .then(|| date.complete_date())
@@ -374,28 +367,6 @@ fn evaluate_component(
                 .flatten()
                 .map(|(y, m, d)| i64::from(weekday(y, m, d) + 1)),
         ),
-        Operation::DayName => Value::String(
-            kind_is(DateKind::COMPLETE_DATE)
-                .then(|| date.complete_date())
-                .flatten()
-                .map(|(y, m, d)| day_name(weekday(y, m, d)))
-                .unwrap_or_default()
-                .into(),
-        ),
-        Operation::DayAbbreviation => Value::String(
-            kind_is(DateKind::COMPLETE_DATE)
-                .then(|| date.complete_date())
-                .flatten()
-                .map(|(y, m, d)| &day_name(weekday(y, m, d))[..3])
-                .unwrap_or_default()
-                .into(),
-        ),
-        Operation::Time => Value::String(
-            kind_is(DateKind::TIME_BEARING)
-                .then(|| date.time_string())
-                .flatten()
-                .unwrap_or_default(),
-        ),
         Operation::HourInDay => number(
             kind_is(DateKind::TIME_BEARING)
                 .then_some(date.hour)
@@ -413,7 +384,46 @@ fn evaluate_component(
             .flatten()
             .map_or(Value::Number(f64::NAN), Value::Number),
         _ => unreachable!("non-component operation was handled by the caller"),
-    })
+    }
+}
+
+fn text_component(operation: Operation, date: &DateValue) -> String {
+    let kind_is = |kinds: &[DateKind]| kinds.contains(&date.kind);
+    match operation {
+        Operation::MonthName | Operation::MonthAbbreviation => {
+            kind_is(DateKind::MONTH_NAME_BEARING)
+                .then_some(date.month)
+                .flatten()
+                .map(month_name)
+                .map(|name| {
+                    if matches!(operation, Operation::MonthAbbreviation) {
+                        &name[..3]
+                    } else {
+                        name
+                    }
+                })
+                .unwrap_or_default()
+                .into()
+        }
+        Operation::DayName | Operation::DayAbbreviation => kind_is(DateKind::COMPLETE_DATE)
+            .then(|| date.complete_date())
+            .flatten()
+            .map(|(year, month, day)| day_name(weekday(year, month, day)))
+            .map(|name| {
+                if matches!(operation, Operation::DayAbbreviation) {
+                    &name[..3]
+                } else {
+                    name
+                }
+            })
+            .unwrap_or_default()
+            .into(),
+        Operation::Time => kind_is(DateKind::TIME_BEARING)
+            .then(|| date.time_string())
+            .flatten()
+            .unwrap_or_default(),
+        _ => unreachable!("only textual date components are dispatched here"),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -422,7 +432,8 @@ struct DurationValue {
     seconds: f64,
 }
 
-const MAX_RENDERABLE_DURATION_SECONDS: f64 = u64::MAX as f64 * 86_400.0;
+// The binary64 projection of u64::MAX rounds to 2^64.
+const MAX_RENDERABLE_DURATION_SECONDS: f64 = 18_446_744_073_709_551_616.0 * 86_400.0;
 
 impl DurationValue {
     fn parse(input: &str) -> Option<Self> {
@@ -498,10 +509,11 @@ impl DurationValue {
             }
             match rank {
                 1 | 2 => {
-                    if value >= i64::MAX as f64 {
+                    if value >= super::number::signed(i64::MAX) {
                         return None;
                     }
-                    let months = (value as i64).checked_mul(if rank == 1 { 12 } else { 1 })?;
+                    let months = super::number::truncating_signed(value)
+                        .checked_mul(if rank == 1 { 12 } else { 1 })?;
                     result.months = result.months.checked_add(months)?;
                 }
                 3..=6 => {
@@ -539,7 +551,7 @@ impl DurationValue {
     fn checked_add(self, other: Self) -> Option<Self> {
         let months = self.months.checked_add(other.months)?;
         let seconds = self.seconds + other.seconds;
-        ((months == 0 || seconds == 0.0 || months.signum() as f64 == seconds.signum())
+        ((months == 0 || seconds == 0.0 || (months < 0) == seconds.is_sign_negative())
             && seconds.is_finite())
         .then_some(Self { months, seconds })
     }
@@ -558,36 +570,36 @@ impl DurationValue {
         if rounded != 0.0 && (seconds - rounded).abs() < 1e-9 {
             seconds = rounded;
         }
-        let days = (seconds / 86_400.0).floor() as u64;
-        seconds -= days as f64 * 86_400.0;
-        let hours = (seconds / 3_600.0).floor() as u64;
-        seconds -= hours as f64 * 3_600.0;
-        let minutes = (seconds / 60.0).floor() as u64;
-        seconds -= minutes as f64 * 60.0;
+        let days = super::number::truncating_unsigned((seconds / 86_400.0).floor());
+        seconds -= super::number::unsigned(days) * 86_400.0;
+        let hours = super::number::truncating_unsigned((seconds / 3_600.0).floor());
+        seconds -= super::number::unsigned(hours) * 3_600.0;
+        let minutes = super::number::truncating_unsigned((seconds / 60.0).floor());
+        seconds -= super::number::unsigned(minutes) * 60.0;
         let mut output = if negative {
             "-P".to_owned()
         } else {
             "P".to_owned()
         };
         if months / 12 != 0 {
-            output.push_str(&format!("{}Y", months / 12));
+            write!(output, "{}Y", months / 12).expect("writing to String cannot fail");
         }
         if !months.is_multiple_of(12) {
-            output.push_str(&format!("{}M", months % 12));
+            write!(output, "{}M", months % 12).expect("writing to String cannot fail");
         }
         if days != 0 {
-            output.push_str(&format!("{days}D"));
+            write!(output, "{days}D").expect("writing to String cannot fail");
         }
         if hours != 0 || minutes != 0 || seconds != 0.0 {
             output.push('T');
             if hours != 0 {
-                output.push_str(&format!("{hours}H"));
+                write!(output, "{hours}H").expect("writing to String cannot fail");
             }
             if minutes != 0 {
-                output.push_str(&format!("{minutes}M"));
+                write!(output, "{minutes}M").expect("writing to String cannot fail");
             }
             if seconds != 0.0 {
-                output.push_str(&format!("{}S", trim_float(seconds)));
+                write!(output, "{}S", trim_float(seconds)).expect("writing to String cannot fail");
             }
         }
         output
@@ -688,6 +700,10 @@ impl DateValue {
                 ..empty
             });
         }
+        Self::parse_date_and_time(body, &empty)
+    }
+
+    fn parse_date_and_time(body: &str, empty: &Self) -> Option<Self> {
         let (date, time) = body
             .split_once('T')
             .map_or((body, None), |(date, time)| (date, Some(time)));
@@ -699,7 +715,7 @@ impl DateValue {
             return (tail.is_empty() && time.is_none()).then_some(Self {
                 year: Some(year),
                 kind: DateKind::Year,
-                ..empty
+                ..*empty
             });
         };
         let (month, tail) = if let Some((month, tail)) = tail.split_once('-') {
@@ -715,7 +731,7 @@ impl DateValue {
                 year: Some(year),
                 month: Some(month),
                 kind: DateKind::YearMonth,
-                ..empty
+                ..*empty
             });
         };
         let mut day = parse_two(day)?;
@@ -739,7 +755,7 @@ impl DateValue {
                 minute: Some(time.minute),
                 second: Some(time.second),
                 kind: DateKind::DateTime,
-                ..empty
+                ..*empty
             })
         } else {
             Some(Self {
@@ -747,7 +763,7 @@ impl DateValue {
                 month: Some(month),
                 day: Some(day),
                 kind: DateKind::Date,
-                ..empty
+                ..*empty
             })
         }
     }
@@ -774,7 +790,8 @@ impl DateValue {
         let time = f64::from(self.hour.unwrap_or(0)) * 3600.0
             + f64::from(self.minute.unwrap_or(0)) * 60.0
             + self.second.unwrap_or(0.0);
-        let seconds = days as f64 * 86_400.0 + time - f64::from(self.timezone.unwrap_or(0));
+        let seconds = super::number::wide_signed(days) * 86_400.0 + time
+            - f64::from(self.timezone.unwrap_or(0));
         seconds.is_finite().then_some(seconds)
     }
     fn difference(self, other: Self) -> Option<DurationValue> {
@@ -845,7 +862,10 @@ impl DateValue {
             // EXSLT date:add promotes gYear to gYearMonth before applying a non-zero month
             // component, so the computed month must survive even when the input omitted it.
             // https://exslt.github.io/date/functions/add/date.add.2.html
-            self.month = Some((serial.rem_euclid(12) + 1) as u8);
+            self.month = Some(
+                u8::try_from(serial.rem_euclid(12) + 1)
+                    .expect("Euclidean month remainder is in 1..=12"),
+            );
             if let (Some(year), Some(month), Some(day)) = (self.year, self.month, self.day) {
                 self.day = Some(day.min(days_in_month(year, month)));
             }
@@ -858,20 +878,20 @@ impl DateValue {
                 return None;
             }
             let days = (local / 86_400.0).floor();
-            let minimum = days_from_civil(i64::MIN, 1, 1) as f64;
-            let maximum = days_from_civil(i64::MAX, 12, 31) as f64;
+            let minimum = super::number::wide_signed(days_from_civil(i64::MIN, 1, 1));
+            let maximum = super::number::wide_signed(days_from_civil(i64::MAX, 12, 31));
             if days < minimum || days > maximum {
                 return None;
             }
-            let days = days as i128;
-            let mut seconds = local - days as f64 * 86_400.0;
+            let days = super::number::truncating_wide_signed(days);
+            let mut seconds = local - super::number::wide_signed(days) * 86_400.0;
             let (year, month, day) = civil_from_days(days + days_from_civil(1970, 1, 1))?;
             self.year = Some(year);
             self.month = Some(month);
             self.day = Some(day);
-            self.hour = Some((seconds / 3600.0).floor() as u8);
+            self.hour = Some(super::number::truncating_byte((seconds / 3600.0).floor()));
             seconds %= 3600.0;
-            self.minute = Some((seconds / 60.0).floor() as u8);
+            self.minute = Some(super::number::truncating_byte((seconds / 60.0).floor()));
             self.second = Some(seconds % 60.0);
         }
         let has_time = self.hour.unwrap_or(0) != 0
@@ -879,13 +899,10 @@ impl DateValue {
             || self.second.unwrap_or(0.0) != 0.0;
         self.kind = match original_kind {
             DateKind::DateTime => DateKind::DateTime,
-            DateKind::Date if has_time => DateKind::DateTime,
+            DateKind::Date | DateKind::YearMonth | DateKind::Year if has_time => DateKind::DateTime,
+            DateKind::YearMonth | DateKind::Year if self.day.unwrap_or(1) != 1 => DateKind::Date,
             DateKind::Date => DateKind::Date,
-            DateKind::YearMonth if has_time => DateKind::DateTime,
-            DateKind::YearMonth if self.day.unwrap_or(1) != 1 => DateKind::Date,
             DateKind::YearMonth => DateKind::YearMonth,
-            DateKind::Year if has_time => DateKind::DateTime,
-            DateKind::Year if self.day.unwrap_or(1) != 1 => DateKind::Date,
             DateKind::Year if self.month.unwrap_or(1) != 1 => DateKind::YearMonth,
             DateKind::Year => DateKind::Year,
             _ => return None,
@@ -1063,7 +1080,8 @@ fn ordinal(year: i64, month: u8, day: u8) -> u16 {
         + u16::from(day)
 }
 fn weekday(year: i64, month: u8, day: u8) -> u8 {
-    (days_from_civil(year, month, day) + 3).rem_euclid(7) as u8
+    u8::try_from((days_from_civil(year, month, day) + 3).rem_euclid(7))
+        .expect("weekday remainder is in 0..7")
 }
 fn iso_week(year: i64, month: u8, day: u8) -> u8 {
     let ordinal = i32::from(ordinal(year, month, day));
@@ -1076,13 +1094,14 @@ fn iso_week(year: i64, month: u8, day: u8) -> u8 {
     } else if week > i32::from(weeks_in_year(year)) {
         week = 1;
     }
-    week as u8
+    u8::try_from(week).expect("ISO week is in 1..=53")
 }
 fn weeks_in_year(year: i64) -> u8 {
     weeks_in_astronomical_year(i128::from(astronomical_year(year)))
 }
 fn weeks_in_astronomical_year(year: i128) -> u8 {
-    let weekday = (days_from_civil_i128(year, 1, 1) + 3).rem_euclid(7) as u8;
+    let weekday = u8::try_from((days_from_civil_i128(year, 1, 1) + 3).rem_euclid(7))
+        .expect("weekday remainder is in 0..7");
     let leap = year.rem_euclid(4) == 0 && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
     if weekday == 4 || (weekday == 3 && leap) {
         53
@@ -1105,12 +1124,12 @@ fn days_from_civil_i128(mut y: i128, month: u8, day: u8) -> i128 {
     let yoe = y - era * 400;
     let mp = i128::from(month) + if month > 2 { -3 } else { 9 };
     let doy = (153 * mp + 2) / 5 + i128::from(day) - 1;
-    era * 146097 + yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy
 }
 fn civil_from_days(days: i128) -> Option<(i64, u8, u8)> {
-    let era = days.div_euclid(146097);
-    let doe = days - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let era = days.div_euclid(146_097);
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
     let mut year = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -1122,7 +1141,11 @@ fn civil_from_days(days: i128) -> Option<(i64, u8, u8)> {
     } else {
         year
     };
-    Some((year.try_into().ok()?, month as u8, day as u8))
+    Some((
+        year.try_into().ok()?,
+        u8::try_from(month).expect("civil month is in 1..=12"),
+        u8::try_from(day).expect("civil day is in 1..=31"),
+    ))
 }
 fn month_name(month: u8) -> &'static str {
     [
@@ -1173,7 +1196,7 @@ fn render_timezone(timezone: Option<i32>) -> String {
 
 fn format_second(second: f64) -> String {
     if second.fract() == 0.0 {
-        format!("{:02}", second as u8)
+        format!("{:02}", super::number::truncating_byte(second))
     } else {
         let truncated = (second * 1_000_000_000.0).floor() / 1_000_000_000.0;
         let value = format!("{truncated:.9}")

@@ -26,9 +26,9 @@ pub struct ResolveRequest<'a> {
     pub base_uri: Option<&'a str>,
     /// Engine operation that requested the resource.
     pub purpose: ResolvePurpose,
-    /// Preferred media types from XInclude's `accept` attribute, when present.
+    /// Preferred media types from `XInclude`'s `accept` attribute, when present.
     pub accept: Option<&'a str>,
-    /// Preferred languages from XInclude's `accept-language` attribute, when present.
+    /// Preferred languages from `XInclude`'s `accept-language` attribute, when present.
     pub accept_language: Option<&'a str>,
 }
 
@@ -106,6 +106,9 @@ pub trait Resolver: Send + Sync {
     /// authorization binds the immediately following use; callers must keep identities immutable
     /// and make the acquisition enforce the same grant atomically where revocation can race.
     /// In-memory resolvers with permanent grants may explicitly return `Ok(())`.
+    ///
+    /// # Errors
+    /// Returns a typed access denial when the current grant refuses the resource.
     fn authorize(&self, access: ResourceAccess<'_>) -> Result<()>;
 
     /// Resolve one URI reference and return stable provenance with its bytes.
@@ -113,47 +116,50 @@ pub trait Resolver: Send + Sync {
     /// Path-like fallback resolution preserves lexical `..` segments. A resolver
     /// that maps the result onto a filesystem must canonicalize it and enforce its
     /// configured root boundary before reading any bytes.
+    ///
+    /// # Errors
+    /// Returns acquisition or access failures without substituting another resource.
     fn resolve(&self, request: ResolveRequest<'_>) -> Result<ResolvedResource>;
 }
 
-pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> Result<String> {
+pub(crate) fn resolve_uri_reference(base: Option<&str>, reference: &str) -> String {
     if let Ok(absolute) = url::Url::parse(reference) {
-        return Ok(absolute.to_string());
+        return absolute.to_string();
     }
     if let Some(base) = base {
         if let Ok(base_url) = url::Url::parse(base) {
             if let Ok(joined) = base_url.join(reference) {
-                return Ok(joined.to_string());
+                return joined.to_string();
             }
             if base_url.cannot_be_a_base()
                 && let Some(joined) = resolve_rootless_absolute_uri(&base_url, reference)
             {
-                return Ok(joined);
+                return joined;
             }
         }
         if reference.is_empty() {
-            return Ok(base
+            return base
                 .split_once('#')
                 .map_or(base, |(document, _)| document)
-                .to_owned());
+                .to_owned();
         }
         if reference.starts_with('#') {
             let document = base.split_once('#').map_or(base, |(document, _)| document);
-            return Ok(format!("{document}{reference}"));
+            return format!("{document}{reference}");
         }
         if reference.starts_with('?') {
             let document = base.split(['?', '#']).next().unwrap_or(base);
-            return Ok(format!("{document}{reference}"));
+            return format!("{document}{reference}");
         }
         if reference.starts_with('/') {
-            return Ok(reference.to_owned());
+            return reference.to_owned();
         }
         let base_path = base.split(['?', '#']).next().unwrap_or(base);
         if let Some((directory, _)) = base_path.rsplit_once('/') {
-            return Ok(format!("{directory}/{reference}"));
+            return format!("{directory}/{reference}");
         }
     }
-    Ok(reference.to_owned())
+    reference.to_owned()
 }
 
 fn resolve_rootless_absolute_uri(base: &url::Url, reference: &str) -> Option<String> {
@@ -194,7 +200,7 @@ pub(crate) fn decode_resource(
             maximum_decoded_bytes,
         )
     };
-    decoded.map(|value| value.into_owned())
+    decoded.map(std::borrow::Cow::into_owned)
 }
 
 /// Resolver that denies every external resource.

@@ -50,8 +50,7 @@ fn default_denials_preserve_the_policy_error_category() {
 fn path_like_resolution_preserves_root_absolute_references() {
     // URL joining and filesystem-like fallback both preserve an absolute target.
     assert_eq!(
-        resolve_uri_reference(Some("tmp/styles/main.xsl"), "/shared/base.xsl")
-            .expect("path resolution succeeds"),
+        resolve_uri_reference(Some("tmp/styles/main.xsl"), "/shared/base.xsl"),
         "/shared/base.xsl"
     );
 }
@@ -61,18 +60,15 @@ fn path_like_resolution_preserves_document_for_same_document_references() {
     // Fragment- and query-only references address the current document. Directory fallback
     // must not replace its filename when the base is not parseable as an absolute URL.
     assert_eq!(
-        resolve_uri_reference(Some("styles/main.xsl"), "#part")
-            .expect("fragment resolution succeeds"),
+        resolve_uri_reference(Some("styles/main.xsl"), "#part"),
         "styles/main.xsl#part"
     );
     assert_eq!(
-        resolve_uri_reference(Some("main.xsl#old"), "?mode=compact")
-            .expect("query resolution succeeds"),
+        resolve_uri_reference(Some("main.xsl#old"), "?mode=compact"),
         "main.xsl?mode=compact"
     );
     assert_eq!(
-        resolve_uri_reference(Some("main.xsl?old=yes#part"), "#new")
-            .expect("fragment replacement succeeds"),
+        resolve_uri_reference(Some("main.xsl?old=yes#part"), "#new"),
         "main.xsl?old=yes#new"
     );
 }
@@ -80,8 +76,7 @@ fn path_like_resolution_preserves_document_for_same_document_references() {
 #[test]
 fn path_like_resolution_ignores_query_and_fragment_slashes() {
     assert_eq!(
-        resolve_uri_reference(Some("styles/main.xsl?mirror=/old/file#part"), "sub/")
-            .expect("path resolution succeeds"),
+        resolve_uri_reference(Some("styles/main.xsl?mirror=/old/file#part"), "sub/"),
         "styles/sub/"
     );
 }
@@ -91,13 +86,11 @@ fn rootless_absolute_base_preserves_its_scheme_and_path() {
     // XML Base section 4 delegates this merge to RFC 3986 section 5.2.2: a relative
     // reference inherits the scheme and merges with the rootless base path.
     assert_eq!(
-        resolve_uri_reference(Some("memory:styles/main.xsl"), "../modules/shared.xsl")
-            .expect("rootless absolute URI resolution succeeds"),
+        resolve_uri_reference(Some("memory:styles/main.xsl"), "../modules/shared.xsl"),
         "memory:modules/shared.xsl"
     );
     assert_eq!(
-        resolve_uri_reference(Some("memory:main.xsl?old=yes#part"), "modules/")
-            .expect("rootless absolute URI resolution succeeds"),
+        resolve_uri_reference(Some("memory:main.xsl?old=yes#part"), "modules/"),
         "memory:modules/"
     );
 }

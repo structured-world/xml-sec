@@ -39,22 +39,20 @@ fn principal_base_uri_copy_is_charged_by_retained_capacity() {
 fn active_module_stack_is_bounded_before_growth() {
     let slot_bytes = std::mem::size_of::<ActiveResource>();
     let budget = CompileBudget::new(4096, 0, 32, slot_bytes * 4 - 1);
-    let compiler = Compiler::new(Arc::new(crate::NoResolver), budget);
     let mut state = CompileState::new(budget, 0);
     let entered = Cell::new(false);
 
-    let error = compiler
-        .enter_module(
-            StylesheetDocumentId(1),
-            "memory:module.xsl",
-            None,
-            &mut state,
-            |_| {
-                entered.set(true);
-                Ok(())
-            },
-        )
-        .expect_err("active module storage must cross the compile-owned budget first");
+    let error = Compiler::<crate::NoResolver>::enter_module(
+        StylesheetDocumentId(1),
+        "memory:module.xsl",
+        None,
+        &mut state,
+        |_| {
+            entered.set(true);
+            Ok(())
+        },
+    )
+    .expect_err("active module storage must cross the compile-owned budget first");
 
     assert!(!entered.get());
     assert!(matches!(
@@ -106,15 +104,13 @@ fn xpath_parser_diagnostic_accounts_for_owned_token_and_escaping() {
         occupied: 0,
         retained: &retained,
     };
-    assert!(
-        matches!(workspace.parser_error(error.clone(), source, false),
-        Error::Budget { actual, .. } if actual == required)
-    );
+    assert!(matches!(workspace.parser_error(&error, source, false),
+        Error::Budget { actual, .. } if actual == required));
     let workspace = CompileWorkspace {
         limit: required,
         ..workspace
     };
-    assert!(matches!(workspace.parser_error(error, source, false),
+    assert!(matches!(workspace.parser_error(&error, source, false),
         Error::Static(actual) if actual == message));
 }
 
@@ -646,14 +642,21 @@ fn fragment_only_include_counts_once_across_compilation_phases() {
 
 #[test]
 fn embedded_modules_charge_only_additional_ir_copies() {
+    use std::fmt::Write as _;
+
     // The source-document estimate already covers each embedded node once. A second
     // include retains another IR copy and must consume additional owned-byte budget.
-    let templates = (0..32)
-        .map(|index| format!(r#"<xsl:template match="item[{index}]"><out/></xsl:template>"#))
-        .collect::<String>();
+    let mut templates = String::new();
+    for index in 0..32 {
+        write!(
+            templates,
+            r#"<xsl:template match="item[{index}]"><out/></xsl:template>"#
+        )
+        .expect("writing to String cannot fail");
+    }
     let local = |includes: &str| {
         format!(
-            r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext">{includes}<ext:modules><xsl:stylesheet id="target" version="1.0">{templates}</xsl:stylesheet></ext:modules></xsl:stylesheet>"##
+            r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ext="urn:ext">{includes}<ext:modules><xsl:stylesheet id="target" version="1.0">{templates}</xsl:stylesheet></ext:modules></xsl:stylesheet>"#
         )
     };
     let one = local(r##"<xsl:include href="#target"/>"##);

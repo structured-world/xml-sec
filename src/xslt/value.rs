@@ -6,15 +6,15 @@ use super::{Document, NodeReference};
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Value {
-    /// XPath nodes whose identities are interpreted against the associated source document.
+    /// `XPath` nodes whose identities are interpreted against the associated source document.
     NodeSet(Vec<NodeReference>),
-    /// XPath boolean value.
+    /// `XPath` boolean value.
     Boolean(bool),
-    /// XPath IEEE-754 number value.
+    /// `XPath` IEEE-754 number value.
     Number(f64),
-    /// XPath string value.
+    /// `XPath` string value.
     String(String),
-    /// Compiled-expression handle produced by compatible dynamic XPath extensions.
+    /// Compiled-expression handle produced by compatible dynamic `XPath` extensions.
     StoredExpression(String),
     /// XSLT 1.0 temporary tree retaining all constructed node kinds.
     ResultTreeFragment(Arc<Document>),
@@ -31,8 +31,7 @@ impl Value {
             Self::NodeSet(nodes) => !nodes.is_empty(),
             Self::Boolean(value) => *value,
             Self::Number(value) => *value != 0.0 && !value.is_nan(),
-            Self::String(value) => !value.is_empty(),
-            Self::StoredExpression(value) => !value.is_empty(),
+            Self::String(value) | Self::StoredExpression(value) => !value.is_empty(),
             // XSLT 1.0 defines every result-tree fragment as the equivalent node-set
             // containing its root node, including fragments with no constructed children.
             Self::ResultTreeFragment(_) => true,
@@ -74,8 +73,7 @@ impl Value {
             Self::Number(value) if value == f64::NEG_INFINITY => "-Infinity".into(),
             Self::Number(0.0) => "0".into(),
             Self::Number(value) => format_xpath_number(value),
-            Self::String(value) => value,
-            Self::StoredExpression(value) => value,
+            Self::String(value) | Self::StoredExpression(value) => value,
             Self::ResultTreeFragment(document) => document.string_value(document.root()),
         }
     }
@@ -111,7 +109,8 @@ fn expand_decimal_exponent(value: &str) -> String {
     let decimal = mantissa
         .trim_start_matches('-')
         .find('.')
-        .map_or_else(|| digits.len() as i32, |index| index as i32);
+        .unwrap_or(digits.len());
+    let decimal = i32::try_from(decimal).expect("binary64 mantissa length fits i32");
     let target = decimal + exponent;
     let mut output = String::new();
     if negative {
@@ -119,16 +118,20 @@ fn expand_decimal_exponent(value: &str) -> String {
     }
     if target <= 0 {
         output.push_str("0.");
-        output.extend(std::iter::repeat_n('0', target.unsigned_abs() as usize));
+        let zeroes =
+            usize::try_from(target.unsigned_abs()).expect("binary64 decimal exponent fits usize");
+        output.extend(std::iter::repeat_n('0', zeroes));
         output.push_str(&digits);
-    } else if target as usize >= digits.len() {
-        output.push_str(&digits);
-        output.extend(std::iter::repeat_n('0', target as usize - digits.len()));
     } else {
-        let target = target as usize;
-        output.push_str(&digits[..target]);
-        output.push('.');
-        output.push_str(&digits[target..]);
+        let target = usize::try_from(target).expect("positive decimal position fits usize");
+        if target >= digits.len() {
+            output.push_str(&digits);
+            output.extend(std::iter::repeat_n('0', target - digits.len()));
+        } else {
+            output.push_str(&digits[..target]);
+            output.push('.');
+            output.push_str(&digits[target..]);
+        }
     }
     output
 }

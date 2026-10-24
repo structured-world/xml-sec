@@ -66,11 +66,15 @@ impl<R: Resolver> Compiler<R> {
     }
 
     /// Compile a complete stylesheet graph into immutable executable IR.
+    ///
+    /// # Errors
+    /// Returns XML/static errors, resolver refusals or exhaustion of the compile budget.
     pub fn compile(&self, xml: &str, base_uri: Option<&str>) -> Result<Stylesheet> {
         self.compile_reported(xml, base_uri).outcome
     }
 
     /// [`Self::compile`], also reporting the parser work it admitted.
+    #[must_use]
     pub fn compile_reported(
         &self,
         xml: &str,
@@ -121,6 +125,9 @@ impl<R: Resolver> Compiler<R> {
     }
 
     /// Decode and compile a complete stylesheet graph from external XML bytes.
+    ///
+    /// # Errors
+    /// Returns decoding/XML/static failures, resolver refusals or compile-budget exhaustion.
     pub fn compile_bytes(&self, bytes: &[u8], base_uri: Option<&str>) -> Result<Stylesheet> {
         ensure(
             BudgetKind::StylesheetBytes,
@@ -210,6 +217,64 @@ impl<R: Resolver> Compiler<R> {
         )
     }
 
+    fn compile_included_imports(
+        &self,
+        root: roxmltree::Node<'_, '_>,
+        source_xml: &str,
+        base_uri: Option<&str>,
+        state: &mut CompileState,
+        depth: usize,
+        saw_non_import: &mut bool,
+    ) -> Result<()> {
+        if let StylesheetModuleKind::Standard { forward } = stylesheet_module_kind(root)? {
+            validate_standard_stylesheet_content(root)?;
+            validate_top_level_declaration_attributes(root, forward)?;
+            validate_namespace_prefix_attributes(root, forward, self.prefix_lists)?;
+            self.compile_effective_imports(
+                root,
+                source_xml,
+                base_uri,
+                state,
+                depth,
+                saw_non_import,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn compile_external_imports(
+        &self,
+        resource: &Arc<ResolvedResource>,
+        fragment: Option<&str>,
+        state: &mut CompileState,
+        depth: usize,
+        saw_non_import: &mut bool,
+    ) -> Result<()> {
+        Self::enter_resource(resource, fragment, state, |state| {
+            let source = resource_source(resource, state)?;
+            with_compiler_document(
+                source.as_str(),
+                Some(&resource.canonical_uri),
+                state,
+                |document, state| {
+                    let root = stylesheet_module_root(
+                        document,
+                        fragment,
+                        state.current_module_document(),
+                    )?;
+                    self.compile_included_imports(
+                        root,
+                        source.as_str(),
+                        Some(&resource.canonical_uri),
+                        state,
+                        depth,
+                        saw_non_import,
+                    )
+                },
+            )
+        })
+    }
+
     fn compile_effective_imports(
         &self,
         root: roxmltree::Node<'_, '_>,
@@ -237,9 +302,9 @@ impl<R: Resolver> Compiler<R> {
                 match module {
                     ResolvedModule::Local { fragment } => {
                         let target =
-                            self.local_module_root(child, fragment, source_xml, base_uri, state)?;
+                            Self::local_module_root(child, fragment, source_xml, base_uri, state)?;
                         let document_id = state.current_stylesheet_document();
-                        self.enter_module(
+                        Self::enter_module(
                             document_id,
                             base_uri.unwrap_or(""),
                             Some(fragment),
@@ -258,7 +323,7 @@ impl<R: Resolver> Compiler<R> {
                         )?;
                     }
                     ResolvedModule::External { resource, fragment } => {
-                        self.enter_resource(&resource, fragment, state, |state| {
+                        Self::enter_resource(&resource, fragment, state, |state| {
                             let source = resource_source(&resource, state)?;
                             self.compile_module(
                                 source.as_str(),
@@ -282,76 +347,33 @@ impl<R: Resolver> Compiler<R> {
                 match module {
                     ResolvedModule::Local { fragment } => {
                         let target =
-                            self.local_module_root(child, fragment, source_xml, base_uri, state)?;
+                            Self::local_module_root(child, fragment, source_xml, base_uri, state)?;
                         let document_id = state.current_stylesheet_document();
-                        self.enter_module(
+                        Self::enter_module(
                             document_id,
                             base_uri.unwrap_or(""),
                             Some(fragment),
                             state,
                             |state| {
-                                if let StylesheetModuleKind::Standard { forward } =
-                                    stylesheet_module_kind(target)?
-                                {
-                                    validate_standard_stylesheet_content(target)?;
-                                    validate_top_level_declaration_attributes(target, forward)?;
-                                    validate_namespace_prefix_attributes(
-                                        target,
-                                        forward,
-                                        self.prefix_lists,
-                                    )?;
-                                    self.compile_effective_imports(
-                                        target,
-                                        source_xml,
-                                        base_uri,
-                                        state,
-                                        depth + 1,
-                                        saw_non_import,
-                                    )?;
-                                }
-                                Ok(())
+                                self.compile_included_imports(
+                                    target,
+                                    source_xml,
+                                    base_uri,
+                                    state,
+                                    depth + 1,
+                                    saw_non_import,
+                                )
                             },
                         )?;
                     }
                     ResolvedModule::External { resource, fragment } => {
-                        self.enter_resource(&resource, fragment, state, |state| {
-                            let source = resource_source(&resource, state)?;
-                            with_compiler_document(
-                                source.as_str(),
-                                Some(&resource.canonical_uri),
-                                state,
-                                |document, state| {
-                                    let included_root = stylesheet_module_root(
-                                        document,
-                                        fragment,
-                                        state.current_module_document(),
-                                    )?;
-                                    match stylesheet_module_kind(included_root)? {
-                                        StylesheetModuleKind::Standard { forward } => {
-                                            validate_standard_stylesheet_content(included_root)?;
-                                            validate_top_level_declaration_attributes(
-                                                included_root,
-                                                forward,
-                                            )?;
-                                            validate_namespace_prefix_attributes(
-                                                included_root,
-                                                forward,
-                                                self.prefix_lists,
-                                            )?;
-                                            self.compile_effective_imports(
-                                                included_root,
-                                                source.as_str(),
-                                                Some(&resource.canonical_uri),
-                                                state,
-                                                depth + 1,
-                                                saw_non_import,
-                                            )
-                                        }
-                                        StylesheetModuleKind::Simplified => Ok(()),
-                                    }
-                                },
-                            )
-                        })?;
+                        self.compile_external_imports(
+                            &resource,
+                            fragment,
+                            state,
+                            depth + 1,
+                            saw_non_import,
+                        )?;
                     }
                 }
                 // XSLT 1.0 section 2.6.2 requires imports to precede every other top-level
@@ -390,9 +412,9 @@ impl<R: Resolver> Compiler<R> {
                 match module {
                     ResolvedModule::Local { fragment } => {
                         let target =
-                            self.local_module_root(child, fragment, source_xml, base_uri, state)?;
+                            Self::local_module_root(child, fragment, source_xml, base_uri, state)?;
                         let document_id = state.current_stylesheet_document();
-                        self.enter_module(
+                        Self::enter_module(
                             document_id,
                             base_uri.unwrap_or(""),
                             Some(fragment),
@@ -422,7 +444,7 @@ impl<R: Resolver> Compiler<R> {
                         )?;
                     }
                     ResolvedModule::External { resource, fragment } => {
-                        self.enter_resource(&resource, fragment, state, |state| {
+                        Self::enter_resource(&resource, fragment, state, |state| {
                             let source = resource_source(&resource, state)?;
                             with_frontend_document(source.as_str(), state, |document, state| {
                                 let included_root = stylesheet_module_root(
@@ -483,7 +505,7 @@ impl<R: Resolver> Compiler<R> {
                 "stylesheet module fragment identifier must not be empty".into(),
             ));
         }
-        let effective_base = effective_base_uri(node, base_uri)?;
+        let effective_base = effective_base_uri(node, base_uri);
         if let Some(fragment) = fragment
             && resource_href.is_empty()
             && effective_base.as_deref() == base_uri
@@ -564,28 +586,7 @@ impl<R: Resolver> Compiler<R> {
                 (Arc::new(resolved), document_id, true)
             };
         if new_identity {
-            state.charge_owned(module_document_cache_entry_bytes())?;
-            let source = resource_source(&resource, state)?;
-            let document = parse_semantic_document_metered(
-                source.as_str(),
-                Some(&resource.canonical_uri),
-                state,
-            )?;
-            state.module_documents.insert(
-                document_id,
-                ModuleDocument {
-                    id: document_id,
-                    document,
-                },
-            );
-            state.resolved_identities.insert(
-                resource.identity.clone(),
-                ResolvedIdentity {
-                    resource: Arc::clone(&resource),
-                    document_id,
-                },
-            );
-            state.resources.push(resource.identity.clone());
+            state.cache_module_document(&resource, document_id)?;
         }
         state
             .resolved_requests
@@ -594,14 +595,13 @@ impl<R: Resolver> Compiler<R> {
     }
 
     fn enter_resource<T>(
-        &self,
         resource: &Arc<ResolvedResource>,
         fragment: Option<&str>,
         state: &mut CompileState,
         compile: impl FnOnce(&mut CompileState) -> Result<T>,
     ) -> Result<T> {
         let document_id = state.resolved_identities[&resource.identity].document_id;
-        self.enter_module(
+        Self::enter_module(
             document_id,
             &resource.canonical_uri,
             fragment,
@@ -611,7 +611,6 @@ impl<R: Resolver> Compiler<R> {
     }
 
     fn enter_module<T>(
-        &self,
         document_id: StylesheetDocumentId,
         uri: &str,
         fragment: Option<&str>,
@@ -651,7 +650,6 @@ impl<R: Resolver> Compiler<R> {
     }
 
     fn local_module_root<'nodes, 'input>(
-        &self,
         include_or_import: roxmltree::Node<'nodes, 'input>,
         fragment: &str,
         source_xml: &str,
@@ -723,6 +721,132 @@ impl<R: Resolver> Compiler<R> {
         Ok(())
     }
 
+    fn compile_exslt_function(
+        &self,
+        node: roxmltree::Node<'_, '_>,
+        base_uri: Option<&str>,
+        precedence: usize,
+        forward: bool,
+        state: &mut CompileState,
+        depth: usize,
+    ) -> Result<()> {
+        validate_exslt_function_result_structure(node)?;
+        let context = CompileContext::new(
+            forward,
+            depth,
+            state.budget.recursion_depth,
+            base_uri,
+            state.current_stylesheet_document(),
+            state.workspace(),
+            self.prefix_lists,
+        )?
+        .inside_function();
+        let (params, body) = compile_parameterized_sequence(node, &context)?;
+        drop(context);
+        let order = state.next_order();
+        let name = required_qname_attr(node, "name")?;
+        // EXSLT func:function requires a non-null namespace so it cannot replace a core binding.
+        // https://exslt.github.io/func/elements/function/index.html
+        if name.namespace.is_none() {
+            return Err(Error::Static(
+                "EXSLT func:function name requires a namespace prefix".into(),
+            ));
+        }
+        state.functions.push(ExsltFunction {
+            name,
+            params,
+            body,
+            precedence,
+            order,
+        });
+        Ok(())
+    }
+
+    fn compile_template(
+        &self,
+        node: roxmltree::Node<'_, '_>,
+        base_uri: Option<&str>,
+        precedence: usize,
+        forward: bool,
+        state: &mut CompileState,
+        depth: usize,
+    ) -> Result<()> {
+        let name = optional_qname_attr(node, "name")?;
+        let patterns = node
+            .attribute("match")
+            .map(|value| Pattern::template_branches(value, node, state.workspace()))
+            .transpose()?
+            .unwrap_or_default();
+        if name.is_none() && patterns.is_empty() {
+            return Err(Error::Static("xsl:template requires name or match".into()));
+        }
+        let explicit_priority = node
+            .attribute("priority")
+            .map(|value| {
+                let priority = super::xpath::xpath_number(value);
+                priority.is_finite().then_some(priority).ok_or_else(|| {
+                    Error::Static("template priority must be a finite XPath number".into())
+                })
+            })
+            .transpose()?
+            .filter(|_| !patterns.is_empty());
+        // XSLT 1.0 sections 5.5 and 6 make priority irrelevant to named-template invocation.
+        // Validate its lexical value first, then discard it for a named-only template.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
+        let mode = optional_qname_attr(node, "mode")?;
+        // XSLT 1.0 section 5.7 forbids mode when the template has no match rule.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#modes
+        if patterns.is_empty() && mode.is_some() {
+            return Err(Error::Static(
+                "xsl:template mode requires a match attribute".into(),
+            ));
+        }
+        let context = CompileContext::new(
+            forward,
+            depth,
+            state.budget.recursion_depth,
+            base_uri,
+            state.current_stylesheet_document(),
+            state.workspace(),
+            self.prefix_lists,
+        )?;
+        let (params, body) = compile_parameterized_sequence(node, &context)?;
+        drop(context);
+        let params: Arc<[Variable]> = params.into();
+        let order = state.next_order();
+        if patterns.is_empty() {
+            state.templates.push(Template {
+                name,
+                pattern: None,
+                mode,
+                priority: 0.0,
+                precedence,
+                order,
+                params,
+                body,
+            });
+        } else {
+            let pattern_buffer_bytes = patterns.capacity() * std::mem::size_of::<Pattern>();
+            for (index, pattern) in patterns.into_iter().enumerate() {
+                state.templates.push(Template {
+                    name: (index == 0).then(|| name.clone()).flatten(),
+                    priority: match explicit_priority {
+                        Some(priority) => priority,
+                        None => pattern.default_priority(state.workspace())?,
+                    },
+                    pattern: Some(pattern),
+                    mode: mode.clone(),
+                    precedence,
+                    order,
+                    params: Arc::clone(&params),
+                    body: Arc::clone(&body),
+                });
+            }
+            state.workspace().release(pattern_buffer_bytes);
+        }
+        Ok(())
+    }
+
     fn compile_top_level(
         &self,
         node: roxmltree::Node<'_, '_>,
@@ -733,48 +857,7 @@ impl<R: Resolver> Compiler<R> {
         depth: usize,
     ) -> Result<()> {
         if is_exslt_function_declaration(node, self.prefix_lists)? {
-            validate_exslt_function_result_structure(node)?;
-            let context = CompileContext::new(
-                forward,
-                depth,
-                state.budget.recursion_depth,
-                base_uri,
-                state.current_stylesheet_document(),
-                state.workspace(),
-                self.prefix_lists,
-            )?
-            .inside_function();
-            let mut children = node.children().peekable();
-            let mut params = Vec::new();
-            while let Some(child) = children.peek().copied() {
-                if child.has_tag_name((XSLT_NS, "param")) {
-                    params.push(compile_variable(child, context.clone())?);
-                    children.next();
-                } else if is_ignorable_stylesheet_child(child) {
-                    children.next();
-                } else {
-                    break;
-                }
-            }
-            let body = compile_sequence(children, context)?;
-            let order = state.next_order();
-            let name = required_qname_attr(node, "name")?;
-            // EXSLT func:function requires the expanded name to have a non-null namespace;
-            // otherwise it could replace an XPath core function binding.
-            // https://exslt.github.io/func/elements/function/index.html
-            if name.namespace.is_none() {
-                return Err(Error::Static(
-                    "EXSLT func:function name requires a namespace prefix".into(),
-                ));
-            }
-            state.functions.push(ExsltFunction {
-                name,
-                params,
-                body,
-                precedence,
-                order,
-            });
-            return Ok(());
+            return self.compile_exslt_function(node, base_uri, precedence, forward, state, depth);
         }
         if node.tag_name().namespace() != Some(XSLT_NS) {
             if node.tag_name().namespace().is_some() || forward {
@@ -790,96 +873,12 @@ impl<R: Resolver> Compiler<R> {
         }
         match node.tag_name().name() {
             "template" => {
-                let name = optional_qname_attr(node, "name")?;
-                let patterns = node
-                    .attribute("match")
-                    .map(|value| Pattern::template_branches(value, node, state.workspace()))
-                    .transpose()?
-                    .unwrap_or_default();
-                if name.is_none() && patterns.is_empty() {
-                    return Err(Error::Static("xsl:template requires name or match".into()));
-                }
-                let explicit_priority = node
-                    .attribute("priority")
-                    .map(|value| {
-                        let priority = super::xpath::xpath_number(value);
-                        priority.is_finite().then_some(priority).ok_or_else(|| {
-                            Error::Static("template priority must be a finite XPath number".into())
-                        })
-                    })
-                    .transpose()?
-                    .filter(|_| !patterns.is_empty());
-                // XSLT 1.0 sections 5.5 and 6 define priority for template-rule conflict
-                // resolution, but explicitly make it irrelevant to named-template invocation.
-                // Validate the lexical value above, then discard it for a named-only template.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
-                let mode = optional_qname_attr(node, "mode")?;
-                // XSLT 1.0 section 5.7 forbids mode when the template has no match rule.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#modes
-                if patterns.is_empty() && mode.is_some() {
-                    return Err(Error::Static(
-                        "xsl:template mode requires a match attribute".into(),
-                    ));
-                }
-                let context = CompileContext::new(
-                    forward,
-                    depth,
-                    state.budget.recursion_depth,
-                    base_uri,
-                    state.current_stylesheet_document(),
-                    state.workspace(),
-                    self.prefix_lists,
-                )?;
-                let mut children = node.children().peekable();
-                let mut params = Vec::new();
-                while let Some(child) = children.peek().copied() {
-                    if child.has_tag_name((XSLT_NS, "param")) {
-                        params.push(compile_variable(child, context.clone())?);
-                        children.next();
-                    } else if is_ignorable_stylesheet_child(child) {
-                        children.next();
-                    } else {
-                        break;
-                    }
-                }
-                let body: Arc<[Instruction]> = compile_sequence(children, context)?;
-                let params: Arc<[Variable]> = params.into();
-                let order = state.next_order();
-                if patterns.is_empty() {
-                    state.templates.push(Template {
-                        name,
-                        pattern: None,
-                        mode,
-                        priority: 0.0,
-                        precedence,
-                        order,
-                        params,
-                        body,
-                    });
-                } else {
-                    let pattern_buffer_bytes = patterns.capacity() * std::mem::size_of::<Pattern>();
-                    for (index, pattern) in patterns.into_iter().enumerate() {
-                        state.templates.push(Template {
-                            name: (index == 0).then(|| name.clone()).flatten(),
-                            priority: match explicit_priority {
-                                Some(priority) => priority,
-                                None => pattern.default_priority(state.workspace())?,
-                            },
-                            pattern: Some(pattern),
-                            mode: mode.clone(),
-                            precedence,
-                            order,
-                            params: Arc::clone(&params),
-                            body: Arc::clone(&body),
-                        });
-                    }
-                    state.workspace().release(pattern_buffer_bytes);
-                }
+                self.compile_template(node, base_uri, precedence, forward, state, depth)?;
             }
             "variable" | "param" => {
                 let variable = compile_variable(
                     node,
-                    CompileContext::new(
+                    &CompileContext::new(
                         forward,
                         depth,
                         state.budget.recursion_depth,
@@ -905,57 +904,9 @@ impl<R: Resolver> Compiler<R> {
                 forward,
             )?,
             "strip-space" | "preserve-space" => {
-                // XSLT 1.0 section 3.4 gives both declarations an EMPTY content model.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
-                require_empty_instruction(node)?;
-                let preserve = node.tag_name().name() == "preserve-space";
-                let elements = required_attr(node, "elements")?;
-                let mut name_tests = elements.split_ascii_whitespace().peekable();
-                if name_tests.peek().is_none() {
-                    return Err(Error::Static(format!(
-                        "xsl:{} elements must contain at least one name test",
-                        node.tag_name().name()
-                    )));
-                }
-                for token in name_tests {
-                    let order = state.next_order();
-                    state.whitespace.push((
-                        NameTest::parse(token, node)?,
-                        preserve,
-                        precedence,
-                        order,
-                    ));
-                }
+                state.add_whitespace_declaration(node, precedence)?;
             }
-            "key" => {
-                // XSLT 1.0 section 12.2 defines xsl:key with an EMPTY content model.
-                // https://www.w3.org/TR/1999/REC-xslt-19991116#key
-                require_empty_instruction(node)?;
-                let match_pattern = required_attr(node, "match")?;
-                let use_expression = required_attr(node, "use")?;
-                validate_key_dependency_expression(
-                    "match",
-                    match_pattern,
-                    state.workspace().pending_source(match_pattern, node),
-                )?;
-                validate_key_dependency_expression(
-                    "use",
-                    use_expression,
-                    state.workspace().pending_source(use_expression, node),
-                )?;
-                state.keys.push(KeyDeclaration {
-                    name: required_qname_attr(node, "name")?,
-                    match_pattern: Pattern::new(match_pattern, node, state.workspace())?,
-                    use_expression: Expression::new(
-                        use_expression,
-                        node,
-                        base_uri,
-                        state.current_stylesheet_document(),
-                        state.budget.recursion_depth,
-                        state.workspace(),
-                    )?,
-                });
-            }
+            "key" => state.add_key_declaration(node, base_uri)?,
             "decimal-format" => {
                 // XSLT 1.0 section 12.3 defines xsl:decimal-format as EMPTY.
                 // https://www.w3.org/TR/1999/REC-xslt-19991116#format-number
@@ -985,7 +936,7 @@ impl<R: Resolver> Compiler<R> {
                     &mut state.namespace_aliases,
                     &mut state.namespace_alias_index,
                     parse_namespace_alias(node, precedence)?,
-                )?;
+                );
             }
             "attribute-set" => {
                 let order = state.next_order();
@@ -998,8 +949,9 @@ impl<R: Resolver> Compiler<R> {
                     state.workspace(),
                     self.prefix_lists,
                 )?;
-                let attribute_set = AttributeSet::parse(node, context, precedence, order)?;
-                state.attribute_sets.push(attribute_set)
+                let attribute_set = AttributeSet::parse(node, &context, precedence, order)?;
+                drop(context);
+                state.attribute_sets.push(attribute_set);
             }
             _unknown if forward => {}
             unknown => return Err(Error::Static(format!("unknown top-level xsl:{unknown}"))),
@@ -1148,7 +1100,7 @@ pub(crate) struct Variable {
 pub(crate) struct Expression {
     pub source: String,
     pub namespaces: Arc<Vec<(String, String)>>,
-    /// Expanded references let execution initialize only globals on the reached XPath path.
+    /// Expanded references let execution initialize only globals on the reached `XPath` path.
     pub variable_references: Arc<[ExpandedName]>,
     /// Static base of the stylesheet module that owns this expression.
     pub static_base_uri: Option<Arc<str>>,
@@ -1375,7 +1327,7 @@ impl Expression {
         max_depth: usize,
         workspace: CompileWorkspace<'_>,
     ) -> Result<Self> {
-        let static_base_uri = effective_base_uri(node, static_base_uri)?.map(Arc::from);
+        let static_base_uri = effective_base_uri(node, static_base_uri).map(Arc::from);
         Self::new_with_namespaces_and_base(
             source,
             namespaces,
@@ -1531,7 +1483,7 @@ fn referenced_variables_bounded(
     });
     let vector_bytes = count
         .checked_mul(std::mem::size_of::<ExpandedName>())
-        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .filter(|bytes| isize::try_from(*bytes).is_ok())
         .ok_or_else(|| workspace.overflow())?;
     let payload = payload.ok_or_else(|| workspace.overflow())?;
     let bytes = vector_bytes
@@ -1547,7 +1499,7 @@ fn referenced_variables_bounded(
         .len()
         .checked_mul(std::mem::size_of::<ExpandedName>())
         .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
-        .filter(|bytes| *bytes <= isize::MAX as usize)
+        .filter(|bytes| isize::try_from(*bytes).is_ok())
         .ok_or_else(|| workspace.overflow())?;
     // Vec's buffer and the new Arc allocation overlap during conversion; strings move intact.
     workspace.retain(arc_bytes)?;
@@ -1593,7 +1545,7 @@ impl Pattern {
                 &normalized,
                 workspace.remaining(),
             )
-            .map_err(|error| workspace.parser_error(error, source, true))?
+            .map_err(|error| workspace.parser_error(&error, source, true))?
         };
         if validation_workspace.occupied == workspace.occupied {
             workspace.retain(source.len())?;
@@ -1613,7 +1565,7 @@ impl Pattern {
         let count = split_pattern_branches(source).count();
         let bytes = count
             .checked_mul(std::mem::size_of::<Self>())
-            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .filter(|bytes| isize::try_from(*bytes).is_ok())
             .ok_or_else(|| workspace.overflow())?;
         workspace.retain(bytes)?;
         let mut patterns = Vec::with_capacity(count);
@@ -2088,10 +2040,9 @@ impl NameTest {
 
     pub(crate) const fn priority(&self) -> i8 {
         match (&self.namespace, &self.local) {
-            (NamespaceTest::Any, None) => -2,
+            (NamespaceTest::Any | NamespaceTest::None, None) => -2,
             (NamespaceTest::Exact(_), None) => -1,
             (_, Some(_)) => 0,
-            (NamespaceTest::None, None) => -2,
         }
     }
 }
@@ -2125,25 +2076,19 @@ fn merge_namespace_alias(
     aliases: &mut Vec<NamespaceAlias>,
     index: &mut HashMap<Option<Arc<str>>, usize>,
     incoming: NamespaceAlias,
-) -> Result<()> {
+) {
     let Some(existing_index) = index.get(&incoming.stylesheet_namespace).copied() else {
         index.insert(incoming.stylesheet_namespace.clone(), aliases.len());
         aliases.push(incoming);
-        return Ok(());
+        return;
     };
     let existing = &aliases[existing_index];
     if existing.precedence > incoming.precedence {
-        return Ok(());
+        return;
     }
-    if existing.precedence == incoming.precedence {
-        // XSLT 1.0 section 7.1.1 permits recovery from a highest-precedence conflict by choosing
-        // the declaration occurring last, which is the libxslt-compatible behavior.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
-        aliases[existing_index] = incoming;
-        return Ok(());
-    }
+    // XSLT 1.0 section 7.1.1 permits equal-precedence recovery by selecting the last declaration.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#literal-result-element
     aliases[existing_index] = incoming;
-    Ok(())
 }
 
 #[derive(Default)]
@@ -2375,7 +2320,94 @@ impl CompileState {
             self.stylesheet_bytes.saturating_add(amount),
         )
     }
-    fn finish(mut self) -> Result<Stylesheet> {
+    fn add_whitespace_declaration(
+        &mut self,
+        node: roxmltree::Node<'_, '_>,
+        precedence: usize,
+    ) -> Result<()> {
+        // XSLT 1.0 section 3.4 gives both declarations an EMPTY content model.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#strip
+        require_empty_instruction(node)?;
+        let preserve = node.tag_name().name() == "preserve-space";
+        let elements = required_attr(node, "elements")?;
+        let mut name_tests = elements.split_ascii_whitespace().peekable();
+        if name_tests.peek().is_none() {
+            return Err(Error::Static(format!(
+                "xsl:{} elements must contain at least one name test",
+                node.tag_name().name()
+            )));
+        }
+        for token in name_tests {
+            let order = self.next_order();
+            self.whitespace
+                .push((NameTest::parse(token, node)?, preserve, precedence, order));
+        }
+        Ok(())
+    }
+
+    fn add_key_declaration(
+        &mut self,
+        node: roxmltree::Node<'_, '_>,
+        base_uri: Option<&str>,
+    ) -> Result<()> {
+        // XSLT 1.0 section 12.2 defines xsl:key with an EMPTY content model.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#key
+        require_empty_instruction(node)?;
+        let match_pattern = required_attr(node, "match")?;
+        let use_expression = required_attr(node, "use")?;
+        validate_key_dependency_expression(
+            "match",
+            match_pattern,
+            self.workspace().pending_source(match_pattern, node),
+        )?;
+        validate_key_dependency_expression(
+            "use",
+            use_expression,
+            self.workspace().pending_source(use_expression, node),
+        )?;
+        self.keys.push(KeyDeclaration {
+            name: required_qname_attr(node, "name")?,
+            match_pattern: Pattern::new(match_pattern, node, self.workspace())?,
+            use_expression: Expression::new(
+                use_expression,
+                node,
+                base_uri,
+                self.current_stylesheet_document(),
+                self.budget.recursion_depth,
+                self.workspace(),
+            )?,
+        });
+        Ok(())
+    }
+
+    fn cache_module_document(
+        &mut self,
+        resource: &Arc<ResolvedResource>,
+        document_id: StylesheetDocumentId,
+    ) -> Result<()> {
+        self.charge_owned(module_document_cache_entry_bytes())?;
+        let source = resource_source(resource, self)?;
+        let document =
+            parse_semantic_document_metered(source.as_str(), Some(&resource.canonical_uri), self)?;
+        self.module_documents.insert(
+            document_id,
+            ModuleDocument {
+                id: document_id,
+                document,
+            },
+        );
+        self.resolved_identities.insert(
+            resource.identity.clone(),
+            ResolvedIdentity {
+                resource: Arc::clone(resource),
+                document_id,
+            },
+        );
+        self.resources.push(resource.identity.clone());
+        Ok(())
+    }
+
+    fn named_template_index(&mut self) -> Result<HashMap<ExpandedName, usize>> {
         self.templates
             .sort_by_key(|template| (template.precedence, template.order));
         let named_count = self
@@ -2442,6 +2474,50 @@ impl CompileState {
             },
         );
         self.release_owned(named_index_bytes.saturating_sub(actual_named_index_bytes));
+        Ok(named_template_index)
+    }
+
+    fn function_names(&mut self) -> Result<HashSet<ExpandedName>> {
+        let validation_workspace = self
+            .functions
+            .len()
+            .saturating_mul(hash_entry_storage::<(&ExpandedName, usize), ()>());
+        self.charge_owned(validation_workspace)?;
+        let mut functions = HashSet::with_capacity(self.functions.len());
+        let validation = (|| {
+            for function in &self.functions {
+                if !functions.insert((&function.name, function.precedence)) {
+                    return Err(Error::Static(format!(
+                        "duplicate EXSLT function {} at equal import precedence",
+                        function.name.local
+                    )));
+                }
+            }
+            Ok(())
+        })();
+        drop(functions);
+        self.release_owned(validation_workspace);
+        validation?;
+        let index_bytes = self.functions.iter().fold(
+            self.functions
+                .len()
+                .saturating_mul(hash_entry_storage::<ExpandedName, ()>()),
+            |total, function| {
+                total
+                    .saturating_add(function.name.local.len())
+                    .saturating_add(function.name.namespace.as_ref().map_or(0, String::len))
+            },
+        );
+        self.charge_owned(index_bytes)?;
+        Ok(self
+            .functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect())
+    }
+
+    fn finish(mut self) -> Result<Stylesheet> {
+        let named_template_index = self.named_template_index()?;
         let key_name_workspace = self
             .keys
             .len()
@@ -2481,42 +2557,7 @@ impl CompileState {
         drop(globals);
         self.release_owned(global_validation_workspace);
         global_validation?;
-        let function_validation_workspace = self
-            .functions
-            .len()
-            .saturating_mul(hash_entry_storage::<(&ExpandedName, usize), ()>());
-        self.charge_owned(function_validation_workspace)?;
-        let mut functions = HashSet::with_capacity(self.functions.len());
-        let function_validation = (|| {
-            for function in &self.functions {
-                if !functions.insert((&function.name, function.precedence)) {
-                    return Err(Error::Static(format!(
-                        "duplicate EXSLT function {} at equal import precedence",
-                        function.name.local
-                    )));
-                }
-            }
-            Ok(())
-        })();
-        drop(functions);
-        self.release_owned(function_validation_workspace);
-        function_validation?;
-        let function_index_bytes = self.functions.iter().fold(
-            self.functions
-                .len()
-                .saturating_mul(hash_entry_storage::<ExpandedName, ()>()),
-            |total, function| {
-                total
-                    .saturating_add(function.name.local.len())
-                    .saturating_add(function.name.namespace.as_ref().map_or(0, String::len))
-            },
-        );
-        self.charge_owned(function_index_bytes)?;
-        let function_names = self
-            .functions
-            .iter()
-            .map(|function| function.name.clone())
-            .collect::<HashSet<_>>();
+        let function_names = self.function_names()?;
         let named_alias_count = self
             .namespace_aliases
             .iter()
@@ -2751,7 +2792,9 @@ fn validate_attribute_sets_in_sequence(
             | Instruction::Processing { body, .. }
             | Instruction::Message { body, .. }
             | Instruction::SecondaryOutput { body, .. }
-            | Instruction::ExtensionFallback { body, .. } => {
+            | Instruction::ExtensionFallback { body, .. }
+            | Instruction::Comment(body)
+            | Instruction::FunctionResult { content: body, .. } => {
                 validate_attribute_sets_in_sequence(body, validate_name)?;
             }
             Instruction::Choose {
@@ -2763,14 +2806,8 @@ fn validate_attribute_sets_in_sequence(
                 }
                 validate_attribute_sets_in_sequence(otherwise, validate_name)?;
             }
-            Instruction::Comment(body) => {
-                validate_attribute_sets_in_sequence(body, validate_name)?;
-            }
             Instruction::Variable(variable) => {
                 validate_attribute_sets_in_sequence(&variable.content, validate_name)?;
-            }
-            Instruction::FunctionResult { content, .. } => {
-                validate_attribute_sets_in_sequence(content, validate_name)?;
             }
             Instruction::Text(..)
             | Instruction::ApplyImports
@@ -3027,7 +3064,7 @@ impl CompileWorkspace<'_> {
             return Ok((Cow::Borrowed(source), self));
         }
         let length = length
-            .filter(|length| *length <= isize::MAX as usize)
+            .filter(|length| isize::try_from(*length).is_ok())
             .ok_or_else(|| self.overflow())?;
         let workspace = self.reserve(length)?;
         let mut normalized = String::with_capacity(length);
@@ -3042,12 +3079,12 @@ impl CompileWorkspace<'_> {
         pattern: bool,
     ) -> Result<sxd_xpath_no_unsafe::XPath> {
         sxd_xpath_no_unsafe::Factory::build_bounded(normalized, self.remaining())
-            .map_err(|error| self.parser_error(error, source, pattern))
+            .map_err(|error| self.parser_error(&error, source, pattern))
     }
 
     fn parser_error(
         self,
-        error: sxd_xpath_no_unsafe::ParserError,
+        error: &sxd_xpath_no_unsafe::ParserError,
         source: &str,
         pattern: bool,
     ) -> Error {
@@ -3361,8 +3398,7 @@ impl<'a> CompileContext<'a> {
         {
             base_uri.clone()
         } else {
-            let base_uri =
-                effective_base_uri(node, self.static_base_uri.as_deref())?.map(Arc::from);
+            let base_uri = effective_base_uri(node, self.static_base_uri.as_deref()).map(Arc::from);
             *base_snapshot = Some((node.id(), base_uri.clone()));
             base_uri
         };
@@ -3608,7 +3644,10 @@ fn stylesheet_version_is_forward_compatible(version: &str) -> Result<bool> {
     // XSLT 1.0 sections 2.2 and 2.5 enable forwards-compatible processing whenever
     // the version Number is not equal to 1.0, including values below 1.0.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#forwards
-    Ok(parse_stylesheet_version(version)? != 1.0)
+    Ok(!super::number::equal(
+        parse_stylesheet_version(version)?,
+        1.0,
+    ))
 }
 
 fn parse_stylesheet_version(version: &str) -> Result<f64> {
@@ -3619,10 +3658,7 @@ fn parse_stylesheet_version(version: &str) -> Result<f64> {
         .ok_or_else(|| Error::Static(format!("unsupported XSLT version {version}")))
 }
 
-fn effective_base_uri(
-    node: roxmltree::Node<'_, '_>,
-    module_base: Option<&str>,
-) -> Result<Option<String>> {
+fn effective_base_uri(node: roxmltree::Node<'_, '_>, module_base: Option<&str>) -> Option<String> {
     let mut base = module_base.map(str::to_owned);
     let mut ancestors = node
         .ancestors()
@@ -3634,16 +3670,42 @@ fn effective_base_uri(
             base = Some(super::resolver::resolve_uri_reference(
                 base.as_deref(),
                 reference,
-            )?);
+            ));
         }
     }
-    Ok(base)
+    base
+}
+
+fn compile_parameterized_sequence(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<(Vec<Variable>, InstructionSequence)> {
+    let mut children = node.children().peekable();
+    let mut parameters = Vec::new();
+    while let Some(child) = children.peek().copied() {
+        if child.has_tag_name((XSLT_NS, "param")) {
+            parameters.push(compile_variable(child, context)?);
+            children.next();
+        } else if is_ignorable_stylesheet_child(child) {
+            children.next();
+        } else {
+            break;
+        }
+    }
+    Ok((parameters, compile_sequence(children, context)?))
 }
 
 fn compile_sequence<'a>(
     nodes: impl Iterator<Item = roxmltree::Node<'a, 'a>>,
-    context: CompileContext,
+    context: &CompileContext<'_>,
 ) -> Result<InstructionSequence> {
+    Ok(compile_instructions(nodes, context)?.into())
+}
+
+fn compile_instructions<'a>(
+    nodes: impl Iterator<Item = roxmltree::Node<'a, 'a>>,
+    context: &CompileContext<'_>,
+) -> Result<Vec<Instruction>> {
     let mut out = Vec::new();
     let mut follows_function_result = false;
     for node in nodes {
@@ -3666,7 +3728,7 @@ fn compile_sequence<'a>(
             out.push(compile_instruction(node, context.descend()?)?);
         }
     }
-    Ok(out.into())
+    Ok(out)
 }
 
 fn stylesheet_space_is_preserved(node: roxmltree::Node<'_, '_>) -> bool {
@@ -3683,241 +3745,300 @@ fn stylesheet_space_is_preserved(node: roxmltree::Node<'_, '_>) -> bool {
         })
         .unwrap_or(false)
 }
+fn compile_function_result(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    if !context.inside_function {
+        return Err(Error::Static(
+            "func:result is only permitted inside func:function".into(),
+        ));
+    }
+    let select = node
+        .attribute("select")
+        .map(|value| context.expression(value, node))
+        .transpose()?;
+    let base_uri = effective_base_uri(node, context.static_base_uri.as_deref());
+    let body = compile_sequence(node.children(), context)?;
+    if select.is_some() && !body.is_empty() {
+        return Err(Error::Static(
+            "func:result with select cannot have content".into(),
+        ));
+    }
+    Ok(Instruction::FunctionResult {
+        select,
+        content: body,
+        base_uri,
+    })
+}
+
+fn compile_fallback<'a>(
+    node: roxmltree::Node<'a, 'a>,
+    context: &CompileContext<'_>,
+    validate: impl Fn(roxmltree::Node<'a, 'a>) -> Result<()>,
+) -> Result<Instruction> {
+    let mut fallback = Vec::new();
+    let mut present = false;
+    for child in node
+        .children()
+        .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
+    {
+        present = true;
+        validate(child)?;
+        fallback.extend(compile_instructions(child.children(), &context.descend()?)?);
+    }
+    Ok(Instruction::ExtensionFallback {
+        name: node.tag_name().name().into(),
+        present,
+        body: fallback.into(),
+    })
+}
+
+fn compile_extension_instruction(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    let locator = match (node.tag_name().namespace(), node.tag_name().name()) {
+        (Some(XT_NS), "document") => Some("href"),
+        (Some(SAXON_NS), "output") | (Some(XALAN_REDIRECT_NS), "write") => Some("file"),
+        _ => None,
+    };
+    if let Some(locator) = locator {
+        let uri = parse_avt(required_attr(node, locator)?, node, context)?;
+        let properties = node
+            .attributes()
+            .filter(|attribute| attribute.name() != locator)
+            .map(|attribute| {
+                if attribute.namespace().is_some() {
+                    return Err(Error::Static(format!(
+                        "unsupported namespaced secondary-output attribute {}",
+                        attribute.name()
+                    )));
+                }
+                Ok((
+                    attribute.name().to_owned(),
+                    parse_avt(attribute.value(), node, context)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Ok(Instruction::SecondaryOutput {
+            uri,
+            properties,
+            body: compile_sequence(
+                node.children()
+                    .filter(|child| !child.has_tag_name((XSLT_NS, "fallback"))),
+                &context.descend()?,
+            )?,
+        });
+    }
+    let comment = match (node.tag_name().namespace(), node.tag_name().name()) {
+        (Some(LIBXSLT_TEST_NS), "test") => Some("libxslt:test element test worked"),
+        (Some(LIBXSLT_TEST_PLUGIN_NS), "testplugin") => {
+            Some("libxslt:testplugin element test worked")
+        }
+        _ => None,
+    };
+    if let Some(comment) = comment {
+        return Ok(Instruction::CompatibilityComment(comment.into()));
+    }
+    compile_fallback(node, context, |child| {
+        validate_instruction_attributes(child, context.forward)
+    })
+}
+
+fn compile_apply_templates(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    let mut sorts = vec![];
+    let mut parameters = vec![];
+    let mut names = HashSet::new();
+    let mut saw_parameter = false;
+    for child in node.children() {
+        if is_ignorable_stylesheet_child(child) {
+            continue;
+        }
+        if child.has_tag_name((XSLT_NS, "sort")) && !saw_parameter {
+            sorts.push(compile_sort(child, context)?);
+        } else if child.has_tag_name((XSLT_NS, "with-param")) {
+            saw_parameter = true;
+            push_with_param(&mut parameters, &mut names, child, &context.descend()?)?;
+        } else {
+            return Err(Error::Static(
+                "xsl:apply-templates accepts only xsl:sort and xsl:with-param".into(),
+            ));
+        }
+    }
+    Ok(Instruction::ApplyTemplates {
+        select: context.expression(node.attribute("select").unwrap_or("node()"), node)?,
+        mode: optional_qname_attr(node, "mode")?,
+        sorts,
+        parameters,
+    })
+}
+
+fn compile_call_template(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    let mut parameters = Vec::new();
+    let mut names = HashSet::new();
+    for child in node.children() {
+        if is_ignorable_stylesheet_child(child) {
+            continue;
+        }
+        if !child.has_tag_name((XSLT_NS, "with-param")) {
+            return Err(Error::Static(
+                "xsl:call-template accepts only xsl:with-param".into(),
+            ));
+        }
+        push_with_param(&mut parameters, &mut names, child, &context.descend()?)?;
+    }
+    Ok(Instruction::CallTemplate {
+        name: required_qname_attr(node, "name")?,
+        parameters,
+    })
+}
+
+fn compile_for_each(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    let mut sorts = vec![];
+    let mut body = vec![];
+    let mut sorting = true;
+    for child in node.children() {
+        if child.has_tag_name((XSLT_NS, "sort")) && sorting {
+            sorts.push(compile_sort(child, context)?);
+        } else if !is_ignorable_stylesheet_child(child) {
+            sorting = false;
+            if child.is_text() {
+                if let Some(text) = child.text()
+                    && (!is_xml_whitespace_only(text) || stylesheet_space_is_preserved(child))
+                {
+                    body.push(Instruction::Text(text.into(), false));
+                }
+            } else if child.is_element() {
+                body.push(compile_instruction(child, context.descend()?)?);
+            }
+        }
+    }
+    Ok(Instruction::ForEach {
+        select: context.expression(required_attr(node, "select")?, node)?,
+        sorts,
+        body: body.into(),
+    })
+}
+
+fn compile_choose(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    let mut branches = vec![];
+    let mut otherwise = Arc::from([]);
+    let mut saw_otherwise = false;
+    for child in node.children() {
+        if child.is_text() {
+            if is_ignorable_stylesheet_text(child) {
+                continue;
+            }
+            return Err(Error::Static(
+                "xsl:choose does not permit character data".into(),
+            ));
+        }
+        if !child.is_element() {
+            continue;
+        }
+        if child.has_tag_name((XSLT_NS, "when")) && !saw_otherwise {
+            validate_instruction_attributes(child, context.forward)?;
+            branches.push((
+                context.expression(required_attr(child, "test")?, child)?,
+                compile_sequence(child.children(), &context.descend()?)?,
+            ));
+        } else if child.has_tag_name((XSLT_NS, "otherwise")) {
+            validate_instruction_attributes(child, context.forward)?;
+            if saw_otherwise {
+                return Err(Error::Static(
+                    "xsl:choose permits only one xsl:otherwise".into(),
+                ));
+            }
+            saw_otherwise = true;
+            otherwise = compile_sequence(child.children(), &context.descend()?)?;
+        } else {
+            return Err(Error::Static(
+                "xsl:choose accepts only xsl:when and xsl:otherwise".into(),
+            ));
+        }
+    }
+    if branches.is_empty() {
+        return Err(Error::Static("xsl:choose requires xsl:when".into()));
+    }
+    Ok(Instruction::Choose {
+        branches,
+        otherwise,
+    })
+}
+
+fn compile_element(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    Ok(Instruction::Element {
+        base_uri: effective_base_uri(node, context.static_base_uri.as_deref()),
+        name: parse_avt(required_attr(node, "name")?, node, context)?,
+        namespace: node
+            .attribute("namespace")
+            .map(|value| parse_avt(value, node, context))
+            .transpose()?,
+        body: compile_sequence(node.children(), context)?,
+        attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
+        namespaces: computed_element_namespaces(node),
+    })
+}
+
+fn compile_attribute(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Instruction> {
+    Ok(Instruction::Attribute {
+        name: parse_avt(required_attr(node, "name")?, node, context)?,
+        namespace: node
+            .attribute("namespace")
+            .map(|value| parse_avt(value, node, context))
+            .transpose()?,
+        body: compile_sequence(node.children(), context)?,
+        namespaces: namespaces(node),
+    })
+}
+
 fn compile_instruction(
     node: roxmltree::Node<'_, '_>,
     context: CompileContext,
 ) -> Result<Instruction> {
     if node.has_tag_name((EXSLT_FUNCTIONS_NS, "result")) {
-        if !context.inside_function {
-            return Err(Error::Static(
-                "func:result is only permitted inside func:function".into(),
-            ));
-        }
-        let select = node
-            .attribute("select")
-            .map(|value| context.expression(value, node))
-            .transpose()?;
-        let base_uri = effective_base_uri(node, context.static_base_uri.as_deref())?;
-        let content = compile_sequence(node.children(), context)?;
-        if select.is_some() && !content.is_empty() {
-            return Err(Error::Static(
-                "func:result with select cannot have content".into(),
-            ));
-        }
-        return Ok(Instruction::FunctionResult {
-            select,
-            content,
-            base_uri,
-        });
+        return compile_function_result(node, &context);
     }
     if node.tag_name().namespace() != Some(XSLT_NS) {
         if is_extension_element(node, context.prefix_lists)? {
-            let locator = match (node.tag_name().namespace(), node.tag_name().name()) {
-                (Some(XT_NS), "document") => Some("href"),
-                (Some(SAXON_NS), "output") | (Some(XALAN_REDIRECT_NS), "write") => Some("file"),
-                _ => None,
-            };
-            if let Some(locator) = locator {
-                let uri = parse_avt(required_attr(node, locator)?, node, &context)?;
-                let properties = node
-                    .attributes()
-                    .filter(|attribute| attribute.name() != locator)
-                    .map(|attribute| {
-                        if attribute.namespace().is_some() {
-                            return Err(Error::Static(format!(
-                                "unsupported namespaced secondary-output attribute {}",
-                                attribute.name()
-                            )));
-                        }
-                        Ok((
-                            attribute.name().to_owned(),
-                            parse_avt(attribute.value(), node, &context)?,
-                        ))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                return Ok(Instruction::SecondaryOutput {
-                    uri,
-                    properties,
-                    body: compile_sequence(
-                        node.children()
-                            .filter(|child| !child.has_tag_name((XSLT_NS, "fallback"))),
-                        context.descend()?,
-                    )?,
-                });
-            }
-            let compatibility_comment = match (node.tag_name().namespace(), node.tag_name().name())
-            {
-                (Some(LIBXSLT_TEST_NS), "test") => Some("libxslt:test element test worked"),
-                (Some(LIBXSLT_TEST_PLUGIN_NS), "testplugin") => {
-                    Some("libxslt:testplugin element test worked")
-                }
-                _ => None,
-            };
-            if let Some(comment) = compatibility_comment {
-                return Ok(Instruction::CompatibilityComment(comment.into()));
-            }
-            let mut fallback = Vec::new();
-            let fallback_nodes = node
-                .children()
-                .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
-                .collect::<Vec<_>>();
-            for child in &fallback_nodes {
-                validate_instruction_attributes(*child, context.forward)?;
-                fallback.extend(
-                    compile_sequence(child.children(), context.descend()?)?
-                        .iter()
-                        .cloned(),
-                );
-            }
-            return Ok(Instruction::ExtensionFallback {
-                name: node.tag_name().name().into(),
-                present: !fallback_nodes.is_empty(),
-                body: fallback.into(),
-            });
+            return compile_extension_instruction(node, &context);
         }
         return compile_literal_element(node, context);
     }
     validate_instruction_attributes(node, context.forward)?;
-    let sequence = || compile_sequence(node.children(), context.clone());
+    let sequence = || compile_sequence(node.children(), &context);
     Ok(match node.tag_name().name() {
-        "apply-templates" => {
-            let mut sorts = vec![];
-            let mut parameters = vec![];
-            let mut parameter_names = HashSet::new();
-            let mut saw_parameter = false;
-            for child in node.children() {
-                if is_ignorable_stylesheet_child(child) {
-                    continue;
-                }
-                if child.has_tag_name((XSLT_NS, "sort")) && !saw_parameter {
-                    sorts.push(compile_sort(child, &context)?)
-                } else if child.has_tag_name((XSLT_NS, "with-param")) {
-                    saw_parameter = true;
-                    push_with_param(
-                        &mut parameters,
-                        &mut parameter_names,
-                        child,
-                        context.descend()?,
-                    )?;
-                } else {
-                    return Err(Error::Static(
-                        "xsl:apply-templates accepts only xsl:sort and xsl:with-param".into(),
-                    ));
-                }
-            }
-            Instruction::ApplyTemplates {
-                select: context.expression(node.attribute("select").unwrap_or("node()"), node)?,
-                mode: optional_qname_attr(node, "mode")?,
-                sorts,
-                parameters,
-            }
-        }
+        "apply-templates" => compile_apply_templates(node, &context)?,
         "apply-imports" => {
             require_empty_instruction(node)?;
             Instruction::ApplyImports
         }
-        "call-template" => {
-            let mut parameters = Vec::new();
-            let mut parameter_names = HashSet::new();
-            for child in node.children() {
-                if is_ignorable_stylesheet_child(child) {
-                    continue;
-                }
-                if !child.has_tag_name((XSLT_NS, "with-param")) {
-                    return Err(Error::Static(
-                        "xsl:call-template accepts only xsl:with-param".into(),
-                    ));
-                }
-                push_with_param(
-                    &mut parameters,
-                    &mut parameter_names,
-                    child,
-                    context.descend()?,
-                )?;
-            }
-            Instruction::CallTemplate {
-                name: required_qname_attr(node, "name")?,
-                parameters,
-            }
-        }
-        "for-each" => {
-            let mut sorts = vec![];
-            let mut body = vec![];
-            let mut sorting = true;
-            for child in node.children() {
-                if child.has_tag_name((XSLT_NS, "sort")) && sorting {
-                    sorts.push(compile_sort(child, &context)?)
-                } else if is_ignorable_stylesheet_child(child) {
-                    continue;
-                } else {
-                    sorting = false;
-                    if child.is_text() {
-                        if let Some(text) = child.text()
-                            && (!is_xml_whitespace_only(text)
-                                || stylesheet_space_is_preserved(child))
-                        {
-                            body.push(Instruction::Text(text.into(), false));
-                        }
-                    } else if child.is_element() {
-                        body.push(compile_instruction(child, context.descend()?)?);
-                    }
-                }
-            }
-            Instruction::ForEach {
-                select: context.expression(required_attr(node, "select")?, node)?,
-                sorts,
-                body: body.into(),
-            }
-        }
+        "call-template" => compile_call_template(node, &context)?,
+        "for-each" => compile_for_each(node, &context)?,
         "if" => Instruction::If {
             test: context.expression(required_attr(node, "test")?, node)?,
             body: sequence()?,
         },
-        "choose" => {
-            let mut branches = vec![];
-            let mut otherwise = Arc::from([]);
-            let mut saw_otherwise = false;
-            for child in node.children() {
-                if child.is_text() {
-                    if is_ignorable_stylesheet_text(child) {
-                        continue;
-                    }
-                    return Err(Error::Static(
-                        "xsl:choose does not permit character data".into(),
-                    ));
-                }
-                if !child.is_element() {
-                    continue;
-                }
-                if child.has_tag_name((XSLT_NS, "when")) && !saw_otherwise {
-                    validate_instruction_attributes(child, context.forward)?;
-                    branches.push((
-                        context.expression(required_attr(child, "test")?, child)?,
-                        compile_sequence(child.children(), context.descend()?)?,
-                    ));
-                } else if child.has_tag_name((XSLT_NS, "otherwise")) {
-                    validate_instruction_attributes(child, context.forward)?;
-                    if saw_otherwise {
-                        return Err(Error::Static(
-                            "xsl:choose permits only one xsl:otherwise".into(),
-                        ));
-                    }
-                    saw_otherwise = true;
-                    otherwise = compile_sequence(child.children(), context.descend()?)?;
-                } else {
-                    return Err(Error::Static(
-                        "xsl:choose accepts only xsl:when and xsl:otherwise".into(),
-                    ));
-                }
-            }
-            if branches.is_empty() {
-                return Err(Error::Static("xsl:choose requires xsl:when".into()));
-            }
-            Instruction::Choose {
-                branches,
-                otherwise,
-            }
-        }
+        "choose" => compile_choose(node, &context)?,
         "value-of" => {
             require_empty_instruction(node)?;
             Instruction::ValueOf {
@@ -3933,34 +4054,16 @@ fn compile_instruction(
             require_empty_instruction(node)?;
             Instruction::CopyOf {
                 select: context.expression(required_attr(node, "select")?, node)?,
-                base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
+                base_uri: effective_base_uri(node, context.static_base_uri.as_deref()),
             }
         }
         "copy" => Instruction::Copy {
-            base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
+            base_uri: effective_base_uri(node, context.static_base_uri.as_deref()),
             body: sequence()?,
             attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
         },
-        "element" => Instruction::Element {
-            base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
-            name: parse_avt(required_attr(node, "name")?, node, &context)?,
-            namespace: node
-                .attribute("namespace")
-                .map(|v| parse_avt(v, node, &context))
-                .transpose()?,
-            body: sequence()?,
-            attribute_sets: qname_list_attr(node, "use-attribute-sets")?,
-            namespaces: computed_element_namespaces(node),
-        },
-        "attribute" => Instruction::Attribute {
-            name: parse_avt(required_attr(node, "name")?, node, &context)?,
-            namespace: node
-                .attribute("namespace")
-                .map(|v| parse_avt(v, node, &context))
-                .transpose()?,
-            body: sequence()?,
-            namespaces: namespaces(node),
-        },
+        "element" => compile_element(node, &context)?,
+        "attribute" => compile_attribute(node, &context)?,
         "text" => {
             if node
                 .children()
@@ -3982,7 +4085,7 @@ fn compile_instruction(
             body: sequence()?,
         },
         "number" => Instruction::Number(compile_number(node, &context)?),
-        "variable" => Instruction::Variable(compile_variable(node, context)?),
+        "variable" => Instruction::Variable(compile_variable(node, &context)?),
         "param" => {
             return Err(Error::Static(
                 "xsl:param must precede template content".into(),
@@ -3997,25 +4100,7 @@ fn compile_instruction(
                 "xsl:fallback is permitted only as a child of an extension instruction".into(),
             ));
         }
-        _unknown if context.forward => {
-            let mut fallback = Vec::new();
-            let fallback_nodes = node
-                .children()
-                .filter(|child| child.has_tag_name((XSLT_NS, "fallback")))
-                .collect::<Vec<_>>();
-            for child in &fallback_nodes {
-                fallback.extend(
-                    compile_sequence(child.children(), context.descend()?)?
-                        .iter()
-                        .cloned(),
-                );
-            }
-            Instruction::ExtensionFallback {
-                name: node.tag_name().name().into(),
-                present: !fallback_nodes.is_empty(),
-                body: fallback.into(),
-            }
-        }
+        _unknown if context.forward => compile_fallback(node, &context, |_| Ok(()))?,
         unknown => {
             return Err(Error::Static(format!(
                 "unknown XSLT instruction xsl:{unknown}"
@@ -4028,7 +4113,7 @@ fn push_with_param(
     parameters: &mut Vec<WithParam>,
     names: &mut HashSet<ExpandedName>,
     node: roxmltree::Node<'_, '_>,
-    context: CompileContext,
+    context: &CompileContext<'_>,
 ) -> Result<()> {
     let variable = compile_variable(node, context)?;
     if !names.insert(variable.name.clone()) {
@@ -4335,12 +4420,12 @@ fn compile_literal_element(
         .transpose()?
         .unwrap_or_default();
     Ok(Instruction::LiteralElement {
-        base_uri: effective_base_uri(node, context.static_base_uri.as_deref())?,
+        base_uri: effective_base_uri(node, context.static_base_uri.as_deref()),
         name: ExpandedName::new(node.tag_name().namespace(), node.tag_name().name()),
         prefix,
         attributes,
         namespaces,
-        children: compile_sequence(node.children(), context)?,
+        children: compile_sequence(node.children(), &context)?,
         attribute_sets,
     })
 }
@@ -4540,17 +4625,20 @@ fn validate_local_binding_scope(
     Ok(())
 }
 
-fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> Result<Variable> {
+fn compile_variable(
+    node: roxmltree::Node<'_, '_>,
+    context: &CompileContext<'_>,
+) -> Result<Variable> {
     validate_instruction_attributes(node, context.forward)?;
     let name = required_qname_attr(node, "name")?;
-    validate_local_binding_scope(node, &name, &context)?;
+    validate_local_binding_scope(node, &name, context)?;
     let select = node
         .attribute("select")
         .map(|value| context.expression(value, node))
         .transpose()?;
-    let base_uri = effective_base_uri(node, context.static_base_uri.as_deref())?;
-    let content = compile_sequence(node.children(), context.clone())?;
-    if select.is_some() && !content.is_empty() {
+    let base_uri = effective_base_uri(node, context.static_base_uri.as_deref());
+    let body = compile_sequence(node.children(), context)?;
+    if select.is_some() && !body.is_empty() {
         return Err(Error::Static(
             "variable with select cannot have content".into(),
         ));
@@ -4558,7 +4646,7 @@ fn compile_variable(node: roxmltree::Node<'_, '_>, context: CompileContext) -> R
     let variable = Variable {
         name,
         select,
-        content,
+        content: body,
         base_uri,
     };
     context.register_local_binding(node, &variable.name)?;
@@ -4652,11 +4740,11 @@ fn parse_avt(
         match ch {
             '{' if chars.peek().is_some_and(|(_, c)| *c == '{') => {
                 chars.next();
-                literal.push('{')
+                literal.push('{');
             }
             '}' if chars.peek().is_some_and(|(_, c)| *c == '}') => {
                 chars.next();
-                literal.push('}')
+                literal.push('}');
             }
             '{' => {
                 if !literal.is_empty() {
@@ -4671,9 +4759,9 @@ fn parse_avt(
                     };
                     if matches!(c, '\'' | '"') {
                         if quote == Some(c) {
-                            quote = None
+                            quote = None;
                         } else if quote.is_none() {
-                            quote = Some(c)
+                            quote = Some(c);
                         }
                     }
                     if c == '}' && quote.is_none() {
@@ -4751,7 +4839,7 @@ fn merge_output(
         if method.is_some_and(|method| {
             merge_output_property(&mut out.method, &mut properties.method, method, precedence)
         }) {
-            out.method_explicit = true;
+            out.explicit.method = true;
         }
     }
     if let Some(v) = node.attribute("version") {
@@ -4770,7 +4858,7 @@ fn merge_output(
             precedence,
         )
     {
-        out.encoding_explicit = true;
+        out.explicit.encoding = true;
     }
     if let Some(value) = node
         .attribute("omit-xml-declaration")
@@ -4821,7 +4909,7 @@ fn merge_output(
         .flatten()
         && merge_output_property(&mut out.indent, &mut properties.indent, value, precedence)
     {
-        out.indent_explicit = true;
+        out.explicit.indent = true;
     }
     if let Some(v) = node.attribute("media-type") {
         merge_output_property(
@@ -4831,6 +4919,14 @@ fn merge_output(
             precedence,
         );
     }
+    merge_cdata_output(out, node, forward)
+}
+
+fn merge_cdata_output(
+    out: &mut OutputDefinition,
+    node: roxmltree::Node<'_, '_>,
+    forward: bool,
+) -> Result<()> {
     if let Some(v) = node.attribute("cdata-section-elements") {
         let names = v
             .split_ascii_whitespace()
@@ -4968,7 +5064,7 @@ fn validate_key_dependency_expression(
 impl AttributeSet {
     fn parse(
         node: roxmltree::Node<'_, '_>,
-        context: CompileContext,
+        context: &CompileContext<'_>,
         precedence: usize,
         order: usize,
     ) -> Result<Self> {

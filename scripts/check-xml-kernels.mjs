@@ -9,7 +9,7 @@ const directories = ['crates/xml-sec-xml-input/src/', 'src/c14n/', 'src/parser_r
 const files = new Set(['src/document.rs', 'src/encoding.rs', 'src/xml.rs', 'src/hard_limits/xpath.rs',
   'vendor/sxd-xpath-no-unsafe/tests/integration.rs']);
 
-function physical(path) {
+export function physical(path) {
   try { return realpathSync(path); }
   catch { return resolve(path); }
 }
@@ -21,8 +21,9 @@ export function ownsSource(root, filename) {
 }
 
 export class DiagnosticGate {
-  constructor(root) {
+  constructor(root, sourceOwner) {
     this.root = root;
+    this.sourceOwner = sourceOwner;
     this.failures = [];
     this.seen = new Set();
     this.finished = false;
@@ -51,7 +52,7 @@ export class DiagnosticGate {
     let owned;
     while (pending.length) {
       const span = pending.pop();
-      if (ownsSource(this.root, span.file_name)) { owned = span; break; }
+      if (this.sourceOwner(this.root, span.file_name)) { owned = span; break; }
       if (span.expansion?.span) pending.push(span.expansion.span);
     }
     // Compiler failures are terminal irrespective of scope. Warnings from
@@ -68,9 +69,9 @@ export class DiagnosticGate {
   }
 }
 
-async function check(root, name, args) {
-  console.error(`XML-kernel pedantic: ${name}`);
-  const gate = new DiagnosticGate(root);
+export async function check(root, name, args, sourceOwner) {
+  console.error(`Component pedantic: ${name}`);
+  const gate = new DiagnosticGate(root, sourceOwner);
   const child = spawn('cargo', ['clippy', ...args, '--message-format=json', '--',
     '--force-warn', 'clippy::pedantic'], { cwd: root, stdio: ['ignore', 'pipe', 'inherit'] });
   const completed = new Promise((resolve, reject) => {
@@ -100,7 +101,7 @@ async function main() {
     ['core-minimal', ['-p', 'xml-sec', '--lib', '--no-default-features', '--features',
       'xmldsig,xmlenc,c14n,xml-backend-differential']],
     ['xml-input-alloc', ['-p', 'xml-sec-xml-input', '--lib', '--no-default-features']],
-  ]) await check(root, name, args);
+  ]) await check(root, name, args, ownsSource);
   console.log('XML-kernel pedantic: all entry graphs passed');
 }
 
