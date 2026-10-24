@@ -441,16 +441,16 @@ fn parse_budget_controls_entity_expansion_depth() {
     // XML 1.0 section 4.4.2 requires included replacement text to be processed in place and
     // defines no fixed nesting ceiling; recursion is therefore a caller-selected budget.
     // https://www.w3.org/TR/xml/#included
-    let declarations = (0..12)
-        .map(|depth| {
-            let replacement = if depth == 11 {
-                "expanded".to_owned()
-            } else {
-                format!("&e{};", depth + 1)
-            };
-            format!(r#"<!ENTITY e{depth} "{replacement}">"#)
-        })
-        .collect::<String>();
+    let mut declarations = String::new();
+    for depth in 0..12 {
+        write!(declarations, "<!ENTITY e{depth} \"").expect("writing to String cannot fail");
+        if depth == 11 {
+            declarations.push_str("expanded");
+        } else {
+            write!(declarations, "&e{};", depth + 1).expect("writing to String cannot fail");
+        }
+        declarations.push_str("\">");
+    }
     let xml = format!("<!DOCTYPE root [{declarations}]><root>&e0;</root>");
     let constrained = ParseBudget::new(
         usize::MAX,
@@ -508,7 +508,9 @@ fn parse_budget_controls_namespace_scope_materialization() {
                 assert!(actual > exact_limit);
                 exact_limit = actual;
             }
-            Err(_) => panic!("namespace storage must use the typed parse-budget contract"),
+            Err(error) => {
+                panic!("namespace storage must use the typed parse-budget contract: {error}")
+            }
         }
     }
     let below_boundary = ParseBudget::new(
@@ -638,9 +640,12 @@ fn defaulted_xml_id_is_processed_atomically() {
     assert!(document.ids().any(|(value, root, owner)| value == "target"
         && root == document.root()
         && owner == first));
-    let first_attributes = match &document.node(first).expect("first remains present").kind {
-        NodeKind::Element { attributes, .. } => attributes,
-        _ => panic!("first remains an element"),
+    let NodeKind::Element {
+        attributes: first_attributes,
+        ..
+    } = &document.node(first).expect("first remains present").kind
+    else {
+        panic!("first remains an element");
     };
     assert_eq!(first_attributes[0].value, "target");
 
@@ -652,9 +657,12 @@ fn defaulted_xml_id_is_processed_atomically() {
         .add_default_attribute(second, xml_id("target"))
         .expect_err("duplicate defaulted xml:id is rejected");
     assert!(duplicate.to_string().contains("duplicate XML ID"));
-    let second_attributes = match &document.node(second).expect("second remains present").kind {
-        NodeKind::Element { attributes, .. } => attributes,
-        _ => panic!("second remains an element"),
+    let NodeKind::Element {
+        attributes: second_attributes,
+        ..
+    } = &document.node(second).expect("second remains present").kind
+    else {
+        panic!("second remains an element");
     };
     assert!(second_attributes.is_empty(), "failed additions are atomic");
 }
@@ -1059,8 +1067,8 @@ fn internal_dtd_enumerations_follow_xml_token_grammar() {
 #[test]
 fn internal_dtd_markup_declarations_follow_xml_grammar() {
     for valid in [
-        r#"<!DOCTYPE r [<!ELEMENT r (head, (body | note)*, tail?)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA | item)*>]><r/>"#,
+        r"<!DOCTYPE r [<!ELEMENT r (head, (body | note)*, tail?)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (#PCDATA | item)*>]><r/>",
         r#"<!DOCTYPE r [<!NOTATION png SYSTEM "image/png">]><r/>"#,
         r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png">]><r/>"#,
         r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" "png.viewer">]><r/>"#,
@@ -1071,18 +1079,18 @@ fn internal_dtd_markup_declarations_follow_xml_grammar() {
     }
 
     for malformed in [
-        r#"<!DOCTYPE r [<!ELEMENT r (a||b)>]><r/>"#,
+        r"<!DOCTYPE r [<!ELEMENT r (a||b)>]><r/>",
         // PE references within internal declarations violate XML 1.0 section 2.8.
         r#"<!DOCTYPE r [<!ENTITY % p "parameter"><!ENTITY e "%p; &amp; &#37;">]><r>&e;</r>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (a,b|c)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (#PCDATA|item)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r EMPTY extra>]><r/>"#,
-        r#"<!DOCTYPE r [<!NOTATION png SYSTEM>]><r/>"#,
+        r"<!DOCTYPE r [<!ELEMENT r (a,b|c)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (#PCDATA|item)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r EMPTY extra>]><r/>",
+        r"<!DOCTYPE r [<!NOTATION png SYSTEM>]><r/>",
         r#"<!DOCTYPE r [<!NOTATION png PUBLIC "image/png" extra>]><r/>"#,
         r#"<!DOCTYPE r [<!ENTITY e PUBLIC "[bad" "urn:example">]><r/>"#,
         r#"<!DOCTYPE r [<!ENTITY e "%">]><r>&e;</r>"#,
         r#"<!DOCTYPE r [<!ENTITY e "&bad">]><r>&e;</r>"#,
-        r#"<!DOCTYPE r [<!UNKNOWN r ANY>]><r/>"#,
+        r"<!DOCTYPE r [<!UNKNOWN r ANY>]><r/>",
     ] {
         Document::parse_iterative(malformed, None)
             .expect_err("malformed markup declaration must be rejected");
@@ -1092,21 +1100,21 @@ fn internal_dtd_markup_declarations_follow_xml_grammar() {
 #[test]
 fn element_children_groups_follow_choice_and_sequence_grammar() {
     for valid in [
-        r#"<!DOCTYPE r [<!ELEMENT r (a)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (a?)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r ((a,b))>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (a,b)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (a|b)>]><r/>"#,
+        r"<!DOCTYPE r [<!ELEMENT r (a)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (a?)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r ((a,b))>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (a,b)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (a|b)>]><r/>",
     ] {
         Document::parse_iterative(valid, None)
             .expect("single-particle sequences and multi-particle groups remain valid");
     }
 
     for malformed in [
-        r#"<!DOCTYPE r [<!ELEMENT r ()>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (|a)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (a|)>]><r/>"#,
-        r#"<!DOCTYPE r [<!ELEMENT r (a,)>]><r/>"#,
+        r"<!DOCTYPE r [<!ELEMENT r ()>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (|a)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (a|)>]><r/>",
+        r"<!DOCTYPE r [<!ELEMENT r (a,)>]><r/>",
     ] {
         Document::parse_iterative(malformed, None)
             .expect_err("incomplete choice and sequence groups must be rejected");
@@ -1583,9 +1591,10 @@ fn bounded_parse_rejects_source_before_building_the_tree() {
 fn parser_workspace_bound_covers_wide_retained_documents() {
     // External-resource parsing reserves this bound before scanning. A wide start tag is the
     // adversarial shape where attribute-vector and semantic-arena storage dominate input size.
-    let attributes = (0..4096)
-        .map(|index| format!(" a{index}='x'"))
-        .collect::<String>();
+    let mut attributes = String::new();
+    for index in 0..4096 {
+        write!(attributes, " a{index}='x'").expect("writing to String cannot fail");
+    }
     let xml = format!("<root{attributes}/>");
     let document = Document::parse(&xml, None).expect("wide document parses");
     assert!(parser_workspace_bytes(&xml) >= document.estimated_owned_bytes());

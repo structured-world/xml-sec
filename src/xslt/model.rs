@@ -61,7 +61,7 @@ impl NodeId {
     }
 }
 
-/// Stable identity of any XPath node in one owned document.
+/// Stable identity of any `XPath` node in one owned document.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum NodeReference {
@@ -310,11 +310,17 @@ impl Document {
     /// Parse trusted, caller-decoded XML without a caller-selected resource budget.
     ///
     /// Use [`Self::parse_with_budget`] for untrusted input.
+    ///
+    /// # Errors
+    /// Returns XML syntax or entity expansion failures.
     pub fn parse(xml: &str, base_uri: Option<&str>) -> Result<Self> {
         Self::parse_iterative(xml, base_uri)
     }
 
     /// Parse caller-decoded XML with explicit structural and allocation limits.
+    ///
+    /// # Errors
+    /// Returns XML syntax, entity expansion, structural or resource-budget failures.
     pub fn parse_with_budget(
         xml: &str,
         base_uri: Option<&str>,
@@ -324,6 +330,7 @@ impl Document {
     }
 
     /// [`Self::parse_with_budget`], also reporting the parser work it admitted.
+    #[must_use]
     pub fn parse_with_budget_reported(
         xml: &str,
         base_uri: Option<&str>,
@@ -348,6 +355,9 @@ impl Document {
     /// Decode and parse trusted XML bytes without a caller-selected resource budget.
     ///
     /// Use [`Self::parse_bytes_with_budget`] for untrusted input.
+    ///
+    /// # Errors
+    /// Returns XML encoding, syntax or entity expansion failures.
     pub fn parse_bytes(bytes: &[u8], base_uri: Option<&str>) -> Result<Self> {
         let xml =
             xml_sec_xml_input::decode_xml(bytes, None).map_err(super::error::decoded_xml_error)?;
@@ -355,6 +365,9 @@ impl Document {
     }
 
     /// Decode and parse XML bytes with explicit structural and allocation limits.
+    ///
+    /// # Errors
+    /// Returns encoding, XML syntax, entity expansion, structural or resource-budget failures.
     pub fn parse_bytes_with_budget(
         bytes: &[u8],
         base_uri: Option<&str>,
@@ -554,70 +567,7 @@ impl Document {
                 .and_then(|node| mapping.get(&node.id()).copied())
                 .ok_or_else(|| Error::Xml("parsed node has no projected parent".into()))?;
             let kind = if source.is_element() {
-                let prefix = lexical_prefix(xml, source.range().start, source.tag_name().name());
-                if !super::lexical::is_ncname(source.tag_name().name())
-                    || prefix
-                        .as_deref()
-                        .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
-                {
-                    return Err(Error::Xml("invalid element QName".into()));
-                }
-                let attributes = source
-                    .attributes()
-                    .map(|attribute| {
-                        let prefix = attribute_prefix(xml, source, attribute);
-                        if !super::lexical::is_ncname(attribute.name())
-                            || prefix
-                                .as_deref()
-                                .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
-                        {
-                            return Err(Error::Xml("invalid attribute QName".into()));
-                        }
-                        Ok(Attribute {
-                            name: ExpandedName::new(attribute.namespace(), attribute.name()),
-                            prefix,
-                            value: attribute.value().to_owned(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let mut namespaces = Arc::new(Vec::new());
-                let mut namespace_index = HashMap::new();
-                for namespace in source.namespaces() {
-                    if namespace
-                        .name()
-                        .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
-                    {
-                        return Err(Error::Xml("invalid namespace prefix".into()));
-                    }
-                    validate_namespace_binding(namespace.name(), namespace.uri())?;
-                    set_namespace(
-                        &mut namespaces,
-                        &mut namespace_index,
-                        namespace.name().map(str::to_owned),
-                        namespace.uri().to_owned(),
-                    );
-                }
-                if !namespaces.iter().any(|namespace| {
-                    namespace.prefix.as_deref() == Some("xml")
-                        && namespace.uri == "http://www.w3.org/XML/1998/namespace"
-                }) {
-                    Arc::make_mut(&mut namespaces).insert(
-                        0,
-                        Namespace {
-                            prefix: Some("xml".into()),
-                            uri: "http://www.w3.org/XML/1998/namespace".into(),
-                        },
-                    );
-                }
-                NodeKind::Element {
-                    name: ExpandedName::new(
-                        source.tag_name().namespace(),
-                        source.tag_name().name(),
-                    ),
-                    prefix,
-                    attributes,
-                    namespaces,
-                }
+                project_tree_element(xml, source)?
             } else if source.is_text() {
                 NodeKind::Text {
                     value: source.text().unwrap_or_default().to_owned(),
@@ -642,7 +592,7 @@ impl Document {
                 Some(super::resolver::resolve_uri_reference(
                     inherited_base.as_deref(),
                     reference,
-                )?)
+                ))
             } else {
                 inherited_base
             };
@@ -673,14 +623,6 @@ impl Document {
         budget: ParseBudget,
         work: &mut ParseWork,
     ) -> Result<Self> {
-        #[derive(Clone, Copy, PartialEq, Eq)]
-        enum DocumentPhase {
-            Start,
-            Prolog,
-            Content,
-            Epilog,
-        }
-
         ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
         ensure(BudgetKind::SourceNodes, budget.source_nodes, 1)?;
         let initial_owned = std::mem::size_of::<Node>()
@@ -741,269 +683,30 @@ impl Document {
                 temporary: &lexical_temporary,
             },
         );
-        let mut previous_event_offset = 0usize;
-        let mut source_line = 1usize;
-        let mut phase = DocumentPhase::Start;
         // XML 1.0 section 2.8 makes matching the DOCTYPE and document-element names a validity
         // constraint; section 5.1 does not require this non-validating parser to enforce it.
         // https://www.w3.org/TR/xml/#sec-prolog-dtd
-        let mut saw_doctype = false;
         let mut elements = Vec::new();
         reserve_charged(&mut elements, 1, &mut meter)?;
         elements.push(StreamElementFrame {
             node: document.root,
             lexical_name: None,
         });
-        loop {
-            lexical_held.set(
-                meter
-                    .retained_bytes()
-                    .saturating_add(meter.entity_expansion.used)
-                    .saturating_add(meter.entity_expansion.declaration_bytes),
-            );
-            let Some(event) = reader.next_event().map_err(|error| match error {
-                xml_sec_xml_input::lexical::Error::Resource(error) => error,
-                error => Error::Xml(error.to_string()),
-            })?
-            else {
-                break;
-            };
-            let event_offset = event_range_start(&event);
-            source_line = source_line.saturating_add(xml_line_endings(
-                &expanded_xml.as_bytes()[previous_event_offset..event_offset],
-            ));
-            previous_event_offset = event_offset;
-            match event {
-                Event::Start(start) => {
-                    #[cfg(test)]
-                    expansion_workspace_tests::SCANNED_ATTRIBUTES
-                        .with(|count| count.set(count.get() + start.attributes.len()));
-                    let lexical_bytes = start.attributes.bytes();
-                    meter.charge_owned(lexical_bytes)?;
-                    if elements.len() == 1 {
-                        if phase == DocumentPhase::Epilog {
-                            return Err(Error::Xml("multiple document elements".into()));
-                        }
-                        phase = DocumentPhase::Content;
-                    }
-                    let id = push_stream_element(
-                        &mut document,
-                        &mut elements,
-                        &start,
-                        false,
-                        &declarations,
-                        &mut meter,
-                    )?;
-                    document.nodes[id.0].source_line = Some(source_line);
-                    drop(start);
-                    meter.release_owned(lexical_bytes);
-                }
-                Event::Empty(start) => {
-                    #[cfg(test)]
-                    expansion_workspace_tests::SCANNED_ATTRIBUTES
-                        .with(|count| count.set(count.get() + start.attributes.len()));
-                    let lexical_bytes = start.attributes.bytes();
-                    meter.charge_owned(lexical_bytes)?;
-                    if elements.len() == 1 {
-                        if phase == DocumentPhase::Epilog {
-                            return Err(Error::Xml("multiple document elements".into()));
-                        }
-                        phase = DocumentPhase::Epilog;
-                    }
-                    let id = push_stream_element(
-                        &mut document,
-                        &mut elements,
-                        &start,
-                        true,
-                        &declarations,
-                        &mut meter,
-                    )?;
-                    document.nodes[id.0].source_line = Some(source_line);
-                    drop(start);
-                    meter.release_owned(lexical_bytes);
-                }
-                Event::End { name, .. } => {
-                    if elements.len() == 1 {
-                        return Err(Error::Xml("unmatched closing element".into()));
-                    }
-                    let opening_name = elements
-                        .last()
-                        .and_then(|frame| frame.lexical_name)
-                        .expect("non-root element frames retain their lexical name");
-                    if name != opening_name {
-                        let closing_name = name.qualified();
-                        let opening_name = opening_name.qualified();
-                        return Err(Error::Xml(format!(
-                            "closing element `{closing_name}` does not match `{opening_name}`"
-                        )));
-                    }
-                    elements.pop();
-                    if elements.len() == 1 {
-                        phase = DocumentPhase::Epilog;
-                    }
-                }
-                Event::Text { text, .. } => {
-                    if elements.len() == 1 && !text.trim_matches([' ', '\t', '\r', '\n']).is_empty()
-                    {
-                        return Err(Error::Xml(
-                            "non-whitespace text outside the document element".into(),
-                        ));
-                    }
-                    if elements.len() > 1 && !text.is_empty() {
-                        let id = push_parsed_text(
-                            &mut document,
-                            &elements,
-                            ParsedText::Source(text),
-                            &mut meter,
-                        )?;
-                        document.nodes[id.0].source_line.get_or_insert(source_line);
-                    } else if phase == DocumentPhase::Start {
-                        phase = DocumentPhase::Prolog;
-                    }
-                }
-                Event::CData { text, .. } => {
-                    if elements.len() == 1 {
-                        return Err(Error::Xml(
-                            "CDATA is not allowed outside the document element".into(),
-                        ));
-                    }
-                    let id = push_parsed_text(
-                        &mut document,
-                        &elements,
-                        ParsedText::Source(text),
-                        &mut meter,
-                    )?;
-                    document.nodes[id.0].source_line.get_or_insert(source_line);
-                }
-                Event::Comment { text, .. } => {
-                    if phase == DocumentPhase::Start {
-                        phase = DocumentPhase::Prolog;
-                    }
-                    let parent = elements
-                        .last()
-                        .expect("document frame remains present")
-                        .node;
-                    meter.reserve_node()?;
-                    let value = copy_parsed_text(ParsedText::Source(text), &mut meter)?;
-                    let inherited_base = copy_base_uri(&document, parent, &mut meter)?;
-                    let id = push_metered(
-                        &mut document,
-                        parent,
-                        NodeKind::Comment(value),
-                        inherited_base,
-                        &mut meter,
-                    )?;
-                    document.nodes[id.0].source_line = Some(source_line);
-                }
-                Event::ProcessingInstruction {
-                    target, content, ..
-                } => {
-                    if phase == DocumentPhase::Start {
-                        phase = DocumentPhase::Prolog;
-                    }
-                    let parent = elements
-                        .last()
-                        .expect("document frame remains present")
-                        .node;
-                    meter.reserve_node()?;
-                    let target = copy_parsed_literal(target, &mut meter)?;
-                    let value = content
-                        .map(|text| copy_parsed_text(ParsedText::Source(text), &mut meter))
-                        .transpose()?;
-                    let inherited_base = copy_base_uri(&document, parent, &mut meter)?;
-                    let id = push_metered(
-                        &mut document,
-                        parent,
-                        NodeKind::ProcessingInstruction { target, value },
-                        inherited_base,
-                        &mut meter,
-                    )?;
-                    document.nodes[id.0].source_line = Some(source_line);
-                }
-                Event::Reference {
-                    name: reference, ..
-                } => {
-                    if elements.len() == 1 {
-                        return Err(Error::Xml(
-                            "character and entity references are not allowed outside the document element"
-                                .into(),
-                        ));
-                    }
-                    let value = match reference {
-                        "amp" => '&',
-                        "apos" => '\'',
-                        "gt" => '>',
-                        "lt" => '<',
-                        "quot" => '"',
-                        value if value.starts_with('#') => {
-                            xml_sec_xml_input::lexical::decode_numeric_character_reference(
-                                &value[1..],
-                            )
-                            .map_err(|_| Error::Xml("invalid character reference".into()))?
-                        }
-                        name => {
-                            return Err(Error::Xml(format!(
-                                "unresolved entity reference &{name};"
-                            )));
-                        }
-                    };
-                    let id = push_parsed_text(
-                        &mut document,
-                        &elements,
-                        ParsedText::Reference(value),
-                        &mut meter,
-                    )?;
-                    document.nodes[id.0].source_line.get_or_insert(source_line);
-                }
-                Event::Declaration { .. } => {
-                    if phase != DocumentPhase::Start {
-                        return Err(Error::Xml(
-                            "XML declaration is permitted only at the start of the document".into(),
-                        ));
-                    }
-                    phase = DocumentPhase::Prolog;
-                }
-                Event::DocType { .. } => {
-                    if matches!(phase, DocumentPhase::Content | DocumentPhase::Epilog) {
-                        return Err(Error::Xml(
-                            "document type declaration is permitted only in the prolog".into(),
-                        ));
-                    }
-                    if saw_doctype {
-                        return Err(Error::Xml("duplicate document type declaration".into()));
-                    }
-                    saw_doctype = true;
-                    phase = DocumentPhase::Prolog;
-                }
-            }
-        }
-        if elements.len() != 1 {
-            return Err(Error::Xml("unclosed element".into()));
-        }
-        if phase != DocumentPhase::Epilog {
-            return Err(Error::Xml("document element is missing".into()));
-        }
+        let mut builder = StreamDocumentBuilder {
+            document: &mut document,
+            elements: &mut elements,
+            declarations: &declarations,
+            meter: &mut meter,
+            phase: DocumentPhase::Start,
+            saw_doctype: false,
+        };
+        builder.scan(&mut reader, expanded_xml.as_ref(), &lexical_held)?;
         let stack_bytes = elements.capacity() * std::mem::size_of::<StreamElementFrame>();
         drop(elements);
         drop(reader);
         drop(expanded_xml);
         meter.release_owned(stack_bytes);
-        let unparsed = std::mem::take(&mut declarations.unparsed);
-        for (name, system_identifier) in unparsed {
-            let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier)?;
-            // Transfer the name's existing admission rather than charging its allocation twice.
-            let name_bytes = name.capacity();
-            meter.entity_expansion.release_declarations(name_bytes);
-            declarations.owned_bytes -= name_bytes;
-            meter.charge_owned(name_bytes)?;
-            // Names are unique in `declarations`, so every entry is kept.
-            reserve_index_entry(&mut document.unparsed_entities, uri.capacity(), &mut meter)?;
-            document.register_unparsed_entity(name, uri)?;
-            let released = system_identifier.capacity();
-            drop(system_identifier);
-            meter.entity_expansion.release_declarations(released);
-            declarations.owned_bytes -= released;
-        }
+        document.transfer_unparsed_entities(&mut declarations, base_uri, &mut meter)?;
         let declaration_bytes = declarations.owned_bytes;
         drop(declarations);
         meter
@@ -1013,12 +716,37 @@ impl Document {
         document.retained_bytes = meter.retained_bytes();
         Ok(document)
     }
+    fn transfer_unparsed_entities(
+        &mut self,
+        declarations: &mut InternalEntityDeclarations,
+        base_uri: Option<&str>,
+        meter: &mut StreamParseMeter<'_>,
+    ) -> Result<()> {
+        let unparsed = std::mem::take(&mut declarations.unparsed);
+        for (name, system_identifier) in unparsed {
+            let uri = super::resolver::resolve_uri_reference(base_uri, &system_identifier);
+            // Transfer the name's existing admission rather than charging its allocation twice.
+            let name_bytes = name.capacity();
+            meter.entity_expansion.release_declarations(name_bytes);
+            declarations.owned_bytes -= name_bytes;
+            meter.charge_owned(name_bytes)?;
+            // Names are unique in `declarations`, so every entry is kept.
+            reserve_index_entry(&mut self.unparsed_entities, uri.capacity(), meter)?;
+            self.register_unparsed_entity(name, uri)?;
+            let released = system_identifier.capacity();
+            drop(system_identifier);
+            meter.entity_expansion.release_declarations(released);
+            declarations.owned_bytes -= released;
+        }
+
+        Ok(())
+    }
 
     #[must_use]
     pub fn empty(base_uri: Option<String>) -> Self {
+        static NEXT_DOCUMENT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         #[cfg(test)]
         expansion_workspace_tests::CREATED_ROOTS.with(|count| count.set(count.get() + 1));
-        static NEXT_DOCUMENT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         let identity = NEXT_DOCUMENT_IDENTITY.fetch_add(1, Ordering::Relaxed);
         Self {
             identity,
@@ -1203,6 +931,9 @@ impl Document {
     ///
     /// This lets a caller that parsed trusted DTD/schema metadata preserve the
     /// typed ID information without enabling DTD processing in this crate.
+    ///
+    /// # Errors
+    /// Returns an error for a stale attribute, empty or duplicate ID, or missing logical document.
     pub fn mark_id_attribute(&mut self, owner: NodeId, attribute_index: usize) -> Result<()> {
         let value = &self
             .node(owner)
@@ -1260,6 +991,9 @@ impl Document {
     /// Apply XML's whitespace collapsing rule to an attribute declared with a
     /// tokenized DTD type. The caller supplies trusted declaration metadata;
     /// the core parser deliberately does not load DTD resources itself.
+    ///
+    /// # Errors
+    /// Returns an error when the attribute is absent or its owner is not a current element.
     pub fn normalize_tokenized_attribute(
         &mut self,
         owner: NodeId,
@@ -1279,6 +1013,12 @@ impl Document {
     }
 
     /// Add a schema/DTD-defaulted attribute supplied by a trusted parser.
+    ///
+    /// # Errors
+    /// Returns an error for a stale or non-element owner, invalid `xml:id`, or conflicting ID.
+    ///
+    /// # Panics
+    /// Panics if internal arena invariants change the validated owner during ID registration.
     pub fn add_default_attribute(&mut self, owner: NodeId, mut attribute: Attribute) -> Result<()> {
         let node = self
             .node(owner)
@@ -1297,7 +1037,7 @@ impl Document {
         let updated_bases = if attribute.name.namespace.as_deref() == Some(XML_NS)
             && attribute.name.local == "base"
         {
-            Some(self.defaulted_xml_base_updates(owner, &attribute.value)?)
+            Some(self.defaulted_xml_base_updates(owner, &attribute.value))
         } else {
             None
         };
@@ -1337,11 +1077,9 @@ impl Document {
         &self,
         owner: NodeId,
         reference: &str,
-    ) -> Result<Vec<(NodeId, Option<String>)>> {
+    ) -> Vec<(NodeId, Option<String>)> {
         let inherited = self.node(owner).and_then(|node| node.base_uri.as_deref());
-        let owner_base = Some(super::resolver::resolve_uri_reference(
-            inherited, reference,
-        )?);
+        let owner_base = Some(super::resolver::resolve_uri_reference(inherited, reference));
         let mut updates = vec![(owner, owner_base)];
         let mut cursor = 0;
         while cursor < updates.len() {
@@ -1350,17 +1088,19 @@ impl Document {
                 let base_uri = {
                     let child_base = updates[cursor].1.as_deref();
                     self.nodes[child.0].xml_base_reference().map_or_else(
-                        || Ok(child_base.map(str::to_owned)),
+                        || child_base.map(str::to_owned),
                         |reference| {
-                            super::resolver::resolve_uri_reference(child_base, reference).map(Some)
+                            Some(super::resolver::resolve_uri_reference(
+                                child_base, reference,
+                            ))
                         },
-                    )?
+                    )
                 };
                 updates.push((child, base_uri));
             }
             cursor += 1;
         }
-        Ok(updates)
+        updates
     }
 
     pub(crate) fn ids(&self) -> impl Iterator<Item = (&str, NodeId, NodeId)> {
@@ -1373,6 +1113,9 @@ impl Document {
     ///
     /// The URI is metadata supplied by a trusted external parser. The XSLT
     /// engine exposes it through `unparsed-entity-uri()` but never dereferences it.
+    ///
+    /// # Errors
+    /// Returns an error when the entity name is empty or already registered.
     pub fn register_unparsed_entity(
         &mut self,
         name: impl Into<String>,
@@ -1466,20 +1209,7 @@ impl Document {
     }
 
     pub(crate) fn finalize_xml_ids(&mut self, meter: &mut Meter) -> Result<()> {
-        let (count, value_bytes) = self.nodes().fold((0usize, 0usize), |totals, (_, node)| {
-            let NodeKind::Element { attributes, .. } = &node.kind else {
-                return totals;
-            };
-            let Some(attribute) = attributes.iter().find(|attribute| {
-                attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "id"
-            }) else {
-                return totals;
-            };
-            (
-                totals.0.saturating_add(1),
-                totals.1.saturating_add(attribute.value.len()),
-            )
-        });
+        let (count, value_bytes) = self.xml_id_summary();
         if count == 0 {
             return Ok(());
         }
@@ -1572,7 +1302,24 @@ impl Document {
         meter.release_owned_bytes(peak_upper_bound.saturating_sub(retained));
         Ok(())
     }
+    fn xml_id_summary(&self) -> (usize, usize) {
+        self.nodes().fold((0usize, 0usize), |totals, (_, node)| {
+            let NodeKind::Element { attributes, .. } = &node.kind else {
+                return totals;
+            };
+            let Some(attribute) = attributes.iter().find(|attribute| {
+                attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "id"
+            }) else {
+                return totals;
+            };
+            (
+                totals.0.saturating_add(1),
+                totals.1.saturating_add(attribute.value.len()),
+            )
+        })
+    }
 
+    #[must_use = "iterate to inspect the document's nodes"]
     pub fn nodes(&self) -> impl ExactSizeIterator<Item = (NodeId, &Node)> {
         self.nodes
             .iter()
@@ -1947,6 +1694,16 @@ impl Document {
             meter.release_owned_bytes(temporary_bytes);
             return Err(error);
         }
+        self.remap_retained_nodes(&remap, &remap_by_index);
+        meter.release_owned_bytes(rebuilt_map_bytes);
+        meter.release_owned_bytes(temporary_bytes);
+        Ok((remap, retained_map_bytes))
+    }
+    fn remap_retained_nodes(
+        &mut self,
+        remap: &HashMap<NodeId, NodeId>,
+        remap_by_index: &[Option<NodeId>],
+    ) {
         self.ids = std::mem::take(&mut self.ids)
             .into_iter()
             .filter_map(|((root, value), owner)| {
@@ -1982,9 +1739,6 @@ impl Document {
         self.logical_roots.clear();
         self.logical_roots.push(self.root);
         self.source_bytes = 0;
-        meter.release_owned_bytes(rebuilt_map_bytes);
-        meter.release_owned_bytes(temporary_bytes);
-        Ok((remap, retained_map_bytes))
     }
 }
 
@@ -2048,93 +1802,17 @@ pub(crate) fn prepare_xml_frontend_bounded<'a>(
         .next_event()
         .map_err(|error| Error::Xml(error.to_string()))?
     {
-        let start = match event {
-            Event::Start(start) | Event::Empty(start) => start,
-            _ => continue,
+        let (Event::Start(start) | Event::Empty(start)) = event else {
+            continue;
         };
-        let defaults = declarations
-            .attributes
-            .get(start.name.qualified().as_ref())
-            .map_or(&[][..], Vec::as_slice);
-        for attribute in &start.attributes {
-            let name = attribute.name.qualified();
-            let is_cdata = defaults
-                .iter()
-                .find(|declaration| declaration.name == name)
-                .is_none_or(|declaration| declaration.attribute_type.is_cdata());
-            // XML 1.0 section 3.3.3 requires tokenized normalization even without
-            // entity references; removing the DTD otherwise loses this type information.
-            // https://www.w3.org/TR/xml/#AVNormalize
-            if is_cdata
-                && !contains_expandable_entity_reference(attribute.value, &declarations.general)
-            {
-                continue;
-            }
-            let value = prepare_attribute_value(
-                name.as_ref(),
-                attribute.value,
-                &declarations.general,
-                is_cdata,
-                &mut entity_references,
-                &mut entity_expansion,
-            )?;
-            let replacement_len = escaped_xml_attribute_value_len(&value)
-                .and_then(|length| length.checked_add(name.len()))
-                .and_then(|length| length.checked_add(3))
-                .ok_or_else(|| Error::Xml("expanded attribute output is too large".into()))?;
-            entity_expansion.charge(replacement_len)?;
-            let mut replacement = String::with_capacity(replacement_len);
-            replacement.push_str(name.as_ref());
-            replacement.push_str("=\"");
-            push_escaped_xml_attribute_value(&mut replacement, &value);
-            replacement.push('"');
-            edits.push((attribute.range.clone(), replacement));
-        }
-        // XML 1.0 section 3.3.2 requires a non-validating processor to report defaulted
-        // attributes when it reads their declarations from the internal subset.
-        // https://www.w3.org/TR/xml/#sec-attr-defaults
-        let mut insertion = String::new();
-        for declaration in defaults {
-            let Some(default) = declaration.default.as_deref() else {
-                continue;
-            };
-            if start
-                .attributes
-                .iter()
-                .any(|attribute| attribute.name.is_qualified(&declaration.name))
-            {
-                continue;
-            }
-            let value = prepare_attribute_value(
-                &declaration.name,
-                default,
-                &declarations.general,
-                declaration.attribute_type.is_cdata(),
-                &mut entity_references,
-                &mut entity_expansion,
-            )?;
-            let insertion_len = escaped_xml_attribute_value_len(&value)
-                .and_then(|length| length.checked_add(declaration.name.len()))
-                .and_then(|length| length.checked_add(4))
-                .ok_or_else(|| Error::Xml("DTD default attribute output is too large".into()))?;
-            // The insertion strings coexist with the final prepared document. Charge them before
-            // reserving so defaults cannot hide temporary allocation outside the XML budget.
-            entity_expansion.charge(insertion_len)?;
-            insertion.reserve(insertion_len);
-            insertion.push(' ');
-            insertion.push_str(&declaration.name);
-            insertion.push_str("=\"");
-            push_escaped_xml_attribute_value(&mut insertion, &value);
-            insertion.push('"');
-        }
-        if !insertion.is_empty() {
-            let before_close = if expanded_xml.as_bytes().get(start.range.end - 2) == Some(&b'/') {
-                start.range.end - 2
-            } else {
-                start.range.end - 1
-            };
-            edits.push((before_close..before_close, insertion));
-        }
+        prepare_frontend_attribute_edits(
+            expanded_xml.as_ref(),
+            &start,
+            &declarations,
+            &mut entity_references,
+            &mut entity_expansion,
+            &mut edits,
+        )?;
     }
 
     edits.sort_by_key(|(range, _)| range.start);
@@ -2160,6 +1838,118 @@ pub(crate) fn prepare_xml_frontend_bounded<'a>(
     }
     prepared.push_str(&expanded_xml[cursor..]);
     Ok(Cow::Owned(prepared))
+}
+fn prepare_frontend_attribute_edits(
+    xml: &str,
+    start: &xml_sec_xml_input::lexical::StartTag<'_>,
+    declarations: &InternalEntityDeclarations,
+    entity_references: &mut usize,
+    entity_expansion: &mut EntityExpansionMeter<'_>,
+    edits: &mut Vec<(std::ops::Range<usize>, String)>,
+) -> Result<()> {
+    let defaults = declarations
+        .attributes
+        .get(start.name.qualified().as_ref())
+        .map_or(&[][..], Vec::as_slice);
+
+    for attribute in &start.attributes {
+        let name = attribute.name.qualified();
+        let is_cdata = defaults
+            .iter()
+            .find(|declaration| declaration.name == name)
+            .is_none_or(|declaration| declaration.attribute_type.is_cdata());
+        // XML 1.0 section 3.3.3 requires tokenized normalization even without
+        // entity references; removing the DTD otherwise loses this type information.
+        // https://www.w3.org/TR/xml/#AVNormalize
+        if is_cdata && !contains_expandable_entity_reference(attribute.value, &declarations.general)
+        {
+            continue;
+        }
+        let value = prepare_attribute_value(
+            name.as_ref(),
+            attribute.value,
+            &declarations.general,
+            is_cdata,
+            entity_references,
+            entity_expansion,
+        )?;
+        let replacement_len = escaped_xml_attribute_value_len(&value)
+            .and_then(|length| length.checked_add(name.len()))
+            .and_then(|length| length.checked_add(3))
+            .ok_or_else(|| Error::Xml("expanded attribute output is too large".into()))?;
+        entity_expansion.charge(replacement_len)?;
+        let mut replacement = String::with_capacity(replacement_len);
+        replacement.push_str(name.as_ref());
+        replacement.push_str("=\"");
+        push_escaped_xml_attribute_value(&mut replacement, &value);
+        replacement.push('"');
+        edits.push((attribute.range.clone(), replacement));
+    }
+
+    let insertion = frontend_default_attributes(
+        start,
+        defaults,
+        declarations,
+        entity_references,
+        entity_expansion,
+    )?;
+    if !insertion.is_empty() {
+        let before_close = if xml.as_bytes().get(start.range.end - 2) == Some(&b'/') {
+            start.range.end - 2
+        } else {
+            start.range.end - 1
+        };
+        edits.push((before_close..before_close, insertion));
+    }
+    Ok(())
+}
+
+fn frontend_default_attributes(
+    start: &xml_sec_xml_input::lexical::StartTag<'_>,
+    defaults: &[InternalAttributeDeclaration],
+    declarations: &InternalEntityDeclarations,
+    entity_references: &mut usize,
+    entity_expansion: &mut EntityExpansionMeter<'_>,
+) -> Result<String> {
+    // XML 1.0 section 3.3.2 requires a non-validating processor to report defaulted
+    // attributes when it reads their declarations from the internal subset.
+    // https://www.w3.org/TR/xml/#sec-attr-defaults
+    let mut insertion = String::new();
+    for declaration in defaults {
+        let Some(default) = declaration.default.as_deref() else {
+            continue;
+        };
+        if start
+            .attributes
+            .iter()
+            .any(|attribute| attribute.name.is_qualified(&declaration.name))
+        {
+            continue;
+        }
+        let value = prepare_attribute_value(
+            &declaration.name,
+            default,
+            &declarations.general,
+            declaration.attribute_type.is_cdata(),
+            entity_references,
+            entity_expansion,
+        )?;
+        let insertion_len = escaped_xml_attribute_value_len(&value)
+            .and_then(|length| length.checked_add(declaration.name.len()))
+            .and_then(|length| length.checked_add(4))
+            .ok_or_else(|| Error::Xml("DTD default attribute output is too large".into()))?;
+        // The insertion strings coexist with the final prepared document. Charge them before
+        // reserving so defaults cannot hide temporary allocation outside the XML budget.
+        entity_expansion.charge(insertion_len)?;
+        insertion.reserve(insertion_len);
+        insertion.push(' ');
+        insertion.push_str(&declaration.name);
+        insertion.push_str("=\"");
+        push_escaped_xml_attribute_value(&mut insertion, &value);
+        insertion.push('"');
+    }
+
+    Ok(insertion)
 }
 
 fn escaped_xml_attribute_value_len(value: &str) -> Option<usize> {
@@ -2311,6 +2101,373 @@ fn normalize_xml_attribute_value(value: Cow<'_, str>) -> Cow<'_, str> {
         }
     }
     Cow::Owned(normalized)
+}
+
+#[cfg(test)]
+fn project_tree_element(xml: &str, source: roxmltree::Node<'_, '_>) -> Result<NodeKind> {
+    let prefix = lexical_prefix(xml, source.range().start, source.tag_name().name());
+    if !super::lexical::is_ncname(source.tag_name().name())
+        || prefix
+            .as_deref()
+            .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
+    {
+        return Err(Error::Xml("invalid element QName".into()));
+    }
+    let attributes = source
+        .attributes()
+        .map(|attribute| {
+            let prefix = attribute_prefix(xml, source, attribute);
+            if !super::lexical::is_ncname(attribute.name())
+                || prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
+            {
+                return Err(Error::Xml("invalid attribute QName".into()));
+            }
+            Ok(Attribute {
+                name: ExpandedName::new(attribute.namespace(), attribute.name()),
+                prefix,
+                value: attribute.value().to_owned(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut namespaces = Arc::new(Vec::new());
+    let mut namespace_index = HashMap::new();
+    for namespace in source.namespaces() {
+        if namespace
+            .name()
+            .is_some_and(|prefix| !super::lexical::is_ncname(prefix))
+        {
+            return Err(Error::Xml("invalid namespace prefix".into()));
+        }
+        validate_namespace_binding(namespace.name(), namespace.uri())?;
+        set_namespace(
+            &mut namespaces,
+            &mut namespace_index,
+            namespace.name().map(str::to_owned),
+            namespace.uri().to_owned(),
+        );
+    }
+    if !namespaces.iter().any(|namespace| {
+        namespace.prefix.as_deref() == Some("xml")
+            && namespace.uri == "http://www.w3.org/XML/1998/namespace"
+    }) {
+        Arc::make_mut(&mut namespaces).insert(
+            0,
+            Namespace {
+                prefix: Some("xml".into()),
+                uri: "http://www.w3.org/XML/1998/namespace".into(),
+            },
+        );
+    }
+    Ok(NodeKind::Element {
+        name: ExpandedName::new(source.tag_name().namespace(), source.tag_name().name()),
+        prefix,
+        attributes,
+        namespaces,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DocumentPhase {
+    Start,
+    Prolog,
+    Content,
+    Epilog,
+}
+
+struct StreamDocumentBuilder<'borrow, 'input, 'work> {
+    document: &'borrow mut Document,
+    elements: &'borrow mut Vec<StreamElementFrame<'input>>,
+    declarations: &'borrow InternalEntityDeclarations,
+    meter: &'borrow mut StreamParseMeter<'work>,
+    phase: DocumentPhase,
+    saw_doctype: bool,
+}
+
+impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
+    fn scan<'storage>(
+        &mut self,
+        reader: &mut Scanner<'input, lexical_storage::Storage<'storage>>,
+        xml: &'input str,
+        lexical_held: &std::cell::Cell<usize>,
+    ) -> Result<()> {
+        let mut previous_event_offset = 0usize;
+        let mut source_line = 1usize;
+        loop {
+            lexical_held.set(
+                self.meter
+                    .retained_bytes()
+                    .saturating_add(self.meter.entity_expansion.used)
+                    .saturating_add(self.meter.entity_expansion.declaration_bytes),
+            );
+            let Some(event) = reader.next_event().map_err(|error| match error {
+                xml_sec_xml_input::lexical::Error::Resource(error) => error,
+                error => Error::Xml(error.to_string()),
+            })?
+            else {
+                break;
+            };
+            let event_offset = event_range_start(&event);
+            source_line = source_line.saturating_add(xml_line_endings(
+                &xml.as_bytes()[previous_event_offset..event_offset],
+            ));
+            previous_event_offset = event_offset;
+            self.process(event, source_line)?;
+        }
+        self.finish()
+    }
+
+    fn process<'storage>(
+        &mut self,
+        event: Event<'input, lexical_storage::Attributes<'input, 'storage>>,
+        source_line: usize,
+    ) -> Result<()> {
+        match event {
+            Event::Start(start) => self.start(start, false, source_line),
+            Event::Empty(start) => self.start(start, true, source_line),
+            Event::End { name, .. } => self.end(name),
+            Event::Text { text, .. } => self.text(text, source_line),
+            Event::CData { text, .. } => self.cdata(text, source_line),
+            Event::Comment { text, .. } => self.comment(text, source_line),
+            Event::ProcessingInstruction {
+                target, content, ..
+            } => self.processing_instruction(target, content, source_line),
+            Event::Reference { name, .. } => self.reference(name, source_line),
+            Event::Declaration { .. } => self.declaration(),
+            Event::DocType { .. } => self.doctype(),
+        }
+    }
+    fn start<'storage>(
+        &mut self,
+        start: xml_sec_xml_input::lexical::StartTag<
+            'input,
+            lexical_storage::Attributes<'input, 'storage>,
+        >,
+        empty: bool,
+        source_line: usize,
+    ) -> Result<()> {
+        #[cfg(test)]
+        expansion_workspace_tests::SCANNED_ATTRIBUTES
+            .with(|count| count.set(count.get() + start.attributes.len()));
+        let lexical_bytes = start.attributes.bytes();
+        self.meter.charge_owned(lexical_bytes)?;
+        if self.elements.len() == 1 {
+            if self.phase == DocumentPhase::Epilog {
+                return Err(Error::Xml("multiple document elements".into()));
+            }
+            self.phase = if empty {
+                DocumentPhase::Epilog
+            } else {
+                DocumentPhase::Content
+            };
+        }
+        let id = push_stream_element(
+            self.document,
+            self.elements,
+            &start,
+            empty,
+            self.declarations,
+            self.meter,
+        )?;
+        self.document.nodes[id.0].source_line = Some(source_line);
+        drop(start);
+        self.meter.release_owned(lexical_bytes);
+
+        Ok(())
+    }
+
+    fn end(&mut self, name: xml_sec_xml_input::lexical::Name<'input>) -> Result<()> {
+        if self.elements.len() == 1 {
+            return Err(Error::Xml("unmatched closing element".into()));
+        }
+        let opening_name = self
+            .elements
+            .last()
+            .and_then(|frame| frame.lexical_name)
+            .expect("non-root element frames retain their lexical name");
+        if name != opening_name {
+            let closing_name = name.qualified();
+            let opening_name = opening_name.qualified();
+            return Err(Error::Xml(format!(
+                "closing element `{closing_name}` does not match `{opening_name}`"
+            )));
+        }
+        self.elements.pop();
+        if self.elements.len() == 1 {
+            self.phase = DocumentPhase::Epilog;
+        }
+
+        Ok(())
+    }
+
+    fn text(&mut self, text: &str, source_line: usize) -> Result<()> {
+        if self.elements.len() == 1 && !text.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+            return Err(Error::Xml(
+                "non-whitespace text outside the document element".into(),
+            ));
+        }
+        if self.elements.len() > 1 && !text.is_empty() {
+            let id = push_parsed_text(
+                self.document,
+                self.elements,
+                ParsedText::Source(text),
+                self.meter,
+            )?;
+            self.document.nodes[id.0]
+                .source_line
+                .get_or_insert(source_line);
+        } else if self.phase == DocumentPhase::Start {
+            self.phase = DocumentPhase::Prolog;
+        }
+
+        Ok(())
+    }
+
+    fn cdata(&mut self, text: &str, source_line: usize) -> Result<()> {
+        if self.elements.len() == 1 {
+            return Err(Error::Xml(
+                "CDATA is not allowed outside the document element".into(),
+            ));
+        }
+        let id = push_parsed_text(
+            self.document,
+            self.elements,
+            ParsedText::Source(text),
+            self.meter,
+        )?;
+        self.document.nodes[id.0]
+            .source_line
+            .get_or_insert(source_line);
+
+        Ok(())
+    }
+
+    fn comment(&mut self, text: &str, source_line: usize) -> Result<()> {
+        if self.phase == DocumentPhase::Start {
+            self.phase = DocumentPhase::Prolog;
+        }
+        let parent = self
+            .elements
+            .last()
+            .expect("document frame remains present")
+            .node;
+        self.meter.reserve_node()?;
+        let value = copy_parsed_text(ParsedText::Source(text), self.meter)?;
+        let inherited_base = copy_base_uri(self.document, parent, self.meter)?;
+        let id = push_metered(
+            self.document,
+            parent,
+            NodeKind::Comment(value),
+            inherited_base,
+            self.meter,
+        )?;
+        self.document.nodes[id.0].source_line = Some(source_line);
+
+        Ok(())
+    }
+
+    fn processing_instruction(
+        &mut self,
+        target: &str,
+        content: Option<&str>,
+        source_line: usize,
+    ) -> Result<()> {
+        if self.phase == DocumentPhase::Start {
+            self.phase = DocumentPhase::Prolog;
+        }
+        let parent = self
+            .elements
+            .last()
+            .expect("document frame remains present")
+            .node;
+        self.meter.reserve_node()?;
+        let target = copy_parsed_literal(target, self.meter)?;
+        let value = content
+            .map(|text| copy_parsed_text(ParsedText::Source(text), self.meter))
+            .transpose()?;
+        let inherited_base = copy_base_uri(self.document, parent, self.meter)?;
+        let id = push_metered(
+            self.document,
+            parent,
+            NodeKind::ProcessingInstruction { target, value },
+            inherited_base,
+            self.meter,
+        )?;
+        self.document.nodes[id.0].source_line = Some(source_line);
+
+        Ok(())
+    }
+
+    fn reference(&mut self, reference: &str, source_line: usize) -> Result<()> {
+        if self.elements.len() == 1 {
+            return Err(Error::Xml(
+                "character and entity references are not allowed outside the document element"
+                    .into(),
+            ));
+        }
+        let value = match reference {
+            "amp" => '&',
+            "apos" => '\'',
+            "gt" => '>',
+            "lt" => '<',
+            "quot" => '"',
+            value if value.starts_with('#') => {
+                xml_sec_xml_input::lexical::decode_numeric_character_reference(&value[1..])
+                    .map_err(|_| Error::Xml("invalid character reference".into()))?
+            }
+            name => {
+                return Err(Error::Xml(format!("unresolved entity reference &{name};")));
+            }
+        };
+        let id = push_parsed_text(
+            self.document,
+            self.elements,
+            ParsedText::Reference(value),
+            self.meter,
+        )?;
+        self.document.nodes[id.0]
+            .source_line
+            .get_or_insert(source_line);
+
+        Ok(())
+    }
+
+    fn declaration(&mut self) -> Result<()> {
+        if self.phase != DocumentPhase::Start {
+            return Err(Error::Xml(
+                "XML declaration is permitted only at the start of the document".into(),
+            ));
+        }
+        self.phase = DocumentPhase::Prolog;
+
+        Ok(())
+    }
+
+    fn doctype(&mut self) -> Result<()> {
+        if matches!(self.phase, DocumentPhase::Content | DocumentPhase::Epilog) {
+            return Err(Error::Xml(
+                "document type declaration is permitted only in the prolog".into(),
+            ));
+        }
+        if self.saw_doctype {
+            return Err(Error::Xml("duplicate document type declaration".into()));
+        }
+        self.saw_doctype = true;
+        self.phase = DocumentPhase::Prolog;
+
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.elements.len() != 1 {
+            return Err(Error::Xml("unclosed element".into()));
+        }
+        if self.phase != DocumentPhase::Epilog {
+            return Err(Error::Xml("document element is missing".into()));
+        }
+        Ok(())
+    }
 }
 
 struct StreamElementFrame<'a> {
@@ -2582,16 +2739,8 @@ fn push_stream_element<
             uri: "http://www.w3.org/XML/1998/namespace".into(),
         }]),
     };
-    let mut namespace_index_bytes = namespace_index_owned_bytes(&namespaces);
-    ensure(
-        BudgetKind::NamespaceScopeBytes,
-        meter.budget.namespace_scope_bytes,
-        meter
-            .namespace_scope_bytes
-            .saturating_add(namespace_index_bytes),
-    )?;
-    meter.charge_owned(namespace_index_bytes)?;
-    let mut namespace_index = namespace_index(&namespaces);
+    let (mut namespace_index, mut namespace_index_bytes) =
+        admit_namespace_index(&namespaces, meter)?;
     meter
         .charge_owned(start.name.local().len() + start.name.prefix().map_or(0, |p| p.len() + 1))?;
     let lexical_name = start.name.qualified();
@@ -2600,105 +2749,15 @@ fn push_stream_element<
         .get(lexical_name.as_ref())
         .map_or(&[][..], Vec::as_slice);
     let mut raw_attributes = Vec::new();
-    for attribute in start.attributes.iter() {
-        meter.charge_owned(
-            attribute.name.local().len() + attribute.name.prefix().map_or(0, |p| p.len() + 1),
-        )?;
-        let name = attribute.name.qualified();
-        let attribute_type = declared_attributes
-            .iter()
-            .find(|declaration| declaration.name == name)
-            .map_or(InternalAttributeType::Cdata, |declaration| {
-                declaration.attribute_type
-            });
-        let value = prepare_stream_attribute_value(
-            name.as_ref(),
-            attribute.value,
-            &declarations.general,
-            attribute_type.is_cdata(),
-            meter,
-        )?;
-        if name == "xmlns" {
-            validate_namespace_binding(None, &value)?;
-            set_namespace_bounded(
-                &mut namespaces,
-                &mut namespace_index,
-                None,
-                value,
-                meter.budget.namespace_scope_bytes,
-                &mut namespace_index_bytes,
-                &mut meter.namespace_scope_bytes,
-            )?;
-        } else if let Some(prefix) = name.strip_prefix("xmlns:") {
-            if !super::lexical::is_ncname(prefix) {
-                return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
-            }
-            validate_namespace_binding(Some(prefix), &value)?;
-            set_namespace_bounded(
-                &mut namespaces,
-                &mut namespace_index,
-                Some(prefix.into()),
-                value,
-                meter.budget.namespace_scope_bytes,
-                &mut namespace_index_bytes,
-                &mut meter.namespace_scope_bytes,
-            )?;
-        } else {
-            if raw_attributes.len() == raw_attributes.capacity() {
-                let additional = raw_attributes.capacity().max(4);
-                reserve_charged(&mut raw_attributes, additional, meter)?;
-            }
-            raw_attributes.push((name.into_owned(), value, attribute_type));
-        }
-    }
-    for declaration in declared_attributes {
-        let Some(default) = declaration.default.as_deref() else {
-            continue;
+    {
+        let mut stage = StreamAttributeStage {
+            namespaces: &mut namespaces,
+            namespace_index: &mut namespace_index,
+            namespace_index_bytes: &mut namespace_index_bytes,
+            raw_attributes: &mut raw_attributes,
         };
-        if start
-            .attributes
-            .iter()
-            .any(|attribute| attribute.name.is_qualified(&declaration.name))
-        {
-            continue;
-        }
-        meter.charge_owned(declaration.name.len())?;
-        let value = prepare_stream_attribute_value(
-            &declaration.name,
-            default,
-            &declarations.general,
-            declaration.attribute_type.is_cdata(),
-            meter,
-        )?;
-        if declaration.name == "xmlns" {
-            validate_namespace_binding(None, &value)?;
-            set_namespace_bounded(
-                &mut namespaces,
-                &mut namespace_index,
-                None,
-                value,
-                meter.budget.namespace_scope_bytes,
-                &mut namespace_index_bytes,
-                &mut meter.namespace_scope_bytes,
-            )?;
-        } else if let Some(prefix) = declaration.name.strip_prefix("xmlns:") {
-            validate_namespace_binding(Some(prefix), &value)?;
-            set_namespace_bounded(
-                &mut namespaces,
-                &mut namespace_index,
-                Some(prefix.into()),
-                value,
-                meter.budget.namespace_scope_bytes,
-                &mut namespace_index_bytes,
-                &mut meter.namespace_scope_bytes,
-            )?;
-        } else {
-            if raw_attributes.len() == raw_attributes.capacity() {
-                let additional = raw_attributes.capacity().max(4);
-                reserve_charged(&mut raw_attributes, additional, meter)?;
-            }
-            raw_attributes.push((declaration.name.clone(), value, declaration.attribute_type));
-        }
+        stage.source_attributes(start, declared_attributes, declarations, meter)?;
+        stage.default_attributes(start, declared_attributes, declarations, meter)?;
     }
     meter.charge_owned(lexical_name.len())?;
     let prefix = start.name.prefix().map(str::to_owned);
@@ -2713,6 +2772,253 @@ fn push_stream_element<
         )));
     }
     drop(lexical_name);
+    let StreamProjectedAttributes {
+        attributes,
+        first_id_attribute,
+        additional_id_attributes,
+    } = project_stream_attributes(raw_attributes, &namespaces, &namespace_index, meter)?;
+    let inherited_base = copy_base_uri(document, parent, meter)?;
+    let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
+        attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
+    }) {
+        Some(super::resolver::resolve_uri_reference(
+            inherited_base.as_deref(),
+            &attribute.value,
+        ))
+    } else {
+        inherited_base
+    };
+    drop(namespace_index);
+    // Keep the admitted payload live while growing the node arena and parent's
+    // child vector. Only dropped staging is released, never the moved strings.
+    let id_bytes = additional_id_attributes.capacity() * std::mem::size_of::<usize>();
+    let kind = NodeKind::Element {
+        name: ExpandedName::new(namespace, local),
+        prefix,
+        attributes,
+        namespaces,
+    };
+    let payload = node_payload_bytes(&kind, effective_base.as_deref());
+    let staged = meter.owned_bytes - staging_start - id_bytes;
+    if staged >= payload {
+        meter.release_owned(staged - payload);
+    } else {
+        meter.charge_owned(payload - staged)?;
+    }
+    reserve_node_storage(document, parent, meter)?;
+    let projected = document.push(parent, kind, effective_base);
+    register_stream_id_attributes(
+        document,
+        projected,
+        first_id_attribute
+            .into_iter()
+            .chain(additional_id_attributes),
+        meter,
+    )?;
+    meter.release_owned(id_bytes);
+    if !empty {
+        elements.push(StreamElementFrame {
+            node: projected,
+            lexical_name: Some(start.name),
+        });
+    }
+    Ok(projected)
+}
+fn admit_namespace_index(
+    namespaces: &[Namespace],
+    meter: &mut StreamParseMeter<'_>,
+) -> Result<(HashMap<String, usize>, usize)> {
+    let bytes = namespace_index_owned_bytes(namespaces);
+    ensure(
+        BudgetKind::NamespaceScopeBytes,
+        meter.budget.namespace_scope_bytes,
+        meter.namespace_scope_bytes.saturating_add(bytes),
+    )?;
+    meter.charge_owned(bytes)?;
+    Ok((namespace_index(namespaces), bytes))
+}
+
+fn register_stream_id_attributes(
+    document: &mut Document,
+    projected: NodeId,
+    indices: impl IntoIterator<Item = usize>,
+    meter: &mut StreamParseMeter<'_>,
+) -> Result<()> {
+    for index in indices {
+        let value = document
+            .node(projected)
+            .and_then(|node| match &node.kind {
+                NodeKind::Element { attributes, .. } => attributes.get(index),
+                _ => None,
+            })
+            .map(|attribute| collapse_xml_whitespace(&attribute.value).into_owned())
+            .ok_or_else(|| Error::Xml("DTD ID attribute reference is stale".into()))?;
+        let key_bytes = value.capacity();
+        reserve_index_entry(&mut document.ids, key_bytes, meter)?;
+        let indexed = document.ids.len();
+        document.register_dtd_id_value(projected, value)?;
+        if document.ids.len() == indexed {
+            // A repeated ID keeps its first owner; this key was dropped.
+            meter.release_owned(key_bytes);
+        }
+    }
+    Ok(())
+}
+
+struct StreamAttributeStage<'a> {
+    namespaces: &'a mut Arc<Vec<Namespace>>,
+    namespace_index: &'a mut HashMap<String, usize>,
+    namespace_index_bytes: &'a mut usize,
+    raw_attributes: &'a mut Vec<(String, String, InternalAttributeType)>,
+}
+
+impl StreamAttributeStage<'_> {
+    fn source_attributes<
+        'input,
+        A: std::ops::Deref<Target = [xml_sec_xml_input::lexical::Attribute<'input>]>,
+    >(
+        &mut self,
+        start: &xml_sec_xml_input::lexical::StartTag<'input, A>,
+        declared_attributes: &[InternalAttributeDeclaration],
+        declarations: &InternalEntityDeclarations,
+        meter: &mut StreamParseMeter<'_>,
+    ) -> Result<()> {
+        for attribute in start.attributes.iter() {
+            meter.charge_owned(
+                attribute.name.local().len() + attribute.name.prefix().map_or(0, |p| p.len() + 1),
+            )?;
+            let name = attribute.name.qualified();
+            let attribute_type = declared_attributes
+                .iter()
+                .find(|declaration| declaration.name == name)
+                .map_or(InternalAttributeType::Cdata, |declaration| {
+                    declaration.attribute_type
+                });
+            let value = prepare_stream_attribute_value(
+                name.as_ref(),
+                attribute.value,
+                &declarations.general,
+                attribute_type.is_cdata(),
+                meter,
+            )?;
+            if name == "xmlns" {
+                validate_namespace_binding(None, &value)?;
+                set_namespace_bounded(
+                    self.namespaces,
+                    self.namespace_index,
+                    None,
+                    value,
+                    meter.budget.namespace_scope_bytes,
+                    self.namespace_index_bytes,
+                    &mut meter.namespace_scope_bytes,
+                )?;
+            } else if let Some(prefix) = name.strip_prefix("xmlns:") {
+                if !super::lexical::is_ncname(prefix) {
+                    return Err(Error::Xml(format!("invalid namespace prefix {prefix}")));
+                }
+                validate_namespace_binding(Some(prefix), &value)?;
+                set_namespace_bounded(
+                    self.namespaces,
+                    self.namespace_index,
+                    Some(prefix.into()),
+                    value,
+                    meter.budget.namespace_scope_bytes,
+                    self.namespace_index_bytes,
+                    &mut meter.namespace_scope_bytes,
+                )?;
+            } else {
+                if self.raw_attributes.len() == self.raw_attributes.capacity() {
+                    let additional = self.raw_attributes.capacity().max(4);
+                    reserve_charged(self.raw_attributes, additional, meter)?;
+                }
+                self.raw_attributes
+                    .push((name.into_owned(), value, attribute_type));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn default_attributes<
+        'input,
+        A: std::ops::Deref<Target = [xml_sec_xml_input::lexical::Attribute<'input>]>,
+    >(
+        &mut self,
+        start: &xml_sec_xml_input::lexical::StartTag<'input, A>,
+        declared_attributes: &[InternalAttributeDeclaration],
+        declarations: &InternalEntityDeclarations,
+        meter: &mut StreamParseMeter<'_>,
+    ) -> Result<()> {
+        for declaration in declared_attributes {
+            let Some(default) = declaration.default.as_deref() else {
+                continue;
+            };
+            if start
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name.is_qualified(&declaration.name))
+            {
+                continue;
+            }
+            meter.charge_owned(declaration.name.len())?;
+            let value = prepare_stream_attribute_value(
+                &declaration.name,
+                default,
+                &declarations.general,
+                declaration.attribute_type.is_cdata(),
+                meter,
+            )?;
+            if declaration.name == "xmlns" {
+                validate_namespace_binding(None, &value)?;
+                set_namespace_bounded(
+                    self.namespaces,
+                    self.namespace_index,
+                    None,
+                    value,
+                    meter.budget.namespace_scope_bytes,
+                    self.namespace_index_bytes,
+                    &mut meter.namespace_scope_bytes,
+                )?;
+            } else if let Some(prefix) = declaration.name.strip_prefix("xmlns:") {
+                validate_namespace_binding(Some(prefix), &value)?;
+                set_namespace_bounded(
+                    self.namespaces,
+                    self.namespace_index,
+                    Some(prefix.into()),
+                    value,
+                    meter.budget.namespace_scope_bytes,
+                    self.namespace_index_bytes,
+                    &mut meter.namespace_scope_bytes,
+                )?;
+            } else {
+                if self.raw_attributes.len() == self.raw_attributes.capacity() {
+                    let additional = self.raw_attributes.capacity().max(4);
+                    reserve_charged(self.raw_attributes, additional, meter)?;
+                }
+                self.raw_attributes.push((
+                    declaration.name.clone(),
+                    value,
+                    declaration.attribute_type,
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+struct StreamProjectedAttributes {
+    attributes: Vec<Attribute>,
+    first_id_attribute: Option<usize>,
+    additional_id_attributes: Vec<usize>,
+}
+
+fn project_stream_attributes(
+    raw_attributes: Vec<(String, String, InternalAttributeType)>,
+    namespaces: &[Namespace],
+    namespace_index: &HashMap<String, usize>,
+    meter: &mut StreamParseMeter<'_>,
+) -> Result<StreamProjectedAttributes> {
     let mut first_id_attribute = None;
     let mut additional_id_attributes = Vec::new();
     let mut attributes = Vec::new();
@@ -2728,7 +3034,7 @@ fn push_stream_element<
         }
         let namespace = prefix
             .as_deref()
-            .and_then(|prefix| namespace_for(&namespaces, &namespace_index, Some(prefix)));
+            .and_then(|prefix| namespace_for(namespaces, namespace_index, Some(prefix)));
         if prefix.is_some() && namespace.is_none() {
             return Err(Error::Xml(format!(
                 "undeclared namespace prefix in attribute {lexical}"
@@ -2751,6 +3057,19 @@ fn push_stream_element<
             value,
         });
     }
+
+    check_duplicate_attributes(&attributes, meter)?;
+    Ok(StreamProjectedAttributes {
+        attributes,
+        first_id_attribute,
+        additional_id_attributes,
+    })
+}
+
+fn check_duplicate_attributes(
+    attributes: &[Attribute],
+    meter: &mut StreamParseMeter<'_>,
+) -> Result<()> {
     // Borrow names instead of cloning every namespace/local string into the
     // duplicate detector. Admit its bucket bound before allocating it.
     if attributes.len() > 1 {
@@ -2781,65 +3100,8 @@ fn push_stream_element<
         drop(expanded_names);
         meter.release_owned(duplicate_bytes);
     }
-    let inherited_base = copy_base_uri(document, parent, meter)?;
-    let effective_base = if let Some(attribute) = attributes.iter().find(|attribute| {
-        attribute.name.namespace.as_deref() == Some(XML_NS) && attribute.name.local == "base"
-    }) {
-        Some(super::resolver::resolve_uri_reference(
-            inherited_base.as_deref(),
-            &attribute.value,
-        )?)
-    } else {
-        inherited_base
-    };
-    drop(namespace_index);
-    // Keep the admitted payload live while growing the node arena and parent's
-    // child vector. Only dropped staging is released, never the moved strings.
-    let id_bytes = additional_id_attributes.capacity() * std::mem::size_of::<usize>();
-    let kind = NodeKind::Element {
-        name: ExpandedName::new(namespace, local),
-        prefix,
-        attributes,
-        namespaces,
-    };
-    let payload = node_payload_bytes(&kind, effective_base.as_deref());
-    let staged = meter.owned_bytes - staging_start - id_bytes;
-    if staged >= payload {
-        meter.release_owned(staged - payload);
-    } else {
-        meter.charge_owned(payload - staged)?;
-    }
-    reserve_node_storage(document, parent, meter)?;
-    let projected = document.push(parent, kind, effective_base);
-    for index in first_id_attribute
-        .into_iter()
-        .chain(additional_id_attributes)
-    {
-        let value = document
-            .node(projected)
-            .and_then(|node| match &node.kind {
-                NodeKind::Element { attributes, .. } => attributes.get(index),
-                _ => None,
-            })
-            .map(|attribute| collapse_xml_whitespace(&attribute.value).into_owned())
-            .ok_or_else(|| Error::Xml("DTD ID attribute reference is stale".into()))?;
-        let key_bytes = value.capacity();
-        reserve_index_entry(&mut document.ids, key_bytes, meter)?;
-        let indexed = document.ids.len();
-        document.register_dtd_id_value(projected, value)?;
-        if document.ids.len() == indexed {
-            // A repeated ID keeps its first owner; this key was dropped.
-            meter.release_owned(key_bytes);
-        }
-    }
-    meter.release_owned(id_bytes);
-    if !empty {
-        elements.push(StreamElementFrame {
-            node: projected,
-            lexical_name: Some(start.name),
-        });
-    }
-    Ok(projected)
+
+    Ok(())
 }
 
 fn prepare_attribute_value(
@@ -3514,171 +3776,207 @@ fn collect_internal_entity_declarations(
                 "internal DTD subset contains invalid markup or character data".into(),
             ));
         }
-        let declaration_start = cursor;
-        cursor += "<!ENTITY".len();
-        let spacing_start = cursor;
-        skip_xml_whitespace(subset, &mut cursor);
-        if cursor == spacing_start {
-            return Err(Error::Xml(
-                "internal entity declaration requires XML whitespace after <!ENTITY".into(),
-            ));
-        }
-        let parameter = subset[cursor..].starts_with('%');
-        if parameter {
-            cursor += 1;
-            let spacing_start = cursor;
-            skip_xml_whitespace(subset, &mut cursor);
-            if cursor == spacing_start {
-                return Err(Error::Xml(
-                    "parameter entity declaration requires XML whitespace after %".into(),
-                ));
-            }
-        }
-        let name = parse_dtd_name(subset, &mut cursor, "internal entity declaration")?;
-        let spacing_start = cursor;
-        skip_xml_whitespace(subset, &mut cursor);
-        if cursor == spacing_start {
-            return Err(Error::Xml(format!(
-                "internal entity declaration `{name}` requires XML whitespace before its definition"
-            )));
-        }
-        let Some(quote) = subset.as_bytes().get(cursor).copied() else {
-            return Err(Error::Xml(
-                "unterminated internal entity declaration".into(),
-            ));
-        };
-        if !matches!(quote, b'\'' | b'"') {
-            let (end, system_identifier) =
-                parse_external_entity_declaration(subset, cursor, parameter)?;
-            if !parameter && !declarations.declared_general.contains(name) {
-                let mut allocation = DeclarationAllocation {
-                    expansion: meter,
-                    owned: &mut declarations.owned_bytes,
-                };
-                reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
-                declarations
-                    .declared_general
-                    .insert(declaration_string(name, &mut allocation)?);
-                if let Some(system_identifier) = system_identifier {
-                    reserve_index_entry(&mut declarations.unparsed, 0, &mut allocation)?;
-                    let name = declaration_string(name, &mut allocation)?;
-                    let identifier = declaration_string(system_identifier, &mut allocation)?;
-                    declarations.unparsed.insert(name, identifier);
-                } else {
-                    reserve_index_entry(&mut declarations.parsed_external, 0, &mut allocation)?;
-                    declarations
-                        .parsed_external
-                        .insert(declaration_string(name, &mut allocation)?);
-                }
-            }
-            cursor = end;
-            continue;
-        }
-        cursor += 1;
-        let value_start = cursor;
-        while subset
-            .as_bytes()
-            .get(cursor)
-            .is_some_and(|byte| *byte != quote)
-        {
-            cursor += 1;
-        }
-        if cursor == subset.len() {
-            return Err(Error::Xml(format!(
-                "unterminated value for internal entity `{name}`"
-            )));
-        }
-        let raw_value = &subset[value_start..cursor];
-        cursor += 1;
-        validate_entity_value(name, raw_value, parameter)?;
-        // XML 1.0 Fifth Edition section 4.2, [70]-[74], permits only XML S before `>`
-        // after an internal EntityValue, for both general and parameter entities.
-        // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
-        skip_xml_whitespace(subset, &mut cursor);
-        if subset.as_bytes().get(cursor) != Some(&b'>') {
-            return Err(Error::Xml(format!(
-                "entity declaration `{name}` has content after its definition"
-            )));
-        }
-        cursor += 1;
-        let mut allocation = DeclarationAllocation {
-            expansion: meter,
-            owned: &mut declarations.owned_bytes,
-        };
-        if parameter {
-            if declarations.parameter_spans.len() == declarations.parameter_spans.capacity() {
-                let additional = declarations.parameter_spans.capacity().max(4);
-                reserve_charged(
-                    &mut declarations.parameter_spans,
-                    additional,
-                    &mut allocation,
-                )?;
-            }
-            declarations
-                .parameter_spans
-                .push((declaration_start, cursor));
-        }
-        let duplicate = if parameter {
-            declarations.parameter.contains_key(name)
-        } else {
-            declarations.declared_general.contains(name)
-        };
-        let predefined = !parameter && matches!(name, "amp" | "apos" | "gt" | "lt" | "quot");
-        if duplicate && !predefined {
-            continue;
-        }
-        let value;
-        if !parameter {
-            if predefined {
-                let scratch = raw_value.len().checked_mul(2).ok_or(Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    limit: allocation.owned_limit(),
-                    actual: usize::MAX,
-                })?;
-                allocation.charge_owned(scratch)?;
-                value = normalize_predefined_entity_declaration(name, raw_value)?;
-                allocation.release_owned(scratch - value.capacity());
-            } else {
-                // XML 1.0 section 4.5 constructs replacement text by expanding character
-                // references, but leaves general references for their eventual context.
-                // https://www.w3.org/TR/xml/#intern-replacement
-                value = match decode_parameter_character_references_in(raw_value, |bytes| {
-                    allocation.expansion.check(bytes)?;
-                    allocation.charge_owned(bytes)
-                })? {
-                    Cow::Owned(value) => value,
-                    Cow::Borrowed(value) => declaration_string(value, &mut allocation)?,
-                };
-            }
-        } else {
-            value = declaration_string(raw_value, &mut allocation)?;
-        }
-        if duplicate {
-            let capacity = value.capacity();
-            drop(value);
-            allocation.release_owned(capacity);
-            continue;
-        }
-        if parameter {
-            reserve_index_entry(&mut declarations.parameter, 0, &mut allocation)?;
-            declarations
-                .parameter
-                .entry(declaration_string(name, &mut allocation)?)
-                .or_insert(value);
-        } else {
-            reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
-            declarations
-                .declared_general
-                .insert(declaration_string(name, &mut allocation)?);
-            reserve_index_entry(&mut declarations.general, 0, &mut allocation)?;
-            declarations
-                .general
-                .insert(declaration_string(name, &mut allocation)?, value);
-        }
+        cursor = collect_entity_declaration(subset, cursor, &mut declarations, meter)?;
     }
     #[cfg(test)]
     expansion_workspace_tests::observe_declarations(&declarations);
     Ok(declarations)
+}
+fn collect_entity_declaration(
+    subset: &str,
+    mut cursor: usize,
+    declarations: &mut InternalEntityDeclarations,
+    meter: &mut EntityExpansionMeter<'_>,
+) -> Result<usize> {
+    let declaration_start = cursor;
+    cursor += "<!ENTITY".len();
+    let spacing_start = cursor;
+    skip_xml_whitespace(subset, &mut cursor);
+    if cursor == spacing_start {
+        return Err(Error::Xml(
+            "internal entity declaration requires XML whitespace after <!ENTITY".into(),
+        ));
+    }
+    let parameter = subset[cursor..].starts_with('%');
+    if parameter {
+        cursor += 1;
+        let spacing_start = cursor;
+        skip_xml_whitespace(subset, &mut cursor);
+        if cursor == spacing_start {
+            return Err(Error::Xml(
+                "parameter entity declaration requires XML whitespace after %".into(),
+            ));
+        }
+    }
+    let name = parse_dtd_name(subset, &mut cursor, "internal entity declaration")?;
+    let spacing_start = cursor;
+    skip_xml_whitespace(subset, &mut cursor);
+    if cursor == spacing_start {
+        return Err(Error::Xml(format!(
+            "internal entity declaration `{name}` requires XML whitespace before its definition"
+        )));
+    }
+    let Some(quote) = subset.as_bytes().get(cursor).copied() else {
+        return Err(Error::Xml(
+            "unterminated internal entity declaration".into(),
+        ));
+    };
+    if !matches!(quote, b'\'' | b'"') {
+        let (end, system_identifier) =
+            parse_external_entity_declaration(subset, cursor, parameter)?;
+        record_external_entity(declarations, meter, name, parameter, system_identifier)?;
+        cursor = end;
+        return Ok(cursor);
+    }
+    cursor += 1;
+    let value_start = cursor;
+    while subset
+        .as_bytes()
+        .get(cursor)
+        .is_some_and(|byte| *byte != quote)
+    {
+        cursor += 1;
+    }
+    if cursor == subset.len() {
+        return Err(Error::Xml(format!(
+            "unterminated value for internal entity `{name}`"
+        )));
+    }
+    let raw_value = &subset[value_start..cursor];
+    cursor += 1;
+    validate_entity_value(name, raw_value, parameter)?;
+    // XML 1.0 Fifth Edition section 4.2, [70]-[74], permits only XML S before `>`
+    // after an internal EntityValue, for both general and parameter entities.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#sec-entity-decl
+    skip_xml_whitespace(subset, &mut cursor);
+    if subset.as_bytes().get(cursor) != Some(&b'>') {
+        return Err(Error::Xml(format!(
+            "entity declaration `{name}` has content after its definition"
+        )));
+    }
+    cursor += 1;
+
+    record_internal_entity(
+        declarations,
+        meter,
+        name,
+        raw_value,
+        parameter,
+        (declaration_start, cursor),
+    )?;
+    Ok(cursor)
+}
+
+fn record_external_entity(
+    declarations: &mut InternalEntityDeclarations,
+    meter: &mut EntityExpansionMeter<'_>,
+    name: &str,
+    parameter: bool,
+    system_identifier: Option<&str>,
+) -> Result<()> {
+    if !parameter && !declarations.declared_general.contains(name) {
+        let mut allocation = DeclarationAllocation {
+            expansion: meter,
+            owned: &mut declarations.owned_bytes,
+        };
+        reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
+        declarations
+            .declared_general
+            .insert(declaration_string(name, &mut allocation)?);
+        if let Some(system_identifier) = system_identifier {
+            reserve_index_entry(&mut declarations.unparsed, 0, &mut allocation)?;
+            let name = declaration_string(name, &mut allocation)?;
+            let identifier = declaration_string(system_identifier, &mut allocation)?;
+            declarations.unparsed.insert(name, identifier);
+        } else {
+            reserve_index_entry(&mut declarations.parsed_external, 0, &mut allocation)?;
+            declarations
+                .parsed_external
+                .insert(declaration_string(name, &mut allocation)?);
+        }
+    }
+    Ok(())
+}
+
+fn record_internal_entity(
+    declarations: &mut InternalEntityDeclarations,
+    meter: &mut EntityExpansionMeter<'_>,
+    name: &str,
+    raw_value: &str,
+    parameter: bool,
+    declaration_span: (usize, usize),
+) -> Result<()> {
+    let mut allocation = DeclarationAllocation {
+        expansion: meter,
+        owned: &mut declarations.owned_bytes,
+    };
+    if parameter {
+        if declarations.parameter_spans.len() == declarations.parameter_spans.capacity() {
+            let additional = declarations.parameter_spans.capacity().max(4);
+            reserve_charged(
+                &mut declarations.parameter_spans,
+                additional,
+                &mut allocation,
+            )?;
+        }
+        declarations.parameter_spans.push(declaration_span);
+    }
+    let duplicate = if parameter {
+        declarations.parameter.contains_key(name)
+    } else {
+        declarations.declared_general.contains(name)
+    };
+    let predefined = !parameter && matches!(name, "amp" | "apos" | "gt" | "lt" | "quot");
+    if duplicate && !predefined {
+        return Ok(());
+    }
+    let value = if parameter {
+        declaration_string(raw_value, &mut allocation)?
+    } else if predefined {
+        let scratch = raw_value.len().checked_mul(2).ok_or(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            limit: allocation.owned_limit(),
+            actual: usize::MAX,
+        })?;
+        allocation.charge_owned(scratch)?;
+        let value = normalize_predefined_entity_declaration(name, raw_value)?;
+        allocation.release_owned(scratch - value.capacity());
+        value
+    } else {
+        // XML 1.0 section 4.5 constructs replacement text by expanding character
+        // references, but leaves general references for their eventual context.
+        // https://www.w3.org/TR/xml/#intern-replacement
+        match decode_parameter_character_references_in(raw_value, |bytes| {
+            allocation.expansion.check(bytes)?;
+            allocation.charge_owned(bytes)
+        })? {
+            Cow::Owned(value) => value,
+            Cow::Borrowed(value) => declaration_string(value, &mut allocation)?,
+        }
+    };
+    if duplicate {
+        let capacity = value.capacity();
+        drop(value);
+        allocation.release_owned(capacity);
+        return Ok(());
+    }
+    if parameter {
+        reserve_index_entry(&mut declarations.parameter, 0, &mut allocation)?;
+        declarations
+            .parameter
+            .entry(declaration_string(name, &mut allocation)?)
+            .or_insert(value);
+    } else {
+        reserve_index_entry(&mut declarations.declared_general, 0, &mut allocation)?;
+        declarations
+            .declared_general
+            .insert(declaration_string(name, &mut allocation)?);
+        reserve_index_entry(&mut declarations.general, 0, &mut allocation)?;
+        declarations
+            .general
+            .insert(declaration_string(name, &mut allocation)?, value);
+    }
+    Ok(())
 }
 
 fn parse_dtd_processing_instruction(subset: &str, mut cursor: usize) -> Result<usize> {
@@ -5144,7 +5442,7 @@ fn attribute_prefix(
     lexical_attribute_prefix(xml, attribute.range().start, attribute.name()).or_else(|| {
         node.namespaces()
             .find(|entry| entry.uri() == namespace && entry.name().is_some())
-            .and_then(|entry| entry.name())
+            .and_then(roxmltree::Namespace::name)
             .map(str::to_owned)
     })
 }
@@ -5212,344 +5510,5 @@ mod expansion_workspace_tests {
         DECLARATION_BYTES.with(|peak| peak.set(peak.get().max(bytes)));
     }
 
-    #[test]
-    fn unused_literal_declarations_do_not_spend_expansion_output() {
-        // Retaining a literal declaration is workspace, not expansion output.
-        // No reference is expanded here, even with a zero expansion quota.
-        let mut meter = EntityExpansionMeter::new(0);
-        let declarations =
-            collect_internal_entity_declarations("<!ENTITY unused 'literal'>", &mut meter)
-                .expect("literal declaration needs no expansion output");
-        assert_eq!(declarations.general["unused"], "literal");
-        assert_eq!(meter.used, 0);
-    }
-
-    #[test]
-    fn coalesced_text_keeps_reference_carriage_returns() {
-        // XML 1.0 section 2.11 normalizes literal CR/CRLF, not a CR produced
-        // by a character reference. Text and CDATA still coalesce in one node.
-        let document = Document::parse("<r>a\r\nb\rc&#13;<![CDATA[d\r\ne]]>f</r>", None)
-            .expect("mixed text parses");
-        assert_eq!(document.string_value(document.root()), "a\nb\nc\rd\nef");
-    }
-
-    #[test]
-    fn retained_dtd_declarations_are_admitted_before_materialization() {
-        // Unused values, name indexes, spans and ATTLIST vectors remain live
-        // while the tiny tree is parsed; output expansion limits cannot pay for them.
-        let large = "x".repeat(64 * 1024);
-        let general = (0..128)
-            .map(|i| format!("<!ENTITY e{i} ''>"))
-            .collect::<String>();
-        let parameter = (0..128)
-            .map(|i| format!("<!ENTITY % p{i} ''>"))
-            .collect::<String>();
-        let external = (0..128)
-            .map(|i| format!("<!ENTITY x{i} SYSTEM 'external'>"))
-            .collect::<String>();
-        let unparsed = (0..128)
-            .map(|i| format!("<!ENTITY u{i} SYSTEM 'asset' NDATA n>"))
-            .collect::<String>();
-        let attributes = (0..128)
-            .map(|i| format!(" a{i} CDATA #IMPLIED"))
-            .collect::<String>();
-        let subsets = [
-            format!("<!ENTITY e '{large}'>"),
-            format!("<!ENTITY % p '{large}'>"),
-            format!("<!ATTLIST other a CDATA '{large}'>"),
-            format!("<!NOTATION n SYSTEM 'n'><!ENTITY u SYSTEM '{large}' NDATA n>"),
-            general,
-            parameter,
-            external,
-            format!("<!NOTATION n SYSTEM 'n'>{unparsed}"),
-            format!("<!ATTLIST other{attributes}>"),
-        ];
-        let mut violations = Vec::new();
-        for (case, subset) in subsets.into_iter().enumerate() {
-            let xml = format!("<!DOCTYPE r [{subset}]><r/>");
-            DECLARATION_BYTES.with(|bytes| bytes.set(0));
-            let result = Document::parse_with_budget(
-                &xml,
-                None,
-                ParseBudget::UNBOUNDED.with_owned_bytes(4096),
-            );
-            let peak = DECLARATION_BYTES.with(std::cell::Cell::get);
-            let refused = matches!(
-                result,
-                Err(Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    ..
-                })
-            );
-            if !refused || peak > 4096 {
-                violations.push((case, peak, refused));
-            }
-            Document::parse_with_budget(
-                &xml,
-                None,
-                ParseBudget::UNBOUNDED.with_owned_bytes(1 << 22),
-            )
-            .expect("the same valid declarations fit sufficient workspace");
-        }
-        assert!(
-            violations.is_empty(),
-            "declarations escaped workspace: {violations:?}"
-        );
-    }
-
-    #[test]
-    fn initial_root_storage_is_admitted_before_construction() {
-        // The initial arena and copied base URI are allocations too, even if
-        // the first opening tag would subsequently refuse the tiny workspace.
-        let long_base = format!("https://example.test/{}", "x".repeat(8192));
-        for (base, limit) in [(None, 0), (Some(long_base.as_str()), 4096)] {
-            CREATED_ROOTS.with(|count| count.set(0));
-            assert!(matches!(
-                Document::parse_with_budget(
-                    "<r/>",
-                    base,
-                    ParseBudget::UNBOUNDED.with_owned_bytes(limit)
-                ),
-                Err(Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    ..
-                })
-            ));
-            CREATED_ROOTS.with(|count| assert_eq!(count.get(), 0));
-        }
-    }
-
-    #[test]
-    fn scalar_text_is_admitted_before_normalization() {
-        // Text, CDATA, comments and PI content share the same normalization
-        // allocation; none may materialize a large value before workspace admission.
-        let large = "x".repeat(64 * 1024);
-        let mut materialized = Vec::new();
-        for xml in [
-            format!("<r>{large}</r>"),
-            format!("<r><![CDATA[{large}]]></r>"),
-            format!("<r><!--{large}--></r>"),
-            format!("<r><?p {large}?></r>"),
-        ] {
-            NORMALIZED_BYTES.with(|bytes| bytes.set(0));
-            let result = Document::parse_with_budget(
-                &xml,
-                None,
-                ParseBudget::UNBOUNDED.with_owned_bytes(4096),
-            );
-            assert!(matches!(
-                result,
-                Err(Error::Budget {
-                    kind: BudgetKind::OwnedBytes,
-                    ..
-                })
-            ));
-            materialized.push(NORMALIZED_BYTES.with(std::cell::Cell::get));
-        }
-        assert_eq!(materialized, [0; 4], "normalization ran before admission");
-    }
-
-    #[test]
-    fn discarded_misc_whitespace_needs_no_owned_copy() {
-        // XPath's root node has no whitespace text children; ignored XML Misc
-        // must not allocate a document-sized normalization buffer.
-        let xml = format!("{}<r/>{}", " \r\n".repeat(8192), " \r\n".repeat(8192));
-        NORMALIZED_BYTES.with(|bytes| bytes.set(0));
-        Document::parse_with_budget(&xml, None, ParseBudget::UNBOUNDED.with_owned_bytes(4096))
-            .expect("tiny tree fits despite ignored whitespace");
-        NORMALIZED_BYTES.with(|bytes| assert_eq!(bytes.get(), 0));
-    }
-
-    #[test]
-    fn live_element_stack_capacity_remains_charged() {
-        // The identical projected element needs more live storage when its
-        // closing tag is still pending. Semantic staging must not refund frames.
-        let xml = "<root>";
-        let mut scanner = Scanner::new(xml);
-        let Some(Event::Start(start)) = scanner.next_event().expect("opening tag") else {
-            panic!("expected start element");
-        };
-        let measure = |empty| {
-            let mut document = Document::empty(None);
-            let mut elements = vec![StreamElementFrame {
-                node: document.root(),
-                lexical_name: None,
-            }];
-            let budget = ParseBudget::UNBOUNDED;
-            let mut meter = StreamParseMeter {
-                budget,
-                nodes: 1,
-                entity_references: 0,
-                entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
-                namespace_scope_bytes: 0,
-                owned_bytes: elements.capacity() * std::mem::size_of::<StreamElementFrame>(),
-            };
-            push_stream_element(
-                &mut document,
-                &mut elements,
-                &start,
-                empty,
-                &InternalEntityDeclarations::default(),
-                &mut meter,
-            )
-            .expect("element fits unbounded workspace");
-            (meter.retained_bytes(), elements.capacity())
-        };
-        let (closed_bytes, closed_capacity) = measure(true);
-        let (open_bytes, open_capacity) = measure(false);
-        assert!(
-            open_capacity > closed_capacity,
-            "test exercises frame growth"
-        );
-        assert!(
-            open_bytes
-                >= closed_bytes
-                    + (open_capacity - closed_capacity) * std::mem::size_of::<StreamElementFrame>(),
-            "live frame capacity was refunded with semantic staging"
-        );
-    }
-
-    #[test]
-    fn lexical_attributes_cannot_materialize_before_workspace_admission() {
-        // The lexical event itself owns a vector; refusing semantic staging
-        // afterwards cannot pay for that already-materialized opening tag.
-        let attributes = (0..128).map(|i| format!(" a{i}='v'")).collect::<String>();
-        let xml = format!("<root{attributes}/>");
-        SCANNED_ATTRIBUTES.with(|count| count.set(0));
-        let result =
-            Document::parse_with_budget(&xml, None, ParseBudget::UNBOUNDED.with_owned_bytes(128));
-        assert!(matches!(
-            result,
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-        SCANNED_ATTRIBUTES.with(|count| {
-            assert_eq!(
-                count.get(),
-                0,
-                "opening-tag vector was materialized before the workspace refusal"
-            )
-        });
-    }
-
-    #[test]
-    fn attribute_staging_is_admitted_before_semantic_processing() {
-        // Ordinary and DTD-defaulted attributes must not reach QName resolution
-        // after constructing attacker-sized staging buffers without workspace.
-        for defaults in [false, true] {
-            let attributes = (0..64)
-                .map(|i| {
-                    if defaults {
-                        format!("a{i} CDATA 'value' ")
-                    } else {
-                        format!("a{i}='value' ")
-                    }
-                })
-                .collect::<String>();
-            let xml = if defaults {
-                format!(
-                    "<!DOCTYPE root [<!ATTLIST root {attributes} missing:last CDATA 'v'>]><root/>"
-                )
-            } else {
-                format!("<root {attributes} missing:last='v'/>")
-            };
-            let mut references = 0;
-            let mut expansion = EntityExpansionMeter::new(1 << 20);
-            let (_, declarations) =
-                internal_general_entities(&xml, &mut references, &mut expansion)
-                    .expect("declarations parse");
-            let mut scanner = Scanner::new(&xml);
-            let start = loop {
-                match scanner
-                    .next_event()
-                    .expect("lexical event")
-                    .expect("root start")
-                {
-                    Event::Empty(start) => break start,
-                    _ => continue,
-                }
-            };
-            let mut document = Document::empty(None);
-            let mut elements = vec![StreamElementFrame {
-                node: document.root(),
-                lexical_name: None,
-            }];
-            let budget = ParseBudget::UNBOUNDED.with_owned_bytes(1024);
-            let mut meter = StreamParseMeter {
-                budget,
-                nodes: 1,
-                entity_references: 0,
-                entity_expansion: EntityExpansionMeter::with_parse_budget(budget),
-                namespace_scope_bytes: 0,
-                owned_bytes: 0,
-            };
-            let result = push_stream_element(
-                &mut document,
-                &mut elements,
-                &start,
-                true,
-                &declarations,
-                &mut meter,
-            );
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::Budget {
-                        kind: BudgetKind::OwnedBytes,
-                        ..
-                    })
-                ),
-                "defaults={defaults}: {result:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn parser_work_stops_entity_materialization_before_append() {
-        // A later scan refusal cannot pay for strings already materialized.
-        let xml = format!(
-            "<!DOCTYPE doc [<!ENTITY e '{}'>]><doc>{}</doc>",
-            "x".repeat(2000),
-            "&e;".repeat(100)
-        );
-        APPENDED.with(|bytes| bytes.set(0));
-        let report = Document::parse_with_budget_reported(
-            &xml,
-            None,
-            ParseBudget::new(1 << 20, 100, 32, 1000, 1 << 20, 1 << 20)
-                .with_owned_bytes(1 << 20)
-                .with_parse_work_bytes(25_000),
-        );
-        assert!(matches!(
-            report.outcome,
-            Err(Error::Budget {
-                kind: BudgetKind::ParseWorkBytes,
-                ..
-            })
-        ));
-        APPENDED.with(|bytes| {
-            assert!(
-                bytes.get() <= 25_000,
-                "{} bytes appended before work admission",
-                bytes.get()
-            )
-        });
-    }
-
-    #[test]
-    fn entity_expansion_cannot_outgrow_parser_workspace() {
-        // Expansion is temporary parser storage, not merely a limit on the
-        // tree eventually retained after a much larger string was allocated.
-        let budget = ParseBudget::new(4096, 100, 32, 100, 4096, 4096).with_owned_bytes(128);
-        let mut meter = EntityExpansionMeter::with_parse_budget(budget);
-        assert!(matches!(
-            meter.charge(129),
-            Err(Error::Budget {
-                kind: BudgetKind::OwnedBytes,
-                ..
-            })
-        ));
-    }
+    include!("model/expansion_workspace_tests.rs");
 }

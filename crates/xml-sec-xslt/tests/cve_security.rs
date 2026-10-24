@@ -64,7 +64,7 @@ fn cve_2011_1202_generated_ids_are_stable_node_ids_not_addresses() {
     for path in ["/*", "/*/namespace::p"] {
         let sheet = text_sheet(&format!("<xsl:value-of select='generate-id({path})'/>"));
         let expected = run(&sheet, "<r xmlns:p='urn:p'/>");
-        assert!(!expected.is_empty());
+        assert_ne!(expected, Vec::<u8>::new());
         for _ in 0..16 {
             assert_eq!(run(&sheet, "<r xmlns:p='urn:p'/>"), expected);
         }

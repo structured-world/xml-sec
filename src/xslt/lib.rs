@@ -40,6 +40,7 @@ mod expression;
 mod exslt_date;
 mod lexical;
 mod model;
+mod number;
 mod resolver;
 mod runtime;
 mod serializer;

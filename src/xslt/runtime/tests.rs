@@ -1041,22 +1041,7 @@ fn sibling_and_comment_fast_paths_charge_traversal() {
         .last()
         .expect("last child");
     let target = super::SourceNode::Node(last);
-    let budget = ExecutionBudget {
-        source_bytes: usize::MAX,
-        external_documents: usize::MAX,
-        recursion_depth: usize::MAX,
-        xpath_evaluations: usize::MAX,
-        xpath_operations: 1,
-        extension_operations: usize::MAX,
-        pattern_evaluations: usize::MAX,
-        template_applications: usize::MAX,
-        sort_comparisons: usize::MAX,
-        key_entries: usize::MAX,
-        result_nodes: usize::MAX,
-        serialized_bytes: usize::MAX,
-        messages: usize::MAX,
-        owned_bytes: usize::MAX,
-    };
+    let budget = SINGLE_XPATH_OPERATION_BUDGET;
     execution.meter = Meter::new(budget, 0).expect("fresh work meter");
     assert!(matches!(
         execution.sibling_number(&target, &mut |_, _| Ok(true)),
@@ -1098,6 +1083,23 @@ fn sibling_and_comment_fast_paths_charge_traversal() {
         })
     ));
 }
+
+const SINGLE_XPATH_OPERATION_BUDGET: ExecutionBudget = ExecutionBudget {
+    source_bytes: usize::MAX,
+    external_documents: usize::MAX,
+    recursion_depth: usize::MAX,
+    xpath_evaluations: usize::MAX,
+    xpath_operations: 1,
+    extension_operations: usize::MAX,
+    pattern_evaluations: usize::MAX,
+    template_applications: usize::MAX,
+    sort_comparisons: usize::MAX,
+    key_entries: usize::MAX,
+    result_nodes: usize::MAX,
+    serialized_bytes: usize::MAX,
+    messages: usize::MAX,
+    owned_bytes: usize::MAX,
+};
 
 #[test]
 fn normalize_space_fast_path_charges_descendant_traversal() {

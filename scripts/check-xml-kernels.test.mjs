@@ -31,7 +31,7 @@ test('scope follows physical XML implementations through every crate entry path'
 test('the gate deduplicates aliases but retains distinct defects and macro callers', () => {
   // Standalone and embedded reports must not inflate counts, while an
   // expansion in an owned caller must not disappear behind a foreign macro.
-  const gate = new DiagnosticGate(root);
+  const gate = new DiagnosticGate(root, ownsSource);
   gate.accept(warning('src/sxd_xpath/lib.rs'));
   gate.accept(warning('vendor/sxd-xpath-no-unsafe/../../src/sxd_xpath/lib.rs'));
   gate.accept(warning('src/sxd_xpath/lib.rs', { message: 'different defect' }));
@@ -44,7 +44,7 @@ test('the gate deduplicates aliases but retains distinct defects and macro calle
 
 test('compiler errors and malformed streams cannot produce successful qualification', () => {
   // A build failure remains terminal even when no owned source span exists.
-  const gate = new DiagnosticGate(root);
+  const gate = new DiagnosticGate(root, ownsSource);
   gate.accept(warning('src/provider.rs', { level: 'error' }));
   gate.accept({ reason: 'compiler-message', message: { level: 'error', message: 'no span', spans: [] } });
   gate.acceptLine('not cargo JSON');

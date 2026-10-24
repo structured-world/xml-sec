@@ -70,7 +70,10 @@ fn html_inference_requires_no_preceding_nonwhitespace_text() {
         .rotate_right(1);
     let definition = OutputDefinition {
         omit_xml_declaration: true,
-        indent_explicit: true,
+        explicit: super::ExplicitOutput {
+            indent: true,
+            ..super::ExplicitOutput::default()
+        },
         ..OutputDefinition::default()
     };
     assert_eq!(
@@ -92,7 +95,10 @@ fn html_namespaced_attributes_preserve_xml_values() {
     let document = Document::parse("<e xmlns='urn:e' a='&lt;&#10;'/>", None).expect("XML");
     let definition = OutputDefinition {
         method: OutputMethod::Html,
-        method_explicit: true,
+        explicit: super::ExplicitOutput {
+            method: true,
+            ..super::ExplicitOutput::default()
+        },
         ..OutputDefinition::default()
     };
     let output = serialize_audit_document(&document, &definition).expect("serializes");
@@ -109,7 +115,10 @@ fn html_uri_attributes_preserve_leading_whitespace() {
     let document = Document::parse("<a href='  relative'/>", None).expect("XML");
     let definition = OutputDefinition {
         method: OutputMethod::Html,
-        method_explicit: true,
+        explicit: super::ExplicitOutput {
+            method: true,
+            ..super::ExplicitOutput::default()
+        },
         ..OutputDefinition::default()
     };
 

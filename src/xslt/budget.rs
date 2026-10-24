@@ -210,7 +210,7 @@ pub struct ExecutionBudget {
     pub xpath_evaluations: usize,
     /// Maximum primitive traversal, predicate, comparison, and node-set insertion operations.
     pub xpath_operations: usize,
-    /// Internal work performed by extension functions after one XPath call is dispatched.
+    /// Internal work performed by extension functions after one `XPath` call is dispatched.
     pub extension_operations: usize,
     pub pattern_evaluations: usize,
     pub template_applications: usize,
@@ -545,14 +545,14 @@ pub(crate) fn reserve_metered_string(
     let required = current
         .len()
         .checked_add(additional)
-        .filter(|length| *length <= isize::MAX as usize)
+        .filter(|length| isize::try_from(*length).is_ok())
         .ok_or_else(|| Error::Dynamic("text value is too large".into()))?;
     if required <= current.capacity() {
         return Ok(());
     }
 
     meter.check_additional(BudgetKind::OwnedBytes, required)?;
-    debug_assert!(current.capacity() <= isize::MAX as usize);
+    debug_assert!(isize::try_from(current.capacity()).is_ok());
     let target_capacity = (current.capacity() * 2)
         .max(required)
         .min(isize::MAX as usize)

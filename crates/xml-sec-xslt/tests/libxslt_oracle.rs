@@ -250,7 +250,7 @@ fn execution_budget() -> ExecutionBudget {
 fn read_xml(path: &Path) -> xml_sec_xslt::Result<String> {
     let bytes = std::fs::read(path).map_err(|error| Error::Xml(format!("input: {error}")))?;
     xml_sec_xml_input::decode_xml(&bytes, None)
-        .map(|xml| xml.into_owned())
+        .map(std::borrow::Cow::into_owned)
         .map_err(|error| Error::Xml(format!("{}: {error}", path.display())))
 }
 
@@ -341,7 +341,7 @@ fn prepare_oracle_xml_bytes(
     bytes: &[u8],
 ) -> xml_sec_xslt::Result<PreparedXml> {
     let xml = xml_sec_xml_input::decode_xml(bytes, None)
-        .map(|xml| xml.into_owned())
+        .map(std::borrow::Cow::into_owned)
         .map_err(|error| Error::Xml(format!("{}: {error}", path.display())))?;
     prepare_oracle_xml_text(path, corpus_root, xml)
 }
@@ -361,59 +361,10 @@ fn prepare_oracle_xml_text(
         });
     };
     let declaration = &xml[range.clone()];
-    let mut dtd_sources = vec![(
-        doctype_internal_subset(declaration)
-            .unwrap_or_default()
-            .to_owned(),
-        path.parent().unwrap_or(corpus_root).to_owned(),
-    )];
-    if let Some(system) = doctype_external_entity_path(declaration) {
-        let dtd_path =
-            confined_oracle_path(path.parent().unwrap_or(corpus_root), system, corpus_root)?;
-        dtd_sources.push((
-            read_xml(&dtd_path)?,
-            dtd_path.parent().unwrap_or(corpus_root).to_owned(),
-        ));
-    }
-    let mut source_cursor = 0usize;
-    let mut loaded_dtds = HashSet::new();
-    let mut parameter_entities = std::collections::HashMap::new();
-    while source_cursor < dtd_sources.len() {
-        let (dtd, base) = dtd_sources[source_cursor].clone();
-        source_cursor += 1;
-        for declaration in markup_declarations(&dtd)? {
-            let Some(body) = declaration
-                .strip_prefix("<!ENTITY")
-                .and_then(|value| value.strip_suffix('>'))
-                .map(str::trim)
-            else {
-                continue;
-            };
-            let Some(parameter) = body.strip_prefix('%').map(str::trim_start) else {
-                continue;
-            };
-            let Some((name, value)) = parameter.split_once(char::is_whitespace) else {
-                continue;
-            };
-            let value = value.trim();
-            if let Some(relative) = external_entity_path(value) {
-                let dtd_path = confined_oracle_path(&base, relative, corpus_root)?;
-                let content = read_xml(&dtd_path)?;
-                // XML uses the first declaration of an entity. DocBook sets
-                // table-specific overrides before loading the table module,
-                // whose fallback declarations must therefore be ignored.
-                parameter_entities.entry(name.to_owned()).or_insert(None);
-                if loaded_dtds.insert(dtd_path.clone()) {
-                    dtd_sources
-                        .push((content, dtd_path.parent().unwrap_or(corpus_root).to_owned()));
-                }
-            } else if let Some(value) = quoted_value(value) {
-                parameter_entities
-                    .entry(name.to_owned())
-                    .or_insert_with(|| Some(value.to_owned()));
-            }
-        }
-    }
+    let OracleDtdSources {
+        sources: dtd_sources,
+        parameter_entities,
+    } = load_parameter_dtds(path, corpus_root, declaration)?;
     let mut text = String::with_capacity(xml.len() - range.len());
     text.push_str(&xml[..range.start]);
     text.push_str(&xml[range.end..]);
@@ -491,6 +442,75 @@ fn prepare_oracle_xml_text(
         default_attributes,
         tokenized_attributes: tokenized_attributes.into_iter().collect(),
         unparsed_entities: unparsed_entities.into_iter().collect(),
+    })
+}
+
+struct OracleDtdSources {
+    sources: Vec<(String, PathBuf)>,
+    parameter_entities: std::collections::HashMap<String, Option<String>>,
+}
+
+fn load_parameter_dtds(
+    path: &Path,
+    corpus_root: &Path,
+    declaration: &str,
+) -> xml_sec_xslt::Result<OracleDtdSources> {
+    let mut dtd_sources = vec![(
+        doctype_internal_subset(declaration)
+            .unwrap_or_default()
+            .to_owned(),
+        path.parent().unwrap_or(corpus_root).to_owned(),
+    )];
+    if let Some(system) = doctype_external_entity_path(declaration) {
+        let dtd_path =
+            confined_oracle_path(path.parent().unwrap_or(corpus_root), system, corpus_root)?;
+        dtd_sources.push((
+            read_xml(&dtd_path)?,
+            dtd_path.parent().unwrap_or(corpus_root).to_owned(),
+        ));
+    }
+    let mut source_cursor = 0usize;
+    let mut loaded_dtds = HashSet::new();
+    let mut parameter_entities = std::collections::HashMap::new();
+    while source_cursor < dtd_sources.len() {
+        let (dtd, base) = dtd_sources[source_cursor].clone();
+        source_cursor += 1;
+        for declaration in markup_declarations(&dtd)? {
+            let Some(body) = declaration
+                .strip_prefix("<!ENTITY")
+                .and_then(|value| value.strip_suffix('>'))
+                .map(str::trim)
+            else {
+                continue;
+            };
+            let Some(parameter) = body.strip_prefix('%').map(str::trim_start) else {
+                continue;
+            };
+            let Some((name, value)) = parameter.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let value = value.trim();
+            if let Some(relative) = external_entity_path(value) {
+                let dtd_path = confined_oracle_path(&base, relative, corpus_root)?;
+                let content = read_xml(&dtd_path)?;
+                // XML uses the first declaration of an entity. DocBook sets
+                // table-specific overrides before loading the table module,
+                // whose fallback declarations must therefore be ignored.
+                parameter_entities.entry(name.to_owned()).or_insert(None);
+                if loaded_dtds.insert(dtd_path.clone()) {
+                    dtd_sources
+                        .push((content, dtd_path.parent().unwrap_or(corpus_root).to_owned()));
+                }
+            } else if let Some(value) = quoted_value(value) {
+                parameter_entities
+                    .entry(name.to_owned())
+                    .or_insert_with(|| Some(value.to_owned()));
+            }
+        }
+    }
+    Ok(OracleDtdSources {
+        sources: dtd_sources,
+        parameter_entities,
     })
 }
 
@@ -1329,29 +1349,13 @@ fn is_expected_message_only_success(case: &Case, result: &xml_sec_xslt::Transfor
 fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u8]) -> bool {
     let stylesheet = case.stylesheet.to_string_lossy();
     let actual = String::from_utf8_lossy(actual);
+    if assert_numeric_output_deviation(stylesheet.as_ref(), actual.as_ref(), expected)
+        || assert_structural_output_deviation(stylesheet.as_ref(), actual.as_ref(), expected)
+        || assert_serialization_output_deviation(stylesheet.as_ref(), actual.as_ref(), expected)
+    {
+        return true;
+    }
     match stylesheet.as_ref() {
-        // libxslt injects HTML Content-Type metadata for explicit XML output with an XHTML
-        // doctype. XSLT 1.0 section 16.2 confines this behavior to the HTML output method.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-        "documents/bredfort.xsl" | "general/bug-152.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            let charset = if stylesheet == "documents/bredfort.xsl" {
-                "iso-8859-1"
-            } else {
-                "US-ASCII"
-            };
-            let marker = format!(
-                "<meta content=\"text/html; charset={charset}\" http-equiv=\"Content-Type\"/>"
-            );
-            assert_eq!(expected.matches(&marker).count(), 1);
-            let expected = if stylesheet == "general/bug-152.xsl" {
-                expected.replacen(&format!("    {marker}\n"), "", 1)
-            } else {
-                expected.replacen(&marker, "", 1)
-            };
-            assert_eq!(actual.as_ref(), expected);
-            true
-        }
         // libxslt rejects the XML Schema end-of-day lexical form in this fixture. XML Schema
         // Part 2 sections 3.2.7.1 and 3.2.8.1 require 24:00:00 to normalize to midnight, so
         // compare every other byte while accepting only that four-field normative delta.
@@ -1386,70 +1390,6 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert_eq!(format!("{prefix}{marker}{suffix}"), expected);
             true
         }
-        // libxslt forwards parameters through built-in template rules. XSLT 1.0 defines the
-        // built-in rule as an apply-templates without with-param, so the strict result must not
-        // retain the forms carried by the original parameter.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#built-in-rule
-        "exslt/common/node-set.5.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            let (metadata, _) = expected
-                .split_once("</metaproperties>")
-                .expect("donor output contains the unchanged metadata");
-            assert_eq!(
-                actual.as_ref(),
-                format!(
-                    "{metadata}</metaproperties><horizontal><node heading=\"caste\"><node heading=\"Brahmin\">\n\t \n  </node><node heading=\"non-Brahmin\">\n\t \n  </node></node></horizontal><vertical>\n\t \n  </vertical><cells/></document>\n"
-                )
-            );
-            true
-        }
-        "exslt/common/node-set.6.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            let (prefix, rest) = expected
-                .split_once("<cells>")
-                .expect("donor output contains the parameter-dependent cells");
-            let (_, suffix) = rest
-                .split_once("</cells>")
-                .expect("donor output closes the parameter-dependent cells");
-            assert_eq!(actual.as_ref(), format!("{prefix}<cells/>{suffix}"));
-            true
-        }
-        // libxslt applies numbering tokens to negative and zero values. XSLT 1.0 requires the
-        // XPath string form for values below 0.5, independent of the requested token.
-        "general/bug-187.xsl" => {
-            let expected = std::str::from_utf8(expected).expect("numbering oracle is UTF-8");
-            let parts = expected.split("<number>0</number>").collect::<Vec<_>>();
-            assert_eq!(parts.len(), 6, "the pinned oracle has five zero values");
-            let mut normalized = String::with_capacity(expected.len() + 24);
-            normalized.push_str(parts[0]);
-            for (index, part) in parts.iter().enumerate().skip(1) {
-                normalized.push_str(if matches!(index, 1 | 2 | 4) {
-                    "<number>-123.456</number>"
-                } else {
-                    "<number>0</number>"
-                });
-                normalized.push_str(part);
-            }
-            assert_eq!(actual, normalized);
-            true
-        }
-        "general/bug-219.xsl" => {
-            let expected = std::str::from_utf8(expected).expect("numbering oracle is UTF-8");
-            let mut normalized = String::with_capacity(expected.len());
-            let mut remainder = expected;
-            let mut zero_values = 0;
-            while let Some((before, tail)) = remainder.split_once("<value v=\"0\">") {
-                let (_, after) = tail.split_once("</value>").expect("zero value is closed");
-                normalized.push_str(before);
-                normalized.push_str("<value v=\"0\">0</value>");
-                remainder = after;
-                zero_values += 1;
-            }
-            assert_eq!(zero_values, 13, "the pinned oracle has 13 zero values");
-            normalized.push_str(remainder);
-            assert_eq!(actual, normalized);
-            true
-        }
         // libxslt leaves `@` unescaped in true mode and `[]` unescaped in false mode. EXSLT's
         // RFC 2396 contract respectively requires reserved characters to be escaped and excludes
         // square brackets from the reserved production.
@@ -1473,13 +1413,6 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
             assert_eq!(actual.as_ref(), "<?xml version=\"1.0\"?>\n");
             true
         }
-        // XSLT 1.0 section 16.2 emits an HTML doctype only when doctype-public or
-        // doctype-system is specified. libxslt extends version="5" into an HTML5 doctype.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-        "general/bug-206.xsl" => {
-            assert_eq!(actual, "<html></html>");
-            true
-        }
         // element-available() reports executable instructions. Structural children and
         // declarations are not instructions, and libxslt:debug has no engine implementation,
         // although libxslt advertises all of these names.
@@ -1496,88 +1429,6 @@ fn assert_strict_xslt_output_deviation(case: &Case, actual: &[u8], expected: &[u
                     .replace("xsl:when available\n", "")
                     .replace("xsl:otherwise available\n", "")
                     .replace("libxslt:debug available\n", "")
-            );
-            true
-        }
-        // libxslt ignores xsl:exclude-result-prefixes on this literal result element.
-        // XSLT 1.0 section 7.1.1 makes the exclusion effective for that subtree.
-        "REC/test-7.1.1-3.xsl" => {
-            assert_eq!(actual, "<?xml version=\"1.0\"?>\n<out>SUCCESS</out>\n");
-            true
-        }
-        // XSLT 1.0 section 7.1.1 assigns the namespace node designated by result-prefix,
-        // including its prefix. libxslt retains the stylesheet prefix while changing only URI.
-        "REC/test-7.1.1.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            let expected = expected.replace("axsl:", "xsl:").replace("xmlns:axsl=", "xmlns:xsl=").replace(
-                "xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\" xmlns:fo=\"http://www.w3.org/1999/XSL/Format\"",
-                "xmlns:fo=\"http://www.w3.org/1999/XSL/Format\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"",
-            );
-            assert_eq!(actual.as_ref(), expected);
-            true
-        }
-        // XSLT 1.0 section 7.1.1 maps #default to the default namespace bound at the
-        // namespace-alias declaration. This fixture has no such binding; libxslt instead keeps
-        // the stylesheet namespace URI while dropping its prefix.
-        "namespaces/tst7.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            let strict = expected
-                .replace(" xmlns=\"http://www.w3.org/1999/xhtml\"", "")
-                .replace(
-                    "    <meta content=\"text/html; charset=utf-8\" http-equiv=\"Content-Type\"/>\n",
-                    "",
-                );
-            assert_eq!(actual.as_ref(), strict);
-            true
-        }
-        // XSLT 1.0 section 16.2 reserves HTML serialization for null-namespace elements.
-        // libxslt inserts an HTML META into this namespaced HEAD instead.
-        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
-        "general/bug-130.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            assert_eq!(actual, expected.replacen("<meta charset=\"UTF-8\">", "", 1));
-            true
-        }
-        // HTML 4.01 section 12.2.1 defines A/name as an anchor identifier, not a URI.
-        // libxslt percent-encodes that attribute in its HTML output.
-        // https://www.w3.org/TR/html401/struct/links.html#h-12.2.1
-        "general/bug-159.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            assert_eq!(
-                actual,
-                expected.replacen("name=\"%D1%91\"", "name=\"&#1105;\"", 1)
-            );
-            true
-        }
-        // XPath 1.0 section 4.2 requires enough decimal digits to distinguish the IEEE-754 value.
-        // libxslt rounds these arithmetic results to a shorter, non-distinguishing representation.
-        "general/bug-5-.xsl" => {
-            assert!(numeric_lexical_forms_match_known_libxslt_rounding(
-                &actual, expected
-            ));
-            true
-        }
-        "general/bug-81.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            assert_eq!(expected.matches("0.64").count(), 2);
-            assert_eq!(
-                actual.as_ref(),
-                expected.replace("0.64", "0.6400000000000001")
-            );
-            true
-        }
-        // XPath 1.0 section 4.2 retains enough decimal digits to distinguish these two
-        // arithmetic results; the donor prints shorter decimal forms.
-        // https://www.w3.org/TR/1999/REC-xpath-19991116#function-string
-        "XSLTMark/metric.xsl" => {
-            let expected = String::from_utf8_lossy(expected);
-            assert_eq!(expected.matches("95012.3884199").count(), 1);
-            assert_eq!(expected.matches("0.04702523").count(), 1);
-            assert_eq!(
-                actual.as_ref(),
-                expected
-                    .replacen("95012.3884199", "95012.38841989999", 1)
-                    .replacen("0.04702523", "0.047025229999999994", 1)
             );
             true
         }
@@ -1898,6 +1749,196 @@ fn normalize_text_quote_references(bytes: &[u8]) -> Vec<u8> {
     normalized
 }
 
+fn assert_numeric_output_deviation(stylesheet: &str, actual: &str, expected: &[u8]) -> bool {
+    match stylesheet {
+        // libxslt applies numbering tokens to negative and zero values. XSLT 1.0 requires the
+        // XPath string form for values below 0.5, independent of the requested token.
+        "general/bug-187.xsl" => {
+            let expected = std::str::from_utf8(expected).expect("numbering oracle is UTF-8");
+            let parts = expected.split("<number>0</number>").collect::<Vec<_>>();
+            assert_eq!(parts.len(), 6, "the pinned oracle has five zero values");
+            let mut normalized = String::with_capacity(expected.len() + 24);
+            normalized.push_str(parts[0]);
+            for (index, part) in parts.iter().enumerate().skip(1) {
+                normalized.push_str(if matches!(index, 1 | 2 | 4) {
+                    "<number>-123.456</number>"
+                } else {
+                    "<number>0</number>"
+                });
+                normalized.push_str(part);
+            }
+            assert_eq!(actual, normalized);
+            true
+        }
+        "general/bug-219.xsl" => {
+            let expected = std::str::from_utf8(expected).expect("numbering oracle is UTF-8");
+            let mut normalized = String::with_capacity(expected.len());
+            let mut remainder = expected;
+            let mut zero_values = 0;
+            while let Some((before, tail)) = remainder.split_once("<value v=\"0\">") {
+                let (_, after) = tail.split_once("</value>").expect("zero value is closed");
+                normalized.push_str(before);
+                normalized.push_str("<value v=\"0\">0</value>");
+                remainder = after;
+                zero_values += 1;
+            }
+            assert_eq!(zero_values, 13, "the pinned oracle has 13 zero values");
+            normalized.push_str(remainder);
+            assert_eq!(actual, normalized);
+            true
+        }
+        // XPath 1.0 section 4.2 requires enough decimal digits to distinguish the IEEE-754 value.
+        // libxslt rounds these arithmetic results to a shorter, non-distinguishing representation.
+        "general/bug-5-.xsl" => {
+            assert!(numeric_lexical_forms_match_known_libxslt_rounding(
+                actual, expected
+            ));
+            true
+        }
+        "general/bug-81.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(expected.matches("0.64").count(), 2);
+            assert_eq!(actual, expected.replace("0.64", "0.6400000000000001"));
+            true
+        }
+        // XPath 1.0 section 4.2 retains enough decimal digits to distinguish these two
+        // arithmetic results; the donor prints shorter decimal forms.
+        // https://www.w3.org/TR/1999/REC-xpath-19991116#function-string
+        "XSLTMark/metric.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(expected.matches("95012.3884199").count(), 1);
+            assert_eq!(expected.matches("0.04702523").count(), 1);
+            assert_eq!(
+                actual,
+                expected
+                    .replacen("95012.3884199", "95012.38841989999", 1)
+                    .replacen("0.04702523", "0.047025229999999994", 1)
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn assert_structural_output_deviation(stylesheet: &str, actual: &str, expected: &[u8]) -> bool {
+    match stylesheet {
+        // libxslt forwards parameters through built-in template rules. XSLT 1.0 defines the
+        // built-in rule as an apply-templates without with-param, so the strict result must not
+        // retain the forms carried by the original parameter.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#built-in-rule
+        "exslt/common/node-set.5.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let (metadata, _) = expected
+                .split_once("</metaproperties>")
+                .expect("donor output contains the unchanged metadata");
+            assert_eq!(
+                actual,
+                format!(
+                    "{metadata}</metaproperties><horizontal><node heading=\"caste\"><node heading=\"Brahmin\">\n\t \n  </node><node heading=\"non-Brahmin\">\n\t \n  </node></node></horizontal><vertical>\n\t \n  </vertical><cells/></document>\n"
+                )
+            );
+            true
+        }
+        "exslt/common/node-set.6.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let (prefix, rest) = expected
+                .split_once("<cells>")
+                .expect("donor output contains the parameter-dependent cells");
+            let (_, suffix) = rest
+                .split_once("</cells>")
+                .expect("donor output closes the parameter-dependent cells");
+            assert_eq!(actual, format!("{prefix}<cells/>{suffix}"));
+            true
+        }
+        // libxslt ignores xsl:exclude-result-prefixes on this literal result element.
+        // XSLT 1.0 section 7.1.1 makes the exclusion effective for that subtree.
+        "REC/test-7.1.1-3.xsl" => {
+            assert_eq!(actual, "<?xml version=\"1.0\"?>\n<out>SUCCESS</out>\n");
+            true
+        }
+        // XSLT 1.0 section 7.1.1 assigns the namespace node designated by result-prefix,
+        // including its prefix. libxslt retains the stylesheet prefix while changing only URI.
+        "REC/test-7.1.1.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let expected = expected.replace("axsl:", "xsl:").replace("xmlns:axsl=", "xmlns:xsl=").replace(
+                "xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\" xmlns:fo=\"http://www.w3.org/1999/XSL/Format\"",
+                "xmlns:fo=\"http://www.w3.org/1999/XSL/Format\" xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\"",
+            );
+            assert_eq!(actual, expected);
+            true
+        }
+        // XSLT 1.0 section 7.1.1 maps #default to the default namespace bound at the
+        // namespace-alias declaration. This fixture has no such binding; libxslt instead keeps
+        // the stylesheet namespace URI while dropping its prefix.
+        "namespaces/tst7.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let strict = expected
+                .replace(" xmlns=\"http://www.w3.org/1999/xhtml\"", "")
+                .replace(
+                    "    <meta content=\"text/html; charset=utf-8\" http-equiv=\"Content-Type\"/>\n",
+                    "",
+                );
+            assert_eq!(actual, strict);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn assert_serialization_output_deviation(stylesheet: &str, actual: &str, expected: &[u8]) -> bool {
+    match stylesheet {
+        // libxslt injects HTML Content-Type metadata for explicit XML output with an XHTML
+        // doctype. XSLT 1.0 section 16.2 confines this behavior to the HTML output method.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        "documents/bredfort.xsl" | "general/bug-152.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            let charset = if stylesheet == "documents/bredfort.xsl" {
+                "iso-8859-1"
+            } else {
+                "US-ASCII"
+            };
+            let marker = format!(
+                "<meta content=\"text/html; charset={charset}\" http-equiv=\"Content-Type\"/>"
+            );
+            assert_eq!(expected.matches(&marker).count(), 1);
+            let expected = if stylesheet == "general/bug-152.xsl" {
+                expected.replacen(&format!("    {marker}\n"), "", 1)
+            } else {
+                expected.replacen(&marker, "", 1)
+            };
+            assert_eq!(actual, expected);
+            true
+        }
+        // XSLT 1.0 section 16.2 emits an HTML doctype only when doctype-public or
+        // doctype-system is specified. libxslt extends version="5" into an HTML5 doctype.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        "general/bug-206.xsl" => {
+            assert_eq!(actual, "<html></html>");
+            true
+        }
+        // XSLT 1.0 section 16.2 reserves HTML serialization for null-namespace elements.
+        // libxslt inserts an HTML META into this namespaced HEAD instead.
+        // https://www.w3.org/TR/1999/REC-xslt-19991116#section-HTML-Output-Method
+        "general/bug-130.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(actual, expected.replacen("<meta charset=\"UTF-8\">", "", 1));
+            true
+        }
+        // HTML 4.01 section 12.2.1 defines A/name as an anchor identifier, not a URI.
+        // libxslt percent-encodes that attribute in its HTML output.
+        // https://www.w3.org/TR/html401/struct/links.html#h-12.2.1
+        "general/bug-159.xsl" => {
+            let expected = String::from_utf8_lossy(expected);
+            assert_eq!(
+                actual,
+                expected.replacen("name=\"%D1%91\"", "name=\"&#1105;\"", 1)
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
 fn serialized_markup_end(bytes: &[u8], start: usize) -> usize {
     for (prefix, suffix) in [
         (b"<!--".as_slice(), b"-->".as_slice()),
@@ -1914,16 +1955,23 @@ fn serialized_markup_end(bytes: &[u8], start: usize) -> usize {
         }
     }
 
+    let end = quoted_markup_end(bytes, start);
+    if end < bytes.len() { end + 1 } else { end }
+}
+
+fn quoted_markup_end(bytes: &[u8], start: usize) -> usize {
+    let mut end = start + 1;
     let mut quote = None;
-    for (offset, byte) in bytes[start + 1..].iter().copied().enumerate() {
-        match (quote, byte) {
-            (None, b'\'' | b'"') => quote = Some(byte),
-            (Some(delimiter), value) if delimiter == value => quote = None,
-            (None, b'>') => return start + offset + 2,
+    while end < bytes.len() {
+        match (quote, bytes[end]) {
+            (Some(active), byte) if byte == active => quote = None,
+            (None, byte @ (b'\'' | b'"')) => quote = Some(byte),
+            (None, b'>') => break,
             _ => {}
         }
+        end += 1;
     }
-    bytes.len()
+    end
 }
 
 fn normalize_xml_attribute_order(bytes: &[u8]) -> Vec<u8> {
@@ -1939,17 +1987,7 @@ fn normalize_xml_attribute_order(bytes: &[u8]) -> Vec<u8> {
             cursor += 1;
             continue;
         }
-        let mut end = cursor + 1;
-        let mut quote = None;
-        while end < bytes.len() {
-            match (quote, bytes[end]) {
-                (Some(active), byte) if byte == active => quote = None,
-                (None, byte @ (b'\'' | b'"')) => quote = Some(byte),
-                (None, b'>') => break,
-                _ => {}
-            }
-            end += 1;
-        }
+        let end = quoted_markup_end(bytes, cursor);
         if end == bytes.len() {
             output.extend_from_slice(&bytes[cursor..]);
             break;
@@ -2028,6 +2066,21 @@ fn normalize_xml_attribute_order(bytes: &[u8]) -> Vec<u8> {
         cursor = end + 1;
     }
     output
+}
+
+#[test]
+fn quoted_markup_boundaries_preserve_delimiters_and_unterminated_tail() {
+    // A quoted greater-than sign is data. Incomplete tags must remain opaque rather
+    // than letting attribute normalization reinterpret the final quoted delimiter.
+    let opening = b"<r a='>' b=\"/>\">";
+    let input = [opening.as_slice(), b"tail"].concat();
+    assert_eq!(quoted_markup_end(&input, 0), opening.len() - 1);
+    assert_eq!(serialized_markup_end(&input, 0), opening.len());
+    assert_eq!(normalize_xml_attribute_order(&input), input);
+    for incomplete in [b"<r a='>".as_slice(), b"<r a=\"value>"] {
+        assert_eq!(quoted_markup_end(incomplete, 0), incomplete.len());
+        assert_eq!(normalize_xml_attribute_order(incomplete), incomplete);
+    }
 }
 
 fn normalize_numeric_character_references(bytes: &[u8]) -> Vec<u8> {

@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::Arc;
 use xml_sec_xslt::{
     CompileBudget, Compiler, Document, ExecutionBudget, ExecutionEnvironment, ExecutionOptions,
@@ -33,9 +34,11 @@ impl Fixture {
             ),
             _ => panic!("unknown XSLT fixture"),
         };
-        let templates = (0..size)
-            .map(|n| format!("<xsl:template name='unused{n}'/>"))
-            .collect::<String>();
+        let mut templates = String::new();
+        for index in 0..size {
+            write!(templates, "<xsl:template name='unused{index}'/>")
+                .expect("writing to a String cannot fail");
+        }
         Self {
             source: format!("<root>{input}</root>"),
             stylesheet: format!(

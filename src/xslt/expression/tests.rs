@@ -75,7 +75,7 @@ fn namespaced_call_discovery_accepts_complete_ncname_grammar() {
 fn unprefixed_call_discovery_excludes_qualified_names() {
     // A prefixed extension function whose local name matches a core function
     // must not activate the core function's compile-time or runtime behavior.
-    assert!(metered_calls("x:key()", "key").is_empty());
+    assert_eq!(metered_calls("x:key()", "key"), Vec::<(usize, &str)>::new());
     assert_eq!(metered_calls("key()", "key").len(), 1);
 }
 

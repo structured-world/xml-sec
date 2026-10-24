@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{collections::HashMap, sync::Mutex};
@@ -77,6 +78,45 @@ fn execution_budget(source_bytes: usize) -> ExecutionBudget {
         messages: 100,
         owned_bytes: 8 << 20,
     }
+}
+
+#[test]
+fn execution_options_accept_owned_and_borrowed_inputs() {
+    // Borrowing options preserves caller ownership and the same entry template, bytes and work.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template name="selected">selected</xsl:template></xsl:stylesheet>"#,
+    );
+    let source = Document::parse("<source/>", None).expect("source parses");
+    let options = ExecutionOptions {
+        budget: execution_budget(1024),
+        initial_mode: None,
+        initial_template: Some(ExpandedName::new(None::<String>, "selected")),
+    };
+    let borrowed = stylesheet.execute_reported(
+        &source,
+        &Parameters::new(),
+        ExecutionEnvironment::new(Arc::new(NoResolver)),
+        &options,
+    );
+    assert_eq!(
+        options
+            .initial_template
+            .as_ref()
+            .expect("caller retains options")
+            .local,
+        "selected"
+    );
+    let owned = stylesheet.execute_reported(
+        &source,
+        &Parameters::new(),
+        ExecutionEnvironment::new(Arc::new(NoResolver)),
+        options,
+    );
+    assert_eq!(borrowed.usage, owned.usage);
+    let borrowed = borrowed.outcome.expect("borrowed options execute");
+    let owned = owned.outcome.expect("owned options execute");
+    assert_eq!(borrowed.serialized.bytes, b"selected");
+    assert_eq!(borrowed.serialized.bytes, owned.serialized.bytes);
 }
 
 #[test]
@@ -214,9 +254,12 @@ fn identity_indexes_are_charged_to_the_parse() {
     )
     .with_owned_bytes(usize::MAX);
     let elements = |attribute: &str| {
-        (0..512)
-            .map(|index| format!(r#"<e {attribute}="identifier-{index:04}"/>"#))
-            .collect::<String>()
+        let mut elements = String::new();
+        for index in 0..512 {
+            write!(elements, r#"<e {attribute}="identifier-{index:04}"/>"#)
+                .expect("writing to String cannot fail");
+        }
+        elements
     };
     let retained = |xml: String| {
         Document::parse_with_budget(&xml, None, unbounded)
@@ -231,7 +274,7 @@ fn identity_indexes_are_charged_to_the_parse() {
         xml_ids + 512 * 2 >= plain + values,
         "xml:id {xml_ids} vs plain {plain}"
     );
-    let dtd = r#"<!DOCTYPE r [<!ATTLIST e i ID #IMPLIED>]>"#;
+    let dtd = r"<!DOCTYPE r [<!ATTLIST e i ID #IMPLIED>]>";
     let plain = retained(format!("{dtd}<r>{}</r>", elements("a")));
     let dtd_ids = retained(format!("{dtd}<r>{}</r>", elements("i")));
     assert!(
@@ -255,11 +298,15 @@ fn unparsed_entities_are_charged_to_the_parse() {
     )
     .with_owned_bytes(usize::MAX);
     let declarations = |notation: &str| {
-        (0..256)
-            .map(|index| {
-                format!(r#"<!ENTITY u{index:04} SYSTEM "urn:entity:{index:04}"{notation}>"#)
-            })
-            .collect::<String>()
+        let mut declarations = String::new();
+        for index in 0..256 {
+            write!(
+                declarations,
+                r#"<!ENTITY u{index:04} SYSTEM "urn:entity:{index:04}"{notation}>"#
+            )
+            .expect("writing to String cannot fail");
+        }
+        declarations
     };
     let retained = |declarations: String| {
         let xml = format!(r#"<!DOCTYPE r [<!NOTATION n SYSTEM "urn:n">{declarations}]><r/>"#);
@@ -379,6 +426,8 @@ fn the_work_ceiling_bounds_every_kind_together() {
 
 #[test]
 fn reported_usage_is_the_work_the_budget_enforces() {
+    type SetLimit = fn(&mut ExecutionBudget, usize);
+
     // Callers that share one allowance across executions pass the remainder of the previous
     // report as the next budget. That is sound only if each reported counter is exactly the
     // amount the meter admitted: the reported value must fit and one unit less must not.
@@ -409,7 +458,6 @@ fn reported_usage_is_the_work_the_budget_enforces() {
     assert_eq!(usage.external_documents, 0);
     assert_eq!(usage.messages, 0);
 
-    type SetLimit = fn(&mut ExecutionBudget, usize);
     let cases: [(BudgetKind, usize, SetLimit); 6] = [
         (
             BudgetKind::XPathEvaluations,
@@ -440,7 +488,7 @@ fn reported_usage_is_the_work_the_budget_enforces() {
             },
         ),
         (BudgetKind::ResultNodes, usage.result_nodes, |b, v| {
-            b.result_nodes = v
+            b.result_nodes = v;
         }),
         (
             BudgetKind::SerializedBytes,
@@ -570,8 +618,9 @@ fn compiled_dependencies_require_execution_authorization() {
     impl Resolver for DeniedResolver {
         fn authorize(&self, access: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
             let resource = match access {
-                ResourceAccess::Request(request) => request.uri,
-                ResourceAccess::Retained { request, .. } => request.uri,
+                ResourceAccess::Request(request) | ResourceAccess::Retained { request, .. } => {
+                    request.uri
+                }
                 ResourceAccess::Dependency(identity) => &identity.0,
             };
             Err(Error::Resolver {
@@ -630,8 +679,9 @@ impl Resolver for LeaseResolver {
     fn authorize(&self, access: ResourceAccess<'_>) -> xml_sec_xslt::Result<()> {
         self.authorizations.fetch_add(1, Ordering::Relaxed);
         let resource = match access {
-            ResourceAccess::Request(request) => request.uri,
-            ResourceAccess::Retained { request, .. } => request.uri,
+            ResourceAccess::Request(request) | ResourceAccess::Retained { request, .. } => {
+                request.uri
+            }
             ResourceAccess::Dependency(identity) => &identity.0,
         };
         if let Some(reason) = *self.refusal.lock().expect("lease lock") {
@@ -1798,7 +1848,7 @@ fn assert_imported_copy_uses_creating_base(instruction: &str) {
         Some("https://example.test/styles/main.xsl"),
     )
     .expect("stylesheet graph compiles");
-    let produced = producer
+    let imported_result = producer
         .execute(
             &Document::parse("<root><copied/></root>", None).expect("source parses"),
             &Parameters::new(),
@@ -1821,7 +1871,7 @@ fn assert_imported_copy_uses_creating_base(instruction: &str) {
     .expect("consumer stylesheet compiles");
     let result = consumer
         .execute(
-            &produced.document,
+            &imported_result.document,
             &Parameters::new(),
             resolver,
             ExecutionOptions {
@@ -2636,7 +2686,7 @@ fn empty_unparsed_entity_system_identifier_reaches_xpath() {
             },
         )
         .expect("empty unparsed-entity URI remains XPath-visible");
-    assert!(result.serialized.bytes.is_empty());
+    assert_eq!(result.serialized.bytes, Vec::<u8>::new());
 }
 
 #[test]
@@ -3030,6 +3080,57 @@ fn document_function_uses_node_module_and_explicit_base_uris() {
     // scalar references their stylesheet module base, and the optional second
     // argument overrides either without collapsing equal hrefs in the cache.
     let resolver = Arc::new(ContextResolver::default());
+    populate_document_base_resources(&resolver);
+
+    let stylesheet = Compiler::new(
+        resolver.clone(),
+        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
+    )
+    .compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="document(@href)/doc"/></xsl:for-each><xsl:text>|</xsl:text><xsl:value-of select="document('override.xml', root/item[2])/doc"/><xsl:text>|</xsl:text><xsl:call-template name="imported"/></xsl:template></xsl:stylesheet>"#,
+        Some("https://example.test/styles/main.xsl"),
+    )
+    .expect("stylesheet graph compiles");
+    let source = Document::parse(
+        r#"<root xml:base="https://example.test/source/"><item xml:base="a/" href="same.xml"/><item xml:base="b/" href="same.xml"/></root>"#,
+        Some("https://example.test/source/input.xml"),
+    )
+    .expect("source parses");
+    let result = stylesheet
+        .execute(
+            &source,
+            &Parameters::new(),
+            resolver.clone(),
+            ExecutionOptions {
+                budget: execution_budget(1 << 20),
+                initial_mode: None,
+                initial_template: None,
+            },
+        )
+        .expect("all document bases resolve");
+    assert_eq!(result.serialized.bytes, b"AB|override|module");
+
+    let calls = resolver
+        .calls
+        .lock()
+        .expect("test resolver mutex is not poisoned");
+    assert!(calls.iter().any(|(href, base, purpose)| {
+        href == "same.xml"
+            && base.as_deref() == Some("https://example.test/source/a/")
+            && *purpose == ResolvePurpose::Document
+    }));
+    assert!(calls.iter().any(|(href, base, purpose)| {
+        href == "same.xml"
+            && base.as_deref() == Some("https://example.test/source/b/")
+            && *purpose == ResolvePurpose::Document
+    }));
+    assert!(calls.iter().any(|(href, base, purpose)| {
+        href == "module.xml"
+            && base.as_deref() == Some("https://example.test/modules/imported.xsl")
+            && *purpose == ResolvePurpose::Document
+    }));
+}
+fn populate_document_base_resources(resolver: &ContextResolver) {
     let mut resources = resolver
         .resources
         .lock()
@@ -3084,54 +3185,6 @@ fn document_function_uses_node_module_and_explicit_base_uris() {
         );
     }
     drop(resources);
-
-    let stylesheet = Compiler::new(
-        resolver.clone(),
-        CompileBudget::new(1 << 20, 8, 256, 1 << 20),
-    )
-    .compile(
-        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="imported.xsl"/><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="document(@href)/doc"/></xsl:for-each><xsl:text>|</xsl:text><xsl:value-of select="document('override.xml', root/item[2])/doc"/><xsl:text>|</xsl:text><xsl:call-template name="imported"/></xsl:template></xsl:stylesheet>"#,
-        Some("https://example.test/styles/main.xsl"),
-    )
-    .expect("stylesheet graph compiles");
-    let source = Document::parse(
-        r#"<root xml:base="https://example.test/source/"><item xml:base="a/" href="same.xml"/><item xml:base="b/" href="same.xml"/></root>"#,
-        Some("https://example.test/source/input.xml"),
-    )
-    .expect("source parses");
-    let result = stylesheet
-        .execute(
-            &source,
-            &Parameters::new(),
-            resolver.clone(),
-            ExecutionOptions {
-                budget: execution_budget(1 << 20),
-                initial_mode: None,
-                initial_template: None,
-            },
-        )
-        .expect("all document bases resolve");
-    assert_eq!(result.serialized.bytes, b"AB|override|module");
-
-    let calls = resolver
-        .calls
-        .lock()
-        .expect("test resolver mutex is not poisoned");
-    assert!(calls.iter().any(|(href, base, purpose)| {
-        href == "same.xml"
-            && base.as_deref() == Some("https://example.test/source/a/")
-            && *purpose == ResolvePurpose::Document
-    }));
-    assert!(calls.iter().any(|(href, base, purpose)| {
-        href == "same.xml"
-            && base.as_deref() == Some("https://example.test/source/b/")
-            && *purpose == ResolvePurpose::Document
-    }));
-    assert!(calls.iter().any(|(href, base, purpose)| {
-        href == "module.xml"
-            && base.as_deref() == Some("https://example.test/modules/imported.xsl")
-            && *purpose == ResolvePurpose::Document
-    }));
 }
 
 #[test]
@@ -6949,12 +7002,11 @@ fn numeric_sort_workspace_is_metered_before_allocation() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort select="@a" data-type="number"/><xsl:sort select="@b" data-type="number"/><xsl:value-of select="@a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
     );
-    let xml = format!(
-        "<root>{}</root>",
-        (0..1024)
-            .map(|index| format!(r#"<item a="{index}" b="{}"/>"#, 1024 - index))
-            .collect::<String>()
-    );
+    let mut xml = String::from("<root>");
+    for index in 0..1024 {
+        write!(xml, r#"<item a="{index}" b="{}"/>"#, 1024 - index).expect("String write");
+    }
+    xml.push_str("</root>");
     let source = Document::parse(&xml, None).expect("source parses");
     let mut budget = execution_budget(xml.len());
     budget.owned_bytes = 2_200_000;
@@ -7207,20 +7259,7 @@ fn xinclude_text_distinguishes_unavailable_encodings_from_invalid_bytes() {
         ("invalid-utf8.txt", "UTF-8", vec![0xFF]),
         ("truncated-utf16.txt", "UTF-16LE", vec![0x41]),
     ] {
-        resolver
-            .resources
-            .lock()
-            .expect("test resolver mutex is not poisoned")
-            .insert(
-                (href.into(), Some("memory:source.xml".into())),
-                ResolvedResource {
-                    canonical_uri: format!("memory:{href}"),
-                    identity: ResourceIdentity(href.into()),
-                    bytes,
-                    media_type: Some("text/plain".into()),
-                    encoding: Some(encoding.into()),
-                },
-            );
+        insert_xinclude_text_resource(&resolver, href, Some(encoding), bytes);
     }
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
@@ -7254,20 +7293,7 @@ fn xinclude_text_distinguishes_unavailable_encodings_from_invalid_bytes() {
         ("replacement.txt", "replacement"),
         ("iso-2022-kr.txt", "ISO-2022-KR"),
     ] {
-        resolver
-            .resources
-            .lock()
-            .expect("test resolver mutex is not poisoned")
-            .insert(
-                (href.into(), Some("memory:source.xml".into())),
-                ResolvedResource {
-                    canonical_uri: format!("memory:{href}"),
-                    identity: ResourceIdentity(href.into()),
-                    bytes: Vec::new(),
-                    media_type: Some("text/plain".into()),
-                    encoding: Some(encoding.into()),
-                },
-            );
+        insert_xinclude_text_resource(&resolver, href, Some(encoding), Vec::new());
         let source = Document::parse(
             &format!(
                 r#"<root xmlns:xi="http://www.w3.org/2001/XInclude"><xi:include href="{href}" parse="text"><xi:fallback>fallback</xi:fallback></xi:include></root>"#
@@ -7324,6 +7350,27 @@ fn xinclude_text_distinguishes_unavailable_encodings_from_invalid_bytes() {
         ),
         Err(Error::Xml(message)) if message.contains("forbidden XML character")
     ));
+}
+fn insert_xinclude_text_resource(
+    resolver: &ContextResolver,
+    href: &str,
+    encoding: Option<&str>,
+    bytes: Vec<u8>,
+) {
+    resolver
+        .resources
+        .lock()
+        .expect("test resolver mutex is not poisoned")
+        .insert(
+            (href.into(), Some("memory:source.xml".into())),
+            ResolvedResource {
+                canonical_uri: format!("memory:{href}"),
+                identity: ResourceIdentity(href.into()),
+                bytes,
+                media_type: Some("text/plain".into()),
+                encoding: encoding.map(str::to_owned),
+            },
+        );
 }
 
 #[test]
@@ -7570,7 +7617,7 @@ fn xinclude_base_fixup_replaces_stale_attributes_but_avoids_redundancy() {
             SourceProcessing::XInclude,
         )
         .expect("equal bases need no fixup");
-    assert!(unchanged.serialized.bytes.is_empty());
+    assert_eq!(unchanged.serialized.bytes, Vec::<u8>::new());
 }
 
 #[test]
@@ -7624,92 +7671,7 @@ fn xinclude_text_distinguishes_generic_boms_from_explicit_endian_text() {
     // before the text resource is included in the document.
     // https://www.w3.org/TR/xinclude/#text_included
     let resolver = Arc::new(ContextResolver::default());
-    for (href, encoding, bytes) in [
-        (
-            "utf8.txt",
-            "UTF-8",
-            [b"\xEF\xBB\xBF".as_slice(), "alpha".as_bytes()].concat(),
-        ),
-        (
-            "utf16le.txt",
-            "UTF-16LE",
-            [0xFEFF_u16]
-                .into_iter()
-                .chain("beta".encode_utf16())
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        ),
-        (
-            "utf16be.txt",
-            "UTF-16",
-            [0xFEFF_u16]
-                .into_iter()
-                .chain("gamma".encode_utf16())
-                .flat_map(u16::to_be_bytes)
-                .collect(),
-        ),
-        (
-            "utf16be-explicit.txt",
-            "UTF-16BE",
-            [0xFEFF_u16]
-                .into_iter()
-                .chain("theta".encode_utf16())
-                .flat_map(u16::to_be_bytes)
-                .collect(),
-        ),
-    ] {
-        resolver
-            .resources
-            .lock()
-            .expect("test resolver mutex is not poisoned")
-            .insert(
-                (href.into(), Some("memory:source.xml".into())),
-                ResolvedResource {
-                    canonical_uri: format!("memory:{href}"),
-                    identity: ResourceIdentity(href.into()),
-                    bytes,
-                    media_type: Some("text/plain".into()),
-                    encoding: Some(encoding.into()),
-                },
-            );
-    }
-
-    for (href, bytes) in [
-        (
-            "utf16-signature.txt",
-            [0xFEFF_u16]
-                .into_iter()
-                .chain("delta".encode_utf16())
-                .flat_map(u16::to_le_bytes)
-                .collect(),
-        ),
-        (
-            "utf32-signature.txt",
-            [0xFF, 0xFE, 0x00, 0x00]
-                .into_iter()
-                .chain(
-                    "epsilon"
-                        .chars()
-                        .flat_map(|character| u32::from(character).to_le_bytes()),
-                )
-                .collect(),
-        ),
-    ] {
-        resolver
-            .resources
-            .lock()
-            .expect("test resolver mutex is not poisoned")
-            .insert(
-                (href.into(), Some("memory:source.xml".into())),
-                ResolvedResource {
-                    canonical_uri: format!("memory:{href}"),
-                    identity: ResourceIdentity(href.into()),
-                    bytes,
-                    media_type: Some("text/plain".into()),
-                    encoding: None,
-                },
-            );
-    }
+    populate_xinclude_bom_resources(&resolver);
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="root"/></xsl:template></xsl:stylesheet>"#,
     );
@@ -7781,6 +7743,68 @@ fn xinclude_text_distinguishes_generic_boms_from_explicit_endian_text() {
             )
             .is_err()
     );
+}
+fn populate_xinclude_bom_resources(resolver: &ContextResolver) {
+    for (href, encoding, bytes) in [
+        (
+            "utf8.txt",
+            "UTF-8",
+            [b"\xEF\xBB\xBF".as_slice(), "alpha".as_bytes()].concat(),
+        ),
+        (
+            "utf16le.txt",
+            "UTF-16LE",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("beta".encode_utf16())
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        ),
+        (
+            "utf16be.txt",
+            "UTF-16",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("gamma".encode_utf16())
+                .flat_map(u16::to_be_bytes)
+                .collect(),
+        ),
+        (
+            "utf16be-explicit.txt",
+            "UTF-16BE",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("theta".encode_utf16())
+                .flat_map(u16::to_be_bytes)
+                .collect(),
+        ),
+    ] {
+        insert_xinclude_text_resource(resolver, href, Some(encoding), bytes);
+    }
+
+    for (href, bytes) in [
+        (
+            "utf16-signature.txt",
+            [0xFEFF_u16]
+                .into_iter()
+                .chain("delta".encode_utf16())
+                .flat_map(u16::to_le_bytes)
+                .collect(),
+        ),
+        (
+            "utf32-signature.txt",
+            [0xFF, 0xFE, 0x00, 0x00]
+                .into_iter()
+                .chain(
+                    "epsilon"
+                        .chars()
+                        .flat_map(|character| u32::from(character).to_le_bytes()),
+                )
+                .collect(),
+        ),
+    ] {
+        insert_xinclude_text_resource(resolver, href, None, bytes);
+    }
 }
 
 #[test]
@@ -7916,7 +7940,7 @@ fn xinclude_element_scheme_budgets_only_the_selected_projection() {
     let unselected = "x".repeat(256 * 1024);
     resolver.resources.lock().expect("resolver mutex").insert(
         "included.xml".into(),
-        format!(r#"<doc><selected/><unselected>{unselected}</unselected></doc>"#),
+        format!(r"<doc><selected/><unselected>{unselected}</unselected></doc>"),
     );
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><xsl:copy-of select="."/></xsl:template></xsl:stylesheet>"#,
@@ -8602,16 +8626,26 @@ fn exslt_encode_uri_honors_the_optional_encoding() {
 fn undeclared_unicode_ncname_prefix_is_a_static_error() {
     // XML Names permits combining marks after the first prefix character; namespace validation
     // must not defer such an unbound prefix until the expression happens to execute.
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="ṕ:item"/></xsl:template></xsl:stylesheet>"#;
+    let stylesheet = concat!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><xsl:value-of select="p"#,
+        "\u{301}",
+        r#":item"/></xsl:template></xsl:stylesheet>"#,
+    );
     let error = Compiler::new(
         Arc::new(NoResolver),
         CompileBudget::new(1 << 20, 16, 256, 4 << 20),
     )
     .compile(stylesheet, Some("memory:main.xsl"))
     .expect_err("the Unicode prefix is not bound");
-    assert!(matches!(error, Error::Static(message) if message.contains("ṕ")));
+    assert!(matches!(error, Error::Static(message) if message.contains("p\u{301}")));
 
-    let declared = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:ṕ="urn:unicode"><xsl:template match="/"><xsl:value-of select="ṕ:item"/></xsl:template></xsl:stylesheet>"#;
+    let declared = concat!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:p"#,
+        "\u{301}",
+        r#"="urn:unicode"><xsl:template match="/"><xsl:value-of select="p"#,
+        "\u{301}",
+        r#":item"/></xsl:template></xsl:stylesheet>"#,
+    );
     Compiler::new(
         Arc::new(NoResolver),
         CompileBudget::new(1 << 20, 16, 256, 4 << 20),
@@ -8624,7 +8658,13 @@ fn undeclared_unicode_ncname_prefix_is_a_static_error() {
 fn xpath_function_whitespace_accepts_complete_unicode_ncnames() {
     // XPath 1.0 section 3.7 permits XML whitespace before `(`, while FunctionName is a QName and
     // therefore admits combining NCName characters: https://www.w3.org/TR/1999/REC-xpath-19991116/#exprlex
-    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:á"><func:result select="'ok'"/></func:function><xsl:template match="/"><xsl:value-of select="f:á ()"/></xsl:template></xsl:stylesheet>"#;
+    let stylesheet = concat!(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:func="http://exslt.org/functions" xmlns:f="urn:functions" extension-element-prefixes="func"><xsl:output method="text"/><func:function name="f:a"#,
+        "\u{301}",
+        r#""><func:result select="'ok'"/></func:function><xsl:template match="/"><xsl:value-of select="f:a"#,
+        "\u{301}",
+        r#" ()"/></xsl:template></xsl:stylesheet>"#,
+    );
     assert_eq!(execute(stylesheet, "<source/>"), "ok");
 }
 
@@ -8699,9 +8739,10 @@ fn retained_dynamic_xpath_expressions_consume_owned_memory_budget() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:dyn="http://exslt.org/dynamic"><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="dyn:evaluate(@expr)"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
     );
     let source_with = |expression: &dyn Fn(usize) -> String| {
-        let expressions = (0..64)
-            .map(|index| format!(r#"<item expr="{}"/>"#, expression(index)))
-            .collect::<String>();
+        let mut expressions = String::new();
+        for index in 0..64 {
+            write!(expressions, r#"<item expr="{}"/>"#, expression(index)).expect("String write");
+        }
         Document::parse(&format!("<root>{expressions}</root>"), None).expect("source parses")
     };
     let repeated_expression = format!("{}1", "1 + ".repeat(64));
@@ -9582,9 +9623,14 @@ fn prepared_extension_calls_borrow_the_visible_variable_snapshot() {
 #[test]
 fn prepared_extension_rewrite_charges_its_namespace_snapshot() {
     let namespace_payload = "x".repeat(2048);
-    let namespaces = (0..64)
-        .map(|index| format!(r#" xmlns:n{index}="urn:{index}:{namespace_payload}""#))
-        .collect::<String>();
+    let mut namespaces = String::new();
+    for index in 0..64 {
+        write!(
+            namespaces,
+            r#" xmlns:n{index}="urn:{index}:{namespace_payload}""#
+        )
+        .expect("String write");
+    }
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:exsl="http://exslt.org/common"{namespaces}>
           <xsl:output method="text"/>
@@ -9759,9 +9805,10 @@ fn repeated_namespace_overrides_release_replaced_storage() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><result>{copies}</result></xsl:template></xsl:stylesheet>"#,
     ));
     let payload = "x".repeat(4 * 1024);
-    let items = (0..64)
-        .map(|index| format!(r#"<item xmlns:p="urn:{index}:{payload}"/>"#))
-        .collect::<String>();
+    let mut items = String::new();
+    for index in 0..64 {
+        write!(items, r#"<item xmlns:p="urn:{index}:{payload}"/>"#).expect("String write");
+    }
     let source_xml = format!("<root>{items}</root>");
     let source = Document::parse(&source_xml, None).expect("source parses");
     let mut budget = execution_budget(source_xml.len());
@@ -9804,7 +9851,7 @@ fn xpath_sessions_do_not_clone_retained_result_tree_fragments() {
             },
         )
         .expect("borrowed RTF session remains inside the allocation gate");
-    assert!(result.serialized.bytes.is_empty());
+    assert_eq!(result.serialized.bytes, Vec::<u8>::new());
 }
 
 #[test]
@@ -10022,9 +10069,14 @@ fn dynamic_evaluators_reserve_source_coercion_before_parsing() {
 #[test]
 fn template_candidate_scans_are_bounded_as_pattern_work() {
     // Selection scans are attacker-controlled work even when every cheap mode/name check rejects.
-    let decoys = (0..64)
-        .map(|index| format!(r#"<xsl:template match="decoy-{index}" mode="unused"/>"#))
-        .collect::<String>();
+    let mut decoys = String::new();
+    for index in 0..64 {
+        write!(
+            decoys,
+            r#"<xsl:template match="decoy-{index}" mode="unused"/>"#
+        )
+        .expect("String write");
+    }
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{decoys}<xsl:template match="/"/></xsl:stylesheet>"#
     ));
@@ -10218,13 +10270,14 @@ fn sequential_secondary_outputs_release_temporary_fragment_memory() {
     // Serialized secondary outputs remain live, but their source fragments are temporary and
     // must not accumulate against the peak-live OwnedBytes ceiling.
     let payload = "x".repeat(4096);
-    let outputs = (0..32)
-        .map(|index| {
-            format!(
-                r#"<xt:document href="memory:{index}.xml"><detail>{payload}</detail></xt:document>"#
-            )
-        })
-        .collect::<String>();
+    let mut outputs = String::new();
+    for index in 0..32 {
+        write!(
+            outputs,
+            r#"<xt:document href="memory:{index}.xml"><detail>{payload}</detail></xt:document>"#
+        )
+        .expect("String write");
+    }
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform" xmlns:xt="http://www.jclark.com/xt" extension-element-prefixes="xt"><xsl:template match="/">{outputs}</xsl:template></xsl:stylesheet>"#
     ));
@@ -10249,9 +10302,14 @@ fn sequential_secondary_outputs_release_temporary_fragment_memory() {
 fn secondary_output_uri_index_scales_and_rejects_duplicates() {
     // URI uniqueness is an indexed invariant, not a scan whose work grows quadratically with the
     // number of otherwise tiny result documents.
-    let outputs = (0..2048)
-        .map(|index| format!(r#"<xt:document href="memory:{index}.xml" method="text"/>"#))
-        .collect::<String>();
+    let mut outputs = String::new();
+    for index in 0..2048 {
+        write!(
+            outputs,
+            r#"<xt:document href="memory:{index}.xml" method="text"/>"#
+        )
+        .expect("String write");
+    }
     let stylesheet = Compiler::new(
         Arc::new(NoResolver),
         CompileBudget::new(1 << 20, 0, 256, 16 << 20),
@@ -11384,16 +11442,15 @@ fn compile_budget_controls_stylesheet_entity_expansion_depth() {
     // XML 1.0 section 4.4.2 defines no fixed entity nesting ceiling, so stylesheet parsing must
     // use the same caller-selected recursion budget as source parsing.
     // https://www.w3.org/TR/xml/#included
-    let declarations = (0..12)
-        .map(|depth| {
-            let replacement = if depth == 11 {
-                "expanded".to_owned()
-            } else {
-                format!("&e{};", depth + 1)
-            };
-            format!(r#"<!ENTITY e{depth} "{replacement}">"#)
-        })
-        .collect::<String>();
+    let mut declarations = String::new();
+    for depth in 0..12 {
+        let replacement = if depth == 11 {
+            "expanded".to_owned()
+        } else {
+            format!("&e{};", depth + 1)
+        };
+        write!(declarations, r#"<!ENTITY e{depth} "{replacement}">"#).expect("String write");
+    }
     let stylesheet = format!(
         r#"<!DOCTYPE xsl:stylesheet [{declarations}]><xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/">&e0;</xsl:template></xsl:stylesheet>"#
     );
@@ -11687,7 +11744,7 @@ fn main_result_tree_finalizes_xml_ids_before_returning() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><root><item xml:id="  target  ">found</item></root></xsl:template></xsl:stylesheet>"#,
     );
     let source = Document::parse("<source/>", None).expect("source parses");
-    let produced = producer
+    let result_tree = producer
         .execute(
             &source,
             &Parameters::new(),
@@ -11702,9 +11759,9 @@ fn main_result_tree_finalizes_xml_ids_before_returning() {
     let consumer = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="id('target')"/></xsl:template></xsl:stylesheet>"#,
     );
-    let consumed = consumer
+    let selected_result = consumer
         .execute(
-            &produced.document,
+            &result_tree.document,
             &Parameters::new(),
             Arc::new(NoResolver),
             ExecutionOptions {
@@ -11714,7 +11771,7 @@ fn main_result_tree_finalizes_xml_ids_before_returning() {
             },
         )
         .expect("a subsequent transformation sees the finalized ID index");
-    assert_eq!(consumed.serialized.bytes, b"found");
+    assert_eq!(selected_result.serialized.bytes, b"found");
 
     for body in [
         r#"<root><item><xsl:attribute name="xml:id" namespace="http://www.w3.org/XML/1998/namespace">not valid</xsl:attribute></item></root>"#,
@@ -12276,9 +12333,14 @@ fn unused_attribute_set_cycles_are_static_errors() {
 fn retained_pattern_match_sets_consume_the_execution_memory_budget() {
     // Distinct complex patterns may each select the whole source, but their retained cache sets
     // cannot multiply memory beyond the operation's OwnedBytes limit.
-    let templates = (1..=120)
-        .map(|index| format!(r#"<xsl:template match="item[position() &gt;= 1][{index} &gt; 0]"/>"#))
-        .collect::<String>();
+    let mut templates = String::new();
+    for index in 1..=120 {
+        write!(
+            templates,
+            r#"<xsl:template match="item[position() &gt;= 1][{index} &gt; 0]"/>"#
+        )
+        .expect("String write");
+    }
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{templates}<xsl:template match="/"><xsl:apply-templates select="root/item"/></xsl:template></xsl:stylesheet>"#
     ));
@@ -12330,9 +12392,10 @@ fn optimized_child_selection_accounts_for_projected_node_storage() {
 fn identity_axis_shortcuts_do_not_raise_the_index_dominated_peak() {
     // The source projection indexes dominate the peak for attribute-heavy documents. Identity
     // selection must fit inside that already-accounted peak instead of adding retained storage.
-    let attributes = (0..2_048)
-        .map(|index| format!(r#" a{index}="""#))
-        .collect::<String>();
+    let mut attributes = String::new();
+    for index in 0..2_048 {
+        write!(attributes, r#" a{index}="""#).expect("String write");
+    }
     let source_xml = format!("<root{attributes}/>");
     let source = Document::parse(&source_xml, None).expect("wide source parses");
     let stylesheet = compile(
@@ -12357,9 +12420,14 @@ fn identity_axis_shortcuts_do_not_raise_the_index_dominated_peak() {
 fn effective_global_index_accounts_for_retained_storage() {
     // The effective-global lookup table survives initialization even when every declaration is
     // unused, so its buckets and cloned expanded names belong to peak OwnedBytes.
-    let globals = (0..256)
-        .map(|index| format!(r#"<xsl:variable name="global-{index}" select="{index}"/>"#))
-        .collect::<String>();
+    let mut globals = String::new();
+    for index in 0..256 {
+        write!(
+            globals,
+            r#"<xsl:variable name="global-{index}" select="{index}"/>"#
+        )
+        .expect("String write");
+    }
     let baseline = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     );
@@ -12395,9 +12463,10 @@ fn attribute_set_selection_does_not_accumulate_setup_workspace() {
 fn whitespace_rule_candidate_work_consumes_pattern_budget() {
     // Product work limits are independent of XSLT's whitespace semantics: every candidate rule
     // inspected for an untrusted text node must consume aggregate pattern work.
-    let rules = (0..64)
-        .map(|index| format!(r#"<xsl:strip-space elements="n{index}"/>"#))
-        .collect::<String>();
+    let mut rules = String::new();
+    for index in 0..64 {
+        write!(rules, r#"<xsl:strip-space elements="n{index}"/>"#).expect("String write");
+    }
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{rules}<xsl:template match="/"/></xsl:stylesheet>"#
     ));
@@ -12691,7 +12760,7 @@ fn format_number_suppresses_only_a_rounded_zero_integer() {
 fn format_number_honors_apostrophe_quoted_literals() {
     // DecimalFormat quotes remove syntax from enclosed symbols; doubled apostrophes emit one
     // literal apostrophe without changing the active numeric subpattern.
-    let stylesheet = r##"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(12, &quot;'#'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;'%'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;''0&quot;)"/></xsl:template></xsl:stylesheet>"##;
+    let stylesheet = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="format-number(12, &quot;'#'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;'%'0&quot;)"/><xsl:text>|</xsl:text><xsl:value-of select="format-number(12, &quot;''0&quot;)"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(stylesheet, "<source/>"), "#12|%12|'12");
 }
 
@@ -12883,7 +12952,7 @@ fn instruction_value_capture_rejects_non_text_nodes() {
     // XSLT does not flatten forbidden element descendants into attribute, comment, or PI values.
     for instruction in [
         r#"<out><xsl:attribute name="value"><bad>attribute</bad></xsl:attribute></out>"#,
-        r#"<xsl:comment><bad>comment</bad></xsl:comment>"#,
+        r"<xsl:comment><bad>comment</bad></xsl:comment>",
         r#"<xsl:processing-instruction name="target"><bad>pi</bad></xsl:processing-instruction>"#,
     ] {
         let stylesheet = compile(&format!(
@@ -12922,7 +12991,7 @@ fn empty_xslt_instructions_reject_content() {
     for instruction in [
         r#"<xsl:value-of select="1"><bad/></xsl:value-of>"#,
         r#"<xsl:copy-of select=".">content</xsl:copy-of>"#,
-        r#"<xsl:number><bad/></xsl:number>"#,
+        r"<xsl:number><bad/></xsl:number>",
         r#"<xsl:apply-templates><xsl:sort select="."><bad/></xsl:sort></xsl:apply-templates>"#,
     ] {
         let stylesheet = format!(
@@ -13409,7 +13478,7 @@ fn exclude_result_prefixes_rejects_xslt_20_all_token_in_strict_mode() {
         Err(Error::Static(message)) if message.contains("#all")
     ));
 
-    let forward = r##"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xmlns:p="urn:p" xsl:exclude-result-prefixes="p #all"/></xsl:template></xsl:stylesheet>"##;
+    let forward = r#"<xsl:stylesheet version="2.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output omit-xml-declaration="yes"/><xsl:template match="/"><out xmlns:p="urn:p" xsl:exclude-result-prefixes="p #all"/></xsl:template></xsl:stylesheet>"#;
     assert_eq!(execute(forward, "<source/>"), "<out xmlns:p=\"urn:p\"/>\n");
 }
 
@@ -13643,9 +13712,14 @@ fn duplicate_key_values_count_materialization_toward_peak_memory() {
 fn empty_key_build_markers_do_not_accumulate_setup_workspace() {
     // Dynamic key names retain metered completed-build identities, but those execution entries
     // must not accumulate semantic-path workspace released after projection.
-    let declarations = (0..128)
-        .map(|index| format!(r#"<xsl:key name="key-{index}" match="missing" use="."/>"#))
-        .collect::<String>();
+    let mut declarations = String::new();
+    for index in 0..128 {
+        write!(
+            declarations,
+            r#"<xsl:key name="key-{index}" match="missing" use="."/>"#
+        )
+        .expect("String write");
+    }
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">{declarations}<xsl:param name="requested" select="'absent'"/><xsl:output method="text"/><xsl:template name="baseline"><xsl:value-of select="count(/missing) + string-length($requested)"/></xsl:template><xsl:template name="keys"><xsl:value-of select="count(key($requested, 'x'))"/></xsl:template></xsl:stylesheet>"#,
     ));
@@ -14464,7 +14538,7 @@ fn document_function_decodes_non_utf8_resources() {
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="document('encoded.xml')/root"/></xsl:template></xsl:stylesheet>"#,
     );
     let latin1 = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><root>caf\xe9</root>".to_vec();
-    let utf16le = [0xff, 0xfe]
+    let little_endian = [0xff, 0xfe]
         .into_iter()
         .chain(
             "<?xml version=\"1.0\"?><root>λ</root>"
@@ -14472,7 +14546,7 @@ fn document_function_decodes_non_utf8_resources() {
                 .flat_map(u16::to_le_bytes),
         )
         .collect::<Vec<_>>();
-    let utf16be = [0xfe, 0xff]
+    let big_endian = [0xfe, 0xff]
         .into_iter()
         .chain(
             "<?xml version=\"1.0\"?><root>Ж</root>"
@@ -14482,8 +14556,8 @@ fn document_function_decodes_non_utf8_resources() {
         .collect::<Vec<_>>();
     for (bytes, encoding, expected) in [
         (latin1, None, "café"),
-        (utf16le, None, "λ"),
-        (utf16be, None, "Ж"),
+        (little_endian, None, "λ"),
+        (big_endian, None, "Ж"),
         (
             b"<root>caf\xe9</root>".to_vec(),
             Some("ISO-8859-1".into()),
@@ -14710,7 +14784,7 @@ fn number_letter_value_rejects_invalid_evaluated_values_in_strict_mode() {
         let stylesheet = format!(
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:number value="1" format="A" letter-value="{letter_value}"/></xsl:template></xsl:stylesheet>"#
         );
-        assert!(!execute(&stylesheet, "<source/>").is_empty());
+        assert_ne!(execute(&stylesheet, "<source/>"), "");
     }
 }
 
