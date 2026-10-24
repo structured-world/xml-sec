@@ -781,7 +781,7 @@ fn parse_key_retrieval_transforms(
     let mut children = element_children(child);
     match children.next() {
         Some(container) if container.has_tag_name((XMLDSIG_NS, "Transforms")) => {
-            if children.next().is_some() || container.children().find(Node::is_element).is_none() {
+            if children.next().is_some() || container.children().all(|node| !node.is_element()) {
                 return Err(XmlEncError::InvalidStructure(
                     "RetrievalMethod requires one nonempty ds:Transforms container".into(),
                 ));
@@ -1337,7 +1337,7 @@ fn detached_key_matches<'doc>(
                 })
             })
             .is_some_and(|label| {
-                label.children().find(Node::is_element).is_none()
+                label.children().all(|child| !child.is_element())
                     && label
                         .children()
                         .filter_map(Node::text)
