@@ -1,6 +1,6 @@
 //! Shared deterministic workloads and correctness checks for every measurement mode.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 use xml_sec::{
     XmlBackend, XmlDocument,
     c14n::{C14nAlgorithm, C14nMode, canonicalize_document},
@@ -91,18 +91,18 @@ fn body(shape: usize, units: usize) -> String {
         "saml" => {
             xml.push_str("<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Version=\"2.0\"><saml:Subject><saml:NameID>benchmark@example.invalid</saml:NameID></saml:Subject><saml:AttributeStatement>");
             for i in 0..units {
-                xml.push_str(&format!("<saml:Attribute Name=\"attribute-{i}\"><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>"));
+                write!(xml, "<saml:Attribute Name=\"attribute-{i}\"><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>").expect("writing to a String cannot fail");
             }
             xml.push_str("</saml:AttributeStatement></saml:Assertion>");
         }
         "namespaces" => {
             for i in 0..units {
-                xml.push_str(&format!("<n:v xmlns:n=\"urn:bench:{i}\" xmlns:a=\"urn:attribute:{i}\" a:x=\"v\"><n:child/></n:v>"));
+                write!(xml, "<n:v xmlns:n=\"urn:bench:{i}\" xmlns:a=\"urn:attribute:{i}\" a:x=\"v\"><n:child/></n:v>").expect("writing to a String cannot fail");
             }
         }
         "attributes" => {
             for i in 0..units {
-                xml.push_str(&format!("<v a=\"{i}\" b=\"value\" c=\"&amp;&quot;&#xA;\" d=\"4\" e=\"5\" f=\"6\" g=\"7\" h=\"8\"/>"));
+                write!(xml, "<v a=\"{i}\" b=\"value\" c=\"&amp;&quot;&#xA;\" d=\"4\" e=\"5\" f=\"6\" g=\"7\" h=\"8\"/>").expect("writing to a String cannot fail");
             }
         }
         "bulk" => {
@@ -124,6 +124,55 @@ fn body(shape: usize, units: usize) -> String {
     }
     xml.push_str("</Payload></Envelope>");
     xml
+}
+
+/// The provider and its RSA-2048 signing key for one measured engine.
+fn engine_signer(engine: Engine) -> (Arc<dyn CryptoProvider>, Box<dyn SigningKey>) {
+    match engine {
+        Engine::RustCrypto => (
+            Arc::new(RustCryptoProvider),
+            Box::new(
+                RsaSigningKey::from_pkcs8_pem(include_str!(
+                    "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+                ))
+                .expect("test key"),
+            ),
+        ),
+        #[cfg(feature = "aws-lc-fips")]
+        Engine::AwsLcFips => {
+            let der = pem::parse(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+            ))
+            .expect("test PEM")
+            .into_contents();
+            (
+                Arc::new(xml_sec::provider::AwsLcFipsProvider),
+                Box::new(
+                    xml_sec::provider::AwsLcSigningKey::from_pkcs8_der(
+                        SignatureAlgorithm::RsaSha256,
+                        &der,
+                    )
+                    .expect("native test key"),
+                ),
+            )
+        }
+    }
+}
+
+/// `signed` with the first `SignatureValue` character flipped: still XML, never valid.
+fn corrupted_signature(signed: &str, backend: XmlBackend) -> XmlDocument {
+    let mut corrupted = signed.to_owned();
+    let offset = corrupted
+        .find("<ds:SignatureValue>")
+        .expect("signature value")
+        + "<ds:SignatureValue>".len();
+    let replacement = if corrupted.as_bytes()[offset] == b'A' {
+        "B"
+    } else {
+        "A"
+    };
+    corrupted.replace_range(offset..=offset, replacement);
+    XmlDocument::parse_with_backend(corrupted, backend).expect("corrupted signature remains XML")
 }
 
 pub struct Fixture {
@@ -162,35 +211,7 @@ impl Fixture {
     }
 
     pub fn new(spec: Spec) -> Self {
-        let (provider, key): (Arc<dyn CryptoProvider>, Box<dyn SigningKey>) = match spec.engine {
-            Engine::RustCrypto => (
-                Arc::new(RustCryptoProvider),
-                Box::new(
-                    RsaSigningKey::from_pkcs8_pem(include_str!(
-                        "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-                    ))
-                    .expect("test key"),
-                ),
-            ),
-            #[cfg(feature = "aws-lc-fips")]
-            Engine::AwsLcFips => {
-                let der = pem::parse(include_str!(
-                    "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-                ))
-                .expect("test PEM")
-                .into_contents();
-                (
-                    Arc::new(xml_sec::provider::AwsLcFipsProvider),
-                    Box::new(
-                        xml_sec::provider::AwsLcSigningKey::from_pkcs8_der(
-                            SignatureAlgorithm::RsaSha256,
-                            &der,
-                        )
-                        .expect("native test key"),
-                    ),
-                )
-            }
-        };
+        let (provider, key) = engine_signer(spec.engine);
         let verification_key = VerificationKey {
             algorithm: SignatureAlgorithm::RsaSha256,
             public_key_bytes: key
@@ -265,19 +286,7 @@ impl Fixture {
         }
         let document =
             XmlDocument::parse_with_backend(signed.clone(), spec.backend).expect("signed document");
-        let mut corrupted = signed.clone();
-        let offset = corrupted
-            .find("<ds:SignatureValue>")
-            .expect("signature value")
-            + "<ds:SignatureValue>".len();
-        let replacement = if corrupted.as_bytes()[offset] == b'A' {
-            "B"
-        } else {
-            "A"
-        };
-        corrupted.replace_range(offset..=offset, replacement);
-        let rejected_document = XmlDocument::parse_with_backend(corrupted, spec.backend)
-            .expect("corrupted signature remains XML");
+        let rejected_document = corrupted_signature(&signed, spec.backend);
         let canonical = canonicalize_document(
             &document,
             &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
@@ -414,7 +423,7 @@ impl Fixture {
                         assert_eq!(xml, self.unsigned);
                         xml.len()
                     }
-                    _ => panic!("expected XML"),
+                    DecryptedContent::Bytes(_) => panic!("expected XML"),
                 }
             }
             _ => panic!("unknown operation"),

@@ -20,3 +20,6 @@ thiserror = "2"
 default = ["xml-backend-xmloxide"]
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
+
+[lints]
+workspace = true

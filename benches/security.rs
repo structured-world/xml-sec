@@ -98,10 +98,14 @@ fn projection(bencher: divan::Bencher, spec: Spec) {
 /// Signed-document shape for node-set measurements: `elements` siblings with
 /// two attributes under two in-scope namespace declarations.
 fn node_set_document(elements: usize) -> String {
-    let body = (0..elements)
-        .map(|index| format!("<p:e id='e{index}' a:k='{index}'>text {index}</p:e>"))
-        .collect::<String>();
-    format!("<p:root xmlns:p='urn:p' xmlns:a='urn:a'>{body}<p:Signature/></p:root>")
+    use std::fmt::Write as _;
+    let mut xml = String::from("<p:root xmlns:p='urn:p' xmlns:a='urn:a'>");
+    for index in 0..elements {
+        write!(xml, "<p:e id='e{index}' a:k='{index}'>text {index}</p:e>")
+            .expect("writing to a String cannot fail");
+    }
+    xml.push_str("<p:Signature/></p:root>");
+    xml
 }
 
 #[divan::bench(args = [1_024, 16_384])]

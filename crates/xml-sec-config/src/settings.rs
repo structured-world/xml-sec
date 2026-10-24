@@ -5,11 +5,21 @@ use std::{
 };
 use toml::{Table, Value};
 #[cfg(feature = "xmlenc")]
+use xml_sec::policy::{DecryptionPolicy, EncryptionPolicy};
+#[cfg(feature = "xmlenc")]
 use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
 use xml_sec::{
-    policy::*,
+    policy::{
+        CertificateSignatureAlgorithms, CompiledPolicies, DsaKeyPolicy,
+        EcdsaSignatureValueEncoding, ExtendedKeyPurpose, HmacPolicy, KemContentAuthentication,
+        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind,
+        KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition, PolicySet,
+        PolicyValidity, ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics,
+        SignatureConstraints, SigningPolicy, TransformPolicy, UriPolicy, VerificationPolicy,
+        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+    },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
         DigestAlgorithm, RsaPssParameters, SignatureAlgorithm, UriTypeSet, XPathHereSemantics,
@@ -47,14 +57,14 @@ fn timestamp(value: &Value, field: &str) -> Result<std::time::SystemTime, Error>
         let nanos = t
             .get("nanoseconds")
             .and_then(Value::as_integer)
-            .filter(|v| (0..1_000_000_000).contains(v))
+            .and_then(|v| u64::try_from(v).ok())
+            .filter(|v| *v < 1_000_000_000)
             .ok_or_else(|| invalid(field))?;
-        (seconds, nanos as u64)
+        (seconds, nanos)
     };
-    let base = if seconds >= 0 {
-        UNIX_EPOCH.checked_add(Duration::from_secs(seconds as u64))
-    } else {
-        UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs()))
+    let base = match u64::try_from(seconds) {
+        Ok(seconds) => UNIX_EPOCH.checked_add(Duration::from_secs(seconds)),
+        Err(_) => UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs())),
     };
     base.and_then(|base| base.checked_add(Duration::from_nanos(nanos)))
         .ok_or_else(|| invalid(field))
@@ -251,7 +261,7 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
     for (key, value) in table(v, "transforms")? {
         match key.as_str() {
             "allowed_algorithms" => {
-                p.allowed_algorithms = optional(value, key, |v| Ok(string(v, key)?.to_owned()))?
+                p.allowed_algorithms = optional(value, key, |v| Ok(string(v, key)?.to_owned()))?;
             }
             "xpath_here_semantics" => {
                 p.xpath_here_semantics = choice!(
@@ -259,7 +269,7 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     XPathHereSemantics::Specification,
                     XPathHereSemantics::XmlSecLegacy
-                )
+                );
             }
             "same_document_id_semantics" => {
                 p.same_document_id_semantics = choice!(
@@ -268,7 +278,7 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     SameDocumentIdSemantics::Specification,
                     SameDocumentIdSemantics::XmlSecBarename,
                     SameDocumentIdSemantics::XmlSecVisa3d
-                )
+                );
             }
             "opc_relationship_edition" => {
                 p.opc_relationship_edition = choice!(
@@ -276,7 +286,7 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     OpcRelationshipEdition::Ecma2012,
                     OpcRelationshipEdition::Ecma2021
-                )
+                );
             }
             "xslt_stylesheet_semantics" => {
                 p.xslt_stylesheet_semantics = choice!(
@@ -284,7 +294,7 @@ fn transforms(p: &mut TransformPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     XsltStylesheetSemantics::Specification,
                     XsltStylesheetSemantics::Libxmlsec1
-                )
+                );
             }
             _ => return Err(invalid(key)),
         }
@@ -297,18 +307,18 @@ fn key_establishment(p: &mut KeyEstablishmentPolicy, v: &Value) -> Result<(), Er
             "agreement_algorithms" => {
                 p.agreement_algorithms = optional(value, key, |v| {
                     KeyAgreementAlgorithm::from_uri(string(v, key)?).ok_or_else(|| invalid(key))
-                })?
+                })?;
             }
             "derivation_algorithms" => {
                 p.derivation_algorithms = optional(value, key, |v| {
                     KeyDerivationAlgorithm::from_uri(string(v, key)?).ok_or_else(|| invalid(key))
-                })?
+                })?;
             }
             "digest_algorithms" => p.digest_algorithms = optional(value, key, digest)?,
             "encapsulation_algorithms" => {
                 p.encapsulation_algorithms = selected(value, key, |v| {
                     KeyEncapsulationAlgorithm::from_uri(string(v, key)?).ok_or_else(|| invalid(key))
-                })?
+                })?;
             }
             "kem_content_authentication" => {
                 p.kem_content_authentication = choice!(
@@ -316,7 +326,7 @@ fn key_establishment(p: &mut KeyEstablishmentPolicy, v: &Value) -> Result<(), Er
                     key,
                     KemContentAuthentication::RequireAuthenticatedCipher,
                     KemContentAuthentication::ExternalAuthenticated
-                )
+                );
             }
             "max_encapsulation_operations" => p.max_encapsulation_operations = number(value, key)?,
             "max_hash_blocks" => p.max_hash_blocks = number(value, key)?,
@@ -423,7 +433,7 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
                     key,
                     VerificationTrustMode::RequireTrustedKey,
                     VerificationTrustMode::CryptographicOnly
-                )
+                );
             }
             "verify_x509_chains" => p.verify_x509_chains = boolean(value, key)?,
             "check_crls" => p.check_crls = boolean(value, key)?,
@@ -432,7 +442,7 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
             "rsa_keys" => rsa(&mut p.rsa_keys, value)?,
             "dsa_keys" => dsa(&mut p.dsa_keys, value)?,
             "allowed_legacy_signature_algorithms" => {
-                p.allowed_legacy_signature_algorithms = selected(value, key, signature)?
+                p.allowed_legacy_signature_algorithms = selected(value, key, signature)?;
             }
             "parameterized_rsa_pss" => {
                 p.parameterized_rsa_pss = choice!(
@@ -441,7 +451,7 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
                     RsaPssPermission::ExactOnly,
                     RsaPssPermission::SecureSupported,
                     RsaPssPermission::AllSupported
-                )
+                );
             }
             "certificate_signature_algorithms" => {
                 p.certificate_signature_algorithms = if value.as_str() == Some("default") {
@@ -454,17 +464,17 @@ fn key_trust(p: &mut KeyTrustPolicy, v: &Value) -> Result<(), Error> {
                         key,
                         certificate,
                     )?))
-                }
+                };
             }
             "allowed_extended_key_usages" => {
-                p.allowed_extended_key_usages = selected(value, key, purpose)?
+                p.allowed_extended_key_usages = selected(value, key, purpose)?;
             }
             "verification_time" => {
                 p.verification_time = if value.as_str() == Some("system") {
                     None
                 } else {
                     Some(timestamp(value, key)?)
-                }
+                };
             }
             _ => return Err(invalid(key)),
         }
@@ -488,7 +498,7 @@ macro_rules! signature_fields {
                     RsaPssPermission::ExactOnly,
                     RsaPssPermission::SecureSupported,
                     RsaPssPermission::AllSupported
-                )
+                );
             }
             "ecdsa_signature_value_encoding" => {
                 $p.ecdsa_signature_value_encoding = choice!(
@@ -675,7 +685,7 @@ fn sorted<T>(values: impl IntoIterator<Item = T>, convert: impl Fn(T) -> Value) 
     values.sort_by_cached_key(ToString::to_string);
     Value::Array(values)
 }
-fn optional_value<T: Copy>(set: &Option<HashSet<T>>, convert: impl Fn(T) -> Value) -> Value {
+fn optional_value<T: Copy>(set: Option<&HashSet<T>>, convert: impl Fn(T) -> Value) -> Value {
     match set {
         None => text("default"),
         Some(set) => sorted(set.iter().copied(), convert),
@@ -804,15 +814,15 @@ fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {
         ),
         (
             "agreement_algorithms".into(),
-            optional_value(&p.agreement_algorithms, |v| text(v.uri())),
+            optional_value(p.agreement_algorithms.as_ref(), |v| text(v.uri())),
         ),
         (
             "derivation_algorithms".into(),
-            optional_value(&p.derivation_algorithms, |v| text(v.uri())),
+            optional_value(p.derivation_algorithms.as_ref(), |v| text(v.uri())),
         ),
         (
             "digest_algorithms".into(),
-            optional_value(&p.digest_algorithms, |v| text(v.uri())),
+            optional_value(p.digest_algorithms.as_ref(), |v| text(v.uri())),
         ),
         (
             "max_encapsulation_operations".into(),
@@ -832,7 +842,7 @@ fn establishment_snapshot(p: &KeyEstablishmentPolicy) -> Value {
         ("max_modular_work".into(), int(p.max_modular_work)),
     ]))
 }
-fn validity_snapshot(p: &Option<PolicyValidity>) -> Result<Value, Error> {
+fn validity_snapshot(p: Option<&PolicyValidity>) -> Result<Value, Error> {
     Ok(match p {
         None => text("none"),
         Some(p) => Value::Table(Table::from_iter([
@@ -955,7 +965,7 @@ macro_rules! signature_snapshot {
     ($p:expr) => {
         Table::from_iter([
             ("enabled".into(), Value::Boolean(true)),
-            ("validity".into(), validity_snapshot(&$p.validity)?),
+            ("validity".into(), validity_snapshot($p.validity.as_ref())?),
             (
                 "signature_constraints".into(),
                 named($p.signature_constraints),
@@ -966,11 +976,11 @@ macro_rules! signature_snapshot {
             ),
             (
                 "signature_algorithms".into(),
-                optional_value(&$p.signature_algorithms, signature_value),
+                optional_value($p.signature_algorithms.as_ref(), signature_value),
             ),
             (
                 "digest_algorithms".into(),
-                optional_value(&$p.digest_algorithms, |v| text(v.uri())),
+                optional_value($p.digest_algorithms.as_ref(), |v| text(v.uri())),
             ),
             (
                 "hmac".into(),
@@ -1003,22 +1013,22 @@ macro_rules! encryption_snapshot {
     ($p:expr) => {
         Table::from_iter([
             ("enabled".into(), Value::Boolean(true)),
-            ("validity".into(), validity_snapshot(&$p.validity)?),
+            ("validity".into(), validity_snapshot($p.validity.as_ref())?),
             (
                 "data_algorithms".into(),
-                optional_value(&$p.data_algorithms, |v| text(v.uri())),
+                optional_value($p.data_algorithms.as_ref(), |v| text(v.uri())),
             ),
             (
                 "key_transport_algorithms".into(),
-                optional_value(&$p.key_transport_algorithms, |v| text(v.uri())),
+                optional_value($p.key_transport_algorithms.as_ref(), |v| text(v.uri())),
             ),
             (
                 "key_wrap_algorithms".into(),
-                optional_value(&$p.key_wrap_algorithms, |v| text(v.uri())),
+                optional_value($p.key_wrap_algorithms.as_ref(), |v| text(v.uri())),
             ),
             (
                 "oaep_digests".into(),
-                optional_value(&$p.oaep_digests, |v| text(v.uri())),
+                optional_value($p.oaep_digests.as_ref(), |v| text(v.uri())),
             ),
             ("rsa_keys".into(), rsa_snapshot($p.rsa_keys)),
             (
@@ -1030,120 +1040,120 @@ macro_rules! encryption_snapshot {
         ])
     };
 }
+// Each snapshot destructures its policy exhaustively, so a new policy field
+// fails to compile until the effective-settings report covers it.
+fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
+    let VerificationPolicy {
+        validity: _,
+        signature_constraints: _,
+        key_establishment: _,
+        parameterized_rsa_pss: _,
+        signature_algorithms: _,
+        digest_algorithms: _,
+        hmac: _,
+        ecdsa_signature_value_encoding: _,
+        key_trust: _,
+        key_sources: _,
+        uris: _,
+        transforms: _,
+        manifest_processing: _,
+        xml: _,
+        resources: _,
+    } = p;
+    let mut t = signature_snapshot!(p);
+    t.insert("key_trust".into(), trust_snapshot(&p.key_trust)?);
+    t.insert("key_sources".into(), source_snapshot(p.key_sources));
+    Ok(Value::Table(t))
+}
+
+fn signing_snapshot(p: &SigningPolicy) -> Result<Value, Error> {
+    let SigningPolicy {
+        validity: _,
+        signature_constraints: _,
+        key_establishment: _,
+        parameterized_rsa_pss: _,
+        signature_algorithms: _,
+        digest_algorithms: _,
+        hmac: _,
+        ecdsa_signature_value_encoding: _,
+        rsa_keys: _,
+        dsa_keys: _,
+        uris: _,
+        transforms: _,
+        manifest_processing: _,
+        xml: _,
+        resources: _,
+    } = p;
+    let mut t = signature_snapshot!(p);
+    t.insert("rsa_keys".into(), rsa_snapshot(p.rsa_keys));
+    t.insert("dsa_keys".into(), dsa_snapshot(p.dsa_keys));
+    Ok(Value::Table(t))
+}
+
+#[cfg(feature = "xmlenc")]
+fn encryption_policy_snapshot(p: &EncryptionPolicy) -> Result<Value, Error> {
+    let EncryptionPolicy {
+        validity: _,
+        data_algorithms: _,
+        key_transport_algorithms: _,
+        key_wrap_algorithms: _,
+        oaep_digests: _,
+        rsa_keys: _,
+        key_establishment: _,
+        xml: _,
+        resources: _,
+    } = p;
+    Ok(Value::Table(encryption_snapshot!(p)))
+}
+
+#[cfg(feature = "xmlenc")]
+fn decryption_snapshot(p: &DecryptionPolicy) -> Result<Value, Error> {
+    let DecryptionPolicy {
+        validity: _,
+        data_algorithms: _,
+        key_transport_algorithms: _,
+        key_wrap_algorithms: _,
+        oaep_digests: _,
+        rsa_keys: _,
+        key_establishment: _,
+        xml: _,
+        resources: _,
+        uris: _,
+        transforms: _,
+    } = p;
+    let mut t = encryption_snapshot!(p);
+    t.insert("uris".into(), uri_snapshot(p.uris));
+    t.insert("transforms".into(), transform_snapshot(&p.transforms));
+    Ok(Value::Table(t))
+}
+
 pub(super) fn snapshot(p: &CompiledPolicies) -> Result<Table, Error> {
-    let mut output = Table::new();
-    output.insert("base".into(), named(p.profile()));
     let disabled = || {
         Value::Table(Table::from_iter([(
             "enabled".into(),
             Value::Boolean(false),
         )]))
     };
-    output.insert(
-        "verification".into(),
-        match p.verification() {
-            None => disabled(),
-            Some(p) => {
-                let VerificationPolicy {
-                    validity: _,
-                    signature_constraints: _,
-                    key_establishment: _,
-                    parameterized_rsa_pss: _,
-                    signature_algorithms: _,
-                    digest_algorithms: _,
-                    hmac: _,
-                    ecdsa_signature_value_encoding: _,
-                    key_trust: _,
-                    key_sources: _,
-                    uris: _,
-                    transforms: _,
-                    manifest_processing: _,
-                    xml: _,
-                    resources: _,
-                } = p;
-                let mut t = signature_snapshot!(p);
-                t.insert("key_trust".into(), trust_snapshot(&p.key_trust)?);
-                t.insert("key_sources".into(), source_snapshot(p.key_sources));
-                Value::Table(t)
-            }
-        },
-    );
-    output.insert(
-        "signing".into(),
-        match p.signing() {
-            None => disabled(),
-            Some(p) => {
-                let SigningPolicy {
-                    validity: _,
-                    signature_constraints: _,
-                    key_establishment: _,
-                    parameterized_rsa_pss: _,
-                    signature_algorithms: _,
-                    digest_algorithms: _,
-                    hmac: _,
-                    ecdsa_signature_value_encoding: _,
-                    rsa_keys: _,
-                    dsa_keys: _,
-                    uris: _,
-                    transforms: _,
-                    manifest_processing: _,
-                    xml: _,
-                    resources: _,
-                } = p;
-                let mut t = signature_snapshot!(p);
-                t.insert("rsa_keys".into(), rsa_snapshot(p.rsa_keys));
-                t.insert("dsa_keys".into(), dsa_snapshot(p.dsa_keys));
-                Value::Table(t)
-            }
-        },
-    );
+    let mut output = Table::new();
+    output.insert("base".into(), named(p.profile()));
+    let verification = p
+        .verification()
+        .map_or_else(|| Ok(disabled()), verification_snapshot)?;
+    output.insert("verification".into(), verification);
+    let signing = p
+        .signing()
+        .map_or_else(|| Ok(disabled()), signing_snapshot)?;
+    output.insert("signing".into(), signing);
     #[cfg(feature = "xmlenc")]
     {
-        output.insert(
-            "encryption".into(),
-            match p.encryption() {
-                None => disabled(),
-                Some(p) => {
-                    let EncryptionPolicy {
-                        validity: _,
-                        data_algorithms: _,
-                        key_transport_algorithms: _,
-                        key_wrap_algorithms: _,
-                        oaep_digests: _,
-                        rsa_keys: _,
-                        key_establishment: _,
-                        xml: _,
-                        resources: _,
-                    } = p;
-                    Value::Table(encryption_snapshot!(p))
-                }
-            },
-        );
-        output.insert(
-            "decryption".into(),
-            match p.decryption() {
-                None => disabled(),
-                Some(p) => {
-                    let DecryptionPolicy {
-                        validity: _,
-                        data_algorithms: _,
-                        key_transport_algorithms: _,
-                        key_wrap_algorithms: _,
-                        oaep_digests: _,
-                        rsa_keys: _,
-                        key_establishment: _,
-                        xml: _,
-                        resources: _,
-                        uris: _,
-                        transforms: _,
-                    } = p;
-                    let mut t = encryption_snapshot!(p);
-                    t.insert("uris".into(), uri_snapshot(p.uris));
-                    t.insert("transforms".into(), transform_snapshot(&p.transforms));
-                    Value::Table(t)
-                }
-            },
-        );
+        let encryption = p
+            .encryption()
+            .map_or_else(|| Ok(disabled()), encryption_policy_snapshot)?;
+        output.insert("encryption".into(), encryption);
+        let decryption = p
+            .decryption()
+            .map_or_else(|| Ok(disabled()), decryption_snapshot)?;
+        output.insert("decryption".into(), decryption);
     }
     Ok(output)
 }
@@ -1178,7 +1188,7 @@ fn flatten<'a>(
                     "not_before" | "expires_at" | "verification_time"
                 ) =>
             {
-                flatten(t, other.and_then(Value::as_table), &field, output)
+                flatten(t, other.and_then(Value::as_table), &field, output);
             }
             _ => {
                 output.insert(field, value);
