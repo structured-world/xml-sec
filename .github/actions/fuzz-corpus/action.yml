@@ -1,0 +1,66 @@
+name: Retain target-specific fuzz corpora
+description: Preserve existing corpus keys when PR targets share a runner
+inputs:
+  target:
+    description: Single target or the ASan smoke block
+    required: true
+  fips:
+    description: Provider-isolated corpus namespace
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'xmldsig_verify'
+      with:
+        path: fuzz/corpus/xmldsig_verify
+        key: fuzz-corpus-${{ runner.os }}-xmldsig_verify-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-xmldsig_verify-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'xml_semantics'
+      with:
+        path: fuzz/corpus/xml_semantics
+        key: fuzz-corpus-${{ runner.os }}-xml_semantics-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-xml_semantics-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'security_roundtrip'
+      with:
+        path: fuzz/corpus/security_roundtrip
+        key: fuzz-corpus-${{ runner.os }}-security_roundtrip-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-security_roundtrip-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'transform_parameters'
+      with:
+        path: fuzz/corpus/transform_parameters
+        key: fuzz-corpus-${{ runner.os }}-transform_parameters-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-transform_parameters-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'xslt_execution'
+      with:
+        path: fuzz/corpus/xslt_execution
+        key: fuzz-corpus-${{ runner.os }}-xslt_execution-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-xslt_execution-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'key_formats'
+      with:
+        path: fuzz/corpus/key_formats
+        key: fuzz-corpus-${{ runner.os }}-key_formats-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-key_formats-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'policy_compilation'
+      with:
+        path: fuzz/corpus/policy_compilation
+        key: fuzz-corpus-${{ runner.os }}-policy_compilation-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-policy_compilation-false-
+    - uses: actions/cache@v6
+      if: inputs.target == 'asan' || inputs.target == 'provider_operations'
+      with:
+        path: fuzz/corpus/provider_operations
+        key: fuzz-corpus-${{ runner.os }}-provider_operations-${{ inputs.fips }}-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-provider_operations-${{ inputs.fips }}-
+    - uses: actions/cache@v6
+      if: inputs.target == 'xmlsec_oracle'
+      with:
+        path: fuzz/corpus/xmlsec_oracle
+        key: fuzz-corpus-${{ runner.os }}-xmlsec_oracle-false-${{ github.run_id }}-${{ github.run_attempt }}
+        restore-keys: fuzz-corpus-${{ runner.os }}-xmlsec_oracle-false-

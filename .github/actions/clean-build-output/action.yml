@@ -1,0 +1,14 @@
+name: Clean successful build output
+description: Register cleanup after dependency-cache post actions
+inputs:
+  manifest:
+    description: Cargo workspace manifest
+    required: true
+  toolchain:
+    description: Installed toolchain used to clean the workspace
+    required: true
+runs:
+  using: node24
+  main: register.mjs
+  post: cleanup.mjs
+  post-if: success()

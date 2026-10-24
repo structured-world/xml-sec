@@ -96,6 +96,37 @@ Pull-request qualification runs for every base branch, including dependent
 branches in a PR stack. Push qualification remains limited to `main`; PR jobs
 retain read-only repository permissions.
 
+### Build Reuse
+
+PR fuzz smoke uses three runner blocks: eight ordinary ASan targets share one
+compilation, while the external oracle and real FIPS module stay separate.
+Scheduled and explicitly dispatched campaigns retain independent target jobs.
+Every target keeps its original corpus cache key, mutation allowance, timeout,
+reproducer directory and evidence. A failed target stops its block and retains
+the failed build; the required fuzz aggregate cannot pass a failed block.
+
+The local `rust-build-cache` action uses explicit compatibility domains rather
+than job IDs. OS, architecture, compiler, manifests and compiler environment
+remain part of the upstream cache fingerprint. Ordinary jobs read a shared
+dependency cache; only the extended Linux matrix block for each compiler saves
+it. Each other OS has its own default-feature writer, avoiding competing partial
+writers without leaving desktop caches permanently cold. Coverage, alloc-only targets, benchmark,
+fuzz harness, ASan and FIPS use separate domains; smoke and optimized campaigns
+also remain separate. Scheduled differential qualification has its own writer.
+The pinned native xmlsec1 installation is cached separately by OS image family,
+architecture, installer/source revision and modern/legacy capability profile;
+the installer still validates its source marker, version and capabilities on a
+cache hit. Cache hits never substitute for executing qualification.
+
+Cleanup registers before the cache action, so reverse-order post actions save
+dependencies before removing successful build output. The cache-managed fuzz
+and conformance entrypoints leave cleanup to that action; standalone invocations
+still clean immediately on success. Failed jobs retain build evidence. XSLT
+measurements use a separate temporary target directory and fresh evidence,
+so cleaning a measurement does not erase the qualification dependency cache.
+Concurrent jobs restore prior caches, not unfinished output from another job in
+the same run; sharing does not impose a producer dependency on the critical path.
+
 The XML-oracle block runs both the live XMLDSig/XAdES corpus and XSLT conformance
 with their original independent validators and separate evidence artifacts.
 Shared mechanisms are resolved as one registry version across ASN.1, PKIX, CMS,
