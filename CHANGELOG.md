@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/structured-world/xml-sec/compare/v0.2.0...v0.3.0) - 2026-10-24
+
+### Added
+
+- *(api)* [**breaking**] bind Rust operations to policy ([#267](https://github.com/structured-world/xml-sec/pull/267))
+
+### Documentation
+
+- qualify public API and migration guides ([#271](https://github.com/structured-world/xml-sec/pull/271))
+
+### Fixed
+
+- *(xslt)* skip unused function registry setup ([#288](https://github.com/structured-world/xml-sec/pull/288))
+- *(interop)* make corpus execution reproducible ([#285](https://github.com/structured-world/xml-sec/pull/285))
+
+### Performance
+
+- *(xslt)* add phase and reuse measurements ([#260](https://github.com/structured-world/xml-sec/pull/260))
+
+### Refactored
+
+- *(xslt)* qualify compiler and runtime ([#293](https://github.com/structured-world/xml-sec/pull/293))
+- *(xml)* [**breaking**] qualify kernels and group ci ([#289](https://github.com/structured-world/xml-sec/pull/289))
+- *(pkix)* [**breaking**] use shared spki framing ([#283](https://github.com/structured-world/xml-sec/pull/283))
+
 ### Documentation
 
 - Add executable policy-bound and low-level API examples, expected-target
