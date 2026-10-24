@@ -1,0 +1,15 @@
+name: Cache pinned native oracle
+description: Restore the native installation without bypassing installer validation
+inputs:
+  profile:
+    description: Modern or legacy oracle capability profile
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/runner-image
+      id: image
+    - uses: actions/cache@v6
+      with:
+        path: ${{ env.XMLSEC1_PREFIX }}
+        key: xmlsec-oracle-${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.identity }}-${{ inputs.profile }}-${{ hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt') }}

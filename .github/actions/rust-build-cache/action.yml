@@ -16,6 +16,8 @@ inputs:
 runs:
   using: composite
   steps:
+    - uses: ./.github/actions/runner-image
+      id: image
     - uses: ./.github/actions/clean-build-output
       with:
         manifest: ${{ inputs.workspace }}/Cargo.toml
@@ -25,7 +27,7 @@ runs:
         RUSTUP_TOOLCHAIN: ${{ inputs.toolchain }}
       with:
         prefix-key: xmlsec-build-v1
-        shared-key: ${{ inputs.domain }}
+        shared-key: ${{ inputs.domain }}-${{ steps.image.outputs.identity }}
         workspaces: ${{ inputs.workspace }} -> target
         save-if: ${{ inputs.save }}
         # Preserve runner-provided Cargo/rustup shims for later post actions.

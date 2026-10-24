@@ -1,0 +1,8 @@
+name: Identify hosted runner image
+description: Read the actual image family from the runner process environment
+outputs:
+  identity:
+    description: Hosted image family used to isolate ABI-sensitive build caches
+runs:
+  using: node24
+  main: identity.mjs

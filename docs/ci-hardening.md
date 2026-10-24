@@ -106,8 +106,9 @@ reproducer directory and evidence. A failed target stops its block and retains
 the failed build; the required fuzz aggregate cannot pass a failed block.
 
 The local `rust-build-cache` action uses explicit compatibility domains rather
-than job IDs. OS, architecture, compiler, manifests and compiler environment
-remain part of the upstream cache fingerprint. Ordinary jobs read a shared
+than job IDs. Hosted image family is captured from the runner process environment;
+OS, architecture, compiler, manifests and compiler environment remain part of
+the cache fingerprint. Ordinary jobs read a shared
 dependency cache; only the extended Linux matrix block for each compiler saves
 it. Each other OS has its own default-feature writer, avoiding competing partial
 writers without leaving desktop caches permanently cold. Coverage, alloc-only targets, benchmark,

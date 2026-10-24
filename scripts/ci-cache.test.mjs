@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { clean } from '../.github/actions/clean-build-output/cleanup.mjs';
+import { identity } from '../.github/actions/runner-image/identity.mjs';
 
 const source = path => readFileSync(new URL('../' + path, import.meta.url), 'utf8');
 
@@ -10,7 +11,7 @@ test('dependency saving precedes successful cleanup, with failed builds retained
   const cache = source('.github/actions/rust-build-cache/action.yml');
   assert.ok(cache.indexOf('uses: ./.github/actions/clean-build-output') < cache.indexOf('uses: Swatinem/rust-cache'));
   assert.match(source('.github/actions/clean-build-output/action.yml'), /post-if: success\(\)/);
-  assert.match(cache, /shared-key: \$\{\{ inputs.domain \}\}/);
+  assert.match(cache, /shared-key: \$\{\{ inputs.domain \}\}-\$\{\{ steps.image.outputs.identity \}\}/);
   assert.match(cache, /save-if: \$\{\{ inputs.save \}\}/);
   assert.doesNotMatch(cache, /add-rust-environment-hash-key: false/);
 });
@@ -73,9 +74,23 @@ test('ordinary jobs have one matrix writer per compiler and separate instrumente
 test('cached native oracles still pass installer provenance and capability validation', () => {
   // A cache hit must not bypass validation or share modern and legacy profiles.
   const workflow = source('.github/workflows/ci.yml');
-  assert.equal([...workflow.matchAll(/key: xmlsec-oracle-.*-modern-/g)].length, 2);
-  assert.equal([...workflow.matchAll(/key: xmlsec-oracle-.*-legacy-/g)].length, 1);
+  assert.equal([...workflow.matchAll(/profile: modern/g)].length, 2);
+  assert.equal([...workflow.matchAll(/profile: legacy/g)].length, 1);
   assert.doesNotMatch(workflow, /if:.*cache-hit/);
-  assert.ok(workflow.includes("hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt')"));
+  assert.ok(source('.github/actions/xmlsec-oracle-cache/action.yml').includes("hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt')"));
   assert.equal([...workflow.matchAll(/(?:bash )?scripts\/install-xmlsec1.sh\n/g)].length, 3);
+});
+
+test('runner image identity is read at runtime rather than an empty env context', () => {
+  // Hosted-runner ImageOS is process environment, not a workflow env entry.
+  assert.doesNotMatch(source('.github/workflows/ci.yml'), /\$\{\{ env.ImageOS \}\}/);
+  assert.match(source('.github/actions/rust-build-cache/action.yml'), /steps.image.outputs.identity/);
+  assert.match(source('.github/actions/xmlsec-oracle-cache/action.yml'), /steps.image.outputs.identity/);
+  for (const image of ['ubuntu24', 'ubuntu26', 'macos26', 'win25']) {
+    assert.equal(identity({ ImageOS: image }), image);
+  }
+  assert.notEqual(identity({ ImageOS: 'ubuntu24' }), identity({ ImageOS: 'ubuntu26' }));
+  for (const image of [undefined, '', 'ubuntu24\nother=value']) {
+    assert.throws(() => identity({ ImageOS: image }));
+  }
 });

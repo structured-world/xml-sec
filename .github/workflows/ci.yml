@@ -92,10 +92,9 @@ jobs:
         with:
           domain: coverage
           save: 'true'
-      - uses: actions/cache@v6
+      - uses: ./.github/actions/xmlsec-oracle-cache
         with:
-          path: ${{ env.XMLSEC1_PREFIX }}
-          key: xmlsec-oracle-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-modern-${{ hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt') }}
+          profile: modern
       - name: Provision independent oracles and disposable token support
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
@@ -353,10 +352,9 @@ jobs:
       - name: Provision all-feature token tests
         if: matrix.token
         run: sudo apt-get install -y softhsm2
-      - uses: actions/cache@v6
+      - uses: ./.github/actions/xmlsec-oracle-cache
         with:
-          path: ${{ env.XMLSEC1_PREFIX }}
-          key: xmlsec-oracle-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-modern-${{ hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt') }}
+          profile: modern
       - name: Build pinned xmlsec1 for external-oracle tests
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
@@ -449,10 +447,9 @@ jobs:
           node-version: '24'
       - name: Check conformance admission and failure propagation
         run: node --test scripts/check-xslt-conformance.test.mjs
-      - uses: actions/cache@v6
+      - uses: ./.github/actions/xmlsec-oracle-cache
         with:
-          path: ${{ env.XMLSEC1_PREFIX }}
-          key: xmlsec-oracle-${{ runner.os }}-${{ runner.arch }}-${{ env.ImageOS }}-legacy-${{ hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt') }}
+          profile: legacy
       - name: Provision pinned XML signature oracle
         run: |
           sudo apt-get update
