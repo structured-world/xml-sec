@@ -16,7 +16,9 @@ if [[ "$selection" == asan ]]; then
   targets=(xmldsig_verify xml_semantics security_roundtrip transform_parameters xslt_execution key_formats policy_compilation provider_operations)
 fi
 case "$mode" in
-  smoke) arguments=(); build=(--dev) ;;
+  # Smoke replays the whole evolving corpus under ASan; an optimized build with
+  # debug assertions keeps overflow checks while replaying ~20x faster than --dev.
+  smoke) arguments=(); build=(--debug-assertions) ;;
   campaign) arguments=(-max_total_time=600); build=(--codegen-units 16) ;;
   replay) arguments=(-runs=0); build=(--dev) ;;
   *) printf 'Unknown fuzz mode: %s\n' "$mode" >&2; exit 2 ;;
