@@ -1293,7 +1293,7 @@ fn prepare_signing_key_candidate_inner(
         import_explicit_private_key(
             inventory,
             &key_bytes,
-            key_material::PrivateKeyImport {
+            &key_material::PrivateKeyImport {
                 path: Path::new(path),
                 name,
                 format,
@@ -2085,7 +2085,7 @@ impl ExternalMaterialBudget {
 fn import_explicit_private_key(
     inventory: &mut KeyInventory,
     bytes: &[u8],
-    import: key_material::PrivateKeyImport<'_>,
+    import: &key_material::PrivateKeyImport<'_>,
     budget: &ExternalMaterialBudget,
 ) -> Result<(), CommandError> {
     // Container normalization is provider-independent. Already charged material
@@ -2102,9 +2102,9 @@ fn import_explicit_private_key(
     key_material::import_private_key(
         inventory,
         bytes,
-        key_material::PrivateKeyImport {
+        &key_material::PrivateKeyImport {
             resources: &remaining,
-            ..import
+            ..*import
         },
     )
     .map_err(|error| match error {
@@ -4470,7 +4470,7 @@ fn decrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
                         import_explicit_private_key(
                             inventory,
                             &bytes,
-                            key_material::PrivateKeyImport {
+                            &key_material::PrivateKeyImport {
                                 path: Path::new(path),
                                 name: "explicit",
                                 format,
@@ -5240,7 +5240,7 @@ fn select_decapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
             import_explicit_private_key(
                 store,
                 &bytes,
-                key_material::PrivateKeyImport {
+                &key_material::PrivateKeyImport {
                     path,
                     name: "recipient",
                     format: private_key_format(option),

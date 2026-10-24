@@ -95,9 +95,7 @@ impl Command {
             return Some((command, None));
         }
         let target = value.strip_prefix("help-")?;
-        let target = Self::parse_direct(target)
-            .map(HelpTarget::Command)
-            .unwrap_or(HelpTarget::Unknown);
+        let target = Self::parse_direct(target).map_or(HelpTarget::Unknown, HelpTarget::Command);
         Some((Self::Help, Some(target)))
     }
 }
@@ -259,6 +257,15 @@ pub(crate) const OPTION_SPECS: &[OptionSpec] = &[
 ];
 
 impl Invocation {
+    /// Parse `argv` with libxmlsec1's command, option and positional rules.
+    ///
+    /// # Errors
+    /// Returns a missing, non-UTF-8 or unknown command, and an unsupported,
+    /// repeated, parameterized or value-less option.
+    ///
+    /// # Panics
+    /// Never: option-shaped arguments are checked to be UTF-8 and to start
+    /// with a dash before they are split.
     pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Self, ParseError> {
         let mut args = args.into_iter();
         let _program = args.next();
@@ -278,7 +285,7 @@ impl Invocation {
         while index < remaining.len() {
             let argument = &remaining[index];
             if options_finished {
-                positional.push(argument.clone());
+                positional.push(std::mem::take(&mut remaining[index]));
                 index += 1;
                 continue;
             }
@@ -291,7 +298,7 @@ impl Invocation {
             if argument == OsStr::new("-")
                 || !option_text.is_some_and(|value| value.starts_with('-'))
             {
-                positional.push(argument.clone());
+                positional.push(std::mem::take(&mut remaining[index]));
                 options_finished = true;
                 index += 1;
                 continue;
@@ -362,10 +369,12 @@ impl Invocation {
         })
     }
 
+    #[must_use]
     pub fn flag(&self, name: &str) -> bool {
         self.options.contains_key(name)
     }
 
+    #[must_use]
     pub fn last_value(&self, name: &str) -> Option<&OsStr> {
         self.options
             .get(name)
