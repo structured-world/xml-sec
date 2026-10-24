@@ -28,6 +28,12 @@ test('cleanup addresses the selected workspace and propagates process failures',
   assert.throws(() => clean('', 'stable'));
 });
 
+test('saving dependencies cannot remove the toolchain needed by post cleanup', () => {
+  // rust-cache bin cleanup can remove runner-provided Cargo/rustup shims.
+  const action = source('.github/actions/rust-build-cache/action.yml');
+  assert.match(action, /cache-bin: 'false'/);
+});
+
 test('PR smoke uses three jobs while long campaigns retain target parallelism', () => {
   // Only runner granularity changes: every campaign target and FIPS remain.
   const workflow = source('.github/workflows/fuzz.yml');

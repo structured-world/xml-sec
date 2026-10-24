@@ -119,7 +119,9 @@ the installer still validates its source marker, version and capabilities on a
 cache hit. Cache hits never substitute for executing qualification.
 
 Cleanup registers before the cache action, so reverse-order post actions save
-dependencies before removing successful build output. The cache-managed fuzz
+dependencies before removing successful build output. Cargo-bin caching is
+disabled so upstream cache pruning cannot remove runner-provided Cargo/rustup
+shims needed by later post actions. The cache-managed fuzz
 and conformance entrypoints leave cleanup to that action; standalone invocations
 still clean immediately on success. Failed jobs retain build evidence. XSLT
 measurements use a separate temporary target directory and fresh evidence,

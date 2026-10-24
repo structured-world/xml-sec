@@ -28,3 +28,5 @@ runs:
         shared-key: ${{ inputs.domain }}
         workspaces: ${{ inputs.workspace }} -> target
         save-if: ${{ inputs.save }}
+        # Preserve runner-provided Cargo/rustup shims for later post actions.
+        cache-bin: 'false'
