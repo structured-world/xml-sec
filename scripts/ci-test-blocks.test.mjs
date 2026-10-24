@@ -6,8 +6,8 @@ import { blocks, execute, plan } from './ci-test-blocks.mjs';
 test('grouping retains every isolated test graph and toolchain', () => {
   // Batching must not turn separate Cargo feature resolutions into a union.
   const profiles = Object.values(blocks).flatMap(block => block.profiles);
-  assert.equal(profiles.length, 20);
-  assert.equal(new Set(profiles.map(profile => `${profile.rust}:${profile.name}`)).size, 20);
+  assert.equal(profiles.length, 23);
+  assert.equal(new Set(profiles.map(profile => `${profile.rust}:${profile.name}`)).size, 23);
   assert.deepEqual(profiles.map(profile => `${profile.rust}:${profile.name}`).sort(), [
     '1.92.0:all-features', '1.92.0:aws-fips-differential', '1.92.0:aws-fips-fat-runtime',
     '1.92.0:aws-fips-roxmltree', '1.92.0:aws-fips-xmloxide',
@@ -16,7 +16,8 @@ test('grouping retains every isolated test graph and toolchain', () => {
     '1.92.0:roxmltree', '1.92.0:xmloxide', '1.92.0:xslt-xmloxide',
     'stable:all-features', 'stable:default-features', 'stable:differential',
     'stable:fat-runtime', 'stable:legacy-fat-runtime', 'stable:roxmltree',
-    'stable:xmloxide', 'stable:xslt-fat-runtime',
+    'stable:xmldsig-minimal', 'stable:xmlenc-minimal', 'stable:xmloxide',
+    'stable:xslt-fat-runtime', 'stable:xslt-minimal',
   ]);
   assert.deepEqual(profiles.filter(profile => profile.all).map(profile => profile.rust).sort(), ['1.92.0', 'stable']);
   assert.equal(profiles.filter(profile => profile.fips).length, 5);
@@ -24,9 +25,10 @@ test('grouping retains every isolated test graph and toolchain', () => {
   for (const [name, block] of Object.entries(blocks)) {
     assert.ok(block.profiles.every(profile => profile.rust === block.rust), name);
     const commands = plan(name, '/test/token.so');
-    assert.equal(commands.filter(command => command.label.endsWith(': tests')).length, block.profiles.length);
-    assert.equal(commands.filter(command => command.label.endsWith(': docs')).length, block.profiles.length);
-    for (const profile of block.profiles) {
+    const tested = block.profiles.filter(profile => !profile.lintOnly);
+    assert.equal(commands.filter(command => command.label.endsWith(': tests')).length, tested.length);
+    assert.equal(commands.filter(command => command.label.endsWith(': docs')).length, tested.length);
+    for (const profile of tested) {
       const command = commands.find(command => command.label === `${profile.name}: tests`);
       assert.ok(command.args.includes('--workspace'));
       assert.deepEqual(command.args.slice(-2), ['-E', 'not binary(libxslt_oracle)']);
@@ -42,7 +44,23 @@ test('build and lint contracts remain separately resolved', () => {
   assert.equal(commands.filter(command => command.label.endsWith(': build')).length, 9);
   const inventory = commands.find(command => command.label === 'xmlenc-inventory: build');
   assert.deepEqual(inventory.args, ['build', '-p', 'xml-sec', '--no-default-features', '--features', 'xmlenc,xml-backend-xmloxide']);
-  assert.equal(commands.filter(command => command.label.endsWith(': lint')).length, 15);
+  const lints = commands.filter(command => command.label.endsWith(': lint'));
+  assert.equal(lints.length, 20);
+  // Workspace lints carry clippy::pedantic; every lint denies its warnings.
+  for (const lint of lints) assert.deepEqual(lint.args.slice(lint.args.indexOf('--'), lint.args.indexOf('--') + 3), ['--', '-D', 'warnings']);
+  // Former scoped pedantic gates remain separately resolved library graphs.
+  for (const feature of ['xmldsig', 'xmlenc', 'xslt']) {
+    const lint = lints.find(command => command.label === `${feature}-minimal: lint`);
+    assert.deepEqual(lint.args, ['clippy', '-p', 'xml-sec', '--lib', '--no-default-features', '--features',
+      `${feature},xml-backend-differential`, '--', '-D', 'warnings']);
+    assert.ok(!commands.some(command => command.label.startsWith(`${feature}-minimal: `) && command !== lint));
+  }
+  // Only the MSRV toolchain needs the libtest large_stack_arrays workaround.
+  for (const [name, block] of Object.entries(blocks)) {
+    for (const lint of plan(name, '/test/token.so').filter(command => command.label.endsWith(': lint'))) {
+      assert.equal(lint.args.includes('clippy::large_stack_arrays'), block.rust !== 'stable', lint.label);
+    }
+  }
   assert.equal(commands.filter(command => command.label === 'FIPS without encryption').length, 1);
   assert.throws(() => plan('unknown', '/test/token.so'), /Unknown/);
   assert.throws(() => plan('msrv-extended'), /PKCS11_MODULE/);

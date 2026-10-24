@@ -7,20 +7,28 @@ const core = backend => `xmldsig,xmlenc,c14n,${backend === 'fat-runtime' ? 'xml-
 const profile = (rust, name, features, extra = {}) => ({ rust, name, features, ...extra });
 const ordinary = (rust, backend) => profile(rust, backend, core(backend), { build: true, lint: rust === 'stable' });
 const all = rust => profile(rust, 'all-features', undefined, { all: true, build: true, lint: true });
+// Library-only lint graphs whose cfg combinations no tested profile resolves.
+const minimal = feature => profile('stable', `${feature}-minimal`, `${feature},xml-backend-differential`,
+  { lint: true, lintOnly: true });
+// clippy 1.92 reports the libtest descriptor array of a large test crate as a
+// spanless large_stack_arrays finding (rust-lang/rust-clippy#13774, fixed by
+// rust-lang/rust-clippy#16347); stable lint keeps the check for real arrays.
+const harnessLint = rust => rust === 'stable' ? [] : ['-A', 'clippy::large_stack_arrays'];
 
 // Each profile remains a distinct Cargo invocation: a block shares runner/setup,
 // not enabled features. Keep expensive FIPS compilation in its own block.
 export const blocks = {
   'stable-core': { rust: 'stable', profiles: [
-    profile('stable', 'default-features'),
+    profile('stable', 'default-features', undefined, { lint: true }),
     ...['xmloxide', 'roxmltree', 'differential', 'fat-runtime'].map(backend => ordinary('stable', backend)),
+    ...['xmldsig', 'xmlenc', 'xslt'].map(minimal),
   ] },
   'msrv-core': { rust: '1.92.0', profiles: ['xmloxide', 'roxmltree'].map(backend => ordinary('1.92.0', backend)) },
   'msrv-extended': { rust: '1.92.0', profiles: [
     all('1.92.0'),
     ...['xmloxide', 'roxmltree', 'differential'].map(backend => profile('1.92.0',
       `experimental-pq-${backend}`, `${core(backend)},legacy-algorithms,experimental-pq`, { pq: true, lint: true })),
-    profile('1.92.0', 'xslt-xmloxide', `${core('xmloxide')},xslt`),
+    profile('1.92.0', 'xslt-xmloxide', `${core('xmloxide')},xslt`, { lint: true }),
   ] },
   'stable-extended': { rust: 'stable', profiles: [
     all('stable'),
@@ -44,7 +52,10 @@ export function plan(name, module) {
   for (const profile of blocks[name].profiles) {
     const args = profile.all ? ['--all-features'] : profile.features ? ['--no-default-features', '--features', profile.features] : [];
     if (profile.build) add(`${profile.name}: build`, 'cargo', ['build', '--workspace', ...args]);
-    if (profile.lint) add(`${profile.name}: lint`, 'cargo', ['clippy', ...(profile.pq || profile.fips ? [] : ['--workspace']), '--all-targets', ...args, '--', '-D', 'warnings']);
+    const scope = profile.lintOnly ? ['-p', 'xml-sec', '--lib']
+      : [...(profile.pq || profile.fips ? [] : ['--workspace']), '--all-targets'];
+    if (profile.lint) add(`${profile.name}: lint`, 'cargo', ['clippy', ...scope, ...args, '--', '-D', 'warnings', ...harnessLint(profile.rust)]);
+    if (profile.lintOnly) continue;
     const tests = ['--workspace', ...args, '-E', 'not binary(libxslt_oracle)'];
     if (profile.all) {
       if (!module) throw new Error('PKCS11_MODULE is required for all-feature test blocks');
