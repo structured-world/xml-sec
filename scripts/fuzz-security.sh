@@ -3,8 +3,18 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
-target=${1:?usage: fuzz-security.sh TARGET [smoke|campaign|replay]}
+selection=${1:?usage: fuzz-security.sh TARGET|asan [smoke|campaign|replay] [--cache-managed]}
 mode=${2:-smoke}
+cleanup=true
+case ${3:-} in
+  '') ;;
+  --cache-managed) cleanup=false ;;
+  *) printf 'Unknown cleanup option: %s\n' "$3" >&2; exit 2 ;;
+esac
+targets=("$selection")
+if [[ "$selection" == asan ]]; then
+  targets=(xmldsig_verify xml_semantics security_roundtrip transform_parameters xslt_execution key_formats policy_compilation provider_operations)
+fi
 case "$mode" in
   smoke) arguments=(); build=(--dev) ;;
   campaign) arguments=(-max_total_time=600); build=(--codegen-units 16) ;;
@@ -12,27 +22,33 @@ case "$mode" in
   *) printf 'Unknown fuzz mode: %s\n' "$mode" >&2; exit 2 ;;
 esac
 available=$(cargo +nightly fuzz list)
-if ! printf '%s\n' "$available" | grep -Fxq -- "$target"; then
-  printf 'Unknown fuzz target: %s\n' "$target" >&2
-  exit 2
-fi
-corpus="$root/fuzz/corpus/$target"
-output=${FUZZ_OUTPUT:-$root/fuzz/evidence/$target}
-crashes="$root/fuzz/artifacts/$target"
-mkdir -p "$corpus" "$output" "$crashes"
+for target in "${targets[@]}"; do
+  if ! printf '%s\n' "$available" | grep -Fxq -- "$target"; then
+    printf 'Unknown fuzz target: %s\n' "$target" >&2
+    exit 2
+  fi
+done
+base_output=${FUZZ_OUTPUT:-$root/fuzz/evidence/$selection}
+output=$base_output
 finish() {
   status=$?
   trap - EXIT
   if [[ -f fuzz/Cargo.lock ]]; then
     cp fuzz/Cargo.lock "$output/Cargo.lock" || status=1
   fi
-  if (( status == 0 )); then
+  if (( status == 0 )) && [[ "$cleanup" == true ]]; then
     cargo +nightly clean --manifest-path fuzz/Cargo.toml || status=$?
   fi
   exit "$status"
 }
 trap finish EXIT
 
+for target in "${targets[@]}"; do
+corpus="$root/fuzz/corpus/$target"
+output=$base_output
+if [[ "$selection" == asan ]]; then output="$base_output/$target"; fi
+crashes="$root/fuzz/artifacts/$target"
+mkdir -p "$corpus" "$output" "$crashes"
 # Selection metadata, not a recursive import of every third-party fixture.
 # Source files retain their repository provenance and licence notices.
 while IFS=$'\t' read -r selected source; do
@@ -68,7 +84,10 @@ printf '%q ' cargo +nightly fuzz run "$target" "${build[@]}" ${features[@]+"${fe
   "-artifact_prefix=$crashes/" > "$output/command.txt"
 printf '\n' >> "$output/command.txt"
 # Pipefail preserves crashes/timeouts. Failed runs retain artifacts and build
-# output for diagnosis; successful campaigns immediately remove only this crate's output.
+# output for diagnosis. A block shares compilation until every target completes;
+# cache-managed CI saves dependencies before its registered post action cleans.
 cargo +nightly fuzz run "$target" "${build[@]}" ${features[@]+"${features[@]}"} --sanitizer "$sanitizer" "$corpus" -- \
   "${arguments[@]}" -max_len=65536 -timeout=30 -rss_limit_mb=2048 \
   "-artifact_prefix=$crashes/" 2>&1 | tee "$output/run.log"
+if [[ -f fuzz/Cargo.lock ]]; then cp fuzz/Cargo.lock "$output/Cargo.lock"; fi
+done

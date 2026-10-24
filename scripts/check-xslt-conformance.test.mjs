@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, delimiter } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-function runGate(t, overrides = {}) {
+function runGate(t, overrides = {}, args = []) {
   const root = mkdtempSync(join(tmpdir(), 'xml-sec-xslt-gate-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, 'scripts'));
@@ -32,7 +32,7 @@ if (args[0] === 'nextest' && args.includes('xml-sec') && !fs.existsSync(process.
 }
 `, { mode: 0o755 });
   const log = join(root, 'calls');
-  const result = spawnSync('/bin/bash', ['scripts/check-xslt-conformance.sh'], {
+  const result = spawnSync('/bin/bash', ['scripts/check-xslt-conformance.sh', ...args], {
     cwd: root,
     encoding: 'utf8',
     timeout: 10_000,
@@ -52,6 +52,13 @@ if (args[0] === 'nextest' && args.includes('xml-sec') && !fs.existsSync(process.
   const calls = existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : [];
   return { ...result, calls };
 }
+
+test('cache-managed conformance preserves compilation for post-action saving', t => {
+  // The complete reciprocal gate still runs; only successful cleanup changes owner.
+  const result = runGate(t, {}, ['--cache-managed']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls.map(call => call.args[0]), ['nextest', 'nextest']);
+});
 
 test('conformance cannot inherit a sliced corpus and cleans the successful gate', t => {
   // A developer's single-case diagnosis must never masquerade as the full gate.

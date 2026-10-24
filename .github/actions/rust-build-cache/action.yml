@@ -1,0 +1,34 @@
+name: Compatible Rust dependency cache
+description: Restore compatible dependencies and save before successful cleanup
+inputs:
+  domain:
+    description: Compatibility domain, including instrumentation and build mode
+    required: true
+  toolchain:
+    description: Installed compiler used by this job
+    default: '1.92.0'
+  workspace:
+    description: Cargo workspace relative to the checkout
+    default: '.'
+  save:
+    description: Whether this job owns writes to the shared cache
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/runner-image
+      id: image
+    - uses: ./.github/actions/clean-build-output
+      with:
+        manifest: ${{ inputs.workspace }}/Cargo.toml
+        toolchain: ${{ inputs.toolchain }}
+    - uses: Swatinem/rust-cache@v2
+      env:
+        RUSTUP_TOOLCHAIN: ${{ inputs.toolchain }}
+      with:
+        prefix-key: xmlsec-build-v1
+        shared-key: ${{ inputs.domain }}-${{ steps.image.outputs.identity }}
+        workspaces: ${{ inputs.workspace }} -> target
+        save-if: ${{ inputs.save }}
+        # Preserve runner-provided Cargo/rustup shims for later post actions.
+        cache-bin: 'false'

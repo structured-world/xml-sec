@@ -3,6 +3,12 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+cleanup=true
+case ${1:-} in
+  '') ;;
+  --cache-managed) cleanup=false ;;
+  *) printf 'Unknown conformance option: %s\n' "$1" >&2; exit 2 ;;
+esac
 : "${LIBXSLT_SOURCE_DIR:?set the pinned libxslt source checkout}"
 : "${XMLSEC1_BIN:?set the explicitly provisioned xmlsec1 oracle}"
 oracle_prefix=$(cd "$(dirname "$XMLSEC1_BIN")/.." && pwd)
@@ -33,5 +39,5 @@ cargo nextest run -p xml-sec --features xslt,xml-backends-all \
   --test xslt_transform_integration --test xmlsec1_interop \
   --test donor_interop_suite --test merlin_interop --test phaos_interop \
   --test capability_ledger -E 'not binary(xmlsec1_interop) or test(xslt)' --no-fail-fast
-cargo clean
+if [[ "$cleanup" == true ]]; then cargo clean; fi
 printf 'XSLT conformance: engine, Recommendation examples, donor signatures and reciprocal oracle passed\n'
