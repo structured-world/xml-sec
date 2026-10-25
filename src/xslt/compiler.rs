@@ -14,6 +14,7 @@ use super::lexical::{
 };
 use super::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
 use super::resolver::decode_resource;
+use super::xpath::PreparedXPath;
 use super::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, NodeKind,
     OutputDefinition, OutputMethod, ParseBudget, ParseUsage, Reported, ResolvePurpose,
@@ -1106,6 +1107,9 @@ pub(crate) struct Expression {
     pub static_base_uri: Option<Arc<str>>,
     /// Stable identity of the stylesheet document containing this expression.
     pub(crate) stylesheet_document: StylesheetDocumentId,
+    /// Engine form prepared under the compile budget. Text created during execution is
+    /// prepared per evaluation instead, after its workspace is admitted.
+    pub(crate) prepared: Option<PreparedXPath>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -1360,12 +1364,15 @@ impl Expression {
             workspace.retain(source.len())?;
         }
         let variable_references = referenced_variables_bounded(source, &namespaces, workspace)?;
+        let prepared = PreparedXPath::new(source, &namespaces);
+        workspace.retain(prepared.retained_bytes())?;
         Ok(Self {
             source: source.to_owned(),
             namespaces,
             static_base_uri,
             stylesheet_document,
             variable_references,
+            prepared: Some(prepared),
         })
     }
 
@@ -1400,6 +1407,7 @@ impl Expression {
             variable_references,
             static_base_uri,
             stylesheet_document,
+            prepared: None,
         }
     }
 }
