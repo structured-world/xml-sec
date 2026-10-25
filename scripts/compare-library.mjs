@@ -93,14 +93,16 @@ function main() {
       return true;
     };
     // Every produced result must be consumed by every engine that consumes this
-    // workload before anything is timed; the xml-sec result is the timed input.
+    // workload before anything is timed. The xml-sec result is the timed input, or
+    // the first engine's when xml-sec refuses the input under its default policy.
     const produced = [];
     for (const engine of engines) for (const boundary of BOUNDARIES) {
       const out = scratch(`${name}.${producing}-${engine.id}-${boundary}.xml`);
       if (probe(engine, producing, boundary, source, out)) produced.push({ engine, boundary, out });
     }
-    const canonical = produced.find(entry => entry.engine.id === 'xml-sec' && entry.boundary === 'parse');
-    if (!canonical) throw Error(`xml-sec produced no ${producing} result for ${name}`);
+    const parsed = produced.filter(entry => entry.boundary === 'parse');
+    const canonical = parsed.find(entry => entry.engine.id === 'xml-sec') ?? parsed[0];
+    if (!canonical) throw Error(`no engine produced a ${producing} result for ${name}`);
     if (scenario === 'assertion')
       for (const entry of produced)
         if (!fs.readFileSync(entry.out, 'utf8').includes('X509Certificate>')) throw Error(`No signer certificate: ${entry.engine.name}, ${name}`);

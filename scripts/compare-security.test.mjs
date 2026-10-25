@@ -7,8 +7,19 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   percentile, resources, heapStats, createEvidenceDirectory,
-  SCENARIOS, unsupported, documentBody, tamper, wrap, engineArguments, caseFiles,
+  SCENARIOS, unsupported, documentBody, tamper, wrap, engineArguments, caseFiles, policyRefusal,
 } from './compare-security.mjs';
+
+test('only a default resource-limit refusal is recorded instead of failing', () => {
+  // An engine over its own default limit is reported with its reason; any other failure,
+  // including an invalid signature, must still stop the comparison.
+  assert.equal(
+    policyRefusal('Error: XML signature operation failed: signing policy violation: XSLT workspace bytes exceeds policy maximum 67108864: got 67280426\n'),
+    'XSLT workspace bytes exceeds policy maximum 67108864: got 67280426',
+  );
+  assert.equal(policyRefusal('Error: signature verification failed: digest mismatch\n'), undefined);
+  assert.equal(policyRefusal('verification policy violation: signing policy rejects algorithm sha1\n'), undefined);
+});
 
 test('wrapping places an unsigned forgery with the signed ID before the signed assertion', () => {
   // Engines are checked to reject this; a no-op wrap would check an intact document.
@@ -144,10 +155,10 @@ test('published package includes every shared benchmark entry point', () => {
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.copyFileSync(path.join(root, file), destination);
     }
-    const report = { schema: 2, results: Array.from({ length: 224 }, (_, index) => index < 8
+    const report = { schema: 2, results: Array.from({ length: 336 }, (_, index) => index < 8
       ? { unsupported: 'not available' } : { commands: ['private path'], repetitions: [{}] }) };
     fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify(report));
-    const library = { schema: 1, results: Array.from({ length: 96 }, (_, index) => index < 4
+    const library = { schema: 1, results: Array.from({ length: 144 }, (_, index) => index < 4
       ? { unsupported: 'not available' } : { repetitions: [{}] }) };
     fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify(library));
     const output = path.join(directory, 'site');
@@ -159,9 +170,9 @@ test('published package includes every shared benchmark entry point', () => {
         fs.readFileSync(path.join(root, 'benchmarks/dashboard', file)));
     }
     const published = JSON.parse(fs.readFileSync(path.join(output, 'comparison.json'), 'utf8'));
-    assert.equal(published.results.length, 224);
+    assert.equal(published.results.length, 336);
     assert.ok(published.results.every(entry => !Object.hasOwn(entry, 'commands')));
-    assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'library.json'), 'utf8')).results.length, 96);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'library.json'), 'utf8')).results.length, 144);
   } finally {
     fs.rmSync(directory, { recursive: true });
   }
@@ -218,8 +229,8 @@ test('incomplete reports cannot publish a dashboard', () => {
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   try {
     const output = path.join(directory, 'site');
-    const complete = Array.from({ length: 224 }, () => ({ repetitions: [{}] }));
-    const library = Array.from({ length: 96 }, () => ({ repetitions: [{}] }));
+    const complete = Array.from({ length: 336 }, () => ({ repetitions: [{}] }));
+    const library = Array.from({ length: 144 }, () => ({ repetitions: [{}] }));
     const unmeasured = list => [...list.slice(1), { engine: 'unmeasured' }];
     // Missing entries, and a supported entry without measurements, are both incomplete
     // at either level; a complete pair is the control that the builder accepts.

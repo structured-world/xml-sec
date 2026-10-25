@@ -16,8 +16,9 @@
 //! Built with `allocation-profile`, a further untimed run counts the operation's
 //! heap work; that build's timings are never reported.
 //!
-//! Exit status: 0 measured or rejected as required, 2 usage, 3 unsupported (the
-//! reason on stderr), 4 operation failure.
+//! Exit status: 0 measured or rejected as required, 2 usage, 3 unsupported or
+//! refused under the engine's default resource policy (the reason on stderr), 4
+//! operation failure.
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -178,6 +179,10 @@ pub enum Outcome {
     Accepted,
     /// The engine cannot perform the request; never timed.
     Unsupported(&'static str),
+    /// The engine refuses this input under its default resource policy, with the
+    /// engine's own reason; never timed. It is decided per input, so a later
+    /// engine revision that accepts the input is measured again.
+    Refused(String),
 }
 
 /// Validate once, warm up, then time `samples` runs of `operation` on fresh
@@ -284,6 +289,10 @@ pub fn main(engine: &str, execute: impl FnOnce(&Args) -> Result<Outcome, String>
     match execute(&args) {
         Ok(Outcome::Unsupported(reason)) => {
             eprintln!("unsupported: {reason}");
+            ExitCode::from(3)
+        }
+        Ok(Outcome::Refused(reason)) => {
+            eprintln!("unsupported: refused under the engine's default policy: {reason}");
             ExitCode::from(3)
         }
         Ok(Outcome::Rejected) if rejecting => {

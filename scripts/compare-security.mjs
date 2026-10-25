@@ -32,6 +32,15 @@ export function heapStats(memcheck, massif) {
   };
 }
 
+/**
+ * The reason an engine gave for refusing an input over one of its default resource
+ * limits, or undefined for any other failure. A refusal is recorded per input and
+ * never timed, so a later engine revision that accepts the input is measured again.
+ */
+export function policyRefusal(stderr) {
+  return stderr.match(/policy violation: (.*exceeds policy maximum.*)/)?.[1].trim();
+}
+
 function checked(binary, args, options = {}) {
   const result = spawnSync(binary, args, { encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024, ...options });
   if (result.error || result.signal || result.status !== 0) throw Error(`${binary} failed: ${result.error ?? result.signal ?? result.status}\n${result.stderr}`);
@@ -207,6 +216,14 @@ function main() {
     return [...loader, engine.binary, args[0], ...(engine.backend ?? []), ...args.slice(1)];
   };
   const invoke = cmd => checked(cmd[0], cmd.slice(1), { stdio: ['ignore', 'ignore', 'pipe'] });
+  // Run a validation command; return the engine's resource-policy refusal, if any.
+  const attempt = cmd => {
+    const result = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024, stdio: ['ignore', 'ignore', 'pipe'] });
+    if (!result.error && !result.signal && result.status === 0) return undefined;
+    const refusal = result.error || result.signal ? undefined : policyRefusal(result.stderr);
+    if (refusal) return refusal;
+    throw Error(`${cmd[0]} failed: ${result.error ?? result.signal ?? result.status}\n${result.stderr}`);
+  };
   const reject = (engine, item, input, what) => {
     const invalid = command(engine, item, 'verify', null, input);
     const rejection = spawnSync(invalid[0], invalid.slice(1), { encoding: 'utf8', timeout: 120000 });
@@ -220,46 +237,60 @@ function main() {
   for (const item of cases) {
     const { name, scenario } = item;
     const operations = SCENARIOS[scenario];
-    const able = operation => engines.filter(engine => !unsupported(engine.id, scenario, operation));
+    // Engines that refused this case under their default resource policy, per operation.
+    const refused = new Map();
+    const blocked = (engine, operation) => unsupported(engine.id, scenario, operation) ?? refused.get(`${engine.name}/${operation}`);
+    const able = operation => engines.filter(engine => !blocked(engine, operation));
+    const refuse = (engine, operation, reason) => refused.set(`${engine.name}/${operation}`, `refused under the engine's default policy: ${reason}`);
     if (operations.includes('sign')) {
       // Every signer's output must verify with every verifier, and a changed signed value
       // (and, for assertions, a wrapped forgery) must be rejected before anything is timed.
-      const signers = able('sign');
-      const verifiers = able('verify');
-      for (let index = 0; index < signers.length; index++) {
+      const outputs = [];
+      for (const [index, signer] of able('sign').entries()) {
         const signed = file(`${name}.signed-${index}.xml`);
-        invoke(command(signers[index], item, 'sign', signed));
-        if (scenario === 'assertion' && !fs.readFileSync(signed, 'utf8').includes('X509Certificate>')) throw Error(`No signer certificate: ${signers[index].name}, ${name}`);
-        for (const verifier of verifiers) invoke(command(verifier, item, 'verify', null, signed));
+        const refusal = attempt(command(signer, item, 'sign', signed));
+        if (refusal) { refuse(signer, 'sign', refusal); continue; }
+        if (scenario === 'assertion' && !fs.readFileSync(signed, 'utf8').includes('X509Certificate>')) throw Error(`No signer certificate: ${signer.name}, ${name}`);
+        outputs.push(signed);
       }
-      fs.copyFileSync(file(`${name}.signed-0.xml`), file(`${name}.signed.xml`));
+      if (!outputs.length) throw Error(`No engine signed ${name}`);
+      for (const signed of outputs) for (const verifier of able('verify')) {
+        const refusal = attempt(command(verifier, item, 'verify', null, signed));
+        if (refusal) refuse(verifier, 'verify', refusal);
+      }
+      fs.copyFileSync(outputs[0], file(`${name}.signed.xml`));
       const signedText = fs.readFileSync(file(`${name}.signed.xml`), 'utf8');
       const tampered = file(`${name}.tampered.xml`);
       fs.writeFileSync(tampered, tamper(signedText, scenario));
-      for (const verifier of verifiers) reject(verifier, item, tampered, 'tampered');
+      // A refusing verifier says nothing about tamper detection, so it is not counted.
+      for (const verifier of able('verify')) reject(verifier, item, tampered, 'tampered');
       if (scenario === 'assertion') {
         const wrapped = file(`${name}.wrapped.xml`);
         fs.writeFileSync(wrapped, wrap(signedText));
-        for (const verifier of verifiers) reject(verifier, item, wrapped, 'wrapped');
+        for (const verifier of able('verify')) reject(verifier, item, wrapped, 'wrapped');
       }
     }
     if (operations.includes('encrypt')) {
       const plain = fs.readFileSync(file(caseFiles(item).plain));
-      const encryptors = able('encrypt');
-      for (let index = 0; index < encryptors.length; index++) {
+      const outputs = [];
+      for (const [index, encryptor] of able('encrypt').entries()) {
         const encrypted = file(`${name}.encrypted-${index}.xml`);
-        invoke(command(encryptors[index], item, 'encrypt', encrypted));
-        for (const decryptor of able('decrypt')) {
-          const decrypted = file(`${name}.decrypted.xml`);
-          invoke(command(decryptor, item, 'decrypt', decrypted, encrypted));
-          // Byte payloads must round-trip exactly; XML results may differ only in the
-          // declaration and surrounding whitespace the writing engine adds.
-          const output = fs.readFileSync(decrypted);
-          const equal = scenario === 'payload' ? output.equals(plain) : documentBody(output) === documentBody(plain);
-          if (!equal) throw Error(`Plaintext mismatch: ${encryptors[index].name} -> ${decryptor.name}, ${name}`);
-        }
+        const refusal = attempt(command(encryptor, item, 'encrypt', encrypted));
+        if (refusal) { refuse(encryptor, 'encrypt', refusal); continue; }
+        outputs.push({ encryptor, encrypted });
       }
-      fs.copyFileSync(file(`${name}.encrypted-0.xml`), file(`${name}.encrypted.xml`));
+      if (!outputs.length) throw Error(`No engine encrypted ${name}`);
+      for (const { encryptor, encrypted } of outputs) for (const decryptor of able('decrypt')) {
+        const decrypted = file(`${name}.decrypted.xml`);
+        const refusal = attempt(command(decryptor, item, 'decrypt', decrypted, encrypted));
+        if (refusal) { refuse(decryptor, 'decrypt', refusal); continue; }
+        // Byte payloads must round-trip exactly; XML results may differ only in the
+        // declaration and surrounding whitespace the writing engine adds.
+        const output = fs.readFileSync(decrypted);
+        const equal = scenario === 'payload' ? output.equals(plain) : documentBody(output) === documentBody(plain);
+        if (!equal) throw Error(`Plaintext mismatch: ${encryptor.name} -> ${decryptor.name}, ${name}`);
+      }
+      fs.copyFileSync(outputs[0].encrypted, file(`${name}.encrypted.xml`));
     }
     for (const operation of operations) {
       const supported = able(operation);
@@ -301,8 +332,8 @@ function main() {
         }
       }
       results.push(...entries);
-      for (const engine of engines.filter(engine => unsupported(engine.id, scenario, operation))) {
-        results.push({ level: 'cli', engine: engine.name, operation, ...item, unsupported: unsupported(engine.id, scenario, operation) });
+      for (const engine of engines.filter(engine => blocked(engine, operation))) {
+        results.push({ level: 'cli', engine: engine.name, operation, ...item, unsupported: blocked(engine, operation) });
       }
     }
   }

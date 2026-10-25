@@ -4,14 +4,14 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use std::collections::HashSet;
 use std::process::ExitCode;
 use xml_sec::policy::{
-    DecryptionPolicy, EncryptionPolicy, SigningPolicy, TransformPolicy, VerificationPolicy,
-    XsltStylesheetSemantics,
+    DecryptionPolicy, EncryptionPolicy, PolicyViolation, SigningPolicy, TransformPolicy,
+    VerificationPolicy, XsltStylesheetSemantics,
 };
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::rsa_encoding::{RsaPrivateKeyEncoding as _, RsaPublicKeyEncoding as _};
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DsigStatus, KeyResolverConfig, KeyTrustEvidence, RsaSigningKey,
-    SignContext, SignatureAlgorithm, VerificationKey, VerifyContext, VerifyResult,
+    DefaultKeyResolver, DsigError, DsigStatus, KeyResolverConfig, KeyTrustEvidence, RsaSigningKey,
+    SignContext, SignatureAlgorithm, SigningError, VerificationKey, VerifyContext, VerifyResult,
     X509CertificateKeyInfoWriter,
 };
 use xml_sec::xmlenc::{
@@ -92,6 +92,12 @@ fn sign(args: &Args, ids: &[IdAttributeRegistration], input: &str) -> Result<Out
     if args.scenario == "assertion" {
         context = context.key_info_writer(&writer);
     }
+    // An input over a default resource limit is a refusal to report, not a failure.
+    if let Err(error @ SigningError::Policy(PolicyViolation::ResourceLimit { .. })) =
+        context.sign_template(input)
+    {
+        return Ok(Outcome::Refused(error.to_string()));
+    }
     let measurement = match args.boundary {
         Boundary::Parse => measure(
             args.samples,
@@ -154,6 +160,13 @@ fn verify(args: &Args, ids: &[IdAttributeRegistration], input: &str) -> Result<O
     } else {
         context.key(&key)
     };
+    // A refusal is reported before `reject` too: refusing an input over a resource
+    // limit says nothing about whether the engine detects tampering.
+    if let Err(error @ DsigError::Policy(PolicyViolation::ResourceLimit { .. })) =
+        context.verify(input)
+    {
+        return Ok(Outcome::Refused(error.to_string()));
+    }
     if args.operation == "reject" {
         // A processing error refuses the input as surely as an invalid status.
         return Ok(match context.verify(input) {
