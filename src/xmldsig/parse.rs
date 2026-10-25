@@ -1,4 +1,4 @@
-//! Parsing of XMLDSig `<Signature>` and `<SignedInfo>` elements.
+//! Parsing of `XMLDSig` `<Signature>` and `<SignedInfo>` elements.
 //!
 //! Implements strict child order enforcement per
 //! [XMLDSig §4.1](https://www.w3.org/TR/xmldsig-core1/#sec-Signature):
@@ -17,7 +17,6 @@
 //! ```
 
 use crate::xml::dom::{Document, Node};
-use der::{Decode, asn1::ObjectIdentifier};
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -36,9 +35,9 @@ pub(crate) use crate::hard_limits::SIGNATURE_REFERENCE_CEILING as MAX_REFERENCES
 #[cfg(test)]
 use crate::hard_limits::X509_CHAIN_DEPTH_CEILING as MAX_X509_CHAIN_DEPTH;
 
-/// XMLDSig namespace URI.
+/// `XMLDSig` namespace URI.
 pub(crate) const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
-/// XMLDSig 1.1 namespace URI.
+/// `XMLDSig` 1.1 namespace URI.
 pub(crate) const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
 const MAX_DER_ENCODED_KEY_VALUE_LEN: usize = 8192;
 const MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN: usize = 65_536;
@@ -56,6 +55,10 @@ pub struct SignatureContext(Vec<u8>);
 impl SignatureContext {
     /// RFC 8032 section 5 limits contexts to 255 octets, independently of policy.
     /// <https://www.rfc-editor.org/rfc/rfc8032.html#section-5>
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::InvalidStructure`] when `bytes` exceeds 255 octets.
     pub fn new(bytes: &[u8]) -> Result<Self, ParseError> {
         if bytes.len() > 255 {
             return Err(ParseError::InvalidStructure(
@@ -66,6 +69,7 @@ impl SignatureContext {
     }
 
     /// Borrow the domain-separation bytes without copying them at provider boundaries.
+    #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -152,7 +156,7 @@ pub enum SignatureAlgorithm {
     EcdsaRipemd160,
     /// DSA with SHA-1. Legacy algorithm disabled for signing by default.
     DsaSha1,
-    /// DSA with SHA-256 as defined by XMLDSig 1.1.
+    /// DSA with SHA-256 as defined by `XMLDSig` 1.1.
     DsaSha256,
     /// HMAC with SHA-1. Legacy algorithm disabled for signing by default.
     HmacSha1,
@@ -228,6 +232,7 @@ pub enum SignatureAlgorithm {
 
 impl SignatureAlgorithm {
     /// Effective PSS parameters for fixed and parameterized method identifiers.
+    #[must_use]
     pub fn rsa_pss_parameters(self) -> Option<RsaPssParameters> {
         let digest = match self {
             Self::RsaPss(parameters) => return Some(parameters),
@@ -250,6 +255,7 @@ impl SignatureAlgorithm {
     }
 
     /// Whether either PSS hash needs explicit historical-algorithm permission.
+    #[must_use]
     pub fn uses_legacy_pss_hash(self) -> bool {
         self.rsa_pss_parameters().is_some_and(|parameters| {
             [parameters.digest, parameters.mgf_digest]
@@ -327,6 +333,7 @@ impl SignatureAlgorithm {
     ];
 
     /// Digest selected by an ECDSA method, independently of its key's curve.
+    #[must_use]
     pub const fn ecdsa_digest(self) -> Option<DigestAlgorithm> {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -344,7 +351,7 @@ impl SignatureAlgorithm {
         }
     }
 
-    /// Fixed pure EdDSA signature width from RFC 8032 sections 5.1 and 5.2.
+    /// Fixed pure `EdDSA` signature width from RFC 8032 sections 5.1 and 5.2.
     pub(crate) const fn eddsa_signature_len(self) -> Option<usize> {
         match self {
             Self::Ed25519 | Self::Ed25519Ctx | Self::Ed25519Ph => Some(64),
@@ -371,7 +378,7 @@ impl SignatureAlgorithm {
         }
     }
 
-    /// Fixed XMLDSig component width for DSA's `r || s` representation.
+    /// Fixed `XMLDSig` component width for DSA's `r || s` representation.
     pub(crate) const fn dsa_component_len(self) -> Option<usize> {
         match self {
             Self::DsaSha1 => Some(20),
@@ -537,6 +544,7 @@ impl SignatureAlgorithm {
     }
 
     /// Whether this optional historical method requires explicit policy permission.
+    #[must_use]
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -550,6 +558,7 @@ impl SignatureAlgorithm {
     }
 
     /// Whether this method uses an RSA key and PKCS#1 signature encoding.
+    #[must_use]
     pub const fn is_rsa(self) -> bool {
         match self {
             Self::RsaPssSha1 => true,
@@ -578,13 +587,13 @@ impl SignatureAlgorithm {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct SignedInfo {
-    /// Canonicalization method for SignedInfo itself.
+    /// Canonicalization method for `SignedInfo` itself.
     pub c14n_method: C14nAlgorithm,
     /// Signature algorithm.
     pub signature_method: SignatureAlgorithm,
     /// Optional byte-aligned HMAC output length in bits.
     pub hmac_output_length_bits: Option<usize>,
-    /// Domain separation supplied by the selected SignatureMethod extension.
+    /// Domain separation supplied by the selected `SignatureMethod` extension.
     pub signature_context: SignatureContext,
     /// One or more `<Reference>` elements.
     pub references: Vec<Reference>,
@@ -655,7 +664,7 @@ pub enum KeyInfoSource {
         /// Supported transform shape declared by the retrieval method.
         transforms: RetrievalMethodTransforms,
     },
-    /// XMLDSig 1.1 reference to another `KeyInfo` element.
+    /// `XMLDSig` 1.1 reference to another `KeyInfo` element.
     KeyInfoReference {
         /// RFC 3986-resolved resource identity.
         uri: String,
@@ -672,10 +681,10 @@ pub enum RetrievalMethodTransforms {
     X509DataNodeSetFilter {
         /// Original expression retained for operation policy accounting.
         expression: String,
-        /// Namespace axis visible from the XPath parameter element.
+        /// Namespace axis visible from the `XPath` parameter element.
         namespaces: BTreeMap<String, String>,
     },
-    /// A transform chain attached to a RetrievalMethod type this implementation
+    /// A transform chain attached to a `RetrievalMethod` type this implementation
     /// does not materialize. Resolvers may ignore this advisory key source and
     /// continue with later `<KeyInfo>` children.
     Unsupported,
@@ -685,7 +694,7 @@ pub enum RetrievalMethodTransforms {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KeyValueInfo {
-    /// XMLEnc 1.1 §5.6.1 DH public value and optional complete domain group.
+    /// `XMLEnc` 1.1 §5.6.1 DH public value and optional complete domain group.
     Dh {
         /// Optional prime modulus, present together with Q and Generator.
         p: Option<Vec<u8>>,
@@ -711,7 +720,7 @@ pub enum KeyValueInfo {
         /// Public value Y.
         y: Vec<u8>,
     },
-    /// `<RSAKeyValue>` with unsigned big-endian CryptoBinary parameters.
+    /// `<RSAKeyValue>` with unsigned big-endian `CryptoBinary` parameters.
     Rsa {
         /// RSA modulus.
         modulus: Vec<u8>,
@@ -720,7 +729,7 @@ pub enum KeyValueInfo {
     },
     /// `dsig11:ECKeyValue` with a supported named curve and SEC1 public point.
     Ec {
-        /// Bare named-curve OID, without the XMLDSig `urn:oid:` prefix.
+        /// Bare named-curve OID, without the `XMLDSig` `urn:oid:` prefix.
         curve_oid: String,
         /// Uncompressed SEC1 point (`0x04 || x || y`).
         public_key: Vec<u8>,
@@ -780,7 +789,7 @@ pub struct ParsedX509Certificate {
     pub public_key: X509PublicKeyInfo,
 }
 
-/// Public key material extracted from certificate SubjectPublicKeyInfo.
+/// Public key material extracted from certificate `SubjectPublicKeyInfo`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum X509PublicKeyInfo {
@@ -793,19 +802,19 @@ pub enum X509PublicKeyInfo {
     },
     /// EC public key (`curve_oid`, encoded point bytes).
     Ec {
-        /// Named-curve OID from SubjectPublicKeyInfo parameters.
+        /// Named-curve OID from `SubjectPublicKeyInfo` parameters.
         curve_oid: String,
-        /// Encoded EC point bytes from SubjectPublicKeyInfo.
+        /// Encoded EC point bytes from `SubjectPublicKeyInfo`.
         public_key: Vec<u8>,
     },
     /// Public key algorithm is present but not parsed into a concrete key type.
     Unsupported {
-        /// SubjectPublicKeyInfo algorithm OID.
+        /// `SubjectPublicKeyInfo` algorithm OID.
         algorithm_oid: String,
     },
 }
 
-/// Errors during XMLDSig element parsing.
+/// Errors during `XMLDSig` element parsing.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ParseError {
@@ -853,7 +862,7 @@ pub enum ParseError {
     #[error("base64 decode error: {0}")]
     Base64(String),
 
-    /// DigestValue length did not match the declared DigestMethod.
+    /// `DigestValue` length did not match the declared `DigestMethod`.
     #[error(
         "digest length mismatch for {algorithm}: expected {expected} bytes, got {actual} bytes"
     )]
@@ -883,8 +892,13 @@ pub fn find_signature_node<'a>(doc: &'a Document<'a>) -> Option<Node<'a, 'a>> {
 
 /// Parse a `<ds:SignedInfo>` element.
 ///
-/// Enforces strict child order per XMLDSig spec:
+/// Enforces strict child order per `XMLDSig` spec:
 /// `<CanonicalizationMethod>` → `<SignatureMethod>` → `<Reference>`+
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for misplaced or missing children, unsupported
+/// algorithms, malformed parameters and exceeded default resource limits.
 pub fn parse_signed_info(signed_info_node: Node) -> Result<SignedInfo, ParseError> {
     parse_signed_info_with_xpath_budget(
         signed_info_node,
@@ -961,9 +975,14 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
 #[derive(Clone, Copy)]
 struct ByteAlignedHmacOutputLength(usize);
 
-/// Parse a complete SignatureMethod, including its bounded algorithm parameters.
-/// This is also usable for unsigned templates whose DigestValue placeholders
+/// Parse a complete `SignatureMethod`, including its bounded algorithm parameters.
+/// This is also usable for unsigned templates whose `DigestValue` placeholders
 /// are not yet valid signature input; callers still apply operation policy.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for an unsupported algorithm URI, unexpected content
+/// and malformed or out-of-bounds algorithm parameters.
 pub fn parse_signature_method(
     node: Node<'_, '_>,
     resources: &crate::policy::ResourcePolicy,
@@ -1237,6 +1256,11 @@ fn parse_signature_context(
 /// Parse a single `<ds:Reference>` element.
 ///
 /// Structure: `<Transforms>?` → `<DigestMethod>` → `<DigestValue>`
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for misplaced or missing children, unsupported
+/// transform or digest algorithms and malformed digest values.
 pub fn parse_reference(reference_node: Node) -> Result<Reference, ParseError> {
     parse_reference_with_xpath_budget(
         reference_node,
@@ -1484,7 +1508,7 @@ fn layout_transforms_and_digest_method<'a, 'input>(
 ///
 /// Supported source elements:
 /// - `<ds:KeyName>`
-/// - `<ds:KeyValue>` (dispatch by child QName; RSA and `dsig11:ECKeyValue` are parsed)
+/// - `<ds:KeyValue>` (dispatch by child `QName`; RSA and `dsig11:ECKeyValue` are parsed)
 /// - `<ds:X509Data>`
 /// - `<dsig11:DEREncodedKeyValue>`
 ///
@@ -1492,11 +1516,16 @@ fn layout_transforms_and_digest_method<'a, 'input>(
 /// unknown XMLDSig-owned (`ds:*` / `dsig11:*`) children inside `<X509Data>` are
 /// rejected fail-closed.
 /// `<X509Data>` may still be empty or contain only non-XMLDSig extension children.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] for malformed supported sources and for exceeded
+/// default ingestion limits.
 pub fn parse_key_info(key_info_node: Node) -> Result<KeyInfo, ParseError> {
     parse_key_info_with_provider(key_info_node, crate::provider::default_provider())
 }
 
-/// Shared ingestion accounting for KeyInfo elements in one operation.
+/// Shared ingestion accounting for `KeyInfo` elements in one operation.
 ///
 /// Parsing charges embedded candidates and X.509 bytes before materialization;
 /// these charges are independent of later resolver inspection work and are not
@@ -1548,6 +1577,11 @@ impl<'a> KeyInfoParsingSession<'a> {
     /// Inspect original certificate SPKI without constructing display metadata
     /// or starting another certificate budget. Parsing does not establish trust.
     /// The callback owns any further key conversion and its accounting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] when admitting `der` exceeds this session's
+    /// allowance or the certificate cannot be read.
     pub fn with_certificate_public_key<R>(
         &mut self,
         der: &[u8],
@@ -1558,11 +1592,16 @@ impl<'a> KeyInfoParsingSession<'a> {
             .usage
             .certificates
             .read(der)
-            .map_err(|error| self.usage.certificates.parse_error(error))?;
+            .map_err(ParseError::from)?;
         Ok(inspect(certificate.tbs().public_key().as_bytes()))
     }
 
     /// Match a candidate's selectors in this operation's retained account.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] when admitting `der` exceeds this session's
+    /// allowance or a selector cannot be compared with the certificate.
     pub fn certificate_matches_selectors(
         &mut self,
         info: &X509DataInfo,
@@ -1633,6 +1672,10 @@ impl<'a> KeyInfoParsingSession<'a> {
     }
 
     /// Start a session using the operation's resource policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError::Policy`] when `resources` is not a valid policy.
     pub fn new(resources: &'a crate::policy::ResourcePolicy) -> Result<Self, ParseError> {
         resources.validate()?;
         Ok(Self {
@@ -1646,11 +1689,20 @@ impl<'a> KeyInfoParsingSession<'a> {
     }
 
     /// Parse another element without resetting this operation's allowance.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::parse_with_provider`].
     pub fn parse(&mut self, node: Node) -> Result<KeyInfo, ParseError> {
         self.parse_with_provider(node, crate::provider::default_provider())
     }
 
     /// Parse with the operation's explicit crypto engine and existing allowance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ParseError`] for malformed supported sources and when the
+    /// session's ingestion allowance is exceeded.
     pub fn parse_with_provider(
         &mut self,
         node: Node,
@@ -1676,7 +1728,7 @@ impl<'a> KeyInfoParsingSession<'a> {
         )
     }
 
-    /// Parse the KeyInfoType carried by an XML Encryption agreement role.
+    /// Parse the `KeyInfoType` carried by an XML Encryption agreement role.
     /// Keep the original node for XML Base and share this session's allowance.
     #[cfg(feature = "xmlenc")]
     pub(crate) fn parse_agreement_role(
@@ -1804,48 +1856,12 @@ fn parse_key_info_contents_in_session(
             }
             (Some(XMLDSIG_NS), "RetrievalMethod") => {
                 ensure_no_non_whitespace_text(child, "RetrievalMethod")?;
-                let lexical_uri = child.attribute("URI").ok_or_else(|| {
-                    ParseError::InvalidStructure("RetrievalMethod requires URI".into())
-                })?;
-                if lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
-                    return Err(ParseError::InvalidStructure(
-                        "RetrievalMethod URI exceeds maximum length".into(),
-                    ));
-                }
-                let uri = if lexical_uri.is_empty() || lexical_uri.starts_with('#') {
-                    lexical_uri.to_owned()
-                } else {
-                    // RetrievalMethod is parsed independently from later key
-                    // materialization, so retain its resolved resource identity.
-                    resolve_uri_from_node_with_document_base_with_budget(
-                        child,
-                        lexical_uri,
-                        document_base,
-                        xml_base_budget,
-                    )
-                    .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
-                };
-                let resource_type = child.attribute("Type");
-                if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
-                    return Err(ParseError::InvalidStructure(
-                        "RetrievalMethod Type exceeds maximum length".into(),
-                    ));
-                }
-                let resource_type = resource_type.map(str::to_owned);
-                let transforms = if resource_type.as_deref()
-                    == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
-                {
-                    parse_retrieval_method_transforms(child, resources)?
-                } else if element_children(child).next().is_some() {
-                    RetrievalMethodTransforms::Unsupported
-                } else {
-                    RetrievalMethodTransforms::None
-                };
-                sources.push(KeyInfoSource::RetrievalMethod {
-                    uri,
-                    resource_type,
-                    transforms,
-                });
+                sources.push(parse_retrieval_method_source(
+                    child,
+                    document_base,
+                    xml_base_budget,
+                    resources,
+                )?);
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
                 charge_embedded_key_candidate(&mut usage.embedded_candidates, resources)?;
@@ -1856,25 +1872,8 @@ fn parse_key_info_contents_in_session(
             (Some(XMLDSIG11_NS), "KeyInfoReference") => {
                 ensure_no_element_children(child, "KeyInfoReference")?;
                 ensure_no_non_whitespace_text(child, "KeyInfoReference")?;
-                let lexical_uri = child.attribute("URI").ok_or_else(|| {
-                    ParseError::InvalidStructure("KeyInfoReference requires URI".into())
-                })?;
-                if lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
-                    return Err(ParseError::InvalidStructure(
-                        "KeyInfoReference URI exceeds maximum length".into(),
-                    ));
-                }
-                let uri = if lexical_uri.is_empty() || lexical_uri.starts_with('#') {
-                    lexical_uri.to_owned()
-                } else {
-                    resolve_uri_from_node_with_document_base_with_budget(
-                        child,
-                        lexical_uri,
-                        document_base,
-                        xml_base_budget,
-                    )
-                    .map_err(|error| ParseError::InvalidStructure(error.to_string()))?
-                };
+                let uri =
+                    key_info_source_uri(child, "KeyInfoReference", document_base, xml_base_budget)?;
                 sources.push(KeyInfoSource::KeyInfoReference { uri });
             }
             _ => {}
@@ -1882,6 +1881,64 @@ fn parse_key_info_contents_in_session(
     }
 
     Ok(KeyInfo { sources })
+}
+
+/// Bound and resolve a `KeyInfo` source `URI` attribute. Same-document URIs
+/// stay lexical; others retain their resolved resource identity because the
+/// source is parsed independently of later key materialization.
+fn key_info_source_uri(
+    child: Node,
+    element: &'static str,
+    document_base: Option<&str>,
+    xml_base_budget: &XmlBaseResolutionBudget,
+) -> Result<String, ParseError> {
+    let lexical_uri = child
+        .attribute("URI")
+        .ok_or_else(|| ParseError::InvalidStructure(format!("{element} requires URI")))?;
+    if lexical_uri.len() > MAX_KEY_NAME_TEXT_LEN {
+        return Err(ParseError::InvalidStructure(format!(
+            "{element} URI exceeds maximum length"
+        )));
+    }
+    if lexical_uri.is_empty() || lexical_uri.starts_with('#') {
+        return Ok(lexical_uri.to_owned());
+    }
+    resolve_uri_from_node_with_document_base_with_budget(
+        child,
+        lexical_uri,
+        document_base,
+        xml_base_budget,
+    )
+    .map_err(|error| ParseError::InvalidStructure(error.to_string()))
+}
+
+fn parse_retrieval_method_source(
+    child: Node,
+    document_base: Option<&str>,
+    xml_base_budget: &XmlBaseResolutionBudget,
+    resources: &crate::policy::ResourcePolicy,
+) -> Result<KeyInfoSource, ParseError> {
+    let uri = key_info_source_uri(child, "RetrievalMethod", document_base, xml_base_budget)?;
+    let resource_type = child.attribute("Type");
+    if resource_type.is_some_and(|value| value.len() > MAX_KEY_NAME_TEXT_LEN) {
+        return Err(ParseError::InvalidStructure(
+            "RetrievalMethod Type exceeds maximum length".into(),
+        ));
+    }
+    let resource_type = resource_type.map(str::to_owned);
+    let transforms =
+        if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#X509Data") {
+            parse_retrieval_method_transforms(child, resources)?
+        } else if element_children(child).next().is_some() {
+            RetrievalMethodTransforms::Unsupported
+        } else {
+            RetrievalMethodTransforms::None
+        };
+    Ok(KeyInfoSource::RetrievalMethod {
+        uri,
+        resource_type,
+        transforms,
+    })
 }
 
 fn charge_embedded_key_candidate(
@@ -1962,7 +2019,7 @@ fn parse_retrieval_method_transforms(
 
 /// Iterate only element children (skip text, comments, PIs).
 fn element_children<'a>(node: Node<'a, 'a>) -> impl Iterator<Item = Node<'a, 'a>> {
-    node.children().filter(|n| n.is_element())
+    node.children().filter(Node::is_element)
 }
 
 /// Verify that a node is a `<ds:{expected_name}>` element.
@@ -2030,7 +2087,7 @@ fn required_algorithm_attr<'a>(
 /// Parse the `PrefixList` attribute from an `<ec:InclusiveNamespaces>` child of
 /// `<CanonicalizationMethod>`, if present.
 ///
-/// This mirrors transform parsing for Exclusive C14N and keeps SignedInfo
+/// This mirrors transform parsing for Exclusive C14N and keeps `SignedInfo`
 /// canonicalization parameters lossless.
 fn parse_inclusive_prefixes<'a>(node: Node<'a, '_>) -> Result<Option<&'a str>, ParseError> {
     const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
@@ -2292,10 +2349,9 @@ fn parse_ec_key_value(node: Node<'_, '_>) -> Result<KeyValueInfo, ParseError> {
         return Ok(KeyValueInfo::InvalidEcKeyValue);
     }
 
-    let public_key = match decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
-    {
-        Ok(public_key) => public_key,
-        Err(_) => return Ok(KeyValueInfo::InvalidEcKeyValue),
+    let Ok(public_key) = decode_crypto_binary(public_key_node, "PublicKey", MAX_EC_PUBLIC_KEY_LEN)
+    else {
+        return Ok(KeyValueInfo::InvalidEcKeyValue);
     };
     if validate_ec_public_key_point(&public_key, expected_public_key_len).is_err() {
         return Ok(KeyValueInfo::InvalidEcKeyValue);
@@ -2481,7 +2537,7 @@ fn parse_x509_data_in_session(
                 let digest = decode_x509_base64(child, "X509Digest", total_binary_len, resources)?;
                 info.digests.push((algorithm.to_string(), digest));
             }
-            (Some(XMLDSIG_NS), child_name) | (Some(XMLDSIG11_NS), child_name) => {
+            (Some(XMLDSIG_NS | XMLDSIG11_NS), child_name) => {
                 return Err(ParseError::InvalidStructure(format!(
                     "X509Data contains unsupported XMLDSig child element <{child_name}>"
                 )));
@@ -2562,6 +2618,16 @@ impl From<super::X509ChainError> for X509ChainBuildError {
             super::X509ChainError::Policy(error) => Self::Policy(error),
             super::X509ChainError::Provider(error) => Self::Provider(error),
             error => Self::Certificate(error),
+        }
+    }
+}
+
+impl From<super::X509ChainError> for ParseError {
+    fn from(error: super::X509ChainError) -> Self {
+        match error {
+            super::X509ChainError::Policy(error) => Self::Policy(error),
+            super::X509ChainError::Processing(error) => Self::Certificate(error),
+            error => Self::InvalidStructure(error.to_string()),
         }
     }
 }
@@ -2658,19 +2724,19 @@ pub(crate) fn build_x509_certificate_chain_from(
                     ) {
                         Ok(true) => verified.push(issuer_idx),
                         Ok(false) => {}
-                        Err(super::X509ChainError::Provider(
-                            crate::provider::ProviderError::Unsupported {
-                                operation: crate::provider::ProviderOperation::VerifyCertificate,
-                                algorithm: Some(oid),
-                            },
-                        )) => {
+                        Err(
+                            super::X509ChainError::Provider(
+                                crate::provider::ProviderError::Unsupported {
+                                    operation: crate::provider::ProviderOperation::VerifyCertificate,
+                                    algorithm: Some(oid),
+                                },
+                            )
+                            | super::X509ChainError::UnsupportedSignatureAlgorithm { oid },
+                        ) => {
                             unsupported_oid.get_or_insert(oid);
                         }
                         Err(super::X509ChainError::Provider(error)) => {
                             return Err(X509ChainBuildError::Provider(error));
-                        }
-                        Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
-                            unsupported_oid.get_or_insert(oid);
                         }
                         Err(super::X509ChainError::Policy(error)) => {
                             return Err(X509ChainBuildError::Policy(error));
@@ -2757,6 +2823,7 @@ pub(crate) fn build_x509_certificate_paths_to_selector_targets(
     )
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct X509PathBounds {
     pub(crate) max_depth: usize,
     pub(crate) max_candidate_paths: usize,
@@ -2803,8 +2870,7 @@ fn build_x509_certificate_paths(
     let mut completed = memory.vector();
     let mut generated_paths = 1usize;
     let mut depth_exceeded = false;
-    let mut unsupported_oid = None;
-    let mut policy_rejection = None;
+    let mut rejections = IssuerRejections::default();
     let mut issuer_cache = memory.vector();
     issuer_cache
         .try_reserve_exact(info.certificate_count())
@@ -2836,73 +2902,14 @@ fn build_x509_certificate_paths(
             continue;
         }
 
-        let current = &source[current_idx];
         if issuer_cache[current_idx].is_none() {
-            let mut verified = memory.vector();
-            for (issuer_idx, issuer) in source.iter().enumerate() {
-                if !certificates
-                    .source_names_equal(issuer.tbs().subject(), current.tbs().issuer())
-                    .map_err(X509ChainBuildError::from)?
-                {
-                    continue;
-                }
-                match super::x509::shared_certificate_signature_outcome(
-                    current,
-                    issuer,
-                    verifier.provider,
-                    verifier.allowed,
-                    certificates,
-                ) {
-                    Ok(
-                        structured_pkix::path::Verified::Yes
-                        | structured_pkix::path::Verified::Unsupported,
-                    ) => {
-                        // An isolated edge with inherited parameters cannot prove
-                        // rejection. Only complete supplied-path validation grants trust.
-                        verified.try_push(issuer_idx).map_err(allocation_error)?;
-                    }
-                    Ok(structured_pkix::path::Verified::No) => {}
-                    Ok(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
-                    Err(super::X509ChainError::Provider(
-                        crate::provider::ProviderError::Unsupported {
-                            operation: crate::provider::ProviderOperation::VerifyCertificate,
-                            algorithm: Some(oid),
-                        },
-                    )) => {
-                        // Provider capability can depend on the issuer SPKI,
-                        // so retain the diagnostic but try every same-DN key.
-                        unsupported_oid.get_or_insert(oid);
-                        continue;
-                    }
-                    Err(super::X509ChainError::Provider(error)) => {
-                        return Err(X509ChainBuildError::Provider(error));
-                    }
-                    Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
-                        // The mapper rejected this child's AlgorithmIdentifier;
-                        // no issuer candidate can alter it on the current path.
-                        unsupported_oid.get_or_insert(oid);
-                        break;
-                    }
-                    Err(super::X509ChainError::Policy(error)) => {
-                        if matches!(
-                            error,
-                            crate::policy::PolicyViolation::ResourceLimit { .. }
-                                | crate::policy::PolicyViolation::ResourceLimitExceeded { .. }
-                        ) {
-                            return Err(X509ChainBuildError::Policy(error));
-                        }
-                        // Certificate permission belongs to this child's
-                        // parent edge, not to other cross-certified paths.
-                        // RFC 5280 section 6.1 validates a prospective path;
-                        // discovery among alternatives is our product policy.
-                        // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
-                        policy_rejection.get_or_insert(error);
-                        break;
-                    }
-                    Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
-                }
-            }
-            issuer_cache[current_idx] = Some(verified);
+            issuer_cache[current_idx] = Some(verified_issuers(
+                &source[current_idx],
+                &source,
+                verifier,
+                certificates,
+                &mut rejections,
+            )?);
         }
         let issuers = issuer_cache[current_idx]
             .as_ref()
@@ -2934,17 +2941,110 @@ fn build_x509_certificate_paths(
     }
 
     if completed.is_empty() {
-        if let Some(error) = policy_rejection {
+        rejections.into_result(depth_exceeded)?;
+    }
+    Ok(completed)
+}
+
+/// First rejection causes retained across issuer discovery; they are reported
+/// only when no candidate path completes.
+#[derive(Default)]
+struct IssuerRejections {
+    unsupported_oid: Option<String>,
+    policy: Option<crate::policy::PolicyViolation>,
+}
+
+impl IssuerRejections {
+    /// Policy refusal outranks an unsupported algorithm, which outranks depth.
+    fn into_result(self, depth_exceeded: bool) -> Result<(), X509ChainBuildError> {
+        if let Some(error) = self.policy {
             return Err(X509ChainBuildError::Policy(error));
         }
-        if let Some(oid) = unsupported_oid {
+        if let Some(oid) = self.unsupported_oid {
             return Err(X509ChainBuildError::UnsupportedSignatureAlgorithm { oid });
         }
         if depth_exceeded {
             return Err(X509ChainBuildError::DepthExceeded);
         }
+        Ok(())
     }
-    Ok(completed)
+}
+
+/// Indices of same-DN issuers whose edge signature does not disprove `current`.
+fn verified_issuers(
+    current: &structured_pkix::Certificate<'_>,
+    source: &[structured_pkix::Certificate<'_>],
+    verifier: super::pkix::ProviderVerifier<'_>,
+    certificates: &super::pkix::CertificateSession,
+    rejections: &mut IssuerRejections,
+) -> Result<structured_asn1::memory::OwnedVec<usize>, X509ChainBuildError> {
+    let allocation_error = |reason| {
+        X509ChainBuildError::from(certificates.error(structured_pkix::Error::resource(
+            reason,
+            "certificate.paths",
+            0,
+        )))
+    };
+    let mut issuers = certificates.memory().vector();
+    for (issuer_idx, issuer) in source.iter().enumerate() {
+        if !certificates
+            .source_names_equal(issuer.tbs().subject(), current.tbs().issuer())
+            .map_err(X509ChainBuildError::from)?
+        {
+            continue;
+        }
+        match super::x509::shared_certificate_signature_outcome(
+            current,
+            issuer,
+            verifier.provider,
+            verifier.allowed,
+            certificates,
+        ) {
+            Ok(
+                structured_pkix::path::Verified::Yes | structured_pkix::path::Verified::Unsupported,
+            ) => {
+                // An isolated edge with inherited parameters cannot prove
+                // rejection. Only complete supplied-path validation grants trust.
+                issuers.try_push(issuer_idx).map_err(allocation_error)?;
+            }
+            Ok(structured_pkix::path::Verified::No) => {}
+            Err(super::X509ChainError::Provider(crate::provider::ProviderError::Unsupported {
+                operation: crate::provider::ProviderOperation::VerifyCertificate,
+                algorithm: Some(oid),
+            })) => {
+                // Provider capability can depend on the issuer SPKI,
+                // so retain the diagnostic but try every same-DN key.
+                rejections.unsupported_oid.get_or_insert(oid);
+            }
+            Err(super::X509ChainError::Provider(error)) => {
+                return Err(X509ChainBuildError::Provider(error));
+            }
+            Err(super::X509ChainError::UnsupportedSignatureAlgorithm { oid }) => {
+                // The mapper rejected this child's AlgorithmIdentifier;
+                // no issuer candidate can alter it on the current path.
+                rejections.unsupported_oid.get_or_insert(oid);
+                break;
+            }
+            Err(super::X509ChainError::Policy(error)) => {
+                if matches!(
+                    error,
+                    crate::policy::PolicyViolation::ResourceLimit { .. }
+                        | crate::policy::PolicyViolation::ResourceLimitExceeded { .. }
+                ) {
+                    return Err(X509ChainBuildError::Policy(error));
+                }
+                // Certificate permission belongs to this child's
+                // parent edge, not to other cross-certified paths.
+                // RFC 5280 section 6.1 validates a prospective path;
+                // discovery among alternatives is our product policy.
+                // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1
+                rejections.policy.get_or_insert(error);
+                break;
+            }
+            Ok(_) | Err(_) => return Err(X509ChainBuildError::IssuerSignatureMismatch),
+        }
+    }
+    Ok(issuers)
 }
 
 fn select_x509_signing_certificate(
@@ -2974,18 +3074,17 @@ fn select_x509_signing_certificate(
                 "X509Data lookup identifiers do not match any embedded certificate".into(),
             ));
         }
-        [] => {}
         _ => {}
     }
 
     let source = certificates
         .read_pool(&info.certificates)
-        .map_err(|error| certificates.parse_error(error))?;
+        .map_err(ParseError::from)?;
     let mut leaf_candidates = Vec::new();
     for (idx, cert) in source.iter().enumerate() {
         if certificates
             .source_names_equal(cert.tbs().subject(), cert.tbs().issuer())
-            .map_err(|error| certificates.parse_error(error))?
+            .map_err(ParseError::from)?
         {
             continue;
         }
@@ -2993,7 +3092,7 @@ fn select_x509_signing_certificate(
         for other in &source {
             if certificates
                 .source_names_equal(other.tbs().issuer(), cert.tbs().subject())
-                .map_err(|error| certificates.parse_error(error))?
+                .map_err(ParseError::from)?
             {
                 issuer = true;
                 break;
@@ -3043,25 +3142,21 @@ pub(crate) fn x509_certificate_matches_any_selector(
 ) -> Result<bool, ParseError> {
     let decoded = certificates
         .read(certificate_der)
-        .map_err(|error| certificates.parse_error(error))?;
+        .map_err(ParseError::from)?;
     let mut subject_match = false;
     for subject in &info.subject_names {
-        let selector = certificates
-            .selector(subject)
-            .map_err(|error| certificates.parse_error(error))?;
+        let selector = certificates.selector(subject).map_err(ParseError::from)?;
         subject_match |= selector
             .matches_name(decoded.tbs().subject(), certificates.memory())
-            .map_err(|error| certificates.parse_error(certificates.error(error)))?;
+            .map_err(|error| certificates.parse_failure(error))?;
     }
     let mut issuer_serial_match = false;
     for (issuer, serial) in &info.issuer_serials {
         let serial = selector_serial(serial, certificates)?;
-        let selector = certificates
-            .selector(issuer)
-            .map_err(|error| certificates.parse_error(error))?;
+        let selector = certificates.selector(issuer).map_err(ParseError::from)?;
         issuer_serial_match |= selector
             .matches_name(decoded.tbs().issuer(), certificates.memory())
-            .map_err(|error| certificates.parse_error(certificates.error(error)))?
+            .map_err(|error| certificates.parse_failure(error))?
             && source_serial_matches(&serial, &decoded, certificates)?;
     }
     let mut ski_match = false;
@@ -3083,9 +3178,14 @@ pub(crate) fn x509_certificate_matches_any_selector(
 
 /// Match every selector asserted by `X509Data` against one configured certificate.
 ///
-/// This supports XMLDSig lookup-only `X509Data`, where the document identifies a
+/// This supports `XMLDSig` lookup-only `X509Data`, where the document identifies a
 /// certificate without embedding it. All selector values are constraints and must
 /// match the same candidate certificate.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when the certificate cannot be read or a selector
+/// cannot be compared with it under the default resource limits.
 pub fn x509_certificate_matches_selectors(
     info: &X509DataInfo,
     certificate_der: &[u8],
@@ -3122,27 +3222,23 @@ pub(crate) fn x509_selector_categories_match_candidates<'a>(
 ) -> Result<bool, ParseError> {
     let mut decoded = certificates.memory().vector();
     for der in candidates {
-        let certificate = certificates
-            .read(der)
-            .map_err(|error| certificates.parse_error(error))?;
+        let certificate = certificates.read(der).map_err(ParseError::from)?;
         decoded.try_push(certificate).map_err(|reason| {
-            certificates.parse_error(certificates.error(structured_pkix::Error::resource(
+            certificates.parse_failure(structured_pkix::Error::resource(
                 reason,
                 "name.candidates",
                 0,
-            )))
+            ))
         })?;
     }
     let mut subject_match = true;
     for subject in &info.subject_names {
-        let selector = certificates
-            .selector(subject)
-            .map_err(|error| certificates.parse_error(error))?;
+        let selector = certificates.selector(subject).map_err(ParseError::from)?;
         let mut matched = false;
         for certificate in &decoded {
             if selector
                 .matches_name(certificate.tbs().subject(), certificates.memory())
-                .map_err(|error| certificates.parse_error(certificates.error(error)))?
+                .map_err(|error| certificates.parse_failure(error))?
             {
                 matched = true;
                 break;
@@ -3154,15 +3250,13 @@ pub(crate) fn x509_selector_categories_match_candidates<'a>(
     let mut issuer_serial_match = true;
     for (issuer, serial) in &info.issuer_serials {
         let serial = selector_serial(serial, certificates)?;
-        let selector = certificates
-            .selector(issuer)
-            .map_err(|error| certificates.parse_error(error))?;
+        let selector = certificates.selector(issuer).map_err(ParseError::from)?;
         let mut matched = false;
         for certificate in &decoded {
             if source_serial_matches(&serial, certificate, certificates)?
                 && selector
                     .matches_name(certificate.tbs().issuer(), certificates.memory())
-                    .map_err(|error| certificates.parse_error(certificates.error(error)))?
+                    .map_err(|error| certificates.parse_failure(error))?
             {
                 matched = true;
                 break;
@@ -3225,18 +3319,18 @@ fn selector_serial(
             )
         })
         .ok_or_else(|| {
-            session.parse_error(session.error(structured_pkix::Error::resource(
+            session.parse_failure(structured_pkix::Error::resource(
                 structured_asn1::memory::MemoryError::WorkExceeded,
                 "certificate.serial_selector",
                 0,
-            )))
+            ))
         })?;
     session.memory().charge_work(work).map_err(|reason| {
-        session.parse_error(session.error(structured_pkix::Error::resource(
+        session.parse_failure(structured_pkix::Error::resource(
             reason,
             "certificate.serial_selector",
             0,
-        )))
+        ))
     })?;
     x509_serial_decimal_bytes(serial).ok_or_else(|| {
         ParseError::InvalidStructure(
@@ -3262,11 +3356,11 @@ fn source_serial_matches(
         .memory()
         .charge_work(expected.len() as u64 + bytes.len() as u64)
         .map_err(|reason| {
-            session.parse_error(session.error(structured_pkix::Error::resource(
+            session.parse_failure(structured_pkix::Error::resource(
                 reason,
                 "certificate.serial_selector",
                 certificate.span().start,
-            )))
+            ))
         })?;
     let padding = expected.len() - bytes.len();
     Ok(expected[..padding].iter().all(|byte| *byte == 0) && expected[padding..] == *bytes)
@@ -3281,7 +3375,7 @@ fn source_ski_matches(
         .tbs()
         .extensions()
         .subject_key_identifier(session.memory())
-        .map_err(|error| session.parse_error(session.error(error)))?
+        .map_err(|error| session.parse_failure(error))?
     else {
         return Ok(false);
     };
@@ -3292,11 +3386,11 @@ fn source_ski_matches(
         .memory()
         .charge_work(expected.len() as u64)
         .map_err(|reason| {
-            session.parse_error(session.error(structured_pkix::Error::resource(
+            session.parse_failure(structured_pkix::Error::resource(
                 reason,
                 "certificate.ski_selector",
                 certificate.span().start,
-            )))
+            ))
         })?;
     Ok(ski.as_bytes() == expected)
 }
@@ -3320,11 +3414,11 @@ fn source_digest_matches(
         return Ok(false);
     }
     let resource = |reason| {
-        session.parse_error(session.error(structured_pkix::Error::resource(
+        session.parse_failure(structured_pkix::Error::resource(
             reason,
             "certificate.digest_selector",
             0,
-        )))
+        ))
     };
     session
         .memory()
@@ -3442,9 +3536,7 @@ pub(crate) fn parse_x509_certificate_in(
     cert_der: &[u8],
     session: &super::pkix::CertificateSession,
 ) -> Result<ParsedX509Certificate, ParseError> {
-    let cert = session
-        .read(cert_der)
-        .map_err(|error| session.parse_error(error))?;
+    let cert = session.read(cert_der).map_err(ParseError::from)?;
     certificate_metadata(&cert, session)
 }
 
@@ -3465,7 +3557,7 @@ pub(crate) fn certificate_metadata(
         .tbs()
         .extensions()
         .subject_key_identifier(session.memory())
-        .map_err(|error| session.parse_error(session.error(error)))?
+        .map_err(|error| session.parse_failure(error))?
         .map(|ski| ski.as_bytes().to_vec());
 
     let spki = cert.tbs().public_key();
@@ -3476,7 +3568,7 @@ pub(crate) fn certificate_metadata(
         // RFC 8017 A.1.1: positive modulus and exponent, nothing after them.
         let rsa = structured_pkix::key::rsa::read(spki, session.memory()).map_err(|error| {
             if error.is_resource() {
-                session.parse_error(session.error(error))
+                session.parse_failure(error)
             } else {
                 ParseError::InvalidStructure(format!("X509Certificate RSA key: {error}"))
             }
@@ -3491,18 +3583,31 @@ pub(crate) fn certificate_metadata(
                 "X509Certificate EC public key is not octet-aligned".into(),
             )
         })?;
-        let Some(params) = spki.algorithm().parameters() else {
+        if spki.algorithm().parameters().is_none() {
             return Err(ParseError::InvalidStructure(
                 "X509Certificate EC key is missing curve parameters".into(),
             ));
+        }
+        // RFC 5480 2.1.1: only namedCurve is a recognized EC key here; the
+        // shared reader distinguishes it from implicit and specified curves.
+        // https://www.rfc-editor.org/rfc/rfc5480#section-2.1.1
+        let curve = match structured_pkix::key::ec::read(
+            structured_pkix::path::WorkingKey::standing(spki),
+            session.memory(),
+        ) {
+            Ok(key) => match key.curve() {
+                structured_pkix::key::ec::Curve::Named(curve) => Some(curve),
+                _ => None,
+            },
+            Err(error) if error.is_resource() => return Err(session.parse_failure(error)),
+            Err(_) => None,
         };
-
-        match <ObjectIdentifier>::from_der(params) {
-            Ok(oid) => X509PublicKeyInfo::Ec {
-                curve_oid: oid.to_string(),
+        match curve {
+            Some(curve) => X509PublicKeyInfo::Ec {
+                curve_oid: shared_oid_text(curve, session)?,
                 public_key: key_octets.to_vec(),
             },
-            Err(_) => X509PublicKeyInfo::Unsupported {
+            None => X509PublicKeyInfo::Unsupported {
                 algorithm_oid: shared_oid_text(spki.algorithm().algorithm(), session)?,
             },
         }
@@ -3528,11 +3633,11 @@ fn shared_name_text(
 ) -> Result<String, ParseError> {
     let text = name
         .rfc4514_readable(session.memory())
-        .map_err(|error| session.parse_error(session.error(error)))?;
+        .map_err(|error| session.parse_failure(error))?;
     text.as_str(session.memory())
         .map(str::to_owned)
         .map_err(|reason| {
-            session.parse_error(session.error(structured_pkix::Error::resource(reason, "name", 0)))
+            session.parse_failure(structured_pkix::Error::resource(reason, "name", 0))
         })
 }
 
@@ -3540,25 +3645,22 @@ fn shared_oid_text(
     oid: structured_asn1::Oid<'_>,
     session: &super::pkix::CertificateSession,
 ) -> Result<String, ParseError> {
-    let text = oid.text(session.memory()).map_err(|error| {
-        session.parse_error(session.error(structured_pkix::Error::resource(error, "algorithm", 0)))
-    })?;
+    let resource =
+        |error| session.parse_failure(structured_pkix::Error::resource(error, "algorithm", 0));
+    let text = oid.text(session.memory()).map_err(resource)?;
     text.as_str(session.memory())
         .map(str::to_owned)
-        .map_err(|error| {
-            session.parse_error(session.error(structured_pkix::Error::resource(
-                error,
-                "algorithm",
-                0,
-            )))
-        })
+        .map_err(resource)
 }
 
 fn format_x509_serial_hex(serial: &[u8]) -> String {
-    serial
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<String>()
+    const DIGITS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut hex = String::with_capacity(serial.len() * 2);
+    for byte in serial {
+        hex.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        hex.push(char::from(DIGITS[usize::from(byte & 0x0f)]));
+    }
+    hex
 }
 
 fn format_x509_serial_value_hex(serial: &[u8]) -> String {
@@ -3590,8 +3692,10 @@ fn x509_serial_decimal_bytes(serial: &str) -> Option<[u8; MAX_X509_SERIAL_NUMBER
         let mut carry = u16::from(digit);
         for byte in bytes.iter_mut().rev() {
             let value = u16::from(*byte) * 10 + carry;
-            *byte = value as u8;
-            carry = value >> 8;
+            // Base-256 digit: the low byte stays here, the high byte carries.
+            let [low, high] = value.to_le_bytes();
+            *byte = low;
+            carry = u16::from(high);
         }
         if carry != 0 {
             return None;
@@ -3662,7 +3766,7 @@ fn parse_x509_issuer_serial(node: Node<'_, '_>) -> Result<(String, String), Pars
 
 /// Base64-decode a digest value string, stripping whitespace.
 ///
-/// XMLDSig allows whitespace within base64 content (line-wrapped encodings).
+/// `XMLDSig` allows whitespace within base64 content (line-wrapped encodings).
 fn base64_decode_digest(b64: &str, digest_method: DigestAlgorithm) -> Result<Vec<u8>, ParseError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
@@ -3732,11 +3836,7 @@ fn decode_der_encoded_key_value_base64(node: Node<'_, '_>) -> Result<Vec<u8>, Pa
 
     let mut cleaned = String::new();
     let mut raw_text_len = 0usize;
-    for text in node
-        .children()
-        .filter(|child| child.is_text())
-        .filter_map(|child| child.text())
-    {
+    for text in node.children().filter(Node::is_text).filter_map(Node::text) {
         if raw_text_len.saturating_add(text.len()) > MAX_DER_ENCODED_KEY_VALUE_TEXT_LEN {
             return Err(ParseError::InvalidStructure(
                 "DEREncodedKeyValue exceeds maximum allowed text length".into(),
@@ -3923,14 +4023,14 @@ mod tests {
     fn inspected_reference_layout_errors_do_not_own_diagnostics() {
         // Metadata classification borrows its original malformed source and
         // must not retain/construct an owned parser diagnostic on that path.
+        fn owns_storage<T>(_: &T) -> bool {
+            std::mem::needs_drop::<T>()
+        }
         let doc = crate::xml::dom::Document::parse(
             "<Reference xmlns='http://www.w3.org/2000/09/xmldsig#'><wrong/></Reference>",
         )
         .unwrap();
         let fault = super::inspect_reference_layout(doc.root_element()).unwrap_err();
-        fn owns_storage<T>(_: &T) -> bool {
-            std::mem::needs_drop::<T>()
-        }
         assert!(!owns_storage(&fault));
     }
 
@@ -3960,7 +4060,7 @@ mod tests {
         let mut session = super::KeyInfoParsingSession::new(&resources).expect("resource policy");
         session
             .with_certificate_public_key(&der, |spki| {
-                assert!(!spki.is_empty());
+                assert_ne!(spki, []);
                 assert!(spki.as_ptr() >= der.as_ptr());
                 assert!(spki.as_ptr() as usize + spki.len() <= der.as_ptr() as usize + der.len());
             })
@@ -4383,8 +4483,8 @@ mod tests {
         assert_eq!(x509_info.parsed_certificates.len(), 1);
         assert_eq!(x509_info.certificate_chain, vec![0]);
         let parsed_cert = &x509_info.parsed_certificates[0];
-        assert!(!parsed_cert.subject_dn.is_empty());
-        assert!(!parsed_cert.issuer_dn.is_empty());
+        assert_ne!(parsed_cert.subject_dn, "");
+        assert_ne!(parsed_cert.issuer_dn, "");
         assert_eq!(
             parsed_cert.serial_number_hex,
             "7735EE487F6862DAF1B3956D961CCB0FA6F34F53"
@@ -4404,13 +4504,13 @@ mod tests {
     #[test]
     fn parse_rsa_key_value_preserves_wrapped_crypto_binary() {
         // CryptoBinary is unsigned big-endian data and XML whitespace is insignificant.
-        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Modulus> AQID
 BA== </Modulus>
                 <Exponent> AQAB </Exponent>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"##;
+        </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
         assert_eq!(
@@ -4425,11 +4525,11 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_reordered_parameters() {
         // XMLDSig defines Modulus followed by Exponent; accepting reordered input is ambiguous.
-        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Exponent>AQAB</Exponent><Modulus>AQID</Modulus>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"##;
+        </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -4441,9 +4541,9 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_missing_exponent() {
         // Both RSA public parameters are required to construct a usable key.
-        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue><Modulus>AQID</Modulus></RSAKeyValue></KeyValue>
-        </KeyInfo>"##;
+        </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -4455,11 +4555,11 @@ BA== </Modulus>
     #[test]
     fn parse_rsa_key_value_rejects_duplicate_exponent() {
         // RSAKeyValue has a closed two-child schema; duplicate parameters are invalid.
-        let xml = r##"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        let xml = r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
             <KeyValue><RSAKeyValue>
                 <Modulus>AQID</Modulus><Exponent>AQAB</Exponent><Exponent>AQAB</Exponent>
             </RSAKeyValue></KeyValue>
-        </KeyInfo>"##;
+        </KeyInfo>"#;
         let doc = Document::parse(xml).unwrap();
 
         assert!(matches!(
@@ -4729,10 +4829,12 @@ BA== </Modulus>
 
     #[test]
     fn parse_key_info_rejects_x509_data_exceeding_entry_budget() {
-        let subjects = (0..(MAX_X509_DATA_ENTRY_COUNT + 1))
-            .map(|idx| format!("<X509SubjectName>CN={idx}</X509SubjectName>"))
-            .collect::<Vec<_>>()
-            .join("");
+        use core::fmt::Write as _;
+        let mut subjects = String::new();
+        for idx in 0..=MAX_X509_DATA_ENTRY_COUNT {
+            write!(subjects, "<X509SubjectName>CN={idx}</X509SubjectName>")
+                .expect("writing to a String cannot fail");
+        }
         let xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{subjects}</X509Data></KeyInfo>"
         );
@@ -4745,10 +4847,7 @@ BA== </Modulus>
     #[test]
     fn parse_key_info_rejects_x509_data_exceeding_total_binary_budget() {
         let payload = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 190_000]);
-        let entries = (0..6)
-            .map(|_| format!("<X509SKI>{payload}</X509SKI>"))
-            .collect::<Vec<_>>()
-            .join("");
+        let entries = format!("<X509SKI>{payload}</X509SKI>").repeat(6);
         let xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{entries}</X509Data></KeyInfo>"
         );
@@ -4821,8 +4920,8 @@ BA== </Modulus>
         assert_eq!(x509_info.parsed_certificates.len(), 1);
         assert_eq!(x509_info.certificate_chain, vec![0]);
         let parsed_cert = &x509_info.parsed_certificates[0];
-        assert!(!parsed_cert.subject_dn.is_empty());
-        assert!(!parsed_cert.issuer_dn.is_empty());
+        assert_ne!(parsed_cert.subject_dn, "");
+        assert_ne!(parsed_cert.issuer_dn, "");
         assert!(parsed_cert.subject_key_identifier.is_some());
         assert!(matches!(
             parsed_cert.public_key,
@@ -5634,23 +5733,18 @@ BA== </Modulus>
     fn parse_key_info_accepts_large_textual_x509_entries_within_entry_budget() {
         let issuer_name = "C".repeat(MAX_X509_ISSUER_NAME_TEXT_LEN);
         let serial_number = "0".repeat(MAX_X509_SERIAL_NUMBER_VALUE_DIGITS - 1) + "1";
-        let issuer_serials = (0..52)
-            .map(|_| {
-                format!(
-                    "<X509IssuerSerial><X509IssuerName>{issuer_name}</X509IssuerName><X509SerialNumber>{serial_number}</X509SerialNumber></X509IssuerSerial>"
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("");
+        let issuer_serials = format!(
+            "<X509IssuerSerial><X509IssuerName>{issuer_name}</X509IssuerName><X509SerialNumber>{serial_number}</X509SerialNumber></X509IssuerSerial>"
+        )
+        .repeat(52);
         let xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><X509Data>{issuer_serials}</X509Data></KeyInfo>"
         );
         let doc = Document::parse(&xml).unwrap();
 
         let key_info = parse_key_info(doc.root_element()).unwrap();
-        let parsed = match &key_info.sources[0] {
-            KeyInfoSource::X509Data(x509) => x509,
-            _ => panic!("expected X509Data source"),
+        let KeyInfoSource::X509Data(parsed) = &key_info.sources[0] else {
+            panic!("expected X509Data source");
         };
         assert_eq!(parsed.issuer_serials.len(), 52);
     }
@@ -6273,9 +6367,12 @@ BA== </Modulus>
     #[test]
     fn parse_key_info_rejects_excessive_child_sources() {
         // KeyInfo extensions are lax, but their parse work remains bounded.
-        let children = (0..=64)
-            .map(|index| format!(r#"<extension xmlns="urn:test" index="{index}"/>"#))
-            .collect::<String>();
+        use core::fmt::Write as _;
+        let mut children = String::new();
+        for index in 0..=64 {
+            write!(children, r#"<extension xmlns="urn:test" index="{index}"/>"#)
+                .expect("writing to a String cannot fail");
+        }
         let xml =
             format!(r#"<KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">{children}</KeyInfo>"#);
         let document = Document::parse(&xml).unwrap();
@@ -6512,16 +6609,18 @@ BA== </Modulus>
     fn parse_signed_info_rejects_too_many_references() {
         // Reference processing shares signature-wide resource budgets, so the
         // parser must bound cardinality before retaining attacker-controlled entries.
-        let references = (0..=MAX_REFERENCES_PER_SIGNATURE)
-            .map(|index| {
-                format!(
-                    r##"<Reference URI="#item-{index}">
+        use core::fmt::Write as _;
+        let mut references = String::new();
+        for index in 0..=MAX_REFERENCES_PER_SIGNATURE {
+            write!(
+                references,
+                r##"<Reference URI="#item-{index}">
                         <DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
                         <DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</DigestValue>
                     </Reference>"##
-                )
-            })
-            .collect::<String>();
+            )
+            .expect("writing to a String cannot fail");
+        }
         let xml = format!(
             r#"<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
                 <CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
@@ -6611,7 +6710,7 @@ BA== </Modulus>
         let doc = Document::parse(xml).unwrap();
         let si = parse_signed_info(doc.root_element()).unwrap();
 
-        assert!(si.references[0].transforms.is_empty());
+        assert_eq!(si.references[0].transforms, []);
     }
 
     #[test]

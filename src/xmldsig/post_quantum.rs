@@ -1,4 +1,4 @@
-//! Opaque RustCrypto PQ primitives, invoked through CryptoProvider only.
+//! Opaque `RustCrypto` PQ primitives, invoked through `CryptoProvider` only.
 
 use crate::rustcrypto_ml_dsa as ml_dsa;
 
@@ -6,7 +6,7 @@ use super::{
     PqAlgorithm, SignatureAlgorithm, SignatureContext, SignatureVerificationError, SigningKey,
     SigningKeyError, SigningPublicKeyInfo,
 };
-use pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
+use pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use signature::Keypair;
 use zeroize::Zeroizing;
 
@@ -218,6 +218,10 @@ macro_rules! parameter_sets {
 
         impl PostQuantumSigningKey {
             /// Strict PKCS#8 import for the explicitly selected parameter set.
+            ///
+            /// # Errors
+            /// Returns an error for invalid DER, mismatched algorithm or public
+            /// key, or parameters forbidden by the selected key format.
             pub fn from_pkcs8_der(algorithm: PqAlgorithm, der: &[u8]) -> Result<Self, SigningKeyError> {
                 use pkcs8::der::Decode;
                 let info = pkcs8::PrivateKeyInfoRef::from_der(der).map_err(|_| SigningKeyError::InvalidKeyDer)?;
@@ -237,6 +241,9 @@ macro_rules! parameter_sets {
             }
 
             /// Export into a zeroizing private-key document, never an ordinary Vec.
+            ///
+            /// # Errors
+            /// Returns an error if the primitive cannot encode the private key.
             pub fn to_pkcs8_der(&self) -> Result<pkcs8::SecretDocument, SigningKeyError> {
                 match &self.key { $(PrivateKey::$variant(key) => key.to_pkcs8_der()),+ }.map_err(|_| SigningKeyError::InvalidKeyDer)
             }
@@ -250,15 +257,17 @@ macro_rules! parameter_sets {
             }
         }
 
-        pub(crate) fn validate_public_key(algorithm: PqAlgorithm, der: &[u8]) -> Result<(), SignatureVerificationError> {
-            validate_public_encoding(algorithm, der)?;
-            match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_key_der(der).map(|_| ()).map_err(|_| SignatureVerificationError::InvalidKeyDer)),+ }
+        pub(crate) fn validate_public_key(algorithm: PqAlgorithm, der: &[u8], session: &super::pkix::CertificateSession) -> Result<(), SignatureVerificationError> {
+            with_public_octets(algorithm, der, session, |octets| match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_octets(octets).map(|_| ())),+ })?
+                .ok_or(SignatureVerificationError::InvalidKeyDer)
         }
 
-        pub(crate) fn verify(algorithm: PqAlgorithm, der: &[u8], context: &SignatureContext, message: &[u8], signature: &[u8]) -> Result<bool, SignatureVerificationError> {
-            validate_public_encoding(algorithm, der)?;
-            if signature.len() != algorithm.signature_len() { return Ok(false); }
-            match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_key_der(der).map_err(|_| SignatureVerificationError::InvalidKeyDer)?.verify_context(context.as_bytes(), message, signature)),+ }
+        pub(crate) fn verify(algorithm: PqAlgorithm, der: &[u8], context: &SignatureContext, message: &[u8], signature: &[u8], session: &super::pkix::CertificateSession) -> Result<bool, SignatureVerificationError> {
+            with_public_octets(algorithm, der, session, |octets| {
+                if signature.len() != algorithm.signature_len() { return Some(Ok(false)); }
+                match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_octets(octets).map(|key| key.verify_context(context.as_bytes(), message, signature))),+ }
+            })?
+                .ok_or(SignatureVerificationError::InvalidKeyDer)?
         }
 
         impl SigningKey for PostQuantumSigningKey {
@@ -300,15 +309,51 @@ parameter_sets! {
     SlhDsaSha2_256s: slh_dsa::SigningKey<slh_dsa::Sha2_256s> => slh_dsa::VerifyingKey<slh_dsa::Sha2_256s>,
 }
 
-fn validate_public_encoding(
+/// Hands the raw public key of an `algorithm` SPKI, read by the shared PKIX
+/// reader under `session`, to `use_key`; `None` for any other or malformed
+/// SPKI. RFC 9881 section 2 / RFC 9909 section 3: the exact OID, parameters
+/// absent. <https://www.rfc-editor.org/rfc/rfc9881.html#section-2>
+fn with_public_octets<T>(
     algorithm: PqAlgorithm,
     der: &[u8],
-) -> Result<(), SignatureVerificationError> {
-    use pkcs8::{der::Decode, spki::SubjectPublicKeyInfoRef};
-    let info = SubjectPublicKeyInfoRef::from_der(der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    if info.algorithm.parameters.is_some() || info.algorithm.oid != algorithm.object_oid() {
-        return Err(SignatureVerificationError::InvalidKeyDer);
+    session: &super::pkix::CertificateSession,
+    use_key: impl FnOnce(&[u8]) -> Option<T>,
+) -> Result<Option<T>, SignatureVerificationError> {
+    let read = session.with_public_key_info(der, |info, _| {
+        let identifier = info.algorithm();
+        Ok(
+            if identifier.parameters().is_none()
+                && identifier.algorithm().as_bytes() == algorithm.object_oid().as_bytes()
+            {
+                info.key_octets().and_then(use_key)
+            } else {
+                None
+            },
+        )
+    });
+    match read {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_resource() => Err(super::signature::key_read_error(session, &error)),
+        Err(_) => Ok(None),
     }
-    Ok(())
+}
+
+/// Verifying-key construction from raw public octets (FIPS 204 pkDecode,
+/// FIPS 205 PK.seed || PK.root).
+trait PublicOctets: Sized {
+    fn from_public_octets(octets: &[u8]) -> Option<Self>;
+}
+
+impl<P: ml_dsa::MlDsaParams> PublicOctets for ml_dsa::VerifyingKey<P> {
+    fn from_public_octets(octets: &[u8]) -> Option<Self> {
+        ml_dsa::EncodedVerifyingKey::<P>::try_from(octets)
+            .ok()
+            .map(|encoded| Self::decode(&encoded))
+    }
+}
+
+impl<P: slh_dsa::ParameterSet> PublicOctets for slh_dsa::VerifyingKey<P> {
+    fn from_public_octets(octets: &[u8]) -> Option<Self> {
+        Self::try_from(octets).ok()
+    }
 }

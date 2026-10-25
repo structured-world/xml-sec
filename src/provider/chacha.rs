@@ -1,4 +1,4 @@
-//! Primitive dispatch for the draft XML-security ChaCha profiles.
+//! Primitive dispatch for the draft XML-security `ChaCha` profiles.
 use super::{ProviderError, ProviderInputError};
 use crate::xmlenc::{ChaChaParametersRef, DataEncryptionAlgorithm};
 use chacha20poly1305::{

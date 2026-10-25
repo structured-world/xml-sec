@@ -1,4 +1,4 @@
-//! End-to-end XMLDSig XPath and XPath Filter 2.0 coverage.
+//! End-to-end `XMLDSig` `XPath` and `XPath` Filter 2.0 coverage.
 
 use std::fs;
 
@@ -15,10 +15,10 @@ use xml_sec::xmldsig::{
     XPATH_TRANSFORM_URI, XPathExpression, XPathFilter, XPathFilterOperation, XPathHereSemantics,
 };
 
-const DOCUMENT: &str = r#"<root>
+const DOCUMENT: &str = r"<root>
   <Signed><Keep>covered</Keep><Excluded>mutable</Excluded></Signed>
   <Outside>also mutable</Outside>
-</root>"#;
+</root>";
 
 fn exclusive_c14n() -> C14nAlgorithm {
     C14nAlgorithm::new(C14nMode::Exclusive1_0, false)

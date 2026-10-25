@@ -27,7 +27,7 @@ impl<'a> Projection<'a> {
     }
 }
 
-/// XMLDSig node sets over one prepared document, canonicalized after selection.
+/// `XMLDSig` node sets over one prepared document, canonicalized after selection.
 pub struct NodeSets<'a> {
     document: crate::xml::dom::Document<'a>,
 }
@@ -42,6 +42,7 @@ impl<'a> NodeSets<'a> {
 
     /// `URI=""` minus the document element's last child, as an enveloped
     /// signature, then inclusive C14N. Returns the canonical length.
+    #[must_use]
     pub fn enveloped(&self) -> usize {
         let mut nodes = crate::xmldsig::NodeSet::entire_document_without_comments(&self.document)
             .expect("benchmark document fits node-set limits");
@@ -66,7 +67,7 @@ impl<'a> NodeSets<'a> {
         for element in self
             .document
             .descendants()
-            .filter(|node| node.is_element())
+            .filter(crate::xml::dom::Node::is_element)
             .step_by(stride)
         {
             nodes
@@ -108,6 +109,7 @@ pub struct Plan {
 
 impl Plan {
     /// Build a document -> parallel references -> crypto -> evidence graph.
+    #[must_use]
     pub fn new(references: usize) -> Self {
         assert!((1..=64).contains(&references), "bounded benchmark graph");
         let mut context = OperationExecutionContext::new((), (), None);

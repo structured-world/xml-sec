@@ -1,4 +1,4 @@
-//! XML Digital Signatures (XMLDSig).
+//! XML Digital Signatures (`XMLDSig`).
 //!
 //! Implements [XML Signature Syntax and Processing](https://www.w3.org/TR/xmldsig-core1/).
 //!
@@ -7,7 +7,7 @@
 //! - URI dereference: same-document references (`""`, `#id`, `#xpointer(/)`, `#xpointer(id('...'))`)
 //! - ID attribute resolution with configurable attribute names
 //! - Exact element, attribute, and namespace node sets for transform processing
-//! - Enveloped, canonicalization, Base64, XPath 1.0, and XPath Filter 2.0 transforms
+//! - Enveloped, canonicalization, Base64, `XPath` 1.0, and `XPath` Filter 2.0 transforms
 //!
 //! ## Signing and verification
 //!
@@ -56,7 +56,7 @@ pub mod builder;
 pub mod digest;
 pub mod extension;
 pub mod keys;
-mod modern;
+pub(crate) mod modern;
 #[cfg(feature = "experimental-pq")]
 pub(crate) mod post_quantum;
 mod pq_algorithm;
@@ -122,8 +122,8 @@ pub use verify::{
     ReferenceResolution, ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode,
     ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod, SessionDigest,
     SignatureEvidence, SignatureHashUse, SignatureKeyInfoMetadata, SignatureRequirement,
-    SignatureSelection, UriTypeSet, VerificationRequest, VerifiedSession, VerifyContext,
-    VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,
+    SignatureSelection, UriTypeSet, VerificationRequest, VerificationScope, VerifiedSession,
+    VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,
     inspect_pinned_verification_key_info, inspect_signing_key_info, inspect_verification_key_info,
     materialize_signing_key_info_references, materialize_verification_key_info_references,
     process_all_references, process_reference, verify_signature_with_pem_key,

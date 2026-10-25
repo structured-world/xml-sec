@@ -71,7 +71,7 @@ fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
     for backend in xml_sec::XmlBackend::available() {
         let document = xml_sec::XmlDomDocument::parse_with_options_and_backend(
             &xml,
-            Default::default(),
+            xml_sec::ParsingOptions::default(),
             backend,
         )
         .expect("parse CipherReference document");
@@ -99,11 +99,11 @@ fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
             }
         }
         assert!(lower > 1);
-        let resolver = SymmetricKeyDecryptor::new(key);
+        let decryptor = SymmetricKeyDecryptor::new(key);
         let mut policy = external_policy();
         policy.resources.max_xslt_work = lower;
         assert_eq!(
-            DecryptContext::new(&resolver)
+            DecryptContext::new(&decryptor)
                 .policy(policy.clone())
                 .xml_backend(backend)
                 .external_resources(&resources)
@@ -112,7 +112,7 @@ fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
             DecryptedContent::Bytes(b"one XSLT allowance".to_vec())
         );
         policy.resources.max_xslt_work -= 1;
-        let error = DecryptContext::new(&resolver)
+        let error = DecryptContext::new(&decryptor)
             .policy(policy)
             .xml_backend(backend)
             .external_resources(&resources)

@@ -7,7 +7,6 @@
 use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use crate::rustcrypto_sha3 as sha3;
 use crypto_bigint::BoxedUint;
-use der::{Decode as _, Reader as _, Tagged as _};
 use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};
 use sha2::Digest as _;
 use subtle::ConstantTimeEq as _;
@@ -50,12 +49,8 @@ fn mask(out: &mut [u8], algorithm: DigestAlgorithm, seed: &[u8]) {
     // https://www.rfc-editor.org/rfc/rfc8017.html#appendix-B.2.1
     // RSA's absolute modulus ceiling bounds the counter far below 2^32.
     let mut block = [0u8; 64];
-    for (counter, chunk) in out.chunks_mut(algorithm.output_len()).enumerate() {
-        hash(
-            algorithm,
-            &[seed, &(counter as u32).to_be_bytes()],
-            &mut block,
-        );
+    for (counter, chunk) in (0u32..).zip(out.chunks_mut(algorithm.output_len())) {
+        hash(algorithm, &[seed, &counter.to_be_bytes()], &mut block);
         for (byte, mask) in chunk.iter_mut().zip(&block) {
             *byte ^= mask;
         }
@@ -67,99 +62,40 @@ fn valid_key(parameters: RsaPssParameters, key: &impl PublicKeyParts) -> bool {
     bits <= crate::hard_limits::RSA_MODULUS_BIT_CEILING && parameters.fits_modulus_bits(bits)
 }
 
-pub(crate) fn public_key(spki: &[u8], parameters: RsaPssParameters) -> Option<RsaPublicKey> {
+pub(crate) fn public_key(
+    spki: &[u8],
+    parameters: RsaPssParameters,
+    session: &crate::xmldsig::pkix::CertificateSession,
+) -> Result<RsaPublicKey, crate::xmldsig::SignatureVerificationError> {
     // RFC 4055 section 3.3: a PSS SPKI restricts hashes/trailer and sets a
     // minimum salt length; absent parameters permit any supported PSS tuple.
     // https://www.rfc-editor.org/rfc/rfc4055.html#section-3.3
-    RsaPublicKey::from_pkcs1_der(encoded_public_key(spki, parameters)?).ok()
+    RsaPublicKey::from_pkcs1_der(encoded_public_key(spki, parameters, session)?)
+        .map_err(|_| crate::xmldsig::SignatureVerificationError::InvalidKeyDer)
 }
 
 /// Borrow the RSA bit string after checking its algorithm restrictions. Native
 /// providers share this preflight without allocating software RSA bigints.
-pub(crate) fn encoded_public_key(spki: &[u8], parameters: RsaPssParameters) -> Option<&[u8]> {
-    use x509_parser::prelude::FromDer as _;
-    let public = pkcs8::SubjectPublicKeyInfoRef::from_der(spki).ok()?;
-    let (_, parsed) = x509_parser::x509::SubjectPublicKeyInfo::from_der(spki).ok()?;
-    match parsed.algorithm.algorithm.as_bytes() {
-        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01] => {
-            if public
-                .algorithm
-                .parameters
-                .is_some_and(|value| !value.is_null())
-            {
-                return None;
-            }
-        }
-        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0a] => {
-            if public
-                .algorithm
-                .parameters
-                .is_some_and(|value| !valid_parameter_encoding(value))
-            {
-                return None;
-            }
-            if parsed.algorithm.parameters.as_ref().is_some_and(|value| {
-                !super::rustcrypto_x509::rsa_pss_key_parameters_allow(
-                    value,
-                    super::X509SignatureAlgorithm::RsaPss {
-                        digest: parameters.digest,
-                        mgf_digest: parameters.mgf_digest,
-                        salt_len: parameters.salt_len,
-                    },
-                )
-            }) {
-                return None;
-            }
-        }
-        _ => return None,
-    }
-    public.subject_public_key.as_bytes()
-}
-
-fn valid_parameter_encoding(parameters: der::asn1::AnyRef<'_>) -> bool {
-    // RFC 8017 appendix A.2.3 defines an ordered, explicitly tagged sequence.
-    // x509-parser's value decoder does not check its unconsumed suffix, so
-    // validate the complete borrowed DER before interpreting key restrictions.
-    // https://www.rfc-editor.org/rfc/rfc8017.html#appendix-A.2.3
-    parameters
-        .sequence(|reader| -> der::Result<()> {
-            let mut previous = None;
-            while !reader.is_finished() {
-                let field: der::asn1::AnyRef<'_> = reader.decode()?;
-                let der::Tag::ContextSpecific {
-                    constructed: true,
-                    number,
-                } = field.tag()
-                else {
-                    return Err(field.tag().value_error().into());
-                };
-                if number.0 > 3 || previous.is_some_and(|last| number.0 <= last) {
-                    return Err(field.tag().value_error().into());
-                }
-                previous = Some(number.0);
-                match number.0 {
-                    0 | 1 => {
-                        let algorithm = pkcs8::AlgorithmIdentifierRef::from_der(field.value())?;
-                        let hash = if number.0 == 1 {
-                            algorithm
-                                .parameters
-                                .ok_or(field.tag().value_error())?
-                                .decode_as::<pkcs8::AlgorithmIdentifierRef<'_>>()?
-                        } else {
-                            algorithm
-                        };
-                        if hash.parameters.is_some_and(|value| !value.is_null()) {
-                            return Err(field.tag().value_error().into());
-                        }
-                    }
-                    _ => {
-                        u32::from_der(field.value())?;
-                    }
-                }
-            }
-            Ok(())
-        })
-        .is_ok()
+pub(crate) fn encoded_public_key<'a>(
+    spki: &'a [u8],
+    parameters: RsaPssParameters,
+    session: &crate::xmldsig::pkix::CertificateSession,
+) -> Result<&'a [u8], crate::xmldsig::SignatureVerificationError> {
+    use crate::xmldsig::SignatureVerificationError;
+    // The shared PKIX reader owns SPKI and RSASSA-PSS-params syntax.
+    // The SPKI is read at document offset zero, so its source span indexes it.
+    let span = crate::xmldsig::signature::read_rsa_public_key(session, spki, Some(parameters))?
+        .element()
+        .span();
+    let range = usize::try_from(span.start).ok().and_then(|start| {
+        usize::try_from(span.length)
+            .ok()
+            .and_then(|length| start.checked_add(length))
+            .map(|end| start..end)
+    });
+    range
+        .and_then(|range| spki.get(range))
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
 }
 
 pub(crate) fn sign(

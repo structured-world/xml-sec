@@ -249,7 +249,7 @@ mod test {
     fn test_sample_in_ball() {
         for tau in 1..65 {
             for seed in 0_usize..255 {
-                let rho = ((tau as u16) << 8) + (seed as u16);
+                let rho = (u16::try_from(tau).unwrap() << 8) + u16::try_from(seed).unwrap();
                 let p = sample_in_ball(&rho.to_be_bytes(), tau);
                 assert_eq!(hamming_weight(&p), tau);
                 assert!(max_abs_1(&p));
@@ -262,7 +262,7 @@ mod test {
     #[test]
     fn test_rej_ntt_poly() {
         let sample: Array<Array<Elem, U256>, U16> = Array::from_fn(|i| {
-            let i = i as u8;
+            let i = u8::try_from(i).unwrap();
             let rho = [i; 32];
             rej_ntt_poly(&rho, i, i + 1).0
         });

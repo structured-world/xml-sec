@@ -15,7 +15,7 @@ fn account() -> Memory {
     Memory::new(Arc::new(MemoryAccount::new(1 << 22, 1 << 28)))
 }
 
-/// A verified HMAC signature over `#target`, next to DigestMethod elements
+/// A verified HMAC signature over `#target`, next to `DigestMethod` elements
 /// with a known, an unknown, an absent and a policy-restricted algorithm.
 fn with_session(check: impl FnOnce(&VerifiedSession<'_, '_, '_, Memory>, &Memory)) {
     with_session_in(|_| {}, check);

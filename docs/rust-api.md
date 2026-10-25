@@ -45,9 +45,9 @@ target evidence still require the retained-document request API.
 
 `security.signer(&key)?` accepts an opaque caller-owned signing handle. Its
 `sign`/`sign_xml` methods use `SignatureBuilder`; `sign_template` and
-`sign_template_xml` fill existing templates. Request bindings support KeyInfo
+`sign_template_xml` fill existing templates. Request bindings support `KeyInfo`
 writers, detached resources, ID attributes and template/append selection. A
-KeyInfo writer fills an existing placeholder: request it with
+`KeyInfo` writer fills an existing placeholder: request it with
 `SignatureBuilder::key_info(true)` when using a builder.
 `security.signing_key(&inventory, name, algorithm)` selects/imports an authorized
 named key into the same selected provider. Inventory lookup is not permission
@@ -89,7 +89,7 @@ single parse+operation cumulative-budget path, without an extra facade parse.
 on non-thread-safe caller keys/resolvers. Share immutable policies/providers using
 application-owned storage or `Arc`, not a global registry. The facade requires
 `xmldsig` (which currently requires `std`); C14N-only and alloc-only XML input
-remain independent. It does not claim alloc-only XMLDSig.
+remain independent. It does not claim alloc-only `XMLDSig`.
 
 `XmlSecError` is now a non-exhaustive typed sum of original document, policy,
 verification, signing, key-store, encryption and C14N failures, plus

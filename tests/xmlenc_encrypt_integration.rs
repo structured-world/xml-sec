@@ -1,4 +1,4 @@
-//! XMLEnc encryption pipeline integration and donor-template coverage.
+//! `XMLEnc` encryption pipeline integration and donor-template coverage.
 
 #![cfg(feature = "xmlenc")]
 

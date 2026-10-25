@@ -1,6 +1,16 @@
 use super::*;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount};
+
+/// `count` distinct attributes for a wide-element fixture.
+fn wide_attributes(count: usize) -> String {
+    let mut attributes = String::new();
+    for index in 0..count {
+        write!(attributes, " a{index}='v'").expect("writing to a String cannot fail");
+    }
+    attributes
+}
 
 #[test]
 fn set_algebra_reads_retained_keys_only_with_current_execution() {
@@ -90,7 +100,7 @@ fn failed_filter_is_sticky_and_cannot_be_observed_as_successful_subset() {
         crate::c14n::canonicalize_with_visibility(&document, Some(&nodes), &algorithm, &mut output)
             .is_err()
     );
-    assert!(output.is_empty());
+    assert_eq!(output, b"");
     drop(nodes);
     assert_eq!(memory.used(), 0);
 }
@@ -117,7 +127,7 @@ fn compact_projection_matches_original_axes_and_canonical_bytes() {
         let paid =
             Projection::accounted_subtree(root, true, &budget, &memory).expect("paid projection");
         assert!(paid.with_comments());
-        assert!(std::ptr::eq(paid.document(), &document));
+        assert!(std::ptr::eq(paid.document(), &raw const document));
         for mode in [
             crate::c14n::C14nMode::Inclusive1_0,
             crate::c14n::C14nMode::Inclusive1_1,
@@ -185,9 +195,7 @@ fn inserting_present_members_keeps_semantic_projection_unmaterialized() {
 fn semantic_members_pay_work_for_every_emitted_index() {
     // Attribute and namespace nodes of one element are emitted individually
     // when a semantic projection becomes explicit; each costs execution work.
-    let attributes = (0..4096)
-        .map(|index| format!(" a{index}='v'"))
-        .collect::<String>();
+    let attributes = wide_attributes(4096);
     let xml = format!("<root{attributes}/>");
     let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide element");
     let budget = super::super::NodeSetMaterializationBudget::default();
@@ -249,9 +257,7 @@ fn excluding_from_explicit_sets_pays_every_examined_member() {
 fn excluding_semantic_subtrees_pays_every_removed_axis() {
     // Removing an attribute-heavy element from a semantic projection walks
     // each of its axes to release their name bytes; each axis costs work.
-    let attributes = (0..4096)
-        .map(|index| format!(" a{index}='v'"))
-        .collect::<String>();
+    let attributes = wide_attributes(4096);
     let xml = format!("<root><signature{attributes}/></root>");
     let document = crate::xml::dom::Document::parse(&xml).expect("fixed wide element");
     let signature = document
@@ -407,7 +413,7 @@ impl NodeVisibility for Reference {
     }
 }
 
-/// Deterministic SplitMix64 test generator; reproducible from the printed seed.
+/// Deterministic `SplitMix64` test generator; reproducible from the printed seed.
 struct Choices(u64);
 impl Choices {
     fn below(&mut self, bound: usize) -> usize {
@@ -416,7 +422,8 @@ impl Choices {
         mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
         mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
         mixed ^= mixed >> 31;
-        (mixed % bound as u64) as usize
+        let bound = u64::try_from(bound).expect("usize fits u64");
+        usize::try_from(mixed % bound).expect("the remainder is below a usize bound")
     }
 }
 
@@ -517,7 +524,7 @@ fn randomized_algebra<K: Keys>(
     document: &Document<'_>,
     keys: impl Fn() -> K,
     seed: u64,
-    seen: &mut std::collections::BTreeSet<&'static str>,
+    representations: &mut std::collections::BTreeSet<&'static str>,
 ) {
     let nodes: Vec<_> = document.descendants().collect();
     let budget = NodeSetMaterializationBudget::default();
@@ -525,7 +532,7 @@ fn randomized_algebra<K: Keys>(
     let (mut projection, mut reference) =
         random_pair(document, &nodes, &keys, &budget, &mut choices);
     for step in 0..12 {
-        seen.insert(projection.representation());
+        representations.insert(projection.representation());
         let context = format!("seed {seed}, step {step}");
         match choices.below(5) {
             0 => {
@@ -593,12 +600,12 @@ fn randomized_algebra<K: Keys>(
 }
 
 fn algebra_documents() -> Vec<String> {
-    let wide = (0..300)
-        .map(|index| {
-            let child = if index % 7 == 0 { "<!--x-->" } else { "t" };
-            format!("<e i='{index}' n:j='{index}'>{child}</e>")
-        })
-        .collect::<String>();
+    let mut wide = String::new();
+    for index in 0..300 {
+        let child = if index % 7 == 0 { "<!--x-->" } else { "t" };
+        write!(wide, "<e i='{index}' n:j='{index}'>{child}</e>")
+            .expect("writing to a String cannot fail");
+    }
     vec![
         r#"<outer xmlns="urn:default" xmlns:p="urn:a" xml:lang="en"><child p:a="v" b="w"><!--c1--><p:leaf xmlns:p="urn:b" p:x="1"/><?pi data?>text</child><!--c2--><other xmlns="" q="2"/></outer>"#.to_owned(),
         "<!--head--><?top x?><r a='1'><s><t/></s><!--tail--></r><!--after-->".to_owned(),
@@ -638,7 +645,7 @@ fn randomized_paid_set_algebra_matches_and_releases_storage() {
                 &document,
                 || PaidKeys::new(&memory),
                 seed,
-                &mut Default::default(),
+                &mut std::collections::BTreeSet::default(),
             );
             assert_eq!(memory.used(), 0, "seed {seed}");
         }

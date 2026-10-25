@@ -1,4 +1,4 @@
-//! Integration tests for XMLDSig RSA signature verification.
+//! Integration tests for `XMLDSig` RSA signature verification.
 //!
 //! These tests validate the low-level crypto layer:
 //! canonicalized `<SignedInfo>` bytes plus a real RSA public key must verify
@@ -48,7 +48,7 @@ fn canonicalized_signed_info_and_signature(xml: &str) -> (SignatureAlgorithm, Ve
     let signature_value_text = signature_node
         .children()
         .find(|node| node.is_element() && node.tag_name().name() == "SignatureValue")
-        .and_then(|node| node.text())
+        .and_then(xml_sec::Node::text)
         .expect("fixture XML should contain SignatureValue text")
         .chars()
         .filter(|ch| !ch.is_whitespace())

@@ -253,7 +253,7 @@ fn every_entry_is_unique_sorted_and_evidenced() {
             "{id} references unknown evidence {}",
             classification.evidence
         );
-        assert!(!item.classification.is_empty());
+        assert_ne!(item.classification, "");
         assert!(
             conditions_for(&ledger, item)
                 .iter()

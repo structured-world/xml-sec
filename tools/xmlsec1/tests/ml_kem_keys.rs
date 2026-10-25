@@ -540,7 +540,9 @@ fn hmac_encapsulation_resolves_key_info_references() {
         );
     }
     let mut denied = policy.clone();
-    denied.key_sources.key_info_reference = false;
+    denied
+        .key_sources
+        .remove(xml_sec::policy::KeySourceKind::KeyInfoReference);
     assert!(verify(&same_document, denied).is_err());
     let cyclic = same_document.replacen(
         &target,

@@ -1,4 +1,4 @@
-//! End-to-end XMLDSig Base64 transform coverage.
+//! End-to-end `XMLDSig` Base64 transform coverage.
 
 use std::fs;
 

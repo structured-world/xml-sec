@@ -137,7 +137,7 @@ fn request_handles_outlive_the_temporary_facade() {
         .unwrap()
         .signer(&key)
         .unwrap();
-    let signed = signer
+    let document = signer
         .sign_xml("<root><p Id='payload'>secret</p></root>", &builder())
         .unwrap();
     let verify_key = HmacVerificationKey::new(vec![7; 32]).unwrap();
@@ -146,7 +146,7 @@ fn request_handles_outlive_the_temporary_facade() {
         api.verifier()
             .unwrap()
             .key(&verify_key)
-            .verify_signature_xml(&signed)
+            .verify_signature_xml(&document)
             .unwrap()
             .status,
         DsigStatus::Valid
@@ -214,15 +214,15 @@ fn bound_encryption_never_uses_the_builder_provider_or_a_weaker_policy() {
     ));
     assert_eq!(document.as_xml(), "<root>secret</root>");
     assert_eq!(document.generation(), 0);
-    let compiler = PolicyCompiler::new(PolicyProfile::Modern, &RustCryptoProvider, None).unwrap();
-    let mut restrictive = compiler.policies().clone();
+    let profile = PolicyCompiler::new(PolicyProfile::Modern, &RustCryptoProvider, None).unwrap();
+    let mut restrictive = profile.policies().clone();
     restrictive
         .encryption
         .as_mut()
         .unwrap()
         .resources
         .max_encryption_plaintext_bytes = 1;
-    let compiled = compiler
+    let compiled = profile
         .restrict(&restrictive)
         .unwrap()
         .compile(&PolicyCompileContext {
@@ -310,13 +310,13 @@ fn borrowed_string_and_template_paths_share_the_existing_crypto_pipeline() {
     let verify_key = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
     let xml = "<root><p Id='payload'>signed</p></root>";
     let signer = api.signer(&sign_key).unwrap();
-    let signed = signer.sign_xml(xml, &builder()).unwrap();
+    let document = signer.sign_xml(xml, &builder()).unwrap();
     let verifier = api.verifier().unwrap().key(&verify_key);
     assert_eq!(
-        verifier.verify_signature_xml(&signed).unwrap().status,
+        verifier.verify_signature_xml(&document).unwrap().status,
         DsigStatus::Valid
     );
-    let invalid = signed.replace("signed</p>", "altered</p>");
+    let invalid = document.replace("signed</p>", "altered</p>");
     assert_ne!(
         verifier.verify_signature_xml(&invalid).unwrap().status,
         DsigStatus::Valid
@@ -597,7 +597,7 @@ fn external_policies() -> CompiledPolicies {
     compiler
         .authorize_replacement(
             replacement,
-            PolicyValidity {
+            &PolicyValidity {
                 authorization_id: "offline-input-test".into(),
                 authority: "test caller".into(),
                 reason: "caller-supplied detached bytes".into(),

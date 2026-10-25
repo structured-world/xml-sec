@@ -557,7 +557,8 @@ fn policy_aware_builder_accounts_for_filled_digest_values() {
         .descendants()
         .find(|node| node.has_tag_name((DSIG_NS, "SignedInfo")))
         .expect("generated SignedInfo");
-    let signed_info_subtree: HashSet<_> = signed_info.descendants().map(|node| node.id()).collect();
+    let signed_info_subtree: HashSet<_> =
+        signed_info.descendants().map(xml_sec::Node::id).collect();
     let mut empty_canonical = Vec::new();
     canonicalize(
         &document,
@@ -621,7 +622,7 @@ fn serializes_xpath_and_exclusive_prefix_list() {
     assert_eq!(xpath.text(), Some("not(ancestor-or-self::dsig:Signature)"));
     let transforms = xpath
         .parent()
-        .and_then(|node| node.parent())
+        .and_then(xml_sec::Node::parent)
         .expect("Transforms");
     assert!(matches!(
         parse_transforms(transforms).as_deref(),

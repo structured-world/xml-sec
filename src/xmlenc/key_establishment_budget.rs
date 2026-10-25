@@ -25,6 +25,9 @@ pub struct KeyEstablishmentBudget<'a> {
 
 impl<'a> KeyEstablishmentBudget<'a> {
     /// Validate the snapshot before compiling or executing key-establishment work.
+    ///
+    /// # Errors
+    /// Returns the policy violation if the snapshot is inconsistent.
     pub fn new(policy: &'a KeyEstablishmentPolicy) -> Result<Self, PolicyViolation> {
         policy.validate()?;
         Ok(Self {
@@ -35,6 +38,10 @@ impl<'a> KeyEstablishmentBudget<'a> {
 
     /// Derive through the selected provider only after syntax, permission,
     /// capability and aggregate allocation/CPU reservations have succeeded.
+    ///
+    /// # Errors
+    /// Returns an error for invalid parameters, policy or resource refusal,
+    /// unavailable provider capability, or provider failure.
     pub fn derive_key(
         &mut self,
         provider: &dyn CryptoProvider,
@@ -47,6 +54,10 @@ impl<'a> KeyEstablishmentBudget<'a> {
 
     /// Agree and derive using the same monotonic operation allowance. Permission
     /// and both workspace/output reservations precede either provider callback.
+    ///
+    /// # Errors
+    /// Returns an error for invalid agreement or KDF parameters, policy or resource
+    /// refusal, unavailable provider capability, or provider failure.
     pub fn agree_and_derive(
         &mut self,
         provider: &dyn CryptoProvider,
@@ -59,16 +70,19 @@ impl<'a> KeyEstablishmentBudget<'a> {
     }
 
     /// Cumulative compression work reserved, including failed attempts.
+    #[must_use]
     pub const fn hash_blocks(&self) -> usize {
         self.usage.hash_blocks
     }
 
     /// Cumulative output allocations reserved, including failed attempts.
+    #[must_use]
     pub const fn owned_bytes(&self) -> usize {
         self.usage.owned_bytes
     }
 
     /// Cumulative finite-field validation and exponentiation work reserved.
+    #[must_use]
     pub const fn modular_work(&self) -> usize {
         self.usage.modular_work
     }
@@ -268,16 +282,11 @@ fn unsupported(uri: &str) -> XmlEncError {
 // https://www.rfc-editor.org/rfc/rfc8018.html#section-5.2
 // https://www.rfc-editor.org/rfc/rfc5869.html#section-2
 // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-ConcatKDF
-fn preflight(
-    parameters: &KdfParameters<'_>,
-    secret_len: usize,
-) -> Result<(KeyDerivationAlgorithm, DigestAlgorithm, u128), XmlEncError> {
-    let algorithm = KeyDerivationAlgorithm::from_uri(parameters.algorithm)
-        .ok_or_else(|| unsupported(parameters.algorithm))?;
-    let uri = parameters
-        .digest
-        .ok_or_else(|| unsupported(parameters.algorithm))?;
-    let digest = match algorithm {
+fn kdf_digest(
+    algorithm: KeyDerivationAlgorithm,
+    uri: &str,
+) -> Result<DigestAlgorithm, XmlEncError> {
+    Ok(match algorithm {
         KeyDerivationAlgorithm::Hkdf | KeyDerivationAlgorithm::Pbkdf2 => {
             match SignatureAlgorithm::from_uri(uri) {
                 Some(SignatureAlgorithm::HmacSha1) => DigestAlgorithm::Sha1,
@@ -304,7 +313,37 @@ fn preflight(
             Some(value @ (DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160)) => value,
             _ => return Err(unsupported(uri)),
         },
+    })
+}
+
+/// Bit length of a `ConcatKDF` context whose unused trailing bits are zero.
+fn concat_kdf_context_bits(info: KdfContext<'_>) -> Result<u128, XmlEncError> {
+    let (bytes, bits) = match info {
+        KdfContext::Octets(bytes) => (bytes, bytes.len() as u128 * 8),
+        KdfContext::Bits { bytes, bit_len } => (bytes, bit_len as u128),
+        KdfContext::LegacyDh { .. } => {
+            return Err(invalid(ProviderInputError::ConcatKdfParameters));
+        }
     };
+    let used = (bits % 8) as usize;
+    if bits.div_ceil(8) != bytes.len() as u128
+        || (used != 0 && bytes[bytes.len() - 1] & (0xff >> used) != 0)
+    {
+        return Err(invalid(ProviderInputError::ConcatKdfParameters));
+    }
+    Ok(bits)
+}
+
+fn preflight(
+    parameters: &KdfParameters<'_>,
+    secret_len: usize,
+) -> Result<(KeyDerivationAlgorithm, DigestAlgorithm, u128), XmlEncError> {
+    let algorithm = KeyDerivationAlgorithm::from_uri(parameters.algorithm)
+        .ok_or_else(|| unsupported(parameters.algorithm))?;
+    let uri = parameters
+        .digest
+        .ok_or_else(|| unsupported(parameters.algorithm))?;
+    let digest = kdf_digest(algorithm, uri)?;
     let width = digest.output_len();
     // FIPS 202 §§5.1, 6.1: SHA-3's rate depends on output width, not
     // SHA-2's 512/1024-bit compression blocks. Round partial octets upward;
@@ -332,7 +371,7 @@ fn preflight(
             if parameters.iterations == 0
                 || parameters.output_len == 0
                 || octets(parameters.info).is_none_or(|info| !info.is_empty())
-                || output_blocks > u32::MAX as u128
+                || output_blocks > u128::from(u32::MAX)
             {
                 return Err(invalid(ProviderInputError::Pbkdf2Parameters));
             }
@@ -342,7 +381,7 @@ fn preflight(
             hmac_key(secret_len)
                 + salt / block
                 + output_blocks
-                    * (hash(salt % block + 4) + 1 + 2 * (parameters.iterations as u128 - 1))
+                    * (hash(salt % block + 4) + 1 + 2 * (u128::from(parameters.iterations) - 1))
         }
         KeyDerivationAlgorithm::Hkdf => {
             let info = octets(parameters.info)
@@ -362,21 +401,11 @@ fn preflight(
             if parameters.iterations != 0
                 || !parameters.salt.is_empty()
                 || parameters.output_len == 0
-                || output_blocks > u32::MAX as u128
+                || output_blocks > u128::from(u32::MAX)
             {
                 return Err(invalid(ProviderInputError::ConcatKdfParameters));
             }
-            let (bytes, bits) = match parameters.info {
-                KdfContext::Octets(bytes) => (bytes, bytes.len() as u128 * 8),
-                KdfContext::Bits { bytes, bit_len } => (bytes, bit_len as u128),
-                _ => return Err(invalid(ProviderInputError::ConcatKdfParameters)),
-            };
-            let used = (bits % 8) as usize;
-            if bits.div_ceil(8) != bytes.len() as u128
-                || (used != 0 && bytes[bytes.len() - 1] & (0xff >> used) != 0)
-            {
-                return Err(invalid(ProviderInputError::ConcatKdfParameters));
-            }
+            let bits = concat_kdf_context_bits(parameters.info)?;
             output_blocks * hash(4 + secret_len as u128 + bits.div_ceil(8))
         }
         KeyDerivationAlgorithm::LegacyDh => {

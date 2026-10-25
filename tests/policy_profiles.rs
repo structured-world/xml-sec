@@ -317,15 +317,55 @@ fn decryption_profile_uses_only_inbound_provider_capabilities() {
     }
 }
 
+/// Content encrypted with `algorithm` under a policy admitting only it
+/// decrypts under the compiled `inbound` policy.
+#[cfg(feature = "xmlenc")]
+fn assert_inbound_round_trip(
+    algorithm: xml_sec::xmlenc::DataEncryptionAlgorithm,
+    inbound: &xml_sec::policy::DecryptionPolicy,
+) {
+    use xml_sec::policy::EncryptionPolicy;
+    use xml_sec::xmlenc::{
+        DataEncryptionAlgorithm as Data, DecryptContext, EncryptedDataBuilder,
+        SymmetricKeyDecryptor,
+    };
+    let key = vec![0x31; algorithm.key_len()];
+    let mut builder = EncryptedDataBuilder::new(algorithm)
+        .direct_key(key.as_slice())
+        .policy(EncryptionPolicy {
+            data_algorithms: Some(HashSet::from([algorithm])),
+            ..Default::default()
+        });
+    if matches!(algorithm, Data::ChaCha20 | Data::ChaCha20Poly1305) {
+        builder = builder.chacha_parameters(xml_sec::xmlenc::ChaChaParameters {
+            counter: if algorithm == Data::ChaCha20 {
+                Some([0; 4])
+            } else {
+                None
+            },
+            ..Default::default()
+        });
+    }
+    let encrypted = builder.encrypt_binary(b"compatibility profile").unwrap();
+    let resolver = SymmetricKeyDecryptor::with_kind(key, algorithm.key_kind());
+    let result = DecryptContext::new(&resolver)
+        .policy(inbound.clone())
+        .decrypt(&encrypted.encrypted_data_xml)
+        .unwrap();
+    assert_eq!(
+        result,
+        xml_sec::xmlenc::DecryptedContent::Bytes(b"compatibility profile".to_vec())
+    );
+}
+
 #[cfg(feature = "xmlenc")]
 #[test]
 fn compatibility_decryption_permissions_are_explicit_and_operation_local() {
     // A named compatibility profile grants compiled inbound mechanisms, not
     // implicit defaults, and never relaxes the modern outbound profile.
-    use xml_sec::policy::EncryptionPolicy;
     use xml_sec::xmlenc::{
-        DataEncryptionAlgorithm as Data, DecryptContext, EncryptedDataBuilder,
-        KeyTransportAlgorithm as Transport, KeyWrapAlgorithm as Wrap, SymmetricKeyDecryptor,
+        DataEncryptionAlgorithm as Data, KeyTransportAlgorithm as Transport,
+        KeyWrapAlgorithm as Wrap,
     };
     let compiled = compiler(PolicyProfile::XmlSecCompatible)
         .compile(&context())
@@ -375,33 +415,7 @@ fn compatibility_decryption_permissions_are_explicit_and_operation_local() {
                     .contains(&algorithm)
             );
         }
-        let key = vec![0x31; algorithm.key_len()];
-        let mut builder = EncryptedDataBuilder::new(algorithm)
-            .direct_key(key.as_slice())
-            .policy(EncryptionPolicy {
-                data_algorithms: Some(HashSet::from([algorithm])),
-                ..Default::default()
-            });
-        if matches!(algorithm, Data::ChaCha20 | Data::ChaCha20Poly1305) {
-            builder = builder.chacha_parameters(xml_sec::xmlenc::ChaChaParameters {
-                counter: if algorithm == Data::ChaCha20 {
-                    Some([0; 4])
-                } else {
-                    None
-                },
-                ..Default::default()
-            });
-        }
-        let encrypted = builder.encrypt_binary(b"compatibility profile").unwrap();
-        let resolver = SymmetricKeyDecryptor::with_kind(key, algorithm.key_kind());
-        let result = DecryptContext::new(&resolver)
-            .policy(inbound.clone())
-            .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap();
-        assert_eq!(
-            result,
-            xml_sec::xmlenc::DecryptedContent::Bytes(b"compatibility profile".to_vec())
-        );
+        assert_inbound_round_trip(algorithm, inbound);
     }
     for algorithm in wraps {
         assert!(
@@ -590,7 +604,7 @@ fn compiler_rejects_impossible_hmac_and_missing_request_contracts() {
     all_external.verification.as_mut().unwrap().uris.references = xml_sec::xmldsig::UriTypeSet::ALL;
     assert!(
         compiler(PolicyProfile::Modern)
-            .authorize_replacement(all_external, grant())
+            .authorize_replacement(all_external, &grant())
             .unwrap()
             .compile(&context())
             .is_err()
@@ -704,7 +718,7 @@ fn relaxation_requires_valid_grant_and_preserves_earlier_expiration() {
     let mut later = earlier.clone();
     later.expires_at += Duration::from_secs(3600);
     let compiled = initial
-        .authorize_replacement(replacement, later)
+        .authorize_replacement(replacement, &later)
         .unwrap()
         .compile(&context())
         .unwrap();

@@ -376,15 +376,16 @@ fn xml(p: &mut XmlInputPolicy, v: &Value) -> Result<(), Error> {
 }
 fn key_sources(p: &mut KeySourcePolicy, v: &Value) -> Result<(), Error> {
     for (key, value) in table(v, "key_sources")? {
-        match key.as_str() {
-            "preset_key" => p.preset_key = boolean(value, key)?,
-            "key_name" => p.key_name = boolean(value, key)?,
-            "key_value" => p.key_value = boolean(value, key)?,
-            "der_encoded_key_value" => p.der_encoded_key_value = boolean(value, key)?,
-            "x509_data" => p.x509_data = boolean(value, key)?,
-            "key_info_reference" => p.key_info_reference = boolean(value, key)?,
+        let source = match key.as_str() {
+            "preset_key" => KeySourceKind::PresetKey,
+            "key_name" => KeySourceKind::KeyName,
+            "key_value" => KeySourceKind::KeyValue,
+            "der_encoded_key_value" => KeySourceKind::DerEncodedKeyValue,
+            "x509_data" => KeySourceKind::X509Data,
+            "key_info_reference" => KeySourceKind::KeyInfoReference,
             _ => return Err(invalid(key)),
-        }
+        };
+        p.set(source, boolean(value, key)?);
     }
     Ok(())
 }
@@ -936,28 +937,19 @@ fn trust_snapshot(p: &KeyTrustPolicy) -> Result<Value, Error> {
     ])))
 }
 fn source_snapshot(p: KeySourcePolicy) -> Value {
-    let KeySourcePolicy {
-        preset_key: _,
-        key_name: _,
-        key_value: _,
-        der_encoded_key_value: _,
-        x509_data: _,
-        key_info_reference: _,
-    } = p;
-    Value::Table(Table::from_iter([
-        ("preset_key".into(), Value::Boolean(p.preset_key)),
-        ("key_name".into(), Value::Boolean(p.key_name)),
-        ("key_value".into(), Value::Boolean(p.key_value)),
-        (
-            "der_encoded_key_value".into(),
-            Value::Boolean(p.der_encoded_key_value),
-        ),
-        ("x509_data".into(), Value::Boolean(p.x509_data)),
-        (
-            "key_info_reference".into(),
-            Value::Boolean(p.key_info_reference),
-        ),
-    ]))
+    Value::Table(Table::from_iter(KeySourceKind::ALL.into_iter().map(
+        |source| {
+            let name = match source {
+                KeySourceKind::PresetKey => "preset_key",
+                KeySourceKind::KeyName => "key_name",
+                KeySourceKind::KeyValue => "key_value",
+                KeySourceKind::DerEncodedKeyValue => "der_encoded_key_value",
+                KeySourceKind::X509Data => "x509_data",
+                KeySourceKind::KeyInfoReference => "key_info_reference",
+            };
+            (name.into(), Value::Boolean(p.contains(source)))
+        },
+    )))
 }
 macro_rules! signature_snapshot {
     ($p:expr) => {
@@ -1384,6 +1376,9 @@ pub(super) fn diff(old: &Table, new: &Table) -> Vec<Change> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod key_source_tests;
 
 #[cfg(test)]
 mod tests {

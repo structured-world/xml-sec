@@ -1,4 +1,4 @@
-//! XMLDSig reference processing and end-to-end signature verification pipeline.
+//! `XMLDSig` reference processing and end-to-end signature verification pipeline.
 //!
 //! Implements [XMLDSig §4.3.3](https://www.w3.org/TR/xmldsig-core1/#sec-CoreValidation):
 //! for each `<Reference>` in `<SignedInfo>`, dereference the URI, apply transforms,
@@ -64,6 +64,40 @@ use capture::{CapturedOperation, ScopedCapture, VerificationCapture};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
+
+/// One verification operation's immutable policy and its key-material account.
+///
+/// Policy-aware [`VerifyingKey`] hooks receive this scope so that reading a
+/// key's public material is charged to the operation's X.509 allowance and
+/// reported as a typed policy violation, never to a fresh account.
+#[derive(Clone, Copy)]
+pub struct VerificationScope<'a> {
+    policy: &'a crate::policy::VerificationPolicy,
+    certificates: &'a super::pkix::CertificateSession,
+}
+
+impl<'a> VerificationScope<'a> {
+    pub(crate) fn new(
+        policy: &'a crate::policy::VerificationPolicy,
+        certificates: &'a super::pkix::CertificateSession,
+    ) -> Self {
+        Self {
+            policy,
+            certificates,
+        }
+    }
+
+    /// The operation's immutable verification policy.
+    #[must_use]
+    pub fn policy(&self) -> &'a crate::policy::VerificationPolicy {
+        self.policy
+    }
+
+    pub(crate) fn certificates(&self) -> &'a super::pkix::CertificateSession {
+        self.certificates
+    }
+}
+
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
@@ -84,6 +118,9 @@ pub trait VerifyingKey {
     /// Composite resolvers may try individual keys through the selected engine.
     /// `None` identifies a leaf handle. Wrappers must preserve per-key policy
     /// when forwarding the visitor; no public/private key copy is required.
+    ///
+    /// # Errors
+    /// Propagates visitor, per-candidate policy and composite-resolution failures.
     fn verify_candidate_keys(
         &self,
         _verify: &mut dyn FnMut(&dyn VerifyingKey) -> Result<bool, DsigError>,
@@ -92,6 +129,9 @@ pub trait VerifyingKey {
     }
     /// Borrow public SPKI for native verification, validating method/key binding.
     /// Opaque external keys may return `None`; native providers then fail closed.
+    ///
+    /// # Errors
+    /// Returns method/key binding, policy or public-metadata processing failures.
     fn verification_spki(
         &self,
         _algorithm: SignatureAlgorithm,
@@ -104,6 +144,10 @@ pub trait VerifyingKey {
         crate::policy::EcdsaSignatureValueEncoding::XmlDsig
     }
     /// Verify with validated domain separation, rejecting unsupported contexts.
+    ///
+    /// # Errors
+    /// Returns an unsupported context or the key's verification-processing
+    /// failure. A completed cryptographic mismatch remains `Ok(false)`.
     fn verify_with_context(
         &self,
         algorithm: SignatureAlgorithm,
@@ -122,12 +166,14 @@ pub trait VerifyingKey {
     /// Validate this key against the operation's immutable trust policy.
     ///
     /// Built-in keys override this hook so pre-resolved and resolver-produced
-    /// keys enforce identical strength constraints. Custom opaque keys may
-    /// retain their own policy enforcement by accepting the default no-op.
-    fn validate_policy(
-        &self,
-        _policy: &crate::policy::VerificationPolicy,
-    ) -> Result<(), DsigError> {
+    /// keys enforce identical strength constraints, reading their public
+    /// material under the scope's account. Custom opaque keys may retain their
+    /// own policy enforcement by accepting the default no-op.
+    ///
+    /// # Errors
+    /// Implementations return policy refusals for incompatible key strength,
+    /// permitted usage, encoding, trust or resource constraints.
+    fn validate_policy(&self, _scope: &VerificationScope<'_>) -> Result<(), DsigError> {
         Ok(())
     }
 
@@ -135,7 +181,11 @@ pub trait VerifyingKey {
     /// declared algorithm and this key before provider dispatch.
     ///
     /// Key implementations with key-size-dependent framing should override
-    /// this method. The default enforces the algorithm-wide XMLDSig envelope.
+    /// this method. The default enforces the algorithm-wide `XMLDSig` envelope.
+    ///
+    /// # Errors
+    /// Implementations propagate key-metadata processing failures. An ordinary
+    /// framing mismatch is `Ok(false)`, not a provider execution failure.
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
@@ -150,21 +200,28 @@ pub trait VerifyingKey {
     /// Validate wire framing under the operation's immutable compatibility policy.
     ///
     /// The default delegates to [`VerifyingKey::validate_signature_value`] and
-    /// therefore implements only the standard XMLDSig framing contract. Custom
+    /// therefore implements only the standard `XMLDSig` framing contract. Custom
     /// keys that support policy-selected wire formats, such as
     /// [`crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der`], must
     /// override this hook rather than accepting both formats implicitly.
+    ///
+    /// # Errors
+    /// Propagates policy and key-metadata processing failures; completed framing
+    /// mismatches are `Ok(false)` under the selected wire contract.
     fn validate_signature_value_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        _scope: &VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let _ = policy;
         self.validate_signature_value(algorithm, signature_value)
     }
 
     /// Verify `signature_value` over `signed_data` with the declared algorithm.
+    ///
+    /// # Errors
+    /// Returns unsupported key/method combinations or verification-processing
+    /// failures. A completed cryptographic mismatch is `Ok(false)`.
     fn verify(
         &self,
         algorithm: SignatureAlgorithm,
@@ -174,18 +231,23 @@ pub trait VerifyingKey {
 
     /// Verify after applying operation-scoped compatibility semantics.
     ///
-    /// The default delegates to [`VerifyingKey::verify`]. Custom keys whose
-    /// provider input depends on compatibility policy must override this hook
-    /// consistently with [`VerifyingKey::validate_signature_value_with_policy`].
+    /// The default delegates to [`VerifyingKey::verify_with_context`]. Custom
+    /// keys whose provider input depends on compatibility policy must override
+    /// this hook consistently with
+    /// [`VerifyingKey::validate_signature_value_with_policy`].
+    ///
+    /// # Errors
+    /// Propagates policy, unsupported-method and verification-processing failures;
+    /// a completed cryptographic mismatch remains `Ok(false)`.
     fn verify_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        _scope: &VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let _ = policy;
-        self.verify(algorithm, signed_data, signature_value)
+        self.verify_with_context(algorithm, context, signed_data, signature_value)
     }
 }
 
@@ -198,6 +260,10 @@ pub trait KeyResolver {
     /// The default charges one custom-resolver dispatch. Implementations searching
     /// multiple candidates override this method, charging each inspection through
     /// `budget` and using its execution account for certificate mechanism work.
+    ///
+    /// # Errors
+    /// Returns invalid policy, cumulative candidate/resource refusal or the
+    /// resolver's key/trust processing failure. A complete search miss is `Ok(None)`.
     fn resolve_for_verification_with_budget<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
@@ -214,6 +280,10 @@ pub trait KeyResolver {
     /// Discover and explicitly authorize a key for an end-to-end operation.
     /// The default preserves discovery only: applications that authorize keys
     /// themselves return `ResolvedVerificationKey::CallerTrusted` explicitly.
+    ///
+    /// # Errors
+    /// Propagates policy/provider-aware key discovery and trust processing
+    /// failures; absence of a usable candidate is `Ok(None)`.
     fn resolve_for_verification<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
@@ -231,6 +301,10 @@ pub trait KeyResolver {
     /// key material (for example, missing `<KeyInfo>` candidates). `VerifyContext`
     /// maps `Ok(None)` to `DsigStatus::Invalid(FailureReason::KeyNotFound)`;
     /// reserve `Err(...)` for resolver failures.
+    ///
+    /// # Errors
+    /// Returns key decoding, unsupported mechanism, policy/resource or resolver
+    /// execution failures, rather than a completed search miss.
     fn resolve<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
@@ -246,6 +320,10 @@ pub trait KeyResolver {
     /// capacity for the single candidate returned by any resolver. The default
     /// preserves source-only custom resolvers whose behavior is independent of
     /// other policy fields.
+    ///
+    /// # Errors
+    /// Propagates resolver failures and any implementation-specific policy or
+    /// cumulative candidate-budget refusal; a complete miss remains `Ok(None)`.
     fn resolve_with_policy<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
@@ -260,6 +338,10 @@ pub trait KeyResolver {
     /// Resolvers that evaluate cryptographic key metadata, such as
     /// `X509Digest`, must override this hook. The default keeps existing
     /// policy-aware custom resolvers source-compatible.
+    ///
+    /// # Errors
+    /// Propagates resolver, policy/resource, key/certificate decoding and
+    /// selected-provider processing failures; a complete miss is `Ok(None)`.
     fn resolve_with_policy_and_provider<'a>(
         &'a self,
         key_info: Option<&KeyInfo>,
@@ -281,7 +363,7 @@ pub trait KeyResolver {
     }
 }
 
-/// Allowed structural URI classes for XMLDSig reference and key-source policy.
+/// Allowed structural URI classes for `XMLDSig` reference and key-source policy.
 ///
 /// External URIs resolve only from bytes supplied through
 /// [`VerifyContext::external_resources`]; allowing them never enables I/O.
@@ -337,6 +419,7 @@ impl UriTypeSet {
     };
 
     /// Return whether this set permits the URI's structural class.
+    #[must_use]
     pub fn allows(self, uri: &str) -> bool {
         match classify_uri(uri) {
             UriClass::Empty => self.allow_empty,
@@ -352,7 +435,7 @@ impl Default for UriTypeSet {
     }
 }
 
-/// Request-scoped selection of the XMLDSig operation node.
+/// Request-scoped selection of the `XMLDSig` operation node.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SignatureSelection<'a> {
     /// Require exactly one `Signature` in the complete document.
@@ -470,8 +553,8 @@ impl<'a> VerifyContext<'a> {
     /// `URI="#xpointer(/)"` do not establish an element-specific Manifest
     /// authentication proof for this option.
     ///
-    /// Manifests are parsed and processed only after the SignedInfo references
-    /// and SignatureValue both validate. Their digest mismatches, policy
+    /// Manifests are parsed and processed only after the `SignedInfo` references
+    /// and `SignatureValue` both validate. Their digest mismatches, policy
     /// violations, and processing failures are then reported independently in
     /// `VerifyResult::manifest_references` and do not alter `VerifyResult::status`.
     /// Callers that enable `process_manifests(true)` must inspect
@@ -555,8 +638,8 @@ impl<'a> VerifyContext<'a> {
     /// - `http://www.w3.org/2000/09/xmldsig#enveloped-signature`
     /// - `http://www.w3.org/2001/10/xml-exc-c14n#`
     ///
-    /// The allowlist covers explicit Reference and RetrievalMethod transforms,
-    /// the declared SignedInfo canonicalization method, and implicit default
+    /// The allowlist covers explicit Reference and `RetrievalMethod` transforms,
+    /// the declared `SignedInfo` canonicalization method, and implicit default
     /// C14N (`http://www.w3.org/TR/2001/REC-xml-c14n-20010315`) when a Reference
     /// transform chain ends as a node set.
     pub fn allowed_transforms<I, S>(mut self, transforms: I) -> Self
@@ -581,9 +664,9 @@ impl<'a> VerifyContext<'a> {
         self
     }
 
-    /// Select the node returned by XPath's `here()` extension function.
+    /// Select the node returned by `XPath`'s `here()` extension function.
     ///
-    /// The default follows XMLDSig and returns the `<XPath>` parameter.
+    /// The default follows `XMLDSig` and returns the `<XPath>` parameter.
     /// Use [`XPathHereSemantics::XmlSecLegacy`] only for documents known to
     /// have been generated with libxmlsec1's `<Transform>` interpretation.
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
@@ -604,13 +687,17 @@ impl<'a> VerifyContext<'a> {
             .xslt_stylesheet_semantics(self.policy.transforms.xslt_stylesheet_semantics)
     }
 
-    /// Verify one XMLDSig signature using this context.
+    /// Verify one `XMLDSig` signature using this context.
     ///
     /// Returns `Ok(VerifyResult)` for both valid and invalid signatures; inspect
     /// `VerifyResult::status` for the core `<SignedInfo>` and signature-value
     /// outcome. When Manifest processing is enabled, inspect every
     /// `VerifyResult::manifest_references` entry separately. `Err(...)` is
     /// reserved for pipeline failures.
+    ///
+    /// # Errors
+    /// Returns XML/structure, policy/resource, resolution or selected-provider
+    /// processing failures; completed invalid signatures remain result statuses.
     pub fn verify(&self, xml: &str) -> Result<VerifyResult, DsigError> {
         verify_signature_with_context(xml, self)
     }
@@ -620,6 +707,10 @@ impl<'a> VerifyContext<'a> {
     /// The active XML input policy is revalidated against the document's parse
     /// provenance as well as its current byte and node counts. In particular, a
     /// strict context rejects a document that required internal DTD support.
+    ///
+    /// # Errors
+    /// Returns document provenance/policy mismatch or XML, resource, resolution
+    /// and selected-provider processing failures.
     pub fn verify_document(&self, document: &XmlDocument) -> Result<VerifyResult, DsigError> {
         verify_signature_document_with_context(document, self)
     }
@@ -632,6 +723,10 @@ impl<'a> VerifyContext<'a> {
     /// current document before accepting the request; a successful return
     /// alone is not validation. [`VerifyEvidence::all_valid`] is historical
     /// mathematical diagnostics only and does not revalidate document generation.
+    ///
+    /// # Errors
+    /// Returns request/document preparation, provenance, policy or aggregate
+    /// resource failures. Individual signature failures remain in the evidence.
     pub fn verify_all(&self, document: &XmlDocument) -> Result<VerifyEvidence, DsigError> {
         verify_all_document(document, self, &VerificationRequest::default())
     }
@@ -640,6 +735,10 @@ impl<'a> VerifyContext<'a> {
     ///
     /// These are untrusted selection handles, not verification evidence. Use
     /// them to authorize request keys even when Signatures have no XML ID.
+    ///
+    /// # Errors
+    /// Returns invalid policy, incompatible document provenance or exhaustion
+    /// of the snapshot's signature discovery allowance.
     pub fn signature_identities(
         &self,
         document: &XmlDocument,
@@ -662,6 +761,10 @@ impl<'a> VerifyContext<'a> {
     ///
     /// Requests are not policy: they cannot permit algorithms, URI classes or
     /// XML features forbidden by the immutable policy snapshot.
+    ///
+    /// # Errors
+    /// Returns invalid request identities/requirements, document provenance,
+    /// policy or aggregate resource failures. Individual failures remain evidence.
     pub fn verify_request(
         &self,
         document: &XmlDocument,
@@ -687,7 +790,7 @@ pub enum SignatureRequirement {
 pub struct CallerTrustedSignatureKey<'a> {
     /// Signature that this key is authorized to verify.
     pub signature: NodeIdentity,
-    /// Application-owned key; embedded KeyInfo cannot override it.
+    /// Application-owned key; embedded `KeyInfo` cannot override it.
     pub key: &'a dyn VerifyingKey,
 }
 
@@ -740,6 +843,9 @@ pub struct VerifyEvidence<V = Vec<SignatureEvidence>> {
 impl<V: std::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
     /// Whether the explicit request requirements hold for this document.
     /// Foreign documents or any mutation after verification invalidate acceptance.
+    ///
+    /// # Errors
+    /// Returns the document identity/generation refusal for stale or foreign evidence.
     pub fn accepted(&self, document: &XmlDocument) -> Result<bool, DsigError> {
         document.with_view(|view| {
             view.resolve_node(self.document)?;
@@ -760,6 +866,10 @@ impl<V: std::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
     /// remain indeterminate rather than falsely covering their original input.
     /// The exact document generation must still exist; wrapping an unsigned
     /// sibling with a matching name cannot satisfy an identity-based assertion.
+    ///
+    /// # Errors
+    /// Returns stale/foreign evidence or target identities, or an invalid
+    /// request when the target is not an element.
     pub fn covers_element(
         &self,
         document: &XmlDocument,
@@ -882,7 +992,7 @@ pub struct ReferenceResult {
 
 /// Conservative coverage classification for the original semantic document.
 ///
-/// XMLDSig 1.1 §8.1.1 protects only transformed data. Unknown projection is
+/// `XMLDSig` 1.1 §8.1.1 protects only transformed data. Unknown projection is
 /// deliberately not promoted to complete original-element coverage.
 /// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Signed>
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -916,7 +1026,7 @@ pub enum DsigStatus {
     Invalid(FailureReason),
 }
 
-/// Why XMLDSig verification failed.
+/// Why `XMLDSig` verification failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FailureReason {
@@ -987,7 +1097,7 @@ impl ReferencesResult {
 /// # Errors
 ///
 /// Returns `Err` for processing failures (URI dereference, transform errors).
-/// Digest mismatch is NOT an error — it produces
+/// Digest mismatch is NOT an error; it produces
 /// `Ok(ReferenceResult { status: Invalid(ReferenceDigestMismatch { .. }) })`.
 pub fn process_reference(
     reference: &Reference,
@@ -1135,7 +1245,7 @@ impl<'a> VerificationOperationBudgets<'a> {
         Self {
             key_info_parse: RefCell::new(key_info_parse),
             key_candidates: RefCell::new(key_candidates),
-            key_establishment: Default::default(),
+            key_establishment: RefCell::default(),
             transforms,
             canonicalized: CanonicalizedDataBudget::with_limit(
                 policy.resources.effective_canonicalized_bytes(),
@@ -1194,7 +1304,7 @@ impl<'a> VerificationOperationBudgets<'a> {
             // XML Base Second Edition §4.2 resolves the external reference in
             // its owning element's context. Identity and execution must agree.
             // https://www.w3.org/TR/2009/REC-xmlbase-20090128/#resolving
-            let Ok(resolved) = crate::c14n::xml_base::resolve_uri_from_node_with_budget(
+            let Ok(absolute_uri) = crate::c14n::xml_base::resolve_uri_from_node_with_budget(
                 origin,
                 uri,
                 self.transforms.xml_base_resolution(),
@@ -1204,7 +1314,7 @@ impl<'a> VerificationOperationBudgets<'a> {
                     index,
                 );
             };
-            resolved_uri = resolved;
+            resolved_uri = absolute_uri;
             resolved_uri.as_str()
         } else {
             uri
@@ -1379,10 +1489,9 @@ fn process_reference_with_options<C: VerificationCapture>(
     reference_node: Option<Node<'_, '_>>,
     execution: &ReferenceExecutionContext<'_, C>,
 ) -> Result<ReferenceResult, ReferenceProcessingError> {
-    execution.capture.admit_digest(
-        reference_node.map(|node| node.id()),
-        reference.digest_method,
-    )?;
+    execution
+        .capture
+        .admit_digest(reference_node.map(Node::id), reference.digest_method)?;
     // 1. Dereference URI. Omitted URI is distinct from URI="" in XMLDSig and
     // must be rejected until caller-provided external object resolution exists.
     let uri = reference
@@ -1442,7 +1551,7 @@ fn process_reference_with_options<C: VerificationCapture>(
     })?;
     execution
         .capture
-        .computed_digest(reference_node.map(|node| node.id()))?;
+        .computed_digest(reference_node.map(Node::id))?;
 
     // 4. Compare with stored DigestValue (constant-time)
     let status = if constant_time_eq(&computed_digest, &reference.digest_value) {
@@ -1478,7 +1587,7 @@ fn process_reference_with_options<C: VerificationCapture>(
 /// Process all `<Reference>` elements in a `<SignedInfo>`, with fail-fast
 /// on the first digest mismatch.
 ///
-/// Per XMLDSig spec: if any reference fails, the entire signature is invalid.
+/// Per `XMLDSig` spec: if any reference fails, the entire signature is invalid.
 /// Processing stops at the first failure for efficiency.
 ///
 /// # Errors
@@ -1581,14 +1690,14 @@ impl ReferenceProcessingError {
     }
 }
 
-/// End-to-end XMLDSig verification result for one `<Signature>`.
+/// End-to-end `XMLDSig` verification result for one `<Signature>`.
 #[derive(Debug)]
 #[non_exhaustive]
 #[must_use = "inspect status before accepting the document"]
 pub struct VerifyResult {
     /// Key authorization, independent of `status`; neither alone authorizes data.
     pub key_trust: super::KeyTrustEvidence,
-    /// Core XMLDSig status for the `<SignedInfo>` references and signature value.
+    /// Core `XMLDSig` status for the `<SignedInfo>` references and signature value.
     ///
     /// Manifest reference failures do not alter this field; inspect
     /// [`Self::manifest_references`] before accepting Manifest-backed data.
@@ -1609,11 +1718,11 @@ pub struct VerifyResult {
     /// empty list does not imply that no Manifest elements existed in `verify()` input.
     pub manifest_references: Vec<ReferenceResult>,
     /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled
-    /// and verification reaches SignedInfo canonicalization.
+    /// and verification reaches `SignedInfo` canonicalization.
     pub canonicalized_signed_info: Option<Vec<u8>>,
 }
 
-/// Errors while running end-to-end XMLDSig verification.
+/// Errors while running end-to-end `XMLDSig` verification.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DsigError {
@@ -1661,7 +1770,7 @@ pub enum DsigError {
         element: &'static str,
     },
 
-    /// Signature element tree shape violates XMLDSig structure requirements.
+    /// Signature element tree shape violates `XMLDSig` structure requirements.
     #[error("invalid Signature structure: {reason}")]
     InvalidStructure {
         /// Validation failure reason.
@@ -1699,11 +1808,11 @@ pub enum DsigError {
     #[error("reference processing failed: {0}")]
     Reference(ReferenceProcessingError),
 
-    /// SignedInfo canonicalization failed.
+    /// `SignedInfo` canonicalization failed.
     #[error("SignedInfo canonicalization failed: {0}")]
     Canonicalization(#[from] crate::c14n::C14nError),
 
-    /// SignatureValue base64 decoding failed.
+    /// `SignatureValue` base64 decoding failed.
     #[error("invalid SignatureValue base64: {0}")]
     SignatureValueBase64(#[from] base64::DecodeError),
 
@@ -1761,7 +1870,7 @@ impl From<OperationPlanError> for DsigError {
     }
 }
 
-/// Verify one XMLDSig `<Signature>` end-to-end with a PEM public key.
+/// Verify one `XMLDSig` `<Signature>` end-to-end with a PEM public key.
 ///
 /// Pipeline:
 /// 1. Parse `<Signature>` children and enforce structural constraints
@@ -1780,14 +1889,18 @@ impl From<OperationPlanError> for DsigError {
 /// on this API path.
 ///
 /// Structural constraints enforced by this API:
-/// - The document must contain exactly one XMLDSig `<Signature>` element.
+/// - The document must contain exactly one `XMLDSig` `<Signature>` element.
 /// - `<SignedInfo>` must be the first element child of `<Signature>` and appear once.
 /// - `<SignatureValue>` must be the second element child of `<Signature>` and appear once.
 /// - `<KeyInfo>` is optional and, when present, must be the third element child.
-/// - Only XMLDSig namespace element children are allowed under `<Signature>`.
+/// - Only `XMLDSig` namespace element children are allowed under `<Signature>`.
 /// - Non-whitespace mixed text content under `<Signature>` is rejected.
 /// - After `<SignedInfo>`, `<SignatureValue>`, and optional `<KeyInfo>`, only `<Object>` elements are allowed.
 /// - `<SignatureValue>` must not contain nested element children.
+///
+/// # Errors
+/// Returns an error for invalid XML, signature structure, key encoding, denied
+/// algorithms, resource exhaustion, or reference-processing failures.
 pub fn verify_signature_with_pem_key(
     xml: &str,
     public_key_pem: &str,
@@ -1816,15 +1929,17 @@ pub fn verify_signature_with_pem_key(
             }
             let (rest, pem) = x509_parser::pem::parse_x509_pem(self.public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+            if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
                 return Err(SignatureVerificationError::InvalidKeyPem.into());
             }
+            // Like any opaque caller key, this PEM key reads its own material.
             Ok(super::modern::verify_with_context(
                 algorithm,
                 &pem.contents,
                 context,
                 signed_data,
                 signature_value,
+                &super::pkix::CertificateSession::standalone(),
             )?)
         }
 
@@ -1874,32 +1989,7 @@ fn map_document_parse_error(error: XmlDocumentError, settings: DocumentParseSett
 }
 
 #[cfg(test)]
-mod xml_parse_budget_tests {
-    use super::*;
-
-    #[test]
-    fn verification_initial_parse_uses_the_policy_work_budget() {
-        // Even a structurally invalid signature must not reach parsing when
-        // the immutable operation snapshot denies all XML parse work.
-        let xml = "<root/>";
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xml_parse_work_bytes = 0;
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(xml)
-            .expect_err("a zero parse-work budget must reject the input parse");
-
-        assert!(matches!(
-            error,
-            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
-                maximum: 0,
-                actual,
-            }) if actual == xml.len()
-        ));
-    }
-}
+mod xml_parse_budget_tests;
 
 fn verify_signature_document_with_context(
     document: &XmlDocument,
@@ -2097,16 +2187,105 @@ fn verify_all_document(
         document,
         ctx,
         request,
-        CollectedRequestStorage,
+        &CollectedRequestStorage,
         |_, _, _, evidence, (), _| Ok(evidence),
     )
+}
+
+fn validate_verification_request(
+    view: DocumentView<'_>,
+    request: &VerificationRequest<'_>,
+    policy: &crate::policy::VerificationPolicy,
+) -> Result<(), DsigError> {
+    match request.signatures {
+        SignatureRequirement::AtLeast(0) | SignatureRequirement::Exactly(0) => {
+            return Err(DsigError::InvalidRequest {
+                reason: "signature requirement must be nonzero",
+            });
+        }
+        _ => {}
+    }
+    if request.expected_targets.len() > policy.resources.max_references {
+        return Err(DsigError::InvalidRequest {
+            reason: "too many expected coverage targets",
+        });
+    }
+    if request.trusted_keys.len() > policy.resources.max_signatures {
+        return Err(DsigError::InvalidRequest {
+            reason: "too many trusted signature keys",
+        });
+    }
+    for (index, target) in request.expected_targets.iter().copied().enumerate() {
+        if !view.resolve_node(target)?.is_element() {
+            return Err(DsigError::InvalidRequest {
+                reason: "coverage target must be an element",
+            });
+        }
+        if request.expected_targets[..index].contains(&target) {
+            return Err(DsigError::InvalidRequest {
+                reason: "duplicate expected coverage target",
+            });
+        }
+    }
+    for (index, entry) in request.trusted_keys.iter().enumerate() {
+        if !view
+            .resolve_node(entry.signature)?
+            .has_tag_name((XMLDSIG_NS, "Signature"))
+        {
+            return Err(DsigError::InvalidRequest {
+                reason: "trusted key target must be a Signature",
+            });
+        }
+        if request.trusted_keys[..index]
+            .iter()
+            .any(|prior| prior.signature == entry.signature)
+        {
+            return Err(DsigError::InvalidRequest {
+                reason: "ambiguous trusted keys for one Signature",
+            });
+        }
+    }
+    Ok(())
+}
+
+fn accept_verification_evidence<V: std::ops::Deref<Target = [SignatureEvidence]>>(
+    document: &XmlDocument,
+    request: &VerificationRequest<'_>,
+    evidence: &mut VerifyEvidence<V>,
+    count: usize,
+) -> Result<(), DsigError> {
+    let valid = evidence
+        .signatures
+        .iter()
+        .filter(|entry| {
+            entry.result.as_ref().is_ok_and(|result| {
+                result.status == DsigStatus::Valid
+                    && result
+                        .manifest_references
+                        .iter()
+                        .all(|reference| reference.status == DsigStatus::Valid)
+            })
+        })
+        .count();
+    evidence.accepted = match request.signatures {
+        SignatureRequirement::All => valid > 0 && valid == count,
+        SignatureRequirement::AtLeast(minimum) => valid >= minimum,
+        SignatureRequirement::Exactly(required) => valid == required && count == required,
+    };
+    for target in request.expected_targets {
+        if !evidence.covers_element(document, *target)? {
+            evidence.accepted = false;
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn with_verified_document<'inputs, R, S: RequestStorage>(
     document: &XmlDocument,
     ctx: &VerifyContext<'inputs>,
     request: &VerificationRequest<'inputs>,
-    storage: S,
+    storage: &S,
     continuation: impl for<'view, 'scope> FnOnce(
         DocumentView<'view>,
         &'scope VerifyContext<'inputs>,
@@ -2158,54 +2337,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
         ctx.utc_facts,
     );
     document.with_view(|view| {
-        match request.signatures {
-            SignatureRequirement::AtLeast(0) | SignatureRequirement::Exactly(0) => {
-                return Err(DsigError::InvalidRequest {
-                    reason: "signature requirement must be nonzero",
-                });
-            }
-            _ => {}
-        }
-        if request.expected_targets.len() > ctx.policy.resources.max_references {
-            return Err(DsigError::InvalidRequest {
-                reason: "too many expected coverage targets",
-            });
-        }
-        if request.trusted_keys.len() > ctx.policy.resources.max_signatures {
-            return Err(DsigError::InvalidRequest {
-                reason: "too many trusted signature keys",
-            });
-        }
-        for (index, target) in request.expected_targets.iter().copied().enumerate() {
-            if !view.resolve_node(target)?.is_element() {
-                return Err(DsigError::InvalidRequest {
-                    reason: "coverage target must be an element",
-                });
-            }
-            if request.expected_targets[..index].contains(&target) {
-                return Err(DsigError::InvalidRequest {
-                    reason: "duplicate expected coverage target",
-                });
-            }
-        }
-        for (index, entry) in request.trusted_keys.iter().enumerate() {
-            if !view
-                .resolve_node(entry.signature)?
-                .has_tag_name((XMLDSIG_NS, "Signature"))
-            {
-                return Err(DsigError::InvalidRequest {
-                    reason: "trusted key target must be a Signature",
-                });
-            }
-            if request.trusted_keys[..index]
-                .iter()
-                .any(|prior| prior.signature == entry.signature)
-            {
-                return Err(DsigError::InvalidRequest {
-                    reason: "ambiguous trusted keys for one Signature",
-                });
-            }
-        }
+        validate_verification_request(view, request, &ctx.policy)?;
         let is_signature = |node: &Node<'_, '_>| node.has_tag_name((XMLDSIG_NS, "Signature"));
         let count = count_signature_nodes(view, ctx.policy.resources.max_signatures)?;
         // Cardinality is checked before allocating the report or calling a
@@ -2260,30 +2392,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
             accepted: false,
             correlation: request.correlation,
         };
-        let valid = evidence
-            .signatures
-            .iter()
-            .filter(|entry| {
-                entry.result.as_ref().is_ok_and(|result| {
-                    result.status == DsigStatus::Valid
-                        && result
-                            .manifest_references
-                            .iter()
-                            .all(|reference| reference.status == DsigStatus::Valid)
-                })
-            })
-            .count();
-        evidence.accepted = match request.signatures {
-            SignatureRequirement::All => valid > 0 && valid == count,
-            SignatureRequirement::AtLeast(minimum) => valid >= minimum,
-            SignatureRequirement::Exactly(required) => valid == required && count == required,
-        };
-        for target in request.expected_targets {
-            if !evidence.covers_element(document, *target)? {
-                evidence.accepted = false;
-                break;
-            }
-        }
+        accept_verification_evidence(document, request, &mut evidence, count)?;
         continuation(view, ctx, &budgets, evidence, operations, resolver)
     })
 }
@@ -2319,8 +2428,8 @@ fn verify_signature_document_with_context_and_transforms(
     document.with_view(|view| verify_signature_view(view, ctx, &mut operation))
 }
 
-fn verify_signature_view<'a>(
-    view: DocumentView<'a>,
+fn verify_signature_view(
+    view: DocumentView<'_>,
     ctx: &VerifyContext<'_>,
     operation: &mut OperationExecutionContext<
         &crate::policy::VerificationPolicy,
@@ -2391,271 +2500,73 @@ fn verify_signature_view<'a>(
     )
 }
 
-fn verify_signature_node<'a, C: VerificationCapture>(
-    view: DocumentView<'a>,
-    ctx: &VerifyContext<'_>,
-    key: Option<&dyn VerifyingKey>,
+fn canonicalize_verification_signed_info(
+    signed_info_node: Node<'_, '_>,
+    method: &crate::c14n::C14nAlgorithm,
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+) -> Result<Vec<u8>, DsigError> {
+    let doc = signed_info_node.document();
+    let signed_info_subtree: HashSet<_> = signed_info_node.descendants().map(Node::id).collect();
+    let mut canonical_signed_info = Vec::new();
+    let signed_info_limit = operation
+        .budgets()
+        .canonicalized
+        .remaining()
+        .min(operation.budgets().transforms.remaining_c14n_output());
+    canonicalize_bounded_with_xml_base_budget(
+        doc,
+        Some(&|node| signed_info_subtree.contains(&node.id())),
+        method,
+        signed_info_limit,
+        operation.budgets().transforms.xml_base_resolution(),
+        &mut canonical_signed_info,
+    )
+    .map_err(|error| {
+        if let Some(violation) = map_c14n_resource_policy_violation(
+            &error,
+            crate::policy::resource_name::CANONICALIZED_BYTES,
+            operation.budgets().canonicalized.max_bytes,
+        ) {
+            SignatureVerificationPipelineError::Policy(violation)
+        } else {
+            SignatureVerificationPipelineError::Canonicalization(error)
+        }
+    })?;
+    operation
+        .budgets()
+        .transforms
+        .charge_c14n_output(canonical_signed_info.len())
+        .map_err(ReferenceProcessingError::Transform)?;
+    operation
+        .budgets()
+        .canonicalized
+        .charge(canonical_signed_info.len())?;
+    Ok::<_, SignatureVerificationPipelineError>(canonical_signed_info)
+}
+
+fn process_signed_info_references<C: VerificationCapture>(
     operation: &mut OperationExecutionContext<
         &crate::policy::VerificationPolicy,
         &VerificationOperationBudgets,
     >,
-    resolver: &UriReferenceResolver<'a>,
-    signature_node: Node<'a, 'a>,
-    capture: &C,
-) -> Result<VerifyResult, DsigError> {
-    if ctx.policy.resources.max_signatures == 0 {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::VERIFICATION_SIGNATURES,
-            maximum: 0,
-            actual: 1,
-        }
-        .into());
-    }
-    let doc = view.document();
-    let signature_children = parse_signature_children(signature_node)?;
-    ctx.policy
-        .signature_constraints
-        .check(signature_node, &operation.budgets().transforms)?;
-    if ctx.decapsulation_key.is_some() {
-        // Public-key encapsulation establishes a recipient secret, not sender
-        // identity. Reject an impossible trust requirement before key work.
-        if ctx.policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly {
-            return Err(crate::policy::PolicyViolation::KeyTrust {
-                reason: "KEM/HMAC does not authenticate sender identity",
-            }
-            .into());
-        }
-    }
-    let signed_info_node = signature_children.signed_info_node;
-    let should_parse_key_info = ctx.decapsulation_key.is_none()
-        && match (key, ctx.key_resolver) {
-            (Some(_), _) => false,
-            (None, Some(resolver)) => resolver.consumes_document_key_info(),
-            (None, None) => true,
-        };
-    let mut key_info = if should_parse_key_info {
-        signature_children
-            .key_info_node
-            .map(|node| {
-                super::parse::validate_x509_digest_policy(node, &|algorithm| {
-                    ctx.policy.check_digest_algorithm(algorithm)
-                })?;
-                super::parse::parse_key_info_in_session(
-                    node,
-                    ctx.provider,
-                    operation.budgets().transforms.xml_base_resolution(),
-                    &ctx.policy.resources,
-                    None,
-                    ctx.policy
-                        .key_trust
-                        .certificate_signature_algorithms
-                        .as_ref(),
-                    &mut operation.budgets().key_info_parse.borrow_mut(),
-                )
-            })
-            .transpose()
-            .map_err(map_key_info_parse_error)?
-    } else {
-        None
-    };
-
-    let signed_info = parse_signed_info_with_xpath_budget(
-        signed_info_node,
-        &mut operation.budgets().xpath_parse.borrow_mut(),
-        &ctx.policy.resources,
-    )?;
-    capture.method(view, signed_info_node, signed_info.signature_method)?;
-    if signed_info.references.len() > ctx.policy.resources.max_references {
-        return Err(crate::policy::PolicyViolation::ResourceLimit {
-            resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
-            maximum: ctx.policy.resources.max_references,
-            actual: signed_info.references.len(),
-        }
-        .into());
-    }
-    for reference in &signed_info.references {
-        if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
-            return Err(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
-                maximum: ctx.policy.resources.max_transforms_per_reference,
-                actual: reference.transforms.len(),
-            }
-            .into());
-        }
-    }
-    ctx.policy
-        .check_signature_algorithm(signed_info.signature_method)?;
-    // Refuse an inadmissible authenticator before reference resolution/transforms.
-    // XMLDSig 1.1 section 4.4.2 explicitly requires max(80, hash_bits/2),
-    // independently of data; section 6.3.1 separately requires octet alignment.
-    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
-    if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
-        ctx.policy.hmac.validate_output(
-            signed_info.signature_method,
-            signed_info
-                .hmac_output_length_bits
-                .unwrap_or(full_output_bits),
-        )?;
-    }
-    for reference in &signed_info.references {
-        ctx.policy.check_digest_algorithm(reference.digest_method)?;
-        super::transforms::validate_relationship_chain(
-            &reference.transforms,
-            ctx.policy.transforms.opc_relationship_edition,
-        )
-        .map_err(ReferenceProcessingError::Transform)?;
-    }
-    enforce_reference_policies(
-        &signed_info.references,
-        ctx.policy.uris.references,
-        ctx.allowed_transform_uris(),
-    )?;
-    enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
-
-    if let Some(resources) = ctx.external_resources {
-        validate_external_resource_map(
-            resources,
-            ctx.policy.resources.max_external_resource_bytes,
-            ctx.policy.resources.max_external_resource_total_bytes,
-        )
-        .map_err(|error| match error {
-            ExternalResourceMapError::Policy(error) => error.into(),
-            ExternalResourceMapError::TotalLengthOverflow => {
-                SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "external resource total length overflow",
-                }
-            }
-        })?;
-    }
-    let remaining_reference_capacity = ctx
-        .policy
-        .resources
-        .max_references
-        .checked_sub(signed_info.references.len())
-        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "SignedInfo exceeds the per-signature Reference limit",
-        })?;
-    let plan_nodes = compile_verification_operation_plan(
-        operation,
-        view,
-        signature_node,
-        &signed_info.references,
-        resolver,
-    )?;
-    let signature_identity =
-        OperationResourceIdentity::DocumentNode(view.node_identity(signature_node));
-    operation.run_with_resource(plan_nodes.document, &signature_identity, || {
-        operation
-            .validate_document_view(view)
-            .map_err(map_verification_plan_error)
-    })?;
-    let observed_key_resources = operation.budgets().external_resource_set_identity(resolver);
-    let retrieval_materialization = operation.run_with_resource(
-        plan_nodes.key_materialization,
-        &observed_key_resources,
-        || {
-            let budgets = operation.budgets();
-            let mut materialization = budgets.key_info_materialization.borrow_mut();
-            materialization.collect_encapsulation = true;
-            materialization.encapsulation = None;
-            if let Some(node) = signature_children.key_info_node {
-                // A pinned key ignores lookup hints, not mechanism instructions.
-                // Apply the same bounded reference discovery before key work.
-                if ctx.decapsulation_key.is_some() {
-                    discover_encapsulation_with_budget(
-                        node,
-                        resolver,
-                        &ctx.policy.resources,
-                        &budgets.transforms,
-                        Some((&ctx.policy, ctx.xml_backend)),
-                        Some(&mut materialization),
-                    )?;
-                } else if !should_parse_key_info {
-                    if has_encapsulation_with_budget(
-                        node,
-                        resolver,
-                        &ctx.policy.resources,
-                        &budgets.transforms,
-                        Some((&ctx.policy, ctx.xml_backend)),
-                    )? {
-                        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-                            "mechanism and explicit recipient key must be supplied together",
-                        )
-                        .into());
-                    }
-                } else {
-                    materialization.observe_encapsulation(node, resolver, 0)?;
-                }
-            }
-            if let Some(info) = key_info.as_mut() {
-                let mut xpath_parse = budgets.xpath_parse.borrow_mut();
-                let mut retrieval_budgets = RetrievalMaterializationBudgets {
-                    key_info_parse: &budgets.key_info_parse,
-                    xpath_parse: &mut xpath_parse,
-                    execution: &budgets.transforms,
-                    resources: &ctx.policy.resources,
-                    certificate_signature_algorithms: ctx
-                        .policy
-                        .key_trust
-                        .certificate_signature_algorithms
-                        .as_ref(),
-                    xml_backend: ctx.xml_backend,
-                };
-                let mut outcome = materialize_key_info_references_with_budgets(
-                    info,
-                    resolver,
-                    &ctx.policy,
-                    ctx.provider,
-                    &mut retrieval_budgets,
-                    &mut materialization,
-                )?;
-                outcome.merge(materialize_retrieval_methods_with_budgets(
-                    info,
-                    resolver,
-                    &ctx.policy,
-                    ctx.provider,
-                    &mut retrieval_budgets,
-                    &mut materialization.candidate_work,
-                )?);
-                Ok::<_, SignatureVerificationPipelineError>(outcome)
-            } else {
-                Ok(RetrievalMaterialization::default())
-            }
-        },
-    )?;
-    let encapsulation = operation
-        .budgets()
-        .key_info_materialization
-        .borrow_mut()
-        .encapsulation
-        .take();
-    if encapsulation.is_some() != ctx.decapsulation_key.is_some() {
-        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-            "mechanism and explicit recipient key must be supplied together",
-        )
-        .into());
-    }
-    if let Some(mechanism) = &encapsulation {
-        ctx.policy
-            .key_establishment
-            .check_encapsulation(mechanism.algorithm)?;
-        if ctx
-            .decapsulation_key
-            .is_some_and(|key| key.algorithm() != mechanism.algorithm)
-        {
-            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-                "recipient parameter set mismatch",
-            )
-            .into());
-        }
-    }
-    let mut reference_results = Vec::with_capacity(signed_info.references.len());
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    verification: &ManifestVerification<'_, '_, C>,
+    signed_info_references: &[Reference],
+    digests: &[OperationNodeId],
+) -> Result<ReferencesResult, DsigError> {
+    let ctx = verification.context;
+    let capture = verification.capture;
+    let mut reference_results = Vec::with_capacity(signed_info_references.len());
     let mut first_failure = None;
-    for (index, (node, reference)) in plan_nodes
-        .digests
+    for (index, (node, reference)) in digests
         .iter()
         .copied()
-        .zip(&signed_info.references)
+        .zip(signed_info_references)
         .enumerate()
     {
         let observed = operation.budgets().resource_identity_for_reference(
@@ -2704,7 +2615,7 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             },
         );
         if result.status == DsigStatus::Valid
-            && let Some(reference) = signed_info.references.get(result.reference_index)
+            && let Some(reference) = signed_info_references.get(result.reference_index)
             && reference
                 .transforms
                 .iter()
@@ -2723,14 +2634,648 @@ fn verify_signature_node<'a, C: VerificationCapture>(
         }
     }
     debug_assert!(
-        plan_nodes.digests[reference_results.len()..]
+        digests[reference_results.len()..]
             .iter()
             .all(|node| !operation.is_executed(*node))
     );
-    let references = ReferencesResult {
+    Ok(ReferencesResult {
         results: reference_results,
         first_failure,
+    })
+}
+
+fn materialize_verification_hints(
+    key_info_node: Option<Node<'_, '_>>,
+    ctx: &VerifyContext<'_>,
+    budgets: &VerificationOperationBudgets<'_>,
+    resolver: &UriReferenceResolver<'_>,
+    should_parse_key_info: bool,
+    key_info: &mut Option<KeyInfo>,
+) -> Result<RetrievalMaterialization, DsigError> {
+    let mut materialization = budgets.key_info_materialization.borrow_mut();
+    materialization.collect_encapsulation = true;
+    materialization.encapsulation = None;
+    if let Some(node) = key_info_node {
+        // A pinned key ignores lookup hints, not mechanism instructions.
+        // Apply the same bounded reference discovery before key work.
+        if ctx.decapsulation_key.is_some() {
+            discover_encapsulation_with_budget(
+                node,
+                resolver,
+                &ctx.policy.resources,
+                &budgets.transforms,
+                Some((&ctx.policy, ctx.xml_backend)),
+                Some(&mut materialization),
+            )?;
+        } else if !should_parse_key_info {
+            if has_encapsulation_with_budget(
+                node,
+                resolver,
+                &ctx.policy.resources,
+                &budgets.transforms,
+                Some((&ctx.policy, ctx.xml_backend)),
+            )? {
+                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                    "mechanism and explicit recipient key must be supplied together",
+                )
+                .into());
+            }
+        } else {
+            materialization.observe_encapsulation(node, resolver, 0)?;
+        }
+    }
+    if let Some(info) = key_info.as_mut() {
+        let mut xpath_parse = budgets.xpath_parse.borrow_mut();
+        let mut retrieval_budgets = RetrievalMaterializationBudgets {
+            key_info_parse: &budgets.key_info_parse,
+            xpath_parse: &mut xpath_parse,
+            execution: &budgets.transforms,
+            resources: &ctx.policy.resources,
+            certificate_signature_algorithms: ctx
+                .policy
+                .key_trust
+                .certificate_signature_algorithms
+                .as_ref(),
+            xml_backend: ctx.xml_backend,
+        };
+        let mut outcome = materialize_key_info_references_with_budgets(
+            info,
+            resolver,
+            &ctx.policy,
+            ctx.provider,
+            &mut retrieval_budgets,
+            &mut materialization,
+        )?;
+        outcome.merge(materialize_retrieval_methods_with_budgets(
+            info,
+            resolver,
+            &ctx.policy,
+            ctx.provider,
+            &mut retrieval_budgets,
+            &mut materialization.candidate_work,
+        )?);
+        Ok::<_, SignatureVerificationPipelineError>(outcome)
+    } else {
+        Ok(RetrievalMaterialization::default())
+    }
+}
+
+fn validate_verification_inputs(
+    signed_info: &super::parse::SignedInfo,
+    ctx: &VerifyContext<'_>,
+) -> Result<(), DsigError> {
+    if signed_info.references.len() > ctx.policy.resources.max_references {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::SIGNATURE_REFERENCES,
+            maximum: ctx.policy.resources.max_references,
+            actual: signed_info.references.len(),
+        }
+        .into());
+    }
+    for reference in &signed_info.references {
+        if reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+                maximum: ctx.policy.resources.max_transforms_per_reference,
+                actual: reference.transforms.len(),
+            }
+            .into());
+        }
+    }
+    ctx.policy
+        .check_signature_algorithm(signed_info.signature_method)?;
+    // Refuse an inadmissible authenticator before reference resolution/transforms.
+    // XMLDSig 1.1 section 4.4.2 explicitly requires max(80, hash_bits/2),
+    // independently of data; section 6.3.1 separately requires octet alignment.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-SignatureMethod
+    if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
+        ctx.policy.hmac.validate_output(
+            signed_info.signature_method,
+            signed_info
+                .hmac_output_length_bits
+                .unwrap_or(full_output_bits),
+        )?;
+    }
+    for reference in &signed_info.references {
+        ctx.policy.check_digest_algorithm(reference.digest_method)?;
+        super::transforms::validate_relationship_chain(
+            &reference.transforms,
+            ctx.policy.transforms.opc_relationship_edition,
+        )
+        .map_err(ReferenceProcessingError::Transform)?;
+    }
+    enforce_reference_policies(
+        &signed_info.references,
+        ctx.policy.uris.references,
+        ctx.allowed_transform_uris(),
+    )?;
+    enforce_transform_allowed(ctx.allowed_transform_uris(), signed_info.c14n_method.uri())?;
+    if let Some(resources) = ctx.external_resources {
+        validate_external_resource_map(
+            resources,
+            ctx.policy.resources.max_external_resource_bytes,
+            ctx.policy.resources.max_external_resource_total_bytes,
+        )
+        .map_err(|error| match error {
+            ExternalResourceMapError::Policy(error) => error.into(),
+            ExternalResourceMapError::TotalLengthOverflow => {
+                SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "external resource total length overflow",
+                }
+            }
+        })?;
+    }
+    Ok(())
+}
+
+struct PreparedVerificationSignature<'a> {
+    children: SignatureChildNodes<'a, 'a>,
+    signed_info: super::parse::SignedInfo,
+    key_info: Option<KeyInfo>,
+    should_parse_key_info: bool,
+    remaining_reference_capacity: usize,
+}
+
+fn prepare_verification_signature<'a, C: VerificationCapture>(
+    view: DocumentView<'a>,
+    signature_node: Node<'a, 'a>,
+    key: Option<&dyn VerifyingKey>,
+    verification: &ManifestVerification<'_, '_, C>,
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+) -> Result<PreparedVerificationSignature<'a>, DsigError> {
+    let ctx = verification.context;
+    let capture = verification.capture;
+    if ctx.policy.resources.max_signatures == 0 {
+        return Err(crate::policy::PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::VERIFICATION_SIGNATURES,
+            maximum: 0,
+            actual: 1,
+        }
+        .into());
+    }
+    let signature_children = parse_signature_children(signature_node)?;
+    ctx.policy
+        .signature_constraints
+        .check(signature_node, &operation.budgets().transforms)?;
+    if ctx.decapsulation_key.is_some() {
+        // Public-key encapsulation establishes a recipient secret, not sender
+        // identity. Reject an impossible trust requirement before key work.
+        if ctx.policy.key_trust.mode != crate::policy::VerificationTrustMode::CryptographicOnly {
+            return Err(crate::policy::PolicyViolation::KeyTrust {
+                reason: "KEM/HMAC does not authenticate sender identity",
+            }
+            .into());
+        }
+    }
+    let signed_info_node = signature_children.signed_info;
+    let should_parse_key_info = ctx.decapsulation_key.is_none()
+        && match (key, ctx.key_resolver) {
+            (Some(_), _) => false,
+            (None, Some(resolver)) => resolver.consumes_document_key_info(),
+            (None, None) => true,
+        };
+    let key_info = if should_parse_key_info {
+        signature_children
+            .key_info
+            .map(|node| {
+                super::parse::validate_x509_digest_policy(node, &|algorithm| {
+                    ctx.policy.check_digest_algorithm(algorithm)
+                })?;
+                super::parse::parse_key_info_in_session(
+                    node,
+                    ctx.provider,
+                    operation.budgets().transforms.xml_base_resolution(),
+                    &ctx.policy.resources,
+                    None,
+                    ctx.policy
+                        .key_trust
+                        .certificate_signature_algorithms
+                        .as_ref(),
+                    &mut operation.budgets().key_info_parse.borrow_mut(),
+                )
+            })
+            .transpose()
+            .map_err(map_key_info_parse_error)?
+    } else {
+        None
     };
+
+    let signed_info = parse_signed_info_with_xpath_budget(
+        signed_info_node,
+        &mut operation.budgets().xpath_parse.borrow_mut(),
+        &ctx.policy.resources,
+    )?;
+    capture.method(view, signed_info_node, signed_info.signature_method)?;
+    validate_verification_inputs(&signed_info, ctx)?;
+    let remaining_reference_capacity = ctx
+        .policy
+        .resources
+        .max_references
+        .checked_sub(signed_info.references.len())
+        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "SignedInfo exceeds the per-signature Reference limit",
+        })?;
+    Ok(PreparedVerificationSignature {
+        children: signature_children,
+        signed_info,
+        key_info,
+        should_parse_key_info,
+        remaining_reference_capacity,
+    })
+}
+
+fn check_verification_encapsulation(
+    encapsulation: Option<&ResolvedEncapsulation>,
+    ctx: &VerifyContext<'_>,
+) -> Result<(), DsigError> {
+    if encapsulation.is_some() != ctx.decapsulation_key.is_some() {
+        return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+            "mechanism and explicit recipient key must be supplied together",
+        )
+        .into());
+    }
+    if let Some(mechanism) = encapsulation {
+        ctx.policy
+            .key_establishment
+            .check_encapsulation(mechanism.algorithm)?;
+        if ctx
+            .decapsulation_key
+            .is_some_and(|key| key.algorithm() != mechanism.algorithm)
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "recipient parameter set mismatch",
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+struct VerificationCompletion<'a> {
+    signature_value_node: Node<'a, 'a>,
+    signed_info: super::parse::SignedInfo,
+    key_info: Option<KeyInfo>,
+    plan_nodes: VerificationPlanNodes,
+    encapsulation: Option<ResolvedEncapsulation>,
+    retrieval_materialization: RetrievalMaterialization,
+    references: ReferencesResult,
+    canonical_signed_info: Vec<u8>,
+    remaining_reference_capacity: usize,
+}
+
+fn resolve_operation_verification_key<'k>(
+    ctx: &VerifyContext<'k>,
+    key: Option<&'k dyn VerifyingKey>,
+    key_info: Option<&KeyInfo>,
+    algorithm: SignatureAlgorithm,
+    encapsulation: Option<&ResolvedEncapsulation>,
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+) -> Result<Option<ResolvedVerifyingKey<'k>>, DsigError> {
+    if let Some(recipient) = ctx.decapsulation_key {
+        if key.is_some() || ctx.key_resolver.is_some() {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "ambiguous verification key request",
+            )
+            .into());
+        }
+        require_verifying_key_candidate_capacity(&ctx.policy)?;
+        if !ctx
+            .policy
+            .key_sources
+            .contains(crate::policy::KeySourceKind::PresetKey)
+            || algorithm.hmac_output_bits().is_none()
+        {
+            return Err(crate::key_establishment::KeyEstablishmentError::Structure(
+                "encapsulation requires permitted explicit key and HMAC",
+            )
+            .into());
+        }
+        ctx.policy.hmac.validate_key_bits(256)?;
+        let mechanism = encapsulation.ok_or(
+            crate::key_establishment::KeyEstablishmentError::Structure("missing mechanism"),
+        )?;
+        operation.budgets().key_candidates.borrow_mut().charge()?;
+        operation
+            .budgets()
+            .key_establishment
+            .borrow_mut()
+            .commit_all(&ctx.policy.key_establishment, 0, 0, 32)?;
+        let secret = operation
+            .budgets()
+            .key_establishment
+            .borrow_mut()
+            .decapsulate(
+                &ctx.policy.key_establishment,
+                ctx.provider,
+                recipient,
+                mechanism.algorithm,
+                &mechanism.ciphertext[..mechanism.algorithm.ciphertext_len()],
+            )?;
+        let hmac = super::HmacVerificationKey::new(secret.to_vec())?;
+        return Ok(Some(ResolvedVerifyingKey::Established(hmac)));
+    }
+    resolve_verifying_key(
+        ctx,
+        key,
+        key_info,
+        algorithm,
+        &mut operation.budgets().key_candidates.borrow_mut(),
+    )
+}
+
+fn verify_operation_authenticator<C: VerificationCapture>(
+    verifier: &dyn VerifyingKey,
+    ctx: &VerifyContext<'_>,
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    capture: &C,
+    input: crate::provider::SignatureVerificationInput<'_>,
+) -> Result<bool, DsigError> {
+    // A handle on the operation's certificate account: key reads below share
+    // its allowance and usage without holding the candidate budget borrowed.
+    let certificates = operation
+        .budgets()
+        .key_candidates
+        .borrow()
+        .certificates()
+        .share();
+    let scope = VerificationScope::new(&ctx.policy, &certificates);
+    verifier.validate_policy(&scope)?;
+    if !verifier.validate_signature_value_with_policy(&scope, input.algorithm, input.signature)? {
+        return Ok::<_, SignatureVerificationPipelineError>(false);
+    }
+    ctx.provider
+        .require_capability(crate::provider::ProviderCapability::Verify(input.algorithm))?;
+    let candidate_refusal = RefCell::new(None);
+    let policy_verifier = PolicyVerifyingKey {
+        key: verifier,
+        scope,
+        candidates: &operation.budgets().key_candidates,
+        candidate_refusal: &candidate_refusal,
+    };
+    #[cfg(feature = "aws-lc-fips")]
+    let input = input.with_certificates(&certificates);
+    let result = capture.verify(ctx.provider, &policy_verifier, input);
+    if let Some(error) = candidate_refusal.into_inner() {
+        return Err(error.into());
+    }
+    result
+}
+
+fn finish_authenticated_verification<C: VerificationCapture>(
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    verification: &ManifestVerification<'_, '_, C>,
+    resolved_key: &ResolvedVerifyingKey<'_>,
+    completion: VerificationCompletion<'_>,
+) -> Result<VerifyResult, DsigError> {
+    let ctx = verification.context;
+    let capture = verification.capture;
+    operation.set_outcome(
+        completion.plan_nodes.crypto,
+        true,
+        OperationDecisionReason::SignatureVerified,
+    );
+    // Manifest syntax and references are authenticated content. Delay parsing
+    // until SignatureValue succeeds, then extend the same operation graph with
+    // the newly trusted dependency subgraph and its evidence node.
+    let (manifest_references, manifest_digests) =
+        if ctx.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
+            process_authenticated_manifest_references(
+                operation,
+                view,
+                signature_node,
+                resolver,
+                &ManifestVerification {
+                    context: ctx,
+                    capture,
+                },
+                completion.remaining_reference_capacity,
+                completion.plan_nodes.crypto,
+            )?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+    operation.extend();
+    let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
+    operation
+        .add_dependency(evidence, completion.plan_nodes.crypto)
+        .map_err(map_verification_plan_error)?;
+    for digest in manifest_digests {
+        operation
+            .add_dependency(evidence, digest)
+            .map_err(map_verification_plan_error)?;
+    }
+    operation.compile().map_err(map_verification_plan_error)?;
+    operation.run(evidence, || {
+        Ok::<_, SignatureVerificationPipelineError>(VerifyResult {
+            key_trust: resolved_key.evidence(&ctx.policy)?,
+            status: DsigStatus::Valid,
+            signed_info_references: completion.references.results,
+            manifest_references,
+            canonicalized_signed_info: if ctx.store_pre_digest {
+                Some(completion.canonical_signed_info)
+            } else {
+                None
+            },
+        })
+    })
+}
+
+fn verify_signature_authenticator<C: VerificationCapture>(
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    verification: &ManifestVerification<'_, '_, C>,
+    key: Option<&dyn VerifyingKey>,
+    completion: VerificationCompletion<'_>,
+) -> Result<VerifyResult, DsigError> {
+    let ctx = verification.context;
+    let signature_value = decode_signature_value(
+        completion.signature_value_node,
+        completion.signed_info.signature_method,
+        &ctx.policy.resources,
+    )?;
+    if let Some(full_output_bits) = completion.signed_info.signature_method.hmac_output_bits() {
+        let expected_bits = completion
+            .signed_info
+            .hmac_output_length_bits
+            .unwrap_or(full_output_bits);
+        if signature_value.len() != expected_bits / 8 {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue length does not match HMACOutputLength",
+            });
+        }
+    }
+    let resolved_key = operation.run(completion.plan_nodes.key, || {
+        resolve_operation_verification_key(
+            ctx,
+            key,
+            completion.key_info.as_ref(),
+            completion.signed_info.signature_method,
+            completion.encapsulation.as_ref(),
+            operation,
+        )
+    })?;
+    let Some(resolved_key) = resolved_key else {
+        operation.set_outcome(
+            completion.plan_nodes.key,
+            false,
+            OperationDecisionReason::KeyUnavailable,
+        );
+        if let Some(error) = completion.retrieval_materialization.deferred_error {
+            return Err(error);
+        }
+        return Ok(VerifyResult {
+            key_trust: super::KeyTrustEvidence::NotEvaluated,
+            status: DsigStatus::Invalid(FailureReason::KeyNotFound),
+            signed_info_references: completion.references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info: if ctx.store_pre_digest {
+                Some(completion.canonical_signed_info)
+            } else {
+                None
+            },
+        });
+    };
+    operation.set_outcome(
+        completion.plan_nodes.key,
+        true,
+        OperationDecisionReason::KeyResolved,
+    );
+    let verifier = resolved_key.as_ref();
+    let signature_valid = operation.run(completion.plan_nodes.crypto, || {
+        verify_operation_authenticator(
+            verifier,
+            ctx,
+            operation,
+            verification.capture,
+            crate::provider::SignatureVerificationInput::new(
+                completion.signed_info.signature_method,
+                &completion.signed_info.signature_context,
+                &completion.canonical_signed_info,
+                &signature_value,
+            ),
+        )
+    })?;
+    if !signature_valid {
+        operation.set_outcome(
+            completion.plan_nodes.crypto,
+            false,
+            OperationDecisionReason::SignatureRejected,
+        );
+        return Ok(VerifyResult {
+            key_trust: resolved_key.evidence(&ctx.policy)?,
+            status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
+            signed_info_references: completion.references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info: if ctx.store_pre_digest {
+                Some(completion.canonical_signed_info)
+            } else {
+                None
+            },
+        });
+    }
+    finish_authenticated_verification(
+        operation,
+        view,
+        signature_node,
+        resolver,
+        verification,
+        &resolved_key,
+        completion,
+    )
+}
+
+fn verify_signature_node<'a, C: VerificationCapture>(
+    view: DocumentView<'a>,
+    ctx: &VerifyContext<'_>,
+    key: Option<&dyn VerifyingKey>,
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    resolver: &UriReferenceResolver<'a>,
+    signature_node: Node<'a, 'a>,
+    capture: &C,
+) -> Result<VerifyResult, DsigError> {
+    let verification = ManifestVerification {
+        context: ctx,
+        capture,
+    };
+    let PreparedVerificationSignature {
+        children: signature_children,
+        signed_info,
+        mut key_info,
+        should_parse_key_info,
+        remaining_reference_capacity,
+    } = prepare_verification_signature(view, signature_node, key, &verification, operation)?;
+    let signed_info_node = signature_children.signed_info;
+    let plan_nodes = compile_verification_operation_plan(
+        operation,
+        view,
+        signature_node,
+        &signed_info.references,
+        resolver,
+    )?;
+    let signature_identity =
+        OperationResourceIdentity::DocumentNode(view.node_identity(signature_node));
+    operation.run_with_resource(plan_nodes.document, &signature_identity, || {
+        operation
+            .validate_document_view(view)
+            .map_err(map_verification_plan_error)
+    })?;
+    let observed_key_resources = operation.budgets().external_resource_set_identity(resolver);
+    let retrieval_materialization = operation.run_with_resource(
+        plan_nodes.key_materialization,
+        &observed_key_resources,
+        || {
+            materialize_verification_hints(
+                signature_children.key_info,
+                ctx,
+                operation.budgets(),
+                resolver,
+                should_parse_key_info,
+                &mut key_info,
+            )
+        },
+    )?;
+    let encapsulation = operation
+        .budgets()
+        .key_info_materialization
+        .borrow_mut()
+        .encapsulation
+        .take();
+    check_verification_encapsulation(encapsulation.as_ref(), ctx)?;
+    let references = process_signed_info_references(
+        operation,
+        view,
+        signature_node,
+        resolver,
+        &ManifestVerification {
+            context: ctx,
+            capture,
+        },
+        &signed_info.references,
+        &plan_nodes.digests,
+    )?;
 
     if let Some(first_failure) = references.first_failure {
         debug_assert!(operation.first_failure().is_some());
@@ -2745,242 +3290,33 @@ fn verify_signature_node<'a, C: VerificationCapture>(
     }
 
     let canonical_signed_info = operation.run(plan_nodes.canonicalization, || {
-        let signed_info_subtree: HashSet<_> = signed_info_node
-            .descendants()
-            .map(|node: Node<'_, '_>| node.id())
-            .collect();
-        let mut canonical_signed_info = Vec::new();
-        let signed_info_limit = operation
-            .budgets()
-            .canonicalized
-            .remaining()
-            .min(operation.budgets().transforms.remaining_c14n_output());
-        canonicalize_bounded_with_xml_base_budget(
-            doc,
-            Some(&|node| signed_info_subtree.contains(&node.id())),
-            &signed_info.c14n_method,
-            signed_info_limit,
-            operation.budgets().transforms.xml_base_resolution(),
-            &mut canonical_signed_info,
-        )
-        .map_err(|error| {
-            if let Some(violation) = map_c14n_resource_policy_violation(
-                &error,
-                crate::policy::resource_name::CANONICALIZED_BYTES,
-                operation.budgets().canonicalized.max_bytes,
-            ) {
-                SignatureVerificationPipelineError::Policy(violation)
-            } else {
-                SignatureVerificationPipelineError::Canonicalization(error)
-            }
-        })?;
-        operation
-            .budgets()
-            .transforms
-            .charge_c14n_output(canonical_signed_info.len())
-            .map_err(ReferenceProcessingError::Transform)?;
-        operation
-            .budgets()
-            .canonicalized
-            .charge(canonical_signed_info.len())?;
-        Ok::<_, SignatureVerificationPipelineError>(canonical_signed_info)
+        canonicalize_verification_signed_info(signed_info_node, &signed_info.c14n_method, operation)
     })?;
 
-    let signature_value = decode_signature_value(
-        signature_children.signature_value_node,
-        signed_info.signature_method,
-        &ctx.policy.resources,
-    )?;
-    if let Some(full_output_bits) = signed_info.signature_method.hmac_output_bits() {
-        let expected_bits = signed_info
-            .hmac_output_length_bits
-            .unwrap_or(full_output_bits);
-        if signature_value.len() != expected_bits / 8 {
-            return Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue length does not match HMACOutputLength",
-            });
-        }
-    }
-    let resolved_key = operation.run(plan_nodes.key, || {
-        if let Some(recipient) = ctx.decapsulation_key {
-            if key.is_some() || ctx.key_resolver.is_some() {
-                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-                    "ambiguous verification key request",
-                )
-                .into());
-            }
-            require_verifying_key_candidate_capacity(&ctx.policy)?;
-            if !ctx.policy.key_sources.preset_key
-                || signed_info.signature_method.hmac_output_bits().is_none()
-            {
-                return Err(crate::key_establishment::KeyEstablishmentError::Structure(
-                    "encapsulation requires permitted explicit key and HMAC",
-                )
-                .into());
-            }
-            ctx.policy.hmac.validate_key_bits(256)?;
-            let mechanism = encapsulation.as_ref().ok_or(
-                crate::key_establishment::KeyEstablishmentError::Structure("missing mechanism"),
-            )?;
-            operation.budgets().key_candidates.borrow_mut().charge()?;
-            operation
-                .budgets()
-                .key_establishment
-                .borrow_mut()
-                .commit_all(&ctx.policy.key_establishment, 0, 0, 32)?;
-            let secret = operation
-                .budgets()
-                .key_establishment
-                .borrow_mut()
-                .decapsulate(
-                    &ctx.policy.key_establishment,
-                    ctx.provider,
-                    recipient,
-                    mechanism.algorithm,
-                    &mechanism.ciphertext[..mechanism.algorithm.ciphertext_len()],
-                )?;
-            let hmac = super::HmacVerificationKey::new(secret.to_vec())?;
-            return Ok(Some(ResolvedVerifyingKey::Established(hmac)));
-        }
-        resolve_verifying_key(
-            ctx,
-            key,
-            key_info.as_ref(),
-            signed_info.signature_method,
-            &mut operation.budgets().key_candidates.borrow_mut(),
-        )
-    })?;
-    let Some(resolved_key) = resolved_key else {
-        operation.set_outcome(
-            plan_nodes.key,
-            false,
-            OperationDecisionReason::KeyUnavailable,
-        );
-        if let Some(error) = retrieval_materialization.deferred_error {
-            return Err(error);
-        }
-        return Ok(VerifyResult {
-            key_trust: super::KeyTrustEvidence::NotEvaluated,
-            status: DsigStatus::Invalid(FailureReason::KeyNotFound),
-            signed_info_references: references.results,
-            manifest_references: Vec::new(),
-            canonicalized_signed_info: if ctx.store_pre_digest {
-                Some(canonical_signed_info)
-            } else {
-                None
-            },
-        });
-    };
-    operation.set_outcome(plan_nodes.key, true, OperationDecisionReason::KeyResolved);
-    let verifier = resolved_key.as_ref();
-    let signature_valid = operation.run(plan_nodes.crypto, || {
-        verifier.validate_policy(&ctx.policy)?;
-        if !verifier.validate_signature_value_with_policy(
-            &ctx.policy,
-            signed_info.signature_method,
-            &signature_value,
-        )? {
-            return Ok::<_, SignatureVerificationPipelineError>(false);
-        }
-        ctx.provider
-            .require_capability(crate::provider::ProviderCapability::Verify(
-                signed_info.signature_method,
-            ))?;
-        let candidate_refusal = RefCell::new(None);
-        let policy_verifier = PolicyVerifyingKey {
-            key: verifier,
-            policy: &ctx.policy,
-            candidates: &operation.budgets().key_candidates,
-            candidate_refusal: &candidate_refusal,
-        };
-        let result = capture.verify(
-            ctx.provider,
-            &policy_verifier,
-            crate::provider::SignatureVerificationInput {
-                algorithm: signed_info.signature_method,
-                context: &signed_info.signature_context,
-                data: &canonical_signed_info,
-                signature: &signature_value,
-            },
-        );
-        if let Some(error) = candidate_refusal.into_inner() {
-            return Err(error.into());
-        }
-        result
-    })?;
-
-    if !signature_valid {
-        operation.set_outcome(
-            plan_nodes.crypto,
-            false,
-            OperationDecisionReason::SignatureRejected,
-        );
-        return Ok(VerifyResult {
-            key_trust: resolved_key.evidence(&ctx.policy)?,
-            status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
-            signed_info_references: references.results,
-            manifest_references: Vec::new(),
-            canonicalized_signed_info: if ctx.store_pre_digest {
-                Some(canonical_signed_info)
-            } else {
-                None
-            },
-        });
-    }
-    operation.set_outcome(
-        plan_nodes.crypto,
-        true,
-        OperationDecisionReason::SignatureVerified,
-    );
-    // Manifest syntax and references are authenticated content. Delay parsing
-    // until SignatureValue succeeds, then extend the same operation graph with
-    // the newly trusted dependency subgraph and its evidence node.
-    let (manifest_references, manifest_digests) =
-        if ctx.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
-            process_authenticated_manifest_references(
-                operation,
-                view,
-                signature_node,
-                resolver,
-                ManifestVerification {
-                    context: ctx,
-                    capture,
-                },
-                remaining_reference_capacity,
-                plan_nodes.crypto,
-            )?
-        } else {
-            (Vec::new(), Vec::new())
-        };
-    operation.extend();
-    let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
-    operation
-        .add_dependency(evidence, plan_nodes.crypto)
-        .map_err(map_verification_plan_error)?;
-    for digest in manifest_digests {
-        operation
-            .add_dependency(evidence, digest)
-            .map_err(map_verification_plan_error)?;
-    }
-    operation.compile().map_err(map_verification_plan_error)?;
-    operation.run(evidence, || {
-        Ok::<_, SignatureVerificationPipelineError>(VerifyResult {
-            key_trust: resolved_key.evidence(&ctx.policy)?,
-            status: DsigStatus::Valid,
-            signed_info_references: references.results,
-            manifest_references,
-            canonicalized_signed_info: if ctx.store_pre_digest {
-                Some(canonical_signed_info)
-            } else {
-                None
-            },
-        })
-    })
+    verify_signature_authenticator(
+        operation,
+        view,
+        signature_node,
+        resolver,
+        &verification,
+        key,
+        VerificationCompletion {
+            signature_value_node: signature_children.signature_value,
+            signed_info,
+            key_info,
+            plan_nodes,
+            encapsulation,
+            retrieval_materialization,
+            references,
+            canonical_signed_info,
+            remaining_reference_capacity,
+        },
+    )
 }
 
 struct PolicyVerifyingKey<'a, 'inputs> {
     key: &'a dyn VerifyingKey,
-    policy: &'a crate::policy::VerificationPolicy,
+    scope: VerificationScope<'a>,
     candidates: &'a RefCell<super::InspectedKeyCandidateBudget<'inputs>>,
     candidate_refusal: &'a RefCell<Option<crate::policy::PolicyViolation>>,
 }
@@ -3006,10 +3342,10 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
                 *self.candidate_refusal.borrow_mut() = Some(error.clone());
                 return Err(error.into());
             }
-            key.validate_policy(self.policy)?;
+            key.validate_policy(&self.scope)?;
             verify(&PolicyVerifyingKey {
                 key,
-                policy: self.policy,
+                scope: self.scope,
                 candidates: self.candidates,
                 candidate_refusal: self.candidate_refusal,
             })
@@ -3020,7 +3356,7 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
     }
 
     fn ecdsa_encoding(&self) -> crate::policy::EcdsaSignatureValueEncoding {
-        self.policy.ecdsa_signature_value_encoding
+        self.scope.policy().ecdsa_signature_value_encoding
     }
     fn verify_with_context(
         &self,
@@ -3029,15 +3365,11 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        if context.as_bytes().is_empty() {
-            self.verify(algorithm, data, signature)
-        } else {
-            self.key
-                .verify_with_context(algorithm, context, data, signature)
-        }
+        self.key
+            .verify_with_policy(&self.scope, algorithm, context, data, signature)
     }
-    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
-        self.key.validate_policy(policy)
+    fn validate_policy(&self, scope: &VerificationScope<'_>) -> Result<(), DsigError> {
+        self.key.validate_policy(scope)
     }
 
     fn validate_signature_value(
@@ -3046,7 +3378,7 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
         self.key
-            .validate_signature_value_with_policy(self.policy, algorithm, signature_value)
+            .validate_signature_value_with_policy(&self.scope, algorithm, signature_value)
     }
 
     fn verify(
@@ -3055,8 +3387,12 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        self.key
-            .verify_with_policy(self.policy, algorithm, signed_data, signature_value)
+        self.verify_with_context(
+            algorithm,
+            &super::SignatureContext::default(),
+            signed_data,
+            signature_value,
+        )
     }
 }
 
@@ -3241,7 +3577,8 @@ impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
     }
 
     fn key_info_reference_source_enabled(&self) -> bool {
-        self.key_sources.key_info_reference
+        self.key_sources
+            .contains(crate::policy::KeySourceKind::KeyInfoReference)
     }
 
     fn allowed_transforms(&self) -> Option<&HashSet<String>> {
@@ -3263,247 +3600,255 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
     budgets: &mut RetrievalMaterializationBudgets<'_>,
     materialization: &mut KeyInfoMaterializationState,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
-    fn visit<P: KeyInfoReferencePolicy>(
-        key_info: &mut KeyInfo,
-        resolver: &UriReferenceResolver<'_>,
-        context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
-        materialization: &mut KeyInfoMaterializationState,
-        depth: usize,
-    ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
-        let mut materialized = Vec::new();
-        let mut outcome = RetrievalMaterialization::default();
-        for source in std::mem::take(&mut key_info.sources) {
-            let source_work = match &source {
-                super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
-                _ => 1,
-            };
-            materialization.candidate_work =
-                materialization.candidate_work.saturating_add(source_work);
-            context
-                .policy
-                .resources()
-                .validate_key_candidates(materialization.candidate_work)?;
-
-            let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
-                materialized.push(source);
-                continue;
-            };
-            if !context.policy.key_info_reference_source_enabled() {
-                return Err(crate::policy::PolicyViolation::KeyTrust {
-                    reason: "KeyInfoReference key sources are disabled",
-                }
-                .into());
-            }
-            if !context.policy.key_info_reference_uris().allows(&uri) {
-                return Err(crate::policy::PolicyViolation::Uri {
-                    operation: "KeyInfoReference",
-                    reason: "URI class is disabled",
-                }
-                .into());
-            }
-            let next_depth = depth.saturating_add(1);
-            context
-                .policy
-                .resources()
-                .validate_key_info_reference_depth(next_depth)?;
-            let cycle_key = (resolver.traversal_document_identity(), uri.clone());
-            if !materialization.active.insert(cycle_key.clone()) {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "KeyInfoReference cycle detected",
-                });
-            }
-
-            let is_same_document = uri.is_empty() || uri.starts_with('#');
-            let (mut referenced, mut nested_outcome) = if is_same_document {
-                let node = resolver
-                    .node_for_same_document_reference(&uri)
-                    .map_err(|error| {
-                        SignatureVerificationPipelineError::from(
-                            ReferenceProcessingError::UriDereference(error),
-                        )
-                    })?
-                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "KeyInfoReference target is missing or ambiguous",
-                    })?;
-                if !node.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "KeyInfoReference target must be KeyInfo",
-                    });
-                }
-                materialization.observe_encapsulation(node, resolver, next_depth)?;
-                if let Some(mechanism) = &materialization.encapsulation {
-                    context
-                        .policy
-                        .key_establishment()
-                        .check_encapsulation(mechanism.algorithm)?;
-                }
-                super::parse::validate_x509_digest_policy(node, &|algorithm| {
-                    context.policy.check_digest_algorithm(algorithm)
-                })
-                .map_err(map_key_info_parse_error)?;
-                (
-                    super::parse::parse_key_info_in_session(
-                        node,
-                        context.provider,
-                        context.budgets.execution.xml_base_resolution(),
-                        context.policy.resources(),
-                        None,
-                        context.policy.certificate_signature_algorithms(),
-                        &mut context.budgets.key_info_parse.borrow_mut(),
-                    )
-                    .map_err(map_key_info_parse_error)?,
-                    RetrievalMaterialization::default(),
-                )
-            } else {
-                // The fragment selects a node inside the retrieved document; it
-                // is not part of either the caller-owned resource identity or
-                // the base URI used by references nested in that document.
-                let (resource_uri, fragment) = uri
-                    .split_once('#')
-                    .map_or((uri.as_str(), None), |(resource, fragment)| {
-                        (resource, (!fragment.is_empty()).then_some(fragment))
-                    });
-                let bytes = resolver
-                    .external_resource(resource_uri)
-                    .map_err(|error| {
-                        SignatureVerificationPipelineError::from(
-                            ReferenceProcessingError::UriDereference(error),
-                        )
-                    })?
-                    .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "KeyInfoReference external resource is unavailable",
-                    })?;
-                // External KeyInfo bytes share the operation's work allowance even if decoding
-                // fails before a document exists. Parsing the decoded text is a separate pass.
-                context
-                    .budgets
-                    .execution
-                    .xml_parse_work()
-                    .charge_policy(bytes.len())?;
-                let xml = crate::encoding::decode_xml_octets(
-                    bytes,
-                    context.policy.resources().max_xml_document_bytes,
-                )
-                .map_err(map_key_info_xml_decode_error)?;
-                let settings = DocumentParseSettings::from_policy(
-                    *context.policy.xml(),
-                    context.policy.resources(),
-                )
-                .with_backend(context.budgets.xml_backend);
-                let document = XmlDocument::parse_with_settings_and_budget(
-                    xml.into_owned(),
-                    settings,
-                    context.budgets.execution.xml_parse_work(),
-                )
-                .map_err(|error| map_document_parse_error(error, settings))?;
-                document.with_view(|view| {
-                    let external_resolver = resolver.for_external_document_view(view, resource_uri);
-                    let target = match fragment {
-                        Some(fragment) => external_resolver
-                            .node_for_same_document_reference(&format!("#{fragment}"))
-                            .map_err(|error| {
-                                SignatureVerificationPipelineError::from(
-                                    ReferenceProcessingError::UriDereference(error),
-                                )
-                            })?
-                            .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-                                reason: "KeyInfoReference external target is missing or ambiguous",
-                            })?,
-                        _ => view.document().root_element(),
-                    };
-                    if !target.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
-                        return Err(SignatureVerificationPipelineError::InvalidStructure {
-                            reason: "KeyInfoReference external target must be KeyInfo",
-                        });
-                    }
-                    materialization.observe_encapsulation(
-                        target,
-                        &external_resolver,
-                        next_depth,
-                    )?;
-                    if let Some(mechanism) = &materialization.encapsulation {
-                        context
-                            .policy
-                            .key_establishment()
-                            .check_encapsulation(mechanism.algorithm)?;
-                    }
-                    super::parse::validate_x509_digest_policy(target, &|algorithm| {
-                        context.policy.check_digest_algorithm(algorithm)
-                    })
-                    .map_err(map_key_info_parse_error)?;
-                    let mut referenced = super::parse::parse_key_info_in_session(
-                        target,
-                        context.provider,
-                        context.budgets.execution.xml_base_resolution(),
-                        context.policy.resources(),
-                        Some(resource_uri),
-                        context.policy.certificate_signature_algorithms(),
-                        &mut context.budgets.key_info_parse.borrow_mut(),
-                    )
-                    .map_err(map_key_info_parse_error)?;
-                    let mut nested_outcome = visit(
-                        &mut referenced,
-                        &external_resolver,
-                        context,
-                        materialization,
-                        next_depth,
-                    )?;
-                    nested_outcome.merge(materialize_retrieval_methods_with_budgets(
-                        &mut referenced,
-                        &external_resolver,
-                        context.policy,
-                        context.provider,
-                        context.budgets,
-                        &mut materialization.candidate_work,
-                    )?);
-                    // RetrievalMethod nodes are meaningful only in the document
-                    // whose resolver owns their same-document URI context.
-                    referenced.sources.retain(|source| {
-                        !matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. })
-                    });
-                    Ok((referenced, nested_outcome))
-                })?
-            };
-            if is_same_document {
-                nested_outcome.merge(visit(
-                    &mut referenced,
-                    resolver,
-                    context,
-                    materialization,
-                    next_depth,
-                )?);
-            }
-            outcome.merge(nested_outcome);
-            materialization.active.remove(&cycle_key);
-            materialized.extend(referenced.sources);
-        }
-        key_info.sources = materialized;
-        context
-            .policy
-            .resources()
-            .validate_key_candidates(key_info.embedded_candidate_count())?;
-        Ok(outcome)
-    }
-
     let mut context = KeyInfoReferenceMaterializationContext {
         policy,
         provider,
         budgets,
     };
     let depth = materialization.reference_depth_base;
-    visit(key_info, resolver, &mut context, materialization, depth)
+    materialize_key_info_visit(key_info, resolver, &mut context, materialization, depth)
+}
+
+fn parse_referenced_key_info<P: KeyInfoReferencePolicy>(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    materialization: &mut KeyInfoMaterializationState,
+    depth: usize,
+    document_base: Option<&str>,
+) -> Result<KeyInfo, SignatureVerificationPipelineError> {
+    materialization.observe_encapsulation(node, resolver, depth)?;
+    if let Some(mechanism) = &materialization.encapsulation {
+        context
+            .policy
+            .key_establishment()
+            .check_encapsulation(mechanism.algorithm)?;
+    }
+    super::parse::validate_x509_digest_policy(node, &|algorithm| {
+        context.policy.check_digest_algorithm(algorithm)
+    })
+    .map_err(map_key_info_parse_error)?;
+    super::parse::parse_key_info_in_session(
+        node,
+        context.provider,
+        context.budgets.execution.xml_base_resolution(),
+        context.policy.resources(),
+        document_base,
+        context.policy.certificate_signature_algorithms(),
+        &mut context.budgets.key_info_parse.borrow_mut(),
+    )
+    .map_err(map_key_info_parse_error)
+}
+
+fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
+    uri: &str,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    materialization: &mut KeyInfoMaterializationState,
+    next_depth: usize,
+) -> Result<(KeyInfo, RetrievalMaterialization), SignatureVerificationPipelineError> {
+    // The fragment selects a node inside the retrieved document; it
+    // is not part of either the caller-owned resource identity or
+    // the base URI used by references nested in that document.
+    let (resource_uri, fragment) = uri
+        .split_once('#')
+        .map_or((uri, None), |(resource, fragment)| {
+            (resource, (!fragment.is_empty()).then_some(fragment))
+        });
+    let bytes = resolver
+        .external_resource(resource_uri)
+        .map_err(|error| {
+            SignatureVerificationPipelineError::from(ReferenceProcessingError::UriDereference(
+                error,
+            ))
+        })?
+        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfoReference external resource is unavailable",
+        })?;
+    // External KeyInfo bytes share the operation's work allowance even if decoding
+    // fails before a document exists. Parsing the decoded text is a separate pass.
+    context
+        .budgets
+        .execution
+        .xml_parse_work()
+        .charge_policy(bytes.len())?;
+    let xml = crate::encoding::decode_xml_octets(
+        bytes,
+        context.policy.resources().max_xml_document_bytes,
+    )
+    .map_err(|error| map_key_info_xml_decode_error(&error))?;
+    let settings =
+        DocumentParseSettings::from_policy(*context.policy.xml(), context.policy.resources())
+            .with_backend(context.budgets.xml_backend);
+    let document = XmlDocument::parse_with_settings_and_budget(
+        xml.into_owned(),
+        settings,
+        context.budgets.execution.xml_parse_work(),
+    )
+    .map_err(|error| map_document_parse_error(error, settings))?;
+    document.with_view(|view| {
+        let external_resolver = resolver.for_external_document_view(view, resource_uri);
+        let target = match fragment {
+            Some(fragment) => external_resolver
+                .node_for_same_document_reference(&format!("#{fragment}"))
+                .map_err(|error| {
+                    SignatureVerificationPipelineError::from(
+                        ReferenceProcessingError::UriDereference(error),
+                    )
+                })?
+                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "KeyInfoReference external target is missing or ambiguous",
+                })?,
+            _ => view.document().root_element(),
+        };
+        if !target.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference external target must be KeyInfo",
+            });
+        }
+        let mut referenced = parse_referenced_key_info(
+            target,
+            &external_resolver,
+            context,
+            materialization,
+            next_depth,
+            Some(resource_uri),
+        )?;
+        let mut nested_outcome = materialize_key_info_visit(
+            &mut referenced,
+            &external_resolver,
+            context,
+            materialization,
+            next_depth,
+        )?;
+        nested_outcome.merge(materialize_retrieval_methods_with_budgets(
+            &mut referenced,
+            &external_resolver,
+            context.policy,
+            context.provider,
+            context.budgets,
+            &mut materialization.candidate_work,
+        )?);
+        // RetrievalMethod nodes are meaningful only in the document
+        // whose resolver owns their same-document URI context.
+        referenced.sources.retain(|source| {
+            !matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. })
+        });
+        Ok((referenced, nested_outcome))
+    })
+}
+
+fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
+    key_info: &mut KeyInfo,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    materialization: &mut KeyInfoMaterializationState,
+    depth: usize,
+) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
+    let mut materialized = Vec::new();
+    let mut outcome = RetrievalMaterialization::default();
+    for source in std::mem::take(&mut key_info.sources) {
+        let source_work = match &source {
+            super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
+            _ => 1,
+        };
+        materialization.candidate_work = materialization.candidate_work.saturating_add(source_work);
+        context
+            .policy
+            .resources()
+            .validate_key_candidates(materialization.candidate_work)?;
+
+        let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
+            materialized.push(source);
+            continue;
+        };
+        if !context.policy.key_info_reference_source_enabled() {
+            return Err(crate::policy::PolicyViolation::KeyTrust {
+                reason: "KeyInfoReference key sources are disabled",
+            }
+            .into());
+        }
+        if !context.policy.key_info_reference_uris().allows(&uri) {
+            return Err(crate::policy::PolicyViolation::Uri {
+                operation: "KeyInfoReference",
+                reason: "URI class is disabled",
+            }
+            .into());
+        }
+        let next_depth = depth.saturating_add(1);
+        context
+            .policy
+            .resources()
+            .validate_key_info_reference_depth(next_depth)?;
+        let cycle_key = (resolver.traversal_document_identity(), uri.clone());
+        if !materialization.active.insert(cycle_key.clone()) {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected",
+            });
+        }
+
+        let is_same_document = uri.is_empty() || uri.starts_with('#');
+        let (mut referenced, mut nested_outcome) = if is_same_document {
+            let node = resolver
+                .node_for_same_document_reference(&uri)
+                .map_err(|error| {
+                    SignatureVerificationPipelineError::from(
+                        ReferenceProcessingError::UriDereference(error),
+                    )
+                })?
+                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "KeyInfoReference target is missing or ambiguous",
+                })?;
+            if !node.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+                return Err(SignatureVerificationPipelineError::InvalidStructure {
+                    reason: "KeyInfoReference target must be KeyInfo",
+                });
+            }
+            (
+                parse_referenced_key_info(
+                    node,
+                    resolver,
+                    context,
+                    materialization,
+                    next_depth,
+                    None,
+                )?,
+                RetrievalMaterialization::default(),
+            )
+        } else {
+            materialize_external_key_info(&uri, resolver, context, materialization, next_depth)?
+        };
+        if is_same_document {
+            nested_outcome.merge(materialize_key_info_visit(
+                &mut referenced,
+                resolver,
+                context,
+                materialization,
+                next_depth,
+            )?);
+        }
+        outcome.merge(nested_outcome);
+        materialization.active.remove(&cycle_key);
+        materialized.extend(referenced.sources);
+    }
+    key_info.sources = materialized;
+    context
+        .policy
+        .resources()
+        .validate_key_candidates(key_info.embedded_candidate_count())?;
+    Ok(outcome)
 }
 
 fn map_key_info_xml_decode_error(
-    error: crate::encoding::XmlEncodingError,
+    error: &crate::encoding::XmlEncodingError,
 ) -> SignatureVerificationPipelineError {
     match error {
         crate::encoding::XmlEncodingError::DecodedLimit { maximum, actual } => {
             SignatureVerificationPipelineError::Policy(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_DOCUMENT,
-                    maximum,
-                    actual,
+                    maximum: *maximum,
+                    actual: *actual,
                 },
             )
         }
@@ -3524,8 +3869,12 @@ pub struct SignatureKeyInfoMetadata {
     pub(crate) cipher_value: Option<NodeId>,
 }
 
-/// Discover operation instructions in local KeyInfo references without consuming
+/// Discover operation instructions in local `KeyInfo` references without consuming
 /// unrelated key hints. A positive result requires full metadata validation.
+///
+/// # Errors
+/// Returns an error for invalid resource limits, mismatched document identity,
+/// or exhausted traversal, parsing, or reference-depth budgets.
 pub fn has_same_document_encapsulation(
     node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
@@ -3573,6 +3922,24 @@ fn has_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
     discover_encapsulation_with_budget(node, resolver, resources, execution, external, None)
 }
 
+struct ExternalProbePath<'a> {
+    uri: &'a str,
+    parent: Option<&'a ExternalProbePath<'a>>,
+}
+
+struct ProbeContext<'a, P> {
+    resources: &'a crate::policy::ResourcePolicy,
+    external: Option<(&'a P, crate::XmlBackend)>,
+    document_base: Option<&'a str>,
+    external_path: Option<&'a ExternalProbePath<'a>>,
+}
+
+struct DiscoveryState<'a> {
+    path: [Option<(usize, NodeId)>; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
+    work: usize,
+    materialization: Option<&'a mut KeyInfoMaterializationState>,
+}
+
 fn discover_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
     node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
@@ -3586,260 +3953,7 @@ fn discover_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
             reason: "KeyInfo and resolver belong to different documents",
         });
     }
-    struct ExternalProbePath<'a> {
-        uri: &'a str,
-        parent: Option<&'a ExternalProbePath<'a>>,
-    }
-    struct ProbeContext<'a, P> {
-        resources: &'a crate::policy::ResourcePolicy,
-        external: Option<(&'a P, crate::XmlBackend)>,
-        document_base: Option<&'a str>,
-        external_path: Option<&'a ExternalProbePath<'a>>,
-    }
-    struct DiscoveryState<'a> {
-        path: [Option<(usize, NodeId)>; crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING + 1],
-        work: usize,
-        materialization: Option<&'a mut KeyInfoMaterializationState>,
-    }
-    fn visit<P: KeyInfoReferencePolicy>(
-        node: Node<'_, '_>,
-        resolver: &UriReferenceResolver<'_>,
-        context: &ProbeContext<'_, P>,
-        state: &mut DiscoveryState<'_>,
-        depth: usize,
-        execution: &TransformExecutionBudget,
-    ) -> Result<bool, DsigError> {
-        let ProbeContext {
-            resources,
-            external,
-            document_base,
-            external_path,
-        } = *context;
-        resources.validate_key_info_reference_depth(depth)?;
-        if depth > crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING {
-            return Err(DsigError::InvalidStructure {
-                reason: "KeyInfoReference safety depth exceeded",
-            });
-        }
-        // Every document on the active stack remains alive for this traversal;
-        // arena identity distinguishes equal node IDs in different documents.
-        let identity = (std::ptr::from_ref(node.document()) as usize, node.id());
-        if state.path[..depth].contains(&Some(identity)) {
-            if state.materialization.is_some() {
-                return Err(DsigError::InvalidStructure {
-                    reason: "KeyInfoReference cycle detected",
-                });
-            }
-            return Ok(false);
-        }
-        state.path[depth] = Some(identity);
-        let mut found = false;
-        for child in node.children().filter(Node::is_element) {
-            let work = match state.materialization.as_deref_mut() {
-                Some(materialization) => &mut materialization.candidate_work,
-                None => &mut state.work,
-            };
-            *work += 1;
-            resources.validate_key_candidates(*work)?;
-            if child.has_tag_name((
-                crate::key_establishment::ENCAPSULATION_NS,
-                "EncapsulationMechanism",
-            )) {
-                if state.materialization.is_none() {
-                    return Ok(true);
-                }
-                if let Some(materialization) = state.materialization.as_deref_mut() {
-                    let mechanism = crate::key_establishment::parse_encapsulation(
-                        child,
-                        materialization.encapsulation_template,
-                    )
-                    .map_err(|_| DsigError::InvalidStructure {
-                        reason: "invalid encapsulation mechanism in resolved KeyInfo",
-                    })?;
-                    materialization.record_encapsulation(mechanism, resolver, depth)?;
-                    if let (Some(mechanism), Some((policy, _))) =
-                        (&materialization.encapsulation, external)
-                    {
-                        policy
-                            .key_establishment()
-                            .check_encapsulation(mechanism.algorithm)?;
-                    }
-                }
-                found = true;
-                continue;
-            }
-            if !child.has_tag_name(("http://www.w3.org/2009/xmldsig11#", "KeyInfoReference")) {
-                continue;
-            }
-            let Some(uri) = child.attribute("URI") else {
-                continue;
-            };
-            if uri.len() > super::parse::MAX_KEY_NAME_TEXT_LEN {
-                continue;
-            }
-            if state.materialization.is_some()
-                && let Some((policy, _)) = external
-                && !policy.key_info_reference_source_enabled()
-            {
-                return Err(crate::policy::PolicyViolation::KeyTrust {
-                    reason: "KeyInfoReference key sources are disabled",
-                }
-                .into());
-            }
-            if !uri.is_empty() && !uri.starts_with('#') {
-                let Some((policy, backend)) = external else {
-                    continue;
-                };
-                // XMLDSig 1.1 section 4.5.10 gives KeyInfoReference the same URI
-                // dereferencing behavior as Reference, including external XML.
-                // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
-                let resolved =
-                    crate::c14n::xml_base::resolve_uri_from_node_with_document_base_with_budget(
-                        child,
-                        uri,
-                        document_base,
-                        execution.xml_base_resolution(),
-                    )
-                    .map_err(|error| {
-                        ReferenceProcessingError::UriDereference(
-                            super::uri::map_xml_base_resolution_error(error),
-                        )
-                    })?;
-                if !policy.key_info_reference_uris().allows(&resolved) {
-                    if state.materialization.is_some() {
-                        return Err(crate::policy::PolicyViolation::Uri {
-                            operation: "KeyInfoReference",
-                            reason: "URI class is disabled",
-                        }
-                        .into());
-                    }
-                    continue;
-                }
-                // Resource identity, not a reparsed arena ID, detects external
-                // cycles. The active URI chain borrows stack frames, no clones.
-                let mut ancestor = external_path;
-                while let Some(entry) = ancestor {
-                    if entry.uri == resolved {
-                        break;
-                    }
-                    ancestor = entry.parent;
-                }
-                if ancestor.is_some() {
-                    if state.materialization.is_some() {
-                        return Err(DsigError::InvalidStructure {
-                            reason: "KeyInfoReference cycle detected",
-                        });
-                    }
-                    continue;
-                }
-                let external_entry = ExternalProbePath {
-                    uri: &resolved,
-                    parent: external_path,
-                };
-                let (resource, fragment) = resolved
-                    .split_once('#')
-                    .map_or((resolved.as_str(), None), |(resource, fragment)| {
-                        (resource, Some(fragment))
-                    });
-                resources.validate_key_info_reference_depth(depth + 1)?;
-                if depth == crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING {
-                    return Err(DsigError::InvalidStructure {
-                        reason: "KeyInfoReference safety depth exceeded",
-                    });
-                }
-                let bytes = match resolver.external_resource(resource) {
-                    Ok(Some(bytes)) => bytes,
-                    Err(TransformError::Policy(violation)) => {
-                        return Err(DsigError::Policy(violation));
-                    }
-                    _ => continue,
-                };
-                execution.xml_parse_work().charge_policy(bytes.len())?;
-                let xml =
-                    crate::encoding::decode_xml_octets(bytes, resources.max_xml_document_bytes)
-                        .map_err(map_key_info_xml_decode_error)?;
-                let settings = DocumentParseSettings::from_policy(*policy.xml(), resources)
-                    .with_backend(backend);
-                let document = XmlDocument::parse_with_settings_and_budget(
-                    xml.into_owned(),
-                    settings,
-                    execution.xml_parse_work(),
-                )
-                .map_err(|error| map_document_parse_error(error, settings))?;
-                let target_found = document.with_view(|view| {
-                    let external_resolver = resolver.for_external_document_view(view, resource);
-                    let target = match fragment {
-                        Some(fragment) if !fragment.is_empty() => external_resolver
-                            .node_for_same_document_reference_with_budget(
-                                &resolved[resource.len()..],
-                                Some(execution.node_set_materialization()),
-                            )
-                            .map_err(ReferenceProcessingError::UriDereference)?,
-                        _ => Some(view.document().root_element()),
-                    };
-                    let Some(target) = target else {
-                        return Ok(false);
-                    };
-                    if !target.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
-                        return Ok(false);
-                    }
-                    visit(
-                        target,
-                        &external_resolver,
-                        &ProbeContext {
-                            document_base: Some(resource),
-                            external_path: Some(&external_entry),
-                            resources,
-                            external,
-                        },
-                        state,
-                        depth + 1,
-                        execution,
-                    )
-                })?;
-                if target_found {
-                    if state.materialization.is_none() {
-                        return Ok(true);
-                    }
-                    found = true;
-                }
-                continue;
-            }
-            // Unconsumed key hints are not validity requirements. Mechanism
-            // discovery checks only reachable KeyInfo instructions, not key
-            // candidates that an explicitly supplied recipient never uses.
-            // The target type is defined by XMLDSig 1.1 section 4.5.10.
-            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
-            if state.materialization.is_some()
-                && let Some((policy, _)) = external
-                && !policy.key_info_reference_uris().allows(uri)
-            {
-                return Err(crate::policy::PolicyViolation::Uri {
-                    operation: "KeyInfoReference",
-                    reason: "URI class is disabled",
-                }
-                .into());
-            }
-            let target = match resolver.node_for_same_document_reference_with_budget(
-                uri,
-                Some(execution.node_set_materialization()),
-            ) {
-                Ok(Some(target)) => target,
-                Err(TransformError::Policy(violation)) => return Err(DsigError::Policy(violation)),
-                _ => continue,
-            };
-            if target.has_tag_name((XMLDSIG_NS, "KeyInfo"))
-                && visit(target, resolver, context, state, depth + 1, execution)?
-            {
-                if state.materialization.is_none() {
-                    return Ok(true);
-                }
-                found = true;
-            }
-        }
-        Ok(found)
-    }
-    visit(
+    visit_encapsulation(
         node,
         resolver,
         &ProbeContext {
@@ -3856,6 +3970,289 @@ fn discover_encapsulation_with_budget<P: KeyInfoReferencePolicy>(
         0,
         execution,
     )
+}
+
+fn record_probe_encapsulation<P: KeyInfoReferencePolicy>(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    context: &ProbeContext<'_, P>,
+    state: &mut DiscoveryState<'_>,
+    depth: usize,
+) -> Result<(), DsigError> {
+    if let Some(materialization) = state.materialization.as_deref_mut() {
+        let mechanism = crate::key_establishment::parse_encapsulation(
+            node,
+            materialization.encapsulation_template,
+        )
+        .map_err(|_| DsigError::InvalidStructure {
+            reason: "invalid encapsulation mechanism in resolved KeyInfo",
+        })?;
+        materialization.record_encapsulation(mechanism, resolver, depth)?;
+        if let (Some(mechanism), Some((policy, _))) =
+            (&materialization.encapsulation, context.external)
+        {
+            policy
+                .key_establishment()
+                .check_encapsulation(mechanism.algorithm)?;
+        }
+    }
+    Ok(())
+}
+
+fn resolve_probe_uri<P: KeyInfoReferencePolicy>(
+    child: Node<'_, '_>,
+    uri: &str,
+    context: &ProbeContext<'_, P>,
+    materializing: bool,
+    execution: &TransformExecutionBudget,
+) -> Result<Option<String>, DsigError> {
+    let Some((policy, _)) = context.external else {
+        return Ok(None);
+    };
+    // XMLDSig 1.1 section 4.5.10 gives KeyInfoReference the same URI
+    // dereferencing behavior as Reference, including external XML.
+    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+    let resolved = crate::c14n::xml_base::resolve_uri_from_node_with_document_base_with_budget(
+        child,
+        uri,
+        context.document_base,
+        execution.xml_base_resolution(),
+    )
+    .map_err(|error| {
+        ReferenceProcessingError::UriDereference(super::uri::map_xml_base_resolution_error(error))
+    })?;
+    if !policy.key_info_reference_uris().allows(&resolved) {
+        if materializing {
+            return Err(crate::policy::PolicyViolation::Uri {
+                operation: "KeyInfoReference",
+                reason: "URI class is disabled",
+            }
+            .into());
+        }
+        return Ok(None);
+    }
+    // Resource identity, not a reparsed arena ID, detects external
+    // cycles. The active URI chain borrows stack frames, no clones.
+    let mut ancestor = context.external_path;
+    while let Some(entry) = ancestor {
+        if entry.uri == resolved {
+            break;
+        }
+        ancestor = entry.parent;
+    }
+    if ancestor.is_some() {
+        if materializing {
+            return Err(DsigError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected",
+            });
+        }
+        return Ok(None);
+    }
+    Ok(Some(resolved))
+}
+
+fn visit_external_encapsulation<P: KeyInfoReferencePolicy>(
+    child: Node<'_, '_>,
+    uri: &str,
+    resolver: &UriReferenceResolver<'_>,
+    context: &ProbeContext<'_, P>,
+    state: &mut DiscoveryState<'_>,
+    depth: usize,
+    execution: &TransformExecutionBudget,
+) -> Result<bool, DsigError> {
+    let resources = context.resources;
+    let Some((policy, backend)) = context.external else {
+        return Ok(false);
+    };
+    let Some(absolute_uri) = resolve_probe_uri(
+        child,
+        uri,
+        context,
+        state.materialization.is_some(),
+        execution,
+    )?
+    else {
+        return Ok(false);
+    };
+    let external_entry = ExternalProbePath {
+        uri: &absolute_uri,
+        parent: context.external_path,
+    };
+    let (resource, fragment) = absolute_uri
+        .split_once('#')
+        .map_or((absolute_uri.as_str(), None), |(resource, fragment)| {
+            (resource, Some(fragment))
+        });
+    resources.validate_key_info_reference_depth(depth + 1)?;
+    if depth == crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING {
+        return Err(DsigError::InvalidStructure {
+            reason: "KeyInfoReference safety depth exceeded",
+        });
+    }
+    let bytes = match resolver.external_resource(resource) {
+        Ok(Some(bytes)) => bytes,
+        Err(TransformError::Policy(violation)) => {
+            return Err(DsigError::Policy(violation));
+        }
+        _ => return Ok(false),
+    };
+    execution.xml_parse_work().charge_policy(bytes.len())?;
+    let xml = crate::encoding::decode_xml_octets(bytes, resources.max_xml_document_bytes)
+        .map_err(|error| map_key_info_xml_decode_error(&error))?;
+    let settings =
+        DocumentParseSettings::from_policy(*policy.xml(), resources).with_backend(backend);
+    let document = XmlDocument::parse_with_settings_and_budget(
+        xml.into_owned(),
+        settings,
+        execution.xml_parse_work(),
+    )
+    .map_err(|error| map_document_parse_error(error, settings))?;
+    document.with_view(|view| {
+        let external_resolver = resolver.for_external_document_view(view, resource);
+        let target = match fragment {
+            Some(fragment) if !fragment.is_empty() => external_resolver
+                .node_for_same_document_reference_with_budget(
+                    &absolute_uri[resource.len()..],
+                    Some(execution.node_set_materialization()),
+                )
+                .map_err(ReferenceProcessingError::UriDereference)?,
+            _ => Some(view.document().root_element()),
+        };
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        if !target.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+            return Ok(false);
+        }
+        visit_encapsulation(
+            target,
+            &external_resolver,
+            &ProbeContext {
+                document_base: Some(resource),
+                external_path: Some(&external_entry),
+                resources,
+                external: context.external,
+            },
+            state,
+            depth + 1,
+            execution,
+        )
+    })
+}
+
+fn visit_encapsulation<P: KeyInfoReferencePolicy>(
+    node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    context: &ProbeContext<'_, P>,
+    state: &mut DiscoveryState<'_>,
+    depth: usize,
+    execution: &TransformExecutionBudget,
+) -> Result<bool, DsigError> {
+    let ProbeContext {
+        resources,
+        external,
+        ..
+    } = *context;
+    resources.validate_key_info_reference_depth(depth)?;
+    if depth > crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING {
+        return Err(DsigError::InvalidStructure {
+            reason: "KeyInfoReference safety depth exceeded",
+        });
+    }
+    // Every document on the active stack remains alive for this traversal;
+    // arena identity distinguishes equal node IDs in different documents.
+    let identity = (std::ptr::from_ref(node.document()) as usize, node.id());
+    if state.path[..depth].contains(&Some(identity)) {
+        if state.materialization.is_some() {
+            return Err(DsigError::InvalidStructure {
+                reason: "KeyInfoReference cycle detected",
+            });
+        }
+        return Ok(false);
+    }
+    state.path[depth] = Some(identity);
+    let mut found = false;
+    for child in node.children().filter(Node::is_element) {
+        let work = match state.materialization.as_deref_mut() {
+            Some(materialization) => &mut materialization.candidate_work,
+            None => &mut state.work,
+        };
+        *work += 1;
+        resources.validate_key_candidates(*work)?;
+        if child.has_tag_name((
+            crate::key_establishment::ENCAPSULATION_NS,
+            "EncapsulationMechanism",
+        )) {
+            if state.materialization.is_none() {
+                return Ok(true);
+            }
+            record_probe_encapsulation(child, resolver, context, state, depth)?;
+            found = true;
+            continue;
+        }
+        if !child.has_tag_name(("http://www.w3.org/2009/xmldsig11#", "KeyInfoReference")) {
+            continue;
+        }
+        let Some(uri) = child.attribute("URI") else {
+            continue;
+        };
+        if uri.len() > super::parse::MAX_KEY_NAME_TEXT_LEN {
+            continue;
+        }
+        if state.materialization.is_some()
+            && let Some((policy, _)) = external
+            && !policy.key_info_reference_source_enabled()
+        {
+            return Err(crate::policy::PolicyViolation::KeyTrust {
+                reason: "KeyInfoReference key sources are disabled",
+            }
+            .into());
+        }
+        if !uri.is_empty() && !uri.starts_with('#') {
+            let target_found = visit_external_encapsulation(
+                child, uri, resolver, context, state, depth, execution,
+            )?;
+            if target_found {
+                if state.materialization.is_none() {
+                    return Ok(true);
+                }
+                found = true;
+            }
+            continue;
+        }
+        // Unconsumed key hints are not validity requirements. Mechanism
+        // discovery checks only reachable KeyInfo instructions, not key
+        // candidates that an explicitly supplied recipient never uses.
+        // The target type is defined by XMLDSig 1.1 section 4.5.10.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-KeyInfoReference
+        if state.materialization.is_some()
+            && let Some((policy, _)) = external
+            && !policy.key_info_reference_uris().allows(uri)
+        {
+            return Err(crate::policy::PolicyViolation::Uri {
+                operation: "KeyInfoReference",
+                reason: "URI class is disabled",
+            }
+            .into());
+        }
+        let target = match resolver.node_for_same_document_reference_with_budget(
+            uri,
+            Some(execution.node_set_materialization()),
+        ) {
+            Ok(Some(target)) => target,
+            Err(TransformError::Policy(violation)) => return Err(DsigError::Policy(violation)),
+            _ => continue,
+        };
+        if target.has_tag_name((XMLDSIG_NS, "KeyInfo"))
+            && visit_encapsulation(target, resolver, context, state, depth + 1, execution)?
+        {
+            if state.materialization.is_none() {
+                return Ok(true);
+            }
+            found = true;
+        }
+    }
+    Ok(found)
 }
 
 fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
@@ -3960,7 +4357,8 @@ pub(crate) fn inspect_signing_key_info_with_budgets(
     resolver: &UriReferenceResolver<'_>,
     policy: &crate::policy::SigningPolicy,
     provider: &dyn crate::provider::CryptoProvider,
-    shared_budgets: (&TransformExecutionBudget, &mut XPathSignatureParseBudget),
+    execution: &TransformExecutionBudget,
+    xpath_parse: &mut XPathSignatureParseBudget,
     xml_backend: crate::XmlBackend,
 ) -> Result<SignatureKeyInfoMetadata, DsigError> {
     inspect_signature_key_info_with_budgets(
@@ -3970,8 +4368,8 @@ pub(crate) fn inspect_signing_key_info_with_budgets(
         provider,
         &mut RetrievalMaterializationBudgets {
             key_info_parse: &RefCell::new(super::parse::KeyInfoParseUsage::new(&policy.resources)),
-            xpath_parse: shared_budgets.1,
-            execution: shared_budgets.0,
+            xpath_parse,
+            execution,
             resources: &policy.resources,
             certificate_signature_algorithms: None,
             xml_backend,
@@ -4013,8 +4411,12 @@ fn inspect_signature_key_info_for_policy<P: KeyInfoReferencePolicy>(
     )
 }
 
-/// Inspect signing hints and KEM targets through the bounded KeyInfoReference
+/// Inspect signing hints and KEM targets through the bounded `KeyInfoReference`
 /// graph. KEM targets must belong to the document that will be mutated.
+///
+/// # Errors
+/// Returns an error for invalid policy, malformed or cyclic references, denied
+/// sources or URIs, exhausted resources, or a KEM target outside the document.
 pub fn inspect_signing_key_info(
     node: Node<'_, '_>,
     resolver: UriReferenceResolver<'_>,
@@ -4030,6 +4432,10 @@ pub fn inspect_signing_key_info(
 /// candidate, depth and cycle gates as core verification.
 /// This original-document metadata API requires KEM targets in that document;
 /// core verification also supports caller-supplied external KEM resources.
+///
+/// # Errors
+/// Returns an error for invalid policy or metadata, denied key sources or URIs,
+/// exhausted resources, reference cycles, or an external KEM mutation target.
 pub fn inspect_verification_key_info(
     node: Node<'_, '_>,
     resolver: UriReferenceResolver<'_>,
@@ -4046,6 +4452,10 @@ pub fn inspect_verification_key_info(
 /// Like `inspect_verification_key_info`, this original-document metadata API
 /// rejects external KEM targets; it never reports a permitted external mechanism
 /// as absent. Use core verification with a decapsulation key for those targets.
+///
+/// # Errors
+/// Returns an error when discovery or required metadata processing fails policy,
+/// structure, identity, or resource checks. No reachable mechanism yields `None`.
 pub fn inspect_pinned_verification_key_info(
     node: Node<'_, '_>,
     resolver: UriReferenceResolver<'_>,
@@ -4140,6 +4550,10 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
 /// is consumed so this operation can bind a fresh aggregate external-resource
 /// budget to the supplied policy. `xml_backend` is used for every recursively
 /// referenced XML document, preserving the caller's parser semantics.
+///
+/// # Errors
+/// Returns an error for invalid policy, denied references, missing or malformed
+/// targets, cycles, or exhausted reference and materialization budgets.
 pub fn materialize_signing_key_info_references(
     key_info: &mut KeyInfo,
     resolver: UriReferenceResolver<'_>,
@@ -4155,7 +4569,7 @@ pub fn materialize_signing_key_info_references(
 /// before verification key selection.
 ///
 /// In addition to URI and resource policy, this entry point enforces the
-/// verification policy's `key_sources.key_info_reference` trust gate. Retrieval
+/// verification policy's `KeySourceKind::KeyInfoReference` trust gate. Retrieval
 /// methods nested in an external referenced document are materialized in that
 /// document's URI context; retrieval methods in the caller's document remain
 /// the responsibility of the complete verification pipeline. Candidate-local
@@ -4165,6 +4579,10 @@ pub fn materialize_signing_key_info_references(
 /// consumed so this operation can bind a fresh aggregate external-resource
 /// budget to the supplied policy. `xml_backend` is used for every recursively
 /// referenced XML document, preserving the caller's parser semantics.
+///
+/// # Errors
+/// Returns an error for invalid policy, disabled reference sources or URI classes,
+/// missing or malformed targets, cycles, or exhausted materialization budgets.
 pub fn materialize_verification_key_info_references(
     key_info: &mut KeyInfo,
     resolver: UriReferenceResolver<'_>,
@@ -4176,6 +4594,185 @@ pub fn materialize_verification_key_info_references(
     materialize_key_info_references_for_policy(key_info, resolver, policy, provider, xml_backend)
 }
 
+struct RetrievalHint {
+    uri: String,
+    resource_type: Option<String>,
+    transforms: RetrievalMethodTransforms,
+}
+
+struct RetrievalUsage<'a> {
+    total_binary_len: &'a mut usize,
+    candidate_work: &'a mut usize,
+    outcome: &'a mut RetrievalMaterialization,
+}
+
+fn materialize_raw_certificate<P: KeyInfoReferencePolicy>(
+    hint: RetrievalHint,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    usage: &mut RetrievalUsage<'_>,
+) -> Result<super::parse::KeyInfoSource, DsigError> {
+    let RetrievalHint {
+        uri: resolved_uri,
+        resource_type,
+        transforms,
+    } = hint;
+    let allowed_uri_types = context.policy.retrieval_method_uris();
+    let budgets = &mut *context.budgets;
+    let candidate_work = &mut *usage.candidate_work;
+    let total_binary_len = &mut *usage.total_binary_len;
+    let outcome = &mut *usage.outcome;
+    if transforms != RetrievalMethodTransforms::None
+        || classify_uri(&resolved_uri) != UriClass::External
+    {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "raw X509 RetrievalMethod requires an untransformed external URI",
+        });
+    }
+    if !allowed_uri_types.allows(&resolved_uri) {
+        return Err(crate::policy::PolicyViolation::Uri {
+            operation: "verification",
+            reason: "retrieval method URI class is not permitted",
+        }
+        .into());
+    }
+    let certificate = resolver.external_resource(&resolved_uri).map_err(|error| {
+        SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
+    })?;
+    let Some(certificate) = certificate else {
+        outcome.deferred_error.get_or_insert_with(|| {
+            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
+                super::TransformError::UnsupportedUri(resolved_uri.clone()),
+            ))
+        });
+        return Ok(super::parse::KeyInfoSource::RetrievalMethod {
+            uri: resolved_uri,
+            resource_type,
+            transforms,
+        });
+    };
+    *candidate_work = candidate_work.saturating_add(1);
+    budgets.resources.validate_key_candidates(*candidate_work)?;
+    if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
+        });
+    }
+    add_retrieval_binary_usage(total_binary_len, certificate.len())?;
+    let parsed = match super::parse::parse_x509_certificate_in(
+        certificate,
+        &budgets.key_info_parse.borrow().certificates,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            let error = map_key_info_parse_error(error);
+            if matches!(error, SignatureVerificationPipelineError::Policy(_)) {
+                return Err(error);
+            }
+            outcome.deferred_error.get_or_insert(error);
+            return Ok(super::parse::KeyInfoSource::RetrievalMethod {
+                uri: resolved_uri,
+                resource_type,
+                transforms,
+            });
+        }
+    };
+    Ok(super::parse::KeyInfoSource::X509Data(
+        super::parse::X509DataInfo {
+            certificates: vec![certificate.to_vec()],
+            parsed_certificates: vec![parsed],
+            certificate_chain: vec![0],
+            ..super::parse::X509DataInfo::default()
+        },
+    ))
+}
+
+fn materialize_x509_data<P: KeyInfoReferencePolicy>(
+    hint: RetrievalHint,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    usage: &mut RetrievalUsage<'_>,
+) -> Result<super::parse::KeyInfoSource, DsigError> {
+    let RetrievalHint {
+        uri: resolved_uri,
+        resource_type,
+        transforms,
+    } = hint;
+    let policy = context.policy;
+    let provider = context.provider;
+    let allowed_uri_types = policy.retrieval_method_uris();
+    let allowed_transforms = policy.allowed_transforms();
+    let budgets = &mut *context.budgets;
+    let candidate_work = &mut *usage.candidate_work;
+    let total_binary_len = &mut *usage.total_binary_len;
+    let outcome = &mut *usage.outcome;
+    if !allowed_uri_types.allows(&resolved_uri) {
+        return Err(crate::policy::PolicyViolation::Uri {
+            operation: "verification",
+            reason: "retrieval method URI class is not permitted",
+        }
+        .into());
+    }
+    let target = resolver
+        .node_for_same_document_reference(&resolved_uri)
+        .map_err(ReferenceProcessingError::Transform)?;
+    let Some(target) = target else {
+        outcome.deferred_error.get_or_insert(
+            SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod target is missing or ambiguous",
+            },
+        );
+        return Ok(super::parse::KeyInfoSource::RetrievalMethod {
+            uri: resolved_uri,
+            resource_type,
+            transforms,
+        });
+    };
+    let node = match transforms {
+        RetrievalMethodTransforms::None if target.has_tag_name((XMLDSIG_NS, "X509Data")) => target,
+        RetrievalMethodTransforms::None => {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "untransformed X509Data RetrievalMethod must target X509Data directly",
+            });
+        }
+        RetrievalMethodTransforms::X509DataNodeSetFilter {
+            expression,
+            namespaces,
+        } => {
+            enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
+            budgets
+                .xpath_parse
+                .validate_expression(&expression)
+                .map_err(ReferenceProcessingError::Transform)?;
+            budgets
+                .xpath_parse
+                .validate_namespaces(&namespaces)
+                .map_err(ReferenceProcessingError::Transform)?;
+            select_retrieved_x509_data_root(target, budgets.execution)?
+        }
+        RetrievalMethodTransforms::Unsupported => {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "X509Data RetrievalMethod contains unsupported transforms",
+            });
+        }
+    };
+    super::parse::validate_x509_digest_policy(node, &|algorithm| {
+        policy.check_digest_algorithm(algorithm)
+    })
+    .map_err(map_key_info_parse_error)?;
+    let data = parse_x509_data_dispatch_with_budget_and_provider(
+        node,
+        total_binary_len,
+        candidate_work,
+        provider,
+        budgets.resources,
+        budgets.certificate_signature_algorithms,
+        &budgets.key_info_parse.borrow().certificates,
+    )
+    .map_err(map_key_info_parse_error)?;
+    Ok(super::parse::KeyInfoSource::X509Data(data))
+}
+
 fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
@@ -4184,8 +4781,6 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     budgets: &mut RetrievalMaterializationBudgets<'_>,
     candidate_work: &mut usize,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
-    let allowed_uri_types = policy.retrieval_method_uris();
-    let allowed_transforms = policy.allowed_transforms();
     let retrieval_count = key_info
         .sources
         .iter()
@@ -4221,153 +4816,37 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
             continue;
         }
 
-        if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
+        let hint = RetrievalHint {
+            uri: resolved_uri,
+            resource_type,
+            transforms,
+        };
+        let mut context = KeyInfoReferenceMaterializationContext {
+            policy,
+            provider,
+            budgets,
+        };
+        let mut usage = RetrievalUsage {
+            total_binary_len: &mut total_binary_len,
+            candidate_work,
+            outcome: &mut outcome,
+        };
+        let source = if hint.resource_type.as_deref()
+            == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
         {
-            if transforms != RetrievalMethodTransforms::None
-                || classify_uri(&resolved_uri) != UriClass::External
-            {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "raw X509 RetrievalMethod requires an untransformed external URI",
-                });
-            }
-            if !allowed_uri_types.allows(&resolved_uri) {
-                return Err(crate::policy::PolicyViolation::Uri {
-                    operation: "verification",
-                    reason: "retrieval method URI class is not permitted",
-                }
-                .into());
-            }
-            let certificate = resolver.external_resource(&resolved_uri).map_err(|error| {
-                SignatureVerificationPipelineError::from(ReferenceProcessingError::Transform(error))
-            })?;
-            let Some(certificate) = certificate else {
-                outcome.deferred_error.get_or_insert_with(|| {
-                    SignatureVerificationPipelineError::Reference(
-                        ReferenceProcessingError::Transform(super::TransformError::UnsupportedUri(
-                            resolved_uri.clone(),
-                        )),
-                    )
-                });
-                materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                    uri: resolved_uri,
-                    resource_type,
-                    transforms,
-                });
-                continue;
-            };
-            *candidate_work = candidate_work.saturating_add(1);
-            budgets.resources.validate_key_candidates(*candidate_work)?;
-            if certificate.len() > MAX_X509_DECODED_BINARY_LEN {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "raw X509 RetrievalMethod certificate exceeds maximum allowed length",
-                });
-            }
-            add_retrieval_binary_usage(&mut total_binary_len, certificate.len())?;
-            let parsed = match super::parse::parse_x509_certificate_in(
-                certificate,
-                &budgets.key_info_parse.borrow().certificates,
-            ) {
-                Ok(parsed) => parsed,
-                Err(error) => {
-                    let error = map_key_info_parse_error(error);
-                    if matches!(error, SignatureVerificationPipelineError::Policy(_)) {
-                        return Err(error);
-                    }
-                    outcome.deferred_error.get_or_insert(error);
-                    materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                        uri: resolved_uri,
-                        resource_type,
-                        transforms,
-                    });
-                    continue;
-                }
-            };
-            materialized.push(super::parse::KeyInfoSource::X509Data(
-                super::parse::X509DataInfo {
-                    certificates: vec![certificate.to_vec()],
-                    parsed_certificates: vec![parsed],
-                    certificate_chain: vec![0],
-                    ..super::parse::X509DataInfo::default()
-                },
-            ));
-        } else if resource_type.as_deref() == Some("http://www.w3.org/2000/09/xmldsig#X509Data") {
-            if !allowed_uri_types.allows(&resolved_uri) {
-                return Err(crate::policy::PolicyViolation::Uri {
-                    operation: "verification",
-                    reason: "retrieval method URI class is not permitted",
-                }
-                .into());
-            }
-            let target = resolver
-                .node_for_same_document_reference(&resolved_uri)
-                .map_err(ReferenceProcessingError::Transform)?;
-            let Some(target) = target else {
-                outcome.deferred_error.get_or_insert(
-                    SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "X509Data RetrievalMethod target is missing or ambiguous",
-                    },
-                );
-                materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                    uri: resolved_uri,
-                    resource_type,
-                    transforms,
-                });
-                continue;
-            };
-            let node = match transforms {
-                RetrievalMethodTransforms::None
-                    if target.has_tag_name((XMLDSIG_NS, "X509Data")) =>
-                {
-                    target
-                }
-                RetrievalMethodTransforms::None => {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "untransformed X509Data RetrievalMethod must target X509Data directly",
-                    });
-                }
-                RetrievalMethodTransforms::X509DataNodeSetFilter {
-                    expression,
-                    namespaces,
-                } => {
-                    enforce_transform_allowed(allowed_transforms, XPATH_TRANSFORM_URI)?;
-                    budgets
-                        .xpath_parse
-                        .validate_expression(&expression)
-                        .map_err(ReferenceProcessingError::Transform)?;
-                    budgets
-                        .xpath_parse
-                        .validate_namespaces(&namespaces)
-                        .map_err(ReferenceProcessingError::Transform)?;
-                    select_retrieved_x509_data_root(target, budgets.execution)?
-                }
-                RetrievalMethodTransforms::Unsupported => {
-                    return Err(SignatureVerificationPipelineError::InvalidStructure {
-                        reason: "X509Data RetrievalMethod contains unsupported transforms",
-                    });
-                }
-            };
-            super::parse::validate_x509_digest_policy(node, &|algorithm| {
-                policy.check_digest_algorithm(algorithm)
-            })
-            .map_err(map_key_info_parse_error)?;
-            let data = parse_x509_data_dispatch_with_budget_and_provider(
-                node,
-                &mut total_binary_len,
-                candidate_work,
-                provider,
-                budgets.resources,
-                budgets.certificate_signature_algorithms,
-                &budgets.key_info_parse.borrow().certificates,
-            )
-            .map_err(map_key_info_parse_error)?;
-            materialized.push(super::parse::KeyInfoSource::X509Data(data));
+            materialize_raw_certificate(hint, resolver, &mut context, &mut usage)?
+        } else if hint.resource_type.as_deref()
+            == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
+        {
+            materialize_x509_data(hint, resolver, &mut context, &mut usage)?
         } else {
-            materialized.push(super::parse::KeyInfoSource::RetrievalMethod {
-                uri: resolved_uri,
-                resource_type,
-                transforms,
-            });
-        }
+            super::parse::KeyInfoSource::RetrievalMethod {
+                uri: hint.uri,
+                resource_type: hint.resource_type,
+                transforms: hint.transforms,
+            }
+        };
+        materialized.push(source);
     }
     key_info.sources = materialized;
     Ok(outcome)
@@ -4532,6 +5011,199 @@ struct ManifestVerification<'context, 'inputs, C> {
     capture: &'context C,
 }
 
+fn schedule_manifest_references(
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+    resolver: &UriReferenceResolver<'_>,
+    parsed: ParsedManifestReferences,
+    discovery: OperationNodeId,
+) -> Result<Vec<ScheduledManifestReference>, DsigError> {
+    operation.extend();
+    let mut scheduled = Vec::with_capacity(parsed.references.len() + parsed.invalid_results.len());
+    for item in parsed.references {
+        let resource = operation.budgets().resource_identity_for_reference(
+            &item.reference,
+            item.index,
+            resolver,
+            view,
+            resolver.node_for_node_id(item.reference_node_id),
+        );
+        let node = operation.add_node(
+            OperationNodeKind::Digest { index: item.index },
+            OperationStage::AuthenticatedDependency,
+            Some(resource.clone()),
+        );
+        operation
+            .add_dependency(node, discovery)
+            .map_err(map_verification_plan_error)?;
+        scheduled.push(ScheduledManifestReference::Parsed {
+            node,
+            reference: item,
+        });
+    }
+    for item in parsed.invalid_results {
+        let node = operation.add_node(
+            OperationNodeKind::Digest {
+                index: item.result.reference_index,
+            },
+            OperationStage::AuthenticatedDependency,
+            None,
+        );
+        operation
+            .add_dependency(node, discovery)
+            .map_err(map_verification_plan_error)?;
+        scheduled.push(ScheduledManifestReference::Invalid {
+            node,
+            invalid: item,
+        });
+    }
+    scheduled.sort_by_key(ScheduledManifestReference::index);
+    operation.compile().map_err(map_verification_plan_error)?;
+    Ok(scheduled)
+}
+
+fn evaluate_manifest_reference<C: VerificationCapture>(
+    reference: &Reference,
+    index: usize,
+    execution: &ReferenceExecutionContext<'_, C>,
+    resolver: &UriReferenceResolver<'_>,
+    signature_node: Node<'_, '_>,
+    ctx: &VerifyContext<'_>,
+    reference_node: Option<Node<'_, '_>>,
+) -> ReferenceResult {
+    if execution.transform_budget.remaining_c14n_output() == 0
+        || super::transforms::validate_relationship_chain(
+            &reference.transforms,
+            ctx.policy.transforms.opc_relationship_edition,
+        )
+        .is_err()
+        || reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
+        || ctx
+            .policy
+            .check_digest_algorithm(reference.digest_method)
+            .is_err()
+    {
+        manifest_reference_invalid_result(
+            reference,
+            index,
+            FailureReason::ReferencePolicyViolation { ref_index: index },
+        )
+    } else {
+        match enforce_reference_policies(
+            std::slice::from_ref(reference),
+            ctx.policy.uris.references,
+            ctx.allowed_transform_uris(),
+        ) {
+            Ok(()) => process_reference_with_options(
+                reference,
+                resolver,
+                signature_node,
+                ReferenceSet::Manifest,
+                index,
+                reference_node,
+                execution,
+            )
+            .unwrap_or_else(|error| {
+                manifest_reference_invalid_result(
+                    reference,
+                    index,
+                    manifest_reference_failure_reason(error, index),
+                )
+            }),
+            Err(SignatureVerificationPipelineError::Policy(_)) => {
+                manifest_reference_invalid_result(
+                    reference,
+                    index,
+                    FailureReason::ReferencePolicyViolation { ref_index: index },
+                )
+            }
+            Err(_) => manifest_reference_invalid_result(
+                reference,
+                index,
+                FailureReason::ReferenceProcessingFailure { ref_index: index },
+            ),
+        }
+    }
+}
+
+fn execute_manifest_reference<C: VerificationCapture>(
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    verification: &ManifestVerification<'_, '_, C>,
+    scheduled_reference: ScheduledManifestReference,
+) -> Result<(OperationNodeId, ReferenceResult), DsigError> {
+    let ctx = verification.context;
+    let capture = verification.capture;
+    match scheduled_reference {
+        ScheduledManifestReference::Invalid { node, invalid } => {
+            let result = operation.run(node, || {
+                Ok::<_, SignatureVerificationPipelineError>(invalid.result)
+            })?;
+            Ok((node, result))
+        }
+        ScheduledManifestReference::Parsed {
+            node,
+            reference: compiled,
+        } => {
+            let observed = operation.budgets().resource_identity_for_reference(
+                &compiled.reference,
+                compiled.index,
+                resolver,
+                view,
+                resolver.node_for_node_id(compiled.reference_node_id),
+            );
+            let result = operation.run_with_resource(node, &observed, || {
+                let reference = &compiled.reference;
+                let budgets = operation.budgets();
+                let execution = ReferenceExecutionContext {
+                    store_pre_digest: ctx.store_pre_digest,
+                    transform_options: ctx.transform_options(),
+                    transform_budget: &budgets.transforms,
+                    canonicalized_data_budget: &budgets.canonicalized,
+                    provider: ctx.provider,
+                    capture,
+                };
+                let mut result = evaluate_manifest_reference(
+                    reference,
+                    compiled.index,
+                    &execution,
+                    resolver,
+                    signature_node,
+                    ctx,
+                    resolver.node_for_node_id(compiled.reference_node_id),
+                );
+                bind_reference_evidence(
+                    &mut result,
+                    reference,
+                    view,
+                    resolver.node_for_node_id(compiled.reference_node_id),
+                    &observed,
+                );
+                if result.status == DsigStatus::Valid
+                    && reference
+                        .transforms
+                        .iter()
+                        .all(transform_preserves_manifest_structure)
+                    && let Some(uri) = reference.uri.as_deref()
+                    && let Ok(Some(target)) = resolver.node_id_for_same_document_reference(uri)
+                {
+                    operation.authenticate(view.node_identity_by_id(target));
+                }
+                Ok::<_, SignatureVerificationPipelineError>(result)
+            })?;
+            Ok((node, result))
+        }
+    }
+}
+
 fn process_authenticated_manifest_references<C: VerificationCapture>(
     operation: &mut OperationExecutionContext<
         &crate::policy::VerificationPolicy,
@@ -4540,12 +5212,11 @@ fn process_authenticated_manifest_references<C: VerificationCapture>(
     view: DocumentView<'_>,
     signature_node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
-    verification: ManifestVerification<'_, '_, C>,
+    verification: &ManifestVerification<'_, '_, C>,
     mut remaining_reference_capacity: usize,
     crypto: OperationNodeId,
 ) -> Result<(Vec<ReferenceResult>, Vec<OperationNodeId>), SignatureVerificationPipelineError> {
     let ctx = verification.context;
-    let capture = verification.capture;
     let mut processed_manifests = HashSet::new();
     let mut next_reference_index = 0usize;
     let mut frontier_index = 0usize;
@@ -4590,161 +5261,17 @@ fn process_authenticated_manifest_references<C: VerificationCapture>(
             break;
         }
 
-        operation.extend();
-        let mut scheduled = Vec::with_capacity(discovered);
-        for item in parsed.references {
-            let resource = operation.budgets().resource_identity_for_reference(
-                &item.reference,
-                item.index,
-                resolver,
-                view,
-                resolver.node_for_node_id(item.reference_node_id),
-            );
-            let node = operation.add_node(
-                OperationNodeKind::Digest { index: item.index },
-                OperationStage::AuthenticatedDependency,
-                Some(resource.clone()),
-            );
-            operation
-                .add_dependency(node, discovery)
-                .map_err(map_verification_plan_error)?;
-            scheduled.push(ScheduledManifestReference::Parsed {
-                node,
-                reference: item,
-            });
-        }
-        for item in parsed.invalid_results {
-            let node = operation.add_node(
-                OperationNodeKind::Digest {
-                    index: item.result.reference_index,
-                },
-                OperationStage::AuthenticatedDependency,
-                None,
-            );
-            operation
-                .add_dependency(node, discovery)
-                .map_err(map_verification_plan_error)?;
-            scheduled.push(ScheduledManifestReference::Invalid {
-                node,
-                invalid: item,
-            });
-        }
-        scheduled.sort_by_key(ScheduledManifestReference::index);
-        operation.compile().map_err(map_verification_plan_error)?;
+        let scheduled = schedule_manifest_references(operation, view, resolver, parsed, discovery)?;
 
         for scheduled_reference in scheduled {
-            let (node, result) = match scheduled_reference {
-                ScheduledManifestReference::Invalid { node, invalid } => {
-                    let result = operation.run(node, || {
-                        Ok::<_, SignatureVerificationPipelineError>(invalid.result)
-                    })?;
-                    (node, result)
-                }
-                ScheduledManifestReference::Parsed {
-                    node,
-                    reference: compiled,
-                } => {
-                    let observed = operation.budgets().resource_identity_for_reference(
-                        &compiled.reference,
-                        compiled.index,
-                        resolver,
-                        view,
-                        resolver.node_for_node_id(compiled.reference_node_id),
-                    );
-                    let result = operation.run_with_resource(node, &observed, || {
-                        let reference = &compiled.reference;
-                        let budgets = operation.budgets();
-                        let execution = ReferenceExecutionContext {
-                            store_pre_digest: ctx.store_pre_digest,
-                            transform_options: ctx.transform_options(),
-                            transform_budget: &budgets.transforms,
-                            canonicalized_data_budget: &budgets.canonicalized,
-                            provider: ctx.provider,
-                            capture,
-                        };
-                        let mut result = if execution.transform_budget.remaining_c14n_output() == 0
-                            || super::transforms::validate_relationship_chain(
-                                &reference.transforms,
-                                ctx.policy.transforms.opc_relationship_edition,
-                            )
-                            .is_err()
-                            || reference.transforms.len()
-                                > ctx.policy.resources.max_transforms_per_reference
-                            || ctx
-                                .policy
-                                .check_digest_algorithm(reference.digest_method)
-                                .is_err()
-                        {
-                            manifest_reference_invalid_result(
-                                reference,
-                                compiled.index,
-                                FailureReason::ReferencePolicyViolation {
-                                    ref_index: compiled.index,
-                                },
-                            )
-                        } else {
-                            match enforce_reference_policies(
-                                std::slice::from_ref(reference),
-                                ctx.policy.uris.references,
-                                ctx.allowed_transform_uris(),
-                            ) {
-                                Ok(()) => process_reference_with_options(
-                                    reference,
-                                    resolver,
-                                    signature_node,
-                                    ReferenceSet::Manifest,
-                                    compiled.index,
-                                    resolver.node_for_node_id(compiled.reference_node_id),
-                                    &execution,
-                                )
-                                .unwrap_or_else(|error| {
-                                    manifest_reference_invalid_result(
-                                        reference,
-                                        compiled.index,
-                                        manifest_reference_failure_reason(error, compiled.index),
-                                    )
-                                }),
-                                Err(SignatureVerificationPipelineError::Policy(_)) => {
-                                    manifest_reference_invalid_result(
-                                        reference,
-                                        compiled.index,
-                                        FailureReason::ReferencePolicyViolation {
-                                            ref_index: compiled.index,
-                                        },
-                                    )
-                                }
-                                Err(_) => manifest_reference_invalid_result(
-                                    reference,
-                                    compiled.index,
-                                    FailureReason::ReferenceProcessingFailure {
-                                        ref_index: compiled.index,
-                                    },
-                                ),
-                            }
-                        };
-                        bind_reference_evidence(
-                            &mut result,
-                            reference,
-                            view,
-                            resolver.node_for_node_id(compiled.reference_node_id),
-                            &observed,
-                        );
-                        if result.status == DsigStatus::Valid
-                            && reference
-                                .transforms
-                                .iter()
-                                .all(transform_preserves_manifest_structure)
-                            && let Some(uri) = reference.uri.as_deref()
-                            && let Ok(Some(target)) =
-                                resolver.node_id_for_same_document_reference(uri)
-                        {
-                            operation.authenticate(view.node_identity_by_id(target));
-                        }
-                        Ok::<_, SignatureVerificationPipelineError>(result)
-                    })?;
-                    (node, result)
-                }
-            };
+            let (node, result) = execute_manifest_reference(
+                operation,
+                view,
+                signature_node,
+                resolver,
+                verification,
+                scheduled_reference,
+            )?;
             let accepted = result.status == DsigStatus::Valid;
             operation.set_outcome(
                 node,
@@ -4812,18 +5339,9 @@ fn parse_manifest_references(
         {
             continue;
         }
-        let mut manifest_is_signed = false;
-        for ancestor in manifest_node.ancestors() {
-            scan.charge_node_filter_work(1)
-                .map_err(ReferenceProcessingError::Transform)?;
-            if operation.is_authenticated(view.node_identity(ancestor)) {
-                manifest_is_signed = true;
-                break;
-            }
-        }
         // Leave unauthenticated Manifests unmarked so a verified outer
         // Manifest can make them eligible on the next discovery pass.
-        if !manifest_is_signed {
+        if !manifest_is_authenticated(manifest_node, operation, view)? {
             continue;
         }
         if !state.processed.insert(manifest_node.id()) {
@@ -4909,6 +5427,27 @@ fn parse_manifest_references(
     })
 }
 
+fn manifest_is_authenticated(
+    manifest_node: Node<'_, '_>,
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+) -> Result<bool, DsigError> {
+    for ancestor in manifest_node.ancestors() {
+        operation
+            .budgets()
+            .transforms
+            .charge_node_filter_work(1)
+            .map_err(ReferenceProcessingError::Transform)?;
+        if operation.is_authenticated(view.node_identity(ancestor)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 struct ParsedManifestReferences {
     references: Vec<CompiledManifestReference>,
     invalid_results: Vec<CompiledManifestInvalid>,
@@ -4992,7 +5531,11 @@ fn resolve_verifying_key<'k>(
     budget: &mut super::InspectedKeyCandidateBudget,
 ) -> Result<Option<ResolvedVerifyingKey<'k>>, SignatureVerificationPipelineError> {
     if let Some(key) = key {
-        if !ctx.policy.key_sources.preset_key {
+        if !ctx
+            .policy
+            .key_sources
+            .contains(crate::policy::KeySourceKind::PresetKey)
+        {
             return Err(crate::policy::PolicyViolation::KeyTrust {
                 reason: "pre-resolved verification keys are disabled",
             }
@@ -5107,9 +5650,9 @@ fn enforce_current_transform_allowed<W: structured_asn1::memory::Work>(
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct SignatureChildNodes<'a, 'input> {
-    signed_info_node: Node<'a, 'input>,
-    signature_value_node: Node<'a, 'input>,
-    pub(super) key_info_node: Option<Node<'a, 'input>>,
+    signed_info: Node<'a, 'input>,
+    signature_value: Node<'a, 'input>,
+    pub(super) key_info: Option<Node<'a, 'input>>,
 }
 
 pub(super) fn parse_signature_children<'a, 'input>(
@@ -5194,6 +5737,26 @@ pub(super) fn parse_signature_children<'a, 'input>(
         signature_value_node.ok_or(SignatureVerificationPipelineError::MissingElement {
             element: "SignatureValue",
         })?;
+    validate_signature_child_order(
+        signed_info_index,
+        signature_value_index,
+        key_info_index,
+        first_unexpected_dsig_index,
+    )?;
+
+    Ok(SignatureChildNodes {
+        signed_info: signed_info_node,
+        signature_value: signature_value_node,
+        key_info: key_info_node,
+    })
+}
+
+fn validate_signature_child_order(
+    signed_info_index: Option<usize>,
+    signature_value_index: Option<usize>,
+    key_info_index: Option<usize>,
+    first_unexpected_dsig_index: Option<usize>,
+) -> Result<(), DsigError> {
     if signed_info_index != Some(1) {
         return Err(SignatureVerificationPipelineError::InvalidStructure {
             reason: "SignedInfo must be the first element child of Signature",
@@ -5223,11 +5786,7 @@ pub(super) fn parse_signature_children<'a, 'input>(
         });
     }
 
-    Ok(SignatureChildNodes {
-        signed_info_node,
-        signature_value_node,
-        key_info_node,
-    })
+    Ok(())
 }
 
 fn decode_signature_value(
@@ -5267,13 +5826,12 @@ fn decode_signature_value(
             }
         });
     }
-    if signature_value_node
-        .children()
-        .any(|child| child.is_element())
-    {
-        return Err(SignatureVerificationPipelineError::InvalidStructure {
-            reason: "SignatureValue must not contain element children",
-        });
+    for child in signature_value_node.children() {
+        if child.is_element() {
+            return Err(SignatureVerificationPipelineError::InvalidStructure {
+                reason: "SignatureValue must not contain element children",
+            });
+        }
     }
 
     // Count bounded borrowed text first: comments may split a
@@ -5282,10 +5840,7 @@ fn decode_signature_value(
     let (maximum, raw_maximum) = signature_value_limits(algorithm, resources);
     let mut text_len = 0usize;
     let mut normalized_len = 0usize;
-    for child in signature_value_node
-        .children()
-        .filter(|child| child.is_text())
-    {
+    for child in signature_value_node.children().filter(Node::is_text) {
         if let Some(text) = child.text() {
             if text.len() > raw_maximum - text_len {
                 return Err(SignatureVerificationPipelineError::InvalidStructure {
@@ -5308,10 +5863,7 @@ fn decode_signature_value(
     }
     let mut normalized = Vec::with_capacity(normalized_len);
     let mut raw_text_len = 0usize;
-    for child in signature_value_node
-        .children()
-        .filter(|child| child.is_text())
-    {
+    for child in signature_value_node.children().filter(Node::is_text) {
         if let Some(text) = child.text() {
             push_normalized_signature_text(
                 text,
@@ -5410,7 +5962,7 @@ fn verify_with_algorithm(
         | SignatureAlgorithm::PostQuantum(_) => {
             let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+            if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
                 return Err(SignatureVerificationError::InvalidKeyPem.into());
             }
             Ok(super::modern::verify(
@@ -5418,12 +5970,13 @@ fn verify_with_algorithm(
                 &pem.contents,
                 signed_data,
                 signature_value,
+                &super::pkix::CertificateSession::standalone(),
             )?)
         }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
                 .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-            if !rest.iter().all(|byte| byte.is_ascii_whitespace()) || pem.label != "PUBLIC KEY" {
+            if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
                 return Err(SignatureVerificationError::InvalidKeyPem.into());
             }
             Ok(verify_dsa_signature_spki(
@@ -5489,5915 +6042,4 @@ fn verify_with_algorithm(
 
 #[cfg(test)]
 #[expect(clippy::unwrap_used, reason = "tests use trusted XML fixtures")]
-mod tests {
-    use super::*;
-    use crate::c14n::C14nAlgorithm;
-    use crate::xml::dom::Document;
-    use crate::xmldsig::TransformError;
-    use crate::xmldsig::digest::DigestAlgorithm;
-    use crate::xmldsig::parse::{Reference, parse_signed_info};
-    use crate::xmldsig::transforms::Transform;
-    use crate::xmldsig::uri::UriReferenceResolver;
-    use base64::Engine;
-
-    // ── Helpers ──────────────────────────────────────────────────────
-
-    /// Build a Reference with given URI, transforms, digest method, and expected digest.
-    fn make_reference(
-        uri: &str,
-        transforms: Vec<Transform>,
-        digest_method: DigestAlgorithm,
-        digest_value: Vec<u8>,
-    ) -> Reference {
-        Reference {
-            uri: Some(uri.to_string()),
-            id: None,
-            ref_type: None,
-            transforms,
-            digest_method,
-            digest_value,
-        }
-    }
-
-    #[test]
-    fn operation_borrows_caller_utc_facts_without_policy_rebinding()
-    -> Result<(), Box<dyn std::error::Error>> {
-        // Synthetic caller facts test transport, not real-world UTC history.
-        // Operation capture shares the original slice and never infers facts
-        // from a different policy or creates a replacement timeline.
-        let transitions = [structured_pkix::temporal::Transition::new(2_678_400, 1)];
-        let facts = structured_pkix::temporal::LeapTable::new(0, 6_000_000, &transitions)
-            .expect("valid synthetic UTC facts");
-        let ctx = VerifyContext::new().utc_facts(facts);
-        let budgets = VerificationOperationBudgets::with_transforms(
-            &ctx.policy,
-            TransformExecutionBudget::from_resources(&ctx.policy.resources),
-            ctx.utc_facts,
-        );
-        let mut budget = budgets.key_candidates.borrow_mut();
-        assert_eq!(
-            budget
-                .utc_facts()
-                .ok_or("operation UTC facts")?
-                .transitions()
-                .as_ptr(),
-            transitions.as_ptr()
-        );
-        budget.bind_policy(&ctx.policy)?;
-        assert_eq!(
-            budget
-                .utc_facts()
-                .ok_or("retained UTC facts")?
-                .transitions()
-                .as_ptr(),
-            transitions.as_ptr()
-        );
-        let standalone =
-            super::super::InspectedKeyCandidateBudget::new_with_utc_facts(&ctx.policy, facts);
-        assert_eq!(
-            standalone
-                .utc_facts()
-                .ok_or("standalone UTC facts")?
-                .transitions()
-                .as_ptr(),
-            transitions.as_ptr()
-        );
-        assert!(
-            super::super::InspectedKeyCandidateBudget::new(&ctx.policy)
-                .utc_facts()
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn reference_resolution_uses_each_elements_effective_xml_base() {
-        // Equal lexical URIs under different xml:base values identify distinct
-        // caller-owned resources and must not collide in the resolver.
-        let first = b"first payload";
-        let second = b"second payload";
-        let first_digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, first));
-        let second_digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, second));
-        let xml = format!(
-            r#"<root xml:base="https://example.test/base/" xmlns:ds="{XMLDSIG_NS}">
-                <ds:Signature><ds:SignedInfo>
-                    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                    <ds:Reference xml:base="one/" URI="payload.bin">
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>{first_digest}</ds:DigestValue>
-                    </ds:Reference>
-                    <ds:Reference xml:base="../two/" URI="payload.bin">
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>{second_digest}</ds:DigestValue>
-                    </ds:Reference>
-                </ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>
-            </root>"#
-        );
-        let document = Document::parse(&xml).unwrap();
-        let signature = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-            .unwrap();
-        let signed_info_node = signature
-            .children()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
-            .unwrap();
-        let signed_info = parse_signed_info(signed_info_node).unwrap();
-        let resources = HashMap::from([
-            (
-                "https://example.test/base/one/payload.bin".into(),
-                first.to_vec(),
-            ),
-            (
-                "https://example.test/two/payload.bin".into(),
-                second.to_vec(),
-            ),
-        ]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        let result = process_all_references(&signed_info.references, &resolver, signature, false)
-            .expect("each Reference should resolve against its own effective base");
-
-        assert!(result.all_valid());
-    }
-
-    #[test]
-    fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
-        // The parse policy covers every XML document in one verification
-        // pipeline, including caller-owned octets converted to a node-set.
-        let detached = b"<!DOCTYPE payload [<!ELEMENT payload (#PCDATA)>]><payload>ok</payload>";
-        let digest = base64::engine::general_purpose::STANDARD.encode(compute_digest(
-            DigestAlgorithm::Sha256,
-            b"<payload>ok</payload>",
-        ));
-        let xml = format!(
-            r#"<root xmlns:ds="{XMLDSIG_NS}">
-  <ds:Signature>
-    <ds:SignedInfo>
-      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-      <ds:Reference URI="urn:detached-dtd">
-        <ds:Transforms>
-          <ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/>
-        </ds:Transforms>
-        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-        <ds:DigestValue>{digest}</ds:DigestValue>
-      </ds:Reference>
-    </ds:SignedInfo>
-    <ds:SignatureValue>AQ==</ds:SignatureValue>
-  </ds:Signature>
-</root>"#
-        );
-        let resources = HashMap::from([("urn:detached-dtd".to_owned(), detached.to_vec())]);
-        let key = AcceptingKey;
-
-        let default_error = VerifyContext::new()
-            .key(&key)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect_err("internal DTD parsing must remain disabled by default");
-        assert!(matches!(
-            default_error,
-            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-                crate::xmldsig::TransformError::XmlParse(_)
-            ))
-        ));
-
-        let result = VerifyContext::new()
-            .key(&key)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .allow_internal_dtd(true)
-            .verify(&xml)
-            .expect("the explicit DTD opt-in must cover detached XML transforms");
-
-        assert_eq!(result.status, DsigStatus::Valid);
-
-        let external_entity = br#"<!DOCTYPE payload [
-            <!ENTITY ext SYSTEM "file:///etc/passwd">
-        ]><payload>&ext;</payload>"#;
-        let external_entity_resources =
-            HashMap::from([("urn:detached-dtd".to_owned(), external_entity.to_vec())]);
-        let external_entity_error = VerifyContext::new()
-            .key(&key)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&external_entity_resources)
-            .allow_internal_dtd(true)
-            .verify(&xml)
-            .expect_err("the internal-DTD opt-in must not resolve external entities");
-        assert!(matches!(
-            external_entity_error,
-            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-                crate::xmldsig::TransformError::XmlParse(_)
-            ))
-        ));
-    }
-
-    #[test]
-    fn owned_verification_revalidates_internal_dtd_provenance() {
-        // A document accepted by one permissive operation must not bypass a
-        // later verification context's stricter XML input policy.
-        let document = XmlDocument::parse_with_settings(
-            "<!DOCTYPE root [<!ENTITY value \"ok\">]><root>&value;</root>".into(),
-            DocumentParseSettings::new(
-                true,
-                crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
-                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
-            ),
-        )
-        .expect("explicitly permitted DTD fixture must parse");
-
-        assert!(matches!(
-            VerifyContext::new().verify_document(&document),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::XmlInput {
-                    reason: "owned document requires internal DTD support"
-                }
-            ))
-        ));
-        assert!(!matches!(
-            VerifyContext::new()
-                .allow_internal_dtd(true)
-                .verify_document(&document),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::XmlInput { .. }
-            ))
-        ));
-    }
-
-    #[test]
-    fn verification_policy_bounds_reference_canonicalization() {
-        // Reference transforms and SignedInfo canonicalization are one operation;
-        // references must not fall back to the transform hard-limit budget.
-        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
-        let xml = format!(
-            r#"<root xmlns:ds="{XMLDSIG_NS}"><payload>{}</payload><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#,
-            "payload".repeat(16)
-        );
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_canonicalized_bytes: 64,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("reference canonicalization must consume the policy budget");
-
-        assert!(
-            matches!(
-                error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::CANONICALIZED_BYTES,
-                        maximum: 64,
-                        ..
-                    }
-                )
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn verification_policy_bounds_document_bytes_before_parsing() {
-        // A small node count does not bound parser work when one text node is
-        // large, so the byte ceiling must reject before structural inspection.
-        let xml = format!("<root>{}</root>", "x".repeat(1_024));
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_xml_document_bytes: xml.len() - 1,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        assert!(matches!(
-            VerifyContext::new().policy(policy).verify(&xml),
-            Err(SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_DOCUMENT,
-                    maximum,
-                    actual,
-                }
-            )) if maximum == xml.len() - 1 && actual == xml.len()
-        ));
-    }
-
-    #[test]
-    fn verification_entry_points_enforce_policy_depth() {
-        // Both borrowed XML and a retained document parsed under wider defaults
-        // must be rejected before signature selection traverses the tree.
-        let xml = "<root><child><leaf/></child></root>";
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_xml_depth: 2,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-        let document = XmlDocument::parse(xml).expect("wide retained fixture must parse");
-
-        assert!(matches!(
-            VerifyContext::new().policy(policy.clone()).verify(xml),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_DEPTH,
-                    maximum: 2,
-                    actual: 3,
-                }
-            ))
-        ));
-        assert!(matches!(
-            VerifyContext::new()
-                .policy(policy)
-                .verify_document(&document),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_DEPTH,
-                    maximum: 2,
-                    actual: 3,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn verification_policy_bounds_base64_transform_input() {
-        // The operation snapshot must reach the transform executor rather than
-        // silently falling back to its implementation-wide default budget.
-        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
-        let xml = format!(
-            r##"<root xmlns:ds="{XMLDSIG_NS}"><payload ID="payload">QUJDRA==</payload><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
-        );
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_base64_transform_input_bytes: 4,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("Base64 input must use the operation policy ceiling");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
-                    maximum: 4,
-                    ..
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verification_policy_bounds_cumulative_base64_transform_output() {
-        // References share one operation budget. Validating each decoded value
-        // against the full ceiling would let a signature multiply output work.
-        let first_digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, b"a"));
-        let second_digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, b"b"));
-        let xml = format!(
-            r##"<root xmlns:ds="{XMLDSIG_NS}"><first ID="first">YQ==</first><second ID="second">Yg==</second><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#first"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{first_digest}</ds:DigestValue></ds:Reference><ds:Reference URI="#second"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{second_digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
-        );
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_base64_transform_input_bytes: 8,
-                max_base64_transform_output_bytes: 1,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("references must share the Base64 output allowance");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
-                    maximum: 1,
-                    actual: 2,
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verification_policy_bounds_xpath_source_before_compilation() {
-        // XPath parser limits are part of the same operation snapshot as the
-        // evaluator limits; parsing cannot use a separate hard-coded budget.
-        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
-        let xml = format!(
-            r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
-        );
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_xpath_expression_bytes: 4,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("XPath source must use the operation policy ceiling");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_EXPRESSION_BYTES,
-                    maximum: 4,
-                    ..
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verification_policy_shares_canonicalization_budget_with_signed_info() {
-        // Reference transforms and SignedInfo canonicalization are one operation.
-        // Each output fits independently, but their aggregate must not receive
-        // two separate copies of the configured canonicalization allowance.
-        let payload_text = "x".repeat(700);
-        let canonical_payload = format!("<payload ID=\"payload\">{payload_text}</payload>");
-        let digest = base64::engine::general_purpose::STANDARD.encode(compute_digest(
-            DigestAlgorithm::Sha256,
-            canonical_payload.as_bytes(),
-        ));
-        let xml = format!(
-            r##"<root xmlns:ds="{XMLDSIG_NS}">{canonical_payload}<ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"##
-        );
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_canonicalized_bytes: 1_024,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("SignedInfo must consume the remaining operation C14N budget");
-
-        assert!(
-            matches!(
-                &error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "canonicalized bytes",
-                        maximum: 1_024,
-                        ..
-                    }
-                )
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn manifest_processing_stops_after_c14n_budget_exhaustion() {
-        // A failed bounded render consumes the remaining operation allowance.
-        // Later Manifest references, including cheap binary ones, must not run.
-        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
-        let xml = format!(
-            r##"<root xmlns:ds="{XMLDSIG_NS}"><payload Id="payload">too large</payload><ds:Signature><ds:Object Id="signed-object"><ds:Manifest><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="urn:small"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
-        );
-        let resources = HashMap::from([("urn:small".to_owned(), b"small".to_vec())]);
-        let transform_budget = TransformExecutionBudget::with_c14n_limit(8);
-        let ctx = VerifyContext::new()
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources);
-        let document = XmlDocument::parse(xml).expect("test signature must parse");
-        let results = document
-            .with_view(|view| {
-                let signature = view
-                    .document()
-                    .descendants()
-                    .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-                    .expect("test signature must contain Signature");
-                let object = signature
-                    .children()
-                    .find(|node| node.has_tag_name((XMLDSIG_NS, "Object")))
-                    .expect("test signature must contain Object");
-                let resolver = UriReferenceResolver::with_document_view(view, &[])
-                    .with_external_resources(&resources);
-                let budgets = VerificationOperationBudgets::with_transforms(
-                    &ctx.policy,
-                    transform_budget,
-                    ctx.utc_facts,
-                );
-                let mut operation = OperationExecutionContext::new(
-                    &ctx.policy,
-                    &budgets,
-                    Some((view.identity(), view.generation())),
-                );
-                let crypto =
-                    operation.add_node(OperationNodeKind::Crypto, OperationStage::Crypto, None);
-                operation.compile().expect("base plan");
-                operation
-                    .run(crypto, || Ok::<_, SignatureVerificationPipelineError>(()))
-                    .expect("crypto gate");
-                operation.authenticate(view.node_identity(object));
-                process_authenticated_manifest_references(
-                    &mut operation,
-                    view,
-                    signature,
-                    &resolver,
-                    ManifestVerification {
-                        context: &ctx,
-                        capture: &(),
-                    },
-                    2,
-                    crypto,
-                )
-                .map(|(results, _)| results)
-            })
-            .expect("resource exhaustion is reported per Manifest reference");
-
-        assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|result| {
-            matches!(
-                result.status,
-                DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
-            )
-        }));
-    }
-
-    #[test]
-    fn verification_policy_bounds_detached_xml_nodes() {
-        // Caller-owned detached octets become a second XML document during a
-        // node-set transform and must inherit the same operation node ceiling.
-        let detached = format!("<payload>{}</payload>", "<n/>".repeat(32));
-        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
-        let xml = format!(
-            r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="urn:detached-nodes"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
-        );
-        let resources = HashMap::from([("urn:detached-nodes".to_owned(), detached.into_bytes())]);
-        let policy = crate::policy::VerificationPolicy {
-            uris: crate::policy::UriPolicy {
-                references: UriTypeSet::ALL,
-                ..crate::policy::UriPolicy::default()
-            },
-            resources: crate::policy::ResourcePolicy {
-                max_xml_nodes: 24,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect_err("detached XML must inherit the policy node ceiling");
-
-        assert!(
-            matches!(
-                error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::XML_NODES,
-                        maximum: 24,
-                        ..
-                    }
-                )
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn query_only_reference_resolves_against_relative_xml_base() {
-        // A query-only URI replaces the inherited base query without changing
-        // its relative path; no absolute document base is required by XML Base.
-        let payload = b"query-selected payload";
-        let digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, payload));
-        let xml = format!(
-            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo>
-                <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                <ds:Reference xml:base="a/b?old" URI="?new">
-                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>{digest}</ds:DigestValue>
-                </ds:Reference>
-            </ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue></ds:Signature>"#
-        );
-        let document = Document::parse(&xml).unwrap();
-        let signature = document.root_element();
-        let signed_info_node = signature
-            .children()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
-            .unwrap();
-        let signed_info = parse_signed_info(signed_info_node).unwrap();
-        let resources = HashMap::from([("a/b?new".to_string(), payload.to_vec())]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        let result = process_all_references(&signed_info.references, &resolver, signature, false)
-            .expect("query-only URI must resolve against the complete relative base path");
-
-        assert!(result.all_valid());
-    }
-
-    #[test]
-    fn manifest_reference_resolution_uses_its_effective_xml_base() {
-        // Manifest references carry their own XML Base context and must not
-        // accidentally reuse the SignedInfo or Signature element context.
-        let payload = b"manifest payload";
-        let digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, payload));
-        let xml = format!(
-            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xml:base="https://example.test/">
-                <ds:Object><ds:Manifest xml:base="manifests/">
-                    <ds:Reference URI="payload.bin">
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>{digest}</ds:DigestValue>
-                    </ds:Reference>
-                </ds:Manifest></ds:Object>
-            </ds:Signature>"#
-        );
-        let document = Document::parse(&xml).unwrap();
-        let signature = document.root_element();
-        let reference_node = signature
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
-            .unwrap();
-        let reference = super::super::parse::parse_reference(reference_node).unwrap();
-        let resources = HashMap::from([(
-            "https://example.test/manifests/payload.bin".to_string(),
-            payload.to_vec(),
-        )]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        let result = process_reference(
-            &reference,
-            &resolver,
-            signature,
-            ReferenceSet::Manifest,
-            0,
-            false,
-        )
-        .expect("Manifest Reference should inherit its own XML Base context");
-
-        assert_eq!(result.status, DsigStatus::Valid);
-    }
-
-    #[test]
-    fn manifest_reference_index_ignores_nested_manifest_descendants() {
-        // The public Manifest index follows Signature/Object/Manifest structure;
-        // wrapper descendants must not steal an index and supply another base URI.
-        let payload = b"direct manifest payload";
-        let digest = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha256, payload));
-        let xml = format!(
-            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}" xml:base="https://example.test/">
-                <ds:Object><wrapper><ds:Manifest xml:base="nested/">
-                    <ds:Reference URI="payload.bin">
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>{digest}</ds:DigestValue>
-                    </ds:Reference>
-                </ds:Manifest></wrapper></ds:Object>
-                <ds:Object><ds:Manifest xml:base="direct/">
-                    <ds:Reference URI="payload.bin">
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>{digest}</ds:DigestValue>
-                    </ds:Reference>
-                </ds:Manifest></ds:Object>
-            </ds:Signature>"#
-        );
-        let document = Document::parse(&xml).unwrap();
-        let signature = document.root_element();
-        let direct_reference_node = signature
-            .children()
-            .filter(|node| node.has_tag_name((XMLDSIG_NS, "Object")))
-            .nth(1)
-            .unwrap()
-            .children()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Manifest")))
-            .unwrap()
-            .children()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
-            .unwrap();
-        let reference = super::super::parse::parse_reference(direct_reference_node).unwrap();
-        let resources = HashMap::from([(
-            "https://example.test/direct/payload.bin".to_string(),
-            payload.to_vec(),
-        )]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        let result = process_reference(
-            &reference,
-            &resolver,
-            signature,
-            ReferenceSet::Manifest,
-            0,
-            false,
-        )
-        .expect("Manifest index must select the direct Object/Manifest reference");
-
-        assert_eq!(result.status, DsigStatus::Valid);
-    }
-
-    struct RejectingKey;
-
-    impl VerifyingKey for RejectingKey {
-        fn verify(
-            &self,
-            _algorithm: SignatureAlgorithm,
-            _signed_data: &[u8],
-            _signature_value: &[u8],
-        ) -> Result<bool, SignatureVerificationPipelineError> {
-            Ok(false)
-        }
-    }
-
-    struct AcceptingKey;
-
-    impl VerifyingKey for AcceptingKey {
-        fn verify(
-            &self,
-            _algorithm: SignatureAlgorithm,
-            _signed_data: &[u8],
-            _signature_value: &[u8],
-        ) -> Result<bool, SignatureVerificationPipelineError> {
-            Ok(true)
-        }
-    }
-
-    struct PanicResolver;
-
-    struct UntrustedTestResolver;
-
-    impl KeyResolver for UntrustedTestResolver {
-        fn resolve<'a>(
-            &'a self,
-            _key_info: Option<&KeyInfo>,
-            _algorithm: SignatureAlgorithm,
-        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-            Ok(Some(Box::new(AcceptingKey)))
-        }
-    }
-
-    #[test]
-    fn verification_requires_explicit_key_authorization() {
-        // A resolver finding a working key must not authorize its signer.
-        let xml = signature_with_target_reference("AQ==");
-        let error = VerifyContext::new()
-            .key_resolver(&UntrustedTestResolver)
-            .verify(&xml)
-            .expect_err("default verification must reject an untrusted resolver candidate");
-        assert!(matches!(
-            error,
-            DsigError::Policy(crate::policy::PolicyViolation::KeyTrust { .. })
-        ));
-    }
-
-    #[test]
-    fn cryptographic_only_is_explicit_and_never_reports_trust() {
-        // Opting out of signer authorization must remain visible in the result.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_trust.mode = crate::policy::VerificationTrustMode::CryptographicOnly;
-        let result = VerifyContext::new()
-            .policy(policy)
-            .key_resolver(&UntrustedTestResolver)
-            .verify(&signature_with_target_reference("AQ=="))
-            .expect("explicit mathematical mode permits an untrusted candidate");
-        assert_eq!(result.status, DsigStatus::Valid);
-        assert_eq!(
-            result.key_trust,
-            super::super::KeyTrustEvidence::NotEstablished
-        );
-    }
-
-    #[test]
-    fn caller_key_authorization_does_not_authenticate_an_invalid_signature() {
-        // A trusted key is not evidence that the signature itself verified.
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&signature_with_target_reference("AQ=="))
-            .expect("an invalid mathematical signature is a completed result");
-        assert_eq!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        );
-        assert_eq!(
-            result.key_trust,
-            super::super::KeyTrustEvidence::CallerTrusted
-        );
-    }
-
-    impl KeyResolver for PanicResolver {
-        fn resolve<'a>(
-            &'a self,
-            _key_info: Option<&KeyInfo>,
-            _algorithm: SignatureAlgorithm,
-        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
-        {
-            panic!("resolver should not be called when references already fail");
-        }
-    }
-
-    struct MissingKeyResolver;
-
-    impl KeyResolver for MissingKeyResolver {
-        fn resolve<'a>(
-            &'a self,
-            _key_info: Option<&KeyInfo>,
-            _algorithm: SignatureAlgorithm,
-        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
-        {
-            Ok(None)
-        }
-    }
-
-    struct ConsumingKeyInfoResolver;
-
-    impl KeyResolver for ConsumingKeyInfoResolver {
-        fn resolve<'a>(
-            &'a self,
-            _key_info: Option<&KeyInfo>,
-            _algorithm: SignatureAlgorithm,
-        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
-        {
-            Ok(None)
-        }
-
-        fn consumes_document_key_info(&self) -> bool {
-            true
-        }
-    }
-
-    struct FallbackKeyInfoResolver;
-
-    impl KeyResolver for FallbackKeyInfoResolver {
-        fn resolve_for_verification<'a>(
-            &'a self,
-            key_info: Option<&KeyInfo>,
-            algorithm: SignatureAlgorithm,
-            _policy: &crate::policy::VerificationPolicy,
-            _provider: &dyn crate::provider::CryptoProvider,
-        ) -> Result<Option<super::super::ResolvedVerificationKey<'a>>, DsigError> {
-            // This test resolver explicitly authorizes its application-owned key.
-            self.resolve(key_info, algorithm)
-                .map(|key| key.map(super::super::ResolvedVerificationKey::CallerTrusted))
-        }
-
-        fn resolve<'a>(
-            &'a self,
-            key_info: Option<&KeyInfo>,
-            _algorithm: SignatureAlgorithm,
-        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
-        {
-            let sources = &key_info.expect("KeyInfo must be parsed").sources;
-            assert!(matches!(
-                sources.as_slice(),
-                [
-                    super::super::parse::KeyInfoSource::RetrievalMethod { .. },
-                    super::super::parse::KeyInfoSource::KeyName(name),
-                ] if name == "fallback"
-            ));
-            Ok(Some(Box::new(AcceptingKey)))
-        }
-
-        fn consumes_document_key_info(&self) -> bool {
-            true
-        }
-    }
-
-    struct EarlyKeyInfoResolver;
-
-    impl KeyResolver for EarlyKeyInfoResolver {
-        fn resolve_for_verification<'a>(
-            &'a self,
-            key_info: Option<&KeyInfo>,
-            algorithm: SignatureAlgorithm,
-            _policy: &crate::policy::VerificationPolicy,
-            _provider: &dyn crate::provider::CryptoProvider,
-        ) -> Result<Option<super::super::ResolvedVerificationKey<'a>>, DsigError> {
-            // Only the selected primary application key is authorized here.
-            self.resolve(key_info, algorithm)
-                .map(|key| key.map(super::super::ResolvedVerificationKey::CallerTrusted))
-        }
-
-        fn resolve<'a>(
-            &'a self,
-            key_info: Option<&KeyInfo>,
-            _algorithm: SignatureAlgorithm,
-        ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError>
-        {
-            let sources = &key_info.expect("KeyInfo must be parsed").sources;
-            assert!(matches!(
-                sources.as_slice(),
-                [
-                    super::super::parse::KeyInfoSource::KeyName(name),
-                    super::super::parse::KeyInfoSource::RetrievalMethod { .. },
-                ] if name == "primary"
-            ));
-            Ok(Some(Box::new(AcceptingKey)))
-        }
-
-        fn consumes_document_key_info(&self) -> bool {
-            true
-        }
-    }
-
-    fn minimal_signature_xml(reference_uri: &str, transforms_xml: &str) -> String {
-        format!(
-            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <ds:SignedInfo>
-    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-    <ds:Reference URI="{reference_uri}">
-      {transforms_xml}
-      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-    </ds:Reference>
-  </ds:SignedInfo>
-  <ds:SignatureValue>AQ==</ds:SignatureValue>
-</ds:Signature>"#
-        )
-    }
-
-    #[test]
-    fn retained_verification_preserves_original_authenticated_operation() {
-        // Keep the original per-Signature graph/authentication state, not a new
-        // set reconstructed from detached digest-result booleans.
-        use structured_asn1::memory::{Memory, MemoryAccount};
-        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(16384, 100000)));
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        let context = VerifyContext::new().key(&AcceptingKey);
-        with_verified_document(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            ScopedRequestStorage(&work),
-            |view, _, budgets, evidence, operations, _| {
-                assert_eq!(evidence.signatures().len(), 1);
-                assert_eq!(operations.len(), 1);
-                let target = view.node_for_id("target", &[]).unwrap();
-                assert!(operations[0].operation.is_authenticated(target));
-                assert!(std::ptr::eq(*operations[0].operation.budgets(), budgets));
-                assert!(budgets.canonicalized.remaining() < budgets.canonicalized.max_bytes);
-                Ok(())
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn retained_verification_accepts_borrowed_keys_and_admits_storage_first() {
-        // The scoped storage projection must not impose 'static on request
-        // keys. Refused report/state storage cannot reach the provider.
-        use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
-        struct BorrowedKey<'a>(&'a Cell<usize>);
-        impl VerifyingKey for BorrowedKey<'_> {
-            fn validate_signature_value(
-                &self,
-                _: SignatureAlgorithm,
-                _: &[u8],
-            ) -> Result<bool, DsigError> {
-                Ok(true)
-            }
-            fn verify(&self, _: SignatureAlgorithm, _: &[u8], _: &[u8]) -> Result<bool, DsigError> {
-                self.0.set(self.0.get() + 1);
-                Ok(true)
-            }
-        }
-        let calls = Cell::new(0);
-        let key = BorrowedKey(&calls);
-        let context = VerifyContext::new().key(&key);
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 100000)));
-        let result: Result<(), DsigError> = with_verified_document(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            ScopedRequestStorage(&denied),
-            |_, _, _, _, _, _| panic!("refused storage must not reach the continuation"),
-        );
-        assert!(matches!(
-            result,
-            Err(DsigError::SharedExecution(MemoryError::LimitExceeded))
-        ));
-        assert_eq!(calls.get(), 0);
-        let admitted = Memory::new(std::sync::Arc::new(MemoryAccount::new(16384, 100000)));
-        with_verified_document(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            ScopedRequestStorage(&admitted),
-            |_, _, _, evidence, operations, _| {
-                assert!(evidence.all_valid());
-                assert_eq!(operations.len(), 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-        assert_eq!(calls.get(), 1);
-    }
-
-    #[test]
-    fn verified_continuation_keeps_the_consumed_operation_budget() {
-        // Extension work continues after core verification with the very same
-        // canonicalization allowance, not a fresh budget built from policy.
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        let context = VerifyContext::new().key(&AcceptingKey);
-        let called = Cell::new(false);
-        let evidence = with_verified_document(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            CollectedRequestStorage,
-            |view, _captured_context, budgets, evidence, (), _| {
-                called.set(true);
-                assert_eq!(view.root(), evidence.document);
-                assert!(evidence.signatures()[0].result().is_ok());
-                let remaining = budgets.canonicalized.remaining();
-                assert!(remaining < budgets.canonicalized.max_bytes);
-                budgets.canonicalized.charge(remaining).unwrap();
-                assert!(budgets.canonicalized.charge(1).is_err());
-                Ok(evidence)
-            },
-        )
-        .unwrap();
-        assert!(called.get());
-        assert_eq!(evidence.signatures().len(), 1);
-    }
-
-    #[test]
-    fn public_session_catalogue_replays_the_original_reference() {
-        // The public continuation must retain the selected operation, expose
-        // original Reference/parent identities, and stream the verified bytes.
-        use structured_asn1::memory::{Memory, MemoryAccount};
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        let context = VerifyContext::new().key(&AcceptingKey);
-        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        with_verified_request(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            &work,
-            |session| {
-                let signature = session.evidence().signatures()[0].identity();
-                let selected = session.select_signature(signature)?;
-                let mut count = 0;
-                let completeness = selected
-                    .visit_authenticated_references(|reference| {
-                        count += 1;
-                        assert!(matches!(reference.parent, ReferenceParent::SignedInfo(_)));
-                        assert_eq!(reference.uri, Some("#target"));
-                        let mut bytes = Vec::new();
-                        let outcome = selected
-                            .replay_reference(
-                                reference.identity,
-                                ReplayMode::ReferenceOutput,
-                                &mut |chunk: &[u8]| {
-                                    bytes.extend_from_slice(chunk);
-                                    Ok::<_, ()>(())
-                                },
-                            )
-                            .unwrap();
-                        assert_eq!(outcome, ReplayOutcome::Complete);
-                        assert_eq!(bytes, b"<target ID=\"target\">payload</target>");
-                        Ok::<_, ()>(())
-                    })
-                    .unwrap();
-                assert_eq!(completeness, CatalogueCompleteness::Complete);
-                assert_eq!(count, 1);
-                Ok(())
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn public_session_resolves_original_attribute_and_fragmented_simple_content() {
-        // Both schema lexical sources must resolve through the same original
-        // ID index. Fragmented text must not drop text after comments or CDATA.
-        use structured_asn1::memory::{Memory, MemoryAccount};
-        let document = XmlDocument::parse(signature_with_target_content(
-            "AQ==",
-            "<property URI=\"#ref\"/><content>#r<!--split--><![CDATA[ef]]></content>",
-        ))
-        .unwrap();
-        let context = VerifyContext::new().key(&AcceptingKey);
-        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        with_verified_request(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            &work,
-            |session| {
-                let selected =
-                    session.select_signature(session.evidence().signatures()[0].identity())?;
-                for (name, source) in [
-                    (
-                        "property",
-                        LexicalSource::Attribute {
-                            namespace: None,
-                            local_name: "URI",
-                        },
-                    ),
-                    ("content", LexicalSource::SimpleContent),
-                ] {
-                    let node = session
-                        .view()
-                        .document()
-                        .descendants()
-                        .find(|node| node.has_tag_name(name))
-                        .unwrap();
-                    let ReferenceResolution::Reference(reference) =
-                        selected.resolve_reference(session.view().node_identity(node), source)?
-                    else {
-                        panic!("original Reference must resolve");
-                    };
-                    assert_eq!(reference.uri, Some("#target"));
-                }
-                Ok(())
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn public_session_manifest_instruction_survives_old_digest_mismatch() {
-        // Renewal covers the authenticated instruction with a new digest. It
-        // must not require the old target digest to match first (EN §5.5.3).
-        use structured_asn1::memory::{Memory, MemoryAccount};
-        let document = XmlDocument::parse(signature_with_manifest_xml(false)).unwrap();
-        let context = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true);
-        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        with_verified_request(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            &work,
-            |session| {
-                let selected =
-                    session.select_signature(session.evidence().signatures()[0].identity())?;
-                let mut manifests = 0;
-                let completeness = selected
-                    .visit_authenticated_references(|reference| {
-                        if let ReferenceParent::Manifest(_) = reference.parent {
-                            manifests += 1;
-                            assert!(matches!(
-                                reference.result.unwrap().status,
-                                DsigStatus::Invalid(_)
-                            ));
-                            let mut calls = 0;
-                            let outcome = selected
-                                .replay_reference(
-                                    reference.identity,
-                                    ReplayMode::ReferenceOutput,
-                                    &mut |_: &[u8]| {
-                                        calls += 1;
-                                        Ok::<_, ()>(())
-                                    },
-                                )
-                                .unwrap();
-                            assert_eq!(outcome, ReplayOutcome::Complete);
-                            assert!(calls > 0);
-                        }
-                        Ok::<_, ()>(())
-                    })
-                    .unwrap();
-                assert_eq!(manifests, 1);
-                assert_eq!(completeness, CatalogueCompleteness::Complete);
-                Ok(())
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn public_session_replay_keeps_original_receiver_failure_sticky() {
-        // No later C14N fragment may overwrite a typed caller refusal or invoke
-        // the receiver a second time after the first error.
-        use structured_asn1::memory::{Memory, MemoryAccount};
-        #[derive(Debug, PartialEq)]
-        struct Refusal(u32);
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        let context = VerifyContext::new().key(&AcceptingKey);
-        let work = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
-        with_verified_request(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            &work,
-            |session| {
-                let selected =
-                    session.select_signature(session.evidence().signatures()[0].identity())?;
-                selected
-                    .visit_authenticated_references(|reference| {
-                        let mut calls = 0;
-                        let result = selected.replay_reference(
-                            reference.identity,
-                            ReplayMode::ReferenceOutput,
-                            &mut |_: &[u8]| {
-                                calls += 1;
-                                Err(Refusal(7))
-                            },
-                        );
-                        assert!(matches!(result, Err(ReplayError::Receiver(Refusal(7)))));
-                        assert_eq!(calls, 1);
-                        Ok::<_, ()>(())
-                    })
-                    .unwrap();
-                Ok(())
-            },
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn verify_all_retains_each_signature_without_vacuous_success() {
-        // Malformed signatures remain individually visible; an empty document
-        // never satisfies a request merely because there were no failures.
-        let document = XmlDocument::parse(format!(
-            "<root xmlns:ds=\"{XMLDSIG_NS}\"><ds:Signature/><ds:Signature/></root>"
-        ))
-        .unwrap();
-        let evidence = VerifyContext::new().verify_all(&document).unwrap();
-        assert_eq!(evidence.signatures().len(), 2);
-        assert!(
-            evidence
-                .signatures()
-                .iter()
-                .all(|entry| entry.result().is_err())
-        );
-        assert!(!evidence.all_valid());
-        let empty = XmlDocument::parse("<root/>").unwrap();
-        assert!(!VerifyContext::new().verify_all(&empty).unwrap().all_valid());
-    }
-
-    #[test]
-    fn verify_all_checks_cardinality_before_running_keys() {
-        // The cardinality policy bounds report allocation and crypto work,
-        // including malformed signatures that never reach core validation.
-        let document = XmlDocument::parse(format!(
-            "<root xmlns:ds=\"{XMLDSIG_NS}\"><ds:Signature/><ds:Signature/></root>"
-        ))
-        .unwrap();
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_signatures = 1;
-        assert!(matches!(
-            VerifyContext::new().policy(policy).verify_all(&document),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "verification signatures",
-                    maximum: 1,
-                    actual: 2,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn verification_signature_limit_also_gates_the_single_api() {
-        // The same compiled resource policy must apply to both public paths.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_signatures = 0;
-        assert!(matches!(
-            VerifyContext::new()
-                .policy(policy)
-                .key(&AcceptingKey)
-                .verify(&signature_with_target_reference("AQ==")),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "verification signatures",
-                    maximum: 0,
-                    actual: 1,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn verify_all_preserves_generation_and_rejects_wrapped_siblings() {
-        // A signature over one element never authenticates a lookalike sibling.
-        let xml = signature_with_target_reference("AQ==")
-            .replace("</root>", "<target ID=\"unsigned\">payload</target></root>");
-        let document = XmlDocument::parse(xml).unwrap();
-        let (signed, unsigned) = document.with_view(|view| {
-            (
-                view.node_for_id("target", &[]).unwrap(),
-                view.node_for_id("unsigned", &[]).unwrap(),
-            )
-        });
-        let evidence = VerifyContext::new()
-            .key(&AcceptingKey)
-            .verify_all(&document)
-            .unwrap();
-        assert!(evidence.all_valid());
-        assert!(evidence.covers_element(&document, signed).unwrap());
-        assert!(!evidence.covers_element(&document, unsigned).unwrap());
-        let foreign = XmlDocument::parse("<target/>").unwrap();
-        let target = foreign.with_view(|view| view.root_element());
-        assert!(matches!(
-            evidence.covers_element(&document, target),
-            Err(DsigError::Document(XmlDocumentError::ForeignIdentity))
-        ));
-    }
-
-    #[test]
-    fn verify_request_rejects_duplicate_targets_before_crypto() {
-        // Ambiguous request mapping is not a successful duplicate assertion.
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        let target = document.with_view(|view| view.node_for_id("target", &[]).unwrap());
-        let targets = [target, target];
-        let request = VerificationRequest {
-            expected_targets: &targets,
-            ..VerificationRequest::default()
-        };
-        assert!(matches!(
-            VerifyContext::new().verify_request(&document, &request),
-            Err(DsigError::InvalidRequest {
-                reason: "duplicate expected coverage target"
-            })
-        ));
-    }
-
-    #[test]
-    fn verify_all_shares_canonicalization_retention_budget() {
-        // Repeating a Signature may not reset the retained-data allowance.
-        let xml = signature_with_target_reference("AQ==");
-        let single = VerifyContext::new()
-            .key(&AcceptingKey)
-            .store_pre_digest(true)
-            .verify(&xml)
-            .unwrap();
-        let bytes = single.canonicalized_signed_info.unwrap().len()
-            + single.signed_info_references[0]
-                .pre_digest_data
-                .as_ref()
-                .unwrap()
-                .len();
-        let parsed = Document::parse(&xml).unwrap();
-        let signature = parsed
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-            .unwrap();
-        let xml = xml.replace("</root>", &format!("{}</root>", &xml[signature.range()]));
-        let document = XmlDocument::parse(xml).unwrap();
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_canonicalized_bytes = bytes * 2 - 1;
-        let evidence = VerifyContext::new()
-            .key(&AcceptingKey)
-            .store_pre_digest(true)
-            .policy(policy)
-            .verify_all(&document)
-            .unwrap();
-        assert_eq!(evidence.signatures.len(), 2);
-        assert_eq!(
-            evidence.signatures[0].result().as_ref().unwrap().status,
-            DsigStatus::Valid
-        );
-        assert!(matches!(
-            evidence.signatures[1].result(),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "canonicalized bytes",
-                    ..
-                }
-            ))
-        ));
-        assert!(!evidence.accepted(&document).unwrap());
-    }
-
-    #[test]
-    fn verify_all_manifest_coverage_requires_its_authenticated_digest() {
-        // A valid enclosing Signature authenticates the Manifest declaration,
-        // not a target whose separately checked Manifest digest mismatches.
-        for valid in [true, false] {
-            let document = XmlDocument::parse(signature_with_manifest_xml(valid)).unwrap();
-            let target = document.with_view(|view| view.node_for_id("target", &[]).unwrap());
-            let evidence = VerifyContext::new()
-                .key(&AcceptingKey)
-                .process_manifests(true)
-                .verify_all(&document)
-                .unwrap();
-            let result = evidence.signatures()[0].result().as_ref().unwrap();
-            assert_eq!(result.manifest_references.len(), 1);
-            assert!(result.manifest_references[0].reference_identity.is_some());
-            assert_eq!(evidence.covers_element(&document, target).unwrap(), valid);
-            assert_eq!(evidence.accepted(&document).unwrap(), valid);
-        }
-    }
-
-    #[test]
-    fn verify_all_filtered_digest_does_not_claim_original_subtree() {
-        // A projection may discard content even when its local digest matches.
-        // No arbitrary filter is promoted to complete original-node coverage.
-        let mut reference = make_reference(
-            "#target",
-            vec![Transform::XpathExcludeAllSignatures],
-            DigestAlgorithm::Sha256,
-            vec![],
-        );
-        let document = XmlDocument::parse(signature_with_target_reference("AQ==")).unwrap();
-        document.with_view(|view| {
-            let target = view.node_for_id("target", &[]).unwrap();
-            let mut result = manifest_reference_invalid_result(
-                &reference,
-                0,
-                FailureReason::ReferenceProcessingFailure { ref_index: 0 },
-            );
-            result.status = DsigStatus::Valid;
-            bind_reference_evidence(
-                &mut result,
-                &reference,
-                view,
-                None,
-                &OperationResourceIdentity::DocumentNode(target),
-            );
-            assert_eq!(result.target_identity, Some(target));
-            assert_eq!(result.coverage, ReferenceCoverage::TransformedData);
-            reference.transforms = vec![Transform::C14n(crate::c14n::C14nAlgorithm::new(
-                crate::c14n::C14nMode::Exclusive1_0,
-                false,
-            ))];
-            bind_reference_evidence(
-                &mut result,
-                &reference,
-                view,
-                None,
-                &OperationResourceIdentity::DocumentNode(target),
-            );
-            assert_eq!(result.coverage, ReferenceCoverage::ElementContent);
-        });
-    }
-
-    #[test]
-    fn verify_request_rejects_conflicting_resource_owners() {
-        // There is no implicit override between request bytes and old builder
-        // configuration: ownership must be explicit before resolver work.
-        let document = XmlDocument::parse("<root/>").unwrap();
-        let resources = HashMap::new();
-        let request = VerificationRequest {
-            external_resources: Some(&resources),
-            ..VerificationRequest::default()
-        };
-        assert!(matches!(
-            VerifyContext::new()
-                .external_resources(&resources)
-                .verify_request(&document, &request),
-            Err(DsigError::InvalidRequest {
-                reason: "external resources configured in both context and request"
-            })
-        ));
-    }
-
-    fn signature_with_target_reference(signature_value_b64: &str) -> String {
-        signature_with_target_content(signature_value_b64, "payload")
-            .replace("<ds:Reference Id=\"ref\"", "<ds:Reference")
-    }
-
-    fn signature_with_target_content(signature_value_b64: &str, content: &str) -> String {
-        let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <target ID="target">payload</target>
-  <ds:Signature>
-    <ds:SignedInfo>
-      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-      <ds:Reference Id="ref" URI="#target">
-        <ds:Transforms>
-          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-        </ds:Transforms>
-        <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-        <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-      </ds:Reference>
-    </ds:SignedInfo>
-    <ds:SignatureValue>SIGNATURE_VALUE_PLACEHOLDER</ds:SignatureValue>
-  </ds:Signature>
-</root>"##
-            .replace(">payload</target>", &format!(">{content}</target>"));
-
-        let doc = Document::parse(&xml_template).unwrap();
-        let sig_node = doc
-            .descendants()
-            .find(|node| node.is_element() && node.tag_name().name() == "Signature")
-            .unwrap();
-        let signed_info_node = sig_node
-            .children()
-            .find(|node| node.is_element() && node.tag_name().name() == "SignedInfo")
-            .unwrap();
-        let signed_info = parse_signed_info(signed_info_node).unwrap();
-        let reference = &signed_info.references[0];
-        let resolver = UriReferenceResolver::new(&doc);
-        let initial_data = resolver
-            .dereference(reference.uri.as_deref().unwrap())
-            .unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(sig_node, initial_data, &reference.transforms)
-                .unwrap();
-        let digest = compute_digest(reference.digest_method, &pre_digest);
-        let digest_b64 = base64::engine::general_purpose::STANDARD.encode(digest);
-        xml_template
-            .replace("AAAAAAAAAAAAAAAAAAAAAAAAAAA=", &digest_b64)
-            .replace("SIGNATURE_VALUE_PLACEHOLDER", signature_value_b64)
-    }
-
-    #[test]
-    fn verify_context_reports_key_not_found_status_without_key_or_resolver() {
-        let xml = signature_with_target_reference("AQ==");
-
-        let result = VerifyContext::new()
-            .verify(&xml)
-            .expect("missing key config must be reported as verification status");
-        assert!(
-            matches!(
-                result.status,
-                DsigStatus::Invalid(FailureReason::KeyNotFound)
-            ),
-            "unexpected status: {:?}",
-            result.status
-        );
-    }
-
-    #[test]
-    fn verify_context_rejects_disallowed_uri() {
-        let xml = minimal_signature_xml("http://example.com/external", "");
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&xml)
-            .expect_err("external URI should be rejected by default policy");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Uri {
-                operation: "verification",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn verify_context_bounds_effective_xml_base_components() {
-        // External URI resolution must stop before repeatedly copying an
-        // attacker-controlled chain of effective XML Base values.
-        let mut xml = minimal_signature_xml("payload", "");
-        for _ in 0..65 {
-            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
-        }
-        let resources = HashMap::new();
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect_err("XML Base component work must be bounded before lookup");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
-                    maximum: 64,
-                    actual: 65,
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verify_context_bounds_cumulative_xml_base_resolution_bytes() {
-        // The operation-wide byte budget charges intermediate URI copies, not
-        // merely the small final external resource returned by the caller map.
-        let mut xml = minimal_signature_xml("payload", "");
-        for _ in 0..2 {
-            xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
-        }
-        let resources = HashMap::new();
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xml_base_resolution_bytes = 32;
-        let error = VerifyContext::new()
-            .policy(policy)
-            .key(&AcceptingKey)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect_err("cumulative XML Base copies must obey the operation budget");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
-                    maximum: 32,
-                    ..
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verify_context_applies_xml_base_policy_to_signed_info_c14n() {
-        // The SignedInfo node-set excludes its ancestors, so C14N 1.1 must
-        // resolve their inherited xml:base values through the same operation
-        // budget already used by Reference processing.
-        let xml = signature_with_target_reference("AQ==")
-            .replacen(
-                "http://www.w3.org/2001/10/xml-exc-c14n#",
-                "http://www.w3.org/2006/12/xml-c14n11",
-                1,
-            )
-            .replace(
-                "  <ds:Signature>",
-                "  <outer xml:base=\"one/\"><inner xml:base=\"two/\"><ds:Signature>",
-            )
-            .replace("  </ds:Signature>", "  </ds:Signature></inner></outer>");
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_xml_base_components: 1,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("SignedInfo C14N must use the operation XML Base budget");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_BASE_COMPONENTS,
-                    maximum: 1,
-                    actual: 2,
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verify_context_classifies_signed_info_xml_base_byte_limit_as_policy() {
-        // SignedInfo C14N 1.1 XML Base work is policy enforcement, not a
-        // malformed canonicalization request, and must retain typed diagnostics.
-        let xml = signature_with_target_reference("AQ==")
-            .replacen(
-                "http://www.w3.org/2001/10/xml-exc-c14n#",
-                "http://www.w3.org/2006/12/xml-c14n11",
-                1,
-            )
-            .replace(
-                "  <ds:Signature>",
-                "  <outer xml:base=\"segment/\"><ds:Signature>",
-            )
-            .replace("  </ds:Signature>", "  </ds:Signature></outer>");
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_xml_base_resolution_bytes: 1,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("SignedInfo XML Base byte exhaustion must be a policy error");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_BASE_RESOLUTION_BYTES,
-                    maximum: 1,
-                    actual,
-                }
-            ) if actual > 1
-        ));
-    }
-
-    #[test]
-    fn verify_context_meters_repeated_external_dereferences() {
-        // One caller-owned entry can be referenced repeatedly. The aggregate
-        // ceiling bounds bytes cloned and processed, not just unique map data.
-        let payload = b"payload";
-        let digest = base64::engine::general_purpose::STANDARD.encode(
-            crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
-        );
-        let reference = format!(
-            r#"<ds:Reference URI="urn:payload"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference>"#
-        );
-        let xml = format!(
-            r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{reference}{reference}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
-        );
-        let resources = HashMap::from([("urn:payload".to_owned(), payload.to_vec())]);
-        let policy = crate::policy::VerificationPolicy {
-            uris: crate::policy::UriPolicy {
-                references: UriTypeSet::ALL,
-                ..crate::policy::UriPolicy::default()
-            },
-            resources: crate::policy::ResourcePolicy {
-                max_external_resource_bytes: payload.len(),
-                max_external_resource_total_bytes: payload.len(),
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect_err("the second dereference must exhaust the aggregate byte ceiling");
-
-        assert!(
-            error
-                .to_string()
-                .contains("aggregate external resource bytes")
-        );
-    }
-
-    #[test]
-    fn verify_context_rejects_empty_uri_when_policy_disallows_empty() {
-        let xml = minimal_signature_xml("", "");
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .allowed_uri_types(UriTypeSet::new(false, true, false))
-            .verify(&xml)
-            .expect_err("empty URI must be rejected when empty references are disabled");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Uri {
-                operation: "verification",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn verify_context_rejects_disallowed_transform() {
-        let xml = minimal_signature_xml(
-            "",
-            r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms>"#,
-        );
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
-            .verify(&xml)
-            .expect_err("enveloped transform should be rejected by allowlist");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Algorithm {
-                operation: "verification transform",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn verify_context_applies_transform_allowlist_to_signed_info_c14n() {
-        // Reference C14N remains allowlisted; only the distinct SignedInfo
-        // canonicalization method should trigger this policy rejection.
-        let xml = signature_with_target_reference("AQ==").replacen(
-            "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
-            "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/TR/2001/REC-xml-c14n-20010315\"/>",
-            1,
-        );
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
-            .verify(&xml)
-            .expect_err("SignedInfo C14N must obey the operation transform allowlist");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::Algorithm {
-                    operation: "verification transform",
-                    ref algorithm,
-                }
-            )
-                if algorithm == "http://www.w3.org/TR/2001/REC-xml-c14n-20010315"
-        ));
-    }
-
-    #[test]
-    fn verify_context_applies_transform_allowlist_to_key_retrieval() {
-        // The reference and SignedInfo both use exclusive C14N. The only XPath
-        // operation is document-selected key retrieval and must be rejected.
-        let xml = signature_with_target_reference("AQ==")
-            .replacen(
-                "</ds:Signature>",
-                r##"<ds:KeyInfo><ds:RetrievalMethod URI="#keys" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo></ds:Signature>"##,
-                1,
-            )
-            .replacen(
-                "</root>",
-                r#"<holder ID="keys"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder></root>"#,
-                1,
-            );
-        let error = VerifyContext::new()
-            .key_resolver(&ConsumingKeyInfoResolver)
-            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
-            .verify(&xml)
-            .expect_err("RetrievalMethod XPath must obey the operation transform allowlist");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::Algorithm {
-                    operation: "verification transform",
-                    ref algorithm,
-                }
-            )
-                if algorithm == XPATH_TRANSFORM_URI
-        ));
-    }
-
-    fn signature_with_manifest_xml(valid_manifest_digest: bool) -> String {
-        signature_with_manifest_xml_with_manifest_mutation(valid_manifest_digest, |xml| xml)
-    }
-
-    fn signature_with_manifest_xml_with_manifest_mutation<F>(
-        valid_manifest_digest: bool,
-        mutate_manifest: F,
-    ) -> String
-    where
-        F: FnOnce(String) -> String,
-    {
-        const TMP_SIGNED_INFO_DIGEST: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAA=";
-        const INVALID_MANIFEST_DIGEST: &str = "//////////////////////////8=";
-        let xml_template = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <target ID="target">payload</target>
-  <ds:Signature>
-    <ds:SignedInfo>
-      <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-      <ds:Reference URI="#manifest">
-        <ds:Transforms>
-          <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-        </ds:Transforms>
-        <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-        <ds:DigestValue>SIGNEDINFO_OBJECT_DIGEST_PLACEHOLDER</ds:DigestValue>
-      </ds:Reference>
-    </ds:SignedInfo>
-    <ds:SignatureValue>AQ==</ds:SignatureValue>
-    <ds:Object>
-      <ds:Manifest ID="manifest">
-        <ds:Reference URI="#target">
-          <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-          <ds:DigestValue>MANIFEST_DIGEST_PLACEHOLDER</ds:DigestValue>
-        </ds:Reference>
-      </ds:Manifest>
-    </ds:Object>
-  </ds:Signature>
-</root>"##;
-        let seed_xml = xml_template.replace(
-            "SIGNEDINFO_OBJECT_DIGEST_PLACEHOLDER",
-            TMP_SIGNED_INFO_DIGEST,
-        );
-        let doc = Document::parse(&seed_xml).unwrap();
-        let signature_node = doc
-            .descendants()
-            .find(|node| {
-                node.is_element()
-                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                    && node.tag_name().name() == "Signature"
-            })
-            .unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-        let initial_data = resolver.dereference("#target").unwrap();
-        let manifest_pre_digest =
-            crate::xmldsig::execute_transforms(signature_node, initial_data, &[]).unwrap();
-        let computed_manifest_digest_b64 = base64::engine::general_purpose::STANDARD
-            .encode(compute_digest(DigestAlgorithm::Sha1, &manifest_pre_digest));
-        let final_manifest_digest_b64 = if valid_manifest_digest {
-            computed_manifest_digest_b64.as_str()
-        } else {
-            INVALID_MANIFEST_DIGEST
-        };
-        let xml_with_manifest_digest = mutate_manifest(
-            seed_xml.replace("MANIFEST_DIGEST_PLACEHOLDER", final_manifest_digest_b64),
-        );
-        let signed_doc = Document::parse(&xml_with_manifest_digest).unwrap();
-        let signed_signature_node = signed_doc
-            .descendants()
-            .find(|node| {
-                node.is_element()
-                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                    && node.tag_name().name() == "Signature"
-            })
-            .unwrap();
-        let signed_info_node = signed_signature_node
-            .children()
-            .find(|node| {
-                node.is_element()
-                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
-                    && node.tag_name().name() == "SignedInfo"
-            })
-            .unwrap();
-        let signed_info = parse_signed_info(signed_info_node).unwrap();
-        let object_reference = &signed_info.references[0];
-        let signed_resolver = UriReferenceResolver::new(&signed_doc);
-        let signed_initial_data = signed_resolver
-            .dereference(object_reference.uri.as_deref().unwrap())
-            .unwrap();
-        let signed_pre_digest = crate::xmldsig::execute_transforms(
-            signed_signature_node,
-            signed_initial_data,
-            &object_reference.transforms,
-        )
-        .unwrap();
-        let signed_digest_b64 = base64::engine::general_purpose::STANDARD.encode(compute_digest(
-            object_reference.digest_method,
-            &signed_pre_digest,
-        ));
-
-        xml_with_manifest_digest.replacen(TMP_SIGNED_INFO_DIGEST, &signed_digest_b64, 1)
-    }
-
-    fn replace_fixture_manifest_digest(xml: &str, replacement: &str) -> String {
-        let object_marker = "<ds:Object>";
-        let object_start = xml
-            .find(object_marker)
-            .expect("fixture should contain ds:Object")
-            + object_marker.len();
-        let open = "<ds:DigestValue>";
-        let close = "</ds:DigestValue>";
-        let value_start = xml[object_start..]
-            .find(open)
-            .map(|offset| object_start + offset + open.len())
-            .expect("Manifest should contain DigestValue");
-        let value_end = xml[value_start..]
-            .find(close)
-            .map(|offset| value_start + offset)
-            .expect("Manifest DigestValue must be closed");
-
-        format!("{}{replacement}{}", &xml[..value_start], &xml[value_end..])
-    }
-
-    #[test]
-    fn verify_context_processes_manifest_references_when_enabled() {
-        let xml = signature_with_manifest_xml(true);
-
-        let result_without_manifests = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&xml)
-            .expect("manifest processing disabled should still verify SignedInfo");
-        assert!(
-            result_without_manifests.manifest_references.is_empty(),
-            "manifest results must stay empty when manifest processing is disabled",
-        );
-        assert!(matches!(
-            result_without_manifests.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-
-        let malformed_manifest_xml = signature_with_manifest_xml(true).replacen(
-            "</ds:Object>",
-            "</ds:Object><ds:Object><ds:Manifest><ds:Foo/></ds:Manifest></ds:Object>",
-            1,
-        );
-        let malformed_with_manifests_disabled = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&malformed_manifest_xml)
-            .expect("malformed Manifest must be ignored when manifest processing is disabled");
-        assert!(
-            malformed_with_manifests_disabled
-                .manifest_references
-                .is_empty(),
-            "manifest parser must not run when process_manifests is disabled",
-        );
-        assert!(matches!(
-            malformed_with_manifests_disabled.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-
-        let result_with_manifests = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("manifest references should be processed when enabled");
-        assert_eq!(result_with_manifests.manifest_references.len(), 1);
-        assert_eq!(
-            result_with_manifests.manifest_references[0].reference_set,
-            ReferenceSet::Manifest
-        );
-        assert_eq!(
-            result_with_manifests.manifest_references[0].reference_index,
-            0
-        );
-        assert!(matches!(
-            result_with_manifests.manifest_references[0].status,
-            DsigStatus::Valid
-        ));
-        assert!(matches!(result_with_manifests.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn verify_context_skips_manifest_work_when_signature_value_is_invalid() {
-        // SignedInfo authenticates the Manifest bytes only after SignatureValue
-        // succeeds. Malformed nested content must not consume parsing work when
-        // the cryptographic signature itself is invalid.
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            replace_fixture_manifest_digest(&xml, "!!!")
-        });
-        assert!(
-            xml.split_once("<ds:Object>")
-                .is_some_and(|(_, object)| object.contains("<ds:DigestValue>!!!</ds:DigestValue>")),
-            "fixture mutation must corrupt the nested Manifest DigestValue",
-        );
-
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("invalid SignatureValue must short-circuit Manifest parsing");
-
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-        assert!(result.manifest_references.is_empty());
-    }
-
-    #[test]
-    fn verify_context_shares_xpath_parse_budget_with_manifest_references() {
-        // SignedInfo and every Manifest form one attacker-controlled parse unit:
-        // splitting expressions across Reference sets must not reset the ceiling.
-        let filters = r#"<XPath xmlns="http://www.w3.org/2002/06/xmldsig-filter2" Filter="intersect">true()</XPath>"#
-            .repeat(64);
-        let transform = format!(
-            r#"<ds:Transform Algorithm="http://www.w3.org/2002/06/xmldsig-filter2">{filters}</ds:Transform>"#
-        );
-        let max_transforms = transform.repeat(16);
-        let max_manifest_reference = format!(
-            r##"<ds:Reference URI="#target"><ds:Transforms>{max_transforms}</ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference>"##
-        );
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen(
-                r##"<ds:Reference URI="#target">"##,
-                &format!(
-                    r##"<ds:Reference URI="#target"><ds:Transforms>{}</ds:Transforms>"##,
-                    max_transforms
-                ),
-                1,
-            )
-            .replacen(
-                "</ds:SignedInfo>",
-                r##"<ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>false()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>2jmj7l5rSw0yVb/vlWAYkK/YBwk=</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
-                1,
-            )
-            .replacen(
-                "</ds:Manifest>",
-                &format!("{}</ds:Manifest>", max_manifest_reference.repeat(3)),
-                1,
-            )
-        });
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect_err("SignedInfo and Manifest References must share one XPath parse budget");
-
-        assert!(
-            matches!(
-                &error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "XPath expressions",
-                        ..
-                    }
-                )
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn verify_context_processes_manifest_when_signedinfo_references_object() {
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen("URI=\"#manifest\"", "URI=\"#object-id\"", 1)
-                .replacen("<ds:Object>", "<ds:Object ID=\"object-id\">", 1)
-                .replacen("<ds:Manifest ID=\"manifest\">", "<ds:Manifest>", 1)
-        });
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("manifest references should be processed when SignedInfo references ds:Object");
-        assert_eq!(
-            result.manifest_references.len(),
-            1,
-            "signed ds:Object should enable processing of its direct-child ds:Manifest",
-        );
-        assert_eq!(
-            result.manifest_references[0].reference_set,
-            ReferenceSet::Manifest
-        );
-        assert_eq!(result.manifest_references[0].reference_index, 0);
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Valid
-        ));
-    }
-
-    #[test]
-    fn verify_context_skips_manifest_removed_by_enveloped_transform() {
-        // The owning Signature contains both eligible ID targets. Subtracting
-        // its subtree therefore removes every target node from the digest input,
-        // so neither form authenticates the Manifest structure for processing.
-        for target_object in [false, true] {
-            let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-                let xml = xml.replacen(
-                    r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
-                    r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
-                    1,
-                );
-                if target_object {
-                    xml.replacen("URI=\"#manifest\"", "URI=\"#object-id\"", 1)
-                        .replacen("<ds:Object>", "<ds:Object ID=\"object-id\">", 1)
-                        .replacen("<ds:Manifest ID=\"manifest\">", "<ds:Manifest>", 1)
-                } else {
-                    xml
-                }
-            });
-
-            let result = VerifyContext::new()
-                .key(&AcceptingKey)
-                .process_manifests(true)
-                .store_pre_digest(true)
-                .verify(&xml)
-                .expect("an emptied reference remains a valid core digest input");
-
-            assert!(matches!(result.status, DsigStatus::Valid));
-            assert_eq!(
-                result.signed_info_references[0].pre_digest_data.as_deref(),
-                Some([].as_slice()),
-                "target_object={target_object} must have empty transformed bytes",
-            );
-            assert!(
-                result.manifest_references.is_empty(),
-                "target_object={target_object} must not authenticate the Manifest",
-            );
-        }
-    }
-
-    #[test]
-    fn verify_context_ignores_manifest_excluded_from_signed_object() {
-        // A Reference URI authenticates only its post-transform bytes. Excluding
-        // the Manifest subtree must not let its independently valid digest chain
-        // masquerade as data authenticated by SignedInfo.
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen("URI=\"#manifest\"", "URI=\"#object-id\"", 1)
-                .replacen("<ds:Object>", "<ds:Object ID=\"object-id\">", 1)
-                .replacen("<ds:Manifest ID=\"manifest\">", "<ds:Manifest>", 1)
-                .replacen(
-                    r#"<ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
-                    r#"<ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>not(ancestor-or-self::ds:Manifest)</ds:XPath></ds:Transform><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
-                    1,
-                )
-        });
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("excluded Manifest content must be ignored, not parsed");
-
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert!(
-            result.manifest_references.is_empty(),
-            "a transform-excluded Manifest is not authenticated by SignedInfo",
-        );
-    }
-
-    #[test]
-    fn verify_context_skips_manifest_digest_work_when_signature_is_invalid() {
-        let xml = signature_with_manifest_xml(false);
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("invalid SignatureValue must short-circuit Manifest digest work");
-        assert!(result.manifest_references.is_empty());
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-    }
-
-    #[test]
-    fn verify_context_manifest_digest_mismatch_is_non_fatal_with_accepting_key() {
-        let xml = signature_with_manifest_xml(false);
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("manifest digest mismatches should be recorded while signature stays valid");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-        assert!(matches!(result.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn invalid_outer_manifest_digest_does_not_parse_nested_manifest() {
-        // The malformed inner Manifest is not authenticated until its parent
-        // Reference digest succeeds. A mismatch must therefore stop before
-        // parsing or charging work for the nested structure.
-        let xml = signature_with_manifest_xml_with_manifest_mutation(false, |xml| {
-            xml.replacen("URI=\"#target\"", "URI=\"#inner-object\"", 1)
-                .replacen(
-                    "</ds:Object>",
-                    "</ds:Object><ds:Object ID=\"inner-object\"><ds:Manifest>junk<ds:Unexpected/></ds:Manifest></ds:Object>",
-                    1,
-                )
-        });
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("an unauthenticated nested Manifest must remain opaque");
-
-        assert_eq!(result.manifest_references.len(), 1);
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn verify_context_skips_manifest_parsing_when_signedinfo_reference_fails() {
-        // Manifest content is not authenticated after a SignedInfo reference
-        // failure, so parsing it would spend work on untrusted nested input.
-        let xml = signature_with_manifest_xml(true);
-        let (signed_info_prefix, object_suffix) = xml
-            .split_once("<ds:Object>")
-            .expect("fixture should contain ds:Object");
-        let open = "<ds:DigestValue>";
-        let close = "</ds:DigestValue>";
-        let digest_start = signed_info_prefix
-            .find(open)
-            .expect("SignedInfo should contain DigestValue");
-        let digest_end = signed_info_prefix[digest_start + open.len()..]
-            .find(close)
-            .map(|offset| digest_start + open.len() + offset)
-            .expect("SignedInfo DigestValue must be closed");
-        let broken_signed_info_prefix = format!(
-            "{}{}AAAAAAAAAAAAAAAAAAAAAAAAAAA={}{}",
-            &signed_info_prefix[..digest_start],
-            open,
-            close,
-            &signed_info_prefix[digest_end + close.len()..],
-        );
-        let broken_xml = format!("{broken_signed_info_prefix}<ds:Object>{object_suffix}");
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect("SignedInfo digest failure should return without parsing Manifests");
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-        assert!(
-            result.manifest_references.is_empty(),
-            "unauthenticated Manifest content must not be parsed",
-        );
-    }
-
-    #[test]
-    fn verify_context_skips_manifest_policy_work_when_signature_is_invalid() {
-        // A digest-valid SignedInfo reference does not authenticate Manifest
-        // policy inputs until SignatureValue also succeeds.
-        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1)
-        });
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect("invalid SignatureValue must short-circuit Manifest policy work");
-        assert!(result.manifest_references.is_empty());
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-    }
-
-    #[test]
-    fn verify_context_records_manifest_policy_violations_with_accepting_key() {
-        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen("URI=\"#target\"", "URI=\"http://example.com/external\"", 1)
-        });
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect("manifest policy violations should be recorded while signature stays valid");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
-        ));
-        assert!(matches!(result.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn verify_context_applies_digest_policy_to_manifest_references() {
-        // Manifest results are authenticated extension data and must obey the
-        // same digest allowlist as SignedInfo references.
-        let policy = crate::policy::VerificationPolicy {
-            manifest_processing: crate::policy::ManifestProcessing::Process,
-            digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
-            ..crate::policy::VerificationPolicy::default()
-        };
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |mut xml| {
-            let legacy = "http://www.w3.org/2000/09/xmldsig#sha1";
-            let offset = xml
-                .rfind(legacy)
-                .expect("Manifest DigestMethod must be present");
-            xml.replace_range(offset..offset + legacy.len(), DigestAlgorithm::Sha256.uri());
-            let value_start = xml[offset..]
-                .find("<ds:DigestValue>")
-                .map(|relative| offset + relative + "<ds:DigestValue>".len())
-                .expect("Manifest DigestValue must be present");
-            let value_end = xml[value_start..]
-                .find("</ds:DigestValue>")
-                .map(|relative| value_start + relative)
-                .expect("Manifest DigestValue must be closed");
-            xml.replace_range(
-                value_start..value_end,
-                &base64::engine::general_purpose::STANDARD.encode([0_u8; 32]),
-            );
-            xml
-        });
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect("a disallowed Manifest digest is a per-reference result");
-
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn verify_context_applies_transform_count_policy_to_manifest_references() {
-        // Authenticated Manifest references share the caller's per-reference
-        // transform ceiling and fail before transform execution when exceeded.
-        let policy = crate::policy::VerificationPolicy {
-            manifest_processing: crate::policy::ManifestProcessing::Process,
-            resources: crate::policy::ResourcePolicy {
-                max_transforms_per_reference: 1,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |mut xml| {
-            let manifest_start = xml
-                .find("<ds:Manifest")
-                .expect("fixture must contain a Manifest");
-            let manifest = xml[manifest_start..].replacen(
-                "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>",
-                concat!(
-                    "<ds:Transforms>",
-                    "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
-                    "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
-                    "</ds:Transforms>",
-                    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>"
-                ),
-                1,
-            );
-            xml.replace_range(manifest_start.., &manifest);
-            xml
-        });
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect("Manifest transform policy is a per-reference result");
-
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn verify_context_skips_manifest_uri_work_when_signature_is_invalid() {
-        // Missing Manifest URIs remain unauthenticated until SignatureValue
-        // succeeds, so they cannot trigger Manifest policy processing here.
-        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1)
-        });
-
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect("invalid SignatureValue must short-circuit Manifest URI processing");
-        assert!(result.manifest_references.is_empty());
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-    }
-
-    #[test]
-    fn verify_context_records_manifest_missing_uri_with_accepting_key() {
-        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen("<ds:Reference URI=\"#target\">", "<ds:Reference>", 1)
-        });
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect("manifest missing URI should be recorded while signature stays valid");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert_eq!(result.manifest_references[0].uri, "<omitted>");
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
-        ));
-        assert!(matches!(result.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn verify_context_processes_authenticated_nested_manifests_in_object() {
-        // XMLDSig §5.1 does not impose a direct Object-child restriction.
-        // The original Reference authenticates this exact wrapped Manifest.
-        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Manifest
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen(
-                "<ds:Manifest ID=\"manifest\">",
-                "<wrapper><ds:Manifest ID=\"manifest\">",
-                1,
-            )
-            .replacen("</ds:Manifest>", "</ds:Manifest></wrapper>", 1)
-        });
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("authenticated nested Manifest is processed");
-        assert_eq!(result.manifest_references.len(), 1);
-        assert_eq!(result.manifest_references[0].uri, "#target");
-        assert_eq!(result.manifest_references[0].status, DsigStatus::Valid);
-        assert!(matches!(result.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn verify_context_reports_manifest_reference_parse_errors_explicitly() {
-        // Malformed nested DigestValue is parsed only after the enclosing
-        // Manifest structure has been authenticated by SignedInfo.
-        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            replace_fixture_manifest_digest(&xml, "!!!")
-        });
-
-        let err = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect_err("invalid Manifest DigestValue must map to ParseManifestReference");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::ParseManifestReference(_)
-        ));
-    }
-
-    #[test]
-    fn verify_context_reports_unsupported_manifest_transform_with_declared_digest() {
-        // Unsupported optional Manifest transforms do not invalidate core
-        // SignedInfo, but their result must preserve the declared digest method.
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            let xml = xml.replacen(
-                "<ds:Reference URI=\"#target\">",
-                "<ds:Reference URI=\"#target\"><ds:Transforms><ds:Transform Algorithm=\"urn:unsupported\"/></ds:Transforms>",
-                1,
-            );
-            let xml = xml.replacen(
-                "</ds:Transforms>\n          <ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/>",
-                "</ds:Transforms>\n          <ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
-                1,
-            );
-            replace_fixture_manifest_digest(&xml, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
-        });
-        assert!(xml.contains("urn:unsupported"));
-        assert!(xml.contains("http://www.w3.org/2001/04/xmlenc#sha256"));
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("unsupported Manifest transform is a per-reference result");
-        assert_eq!(result.status, DsigStatus::Valid);
-        assert_eq!(result.manifest_references.len(), 1);
-        assert_eq!(
-            result.manifest_references[0].digest_algorithm,
-            DigestAlgorithm::Sha256
-        );
-        assert!(matches!(
-            result.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
-        ));
-
-        let restricted = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .allowed_transforms([
-                DEFAULT_IMPLICIT_C14N_URI,
-                "http://www.w3.org/2001/10/xml-exc-c14n#",
-            ])
-            .verify(&xml)
-            .expect("a disallowed Manifest transform is a per-reference policy result");
-        assert!(matches!(
-            restricted.manifest_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn manifest_reference_limit_counts_unsupported_entries() {
-        let references = (0..=MAX_REFERENCES_PER_SIGNATURE)
-            .map(|index| {
-                format!(
-                    r##"<ds:Reference URI="#target-{index}"><ds:Transforms><ds:Transform Algorithm="urn:unsupported"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference>"##
-                )
-            })
-            .collect::<String>();
-        let xml = format!(
-            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:Object Id="signed"><ds:Manifest>{references}</ds:Manifest></ds:Object></ds:Signature>"#
-        );
-        let document = XmlDocument::parse(xml).unwrap();
-        let error = document.with_view(|view| {
-            let signature = view.document().root_element();
-            let object = signature.children().find(|node| node.is_element()).unwrap();
-            let policy = crate::policy::VerificationPolicy::default();
-            let budgets = VerificationOperationBudgets::with_transforms(
-                &policy,
-                TransformExecutionBudget::from_resources(&policy.resources),
-                None,
-            );
-            let operation = OperationExecutionContext::new(
-                &policy,
-                &budgets,
-                Some((view.identity(), view.generation())),
-            );
-            operation.authenticate(view.node_identity(object));
-            let mut processed = HashSet::new();
-            let mut remaining = MAX_REFERENCES_PER_SIGNATURE;
-            let mut next_index = 0;
-            let mut xpath_parse = XPathSignatureParseBudget::default();
-            let mut state = ManifestDiscoveryState {
-                processed: &mut processed,
-                remaining_capacity: &mut remaining,
-                next_reference_index: &mut next_index,
-                xpath_parse: &mut xpath_parse,
-            };
-            match parse_manifest_references(signature, &operation, view, &mut state, None) {
-                Ok(_) => panic!("unsupported references must consume the same aggregate limit"),
-                Err(error) => error,
-            }
-        });
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "signed Manifests exceed the per-signature Reference limit"
-            }
-        ));
-    }
-
-    #[test]
-    fn unsigned_manifest_discovery_cannot_bypass_the_filter_work_budget() {
-        // Unsigned appended nodes still cost discovery work after Signature
-        // authentication. Even an all-unsigned frontier must admit its scan.
-        let document = XmlDocument::parse(format!(
-            "<ds:Signature xmlns:ds=\"{XMLDSIG_NS}\"><ds:Object><ds:Manifest/></ds:Object></ds:Signature>"
-        )).unwrap();
-        document.with_view(|view| {
-            let mut policy = crate::policy::VerificationPolicy::default();
-            policy.resources.max_node_set_filter_work = 0;
-            let budgets = VerificationOperationBudgets::with_transforms(
-                &policy,
-                TransformExecutionBudget::from_resources(&policy.resources),
-                None,
-            );
-            let operation = OperationExecutionContext::new(
-                &policy,
-                &budgets,
-                Some((view.identity(), view.generation())),
-            );
-            let mut processed = HashSet::new();
-            let mut remaining = 1;
-            let mut index = 0;
-            let mut xpath = XPathSignatureParseBudget::default();
-            let result = parse_manifest_references(
-                view.document().root_element(),
-                &operation,
-                view,
-                &mut ManifestDiscoveryState {
-                    processed: &mut processed,
-                    remaining_capacity: &mut remaining,
-                    next_reference_index: &mut index,
-                    xpath_parse: &mut xpath,
-                },
-                None,
-            );
-            assert!(result.is_err(), "unsigned scans are not free");
-        });
-    }
-
-    #[test]
-    fn unsigned_manifest_remains_eligible_after_trust_expands() {
-        // The second Object is not authenticated during the first discovery
-        // pass. It must remain unprocessed so a valid reference from the first
-        // Manifest can make its sibling Manifest eligible on the next pass.
-        let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
-        let xml = format!(
-            r##"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:Object Id="outer"><ds:Manifest><ds:Reference URI="#inner"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object><ds:Object Id="inner"><ds:Manifest><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature>"##
-        );
-        let document = XmlDocument::parse(xml).expect("nested Manifest fixture must parse");
-        document.with_view(|view| {
-            let signature = view.document().root_element();
-            let mut objects = signature.children().filter(|node| node.is_element());
-            let outer = objects.next().expect("outer Object");
-            let inner = objects.next().expect("inner Object");
-            let policy = crate::policy::VerificationPolicy::default();
-            let budgets = VerificationOperationBudgets::with_transforms(
-                &policy,
-                TransformExecutionBudget::from_resources(&policy.resources),
-                None,
-            );
-            let operation = OperationExecutionContext::new(
-                &policy,
-                &budgets,
-                Some((view.identity(), view.generation())),
-            );
-            operation.authenticate(view.node_identity(outer));
-            let mut processed = HashSet::new();
-            let mut remaining = 2;
-            let mut next_index = 0;
-            let mut xpath_budget = XPathSignatureParseBudget::default();
-
-            let first = parse_manifest_references(
-                signature,
-                &operation,
-                view,
-                &mut ManifestDiscoveryState {
-                    processed: &mut processed,
-                    remaining_capacity: &mut remaining,
-                    next_reference_index: &mut next_index,
-                    xpath_parse: &mut xpath_budget,
-                },
-                None,
-            )
-            .expect("outer Manifest must be discovered");
-            assert_eq!(first.references.len(), 1);
-            assert_eq!(first.references[0].reference.uri.as_deref(), Some("#inner"));
-
-            operation.authenticate(view.node_identity(inner));
-            let second = parse_manifest_references(
-                signature,
-                &operation,
-                view,
-                &mut ManifestDiscoveryState {
-                    processed: &mut processed,
-                    remaining_capacity: &mut remaining,
-                    next_reference_index: &mut next_index,
-                    xpath_parse: &mut xpath_budget,
-                },
-                None,
-            )
-            .expect("newly authenticated sibling Manifest must remain eligible");
-            assert_eq!(second.references.len(), 1);
-            assert_eq!(
-                second.references[0].reference.uri.as_deref(),
-                Some("#payload")
-            );
-        });
-    }
-
-    #[test]
-    fn manifest_reference_limit_includes_signed_info_references() {
-        // The per-signature ceiling is shared by core and authenticated
-        // Manifest references; enabling Manifest processing must not reset it.
-        let xml = signature_with_manifest_xml(true);
-        let reference_start = xml
-            .find(r##"<ds:Reference URI="#manifest">"##)
-            .expect("fixture SignedInfo must reference the Manifest");
-        let reference_end = xml[reference_start..]
-            .find("</ds:Reference>")
-            .map(|offset| reference_start + offset + "</ds:Reference>".len())
-            .expect("fixture SignedInfo Reference must be closed");
-        let repeated = xml[reference_start..reference_end].repeat(MAX_REFERENCES_PER_SIGNATURE);
-        let xml = format!(
-            "{}{repeated}{}",
-            &xml[..reference_start],
-            &xml[reference_end..]
-        );
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect_err("one Manifest Reference must exceed the exhausted signature-wide limit");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "signed Manifests exceed the per-signature Reference limit"
-            }
-        ));
-    }
-
-    #[test]
-    fn configured_reference_limit_is_shared_with_manifests() {
-        // Lowering the operation policy must lower the aggregate SignedInfo and
-        // Manifest capacity rather than falling back to the crate hard limit.
-        let policy = crate::policy::VerificationPolicy {
-            manifest_processing: crate::policy::ManifestProcessing::Process,
-            resources: crate::policy::ResourcePolicy {
-                max_references: 1,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&signature_with_manifest_xml(true))
-            .expect_err("Manifest must exceed the caller-selected aggregate limit");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "signed Manifests exceed the per-signature Reference limit"
-            }
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_materializes_single_x509_data_subtree() {
-        for uri in [
-            "#target",
-            "#xpointer(id('target'))",
-            "#xpointer(id(&quot;target&quot;))",
-        ] {
-            for target_xml in [
-                r#"<ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>"#,
-                r#"<holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>"#,
-            ] {
-                let xml = format!(
-                    r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:KeyInfo><ds:RetrievalMethod URI="{uri}" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>{target_xml}</root>"#
-                );
-                let document = Document::parse(&xml).unwrap();
-                let key_info_node = document
-                    .descendants()
-                    .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-                    .unwrap();
-                let mut key_info = parse_key_info(key_info_node).unwrap();
-                let resolver = UriReferenceResolver::new(&document);
-
-                materialize_retrieval_methods(
-                    &mut key_info,
-                    &resolver,
-                    UriTypeSet::SAME_DOCUMENT,
-                    None,
-                    crate::provider::default_provider(),
-                )
-                .expect("XPath filter must produce one X509Data-rooted node-set");
-                assert!(matches!(
-                    key_info.sources.as_slice(),
-                    [super::super::parse::KeyInfoSource::X509Data(info)]
-                        if info.subject_names == ["CN=leaf"]
-                ));
-            }
-        }
-    }
-
-    fn retrieval_method_xpath_signature() -> String {
-        format!(
-            r##"<root xmlns:ds="{XMLDSIG_NS}">
-              <payload Id="payload">ok</payload>
-              <ds:Signature>
-                <ds:SignedInfo>
-                  <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                  <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                  <ds:Reference URI="#payload">
-                    <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                    <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-                  </ds:Reference>
-                </ds:SignedInfo>
-                <ds:SignatureValue>AQ==</ds:SignatureValue>
-                <ds:KeyInfo>
-                  <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data">
-                    <ds:Transforms><ds:Transform Algorithm="{XPATH_TRANSFORM_URI}">
-                      <ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath>
-                    </ds:Transform></ds:Transforms>
-                  </ds:RetrievalMethod>
-                </ds:KeyInfo>
-              </ds:Signature>
-              <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
-            </root>"##
-        )
-    }
-
-    #[test]
-    fn retrieval_method_xpath_uses_signature_expression_budget() {
-        // RetrievalMethod XPath belongs to the same untrusted Signature as
-        // Reference XPath and must not receive a separate parse allowance.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_expressions = 0;
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
-            .expect_err("RetrievalMethod XPath must consume the signature parse budget");
-
-        assert!(
-            matches!(
-                &error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "XPath expressions",
-                        maximum: 0,
-                        actual: 1,
-                    }
-                )
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn retrieval_method_xpath_obeys_expression_byte_limit() {
-        // Edge whitespace is semantically harmless for this restricted shape,
-        // but its raw untrusted bytes still belong to the operation budget.
-        let expression = "ancestor-or-self::ds:X509Data";
-        let padded_expression = format!("  {expression}  ");
-        let xml = retrieval_method_xpath_signature().replace(expression, &padded_expression);
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_expression_bytes = expression.len();
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("RetrievalMethod XPath must obey the expression byte limit");
-
-        assert!(
-            matches!(
-                &error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "XPath expression bytes",
-                        maximum,
-                        actual,
-                    }
-                ) if *maximum == expression.len() && *actual == padded_expression.len()
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn retrieval_method_xpath_obeys_expression_complexity_limit() {
-        // Recognizing a fixed safe predicate must not bypass the common XPath
-        // complexity policy applied to every expression in the signature.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_expression_complexity = 0;
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
-            .expect_err("RetrievalMethod XPath must obey the complexity limit");
-
-        assert!(
-            matches!(
-                &error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: "XPath expression complexity",
-                        maximum: 0,
-                        actual,
-                    }
-                ) if *actual > 0
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn retrieval_method_xpath_uses_node_filter_work_budget() {
-        // Attribute and namespace XPath nodes participate in filtering even
-        // though the optimized X509Data locator scans only tree descendants.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_node_set_filter_work = 4;
-        let xml = retrieval_method_xpath_signature().replace(
-            "<holder Id=\"target\">",
-            "<holder Id=\"target\" role=\"signing\" xmlns:metadata=\"urn:metadata\">",
-        );
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("RetrievalMethod XPath must consume node-filter work");
-
-        assert!(
-            matches!(
-                &error,
-                SignatureVerificationPipelineError::Policy(
-                    crate::policy::PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::NODE_SET_FILTER_WORK,
-                        maximum: 4,
-                        actual,
-                    }
-                ) if *actual > 4
-            ),
-            "unexpected error: {error:?}"
-        );
-    }
-
-    #[test]
-    fn retrieval_method_xpath_charges_every_context_to_evaluation_work() {
-        // The optimized predicate avoids a generic XPath engine, but every
-        // attribute and namespace context still consumes evaluation work.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_evaluation_work = 4;
-        let xml = retrieval_method_xpath_signature().replace(
-            "<holder Id=\"target\">",
-            "<holder Id=\"target\" role=\"signing\" xmlns:metadata=\"urn:metadata\">",
-        );
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("RetrievalMethod XPath must charge every evaluation context");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_EVALUATION_WORK,
-                    maximum: 4,
-                    actual,
-                }
-            ) if actual > 4
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_xpath_obeys_namespace_binding_limit() {
-        // The specialized RetrievalMethod path must retain the XPath element's
-        // in-scope namespaces and enforce the same limit as ordinary XPath.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_namespace_bindings = 0;
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
-            .expect_err("RetrievalMethod XPath namespaces must obey the binding limit");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BINDINGS,
-                    maximum: 0,
-                    actual,
-                }
-            ) if actual > 0
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_xpath_obeys_namespace_byte_limit() {
-        // Prefix and URI bytes retained from the XPath namespace axis consume
-        // the same per-expression byte budget as an ordinary XPath transform.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_namespace_bytes = 0;
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&retrieval_method_xpath_signature())
-            .expect_err("RetrievalMethod XPath namespaces must obey the byte limit");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_NAMESPACE_BYTES,
-                    maximum: 0,
-                    actual,
-                }
-            ) if actual > 0
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_xpath_obeys_context_evaluation_limit() {
-        // A bare fragment includes attribute and namespace XPath nodes in
-        // addition to the four tree nodes below. Tree-only accounting would
-        // incorrectly admit this input at the configured ceiling.
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_xpath_context_evaluations = 4;
-        let xml = retrieval_method_xpath_signature().replace(
-            "<holder Id=\"target\">",
-            "<holder Id=\"target\" role=\"signing\" xmlns:metadata=\"urn:metadata\">",
-        );
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("RetrievalMethod XPath contexts must obey the evaluation limit");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_CONTEXT_EVALUATIONS,
-                    maximum: 4,
-                    actual,
-                }
-            ) if actual > 4
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_materializes_direct_untransformed_x509_data() {
-        // A typed RetrievalMethod may point directly at the XML structure it
-        // identifies; no transform is needed when X509Data is the URI root.
-        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/></ds:KeyInfo>
-          <ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
-        </root>"##;
-        let document = Document::parse(xml).unwrap();
-        let key_info_node = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .unwrap();
-        let mut key_info = parse_key_info(key_info_node).unwrap();
-
-        materialize_retrieval_methods(
-            &mut key_info,
-            &UriReferenceResolver::new(&document),
-            UriTypeSet::SAME_DOCUMENT,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect("a direct X509Data target needs no transform");
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [super::super::parse::KeyInfoSource::X509Data(info)]
-                if info.subject_names == ["CN=leaf"]
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_respects_configured_same_document_id_semantics() {
-        // RetrievalMethod is another consumer of same-document URIs and must
-        // not bypass the grammar selected for normal Reference dereferencing.
-        fn materialize(
-            uri: &str,
-            id: &str,
-            semantics: crate::policy::SameDocumentIdSemantics,
-        ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
-            let xml = format!(
-                r#"<root xmlns:ds="{XMLDSIG_NS}">
-                  <ds:KeyInfo><ds:RetrievalMethod URI="{uri}" Type="{XMLDSIG_NS}X509Data"/></ds:KeyInfo>
-                  <ds:X509Data Id="{id}"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
-                </root>"#
-            );
-            let document = Document::parse(&xml).unwrap();
-            let key_info_node = document
-                .descendants()
-                .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-                .unwrap();
-            let mut key_info = parse_key_info(key_info_node).unwrap();
-            let resolver =
-                UriReferenceResolver::new(&document).with_same_document_id_semantics(semantics);
-
-            materialize_retrieval_methods(
-                &mut key_info,
-                &resolver,
-                UriTypeSet::SAME_DOCUMENT,
-                None,
-                crate::provider::default_provider(),
-            )
-        }
-
-        assert!(
-            materialize(
-                "#12345",
-                "12345",
-                crate::policy::SameDocumentIdSemantics::Specification,
-            )
-            .is_err(),
-            "the standards mode must reject a non-NCName bare fragment"
-        );
-        assert!(
-            materialize(
-                "#visa'3d",
-                "visa'3d",
-                crate::policy::SameDocumentIdSemantics::XmlSecBarename,
-            )
-            .is_err(),
-            "the donor barename wrapper cannot represent an apostrophe"
-        );
-        assert!(
-            materialize(
-                "#visa'3d",
-                "visa'3d",
-                crate::policy::SameDocumentIdSemantics::XmlSecVisa3d,
-            )
-            .is_ok(),
-            "Visa3D mode resolves the registered ID without an XPointer literal"
-        );
-    }
-
-    #[test]
-    fn raw_x509_retrieval_method_uses_inherited_xml_base() {
-        // RetrievalMethod URI is an attribute URI reference, so XML Base uses
-        // the effective base of the element bearing that attribute.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let xml = format!(
-            r#"<root xml:base="https://example.test/keys/nested/" xmlns:ds="{XMLDSIG_NS}">
-                <ds:KeyInfo><ds:RetrievalMethod URI="../signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>
-            </root>"#
-        );
-        let document = Document::parse(&xml).unwrap();
-        let key_info_node = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .unwrap();
-        let mut key_info = parse_key_info(key_info_node).unwrap();
-        let certificate = include_bytes!(
-            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
-        )
-        .to_vec();
-        let resources = HashMap::from([(
-            "https://example.test/keys/signer.der".to_string(),
-            certificate,
-        )]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        materialize_retrieval_methods(
-            &mut key_info,
-            &resolver,
-            UriTypeSet::ALL,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect("RetrievalMethod should resolve against inherited xml:base");
-
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [super::super::parse::KeyInfoSource::X509Data(info)]
-                if info.certificates.len() == 1
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_requires_xpath_for_x509_data_below_uri_root() {
-        // Without a transform the dereferenced holder, not its descendant,
-        // is the result and therefore cannot masquerade as typed X509Data.
-        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/></ds:KeyInfo>
-          <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
-        </root>"##;
-        let document = Document::parse(xml).unwrap();
-        let key_info_node = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .unwrap();
-        let mut key_info = parse_key_info(key_info_node).unwrap();
-
-        let error = materialize_retrieval_methods(
-            &mut key_info,
-            &UriReferenceResolver::new(&document),
-            UriTypeSet::SAME_DOCUMENT,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect_err("a wrapper target requires an explicit selection transform");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "untransformed X509Data RetrievalMethod must target X509Data directly"
-            }
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_rejects_target_inside_external_x509_data_ancestor() {
-        // XPath filtering cannot add an ancestor that was outside the URI's
-        // dereferenced node-set, so this result is not rooted at X509Data.
-        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>
-          <ds:X509Data><ds:X509SubjectName Id="target">CN=leaf</ds:X509SubjectName></ds:X509Data>
-        </root>"##;
-        let document = Document::parse(xml).unwrap();
-        let key_info_node = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .unwrap();
-        let mut key_info = parse_key_info(key_info_node).unwrap();
-
-        let error = materialize_retrieval_methods(
-            &mut key_info,
-            &UriReferenceResolver::new(&document),
-            UriTypeSet::SAME_DOCUMENT,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect_err("filter output without an X509Data root must be rejected");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "X509Data RetrievalMethod selected no X509Data element"
-            }
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_rejects_ambiguous_x509_data_relation() {
-        // A transformed result with multiple X509Data roots is not one KeyInfo child.
-        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-          <ds:KeyInfo><ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod></ds:KeyInfo>
-          <holder Id="target"><ds:X509Data/><ds:X509Data/></holder>
-        </root>"##;
-        let document = Document::parse(xml).unwrap();
-        let key_info_node = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .unwrap();
-        let mut key_info = parse_key_info(key_info_node).unwrap();
-
-        let error = materialize_retrieval_methods(
-            &mut key_info,
-            &UriReferenceResolver::new(&document),
-            UriTypeSet::SAME_DOCUMENT,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect_err("multiple transformed X509Data roots must be rejected");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "X509Data RetrievalMethod selected multiple X509Data elements"
-            }
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_materialization_preserves_key_info_order() {
-        // Replacing the source in place keeps a later fallback behind the
-        // retrieved key material for first-match resolvers.
-        let xml = r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-          <ds:KeyInfo>
-            <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath></ds:Transform></ds:Transforms></ds:RetrievalMethod>
-            <ds:KeyName>fallback</ds:KeyName>
-          </ds:KeyInfo>
-          <holder Id="target"><ds:X509Data><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data></holder>
-        </root>"##;
-        let document = Document::parse(xml).unwrap();
-        let key_info_node = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
-            .unwrap();
-        let mut key_info = parse_key_info(key_info_node).unwrap();
-
-        materialize_retrieval_methods(
-            &mut key_info,
-            &UriReferenceResolver::new(&document),
-            UriTypeSet::SAME_DOCUMENT,
-            None,
-            crate::provider::default_provider(),
-        )
-        .unwrap();
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [
-                super::super::parse::KeyInfoSource::X509Data(_),
-                super::super::parse::KeyInfoSource::KeyName(name)
-            ] if name == "fallback"
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_materialization_bounds_repeated_sources() {
-        // Repeating one allowed certificate must not multiply parsing and clones
-        // before SignatureValue validation.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let certificate = include_bytes!(
-            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
-        )
-        .to_vec();
-        let resources = HashMap::from([("urn:certificate".to_string(), certificate)]);
-        let mut key_info = KeyInfo {
-            sources: (0..=64)
-                .map(|_| super::super::parse::KeyInfoSource::RetrievalMethod {
-                    uri: "urn:certificate".into(),
-                    resource_type: Some(RAW_X509_TYPE.into()),
-                    transforms: RetrievalMethodTransforms::None,
-                })
-                .collect(),
-        };
-        let document = Document::parse("<root/>").unwrap();
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        let error = materialize_retrieval_methods(
-            &mut key_info,
-            &resolver,
-            UriTypeSet::ALL,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect_err("retrieval count must be bounded before materialization");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "KeyInfo contains too many RetrievalMethod elements"
-            }
-        ));
-    }
-
-    #[test]
-    fn key_info_reference_materializes_an_allowed_empty_uri() {
-        // Empty URI is a same-document Reference URI. Element-valued
-        // KeyInfoReference dereferencing therefore selects a KeyInfo document
-        // element rather than consulting the external-resource map.
-        let document = XmlDocument::parse(format!(
-            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>root-key</ds:KeyName></ds:KeyInfo>"#
-        ))
-        .unwrap();
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                uri: String::new(),
-            }],
-        };
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_sources.key_info_reference = true;
-        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
-        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-                &policy.resources,
-            )),
-            xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
-            resources: &policy.resources,
-            certificate_signature_algorithms: policy
-                .key_trust
-                .certificate_signature_algorithms
-                .as_ref(),
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut materialization = KeyInfoMaterializationState::default();
-
-        document
-            .with_view(|view| {
-                materialize_key_info_references_with_budgets(
-                    &mut key_info,
-                    &UriReferenceResolver::with_document_view(view, &[]),
-                    &policy,
-                    crate::provider::default_provider(),
-                    &mut budgets,
-                    &mut materialization,
-                )?;
-                Ok::<_, SignatureVerificationPipelineError>(())
-            })
-            .unwrap();
-
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "root-key"
-        ));
-    }
-
-    #[test]
-    fn raw_certificate_retrieval_retains_spent_operation_work() {
-        // Raw DER retrieval must not bypass the account used by XML KeyInfo parsing.
-        let pair = rcgen::KeyPair::generate().expect("test key generation");
-        let cert = rcgen::CertificateParams::new(Vec::<String>::new())
-            .expect("empty SAN list")
-            .self_signed(&pair)
-            .expect("test certificate signing");
-        let external = HashMap::from([("urn:cert".to_owned(), cert.der().to_vec())]);
-        let document = Document::parse("<root/>").expect("test XML");
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&external);
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_x509_work = 1;
-        policy.uris.retrieval_methods = UriTypeSet::ALL;
-        let usage = RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-            &policy.resources,
-        ));
-        usage
-            .borrow()
-            .certificates
-            .memory()
-            .charge_work(1)
-            .expect("spend allowance");
-        let mut xpath = XPathSignatureParseBudget::from_resources(&policy.resources);
-        let execution = TransformExecutionBudget::from_resources(&policy.resources);
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &usage,
-            xpath_parse: &mut xpath,
-            execution: &execution,
-            resources: &policy.resources,
-            certificate_signature_algorithms: None,
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::RetrievalMethod {
-                uri: "urn:cert".into(),
-                resource_type: Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate".into()),
-                transforms: RetrievalMethodTransforms::None,
-            }],
-        };
-        let result = materialize_retrieval_methods_with_budgets(
-            &mut info,
-            &resolver,
-            &policy,
-            crate::provider::default_provider(),
-            &mut budgets,
-            &mut 0,
-        );
-        assert!(matches!(
-            result,
-            Err(SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimitExceeded {
-                    resource: crate::policy::resource_name::X509_WORK,
-                    maximum: 1,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn empty_key_info_reference_participates_in_cycle_detection() {
-        // Empty URI resolves to the owning document's root KeyInfo. It must
-        // recurse through the same traversal state rather than leave the
-        // self-reference materialized and bypass cycle/depth enforcement.
-        let document = XmlDocument::parse(format!(
-            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig11:KeyInfoReference URI=""/></ds:KeyInfo>"#
-        ))
-        .unwrap();
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                uri: String::new(),
-            }],
-        };
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_sources.key_info_reference = true;
-        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
-        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-                &policy.resources,
-            )),
-            xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
-            resources: &policy.resources,
-            certificate_signature_algorithms: policy
-                .key_trust
-                .certificate_signature_algorithms
-                .as_ref(),
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut materialization = KeyInfoMaterializationState::default();
-
-        let error = document
-            .with_view(|view| {
-                materialize_key_info_references_with_budgets(
-                    &mut key_info,
-                    &UriReferenceResolver::with_document_view(view, &[]),
-                    &policy,
-                    crate::provider::default_provider(),
-                    &mut budgets,
-                    &mut materialization,
-                )
-            })
-            .expect_err("empty-URI self-reference must be rejected as a cycle");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "KeyInfoReference cycle detected"
-            }
-        ));
-    }
-
-    #[test]
-    fn key_info_materialization_shares_candidate_work_across_source_kinds() {
-        // The reference, nested RetrievalMethod, and resulting certificate are
-        // three units of materialization work in one operation.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let document = XmlDocument::parse(format!(
-            r##"<root xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:KeyInfo ID="target"><ds:RetrievalMethod URI="signer.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo></root>"##
-        ))
-        .unwrap();
-        let certificate = include_bytes!(
-            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
-        )
-        .to_vec();
-        let resources = HashMap::from([("signer.der".to_owned(), certificate)]);
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                uri: "#target".into(),
-            }],
-        };
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_sources.key_info_reference = true;
-        policy.uris.retrieval_methods = UriTypeSet::ALL;
-        policy.resources.max_key_candidates = 2;
-        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
-        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-                &policy.resources,
-            )),
-            xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
-            resources: &policy.resources,
-            certificate_signature_algorithms: policy
-                .key_trust
-                .certificate_signature_algorithms
-                .as_ref(),
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut materialization = KeyInfoMaterializationState::default();
-
-        let error = document
-            .with_view(|view| {
-                let resolver = UriReferenceResolver::with_document_view(view, &[])
-                    .with_external_resources(&resources);
-                let mut outcome = materialize_key_info_references_with_budgets(
-                    &mut key_info,
-                    &resolver,
-                    &policy,
-                    crate::provider::default_provider(),
-                    &mut budgets,
-                    &mut materialization,
-                )?;
-                outcome.merge(materialize_retrieval_methods_with_budgets(
-                    &mut key_info,
-                    &resolver,
-                    &policy,
-                    crate::provider::default_provider(),
-                    &mut budgets,
-                    &mut materialization.candidate_work,
-                )?);
-                Ok::<_, DsigError>(outcome)
-            })
-            .expect_err("all materializers must share the candidate-work limit");
-
-        assert!(matches!(
-            error,
-            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::KEY_CANDIDATES,
-                maximum: 2,
-                actual: 3,
-            })
-        ));
-    }
-
-    #[test]
-    fn public_key_info_materialization_binds_external_resource_policy() {
-        // Public helpers must not inherit the resolver's permissive hard-limit
-        // budget when the operation policy selects a stricter byte ceiling.
-        let document = Document::parse("<root/>").unwrap();
-        let external = format!(
-            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
-        );
-        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                uri: "key.xml".into(),
-            }],
-        };
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_sources.key_info_reference = true;
-        policy.uris.key_info_references = UriTypeSet::ALL;
-        policy.resources.max_external_resource_bytes = 0;
-
-        let error = materialize_verification_key_info_references(
-            &mut key_info,
-            resolver,
-            &policy,
-            crate::provider::default_provider(),
-            crate::XmlBackend::default(),
-        )
-        .expect_err("policy must reject non-empty external KeyInfo bytes");
-
-        assert!(matches!(
-            error,
-            DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
-                maximum: 0,
-                actual,
-            }) if actual == resources["key.xml"].len()
-        ));
-    }
-
-    #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
-    #[test]
-    fn public_key_info_materialization_uses_the_selected_backend() {
-        // Public materialization is a standalone parse boundary. Its backend
-        // must be caller-selected just like the complete sign/verify pipeline.
-        let external = format!(
-            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
-        );
-        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
-        let document = Document::parse("<root/>").unwrap();
-
-        for backend in [crate::XmlBackend::Xmloxide, crate::XmlBackend::Roxmltree] {
-            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-            let mut key_info = KeyInfo {
-                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                    uri: "key.xml".into(),
-                }],
-            };
-            let mut policy = crate::policy::VerificationPolicy::default();
-            policy.key_sources.key_info_reference = true;
-            policy.uris.key_info_references = UriTypeSet::ALL;
-
-            materialize_verification_key_info_references(
-                &mut key_info,
-                resolver,
-                &policy,
-                crate::provider::default_provider(),
-                backend,
-            )
-            .unwrap_or_else(|error| panic!("{backend:?} materialization failed: {error}"));
-
-            assert!(matches!(
-                key_info.sources.as_slice(),
-                [super::super::parse::KeyInfoSource::KeyName(name)] if name == "external"
-            ));
-        }
-    }
-
-    #[test]
-    fn public_key_info_materialization_defers_nested_retrieval_failure() {
-        // Metadata expansion must preserve an earlier usable source when a
-        // later retrieval candidate fails. The complete operation reports the
-        // deferred error only if key selection exhausts all usable sources.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let external = format!(
-            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>usable</ds:KeyName><ds:RetrievalMethod URI="missing.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>"#
-        );
-        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
-        let document = Document::parse("<root/>").unwrap();
-
-        for operation in ["signing", "verification"] {
-            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-            let mut key_info = KeyInfo {
-                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                    uri: "key.xml".into(),
-                }],
-            };
-            match operation {
-                "signing" => {
-                    let mut policy = crate::policy::SigningPolicy::default();
-                    policy.uris.key_info_references = UriTypeSet::ALL;
-                    policy.uris.retrieval_methods = UriTypeSet::ALL;
-                    materialize_signing_key_info_references(
-                        &mut key_info,
-                        resolver,
-                        &policy,
-                        crate::provider::default_provider(),
-                        crate::XmlBackend::default(),
-                    )
-                }
-                "verification" => {
-                    let mut policy = crate::policy::VerificationPolicy::default();
-                    policy.key_sources.key_info_reference = true;
-                    policy.uris.key_info_references = UriTypeSet::ALL;
-                    policy.uris.retrieval_methods = UriTypeSet::ALL;
-                    materialize_verification_key_info_references(
-                        &mut key_info,
-                        resolver,
-                        &policy,
-                        crate::provider::default_provider(),
-                        crate::XmlBackend::default(),
-                    )
-                }
-                _ => unreachable!(),
-            }
-            .unwrap_or_else(|error| panic!("{operation} materialization failed: {error}"));
-
-            assert!(matches!(
-                key_info.sources.as_slice(),
-                [super::super::parse::KeyInfoSource::KeyName(name)] if name == "usable"
-            ));
-        }
-    }
-
-    #[test]
-    fn public_key_info_materialization_binds_xpath_policy() {
-        // Both public helpers must carry the caller's XPath parse limits into
-        // RetrievalMethod transforms nested in an external KeyInfo document.
-        let external = format!(
-            r##"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}">
-                <ds:RetrievalMethod URI="#target" Type="http://www.w3.org/2000/09/xmldsig#X509Data">
-                    <ds:Transforms><ds:Transform Algorithm="{XPATH_TRANSFORM_URI}">
-                        <ds:XPath>ancestor-or-self::ds:X509Data</ds:XPath>
-                    </ds:Transform></ds:Transforms>
-                </ds:RetrievalMethod>
-                <ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
-            </ds:KeyInfo>"##
-        );
-        let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
-        let document = Document::parse("<root/>").unwrap();
-
-        for operation in ["signing", "verification"] {
-            let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-            let mut key_info = KeyInfo {
-                sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                    uri: "key.xml".into(),
-                }],
-            };
-            let error = match operation {
-                "signing" => {
-                    let mut policy = crate::policy::SigningPolicy::default();
-                    policy.uris.key_info_references = UriTypeSet::ALL;
-                    policy.resources.max_xpath_expressions = 0;
-                    materialize_signing_key_info_references(
-                        &mut key_info,
-                        resolver,
-                        &policy,
-                        crate::provider::default_provider(),
-                        crate::XmlBackend::default(),
-                    )
-                }
-                "verification" => {
-                    let mut policy = crate::policy::VerificationPolicy::default();
-                    policy.key_sources.key_info_reference = true;
-                    policy.uris.key_info_references = UriTypeSet::ALL;
-                    policy.resources.max_xpath_expressions = 0;
-                    materialize_verification_key_info_references(
-                        &mut key_info,
-                        resolver,
-                        &policy,
-                        crate::provider::default_provider(),
-                        crate::XmlBackend::default(),
-                    )
-                }
-                _ => unreachable!(),
-            }
-            .expect_err("the public helper must enforce the supplied XPath expression limit");
-
-            assert!(
-                matches!(
-                    error,
-                    DsigError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                        resource: crate::policy::resource_name::XPATH_EXPRESSIONS,
-                        maximum: 0,
-                        actual: 1,
-                    })
-                ),
-                "unexpected {operation} error: {error:?}"
-            );
-        }
-    }
-
-    fn materialize_external_key_info_chain(
-        terminal_reference: &str,
-    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
-        let a = format!(
-            r##"<doc xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
-                <ds:KeyInfo ID="root"><dsig11:KeyInfoReference URI="#next"/></ds:KeyInfo>
-                <ds:KeyInfo ID="next"><dsig11:KeyInfoReference URI="b.xml#root"/></ds:KeyInfo>
-            </doc>"##
-        );
-        let b = format!(
-            r##"<doc xmlns:ds="{XMLDSIG_NS}" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
-                <ds:KeyInfo ID="root"><dsig11:KeyInfoReference URI="#next"/></ds:KeyInfo>
-                <ds:KeyInfo ID="next">{terminal_reference}</ds:KeyInfo>
-            </doc>"##
-        );
-        let resources = HashMap::from([
-            ("a.xml".to_owned(), a.into_bytes()),
-            ("b.xml".to_owned(), b.into_bytes()),
-        ]);
-        let document = XmlDocument::parse("<root/>").unwrap();
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                uri: "a.xml#root".into(),
-            }],
-        };
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_sources.key_info_reference = true;
-        policy.uris.key_info_references = UriTypeSet::ALL;
-        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
-        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-                &policy.resources,
-            )),
-            xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
-            resources: &policy.resources,
-            certificate_signature_algorithms: policy
-                .key_trust
-                .certificate_signature_algorithms
-                .as_ref(),
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut materialization = KeyInfoMaterializationState::default();
-
-        document.with_view(|view| {
-            let resolver = UriReferenceResolver::with_document_view(view, &[])
-                .with_external_resources(&resources);
-            materialize_key_info_references_with_budgets(
-                &mut key_info,
-                &resolver,
-                &policy,
-                crate::provider::default_provider(),
-                &mut budgets,
-                &mut materialization,
-            )?;
-            Ok::<_, SignatureVerificationPipelineError>(())
-        })?;
-        Ok(key_info)
-    }
-
-    fn materialize_external_key_info_bytes_with_limit(
-        encoded: Vec<u8>,
-        maximum_document_bytes: usize,
-    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
-        let resources = HashMap::from([("key.xml".to_owned(), encoded)]);
-        let document = XmlDocument::parse("<root/>").unwrap();
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
-                uri: "key.xml".into(),
-            }],
-        };
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_sources.key_info_reference = true;
-        policy.uris.key_info_references = UriTypeSet::ALL;
-        policy.resources.max_xml_document_bytes = maximum_document_bytes;
-        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
-        let execution_budget = TransformExecutionBudget::from_resources(&policy.resources);
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-                &policy.resources,
-            )),
-            xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
-            resources: &policy.resources,
-            certificate_signature_algorithms: policy
-                .key_trust
-                .certificate_signature_algorithms
-                .as_ref(),
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut materialization = KeyInfoMaterializationState::default();
-
-        document.with_view(|view| {
-            let resolver = UriReferenceResolver::with_document_view(view, &[])
-                .with_external_resources(&resources);
-            materialize_key_info_references_with_budgets(
-                &mut key_info,
-                &resolver,
-                &policy,
-                crate::provider::default_provider(),
-                &mut budgets,
-                &mut materialization,
-            )?;
-            Ok::<_, SignatureVerificationPipelineError>(())
-        })?;
-        Ok(key_info)
-    }
-
-    fn materialize_external_key_info_bytes(
-        encoded: Vec<u8>,
-    ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
-        materialize_external_key_info_bytes_with_limit(
-            encoded,
-            crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
-        )
-    }
-
-    #[test]
-    fn external_key_info_reference_decodes_utf16_xml_octets() {
-        // External XML follows the XML encoding declaration/BOM contract, not
-        // the UTF-8-only contract of Rust strings passed by direct callers.
-        let xml = format!(
-            r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>utf16-key</ds:KeyName></ds:KeyInfo>"#
-        );
-        let mut encoded = vec![0xff, 0xfe];
-        encoded.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
-        let key_info = materialize_external_key_info_bytes(encoded)
-            .expect("UTF-16 external KeyInfo must materialize");
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "utf16-key"
-        ));
-    }
-
-    #[test]
-    fn external_key_info_reference_rejects_malformed_xml_encoding() {
-        // A BOM selecting UTF-16 must not permit a truncated code unit to reach
-        // the XML parser under a misleading structural diagnostic.
-        let error = materialize_external_key_info_bytes(vec![0xff, 0xfe, b'<'])
-            .expect_err("truncated UTF-16 must be rejected during octet decoding");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "KeyInfoReference external resource has an invalid XML encoding"
-            }
-        ));
-    }
-
-    #[test]
-    fn external_key_info_reference_preserves_decoded_document_limit() {
-        // Decoding can expand a compact single-byte resource beyond the XML document policy.
-        // That is a typed policy failure, not malformed KeyInfo structure.
-        let encoded = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:KeyName>\xe9\xe9</ds:KeyName></ds:KeyInfo>".to_vec();
-        let maximum = encoded.len();
-        let error = materialize_external_key_info_bytes_with_limit(encoded, maximum)
-            .expect_err("decoded XML expansion must retain resource-limit classification");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XML_DOCUMENT,
-                    maximum: observed_maximum,
-                    actual,
-                }
-            ) if observed_maximum == maximum && actual > maximum
-        ));
-    }
-
-    #[test]
-    fn key_info_reference_cycle_identity_includes_the_owning_resource() {
-        // Equal fragment spellings in separate external documents are distinct
-        // references and must not be rejected as a recursive cycle.
-        let key_info = materialize_external_key_info_chain("<ds:KeyName>terminal</ds:KeyName>")
-            .expect("cross-document duplicate fragments must materialize");
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [super::super::parse::KeyInfoSource::KeyName(name)] if name == "terminal"
-        ));
-    }
-
-    #[test]
-    fn key_info_reference_cycle_identity_survives_external_reparse() {
-        // Returning to the same external resource must remain a cycle even
-        // though each dereference creates a fresh owned XML document.
-        let error =
-            materialize_external_key_info_chain("<dsig11:KeyInfoReference URI=\"a.xml#root\"/>")
-                .expect_err("a resource cycle must fail before exhausting depth");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "KeyInfoReference cycle detected"
-            }
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_materialization_deduplicates_within_count_limit() {
-        // Repeated references to the same raw certificate produce one parsed
-        // key source rather than one certificate clone per XML element.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let certificate = include_bytes!(
-            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
-        )
-        .to_vec();
-        let resources = HashMap::from([("urn:certificate".to_string(), certificate)]);
-        let mut key_info = KeyInfo {
-            sources: (0..MAX_RETRIEVAL_METHOD_COUNT)
-                .map(|_| super::super::parse::KeyInfoSource::RetrievalMethod {
-                    uri: "urn:certificate".into(),
-                    resource_type: Some(RAW_X509_TYPE.into()),
-                    transforms: RetrievalMethodTransforms::None,
-                })
-                .collect(),
-        };
-        let document = Document::parse("<root/>").unwrap();
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        materialize_retrieval_methods(
-            &mut key_info,
-            &resolver,
-            UriTypeSet::ALL,
-            None,
-            crate::provider::default_provider(),
-        )
-        .unwrap();
-        assert!(matches!(
-            key_info.sources.as_slice(),
-            [super::super::parse::KeyInfoSource::X509Data(info)]
-                if info.certificates.len() == 1
-        ));
-    }
-
-    #[test]
-    fn retrieval_method_candidate_budget_includes_embedded_key_values() {
-        // A previously parsed KeyValue consumes the sole candidate slot, so
-        // malformed retrieved DER must be rejected by policy before X.509 parsing.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let resources = HashMap::from([("urn:certificate".to_string(), vec![1, 2, 3])]);
-        let mut key_info = KeyInfo {
-            sources: vec![
-                super::super::parse::KeyInfoSource::KeyValue(
-                    super::super::parse::KeyValueInfo::Unsupported {
-                        namespace: Some(XMLDSIG_NS.into()),
-                        local_name: "FutureKeyValue".into(),
-                    },
-                ),
-                super::super::parse::KeyInfoSource::RetrievalMethod {
-                    uri: "urn:certificate".into(),
-                    resource_type: Some(RAW_X509_TYPE.into()),
-                    transforms: RetrievalMethodTransforms::None,
-                },
-            ],
-        };
-        let document = Document::parse("<root/>").unwrap();
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-        let mut xpath_parse_budget = XPathSignatureParseBudget::default();
-        let execution_budget = TransformExecutionBudget::default();
-        let resource_policy = crate::policy::ResourcePolicy {
-            max_key_candidates: 1,
-            ..crate::policy::ResourcePolicy::default()
-        };
-        let mut budgets = RetrievalMaterializationBudgets {
-            key_info_parse: &RefCell::new(super::super::parse::KeyInfoParseUsage::new(
-                &resource_policy,
-            )),
-            xpath_parse: &mut xpath_parse_budget,
-            execution: &execution_budget,
-            resources: &resource_policy,
-            certificate_signature_algorithms: None,
-            xml_backend: crate::XmlBackend::default(),
-        };
-        let mut candidate_work = key_info.embedded_candidate_count();
-
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.uris.retrieval_methods = UriTypeSet::ALL;
-        let error = materialize_retrieval_methods_with_budgets(
-            &mut key_info,
-            &resolver,
-            &policy,
-            crate::provider::default_provider(),
-            &mut budgets,
-            &mut candidate_work,
-        )
-        .expect_err("the retrieved certificate must exceed the aggregate candidate limit");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_CANDIDATES,
-                    maximum: 1,
-                    actual: 2,
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn raw_x509_retrieval_rejects_empty_same_document_uri() {
-        // rawX509Certificate consumes external DER octets; an empty URI denotes
-        // the XML document and must never become a key into the external map.
-        const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-        let certificate = include_bytes!(
-            "../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
-        )
-        .to_vec();
-        let resources = HashMap::from([(String::new(), certificate)]);
-        let mut key_info = KeyInfo {
-            sources: vec![super::super::parse::KeyInfoSource::RetrievalMethod {
-                uri: String::new(),
-                resource_type: Some(RAW_X509_TYPE.into()),
-                transforms: RetrievalMethodTransforms::None,
-            }],
-        };
-        let document = Document::parse("<root/>").unwrap();
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-
-        let error = materialize_retrieval_methods(
-            &mut key_info,
-            &resolver,
-            UriTypeSet::ALL,
-            None,
-            crate::provider::default_provider(),
-        )
-        .expect_err("empty URI must retain same-document semantics");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "raw X509 RetrievalMethod requires an untransformed external URI"
-            }
-        ));
-    }
-
-    #[test]
-    fn verify_context_does_not_hide_malformed_digest_behind_unsupported_transform() {
-        // A bad DigestValue remains a parse error even when its transform URI is unsupported.
-        let broken_xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            let xml = xml.replacen(
-                "<ds:Reference URI=\"#target\">",
-                "<ds:Reference URI=\"#target\"><ds:Transforms><ds:Transform Algorithm=\"urn:unsupported\"/></ds:Transforms>",
-                1,
-            );
-            replace_fixture_manifest_digest(&xml, "!!!")
-        });
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&broken_xml)
-            .expect_err("malformed Manifest digest must not become a validity result");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::ParseManifestReference(_)
-        ));
-    }
-
-    #[test]
-    fn verify_context_rejects_manifest_non_whitespace_mixed_content() {
-        // Authenticated mixed content is still structurally invalid under the
-        // Manifest element-only grammar.
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            xml.replacen(
-                "<ds:Manifest ID=\"manifest\">",
-                "<ds:Manifest ID=\"manifest\">junk",
-                1,
-            )
-        });
-
-        let err = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect_err("Manifest mixed content must fail verification");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "Manifest contains non-whitespace mixed content"
-            }
-        ));
-    }
-
-    #[test]
-    fn verify_context_rejects_empty_manifest_children() {
-        // An authenticated empty Manifest violates the required Reference+
-        // content model rather than disappearing as an unsigned block.
-        let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
-            let (prefix, rest) = xml
-                .split_once("<ds:Manifest ID=\"manifest\">")
-                .expect("fixture should contain Manifest");
-            let (_, suffix) = rest
-                .split_once("</ds:Manifest>")
-                .expect("fixture should contain closing Manifest");
-            format!("{prefix}<ds:Manifest ID=\"manifest\"></ds:Manifest>{suffix}")
-        });
-
-        let err = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect_err("empty Manifest must fail verification");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "Manifest must contain at least one ds:Reference element child"
-            }
-        ));
-    }
-
-    #[test]
-    fn verify_context_ignores_unsigned_malformed_manifest_blocks() {
-        let xml = signature_with_manifest_xml(true).replacen(
-            "</ds:Object>",
-            "</ds:Object><ds:Object><ds:Manifest>junk<ds:Foo/></ds:Manifest></ds:Object>",
-            1,
-        );
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect("unsigned malformed Manifest must be ignored");
-        assert_eq!(
-            result.manifest_references.len(),
-            1,
-            "only signed Manifest references must be reported",
-        );
-        assert!(matches!(result.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn verify_context_skips_ambiguous_manifest_id_blocks() {
-        let xml = signature_with_manifest_xml(true).replacen(
-            "</ds:Object>",
-            "</ds:Object><ds:Object><ds:Manifest ID=\"manifest\">junk<ds:Foo/></ds:Manifest></ds:Object>",
-            1,
-        );
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .process_manifests(true)
-            .verify(&xml)
-            .expect_err("ambiguous manifest IDs should make SignedInfo #manifest dereference fail");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::Reference(
-                ReferenceProcessingError::UriDereference(
-                    crate::xmldsig::types::TransformError::ElementNotFound(id)
-                )
-            ) if id == "manifest"
-        ));
-    }
-
-    #[test]
-    fn verify_context_rejects_implicit_default_c14n_when_not_allowlisted() {
-        let xml = minimal_signature_xml("", "");
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .allowed_transforms(["http://www.w3.org/2001/10/xml-exc-c14n#"])
-            .verify(&xml)
-            .expect_err("implicit default C14N must be checked against allowlist");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::Policy(crate::policy::PolicyViolation::Algorithm {
-                operation: "verification transform",
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn verify_context_skips_resolver_when_reference_processing_fails() {
-        let xml = minimal_signature_xml("", "");
-        let result = VerifyContext::new()
-            .key_resolver(&PanicResolver)
-            .verify(&xml)
-            .expect("reference digest mismatch should short-circuit before resolver");
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn verify_context_leaves_fail_fast_reference_tail_unexecuted() {
-        // A mismatch on the first Reference must not produce graph evidence for
-        // the second Reference, which was never dereferenced or digested.
-        let second_reference = r#"
-    <ds:Reference URI="">
-      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-    </ds:Reference>"#;
-        let xml = minimal_signature_xml("", "").replacen(
-            "  </ds:SignedInfo>",
-            &format!("{second_reference}\n  </ds:SignedInfo>"),
-            1,
-        );
-
-        let result = VerifyContext::new()
-            .key(&AcceptingKey)
-            .verify(&xml)
-            .expect("digest mismatch must remain a verification result");
-
-        assert_eq!(result.signed_info_references.len(), 1);
-        assert!(matches!(
-            result.signed_info_references[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn verify_context_reports_key_not_found_when_resolver_misses() {
-        let xml = signature_with_target_reference("AQ==");
-        let result = VerifyContext::new()
-            .key_resolver(&MissingKeyResolver)
-            .verify(&xml)
-            .expect("resolver miss should report status, not pipeline error");
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::KeyNotFound)
-        ));
-        assert_eq!(
-            result.signed_info_references.len(),
-            1,
-            "KeyNotFound path must preserve SignedInfo reference diagnostics",
-        );
-        assert!(matches!(
-            result.signed_info_references[0].status,
-            DsigStatus::Valid
-        ));
-    }
-
-    #[test]
-    fn verification_candidate_budget_covers_preset_and_custom_resolver_paths() {
-        // Zero is a valid deny-all ceiling. Neither an already-resolved key nor
-        // a custom resolver may bypass the operation-wide candidate policy.
-        let xml = signature_with_target_reference("AQ==");
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_key_candidates = 0;
-
-        let preset_error = VerifyContext::new()
-            .key(&RejectingKey)
-            .policy(policy.clone())
-            .verify(&xml)
-            .expect_err("a preset key consumes one candidate");
-        assert!(matches!(
-            preset_error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_CANDIDATES,
-                    maximum: 0,
-                    actual: 1,
-                }
-            )
-        ));
-
-        let resolver_error = VerifyContext::new()
-            .key_resolver(&PanicResolver)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("a custom resolver requires candidate capacity before dispatch");
-        assert!(matches!(
-            resolver_error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_CANDIDATES,
-                    maximum: 0,
-                    actual: 1,
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verification_candidate_account_is_not_reset_for_each_signature() {
-        // A rejected signature still spends its candidate allowance in verify_all.
-        let xml = signature_with_target_reference("AQ==");
-        let start = xml
-            .find("<ds:Signature>")
-            .expect("generated signature start");
-        let end = xml
-            .find("</ds:Signature>")
-            .expect("generated signature end")
-            + "</ds:Signature>".len();
-        let document =
-            XmlDocument::parse(xml.replace("</root>", &format!("{}</root>", &xml[start..end])))
-                .expect("two signatures");
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_key_candidates = 1;
-        let evidence = VerifyContext::new()
-            .key(&RejectingKey)
-            .policy(policy)
-            .verify_all(&document)
-            .expect("signature-local failure report");
-        assert_eq!(evidence.signatures().len(), 2);
-        assert!(evidence.signatures()[0].result().is_ok());
-        assert!(matches!(
-            evidence.signatures()[1].result(),
-            Err(DsigError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_CANDIDATES,
-                    maximum: 1,
-                    actual: 2,
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn resolver_receives_the_certificate_account_spent_by_ingestion() {
-        // The public resolver hook receives prior parsing work, not a fresh allowance.
-        struct ProbeResolver {
-            called: Cell<bool>,
-        }
-        impl KeyResolver for ProbeResolver {
-            fn resolve<'a>(
-                &'a self,
-                _info: Option<&KeyInfo>,
-                _algorithm: SignatureAlgorithm,
-            ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, DsigError> {
-                panic!("core must dispatch through the budget-aware hook");
-            }
-            fn resolve_for_verification_with_budget<'a>(
-                &'a self,
-                _info: Option<&KeyInfo>,
-                _algorithm: SignatureAlgorithm,
-                _policy: &crate::policy::VerificationPolicy,
-                _provider: &dyn crate::provider::CryptoProvider,
-                budget: &mut super::super::InspectedKeyCandidateBudget,
-            ) -> Result<Option<super::super::ResolvedVerificationKey<'a>>, DsigError> {
-                assert!(budget.execution().work_used() > 0);
-                budget.charge()?;
-                self.called.set(true);
-                Ok(Some(super::super::ResolvedVerificationKey::CallerTrusted(
-                    Box::new(AcceptingKey),
-                )))
-            }
-            fn consumes_document_key_info(&self) -> bool {
-                true
-            }
-        }
-        let pair = rcgen::KeyPair::generate().expect("test key generation");
-        let certificate = rcgen::CertificateParams::new(Vec::<String>::new())
-            .expect("empty SAN list")
-            .self_signed(&pair)
-            .expect("test certificate");
-        let encoded = base64::engine::general_purpose::STANDARD.encode(certificate.der());
-        let xml = signature_with_target_reference("AQ==").replace("</ds:Signature>", &format!(
-            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{encoded}</ds:X509Certificate></ds:X509Data></ds:KeyInfo></ds:Signature>",
-        ));
-        let resolver = ProbeResolver {
-            called: Cell::new(false),
-        };
-        let result = VerifyContext::new()
-            .key_resolver(&resolver)
-            .verify(&xml)
-            .expect("shared-account resolver dispatch");
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert!(resolver.called.get());
-    }
-
-    #[test]
-    fn verification_candidate_budget_precedes_embedded_x509_parsing() {
-        // The first certificate is valid and consumes the sole permitted slot;
-        // malformed bytes in the second must never reach the X.509 parser.
-        let first_certificate = base64::engine::general_purpose::STANDARD.encode(include_bytes!(
-            "../../tests/fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der"
-        ));
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            &format!(
-                "</ds:SignatureValue>\n    <ds:KeyInfo><ds:X509Data><ds:X509Certificate>{first_certificate}</ds:X509Certificate><ds:X509Certificate>AQID</ds:X509Certificate></ds:X509Data></ds:KeyInfo>\n  </ds:Signature>"
-            ),
-        );
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.resources.max_key_candidates = 1;
-
-        let error = VerifyContext::new()
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("candidate policy must run before embedded certificate parsing");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::KEY_CANDIDATES,
-                    maximum: 1,
-                    actual: 2,
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn verify_context_resolver_can_ignore_malformed_keyinfo_by_default() {
-        let base_xml = signature_with_target_reference("AQ==");
-        let xml = base_xml
-            .replace(
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
-            )
-            .replace(
-                "</ds:SignatureValue>\n  </ds:Signature>",
-                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
-            );
-
-        let result = VerifyContext::new()
-            .key_resolver(&MissingKeyResolver)
-            .verify(&xml)
-            .expect("resolver path should not hard-fail on advisory malformed KeyInfo by default");
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::KeyNotFound)
-        ));
-    }
-
-    #[test]
-    fn verify_context_resolver_can_opt_in_to_keyinfo_parse_failures() {
-        let base_xml = signature_with_target_reference("AQ==");
-        let xml = base_xml
-            .replace(
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
-            )
-            .replace(
-                "</ds:SignatureValue>\n  </ds:Signature>",
-                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
-            );
-
-        let err = VerifyContext::new()
-            .key_resolver(&ConsumingKeyInfoResolver)
-            .verify(&xml)
-            .expect_err("resolver opted into KeyInfo parsing, malformed KeyInfo must fail");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::ParseKeyInfo(_)
-        ));
-    }
-
-    #[test]
-    fn verify_context_ignores_unsupported_retrieval_before_valid_key_source() {
-        // An advisory vendor RetrievalMethod cannot prevent the resolver from
-        // reaching a later supported source in document order.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r##"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:RetrievalMethod URI="#vendor" Type="urn:vendor:key">
-        <ds:Transforms><ds:Transform Algorithm="urn:vendor:transform"/></ds:Transforms>
-      </ds:RetrievalMethod>
-      <ds:KeyName>fallback</ds:KeyName>
-    </ds:KeyInfo>
-  </ds:Signature>"##,
-        );
-
-        let result = VerifyContext::new()
-            .key_resolver(&FallbackKeyInfoResolver)
-            .verify(&xml)
-            .expect("unsupported advisory retrieval must not abort key resolution");
-        assert_eq!(result.status, DsigStatus::Valid);
-    }
-
-    #[test]
-    fn verify_context_does_not_eagerly_fail_unused_retrieval_fallback() {
-        // KeyInfo sources are alternatives in document order. Once an earlier
-        // source resolves, a missing later RetrievalMethod is irrelevant.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r#"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:KeyName>primary</ds:KeyName>
-      <ds:RetrievalMethod URI="missing.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
-    </ds:KeyInfo>
-  </ds:Signature>"#,
-        );
-
-        let result = VerifyContext::new()
-            .key_resolver(&EarlyKeyInfoResolver)
-            .allowed_retrieval_method_uri_types(UriTypeSet::new(true, true, true))
-            .verify(&xml)
-            .expect("an unused missing retrieval fallback must not abort verification");
-
-        assert_eq!(result.status, DsigStatus::Valid);
-    }
-
-    #[test]
-    fn verify_context_does_not_eagerly_fail_unused_same_document_x509_retrieval() {
-        // Same-document X509Data retrieval is an ordered alternative just like
-        // raw-certificate retrieval; a resolved earlier source makes it unused.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r##"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:KeyName>primary</ds:KeyName>
-      <ds:RetrievalMethod URI="#missing" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/>
-    </ds:KeyInfo>
-  </ds:Signature>"##,
-        );
-
-        let result = VerifyContext::new()
-            .key_resolver(&EarlyKeyInfoResolver)
-            .verify(&xml)
-            .expect("an unused missing X509Data retrieval fallback must not abort verification");
-
-        assert_eq!(result.status, DsigStatus::Valid);
-    }
-
-    #[test]
-    fn verify_context_reports_missing_same_document_x509_retrieval_without_fallback() {
-        // Deferred failures retain their exact diagnostic when no alternative
-        // source resolves the verification key.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r##"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:RetrievalMethod URI="#missing" Type="http://www.w3.org/2000/09/xmldsig#X509Data"/>
-    </ds:KeyInfo>
-  </ds:Signature>"##,
-        );
-
-        let error = VerifyContext::new()
-            .key_resolver(&ConsumingKeyInfoResolver)
-            .verify(&xml)
-            .expect_err("a sole missing X509Data retrieval must remain an explicit error");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "X509Data RetrievalMethod target is missing or ambiguous"
-            }
-        ));
-    }
-
-    #[test]
-    fn verify_context_does_not_eagerly_parse_unused_retrieval_fallback() {
-        // Materialization must preserve ordered fallback semantics even when
-        // caller-supplied bytes exist but are not a certificate.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r#"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:KeyName>primary</ds:KeyName>
-      <ds:RetrievalMethod URI="malformed.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
-    </ds:KeyInfo>
-  </ds:Signature>"#,
-        );
-        let resources = HashMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
-
-        let result = VerifyContext::new()
-            .key_resolver(&EarlyKeyInfoResolver)
-            .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect("an unused malformed retrieval fallback must not abort verification");
-
-        assert_eq!(result.status, DsigStatus::Valid);
-    }
-
-    #[test]
-    fn verify_context_reports_missing_retrieval_when_no_key_source_resolves() {
-        // Deferral changes ordering, not diagnostics: if no alternative source
-        // resolves, the first missing retrieval remains the pipeline failure.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r#"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:RetrievalMethod URI="missing.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
-    </ds:KeyInfo>
-  </ds:Signature>"#,
-        );
-
-        let error = VerifyContext::new()
-            .key_resolver(&ConsumingKeyInfoResolver)
-            .allowed_retrieval_method_uri_types(UriTypeSet::new(true, true, true))
-            .verify(&xml)
-            .expect_err("a missing sole RetrievalMethod must remain an explicit error");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-                crate::xmldsig::TransformError::UnsupportedUri(uri)
-            )) if uri == "missing.der"
-        ));
-    }
-
-    #[test]
-    fn verify_context_reports_malformed_retrieval_when_no_key_source_resolves() {
-        // Deferral must retain the parse error when the malformed certificate
-        // is the only candidate rather than degrading it to KeyNotFound.
-        let xml = signature_with_target_reference("AQ==").replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            r#"</ds:SignatureValue>
-    <ds:KeyInfo>
-      <ds:RetrievalMethod URI="malformed.der" Type="http://www.w3.org/2000/09/xmldsig#rawX509Certificate"/>
-    </ds:KeyInfo>
-  </ds:Signature>"#,
-        );
-        let resources = HashMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
-
-        let error = VerifyContext::new()
-            .key_resolver(&ConsumingKeyInfoResolver)
-            .allowed_retrieval_method_uri_types(UriTypeSet::ALL)
-            .external_resources(&resources)
-            .verify(&xml)
-            .expect_err("a malformed sole RetrievalMethod must remain a parse error");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::ParseKeyInfo(_)
-        ));
-    }
-
-    #[test]
-    fn verify_context_preserves_signaturevalue_decode_errors_when_resolver_misses() {
-        let xml = signature_with_target_reference("@@@");
-
-        let err = VerifyContext::new()
-            .key_resolver(&MissingKeyResolver)
-            .verify(&xml)
-            .expect_err("invalid SignatureValue must remain a decode error on resolver miss");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::SignatureValueBase64(_)
-        ));
-    }
-
-    #[test]
-    fn verify_context_preserves_signaturevalue_decode_errors_without_key() {
-        let xml = signature_with_target_reference("@@@");
-
-        let err = VerifyContext::new()
-            .verify(&xml)
-            .expect_err("invalid SignatureValue must remain a decode error");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::SignatureValueBase64(_)
-        ));
-    }
-
-    #[test]
-    fn enforce_reference_policies_rejects_missing_uri_before_uri_type_checks() {
-        let references = vec![Reference {
-            uri: None,
-            id: None,
-            ref_type: None,
-            transforms: vec![],
-            digest_method: DigestAlgorithm::Sha256,
-            digest_value: vec![0; 32],
-        }];
-        let uri_types = UriTypeSet {
-            allow_empty: false,
-            allow_same_document: true,
-            allow_external: false,
-        };
-
-        let err = enforce_reference_policies(&references, uri_types, None)
-            .expect_err("missing URI must fail before allow_empty policy is evaluated");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::Reference(ReferenceProcessingError::MissingUri)
-        ));
-    }
-
-    #[test]
-    fn enforce_reference_policies_checks_only_terminal_binary_output() {
-        let c14n = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).unwrap();
-        let allowed = HashSet::from([
-            BASE64_TRANSFORM_URI.to_owned(),
-            DEFAULT_IMPLICIT_C14N_URI.to_owned(),
-        ]);
-        let without_implicit_c14n = HashSet::from([BASE64_TRANSFORM_URI.to_owned()]);
-
-        for transforms in [
-            vec![Transform::Base64Decode, Transform::C14n(c14n)],
-            vec![Transform::Base64Decode, Transform::Base64Decode],
-        ] {
-            let reference = make_reference("", transforms, DigestAlgorithm::Sha256, vec![0; 32]);
-            enforce_reference_policies(
-                std::slice::from_ref(&reference),
-                UriTypeSet::default(),
-                Some(&allowed),
-            )
-            .expect("terminal binary output must not require implicit C14N");
-        }
-
-        let terminal_base64 = make_reference(
-            "",
-            vec![Transform::Base64Decode, Transform::Base64Decode],
-            DigestAlgorithm::Sha256,
-            vec![0; 32],
-        );
-        enforce_reference_policies(
-            std::slice::from_ref(&terminal_base64),
-            UriTypeSet::default(),
-            Some(&without_implicit_c14n),
-        )
-        .expect("terminal Base64 output must not require implicit C14N");
-
-        let no_transforms = make_reference("", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
-        let error = enforce_reference_policies(
-            std::slice::from_ref(&no_transforms),
-            UriTypeSet::default(),
-            Some(&without_implicit_c14n),
-        )
-        .expect_err("a node-set result must require allowlisted implicit C14N");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::Algorithm {
-                    operation: "verification transform",
-                    ref algorithm,
-                }
-            )
-                if algorithm == DEFAULT_IMPLICIT_C14N_URI
-        ));
-
-        let detached = make_reference("urn:payload", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
-        enforce_reference_policies(
-            std::slice::from_ref(&detached),
-            UriTypeSet::ALL,
-            Some(&without_implicit_c14n),
-        )
-        .expect("external octets without transforms must not require implicit C14N");
-
-        let external_xpath = make_reference(
-            "urn:payload",
-            vec![Transform::XPath(
-                super::super::transforms::XPathExpression::new("true()"),
-            )],
-            DigestAlgorithm::Sha256,
-            vec![0; 32],
-        );
-        let error = enforce_reference_policies(
-            std::slice::from_ref(&external_xpath),
-            UriTypeSet::ALL,
-            Some(&HashSet::from([XPATH_TRANSFORM_URI.to_owned()])),
-        )
-        .expect_err("external XML converted to a node-set must require implicit C14N");
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::Algorithm {
-                    operation: "verification transform",
-                    ref algorithm,
-                }
-            )
-                if algorithm == DEFAULT_IMPLICIT_C14N_URI
-        ));
-    }
-
-    #[test]
-    fn stored_pre_digest_budget_counts_repeated_external_references() {
-        // The caller map owns one bounded payload, but diagnostic retention is
-        // charged per Reference because every result owns its pre-digest bytes.
-        let document =
-            Document::parse("<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"/>")
-                .unwrap();
-        let payload = vec![b'x'; 7];
-        let digest = compute_digest(DigestAlgorithm::Sha256, &payload);
-        let references = (0..5)
-            .map(|_| {
-                make_reference(
-                    "urn:repeated",
-                    Vec::new(),
-                    DigestAlgorithm::Sha256,
-                    digest.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let resources = HashMap::from([("urn:repeated".to_owned(), payload)]);
-        let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
-        let transform_budget = TransformExecutionBudget::default();
-        let canonicalized_data_budget = CanonicalizedDataBudget::with_limit(32);
-        let execution = ReferenceExecutionContext {
-            store_pre_digest: true,
-            transform_options: TransformOptions::default(),
-            transform_budget: &transform_budget,
-            canonicalized_data_budget: &canonicalized_data_budget,
-            provider: crate::provider::default_provider(),
-            capture: &(),
-        };
-
-        let error = process_all_references_with_options(
-            &references,
-            &resolver,
-            document.root_element(),
-            &execution,
-        )
-        .expect_err(
-            "retained diagnostics must not multiply one external allocation past the aggregate cap",
-        );
-        assert!(matches!(
-            error,
-            ReferenceProcessingError::Policy(crate::policy::PolicyViolation::ResourceLimit {
-                resource: "canonicalized bytes",
-                maximum: 32,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn public_reference_entries_inherit_custom_id_registration() {
-        // Both public entry points must pass resolver registrations to XPath.
-        let xml = format!(
-            "<root xmlns:ds='{XMLDSIG_NS}'><data Token='target'>YWJj</data><ds:Signature/></root>"
-        );
-        let document = Document::parse(&xml).unwrap();
-        let signature = document
-            .descendants()
-            .find(|node| node.has_tag_name((XMLDSIG_NS, "Signature")))
-            .unwrap();
-        let registrations = [crate::IdAttributeRegistration::global("Token")];
-        let resolver = UriReferenceResolver::with_id_registrations(&document, &registrations);
-        let expression = crate::xmldsig::transforms::XPathExpression::new(
-            "count(id('target')) = 1 and count(ancestor-or-self::node() | id('target')) = count(ancestor-or-self::node())",
-        );
-        let reference = make_reference(
-            "#target",
-            vec![Transform::XPath(expression), Transform::Base64Decode],
-            DigestAlgorithm::Sha256,
-            compute_digest(DigestAlgorithm::Sha256, b"abc"),
-        );
-        let one = process_reference(
-            &reference,
-            &resolver,
-            signature,
-            ReferenceSet::SignedInfo,
-            0,
-            true,
-        )
-        .unwrap();
-        assert_eq!(one.status, DsigStatus::Valid);
-        let all = process_all_references(&[reference], &resolver, signature, true).unwrap();
-        assert_eq!(all.results.len(), 1);
-        assert_eq!(all.results[0].status, DsigStatus::Valid);
-        assert!(all.first_failure.is_none());
-    }
-
-    #[test]
-    fn normalized_root_xpointers_bind_document_identity() {
-        // Spelling changes must not discard coverage evidence for the root.
-        let document = XmlDocument::parse("<root><item/></root>").unwrap();
-        let budgets = VerificationOperationBudgets::with_transforms(
-            &crate::policy::VerificationPolicy::default(),
-            TransformExecutionBudget::default(),
-            None,
-        );
-        document.with_view(|view| {
-            let resolver = UriReferenceResolver::new(view.document());
-            for uri in ["#xpointer(/)", "#xpointer( / )", "#xpointer(%2F)"] {
-                let reference =
-                    make_reference(uri, Vec::new(), DigestAlgorithm::Sha256, vec![0; 32]);
-                assert_eq!(
-                    budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None),
-                    OperationResourceIdentity::DocumentNode(view.root()),
-                    "{uri}"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn missing_external_identity_does_not_retain_uri_cache_copies() {
-        // No bytes exist to fingerprint or reuse. The graph's Reference node
-        // already carries provenance, so a missing URI must not enter the
-        // available-resource memoization cache or be cloned with every decision.
-        let document = XmlDocument::parse("<root/>").unwrap();
-        let uri = format!("urn:missing:{}", "x".repeat(16384));
-        let reference = make_reference(&uri, Vec::new(), DigestAlgorithm::Sha256, vec![0; 32]);
-        let budgets = VerificationOperationBudgets::with_transforms(
-            &crate::policy::VerificationPolicy::default(),
-            TransformExecutionBudget::default(),
-            None,
-        );
-        document.with_view(|view| {
-            let resolver = UriReferenceResolver::new(view.document());
-            let _ = budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None);
-            assert!(budgets.external_resource_identities.borrow().is_empty());
-        });
-    }
-
-    #[test]
-    fn operation_memoizes_repeated_external_resource_identity() {
-        // The external resource map is immutably borrowed for the operation,
-        // so one content fingerprint safely identifies every repeated URI.
-        let document = XmlDocument::parse("<root/>").expect("fixture must parse");
-        let resources = HashMap::from([("urn:repeated".to_owned(), vec![b'x'; 8 * 1_024])]);
-        let reference = make_reference(
-            "urn:repeated",
-            Vec::new(),
-            DigestAlgorithm::Sha256,
-            vec![0; 32],
-        );
-        let budgets = VerificationOperationBudgets::with_transforms(
-            &crate::policy::VerificationPolicy::default(),
-            TransformExecutionBudget::default(),
-            None,
-        );
-
-        document.with_view(|view| {
-            let resolver =
-                UriReferenceResolver::new(view.document()).with_external_resources(&resources);
-            let first =
-                budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None);
-            let second =
-                budgets.resource_identity_for_reference(&reference, 1, &resolver, view, None);
-
-            assert_eq!(first, second);
-            assert_eq!(budgets.external_resource_identities.borrow().len(), 1);
-        });
-    }
-
-    #[test]
-    fn canonical_signed_info_obeys_policy_without_diagnostic_retention() {
-        // SignedInfo is always materialized for crypto verification, so its
-        // canonical bytes must consume the configured ceiling even when
-        // diagnostics do not retain reference output.
-        let xml = signature_with_target_reference("AQ==");
-        let marker = "<ds:SignatureMethod";
-        let padding = " ".repeat(1_025);
-        let xml = xml.replacen(marker, &format!("{padding}{marker}"), 1);
-        let policy = crate::policy::VerificationPolicy {
-            resources: crate::policy::ResourcePolicy {
-                max_canonicalized_bytes: 1_024,
-                ..crate::policy::ResourcePolicy::default()
-            },
-            ..crate::policy::VerificationPolicy::default()
-        };
-
-        let error = VerifyContext::new()
-            .key(&AcceptingKey)
-            .policy(policy)
-            .verify(&xml)
-            .expect_err("canonicalized SignedInfo must remain policy-bounded");
-
-        assert!(matches!(
-            error,
-            SignatureVerificationPipelineError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: "canonicalized bytes",
-                    ..
-                }
-            )
-        ));
-    }
-
-    #[test]
-    fn fragmented_pq_signature_value_decodes_at_exact_wire_limit() {
-        // Comments split the largest supported signature into tiny text nodes;
-        // decoding must preserve bytes and reject an oversized aggregate.
-        let parameter = super::super::pq_algorithm::PqAlgorithm::SlhDsaSha2_256f;
-        let bytes = vec![0x5a; parameter.signature_len()];
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let mut xml = String::from("<SignatureValue>");
-        for chunk in encoded.as_bytes().chunks(4) {
-            xml.push_str(std::str::from_utf8(chunk).unwrap());
-            xml.push_str("<!--split-->\n");
-        }
-        xml.push_str("</SignatureValue>");
-        let document = Document::parse(&xml).unwrap();
-        let algorithm = SignatureAlgorithm::PostQuantum(parameter);
-        assert_eq!(
-            decode_signature_value(
-                document.root_element(),
-                algorithm,
-                &crate::policy::ResourcePolicy::default()
-            )
-            .unwrap(),
-            bytes
-        );
-        let oversized = xml.replace("</SignatureValue>", "AAAA</SignatureValue>");
-        let document = Document::parse(&oversized).unwrap();
-        assert!(matches!(
-            decode_signature_value(
-                document.root_element(),
-                algorithm,
-                &crate::policy::ResourcePolicy::default()
-            ),
-            Err(SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue exceeds maximum allowed length"
-            })
-        ));
-    }
-
-    #[test]
-    fn push_normalized_signature_text_rejects_form_feed() {
-        let mut normalized = Vec::new();
-        let mut raw_text_len = 0usize;
-        let err = push_normalized_signature_text(
-            "ab\u{000C}cd",
-            &mut raw_text_len,
-            &mut normalized,
-            SignatureAlgorithm::RsaSha256,
-            &crate::policy::ResourcePolicy::default(),
-        )
-        .expect_err("form-feed must not be treated as XML base64 whitespace");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::SignatureValueBase64(
-                base64::DecodeError::InvalidByte(_, 0x0C)
-            )
-        ));
-    }
-
-    #[test]
-    fn push_normalized_signature_text_enforces_byte_limit_for_multibyte_chars() {
-        let mut normalized = vec![b'A'; MAX_SIGNATURE_VALUE_LEN - 1];
-        let mut raw_text_len = normalized.len();
-        let err = push_normalized_signature_text(
-            "é",
-            &mut raw_text_len,
-            &mut normalized,
-            SignatureAlgorithm::RsaSha256,
-            &crate::policy::ResourcePolicy::default(),
-        )
-        .expect_err("multibyte characters must not bypass byte-size limit");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "SignatureValue exceeds maximum allowed length"
-            }
-        ));
-    }
-
-    // ── process_reference: happy path ────────────────────────────────
-
-    #[test]
-    fn reference_with_correct_digest_passes() {
-        // Create a simple document, compute its canonical form digest,
-        // then verify that process_reference returns Valid status.
-        let xml = r##"<root>
-            <data>hello world</data>
-            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#" Id="sig1">
-                <ds:SignedInfo/>
-            </ds:Signature>
-        </root>"##;
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-        let sig_node = doc
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
-            .unwrap();
-
-        // First, compute the expected digest by running the pipeline
-        let initial_data = resolver.dereference("").unwrap();
-        let transforms = vec![
-            Transform::Enveloped,
-            Transform::C14n(
-                crate::c14n::C14nAlgorithm::from_uri("http://www.w3.org/2001/10/xml-exc-c14n#")
-                    .unwrap(),
-            ),
-        ];
-        let pre_digest_bytes =
-            crate::xmldsig::execute_transforms(sig_node, initial_data, &transforms).unwrap();
-        let expected_digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest_bytes);
-
-        // Now build a Reference with the correct digest and verify
-        let reference = make_reference("", transforms, DigestAlgorithm::Sha256, expected_digest);
-
-        let result = process_reference(
-            &reference,
-            &resolver,
-            sig_node,
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        )
-        .unwrap();
-        assert!(
-            matches!(result.status, DsigStatus::Valid),
-            "digest should match"
-        );
-        assert!(result.pre_digest_data.is_none());
-    }
-
-    #[test]
-    fn reference_with_wrong_digest_fails() {
-        let xml = r##"<root>
-            <data>hello</data>
-            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-                <ds:SignedInfo/>
-            </ds:Signature>
-        </root>"##;
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-        let sig_node = doc
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
-            .unwrap();
-
-        let transforms = vec![Transform::Enveloped];
-        // Wrong digest value — all zeros
-        let wrong_digest = vec![0u8; 32];
-        let reference = make_reference("", transforms, DigestAlgorithm::Sha256, wrong_digest);
-
-        let result = process_reference(
-            &reference,
-            &resolver,
-            sig_node,
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn reference_with_wrong_digest_preserves_supplied_ref_index() {
-        let xml = r##"<root>
-            <data>hello</data>
-            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-                <ds:SignedInfo/>
-            </ds:Signature>
-        </root>"##;
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-        let sig_node = doc
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
-            .unwrap();
-
-        let reference = make_reference(
-            "",
-            vec![Transform::Enveloped],
-            DigestAlgorithm::Sha256,
-            vec![0u8; 32],
-        );
-        let result = process_reference(
-            &reference,
-            &resolver,
-            sig_node,
-            ReferenceSet::SignedInfo,
-            7,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 7 })
-        ));
-    }
-
-    #[test]
-    fn reference_stores_pre_digest_data() {
-        let xml = "<root><child>text</child></root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        // No transforms, no enveloped — just canonicalize entire document
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(doc.root_element(), initial_data, &[]).unwrap();
-        let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
-
-        let reference = make_reference("", vec![], DigestAlgorithm::Sha256, digest);
-        let result = process_reference(
-            &reference,
-            &resolver,
-            doc.root_element(),
-            ReferenceSet::SignedInfo,
-            0,
-            true,
-        )
-        .unwrap();
-
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert!(result.pre_digest_data.is_some());
-        assert_eq!(result.pre_digest_data.unwrap(), pre_digest);
-    }
-
-    // ── process_reference: URI dereference ───────────────────────────
-
-    #[test]
-    fn reference_with_id_uri() {
-        let xml = r##"<root>
-            <item ID="target">specific content</item>
-            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-                <ds:SignedInfo/>
-            </ds:Signature>
-        </root>"##;
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-        let sig_node = doc
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
-            .unwrap();
-
-        // Compute expected digest for the #target subtree
-        let initial_data = resolver.dereference("#target").unwrap();
-        let transforms = vec![Transform::C14n(
-            crate::c14n::C14nAlgorithm::from_uri("http://www.w3.org/2001/10/xml-exc-c14n#")
-                .unwrap(),
-        )];
-        let pre_digest =
-            crate::xmldsig::execute_transforms(sig_node, initial_data, &transforms).unwrap();
-        let expected_digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
-
-        let reference = make_reference(
-            "#target",
-            transforms,
-            DigestAlgorithm::Sha256,
-            expected_digest,
-        );
-        let result = process_reference(
-            &reference,
-            &resolver,
-            sig_node,
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(result.status, DsigStatus::Valid));
-    }
-
-    #[test]
-    fn reference_with_nonexistent_id_fails() {
-        let xml = "<root><child/></root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        let reference =
-            make_reference("#nonexistent", vec![], DigestAlgorithm::Sha256, vec![0; 32]);
-        let result = process_reference(
-            &reference,
-            &resolver,
-            doc.root_element(),
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn reference_with_absent_uri_fails_closed() {
-        let xml = "<root><child>text</child></root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        let reference = Reference {
-            uri: None, // absent URI
-            id: None,
-            ref_type: None,
-            transforms: vec![],
-            digest_method: DigestAlgorithm::Sha256,
-            digest_value: vec![0; 32],
-        };
-
-        let result = process_reference(
-            &reference,
-            &resolver,
-            doc.root_element(),
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        );
-        assert!(matches!(result, Err(ReferenceProcessingError::MissingUri)));
-    }
-
-    // ── process_all_references: fail-fast ────────────────────────────
-
-    #[test]
-    fn all_references_pass() {
-        let xml = "<root><child>text</child></root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        // Compute correct digest
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(doc.root_element(), initial_data, &[]).unwrap();
-        let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
-
-        let refs = vec![
-            make_reference("", vec![], DigestAlgorithm::Sha256, digest.clone()),
-            make_reference("", vec![], DigestAlgorithm::Sha256, digest),
-        ];
-
-        let result = process_all_references(&refs, &resolver, doc.root_element(), false).unwrap();
-        assert!(result.all_valid());
-        assert_eq!(result.results.len(), 2);
-        assert!(result.first_failure.is_none());
-    }
-
-    #[test]
-    fn reference_processing_shares_xpath_work_across_references() {
-        // A signature-wide meter must not reset when processing the next
-        // Reference, even though each transform chain is independently valid.
-        let document = Document::parse("<root/>").unwrap();
-        let resolver = UriReferenceResolver::new(&document);
-        let transform = Transform::XPath(super::super::transforms::XPathExpression::new("true()"));
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest = crate::xmldsig::execute_transforms(
-            document.root_element(),
-            initial_data,
-            std::slice::from_ref(&transform),
-        )
-        .unwrap();
-        let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
-        let references = vec![
-            make_reference(
-                "",
-                vec![transform.clone()],
-                DigestAlgorithm::Sha256,
-                digest.clone(),
-            ),
-            make_reference("", vec![transform], DigestAlgorithm::Sha256, digest),
-        ];
-        let budget = TransformExecutionBudget::with_xpath_limit(12);
-        let canonicalized_data_budget = CanonicalizedDataBudget::default();
-        let execution = ReferenceExecutionContext {
-            store_pre_digest: false,
-            transform_options: TransformOptions::default(),
-            transform_budget: &budget,
-            canonicalized_data_budget: &canonicalized_data_budget,
-            provider: crate::provider::default_provider(),
-            capture: &(),
-        };
-
-        let error = process_all_references_with_options(
-            &references,
-            &resolver,
-            document.root_element(),
-            &execution,
-        )
-        .expect_err("the second Reference must consume the first Reference's XPath work");
-
-        assert!(matches!(
-            error,
-            ReferenceProcessingError::Transform(TransformError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::XPATH_EVALUATION_WORK,
-                    ..
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn reference_processing_shares_node_set_materialization_across_references() {
-        // Repeated references to the same small subtree must share one owned-
-        // string budget. Otherwise a large inherited namespace can be cloned
-        // once per Reference even when canonicalization emits little output.
-        let document = Document::parse(
-            r#"<root xmlns:n="urn:0123456789"><target Id="selected">payload</target></root>"#,
-        )
-        .unwrap();
-        let resolver = UriReferenceResolver::new(&document);
-        let initial_data = resolver.dereference("#selected").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(document.root_element(), initial_data, &[]).unwrap();
-        let digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
-        let references = vec![
-            make_reference("#selected", vec![], DigestAlgorithm::Sha256, digest.clone()),
-            make_reference("#selected", vec![], DigestAlgorithm::Sha256, digest),
-        ];
-        let budget = TransformExecutionBudget::with_node_set_materialization_limit(30);
-        let canonicalized_data_budget = CanonicalizedDataBudget::default();
-        let execution = ReferenceExecutionContext {
-            store_pre_digest: false,
-            transform_options: TransformOptions::default(),
-            transform_budget: &budget,
-            canonicalized_data_budget: &canonicalized_data_budget,
-            provider: crate::provider::default_provider(),
-            capture: &(),
-        };
-
-        let error = process_all_references_with_options(
-            &references,
-            &resolver,
-            document.root_element(),
-            &execution,
-        )
-        .expect_err("the second Reference must consume the first Reference's materialization work");
-
-        assert!(matches!(
-            error,
-            ReferenceProcessingError::UriDereference(TransformError::Policy(
-                crate::policy::PolicyViolation::ResourceLimit {
-                    resource: crate::policy::resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
-                    ..
-                }
-            ))
-        ));
-    }
-
-    #[test]
-    fn fail_fast_on_first_mismatch() {
-        let xml = "<root><child>text</child></root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        let wrong_digest = vec![0u8; 32];
-        let refs = vec![
-            make_reference("", vec![], DigestAlgorithm::Sha256, wrong_digest.clone()),
-            // Second reference should NOT be processed
-            make_reference("", vec![], DigestAlgorithm::Sha256, wrong_digest),
-        ];
-
-        let result = process_all_references(&refs, &resolver, doc.root_element(), false).unwrap();
-        assert!(!result.all_valid());
-        assert_eq!(result.first_failure, Some(0));
-        // Only first reference should be in results (fail-fast)
-        assert_eq!(result.results.len(), 1);
-        assert!(matches!(
-            result.results[0].status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-        ));
-    }
-
-    #[test]
-    fn fail_fast_second_reference() {
-        let xml = "<root><child>text</child></root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        // Compute correct digest for first ref
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(doc.root_element(), initial_data, &[]).unwrap();
-        let correct_digest = compute_digest(DigestAlgorithm::Sha256, &pre_digest);
-        let wrong_digest = vec![0u8; 32];
-
-        let refs = vec![
-            make_reference("", vec![], DigestAlgorithm::Sha256, correct_digest),
-            make_reference("", vec![], DigestAlgorithm::Sha256, wrong_digest),
-        ];
-
-        let result = process_all_references(&refs, &resolver, doc.root_element(), false).unwrap();
-        assert!(!result.all_valid());
-        assert_eq!(result.first_failure, Some(1));
-        // Both references should be in results
-        assert_eq!(result.results.len(), 2);
-        assert!(matches!(result.results[0].status, DsigStatus::Valid));
-        assert!(matches!(
-            result.results[1].status,
-            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 1 })
-        ));
-    }
-
-    #[test]
-    fn empty_references_list() {
-        let xml = "<root/>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        let result = process_all_references(&[], &resolver, doc.root_element(), false).unwrap();
-        assert!(result.all_valid());
-        assert!(result.results.is_empty());
-    }
-
-    // ── Digest algorithms ────────────────────────────────────────────
-
-    #[test]
-    fn reference_sha1_digest() {
-        let xml = "<root>content</root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(doc.root_element(), initial_data, &[]).unwrap();
-        let digest = compute_digest(DigestAlgorithm::Sha1, &pre_digest);
-
-        let reference = make_reference("", vec![], DigestAlgorithm::Sha1, digest);
-        let result = process_reference(
-            &reference,
-            &resolver,
-            doc.root_element(),
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha1);
-    }
-
-    #[test]
-    fn reference_sha512_digest() {
-        let xml = "<root>content</root>";
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(doc.root_element(), initial_data, &[]).unwrap();
-        let digest = compute_digest(DigestAlgorithm::Sha512, &pre_digest);
-
-        let reference = make_reference("", vec![], DigestAlgorithm::Sha512, digest);
-        let result = process_reference(
-            &reference,
-            &resolver,
-            doc.root_element(),
-            ReferenceSet::SignedInfo,
-            0,
-            false,
-        )
-        .unwrap();
-        assert!(matches!(result.status, DsigStatus::Valid));
-        assert_eq!(result.digest_algorithm, DigestAlgorithm::Sha512);
-    }
-
-    // ── SAML-like end-to-end ─────────────────────────────────────────
-
-    #[test]
-    fn saml_enveloped_reference_processing() {
-        // Realistic SAML Response with enveloped signature
-        let xml = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
-                                     xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
-                                     ID="_resp1">
-            <saml:Assertion ID="_assert1">
-                <saml:Subject>user@example.com</saml:Subject>
-            </saml:Assertion>
-            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-                <ds:SignedInfo>
-                    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-                    <ds:Reference URI="">
-                        <ds:Transforms>
-                            <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
-                            <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-                        </ds:Transforms>
-                        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
-                        <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-                    </ds:Reference>
-                </ds:SignedInfo>
-                <ds:SignatureValue>fakesig==</ds:SignatureValue>
-            </ds:Signature>
-        </samlp:Response>"##;
-        let doc = Document::parse(xml).unwrap();
-        let resolver = UriReferenceResolver::new(&doc);
-        let sig_node = doc
-            .descendants()
-            .find(|n| n.is_element() && n.tag_name().name() == "Signature")
-            .unwrap();
-
-        // Parse SignedInfo to get the Reference
-        let signed_info_node = sig_node
-            .children()
-            .find(|n| n.is_element() && n.tag_name().name() == "SignedInfo")
-            .unwrap();
-        let signed_info = parse_signed_info(signed_info_node).unwrap();
-        let reference = &signed_info.references[0];
-
-        // Compute the correct digest by running the actual pipeline
-        let initial_data = resolver.dereference("").unwrap();
-        let pre_digest =
-            crate::xmldsig::execute_transforms(sig_node, initial_data, &reference.transforms)
-                .unwrap();
-        let correct_digest = compute_digest(reference.digest_method, &pre_digest);
-
-        // Build a reference with the correct digest
-        let corrected_ref = make_reference(
-            "",
-            reference.transforms.clone(),
-            reference.digest_method,
-            correct_digest,
-        );
-
-        // Verify: should pass
-        let result = process_reference(
-            &corrected_ref,
-            &resolver,
-            sig_node,
-            ReferenceSet::SignedInfo,
-            0,
-            true,
-        )
-        .unwrap();
-        assert!(
-            matches!(result.status, DsigStatus::Valid),
-            "SAML reference should verify"
-        );
-        assert!(result.pre_digest_data.is_some());
-
-        // Verify the pre-digest data contains the canonicalized document without Signature
-        let pre_digest_str = String::from_utf8(result.pre_digest_data.unwrap()).unwrap();
-        assert!(
-            pre_digest_str.contains("samlp:Response"),
-            "pre-digest should contain Response"
-        );
-        assert!(
-            !pre_digest_str.contains("SignatureValue"),
-            "pre-digest should NOT contain Signature"
-        );
-    }
-
-    #[test]
-    fn pipeline_missing_signed_info_returns_missing_element() {
-        let xml = r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"></ds:Signature>"#;
-
-        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
-            .expect_err("missing SignedInfo must fail before crypto stage");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::MissingElement {
-                element: "SignedInfo"
-            }
-        ));
-    }
-
-    #[test]
-    fn pipeline_multiple_signature_elements_are_rejected() {
-        let xml = r#"
-<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <ds:Signature>
-    <ds:SignedInfo/>
-  </ds:Signature>
-  <ds:Signature/>
-</root>
-"#;
-
-        let err = verify_signature_with_pem_key(xml, "dummy-key", false)
-            .expect_err("multiple signatures must fail closed");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "Signature must appear exactly once in document",
-            }
-        ));
-    }
-
-    #[test]
-    fn pipeline_start_node_limits_signature_cardinality_to_its_subtree() {
-        // A start-node selector changes the operation root, not global ID or
-        // reference resolution; another Signature outside the subtree is irrelevant.
-        let xml = r#"
-<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <scope Id="selected"><ds:Signature/></scope>
-  <scope Id="other"><ds:Signature/></scope>
-</root>
-"#;
-        let err = VerifyContext::new()
-            .start_node_id("selected")
-            .verify(xml)
-            .expect_err("the selected Signature remains structurally incomplete");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::MissingElement {
-                element: "SignedInfo"
-            }
-        ));
-    }
-
-    #[test]
-    fn pipeline_reports_keyinfo_parse_error() {
-        let xml = r#"
-<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"
-              xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">
-  <ds:SignedInfo>
-    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-    <ds:Reference URI="">
-      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-    </ds:Reference>
-  </ds:SignedInfo>
-  <ds:SignatureValue>AA==</ds:SignatureValue>
-  <ds:KeyInfo>
-    <dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue>
-  </ds:KeyInfo>
-</ds:Signature>
-"#;
-
-        let err = VerifyContext::new().verify(xml).expect_err(
-            "invalid KeyInfo must map to ParseKeyInfo when no explicit key is supplied",
-        );
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::ParseKeyInfo(_)
-        ));
-    }
-
-    #[test]
-    fn pipeline_ignores_malformed_keyinfo_when_explicit_key_is_supplied() {
-        let base_xml = signature_with_target_reference("AQ==");
-        let xml = base_xml
-            .replace(
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#">"#,
-            )
-            .replace(
-                "</ds:SignatureValue>\n  </ds:Signature>",
-                "</ds:SignatureValue>\n    <ds:KeyInfo><dsig11:DEREncodedKeyValue>%%%invalid%%%</dsig11:DEREncodedKeyValue></ds:KeyInfo>\n  </ds:Signature>",
-            );
-
-        let result = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&xml)
-            .expect("explicit key path should not fail on malformed KeyInfo");
-        assert!(matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::SignatureMismatch)
-        ));
-    }
-
-    #[test]
-    fn pipeline_rejects_foreign_element_children_under_signature() {
-        let base_xml = signature_with_target_reference("AQ==");
-        let xml = base_xml
-            .replace(
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#">"#,
-                r#"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:foo="urn:example:foo">"#,
-            )
-            .replace(
-                "</ds:SignedInfo>\n    <ds:SignatureValue>",
-                "</ds:SignedInfo>\n    <foo:Bar/>\n    <ds:SignatureValue>",
-            );
-
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&xml)
-            .expect_err("foreign element children under Signature must fail closed");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "Signature must contain only XMLDSIG element children",
-            }
-        ));
-    }
-
-    #[test]
-    fn pipeline_rejects_non_whitespace_mixed_content_under_signature() {
-        let base_xml = signature_with_target_reference("AQ==");
-        let xml = base_xml.replace(
-            "</ds:SignedInfo>\n    <ds:SignatureValue>",
-            "</ds:SignedInfo>\n    oops\n    <ds:SignatureValue>",
-        );
-
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&xml)
-            .expect_err("non-whitespace mixed content under Signature must fail closed");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "Signature must not contain non-whitespace mixed content",
-            }
-        ));
-    }
-
-    #[test]
-    fn pipeline_rejects_keyinfo_out_of_order() {
-        let base_xml = signature_with_target_reference("AQ==");
-        let xml = base_xml.replace(
-            "</ds:SignatureValue>\n  </ds:Signature>",
-            "</ds:SignatureValue>\n    <ds:Object/>\n    <ds:KeyInfo><ds:KeyName>late</ds:KeyName></ds:KeyInfo>\n  </ds:Signature>",
-        );
-
-        let err = VerifyContext::new()
-            .key(&RejectingKey)
-            .verify(&xml)
-            .expect_err("KeyInfo after Object must be rejected by Signature child order checks");
-        assert!(matches!(
-            err,
-            SignatureVerificationPipelineError::InvalidStructure {
-                reason: "KeyInfo must be the third element child of Signature when present"
-            }
-        ));
-    }
-
-    #[test]
-    fn pipeline_accepts_comments_and_processing_instructions_under_signature() {
-        let xml = r#"
-<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
-  <?dbg keep ?>
-  <!-- signature metadata -->
-  <ds:SignedInfo>
-    <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
-    <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
-    <ds:Reference URI="">
-      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-    </ds:Reference>
-  </ds:SignedInfo>
-  <!-- between required children -->
-  <ds:SignatureValue>AA==</ds:SignatureValue>
-</ds:Signature>
-"#;
-
-        let doc = Document::parse(xml).expect("test XML must parse");
-        let signature_node = doc.root_element();
-        let parsed = parse_signature_children(signature_node)
-            .expect("comment/PI nodes under Signature must be ignored");
-
-        assert_eq!(parsed.signed_info_node.tag_name().name(), "SignedInfo");
-        assert_eq!(
-            parsed.signature_value_node.tag_name().name(),
-            "SignatureValue"
-        );
-        assert!(parsed.key_info_node.is_none());
-    }
-}
+mod tests;

@@ -24,7 +24,7 @@ fn recipient_wipes_owned_material_without_wiping_its_clone() {
     let EncryptionRecipient::AesKeyWrap { kek, .. } = &recipient else {
         panic!("expected a KEK recipient");
     };
-    assert!(kek.is_empty());
+    assert_eq!(kek.as_slice(), b"");
     let EncryptionRecipient::AesKeyWrap { kek, .. } = &clone else {
         panic!("expected a KEK recipient");
     };

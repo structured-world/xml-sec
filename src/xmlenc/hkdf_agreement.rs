@@ -1,4 +1,4 @@
-//! RFC 9231 HKDF XML adapter, distinct from libxmlsec1's HKDFParams layout.
+//! RFC 9231 HKDF XML adapter, distinct from libxmlsec1's `HKDFParams` layout.
 
 use super::parse::{bounded_simple_text_with_limit, require_element, validate_metadata_len};
 use super::types::{XMLDSIG_NS, XMLENC_NS};
@@ -33,12 +33,17 @@ impl core::fmt::Debug for HkdfAgreement {
 
 impl HkdfAgreement {
     /// Borrow normalized parameters without exposing embedded initial key material.
+    #[must_use]
     pub fn key_derivation_method(&self) -> &KeyDerivationMethod {
         &self.method
     }
 
     /// Derive with XML-supplied IKM or an explicit out-of-band request value.
     /// Supplying both is an ambiguous request and is rejected, never overridden.
+    ///
+    /// # Errors
+    /// Returns an error if key material is absent or supplied twice, the consuming
+    /// width differs, or derivation is refused or fails.
     pub fn derive_key(
         &self,
         output_len: usize,
@@ -57,7 +62,11 @@ impl HkdfAgreement {
 }
 
 /// Parse RFC 9231 section 2.8.1 using the operation-selected backend and policy.
-/// This is a parameter adapter, not an asymmetric AgreementMethod resolver.
+/// This is a parameter adapter, not an asymmetric `AgreementMethod` resolver.
+///
+/// # Errors
+/// Returns an error for invalid policy, XML or HKDF parameters, unsupported algorithms,
+/// or exceeded parsing and metadata limits.
 pub fn parse_hkdf_agreement_method(
     xml: &str,
     policy: &crate::policy::DecryptionPolicy,
@@ -77,6 +86,7 @@ pub fn parse_hkdf_agreement_method(
 }
 
 pub(super) fn parse_node(node: Node<'_, '_>, maximum: usize) -> Result<HkdfAgreement, XmlEncError> {
+    use crate::xmldsig::{DigestAlgorithm as D, SignatureAlgorithm as S};
     require_element(node, XMLENC_NS, "AgreementMethod")?;
     // RFC 9231's illustrative example lowercases "algorithm", but the XML
     // Security wire attribute is case-sensitive Algorithm. No casing fallback.
@@ -122,7 +132,6 @@ pub(super) fn parse_node(node: Node<'_, '_>, maximum: usize) -> Result<HkdfAgree
                 // example names HMAC-SHA256 instead. Both identify the same
                 // underlying HKDF hash, unlike an arbitrary signature URI.
                 // RFC 9231 section 2.8.1: hash function and worked example.
-                use crate::xmldsig::{DigestAlgorithm as D, SignatureAlgorithm as S};
                 let prf = match D::from_uri(value) {
                     Some(D::Sha1) => S::HmacSha1,
                     Some(D::Sha224) => S::HmacSha224,
@@ -144,10 +153,10 @@ pub(super) fn parse_node(node: Node<'_, '_>, maximum: usize) -> Result<HkdfAgree
             }
             (Some(MORE), "Salt") if salt.is_none() => salt = Some(hex_text(child, maximum)?),
             (Some(XMLENC_NS), "KA-Nonce") if info.is_none() => {
-                info = Some(hex_text(child, maximum)?)
+                info = Some(hex_text(child, maximum)?);
             }
             (Some(XMLENC_NS), "OriginatorKeyInfo") if ikm.is_none() => {
-                ikm = Some(zeroize::Zeroizing::new(hex_text(child, maximum)?))
+                ikm = Some(zeroize::Zeroizing::new(hex_text(child, maximum)?));
             }
             (Some(XMLENC_NS), "KeySize") if size.is_none() => {
                 // RFC 9231 section 2.8.1's RFC 5869 A.1 example sets KeySize=42

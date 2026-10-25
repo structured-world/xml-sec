@@ -294,11 +294,7 @@ fn every_pinned_ciphertext_executes_on_every_backend() {
     // Enumeration must equal execution, including the untouched X509 variants;
     // an added fixture cannot silently become an untested file.
     snapshot::verify();
-    let found: BTreeSet<_> = fs::read_dir(path(""))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.ends_with(".xml"))
-        .collect();
+    let found = corpus_files("xml");
     let mut expected = BTreeSet::new();
     for case in CASES {
         expected.insert(format!("{}.xml", case.name));
@@ -341,6 +337,116 @@ fn every_pinned_ciphertext_executes_on_every_backend() {
     }
 }
 
+/// Names of the pinned corpus files with `extension`; the corpus is lowercase.
+fn corpus_files(extension: &str) -> BTreeSet<String> {
+    fs::read_dir(path(""))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| {
+            std::path::Path::new(name)
+                .extension()
+                .is_some_and(|actual| actual == extension)
+        })
+        .collect()
+}
+
+/// The xmlsec1 name of a pinned RSA credential.
+fn rsa_key_name(bits: u16) -> &'static str {
+    if bits == 2048 {
+        "TestRsa2048Key"
+    } else {
+        "TestRsa3072Key"
+    }
+}
+
+/// The donor recipe's xmlsec1 credentials for encrypting `case`'s template.
+fn oracle_encrypt_credentials(command: &mut std::process::Command, case: &Case) {
+    match case.credential {
+        Credential::Aes => {
+            command
+                .arg("--aeskey:TestKeyName_GCM")
+                .arg(path("xenc11-example-AES128-GCM.key"));
+        }
+        Credential::Rsa(bits) => {
+            command
+                .arg(format!("--privkey-der:{}", rsa_key_name(bits)))
+                .arg(path(&format!("RSA-{bits}_SHA256WithRSA.der")));
+        }
+        Credential::Derived(file) => {
+            let (option, name) = match file {
+                "dkey-concatkdf.bin" => ("concatkdf-key", "dkey"),
+                "dkey3-concatkdf.bin" => ("concatkdf-key", "dkey3"),
+                "dkey-pbkdf2.bin" => ("pbkdf2-key", "dkey-pbkdf2"),
+                "dkey3-pbkdf2.bin" => ("pbkdf2-key", "dkey3-pbkdf2"),
+                _ => unreachable!("closed fixture credential inventory"),
+            };
+            command.arg(format!("--{option}:{name}")).arg(path(file));
+        }
+        Credential::Ec(curve, stem) => {
+            let bits = match curve {
+                EcdhCurve::P256 => 256,
+                EcdhCurve::P384 => 384,
+                EcdhCurve::P521 => 521,
+            };
+            command
+                .arg("--enabled-key-data")
+                .arg("agreement-method,enc-key,key-value,key-name,ec")
+                .arg(format!("--privkey-der:EC-P{bits}"))
+                .arg(path(&format!("EC-P{bits}_SHA256WithECDSA.der")))
+                .arg(format!("--pubkey-der:TestKeyName-{stem}"))
+                .arg(format!("tests/fixtures/xmlenc/keys/ec/{stem}-pubkey.der"));
+        }
+        Credential::Dh => {
+            command
+                .arg("--enabled-key-data")
+                .arg("agreement-method,enc-key,key-value,key-name,dh")
+                .arg("--privkey-der:dhx-rfc5114-3-first")
+                .arg("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der")
+                .arg("--pubkey-der:dhx-rfc5114-3-second")
+                .arg("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-pubkey.der");
+        }
+    }
+}
+
+/// The xmlsec1 credentials that decrypt our output for `case`'s recipient.
+fn oracle_decrypt_credentials(command: &mut std::process::Command, case: &Case) {
+    match case.credential {
+        Credential::Aes => {
+            command
+                .arg("--aeskey")
+                .arg(path("xenc11-example-AES128-GCM.key"));
+        }
+        Credential::Rsa(bits) => {
+            command
+                .arg(format!("--privkey-der:{}", rsa_key_name(bits)))
+                .arg(path(&format!("RSA-{bits}_SHA256WithRSA.der")));
+        }
+        Credential::Derived(file) => {
+            command
+                .arg(if file.contains("concatkdf") {
+                    "--concatkdf-key"
+                } else {
+                    "--pbkdf2-key"
+                })
+                .arg(path(file));
+        }
+        Credential::Ec(_, stem) => {
+            command
+                .arg("--enabled-key-data")
+                .arg("agreement-method,enc-key,key-value,key-name,ec")
+                .arg(format!("--privkey-der:TestKeyName-{stem}"))
+                .arg(format!("tests/fixtures/xmlenc/keys/ec/{stem}-key.der"));
+        }
+        Credential::Dh => {
+            command
+                .arg("--enabled-key-data")
+                .arg("agreement-method,enc-key,key-value,key-name,dh")
+                .arg("--privkey-der:dhx-rfc5114-3-second")
+                .arg("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-key.der");
+        }
+    }
+}
+
 fn oracle_output(command: &mut std::process::Command, name: &str) {
     let result = command.output().expect("independent xmlsec1 oracle");
     assert!(
@@ -359,11 +465,7 @@ fn every_original_template_encrypts_for_the_public_decrypt_api() {
         "oracle required: {}",
         xmlsec1::skip_reason()
     );
-    let found: BTreeSet<_> = fs::read_dir(path(""))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .filter(|name| name.ends_with(".tmpl"))
-        .collect();
+    let found = corpus_files("tmpl");
     assert_eq!(
         found,
         CASES
@@ -376,56 +478,7 @@ fn every_original_template_encrypts_for_the_public_decrypt_api() {
         let output = temporary.path().join(format!("{}.xml", case.name));
         let mut command = xmlsec1::command();
         command.arg("encrypt").arg("--output").arg(&output);
-        match case.credential {
-            Credential::Aes => {
-                command
-                    .arg("--aeskey:TestKeyName_GCM")
-                    .arg(path("xenc11-example-AES128-GCM.key"));
-            }
-            Credential::Rsa(bits) => {
-                let name = if bits == 2048 {
-                    "TestRsa2048Key"
-                } else {
-                    "TestRsa3072Key"
-                };
-                command
-                    .arg(format!("--privkey-der:{name}"))
-                    .arg(path(&format!("RSA-{bits}_SHA256WithRSA.der")));
-            }
-            Credential::Derived(file) => {
-                let (option, name) = match file {
-                    "dkey-concatkdf.bin" => ("concatkdf-key", "dkey"),
-                    "dkey3-concatkdf.bin" => ("concatkdf-key", "dkey3"),
-                    "dkey-pbkdf2.bin" => ("pbkdf2-key", "dkey-pbkdf2"),
-                    "dkey3-pbkdf2.bin" => ("pbkdf2-key", "dkey3-pbkdf2"),
-                    _ => unreachable!("closed fixture credential inventory"),
-                };
-                command.arg(format!("--{option}:{name}")).arg(path(file));
-            }
-            Credential::Ec(curve, stem) => {
-                let bits = match curve {
-                    EcdhCurve::P256 => 256,
-                    EcdhCurve::P384 => 384,
-                    EcdhCurve::P521 => 521,
-                };
-                command
-                    .arg("--enabled-key-data")
-                    .arg("agreement-method,enc-key,key-value,key-name,ec")
-                    .arg(format!("--privkey-der:EC-P{bits}"))
-                    .arg(path(&format!("EC-P{bits}_SHA256WithECDSA.der")))
-                    .arg(format!("--pubkey-der:TestKeyName-{stem}"))
-                    .arg(format!("tests/fixtures/xmlenc/keys/ec/{stem}-pubkey.der"));
-            }
-            Credential::Dh => {
-                command
-                    .arg("--enabled-key-data")
-                    .arg("agreement-method,enc-key,key-value,key-name,dh")
-                    .arg("--privkey-der:dhx-rfc5114-3-first")
-                    .arg("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der")
-                    .arg("--pubkey-der:dhx-rfc5114-3-second")
-                    .arg("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-pubkey.der");
-            }
-        }
+        oracle_encrypt_credentials(&mut command, case);
         if matches!(
             case.credential,
             Credential::Rsa(..) | Credential::Ec(..) | Credential::Dh
@@ -459,46 +512,7 @@ fn every_original_template_encrypts_for_the_public_decrypt_api() {
                 .arg("--lax-key-search")
                 .arg("--output")
                 .arg(&plaintext);
-            match case.credential {
-                Credential::Aes => {
-                    command
-                        .arg("--aeskey")
-                        .arg(path("xenc11-example-AES128-GCM.key"));
-                }
-                Credential::Rsa(bits) => {
-                    let name = if bits == 2048 {
-                        "TestRsa2048Key"
-                    } else {
-                        "TestRsa3072Key"
-                    };
-                    command
-                        .arg(format!("--privkey-der:{name}"))
-                        .arg(path(&format!("RSA-{bits}_SHA256WithRSA.der")));
-                }
-                Credential::Derived(file) => {
-                    command
-                        .arg(if file.contains("concatkdf") {
-                            "--concatkdf-key"
-                        } else {
-                            "--pbkdf2-key"
-                        })
-                        .arg(path(file));
-                }
-                Credential::Ec(_, stem) => {
-                    command
-                        .arg("--enabled-key-data")
-                        .arg("agreement-method,enc-key,key-value,key-name,ec")
-                        .arg(format!("--privkey-der:TestKeyName-{stem}"))
-                        .arg(format!("tests/fixtures/xmlenc/keys/ec/{stem}-key.der"));
-                }
-                Credential::Dh => {
-                    command
-                        .arg("--enabled-key-data")
-                        .arg("agreement-method,enc-key,key-value,key-name,dh")
-                        .arg("--privkey-der:dhx-rfc5114-3-second")
-                        .arg("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-key.der");
-                }
-            }
+            oracle_decrypt_credentials(&mut command, case);
             command.arg(&input);
             oracle_output(&mut command, case.name);
             let bytes = fs::read(&plaintext).unwrap();
@@ -514,13 +528,54 @@ fn every_original_template_encrypts_for_the_public_decrypt_api() {
     }
 }
 
+/// The OAEP parameters a populated template's `EncryptedKey` method names.
+fn template_oaep_parameters(
+    method: &xml_sec::xmlenc::EncryptionMethod,
+) -> xml_sec::xmlenc::RsaOaepParameters {
+    use xml_sec::xmlenc::{KeyTransportAlgorithm, OaepDigestAlgorithm as H};
+    // XMLEnc 1.1 §5.5.2 specifies SHA-1 defaults independently for
+    // DigestMethod and MGF; never turn absence into MGF=DigestMethod.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-RSA-OAEP
+    xml_sec::xmlenc::RsaOaepParameters {
+        algorithm: KeyTransportAlgorithm::from_uri(&method.algorithm).unwrap(),
+        digest: method
+            .oaep_digest
+            .as_deref()
+            .map_or(H::Sha1, |uri| H::from_uri(uri).unwrap()),
+        mgf_digest: method
+            .mgf_algorithm
+            .as_deref()
+            .map_or(H::Sha1, |uri| H::from_mgf_uri(uri).unwrap()),
+        label: method.oaep_params.clone().unwrap_or_default(),
+    }
+}
+
+/// A fresh ephemeral ECDH sender on `curve`.
+///
+/// `XMLEnc` §5.6.4 requires a fresh ephemeral sender. Draw an unbiased scalar
+/// through the provider, not a pinned private key.
+fn ephemeral_ec_sender(curve: EcdhCurve) -> RustCryptoEcdhKey {
+    use xml_sec::provider::CryptoProvider as _;
+    let width = match curve {
+        EcdhCurve::P256 => 32,
+        EcdhCurve::P384 => 48,
+        EcdhCurve::P521 => 66,
+    };
+    let mut scalar = zeroize::Zeroizing::new(vec![0; width]);
+    loop {
+        RUST_CRYPTO_PROVIDER.fill_random(&mut scalar).unwrap();
+        if curve == EcdhCurve::P521 {
+            scalar[0] &= 1;
+        }
+        if let Ok(key) = RustCryptoEcdhKey::from_scalar(curve, &scalar) {
+            return key;
+        }
+    }
+}
+
 fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> String {
     use xml_sec::policy::EncryptionPolicy;
-    use xml_sec::provider::CryptoProvider as _;
-    use xml_sec::xmlenc::{
-        EncryptedDataBuilder, EncryptionRecipient, KeyTransportAlgorithm, OaepDigestAlgorithm as H,
-        RsaOaepParameters,
-    };
+    use xml_sec::xmlenc::{EncryptedDataBuilder, EncryptionRecipient};
     let policy = policy();
     let document = Document::parse_with_backend(populated_template, backend).unwrap();
     let parsed = parse_encrypted_data_node_with_policy(document.root_element(), &policy).unwrap();
@@ -544,25 +599,10 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
                 fs::read(path(&format!("RSA-{bits}_SHA256WithRSA.der"))).unwrap(),
             );
             let private = rsa::RsaPrivateKey::from_pkcs1_der(&bytes).unwrap();
-            let method = &parsed.encrypted_keys[0].encryption_method;
-            // XMLEnc 1.1 §5.5.2 specifies SHA-1 defaults independently for
-            // DigestMethod and MGF; never turn absence into MGF=DigestMethod.
-            // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-RSA-OAEP
-            let parameters = RsaOaepParameters {
-                algorithm: KeyTransportAlgorithm::from_uri(&method.algorithm).unwrap(),
-                digest: method
-                    .oaep_digest
-                    .as_deref()
-                    .map_or(H::Sha1, |uri| H::from_uri(uri).unwrap()),
-                mgf_digest: method
-                    .mgf_algorithm
-                    .as_deref()
-                    .map_or(H::Sha1, |uri| H::from_mgf_uri(uri).unwrap()),
-                label: method.oaep_params.clone().unwrap_or_default(),
-            };
             builder = builder.add_recipient(
-                EncryptionRecipient::rsa_oaep(rsa::RsaPublicKey::from(&private))
-                    .oaep_parameters(parameters),
+                EncryptionRecipient::rsa_oaep(rsa::RsaPublicKey::from(&private)).oaep_parameters(
+                    template_oaep_parameters(&parsed.encrypted_keys[0].encryption_method),
+                ),
             );
         }
         Credential::Derived(file) => {
@@ -572,23 +612,7 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
             );
         }
         Credential::Ec(curve, stem) => {
-            // XMLEnc §5.6.4 requires a fresh ephemeral sender. Draw an
-            // unbiased scalar through the provider, not a pinned private key.
-            let width = match curve {
-                EcdhCurve::P256 => 32,
-                EcdhCurve::P384 => 48,
-                EcdhCurve::P521 => 66,
-            };
-            let mut scalar = zeroize::Zeroizing::new(vec![0; width]);
-            let sender = loop {
-                RUST_CRYPTO_PROVIDER.fill_random(&mut scalar).unwrap();
-                if curve == EcdhCurve::P521 {
-                    scalar[0] &= 1;
-                }
-                if let Ok(key) = RustCryptoEcdhKey::from_scalar(curve, &scalar) {
-                    break key;
-                }
-            };
+            let sender = ephemeral_ec_sender(curve);
             let bytes = zeroize::Zeroizing::new(
                 fs::read(format!("tests/fixtures/xmlenc/keys/ec/{stem}-key.der")).unwrap(),
             );
@@ -611,33 +635,11 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
                 .descendants()
                 .find(|node| node.tag_name().name() == "PublicKey")
                 .unwrap();
-            let text = node.children().find(|node| node.is_text()).unwrap();
+            let text = node.children().find(xml_sec::Node::is_text).unwrap();
             public_replacement = Some((text.range(), STANDARD.encode(sender.public_key())));
         }
         Credential::Dh => {
-            // The original template names both RFC 5114 test parties. Their
-            // private handles are explicit test request inputs, not discovered
-            // from KeyInfo. Cryptography and work accounting remain public API.
-            let first = zeroize::Zeroizing::new(
-                fs::read("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der").unwrap(),
-            );
-            let second = zeroize::Zeroizing::new(
-                fs::read("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-key.der").unwrap(),
-            );
-            let sender = dh_key(&first, &policy).unwrap();
-            let recipient = dh_key(&second, &policy).unwrap();
-            let method = &parsed.encrypted_keys[0].sources.agreement_methods[0];
-            let mut budget = KeyEstablishmentBudget::new(&policy.key_establishment).unwrap();
-            let kek = method
-                .derive_key(
-                    W::AesKw128.uri(),
-                    16,
-                    &sender,
-                    &recipient.public_key(),
-                    &RUST_CRYPTO_PROVIDER,
-                    &mut budget,
-                )
-                .unwrap();
+            let kek = rfc5114_dh_kek(&parsed.encrypted_keys[0].sources.agreement_methods[0]);
             builder = builder.recipient_aes_kw(kek.to_vec(), W::AesKw128);
         }
     }
@@ -658,15 +660,60 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
     ) {
         return encrypted;
     }
-    // XMLEnc §5.8.3 specifies xmlenc#sha384, whereas libxmlsec1 only registers
-    // xmldsig-more#sha384. Keep the original template's accepted alias instead
-    // of changing our normative serializer to satisfy this oracle departure.
-    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-SHA384
-    // Caller-managed KEK orchestration uses AgreementMethod::derive_key and
-    // the builder's AES-KW API. Retain the populated original template's party
-    // and KDF descriptors, replacing only cryptographic results. This does not
-    // claim that the CLI exposes an agreement-template encryption option.
-    let generated = Document::parse(&encrypted).unwrap();
+    splice_into_template(
+        populated_template,
+        &document,
+        &encrypted,
+        public_replacement,
+    )
+}
+
+/// The AES-128 KW key-encryption key the RFC 5114 test parties agree.
+///
+/// The original template names both RFC 5114 test parties. Their private
+/// handles are explicit test request inputs, not discovered from `KeyInfo`.
+/// Cryptography and work accounting remain public API.
+fn rfc5114_dh_kek(method: &xml_sec::xmlenc::AgreementMethod) -> zeroize::Zeroizing<Vec<u8>> {
+    let policy = policy();
+    let first = zeroize::Zeroizing::new(
+        fs::read("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-first-key.der").unwrap(),
+    );
+    let second = zeroize::Zeroizing::new(
+        fs::read("tests/fixtures/xmlenc/keys/dhx/dhx-rfc5114-3-second-key.der").unwrap(),
+    );
+    let sender = dh_key(&first, &policy).unwrap();
+    let recipient = dh_key(&second, &policy).unwrap();
+    let mut budget = KeyEstablishmentBudget::new(&policy.key_establishment).unwrap();
+    method
+        .derive_key(
+            W::AesKw128.uri(),
+            16,
+            &sender,
+            &recipient.public_key(),
+            &RUST_CRYPTO_PROVIDER,
+            &mut budget,
+        )
+        .unwrap()
+}
+
+/// The populated original template with only its cryptographic results
+/// replaced by those of `encrypted`.
+///
+/// `XMLEnc` §5.8.3 specifies `xmlenc#sha384`, whereas libxmlsec1 only registers
+/// `xmldsig-more#sha384`. Keep the original template's accepted alias instead
+/// of changing our normative serializer to satisfy this oracle departure.
+/// <https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-SHA384>
+/// Caller-managed KEK orchestration uses `AgreementMethod::derive_key` and
+/// the builder's AES-KW API. Retain the populated original template's party
+/// and KDF descriptors, replacing only cryptographic results. This does not
+/// claim that the CLI exposes an agreement-template encryption option.
+fn splice_into_template(
+    template: &str,
+    document: &Document<'_>,
+    encrypted: &str,
+    public_replacement: Option<(std::ops::Range<usize>, String)>,
+) -> String {
+    let generated = Document::parse(encrypted).unwrap();
     let values: Vec<_> = generated
         .descendants()
         .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
@@ -675,7 +722,12 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
     let targets: Vec<_> = document
         .descendants()
         .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
-        .map(|node| node.children().find(|node| node.is_text()).unwrap().range())
+        .map(|node| {
+            node.children()
+                .find(xml_sec::Node::is_text)
+                .unwrap()
+                .range()
+        })
         .collect();
     assert_eq!(targets.len(), values.len());
     let mut edits: Vec<_> = targets
@@ -686,7 +738,7 @@ fn encrypt_case(case: &Case, populated_template: &str, backend: XmlBackend) -> S
         edits.push(edit);
     }
     edits.sort_by_key(|(range, _)| range.start);
-    let mut candidate = populated_template.to_owned();
+    let mut candidate = template.to_owned();
     for (range, value) in edits.into_iter().rev() {
         candidate.replace_range(range, &value);
     }
@@ -708,7 +760,7 @@ fn corrupted_authenticated_content_and_wrapped_keys_are_rejected() {
             .descendants()
             .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
         {
-            let text = value.children().find(|node| node.is_text()).unwrap();
+            let text = value.children().find(xml_sec::Node::is_text).unwrap();
             let mut bytes = STANDARD
                 .decode(text.text().unwrap().split_whitespace().collect::<String>())
                 .unwrap();
@@ -778,7 +830,7 @@ fn malformed_kdf_parameters_fail_before_key_resolution() {
                 .descendants()
                 .find(|node| node.tag_name().name() == "IterationCount")
                 .unwrap();
-            let text = node.children().find(|node| node.is_text()).unwrap();
+            let text = node.children().find(xml_sec::Node::is_text).unwrap();
             let mut malformed = xml.clone();
             malformed.replace_range(text.range(), "0");
             malformed

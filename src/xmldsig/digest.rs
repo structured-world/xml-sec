@@ -1,14 +1,14 @@
-//! Digest computation for XMLDSig `<Reference>` processing.
+//! Digest computation for `XMLDSig` `<Reference>` processing.
 //!
 //! Implements [XMLDSig §6.1](https://www.w3.org/TR/xmldsig-core1/#sec-DigestMethod):
 //! compute message digests over transform output bytes using the selected algorithm.
 //!
 //! Operation digest computation uses the selected `CryptoProvider`; the built-in
-//! standalone convenience path uses RustCrypto.
+//! standalone convenience path uses `RustCrypto`.
 
 use subtle::ConstantTimeEq;
 
-/// Digest algorithms supported by XMLDSig.
+/// Digest algorithms supported by `XMLDSig`.
 ///
 /// SHA-1 is disabled for signing by default and requires explicit policy opt-in.
 /// SHA-256 is the recommended default for new signatures.
@@ -22,7 +22,7 @@ pub enum DigestAlgorithm {
     Ripemd160,
     /// SHA-1 (160-bit). Disabled for signing by default.
     Sha1,
-    /// SHA-224 (224-bit), required by XMLDSig 1.1 interoperability profiles.
+    /// SHA-224 (224-bit), required by `XMLDSig` 1.1 interoperability profiles.
     Sha224,
     /// SHA-256 (256-bit). Default for SAML.
     Sha256,
@@ -65,7 +65,7 @@ impl DigestAlgorithm {
     ///
     /// Returns `None` for unrecognized URIs.
     /// Recognition is capability, not permission: operation callers must check
-    /// their compiled digest policy before hashing, including X509Digest selectors.
+    /// their compiled digest policy before hashing, including `X509Digest` selectors.
     ///
     /// # URIs
     ///
@@ -76,6 +76,7 @@ impl DigestAlgorithm {
     /// | SHA-256 | `http://www.w3.org/2001/04/xmlenc#sha256` |
     /// | SHA-384 | `http://www.w3.org/2001/04/xmldsig-more#sha384` |
     /// | SHA-512 | `http://www.w3.org/2001/04/xmlenc#sha512` |
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
             // RFC 9231 §§2.1.1, 2.1.4 assign these exact digest identifiers.
@@ -100,6 +101,7 @@ impl DigestAlgorithm {
     }
 
     /// Return the XML namespace URI for this digest algorithm.
+    #[must_use]
     pub fn uri(self) -> &'static str {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -122,11 +124,13 @@ impl DigestAlgorithm {
     ///
     /// SHA-1 is deprecated and disabled by secure signing defaults. An explicit
     /// signing policy allowlist can enable it for a trusted compatibility boundary.
+    #[must_use]
     pub fn signing_allowed(self) -> bool {
         !matches!(self, Self::Sha1) && !self.requires_explicit_permission()
     }
 
     /// Whether reference verification requires an explicit digest allowlist entry.
+    #[must_use]
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -136,6 +140,7 @@ impl DigestAlgorithm {
     }
 
     /// The expected output length in bytes.
+    #[must_use]
     pub fn output_len(self) -> usize {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -154,12 +159,21 @@ impl DigestAlgorithm {
 /// Compute the digest of `data` using the specified algorithm.
 ///
 /// Returns the raw digest bytes (not base64-encoded).
+///
+/// # Panics
+/// Panics if the built-in provider violates its advertised digest capability
+/// or returns an output width inconsistent with the selected algorithm.
+#[must_use]
 pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
     compute_digest_with_provider(crate::provider::default_provider(), algorithm, data)
         .expect("default provider advertises every XMLDSig digest")
 }
 
 /// Compute a digest with an explicitly selected provider.
+///
+/// # Errors
+/// Returns the provider's capability, update, or finalization error, or an error
+/// if the finalized digest has the wrong width for the selected algorithm.
 pub fn compute_digest_with_provider(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DigestAlgorithm,
@@ -180,7 +194,7 @@ pub(crate) fn begin_digest<'p>(
 }
 
 /// Finish an incremental digest. The facade, not an interchangeable provider,
-/// owns the output width of each XMLDSig algorithm.
+/// owns the output width of each `XMLDSig` algorithm.
 pub(crate) fn finish_digest(
     algorithm: DigestAlgorithm,
     state: Box<dyn crate::provider::DigestState + '_>,
@@ -205,6 +219,7 @@ pub(crate) fn finish_digest(
 /// comparison.
 ///
 /// Uses `subtle` constant-time equality.
+#[must_use]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.ct_eq(b).into()
 }
@@ -610,6 +625,11 @@ mod tests {
 
     /// Helper: format bytes as lowercase hex string.
     fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            write!(out, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        out
     }
 }

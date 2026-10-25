@@ -69,6 +69,10 @@ impl X509TrustEvidence {
     /// mechanism as [`Self::certificate_fingerprints`]. This is an identity
     /// lookup, not a use of a document digest, so the operation's digest
     /// policy and provider selection do not apply. `work` pays for the input.
+    ///
+    /// # Errors
+    ///
+    /// Returns the memory error when `work` refuses the input's length.
     pub fn certificate_identity_in<W: structured_asn1::memory::Work>(
         certificate: &[u8],
         work: &W,
@@ -81,22 +85,30 @@ impl X509TrustEvidence {
     }
 
     /// SHA-256 identities in leaf-to-anchor order, including the trust anchor.
+    #[must_use]
     pub fn certificate_fingerprints(&self) -> &[[u8; 32]] {
         &self.fingerprints[..self.path_len]
     }
 
     /// SHA-256 identity of the caller-supplied anchor that terminated the path.
+    #[must_use]
     pub fn anchor_fingerprint(&self) -> &[u8; 32] {
         &self.fingerprints[self.path_len - 1]
     }
 
     /// The single time captured for all candidate-path validation in the operation.
+    #[must_use]
     pub fn verification_time(&self) -> SystemTime {
         self.verification_time
     }
 
     /// The same validation instant the path processor used, at nanosecond
     /// precision, for consumers that re-check this exact path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`super::X509ChainError::CertificateNotValid`] when the captured
+    /// time is outside the representable instant range.
     pub fn validation_instant(
         &self,
     ) -> Result<structured_pkix::temporal::Instant, super::X509ChainError> {
@@ -104,6 +116,7 @@ impl X509TrustEvidence {
     }
 
     /// Whether the policy requested and validation enforced CRL processing.
+    #[must_use]
     pub fn revocation_checked(&self) -> bool {
         self.revocation_checked
     }
@@ -135,8 +148,20 @@ impl TrustedPublicKey {
     }
 
     /// Validated certificate identities and the operation's validation time.
+    #[must_use]
     pub fn evidence(&self) -> &X509TrustEvidence {
         &self.evidence
+    }
+
+    /// Refuse use under a trust policy other than the one that validated it.
+    fn ensure_trust(&self, policy: &VerificationPolicy) -> Result<(), DsigError> {
+        if self.trust != policy.key_trust {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "validated key belongs to a different trust policy",
+            }
+            .into());
+        }
+        Ok(())
     }
 }
 
@@ -168,14 +193,9 @@ impl VerifyingKey for TrustedPublicKey {
         self.key
             .verify_with_context(algorithm, context, data, signature)
     }
-    fn validate_policy(&self, policy: &VerificationPolicy) -> Result<(), DsigError> {
-        if self.trust != policy.key_trust {
-            return Err(PolicyViolation::KeyTrust {
-                reason: "validated key belongs to a different trust policy",
-            }
-            .into());
-        }
-        self.key.validate_policy(policy)
+    fn validate_policy(&self, scope: &super::VerificationScope<'_>) -> Result<(), DsigError> {
+        self.ensure_trust(scope.policy())?;
+        self.key.validate_policy(scope)
     }
 
     fn validate_signature_value(
@@ -188,13 +208,13 @@ impl VerifyingKey for TrustedPublicKey {
 
     fn validate_signature_value_with_policy(
         &self,
-        policy: &VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        self.validate_policy(policy)?;
+        self.validate_policy(scope)?;
         self.key
-            .validate_signature_value_with_policy(policy, algorithm, signature)
+            .validate_signature_value_with_policy(scope, algorithm, signature)
     }
 
     fn verify(
@@ -208,14 +228,15 @@ impl VerifyingKey for TrustedPublicKey {
 
     fn verify_with_policy(
         &self,
-        policy: &VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        self.validate_policy(policy)?;
+        self.validate_policy(scope)?;
         self.key
-            .verify_with_policy(policy, algorithm, data, signature)
+            .verify_with_policy(scope, algorithm, context, data, signature)
     }
 }
 
@@ -235,6 +256,7 @@ pub enum ResolvedVerificationKey<'a> {
 
 impl<'a> ResolvedVerificationKey<'a> {
     /// Extract the mathematical verifier without establishing signer trust.
+    #[must_use]
     pub fn into_key(self) -> Box<dyn VerifyingKey + 'a> {
         match self {
             Self::Candidate(key) | Self::CallerTrusted(key) => key,
@@ -260,7 +282,9 @@ impl<'a> ResolvedVerificationKey<'a> {
             .into()),
             Self::CallerTrusted(_) => Ok(KeyTrustEvidence::CallerTrusted),
             Self::Validated(key) => {
-                key.validate_policy(policy)?;
+                // Key strength is checked with the operation's account before
+                // the key verifies anything; authorization binds trust only.
+                key.ensure_trust(policy)?;
                 Ok(KeyTrustEvidence::ValidatedX509(key.evidence.clone()))
             }
         }
@@ -285,6 +309,7 @@ impl<'a> Deref for ResolvedVerificationKey<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::VerificationScope;
     use super::*;
 
     struct NeverExecuted;
@@ -298,7 +323,7 @@ mod tests {
     fn validated_key_is_bound_to_time_purpose_and_policy() {
         // A validated key must not be reusable under another time or purpose,
         // or through a caller policy whose implicit clock has not been captured.
-        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(500_000);
         let evidence =
             X509TrustEvidence::new([b"bounded certificate identity"].into_iter(), time, false)
                 .expect("a one-certificate proof fits the hard path bound");
@@ -306,16 +331,21 @@ mod tests {
         policy.key_trust.verify_x509_chains = true;
         let key =
             TrustedPublicKey::new(Box::new(NeverExecuted), policy.key_trust.clone(), evidence);
-        assert!(key.validate_policy(&policy).is_err());
+        let certificates = super::super::pkix::CertificateSession::standalone();
+        assert!(
+            key.validate_policy(&VerificationScope::new(&policy, &certificates))
+                .is_err()
+        );
         policy.key_trust.verification_time = Some(time);
-        key.validate_policy(&policy)
+        key.validate_policy(&VerificationScope::new(&policy, &certificates))
             .expect("the exact captured snapshot must match");
         let mut changed = policy.clone();
         changed.key_trust.verification_time = Some(time + std::time::Duration::from_secs(1));
         assert!(
             key.verify_with_policy(
-                &changed,
+                &VerificationScope::new(&changed, &certificates),
                 SignatureAlgorithm::RsaSha256,
+                &super::super::SignatureContext::default(),
                 b"data",
                 b"signature"
             )
@@ -326,9 +356,15 @@ mod tests {
             .key_trust
             .allowed_extended_key_usages
             .insert(crate::policy::ExtendedKeyPurpose::CodeSigning);
-        assert!(key.validate_policy(&changed).is_err());
+        assert!(
+            key.validate_policy(&VerificationScope::new(&changed, &certificates))
+                .is_err()
+        );
         changed = policy;
         changed.key_trust.check_crls = true;
-        assert!(key.validate_policy(&changed).is_err());
+        assert!(
+            key.validate_policy(&VerificationScope::new(&changed, &certificates))
+                .is_err()
+        );
     }
 }

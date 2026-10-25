@@ -1,4 +1,4 @@
-//! Public XMLEnc data structures and errors.
+//! Public `XMLEnc` data structures and errors.
 
 use std::{fmt, sync::Arc};
 
@@ -37,9 +37,9 @@ pub enum DataEncryptionAlgorithm {
     /// AES-192 GCM compatibility capability.
     #[cfg(feature = "legacy-algorithms")]
     Aes192Gcm,
-    /// AES-128 in CBC mode with XMLEnc padding.
+    /// AES-128 in CBC mode with `XMLEnc` padding.
     Aes128Cbc,
-    /// AES-256 in CBC mode with XMLEnc padding.
+    /// AES-256 in CBC mode with `XMLEnc` padding.
     Aes256Cbc,
     /// AES-128 in GCM mode.
     Aes128Gcm,
@@ -51,7 +51,7 @@ pub enum DataEncryptionAlgorithm {
     Camellia192Cbc,
     /// Camellia CBC with a 256-bit key.
     Camellia256Cbc,
-    /// RFC 9231 ChaCha20 profile; unauthenticated and opt-in.
+    /// RFC 9231 `ChaCha20` profile; unauthenticated and opt-in.
     ChaCha20,
     /// ChaCha20-Poly1305 with XML-carried nonce and optional AAD.
     ChaCha20Poly1305,
@@ -59,6 +59,7 @@ pub enum DataEncryptionAlgorithm {
 
 impl DataEncryptionAlgorithm {
     /// Whether successful decryption cryptographically authenticates the key.
+    #[must_use]
     pub const fn is_authenticated(self) -> bool {
         // RFC 9231 §§2.6.7-2.6.8 distinguishes the stream cipher from AEAD.
         // https://www.rfc-editor.org/rfc/rfc9231.html#section-2.6.8
@@ -79,6 +80,7 @@ impl DataEncryptionAlgorithm {
 
     /// Key family required independently of the byte length (AES-192 and
     /// three-key Triple DES both use 24 bytes).
+    #[must_use]
     pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
         if matches!(self, Self::ChaCha20 | Self::ChaCha20Poly1305) {
             return crate::key_manager::SymmetricKeyKind::ChaCha20;
@@ -95,7 +97,10 @@ impl DataEncryptionAlgorithm {
         }
         crate::key_manager::SymmetricKeyKind::Aes
     }
-    /// Parse a supported XMLEnc content-encryption URI.
+    /// Parse a supported `XMLEnc` content-encryption URI.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedAlgorithm` if the URI is unknown or its feature is disabled.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
             #[cfg(feature = "legacy-algorithms")]
@@ -118,6 +123,7 @@ impl DataEncryptionAlgorithm {
     }
 
     /// Required symmetric key length in bytes.
+    #[must_use]
     pub const fn key_len(self) -> usize {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -131,7 +137,8 @@ impl DataEncryptionAlgorithm {
         }
     }
 
-    /// Return the standard XMLEnc algorithm URI.
+    /// Return the standard `XMLEnc` algorithm URI.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -168,6 +175,7 @@ impl DataEncryptionAlgorithm {
 
     /// Compile-time capability is not the operation's permission.
     /// Whether this capability must be explicitly selected in the operation allowlist.
+    #[must_use]
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
             Self::Camellia128Cbc | Self::Camellia192Cbc | Self::Camellia256Cbc => true,
@@ -249,6 +257,7 @@ pub(crate) fn validate_ciphertext_framing(
 
 impl KeyTransportAlgorithm {
     /// Historical transport is never enabled merely by compiling its primitive.
+    #[must_use]
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -256,7 +265,10 @@ impl KeyTransportAlgorithm {
             _ => false,
         }
     }
-    /// Parse a supported XMLEnc key-transport URI.
+    /// Parse a supported `XMLEnc` key-transport URI.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedAlgorithm` if the URI is unknown or its feature is disabled.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
             "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p" => Ok(Self::RsaOaepMgf1p),
@@ -267,7 +279,8 @@ impl KeyTransportAlgorithm {
         }
     }
 
-    /// Return the standard XMLEnc key-transport URI.
+    /// Return the standard `XMLEnc` key-transport URI.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             Self::RsaOaepMgf1p => "http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p",
@@ -280,6 +293,7 @@ impl KeyTransportAlgorithm {
 
 impl KeyWrapAlgorithm {
     /// Family of the wrapping key, not of the wrapped content key.
+    #[must_use]
     pub const fn key_kind(self) -> crate::key_manager::SymmetricKeyKind {
         if let Self::Cbc(algorithm) = self {
             return algorithm.key_kind();
@@ -296,7 +310,10 @@ impl KeyWrapAlgorithm {
         }
         crate::key_manager::SymmetricKeyKind::Aes
     }
-    /// Parse a supported XMLEnc symmetric key-wrap URI.
+    /// Parse a supported `XMLEnc` symmetric key-wrap URI.
+    ///
+    /// # Errors
+    /// Returns `UnsupportedAlgorithm` if the URI is unknown or its feature is disabled.
     pub fn from_uri(uri: &str) -> Result<Self, XmlEncError> {
         match uri {
             #[cfg(feature = "legacy-algorithms")]
@@ -317,6 +334,7 @@ impl KeyWrapAlgorithm {
     }
 
     /// Required key-encryption-key length in bytes.
+    #[must_use]
     pub const fn key_len(self) -> usize {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -330,7 +348,8 @@ impl KeyWrapAlgorithm {
         }
     }
 
-    /// Return the standard XMLEnc key-wrap URI.
+    /// Return the standard `XMLEnc` key-wrap URI.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -347,6 +366,7 @@ impl KeyWrapAlgorithm {
     }
 
     /// Whether use requires an explicit compiled-policy allowlist entry.
+    #[must_use]
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
             Self::CamelliaKw128 | Self::CamelliaKw192 | Self::CamelliaKw256 => true,
@@ -385,7 +405,7 @@ pub enum KeyTransportAlgorithm {
     RsaPkcs1v15,
     /// XML Encryption 1.0 OAEP URI with SHA-1/MGF1-SHA1 absent-field defaults.
     ///
-    /// An explicit DigestMethod or XMLEnc 1.1 MGF child overrides the corresponding default,
+    /// An explicit `DigestMethod` or `XMLEnc` 1.1 MGF child overrides the corresponding default,
     /// matching libxmlsec1 1.3.13 behavior.
     RsaOaepMgf1p,
     /// XML Encryption 1.1 OAEP with explicitly parsed digest and MGF settings.
@@ -397,12 +417,12 @@ pub enum KeyTransportAlgorithm {
 pub enum KeyWrapAlgorithm {
     /// CBC encryption of key bytes. Unlike RFC 3394 this is not authenticated;
     /// permission must name this exact algorithm. Only CBC ciphers are valid.
-    /// XMLEnc 1.1 §3.4 permits EncryptedKey's inherited EncryptionMethod.
+    /// `XMLEnc` 1.1 §3.4 permits `EncryptedKey`'s inherited `EncryptionMethod`.
     Cbc(DataEncryptionAlgorithm),
     /// AES-192 RFC 3394 key wrap, explicitly permitted by compatibility policy.
     #[cfg(feature = "legacy-algorithms")]
     AesKw192,
-    /// CMS Triple DES key wrap, including XMLEnc's optional non-DES key inputs.
+    /// CMS Triple DES key wrap, including `XMLEnc`'s optional non-DES key inputs.
     #[cfg(feature = "legacy-algorithms")]
     TripleDes,
     /// RFC 3394 AES key wrap with a 128-bit KEK.
@@ -426,7 +446,7 @@ pub enum OaepDigestAlgorithm {
     /// RIPEMD-160 compatibility digest; requires explicit legacy permission.
     #[cfg(feature = "legacy-algorithms")]
     Ripemd160,
-    /// SHA-1, retained for legacy XMLEnc OAEP interoperability.
+    /// SHA-1, retained for legacy `XMLEnc` OAEP interoperability.
     Sha1,
     /// SHA-224, including the XML Encryption 1.1 MGF1-SHA224 identifier.
     Sha224,
@@ -448,6 +468,7 @@ pub enum OaepDigestAlgorithm {
 
 impl OaepDigestAlgorithm {
     /// Parse a digest URI accepted by XML Encryption and libxmlsec1.
+    #[must_use]
     pub fn from_uri(uri: &str) -> Option<Self> {
         match uri {
             #[cfg(feature = "legacy-algorithms")]
@@ -469,6 +490,7 @@ impl OaepDigestAlgorithm {
     }
 
     /// Parse an XML Encryption 1.1 MGF1 URI.
+    #[must_use]
     pub fn from_mgf_uri(uri: &str) -> Option<Self> {
         match uri {
             "http://www.w3.org/2009/xmlenc11#mgf1sha1" => Some(Self::Sha1),
@@ -481,6 +503,7 @@ impl OaepDigestAlgorithm {
     }
 
     /// Return the standard digest URI.
+    #[must_use]
     pub const fn uri(self) -> &'static str {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -500,7 +523,8 @@ impl OaepDigestAlgorithm {
     }
 
     /// Return an XML Encryption 1.1 MGF URI, if one exists for this digest.
-    /// DigestMethod support does not invent additional wire MGF identifiers.
+    /// `DigestMethod` support does not invent additional wire MGF identifiers.
+    #[must_use]
     pub const fn mgf_uri(self) -> Option<&'static str> {
         // XML Encryption 1.1 §5.5.2 defines five MGF1 URIs. RFC 8017's
         // arbitrary Hash parameter does not register further XML identifiers.
@@ -516,6 +540,7 @@ impl OaepDigestAlgorithm {
     }
 
     /// Compatibility digest capability never implicitly permits its use.
+    #[must_use]
     pub const fn requires_explicit_permission(self) -> bool {
         match self {
             #[cfg(feature = "legacy-algorithms")]
@@ -576,7 +601,7 @@ mod tests {
 /// RSA-OAEP parameters emitted in an `EncryptedKey`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RsaOaepParameters {
-    /// XMLEnc 1.0 legacy OAEP or XMLEnc 1.1 configurable OAEP.
+    /// `XMLEnc` 1.0 legacy OAEP or `XMLEnc` 1.1 configurable OAEP.
     pub algorithm: KeyTransportAlgorithm,
     /// Digest used by OAEP.
     pub digest: OaepDigestAlgorithm,
@@ -588,6 +613,7 @@ pub struct RsaOaepParameters {
 
 impl RsaOaepParameters {
     /// Create legacy OAEP parameters with SHA-1 and MGF1-SHA-1.
+    #[must_use]
     pub fn legacy() -> Self {
         Self {
             algorithm: KeyTransportAlgorithm::RsaOaepMgf1p,
@@ -597,7 +623,8 @@ impl RsaOaepParameters {
         }
     }
 
-    /// Create XMLEnc 1.1 OAEP parameters.
+    /// Create `XMLEnc` 1.1 OAEP parameters.
+    #[must_use]
     pub fn xmlenc11(digest: OaepDigestAlgorithm, mgf_digest: OaepDigestAlgorithm) -> Self {
         Self {
             algorithm: KeyTransportAlgorithm::RsaOaep11,
@@ -608,6 +635,7 @@ impl RsaOaepParameters {
     }
 
     /// Set the OAEP label bytes.
+    #[must_use]
     pub fn label(mut self, label: impl Into<Vec<u8>>) -> Self {
         self.label = label.into();
         self
@@ -718,6 +746,7 @@ impl fmt::Debug for EncryptionRecipient {
 impl EncryptionRecipient {
     /// Create a historical RSAES-PKCS1-v1_5 recipient. Defaults still deny it.
     #[cfg(feature = "legacy-algorithms")]
+    #[must_use]
     pub fn rsa_pkcs1v15(public_key: RsaPublicKey) -> Self {
         Self::provider_pkcs1v15(Arc::new(crate::provider::RustCryptoRsaPublicKey::new(
             public_key,
@@ -735,9 +764,10 @@ impl EncryptionRecipient {
     }
     /// Create an RSA-OAEP recipient using SHA-256 and MGF1-SHA-256.
     ///
-    /// XMLEnc 1.1 assigns SHA-1 and MGF1-SHA-1 when these parameters are
+    /// `XMLEnc` 1.1 assigns SHA-1 and MGF1-SHA-1 when these parameters are
     /// omitted. Serialized keys therefore include both algorithm values
     /// explicitly instead of relying on the specification's legacy defaults.
+    #[must_use]
     pub fn rsa_oaep(public_key: RsaPublicKey) -> Self {
         Self::provider_key_transport(Arc::new(crate::provider::RustCryptoRsaPublicKey::new(
             public_key,
@@ -765,6 +795,7 @@ impl EncryptionRecipient {
     }
 
     /// Override RSA-OAEP parameters.
+    #[must_use]
     pub fn oaep_parameters(mut self, parameters: RsaOaepParameters) -> Self {
         if let Self::RsaOaep {
             parameters: current,
@@ -777,6 +808,7 @@ impl EncryptionRecipient {
     }
 
     /// Set the recipient identifier emitted on `EncryptedKey`.
+    #[must_use]
     pub fn recipient(mut self, value: impl Into<String>) -> Self {
         match &mut self {
             #[cfg(feature = "legacy-algorithms")]
@@ -789,6 +821,7 @@ impl EncryptionRecipient {
     }
 
     /// Set the key name emitted inside the encrypted key's `KeyInfo`.
+    #[must_use]
     pub fn key_name(mut self, value: impl Into<String>) -> Self {
         match &mut self {
             #[cfg(feature = "legacy-algorithms")]
@@ -839,18 +872,18 @@ pub struct EncryptionMethod {
     pub mgf_algorithm: Option<String>,
     /// Decoded OAEP label bytes.
     pub oaep_params: Option<Vec<u8>>,
-    /// ChaCha profile parameters, separate from RSA-OAEP labels.
+    /// `ChaCha` profile parameters, separate from RSA-OAEP labels.
     pub chacha: Option<ChaChaParameters>,
 }
 
-/// Request/wire data for the RFC 9231 ChaCha profiles, not policy.
+/// Request/wire data for the RFC 9231 `ChaCha` profiles, not policy.
 /// A missing nonce is only allowed in an encryption template; decryption
 /// requires an explicit nonce, and encryption generates it through its provider.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChaChaParameters {
-    /// 96-bit nonce encoded as hexBinary in EncryptionMethod.
+    /// 96-bit nonce encoded as hexBinary in `EncryptionMethod`.
     pub nonce: Option<[u8; 12]>,
-    /// Raw ChaCha's four little-endian counter bytes; absent for Poly1305.
+    /// Raw `ChaCha`'s four little-endian counter bytes; absent for Poly1305.
     pub counter: Option<[u8; 4]>,
     /// Poly1305 additional authenticated data: UTF-8 XML text, not base64.
     pub aad: Option<String>,
@@ -859,6 +892,7 @@ pub struct ChaChaParameters {
 impl ChaChaParameters {
     /// Borrow metadata for cryptographic dispatch and serialization without
     /// copying AAD when the operation supplies a generated nonce.
+    #[must_use]
     pub fn borrowed(&self) -> ChaChaParametersRef<'_> {
         ChaChaParametersRef {
             nonce: self.nonce.as_ref(),
@@ -867,6 +901,10 @@ impl ChaChaParameters {
         }
     }
     /// Check the selected profile before any resolver or provider work.
+    ///
+    /// # Errors
+    /// Returns an error if the algorithm is not a `ChaCha` profile or its counter
+    /// and additional authenticated data violate that profile.
     pub fn validate(&self, algorithm: DataEncryptionAlgorithm) -> Result<(), XmlEncError> {
         self.borrowed().validate(algorithm)
     }
@@ -877,7 +915,7 @@ impl ChaChaParameters {
 pub struct ChaChaParametersRef<'a> {
     /// Explicit or operation-generated nonce.
     pub nonce: Option<&'a [u8; 12]>,
-    /// Raw ChaCha's encoded initial block counter.
+    /// Raw `ChaCha`'s encoded initial block counter.
     pub counter: Option<[u8; 4]>,
     /// Borrowed UTF-8 additional authenticated data.
     pub aad: Option<&'a str>,
@@ -885,6 +923,10 @@ pub struct ChaChaParametersRef<'a> {
 
 impl ChaChaParametersRef<'_> {
     /// Enforce the same profile invariants as owned parsed parameters.
+    ///
+    /// # Errors
+    /// Returns an error if the algorithm is not a `ChaCha` profile or its counter
+    /// and additional authenticated data violate that profile.
     pub fn validate(self, algorithm: DataEncryptionAlgorithm) -> Result<(), XmlEncError> {
         // draft-eastlake-rfc9231bis-xmlsec-uris-06 §§3.6.7–3.6.8 separates
         // Counter from AAD. These experimental identifiers are not RFC 9231.
@@ -952,7 +994,7 @@ fn fixed_aes_key_size(algorithm: &str) -> Option<usize> {
     Some(key_len * 8)
 }
 
-/// Ciphertext storage specified by XMLEnc 1.1 section 3.3.
+/// Ciphertext storage specified by `XMLEnc` 1.1 section 3.3.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CipherData {
     /// Whitespace-normalized base64 text from `CipherValue`.
@@ -964,7 +1006,7 @@ pub enum CipherData {
     Reference {
         /// Required URI, including an explicitly empty URI.
         uri: String,
-        /// Ordered transforms retained with their original XPath source identity.
+        /// Ordered transforms retained with their original `XPath` source identity.
         transforms: Vec<crate::xmldsig::transforms::Transform>,
     },
     /// Ciphertext octets resolved by the operation or supplied by the caller.
@@ -987,6 +1029,7 @@ impl CipherData {
     }
 
     /// Return an inline base64 value, if this ciphertext is enveloped.
+    #[must_use]
     pub fn inline_value(&self) -> Option<&str> {
         match self {
             Self::Value { value } => Some(value),
@@ -1007,7 +1050,7 @@ impl CipherData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedKey {
     /// Sources of the key which protects this transported key. These are not
-    /// alternative content keys: their output feeds this key's EncryptionMethod.
+    /// alternative content keys: their output feeds this key's `EncryptionMethod`.
     pub sources: EncryptionKeySources,
     /// Optional XML identifier.
     pub id: Option<String>,
@@ -1080,7 +1123,7 @@ pub struct EncryptedData {
     pub cipher_data: CipherData,
 }
 
-/// Plaintext returned from XMLEnc decryption.
+/// Plaintext returned from `XMLEnc` decryption.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecryptedContent {
     /// XML plaintext for `Element` and `Content` encrypted data.
@@ -1089,7 +1132,7 @@ pub enum DecryptedContent {
     Bytes(Vec<u8>),
 }
 
-/// Errors raised while parsing, encrypting, resolving, or decrypting XMLEnc data.
+/// Errors raised while parsing, encrypting, resolving, or decrypting `XMLEnc` data.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum XmlEncError {
@@ -1116,7 +1159,7 @@ pub enum XmlEncError {
     /// Required child element or attribute was absent.
     #[error("missing required {0}")]
     MissingRequired(&'static str),
-    /// The XML element order or namespace is invalid for the XMLEnc profile.
+    /// The XML element order or namespace is invalid for the `XMLEnc` profile.
     #[error("invalid encrypted structure: {0}")]
     InvalidStructure(String),
     /// The compiled operation graph rejected an identity, dependency, or generation invariant.
@@ -1156,7 +1199,7 @@ pub enum XmlEncError {
         /// Ciphertext body width, excluding the IV.
         actual: usize,
     },
-    /// XMLEnc random padding is invalid.
+    /// `XMLEnc` random padding is invalid.
     ///
     /// No decrypted padding details are exposed. This does not authenticate CBC
     /// ciphertexts or make success/failure safe to expose to an attacker.
@@ -1185,7 +1228,7 @@ pub enum XmlEncError {
         /// Number of unresolved candidate keys.
         actual: usize,
     },
-    /// A supplied AES key-encryption key is not the size declared by EncryptedKey.
+    /// A supplied AES key-encryption key is not the size declared by `EncryptedKey`.
     #[error("{algorithm:?} requires a {expected}-byte KEK, got {actual}")]
     InvalidKekSize {
         /// Key-wrap algorithm requiring the KEK.

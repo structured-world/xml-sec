@@ -138,7 +138,7 @@ fn invalid(message: &'static str) -> TransformError {
 /// ECMA-376 Part 2 (2021) §10.5.8.2 also constrains package Manifest
 /// placement and per-part uniqueness; those require a package-level validator,
 /// not restrictions on this reusable XMLDSig/XMLEnc transform mechanism.
-/// https://ecma-international.org/publications-and-standards/standards/ecma-376/
+/// <https://ecma-international.org/publications-and-standards/standards/ecma-376/>
 pub(crate) fn validate_chain<I: Instruction>(chain: &[I]) -> Result<(), TransformError> {
     let mut seen = false;
     for (index, transform) in chain.iter().enumerate() {
@@ -349,13 +349,162 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
         },
     };
     let budget = &current;
+    let mut scan = scan_relationships(document, edition, budget, scratch)?;
+    sort_records(&mut scan.records, scan.padded_ids, budget, scratch)?;
+    let selected = select_records(&mut scan.records, selectors, edition, budget)?;
+    write_normalized(&scan, selected, edition, budget, scratch)
+}
+
+/// Relationships part content in document order, borrowing the input arena.
+struct Scan<'a, S: Scratch, D: crate::xml::dom::storage::Storage> {
+    records: S::Values<Relationship<'a, S, D>>,
+    /// Processing instructions before the root element.
+    before: S::Values<Node<'a, 'a, D>>,
+    /// Processing instructions after the root element.
+    after: S::Values<Node<'a, 'a, D>>,
+    /// Relationship slots and root-level instructions in document order.
+    events: S::Values<Event<'a, D>>,
+    /// Whether any Id carries collapsible whitespace.
+    padded_ids: bool,
+}
+
+/// Markup Compatibility handling of one element before vocabulary checks.
+enum Compatibility<'a, D: crate::xml::dom::storage::Storage> {
+    /// Process the element as Relationships vocabulary.
+    Understood,
+    /// Replace the element by this node's children, or by nothing.
+    Replace(Option<Node<'a, 'a, D>>),
+}
+
+fn compatibility<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'a, 'a, D>,
+    edition: OpcRelationshipEdition,
+    budget: &CurrentBudget<'_, S>,
+) -> Result<Compatibility<'a, D>, TransformError> {
+    let tag = node.tag_name();
+    validate_mce_entry(node, edition, budget)?;
+    if tag.namespace() != Some(REL)
+        && tag.namespace() != Some(MC)
+        && ignorable(node, tag.namespace(), budget)?
+    {
+        if !process_content(node, edition, budget)? {
+            return Ok(Compatibility::Replace(None));
+        }
+        check_unwrapped(node)?;
+        if edition == OpcRelationshipEdition::Ecma2021 {
+            must_understand(node, budget)?;
+        }
+        return Ok(Compatibility::Replace(Some(node)));
+    }
+    if edition == OpcRelationshipEdition::Ecma2021 {
+        must_understand(node, budget)?;
+    }
+    if tag.namespace() != Some(MC) {
+        return Ok(Compatibility::Understood);
+    }
+    if tag.name() != "AlternateContent" {
+        return Err(invalid("MCE Choice/Fallback outside AlternateContent"));
+    }
+    check_unwrapped(node)?;
+    let branch = alternate_content(node, edition, budget)?;
+    if let Some(branch) = branch
+        && edition == OpcRelationshipEdition::Ecma2021
+    {
+        must_understand(branch, budget)?;
+    }
+    Ok(Compatibility::Replace(branch))
+}
+
+/// Validate one `Relationship` element; also reports whether its Id is padded.
+fn read_relationship<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'a, 'a, D>,
+    edition: OpcRelationshipEdition,
+    budget: &CurrentBudget<'_, S>,
+    scratch: &S,
+) -> Result<(Relationship<'a, S, D>, bool), TransformError> {
+    validate_attributes(node, &["Id", "Type", "Target", "TargetMode"], budget)?;
+    let id = budget
+        .attribute(node, None, "Id")?
+        .ok_or_else(|| invalid("missing relationship Id"))?;
+    budget.node_filter.charge(id.len())?;
+    // XSD 1.0 §§3.3.8, 4.3.6: ID's whiteSpace facet is collapse.
+    // Schema validation does not replace lexical attribute content
+    // in the transform's input XML infoset.
+    // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#ID
+    if !ncname(id.trim_matches(xml_whitespace)) {
+        return Err(invalid("relationship Id must be an xsd:ID"));
+    }
+    let padded = id != id.trim_matches(xml_whitespace);
+    let kind = budget
+        .attribute(node, None, "Type")?
+        .ok_or_else(|| invalid("missing relationship Type"))?;
+    budget.node_filter.charge(kind.len())?;
+    validate_relationship_type_iri(kind)?;
+    let target = budget
+        .attribute(node, None, "Target")?
+        .ok_or_else(|| invalid("missing relationship Target"))?;
+    let mode = budget
+        .attribute(node, None, "TargetMode")?
+        .unwrap_or("Internal");
+    if mode != "Internal" && mode != "External" {
+        return Err(invalid("invalid relationship TargetMode"));
+    }
+    budget.node_filter.charge(target.len())?;
+    if mode == "Internal" {
+        validate_internal_target_reference_syntax(target)?;
+    } else {
+        validate_external_target_reference_syntax(target, edition)?;
+    }
+    Ok((
+        Relationship {
+            id,
+            kind,
+            target,
+            mode,
+            instructions: scratch.values(),
+            selected: false,
+        },
+        padded,
+    ))
+}
+
+/// Text outside a `Relationship` element must be whitespace.
+fn check_text<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    node: Node<'_, '_, D>,
+    parent: Parent,
+    budget: &CurrentBudget<'_, S>,
+) -> Result<(), TransformError> {
+    budget
+        .node_filter
+        .scratch
+        .charge(node.text().map_or(0, str::len))?;
+    // CT_Relationship extends xsd:string (2012 D.4 / 2021 C.5).
+    // 2012 §13.2.4.24 step 3(2) removes its contents; 2021 §10.6
+    // step 3(a) removes text. CT_Relationships remains element-only.
+    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+    if matches!(parent, Parent::Relationship(_))
+        || node.text().is_some_and(super::is_xml_whitespace_only)
+    {
+        return Ok(());
+    }
+    Err(invalid("Relationships part has character data"))
+}
+
+fn scan_relationships<'a, S: Scratch, D: crate::xml::dom::storage::Storage>(
+    document: &'a Document<'a, D>,
+    edition: OpcRelationshipEdition,
+    budget: &CurrentBudget<'_, S>,
+    scratch: &S,
+) -> Result<Scan<'a, S, D>, TransformError> {
     let mut frames = scratch.values();
-    let mut records = scratch.values::<Relationship<'a, S, D>>();
+    let mut scan: Scan<'a, S, D> = Scan {
+        records: scratch.values(),
+        before: scratch.values(),
+        after: scratch.values(),
+        events: scratch.values(),
+        padded_ids: false,
+    };
     let mut root_seen = false;
-    let mut padded_ids = false;
-    let mut before = scratch.values();
-    let mut after = scratch.values();
-    let mut events = scratch.values();
     budget.opc_workspace.push(
         &mut frames,
         Frame {
@@ -375,79 +524,40 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
             continue;
         }
         if node.is_text() {
-            budget
-                .node_filter
-                .scratch
-                .charge(node.text().map_or(0, str::len))?;
-            // CT_Relationship extends xsd:string (2012 D.4 / 2021 C.5).
-            // 2012 §13.2.4.24 step 3(2) removes its contents; 2021 §10.6
-            // step 3(a) removes text. CT_Relationships remains element-only.
-            // https://ecma-international.org/publications-and-standards/standards/ecma-376/
-            if matches!(parent, Parent::Relationship(_)) {
-                continue;
-            }
-            if !node.text().is_some_and(super::is_xml_whitespace_only) {
-                return Err(invalid("Relationships part has character data"));
-            }
+            check_text(node, parent, budget)?;
             continue;
         }
         if node.is_pi() {
             match parent {
-                Parent::Document if !root_seen => budget.opc_workspace.push(&mut before, node)?,
-                Parent::Document => budget.opc_workspace.push(&mut after, node)?,
+                Parent::Document if !root_seen => {
+                    budget.opc_workspace.push(&mut scan.before, node)?;
+                }
+                Parent::Document => budget.opc_workspace.push(&mut scan.after, node)?,
                 Parent::Relationships => budget
                     .opc_workspace
-                    .push(&mut events, Event::Instruction(node))?,
+                    .push(&mut scan.events, Event::Instruction(node))?,
                 Parent::Relationship(_) if edition == OpcRelationshipEdition::Ecma2012 => {}
-                Parent::Relationship(index) => budget
-                    .opc_workspace
-                    .push(&mut records[index].instructions, node)?,
+                Parent::Relationship(index) => {
+                    budget
+                        .opc_workspace
+                        .push(&mut scan.records[index].instructions, node)?;
+                }
+            }
+            continue;
+        }
+        if let Compatibility::Replace(content) = compatibility(node, edition, budget)? {
+            if let Some(content) = content {
+                budget.opc_workspace.push(
+                    &mut frames,
+                    Frame {
+                        next: content.first_child(),
+                        parent,
+                    },
+                )?;
             }
             continue;
         }
         let tag = node.tag_name();
-        validate_mce_entry(node, edition, budget)?;
-        if tag.namespace() != Some(REL)
-            && tag.namespace() != Some(MC)
-            && ignorable(node, tag.namespace(), budget)?
-        {
-            if process_content(node, edition, budget)? {
-                check_unwrapped(node)?;
-                if edition == OpcRelationshipEdition::Ecma2021 {
-                    must_understand(node, budget)?;
-                }
-                budget.opc_workspace.push(
-                    &mut frames,
-                    Frame {
-                        next: node.first_child(),
-                        parent,
-                    },
-                )?;
-            }
-            continue;
-        }
-        if edition == OpcRelationshipEdition::Ecma2021 {
-            must_understand(node, budget)?;
-        }
-        if tag.namespace() == Some(MC) {
-            if tag.name() != "AlternateContent" {
-                return Err(invalid("MCE Choice/Fallback outside AlternateContent"));
-            }
-            check_unwrapped(node)?;
-            if let Some(branch) = alternate_content(node, edition, budget)? {
-                if edition == OpcRelationshipEdition::Ecma2021 {
-                    must_understand(branch, budget)?;
-                }
-                budget.opc_workspace.push(
-                    &mut frames,
-                    Frame {
-                        next: branch.first_child(),
-                        parent,
-                    },
-                )?;
-            }
-            continue;
-        }
         let next_parent = match (parent, tag.namespace(), tag.name()) {
             (Parent::Document, Some(REL), "Relationships") if !root_seen => {
                 root_seen = true;
@@ -455,54 +565,13 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
                 Parent::Relationships
             }
             (Parent::Relationships, Some(REL), "Relationship") => {
-                validate_attributes(node, &["Id", "Type", "Target", "TargetMode"], budget)?;
-                let id = budget
-                    .attribute(node, None, "Id")?
-                    .ok_or_else(|| invalid("missing relationship Id"))?;
-                budget.node_filter.charge(id.len())?;
-                // XSD 1.0 §§3.3.8, 4.3.6: ID's whiteSpace facet is collapse.
-                // Schema validation does not replace lexical attribute content
-                // in the transform's input XML infoset.
-                // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#ID
-                if !ncname(id.trim_matches(xml_whitespace)) {
-                    return Err(invalid("relationship Id must be an xsd:ID"));
-                }
-                padded_ids |= id != id.trim_matches(xml_whitespace);
-                let kind = budget
-                    .attribute(node, None, "Type")?
-                    .ok_or_else(|| invalid("missing relationship Type"))?;
-                budget.node_filter.charge(kind.len())?;
-                validate_relationship_type_iri(kind)?;
-                let target = budget
-                    .attribute(node, None, "Target")?
-                    .ok_or_else(|| invalid("missing relationship Target"))?;
-                let mode = budget
-                    .attribute(node, None, "TargetMode")?
-                    .unwrap_or("Internal");
-                if mode != "Internal" && mode != "External" {
-                    return Err(invalid("invalid relationship TargetMode"));
-                }
-                budget.node_filter.charge(target.len())?;
-                if mode == "Internal" {
-                    validate_internal_target_reference_syntax(target)?;
-                } else {
-                    validate_external_target_reference_syntax(target, edition)?;
-                }
-                let index = records.len();
-                budget.opc_workspace.push(
-                    &mut records,
-                    Relationship {
-                        id,
-                        kind,
-                        target,
-                        mode,
-                        instructions: scratch.values(),
-                        selected: false,
-                    },
-                )?;
+                let (record, padded) = read_relationship(node, edition, budget, scratch)?;
+                scan.padded_ids |= padded;
+                let index = scan.records.len();
+                budget.opc_workspace.push(&mut scan.records, record)?;
                 budget
                     .opc_workspace
-                    .push(&mut events, Event::Relationship)?;
+                    .push(&mut scan.events, Event::Relationship)?;
                 Parent::Relationship(index)
             }
             _ => return Err(invalid("invalid Relationships part element")),
@@ -518,6 +587,16 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
     if !root_seen {
         return Err(invalid("missing Relationships root"));
     }
+    Ok(scan)
+}
+
+/// Sort records by Id and refuse duplicates under `xsd:ID` whitespace collapse.
+fn sort_records<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    records: &mut S::Values<Relationship<'_, S, D>>,
+    padded_ids: bool,
+    budget: &CurrentBudget<'_, S>,
+    scratch: &S,
+) -> Result<(), TransformError> {
     // String comparison visits are conservatively charged before sorting.
     let max_id = records
         .iter()
@@ -555,6 +634,17 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
             Ok(left.id.cmp(right.id))
         })?;
     }
+    Ok(())
+}
+
+/// Mark records matched by any selector; returns the first and last selected
+/// sorted positions.
+fn select_records<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    records: &mut S::Values<Relationship<'_, S, D>>,
+    selectors: &[impl Selector],
+    edition: OpcRelationshipEdition,
+    budget: &CurrentBudget<'_, S>,
+) -> Result<Option<(usize, usize)>, TransformError> {
     let mut first_selected = None;
     let mut last_selected = 0;
     for (index, record) in records.iter_mut().enumerate() {
@@ -584,13 +674,24 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
             last_selected = index;
         }
     }
+    Ok(first_selected.map(|first| (first, last_selected)))
+}
+
+/// Serialize the selected records in the normalized form.
+fn write_normalized<S: Scratch, D: crate::xml::dom::storage::Storage>(
+    scan: &Scan<'_, S, D>,
+    selected: Option<(usize, usize)>,
+    edition: OpcRelationshipEdition,
+    budget: &CurrentBudget<'_, S>,
+    scratch: &S,
+) -> Result<S::Bytes, TransformError> {
     let mut output = Output {
         bytes: scratch.bytes(),
         budget,
         failure: None,
     };
     let result: Result<(), TransformError> = (|| {
-        for node in before.iter() {
+        for node in scan.before.iter() {
             write_instruction(*node, &mut output)?;
         }
         output
@@ -598,17 +699,17 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
             .map_err(output_error)?;
         output.write_all(REL.as_bytes()).map_err(output_error)?;
         output.write_all(b"\">").map_err(output_error)?;
-        let mut records = records.iter();
+        let mut records = scan.records.iter();
         let mut slots_seen = 0;
-        for event in events.iter() {
+        for event in scan.events.iter() {
             let record = match event {
                 Event::Instruction(node) => {
                     // 2012 §13.2.4.24 step 3 removes all edge characters,
                     // whereas 2021 §10.6 step 3 removes text/comments only:
                     // https://ecma-international.org/publications-and-standards/standards/ecma-376/
                     if edition == OpcRelationshipEdition::Ecma2021
-                        || first_selected
-                            .is_some_and(|first| slots_seen > first && slots_seen <= last_selected)
+                        || selected
+                            .is_some_and(|(first, last)| slots_seen > first && slots_seen <= last)
                     {
                         write_instruction(*node, &mut output)?;
                     }
@@ -644,7 +745,7 @@ pub(super) fn normalize_in<'a, S: Scratch, D: crate::xml::dom::storage::Storage>
         output
             .write_all(b"</Relationships>")
             .map_err(output_error)?;
-        for node in after.iter() {
+        for node in scan.after.iter() {
             write_instruction(*node, &mut output)?;
         }
         Ok(())
@@ -694,7 +795,7 @@ impl<B: crate::c14n::scratch::Bytes> Write for Output<'_, B> {
                     .bytes
                     .len()
                     .checked_add(bytes.len())
-                    .and_then(|n| n.checked_next_power_of_two())
+                    .and_then(usize::checked_next_power_of_two)
                     .ok_or_else(|| invalid("output overflow"))?;
                 self.budget.opc_workspace.charge(capacity)?;
                 self.bytes.reserve(capacity - self.bytes.len())?;
@@ -1098,7 +1199,7 @@ fn valid_iri_reference(value: &str, relative: bool) -> bool {
         && !iri_component(query, |c| {
             iri_pchar(c)
                 || matches!(c, '/' | '?')
-                || matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+                || matches!(c as u32, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x10_0000..=0x10_fffd)
         })
     {
         return false;

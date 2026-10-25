@@ -1,4 +1,4 @@
-//! The XAdES B-B pipeline for one verified signature.
+//! The `XAdES` B-B pipeline for one verified signature.
 
 use crate::path::{self, CounterPathError};
 use crate::{Document, Error};
@@ -133,7 +133,7 @@ pub fn validate_basic<W: Work, R>(
     candidates
         .try_reserve_exact(decoded.len() + certificates.len())
         .map_err(Error::from)?;
-    for bytes in decoded.iter() {
+    for bytes in &decoded {
         candidates.try_push(&bytes[..]).map_err(Error::from)?;
     }
     for bytes in certificates {

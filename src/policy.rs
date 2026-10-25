@@ -24,6 +24,11 @@ pub use key_establishment::{
 };
 
 #[cfg(feature = "xmldsig")]
+mod key_sources;
+#[cfg(feature = "xmldsig")]
+pub use key_sources::{KeySourceKind, KeySourcePolicy};
+
+#[cfg(feature = "xmldsig")]
 mod profiles;
 #[cfg(feature = "xmldsig")]
 pub use profiles::{
@@ -349,6 +354,10 @@ impl Default for DsaKeyPolicy {
 #[cfg(feature = "xmldsig")]
 impl DsaKeyPolicy {
     /// Validate the configured minimum against the implementation ceiling.
+    ///
+    /// # Errors
+    /// Returns `InvalidResourceLimit` for a zero or non-64-bit-aligned minimum,
+    /// and `ResourceLimit` for an above-ceiling minimum.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         validate_modulus_minimum(
             "minimum DSA modulus bits",
@@ -359,7 +368,7 @@ impl DsaKeyPolicy {
         )
     }
 
-    pub(crate) fn validate_modulus_bits(&self, actual_bits: usize) -> Result<(), PolicyViolation> {
+    pub(crate) fn validate_modulus_bits(self, actual_bits: usize) -> Result<(), PolicyViolation> {
         self.validate()?;
         if !(self.minimum_modulus_bits..=crate::hard_limits::DSA_MODULUS_BIT_CEILING)
             .contains(&actual_bits)
@@ -388,6 +397,10 @@ impl Default for RsaKeyPolicy {
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 impl RsaKeyPolicy {
     /// Validate the configured minimum against the implementation ceiling.
+    ///
+    /// # Errors
+    /// Returns `InvalidResourceLimit` for a zero or non-byte-aligned minimum,
+    /// and `ResourceLimit` for an above-ceiling minimum.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         validate_modulus_minimum(
             "minimum RSA modulus bits",
@@ -399,7 +412,7 @@ impl RsaKeyPolicy {
     }
 
     pub(crate) fn validate_components(
-        &self,
+        self,
         operation: &'static str,
         modulus: &[u8],
         exponent: &[u8],
@@ -434,7 +447,7 @@ impl RsaKeyPolicy {
     }
 
     pub(crate) fn validate_public_metadata(
-        &self,
+        self,
         operation: &'static str,
         modulus_bits: usize,
         exponent: Option<u64>,
@@ -518,7 +531,7 @@ pub struct ResourcePolicy {
     pub max_external_resource_bytes: usize,
     /// Maximum bytes in the complete external map and cumulatively dereferenced.
     pub max_external_resource_total_bytes: usize,
-    /// Maximum XMLEnc plaintext bytes.
+    /// Maximum `XMLEnc` plaintext bytes.
     pub max_encryption_plaintext_bytes: usize,
     /// Maximum caller-owned XML bytes accepted by any document operation.
     pub max_xml_document_bytes: usize,
@@ -526,7 +539,7 @@ pub struct ResourcePolicy {
     pub max_xml_parse_work_bytes: usize,
     /// Maximum independently wrapped recipients.
     pub max_encryption_recipients: usize,
-    /// Maximum caller-controlled XMLEnc metadata bytes per field.
+    /// Maximum caller-controlled `XMLEnc` metadata bytes per field.
     pub max_encryption_metadata_bytes: usize,
     /// Maximum key-source expansion work and concrete key or certificate
     /// candidates inspected by one operation stage.
@@ -548,25 +561,25 @@ pub struct ResourcePolicy {
     pub max_base64_transform_input_bytes: usize,
     /// Maximum cumulative bytes emitted by Base64 transforms in one operation.
     pub max_base64_transform_output_bytes: usize,
-    /// Maximum XPath expressions evaluated by one signature operation.
+    /// Maximum `XPath` expressions evaluated by one signature operation.
     pub max_xpath_expressions: usize,
-    /// Maximum UTF-8 bytes in one XPath expression.
+    /// Maximum UTF-8 bytes in one `XPath` expression.
     pub max_xpath_expression_bytes: usize,
-    /// Maximum structural complexity accepted for one XPath expression.
+    /// Maximum structural complexity accepted for one `XPath` expression.
     pub max_xpath_expression_complexity: usize,
-    /// Maximum context-node evaluations for one ordinary XPath transform.
+    /// Maximum context-node evaluations for one ordinary `XPath` transform.
     pub max_xpath_context_evaluations: usize,
-    /// Maximum conservative XPath node-evaluation work per operation.
+    /// Maximum conservative `XPath` node-evaluation work per operation.
     pub max_xpath_evaluation_work: usize,
-    /// Maximum source strings copied into the XPath mirror.
+    /// Maximum source strings copied into the `XPath` mirror.
     pub max_xpath_mirror_string_bytes: usize,
-    /// Maximum conservative XPath string-processing work per operation.
+    /// Maximum conservative `XPath` string-processing work per operation.
     pub max_xpath_string_work_bytes: usize,
-    /// Maximum namespace bindings captured by one XPath expression.
+    /// Maximum namespace bindings captured by one `XPath` expression.
     pub max_xpath_namespace_bindings: usize,
-    /// Maximum aggregate namespace prefix and URI bytes per XPath expression.
+    /// Maximum aggregate namespace prefix and URI bytes per `XPath` expression.
     pub max_xpath_namespace_bytes: usize,
-    /// Maximum filters in one XPath Filter 2.0 transform.
+    /// Maximum filters in one `XPath` Filter 2.0 transform.
     pub max_xpath_filters: usize,
     /// Maximum cumulative node-set entries visited by filtering transforms.
     pub max_node_set_filter_work: usize,
@@ -583,7 +596,7 @@ pub struct ResourcePolicy {
     /// Maximum cumulative OPC normalization workspace allocations during execution.
     pub max_opc_workspace_bytes: usize,
     /// Maximum XSLT work of each kind per operation: stylesheet serialization,
-    /// XPath evaluations and steps,
+    /// `XPath` evaluations and steps,
     /// extension calls, pattern tests, template applications, sort comparisons,
     /// key entries, result nodes and messages.
     pub max_xslt_work: usize,
@@ -618,7 +631,10 @@ impl Default for ResourcePolicy {
             max_key_candidates: crate::hard_limits::KEY_CANDIDATE_CEILING,
             max_x509_work: crate::hard_limits::X509_WORK_CEILING,
             max_x509_workspace_bytes: crate::hard_limits::X509_WORKSPACE_BYTE_CEILING,
-            max_key_import_kdf_work: crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
+            max_key_import_kdf_work: usize::try_from(
+                crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING,
+            )
+            .expect("key import work ceiling fits supported 32-bit and 64-bit targets"),
             max_key_import_kdf_memory_bytes: crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
             max_key_info_reference_depth: crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
             max_base64_transform_input_bytes:
@@ -653,7 +669,18 @@ impl Default for ResourcePolicy {
 
 impl ResourcePolicy {
     /// Validate policy values against non-configurable implementation ceilings.
+    ///
+    /// # Errors
+    /// Returns `ResourceLimit` for the first configured value exceeding its
+    /// implementation ceiling, in XML, material, `XPath`, then transform order.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
+        self.validate_xml_limits()?;
+        self.validate_material_limits()?;
+        self.validate_xpath_limits()?;
+        self.validate_transform_limits()
+    }
+
+    fn validate_xml_limits(&self) -> Result<(), PolicyViolation> {
         Self::within(
             resource_name::XML_NODES,
             self.max_xml_nodes,
@@ -734,6 +761,10 @@ impl ResourcePolicy {
             self.max_encryption_metadata_bytes,
             crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
         )?;
+        Ok(())
+    }
+
+    fn validate_material_limits(&self) -> Result<(), PolicyViolation> {
         for (resource, selected, ceiling) in [
             (
                 resource_name::X509_WORK,
@@ -753,7 +784,8 @@ impl ResourcePolicy {
             (
                 resource_name::KEY_IMPORT_KDF_WORK,
                 self.max_key_import_kdf_work,
-                crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
+                usize::try_from(crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING)
+                    .expect("key import work ceiling fits supported 32-bit and 64-bit targets"),
             ),
             (
                 resource_name::KEY_IMPORT_KDF_MEMORY,
@@ -775,6 +807,14 @@ impl ResourcePolicy {
                 self.max_base64_transform_output_bytes,
                 crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
             ),
+        ] {
+            Self::within(resource, selected, ceiling)?;
+        }
+        Ok(())
+    }
+
+    fn validate_xpath_limits(&self) -> Result<(), PolicyViolation> {
+        for (resource, selected, ceiling) in [
             (
                 resource_name::XPATH_EXPRESSIONS,
                 self.max_xpath_expressions,
@@ -848,6 +888,10 @@ impl ResourcePolicy {
         ] {
             Self::within(resource, selected, ceiling)?;
         }
+        Ok(())
+    }
+
+    fn validate_transform_limits(&self) -> Result<(), PolicyViolation> {
         Self::within(
             resource_name::OPC_WORKSPACE_BYTES,
             self.max_opc_workspace_bytes,
@@ -898,6 +942,9 @@ impl ResourcePolicy {
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     /// Reject aggregate key-candidate work beyond this policy snapshot.
+    ///
+    /// # Errors
+    /// Returns a `ResourceLimit` for candidate counts above `max_key_candidates`.
     pub fn validate_key_candidates(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_key_candidates {
             return Err(PolicyViolation::ResourceLimit {
@@ -910,6 +957,9 @@ impl ResourcePolicy {
     }
 
     /// Reject `KeyInfoReference` traversal beyond this policy snapshot.
+    ///
+    /// # Errors
+    /// Returns a `ResourceLimit` when traversal exceeds `max_key_info_reference_depth`.
     #[cfg(feature = "xmldsig")]
     pub fn validate_key_info_reference_depth(&self, actual: usize) -> Result<(), PolicyViolation> {
         if actual > self.max_key_info_reference_depth {
@@ -998,22 +1048,22 @@ pub enum OpcRelationshipEdition {
     Ecma2021,
 }
 
-/// XMLDSig transform and canonicalization decisions shared by signing and verification.
+/// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SameDocumentIdSemantics {
-    /// Require bare fragment identifiers to satisfy the XML NCName grammar.
+    /// Require bare fragment identifiers to satisfy the XML `NCName` grammar.
     #[default]
     Specification,
     /// Apply libxmlsec1's default barename compatibility grammar.
     ///
     /// Registered non-NCName values are accepted unless a single quote makes
-    /// them unrepresentable in the donor's single-quoted XPointer expression.
+    /// them unrepresentable in the donor's single-quoted `XPointer` expression.
     /// The resulting node set retains barename semantics and excludes comments.
     XmlSecBarename,
     /// Resolve the fragment text directly as an ID, including non-NCName values.
     ///
-    /// This reproduces libxmlsec1's explicit Visa3D compatibility flag.
+    /// This reproduces libxmlsec1's explicit `Visa3D` compatibility flag.
     XmlSecVisa3d,
 }
 
@@ -1038,20 +1088,20 @@ pub enum XsltStylesheetSemantics {
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EcdsaSignatureValueEncoding {
-    /// XMLDSig fixed-width `r || s` representation.
+    /// `XMLDSig` fixed-width `r || s` representation.
     #[default]
     XmlDsig,
     /// ASN.1 DER `SEQUENCE(INTEGER(r), INTEGER(s))` compatibility representation.
     XmlSecAsn1Der,
 }
 
-/// XMLDSig transform and canonicalization decisions shared by signing and verification.
+/// `XMLDSig` transform and canonicalization decisions shared by signing and verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransformPolicy {
     /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
     pub allowed_algorithms: Option<HashSet<String>>,
-    /// Node selected for the XPath `here()` extension function.
+    /// Node selected for the `XPath` `here()` extension function.
     pub xpath_here_semantics: XPathHereSemantics,
     /// Interpretation of bare same-document ID fragments.
     pub same_document_id_semantics: SameDocumentIdSemantics,
@@ -1061,15 +1111,15 @@ pub struct TransformPolicy {
     pub xslt_stylesheet_semantics: XsltStylesheetSemantics,
 }
 
-/// URI-class decisions shared by XMLDSig reference and key retrieval processing.
+/// URI-class decisions shared by `XMLDSig` reference and key retrieval processing.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UriPolicy {
-    /// URI classes accepted by SignedInfo and Manifest references.
+    /// URI classes accepted by `SignedInfo` and Manifest references.
     pub references: UriTypeSet,
-    /// URI classes accepted by RetrievalMethod processing.
+    /// URI classes accepted by `RetrievalMethod` processing.
     pub retrieval_methods: UriTypeSet,
-    /// URI classes accepted by XMLDSig 1.1 `KeyInfoReference` processing.
+    /// URI classes accepted by `XMLDSig` 1.1 `KeyInfoReference` processing.
     pub key_info_references: UriTypeSet,
 }
 
@@ -1080,38 +1130,6 @@ impl Default for UriPolicy {
             references: UriTypeSet::SAME_DOCUMENT,
             retrieval_methods: UriTypeSet::SAME_DOCUMENT,
             key_info_references: UriTypeSet::SAME_DOCUMENT,
-        }
-    }
-}
-
-/// KeyInfo sources an XMLDSig verification operation is permitted to trust.
-#[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct KeySourcePolicy {
-    /// Permit a caller-supplied pre-resolved key.
-    pub preset_key: bool,
-    /// Permit keys selected by document `KeyName`.
-    pub key_name: bool,
-    /// Permit public keys embedded in `KeyValue`.
-    pub key_value: bool,
-    /// Permit public keys embedded in `DEREncodedKeyValue`.
-    pub der_encoded_key_value: bool,
-    /// Permit certificates and selectors embedded in `X509Data`.
-    pub x509_data: bool,
-    /// Permit `KeyInfoReference` indirection to another bounded `KeyInfo`.
-    pub key_info_reference: bool,
-}
-
-#[cfg(feature = "xmldsig")]
-impl Default for KeySourcePolicy {
-    fn default() -> Self {
-        Self {
-            preset_key: true,
-            key_name: true,
-            key_value: true,
-            der_encoded_key_value: true,
-            x509_data: true,
-            key_info_reference: true,
         }
     }
 }
@@ -1173,9 +1191,9 @@ pub struct KeyTrustPolicy {
     pub rsa_keys: RsaKeyPolicy,
     /// DSA requirements enforced for resolved verification keys.
     pub dsa_keys: DsaKeyPolicy,
-    /// Purposes accepted when any certificate in a path carries ExtendedKeyUsage.
+    /// Purposes accepted when any certificate in a path carries `ExtendedKeyUsage`.
     ///
-    /// An empty set accepts only paths whose certificates omit ExtendedKeyUsage
+    /// An empty set accepts only paths whose certificates omit `ExtendedKeyUsage`
     /// or use `anyExtendedKeyUsage`; it does not treat TLS/code-signing purposes
     /// as a generic authorization for XML signatures.
     pub allowed_extended_key_usages: HashSet<ExtendedKeyPurpose>,
@@ -1282,7 +1300,7 @@ impl KeyTrustPolicy {
     }
 }
 
-/// Whether an XMLDSig operation evaluates Manifest references. Verification
+/// Whether an `XMLDSig` operation evaluates Manifest references. Verification
 /// requires original authenticated coverage; signing populates direct Object/Manifest digests.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1294,7 +1312,7 @@ pub enum ManifestProcessing {
     Process,
 }
 
-/// Immutable policy snapshot for XMLDSig verification.
+/// Immutable policy snapshot for `XMLDSig` verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct VerificationPolicy {
@@ -1319,7 +1337,7 @@ pub struct VerificationPolicy {
     pub ecdsa_signature_value_encoding: EcdsaSignatureValueEncoding,
     /// Key and certificate trust rules.
     pub key_trust: KeyTrustPolicy,
-    /// KeyInfo source permissions.
+    /// `KeyInfo` source permissions.
     pub key_sources: KeySourcePolicy,
     /// Reference and key-retrieval URI permissions.
     pub uris: UriPolicy,
@@ -1355,6 +1373,10 @@ impl VerificationPolicy {
         }
     }
     /// Validate the complete snapshot against implementation hard ceilings.
+    ///
+    /// # Errors
+    /// Returns expired/invalid authorization, contradictory target trust, or
+    /// invalid resource, key-establishment, trust and HMAC configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
             validity.validate_at(SystemTime::now())?;
@@ -1373,6 +1395,10 @@ impl VerificationPolicy {
     }
 
     /// Enforce the signature algorithm after key resolution.
+    ///
+    /// # Errors
+    /// Returns an `Algorithm` violation when exact, legacy or parameterized
+    /// method permissions do not admit the requested signature method.
     pub fn check_signature_algorithm(
         &self,
         algorithm: SignatureAlgorithm,
@@ -1423,7 +1449,7 @@ impl VerificationPolicy {
     }
 }
 
-/// Immutable policy snapshot for XMLDSig signing.
+/// Immutable policy snapshot for `XMLDSig` signing.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
 pub struct SigningPolicy {
@@ -1464,6 +1490,10 @@ pub struct SigningPolicy {
 #[cfg(feature = "xmldsig")]
 impl SigningPolicy {
     /// Validate the complete snapshot before signing work begins.
+    ///
+    /// # Errors
+    /// Returns expired/invalid authorization or invalid resource,
+    /// key-establishment, RSA, DSA and HMAC configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
             validity.validate_at(SystemTime::now())?;
@@ -1504,7 +1534,7 @@ impl SigningPolicy {
 }
 
 #[cfg(feature = "xmldsig")]
-fn check_signing_algorithm<T: Eq + std::hash::Hash>(
+fn check_signing_algorithm<T: Copy + Eq + std::hash::Hash>(
     allowlist: Option<&HashSet<T>>,
     algorithm: T,
     default_allowed: bool,
@@ -1539,7 +1569,7 @@ pub(crate) fn check_content_algorithm(
     }
 }
 
-/// Immutable policy snapshot for XMLEnc encryption.
+/// Immutable policy snapshot for `XMLEnc` encryption.
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
 pub struct EncryptionPolicy {
@@ -1566,6 +1596,10 @@ pub struct EncryptionPolicy {
 #[cfg(feature = "xmlenc")]
 impl EncryptionPolicy {
     /// Validate the complete snapshot before outbound encryption work begins.
+    ///
+    /// # Errors
+    /// Returns expired/invalid authorization or invalid resource,
+    /// key-establishment and RSA configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
             validity.validate_at(SystemTime::now())?;
@@ -1576,7 +1610,7 @@ impl EncryptionPolicy {
     }
 }
 
-/// Immutable policy snapshot for XMLEnc decryption.
+/// Immutable policy snapshot for `XMLEnc` decryption.
 #[cfg(feature = "xmlenc")]
 #[derive(Debug, Clone, Default)]
 pub struct DecryptionPolicy {
@@ -1608,6 +1642,10 @@ pub struct DecryptionPolicy {
 #[cfg(feature = "xmlenc")]
 impl DecryptionPolicy {
     /// Validate the complete snapshot before inbound decryption work begins.
+    ///
+    /// # Errors
+    /// Returns expired/invalid authorization or invalid resource,
+    /// key-establishment and RSA configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
             validity.validate_at(SystemTime::now())?;
@@ -1746,228 +1784,85 @@ mod tests {
         // may raise the implementation's allocation ceiling. Exact diagnostics
         // also catch a field accidentally paired with another field's ceiling.
         type Case = (&'static str, usize, fn(&mut ResourcePolicy) -> &mut usize);
-        let cases: &[Case] = &[
-            (
-                resource_name::X509_WORK,
-                crate::hard_limits::X509_WORK_CEILING,
-                |p| &mut p.max_x509_work,
-            ),
-            (
-                resource_name::X509_WORKSPACE_BYTES,
-                crate::hard_limits::X509_WORKSPACE_BYTE_CEILING,
-                |p| &mut p.max_x509_workspace_bytes,
-            ),
-            (
-                resource_name::XML_NODES,
-                crate::hard_limits::XML_DOCUMENT_NODE_CEILING as usize,
-                |p| &mut p.max_xml_nodes,
-            ),
-            (
-                resource_name::XML_DEPTH,
-                crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
-                |p| &mut p.max_xml_depth,
-            ),
-            (
-                resource_name::XML_NAMESPACE_BINDINGS,
-                crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
-                |p| &mut p.max_xml_namespace_bindings,
-            ),
-            (
-                resource_name::SIGNATURE_REFERENCES,
-                crate::hard_limits::SIGNATURE_REFERENCE_CEILING,
-                |p| &mut p.max_references,
-            ),
-            (
-                resource_name::VERIFICATION_SIGNATURES,
-                crate::hard_limits::VERIFICATION_SIGNATURE_CEILING,
-                |p| &mut p.max_signatures,
-            ),
-            (
-                resource_name::REFERENCE_TRANSFORMS,
-                crate::hard_limits::REFERENCE_TRANSFORM_CEILING,
-                |p| &mut p.max_transforms_per_reference,
-            ),
-            (
-                resource_name::XML_BASE_COMPONENTS,
-                crate::hard_limits::XML_BASE_COMPONENT_CEILING,
-                |p| &mut p.max_xml_base_components,
-            ),
-            (
-                resource_name::XML_BASE_RESOLUTION_BYTES,
-                crate::hard_limits::XML_BASE_RESOLUTION_BYTE_CEILING,
-                |p| &mut p.max_xml_base_resolution_bytes,
-            ),
-            (
-                resource_name::CANONICALIZED_BYTES,
-                crate::hard_limits::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING,
-                |p| &mut p.max_canonicalized_bytes,
-            ),
-            (
-                resource_name::EXTERNAL_RESOURCE_BYTES,
-                crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
-                |p| &mut p.max_external_resource_bytes,
-            ),
-            (
-                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
-                |p| &mut p.max_external_resource_total_bytes,
-            ),
-            (
-                resource_name::ENCRYPTION_PLAINTEXT_BYTES,
-                crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
-                |p| &mut p.max_encryption_plaintext_bytes,
-            ),
-            (
-                resource_name::XML_DOCUMENT,
-                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
-                |p| &mut p.max_xml_document_bytes,
-            ),
-            (
-                resource_name::XML_PARSE_WORK_BYTES,
-                crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING,
-                |p| &mut p.max_xml_parse_work_bytes,
-            ),
-            (
-                resource_name::ENCRYPTION_RECIPIENTS,
-                crate::hard_limits::ENCRYPTION_RECIPIENT_CEILING,
-                |p| &mut p.max_encryption_recipients,
-            ),
-            (
-                resource_name::ENCRYPTION_METADATA_BYTES,
-                crate::hard_limits::ENCRYPTION_METADATA_BYTE_CEILING,
-                |p| &mut p.max_encryption_metadata_bytes,
-            ),
-            (
-                resource_name::KEY_CANDIDATES,
-                crate::hard_limits::KEY_CANDIDATE_CEILING,
-                |p| &mut p.max_key_candidates,
-            ),
-            (
-                resource_name::KEY_IMPORT_KDF_WORK,
-                crate::hard_limits::KEY_IMPORT_KDF_WORK_CEILING as usize,
-                |p| &mut p.max_key_import_kdf_work,
-            ),
-            (
-                resource_name::KEY_IMPORT_KDF_MEMORY,
-                crate::hard_limits::KEY_IMPORT_KDF_MEMORY_CEILING,
-                |p| &mut p.max_key_import_kdf_memory_bytes,
-            ),
-            (
-                resource_name::KEY_INFO_REFERENCE_DEPTH,
-                crate::hard_limits::KEY_INFO_REFERENCE_DEPTH_CEILING,
-                |p| &mut p.max_key_info_reference_depth,
-            ),
-            (
-                resource_name::BASE64_TRANSFORM_INPUT_BYTES,
-                crate::hard_limits::BASE64_TRANSFORM_INPUT_BYTE_CEILING,
-                |p| &mut p.max_base64_transform_input_bytes,
-            ),
-            (
-                resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
-                crate::hard_limits::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING,
-                |p| &mut p.max_base64_transform_output_bytes,
-            ),
-            (
-                resource_name::XPATH_EXPRESSIONS,
-                crate::hard_limits::XPATH_EXPRESSION_COUNT_CEILING,
-                |p| &mut p.max_xpath_expressions,
-            ),
-            (
-                resource_name::XPATH_EXPRESSION_BYTES,
-                crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING,
-                |p| &mut p.max_xpath_expression_bytes,
-            ),
-            (
-                resource_name::XPATH_EXPRESSION_COMPLEXITY,
-                crate::hard_limits::XPATH_EXPRESSION_COMPLEXITY_CEILING,
-                |p| &mut p.max_xpath_expression_complexity,
-            ),
-            (
-                resource_name::XPATH_CONTEXT_EVALUATIONS,
-                crate::hard_limits::XPATH_CONTEXT_EVALUATION_CEILING,
-                |p| &mut p.max_xpath_context_evaluations,
-            ),
-            (
-                resource_name::XPATH_EVALUATION_WORK,
-                crate::hard_limits::XPATH_EVALUATION_WORK_CEILING,
-                |p| &mut p.max_xpath_evaluation_work,
-            ),
-            (
-                resource_name::XPATH_MIRROR_STRING_BYTES,
-                crate::hard_limits::XPATH_MIRROR_STRING_BYTE_CEILING,
-                |p| &mut p.max_xpath_mirror_string_bytes,
-            ),
-            (
-                resource_name::XPATH_STRING_WORK_BYTES,
-                crate::hard_limits::XPATH_STRING_WORK_BYTE_CEILING,
-                |p| &mut p.max_xpath_string_work_bytes,
-            ),
-            (
-                resource_name::XPATH_NAMESPACE_BINDINGS,
-                crate::hard_limits::XPATH_NAMESPACE_BINDING_CEILING,
-                |p| &mut p.max_xpath_namespace_bindings,
-            ),
-            (
-                resource_name::XPATH_NAMESPACE_BYTES,
-                crate::hard_limits::XPATH_NAMESPACE_BYTE_CEILING,
-                |p| &mut p.max_xpath_namespace_bytes,
-            ),
-            (
-                resource_name::XPATH_FILTERS,
-                crate::hard_limits::XPATH_FILTER_COUNT_CEILING,
-                |p| &mut p.max_xpath_filters,
-            ),
-            (
-                resource_name::NODE_SET_FILTER_WORK,
-                crate::hard_limits::NODE_SET_FILTER_WORK_CEILING,
-                |p| &mut p.max_node_set_filter_work,
-            ),
-            (
-                resource_name::OPC_PARAMETER_BYTES,
-                crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
-                |p| &mut p.max_opc_parameter_bytes,
-            ),
-            (
-                resource_name::OPC_WORKSPACE_BYTES,
-                crate::hard_limits::OPC_WORKSPACE_BYTE_CEILING,
-                |p| &mut p.max_opc_workspace_bytes,
-            ),
-            (
-                resource_name::NODE_SET_ENTRIES,
-                crate::hard_limits::NODE_SET_ENTRY_CEILING,
-                |p| &mut p.max_node_set_entries,
-            ),
-            (
-                resource_name::NODE_SET_OWNED_STRING_BYTES,
-                crate::hard_limits::NODE_SET_OWNED_STRING_BYTE_CEILING,
-                |p| &mut p.max_node_set_owned_string_bytes,
-            ),
-            (
-                resource_name::NODE_SET_CUMULATIVE_OWNED_STRING_BYTES,
-                crate::hard_limits::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING,
-                |p| &mut p.max_node_set_cumulative_owned_string_bytes,
-            ),
-            (
-                resource_name::XSLT_WORK,
-                crate::hard_limits::XSLT_WORK_CEILING,
-                |p| &mut p.max_xslt_work,
-            ),
-            (
-                resource_name::XSLT_WORKSPACE_BYTES,
-                crate::hard_limits::XSLT_WORKSPACE_BYTE_CEILING,
-                |p| &mut p.max_xslt_workspace_bytes,
-            ),
-            (
-                resource_name::XSLT_OUTPUT_BYTES,
-                crate::hard_limits::XSLT_OUTPUT_BYTE_CEILING,
-                |p| &mut p.max_xslt_output_bytes,
-            ),
-            (
-                resource_name::XSLT_RECURSION_DEPTH,
-                crate::hard_limits::XSLT_RECURSION_DEPTH_CEILING,
-                |p| &mut p.max_xslt_recursion_depth,
-            ),
-        ];
+        // One row per policy field: resource name, hard ceiling, field.
+        macro_rules! cases {
+            ($($resource:ident: $ceiling:expr => $field:ident;)*) => {
+                &[$((resource_name::$resource, $ceiling, |p| &mut p.$field)),*]
+            };
+        }
+        use crate::hard_limits as limit;
+        let key_import_work = usize::try_from(limit::KEY_IMPORT_KDF_WORK_CEILING)
+            .expect("key import work ceiling fits supported 32-bit and 64-bit targets");
+        let cases: &[Case] = cases! {
+            X509_WORK: limit::X509_WORK_CEILING => max_x509_work;
+            X509_WORKSPACE_BYTES: limit::X509_WORKSPACE_BYTE_CEILING => max_x509_workspace_bytes;
+            XML_NODES: limit::XML_DOCUMENT_NODE_CEILING as usize => max_xml_nodes;
+            XML_DEPTH: limit::XML_DOCUMENT_DEPTH_CEILING => max_xml_depth;
+            XML_NAMESPACE_BINDINGS: limit::XML_NAMESPACE_BINDING_CEILING
+                => max_xml_namespace_bindings;
+            SIGNATURE_REFERENCES: limit::SIGNATURE_REFERENCE_CEILING => max_references;
+            VERIFICATION_SIGNATURES: limit::VERIFICATION_SIGNATURE_CEILING => max_signatures;
+            REFERENCE_TRANSFORMS: limit::REFERENCE_TRANSFORM_CEILING
+                => max_transforms_per_reference;
+            XML_BASE_COMPONENTS: limit::XML_BASE_COMPONENT_CEILING => max_xml_base_components;
+            XML_BASE_RESOLUTION_BYTES: limit::XML_BASE_RESOLUTION_BYTE_CEILING
+                => max_xml_base_resolution_bytes;
+            CANONICALIZED_BYTES: limit::CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING
+                => max_canonicalized_bytes;
+            EXTERNAL_RESOURCE_BYTES: limit::EXTERNAL_RESOURCE_BYTE_CEILING
+                => max_external_resource_bytes;
+            AGGREGATE_EXTERNAL_RESOURCE_BYTES: limit::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING
+                => max_external_resource_total_bytes;
+            ENCRYPTION_PLAINTEXT_BYTES: limit::ENCRYPTION_PLAINTEXT_BYTE_CEILING
+                => max_encryption_plaintext_bytes;
+            XML_DOCUMENT: limit::XML_DOCUMENT_BYTE_CEILING => max_xml_document_bytes;
+            XML_PARSE_WORK_BYTES: limit::XML_PARSE_WORK_BYTE_CEILING => max_xml_parse_work_bytes;
+            ENCRYPTION_RECIPIENTS: limit::ENCRYPTION_RECIPIENT_CEILING
+                => max_encryption_recipients;
+            ENCRYPTION_METADATA_BYTES: limit::ENCRYPTION_METADATA_BYTE_CEILING
+                => max_encryption_metadata_bytes;
+            KEY_CANDIDATES: limit::KEY_CANDIDATE_CEILING => max_key_candidates;
+            KEY_IMPORT_KDF_WORK: key_import_work => max_key_import_kdf_work;
+            KEY_IMPORT_KDF_MEMORY: limit::KEY_IMPORT_KDF_MEMORY_CEILING
+                => max_key_import_kdf_memory_bytes;
+            KEY_INFO_REFERENCE_DEPTH: limit::KEY_INFO_REFERENCE_DEPTH_CEILING
+                => max_key_info_reference_depth;
+            BASE64_TRANSFORM_INPUT_BYTES: limit::BASE64_TRANSFORM_INPUT_BYTE_CEILING
+                => max_base64_transform_input_bytes;
+            BASE64_TRANSFORM_OUTPUT_BYTES: limit::BASE64_TRANSFORM_OUTPUT_BYTE_CEILING
+                => max_base64_transform_output_bytes;
+            XPATH_EXPRESSIONS: limit::XPATH_EXPRESSION_COUNT_CEILING => max_xpath_expressions;
+            XPATH_EXPRESSION_BYTES: limit::XPATH_EXPRESSION_BYTE_CEILING
+                => max_xpath_expression_bytes;
+            XPATH_EXPRESSION_COMPLEXITY: limit::XPATH_EXPRESSION_COMPLEXITY_CEILING
+                => max_xpath_expression_complexity;
+            XPATH_CONTEXT_EVALUATIONS: limit::XPATH_CONTEXT_EVALUATION_CEILING
+                => max_xpath_context_evaluations;
+            XPATH_EVALUATION_WORK: limit::XPATH_EVALUATION_WORK_CEILING
+                => max_xpath_evaluation_work;
+            XPATH_MIRROR_STRING_BYTES: limit::XPATH_MIRROR_STRING_BYTE_CEILING
+                => max_xpath_mirror_string_bytes;
+            XPATH_STRING_WORK_BYTES: limit::XPATH_STRING_WORK_BYTE_CEILING
+                => max_xpath_string_work_bytes;
+            XPATH_NAMESPACE_BINDINGS: limit::XPATH_NAMESPACE_BINDING_CEILING
+                => max_xpath_namespace_bindings;
+            XPATH_NAMESPACE_BYTES: limit::XPATH_NAMESPACE_BYTE_CEILING
+                => max_xpath_namespace_bytes;
+            XPATH_FILTERS: limit::XPATH_FILTER_COUNT_CEILING => max_xpath_filters;
+            NODE_SET_FILTER_WORK: limit::NODE_SET_FILTER_WORK_CEILING => max_node_set_filter_work;
+            OPC_PARAMETER_BYTES: limit::OPC_PARAMETER_BYTE_CEILING => max_opc_parameter_bytes;
+            OPC_WORKSPACE_BYTES: limit::OPC_WORKSPACE_BYTE_CEILING => max_opc_workspace_bytes;
+            NODE_SET_ENTRIES: limit::NODE_SET_ENTRY_CEILING => max_node_set_entries;
+            NODE_SET_OWNED_STRING_BYTES: limit::NODE_SET_OWNED_STRING_BYTE_CEILING
+                => max_node_set_owned_string_bytes;
+            NODE_SET_CUMULATIVE_OWNED_STRING_BYTES:
+                limit::NODE_SET_CUMULATIVE_OWNED_STRING_BYTE_CEILING
+                => max_node_set_cumulative_owned_string_bytes;
+            XSLT_WORK: limit::XSLT_WORK_CEILING => max_xslt_work;
+            XSLT_WORKSPACE_BYTES: limit::XSLT_WORKSPACE_BYTE_CEILING => max_xslt_workspace_bytes;
+            XSLT_OUTPUT_BYTES: limit::XSLT_OUTPUT_BYTE_CEILING => max_xslt_output_bytes;
+            XSLT_RECURSION_DEPTH: limit::XSLT_RECURSION_DEPTH_CEILING => max_xslt_recursion_depth;
+        };
 
         for &(resource, ceiling, field) in cases {
             let mut policy = ResourcePolicy::default();

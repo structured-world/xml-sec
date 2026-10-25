@@ -8,7 +8,7 @@ use xml_sec::xmlenc::KeyEstablishmentBudget;
 
 fn hex(input: &str) -> Vec<u8> {
     let (pairs, remainder) = input.as_bytes().as_chunks::<2>();
-    assert!(remainder.is_empty());
+    assert_eq!(remainder, []);
     pairs
         .iter()
         .map(|pair| {
@@ -275,6 +275,40 @@ fn malformed_dh_domains_and_private_scalars_are_rejected() {
     );
 }
 
+/// Stricter modulus or subgroup minimums refuse the test domain before any
+/// modular work or owned storage is spent.
+fn assert_weak_domain_refused_before_work(
+    permission: &KeyEstablishmentPolicy,
+    recipient: &RustCryptoDhKey,
+    sender_public: &[u8],
+    method: &xml_sec::xmlenc::KeyDerivationMethod,
+) {
+    for (minimum_modulus, minimum_subgroup) in [(2048, 160), (1024, 224)] {
+        let strict = KeyEstablishmentPolicy {
+            minimum_dh_modulus_bits: minimum_modulus,
+            minimum_dh_subgroup_bits: minimum_subgroup,
+            ..permission.clone()
+        };
+        let mut strict_budget = KeyEstablishmentBudget::new(&strict).unwrap();
+        assert!(matches!(
+            strict_budget.agree_and_derive(
+                &RUST_CRYPTO_PROVIDER,
+                recipient,
+                &KeyAgreementParameters {
+                    algorithm: KeyAgreementAlgorithm::DhEs.uri(),
+                    peer_public_key: sender_public
+                },
+                &method.parameters(16).unwrap()
+            ),
+            Err(xml_sec::xmlenc::XmlEncError::Policy(
+                xml_sec::policy::PolicyViolation::KeySize { .. }
+            ))
+        ));
+        assert_eq!(strict_budget.modular_work(), 0);
+        assert_eq!(strict_budget.owned_bytes(), 0);
+    }
+}
+
 #[test]
 fn finite_field_key_agreement_reaches_public_encryption_pipeline() {
     // Opposite opaque DH handles derive the AES key inside each operation.
@@ -319,30 +353,7 @@ fn finite_field_key_agreement_reaches_public_encryption_pipeline() {
             )
         ))
     ));
-    for (minimum_modulus, minimum_subgroup) in [(2048, 160), (1024, 224)] {
-        let strict = KeyEstablishmentPolicy {
-            minimum_dh_modulus_bits: minimum_modulus,
-            minimum_dh_subgroup_bits: minimum_subgroup,
-            ..permission.clone()
-        };
-        let mut strict_budget = KeyEstablishmentBudget::new(&strict).unwrap();
-        assert!(matches!(
-            strict_budget.agree_and_derive(
-                &RUST_CRYPTO_PROVIDER,
-                &recipient,
-                &KeyAgreementParameters {
-                    algorithm: KeyAgreementAlgorithm::DhEs.uri(),
-                    peer_public_key: &sender_public
-                },
-                &method.parameters(16).unwrap()
-            ),
-            Err(xml_sec::xmlenc::XmlEncError::Policy(
-                xml_sec::policy::PolicyViolation::KeySize { .. }
-            ))
-        ));
-        assert_eq!(strict_budget.modular_work(), 0);
-        assert_eq!(strict_budget.owned_bytes(), 0);
-    }
+    assert_weak_domain_refused_before_work(&permission, &recipient, &sender_public, &method);
     let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).agreement_key(
         method.clone(),
         sender,

@@ -1,12 +1,15 @@
 //! Original execution facts retained only by scoped verification.
 
-use super::*;
+use super::{
+    Cell, DigestAlgorithm, DocumentView, DsigError, Node, NodeId, NodeIdentity,
+    OperationExecutionContext, RefCell, SignatureAlgorithm, VerifyingKey, XMLDSIG_NS,
+};
 use structured_asn1::memory::{MemoryError, OwnedMap, OwnedVec, Work};
 
 /// Original parsed method, not a reconstruction from an algorithm URI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SelectedSignatureMethod {
-    /// Original SignatureMethod node, including document generation.
+    /// Original `SignatureMethod` node, including document generation.
     pub identity: NodeIdentity,
     /// Parsed signature algorithm, including effective RSA-PSS parameters.
     pub algorithm: SignatureAlgorithm,

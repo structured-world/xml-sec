@@ -209,14 +209,17 @@ mod test {
 
         // Test with r=1
         let r_one = Elem::new(1);
-        let (r1_one, _) = r_one.decompose::<TwoGamma2>();
-        assert_eq!(use_hint::<TwoGamma2>(true, r_one).0, (r1_one.0 + 1) % m);
+        let (one_high, _) = r_one.decompose::<TwoGamma2>();
+        assert_eq!(use_hint::<TwoGamma2>(true, r_one).0, (one_high.0 + 1) % m);
 
         // Test with r=Q-1
         let r_qm1 = Elem::new(BaseField::Q - 1);
-        let (r1_qm1, r0_qm1) = r_qm1.decompose::<TwoGamma2>();
-        if r0_qm1.0 >= BaseField::Q - gamma2 {
-            assert_eq!(use_hint::<TwoGamma2>(true, r_qm1).0, (r1_qm1.0 + m - 1) % m);
+        let (last_high, last_low) = r_qm1.decompose::<TwoGamma2>();
+        if last_low.0 >= BaseField::Q - gamma2 {
+            assert_eq!(
+                use_hint::<TwoGamma2>(true, r_qm1).0,
+                (last_high.0 + m - 1) % m
+            );
         }
     }
 

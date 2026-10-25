@@ -33,6 +33,10 @@ pub struct AgreementMethod {
 impl AgreementMethod {
     /// Establish a consuming key with explicitly bound private and peer keys.
     /// The caller validates party identities before invoking this method.
+    ///
+    /// # Errors
+    /// Returns an error for incompatible parameters or key width, policy or resource
+    /// refusal, unavailable provider capability, or provider failure.
     pub fn derive_key(
         &self,
         consuming_algorithm: &str,
@@ -242,7 +246,7 @@ fn preflight_role_metadata(node: Node<'_, '_>, maximum: usize) -> Result<(), Xml
             for text in child
                 .children()
                 .filter(Node::is_text)
-                .filter_map(|node| node.text())
+                .filter_map(Node::text)
             {
                 length = length
                     .checked_add(text.len())
@@ -261,7 +265,7 @@ pub(super) fn validate_role_metadata(info: &KeyInfo, maximum: usize) -> Result<(
     for source in &info.sources {
         match source {
             KeyInfoSource::KeyName(value) | KeyInfoSource::KeyInfoReference { uri: value } => {
-                check(value.as_bytes())?
+                check(value.as_bytes())?;
             }
             KeyInfoSource::DerEncodedKeyValue(value) => check(value)?,
             KeyInfoSource::KeyValue(value) => match value {

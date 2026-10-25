@@ -53,6 +53,7 @@ pub struct ParsedEncapsulation<'a, 'input> {
 
 impl ParsedEncapsulation<'_, '_> {
     /// Fixed-width public ciphertext; empty only for a validated template.
+    #[must_use]
     pub fn ciphertext(&self) -> &[u8] {
         &self.ciphertext[..self.ciphertext_len]
     }
@@ -64,6 +65,10 @@ impl ParsedEncapsulation<'_, '_> {
 }
 
 /// Validate the experimental ordered grammar and decode into fixed storage.
+///
+/// # Errors
+/// Returns a structure error for an unknown algorithm, malformed child order,
+/// invalid Base64 or ciphertext width that does not match the parameter set.
 pub fn parse_encapsulation<'a, 'input>(
     node: crate::Node<'a, 'input>,
     template: bool,
@@ -143,6 +148,10 @@ pub fn parse_encapsulation<'a, 'input>(
 }
 
 /// Find a single direct mechanism, rejecting ambiguity rather than choosing one.
+///
+/// # Errors
+/// Returns a structure error for multiple direct mechanisms or an invalid
+/// mechanism; absence is reported separately as `Ok(None)`.
 pub fn direct_encapsulation<'a, 'input>(
     key_info: crate::Node<'a, 'input>,
     template: bool,
@@ -172,6 +181,10 @@ pub struct KeyEstablishmentUsage {
 
 impl KeyEstablishmentUsage {
     /// Generate a fresh secret after permission, capability and resource gates.
+    ///
+    /// # Errors
+    /// Returns policy or resource refusal before dispatch, or the selected
+    /// provider's capability, entropy, encapsulation or output-framing failure.
     pub fn encapsulate(
         &mut self,
         policy: &KeyEstablishmentPolicy,
@@ -192,6 +205,10 @@ impl KeyEstablishmentUsage {
     }
 
     /// Recover the real-or-rejection secret; never expose ciphertext validity.
+    ///
+    /// # Errors
+    /// Returns policy or resource refusal, a key/algorithm/framing mismatch,
+    /// or the selected provider's capability or decapsulation failure.
     pub fn decapsulate(
         &mut self,
         policy: &KeyEstablishmentPolicy,

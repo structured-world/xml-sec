@@ -1,4 +1,4 @@
-//! XMLEnc decrypt interoperability against pinned xmlsec1 donor vectors.
+//! `XMLEnc` decrypt interoperability against pinned xmlsec1 donor vectors.
 
 #![cfg(feature = "xmlenc")]
 
@@ -217,7 +217,7 @@ fn decrypts_all_direct_camellia_donor_widths() {
     for entry in key_document
         .root_element()
         .children()
-        .filter(|node| node.is_element())
+        .filter(xml_sec::Node::is_element)
     {
         if entry.descendants().any(|node| {
             node.has_tag_name(("http://www.aleksey.com/xmlsec/2002", "CamelliaKeyValue"))
@@ -365,7 +365,7 @@ fn cbc_encrypted_keys_enforce_framing_without_claiming_integrity() {
         // A block-aligned key has a full padding block. Alter its previous
         // ciphertext block so the final padding-length octet becomes zero.
         let previous_last = invalid_padding.len() - block - 1;
-        invalid_padding[previous_last] ^= block as u8;
+        invalid_padding[previous_last] ^= u8::try_from(block).expect("a cipher block fits a byte");
         assert_eq!(
             RUST_CRYPTO_PROVIDER.unwrap_key(algorithm, &kek, &invalid_padding),
             Err(ProviderError::InvalidInput(
@@ -404,38 +404,38 @@ fn sha224_oaep_digest_and_mgf_are_recognized() {
     );
 }
 
+/// A pinned donor P-256 agreement key: `ec-prime256v1-key` or its `-second` peer.
+fn pinned_p256_key(second: bool) -> xml_sec::provider::RustCryptoEcdhKey {
+    use pkcs8::DecodePrivateKey as _;
+    let name = if second {
+        "ec-prime256v1-second-key"
+    } else {
+        "ec-prime256v1-key"
+    };
+    let encrypted = std::fs::read(format!("tests/fixtures/xmlenc/keys/ec/{name}.p8-der")).unwrap();
+    let plain = pkcs8::EncryptedPrivateKeyInfoRef::try_from(encrypted.as_slice())
+        .unwrap()
+        .decrypt("secret123")
+        .unwrap();
+    let key = p256::SecretKey::from_pkcs8_der(plain.as_bytes()).unwrap();
+    xml_sec::provider::RustCryptoEcdhKey::from_scalar(
+        xml_sec::provider::EcdhCurve::P256,
+        &key.to_bytes(),
+    )
+    .unwrap()
+}
+
 #[test]
 fn decrypts_ecdh_concat_hashes_with_the_pinned_recipient_keys() {
-    use pkcs8::DecodePrivateKey as _;
     use xml_sec::policy::DecryptionPolicy;
-    use xml_sec::provider::{CryptoProvider, EcdhCurve, RUST_CRYPTO_PROVIDER, RustCryptoEcdhKey};
-    use xml_sec::xmldsig::{
-        DigestAlgorithm,
-        parse::{KeyInfo, KeyInfoSource},
-    };
+    use xml_sec::xmldsig::DigestAlgorithm;
     use xml_sec::xmlenc::{
-        AgreementDecryptor, AgreementMethod, CipherData, KeyEstablishmentBudget, KeyWrapAlgorithm,
-        parse_key_derivation_method,
+        AgreementDecryptor, AgreementMethod, KeyWrapAlgorithm, parse_key_derivation_method,
     };
     // The runner selects the second recipient key, not the first originator
     // key. All nine hash families must derive the donor's actual wrapping key.
-    let import = |party: &str| {
-        let name = if party == "second" {
-            "ec-prime256v1-second-key"
-        } else {
-            "ec-prime256v1-key"
-        };
-        let encrypted =
-            std::fs::read(format!("tests/fixtures/xmlenc/keys/ec/{name}.p8-der")).unwrap();
-        let plain = pkcs8::EncryptedPrivateKeyInfoRef::try_from(encrypted.as_slice())
-            .unwrap()
-            .decrypt("secret123")
-            .unwrap();
-        let key = p256::SecretKey::from_pkcs8_der(plain.as_bytes()).unwrap();
-        RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &key.to_bytes()).unwrap()
-    };
-    let recipient = import("second");
-    let originator = import("first");
+    let recipient = pinned_p256_key(true);
+    let originator = pinned_p256_key(false);
     let peer = originator.public_key();
     let policy = DecryptionPolicy::default();
     for (name, digest) in [
@@ -457,18 +457,13 @@ fn decrypts_ecdh_concat_hashes_with_the_pinned_recipient_keys() {
             "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><x:ConcatKDFParams AlgorithmID='00123456' PartyUInfo='00123456' PartyVInfo='00123456'><d:DigestMethod xmlns:d='http://www.w3.org/2000/09/xmldsig#' Algorithm='{}'/></x:ConcatKDFParams></x:KeyDerivationMethod>",
             digest.uri()
         );
-        let role = |name: &str| {
-            let mut info = KeyInfo::default();
-            info.sources.push(KeyInfoSource::KeyName(name.into()));
-            Some(info)
-        };
         let method = AgreementMethod {
             algorithm: xml_sec::policy::KeyAgreementAlgorithm::EcdhEs,
             method: Some(parse_key_derivation_method(&descriptor, &policy).unwrap()),
             nonce: Vec::new(),
             legacy_digest: None,
-            originator: role("originator-key-name"),
-            recipient: role("recipient-key-name"),
+            originator: Some(key_name_info("originator-key-name")),
+            recipient: Some(key_name_info("recipient-key-name")),
         };
         let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml")).unwrap();
         let resolver =
@@ -488,33 +483,7 @@ fn decrypts_ecdh_concat_hashes_with_the_pinned_recipient_keys() {
             ),
             "{name}"
         );
-        let mut budget = KeyEstablishmentBudget::new(&policy.key_establishment).unwrap();
-        let kek = method
-            .derive_key(
-                KeyWrapAlgorithm::AesKw256.uri(),
-                32,
-                &recipient,
-                &peer,
-                &RUST_CRYPTO_PROVIDER,
-                &mut budget,
-            )
-            .unwrap();
-        let parsed = parse_encrypted_data(&xml).unwrap();
-        let CipherData::Value { value } = &parsed.encrypted_keys[0].cipher_data else {
-            panic!("expected donor CipherValue")
-        };
-        let recovered = zeroize::Zeroizing::new(
-            RUST_CRYPTO_PROVIDER
-                .unwrap_key(
-                    KeyWrapAlgorithm::AesKw256,
-                    &kek,
-                    &STANDARD.decode(value).unwrap(),
-                )
-                .unwrap(),
-        );
-        assert_eq!(recovered.len(), 32, "{name}");
-        assert_surplus_cek_plaintext(&xml, &name, &recovered);
-        completed_vector(VECTOR_DIR, &name, CorpusOutcome::DocumentedDeparture);
+        assert_documented_surplus_cek(&xml, &name, &method, &recipient, &peer, &policy);
     }
 }
 
@@ -560,7 +529,7 @@ fn decrypts_ecdh_p384_and_p521_donor_plaintexts() {
                     .expect("P521 private key")
                     .to_bytes()
                     .to_vec(),
-                _ => unreachable!("only the two declared curves"),
+                EcdhCurve::P256 => unreachable!("only the two declared curves"),
             };
             let scalar = zeroize::Zeroizing::new(scalar);
             RustCryptoEcdhKey::from_scalar(curve, &scalar).expect("EC agreement key")
@@ -611,27 +580,12 @@ fn decrypts_ecdh_p384_and_p521_donor_plaintexts() {
 
 #[test]
 fn decrypts_ecdh_hkdf_and_pbkdf2_donor_plaintexts() {
-    use pkcs8::DecodePrivateKey as _;
-    use xml_sec::provider::{
-        CryptoProvider as _, EcdhCurve, RUST_CRYPTO_PROVIDER, RustCryptoEcdhKey,
-    };
+    use xml_sec::provider::{CryptoProvider as _, RUST_CRYPTO_PROVIDER};
     use xml_sec::xmlenc::{AgreementDecryptor, KeyWrapAlgorithm};
     // Independently produced ECDH KDF vectors exercise the complete pipeline;
     // the public path never inherits the donor's surplus-key truncation.
-    let import = |suffix: &str| {
-        let encrypted = std::fs::read(format!(
-            "tests/fixtures/xmlenc/keys/ec/ec-prime256v1{suffix}-key.p8-der"
-        ))
-        .expect("pinned P256 key");
-        let plain = pkcs8::EncryptedPrivateKeyInfoRef::try_from(encrypted.as_slice())
-            .expect("encrypted PKCS8")
-            .decrypt("secret123")
-            .expect("fixture password");
-        let key = p256::SecretKey::from_pkcs8_der(plain.as_bytes()).expect("P256 private key");
-        RustCryptoEcdhKey::from_scalar(EcdhCurve::P256, &key.to_bytes()).expect("agreement key")
-    };
-    let recipient = import("-second");
-    let originator = import("");
+    let recipient = pinned_p256_key(true);
+    let originator = pinned_p256_key(false);
     let peer = originator.public_key();
     let mut policy = xml_sec::policy::DecryptionPolicy::default();
     policy.key_establishment.digest_algorithms = Some(
@@ -886,16 +840,125 @@ fn decrypts_dh_es_concatkdf_with_pinned_domain_and_parties() {
     completed_vector(VECTOR_DIR, name, CorpusOutcome::Decrypted);
 }
 
+/// `KeyInfo` naming one agreement party, as the donor recipes carry it.
+fn key_name_info(name: &str) -> xml_sec::xmldsig::parse::KeyInfo {
+    let mut info = xml_sec::xmldsig::parse::KeyInfo::default();
+    info.sources
+        .push(xml_sec::xmldsig::parse::KeyInfoSource::KeyName(name.into()));
+    info
+}
+
+/// Recover a donor vector's surplus 32-byte CEK through `method` directly and
+/// check it decrypts the vector's plaintext, documenting the departure.
+fn assert_documented_surplus_cek(
+    xml: &str,
+    name: &str,
+    method: &xml_sec::xmlenc::AgreementMethod,
+    recipient: &dyn xml_sec::provider::KeyAgreementKey,
+    peer: &[u8],
+    policy: &xml_sec::policy::DecryptionPolicy,
+) {
+    use xml_sec::provider::{CryptoProvider as _, RUST_CRYPTO_PROVIDER};
+    use xml_sec::xmlenc::KeyWrapAlgorithm;
+    let parsed = parse_encrypted_data(xml).unwrap();
+    let mut budget =
+        xml_sec::xmlenc::KeyEstablishmentBudget::new(&policy.key_establishment).unwrap();
+    let kek = method
+        .derive_key(
+            KeyWrapAlgorithm::AesKw256.uri(),
+            32,
+            recipient,
+            peer,
+            &RUST_CRYPTO_PROVIDER,
+            &mut budget,
+        )
+        .unwrap();
+    let xml_sec::xmlenc::CipherData::Value { value } = &parsed.encrypted_keys[0].cipher_data else {
+        panic!("donor requires CipherValue")
+    };
+    let recovered = zeroize::Zeroizing::new(
+        RUST_CRYPTO_PROVIDER
+            .unwrap_key(
+                KeyWrapAlgorithm::AesKw256,
+                &kek,
+                &STANDARD.decode(value).unwrap(),
+            )
+            .unwrap(),
+    );
+    assert_eq!(recovered.len(), 32, "{name}: actual CEK width");
+    assert_surplus_cek_plaintext(xml, name, &recovered);
+    completed_vector(VECTOR_DIR, name, CorpusOutcome::DocumentedDeparture);
+}
+
+/// A pinned donor X25519 or X448 private key and its public key, after
+/// checking the encrypted and unprotected encodings agree.
+fn pinned_xdh_key(
+    curve: &str,
+    party: &str,
+) -> (Box<dyn xml_sec::provider::KeyAgreementKey>, Vec<u8>) {
+    use der::Decode as _;
+    use xml_sec::provider::{KeyAgreementKey, RustCryptoX448Key, RustCryptoX25519Key};
+    let decode = |bytes: &[u8]| -> (Box<dyn KeyAgreementKey>, Vec<u8>) {
+        if curve == "x448" {
+            let key = RustCryptoX448Key::from_pkcs8_der(bytes).unwrap();
+            let public = key.public_key().to_vec();
+            (Box::new(key), public)
+        } else {
+            // RFC 8410 sections 3 and 7: absent parameters and an inner
+            // CurvePrivateKey OCTET STRING, not raw PKCS#8 wrapper bytes.
+            // https://www.rfc-editor.org/rfc/rfc8410.html#section-7
+            let info = pkcs8::PrivateKeyInfoRef::try_from(bytes).unwrap();
+            assert_eq!(
+                info.algorithm.oid,
+                pkcs8::ObjectIdentifier::new_unwrap("1.3.101.110")
+            );
+            assert!(info.algorithm.parameters.is_none());
+            let inner =
+                <&der::asn1::OctetStringRef>::from_der(info.private_key.as_bytes()).unwrap();
+            let key = RustCryptoX25519Key::from_bytes(inner.as_bytes().try_into().unwrap());
+            let public = key.public_key().to_vec();
+            (Box::new(key), public)
+        }
+    };
+    let encrypted = std::fs::read(format!(
+        "tests/fixtures/xmlenc/keys/xdh/xdh-{curve}-{party}-key.p8-der"
+    ))
+    .unwrap();
+    let plain = pkcs8::EncryptedPrivateKeyInfoRef::try_from(encrypted.as_slice())
+        .unwrap()
+        .decrypt("secret123")
+        .unwrap();
+    let key = decode(plain.as_bytes());
+    let unprotected = std::fs::read(format!(
+        "tests/fixtures/xmlenc/keys/xdh/xdh-{curve}-{party}-key.der"
+    ))
+    .unwrap();
+    assert_eq!(key.1, decode(&unprotected).1);
+    key
+}
+
+/// The `KeyDerivationMethod` of a pinned donor XDH recipe.
+fn donor_xdh_kdf_xml(family: &str, hash: &str) -> String {
+    if family == "concatkdf" {
+        let hash_uri = if hash == "sha256" {
+            "http://www.w3.org/2001/04/xmlenc#sha256"
+        } else {
+            "http://www.w3.org/2001/04/xmldsig-more#sha384"
+        };
+        format!(
+            "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><x:ConcatKDFParams AlgorithmID='00123456' PartyUInfo='00123456' PartyVInfo='00123456'><d:DigestMethod xmlns:d='http://www.w3.org/2000/09/xmldsig#' Algorithm='{hash_uri}'/></x:ConcatKDFParams></x:KeyDerivationMethod>"
+        )
+    } else {
+        format!(
+            "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2021/04/xmldsig-more#hkdf'><h:HKDFParams xmlns:h='http://www.w3.org/2021/04/xmldsig-more#'><h:PRF Algorithm='http://www.w3.org/2001/04/xmldsig-more#hmac-{hash}'/><h:Salt>AAECAwQFBgcICQoL</h:Salt><h:KeyLength>32</h:KeyLength></h:HKDFParams></x:KeyDerivationMethod>"
+        )
+    }
+}
+
 #[test]
 fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
-    use der::Decode as _;
     use std::collections::HashSet;
     use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
-    use xml_sec::provider::{
-        CryptoProvider, KeyAgreementKey, RUST_CRYPTO_PROVIDER, RustCryptoX448Key,
-        RustCryptoX25519Key,
-    };
-    use xml_sec::xmldsig::parse::{KeyInfo, KeyInfoSource};
     use xml_sec::xmlenc::{
         AgreementDecryptor, AgreementMethod, KeyWrapAlgorithm, parse_key_derivation_method,
     };
@@ -905,47 +968,8 @@ fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
         ("x25519", KeyAgreementAlgorithm::X25519),
         ("x448", KeyAgreementAlgorithm::X448),
     ] {
-        let decode = |bytes: &[u8]| -> (Box<dyn KeyAgreementKey>, Vec<u8>) {
-            if algorithm == KeyAgreementAlgorithm::X448 {
-                let key = RustCryptoX448Key::from_pkcs8_der(bytes).unwrap();
-                let public = key.public_key().to_vec();
-                (Box::new(key), public)
-            } else {
-                // RFC 8410 sections 3 and 7: absent parameters and an inner
-                // CurvePrivateKey OCTET STRING, not raw PKCS#8 wrapper bytes.
-                // https://www.rfc-editor.org/rfc/rfc8410.html#section-7
-                let info = pkcs8::PrivateKeyInfoRef::try_from(bytes).unwrap();
-                assert_eq!(
-                    info.algorithm.oid,
-                    pkcs8::ObjectIdentifier::new_unwrap("1.3.101.110")
-                );
-                assert!(info.algorithm.parameters.is_none());
-                let inner =
-                    <&der::asn1::OctetStringRef>::from_der(info.private_key.as_bytes()).unwrap();
-                let key = RustCryptoX25519Key::from_bytes(inner.as_bytes().try_into().unwrap());
-                let public = key.public_key().to_vec();
-                (Box::new(key), public)
-            }
-        };
-        let import = |party: &str| {
-            let encrypted = std::fs::read(format!(
-                "tests/fixtures/xmlenc/keys/xdh/xdh-{curve}-{party}-key.p8-der"
-            ))
-            .unwrap();
-            let plain = pkcs8::EncryptedPrivateKeyInfoRef::try_from(encrypted.as_slice())
-                .unwrap()
-                .decrypt("secret123")
-                .unwrap();
-            let key = decode(plain.as_bytes());
-            let unprotected = std::fs::read(format!(
-                "tests/fixtures/xmlenc/keys/xdh/xdh-{curve}-{party}-key.der"
-            ))
-            .unwrap();
-            assert_eq!(key.1, decode(&unprotected).1);
-            key
-        };
-        let (_originator, peer) = import("first");
-        let (recipient, _recipient_public) = import("second");
+        let (_originator, peer) = pinned_xdh_key(curve, "first");
+        let (recipient, _recipient_public) = pinned_xdh_key(curve, "second");
         let mut policy = DecryptionPolicy::default();
         policy.key_establishment.agreement_algorithms = Some(HashSet::from([algorithm]));
         for (family, hash) in [
@@ -957,32 +981,14 @@ fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
         ] {
             let name = format!("enc_xdh_{curve}_{family}_{hash}_kw_aes256_aes128gcm");
             // Expectations come from the donor test recipe, not from the message.
-            let method_xml = if family == "concatkdf" {
-                let hash_uri = if hash == "sha256" {
-                    "http://www.w3.org/2001/04/xmlenc#sha256"
-                } else {
-                    "http://www.w3.org/2001/04/xmldsig-more#sha384"
-                };
-                format!(
-                    "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><x:ConcatKDFParams AlgorithmID='00123456' PartyUInfo='00123456' PartyVInfo='00123456'><d:DigestMethod xmlns:d='http://www.w3.org/2000/09/xmldsig#' Algorithm='{hash_uri}'/></x:ConcatKDFParams></x:KeyDerivationMethod>"
-                )
-            } else {
-                format!(
-                    "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2021/04/xmldsig-more#hkdf'><h:HKDFParams xmlns:h='http://www.w3.org/2021/04/xmldsig-more#'><h:PRF Algorithm='http://www.w3.org/2001/04/xmldsig-more#hmac-{hash}'/><h:Salt>AAECAwQFBgcICQoL</h:Salt><h:KeyLength>32</h:KeyLength></h:HKDFParams></x:KeyDerivationMethod>"
-                )
-            };
-            let role = |name: &str| {
-                let mut info = KeyInfo::default();
-                info.sources.push(KeyInfoSource::KeyName(name.into()));
-                Some(info)
-            };
+            let method_xml = donor_xdh_kdf_xml(family, hash);
             let expected = AgreementMethod {
                 algorithm,
                 method: Some(parse_key_derivation_method(&method_xml, &policy).unwrap()),
                 nonce: Vec::new(),
                 legacy_digest: None,
-                originator: role("originator-key-name"),
-                recipient: role("recipient-key-name"),
+                originator: Some(key_name_info("originator-key-name")),
+                recipient: Some(key_name_info("recipient-key-name")),
             };
             let xml = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.xml")).unwrap();
             let resolver = AgreementDecryptor::wrapping(
@@ -1011,34 +1017,14 @@ fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
                     ),
                     "{name}: {result:?}"
                 );
-                let parsed = parse_encrypted_data(&xml).unwrap();
-                let mut budget =
-                    xml_sec::xmlenc::KeyEstablishmentBudget::new(&policy.key_establishment)
-                        .unwrap();
-                let kek = expected
-                    .derive_key(
-                        KeyWrapAlgorithm::AesKw256.uri(),
-                        32,
-                        recipient.as_ref(),
-                        &peer,
-                        &RUST_CRYPTO_PROVIDER,
-                        &mut budget,
-                    )
-                    .unwrap();
-                let xml_sec::xmlenc::CipherData::Value { value } =
-                    &parsed.encrypted_keys[0].cipher_data
-                else {
-                    panic!("donor requires CipherValue")
-                };
-                let wrapped = STANDARD.decode(value).unwrap();
-                let recovered = zeroize::Zeroizing::new(
-                    RUST_CRYPTO_PROVIDER
-                        .unwrap_key(KeyWrapAlgorithm::AesKw256, &kek, &wrapped)
-                        .unwrap(),
+                assert_documented_surplus_cek(
+                    &xml,
+                    &name,
+                    &expected,
+                    recipient.as_ref(),
+                    &peer,
+                    &policy,
                 );
-                assert_eq!(recovered.len(), 32, "{name}: actual CEK width");
-                assert_surplus_cek_plaintext(&xml, &name, &recovered);
-                completed_vector(VECTOR_DIR, &name, CorpusOutcome::DocumentedDeparture);
                 continue;
             }
             let actual = result.unwrap_or_else(|error| panic!("{name}: {error}"));
@@ -1561,13 +1547,13 @@ fn decrypts_merlin_signature_documents_without_mutating_other_targets() {
             .find(|node| node.attribute("Id") == Some("encrypt-data-0"))
             .unwrap();
         let cipher = parse_encrypted_data(&xml[target.range()]).unwrap();
-        let DecryptedContent::Xml(content) = context.decrypt_data(&cipher).unwrap() else {
+        let DecryptedContent::Xml(decrypted) = context.decrypt_data(&cipher).unwrap() else {
             panic!("{name}: Content plaintext must be XML");
         };
         let wrapper =
             |content: &str| format!("<PaymentInfo xmlns='urn:example:po'>{content}</PaymentInfo>");
         assert_eq!(
-            canonicalize_xml(wrapper(&content).as_bytes(), &algorithm).unwrap(),
+            canonicalize_xml(wrapper(&decrypted).as_bytes(), &algorithm).unwrap(),
             canonicalize_xml(wrapper(expected_content).as_bytes(), &algorithm).unwrap(),
             "{name}"
         );
@@ -1900,15 +1886,7 @@ fn verifies_merlin_signatures_after_authenticated_symmetric_key_unwrap() {
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
             .unwrap();
-        let wrapped = STANDARD
-            .decode(
-                value
-                    .text()
-                    .unwrap()
-                    .split_ascii_whitespace()
-                    .collect::<String>(),
-            )
-            .unwrap();
+        let wrapped = base64_text(value);
         let key = HmacVerificationKey::new(
             RUST_CRYPTO_PROVIDER
                 .unwrap_key(wrapping, kek, &wrapped)
@@ -2040,16 +2018,47 @@ fn validates_merlin_rsa_transported_hmac_keys_without_exporting_recovered_keys()
     }
 }
 
+/// The original W3C archive DH recipient credentials and the policy that
+/// admits them.
+#[cfg(feature = "legacy-algorithms")]
+struct MerlinDh {
+    key: xml_sec::provider::RustCryptoDhKey,
+    p: Vec<u8>,
+    q: Vec<u8>,
+    g: Vec<u8>,
+    policy: xml_sec::policy::DecryptionPolicy,
+}
+
+/// Base64 text of `node`, ignoring the whitespace that wraps archive values.
+#[cfg(feature = "legacy-algorithms")]
+fn base64_text(node: xml_sec::Node<'_, '_>) -> Vec<u8> {
+    STANDARD
+        .decode(
+            node.text()
+                .unwrap()
+                .split_ascii_whitespace()
+                .collect::<String>(),
+        )
+        .unwrap()
+}
+
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn decrypts_merlin_dh_with_original_w3c_credentials() {
+    let dh = merlin_dh_credentials();
+    decrypts_merlin_dh_encryption_vectors(&dh);
+    #[cfg(feature = "xmldsig")]
+    verifies_merlin_dh_signatures(&dh);
+}
+
+#[cfg(feature = "legacy-algorithms")]
+fn merlin_dh_credentials() -> MerlinDh {
     use der::{Decode as _, Reader as _, asn1::UintRef};
     use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm, KeyDerivationAlgorithm};
     use xml_sec::provider::{RUST_CRYPTO_PROVIDER, RustCryptoDhKey};
     use xml_sec::xmldsig::DigestAlgorithm;
     use xml_sec::xmlenc::{
-        AgreementDecryptor, DataEncryptionAlgorithm as D, KeyEstablishmentBudget,
-        KeyWrapAlgorithm as W,
+        DataEncryptionAlgorithm as D, KeyEstablishmentBudget, KeyWrapAlgorithm as W,
     };
 
     // Original archive credentials have a separate pinned provenance; the
@@ -2100,6 +2109,21 @@ fn decrypts_merlin_dh_with_original_w3c_credentials() {
         private.as_bytes(),
     )
     .unwrap();
+    MerlinDh {
+        key,
+        p: p.as_bytes().to_vec(),
+        q: q.as_bytes().to_vec(),
+        g: g.as_bytes().to_vec(),
+        policy,
+    }
+}
+
+/// Decrypt both archive DH encryption vectors with the original credentials.
+#[cfg(feature = "legacy-algorithms")]
+fn decrypts_merlin_dh_encryption_vectors(dh: &MerlinDh) {
+    use xml_sec::xmlenc::{
+        AgreementDecryptor, DataEncryptionAlgorithm as D, KeyWrapAlgorithm as W,
+    };
     let expected = std::fs::read(format!("{MERLIN_DIR}/plaintext.xml")).unwrap();
     for (name, wrapped) in [
         ("encrypt-content-aes192-cbc-dh-sha512", false),
@@ -2111,7 +2135,8 @@ fn decrypts_merlin_dh_with_original_w3c_credentials() {
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData")))
             .unwrap();
-        let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy).unwrap();
+        let parsed =
+            xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &dh.policy).unwrap();
         let method = if wrapped {
             &parsed.encrypted_keys[0].sources.agreement_methods[0]
         } else {
@@ -2123,22 +2148,14 @@ fn decrypts_merlin_dh_with_original_w3c_credentials() {
             .descendants()
             .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "Public")))
             .unwrap();
-        let peer = STANDARD
-            .decode(
-                public
-                    .text()
-                    .unwrap()
-                    .split_ascii_whitespace()
-                    .collect::<String>(),
-            )
-            .unwrap();
+        let peer = base64_text(public);
         let resolver = if wrapped {
-            AgreementDecryptor::wrapping(method, &key, &peer, W::AesKw256)
+            AgreementDecryptor::wrapping(method, &dh.key, &peer, W::AesKw256)
         } else {
-            AgreementDecryptor::content(method, &key, &peer, D::Aes192Cbc)
+            AgreementDecryptor::content(method, &dh.key, &peer, D::Aes192Cbc)
         };
         let actual = DecryptContext::new(&resolver)
-            .policy(policy.clone())
+            .policy(dh.policy.clone())
             .decrypt_document(&encrypted, None)
             .unwrap_or_else(|error| panic!("{name}: {error}"));
         assert_eq!(
@@ -2148,236 +2165,228 @@ fn decrypts_merlin_dh_with_original_w3c_credentials() {
         );
         completed_vector(MERLIN_DIR, name, CorpusOutcome::Decrypted);
     }
-    #[cfg(feature = "xmldsig")]
-    {
-        use xml_sec::provider::CryptoProvider as _;
-        use xml_sec::xmldsig::{
-            DsigStatus, HmacVerificationKey, SignatureAlgorithm, UriTypeSet, VerifyContext,
+}
+
+/// Check the archive `AgreementMethod` carries the expected fixed DH inputs
+/// and recipient binding; returns the originator public value.
+#[cfg(all(feature = "legacy-algorithms", feature = "xmldsig"))]
+fn merlin_dh_agreement_peer(document: &Document<'_>, dh: &MerlinDh, name: &str) -> Vec<u8> {
+    use der::{Decode as _, asn1::UintRef};
+    use xml_sec::policy::KeyAgreementAlgorithm;
+    use xml_sec::xmldsig::DigestAlgorithm;
+    let agreement = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "AgreementMethod")))
+        .unwrap();
+    assert_eq!(
+        agreement.attribute("Algorithm"),
+        Some(KeyAgreementAlgorithm::LegacyDh.uri())
+    );
+    let field = |local| {
+        agreement
+            .descendants()
+            .find(|node| node.tag_name().name() == local)
+            .unwrap()
+    };
+    let decode = |local| base64_text(field(local));
+    assert_eq!(decode("KA-Nonce"), b"nonce");
+    assert_eq!(
+        field("DigestMethod").attribute("Algorithm"),
+        Some(DigestAlgorithm::Sha256.uri())
+    );
+    assert_eq!(decode("P"), dh.p);
+    assert_eq!(decode("Q"), dh.q);
+    assert_eq!(decode("Generator"), dh.g);
+    let recipient_info = agreement
+        .children()
+        .find(|node| node.tag_name().name() == "RecipientKeyInfo")
+        .unwrap();
+    let cert_node = recipient_info
+        .descendants()
+        .find(|node| node.tag_name().name() == "X509Certificate")
+        .unwrap();
+    let cert = x509_cert::Certificate::from_der(&base64_text(cert_node)).unwrap();
+    let recipient_public = UintRef::from_der(
+        cert.tbs_certificate()
+            .subject_public_key_info()
+            .subject_public_key
+            .as_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        recipient_public.as_bytes(),
+        dh.key.public_key(),
+        "{name}: recipient binding"
+    );
+    decode("Public")
+}
+
+/// Verify both archive DH-keyed HMAC signatures with the original credentials.
+#[cfg(all(feature = "legacy-algorithms", feature = "xmldsig"))]
+fn verifies_merlin_dh_signatures(dh: &MerlinDh) {
+    use xml_sec::policy::KeyAgreementAlgorithm;
+    use xml_sec::provider::{CryptoProvider as _, RUST_CRYPTO_PROVIDER};
+    use xml_sec::xmldsig::{
+        DigestAlgorithm, DsigStatus, HmacVerificationKey, SignatureAlgorithm, UriTypeSet,
+        VerifyContext,
+    };
+    use xml_sec::xmlenc::{KeyEstablishmentBudget, KeyWrapAlgorithm as W};
+    let resources = HashMap::from([(
+        "http://www.w3.org/TR/xml-stylesheet".to_owned(),
+        std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
+    )]);
+    for (name, wrapped) in [
+        ("encsig-hmac-sha256-kw-tripledes-dh", true),
+        ("encsig-hmac-sha256-dh", false),
+    ] {
+        // Fixed archive party binding and KDF inputs are expected values,
+        // not permissions or defaults inferred from an untrusted document.
+        let xml = std::fs::read_to_string(format!("{MERLIN_DIR}/{name}.xml")).unwrap();
+        let document = Document::parse(&xml).unwrap();
+        let peer = merlin_dh_agreement_peer(&document, dh, name);
+        let method = xml_sec::xmlenc::AgreementMethod {
+            algorithm: KeyAgreementAlgorithm::LegacyDh,
+            method: None,
+            nonce: b"nonce".to_vec(),
+            legacy_digest: Some(DigestAlgorithm::Sha256.uri().into()),
+            originator: None,
+            recipient: None,
         };
-        let resources = HashMap::from([(
-            "http://www.w3.org/TR/xml-stylesheet".to_owned(),
-            std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
-        )]);
-        for (name, wrapped) in [
-            ("encsig-hmac-sha256-kw-tripledes-dh", true),
-            ("encsig-hmac-sha256-dh", false),
-        ] {
-            // Fixed archive party binding and KDF inputs are expected values,
-            // not permissions or defaults inferred from an untrusted document.
-            let xml = std::fs::read_to_string(format!("{MERLIN_DIR}/{name}.xml")).unwrap();
-            let document = Document::parse(&xml).unwrap();
-            let agreement = document
-                .descendants()
-                .find(|node| {
-                    node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "AgreementMethod"))
-                })
-                .unwrap();
-            assert_eq!(
-                agreement.attribute("Algorithm"),
-                Some(KeyAgreementAlgorithm::LegacyDh.uri())
-            );
-            let field = |local| {
-                agreement
-                    .descendants()
-                    .find(|node| node.tag_name().name() == local)
-                    .unwrap()
-            };
-            let decode = |local| {
-                STANDARD
-                    .decode(
-                        field(local)
-                            .text()
-                            .unwrap()
-                            .split_ascii_whitespace()
-                            .collect::<String>(),
-                    )
-                    .unwrap()
-            };
-            assert_eq!(decode("KA-Nonce"), b"nonce");
-            assert_eq!(
-                field("DigestMethod").attribute("Algorithm"),
-                Some(DigestAlgorithm::Sha256.uri())
-            );
-            assert_eq!(decode("P"), p.as_bytes());
-            assert_eq!(decode("Q"), q.as_bytes());
-            assert_eq!(decode("Generator"), g.as_bytes());
-            let recipient_info = agreement
-                .children()
-                .find(|node| node.tag_name().name() == "RecipientKeyInfo")
-                .unwrap();
-            let cert_node = recipient_info
-                .descendants()
-                .find(|node| node.tag_name().name() == "X509Certificate")
-                .unwrap();
-            let cert_bytes = STANDARD
-                .decode(
-                    cert_node
-                        .text()
-                        .unwrap()
-                        .split_ascii_whitespace()
-                        .collect::<String>(),
-                )
-                .unwrap();
-            let cert = x509_cert::Certificate::from_der(&cert_bytes).unwrap();
-            let recipient_public = UintRef::from_der(
-                cert.tbs_certificate()
-                    .subject_public_key_info()
-                    .subject_public_key
-                    .as_bytes()
-                    .unwrap(),
+        let mut signing_budget = KeyEstablishmentBudget::new(&dh.policy.key_establishment).unwrap();
+        let consuming = if wrapped {
+            W::TripleDes.uri()
+        } else {
+            SignatureAlgorithm::HmacSha256.uri()
+        };
+        let derived = method
+            .derive_key(
+                consuming,
+                if wrapped { 24 } else { 32 },
+                &dh.key,
+                &peer,
+                &RUST_CRYPTO_PROVIDER,
+                &mut signing_budget,
             )
             .unwrap();
-            assert_eq!(
-                recipient_public.as_bytes(),
-                key.public_key(),
-                "{name}: recipient binding"
-            );
-            let peer = decode("Public");
-            let method = xml_sec::xmlenc::AgreementMethod {
-                algorithm: KeyAgreementAlgorithm::LegacyDh,
-                method: None,
-                nonce: b"nonce".to_vec(),
-                legacy_digest: Some(DigestAlgorithm::Sha256.uri().into()),
-                originator: None,
-                recipient: None,
-            };
-            let mut signing_budget =
-                KeyEstablishmentBudget::new(&policy.key_establishment).unwrap();
-            let consuming = if wrapped {
-                W::TripleDes.uri()
-            } else {
-                SignatureAlgorithm::HmacSha256.uri()
-            };
-            let derived = method
-                .derive_key(
-                    consuming,
-                    if wrapped { 24 } else { 32 },
-                    &key,
-                    &peer,
-                    &RUST_CRYPTO_PROVIDER,
-                    &mut signing_budget,
-                )
+        let secret = if wrapped {
+            let value = document
+                .descendants()
+                .find(|node| {
+                    node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue"))
+                })
                 .unwrap();
-            let secret = if wrapped {
-                let value = document
-                    .descendants()
-                    .find(|node| {
-                        node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue"))
-                    })
-                    .unwrap();
-                let cipher = STANDARD
-                    .decode(
-                        value
-                            .text()
-                            .unwrap()
-                            .split_ascii_whitespace()
-                            .collect::<String>(),
-                    )
-                    .unwrap();
-                RUST_CRYPTO_PROVIDER
-                    .unwrap_key(W::TripleDes, &derived, &cipher)
-                    .unwrap()
-            } else {
-                derived.to_vec()
-            };
-            let verifier = HmacVerificationKey::new(secret).unwrap();
-            if !wrapped {
-                use xml_sec::xmldsig::{FailureReason, VerifyingKey as _};
-
-                // The archive Readme selects a 256-bit HMAC key. Our caller
-                // explicitly binds the consuming HMAC URI to the legacy KDF;
-                // XMLEnc 1.1 section 5.6.2.2 specifies that KDF for encryption,
-                // not an automatic AgreementMethod-to-SignatureMethod mapping.
-                // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DHKeyAgreementLegacyKDF
-                // OpenSSL independently reproduced the DH shared secret and
-                // the HMAC below; libxml2 reproduced canonical SignedInfo.
-                // The original tag does not match this explicit binding. Keep
-                // that rejection distinct from unsupported algorithms and from
-                // the passing DH-to-wrapped-HMAC vector above.
-                let si = document
-                    .descendants()
-                    .find(|node| {
-                        node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo"))
-                    })
-                    .unwrap();
-                let visible =
-                    |node: xml_sec::Node<'_, '_>| node.ancestors().any(|ancestor| ancestor == si);
-                let mut canonical = Vec::new();
-                canonicalize(
-                    &document,
-                    Some(&visible),
-                    &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
-                    &mut canonical,
-                )
-                .unwrap();
-                let expected = hex_literal::hex!(
-                    "ec8acd98c413c7bb9ca0aa4adc8d1f0da59408d1515fb795f4b13d66a78c103a"
-                );
-                assert!(
-                    verifier
-                        .verify(SignatureAlgorithm::HmacSha256, &canonical, &expected)
-                        .unwrap()
-                );
-                let value = document
-                    .descendants()
-                    .find(|node| {
-                        node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue"))
-                    })
-                    .unwrap()
-                    .text()
-                    .unwrap();
-                let original = STANDARD
-                    .decode(value.split_ascii_whitespace().collect::<String>())
-                    .unwrap();
-                assert!(
-                    !verifier
-                        .verify(SignatureAlgorithm::HmacSha256, &canonical, &original)
-                        .unwrap()
-                );
-                let original_result = VerifyContext::new()
-                    .key(&verifier)
-                    .allowed_uri_types(UriTypeSet::ALL)
-                    .external_resources(&resources)
-                    .verify(&xml)
-                    .unwrap();
-                assert_eq!(
-                    original_result.status,
-                    DsigStatus::Invalid(FailureReason::SignatureMismatch),
-                    "{name}: unmodified archive tag",
-                );
-                // A positive counterpart replaces only SignatureValue in
-                // memory, never the archived file or its signed reference.
-                // This checks that full verification succeeds with the
-                // independently computed tag under the same explicit binding.
-                let counterpart = xml.replacen(value, &STANDARD.encode(expected), 1);
-                let positive = VerifyContext::new()
-                    .key(&verifier)
-                    .allowed_uri_types(UriTypeSet::ALL)
-                    .external_resources(&resources)
-                    .verify(&counterpart)
-                    .unwrap();
-                assert_eq!(positive.status, DsigStatus::Valid, "{name}: counterpart");
-                assert_eq!(positive.signed_info_references.len(), 1);
-                assert_eq!(positive.signed_info_references[0].status, DsigStatus::Valid);
-                completed_vector(MERLIN_DIR, name, CorpusOutcome::DocumentedDeparture);
-                continue;
-            }
-            let result = VerifyContext::new()
-                .key(&verifier)
-                .allowed_uri_types(UriTypeSet::ALL)
-                .external_resources(&resources)
-                .verify(&xml)
-                .unwrap();
-            assert_eq!(result.status, DsigStatus::Valid, "{name}");
-            assert_eq!(result.signed_info_references.len(), 1, "{name}");
-            assert_eq!(
-                result.signed_info_references[0].status,
-                DsigStatus::Valid,
-                "{name}"
-            );
-            completed_vector(MERLIN_DIR, name, CorpusOutcome::Decrypted);
+            RUST_CRYPTO_PROVIDER
+                .unwrap_key(W::TripleDes, &derived, &base64_text(value))
+                .unwrap()
+        } else {
+            derived.to_vec()
+        };
+        let verifier = HmacVerificationKey::new(secret).unwrap();
+        if !wrapped {
+            assert_documented_dh_hmac_departure(&document, &xml, name, &verifier, &resources);
+            continue;
         }
+        let result = VerifyContext::new()
+            .key(&verifier)
+            .allowed_uri_types(UriTypeSet::ALL)
+            .external_resources(&resources)
+            .verify(&xml)
+            .unwrap();
+        assert_eq!(result.status, DsigStatus::Valid, "{name}");
+        assert_eq!(result.signed_info_references.len(), 1, "{name}");
+        assert_eq!(
+            result.signed_info_references[0].status,
+            DsigStatus::Valid,
+            "{name}"
+        );
+        completed_vector(MERLIN_DIR, name, CorpusOutcome::Decrypted);
     }
+}
+
+/// The archive's DH-keyed HMAC tag does not match the explicit KDF binding;
+/// document that departure and verify the recomputed counterpart instead.
+#[cfg(all(feature = "legacy-algorithms", feature = "xmldsig"))]
+fn assert_documented_dh_hmac_departure(
+    document: &Document<'_>,
+    xml: &str,
+    name: &str,
+    verifier: &xml_sec::xmldsig::HmacVerificationKey,
+    resources: &HashMap<String, Vec<u8>>,
+) {
+    use xml_sec::xmldsig::{
+        DsigStatus, FailureReason, SignatureAlgorithm, UriTypeSet, VerifyContext, VerifyingKey as _,
+    };
+    // The archive Readme selects a 256-bit HMAC key. Our caller
+    // explicitly binds the consuming HMAC URI to the legacy KDF;
+    // XMLEnc 1.1 section 5.6.2.2 specifies that KDF for encryption,
+    // not an automatic AgreementMethod-to-SignatureMethod mapping.
+    // https://www.w3.org/TR/2013/REC-xmlenc-core1-20130411/#sec-DHKeyAgreementLegacyKDF
+    // OpenSSL independently reproduced the DH shared secret and
+    // the HMAC below; libxml2 reproduced canonical SignedInfo.
+    // The original tag does not match this explicit binding. Keep
+    // that rejection distinct from unsupported algorithms and from
+    // the passing DH-to-wrapped-HMAC vector.
+    let si = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
+        .unwrap();
+    let visible = |node: xml_sec::Node<'_, '_>| node.ancestors().any(|ancestor| ancestor == si);
+    let mut canonical = Vec::new();
+    canonicalize(
+        document,
+        Some(&visible),
+        &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+        &mut canonical,
+    )
+    .unwrap();
+    let expected =
+        hex_literal::hex!("ec8acd98c413c7bb9ca0aa4adc8d1f0da59408d1515fb795f4b13d66a78c103a");
+    assert!(
+        verifier
+            .verify(SignatureAlgorithm::HmacSha256, &canonical, &expected)
+            .unwrap()
+    );
+    let value = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignatureValue")))
+        .unwrap()
+        .text()
+        .unwrap();
+    let original = STANDARD
+        .decode(value.split_ascii_whitespace().collect::<String>())
+        .unwrap();
+    assert!(
+        !verifier
+            .verify(SignatureAlgorithm::HmacSha256, &canonical, &original)
+            .unwrap()
+    );
+    let original_result = VerifyContext::new()
+        .key(verifier)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(resources)
+        .verify(xml)
+        .unwrap();
+    assert_eq!(
+        original_result.status,
+        DsigStatus::Invalid(FailureReason::SignatureMismatch),
+        "{name}: unmodified archive tag",
+    );
+    // A positive counterpart replaces only SignatureValue in
+    // memory, never the archived file or its signed reference.
+    // This checks that full verification succeeds with the
+    // independently computed tag under the same explicit binding.
+    let counterpart = xml.replacen(value, &STANDARD.encode(expected), 1);
+    let positive = VerifyContext::new()
+        .key(verifier)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(resources)
+        .verify(&counterpart)
+        .unwrap();
+    assert_eq!(positive.status, DsigStatus::Valid, "{name}: counterpart");
+    assert_eq!(positive.signed_info_references.len(), 1);
+    assert_eq!(positive.signed_info_references[0].status, DsigStatus::Valid);
+    completed_vector(MERLIN_DIR, name, CorpusOutcome::DocumentedDeparture);
 }
 
 fn read_nist_keys(path: &Path) -> HashMap<String, Vec<u8>> {
@@ -2390,12 +2399,12 @@ fn read_nist_keys(path: &Path) -> HashMap<String, Vec<u8>> {
             let name = key_info
                 .descendants()
                 .find(|node| node.tag_name().name() == "KeyName")
-                .and_then(|node| node.text())
+                .and_then(xml_sec::Node::text)
                 .expect("NIST KeyInfo must contain KeyName");
             let value = key_info
                 .descendants()
                 .find(|node| node.tag_name().name() == "AESKeyValue")
-                .and_then(|node| node.text())
+                .and_then(xml_sec::Node::text)
                 .expect("NIST KeyInfo must contain AESKeyValue");
             let key = STANDARD
                 .decode(value.trim())
@@ -2445,7 +2454,7 @@ fn vector_key_name(xml: &str) -> String {
     document
         .descendants()
         .find(|node| node.tag_name().name() == "KeyName")
-        .and_then(|node| node.text())
+        .and_then(xml_sec::Node::text)
         .expect("NIST vector must name its AES key")
         .to_owned()
 }
@@ -3018,16 +3027,16 @@ fn rejects_original_phaos_bad_wrapping_with_permitted_algorithms() {
 fn complete_corpora_execute_every_vector_exactly_once() {
     // Classification comes from successful execution/assertions, never from
     // filenames mentioned in source, file counts or unsupported capabilities.
-    corpus_snapshot::verify();
     struct Collection;
     impl Drop for Collection {
         fn drop(&mut self) {
             COMPLETED_VECTORS.with(|completed| *completed.borrow_mut() = None);
         }
     }
+    corpus_snapshot::verify();
     COMPLETED_VECTORS.with(|completed| {
         assert!(completed.borrow().is_none());
-        *completed.borrow_mut() = Some(Default::default());
+        *completed.borrow_mut() = Some(std::collections::BTreeMap::default());
     });
     let _collection = Collection;
     decrypts_every_chacha_donor_vector_and_authenticates_aad();

@@ -1,5 +1,5 @@
-//! Bit-oriented hash framing for XMLEnc ConcatKDF. Compression and initial
-//! states come from RustCrypto; this adapter only supplies message padding.
+//! Bit-oriented hash framing for `XMLEnc` `ConcatKDF`. Compression and initial
+//! states come from `RustCrypto`; this adapter only supplies message padding.
 
 use sha2::digest::{block_api::VariableOutputCore, common::hazmat::SerializableState};
 
@@ -19,7 +19,7 @@ pub(super) fn hash(
         + bit_len as u128;
     macro_rules! hash {
         ($initial:expr, $word:ty, $words:expr, $block:expr, $length:expr, $compress:path) => {{
-            if $length == 8 && total_bits > u64::MAX as u128 {
+            if $length == 8 && total_bits > u128::from(u64::MAX) {
                 return Err(ProviderError::InvalidInput(
                     ProviderInputError::ConcatKdfParameters,
                 ));
@@ -49,40 +49,11 @@ pub(super) fn hash(
             Ok(output)
         }};
     }
-    macro_rules! sha3_hash {
-        ($hash:ty) => {{
-            use crate::rustcrypto_sha3::Digest as _;
-            let mut hash = <$hash>::new();
-            for prefix in prefixes {
-                hash.update(prefix);
-            }
-            hash.update(&tail[..bit_len / 8]);
-            let remainder = (bit_len % 8) as u8;
-            // XMLEnc bit strings use significant high bits; the RustCrypto
-            // bit-tail API uses FIPS 202 Appendix B.1's LSB-first encoding.
-            // https://www.w3.org/TR/xmlenc-core1/#sec-ConcatKDF
-            // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf
-            let final_byte = if remainder == 0 {
-                0
-            } else {
-                tail[bit_len / 8].reverse_bits()
-            };
-            let mut digest = hash
-                .finalize_with_bits(final_byte, remainder)
-                .map_err(|_| {
-                    ProviderError::InvalidInput(ProviderInputError::ConcatKdfParameters)
-                })?;
-            let mut output = zeroize::Zeroizing::new([0; 64]);
-            output[..digest.len()].copy_from_slice(&digest);
-            zeroize::Zeroize::zeroize(&mut digest);
-            Ok(output)
-        }};
-    }
     match algorithm {
-        DigestAlgorithm::Sha3_224 => sha3_hash!(crate::rustcrypto_sha3::Sha3_224),
-        DigestAlgorithm::Sha3_256 => sha3_hash!(crate::rustcrypto_sha3::Sha3_256),
-        DigestAlgorithm::Sha3_384 => sha3_hash!(crate::rustcrypto_sha3::Sha3_384),
-        DigestAlgorithm::Sha3_512 => sha3_hash!(crate::rustcrypto_sha3::Sha3_512),
+        DigestAlgorithm::Sha3_224
+        | DigestAlgorithm::Sha3_256
+        | DigestAlgorithm::Sha3_384
+        | DigestAlgorithm::Sha3_512 => hash_sha3(algorithm, prefixes, tail, bit_len),
         DigestAlgorithm::Sha1 => hash!(
             sha1::block_api::Sha1Core::default(),
             u32,
@@ -125,6 +96,52 @@ pub(super) fn hash(
             total_bits,
             algorithm.output_len(),
         ),
+    }
+}
+
+fn hash_sha3(
+    algorithm: DigestAlgorithm,
+    prefixes: &[&[u8]],
+    tail: &[u8],
+    bit_len: usize,
+) -> Result<zeroize::Zeroizing<[u8; 64]>, ProviderError> {
+    macro_rules! sha3_hash {
+        ($hash:ty) => {{
+            use crate::rustcrypto_sha3::Digest as _;
+            let mut hash = <$hash>::new();
+            for prefix in prefixes {
+                hash.update(prefix);
+            }
+            hash.update(&tail[..bit_len / 8]);
+            let remainder = u8::try_from(bit_len % 8).map_err(|_| {
+                ProviderError::InvalidInput(ProviderInputError::ConcatKdfParameters)
+            })?;
+            // XMLEnc bit strings use significant high bits; the RustCrypto
+            // bit-tail API uses FIPS 202 Appendix B.1's LSB-first encoding.
+            // https://www.w3.org/TR/xmlenc-core1/#sec-ConcatKDF
+            // https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf
+            let final_byte = if remainder == 0 {
+                0
+            } else {
+                tail[bit_len / 8].reverse_bits()
+            };
+            let mut digest = hash
+                .finalize_with_bits(final_byte, remainder)
+                .map_err(|_| {
+                    ProviderError::InvalidInput(ProviderInputError::ConcatKdfParameters)
+                })?;
+            let mut output = zeroize::Zeroizing::new([0; 64]);
+            output[..digest.len()].copy_from_slice(&digest);
+            zeroize::Zeroize::zeroize(&mut digest);
+            Ok(output)
+        }};
+    }
+    match algorithm {
+        DigestAlgorithm::Sha3_224 => sha3_hash!(crate::rustcrypto_sha3::Sha3_224),
+        DigestAlgorithm::Sha3_256 => sha3_hash!(crate::rustcrypto_sha3::Sha3_256),
+        DigestAlgorithm::Sha3_384 => sha3_hash!(crate::rustcrypto_sha3::Sha3_384),
+        DigestAlgorithm::Sha3_512 => sha3_hash!(crate::rustcrypto_sha3::Sha3_512),
+        _ => unreachable!("SHA-3 dispatch only accepts SHA-3 algorithms"),
     }
 }
 

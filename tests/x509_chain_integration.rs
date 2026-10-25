@@ -228,7 +228,7 @@ fn parsed_chain(leaf_path: &str, crl: Option<Vec<u8>>) -> X509DataInfo {
     }
 }
 
-fn options<'a>(trusted_certs: &'a [Vec<u8>], check_crls: bool) -> X509ChainOptions<'a> {
+fn options(trusted_certs: &[Vec<u8>], check_crls: bool) -> X509ChainOptions<'_> {
     X509ChainOptions {
         // Explicit synthetic UTC coverage belongs to this test request, never
         // to the library's defaults or a hidden network/clock lookup.
@@ -710,7 +710,7 @@ fn rejects_expired_leaf_at_selected_verification_time() {
     let info = parsed_chain("rsa/rsa-expired-cert.pem", None);
     let anchors = [fixture("cacert.pem")];
     let mut expired_time = options(&anchors, false);
-    expired_time.verification_time = UNIX_EPOCH + Duration::from_secs(1_774_828_800);
+    expired_time.verification_time = UNIX_EPOCH + Duration::from_hours(493_008);
 
     assert_eq!(
         verify_x509_certificate_chain(&info, &expired_time),
@@ -832,10 +832,11 @@ fn crl_time_qualification_requires_explicit_covered_utc_facts() {
         verify_x509_certificate_chain(&info, &inputs),
         Err(X509ChainError::MissingUtcFacts)
     );
+    let verification_second = i64::try_from(VERIFICATION_TIME).unwrap();
     inputs.utc_facts = Some(
         structured_pkix::temporal::LeapTable::new(
-            VERIFICATION_TIME as i64 - 1,
-            VERIFICATION_TIME as i64 + 1,
+            verification_second - 1,
+            verification_second + 1,
             &[],
         )
         .unwrap(),
@@ -852,11 +853,15 @@ fn crl_time_qualification_requires_explicit_covered_utc_facts() {
         verify_x509_certificate_chain(&info, &inputs),
         Err(X509ChainError::Revoked(0))
     );
-    inputs.verification_time =
-        UNIX_EPOCH + Duration::from_secs(date_time_ymd(2026, 3, 15).unix_timestamp() as u64);
+    let at_date = |year, month, day| {
+        UNIX_EPOCH
+            + Duration::from_secs(
+                u64::try_from(date_time_ymd(year, month, day).unix_timestamp()).unwrap(),
+            )
+    };
+    inputs.verification_time = at_date(2026, 3, 15);
     assert_eq!(verify_x509_certificate_chain(&info, &inputs), Ok(()));
-    inputs.verification_time =
-        UNIX_EPOCH + Duration::from_secs(date_time_ymd(2026, 4, 15).unix_timestamp() as u64);
+    inputs.verification_time = at_date(2026, 4, 15);
     assert_eq!(
         verify_x509_certificate_chain(&info, &inputs),
         Err(X509ChainError::Revoked(0))

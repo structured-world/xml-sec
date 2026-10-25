@@ -62,8 +62,7 @@ pub(crate) trait ConstantTimeDiv: Unsigned {
 
     /// Perform constant-time division of x by `Self::U32`
     /// Requires: x < Q (the field modulus, ~2^23)
-    #[allow(clippy::inline_always)] // Required for constant-time guarantees in crypto code
-    #[inline(always)]
+    #[inline]
     fn ct_div(x: u32) -> u32 {
         // Barrett reduction: q = (x * MULTIPLIER) >> SHIFT
         // This gives us floor(x / M) for x < 2^SHIFT / MULTIPLIER * M
@@ -71,9 +70,8 @@ pub(crate) trait ConstantTimeDiv: Unsigned {
         let quotient = (x64 * Self::CT_DIV_MULTIPLIER) >> Self::CT_DIV_SHIFT;
         // Quotient is guaranteed to fit in u32 because:
         // - x < Q (~2^23), so quotient = x / M < x < 2^23 < 2^32
-        #[allow(clippy::cast_possible_truncation, clippy::as_conversions)]
-        let result = quotient as u32;
-        result
+        let bytes = quotient.to_le_bytes();
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
     }
 }
 

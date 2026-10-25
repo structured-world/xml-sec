@@ -1,7 +1,7 @@
-//! Integration tests for the full XMLDSig verification pipeline.
+//! Integration tests for the full `XMLDSig` verification pipeline.
 //!
-//! Verifies full XMLDSig verify pipeline:
-//! reference digest checks + SignedInfo canonicalization + SignatureValue verify.
+//! Verifies full `XMLDSig` verify pipeline:
+//! reference digest checks + `SignedInfo` canonicalization + `SignatureValue` verify.
 
 use std::path::Path;
 
@@ -136,9 +136,10 @@ fn inject_non_ascii_whitespace_in_signature_value(xml: &str) -> String {
 
 fn inject_comment_in_signature_value(xml: &str) -> String {
     replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
-        if chars.len() < 4 {
-            panic!("SignatureValue too short for comment split mutation");
-        }
+        assert!(
+            chars.len() >= 4,
+            "SignatureValue too short for comment split mutation"
+        );
         let split_at = chars.len() / 2;
         let mut with_comment = Vec::with_capacity(chars.len() + 8);
         with_comment.extend_from_slice(&chars[..split_at]);
@@ -235,9 +236,10 @@ fn duplicate_signature_value(xml: &str) -> String {
 
 fn insert_nested_element_in_signature_value(xml: &str) -> String {
     replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
-        if chars.len() < 4 {
-            panic!("SignatureValue too short for nested-element mutation");
-        }
+        assert!(
+            chars.len() >= 4,
+            "SignatureValue too short for nested-element mutation"
+        );
         let split_at = chars.len() / 2;
         let mut mixed = Vec::with_capacity(chars.len() + 6);
         mixed.extend_from_slice(&chars[..split_at]);

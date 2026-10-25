@@ -1,6 +1,15 @@
 //! Continuations over the original verified document and operation state.
 
-use super::*;
+use super::{
+    CapturedOperation, Cell, DEFAULT_IMPLICIT_C14N_URI, DigestAlgorithm, DocumentView, DsigError,
+    Node, NodeIdentity, OperationExecutionContext, OperationPlanError, OperationResourceIdentity,
+    RefCell, ReferenceProcessingError, ReferenceResult, ReferenceSet, ScopedCapture,
+    ScopedRequestStorage, SelectedSignatureMethod, SignatureAlgorithm, SignatureEvidence,
+    TransformError, TransformExecutionBudget, UriClass, UriReferenceResolver,
+    VerificationOperationBudgets, VerificationRequest, VerifyContext, VerifyEvidence, XMLDSIG_NS,
+    XmlDocument, classify_uri, enforce_current_transform_allowed, enforce_transform_allowed,
+    is_xml_whitespace_only, transform_chain_uses_implicit_c14n, with_verified_document,
+};
 use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, Work};
 
 mod hash_uses;
@@ -32,6 +41,11 @@ pub struct VerifiedSession<'view, 'scope, 'inputs, W: Work> {
 /// Verify once, then continue within the same document generation, selected
 /// provider, immutable policy, captured inputs and remaining operation budgets.
 /// The callback cannot return document- or operation-borrowing handles.
+///
+/// # Errors
+/// Returns an error for invalid request or document policy, refused retained
+/// storage/work, or failure of the continuation. Individual verification
+/// failures remain available in the scoped evidence.
 pub fn with_verified_request<'inputs, W: Work, R>(
     document: &XmlDocument,
     context: &VerifyContext<'inputs>,
@@ -45,7 +59,7 @@ pub fn with_verified_request<'inputs, W: Work, R>(
         document,
         context,
         request,
-        ScopedRequestStorage(work),
+        &ScopedRequestStorage(work),
         |view, context, budgets, evidence, operations, resolver| {
             continuation(VerifiedSession {
                 view,
@@ -64,7 +78,7 @@ pub fn with_verified_request<'inputs, W: Work, R>(
 /// The exact authenticated parent of a reference instruction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReferenceParent {
-    /// Direct child of this selected Signature's SignedInfo.
+    /// Direct child of this selected Signature's `SignedInfo`.
     SignedInfo(NodeIdentity),
     /// Direct child of an authenticated original Manifest.
     Manifest(NodeIdentity),
@@ -76,7 +90,7 @@ pub enum ReferenceParent {
 pub struct AuthenticatedReference<'a> {
     /// Original document/generation-bound Reference identity.
     pub identity: NodeIdentity,
-    /// Exact original SignedInfo or Manifest parent.
+    /// Exact original `SignedInfo` or Manifest parent.
     pub parent: ReferenceParent,
     /// Original URI attribute, preserving omitted versus empty.
     pub uri: Option<&'a str>,
@@ -209,6 +223,10 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
 
     /// Select only a Signature whose original cryptographic decision succeeded.
     /// A failed child Manifest digest does not erase that decision.
+    ///
+    /// # Errors
+    /// Returns an error for foreign/stale or unauthenticated signatures,
+    /// retained capture failure, or refused selection work/storage.
     pub fn select_signature(
         &self,
         identity: NodeIdentity,
@@ -222,6 +240,10 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
     /// Selection, inspection, resolution and transform replay spend `work`;
     /// the original compiled policy's cumulative allowances are not reset.
     /// Use `select_signature` instead to retain producer-funded execution.
+    ///
+    /// # Errors
+    /// Returns a processing error when selection fails identity, authentication,
+    /// retained-state, or current-resource checks. Preserves visitor errors.
     pub fn with_query<Q: Work, R, E>(
         &self,
         identity: NodeIdentity,
@@ -326,9 +348,7 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
     }
 }
 
-impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
-    SelectedSignature<'session, 'view, 'scope, 'inputs, W, Q>
-{
+impl<'scope, 'inputs, W: Work, Q: Work> SelectedSignature<'_, '_, 'scope, 'inputs, W, Q> {
     fn operation(
         &self,
     ) -> &OperationExecutionContext<
@@ -362,9 +382,85 @@ impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
         Ok(false)
     }
 
+    fn classify_reference_target(
+        &self,
+        target: Result<Option<Node<'_, '_>>, TransformError>,
+    ) -> Result<ReferenceResolution<'_>, DsigError> {
+        let target = match target {
+            Ok(target) => target,
+            Err(
+                TransformError::UnsupportedUri(_)
+                | TransformError::AccountedUnsupportedUri(_)
+                | TransformError::InvalidFragment,
+            ) => return Ok(ReferenceResolution::Unsupported),
+            Err(error) => {
+                return Err(DsigError::Reference(
+                    ReferenceProcessingError::UriDereference(error),
+                ));
+            }
+        };
+        let Some(target) = target else {
+            return Ok(ReferenceResolution::Unresolved);
+        };
+        let identity = self.session.view.node_identity(target);
+        if !target.has_tag_name((XMLDSIG_NS, "Reference")) {
+            return Ok(ReferenceResolution::NotReference(identity));
+        }
+        match self.descriptor(identity)? {
+            Some(reference) => Ok(ReferenceResolution::Reference(reference)),
+            None => Ok(ReferenceResolution::Unauthenticated(identity)),
+        }
+    }
+
+    fn resolve_detached_reference(
+        &self,
+        node: Node<'_, '_>,
+        uri: &str,
+    ) -> Result<ReferenceResolution<'_>, DsigError> {
+        crate::c14n::xml_base::resolve_uri_from_node_in(
+            node,
+            uri,
+            None,
+            self.session.budgets.transforms.xml_base_resolution(),
+            &crate::c14n::scratch::Accounted(self.work),
+        )
+        .map_err(super::super::uri::map_xml_base_execution_error)
+        .map_err(|error| DsigError::Reference(ReferenceProcessingError::UriDereference(error)))?;
+        Ok(ReferenceResolution::Detached)
+    }
+
+    fn resolve_reference_uri(
+        &self,
+        node: Node<'_, '_>,
+        uri: &str,
+    ) -> Result<ReferenceResolution<'_>, DsigError> {
+        self.work
+            .charge_work(u64::try_from(uri.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
+        if !self.session.context.policy.uris.references.allows(uri) {
+            return Err(crate::policy::PolicyViolation::Uri {
+                operation: "extension reference resolution",
+                reason: "reference URI class is not permitted",
+            }
+            .into());
+        }
+        if !uri.is_empty() && !uri.starts_with('#') {
+            return self.resolve_detached_reference(node, uri);
+        }
+        let target = self.session.resolver.node_for_same_document_reference_in(
+            uri,
+            Some(self.session.budgets.transforms.node_set_materialization()),
+            &crate::c14n::scratch::Accounted(self.work),
+        );
+        self.classify_reference_target(target)
+    }
+
     /// Resolve from the authenticated original property's lexical source, using
     /// this request's URI grammar, ID registrations, policy and XML Base budget.
     /// No network fetch, independent ID scan or fabricated Reference is involved.
+    ///
+    /// # Errors
+    /// Returns an error for invalid document identity or property type, denied
+    /// URI policy, exhausted current resources, or failed bounded resolution.
     pub fn resolve_reference(
         &self,
         property: NodeIdentity,
@@ -430,59 +526,7 @@ impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
                 value
             }
         };
-        let uri = value.as_str();
-        self.work
-            .charge_work(u64::try_from(uri.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
-        if !self.session.context.policy.uris.references.allows(uri) {
-            return Err(crate::policy::PolicyViolation::Uri {
-                operation: "extension reference resolution",
-                reason: "reference URI class is not permitted",
-            }
-            .into());
-        }
-        if !uri.is_empty() && !uri.starts_with('#') {
-            crate::c14n::xml_base::resolve_uri_from_node_in(
-                node,
-                uri,
-                None,
-                self.session.budgets.transforms.xml_base_resolution(),
-                &crate::c14n::scratch::Accounted(self.work),
-            )
-            .map_err(super::super::uri::map_xml_base_execution_error)
-            .map_err(|error| {
-                DsigError::Reference(ReferenceProcessingError::UriDereference(error))
-            })?;
-            return Ok(ReferenceResolution::Detached);
-        }
-        let target = self.session.resolver.node_for_same_document_reference_in(
-            uri,
-            Some(self.session.budgets.transforms.node_set_materialization()),
-            &crate::c14n::scratch::Accounted(self.work),
-        );
-        let target = match target {
-            Ok(target) => target,
-            Err(
-                TransformError::UnsupportedUri(_)
-                | TransformError::AccountedUnsupportedUri(_)
-                | TransformError::InvalidFragment,
-            ) => return Ok(ReferenceResolution::Unsupported),
-            Err(error) => {
-                return Err(DsigError::Reference(
-                    ReferenceProcessingError::UriDereference(error),
-                ));
-            }
-        };
-        let Some(target) = target else {
-            return Ok(ReferenceResolution::Unresolved);
-        };
-        let identity = self.session.view.node_identity(target);
-        if !target.has_tag_name((XMLDSIG_NS, "Reference")) {
-            return Ok(ReferenceResolution::NotReference(identity));
-        }
-        match self.descriptor(identity)? {
-            Some(reference) => Ok(ReferenceResolution::Reference(reference)),
-            None => Ok(ReferenceResolution::Unauthenticated(identity)),
-        }
+        self.resolve_reference_uri(node, value.as_str())
     }
     fn parent(&self, reference: Node<'_, '_>) -> Result<Option<ReferenceParent>, DsigError> {
         if !reference.has_tag_name((XMLDSIG_NS, "Reference")) {
@@ -577,6 +621,10 @@ impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
 
     /// Paid, single-pass original catalogue. No repeated ordinal rescanning;
     /// callbacks borrow descriptors and may retain only copied stable identities.
+    ///
+    /// # Errors
+    /// Returns a processing error for invalid retained state or exhausted query
+    /// resources. Preserves the visitor's original error separately.
     pub fn visit_authenticated_references<E>(
         &self,
         mut visitor: impl for<'a> FnMut(AuthenticatedReference<'a>) -> Result<(), E>,
@@ -694,9 +742,9 @@ impl<'session, 'view, 'scope, 'inputs, W: Work, Q: Work>
 /// octets and therefore take precedence over either implicit mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplayMode {
-    /// XMLDSig 1.1 §4.3.3.2 implicit C14N 1.0.
+    /// `XMLDSig` 1.1 §4.3.3.2 implicit C14N 1.0.
     ReferenceOutput,
-    /// Original timestamp CanonicalizationMethod node, including parameters.
+    /// Original timestamp `CanonicalizationMethod` node, including parameters.
     Timestamp(NodeIdentity),
 }
 
@@ -725,6 +773,17 @@ pub enum ReplayError<E> {
     /// Original receiver error.
     Receiver(E),
 }
+/// Replay parse failures keep shared-execution exhaustion distinct from
+/// malformed reference content.
+fn replay_parse_failure<E>(error: super::super::parse::ParseError) -> ReplayError<E> {
+    match error {
+        super::super::parse::ParseError::Transform(TransformError::C14n(
+            crate::c14n::C14nError::SharedExecution(error),
+        )) => ReplayError::Processing(error.into()),
+        error => ReplayError::Processing(DsigError::ParseManifestReference(error)),
+    }
+}
+
 impl<E> From<TransformError> for ReplayError<E> {
     fn from(error: TransformError) -> Self {
         Self::Processing(match error {
@@ -885,6 +944,11 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     /// EN 319 132-1 V1.3.1 §5.5.3 steps 3/6 and Note 2 deliberately permit
     /// renewal without recomputing the original digest algorithm.
     /// <https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf>
+    ///
+    /// # Errors
+    /// Returns a processing error for unauthenticated instructions, invalid
+    /// retained state, reentrancy, policy/resource refusal, or transform failure.
+    /// Preserves receiver errors separately from processing failures.
     pub fn replay_reference<E>(
         &self,
         reference: NodeIdentity,
@@ -954,35 +1018,16 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
             active: &self.session.replay_active,
             index,
         };
-        let result = self.replay_instruction(descriptor, mode, receiver);
+        let result = self.replay_instruction(&descriptor, mode, receiver);
         admission.finish(&result);
         result
     }
 
-    fn replay_instruction<E>(
+    fn validate_replay_transform_policy<E>(
         &self,
-        descriptor: AuthenticatedReference<'_>,
-        mode: ReplayMode,
-        receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<ReplayOutcome, ReplayError<E>> {
+        node: Node<'_, '_>,
+    ) -> Result<Option<&std::collections::HashSet<String>>, ReplayError<E>> {
         let processing = ReplayError::Processing;
-        let node = self
-            .session
-            .view
-            .resolve_node(descriptor.identity)
-            .map_err(|error| processing(error.into()))?;
-        let uri = descriptor.uri.ok_or_else(|| {
-            processing(DsigError::Reference(ReferenceProcessingError::MissingUri))
-        })?;
-        if !self.session.context.policy.uris.references.allows(uri) {
-            return Err(processing(
-                crate::policy::PolicyViolation::Uri {
-                    operation: "reference replay",
-                    reason: "reference URI class is not permitted",
-                }
-                .into(),
-            ));
-        }
         let allowed = self
             .session
             .context
@@ -1034,18 +1079,69 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                 }
             }
         }
-        let parse_failure = |error| match error {
-            super::super::parse::ParseError::Transform(TransformError::C14n(
-                crate::c14n::C14nError::SharedExecution(error),
-            )) => processing(error.into()),
-            error => processing(DsigError::ParseManifestReference(error)),
-        };
+        Ok(allowed)
+    }
+
+    /// The timestamp's canonicalization method, after its URI passes the
+    /// operation's transform permission.
+    fn replay_timestamp_method<E>(
+        &self,
+        method: NodeIdentity,
+        allowed: Option<&std::collections::HashSet<String>>,
+    ) -> Result<(crate::c14n::C14nAlgorithm, Option<&str>), ReplayError<E>> {
+        let processing = ReplayError::Processing;
+        let method = self
+            .session
+            .view
+            .resolve_node(method)
+            .map_err(|error| processing(error.into()))?;
+        let uri = method.attribute("Algorithm").ok_or_else(|| {
+            processing(DsigError::InvalidStructure {
+                reason: "timestamp method has no Algorithm",
+            })
+        })?;
+        self.work
+            .charge_work(uri.len() as u64)
+            .map_err(|error| processing(error.into()))?;
+        enforce_current_transform_allowed(allowed, uri, self.work).map_err(processing)?;
+        super::super::parse::parse_replay_canonicalization_method(
+            method,
+            &crate::c14n::scratch::Accounted(self.work),
+        )
+        .map_err(replay_parse_failure)
+    }
+
+    fn replay_instruction<E>(
+        &self,
+        descriptor: &AuthenticatedReference<'_>,
+        mode: ReplayMode,
+        receiver: &mut impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<ReplayOutcome, ReplayError<E>> {
+        let processing = ReplayError::Processing;
+        let node = self
+            .session
+            .view
+            .resolve_node(descriptor.identity)
+            .map_err(|error| processing(error.into()))?;
+        let uri = descriptor.uri.ok_or_else(|| {
+            processing(DsigError::Reference(ReferenceProcessingError::MissingUri))
+        })?;
+        if !self.session.context.policy.uris.references.allows(uri) {
+            return Err(processing(
+                crate::policy::PolicyViolation::Uri {
+                    operation: "reference replay",
+                    reason: "reference URI class is not permitted",
+                }
+                .into(),
+            ));
+        }
+        let allowed = self.validate_replay_transform_policy::<E>(node)?;
         let transforms = super::super::parse::parse_replay_transforms(
             node,
             &mut self.session.budgets.xpath_parse.borrow_mut(),
             &crate::c14n::scratch::Accounted(self.work),
         )
-        .map_err(parse_failure)?;
+        .map_err(replay_parse_failure)?;
         if matches!(mode, ReplayMode::ReferenceOutput)
             && transform_chain_uses_implicit_c14n(
                 classify_uri(uri) == UriClass::External,
@@ -1056,28 +1152,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
         }
         let timestamp = match mode {
             ReplayMode::ReferenceOutput => None,
-            ReplayMode::Timestamp(method) => {
-                let method = self
-                    .session
-                    .view
-                    .resolve_node(method)
-                    .map_err(|error| processing(error.into()))?;
-                let uri = method.attribute("Algorithm").ok_or_else(|| {
-                    processing(DsigError::InvalidStructure {
-                        reason: "timestamp method has no Algorithm",
-                    })
-                })?;
-                self.work
-                    .charge_work(uri.len() as u64)
-                    .map_err(|error| processing(error.into()))?;
-                enforce_current_transform_allowed(allowed, uri, self.work).map_err(processing)?;
-                let algorithm = super::super::parse::parse_replay_canonicalization_method(
-                    method,
-                    &crate::c14n::scratch::Accounted(self.work),
-                )
-                .map_err(parse_failure)?;
-                Some(algorithm)
-            }
+            ReplayMode::Timestamp(method) => Some(self.replay_timestamp_method(method, allowed)?),
         };
         let budget = &self.session.budgets.transforms;
         let Some(data) = self.session.resolver.replay_input_from_with_budget(
@@ -1103,7 +1178,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
             enveloped_signature,
             data,
             &transforms,
-            super::super::transforms::ReplayExecution {
+            &super::super::transforms::ReplayExecution {
                 options: self.session.context.transform_options(),
                 budget,
                 work: self.work,

@@ -326,8 +326,9 @@ impl<P: MlDsaParams> ExpandedSigningKey<P> {
 
         // Rejection sampling loop
         for kappa in (0..u16::MAX).step_by(P::L::USIZE) {
-            let y = expand_mask::<P::L, P::Gamma1>(&rhopp, kappa);
-            let w = (&self.A_hat * &y.ntt()).ntt_inverse();
+            // FIPS 204 Algorithm 7 names: mask = y, challenge = c.
+            let mask = expand_mask::<P::L, P::Gamma1>(&rhopp, kappa);
+            let w = (&self.A_hat * &mask.ntt()).ntt_inverse();
             let w1 = w.high_bits::<P::TwoGamma2>();
 
             let w1_tilde = P::encode_w1(&w1);
@@ -335,13 +336,13 @@ impl<P: MlDsaParams> ExpandedSigningKey<P> {
                 .absorb(mu)
                 .absorb(&w1_tilde)
                 .squeeze_new::<P::Lambda>();
-            let c = sample_in_ball(&c_tilde, P::TAU);
-            let c_hat = c.ntt();
+            let challenge = sample_in_ball(&c_tilde, P::TAU);
+            let c_hat = challenge.ntt();
 
             let cs1 = (&c_hat * &self.s1_hat).ntt_inverse();
             let cs2 = (&c_hat * &self.s2_hat).ntt_inverse();
 
-            let z = &y + &cs1;
+            let z = &mask + &cs1;
             let r0 = (&w - &cs2).low_bits::<P::TwoGamma2>();
 
             if z.infinity_norm() >= P::GAMMA1_MINUS_BETA
@@ -567,7 +568,7 @@ impl<P: MlDsaParams> ExpandedSigningKey<P> {
     }
 }
 
-/// Check packed secret coefficients without allocating or invoking BitUnPack.
+/// Check packed secret coefficients without allocating or invoking `BitUnPack`.
 fn valid_secret_encoding(bytes: &[u8], bits: u32, maximum: u16) -> bool {
     let mask = (1u16 << bits) - 1;
     let mut pending = 0u16;

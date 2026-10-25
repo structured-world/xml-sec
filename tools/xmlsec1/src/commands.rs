@@ -24,7 +24,7 @@ use xml_sec::{
         HmacVerificationKey, InspectedKeyCandidateBudget, KeyInfo, KeyInfoSource, KeyInfoWriter,
         KeyResolver, KeyResolverConfig, KeyValueInfo, ReferenceResult, SignContext,
         SignatureAlgorithm, SignatureTemplateSelection, SigningKey, SigningPublicKeyInfo,
-        UriTypeSet, VerificationKey, VerifyContext, VerifyResult, VerifyingKey,
+        UriTypeSet, VerificationKey, VerificationScope, VerifyContext, VerifyResult, VerifyingKey,
         X509CertificateKeyInfoWriter, XPathHereSemantics, parse_key_info,
         uri::UriReferenceResolver, validate_signing_key,
     },
@@ -2397,7 +2397,7 @@ impl CandidateVerificationResolver {
                 }
             };
             if let Some(key) = key {
-                match key.validate_policy(policy) {
+                match key.validate_policy(&candidate_budget.verification_scope(policy)) {
                     Ok(()) => resolved.push(key),
                     Err(error) if self.lax_key_search && !matches!(error, DsigError::Policy(_)) => {
                         last_error = Some(error)
@@ -2546,12 +2546,12 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
 
     fn validate_signature_value_with_policy(
         &self,
-        policy: &VerificationPolicy,
+        scope: &VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
         self.first_accepting(|candidate| {
-            candidate.validate_signature_value_with_policy(policy, algorithm, signature_value)
+            candidate.validate_signature_value_with_policy(scope, algorithm, signature_value)
         })
     }
 
@@ -2566,13 +2566,14 @@ impl VerifyingKey for CandidateVerifyingKey<'_> {
 
     fn verify_with_policy(
         &self,
-        policy: &VerificationPolicy,
+        scope: &VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &xml_sec::xmldsig::SignatureContext,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
         self.first_accepting(|candidate| {
-            candidate.verify_with_policy(policy, algorithm, signed_data, signature_value)
+            candidate.verify_with_policy(scope, algorithm, context, signed_data, signature_value)
         })
     }
 }

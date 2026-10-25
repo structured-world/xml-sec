@@ -22,7 +22,7 @@
 //! This implementation is internal. Use the public `xml-sec` provider API with
 //! `experimental-pq` enabled; the example also uses `der`, `pkcs8`, and `zeroize`
 //! to construct a zeroizing PKCS#8 seed document. These are primitive operations,
-//! not a grant of XMLDSig policy permission or certificate trust.
+//! not a grant of `XMLDSig` policy permission or certificate trust.
 //!
 //! ```rust
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -312,7 +312,7 @@ mod test {
 
     fn encode_decode_round_trip_test<P>()
     where
-        P: MlDsaParams + PartialEq,
+        P: MlDsaParams + PartialEq + core::fmt::Debug,
     {
         let seed = Array::default();
         let ssk = SigningKey::from_seed(&seed);
@@ -323,20 +323,20 @@ mod test {
 
         let vk_bytes = vk.encode();
         let vk2 = VerifyingKey::<P>::decode(&vk_bytes);
-        assert!(vk == vk2);
+        assert_eq!(vk, vk2);
 
         #[allow(deprecated)]
         {
             let sk_bytes = esk.to_expanded();
             let sk2 = ExpandedSigningKey::<P>::from_expanded(&sk_bytes);
-            assert!(esk == &sk2);
+            assert_eq!(esk, &sk2);
 
             let M = b"Hello world";
             let rnd = Array([0u8; 32]);
             let sig = esk.sign_internal(&[M], &rnd);
             let sig_bytes = sig.encode();
             let sig2 = Signature::<P>::decode(&sig_bytes).unwrap();
-            assert!(sig == sig2);
+            assert_eq!(sig, sig2);
         }
     }
 
@@ -349,14 +349,14 @@ mod test {
 
     fn public_from_private_test<P>()
     where
-        P: MlDsaParams + PartialEq,
+        P: MlDsaParams + PartialEq + core::fmt::Debug,
     {
         let ssk = SigningKey::<P>::from_seed(&Array::default());
         let esk = ssk.expanded_key();
         let vk = ssk.verifying_key();
         let vk_derived = esk.verifying_key();
 
-        assert!(vk == vk_derived);
+        assert_eq!(vk, vk_derived);
     }
 
     #[test]
@@ -573,7 +573,7 @@ mod test {
             let kp = SigningKey::<P>::from_seed(&Array::default());
 
             let mut kp_debug = alloc::string::String::new();
-            write!(&mut kp_debug, "{:?}", kp).unwrap();
+            write!(&mut kp_debug, "{kp:?}").unwrap();
             assert!(kp_debug.contains("SigningKey"));
 
             let mut sk_debug = alloc::string::String::new();

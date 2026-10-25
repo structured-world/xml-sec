@@ -1,4 +1,4 @@
-//! Verified XMLDSig evidence projected onto the structured-xades contracts.
+//! Verified `XMLDSig` evidence projected onto the structured-xades contracts.
 
 use crate::{Document, Error, Snapshot};
 use structured_asn1::memory::Work;

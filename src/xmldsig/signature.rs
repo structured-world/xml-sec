@@ -1,22 +1,18 @@
-//! Signature verification helpers for XMLDSig.
+//! Signature verification helpers for `XMLDSig`.
 //!
 //! This module covers RSA PKCS#1 v1.5, DSA-SHA1, and ECDSA verification,
-//! including donor P-521 interoperability under the XMLDSig `ecdsa-sha384` URI.
+//! including donor P-521 interoperability under the `XMLDSig` `ecdsa-sha384` URI.
 //!
-//! Input public keys are accepted in SubjectPublicKeyInfo (SPKI) form because
+//! Input public keys are accepted in `SubjectPublicKeyInfo` (SPKI) form because
 //! that is how the vendored PEM fixtures are stored.
 //! - RSA keys are parsed from full SPKI DER (`PUBLIC KEY`) and verified via
-//!   RustCrypto `rsa::pkcs1v15`.
+//!   `RustCrypto` `rsa::pkcs1v15`.
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
-//!   string and verified with RustCrypto curve crates (`p256`/`p384`/`p521`).
+//!   string and verified with `RustCrypto` curve crates (`p256`/`p384`/`p521`).
 
-use crate::rsa_encoding::RsaPublicKeyEncoding as _;
-use der::Decode as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
-use pkcs8::DecodePublicKey as _;
-use pkcs8::SubjectPublicKeyInfoRef;
 use rsa::signature::hazmat::PrehashVerifier;
 use rsa::{
     pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey},
@@ -27,6 +23,7 @@ use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use signature::Verifier;
 
 use super::parse::SignatureAlgorithm;
+use super::pkix::{CertificateSession, SpkiAlgorithm};
 use crate::policy::EcdsaSignatureValueEncoding;
 
 pub(crate) fn signature_value_matches_algorithm(
@@ -133,17 +130,40 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     }
 }
 
-pub(crate) fn signature_value_matches_spki(
-    algorithm: SignatureAlgorithm,
-    public_key_spki_der: &[u8],
-    signature_value: &[u8],
-) -> Result<bool, SignatureVerificationError> {
-    signature_value_matches_spki_with_encoding(
-        algorithm,
-        public_key_spki_der,
-        signature_value,
-        EcdsaSignatureValueEncoding::XmlDsig,
+/// A shared-reader refusal of key material read under `session`: resource
+/// exhaustion is that account's typed policy violation, anything else a
+/// malformed key.
+pub(crate) fn key_read_error(
+    session: &CertificateSession,
+    error: &structured_pkix::Error,
+) -> SignatureVerificationError {
+    session.resource_violation(error).map_or(
+        SignatureVerificationError::InvalidKeyDer,
+        SignatureVerificationError::KeyPolicy,
     )
+}
+
+/// The RSA key of `spki` admitted for `pss`, read under `session`.
+pub(crate) fn read_rsa_public_key<'a>(
+    session: &'a CertificateSession,
+    spki: &'a [u8],
+    pss: Option<super::RsaPssParameters>,
+) -> Result<structured_pkix::key::rsa::PublicKey<'a>, SignatureVerificationError> {
+    session
+        .rsa_public_key(spki, pss)
+        .map_err(|error| key_read_error(session, &error))?
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
+}
+
+/// The software RSA key of an SPKI, read under `session` with the bare
+/// decoder's admission rules.
+fn software_rsa_public_key(
+    session: &CertificateSession,
+    spki: &[u8],
+) -> Result<rsa::RsaPublicKey, SignatureVerificationError> {
+    crate::rsa_encoding::read_spki_public_key(session, spki)
+        .map_err(|error| key_read_error(session, &error))?
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
 }
 
 pub(crate) fn signature_value_matches_spki_with_encoding(
@@ -151,15 +171,16 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
     public_key_spki_der: &[u8],
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
+    session: &CertificateSession,
 ) -> Result<bool, SignatureVerificationError> {
     if let Some(length) = algorithm.eddsa_signature_len() {
-        super::modern::validate_public_key(algorithm, public_key_spki_der)?;
+        super::modern::validate_public_key(algorithm, public_key_spki_der, session)?;
         return Ok(signature_value.len() == length);
     }
     if let SignatureAlgorithm::PostQuantum(algorithm) = algorithm {
         #[cfg(feature = "experimental-pq")]
         {
-            super::post_quantum::validate_public_key(algorithm, public_key_spki_der)?;
+            super::post_quantum::validate_public_key(algorithm, public_key_spki_der, session)?;
             return Ok(signature_value.len() == algorithm.signature_len());
         }
         #[cfg(not(feature = "experimental-pq"))]
@@ -170,38 +191,36 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
         }
     }
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        use der::Decode as _;
-        let bytes = crate::provider::rsa_pss::encoded_public_key(public_key_spki_der, parameters)
-            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-        let key = pkcs1::RsaPublicKeyRef::from_der(bytes)
+        let modulus =
+            read_rsa_public_key(session, public_key_spki_der, Some(parameters))?.modulus();
+        let bits = usize::try_from(modulus.bits())
             .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-        let modulus = key.modulus.as_bytes();
-        let Some(first) = modulus.first() else {
-            return Err(SignatureVerificationError::InvalidKeyDer);
-        };
-        let bits = modulus.len() * 8 - first.leading_zeros() as usize;
-        return Ok(parameters.fits_modulus_bits(bits) && signature_value.len() == modulus.len());
+        return Ok(
+            parameters.fits_modulus_bits(bits) && signature_value.len() == modulus.as_bytes().len()
+        );
     }
-    let spki = SubjectPublicKeyInfoRef::from_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    match (algorithm, spki.algorithm.oid) {
-        (algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256), dsa::OID) => {
-            let key = decode_dsa_verifying_key(public_key_spki_der)?;
+    let family = session
+        .spki_algorithm(public_key_spki_der)
+        .map_err(|error| key_read_error(session, &error))?;
+    match (algorithm, family) {
+        (
+            algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
+            SpkiAlgorithm::Dsa,
+        ) => {
+            let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
             let component_len = usize::try_from(key.components().q().bits_vartime())
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
                 .div_ceil(8);
             Ok(algorithm.dsa_component_len() == Some(component_len)
                 && signature_value.len() == component_len * 2)
         }
-        (method, pkcs1::ALGORITHM_OID) if method.is_rsa() => {
-            let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+        (method, SpkiAlgorithm::RsaEncryption) if method.is_rsa() => {
+            let key = software_rsa_public_key(session, public_key_spki_der)?;
             Ok(signature_value.len() == key.size())
         }
-        (method, oid)
-            if method.ecdsa_digest().is_some() && oid == p256::elliptic_curve::ALGORITHM_OID =>
-        {
-            let (_, component_len) = ecdsa_curve_and_component_len(&spki)?;
+        (method, SpkiAlgorithm::Ec) if method.ecdsa_digest().is_some() => {
+            let (curve, _) = ecdsa_public_key(session, public_key_spki_der)?;
+            let component_len = curve.component_len();
             match encoding {
                 EcdsaSignatureValueEncoding::XmlDsig
                     if signature_value.len() == component_len * 2 => {}
@@ -212,23 +231,13 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             }
             Ok(true)
         }
-        (
-            SignatureAlgorithm::HmacSha1
-            | SignatureAlgorithm::HmacSha224
-            | SignatureAlgorithm::HmacSha256
-            | SignatureAlgorithm::HmacSha384
-            | SignatureAlgorithm::HmacSha512,
-            _,
-        ) => Err(SignatureVerificationError::KeyAlgorithmMismatch {
-            uri: algorithm.uri().to_owned(),
-        }),
         _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_owned(),
         }),
     }
 }
 
-/// Errors while preparing or running XMLDSig signature verification.
+/// Errors while preparing or running `XMLDSig` signature verification.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SignatureVerificationError {
@@ -239,7 +248,7 @@ pub enum SignatureVerificationError {
     /// The signature method is not an RSA PKCS#1 v1.5 algorithm.
     #[error("unsupported signature algorithm: {uri}")]
     UnsupportedAlgorithm {
-        /// XMLDSig algorithm URI used for diagnostics.
+        /// `XMLDSig` algorithm URI used for diagnostics.
         uri: String,
     },
 
@@ -261,7 +270,7 @@ pub enum SignatureVerificationError {
     /// The provided public key does not match the signature algorithm.
     #[error("public key does not match signature algorithm: {uri}")]
     KeyAlgorithmMismatch {
-        /// XMLDSig algorithm URI used for diagnostics.
+        /// `XMLDSig` algorithm URI used for diagnostics.
         uri: String,
     },
 
@@ -271,10 +280,14 @@ pub enum SignatureVerificationError {
     InvalidSignatureFormat,
 }
 
-/// Verify an RSA XMLDSig signature using a PEM-encoded SPKI public key.
+/// Verify an RSA `XMLDSig` signature using a PEM-encoded SPKI public key.
 ///
 /// The PEM must contain a `PUBLIC KEY` block. Returns `Ok(false)` for signature
 /// mismatch and `Err` for algorithm/key preparation errors.
+///
+/// # Errors
+/// Returns an error for invalid PEM or RSA key encoding, an unsupported method,
+/// or a key that does not meet the direct helper's strength requirements.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_rsa_signature_pem(
     algorithm: SignatureAlgorithm,
@@ -291,14 +304,18 @@ pub fn verify_rsa_signature_pem(
     )
 }
 
-/// Verify an ECDSA XMLDSig signature using a PEM-encoded SPKI public key.
+/// Verify an ECDSA `XMLDSig` signature using a PEM-encoded SPKI public key.
 ///
 /// The PEM must contain a `PUBLIC KEY` block. The signature value is expected
-/// to use the XMLDSig fixed-width `r || s` format required by
+/// to use the `XMLDSig` fixed-width `r || s` format required by
 /// [RFC 9231 section 2.3.6](https://www.rfc-editor.org/rfc/rfc9231.html#section-2.3.6)
-/// (which replaces RFC 6931) and XMLDSig 1.1. Use [`verify_ecdsa_signature_pem_with_encoding`] to opt into
+/// (which replaces RFC 6931) and `XMLDSig` 1.1. Use [`verify_ecdsa_signature_pem_with_encoding`] to opt into
 /// libxmlsec1's ASN.1 compatibility representation. Returns `Ok(false)` for a
 /// signature mismatch and `Err` for key or signature-format errors.
+///
+/// # Errors
+/// Returns an error for invalid PEM, an unsupported algorithm or curve,
+/// mismatched key metadata, or invalid signature framing.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_pem(
     algorithm: SignatureAlgorithm,
@@ -315,7 +332,11 @@ pub fn verify_ecdsa_signature_pem(
     )
 }
 
-/// Verify an ECDSA signature using an explicit XMLDSig compatibility encoding.
+/// Verify an ECDSA signature using an explicit `XMLDSig` compatibility encoding.
+///
+/// # Errors
+/// Returns an error for invalid PEM, an unsupported algorithm or curve,
+/// mismatched key metadata, or framing inconsistent with `encoding`.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_pem_with_encoding(
     algorithm: SignatureAlgorithm,
@@ -337,7 +358,7 @@ pub fn verify_ecdsa_signature_pem_with_encoding(
 fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerificationError> {
     let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
         .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-    if !rest.iter().all(|byte| byte.is_ascii_whitespace()) {
+    if !rest.iter().all(u8::is_ascii_whitespace) {
         return Err(SignatureVerificationError::InvalidKeyPem);
     }
     if pem.label != "PUBLIC KEY" {
@@ -347,11 +368,15 @@ fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerifi
     Ok(pem.contents)
 }
 
-/// Verify an RSA XMLDSig signature using DER-encoded SPKI public key bytes.
+/// Verify an RSA `XMLDSig` signature using DER-encoded SPKI public key bytes.
 ///
 /// The input must be an X.509 `SubjectPublicKeyInfo` wrapping an RSA key.
 /// Returns `Ok(false)` for signature mismatch and `Err` for algorithm/key
 /// preparation errors.
+///
+/// # Errors
+/// Returns an error for invalid or mismatched RSA key encoding, an unsupported
+/// method, or a key that does not meet the direct helper's strength requirements.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_rsa_signature_spki(
     algorithm: SignatureAlgorithm,
@@ -375,12 +400,19 @@ pub(crate) fn verify_rsa_signature_spki_with_minimum(
     signature_value: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<bool, SignatureVerificationError> {
-    validate_rsa_signature_spki_with_minimum(algorithm, public_key_spki_der, minimum_modulus_bits)?;
+    let session = CertificateSession::standalone();
+    validate_rsa_signature_spki_with_minimum(
+        algorithm,
+        public_key_spki_der,
+        minimum_modulus_bits,
+        &session,
+    )?;
     verify_rsa_signature_spki_primitive(
         algorithm,
         public_key_spki_der,
         signed_data,
         signature_value,
+        &session,
     )
 }
 
@@ -388,44 +420,26 @@ pub(crate) fn validate_rsa_signature_spki_with_minimum(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
     minimum_modulus_bits: usize,
+    session: &CertificateSession,
 ) -> Result<(), SignatureVerificationError> {
-    if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        use der::Decode as _;
-        let bytes = crate::provider::rsa_pss::encoded_public_key(public_key_spki_der, parameters)
-            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-        let key = pkcs1::RsaPublicKeyRef::from_der(bytes)
-            .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-        let modulus = key.modulus.as_bytes();
-        validate_rsa_key_components(
-            modulus,
-            key.public_exponent.as_bytes(),
-            minimum_modulus_bits,
-        )?;
-        let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
-        return if parameters.fits_modulus_bits(bits) {
-            Ok(())
-        } else {
-            Err(SignatureVerificationError::KeyAlgorithmMismatch {
-                uri: algorithm.uri().into(),
-            })
-        };
-    }
-    let spki = SubjectPublicKeyInfoRef::from_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    match spki.algorithm.oid {
-        pkcs1::ALGORITHM_OID => {
-            let octets = spki
-                .subject_public_key
-                .as_bytes()
-                .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-            let key = pkcs1::RsaPublicKeyRef::from_der(octets)
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-            validate_rsa_public_key(&key, algorithm, minimum_modulus_bits)
-        }
-        _ => Err(SignatureVerificationError::KeyAlgorithmMismatch {
+    let pss = algorithm.rsa_pss_parameters();
+    if pss.is_none()
+        && session
+            .spki_algorithm(public_key_spki_der)
+            .map_err(|error| key_read_error(session, &error))?
+            != SpkiAlgorithm::RsaEncryption
+    {
+        return Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_string(),
-        }),
+        });
     }
+    let key = read_rsa_public_key(session, public_key_spki_der, pss)?;
+    validate_rsa_public_key(
+        key.modulus(),
+        key.exponent().as_bytes(),
+        algorithm,
+        minimum_modulus_bits,
+    )
 }
 
 pub(crate) fn verify_rsa_signature_spki_primitive(
@@ -433,11 +447,11 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
     public_key_spki_der: &[u8],
     signed_data: &[u8],
     signature_value: &[u8],
+    session: &CertificateSession,
 ) -> Result<bool, SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        let key = crate::provider::rsa_pss::public_key(public_key_spki_der, parameters)
-            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        let key = crate::provider::rsa_pss::public_key(public_key_spki_der, parameters, session)?;
         return Ok(crate::provider::rsa_pss::verify(
             &key,
             parameters,
@@ -445,8 +459,7 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
             signature_value,
         ));
     }
-    let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let key = software_rsa_public_key(session, public_key_spki_der)?;
     let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
         return Ok(false);
     };
@@ -479,12 +492,16 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
     Ok(verified)
 }
 
-/// Verify an XMLDSig DSA-SHA1 or DSA-SHA256 signature using a DER SPKI public key.
+/// Verify an `XMLDSig` DSA-SHA1 or DSA-SHA256 signature using a DER SPKI public key.
 ///
 /// Signatures contain fixed-width `r || s`, rather than ASN.1 DER: 20-byte
 /// components for SHA1 and 32-byte components for SHA256. The direct helper
 /// enforces the default DSA key minimum; use a policy-aware verification
 /// context for explicitly authorized historical 1024-bit keys.
+///
+/// # Errors
+/// Returns an error for invalid DSA key encoding, an unsupported method,
+/// or key parameters that violate the direct helper's strength requirements.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_dsa_signature_spki(
     algorithm: SignatureAlgorithm,
@@ -508,20 +525,23 @@ pub(crate) fn verify_dsa_signature_spki_with_minimum(
     signature_value: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<bool, SignatureVerificationError> {
-    validate_dsa_signature_spki_with_minimum(public_key_spki_der, minimum_modulus_bits)?;
+    let session = CertificateSession::standalone();
+    validate_dsa_signature_spki_with_minimum(public_key_spki_der, minimum_modulus_bits, &session)?;
     verify_dsa_signature_spki_primitive(
         algorithm,
         public_key_spki_der,
         signed_data,
         signature_value,
+        &session,
     )
 }
 
 pub(crate) fn validate_dsa_signature_spki_with_minimum(
     public_key_spki_der: &[u8],
     minimum_modulus_bits: usize,
+    session: &CertificateSession,
 ) -> Result<(), SignatureVerificationError> {
-    let key = decode_dsa_verifying_key(public_key_spki_der)?;
+    let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
     let modulus_bits = usize::try_from(key.components().p().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     crate::policy::DsaKeyPolicy {
@@ -540,28 +560,55 @@ pub(crate) struct BorrowedDsaPublicParameters<'a> {
 
 pub(crate) fn decode_dsa_verifying_key(
     bytes: &[u8],
+    session: &CertificateSession,
 ) -> Result<dsa::VerifyingKey, SignatureVerificationError> {
-    // Component size is a process-safety bound, not a DSA conformance rule.
-    // Inspect borrowed DER integers before any allocating bigint conversion,
-    // including certificate signatures and signature-framing checks.
-    let spki = pkcs8::SubjectPublicKeyInfoRef::from_der(bytes)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let parameters = spki
-        .algorithm
-        .parameters
-        .as_ref()
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?
-        .decode_as::<BorrowedDsaPublicParameters<'_>>()
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    let y = der::asn1::UintRef::from_der(spki.subject_public_key.raw_bytes())
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    for component in [parameters.p, parameters.q, parameters.g, y] {
-        if component.as_bytes().len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING {
-            return Err(SignatureVerificationError::InvalidKeyDer);
-        }
+    // The shared PKIX reader owns SPKI and Dss-Parms syntax (RFC 3279 2.3.2);
+    // a standalone key must write its own parameters.
+    let key = session
+        .read_dsa_public_key(bytes)
+        .map_err(|error| key_read_error(session, &error))?;
+    let parameters = key
+        .parameters()
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    dsa_verifying_key(
+        parameters.p().as_bytes(),
+        parameters.q().as_bytes(),
+        parameters.g().as_bytes(),
+        key.y().as_bytes(),
+    )
+    .ok_or(SignatureVerificationError::InvalidKeyDer)
+}
+
+/// DSA key from unsigned big-endian components, group-validated by `dsa`.
+///
+/// Component size is a process-safety bound, not a DSA conformance rule; it is
+/// checked on borrowed bytes before any allocating bigint conversion.
+pub(crate) fn dsa_verifying_key(
+    p: &[u8],
+    q: &[u8],
+    g: &[u8],
+    y: &[u8],
+) -> Option<dsa::VerifyingKey> {
+    fn trim(bytes: &[u8]) -> &[u8] {
+        &bytes[bytes.iter().take_while(|byte| **byte == 0).count()..]
     }
-    dsa::VerifyingKey::from_public_key_der(bytes)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)
+    let [p, q, g, y] = [trim(p), trim(q), trim(g), trim(y)];
+    if [p, q, g, y].iter().any(|value| {
+        value.is_empty() || value.len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING
+    }) {
+        return None;
+    }
+    let components = dsa::Components::from_components(
+        crypto_bigint::BoxedUint::from_be_slice_vartime(p),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(q),
+        crypto_bigint::BoxedUint::from_be_slice_vartime(g),
+    )
+    .ok()?;
+    dsa::VerifyingKey::from_components(
+        components,
+        crypto_bigint::BoxedUint::from_be_slice_vartime(y),
+    )
+    .ok()
 }
 
 pub(crate) fn verify_dsa_signature_spki_primitive(
@@ -569,6 +616,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
     public_key_spki_der: &[u8],
     signed_data: &[u8],
     signature_value: &[u8],
+    session: &CertificateSession,
 ) -> Result<bool, SignatureVerificationError> {
     if !matches!(
         algorithm,
@@ -578,7 +626,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
             uri: algorithm.uri().to_string(),
         });
     }
-    let key = decode_dsa_verifying_key(public_key_spki_der)?;
+    let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
     let component_len = usize::try_from(key.components().q().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
         .div_ceil(8);
@@ -604,12 +652,16 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
     Ok(verified.is_ok())
 }
 
-/// Verify an ECDSA XMLDSig signature using DER-encoded SPKI public key bytes.
+/// Verify an ECDSA `XMLDSig` signature using DER-encoded SPKI public key bytes.
 ///
 /// The input must be an X.509 `SubjectPublicKeyInfo` wrapping an EC key. The
-/// signature value must use XMLDSig fixed-width `r || s` bytes. Use
+/// signature value must use `XMLDSig` fixed-width `r || s` bytes. Use
 /// [`verify_ecdsa_signature_spki_with_encoding`] to select libxmlsec1's ASN.1
 /// compatibility representation explicitly.
+///
+/// # Errors
+/// Returns an error for invalid key encoding, an unsupported algorithm or curve,
+/// mismatched key metadata, or malformed fixed-width signature bytes.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_spki(
     algorithm: SignatureAlgorithm,
@@ -626,7 +678,11 @@ pub fn verify_ecdsa_signature_spki(
     )
 }
 
-/// Verify an ECDSA signature using an explicit XMLDSig compatibility encoding.
+/// Verify an ECDSA signature using an explicit `XMLDSig` compatibility encoding.
+///
+/// # Errors
+/// Returns an error for invalid key encoding, an unsupported algorithm or curve,
+/// mismatched key metadata, or framing inconsistent with `encoding`.
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_spki_with_encoding(
     algorithm: SignatureAlgorithm,
@@ -635,21 +691,37 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
 ) -> Result<bool, SignatureVerificationError> {
+    verify_ecdsa_signature_spki_in(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        encoding,
+        &CertificateSession::standalone(),
+    )
+}
+
+pub(crate) fn verify_ecdsa_signature_spki_in(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    encoding: EcdsaSignatureValueEncoding,
+    session: &CertificateSession,
+) -> Result<bool, SignatureVerificationError> {
     let digest_algorithm = algorithm.ecdsa_digest().ok_or_else(|| {
         SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         }
     })?;
 
-    let spki = SubjectPublicKeyInfoRef::from_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
-    match spki.algorithm.oid {
-        oid if oid == p256::elliptic_curve::ALGORITHM_OID => {
-            let public_key = spki
-                .subject_public_key
-                .as_bytes()
-                .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-            let (curve, component_len) = ecdsa_curve_and_component_len(&spki)?;
+    match session
+        .spki_algorithm(public_key_spki_der)
+        .map_err(|error| key_read_error(session, &error))?
+    {
+        SpkiAlgorithm::Ec => {
+            let (curve, public_key) = ecdsa_public_key(session, public_key_spki_der)?;
+            let component_len = curve.component_len();
             let signature_encoding = match encoding {
                 EcdsaSignatureValueEncoding::XmlDsig => {
                     if signature_value.len() != component_len * 2 {
@@ -685,46 +757,17 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
     }
 }
 
-/// Verify the ASN.1 DER ECDSA representation required by X.509 signatures.
-///
-/// This is intentionally separate from the XMLDSig policy-aware entry point:
-/// certificate signature framing is fixed by X.509 and must not inherit the
-/// document's `SignatureValue` compatibility mode.
-pub(crate) fn verify_ecdsa_signature_spki_asn1_der(
-    algorithm: SignatureAlgorithm,
-    public_key_spki_der: &[u8],
-    signed_data: &[u8],
-    signature_value: &[u8],
-) -> Result<bool, SignatureVerificationError> {
-    verify_ecdsa_signature_spki_with_encoding(
-        algorithm,
-        public_key_spki_der,
-        signed_data,
-        signature_value,
-        EcdsaSignatureValueEncoding::XmlSecAsn1Der,
-    )
-}
-
 fn validate_rsa_public_key(
-    rsa: &pkcs1::RsaPublicKeyRef<'_>,
+    modulus: structured_pkix::key::rsa::Magnitude<'_>,
+    exponent: &[u8],
     algorithm: SignatureAlgorithm,
     minimum_modulus_bits: usize,
 ) -> Result<(), SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
-    validate_rsa_key_components(
-        rsa.modulus.as_bytes(),
-        rsa.public_exponent.as_bytes(),
-        minimum_modulus_bits,
-    )?;
+    validate_rsa_key_components(modulus.as_bytes(), exponent, minimum_modulus_bits)?;
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        let modulus = rsa
-            .modulus
-            .as_bytes()
-            .iter()
-            .position(|byte| *byte != 0)
-            .map(|start| &rsa.modulus.as_bytes()[start..])
-            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-        let bits = modulus.len() * 8 - modulus[0].leading_zeros() as usize;
+        let bits = usize::try_from(modulus.bits())
+            .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
         if !parameters.fits_modulus_bits(bits) {
             return Err(SignatureVerificationError::KeyAlgorithmMismatch {
                 uri: algorithm.uri().into(),
@@ -734,7 +777,7 @@ fn validate_rsa_public_key(
     Ok(())
 }
 
-/// Apply the RSA key-strength invariant shared by XMLDSig and X.509 algorithms.
+/// Apply the RSA key-strength invariant shared by `XMLDSig` and X.509 algorithms.
 pub(crate) fn validate_rsa_key_components(
     modulus: &[u8],
     exponent: &[u8],
@@ -768,10 +811,6 @@ pub(crate) enum EcCurve {
 }
 
 impl EcCurve {
-    pub(crate) fn from_oid(oid: der::asn1::ObjectIdentifier) -> Option<Self> {
-        Self::from_oid_bytes(oid.as_bytes())
-    }
-
     /// Curve named by the contents octets of an OBJECT IDENTIFIER.
     pub(crate) fn from_oid_bytes(oid: &[u8]) -> Option<Self> {
         use pkcs8::AssociatedOid as _;
@@ -805,21 +844,21 @@ impl EcCurve {
     }
 }
 
-pub(crate) fn ecdsa_curve_and_component_len(
-    spki: &SubjectPublicKeyInfoRef<'_>,
-) -> Result<(EcCurve, usize), SignatureVerificationError> {
-    let curve_oid = spki
-        .algorithm
-        .parameters
-        .and_then(|params| params.decode_as::<der::asn1::ObjectIdentifier>().ok())
+/// Supported named curve and validated uncompressed SEC1 point of an EC SPKI,
+/// read by the shared PKIX reader; the point borrows `spki`.
+fn ecdsa_public_key<'a>(
+    session: &CertificateSession,
+    spki: &'a [u8],
+) -> Result<(EcCurve, &'a [u8]), SignatureVerificationError> {
+    let (curve, range) = session
+        .ec_named_point(spki)
+        .map_err(|error| key_read_error(session, &error))?
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
-    let curve = EcCurve::from_oid(curve_oid).ok_or(SignatureVerificationError::InvalidKeyDer)?;
     let point = spki
-        .subject_public_key
-        .as_bytes()
+        .get(range)
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
     curve.validate_point(point)?;
-    Ok((curve, curve.component_len()))
+    Ok((curve, point))
 }
 
 fn verify_ecdsa_p256(
@@ -978,7 +1017,7 @@ fn encode_der_integer(component: &[u8], output: &mut Vec<u8>) {
 
 fn encode_der_length(len: usize, output: &mut Vec<u8>) {
     if len < 128 {
-        output.push(len as u8);
+        output.push(u8::try_from(len).expect("short DER lengths fit one octet"));
         return;
     }
 
@@ -988,7 +1027,9 @@ fn encode_der_length(len: usize, output: &mut Vec<u8>) {
         .position(|byte| *byte != 0)
         .expect("non-short DER lengths are nonzero");
     let encoded = &bytes[first_nonzero..];
-    output.push(0x80 | encoded.len() as u8);
+    output.push(
+        0x80 | u8::try_from(encoded.len()).expect("a usize length uses at most eight octets"),
+    );
     output.extend_from_slice(encoded);
 }
 
@@ -1013,7 +1054,7 @@ fn inspect_der_encoded_ecdsa_signature(
 
     let sequence = parse_der_length(rest)
         .ok_or(SignatureVerificationError::InvalidSignatureFormat)?
-        .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
+        .map_err(|()| SignatureVerificationError::InvalidSignatureFormat)?;
     let (sequence_len, sequence_rest) = sequence;
     let (sequence_content, trailing) = sequence_rest
         .split_at_checked(sequence_len)
@@ -1044,7 +1085,7 @@ fn parse_der_integer(
 
     let (len, rest) = parse_der_length(rest)
         .ok_or(SignatureVerificationError::InvalidSignatureFormat)?
-        .map_err(|_| SignatureVerificationError::InvalidSignatureFormat)?;
+        .map_err(|()| SignatureVerificationError::InvalidSignatureFormat)?;
     let (integer_bytes, remainder) = rest
         .split_at_checked(len)
         .ok_or(SignatureVerificationError::InvalidSignatureFormat)?;
@@ -1152,6 +1193,16 @@ mod tests {
 
     #[test]
     fn spki_signature_framing_uses_the_resolved_key_width() {
+        let session = CertificateSession::standalone();
+        let signature_value_matches_spki = |algorithm, spki: &[u8], value: &[u8]| {
+            signature_value_matches_spki_with_encoding(
+                algorithm,
+                spki,
+                value,
+                EcdsaSignatureValueEncoding::XmlDsig,
+                &session,
+            )
+        };
         let rsa = parse_public_key_pem(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
         ))

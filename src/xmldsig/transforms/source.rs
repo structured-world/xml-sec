@@ -1,4 +1,4 @@
-//! Original XPath parameter text, borrowed unless XML text nodes require a join.
+//! Original `XPath` parameter text, borrowed unless XML text nodes require a join.
 
 use super::{TransformError, is_xpath_whitespace, transform_resource_limit};
 use crate::c14n::scratch::{Text, TextBuilder};

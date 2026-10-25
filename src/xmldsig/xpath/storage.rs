@@ -1,4 +1,4 @@
-//! Storage adapters for XPath's original-to-mirror identity indexes.
+//! Storage adapters for `XPath`'s original-to-mirror identity indexes.
 
 use std::collections::HashMap;
 use structured_asn1::memory::{HashWork, MemoryError, OwnedMap, Work};
@@ -131,7 +131,7 @@ impl<'source, 'w, W: Work> NamespaceIndex<'source, &'w W>
         key: &NamespaceKey<'_>,
         execution: &'w W,
     ) -> Result<Option<usize>, MemoryError> {
-        self.get(key, execution).map(|value| value.copied())
+        self.get(key, execution).map(Option::<&usize>::copied)
     }
     fn insert_namespace(
         &mut self,

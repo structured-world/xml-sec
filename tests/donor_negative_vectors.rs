@@ -1,9 +1,9 @@
-//! Negative XMLDSig vectors from the Phaos interoperability corpus.
+//! Negative `XMLDSig` vectors from the Phaos interoperability corpus.
 //!
 //! Each check targets the first stable rejection boundary in the public API.
 //! The historical fixtures combine invalid signatures with advisory X.509
-//! metadata, so tests that exercise SignedInfo validation supply a caller key
-//! and deliberately bypass document KeyInfo resolution.
+//! metadata, so tests that exercise `SignedInfo` validation supply a caller key
+//! and deliberately bypass document `KeyInfo` resolution.
 
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
@@ -214,7 +214,7 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
     let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
     let options = X509ChainOptions {
         trusted_certs: &trusted,
-        verification_time: UNIX_EPOCH + Duration::from_secs(1_767_225_600),
+        verification_time: UNIX_EPOCH + Duration::from_hours(490_896),
         utc_facts: None,
         max_chain_depth: 2,
         check_crls: false,
@@ -296,7 +296,7 @@ fn phaos_non_der_key_usage_cannot_establish_certificate_trust() {
     let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
     let options = X509ChainOptions {
         trusted_certs: &trusted,
-        verification_time: UNIX_EPOCH + Duration::from_secs(1_104_580_800),
+        verification_time: UNIX_EPOCH + Duration::from_hours(306_828),
         utc_facts: None,
         max_chain_depth: 2,
         check_crls: false,

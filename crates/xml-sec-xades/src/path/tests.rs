@@ -19,7 +19,7 @@ fn chosen(xml: &str, counters: &[usize]) -> Vec<usize> {
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
     policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+        Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
     let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
     let document = XmlDocument::parse(xml).unwrap();
     let work = Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 30)));
@@ -33,7 +33,7 @@ fn chosen(xml: &str, counters: &[usize]) -> Vec<usize> {
                 .evidence()
                 .signatures()
                 .iter()
-                .map(|entry| entry.identity())
+                .map(xml_sec::xmldsig::SignatureEvidence::identity)
                 .collect();
             let counters: Vec<_> = counters.iter().map(|index| all[*index]).collect();
             let found = signers(&session, all[0], &counters, &work).unwrap();

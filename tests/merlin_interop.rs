@@ -1,4 +1,4 @@
-//! End-to-end coverage for the upstream Merlin XMLDSig interoperability corpus.
+//! End-to-end coverage for the upstream Merlin `XMLDSig` interoperability corpus.
 
 use std::{
     collections::HashMap,
@@ -77,7 +77,10 @@ fn xml(name: &str) -> String {
 fn cert(name: &str) -> Vec<u8> {
     let path = format!("{MERLIN}/certs/{name}");
     let data = bytes(&path);
-    if name.ends_with(".der") {
+    if std::path::Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension == "der")
+    {
         return data;
     }
     let (rest, pem) = x509_parser::pem::parse_x509_pem(&data).expect("certificate PEM");
@@ -88,7 +91,7 @@ fn cert(name: &str) -> Vec<u8> {
 fn verification_key(name: &str, algorithm: SignatureAlgorithm) -> VerificationKey {
     let der = cert(name);
     let (rest, certificate) = X509Certificate::from_der(&der).expect("certificate DER");
-    assert!(rest.is_empty());
+    assert_eq!(rest, []);
     VerificationKey {
         algorithm,
         public_key_bytes: certificate.public_key().raw.to_vec(),
@@ -207,7 +210,12 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
             .external_resources(&resources)
             .verify(&xml("signature-keyname")),
     );
+}
 
+#[test]
+fn verifies_merlin_x509_documents_with_upstream_expectations() {
+    // Certificate-selected documents of the Merlin runner, including its CRL vector.
+    let resources = external_resources();
     for (name, selected) in [
         ("signature-x509-crt", None),
         ("signature-x509-sn", Some("badb.pem")),
@@ -275,7 +283,13 @@ fn verifies_all_merlin_documents_with_upstream_expectations() {
         ),
         "unexpected revoked-vector error: {revoked_error:?}"
     );
+}
 
+#[test]
+fn verifies_the_complex_merlin_signature_with_upstream_expectations() {
+    // The runner's full signature combines external, same-document, XPointer,
+    // Manifest and XSLT references under one key.
+    let resources = external_resources();
     let complex = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![cert("merlin.pem")],
         ..KeyResolverConfig::default()

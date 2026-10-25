@@ -1,4 +1,4 @@
-//! Transform pipeline for XMLDSig `<Reference>` processing.
+//! Transform pipeline for `XMLDSig` `<Reference>` processing.
 //!
 //! Implements [XMLDSig §6.6](https://www.w3.org/TR/xmldsig-core1/#sec-Transforms):
 //! each `<Reference>` specifies a chain of transforms applied sequentially to
@@ -67,9 +67,9 @@ use crate::hard_limits::XML_DOCUMENT_NODE_CEILING;
 pub const ENVELOPED_SIGNATURE_URI: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
 /// The algorithm URI for the Base64 decode transform.
 pub const BASE64_TRANSFORM_URI: &str = "http://www.w3.org/2000/09/xmldsig#base64";
-/// The algorithm URI for the XPath 1.0 transform.
+/// The algorithm URI for the `XPath` 1.0 transform.
 pub const XPATH_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
-/// The algorithm URI for the XPath Filter 2.0 transform.
+/// The algorithm URI for the `XPath` Filter 2.0 transform.
 pub const XPATH_FILTER2_TRANSFORM_URI: &str = "http://www.w3.org/2002/06/xmldsig-filter2";
 /// The algorithm URI for the XSLT transform, executed when the `xslt` feature is built.
 pub const XSLT_TRANSFORM_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
@@ -82,14 +82,14 @@ pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c
 /// temporary XML, so this bounds recursion depth. The signature-wide C14N output
 /// budget below bounds both total work and buffers retained by those frames.
 pub const MAX_TRANSFORMS_PER_REFERENCE: usize = crate::hard_limits::REFERENCE_TRANSFORM_CEILING;
-/// xmlsec1 donor vectors use this XPath expression as a compatibility form of
+/// xmlsec1 donor vectors use this `XPath` expression as a compatibility form of
 /// enveloped-signature exclusion.
 pub(super) const ENVELOPED_SIGNATURE_XPATH_PREFIX: &str = "dsig";
 pub(super) const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
 pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize =
     crate::hard_limits::XPATH_EXPRESSION_BYTE_CEILING;
 pub(super) const MAX_XPATH_FILTERS: usize = crate::hard_limits::XPATH_FILTER_COUNT_CEILING;
-/// Maximum XPath programs retained and compiled while parsing one SignedInfo.
+/// Maximum `XPath` programs retained and compiled while parsing one `SignedInfo`.
 ///
 /// Per-reference bounds remain necessary for transform shape, while this bound
 /// prevents their multiplication across all references in one signature.
@@ -108,10 +108,10 @@ const MAX_NODE_SET_FILTER_WORK: usize = crate::hard_limits::NODE_SET_FILTER_WORK
 /// Namespace URI for Exclusive C14N `<InclusiveNamespaces>` elements.
 const EXCLUSIVE_C14N_NS_URI: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
 
-/// Node returned by the XMLDSig XPath `here()` extension function.
+/// Node returned by the `XMLDSig` `XPath` `here()` extension function.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum XPathHereSemantics {
-    /// Follow XMLDSig: return the `<XPath>` parameter element that contains
+    /// Follow `XMLDSig`: return the `<XPath>` parameter element that contains
     /// the expression text.
     #[default]
     Specification,
@@ -181,11 +181,15 @@ impl NodeFilterWorkBudget {
     }
 }
 
+/// One byte meter: remaining capacity and the ceiling it started from.
+struct ByteBudget {
+    remaining: Cell<usize>,
+    maximum: usize,
+}
+
 struct Base64WorkBudget {
-    remaining_input_bytes: Cell<usize>,
-    remaining_output_bytes: Cell<usize>,
-    max_input_bytes: usize,
-    max_output_bytes: usize,
+    input: ByteBudget,
+    output: ByteBudget,
 }
 
 struct C14nOutputBudget {
@@ -284,26 +288,36 @@ mod c14n_budget_regression_tests {
     }
 }
 
+impl ByteBudget {
+    fn new(maximum: usize) -> Self {
+        Self {
+            remaining: Cell::new(maximum),
+            maximum,
+        }
+    }
+
+    /// Bytes charged so far; `remaining` only decreases from `maximum`.
+    fn consumed(&self) -> usize {
+        self.maximum - self.remaining.get()
+    }
+}
+
 impl Default for Base64WorkBudget {
     fn default() -> Self {
         Self {
-            remaining_input_bytes: Cell::new(MAX_BASE64_TRANSFORM_INPUT_BYTES),
-            remaining_output_bytes: Cell::new(MAX_BASE64_TRANSFORM_OUTPUT_BYTES),
-            max_input_bytes: MAX_BASE64_TRANSFORM_INPUT_BYTES,
-            max_output_bytes: MAX_BASE64_TRANSFORM_OUTPUT_BYTES,
+            input: ByteBudget::new(MAX_BASE64_TRANSFORM_INPUT_BYTES),
+            output: ByteBudget::new(MAX_BASE64_TRANSFORM_OUTPUT_BYTES),
         }
     }
 }
 
 impl Base64WorkBudget {
     fn charge_input(&self, bytes: usize) -> Result<(), TransformError> {
-        let consumed = self
-            .max_input_bytes
-            .saturating_sub(self.remaining_input_bytes.get());
-        if !charge_byte_budget(&self.remaining_input_bytes, bytes) {
+        let consumed = self.input.consumed();
+        if !charge_byte_budget(&self.input.remaining, bytes) {
             return Err(transform_resource_limit(
                 crate::policy::resource_name::BASE64_TRANSFORM_INPUT_BYTES,
-                self.max_input_bytes,
+                self.input.maximum,
                 consumed.saturating_add(bytes),
             ));
         }
@@ -311,14 +325,11 @@ impl Base64WorkBudget {
     }
 
     fn ensure_output_capacity(&self, bytes: usize) -> Result<(), TransformError> {
-        let consumed = self
-            .max_output_bytes
-            .saturating_sub(self.remaining_output_bytes.get());
-        if bytes > self.remaining_output_bytes.get() {
+        if bytes > self.output.remaining.get() {
             return Err(transform_resource_limit(
                 crate::policy::resource_name::BASE64_TRANSFORM_OUTPUT_BYTES,
-                self.max_output_bytes,
-                consumed.saturating_add(bytes),
+                self.output.maximum,
+                self.output.consumed().saturating_add(bytes),
             ));
         }
         Ok(())
@@ -326,7 +337,7 @@ impl Base64WorkBudget {
 
     fn charge_output(&self, bytes: usize) -> Result<(), TransformError> {
         self.ensure_output_capacity(bytes)?;
-        let charged = charge_byte_budget(&self.remaining_output_bytes, bytes);
+        let charged = charge_byte_budget(&self.output.remaining, bytes);
         debug_assert!(charged, "preflighted Base64 output charge must fit");
         Ok(())
     }
@@ -407,10 +418,8 @@ impl TransformExecutionBudget {
         Self {
             xpath: XPathWorkBudget::with_limits(resources),
             base64: Base64WorkBudget {
-                remaining_input_bytes: Cell::new(resources.max_base64_transform_input_bytes),
-                remaining_output_bytes: Cell::new(resources.max_base64_transform_output_bytes),
-                max_input_bytes: resources.max_base64_transform_input_bytes,
-                max_output_bytes: resources.max_base64_transform_output_bytes,
+                input: ByteBudget::new(resources.max_base64_transform_input_bytes),
+                output: ByteBudget::new(resources.max_base64_transform_output_bytes),
             },
             c14n: C14nOutputBudget::with_limit(resources.effective_canonicalized_bytes()),
             node_filter: NodeFilterWorkBudget {
@@ -509,7 +518,7 @@ impl<'r> TransformOptions<'r> {
         self.xslt_stylesheet_semantics = semantics;
         self
     }
-    /// Select the node returned by the XPath `here()` extension function.
+    /// Select the node returned by the `XPath` `here()` extension function.
     #[must_use]
     pub(crate) fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
         self.xpath_here_semantics = semantics;
@@ -610,7 +619,7 @@ struct TransformExecutionContext<'a, S: Scratch = Native> {
     source_has_signature: bool,
 }
 
-/// An XPath 1.0 expression and the namespace bindings in scope where it was declared.
+/// An `XPath` 1.0 expression and the namespace bindings in scope where it was declared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XPathExpression {
     expression: String,
@@ -628,18 +637,21 @@ impl XPathExpression {
         }
     }
 
-    /// Bind a prefix used by this XPath expression.
+    /// Bind a prefix used by this `XPath` expression.
+    #[must_use]
     pub fn with_namespace(mut self, prefix: impl Into<String>, uri: impl Into<String>) -> Self {
         self.namespaces.insert(prefix.into(), uri.into());
         self
     }
 
-    /// XPath source text.
+    /// `XPath` source text.
+    #[must_use]
     pub fn expression(&self) -> &str {
         &self.expression
     }
 
     /// Namespace prefix bindings used during evaluation.
+    #[must_use]
     pub fn namespaces(&self) -> &BTreeMap<String, String> {
         &self.namespaces
     }
@@ -656,7 +668,7 @@ impl XPathExpression {
     }
 }
 
-/// Set operation applied by one XPath Filter 2.0 step.
+/// Set operation applied by one `XPath` Filter 2.0 step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum XPathFilterOperation {
     /// Keep only nodes in the selected subtrees.
@@ -677,7 +689,7 @@ impl XPathFilterOperation {
     }
 }
 
-/// One expression and set operation in an XPath Filter 2.0 transform.
+/// One expression and set operation in an `XPath` Filter 2.0 transform.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XPathFilter {
     operation: XPathFilterOperation,
@@ -686,16 +698,19 @@ pub struct XPathFilter {
 
 impl XPathFilter {
     /// Create a Filter 2.0 step.
+    #[must_use]
     pub fn new(operation: XPathFilterOperation, xpath: XPathExpression) -> Self {
         Self { operation, xpath }
     }
 
     /// Operation applied to the subtree-expanded expression result.
+    #[must_use]
     pub fn operation(&self) -> XPathFilterOperation {
         self.operation
     }
 
-    /// XPath expression evaluated by this step.
+    /// `XPath` expression evaluated by this step.
+    #[must_use]
     pub fn xpath(&self) -> &XPathExpression {
         &self.xpath
     }
@@ -711,17 +726,17 @@ pub enum Transform {
     /// Input: `NodeSet` → Output: `NodeSet`
     Enveloped,
 
-    /// Narrow XPath compatibility form used by some donor vectors:
+    /// Narrow `XPath` compatibility form used by some donor vectors:
     /// `not(ancestor-or-self::dsig:Signature)`.
     ///
     /// Unlike `Enveloped`, this excludes every `ds:Signature` subtree in the
     /// current document, not only the containing signature.
     XpathExcludeAllSignatures,
 
-    /// General XMLDSig XPath 1.0 node filter.
+    /// General `XMLDSig` `XPath` 1.0 node filter.
     XPath(XPathExpression),
 
-    /// XPath Filter 2.0 ordered subtree set operations.
+    /// `XPath` Filter 2.0 ordered subtree set operations.
     XPathFilter2(Vec<XPathFilter>),
 
     /// XML Canonicalization (any supported variant).
@@ -732,7 +747,7 @@ pub enum Transform {
     /// Decode base64 text into the octets consumed by the next transform or digest.
     ///
     /// Node-set input is converted by concatenating included text nodes in
-    /// document order, as required by XMLDSig section 6.6.2. Binary input is
+    /// document order, as required by `XMLDSig` section 6.6.2. Binary input is
     /// decoded directly.
     ///
     /// Input: `NodeSet` or `Binary` → Output: `Binary`
@@ -741,7 +756,7 @@ pub enum Transform {
     /// Normalize an OPC Relationships part before explicit canonicalization.
     /// This is a reusable algorithm, not validation of an OPC package signature:
     /// Manifest-only placement and per-package part uniqueness belong to that
-    /// protocol's validator, not generic SignedInfo or CipherReference execution.
+    /// protocol's validator, not generic `SignedInfo` or `CipherReference` execution.
     /// Both editions require inclusive C14N 1.0, with or without comments.
     /// Selection semantics come from the operation's typed `TransformPolicy`.
     Relationship(Vec<RelationshipSelector>),
@@ -832,6 +847,160 @@ fn apply_transform_with_options_and_state<'s, 'd>(
         .map(ExecutionData::into_native)
 }
 
+/// Execute an OPC Relationship transform over octets, rendering a node-set
+/// input with implicit inclusive C14N first.
+fn apply_relationship_transform<'d, S: TransformScratch, D: DomStorage>(
+    selectors: &[impl parameters::Selector],
+    input: &ExecutionData<'d, S, D>,
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<ExecutionData<'d, S, D>, TransformError> {
+    let budget = context.budget;
+    let xml_parse = context.xml_parse;
+    let collected;
+    let bytes = if let Some(bytes) = input.binary() {
+        bytes
+    } else {
+        let nodes = input.nodes().expect("nodes or bytes");
+        let algorithm = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant URI");
+        let (bytes, _) = c14n::canonicalize_buffer_in(
+            nodes.document(),
+            nodes,
+            (&algorithm, None),
+            None,
+            budget.c14n.remaining(),
+            budget.xml_base_resolution(),
+            context.scratch,
+        )
+        .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
+        budget.c14n.charge(bytes.len())?;
+        collected = bytes;
+        &collected
+    };
+    check_xml_octets(bytes, budget.xml_parse_settings)?;
+    xml_parse.charge_policy(bytes.len())?;
+    // Part 2:2012 §9.1.4 / 2021 §6.2.5 constrains Relationships XML
+    // independently of generic XML policy, including declaration labels.
+    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+    let decoder = context.scratch.decoder();
+    let xml = crate::xml_input_shared::decode_xml_in(
+        bytes,
+        budget.xml_parse_settings.max_bytes,
+        |physical, declaration| {
+            if !physical.eq_ignore_ascii_case("UTF-8")
+                && !physical.eq_ignore_ascii_case("UTF-16LE")
+                && !physical.eq_ignore_ascii_case("UTF-16BE")
+            {
+                return Err(
+                    decoder.label_error(crate::xml_input_shared::LabelError::Forbidden, physical)
+                );
+            }
+            if let Some(label) = declaration
+                && !label.eq_ignore_ascii_case("UTF-8")
+                && !label.eq_ignore_ascii_case("UTF-16")
+            {
+                return Err(
+                    decoder.label_error(crate::xml_input_shared::LabelError::Forbidden, label)
+                );
+            }
+            Ok(())
+        },
+        &decoder,
+    )
+    .map_err(S::decode_error)?;
+    let settings = DocumentParseSettings {
+        allow_dtd: false,
+        ..budget.xml_parse_settings
+    };
+    let document = context
+        .scratch
+        .parse_xml(xml.as_ref(), settings, xml_parse)?;
+    context.state.document_reparsed();
+    relationship::normalize_in(
+        &document,
+        selectors,
+        context.options.opc_relationship_edition,
+        budget,
+        context.scratch,
+    )
+    .map(ExecutionData::Accounted)
+}
+
+/// Execute an XSLT transform over octets, rendering a node-set input with
+/// inclusive C14N 1.0 first.
+#[cfg(feature = "xslt")]
+fn apply_xslt_transform<'d, S: TransformScratch, D: DomStorage>(
+    stylesheet: &xslt::XsltParameter<'_>,
+    input: &ExecutionData<'d, S, D>,
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<ExecutionData<'d, S, D>, TransformError> {
+    let budget = context.budget;
+    let collected;
+    // A slice does not imply borrowed storage: earlier transforms can
+    // own its allocation, which remains live throughout this XSLT step.
+    let (bytes, input_storage): (&[u8], usize) = match input {
+        ExecutionData::NativeBinary(bytes) => (bytes, bytes.capacity()),
+        ExecutionData::Accounted(bytes) => (bytes, bytes.capacity()),
+        ExecutionData::BorrowedBinary(bytes) | ExecutionData::Resource { bytes, .. } => (bytes, 0),
+        ExecutionData::Nodes(nodes) => {
+            // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
+            // node-set input with inclusive C14N 1.0 first.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
+            let bytes = xslt::canonicalize_input(
+                *stylesheet,
+                nodes.document(),
+                nodes,
+                budget,
+                context.scratch,
+            )?;
+            let capacity = bytes.capacity();
+            collected = bytes;
+            (&collected, capacity)
+        }
+    };
+    xslt::execute(
+        *stylesheet,
+        bytes,
+        input_storage,
+        match input {
+            ExecutionData::Resource { uri, .. } => Some(*uri),
+            _ => None,
+        },
+        context.options.xslt_stylesheet_semantics,
+        context.options.internal_dtd_allowed(),
+        budget,
+        context.xml_parse,
+        context.scratch,
+    )
+}
+
+/// Remove every `XMLDSig` `Signature` subtree from `nodes`.
+///
+/// This is an optimized execution of a concrete wire-level `XPath`
+/// expression. Optimization may avoid SXD, but it must retain the
+/// expression's policy accounting for every input context and the node-set
+/// filtering pass.
+fn exclude_signatures<'d, S: TransformScratch, D: DomStorage>(
+    mut nodes: Projection<'d, S::NodeKeys, D>,
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<Projection<'d, S::NodeKeys, D>, TransformError> {
+    let budget = context.budget;
+    let doc = nodes.document();
+    budget.xpath.validate_context_evaluations(nodes.len())?;
+    let source_nodes = doc.descendants().len();
+    budget.xpath.charge(source_nodes)?;
+    context.scratch.charge(source_nodes)?;
+
+    for node in doc.descendants().filter(|node| {
+        node.is_element()
+            && node.tag_name().name() == "Signature"
+            && node.tag_name().namespace() == Some(XMLDSIG_NS)
+    }) {
+        budget.node_filter.charge(nodes.len())?;
+        nodes.exclude_subtree(node)?;
+    }
+    Ok(nodes)
+}
+
 fn apply_transform_with_context<
     's,
     'd,
@@ -848,119 +1017,12 @@ fn apply_transform_with_context<
     let options = context.options;
     let budget = context.budget;
     let state = context.state;
-    let xml_parse = context.xml_parse;
     match transform.view() {
         InstructionView::Relationship(selectors) => {
-            let collected;
-            let bytes = if let Some(bytes) = input.binary() {
-                bytes
-            } else {
-                let nodes = input.nodes().expect("nodes or bytes");
-                let algorithm =
-                    C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant URI");
-                let (bytes, _) = c14n::canonicalize_buffer_in(
-                    nodes.document(),
-                    nodes,
-                    (&algorithm, None),
-                    None,
-                    budget.c14n.remaining(),
-                    budget.xml_base_resolution(),
-                    context.scratch,
-                )
-                .map_err(|error| map_c14n_limit_error(error, &budget.c14n))?;
-                budget.c14n.charge(bytes.len())?;
-                collected = bytes;
-                &collected
-            };
-            check_xml_octets(bytes, budget.xml_parse_settings)?;
-            xml_parse.charge_policy(bytes.len())?;
-            // Part 2:2012 §9.1.4 / 2021 §6.2.5 constrains Relationships XML
-            // independently of generic XML policy, including declaration labels.
-            // https://ecma-international.org/publications-and-standards/standards/ecma-376/
-            let decoder = context.scratch.decoder();
-            let xml = crate::xml_input_shared::decode_xml_in(
-                bytes,
-                budget.xml_parse_settings.max_bytes,
-                |physical, declaration| {
-                    if !physical.eq_ignore_ascii_case("UTF-8")
-                        && !physical.eq_ignore_ascii_case("UTF-16LE")
-                        && !physical.eq_ignore_ascii_case("UTF-16BE")
-                    {
-                        return Err(decoder.label_error(
-                            crate::xml_input_shared::LabelError::Forbidden,
-                            physical,
-                        ));
-                    }
-                    if let Some(label) = declaration
-                        && !label.eq_ignore_ascii_case("UTF-8")
-                        && !label.eq_ignore_ascii_case("UTF-16")
-                    {
-                        return Err(decoder
-                            .label_error(crate::xml_input_shared::LabelError::Forbidden, label));
-                    }
-                    Ok(())
-                },
-                &decoder,
-            )
-            .map_err(S::decode_error)?;
-            let settings = DocumentParseSettings {
-                allow_dtd: false,
-                ..budget.xml_parse_settings
-            };
-            let document = context
-                .scratch
-                .parse_xml(xml.as_ref(), settings, xml_parse)?;
-            state.document_reparsed();
-            relationship::normalize_in(
-                &document,
-                selectors,
-                options.opc_relationship_edition,
-                budget,
-                context.scratch,
-            )
-            .map(ExecutionData::Accounted)
+            apply_relationship_transform(selectors, &input, context)
         }
         #[cfg(feature = "xslt")]
-        InstructionView::Xslt(stylesheet) => {
-            let collected;
-            // A slice does not imply borrowed storage: earlier transforms can
-            // own its allocation, which remains live throughout this XSLT step.
-            let (bytes, input_storage): (&[u8], usize) = match &input {
-                ExecutionData::NativeBinary(bytes) => (bytes, bytes.capacity()),
-                ExecutionData::Accounted(bytes) => (bytes, bytes.capacity()),
-                ExecutionData::BorrowedBinary(bytes) => (bytes, 0),
-                ExecutionData::Resource { bytes, .. } => (bytes, 0),
-                ExecutionData::Nodes(nodes) => {
-                    // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
-                    // node-set input with inclusive C14N 1.0 first.
-                    // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
-                    let bytes = xslt::canonicalize_input(
-                        stylesheet,
-                        nodes.document(),
-                        nodes,
-                        budget,
-                        context.scratch,
-                    )?;
-                    let capacity = bytes.capacity();
-                    collected = bytes;
-                    (&collected, capacity)
-                }
-            };
-            xslt::execute(
-                stylesheet,
-                bytes,
-                input_storage,
-                match &input {
-                    ExecutionData::Resource { uri, .. } => Some(*uri),
-                    _ => None,
-                },
-                options.xslt_stylesheet_semantics,
-                options.internal_dtd_allowed(),
-                budget,
-                xml_parse,
-                context.scratch,
-            )
-        }
+        InstructionView::Xslt(stylesheet) => apply_xslt_transform(&stylesheet, &input, context),
         InstructionView::Enveloped => {
             let mut nodes = input.into_nodes()?;
             // Exclude the Signature element and all its descendants from
@@ -986,28 +1048,7 @@ fn apply_transform_with_context<
             Ok(ExecutionData::Nodes(nodes))
         }
         InstructionView::ExcludeSignatures => {
-            let mut nodes = input.into_nodes()?;
-            let doc = nodes.document();
-
-            // This variant is an optimized execution of a concrete wire-level
-            // XPath expression. Optimization may avoid SXD, but it must retain
-            // the expression's policy accounting for every input context and
-            // the node-set filtering pass.
-            budget.xpath.validate_context_evaluations(nodes.len())?;
-            let source_nodes = doc.descendants().len();
-            budget.xpath.charge(source_nodes)?;
-            context.scratch.charge(source_nodes)?;
-
-            for node in doc.descendants().filter(|node| {
-                node.is_element()
-                    && node.tag_name().name() == "Signature"
-                    && node.tag_name().namespace() == Some(XMLDSIG_NS)
-            }) {
-                budget.node_filter.charge(nodes.len())?;
-                nodes.exclude_subtree(node)?;
-            }
-
-            Ok(ExecutionData::Nodes(nodes))
+            exclude_signatures(input.into_nodes()?, context).map(ExecutionData::Nodes)
         }
         InstructionView::XPath(xpath) => {
             let nodes = input.into_nodes()?;
@@ -1042,7 +1083,7 @@ fn apply_transform_with_context<
             );
             Ok(ExecutionData::Nodes(
                 super::xpath::apply_xpath_projection2_with_budget(
-                    nodes,
+                    &nodes,
                     filters,
                     super::xpath::XPathRequestContext::new(
                         options.here_semantics(),
@@ -1104,7 +1145,7 @@ fn xpath_document_relation<'a, L: DomStorage, R: DomStorage, X: ExpressionParame
     }
 }
 
-/// Retain the RFC 2045 alphabet consumed by the XMLDSig Base64 transform.
+/// Retain the RFC 2045 alphabet consumed by the `XMLDSig` Base64 transform.
 ///
 /// RFC 2045 section 6.8 requires decoders to ignore every byte outside the
 /// alphabet. The raw-input budget is charged before filtering so ignored data
@@ -1165,7 +1206,7 @@ fn base64_projection<S: Scratch, K: super::types::projection::Keys, D: DomStorag
     let mut normalized = scratch.bytes();
     match (binary, nodes) {
         (Some(bytes), _) => {
-            append_normalized_base64(bytes, &mut normalized, &budget.base64, scratch)?
+            append_normalized_base64(bytes, &mut normalized, &budget.base64, scratch)?;
         }
         (None, Some(nodes)) => {
             for node in nodes.document().descendants() {
@@ -1193,6 +1234,12 @@ fn base64_projection<S: Scratch, K: super::types::projection::Keys, D: DomStorag
 ///    to produce bytes (per [XMLDSig §4.3.3.2](https://www.w3.org/TR/xmldsig-core1/#sec-ReferenceProcessingModel)).
 ///
 /// Returns the final byte sequence ready for digest computation.
+///
+/// # Errors
+///
+/// Returns [`TransformError`] when a transform rejects its input, a resource
+/// limit of the default verification policy is exceeded, or the transform is
+/// not permitted by that policy.
 pub fn execute_transforms<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
@@ -1208,8 +1255,14 @@ pub fn execute_transforms<'a>(
 
 /// Execute a standalone reference chain with a trusted verification policy snapshot.
 ///
-/// Applies transform permissions, OPC edition, XPath semantics, XML allowances,
+/// Applies transform permissions, OPC edition, `XPath` semantics, XML allowances,
 /// and aggregate resource limits. This does not verify a signature or resolve keys.
+///
+/// # Errors
+///
+/// Returns [`TransformError`] when `policy` is invalid, the chain is longer
+/// than the policy permits, a transform is not permitted, a transform rejects
+/// its input, or an aggregate resource limit is exceeded.
 pub fn execute_transforms_with_policy<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
@@ -1276,7 +1329,7 @@ pub(crate) fn execute_transforms_with_options_and_budget<'a>(
 }
 
 /// Execute a reference in its actual source context. The caller supplies any
-/// enclosing Signature; XPath `here()` still uses the original source XML.
+/// enclosing Signature; `XPath` `here()` still uses the original source XML.
 pub(crate) fn execute_reference_transforms_with_budget<'a>(
     source_node: Node<'a, 'a>,
     enveloped_signature: Option<Node<'a, 'a>>,
@@ -1299,10 +1352,8 @@ pub(crate) fn execute_reference_transforms_with_budget<'a>(
     };
     execute_transform_chain::<false, _, _, _, _, _, _>(
         source_node,
-        enveloped_signature,
-        initial_data.into(),
+        ChainStep::untracked(enveloped_signature, initial_data.into()),
         transforms,
-        None,
         None,
         &context,
         CollectTerminal,
@@ -1330,14 +1381,14 @@ pub(crate) fn replay_reference_transforms<
     signature: Option<Node<'a, 'a>>,
     initial: super::uri::ReferenceInput<'a>,
     transforms: &[I],
-    execution: ReplayExecution<'w, Q>,
+    execution: &ReplayExecution<'w, Q>,
     terminal: F,
 ) -> Result<(), E>
 where
     E: From<TransformError>,
     F: TransformTerminal<crate::c14n::scratch::Accounted<'w, Q>, Output = (), Error = E>,
 {
-    let ReplayExecution {
+    let &ReplayExecution {
         options,
         budget,
         work,
@@ -1369,7 +1420,12 @@ where
         source_has_signature: signature.is_some(),
     };
     execute_transform_chain::<true, _, _, _, _, _, _>(
-        source, signature, initial, transforms, None, None, &context, terminal,
+        source,
+        ChainStep::untracked(signature, initial),
+        transforms,
+        None,
+        &context,
+        terminal,
     )
     .map(|_| ())
 }
@@ -1882,13 +1938,12 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
         } else {
             let nodes = data.nodes().expect("execution has nodes or bytes");
             let implicit;
-            let algorithm = match explicit {
-                Some(explicit) => explicit,
-                None => {
-                    implicit = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
-                        .expect("constant C14N URI");
-                    (&implicit, None)
-                }
+            let algorithm = if let Some(explicit) = explicit {
+                explicit
+            } else {
+                implicit =
+                    C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).expect("constant C14N URI");
+                (&implicit, None)
             };
             let result = c14n::canonicalize_visible_to_writer_in(
                 nodes.document(),
@@ -1941,10 +1996,8 @@ pub(crate) fn digest_reference_transforms_with_budget<'a>(
     };
     execute_transform_chain::<true, _, _, _, _, _, _>(
         source_node,
-        enveloped_signature,
-        initial_data.into(),
+        ChainStep::untracked(enveloped_signature, initial_data.into()),
         transforms,
-        None,
         None,
         &context,
         DigestTerminal(request),
@@ -1992,10 +2045,239 @@ struct CanonicalDependencyPosition {
     node_type: NodeType,
 }
 
+/// Where binary chain data came from, relative to the enveloping Signature.
+#[derive(Clone, Copy)]
+enum SignatureProvenance {
+    /// Not tracked C14N output: initial, decoded or transformed octets.
+    Untracked,
+    /// Tracked C14N output, with the Signature's byte offset when serialized.
+    Canonical(Option<usize>),
+}
+
+impl DependencyTracking {
+    /// Rebind dependencies to a document reparsed from tracked C14N output.
+    fn remap_reparsed<D: DomStorage>(&mut self, document: &Document<'_, D>) {
+        let Some(positions) = self.canonical_positions.take() else {
+            return;
+        };
+        let mut remapped = Vec::with_capacity(positions.len());
+        for tracked in positions {
+            if let Some(node) = document.descendants().find(|node| {
+                node.node_type() == tracked.node_type && node.range().start == tracked.position
+            }) {
+                remapped.push(TrackedDependencyNode {
+                    index: tracked.index,
+                    node_id: node.id(),
+                    node_type: tracked.node_type,
+                });
+            } else {
+                // Losing provenance must never become proof that later
+                // mutable DigestValue content cannot affect the digest.
+                self.opaque_dependencies.insert(tracked.index);
+            }
+        }
+        self.active_nodes = remapped;
+    }
+
+    /// Record where each active dependency landed in canonical output; returns
+    /// the position of `tracked_element` when it was serialized.
+    fn record_canonical_positions(
+        &mut self,
+        positions: &[(NodeId, usize)],
+        tracked_element: Option<NodeId>,
+    ) -> Option<usize> {
+        let mut canonical_positions = Vec::with_capacity(self.active_nodes.len());
+        for tracked in &self.active_nodes {
+            if let Some((_, position)) = positions
+                .iter()
+                .find(|(tracked_id, _)| *tracked_id == tracked.node_id)
+            {
+                canonical_positions.push(CanonicalDependencyPosition {
+                    index: tracked.index,
+                    position: *position,
+                    node_type: tracked.node_type,
+                });
+            } else {
+                self.opaque_dependencies.insert(tracked.index);
+            }
+        }
+        self.canonical_positions = Some(canonical_positions);
+        tracked_element.and_then(|signature_id| {
+            positions
+                .iter()
+                .find(|(tracked_id, _)| *tracked_id == signature_id)
+                .map(|(_, position)| *position)
+        })
+    }
+
+    /// XML identity was lost: every remaining dependency becomes opaque.
+    fn discard_provenance(&mut self) {
+        self.opaque_dependencies
+            .extend(self.active_nodes.drain(..).map(|tracked| tracked.index));
+        self.dormant_indexes.clear();
+        self.canonical_positions = None;
+    }
+
+    /// Keep dependencies still visible after a node-set transform.
+    fn retain_after_node_set<K: super::types::projection::Keys, D: DomStorage>(
+        &mut self,
+        nodes: &Projection<'_, K, D>,
+        preserve_excluded_as_opaque: bool,
+    ) -> Result<(), TransformError> {
+        if preserve_excluded_as_opaque {
+            self.opaque_dependencies
+                .extend(self.dormant_indexes.drain());
+        }
+        let mut active_nodes = Vec::with_capacity(self.active_nodes.len());
+        for tracked in self.active_nodes.drain(..) {
+            let remains_visible = match nodes.document().get_node(tracked.node_id) {
+                Some(node) => nodes.contains_tree(node).map_err(TransformError::from)?,
+                None => false,
+            };
+            if remains_visible {
+                active_nodes.push(tracked);
+            } else if preserve_excluded_as_opaque {
+                // SXD exposes output membership but not which source
+                // values a predicate coerced. Structural selection does
+                // not depend on mutable DigestValue text, but a value
+                // scan may control another node's inclusion, so absence
+                // is not proof of independence in that case.
+                self.opaque_dependencies.insert(tracked.index);
+            } else {
+                self.dormant_indexes.insert(tracked.index);
+            }
+        }
+        self.active_nodes = active_nodes;
+        Ok(())
+    }
+}
+
+/// Whether a node-set transform may read mutable character data outside its
+/// selected output.
+fn transform_may_read_mutable_data<I: Instruction>(transform: &I) -> bool {
+    match transform.view() {
+        InstructionView::XPath(expression) => {
+            xpath_may_read_mutable_character_data(expression.expression())
+        }
+        InstructionView::Filter2(filters) => filters
+            .iter()
+            .any(|filter| xpath_may_read_mutable_character_data(filter.xpath().expression())),
+        _ => false,
+    }
+}
+
+/// Refuse an Enveloped transform over octets that tracked C14N did not produce.
+///
+/// `XMLDSig` 1.1 §6.6.4 restricts Enveloped to its parent document. Tracked C14N
+/// can preserve its identity through serialization; external or decoded octets
+/// cannot acquire that provenance from equal bytes.
+/// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature>
+fn reject_untracked_enveloped<S: TransformScratch, I: Instruction>(
+    transforms: &[I],
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<(), TransformError> {
+    context.budget.node_filter.charge(transforms.len())?;
+    if transforms
+        .iter()
+        .any(|t| matches!(t.view(), InstructionView::Enveloped))
+    {
+        return Err(TransformError::CrossDocumentSignatureNode);
+    }
+    Ok(())
+}
+
+/// Check and decode transform octets that a node-set transform must reparse.
+fn decode_binary_input<'b, S: TransformScratch>(
+    bytes: &'b [u8],
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<
+    crate::xml_input_shared::Decoded<
+        'b,
+        <S::Decoder as crate::xml_input_shared::DecodeStorage>::Text,
+    >,
+    TransformError,
+> {
+    check_xml_octets(bytes, context.budget.xml_parse_settings)?;
+    // Decoding is a separate input pass, including malformed-input failures. Reserve it
+    // before any transcoding; the subsequent parser charges its own decoded-byte passes.
+    context.xml_parse.charge_policy(bytes.len())?;
+    crate::xml_input_shared::decode_xml_in(
+        bytes,
+        context.budget.xml_parse_settings.max_bytes,
+        |_, _| Ok(()),
+        &context.scratch.decoder(),
+    )
+    .map_err(S::decode_error)
+}
+
+/// The tracked Signature element inside a C14N input, if it is visible there.
+fn tracked_signature_element<K: super::types::projection::Keys, D: DomStorage>(
+    enveloped_signature: Option<Node<'_, '_, D>>,
+    nodes: &Projection<'_, K, D>,
+) -> Result<Option<NodeId>, TransformError> {
+    Ok(match enveloped_signature {
+        Some(signature)
+            if std::ptr::eq(signature.document(), nodes.document())
+                && nodes.contains_tree(signature)? =>
+        {
+            Some(signature.id())
+        }
+        _ => None,
+    })
+}
+
+/// Canonicalize into native storage, recording dependency positions when tracked.
+fn canonicalize_tracked<S: TransformScratch, K: super::types::projection::Keys, D: DomStorage>(
+    nodes: &Projection<'_, K, D>,
+    algorithm: &C14nAlgorithm,
+    tracked_element: Option<NodeId>,
+    dependency_tracking: Option<&mut DependencyTracking>,
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<(Vec<u8>, Option<usize>), TransformError> {
+    let mut output = Vec::new();
+    let position = if let Some(tracking) = dependency_tracking {
+        let mut tracked_ids = tracking
+            .active_nodes
+            .iter()
+            .map(|tracked| tracked.node_id)
+            .collect::<Vec<_>>();
+        if let Some(signature_id) = tracked_element
+            && !tracked_ids.contains(&signature_id)
+        {
+            tracked_ids.push(signature_id);
+        }
+        let positions =
+            c14n::canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
+                nodes.document(),
+                Some(nodes),
+                algorithm,
+                &tracked_ids,
+                context.budget.c14n.remaining(),
+                context.budget.xml_base_resolution(),
+                &mut output,
+            )
+            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
+        tracking.record_canonical_positions(&positions, tracked_element)
+    } else {
+        c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
+            nodes.document(),
+            Some(nodes),
+            algorithm,
+            tracked_element,
+            context.budget.c14n.remaining(),
+            context.budget.xml_base_resolution(),
+            &mut output,
+        )
+        .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?
+    };
+    context.budget.c14n.charge(output.len())?;
+    Ok((output, position))
+}
+
 /// Execute the production transform state machine while carrying node origin.
 ///
 /// Dependency analysis deliberately shares this executor with digest
-/// computation so binary-to-node-set adaptation and later XPath filters cannot
+/// computation so binary-to-node-set adaptation and later `XPath` filters cannot
 /// drift into a second, incomplete transform model.
 pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     signature_node: Node<'a, 'a>,
@@ -2042,10 +2324,8 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     };
     let output = execute_transform_chain::<true, _, _, _, _, _, _>(
         signature_node,
-        Some(signature_node),
-        initial_data.into(),
+        ChainStep::untracked(Some(signature_node), initial_data.into()),
         transforms,
-        None,
         Some(DependencyTracking {
             active_nodes,
             dormant_indexes,
@@ -2071,13 +2351,132 @@ fn ensure_transform_count(count: usize) -> Result<(), TransformError> {
     Ok(())
 }
 
+/// Chain state carried into the next transform.
+struct ChainStep<'e, 'd, S: TransformScratch, D: DomStorage> {
+    /// The enveloping Signature inside the current data's document, if any.
+    enveloped_signature: Option<Node<'e, 'e, D>>,
+    data: ExecutionData<'d, S, D>,
+    provenance: SignatureProvenance,
+}
+
+impl<'e, 'd, S: TransformScratch, D: DomStorage> ChainStep<'e, 'd, S, D> {
+    fn untracked(
+        enveloped_signature: Option<Node<'e, 'e, D>>,
+        data: ExecutionData<'d, S, D>,
+    ) -> Self {
+        Self {
+            enveloped_signature,
+            data,
+            provenance: SignatureProvenance::Untracked,
+        }
+    }
+}
+
+/// Apply one transform whose input needs no reparse, returning the next state.
+fn apply_chain_step<'e, 'd, S: TransformScratch, D: DomStorage, I: Instruction>(
+    source_signature: Node<'_, '_>,
+    step: ChainStep<'e, 'd, S, D>,
+    transform: &I,
+    mut dependency_tracking: Option<&mut DependencyTracking>,
+    context: &TransformExecutionContext<'_, S>,
+) -> Result<ChainStep<'e, 'd, S, D>, TransformError> {
+    let ChainStep {
+        enveloped_signature,
+        data,
+        ..
+    } = step;
+    if let InstructionView::C14n(algo, prefixes) = transform.view()
+        && let Some(nodes) = data.nodes()
+    {
+        let tracked_element = tracked_signature_element(enveloped_signature, nodes)?;
+        if S::ACCOUNTED || prefixes.is_some() {
+            // Dependency capture uses Native storage. A replay retains only
+            // the enclosing Signature's original serialization position.
+            debug_assert!(dependency_tracking.is_none());
+            let (output, position) = c14n::canonicalize_buffer_in(
+                nodes.document(),
+                nodes,
+                (algo, prefixes),
+                tracked_element,
+                context.budget.c14n.remaining(),
+                context.budget.xml_base_resolution(),
+                context.scratch,
+            )
+            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
+            context.budget.c14n.charge(output.len())?;
+            return Ok(ChainStep {
+                enveloped_signature,
+                data: ExecutionData::Accounted(output),
+                provenance: SignatureProvenance::Canonical(position),
+            });
+        }
+        let (output, position) =
+            canonicalize_tracked(nodes, algo, tracked_element, dependency_tracking, context)?;
+        return Ok(ChainStep {
+            enveloped_signature,
+            data: ExecutionData::NativeBinary(output),
+            provenance: SignatureProvenance::Canonical(position),
+        });
+    }
+
+    if S::ACCOUNTED && matches!(transform.view(), InstructionView::Base64) {
+        let bytes =
+            base64_projection(data.binary(), data.nodes(), context.budget, context.scratch)?;
+        if let Some(tracking) = dependency_tracking {
+            tracking.discard_provenance();
+        }
+        return Ok(ChainStep::untracked(
+            enveloped_signature,
+            ExecutionData::Accounted(bytes),
+        ));
+    }
+
+    if matches!(transform.view(), InstructionView::Enveloped) {
+        let Some(signature) = enveloped_signature else {
+            // XMLDSig 1.1 §6.6.4 requires the specified XPath's exact effect.
+            // With no source containing Signature, its union adds no node:
+            // the predicate is false everywhere. A Signature lost only in a
+            // later transform result is different: its source still exists.
+            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
+            let data = if context.source_has_signature {
+                data
+            } else {
+                let ExecutionData::Nodes(nodes) = data else {
+                    unreachable!("node-set transforms adapt binary input before execution")
+                };
+                ExecutionData::Nodes(nodes.empty_like())
+            };
+            return Ok(ChainStep::untracked(None, data));
+        };
+        let data = apply_transform_with_context(signature, transform, data, context)?;
+        return Ok(ChainStep::untracked(Some(signature), data));
+    }
+
+    if !transform_requires_node_set(transform)
+        && let (Some(nodes), Some(tracking)) = (data.nodes(), dependency_tracking.as_deref_mut())
+    {
+        // An octet-consuming transform reads the implicit C14N of the visible nodes
+        // (XMLDSig 1.1 section 4.4.3.2), so excluded fields cannot reach its output,
+        // exactly as for an explicit C14N step.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-ReferenceProcessingModel
+        retain_visible_dependencies(nodes, tracking)?;
+        tracking.dormant_indexes.clear();
+    }
+    let data = apply_transform_with_context(source_signature, transform, data, context)?;
+    if let Some(tracking) = dependency_tracking {
+        if let ExecutionData::Nodes(nodes) = &data {
+            tracking.retain_after_node_set(nodes, transform_may_read_mutable_data(transform))?;
+        } else {
+            tracking.discard_provenance();
+        }
+    }
+    Ok(ChainStep::untracked(enveloped_signature, data))
+}
+
 // Terminal strategy is monomorphized: collecting callers retain their existing
 // position/remapping path, while streaming consumers may intercept final C14N.
-#[allow(clippy::too_many_arguments)]
 fn execute_transform_chain<
     's,
-    'e,
-    'd,
     const STREAM_FINAL_C14N: bool,
     T,
     E,
@@ -2087,10 +2486,8 @@ fn execute_transform_chain<
     I: Instruction,
 >(
     source_signature: Node<'s, 's>,
-    enveloped_signature: Option<Node<'e, 'e, D>>,
-    data: ExecutionData<'d, S, D>,
+    step: ChainStep<'_, '_, S, D>,
     transforms: &[I],
-    canonical_signature_position: Option<Option<usize>>,
     mut dependency_tracking: Option<DependencyTracking>,
     context: &TransformExecutionContext<'_, S>,
     finalize: F,
@@ -2099,6 +2496,11 @@ where
     E: From<TransformError>,
     F: TransformTerminal<S, Output = T, Error = E>,
 {
+    let ChainStep {
+        enveloped_signature,
+        data,
+        provenance,
+    } = step;
     let Some((transform, remaining)) = transforms.split_first() else {
         if let (Some(nodes), Some(tracking)) = (data.nodes(), &mut dependency_tracking) {
             retain_visible_dependencies(nodes, tracking)?;
@@ -2116,38 +2518,15 @@ where
         None
     };
     if let Some(bytes) = binary {
-        // XMLDSig 1.1 §6.6.4: Enveloped is restricted to its parent document.
-        // Tracked C14N can preserve its identity through serialization; external
-        // or decoded octets cannot acquire that provenance from equal bytes.
-        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
-        if canonical_signature_position.is_none() {
-            context.budget.node_filter.charge(transforms.len())?;
-            if transforms
-                .iter()
-                .any(|t| matches!(t.view(), InstructionView::Enveloped))
-            {
-                return Err(TransformError::CrossDocumentSignatureNode.into());
-            }
+        if matches!(provenance, SignatureProvenance::Untracked) {
+            reject_untracked_enveloped(transforms, context)?;
         }
         // The parsed document must outlive every remaining node-set transform.
         // Recursive execution keeps all borrows scoped to this stack frame and
         // returns only owned digest bytes. Every C14N output is charged before
         // recursion, so these retained buffers remain a bounded subset of the
         // signature-wide canonicalization work budget.
-        check_xml_octets(bytes, context.budget.xml_parse_settings)?;
-        // Decoding is a separate input pass, including malformed-input failures. Reserve it
-        // before any transcoding; the subsequent parser charges its own decoded-byte passes.
-        context
-            .xml_parse
-            .charge_policy(bytes.len())
-            .map_err(TransformError::from)?;
-        let xml = crate::xml_input_shared::decode_xml_in(
-            bytes,
-            context.budget.xml_parse_settings.max_bytes,
-            |_, _| Ok(()),
-            &context.scratch.decoder(),
-        )
-        .map_err(S::decode_error)?;
+        let xml = decode_binary_input(bytes, context)?;
         let settings = DocumentParseSettings {
             allow_dtd: context.options.internal_dtd_allowed(),
             ..context.budget.xml_parse_settings
@@ -2162,72 +2541,33 @@ where
             &context.budget.node_set_materialization,
             context.scratch.node_keys(),
         )?;
-        if let Some(tracking) = &mut dependency_tracking
-            && let Some(positions) = tracking.canonical_positions.take()
-        {
-            let mut remapped = Vec::with_capacity(positions.len());
-            for tracked in positions {
-                if let Some(node) = document.descendants().find(|node| {
-                    node.node_type() == tracked.node_type && node.range().start == tracked.position
-                }) {
-                    remapped.push(TrackedDependencyNode {
-                        index: tracked.index,
-                        node_id: node.id(),
-                        node_type: tracked.node_type,
-                    });
-                } else {
-                    // Losing provenance must never become proof that later
-                    // mutable DigestValue content cannot affect the digest.
-                    tracking.opaque_dependencies.insert(tracked.index);
-                }
-            }
-            tracking.active_nodes = remapped;
+        if let Some(tracking) = &mut dependency_tracking {
+            tracking.remap_reparsed(&document);
         }
-        return match canonical_signature_position {
-            Some(Some(position)) => {
-                let remapped = document
+        // Binary input not produced by tracked canonicalization is a different
+        // document. Keep source_signature for XPath here() semantics, but do not
+        // apply its identity to Enveloped.
+        let remapped = match provenance {
+            SignatureProvenance::Canonical(Some(position)) => Some(
+                document
                     .descendants()
                     .find(|node| node.is_element() && node.range().start == position)
                     .filter(|node| {
                         enveloped_signature
                             .is_some_and(|source| node.tag_name() == source.tag_name())
                     })
-                    .ok_or(TransformError::CrossDocumentSignatureNode)?;
-                execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-                    source_signature,
-                    Some(remapped),
-                    ExecutionData::Nodes(nodes),
-                    transforms,
-                    None,
-                    dependency_tracking,
-                    context,
-                    finalize,
-                )
-            }
-            Some(None) => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-                source_signature,
-                None,
-                ExecutionData::Nodes(nodes),
-                transforms,
-                None,
-                dependency_tracking,
-                context,
-                finalize,
+                    .ok_or(TransformError::CrossDocumentSignatureNode)?,
             ),
-            None => execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-                source_signature,
-                // Binary input not produced by tracked canonicalization is a
-                // different document. Keep source_signature for XPath here()
-                // semantics, but do not apply its identity to Enveloped.
-                None,
-                ExecutionData::Nodes(nodes),
-                transforms,
-                None,
-                dependency_tracking,
-                context,
-                finalize,
-            ),
+            SignatureProvenance::Canonical(None) | SignatureProvenance::Untracked => None,
         };
+        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
+            source_signature,
+            ChainStep::untracked(remapped, ExecutionData::Nodes(nodes)),
+            transforms,
+            dependency_tracking,
+            context,
+            finalize,
+        );
     }
 
     if let InstructionView::C14n(algo, prefixes) = transform.view()
@@ -2244,250 +2584,24 @@ where
                 dependencies: dependency_indexes(dependency_tracking),
             });
         }
-        let tracked_element = match enveloped_signature {
-            Some(signature)
-                if std::ptr::eq(signature.document(), nodes.document())
-                    && nodes
-                        .contains_tree(signature)
-                        .map_err(TransformError::from)? =>
-            {
-                Some(signature.id())
-            }
-            _ => None,
-        };
-        if S::ACCOUNTED || prefixes.is_some() {
-            // Dependency capture uses Native storage. A replay retains only
-            // the enclosing Signature's original serialization position.
-            debug_assert!(dependency_tracking.is_none());
-            let (output, position) = c14n::canonicalize_buffer_in(
-                nodes.document(),
-                nodes,
-                (algo, prefixes),
-                tracked_element,
-                context.budget.c14n.remaining(),
-                context.budget.xml_base_resolution(),
-                context.scratch,
-            )
-            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
-            context
-                .budget
-                .c14n
-                .charge(output.len())
-                .map_err(TransformError::from)?;
-            drop(data);
-            return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-                source_signature,
-                enveloped_signature,
-                ExecutionData::Accounted(output),
-                remaining,
-                Some(position),
-                dependency_tracking,
-                context,
-                finalize,
-            );
-        }
-        let mut output = Vec::new();
-        let position = if let Some(tracking) = &mut dependency_tracking {
-            let mut tracked_ids = tracking
-                .active_nodes
-                .iter()
-                .map(|tracked| tracked.node_id)
-                .collect::<Vec<_>>();
-            if let Some(signature_id) = tracked_element
-                && !tracked_ids.contains(&signature_id)
-            {
-                tracked_ids.push(signature_id);
-            }
-            let positions =
-                c14n::canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
-                    nodes.document(),
-                    Some(nodes),
-                    algo,
-                    &tracked_ids,
-                    context.budget.c14n.remaining(),
-                    context.budget.xml_base_resolution(),
-                    &mut output,
-                )
-                .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?;
-            let mut canonical_positions = Vec::with_capacity(tracking.active_nodes.len());
-            for tracked in &tracking.active_nodes {
-                if let Some((_, position)) = positions
-                    .iter()
-                    .find(|(tracked_id, _)| *tracked_id == tracked.node_id)
-                {
-                    canonical_positions.push(CanonicalDependencyPosition {
-                        index: tracked.index,
-                        position: *position,
-                        node_type: tracked.node_type,
-                    });
-                } else {
-                    tracking.opaque_dependencies.insert(tracked.index);
-                }
-            }
-            tracking.canonical_positions = Some(canonical_positions);
-            tracked_element.and_then(|signature_id| {
-                positions
-                    .iter()
-                    .find(|(tracked_id, _)| *tracked_id == signature_id)
-                    .map(|(_, position)| *position)
-            })
-        } else {
-            c14n::canonicalize_with_visibility_and_position_bounded_with_xml_base_budget(
-                nodes.document(),
-                Some(nodes),
-                algo,
-                tracked_element,
-                context.budget.c14n.remaining(),
-                context.budget.xml_base_resolution(),
-                &mut output,
-            )
-            .map_err(|error| map_c14n_limit_error(error, &context.budget.c14n))?
-        };
-        context
-            .budget
-            .c14n
-            .charge(output.len())
-            .map_err(TransformError::from)?;
-        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-            source_signature,
-            enveloped_signature,
-            ExecutionData::NativeBinary(output),
-            remaining,
-            Some(position),
-            dependency_tracking,
-            context,
-            finalize,
-        );
     }
-
-    if S::ACCOUNTED && matches!(transform.view(), InstructionView::Base64) {
-        let bytes =
-            base64_projection(data.binary(), data.nodes(), context.budget, context.scratch)?;
-        // The next binary owns its storage. Do not pin every previous decoded
-        // buffer in recursive frames after that input has been consumed.
-        drop(data);
-        if let Some(tracking) = &mut dependency_tracking {
-            tracking
-                .opaque_dependencies
-                .extend(tracking.active_nodes.drain(..).map(|node| node.index));
-            tracking.dormant_indexes.clear();
-            tracking.canonical_positions = None;
-        }
-        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-            source_signature,
+    // The step consumes its input, so a decoded or canonicalized predecessor is
+    // never pinned in this frame while the rest of the chain runs.
+    let next = apply_chain_step(
+        source_signature,
+        ChainStep {
             enveloped_signature,
-            ExecutionData::Accounted(bytes),
-            remaining,
-            None,
-            dependency_tracking,
-            context,
-            finalize,
-        );
-    }
-
-    if matches!(transform.view(), InstructionView::Enveloped) {
-        let Some(signature) = enveloped_signature else {
-            // XMLDSig 1.1 §6.6.4 requires the specified XPath's exact effect.
-            // With no source containing Signature, its union adds no node:
-            // the predicate is false everywhere. A Signature lost only in a
-            // later transform result is different: its source still exists.
-            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-EnvelopedSignature
-            let data = if !context.source_has_signature {
-                match data {
-                    ExecutionData::Nodes(nodes) => ExecutionData::Nodes(nodes.empty_like()),
-                    _ => unreachable!("node-set transforms adapt binary input before execution"),
-                }
-            } else {
-                data
-            };
-            return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-                source_signature,
-                None,
-                data,
-                remaining,
-                None,
-                dependency_tracking,
-                context,
-                finalize,
-            );
-        };
-        let data = apply_transform_with_context(signature, transform, data, context)?;
-        return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
-            source_signature,
-            Some(signature),
             data,
-            remaining,
-            None,
-            dependency_tracking,
-            context,
-            finalize,
-        );
-    }
-
-    if !transform_requires_node_set(transform)
-        && let (Some(nodes), Some(tracking)) = (data.nodes(), &mut dependency_tracking)
-    {
-        // An octet-consuming transform reads the implicit C14N of the visible nodes
-        // (XMLDSig 1.1 section 4.4.3.2), so excluded fields cannot reach its output,
-        // exactly as for an explicit C14N step.
-        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-ReferenceProcessingModel
-        retain_visible_dependencies(nodes, tracking)?;
-        tracking.dormant_indexes.clear();
-    }
-    let data = apply_transform_with_context(source_signature, transform, data, context)?;
-    if let Some(tracking) = &mut dependency_tracking {
-        match &data {
-            ExecutionData::Nodes(nodes) => {
-                let preserve_excluded_as_opaque = match transform.view() {
-                    InstructionView::XPath(expression) => {
-                        xpath_may_read_mutable_character_data(expression.expression())
-                    }
-                    InstructionView::Filter2(filters) => filters.iter().any(|filter| {
-                        xpath_may_read_mutable_character_data(filter.xpath().expression())
-                    }),
-                    _ => false,
-                };
-                if preserve_excluded_as_opaque {
-                    tracking
-                        .opaque_dependencies
-                        .extend(tracking.dormant_indexes.drain());
-                }
-                let mut active_nodes = Vec::with_capacity(tracking.active_nodes.len());
-                for tracked in tracking.active_nodes.drain(..) {
-                    let remains_visible = match nodes.document().get_node(tracked.node_id) {
-                        Some(node) => nodes.contains_tree(node).map_err(TransformError::from)?,
-                        None => false,
-                    };
-                    if remains_visible {
-                        active_nodes.push(tracked);
-                    } else if preserve_excluded_as_opaque {
-                        // SXD exposes output membership but not which source
-                        // values a predicate coerced. Structural selection does
-                        // not depend on mutable DigestValue text, but a value
-                        // scan may control another node's inclusion, so absence
-                        // is not proof of independence in that case.
-                        tracking.opaque_dependencies.insert(tracked.index);
-                    } else {
-                        tracking.dormant_indexes.insert(tracked.index);
-                    }
-                }
-                tracking.active_nodes = active_nodes;
-            }
-            _ => {
-                tracking
-                    .opaque_dependencies
-                    .extend(tracking.active_nodes.drain(..).map(|tracked| tracked.index));
-                tracking.dormant_indexes.clear();
-                tracking.canonical_positions = None;
-            }
-        }
-    }
+            provenance,
+        },
+        transform,
+        dependency_tracking.as_mut(),
+        context,
+    )?;
     execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
         source_signature,
-        enveloped_signature,
-        data,
+        next,
         remaining,
-        None,
         dependency_tracking,
         context,
         finalize,
@@ -2592,7 +2706,7 @@ pub(crate) fn transform_chain_produces_binary<I: Instruction>(
 
 /// Whether running `transforms` applies the implicit inclusive C14N 1.0: to a
 /// node-set left at the end of the chain, or to one given to an XSLT transform
-/// (XMLDSig 1.1 section 4.4.3.2).
+/// (`XMLDSig` 1.1 section 4.4.3.2).
 /// <https://www.w3.org/TR/xmldsig-core1/#sec-ReferenceProcessingModel>
 pub(crate) fn transform_chain_uses_implicit_c14n<I: Instruction>(
     initial_binary: bool,
@@ -2691,6 +2805,11 @@ fn validate_transform_policy(
 ///
 /// For Exclusive C14N, also parses the optional `<InclusiveNamespaces
 /// PrefixList="...">` child element.
+///
+/// # Errors
+///
+/// Returns [`TransformError`] for an unsupported algorithm URI, malformed
+/// transform parameters, or a parse budget exceeded by `XPath` parameters.
 pub fn parse_transforms(transforms_node: Node) -> Result<Vec<Transform>, TransformError> {
     parse_transforms_with_budget(transforms_node, &mut XPathSignatureParseBudget::default())
 }
@@ -2779,6 +2898,15 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
         }
         scratch.charge(uri.len())?;
 
+        #[cfg(feature = "xslt")]
+        if uri == XSLT_TRANSFORM_URI {
+            chain.push(parse_xslt_transform(
+                child,
+                xpath_state.signature_budget,
+                scratch,
+            )?)?;
+            continue;
+        }
         let transform = if uri == ENVELOPED_SIGNATURE_URI {
             scratch.enveloped()
         } else if uri == BASE64_TRANSFORM_URI {
@@ -2803,10 +2931,6 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
                 None
             };
             scratch.canonicalization(algo, prefixes)
-        } else if let Some(transform) =
-            parse_xslt_transform(uri, child, xpath_state.signature_budget, scratch)?
-        {
-            transform
         } else {
             return Err(scratch.unsupported(format_args!("{uri}")));
         };
@@ -2820,14 +2944,10 @@ pub(crate) fn parse_reference_transforms_in<'a, S: ParseStorage<'a>>(
 
 #[cfg(feature = "xslt")]
 fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
-    uri: &str,
     transform_node: Node<'a, 'a>,
     budget: &XPathSignatureParseBudget,
     scratch: &S,
-) -> Result<Option<S::Instruction>, TransformError> {
-    if uri != XSLT_TRANSFORM_URI {
-        return Ok(None);
-    }
+) -> Result<S::Instruction, TransformError> {
     // XMLDSig 1.1 section 6.6.5: the XSLT namespace-qualified stylesheet element "MUST be
     // the sole child of the Transform element"; comments, processing instructions and
     // whitespace around it are not content.
@@ -2860,17 +2980,7 @@ fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
     // Child source ranges may point backward into the DTD, so capture/execute
     // that tree, never a slice between the first and last child's offsets.
     // https://www.w3.org/TR/2008/REC-xml-20081126/#entproc
-    Ok(Some(scratch.xslt(transform_node, &budget.xslt)?))
-}
-
-#[cfg(not(feature = "xslt"))]
-fn parse_xslt_transform<'a, S: ParseStorage<'a>>(
-    _: &str,
-    _: Node<'a, 'a>,
-    _: &XPathSignatureParseBudget,
-    _: &S,
-) -> Result<Option<S::Instruction>, TransformError> {
-    Ok(None)
+    scratch.xslt(transform_node, &budget.xslt)
 }
 
 /// Validate transforms whose XML syntax does not define parameter content.
@@ -3645,11 +3755,14 @@ mod tests {
         let result: Result<TransformChainOutput<()>, TerminalError> =
             execute_transform_chain::<true, _, _, _, _, _, _>(
                 document.root_element(),
-                Some(document.root_element()),
-                TransformData::NodeSet(NodeSet::entire_document_with_comments(&document).unwrap())
+                ChainStep::untracked(
+                    Some(document.root_element()),
+                    TransformData::NodeSet(
+                        NodeSet::entire_document_with_comments(&document).unwrap(),
+                    )
                     .into(),
+                ),
                 &[Transform::C14n(algorithm)],
-                None,
                 None,
                 &context,
                 RefusingTerminal,
@@ -3948,7 +4061,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(result.into_binary().unwrap().is_empty());
+        assert_eq!(result.into_binary().unwrap(), b"");
     }
 
     #[test]
@@ -4866,7 +4979,7 @@ mod tests {
         // A structural XPath may hide a mutable node from the current set, but
         // a later XPath still evaluates against the full source document.
         let document = Document::parse(
-            r#"<root><Signature><Object><Manifest><DigestValue>pending</DigestValue></Manifest></Object></Signature></root>"#,
+            r"<root><Signature><Object><Manifest><DigestValue>pending</DigestValue></Manifest></Object></Signature></root>",
         )
         .unwrap();
         let signature = document
@@ -4906,7 +5019,7 @@ mod tests {
         // C14N serializes only the current node set. A later XPath reparses
         // those bytes and cannot recover a tracked source node outside it.
         let document = Document::parse(
-            r#"<root><DigestValue>external</DigestValue><Signature><payload>value</payload></Signature></root>"#,
+            r"<root><DigestValue>external</DigestValue><Signature><payload>value</payload></Signature></root>",
         )
         .unwrap();
         let signature = document
@@ -5232,7 +5345,7 @@ mod tests {
         let doc = Document::parse(xml).unwrap();
 
         let chain = parse_transforms(doc.root_element()).unwrap();
-        assert!(chain.is_empty());
+        assert_eq!(chain, Vec::<Transform>::new());
     }
 
     #[test]
@@ -5360,13 +5473,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join(" ");
-        let filters = (0..MAX_XPATH_FILTERS)
-            .map(|_| {
-                format!(
-                    r#"<XPath xmlns="{XPATH_FILTER2_TRANSFORM_URI}" Filter="intersect">true()</XPath>"#
-                )
-            })
-            .collect::<String>();
+        let filters = format!(
+            r#"<XPath xmlns="{XPATH_FILTER2_TRANSFORM_URI}" Filter="intersect">true()</XPath>"#
+        )
+        .repeat(MAX_XPATH_FILTERS);
         let xml = format!(
             r#"<Transforms xmlns="{XMLDSIG_NS}" {declarations}><Transform Algorithm="{XPATH_FILTER2_TRANSFORM_URI}">{filters}</Transform></Transforms>"#
         );

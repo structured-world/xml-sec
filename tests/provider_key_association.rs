@@ -66,12 +66,12 @@ fn receipt_observer_work_refusal_is_terminal() {
         let mut refused = false;
         let result = RustCryptoProvider.verify_with_key_receipt(
             &Recover(&leaves),
-            SignatureVerificationInput {
-                algorithm: SignatureAlgorithm::RsaSha256,
-                context: &SignatureContext::default(),
-                data: &[],
-                signature: &[],
-            },
+            SignatureVerificationInput::new(
+                SignatureAlgorithm::RsaSha256,
+                &SignatureContext::default(),
+                &[],
+                &[],
+            ),
             &mut |event| {
                 assert!(!refused, "observer called after terminal refusal");
                 events += 1;

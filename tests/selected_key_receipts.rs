@@ -17,30 +17,93 @@ fn account() -> Memory {
     Memory::new(Arc::new(MemoryAccount::new(1 << 22, 1 << 28)))
 }
 
+/// An Ed25519 or Ed448 signing key whose seed octets all equal `seed`.
+fn eddsa_signing_key(algorithm: SignatureAlgorithm, seed: u8) -> EdDsaSigningKey {
+    use pkcs8::EncodePrivateKey as _;
+    let der = if algorithm == SignatureAlgorithm::Ed25519 {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .to_pkcs8_der()
+            .unwrap()
+    } else {
+        ed448_goldilocks::SigningKey::try_from(&[seed; 57][..])
+            .unwrap()
+            .to_pkcs8_der()
+            .unwrap()
+    };
+    EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap()
+}
+
+/// Encodings that only resemble `public` (an invalid point, or explicit
+/// parameters) never prove association, and validation is paid first.
+fn assert_malformed_eddsa_spki_unproven(public: &[u8]) {
+    use der::{Decode as _, Encode as _};
+    use xml_sec::provider::CryptoProvider as _;
+    let original = pkcs8::SubjectPublicKeyInfoRef::from_der(public).unwrap();
+    let invalid_bits = vec![0xff; original.subject_public_key.as_bytes().unwrap().len()];
+    let invalid_point = pkcs8::SubjectPublicKeyInfoRef {
+        algorithm: original.algorithm,
+        subject_public_key: der::asn1::BitStringRef::from_bytes(&invalid_bits).unwrap(),
+    }
+    .to_der()
+    .unwrap();
+    let invalid_parameters = pkcs8::SubjectPublicKeyInfoRef {
+        algorithm: pkcs8::AlgorithmIdentifierRef {
+            parameters: Some(der::asn1::AnyRef::NULL),
+            ..original.algorithm
+        },
+        subject_public_key: original.subject_public_key,
+    }
+    .to_der()
+    .unwrap();
+    for malformed in [&invalid_point, &invalid_parameters] {
+        with_expected(public, |expected| {
+            let work = account();
+            assert_eq!(
+                xml_sec::provider::RustCryptoProvider
+                    .associate_verification_key(malformed, expected, &|units| work
+                        .charge_work(units))
+                    .unwrap(),
+                KeyAssociation::Unproven
+            );
+        });
+    }
+    with_expected(&invalid_point, |expected| {
+        let work = account();
+        assert_eq!(
+            xml_sec::provider::RustCryptoProvider
+                .associate_verification_key(&invalid_point, expected, &|units| work
+                    .charge_work(units))
+                .unwrap(),
+            KeyAssociation::Unproven,
+            "identical invalid encodings are not validated keys"
+        );
+    });
+    with_expected(public, |expected| {
+        let small = Memory::new(Arc::new(MemoryAccount::new(0, 4096)));
+        assert!(
+            matches!(
+                xml_sec::provider::RustCryptoProvider.associate_verification_key(
+                    public,
+                    expected,
+                    &|units| small.charge_work(units)
+                ),
+                Err(DsigError::SharedExecution(
+                    structured_asn1::memory::MemoryError::WorkExceeded
+                ))
+            ),
+            "point validation must be admitted before arithmetic"
+        );
+    });
+}
+
 #[test]
 fn fixed_format_eddsa_keys_report_proven_mismatch() {
     // RFC 8410 §§3–4: absent parameters and decoded public key octets
     // identify the key. Two real successful signing-key families exercise
     // Same versus Mismatch without repeating signature verification.
-    use der::{Decode as _, Encode as _};
-    use pkcs8::EncodePrivateKey as _;
-    use xml_sec::provider::CryptoProvider as _;
     for algorithm in [SignatureAlgorithm::Ed25519, SignatureAlgorithm::Ed448] {
-        let make = |seed: u8| {
-            let der = if algorithm == SignatureAlgorithm::Ed25519 {
-                ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
-                    .to_pkcs8_der()
-                    .unwrap()
-            } else {
-                ed448_goldilocks::SigningKey::try_from(&[seed; 57][..])
-                    .unwrap()
-                    .to_pkcs8_der()
-                    .unwrap()
-            };
-            EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap()
-        };
-        let signer = make(0x42);
-        let other = make(0x43);
+        let signer = eddsa_signing_key(algorithm, 0x42);
+        let other = eddsa_signing_key(algorithm, 0x43);
         let public = signer
             .public_key_info()
             .unwrap()
@@ -53,62 +116,7 @@ fn fixed_format_eddsa_keys_report_proven_mismatch() {
             .spki_der()
             .unwrap()
             .to_vec();
-        let original = pkcs8::SubjectPublicKeyInfoRef::from_der(&public).unwrap();
-        let invalid_bits = vec![0xff; original.subject_public_key.as_bytes().unwrap().len()];
-        let invalid_point = pkcs8::SubjectPublicKeyInfoRef {
-            algorithm: original.algorithm,
-            subject_public_key: der::asn1::BitStringRef::from_bytes(&invalid_bits).unwrap(),
-        }
-        .to_der()
-        .unwrap();
-        let invalid_parameters = pkcs8::SubjectPublicKeyInfoRef {
-            algorithm: pkcs8::AlgorithmIdentifierRef {
-                parameters: Some(der::asn1::AnyRef::NULL),
-                ..original.algorithm
-            },
-            subject_public_key: original.subject_public_key,
-        }
-        .to_der()
-        .unwrap();
-        for malformed in [&invalid_point, &invalid_parameters] {
-            with_expected(&public, |expected| {
-                let work = account();
-                assert_eq!(
-                    xml_sec::provider::RustCryptoProvider
-                        .associate_verification_key(malformed, expected, &|units| work
-                            .charge_work(units))
-                        .unwrap(),
-                    KeyAssociation::Unproven
-                );
-            });
-        }
-        with_expected(&invalid_point, |expected| {
-            let work = account();
-            assert_eq!(
-                xml_sec::provider::RustCryptoProvider
-                    .associate_verification_key(&invalid_point, expected, &|units| work
-                        .charge_work(units))
-                    .unwrap(),
-                KeyAssociation::Unproven,
-                "identical invalid encodings are not validated keys"
-            );
-        });
-        with_expected(&public, |expected| {
-            let small = Memory::new(Arc::new(MemoryAccount::new(0, 4096)));
-            assert!(
-                matches!(
-                    xml_sec::provider::RustCryptoProvider.associate_verification_key(
-                        &public,
-                        expected,
-                        &|units| small.charge_work(units)
-                    ),
-                    Err(DsigError::SharedExecution(
-                        structured_asn1::memory::MemoryError::WorkExceeded
-                    ))
-                ),
-                "point validation must be admitted before arithmetic"
-            );
-        });
+        assert_malformed_eddsa_spki_unproven(&public);
         let builder =
             SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
                 .add_reference(
@@ -149,7 +157,7 @@ fn fixed_format_eddsa_keys_report_proven_mismatch() {
                                         assert_eq!(actual, expected_outcome);
                                         Ok::<_, ()>(())
                                     })
-                                    .unwrap()
+                                    .unwrap();
                             });
                         }
                         Ok::<_, ()>(())
@@ -590,70 +598,74 @@ fn equivalent_ec_encodings_use_only_the_selected_providers_semantics() {
     );
 }
 
+/// `base` under id-RSASSA-PSS, unrestricted (`salt` absent) or restricted to
+/// SHA-256 with the given minimum salt (RFC 4055 §3.3; 20 is the default).
+fn pss_restricted_spki(base: &[u8], salt: Option<u8>) -> Vec<u8> {
+    use der::{Decode as _, Encode as _};
+    let base = pkcs8::SubjectPublicKeyInfoRef::from_der(base).unwrap();
+    let digest = pkcs8::AlgorithmIdentifierRef {
+        oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
+        parameters: Some(der::asn1::AnyRef::NULL),
+    }
+    .to_der()
+    .unwrap();
+    let mgf = pkcs8::AlgorithmIdentifierRef {
+        oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8"),
+        parameters: Some(der::asn1::AnyRef::from_der(&digest).unwrap()),
+    }
+    .to_der()
+    .unwrap();
+    let mut content = Vec::new();
+    for (number, bytes) in [(0, digest), (1, mgf)] {
+        content.extend(
+            der::asn1::Any::new(
+                der::Tag::ContextSpecific {
+                    constructed: true,
+                    number: der::TagNumber(number),
+                },
+                bytes,
+            )
+            .unwrap()
+            .to_der()
+            .unwrap(),
+        );
+    }
+    if let Some(salt) = salt
+        && salt != 20
+    {
+        content.extend(
+            der::asn1::Any::new(
+                der::Tag::ContextSpecific {
+                    constructed: true,
+                    number: der::TagNumber(2),
+                },
+                [2, 1, salt],
+            )
+            .unwrap()
+            .to_der()
+            .unwrap(),
+        );
+    }
+    let params = der::asn1::Any::new(der::Tag::Sequence, content)
+        .unwrap()
+        .to_der()
+        .unwrap();
+    pkcs8::SubjectPublicKeyInfoRef {
+        algorithm: pkcs8::AlgorithmIdentifierRef {
+            oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
+            parameters: salt.map(|_| der::asn1::AnyRef::from_der(&params).unwrap()),
+        },
+        subject_public_key: base.subject_public_key,
+    }
+    .to_der()
+    .unwrap()
+}
+
 #[test]
 fn pss_method_compatibility_does_not_erase_effective_key_restrictions() {
     // RFC 4055 §3.3: absent restrictions are not the same key contract as
     // explicit minima, even when the actual salt-32 method fits both keys.
-    use der::{Decode as _, Encode as _};
-    fn public(base: &[u8], salt: Option<u8>) -> Vec<u8> {
-        let base = pkcs8::SubjectPublicKeyInfoRef::from_der(base).unwrap();
-        let digest = pkcs8::AlgorithmIdentifierRef {
-            oid: der::asn1::ObjectIdentifier::new_unwrap("2.16.840.1.101.3.4.2.1"),
-            parameters: Some(der::asn1::AnyRef::NULL),
-        }
-        .to_der()
-        .unwrap();
-        let mgf = pkcs8::AlgorithmIdentifierRef {
-            oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.8"),
-            parameters: Some(der::asn1::AnyRef::from_der(&digest).unwrap()),
-        }
-        .to_der()
-        .unwrap();
-        let mut content = Vec::new();
-        for (number, bytes) in [(0, digest), (1, mgf)] {
-            content.extend(
-                der::asn1::Any::new(
-                    der::Tag::ContextSpecific {
-                        constructed: true,
-                        number: der::TagNumber(number),
-                    },
-                    bytes,
-                )
-                .unwrap()
-                .to_der()
-                .unwrap(),
-            );
-        }
-        if let Some(salt) = salt
-            && salt != 20
-        {
-            content.extend(
-                der::asn1::Any::new(
-                    der::Tag::ContextSpecific {
-                        constructed: true,
-                        number: der::TagNumber(2),
-                    },
-                    [2, 1, salt],
-                )
-                .unwrap()
-                .to_der()
-                .unwrap(),
-            );
-        }
-        let params = der::asn1::Any::new(der::Tag::Sequence, content)
-            .unwrap()
-            .to_der()
-            .unwrap();
-        pkcs8::SubjectPublicKeyInfoRef {
-            algorithm: pkcs8::AlgorithmIdentifierRef {
-                oid: der::asn1::ObjectIdentifier::new_unwrap("1.2.840.113549.1.1.10"),
-                parameters: salt.map(|_| der::asn1::AnyRef::from_der(&params).unwrap()),
-            },
-            subject_public_key: base.subject_public_key,
-        }
-        .to_der()
-        .unwrap()
-    }
+    let public = pss_restricted_spki;
     let key = public_key(include_str!("fixtures/keys/rsa/rsa-2048-pubkey.pem"));
     let unrestricted = public(&key.public_key_bytes, None);
     let minimum20 = public(&key.public_key_bytes, Some(20));

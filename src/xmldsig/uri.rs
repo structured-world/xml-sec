@@ -1,11 +1,11 @@
-//! URI dereference for XMLDSig `<Reference>` elements.
+//! URI dereference for `XMLDSig` `<Reference>` elements.
 //!
 //! Implements same-document URI resolution per
 //! [XMLDSig §4.3.3.2](https://www.w3.org/TR/xmldsig-core1/#sec-Same-Document):
 //!
 //! - **Empty URI** (`""` or absent): the entire document, excluding comments.
 //! - **Bare-name `#id`**: the element whose ID attribute matches `id`, as a subtree
-//!   with comments removed by the XMLDSig same-document dereference rule.
+//!   with comments removed by the `XMLDSig` same-document dereference rule.
 //! - **`#xpointer(/)`**: the entire document, including comments.
 //! - **`#xpointer(id('id'))` / `#xpointer(id("id"))`**: element by ID, with comments retained.
 //!
@@ -29,7 +29,18 @@ use super::types::{
     NodeSet, NodeSetMaterializationBudget, TransformData, TransformError, transform_resource_limit,
 };
 
+/// A `#name` URI under one resolver's fragment grammar and ID semantics.
+pub(crate) enum BareNameNode<'a> {
+    /// Another form: a non-fragment URI, an `XPointer`, or a rejected fragment.
+    NotBareName,
+    /// A bare name that no single element carries.
+    Unresolved,
+    /// The single node carrying the ID.
+    Node(Node<'a, 'a>),
+}
+
 /// Original resource identity, before choosing operation-owned projection storage.
+#[derive(Clone, Copy)]
 pub(crate) enum ReferenceInput<'a> {
     Xml {
         root: Node<'a, 'a>,
@@ -140,10 +151,11 @@ pub(crate) fn validate_signing_reference_request(
     Ok(())
 }
 
+/// External resource byte limits: one resource, and all of them together.
 struct ExternalResourceBudget {
-    remaining_total_bytes: Cell<usize>,
-    max_resource_bytes: usize,
-    max_total_bytes: usize,
+    remaining_total: Cell<usize>,
+    per_resource: usize,
+    total: usize,
 }
 
 pub(crate) enum ExternalResourceMapError {
@@ -241,31 +253,30 @@ impl Default for ExternalResourceBudget {
 impl ExternalResourceBudget {
     fn with_limits(max_resource_bytes: usize, max_total_bytes: usize) -> Self {
         Self {
-            remaining_total_bytes: Cell::new(max_total_bytes),
-            max_resource_bytes,
-            max_total_bytes,
+            remaining_total: Cell::new(max_total_bytes),
+            per_resource: max_resource_bytes,
+            total: max_total_bytes,
         }
     }
 
     fn charge(&self, bytes: usize) -> Result<(), TransformError> {
-        if bytes > self.max_resource_bytes {
+        if bytes > self.per_resource {
             return Err(transform_resource_limit(
                 crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
-                self.max_resource_bytes,
+                self.per_resource,
                 bytes,
             ));
         }
-        let remaining = self.remaining_total_bytes.get();
+        let remaining = self.remaining_total.get();
         let Some(next) = remaining.checked_sub(bytes) else {
-            self.remaining_total_bytes.set(0);
+            self.remaining_total.set(0);
             return Err(transform_resource_limit(
                 crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                self.max_total_bytes,
-                self.max_total_bytes
-                    .saturating_add(bytes.saturating_sub(remaining)),
+                self.total,
+                self.total.saturating_add(bytes.saturating_sub(remaining)),
             ));
         };
-        self.remaining_total_bytes.set(next);
+        self.remaining_total.set(next);
         Ok(())
     }
 }
@@ -350,6 +361,7 @@ impl<'a> UriReferenceResolver<'a> {
         &self.id_registrations
     }
     /// Build a resolver with default ID attribute names (`ID`, `Id`, `id`).
+    #[must_use]
     pub fn new(doc: &'a Document<'a>) -> Self {
         Self::with_id_attrs(doc, &[])
     }
@@ -362,6 +374,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// Attribute names use the semantic DOM's local-name view, independent of
     /// the selected XML parser backend. For example, `wsu:Id="..."` is
     /// registered as `"Id"`, not `"wsu:Id"` or `"{namespace}Id"`.
+    #[must_use]
     pub fn with_id_attrs(doc: &'a Document<'a>, extra_attrs: &[&str]) -> Self {
         let id_registrations = extra_attrs
             .iter()
@@ -383,6 +396,7 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Build a resolver with typed global and element-scoped ID registrations.
+    #[must_use]
     pub fn with_id_registrations(
         doc: &'a Document<'a>,
         registrations: &[crate::IdAttributeRegistration],
@@ -473,7 +487,7 @@ impl<'a> UriReferenceResolver<'a> {
         } else if let Some(view) = self.view {
             TraversalDocumentIdentity::Owned(view.identity())
         } else {
-            TraversalDocumentIdentity::Borrowed(self.doc as *const Document<'_> as usize)
+            TraversalDocumentIdentity::Borrowed(std::ptr::from_ref(self.doc).addr())
         }
     }
 
@@ -482,6 +496,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// No network or filesystem access is performed by this resolver. Keys are
     /// RFC 3986 resolved URI identities: paths have dot segments removed while
     /// query and fragment suffixes are retained.
+    #[must_use]
     pub fn with_external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
         self
@@ -569,6 +584,12 @@ impl<'a> UriReferenceResolver<'a> {
     /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo`, comments included |
     /// | external URI in caller map | `TransformData::Resource` borrowing the mapped bytes and their resolved map key |
     /// | other | `Err(UnsupportedUri)` |
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransformError`] for an unsupported or malformed URI, an ID
+    /// that matches no element or several elements, or an external resource
+    /// outside the caller-supplied map or its byte limits.
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, None)
     }
@@ -677,7 +698,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// Resolve a URI fragment (the part after `#`).
     ///
     /// Handles:
-    /// - `xpointer(/)` → entire document (with comments, per XPointer spec)
+    /// - `xpointer(/)` → entire document (with comments, per `XPointer` spec)
     /// - `xpointer(id('foo'))` → element by ID, retaining comments
     /// - bare name `foo` → element by ID attribute
     fn dereference_fragment(
@@ -776,6 +797,7 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Check if an ID is registered in the resolver's index.
+    #[must_use]
     pub fn has_id(&self, id: &str) -> bool {
         self.id_index.contains(id)
     }
@@ -784,12 +806,18 @@ impl<'a> UriReferenceResolver<'a> {
     ///
     /// Returns `None` when the ID is absent or duplicated, matching fragment
     /// dereferencing and operation start-node selection.
+    #[must_use]
     pub fn node_for_id(&self, id: &str) -> Option<Node<'a, 'a>> {
         self.id_index.node(self.doc, id)
     }
 
     /// Resolve a same-document URI to an element under the configured grammar.
     /// An empty URI selects the document element for element-valued consumers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransformError`] for an unsupported or malformed URI,
+    /// including `#xpointer(/)`, which selects the document node.
     pub fn node_for_same_document_reference(
         &self,
         uri: &str,
@@ -822,17 +850,15 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Resolve a `#name` URI only when it is a bare name under this resolver's
-    /// fragment normalization and ID semantics. `None` means another form: a
-    /// non-fragment URI, an XPointer, or a fragment the grammar rejects;
-    /// `Some(None)` is a bare name no single element carries.
+    /// fragment normalization and ID semantics.
     pub(crate) fn bare_name_node_in(
         &self,
         uri: &str,
         budget: Option<&NodeSetMaterializationBudget>,
         scratch: &impl UriScratch,
-    ) -> Result<Option<Option<Node<'a, 'a>>>, TransformError> {
+    ) -> Result<BareNameNode<'a>, TransformError> {
         let Some(fragment) = uri.strip_prefix('#') else {
-            return Ok(None);
+            return Ok(BareNameNode::NotBareName);
         };
         let normalized = match Self::normalize_fragment_in(
             fragment,
@@ -841,17 +867,20 @@ impl<'a> UriReferenceResolver<'a> {
             scratch,
         ) {
             Ok(normalized) => normalized,
-            Err(TransformError::InvalidFragment) => return Ok(None),
+            Err(TransformError::InvalidFragment) => return Ok(BareNameNode::NotBareName),
             Err(error) => return Err(error),
         };
         let fragment = normalized.view(scratch)?;
         scratch.charge(fragment.len())?;
         // `same_document_id_fragment` returns `None` only when the grammar
         // rejects the fragment. A missing or duplicated ID takes the first arm,
-        // where the index lookup yields `Some(None)`.
+        // where the index lookup finds no single node.
         Ok(match self.same_document_id_fragment(fragment) {
-            Some((id, false)) => Some(self.id_index.node(self.doc, id)),
-            Some((_, true)) | None => None,
+            Some((id, false)) => self
+                .id_index
+                .node(self.doc, id)
+                .map_or(BareNameNode::Unresolved, BareNameNode::Node),
+            Some((_, true)) | None => BareNameNode::NotBareName,
         })
     }
 
@@ -940,6 +969,7 @@ impl<'a> UriReferenceResolver<'a> {
     }
 
     /// Get the number of registered IDs.
+    #[must_use]
     pub fn id_count(&self) -> usize {
         self.id_index.len()
     }
@@ -1017,38 +1047,8 @@ impl<'a> UriReferenceResolver<'a> {
         }
         let text = result.view(scratch)?;
         if text.starts_with("xpointer(") {
-            // Framework [7] balances parentheses even inside XPath literals;
-            // only ^(, ^), and ^^ are escaping pairs.
             scratch.charge(text.len())?;
-            let bytes = text.as_bytes();
-            let mut depth = 0usize;
-            let mut position = "xpointer".len();
-            while position < bytes.len() {
-                match bytes[position] {
-                    b'^' => {
-                        if !matches!(bytes.get(position + 1), Some(b'(' | b')' | b'^')) {
-                            return Err(invalid());
-                        }
-                        position += 2;
-                        continue;
-                    }
-                    b'(' => depth += 1,
-                    b')' => {
-                        if depth == 0 {
-                            return Err(invalid());
-                        }
-                        depth -= 1;
-                        if depth == 0 && position + 1 != bytes.len() {
-                            return Err(invalid());
-                        }
-                    }
-                    _ => {}
-                }
-                position += 1;
-            }
-            if depth != 0 {
-                return Err(invalid());
-            }
+            check_xpointer_scheme_data(text)?;
             scratch.charge(text.len())?;
             if text.contains('^') {
                 if let NormalizedFragment::Borrowed(text) = result {
@@ -1091,6 +1091,44 @@ fn hex_digit(byte: u8) -> Option<u8> {
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
+}
+
+/// Check that `xpointer(...)` scheme data is balanced and ends the pointer.
+///
+/// `XPointer` Framework [7] balances parentheses even inside `XPath`
+/// literals; only `^(`, `^)` and `^^` are escaping pairs.
+/// <https://www.w3.org/TR/2003/REC-xptr-framework-20030325/#NT-SchemeData>
+fn check_xpointer_scheme_data(text: &str) -> Result<(), TransformError> {
+    let bytes = text.as_bytes();
+    let mut depth = 0usize;
+    let mut position = "xpointer".len();
+    while position < bytes.len() {
+        match bytes[position] {
+            b'^' => {
+                if !matches!(bytes.get(position + 1), Some(b'(' | b')' | b'^')) {
+                    return Err(invalid_fragment());
+                }
+                position += 2;
+                continue;
+            }
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return Err(invalid_fragment());
+                }
+                depth -= 1;
+                if depth == 0 && position + 1 != bytes.len() {
+                    return Err(invalid_fragment());
+                }
+            }
+            _ => {}
+        }
+        position += 1;
+    }
+    if depth != 0 {
+        return Err(invalid_fragment());
+    }
+    Ok(())
 }
 
 fn has_encoded_xpointer_prefix(fragment: &str) -> bool {
@@ -1326,7 +1364,7 @@ mod tests {
             .unwrap();
         let comment = document
             .descendants()
-            .find(|node| node.is_comment())
+            .find(crate::xml::dom::Node::is_comment)
             .unwrap();
         assert!(!plain.contains(comment));
         assert!(pointer.contains(comment));
@@ -1588,7 +1626,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             TransformError::UnsupportedUri(uri) => {
-                assert_eq!(uri, "http://example.com/doc.xml")
+                assert_eq!(uri, "http://example.com/doc.xml");
             }
             other => panic!("expected UnsupportedUri, got: {other:?}"),
         }
@@ -1606,7 +1644,7 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             TransformError::UnsupportedUri(uri) => {
-                assert_eq!(uri, "#xpointer(foo())")
+                assert_eq!(uri, "#xpointer(foo())");
             }
             other => panic!("expected UnsupportedUri, got: {other:?}"),
         }
@@ -1965,7 +2003,7 @@ mod tests {
 
     #[test]
     fn node_set_exclude_subtree() {
-        let xml = r#"<root><keep>yes</keep><remove><deep>no</deep></remove></root>"#;
+        let xml = r"<root><keep>yes</keep><remove><deep>no</deep></remove></root>";
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
 
@@ -2146,7 +2184,7 @@ mod tests {
             .unwrap();
         assert!(
             doc.descendants()
-                .filter(|node| node.is_comment())
+                .filter(crate::xml::dom::Node::is_comment)
                 .all(|node| !nodes.contains(node))
         );
         assert!(matches!(

@@ -1,7 +1,7 @@
 //! Fixed-width session-key adaptation of sad-rsa 0.10.2 PKCS#1 v1.5 recovery.
 //!
 //! Source: sadco-io/sad-rsa, src/pkcs1v15.rs and
-//! src/algorithms/pkcs1v15.rs::decrypt_inner (MIT OR Apache-2.0).
+//! `src/algorithms/pkcs1v15.rs::decrypt_inner` (MIT OR Apache-2.0).
 //! RSA arithmetic, blinding and fault checking remain in that dependency.
 //! Unlike its general-message API, this adapter retains padding validity for
 //! the enclosing content operation and never exposes a variable-length result.
@@ -33,7 +33,7 @@ pub(super) fn recover(
     let mut output = Zeroizing::new(vec![0; key_len]);
     provider.fill_random(&mut output)?;
     let mut representative = BoxedUint::from_be_slice(ciphertext, key.n_bits_precision())
-        .map_err(|error| super::rustcrypto::map_rsa_error(error.into()))?;
+        .map_err(|error| super::rustcrypto::map_rsa_error(&error.into()))?;
     let in_range = representative.ct_lt(key.n());
     // Normalize an out-of-range public representative, but retain its invalidity.
     // Every width-correct input still performs blinded RSA and content work.
@@ -43,7 +43,7 @@ pub(super) fn recover(
     );
     let decoded = Zeroizing::new(
         rsa::hazmat::rsa_decrypt_and_check(key, Some(&mut ProviderRng(provider)), &representative)
-            .map_err(super::rustcrypto::map_rsa_error)?,
+            .map_err(|error| super::rustcrypto::map_rsa_error(&error))?,
     );
     let encoded = Zeroizing::new(decoded.to_be_bytes());
     let encoded = &encoded[encoded.len() - width..];

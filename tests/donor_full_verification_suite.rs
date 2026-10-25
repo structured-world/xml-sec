@@ -48,7 +48,7 @@ fn read_pem_der(path: &Path, expected_label: &str) -> Vec<u8> {
     let pem_text = read_fixture(path);
     let (rest, pem) = x509_parser::pem::parse_x509_pem(pem_text.as_bytes())
         .unwrap_or_else(|err| panic!("failed to parse PEM fixture {}: {err}", path.display()));
-    assert!(rest.iter().all(|byte| byte.is_ascii_whitespace()));
+    assert!(rest.iter().all(u8::is_ascii_whitespace));
     assert_eq!(pem.label, expected_label);
     pem.contents
 }
@@ -172,7 +172,7 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                 operation_policy.key_trust.verify_x509_chains = true;
                 // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
                 operation_policy.key_trust.verification_time =
-                    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
+                    Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
                 DefaultKeyResolver::new(KeyResolverConfig {
                     trusted_certs: vec![read_pem_der(&root.join(trust_anchor_path), "CERTIFICATE")],
                     ..KeyResolverConfig::default()

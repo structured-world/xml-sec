@@ -1,6 +1,9 @@
-//! RustCrypto ML-KEM plus the complete RFC 9935 encoding boundary.
+//! `RustCrypto` ML-KEM plus the complete RFC 9935 encoding boundary.
 
-use super::*;
+use super::{
+    CryptoProvider, EncapsulatedKey, KeyDecapsulationKey, KeyEncapsulationAlgorithm,
+    KeyEncapsulationKey, ProviderError, Zeroizing,
+};
 use crate::provider::{ProviderCapability, ProviderInputError};
 use der::{
     AnyRef, Decode, Encode, Reader, Tag, TagMode, TagNumber, Tagged,
@@ -32,12 +35,12 @@ pub enum MlKemPrivateKeyEncoding {
     Combined,
 }
 
-/// RustCrypto recipient private key; secret components are erased by upstream Drop.
+/// `RustCrypto` recipient private key; secret components are erased by upstream Drop.
 pub struct RustCryptoMlKemPrivateKey {
     algorithm: KeyEncapsulationAlgorithm,
     key: PrivateKey,
 }
-/// Validated RustCrypto recipient public key.
+/// Validated `RustCrypto` recipient public key.
 pub struct RustCryptoMlKemPublicKey {
     algorithm: KeyEncapsulationAlgorithm,
     key: PublicKey,
@@ -106,6 +109,9 @@ fn private_choice(bytes: &[u8]) -> Result<PrivateEncoding<'_>, ProviderError> {
 
 impl RustCryptoMlKemPrivateKey {
     /// Import a uniformly random 64-byte seed for this parameter set.
+    ///
+    /// # Errors
+    /// Returns an invalid-key error if the seed is not exactly 64 bytes.
     pub fn from_seed(
         algorithm: KeyEncapsulationAlgorithm,
         seed: &[u8],
@@ -126,6 +132,10 @@ impl RustCryptoMlKemPrivateKey {
     }
 
     /// Generate with the selected provider's CSPRNG, never ambient crate randomness.
+    ///
+    /// # Errors
+    /// Returns an error if the provider lacks the required capabilities,
+    /// randomness fails, or private-key construction fails.
     pub fn generate(
         provider: &dyn CryptoProvider,
         algorithm: KeyEncapsulationAlgorithm,
@@ -138,6 +148,10 @@ impl RustCryptoMlKemPrivateKey {
     }
 
     /// Decode every RFC 9935 private-key form; reject mismatched combined keys.
+    ///
+    /// # Errors
+    /// Returns an invalid-key error for malformed DER, forbidden parameters,
+    /// invalid key components, or inconsistent private/public key material.
     pub fn from_pkcs8_der(bytes: &[u8]) -> Result<Self, ProviderError> {
         Self::from_pkcs8_der_with_algorithm(bytes, None)
     }
@@ -227,6 +241,10 @@ impl RustCryptoMlKemPrivateKey {
     }
 
     /// Export the requested RFC 9935 form; never invent a missing seed.
+    ///
+    /// # Errors
+    /// Returns an error if `encoding` requires an unavailable seed or DER
+    /// construction fails. The returned document retains zeroizing ownership.
     pub fn to_pkcs8_der(
         &self,
         encoding: MlKemPrivateKeyEncoding,
@@ -274,6 +292,7 @@ impl RustCryptoMlKemPrivateKey {
     }
 
     /// Obtain the validated public key without exporting private material.
+    #[must_use]
     pub fn public_key(&self) -> RustCryptoMlKemPublicKey {
         let key = match &self.key {
             PrivateKey::K512(key) => PublicKey::K512(key.encapsulation_key().clone()),
@@ -300,6 +319,9 @@ impl RustCryptoMlKemPrivateKey {
     }
 
     /// Copy identity directly from the retained public component without cloning it.
+    ///
+    /// # Errors
+    /// Returns an invalid-key error if `output` cannot hold the public key.
     pub fn copy_public(&self, output: &mut [u8]) -> Result<usize, ProviderError> {
         let length = self.algorithm.public_key_len();
         if output.len() < length {
@@ -307,13 +329,13 @@ impl RustCryptoMlKemPrivateKey {
         }
         match &self.key {
             PrivateKey::K512(key) => {
-                output[..length].copy_from_slice(&key.encapsulation_key().to_bytes())
+                output[..length].copy_from_slice(&key.encapsulation_key().to_bytes());
             }
             PrivateKey::K768(key) => {
-                output[..length].copy_from_slice(&key.encapsulation_key().to_bytes())
+                output[..length].copy_from_slice(&key.encapsulation_key().to_bytes());
             }
             PrivateKey::K1024(key) => {
-                output[..length].copy_from_slice(&key.encapsulation_key().to_bytes())
+                output[..length].copy_from_slice(&key.encapsulation_key().to_bytes());
             }
         }
         Ok(length)
@@ -338,6 +360,10 @@ struct Both<'a> {
 
 impl RustCryptoMlKemPublicKey {
     /// Validate raw public coefficients before any encapsulation work.
+    ///
+    /// # Errors
+    /// Returns an invalid-key error for an incorrect encoded width or invalid
+    /// coefficients for the explicitly selected parameter set.
     pub fn from_bytes(
         algorithm: KeyEncapsulationAlgorithm,
         bytes: &[u8],
@@ -358,6 +384,10 @@ impl RustCryptoMlKemPublicKey {
     }
 
     /// Import RFC 9935 SPKI with absent parameters and an octet-aligned BIT STRING.
+    ///
+    /// # Errors
+    /// Returns an invalid-key error for malformed DER, an unsupported OID,
+    /// present parameters, unaligned bits, or invalid public coefficients.
     pub fn from_spki_der(bytes: &[u8]) -> Result<Self, ProviderError> {
         Self::from_spki_der_with_algorithm(bytes, None)
     }
@@ -366,18 +396,36 @@ impl RustCryptoMlKemPublicKey {
         bytes: &[u8],
         expected: Option<KeyEncapsulationAlgorithm>,
     ) -> Result<Self, ProviderError> {
-        let info = pkcs8::SubjectPublicKeyInfoRef::from_der(bytes).map_err(|_| invalid())?;
-        let algorithm = algorithm_identifier(info.algorithm)?;
+        // The shared PKIX reader owns SPKI syntax; RFC 9935 section 3 requires
+        // absent parameters (not even NULL) and an octet-aligned key.
+        // https://www.rfc-editor.org/rfc/rfc9935.html#section-3
+        // Key import belongs to no operation: the provider trait hands no account.
+        let session = crate::xmldsig::pkix::CertificateSession::standalone();
+        let (algorithm, key) = session
+            .with_public_key_info(bytes, |info, _| {
+                let identifier = info.algorithm();
+                if identifier.parameters().is_some() {
+                    return Ok(None);
+                }
+                let range = usize::try_from(info.key_offset())
+                    .ok()
+                    .and_then(|start| Some(start..start.checked_add(info.key_octets()?.len())?));
+                Ok(
+                    KeyEncapsulationAlgorithm::from_oid_bytes(identifier.algorithm().as_bytes())
+                        .zip(range),
+                )
+            })
+            .ok()
+            .flatten()
+            .ok_or_else(invalid)?;
         if expected.is_some_and(|expected| expected != algorithm) {
             return Err(invalid());
         }
-        Self::from_bytes(
-            algorithm,
-            info.subject_public_key.as_bytes().ok_or_else(invalid)?,
-        )
+        Self::from_bytes(algorithm, bytes.get(key).ok_or_else(invalid)?)
     }
 
     /// Export the raw FIPS 203 encapsulation key.
+    #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         match &self.key {
             PublicKey::K512(key) => key.to_bytes().to_vec(),
@@ -387,6 +435,9 @@ impl RustCryptoMlKemPublicKey {
     }
 
     /// Copy the public identity into caller-owned fixed storage without allocating.
+    ///
+    /// # Errors
+    /// Returns an invalid-key error if `output` cannot hold the public key.
     pub fn copy_public(&self, output: &mut [u8]) -> Result<usize, ProviderError> {
         let length = self.algorithm.public_key_len();
         if output.len() < length {
@@ -401,6 +452,9 @@ impl RustCryptoMlKemPublicKey {
     }
 
     /// Export RFC 9935 SPKI; no ASN.1 wrapper inside its BIT STRING.
+    ///
+    /// # Errors
+    /// Returns an error if construction or DER encoding of the SPKI fails.
     pub fn to_spki_der(&self) -> Result<pkcs8::Document, ProviderError> {
         macro_rules! encode {
             ($key:expr) => {{

@@ -1,9 +1,9 @@
-//! XAdES baseline validation of signatures verified by xml-sec.
+//! `XAdES` baseline validation of signatures verified by xml-sec.
 //!
 //! [`Document`] implements the `structured-xades` XML access traits over a
 //! [`VerifiedSession`]: the document generation, authenticated reference
 //! catalogue, scalar kernels, hash-use and selected-key receipts that the
-//! XMLDSig verification produced. No second XML representation is built and
+//! `XMLDSig` verification produced. No second XML representation is built and
 //! no signature is verified again. [`validate_basic`] runs the B-B checks of
 //! ETSI EN 319 132-1 for one selected signature.
 //!
@@ -60,7 +60,7 @@ impl<'s, 'view, 'scope, 'inputs, W: Work> Document<'s, 'view, 'scope, 'inputs, W
     }
 }
 
-/// Adapter failure, distinct from every completed XAdES fact.
+/// Adapter failure, distinct from every completed `XAdES` fact.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// The query named a different document or generation than the session.
@@ -84,7 +84,7 @@ pub enum Error {
     /// The signature is not part of the verified request.
     #[error("signature is not part of the verified request")]
     UnknownSignature,
-    /// The ordinal is outside the verified SignedInfo references.
+    /// The ordinal is outside the verified `SignedInfo` references.
     #[error("reference ordinal outside the verified SignedInfo")]
     ReferenceOrdinal,
     /// The verified reference result carries no original node identity.

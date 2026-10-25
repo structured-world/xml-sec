@@ -11,6 +11,11 @@ use xml_sec::xmldsig::{
 };
 use xml_sec::{XmlDocument, XmlDocumentError};
 
+// A late-bound view lifetime, as `with_view` requires of its callback.
+fn root_identity(view: xml_sec::DocumentView<'_>) -> xml_sec::NodeIdentity {
+    view.root_element()
+}
+
 fn signed_pair() -> (XmlDocument, HmacVerificationKey, HmacVerificationKey) {
     let first_secret = vec![0x31; 32];
     let second_secret = vec![0x72; 32];
@@ -413,7 +418,9 @@ fn request_key_authorization_cannot_relax_compiled_policy() {
         ..VerificationRequest::default()
     };
     let mut policy = VerificationPolicy::default();
-    policy.key_sources.preset_key = false;
+    policy
+        .key_sources
+        .remove(xml_sec::policy::KeySourceKind::PresetKey);
     let report = VerifyContext::new()
         .policy(policy)
         .verify_request(&document, &request)
@@ -489,7 +496,7 @@ fn mathematical_embedded_key_success_is_not_authorized_coverage() {
         "fixtures/saml/response_signed_by_idp_ecdsa.xml"
     ))
     .unwrap();
-    let target = document.with_view(|view| view.root_element());
+    let target = document.with_view(root_identity);
     let resolver = DefaultKeyResolver::default();
     let mut policy = VerificationPolicy::default();
     policy.key_trust.mode = VerificationTrustMode::CryptographicOnly;
