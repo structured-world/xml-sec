@@ -942,22 +942,14 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        let range = self.with_view(|view| {
-            let node = view.resolve_mutation_node(target)?;
-            if !node.is_element() {
-                return Err(XmlDocumentError::TargetNotElement);
-            }
-            Ok(node.range())
-        })?;
-        self.ensure_replacement_fits(&range, replacement.len(), self.settings.max_bytes)?;
-        self.validate_single_element_in_parent_context(
+        let next = self.build_node_replacement(
             target,
             replacement,
-            None,
+            ReplacementShape::SingleElement,
             self.settings,
             None,
         )?;
-        self.replace_range(range, replacement, None)
+        self.commit_cell(next)
     }
 
     #[cfg(feature = "xmlenc")]
@@ -968,22 +960,14 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
-        let range = self.with_view(|view| {
-            let node = view.resolve_mutation_node(target)?;
-            if !node.is_element() {
-                return Err(XmlDocumentError::TargetNotElement);
-            }
-            Ok(node.range())
-        })?;
-        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
-        self.validate_single_element_in_parent_context(
+        let next = self.build_node_replacement(
             target,
             replacement,
-            Some(settings.nodes_limit as usize),
+            ReplacementShape::SingleElement,
             settings,
             Some(budget),
         )?;
-        self.replace_range_with_settings(range, replacement, settings, Some(budget))
+        self.commit_cell(next)
     }
 
     #[cfg(feature = "xmlenc")]
@@ -994,22 +978,17 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
-        let range = self.with_view(|view| {
-            let node = view.resolve_mutation_node(target)?;
-            if !node.is_element() {
-                return Err(XmlDocumentError::TargetNotElement);
-            }
-            Ok(node.range())
-        })?;
-        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
-        self.validate_single_element_in_parent_context(
-            target,
-            replacement,
-            Some(settings.nodes_limit as usize),
-            settings,
-            Some(budget),
-        )?;
-        self.prepare_range_replacement(range, replacement, settings, budget)
+        Ok(PreparedDocumentMutation {
+            identity: self.identity,
+            generation: self.generation,
+            cell: self.build_node_replacement(
+                target,
+                replacement,
+                ReplacementShape::SingleElement,
+                settings,
+                Some(budget),
+            )?,
+        })
     }
 
     /// Replace one complete node with an XML fragment valid in its parent context.
@@ -1025,12 +1004,14 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
-        let range = self.with_view(|view| {
-            Ok::<_, XmlDocumentError>(view.resolve_mutation_node(target)?.range())
-        })?;
-        self.ensure_replacement_fits(&range, replacement.len(), self.settings.max_bytes)?;
-        self.validate_fragment_in_parent_context(target, replacement, None, self.settings, None)?;
-        self.replace_range(range, replacement, None)
+        let next = self.build_node_replacement(
+            target,
+            replacement,
+            ReplacementShape::Fragment,
+            self.settings,
+            None,
+        )?;
+        self.commit_cell(next)
     }
 
     #[cfg(feature = "xmlenc")]
@@ -1041,18 +1022,55 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
-        let range = self.with_view(|view| {
-            Ok::<_, XmlDocumentError>(view.resolve_mutation_node(target)?.range())
+        Ok(PreparedDocumentMutation {
+            identity: self.identity,
+            generation: self.generation,
+            cell: self.build_node_replacement(
+                target,
+                replacement,
+                ReplacementShape::Fragment,
+                settings,
+                Some(budget),
+            )?,
+        })
+    }
+
+    /// Parse the generation that replaces `target` with `replacement`, then
+    /// check on that parse that the replacement stayed inside the target's
+    /// slot. Budgeted operations report the node ceiling as a projected limit.
+    fn build_node_replacement(
+        &self,
+        target: NodeIdentity,
+        replacement: &str,
+        shape: ReplacementShape,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<DocumentCell, XmlDocumentError> {
+        let (range, parent) = self.with_view(|view| {
+            let node = view.resolve_mutation_node(target)?;
+            if shape == ReplacementShape::SingleElement && !node.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            Ok((node.range(), node.parent_element().map(Node::range)))
         })?;
-        self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
-        self.validate_fragment_in_parent_context(
-            target,
-            replacement,
-            Some(settings.nodes_limit as usize),
-            settings,
-            Some(budget),
-        )?;
-        self.prepare_range_replacement(range, replacement, settings, budget)
+        let output = self.replaced_range(range.clone(), replacement, settings.max_bytes)?;
+        let next = build_cell(output, settings, budget).map_err(|error| match error {
+            XmlDocumentError::Parse(ParseError::NodesLimitReached) if budget.is_some() => {
+                XmlDocumentError::ProjectedNodeLimit {
+                    maximum: settings.nodes_limit as usize,
+                }
+            }
+            error => error,
+        })?;
+        // The parent encloses the target, and the projected document fits the
+        // byte ceiling, so neither bound can wrap.
+        let slot = range.start..range.start + replacement.len();
+        let parent =
+            parent.map(|parent| parent.start..parent.end - range.len() + replacement.len());
+        next.with_dependent(|xml, parsed| {
+            validate_replacement_slot(xml, &parsed.document, slot, parent, shape)
+        })?;
+        Ok(next)
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
@@ -1623,30 +1641,6 @@ impl XmlDocument {
     }
 
     #[cfg(feature = "xmlenc")]
-    fn prepare_range_replacement(
-        &self,
-        range: std::ops::Range<usize>,
-        replacement: &str,
-        settings: DocumentParseSettings,
-        budget: &XmlParseWorkBudget,
-    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
-        let output = self.replaced_range(range, replacement, settings.max_bytes)?;
-        let cell = build_cell(output, settings, Some(budget)).map_err(|error| match error {
-            XmlDocumentError::Parse(ParseError::NodesLimitReached) => {
-                XmlDocumentError::ProjectedNodeLimit {
-                    maximum: settings.nodes_limit as usize,
-                }
-            }
-            error => error,
-        })?;
-        Ok(PreparedDocumentMutation {
-            identity: self.identity,
-            generation: self.generation,
-            cell,
-        })
-    }
-
-    #[cfg(feature = "xmlenc")]
     pub(crate) fn commit_prepared(
         &mut self,
         prepared: PreparedDocumentMutation,
@@ -1699,59 +1693,6 @@ impl XmlDocument {
             });
         }
         Ok(projected)
-    }
-
-    fn validate_single_element_in_parent_context(
-        &self,
-        target: NodeIdentity,
-        replacement: &str,
-        maximum: Option<usize>,
-        settings: DocumentParseSettings,
-        budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
-        let (parsed, wrapper_range) =
-            self.parse_fragment_in_parent_context(target, replacement, maximum, settings, budget)?;
-        parsed.with_dependent(|_, parsed| {
-            let wrapper = validation_wrapper(parsed, wrapper_range.clone())?;
-            if wrapper.children().filter(Node::is_element).count() != 1
-                || wrapper.children().any(|node| {
-                    !node.is_element()
-                        && !node.is_comment()
-                        && !node.is_pi()
-                        && node.text().is_none_or(|text| !text.trim().is_empty())
-                })
-            {
-                return Err(XmlDocumentError::InvalidReplacement(
-                    "element replacement must contain exactly one element".into(),
-                ));
-            }
-            Ok(())
-        })
-    }
-
-    fn validate_fragment_in_parent_context(
-        &self,
-        target: NodeIdentity,
-        replacement: &str,
-        maximum: Option<usize>,
-        settings: DocumentParseSettings,
-        budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
-        self.parse_fragment_in_parent_context(target, replacement, maximum, settings, budget)
-            .map(|_| ())
-    }
-
-    fn parse_fragment_in_parent_context(
-        &self,
-        target: NodeIdentity,
-        replacement: &str,
-        maximum: Option<usize>,
-        settings: DocumentParseSettings,
-        budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
-        let range =
-            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
-        self.parse_wrapped_range(range, replacement, maximum, settings, budget)
     }
 
     fn validate_content_in_element_context(
@@ -3753,6 +3694,127 @@ fn document_requires_internal_dtd(
     .is_err())
 }
 
+/// What a node replacement must leave in its parent.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplacementShape {
+    /// Exactly one element, beside whitespace, comments and processing instructions.
+    SingleElement,
+    /// Any content that is well-formed in the parent context.
+    Fragment,
+}
+
+/// Check on a parsed candidate that the bytes at `slot` are complete children
+/// of the parent (`None`: the document node) that held the replaced node.
+///
+/// The prefix before `slot` is unchanged, so its tokens still end at
+/// `slot.start`. A parent that spans exactly its projected range keeps every
+/// end tag of the replacement inside itself. A child that crosses the slot
+/// boundary can only be text folded with a neighbour; its part inside the slot
+/// must end on a token boundary, otherwise markup opened by the replacement
+/// (CDATA, a reference) would be closed by the neighbour.
+fn validate_replacement_slot(
+    xml: &str,
+    document: &Document<'_>,
+    slot: std::ops::Range<usize>,
+    parent: Option<std::ops::Range<usize>>,
+    shape: ReplacementShape,
+) -> Result<(), XmlDocumentError> {
+    let escaped = || {
+        XmlDocumentError::InvalidReplacement(
+            "replacement escaped its structural validation boundary".into(),
+        )
+    };
+    let not_single_element = || {
+        XmlDocumentError::InvalidReplacement(
+            "element replacement must contain exactly one element".into(),
+        )
+    };
+    let mut container = document.root();
+    if let Some(parent) = parent {
+        while !(container.is_element() && container.range() == parent) {
+            container = container
+                .children()
+                .find(|child| {
+                    let range = child.range();
+                    child.is_element() && range.start <= parent.start && parent.end <= range.end
+                })
+                .ok_or_else(escaped)?;
+        }
+    }
+    let blank = |range: std::ops::Range<usize>| xml[range].trim().is_empty();
+    let mut elements = 0_usize;
+    let mut covered = slot.start;
+    for child in container.children() {
+        let range = child.range();
+        if range.end <= slot.start {
+            continue;
+        }
+        if range.start >= slot.end {
+            break;
+        }
+        let part = range.start.max(slot.start)..range.end.min(slot.end);
+        // Bytes no node covers are whitespace the parser dropped at document
+        // level. Nodes expanded from one entity reference share its range.
+        if !blank(covered..part.start.max(covered)) {
+            return Err(escaped());
+        }
+        covered = covered.max(part.end);
+        if part != range {
+            if !child.is_text() {
+                return Err(escaped());
+            }
+            let complete = match shape {
+                ReplacementShape::SingleElement => blank(part),
+                ReplacementShape::Fragment => text_tokens_complete(&xml[part]),
+            };
+            if !complete {
+                return Err(match shape {
+                    ReplacementShape::SingleElement => not_single_element(),
+                    ReplacementShape::Fragment => escaped(),
+                });
+            }
+        } else if child.is_element() {
+            elements += 1;
+        } else if child.is_text() {
+            if shape == ReplacementShape::SingleElement
+                && !child.text().is_none_or(|text| text.trim().is_empty())
+            {
+                return Err(not_single_element());
+            }
+        } else if !child.is_comment() && !child.is_pi() {
+            return Err(escaped());
+        }
+    }
+    if !blank(covered..slot.end) {
+        return Err(escaped());
+    }
+    if shape == ReplacementShape::SingleElement && elements != 1 {
+        return Err(not_single_element());
+    }
+    Ok(())
+}
+
+/// Whether character data starting on a token boundary also ends on one: every
+/// CDATA section and reference it opens is closed inside it.
+fn text_tokens_complete(text: &str) -> bool {
+    let mut rest = text;
+    while let Some(start) = rest.find(['&', '<']) {
+        rest = &rest[start..];
+        let close = if rest.starts_with("<![CDATA[") {
+            "]]>"
+        } else if rest.starts_with('&') {
+            ";"
+        } else {
+            return false;
+        };
+        let Some(end) = rest.find(close) else {
+            return false;
+        };
+        rest = &rest[end + close.len()..];
+    }
+    true
+}
+
 fn wrapped_fragment(replacement: &str) -> String {
     format!("{VALIDATION_WRAPPER_OPEN}{replacement}{VALIDATION_WRAPPER_CLOSE}")
 }
@@ -3894,6 +3956,9 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
         "element start tag is incomplete".into(),
     ))
 }
+
+#[cfg(test)]
+mod replacement_tests;
 
 #[cfg(test)]
 mod tests {
