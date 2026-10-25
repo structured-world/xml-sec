@@ -131,14 +131,16 @@ Four workloads, at 16 and 256 repeated units, cover the main application uses:
 
 | Workload | Operations | Configuration |
 |----------|------------|---------------|
-| SAML assertion | sign, verify | Enveloped exclusive-C14N signature over an `Assertion` inside a `Response`. Signing uses a named key; verification trusts only a root CA and receives the signer certificate in `KeyInfo` and an untrusted intermediate CA. Bergshamra runs with `--enabled-key-data x509 --strict`. |
+| SAML assertion | sign, verify | Enveloped exclusive-C14N signature over an `Assertion` inside a `Response`. The signer writes its certificate into `X509Data`; verification trusts only a root CA, receives an untrusted intermediate CA, and must also reject a wrapped forgery that repeats the signed ID. Bergshamra verifies with `--enabled-key-data x509 --strict`. |
 | Element | encrypt, decrypt | A standalone `Payment` element as `Element` `EncryptedData`: AES-256-GCM content key transported with RSA-OAEP to the recipient certificate, decrypted with its private key. |
 | Element in place | encrypt, decrypt | The same `Payment` encrypted where it stands inside an `Order` (`--node-id`); decryption restores the whole document. |
 | XSLT reference | sign, verify | A same-document reference transformed by an XSLT 1.0 stylesheet before exclusive C14N. |
 
-Pinned Bergshamra 0.9.2 has no XSLT transform and its CLI `--node-id` writes a
-standalone `EncryptedData` instead of replacing the element inside its document.
-Those cases are recorded as unsupported with the reason and are never timed.
+Pinned Bergshamra 0.9.2 has no XSLT transform, leaves a template's `X509Data`
+empty when signing, and its CLI `--node-id` writes a standalone `EncryptedData`
+instead of replacing the element inside its document. Those operations are
+recorded as unsupported with the reason and are never timed; it still verifies
+the other engines' assertions and decrypts their in-place documents.
 
 Before timing, each engine's signature is verified by every engine, each
 ciphertext is decrypted by every engine, and all engines must reject a modified

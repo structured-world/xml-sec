@@ -7,8 +7,30 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   percentile, resources, heapStats, createEvidenceDirectory,
-  SCENARIOS, UNSUPPORTED, documentBody, tamper, engineArguments, caseFiles,
+  SCENARIOS, unsupported, documentBody, tamper, wrap, engineArguments, caseFiles,
 } from './compare-security.mjs';
+
+test('wrapping places an unsigned forgery with the signed ID before the signed assertion', () => {
+  // Engines are checked to reject this; a no-op wrap would check an intact document.
+  const signed = '<samlp:Response><saml:Assertion ID="assertion"><ds:Signature xmlns:ds="d"><ds:SignedInfo/></ds:Signature>'
+    + '<saml:Subject><saml:NameID>user@example.invalid</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>';
+  const wrapped = wrap(signed);
+  const forged = wrapped.indexOf('attacker@example.invalid');
+  const original = wrapped.indexOf('user@example.invalid');
+  assert.ok(forged > 0 && original > forged);
+  assert.equal(wrapped.split('ID="assertion"').length, 3);
+  assert.equal(wrapped.split('<ds:Signature').length, 2);
+  assert.throws(() => wrap('<samlp:Response/>'), /Signed assertion missing/);
+});
+
+test('unsupported work is recorded per operation, not per workload', () => {
+  // Bergshamra verifies assertions and decrypts in-place documents it cannot produce.
+  assert.ok(unsupported('bergshamra', 'assertion', 'sign'));
+  assert.equal(unsupported('bergshamra', 'assertion', 'verify'), undefined);
+  assert.ok(unsupported('bergshamra', 'element_in_place', 'encrypt'));
+  assert.equal(unsupported('bergshamra', 'element_in_place', 'decrypt'), undefined);
+  assert.equal(unsupported('xml-sec', 'xslt', 'sign'), undefined);
+});
 
 test('tampering changes a signed value in every signing workload', () => {
   // A replacement that matches nothing would make the rejection check verify an intact document.
@@ -36,8 +58,8 @@ test('every measured engine has arguments for each workload operation', () => {
   const files = { template: 't', signed: 's', plain: 'p', encrypted: 'e', destination: 'd', corpus: 'c' };
   for (const [scenario, operations] of Object.entries(SCENARIOS)) {
     for (const engine of [['xmlsec', 'xml-sec'], ['xmlsec', 'libxmlsec1'], ['berg', 'bergshamra']]) {
-      if (UNSUPPORTED[engine[1]]?.[scenario]) continue;
       for (const operation of operations) {
+        if (unsupported(engine[1], scenario, operation)) continue;
         const args = engineArguments(engine[0], scenario, operation, files);
         assert.ok(Array.isArray(args) && args[0] === operation, `${engine[1]} ${scenario} ${operation}`);
       }

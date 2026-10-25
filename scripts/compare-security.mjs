@@ -52,13 +52,22 @@ export const SCENARIOS = {
   xslt: ['sign', 'verify'],
 };
 
-/** Behavior observed at the pinned competitor revisions; such work is never timed. */
+/** Behavior observed at the pinned competitor revisions, per workload and operation; never timed. */
 export const UNSUPPORTED = {
   bergshamra: {
-    element_in_place: 'CLI --node-id encrypts the extracted element into a standalone EncryptedData and never replaces it inside the data document',
-    xslt: 'no XSLT transform: an XSLT-transformed Reference fails with a digest mismatch',
+    assertion: { sign: 'leaves the template X509Data empty; the signer certificate is never written' },
+    element_in_place: { encrypt: 'CLI --node-id writes a standalone EncryptedData instead of replacing the element inside its document' },
+    xslt: {
+      sign: 'no XSLT transform',
+      verify: 'no XSLT transform: an XSLT-transformed Reference fails with a digest mismatch',
+    },
   },
 };
+
+/** Why `engine` cannot run `operation` of `scenario`, or undefined when it can. */
+export function unsupported(engine, scenario, operation) {
+  return UNSUPPORTED[engine]?.[scenario]?.[operation];
+}
 
 /** The XML document without the declaration and surrounding whitespace engines add on output. */
 export function documentBody(bytes) {
@@ -81,6 +90,24 @@ export function tamper(xml, scenario) {
   return xml.replace(from, to);
 }
 
+/**
+ * Signature wrapping: an unsigned forged assertion with the signed assertion's ID and
+ * another subject precedes the untouched signed one. A verifier that reported success
+ * would leave the application free to read the forgery.
+ */
+export function wrap(xml) {
+  const start = xml.indexOf('<saml:Assertion ID="assertion"');
+  const close = '</saml:Assertion>';
+  const end = xml.indexOf(close, start);
+  if (start < 0 || end < 0) throw Error('Signed assertion missing');
+  const signed = xml.slice(start, end + close.length);
+  const signature = /<ds:Signature[\s>][\s\S]*<\/ds:Signature>/;
+  const subject = '<saml:NameID>user@example.invalid</saml:NameID>';
+  if (!signature.test(signed) || !signed.includes(subject)) throw Error('Signed assertion has no signature or subject');
+  const forged = signed.replace(signature, '').replace(subject, '<saml:NameID>attacker@example.invalid</saml:NameID>');
+  return xml.slice(0, start) + forged + signed + xml.slice(end + close.length);
+}
+
 /** Arguments for one engine and operation; `xmlsec` covers both xmlsec1-compatible CLIs. */
 export function engineArguments(kind, scenario, operation, files) {
   const { template, signed, plain, encrypted, destination, corpus } = files;
@@ -95,14 +122,16 @@ export function engineArguments(kind, scenario, operation, files) {
       },
       // Bergshamra's documented SAML configuration: chain validation plus strict positions.
       assertion: {
-        sign: ['sign', template, '--key-name', `bench:${file('private.pem')}`, '--output', destination],
         verify: ['verify', signed, '--trusted', file('root.pem'), '--untrusted', file('intermediate.pem'), '--enabled-key-data', 'x509', '--strict'],
       },
       element: {
         encrypt: ['encrypt', file('element.template.xml'), '--data', plain, '--cert', file('leaf.pem'), '--output', destination],
         decrypt: ['decrypt', encrypted, '--key', file('private.pem'), '--output', destination],
       },
-    }[scenario][operation];
+      element_in_place: {
+        decrypt: ['decrypt', encrypted, '--key', file('private.pem'), '--output', destination],
+      },
+    }[scenario]?.[operation];
   }
   const recipient = ['--pubkey-cert-pem:recipient', file('leaf.pem'), '--session-key', 'aes-256'];
   return {
@@ -113,7 +142,7 @@ export function engineArguments(kind, scenario, operation, files) {
       decrypt: ['decrypt', '--keys-file', file('keys.xml'), '--output', destination, encrypted],
     },
     assertion: {
-      sign: ['sign', '--privkey-pem:bench', file('private.pem'), '--id-attr:ID', 'urn:oasis:names:tc:SAML:2.0:assertion:Assertion', '--output', destination, template],
+      sign: ['sign', '--privkey-pem:bench', `${file('private.pem')},${file('leaf.pem')}`, '--id-attr:ID', 'urn:oasis:names:tc:SAML:2.0:assertion:Assertion', '--output', destination, template],
       verify: ['verify', '--trusted-pem', file('root.pem'), '--untrusted-pem', file('intermediate.pem'), '--id-attr:ID', 'urn:oasis:names:tc:SAML:2.0:assertion:Assertion', signed],
     },
     element: {
@@ -128,7 +157,7 @@ export function engineArguments(kind, scenario, operation, files) {
       sign: ['sign', '--privkey-pem:bench', file('private.pem'), '--id-attr:Id', 'List', '--output', destination, template],
       verify: ['verify', '--pubkey-pem:bench', file('public.pem'), '--id-attr:Id', 'List', signed],
     },
-  }[scenario][operation];
+  }[scenario]?.[operation];
 }
 
 /** Input files for one case: what each operation reads. */
@@ -178,11 +207,12 @@ function main() {
     return [...loader, engine.binary, args[0], ...(engine.backend ?? []), ...args.slice(1)];
   };
   const invoke = cmd => checked(cmd[0], cmd.slice(1), { stdio: ['ignore', 'ignore', 'pipe'] });
-  const x509KeyInfo = fs.readFileSync(file('x509-keyinfo.xml'), 'utf8');
-  // The enveloped transform removes the whole Signature, so a verifier input may carry
-  // the signer certificate in KeyInfo instead of the key name the template used.
-  const verifierInput = (item, signed) => item.scenario !== 'assertion' ? signed
-    : signed.replace(/<ds:KeyInfo>\s*<ds:KeyName>bench<\/ds:KeyName>\s*<\/ds:KeyInfo>/, x509KeyInfo);
+  const reject = (engine, item, input, what) => {
+    const invalid = command(engine, item, 'verify', null, input);
+    const rejection = spawnSync(invalid[0], invalid.slice(1), { encoding: 'utf8', timeout: 120000 });
+    // A crash/timeout is not successful verification rejection.
+    if (rejection.error || rejection.signal || rejection.status !== 1) throw Error(`Invalid ${what} rejection: ${engine.name}, ${item.name}`);
+  };
   const cases = JSON.parse(fs.readFileSync(file('cases.json'))).map(item => ({ scenario: 'payload', ...item }));
   const results = [];
   const rawDirectory = path.join(root, 'raw');
@@ -190,47 +220,49 @@ function main() {
   for (const item of cases) {
     const { name, scenario } = item;
     const operations = SCENARIOS[scenario];
-    const supported = engines.filter(engine => !UNSUPPORTED[engine.id]?.[scenario]);
+    const able = operation => engines.filter(engine => !unsupported(engine.id, scenario, operation));
     if (operations.includes('sign')) {
-      // Every signer's output must verify with every engine, and a changed signed value
-      // must be rejected by every engine before anything is timed.
-      for (let index = 0; index < supported.length; index++) {
-        const raw = file(`${name}.signed-raw-${index}.xml`);
-        invoke(command(supported[index], item, 'sign', raw));
+      // Every signer's output must verify with every verifier, and a changed signed value
+      // (and, for assertions, a wrapped forgery) must be rejected before anything is timed.
+      const signers = able('sign');
+      const verifiers = able('verify');
+      for (let index = 0; index < signers.length; index++) {
         const signed = file(`${name}.signed-${index}.xml`);
-        const text = verifierInput(item, fs.readFileSync(raw, 'utf8'));
-        if (item.scenario === 'assertion' && !text.includes('<ds:X509Certificate>')) throw Error(`KeyInfo not replaced: ${supported[index].name}, ${name}`);
-        fs.writeFileSync(signed, text);
-        for (const verifier of supported) invoke(command(verifier, item, 'verify', null, signed));
+        invoke(command(signers[index], item, 'sign', signed));
+        if (scenario === 'assertion' && !fs.readFileSync(signed, 'utf8').includes('X509Certificate>')) throw Error(`No signer certificate: ${signers[index].name}, ${name}`);
+        for (const verifier of verifiers) invoke(command(verifier, item, 'verify', null, signed));
       }
       fs.copyFileSync(file(`${name}.signed-0.xml`), file(`${name}.signed.xml`));
+      const signedText = fs.readFileSync(file(`${name}.signed.xml`), 'utf8');
       const tampered = file(`${name}.tampered.xml`);
-      fs.writeFileSync(tampered, tamper(fs.readFileSync(file(`${name}.signed.xml`), 'utf8'), scenario));
-      for (const verifier of supported) {
-        const invalid = command(verifier, item, 'verify', null, tampered);
-        const rejection = spawnSync(invalid[0], invalid.slice(1), { encoding: 'utf8', timeout: 120000 });
-        // A crash/timeout is not successful verification rejection.
-        if (rejection.error || rejection.signal || rejection.status !== 1) throw Error(`Invalid rejection: ${verifier.name}, ${name}`);
+      fs.writeFileSync(tampered, tamper(signedText, scenario));
+      for (const verifier of verifiers) reject(verifier, item, tampered, 'tampered');
+      if (scenario === 'assertion') {
+        const wrapped = file(`${name}.wrapped.xml`);
+        fs.writeFileSync(wrapped, wrap(signedText));
+        for (const verifier of verifiers) reject(verifier, item, wrapped, 'wrapped');
       }
     }
     if (operations.includes('encrypt')) {
       const plain = fs.readFileSync(file(caseFiles(item).plain));
-      for (let index = 0; index < supported.length; index++) {
+      const encryptors = able('encrypt');
+      for (let index = 0; index < encryptors.length; index++) {
         const encrypted = file(`${name}.encrypted-${index}.xml`);
-        invoke(command(supported[index], item, 'encrypt', encrypted));
-        for (const decryptor of supported) {
+        invoke(command(encryptors[index], item, 'encrypt', encrypted));
+        for (const decryptor of able('decrypt')) {
           const decrypted = file(`${name}.decrypted.xml`);
           invoke(command(decryptor, item, 'decrypt', decrypted, encrypted));
           // Byte payloads must round-trip exactly; XML results may differ only in the
           // declaration and surrounding whitespace the writing engine adds.
           const output = fs.readFileSync(decrypted);
           const equal = scenario === 'payload' ? output.equals(plain) : documentBody(output) === documentBody(plain);
-          if (!equal) throw Error(`Plaintext mismatch: ${supported[index].name} -> ${decryptor.name}, ${name}`);
+          if (!equal) throw Error(`Plaintext mismatch: ${encryptors[index].name} -> ${decryptor.name}, ${name}`);
         }
       }
       fs.copyFileSync(file(`${name}.encrypted-0.xml`), file(`${name}.encrypted.xml`));
     }
     for (const operation of operations) {
+      const supported = able(operation);
       const entries = supported.map((engine, index) => ({ level: 'cli', engine: engine.name, operation, ...item,
         boundary: 'fresh CLI process + key loading + file I/O + operation',
         repetitions: [], memory: null, commands: command(engine, item, operation, file(`${name}.${operation}-${index}.output`)) }));
@@ -269,8 +301,8 @@ function main() {
         }
       }
       results.push(...entries);
-      for (const engine of engines.filter(engine => UNSUPPORTED[engine.id]?.[scenario])) {
-        results.push({ level: 'cli', engine: engine.name, operation, ...item, unsupported: UNSUPPORTED[engine.id][scenario] });
+      for (const engine of engines.filter(engine => unsupported(engine.id, scenario, operation))) {
+        results.push({ level: 'cli', engine: engine.name, operation, ...item, unsupported: unsupported(engine.id, scenario, operation) });
       }
     }
   }
@@ -283,7 +315,7 @@ function main() {
       const cmd = [...loader, binary, '--version'];
       return { sha256: digest(binary), bytes: fs.statSync(binary).size, version: checked(cmd[0], cmd.slice(1)).stdout.trim() };
     }),
-    corpus: fs.readdirSync(corpus).filter(name => /\.(template|plain)\.xml$/.test(name) || /^[a-z_]+-\d+\.signed\.xml$/.test(name) || ['keys.xml', 'encryption.xml', 'element.template.xml', 'x509-keyinfo.xml', 'private.pem', 'public.pem', 'leaf.pem', 'intermediate.pem', 'root.pem', 'cases.json'].includes(name)).map(name => ({ name, sha256: digest(file(name)) })), results };
+    corpus: fs.readdirSync(corpus).filter(name => /\.(template|plain)\.xml$/.test(name) || /^[a-z_]+-\d+\.signed\.xml$/.test(name) || ['keys.xml', 'encryption.xml', 'element.template.xml', 'private.pem', 'public.pem', 'leaf.pem', 'intermediate.pem', 'root.pem', 'cases.json'].includes(name)).map(name => ({ name, sha256: digest(file(name)) })), results };
   fs.writeFileSync(path.join(root, 'comparison.json'), JSON.stringify(report));
   const measured = results.filter(entry => !entry.unsupported).length;
   console.log(`Validated ${measured} comparable cases, ${results.length - measured} unsupported; ${samples} samples x 3 repetitions, heap=${Boolean(heapMode)}`);
