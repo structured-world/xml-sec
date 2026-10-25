@@ -1188,6 +1188,39 @@ impl XmlDocument {
         Ok(self.render_content_replacement_edits(&edits, projected))
     }
 
+    /// Serialize the generation that committing these base64 replacements under
+    /// `settings` would produce, without parsing it. Base64 character data cannot
+    /// change element structure, so the commit parse would only recheck the
+    /// projected size and node count, which are checked here instead.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn project_base64_commit(
+        &self,
+        replacements: &[(NodeIdentity, String)],
+        settings: DocumentParseSettings,
+    ) -> Result<String, XmlDocumentError> {
+        validate_base64_replacements(replacements)?;
+        let (edits, projected) =
+            self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
+        let projected_nodes = self.with_view(|view| {
+            replacements
+                .iter()
+                .try_fold(view.node_count(), |count, (target, replacement)| {
+                    // The content becomes exactly one text node, or none when empty. The
+                    // target's descendants (itself included) are part of `count`.
+                    let replaced = view.resolve_mutation_node(*target)?.descendants().count() - 1;
+                    Ok::<_, XmlDocumentError>(
+                        count - replaced + usize::from(!replacement.is_empty()),
+                    )
+                })
+        })?;
+        if projected_nodes > settings.nodes_limit as usize {
+            return Err(XmlDocumentError::ProjectedNodeLimit {
+                maximum: settings.nodes_limit as usize,
+            });
+        }
+        Ok(self.render_content_replacement_edits(&edits, projected))
+    }
+
     fn replace_contents_inner(
         &mut self,
         replacements: &[(NodeIdentity, String)],

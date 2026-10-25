@@ -1665,6 +1665,8 @@ fn sign_with_builder_shares_canonicalization_budget_with_signing() {
 fn sign_with_builder_shares_xpath_parse_budget_with_signing() {
     // Builder validation and the signing parses are one public operation. A
     // caller must not receive a fresh XPath expression allowance between them.
+    // Standalone signing parses the expression three times (discovery,
+    // dependency analysis, final SignedInfo); builder validation adds a fourth.
     let private_key =
         RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
             .expect("RSA private key fixture must parse");
@@ -1676,7 +1678,7 @@ fn sign_with_builder_shares_xpath_parse_budget_with_signing() {
         );
     let xml = "<root><payload ID=\"payload\">content</payload></root>";
     let mut policy = SigningPolicy::default();
-    policy.resources.max_xpath_expressions = 4;
+    policy.resources.max_xpath_expressions = 3;
 
     builder
         .build_template_with_policy(&policy)
@@ -1697,9 +1699,9 @@ fn sign_with_builder_shares_xpath_parse_budget_with_signing() {
         error,
         SigningError::Policy(xml_sec::policy::PolicyViolation::ResourceLimit {
             resource: "XPath expressions",
-            maximum: 4,
+            maximum: 3,
             actual,
-        }) if actual > 4
+        }) if actual > 3
     ));
 }
 

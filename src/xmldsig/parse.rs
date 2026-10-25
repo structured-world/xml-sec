@@ -16,7 +16,7 @@
 //! </Signature>
 //! ```
 
-use crate::xml::dom::{Document, Node};
+use crate::xml::dom::{Document, Node, NodeId};
 use std::collections::BTreeMap;
 
 #[cfg(test)]
@@ -912,6 +912,18 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
     xpath_budget: &mut transforms::XPathSignatureParseBudget,
     resources: &crate::policy::ResourcePolicy,
 ) -> Result<SignedInfo, ParseError> {
+    parse_signed_info_with_pending_digests(signed_info_node, xpath_budget, resources, &[])
+}
+
+/// Parse `SignedInfo` where each listed empty `DigestValue` element is read as
+/// the given base64 content, which a signer has computed but not yet written.
+/// The supplied content passes the same decoding and length checks.
+pub(crate) fn parse_signed_info_with_pending_digests(
+    signed_info_node: Node,
+    xpath_budget: &mut transforms::XPathSignatureParseBudget,
+    resources: &crate::policy::ResourcePolicy,
+    pending_digest_values: &[(NodeId, &str)],
+) -> Result<SignedInfo, ParseError> {
     verify_ds_element(signed_info_node, "SignedInfo")?;
 
     let mut children = element_children(signed_info_node);
@@ -955,7 +967,11 @@ pub(crate) fn parse_signed_info_with_xpath_budget(
             }
             .into());
         }
-        references.push(parse_reference_with_xpath_budget(child, xpath_budget)?);
+        references.push(parse_reference_with_pending_digest(
+            child,
+            xpath_budget,
+            pending_digest_values,
+        )?);
     }
     if references.is_empty() {
         return Err(ParseError::MissingElement {
@@ -1272,6 +1288,14 @@ pub(crate) fn parse_reference_with_xpath_budget(
     reference_node: Node,
     xpath_budget: &mut transforms::XPathSignatureParseBudget,
 ) -> Result<Reference, ParseError> {
+    parse_reference_with_pending_digest(reference_node, xpath_budget, &[])
+}
+
+fn parse_reference_with_pending_digest(
+    reference_node: Node,
+    xpath_budget: &mut transforms::XPathSignatureParseBudget,
+    pending_digest_values: &[(NodeId, &str)],
+) -> Result<Reference, ParseError> {
     verify_ds_element(reference_node, "Reference")?;
     ensure_no_non_whitespace_text(reference_node, "Reference")?;
     let uri = reference_node.attribute("URI").map(String::from);
@@ -1301,7 +1325,15 @@ pub(crate) fn parse_reference_with_xpath_budget(
 
     // Required <DigestValue>
     let digest_value_node = reference_digest_value_node(&mut children)?;
-    let digest_value = decode_digest_value_children(digest_value_node, digest_method)?;
+    let pending = pending_digest_values
+        .iter()
+        .find(|(node, _)| *node == digest_value_node.id())
+        .filter(|_| digest_value_node.children().next().is_none());
+    let digest_value = if let Some((_, content)) = pending {
+        base64_decode_digest(content, digest_method)?
+    } else {
+        decode_digest_value_children(digest_value_node, digest_method)?
+    };
     finish_reference_children(&mut children)?;
 
     // Validate the complete Reference before reporting an unsupported transform.
