@@ -803,6 +803,11 @@ enum DecryptionInput<'a> {
         source: &'a str,
         node_start: Option<usize>,
     },
+    /// An already parsed document whose `EncryptedData` starts at `node_start`.
+    Document {
+        document: &'a crate::XmlDomDocument<'a>,
+        node_start: usize,
+    },
     Parsed(&'a EncryptedData),
 }
 
@@ -948,7 +953,7 @@ impl<'a> DecryptContext<'a> {
     fn parse_decryption_metadata<'input>(
         &self,
         input: DecryptionInput<'input>,
-        source_document: Option<&(crate::XmlDomDocument<'input>, Option<usize>)>,
+        source_document: Option<(&crate::XmlDomDocument<'_>, Option<usize>)>,
         reference_context: &super::CipherReferenceContext<'_>,
         operation: &OperationExecutionContext<
             crate::policy::DecryptionPolicy,
@@ -956,9 +961,9 @@ impl<'a> DecryptContext<'a> {
         >,
     ) -> Result<(Cow<'input, EncryptedData>, Vec<Option<crate::NodeId>>), XmlEncError> {
         match input {
-            DecryptionInput::Xml { .. } => {
+            DecryptionInput::Xml { .. } | DecryptionInput::Document { .. } => {
                 let (document, node_start) = source_document.expect("XML input parsed once");
-                let selected = match *node_start {
+                let selected = match node_start {
                     Some(start) => document
                         .descendants()
                         .find(|node| node.is_element() && node.range().start == start)
@@ -1116,9 +1121,10 @@ impl<'a> DecryptContext<'a> {
             OperationExecutionContext::new(self.policy.clone(), budgets, document_binding);
         operation.policy().resources.validate()?;
         let plan_nodes = compile_decryption_plan(&mut operation, mutates_document)?;
-        let source_document = operation.run(plan_nodes.document, || {
+        let parsed_source = operation.run(plan_nodes.document, || {
             self.parse_source_document(input, &operation.budgets().xml_parse)
         })?;
+        let source_document = source_document_view(input, parsed_source.as_ref());
         let reference_gate = DecryptionReferenceGate {
             operation: &operation,
             document: plan_nodes.document,
@@ -1137,17 +1143,16 @@ impl<'a> DecryptContext<'a> {
             // parse allowance used later for plaintext and controlled mutation.
             let (mut encrypted, origins) = self.parse_decryption_metadata(
                 input,
-                source_document.as_ref(),
+                source_document,
                 &reference_context,
                 &operation,
             )?;
             let algorithm = self.validate_decryption_metadata(&encrypted, operation.policy())?;
-            let bound_references = source_document
-                .as_ref()
-                .map(|(document, _)| reference_context.bind_document(document));
-            let ciphertext = match (&encrypted.cipher_data, source_document.as_ref()) {
+            let bound_references =
+                source_document.map(|(document, _)| reference_context.bind_document(document));
+            let ciphertext = match (&encrypted.cipher_data, source_document) {
                 (super::CipherData::Reference { uri, transforms }, Some((document, start))) => {
-                    let source = selected_encrypted_node(document, *start)?;
+                    let source = selected_encrypted_node(document, start)?;
                     bound_references
                         .as_ref()
                         .expect("XML source has a bound reference context")
@@ -1160,7 +1165,7 @@ impl<'a> DecryptContext<'a> {
                 }
                 _ => encrypted.cipher_data.octets()?.into_owned(),
             };
-            if let Some((document, _)) = source_document.as_ref() {
+            if let Some((document, _)) = source_document {
                 resolve_key_cipher_references(
                     &mut encrypted.to_mut().encrypted_keys,
                     document,
@@ -1181,11 +1186,8 @@ impl<'a> DecryptContext<'a> {
         });
         let (encrypted, algorithm, ciphertext, origins, bound_references) = parsed?;
         let keys = operation.run(plan_nodes.key, || {
-            let document = key_source_document(
-                source_document.as_ref(),
-                bound_references.as_ref(),
-                &origins,
-            )?;
+            let document =
+                key_source_document(source_document, bound_references.as_ref(), &origins)?;
             resolve_content_key_candidates(
                 self.provider,
                 algorithm,
@@ -1982,50 +1984,55 @@ fn decrypt_owned_document_with_context(
         ))
     })?;
     let document_binding = Some((document.identity(), document.generation()));
-    let mut processed = context.process_decryption_input(
-        DecryptionInput::Xml {
-            source: document.as_xml(),
-            node_start: Some(target_start),
-        },
-        document_binding,
-        true,
-        budgets,
-        |candidate, operation_parse_budget| {
-            let DecryptedContent::Xml(plaintext) = candidate else {
-                return Err(XmlEncError::ReplacementRequiresXml);
-            };
-            validate_encryption_document_len(
-                document
-                    .as_xml()
-                    .len()
-                    .saturating_sub(target_len)
-                    .saturating_add(plaintext.len()),
-                &context.policy,
-            )?;
-            let settings = context.document_parse_settings();
-            match replacement_type.as_ref() {
-                Some(EncryptedDataType::Element) => document
-                    .prepare_element_replacement_with_budget(
-                        target,
-                        &plaintext,
-                        settings,
-                        operation_parse_budget,
-                    )
-                    .map_err(|error| map_document_error(error, settings)),
-                Some(EncryptedDataType::Content) => document
-                    .prepare_node_fragment_replacement_with_budget(
-                        target,
-                        &plaintext,
-                        settings,
-                        operation_parse_budget,
-                    )
-                    .map_err(|error| map_document_error(error, settings)),
-                Some(EncryptedDataType::Other(_)) | None => {
-                    Err(XmlEncError::ReplacementRequiresXml)
+    let current: &XmlDocument = document;
+    // The retained generation already satisfies this operation's XML policy,
+    // so its parsed view supplies the EncryptedData metadata directly.
+    let mut processed = current.with_view(|view| {
+        context.process_decryption_input(
+            DecryptionInput::Document {
+                document: view.document(),
+                node_start: target_start,
+            },
+            document_binding,
+            true,
+            budgets,
+            |candidate, operation_parse_budget| {
+                let DecryptedContent::Xml(plaintext) = candidate else {
+                    return Err(XmlEncError::ReplacementRequiresXml);
+                };
+                validate_encryption_document_len(
+                    current
+                        .as_xml()
+                        .len()
+                        .saturating_sub(target_len)
+                        .saturating_add(plaintext.len()),
+                    &context.policy,
+                )?;
+                let settings = context.document_parse_settings();
+                match replacement_type.as_ref() {
+                    Some(EncryptedDataType::Element) => current
+                        .prepare_element_replacement_with_budget(
+                            target,
+                            &plaintext,
+                            settings,
+                            operation_parse_budget,
+                        )
+                        .map_err(|error| map_document_error(error, settings)),
+                    Some(EncryptedDataType::Content) => current
+                        .prepare_node_fragment_replacement_with_budget(
+                            target,
+                            &plaintext,
+                            settings,
+                            operation_parse_budget,
+                        )
+                        .map_err(|error| map_document_error(error, settings)),
+                    Some(EncryptedDataType::Other(_)) | None => {
+                        Err(XmlEncError::ReplacementRequiresXml)
+                    }
                 }
-            }
-        },
-    )?;
+            },
+        )
+    })?;
     let mutation = processed.mutation.ok_or_else(|| {
         XmlEncError::OperationPlan("decryption mutation node is unavailable".into())
     })?;
@@ -2247,9 +2254,26 @@ pub(super) fn resolve_nested_cipher_references<'a>(
     Ok(())
 }
 
+/// The source document of an XML input: the caller's parsed view, or the
+/// parse of its serialization.
+fn source_document_view<'a>(
+    input: DecryptionInput<'a>,
+    parsed: Option<&'a (crate::XmlDomDocument<'a>, Option<usize>)>,
+) -> Option<(&'a crate::XmlDomDocument<'a>, Option<usize>)> {
+    match input {
+        DecryptionInput::Document {
+            document,
+            node_start,
+        } => Some((document, Some(node_start))),
+        DecryptionInput::Xml { .. } | DecryptionInput::Parsed(_) => {
+            parsed.map(|(document, node_start)| (document, *node_start))
+        }
+    }
+}
+
 /// The selected `EncryptedData` of an XML source, for key-source association.
 fn key_source_document<'a, 'doc>(
-    source: Option<&(crate::XmlDomDocument<'_>, Option<usize>)>,
+    source: Option<(&crate::XmlDomDocument<'_>, Option<usize>)>,
     references: Option<&'a super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>>,
     origins: &'a [Option<crate::NodeId>],
 ) -> Result<Option<KeySourceDocument<'a, 'doc>>, XmlEncError> {
@@ -2258,7 +2282,7 @@ fn key_source_document<'a, 'doc>(
     };
     Ok(Some(KeySourceDocument {
         references,
-        target: selected_encrypted_node(document, *start)?.id(),
+        target: selected_encrypted_node(document, start)?.id(),
         origins,
     }))
 }
