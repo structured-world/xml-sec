@@ -2538,6 +2538,74 @@ fn xml_content_serialization_enforces_the_plaintext_limit_while_rendering() {
     ));
 }
 
+const XML_DATA_TEMPLATE: &str = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#;
+
+fn xml_data_command<'a>(
+    invocation: &'a Invocation,
+    policy: &'a EncryptionPolicy,
+) -> EncryptCommand<'a> {
+    EncryptCommand {
+        invocation,
+        template: XML_DATA_TEMPLATE,
+        start_node_id: None,
+        id_attributes: &[],
+        policy,
+        xml_backend: XmlBackend::default(),
+        provider: &xml_sec::provider::RustCryptoProvider,
+    }
+}
+
+#[test]
+fn xml_data_output_obeys_the_document_limit() {
+    // The data document fits the policy, but replacing a small node with the
+    // filled EncryptedData grows it past the limit; the CLI must refuse
+    // rather than write output it cannot read back.
+    let data = format!("<root><t/>{}</root>", "x".repeat(400));
+    let policy = EncryptionPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: data.len() + 16,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..EncryptionPolicy::default()
+    };
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(&data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let target = document
+        .root_element()
+        .first_element_child()
+        .expect("the data has a target element");
+
+    let result = place_encrypted_data(
+        &command,
+        &data,
+        target,
+        &EncryptedDataType::Element,
+        XML_DATA_TEMPLATE,
+    );
+    assert!(result.is_err(), "oversized output was produced: {result:?}");
+}
+
+#[test]
+fn xml_data_template_references_resolve_xpointer_forms() {
+    // Only EncryptedData moves into the data document, so an XPointer
+    // reference to a node outside it would dangle exactly like a bare ID.
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let filled = |uri: &str| {
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="data"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyInfoReference xmlns="http://www.w3.org/2009/xmldsig11#" URI="{uri}"/></KeyInfo><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#
+        )
+    };
+    assert!(ensure_self_contained(&filled("#xpointer(id('mechanism'))"), &command).is_err());
+    assert!(ensure_self_contained(&filled("#mechanism"), &command).is_err());
+    ensure_self_contained(&filled("#xpointer(id('data'))"), &command)
+        .expect("a reference inside EncryptedData stays resolvable");
+}
+
 #[test]
 fn xml_data_reader_decodes_utf16_before_template_use() {
     // --xml-data has its own file reader and must share the same XML 1.0

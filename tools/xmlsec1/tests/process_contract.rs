@@ -5405,6 +5405,69 @@ fn xml_data_node_id_encrypts_the_selected_element_in_place() {
 }
 
 #[test]
+fn xml_data_node_name_selects_the_first_matching_element() {
+    // libxmlsec1 splits --node-name at its last colon into namespace URI and local
+    // name, and selects the first element in document order with exactly that expanded
+    // name; without a colon only un-namespaced elements match (apps/xmlsec.c,
+    // xmlSecAppXmlDataCreate; src/xmltree.c, xmlSecFindNode).
+    let temp = tempfile::tempdir().unwrap();
+    let template = temp.path().join("template.xml");
+    let data = temp.path().join("data.xml");
+    let key = temp.path().join("key.bin");
+    fs::write(&template, aes128_gcm_template("generated", "Element")).unwrap();
+    fs::write(&key, b"0123456789abcdef").unwrap();
+    let run = |document: &str, node_name: &str| {
+        fs::write(&data, document).unwrap();
+        Command::new(binary())
+            .args(["encrypt", "--aes-key"])
+            .arg(&key)
+            .args(["--node-name", node_name, "--xml-data"])
+            .arg(&data)
+            .arg(&template)
+            .output()
+            .unwrap()
+    };
+    let children = |output: &std::process::Output| {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let encrypted = String::from_utf8(output.stdout.clone()).unwrap();
+        let document = roxmltree::Document::parse(&encrypted).unwrap();
+        document
+            .root_element()
+            .children()
+            .filter(roxmltree::Node::is_element)
+            .map(|node| node.tag_name().name().to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(
+        children(&run(PAYMENT_ORDER, "Payment")),
+        ["Customer", "EncryptedData", "Note"]
+    );
+    let namespaced = r#"<o:Order xmlns:o="urn:example:order"><o:Payment>1</o:Payment><Payment>2</Payment></o:Order>"#;
+    assert_eq!(
+        children(&run(namespaced, "urn:example:order:Payment")),
+        ["EncryptedData", "Payment"]
+    );
+    assert_eq!(
+        children(&run(namespaced, "Payment")),
+        ["Payment", "EncryptedData"]
+    );
+
+    let missing = run(PAYMENT_ORDER, "Missing");
+    assert!(!missing.status.success());
+    assert_eq!(missing.stdout, b"");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("failed to find node with name"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
 fn xml_data_node_id_encrypts_only_the_selected_content() {
     // A Content template replaces the selected element's children and keeps the element.
     let temp = tempfile::tempdir().unwrap();
@@ -5483,7 +5546,7 @@ fn session_key_must_match_the_template_and_have_a_recipient() {
     ] {
         let rejected = run(&template, session_key);
         assert!(!rejected.status.success(), "{session_key} must be refused");
-        assert!(rejected.stdout.is_empty());
+        assert_eq!(rejected.stdout, b"");
         assert!(
             String::from_utf8_lossy(&rejected.stderr).contains(message),
             "{}",

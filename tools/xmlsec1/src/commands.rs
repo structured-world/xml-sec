@@ -3312,7 +3312,10 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let provider = selected_provider(invocation)?;
     validate_options(invocation, ENCRYPT_OPTIONS)?;
     let xml_backend = selected_xml_backend(invocation)?;
-    validate_supported_selectors(invocation, &["node-id", "id-attr", "add-id-attr"])?;
+    validate_supported_selectors(
+        invocation,
+        &["node-id", "node-name", "id-attr", "add-id-attr"],
+    )?;
     let has_binary_data = invocation.last_value("binary-data").is_some();
     let has_xml_data = invocation.last_value("xml-data").is_some();
     if has_binary_data == has_xml_data {
@@ -3324,10 +3327,10 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let maximum_document_bytes = policy.resources.max_xml_document_bytes;
     let maximum_plaintext_bytes = policy.resources.max_encryption_plaintext_bytes;
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
-    let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    // libxmlsec1 fills the first EncryptedData of the template and resolves --node-id in
-    // the --xml-data document (apps/xmlsec.c, xmlSecAppEncryptTmpl, xmlSecAppXmlDataCreate).
+    // libxmlsec1 fills the first EncryptedData of the template and resolves --node-id or
+    // --node-name in the --xml-data document (apps/xmlsec.c, xmlSecAppEncryptTmpl,
+    // xmlSecAppXmlDataCreate).
     let metadata = encryption_template(&template, None, &id_attributes, &policy, xml_backend)?;
     check_session_key(
         invocation,
@@ -3376,7 +3379,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         .transpose()?;
     let target = data_document
         .as_ref()
-        .map(|document| xml_data_target(document, start_node_id, &id_attributes))
+        .map(|document| xml_data_target(document, invocation, &id_attributes))
         .transpose()?;
     let result = if let Some(path) = invocation.last_value("binary-data") {
         ensure_binary_template(template_placement, explicit_xml_type)?;
@@ -3478,20 +3481,36 @@ fn ensure_binary_template(
 }
 
 /// The --xml-data node libxmlsec1 encrypts: the `--node-id` element of the data document,
-/// or its root element (`apps/xmlsec.c`, `xmlSecAppXmlDataCreate`).
+/// else the first element named by `--node-name`, else its root element (`apps/xmlsec.c`,
+/// `xmlSecAppXmlDataCreate`).
 fn xml_data_target<'a>(
     document: &'a Document<'a>,
-    start_node_id: Option<&str>,
+    invocation: &Invocation,
     id_attributes: &[IdAttributeRegistration],
 ) -> Result<Node<'a, 'a>, CommandError> {
-    let Some(id) = start_node_id else {
+    if let Some(id) = option_text(invocation, "node-id")? {
+        return UriReferenceResolver::with_id_registrations(document, id_attributes)
+            .node_for_id(id)
+            .filter(Node::is_element)
+            .ok_or_else(|| {
+                CommandError::Encryption(format!("selected node ID is missing or ambiguous: {id}"))
+            });
+    }
+    let Some(selector) = option_text(invocation, "node-name")? else {
         return Ok(document.root_element());
     };
-    UriReferenceResolver::with_id_registrations(document, id_attributes)
-        .node_for_id(id)
-        .filter(Node::is_element)
+    // `[<namespace-uri>:]<name>` splits at the last colon, since the URI itself contains
+    // colons; without one, only elements in no namespace match (`xmlSecCheckNodeName`).
+    let (namespace, name) = match selector.rsplit_once(':') {
+        Some((namespace, name)) => (Some(namespace), name),
+        None => (None, selector),
+    };
+    document
+        .root_element()
+        .descendants()
+        .find(|node| node.has_tag_name((namespace, name)))
         .ok_or_else(|| {
-            CommandError::Encryption(format!("selected node ID is missing or ambiguous: {id}"))
+            CommandError::Encryption(format!("failed to find node with name=\"{name}\""))
         })
 }
 
@@ -3556,7 +3575,17 @@ fn place_encrypted_data(
         EncryptedDataType::Content => replace_element_text(data, target, &filled)?,
         _ => (target.range(), filled),
     };
-    let mut output = String::with_capacity(data.len() - range.len() + replacement.len());
+    // The data document fits the policy, but the EncryptedData can be larger than the
+    // node it replaces; output the CLI could not read back must not be written.
+    // `range` lies inside `data`, so only the addition can overflow, and an overflow
+    // exceeds every limit.
+    let projected = (data.len() - range.len())
+        .checked_add(replacement.len())
+        .filter(|projected| *projected <= command.policy.resources.max_xml_document_bytes)
+        .ok_or_else(|| {
+            CommandError::Encryption("encrypted XML data output exceeds XML document policy".into())
+        })?;
+    let mut output = String::with_capacity(projected);
     output.push_str(&data[..range.start]);
     output.push_str(&replacement);
     output.push_str(&data[range.end..]);
@@ -3575,13 +3604,20 @@ fn ensure_self_contained(filled: &str, command: &EncryptCommand<'_>) -> Result<(
     )?;
     let resolver = UriReferenceResolver::with_id_registrations(&document, command.id_attributes);
     let dangling = document.descendants().find_map(|node| {
-        let id = node.attribute("URI")?.strip_prefix('#')?;
-        // XPointer fragments are expressions, not bare IDs.
-        (!id.contains('(') && resolver.node_for_id(id).is_none()).then_some(id)
+        let uri = node.attribute("URI")?;
+        let fragment = uri.strip_prefix('#')?;
+        // XPointer fragments (`#xpointer(id('x'))`) are resolved by the same
+        // dereferencing the core uses for them; bare names are XML IDs.
+        let reachable = if fragment.contains('(') {
+            resolver.dereference(uri).is_ok()
+        } else {
+            resolver.node_for_id(fragment).is_some()
+        };
+        (!reachable).then_some(uri)
     });
     match dangling {
-        Some(id) => Err(CommandError::Encryption(format!(
-            "template EncryptedData references #{id} outside itself; with --xml-data only the EncryptedData moves into the data document"
+        Some(uri) => Err(CommandError::Encryption(format!(
+            "template EncryptedData references {uri} outside itself; with --xml-data only the EncryptedData moves into the data document"
         ))),
         None => Ok(()),
     }
