@@ -497,6 +497,9 @@ pub(super) fn merge_key_info_source_at_index_with_options(
     merge_key_info_source_at_index_with_budget(xml, key_info_source, target_signature, policy, None)
 }
 
+/// Standalone merge: parse `xml`, merge, then parse the result as a signing
+/// commit would.
+#[cfg(test)]
 pub(super) fn merge_key_info_source_at_index_with_budget(
     xml: &str,
     key_info_source: &str,
@@ -505,7 +508,30 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<String, XmlMutationError> {
     let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
-    let Some(signature) = signature_node(&document, target_signature) else {
+    let merged = merge_key_info_source_in_document(
+        &document,
+        xml,
+        key_info_source,
+        target_signature,
+        policy,
+        budget,
+    )?;
+    parse_mutation_xml_with_budget(&merged, policy, budget)?;
+    Ok(merged)
+}
+
+/// Merge writer output into the target `<Signature>/<KeyInfo>` of `xml`, whose
+/// current parse is `document`. The result is not reparsed here: the caller
+/// commits it through a parse that validates the whole merged document.
+pub(super) fn merge_key_info_source_in_document(
+    document: &crate::xml::dom::Document<'_>,
+    xml: &str,
+    key_info_source: &str,
+    target_signature: usize,
+    policy: Option<&crate::policy::SigningPolicy>,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlMutationError> {
+    let Some(signature) = signature_node(document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "Signature",
             expected: 1,
@@ -596,7 +622,10 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
     }
 
     for (_, _, source) in sources {
+        // While nothing has been spliced, `document` is still the parse of `output`.
+        let current = (output == xml).then_some(document);
         output = merge_one_key_info_source_at_index_with_options(
+            current,
             &output,
             &source,
             target_signature,
@@ -608,17 +637,24 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
 }
 
 fn merge_one_key_info_source_at_index_with_options(
+    current: Option<&crate::xml::dom::Document<'_>>,
     xml: &str,
     key_info_source: &str,
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<String, XmlMutationError> {
-    let document = parse_mutation_xml_with_budget(xml, policy, budget)?;
+    let reparsed;
+    let document = if let Some(document) = current {
+        document
+    } else {
+        reparsed = parse_mutation_xml_with_budget(xml, policy, budget)?;
+        &reparsed
+    };
     let source_document = parse_mutation_xml_with_budget(key_info_source, policy, budget)?;
     let source = source_document.root_element();
     let source_content = element_inner_xml(key_info_source, source.range())?;
-    let Some(signature) = signature_node(&document, target_signature) else {
+    let Some(signature) = signature_node(document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "Signature",
             expected: 1,
@@ -650,7 +686,6 @@ fn merge_one_key_info_source_at_index_with_options(
     } else {
         append_key_info_source(xml, key_info, key_info_source, policy)?
     };
-    parse_mutation_xml_with_budget(&output, policy, budget)?;
     Ok(output)
 }
 

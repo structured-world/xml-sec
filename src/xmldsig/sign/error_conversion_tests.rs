@@ -260,12 +260,13 @@ fn dependency_levels_share_the_xml_parse_work_budget() {
 
 #[test]
 fn final_signed_info_parse_consumes_the_signing_xpath_budget() {
-    // One XPath Reference is parsed while discovering references, while
-    // analyzing dependencies, and while filling its dependency level. The
-    // final SignedInfo parse must consume the same operation-wide budget.
+    // One XPath Reference is parsed while discovering references and while
+    // analyzing dependencies; its single dependency level reuses the
+    // discovered references. The final SignedInfo parse must consume the
+    // same operation-wide budget.
     let xml = r##"<root><payload Id="payload">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
     let mut policy = crate::policy::SigningPolicy::default();
-    policy.resources.max_xpath_expressions = 3;
+    policy.resources.max_xpath_expressions = 2;
 
     let error = SignContext::new(&RejectingSigningKey)
         .policy(policy)
@@ -277,7 +278,7 @@ fn final_signed_info_parse_consumes_the_signing_xpath_budget() {
             error,
             SigningError::Policy(PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XPATH_EXPRESSIONS,
-                maximum: 3,
+                maximum: 2,
                 ..
             })
         ),
@@ -419,7 +420,7 @@ fn owned_signing_commits_the_validated_stage_without_reparsing() {
         )
         .expect("staging must parse");
     context
-        .sign_document_in_place(&mut staged, &mut measured)
+        .sign_document_in_place::<CommitDocument>(&mut staged, &mut measured)
         .expect("staged signing must succeed");
     let exact_stage_work = measured.transforms.xml_parse_work().consumed();
 
@@ -470,7 +471,7 @@ fn builder_signing_fits_the_document_to_parse_work_ratio() {
     )
     .expect("measurement input must parse");
     measurement_context
-        .sign_document_with_builder_in_place(
+        .sign_document_with_builder_in_place::<CommitDocument>(
             &mut measurement_document,
             &builder,
             &mut measurement_budgets,
