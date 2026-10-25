@@ -31,13 +31,13 @@ bash scripts/install-xmlsec1.sh
 # where the project's `stable` override would otherwise download another one.
 export RUSTUP_TOOLCHAIN=${BENCH_RUST_TOOLCHAIN:-1.92.0}
 source_identity() {
-  git ls-files -c -o --exclude-standard -z -- Cargo.toml rust-toolchain.toml src crates vendor benches examples scripts benchmarks compatibility/bergshamra-0.9.2-benchmark-commit.txt compatibility/libxmlsec1-1.3.13-donor-commit.txt tests/fixtures/keys/rsa |
+  git ls-files -c -o --exclude-standard -z -- Cargo.toml rust-toolchain.toml src crates vendor benches examples scripts benchmarks compatibility/bergshamra-0.9.2-benchmark-commit.txt compatibility/libxmlsec1-1.3.13-donor-commit.txt tests/fixtures/keys/rsa tests/fixtures/keys/cacert.pem tests/fixtures/keys/ca2cert.pem |
     sort -zu | xargs -0 shasum -a 256
 }
 before=$(source_identity)
 # The library repository does not track Cargo.lock. Resolve once, then freeze
 # the resulting graph for measurement and retain it with the evidence.
-cargo build --release -p xml-sec-cli --bin xmlsec1 --features benchmark-internals
+cargo build --release -p xml-sec-cli --bin xmlsec1 --features benchmark-internals,xslt
 cargo build --release -p xml-sec --example benchmark_latency --features benchmark-internals
 cargo build --release --locked --manifest-path "$source/Cargo.toml" -p bergshamra --no-default-features --features rustcrypto --target-dir "$target/competitors/bergshamra"
 [[ $before == "$(source_identity)" ]] || { printf 'Source changed during build; discard binaries\n' >&2; exit 3; }

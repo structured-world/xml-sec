@@ -5,7 +5,51 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { percentile, resources, heapStats, createEvidenceDirectory } from './compare-security.mjs';
+import {
+  percentile, resources, heapStats, createEvidenceDirectory,
+  SCENARIOS, UNSUPPORTED, documentBody, tamper, engineArguments, caseFiles,
+} from './compare-security.mjs';
+
+test('tampering changes a signed value in every signing workload', () => {
+  // A replacement that matches nothing would make the rejection check verify an intact document.
+  const signed = {
+    payload: '<Doc><Payload Id="payload">x</Payload></Doc>',
+    assertion: '<saml:Attribute><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>',
+    xslt: '<List Id="list"><Item n="0">value</Item></List>',
+  };
+  for (const [scenario, operations] of Object.entries(SCENARIOS)) {
+    if (!operations.includes('verify')) continue;
+    const changed = tamper(signed[scenario], scenario);
+    assert.notEqual(changed, signed[scenario], scenario);
+  }
+  assert.throws(() => tamper('<Doc/>', 'assertion'), /Tamper target missing/);
+});
+
+test('XML round trips ignore only the declaration and outer whitespace', () => {
+  const plain = Buffer.from('<?xml version="1.0"?><Order><Payment/></Order>');
+  assert.equal(documentBody(Buffer.from('<Order><Payment/></Order>\n')), documentBody(plain));
+  assert.notEqual(documentBody(Buffer.from('<Order><Payment> </Payment></Order>')), documentBody(plain));
+});
+
+test('every measured engine has arguments for each workload operation', () => {
+  // A missing combination would throw mid-run after minutes of earlier measurements.
+  const files = { template: 't', signed: 's', plain: 'p', encrypted: 'e', destination: 'd', corpus: 'c' };
+  for (const [scenario, operations] of Object.entries(SCENARIOS)) {
+    for (const engine of [['xmlsec', 'xml-sec'], ['xmlsec', 'libxmlsec1'], ['berg', 'bergshamra']]) {
+      if (UNSUPPORTED[engine[1]]?.[scenario]) continue;
+      for (const operation of operations) {
+        const args = engineArguments(engine[0], scenario, operation, files);
+        assert.ok(Array.isArray(args) && args[0] === operation, `${engine[1]} ${scenario} ${operation}`);
+      }
+    }
+  }
+});
+
+test('in-place encryption reads the whole document, standalone reads the element', () => {
+  assert.equal(caseFiles({ name: 'element_in_place-16', scenario: 'element_in_place', units: 16 }).plain, 'order-16.plain.xml');
+  assert.equal(caseFiles({ name: 'element-16', scenario: 'element', units: 16 }).plain, 'element-16.plain.xml');
+  assert.equal(caseFiles({ name: 'saml-16', scenario: 'payload', units: 16 }).plain, 'saml-16.plain.xml');
+});
 
 test('fresh nested evidence directories work without overwriting prior results', () => {
   // Clean CI has no performance directory; only parents may be reused.
@@ -78,7 +122,8 @@ test('published package includes every shared benchmark entry point', () => {
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.copyFileSync(path.join(root, file), destination);
     }
-    const report = { schema: 1, results: Array.from({ length: 160 }, () => ({ commands: ['private path'] })) };
+    const report = { schema: 2, results: Array.from({ length: 224 }, (_, index) => index < 8
+      ? { unsupported: 'not available' } : { commands: ['private path'], repetitions: [{}] }) };
     fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify(report));
     const output = path.join(directory, 'site');
     const built = spawnSync(process.execPath, [builder, directory, output],
@@ -89,7 +134,7 @@ test('published package includes every shared benchmark entry point', () => {
         fs.readFileSync(path.join(root, 'benchmarks/dashboard', file)));
     }
     const published = JSON.parse(fs.readFileSync(path.join(output, 'comparison.json'), 'utf8'));
-    assert.equal(published.results.length, 160);
+    assert.equal(published.results.length, 224);
     assert.ok(published.results.every(entry => !Object.hasOwn(entry, 'commands')));
   } finally {
     fs.rmSync(directory, { recursive: true });
@@ -146,11 +191,15 @@ test('incomplete reports cannot publish a dashboard', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-dashboard-test-'));
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   try {
-    fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 1, results: [] }));
     const output = path.join(directory, 'site');
-    const result = spawnSync(process.execPath, ['scripts/build-benchmark-dashboard.mjs', directory, output], { cwd: root });
-    assert.notEqual(result.status, 0);
-    assert.equal(fs.existsSync(output), false);
+    const complete = Array.from({ length: 224 }, () => ({ repetitions: [{}] }));
+    // Missing entries, and a supported entry without measurements, are both incomplete.
+    for (const results of [[], [...complete.slice(1), { engine: 'unmeasured' }]]) {
+      fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 2, results }));
+      const result = spawnSync(process.execPath, ['scripts/build-benchmark-dashboard.mjs', directory, output], { cwd: root });
+      assert.notEqual(result.status, 0);
+      assert.equal(fs.existsSync(output), false);
+    }
   } finally {
     fs.rmSync(directory, { recursive: true });
   }

@@ -5,13 +5,15 @@ try {
   const response = await fetch('comparison.json');
   if (!response.ok) throw Error(`HTTP ${response.status}`);
   const report = await response.json();
-  if (report.schema !== 1 || !Array.isArray(report.results) || !report.results.length) throw Error('Invalid measurement report');
+  if (report.schema !== 2 || !Array.isArray(report.results) || !report.results.length) throw Error('Invalid measurement report');
   status.textContent = `Measured ${report.generated} · ${report.environment.samples} samples × 3 repetitions · revision ${report.source_revision.slice(0, 12)}`;
   document.querySelector('#metadata').textContent = JSON.stringify({ environment: report.environment, binaries: report.binaries, corpus: report.corpus }, null, 2);
   function render() {
     const [operation, shape, units, metric] = controls.map(x => x.value);
-    const rows = report.results.filter(x => x.operation === operation && x.shape === shape && x.units === Number(units));
+    // Payload cases name their document shape; scenario cases name the workload.
+    const rows = report.results.filter(x => x.operation === operation && (x.shape ?? x.scenario) === shape && x.units === Number(units));
     const value = row => {
+      if (row.unsupported) return null;
       if (metric === 'p50_ns' || metric === 'p99_ns') return median(row.repetitions.map(x => x[metric])) / 1e6;
       if (metric === 'throughput') return row.input_bytes / (median(row.repetitions.map(x => x.p50_ns)) / 1e9) / 1048576;
       if (metric === 'cpu_seconds') return median(row.repetitions.flatMap(x => x.raw.map(y => y.cpu_seconds))) * 1000;
@@ -22,6 +24,12 @@ try {
     const maximum = Math.max(0, ...rows.map(value).filter(x => x != null));
     const chart = document.querySelector('#chart');
     chart.replaceChildren();
+    if (!rows.length) {
+      const empty = document.createElement('p');
+      empty.className = 'muted';
+      empty.textContent = 'This workload does not include this operation.';
+      chart.append(empty);
+    }
     for (const row of rows) {
       const number = value(row);
       const container = document.createElement('div');
@@ -36,7 +44,8 @@ try {
       track.append(bar);
       const text = document.createElement('span');
       text.className = 'value';
-      text.textContent = number == null ? 'Not measured' : number.toLocaleString('en', { maximumFractionDigits: 3 });
+      text.textContent = row.unsupported ? 'Unsupported' : number == null ? 'Not measured' : number.toLocaleString('en', { maximumFractionDigits: 3 });
+      if (row.unsupported) text.title = row.unsupported;
       container.append(label, track, text);
       chart.append(container);
     }

@@ -124,12 +124,27 @@ existing libxmlsec1 1.3.13 oracle, independently of the product dependency graph
 It compares both xml-sec XML backends against those CLIs: single-reference
 RSA-2048/SHA-256 sign/verify and AES-256-GCM encrypt/decrypt of identical plaintext
 octets, at two sizes for five deterministic document shapes. AES keys use the
-same named XML key store; RSA keys use named PEM imports. Encrypt/decrypt is
-byte-oriented XML payload encryption, not element/content selection parity.
+same named XML key store; RSA keys use named PEM imports. These payload cases
+are byte-oriented encryption, not element selection.
+
+Four workloads, at 16 and 256 repeated units, cover the main application uses:
+
+| Workload | Operations | Configuration |
+|----------|------------|---------------|
+| SAML assertion | sign, verify | Enveloped exclusive-C14N signature over an `Assertion` inside a `Response`. Signing uses a named key; verification trusts only a root CA and receives the signer certificate in `KeyInfo` and an untrusted intermediate CA. Bergshamra runs with `--enabled-key-data x509 --strict`. |
+| Element | encrypt, decrypt | A standalone `Payment` element as `Element` `EncryptedData`: AES-256-GCM content key transported with RSA-OAEP to the recipient certificate, decrypted with its private key. |
+| Element in place | encrypt, decrypt | The same `Payment` encrypted where it stands inside an `Order` (`--node-id`); decryption restores the whole document. |
+| XSLT reference | sign, verify | A same-document reference transformed by an XSLT 1.0 stylesheet before exclusive C14N. |
+
+Pinned Bergshamra 0.9.2 has no XSLT transform and its CLI `--node-id` writes a
+standalone `EncryptedData` instead of replacing the element inside its document.
+Those cases are recorded as unsupported with the reason and are never timed.
+
 Before timing, each engine's signature is verified by every engine, each
-ciphertext is decrypted by every engine with exact plaintext equality, and all
-engines must reject a modified signed payload. A crash or timeout is failure,
-not successful rejection. Unsupported work never produces a timing entry.
+ciphertext is decrypted by every engine, and all engines must reject a modified
+signed value. Payload plaintexts must match exactly; XML documents may differ
+only in the XML declaration and surrounding whitespace the writing engine emits.
+A crash or timeout is failure, not successful rejection.
 
 Every sample includes fresh process launch, key loading, file I/O and operation;
 three interleaved repetitions rotate engine order. File caches are warm. CPU

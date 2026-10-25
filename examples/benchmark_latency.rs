@@ -2,7 +2,7 @@
 #[path = "../benches/support/mod.rs"]
 mod support;
 
-use std::{error::Error, time::Instant};
+use std::{error::Error, fmt::Write as _, time::Instant};
 use support::{Engine, Fixture, OPERATIONS, SHAPES, Spec};
 use xml_sec::XmlBackend;
 
@@ -129,10 +129,112 @@ fn export(directory: &std::path::Path) -> Result<(), Box<dyn Error>> {
             serde_json::json!({"name": name, "shape": SHAPES[spec.shape], "units": spec.units}),
         );
     }
+    export_scenarios(directory, &mut cases)?;
     std::fs::write(
         directory.join("cases.json"),
         serde_json::to_vec_pretty(&cases)?,
     )?;
+    Ok(())
+}
+
+const XMLDSIG: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+/// An empty `Signature` template: RSA-SHA256 over `reference_uri` after `transforms`,
+/// with the signing key named `bench`.
+fn signature_template(reference_uri: &str, transforms: &str) -> String {
+    format!(
+        "<ds:Signature xmlns:ds=\"{XMLDSIG}\"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/><ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/><ds:Reference URI=\"{reference_uri}\"><ds:Transforms>{transforms}</ds:Transforms><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue></ds:SignatureValue><ds:KeyInfo><ds:KeyName>bench</ds:KeyName></ds:KeyInfo></ds:Signature>"
+    )
+}
+
+/// Main user scenarios shared by every engine: SAML-shaped verification with an X.509
+/// chain, element encryption with RSA-OAEP key transport, and an XSLT-transformed
+/// Reference. Every file is plain input; each engine produces its own outputs.
+fn export_scenarios(
+    directory: &std::path::Path,
+    cases: &mut Vec<serde_json::Value>,
+) -> Result<(), Box<dyn Error>> {
+    // A leaf certificate for the signing key, its intermediate CA and the root CA,
+    // rewritten as bare PEM blocks so every engine's loader reads them.
+    let mut leaf_der = Vec::new();
+    for (name, source) in [
+        (
+            "leaf.pem",
+            include_str!("../tests/fixtures/keys/rsa/rsa-2048-cert.pem"),
+        ),
+        (
+            "intermediate.pem",
+            include_str!("../tests/fixtures/keys/ca2cert.pem"),
+        ),
+        (
+            "root.pem",
+            include_str!("../tests/fixtures/keys/cacert.pem"),
+        ),
+    ] {
+        let certificate = pem::parse_many(source)?
+            .into_iter()
+            .find(|block| block.tag() == "CERTIFICATE")
+            .ok_or("fixture has no certificate")?;
+        if name == "leaf.pem" {
+            leaf_der = certificate.contents().to_vec();
+        }
+        std::fs::write(directory.join(name), pem::encode(&certificate))?;
+    }
+    let leaf = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &leaf_der);
+    // KeyInfo sits inside the Signature that the enveloped transform removes, so a
+    // verifier input may carry the certificate instead of the signer's key name.
+    std::fs::write(
+        directory.join("x509-keyinfo.xml"),
+        format!(
+            "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{leaf}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>"
+        ),
+    )?;
+    std::fs::write(
+        directory.join("element.template.xml"),
+        "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" Type=\"http://www.w3.org/2001/04/xmlenc#Element\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/></xenc:EncryptionMethod><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>",
+    )?;
+    for units in [16, 256] {
+        let mut attributes = String::new();
+        let mut items = String::new();
+        for index in 0..units {
+            write!(
+                attributes,
+                "<saml:Attribute Name=\"attribute-{index}\"><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>"
+            )?;
+            write!(items, "<Item n=\"{index}\">value</Item>")?;
+        }
+        let enveloped = "<ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#enveloped-signature\"/><ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>";
+        std::fs::write(
+            directory.join(format!("assertion-{units}.template.xml")),
+            format!(
+                "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" ID=\"response\" Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\"><saml:Issuer>https://idp.example.invalid</saml:Issuer><saml:Assertion ID=\"assertion\" Version=\"2.0\" IssueInstant=\"2026-01-01T00:00:00Z\"><saml:Issuer>https://idp.example.invalid</saml:Issuer>{}<saml:Subject><saml:NameID>user@example.invalid</saml:NameID></saml:Subject><saml:AttributeStatement>{attributes}</saml:AttributeStatement></saml:Assertion></samlp:Response>",
+                signature_template("#assertion", enveloped)
+            ),
+        )?;
+        let payment =
+            format!("<Payment Id=\"payment\"><Card>4111111111111111</Card>{items}</Payment>");
+        std::fs::write(
+            directory.join(format!("element-{units}.plain.xml")),
+            &payment,
+        )?;
+        std::fs::write(
+            directory.join(format!("order-{units}.plain.xml")),
+            format!(
+                "<Order><Customer>benchmark@example.invalid</Customer>{payment}<Note>kept</Note></Order>"
+            ),
+        )?;
+        let stylesheet = "<ds:Transform Algorithm=\"http://www.w3.org/TR/1999/REC-xslt-19991116\"><xsl:stylesheet xmlns:xsl=\"http://www.w3.org/1999/XSL/Transform\" version=\"1.0\"><xsl:output method=\"xml\" omit-xml-declaration=\"yes\"/><xsl:template match=\"/\"><out><xsl:for-each select=\"//Item\"><v n=\"{@n}\"><xsl:value-of select=\".\"/></v></xsl:for-each></out></xsl:template></xsl:stylesheet></ds:Transform>";
+        std::fs::write(
+            directory.join(format!("xslt-{units}.template.xml")),
+            format!(
+                "<Catalog><List Id=\"list\">{items}</List>{}</Catalog>",
+                signature_template("#list", stylesheet)
+            ),
+        )?;
+        for scenario in ["assertion", "element", "element_in_place", "xslt"] {
+            cases.push(serde_json::json!({"name": format!("{scenario}-{units}"), "scenario": scenario, "units": units}));
+        }
+    }
     Ok(())
 }
 
