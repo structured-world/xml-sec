@@ -236,6 +236,46 @@ fn projected_node_count_matches_the_commit_parse() {
     }
 }
 
+#[test]
+fn signing_refuses_a_reference_to_content_the_signature_value_replaces() {
+    // Filling SignatureValue removes its element content, so a Reference to
+    // that content has no target in the signed document and must fail.
+    let xml = template(
+        EXCLUSIVE,
+        &reference("#p", "", "<ds:DigestValue/>"),
+        r#"<ds:SignatureValue><held Id="p"/></ds:SignatureValue>"#,
+        "",
+    );
+    let result = SignContext::new(&FixedSigningKeyForLimits).sign_template(&xml);
+    assert!(result.is_err(), "signed output lost its target: {result:?}");
+}
+
+#[cfg(feature = "xml-backend-roxmltree")]
+#[test]
+fn deferred_digest_may_replace_longer_lexical_content() {
+    // References to an empty internal entity leave a DigestValue without
+    // semantic children but with more source bytes than the digest that
+    // replaces them, so filling it shrinks the document.
+    let digest_value = format!("<ds:DigestValue>{}</ds:DigestValue>", "&empty;".repeat(10));
+    let xml = format!(
+        r#"<!DOCTYPE root [<!ENTITY empty "">]>{}"#,
+        template(
+            EXCLUSIVE,
+            &reference("#payload", "", &digest_value),
+            "<ds:SignatureValue/>",
+            ""
+        )
+    );
+    let mut policy = crate::policy::SigningPolicy::default();
+    policy.xml.allow_internal_dtd = true;
+    let signed = SignContext::new(&FixedSigningKeyForLimits)
+        .policy(policy)
+        .xml_backend(crate::XmlBackend::Roxmltree)
+        .sign_template(&xml)
+        .expect("a shrinking DigestValue replacement must sign");
+    assert!(!signed.contains("&empty;"));
+}
+
 struct FixedSigningKeyForLimits;
 
 impl SigningKey for FixedSigningKeyForLimits {

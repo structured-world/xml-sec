@@ -2399,18 +2399,20 @@ impl<'a> SignContext<'a> {
         })?;
         let mut projected_document_len = document
             .projected_content_replacement_len(signature_value_node, encoded_signature_len)?;
-        // Deferred digests fill empty DigestValue elements, so each only grows the document.
+        // A DigestValue without semantic children may still hold source bytes
+        // (references to an empty entity), so a replacement can also shrink
+        // the document. The replaced ranges are disjoint, so the running total
+        // never drops below what one replacement removes.
         for (digest_value_node, digest) in pending_digests {
-            let growth = document
-                .projected_content_replacement_len(*digest_value_node, digest.len())?
-                - document.as_xml().len();
-            projected_document_len = projected_document_len.checked_add(growth).ok_or(
+            let replaced =
+                document.projected_content_replacement_len(*digest_value_node, digest.len())?;
+            projected_document_len = projected_document_len.checked_add(replaced).ok_or(
                 crate::policy::PolicyViolation::ResourceLimit {
                     resource: crate::policy::resource_name::XML_DOCUMENT,
                     maximum: self.policy.resources.max_xml_document_bytes,
                     actual: usize::MAX,
                 },
-            )?;
+            )? - document.as_xml().len();
         }
         self.policy
             .resources
@@ -3185,12 +3187,23 @@ fn analyze_signing_reference_inputs(
         // These transforms keep or remove whole subtrees, so a DigestValue or
         // SignatureValue element is covered exactly when its future text is:
         // the current tree decides every dependency without placeholder text.
-        let analysis_references = all_references.cloned().collect::<Vec<_>>();
-        return document.with_view(|view| {
+        // That holds only while filling a value removes nothing but text; a
+        // value holding other nodes needs the placeholder tree, where those
+        // nodes are already gone.
+        let analysis_references = all_references.clone().cloned().collect::<Vec<_>>();
+        let current_tree = document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
                 SigningSignatureTarget::Index(request.target_signature),
             )?;
+            let signature_value = find_required_child(signature, "SignatureValue")?;
+            let text_only = all_references
+                .filter_map(|reference| view.document().get_node(reference.digest_value_node_id))
+                .chain([signature_value])
+                .all(|value| value.children().all(|child| child.is_text()));
+            if !text_only {
+                return Ok(None);
+            }
             reference_dependency_levels(
                 view.document(),
                 signature,
@@ -3199,7 +3212,11 @@ fn analyze_signing_reference_inputs(
                 &budgets.transforms,
                 request.uri_resolution(policy.transforms.same_document_id_semantics),
             )
-        });
+            .map(Some)
+        })?;
+        if let Some(plan) = current_tree {
+            return Ok(plan);
+        }
     }
     let placeholder = "AA==";
     // SignatureValue is the final mutable value in the signing pipeline. Give
