@@ -1,28 +1,33 @@
 const status = document.querySelector('#status');
-const controls = ['operation', 'shape', 'units', 'metric'].map(id => document.querySelector(`#${id}`));
 const median = values => [...values].sort((a, b) => a - b)[Math.floor(values.length / 2)];
-try {
-  const response = await fetch('comparison.json');
-  if (!response.ok) throw Error(`HTTP ${response.status}`);
-  const report = await response.json();
-  if (report.schema !== 2 || !Array.isArray(report.results) || !report.results.length) throw Error('Invalid measurement report');
-  status.textContent = `Measured ${report.generated} · ${report.environment.samples} samples × 3 repetitions · revision ${report.source_revision.slice(0, 12)}`;
-  document.querySelector('#metadata').textContent = JSON.stringify({ environment: report.environment, binaries: report.binaries, corpus: report.corpus }, null, 2);
+
+async function load(name) {
+  const response = await fetch(name);
+  if (!response.ok) throw Error(`${name}: HTTP ${response.status}`);
+  return response.json();
+}
+
+function value(row, metric) {
+  if (row.unsupported) return null;
+  if (metric === 'p50_ns' || metric === 'p99_ns') return median(row.repetitions.map(x => x[metric])) / 1e6;
+  if (metric === 'throughput') return row.input_bytes / (median(row.repetitions.map(x => x.p50_ns)) / 1e9) / 1048576;
+  if (metric === 'cpu_seconds') return median(row.repetitions.flatMap(x => x.raw.map(y => y.cpu_seconds))) * 1000;
+  // CLI samples each carry the process's RSS; a library repetition carries one.
+  if (metric === 'rss_bytes') return Math.max(...row.repetitions.flatMap(x => x.rss_bytes ?? x.raw.map(y => y.rss_bytes))) / 1048576;
+  const measured = row.memory?.[metric];
+  return measured == null ? null : metric === 'allocation_calls' ? measured : measured / 1048576;
+}
+
+/** Render one level's chart from its own controls; levels are never ranked together. */
+function section(prefix, results, select, describe) {
+  const controls = [...document.querySelectorAll(`[data-section="${prefix}"]`)];
+  const chart = document.querySelector(`#${prefix}-chart`);
+  const boundary = document.querySelector(`#${prefix}-boundary`);
   function render() {
-    const [operation, shape, units, metric] = controls.map(x => x.value);
-    // Payload cases name their document shape; scenario cases name the workload.
-    const rows = report.results.filter(x => x.operation === operation && (x.shape ?? x.scenario) === shape && x.units === Number(units));
-    const value = row => {
-      if (row.unsupported) return null;
-      if (metric === 'p50_ns' || metric === 'p99_ns') return median(row.repetitions.map(x => x[metric])) / 1e6;
-      if (metric === 'throughput') return row.input_bytes / (median(row.repetitions.map(x => x.p50_ns)) / 1e9) / 1048576;
-      if (metric === 'cpu_seconds') return median(row.repetitions.flatMap(x => x.raw.map(y => y.cpu_seconds))) * 1000;
-      if (metric === 'rss_bytes') return Math.max(...row.repetitions.flatMap(x => x.raw.map(y => y.rss_bytes))) / 1048576;
-      const measured = row.memory?.[metric];
-      return measured == null ? null : metric === 'allocation_calls' ? measured : measured / 1048576;
-    };
-    const maximum = Math.max(0, ...rows.map(value).filter(x => x != null));
-    const chart = document.querySelector('#chart');
+    const chosen = Object.fromEntries(controls.map(control => [control.dataset.field, control.value]));
+    const rows = results.filter(row => select(row, chosen));
+    if (boundary) boundary.textContent = describe(chosen) ?? '';
+    const maximum = Math.max(0, ...rows.map(row => value(row, chosen.metric)).filter(x => x != null));
     chart.replaceChildren();
     if (!rows.length) {
       const empty = document.createElement('p');
@@ -31,7 +36,7 @@ try {
       chart.append(empty);
     }
     for (const row of rows) {
-      const number = value(row);
+      const number = value(row, chosen.metric);
       const container = document.createElement('div');
       container.className = 'row';
       const label = document.createElement('span');
@@ -52,6 +57,20 @@ try {
   }
   controls.forEach(control => control.addEventListener('change', render));
   render();
+}
+
+try {
+  const [cli, library] = await Promise.all([load('comparison.json'), load('library.json')]);
+  if (cli.schema !== 2 || !Array.isArray(cli.results) || !cli.results.length) throw Error('Invalid CLI measurement report');
+  if (library.schema !== 1 || !Array.isArray(library.results) || !library.results.length) throw Error('Invalid library measurement report');
+  status.textContent = `Measured ${cli.generated} · ${cli.environment.samples} samples × 3 repetitions · revision ${cli.source_revision.slice(0, 12)}`;
+  document.querySelector('#metadata').textContent = JSON.stringify({ cli: { environment: cli.environment, binaries: cli.binaries, corpus: cli.corpus },
+    library: { environment: library.environment, binaries: library.binaries } }, null, 2);
+  // Payload cases name their document shape; workload cases name the workload.
+  section('cli', cli.results, (row, chosen) => row.operation === chosen.operation && (row.shape ?? row.scenario) === chosen.shape
+    && row.units === Number(chosen.units), () => null);
+  section('library', library.results, (row, chosen) => row.operation === chosen.operation && row.scenario === chosen.shape
+    && row.units === Number(chosen.units) && row.boundary === chosen.boundary, chosen => library.boundaries[chosen.boundary]);
 } catch (error) {
   status.textContent = `Measurements unavailable: ${error.message}. No performance conclusions can be drawn.`;
 }

@@ -40,18 +40,49 @@ before=$(source_identity)
 cargo build --release -p xml-sec-cli --bin xmlsec1 --features benchmark-internals,xslt
 cargo build --release -p xml-sec --example benchmark_latency --features benchmark-internals
 cargo build --release --locked --manifest-path "$source/Cargo.toml" -p bergshamra --no-default-features --features rustcrypto --target-dir "$target/competitors/bergshamra"
+# Library level: in-process harnesses from a project outside the product workspace.
+# Timing and allocation counting are separate builds.
+competitors=benchmarks/competitors/Cargo.toml
+cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library"
+cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library-profile" --features allocation-profile
+native="$target/competitors/libxmlsec1"
+mkdir -p "$native"
+read -r -a xmlsec_cflags <<< "$(PKG_CONFIG_PATH="$XMLSEC1_PREFIX/lib/pkgconfig" pkg-config --cflags xmlsec1-openssl)"
+case "$(uname -s)" in
+  Darwin) libxml_cflags=("-I$(xcrun --show-sdk-path)/usr/include/libxml2") ;;
+  *) read -r -a libxml_cflags <<< "$(pkg-config --cflags libxml-2.0)" ;;
+esac
+# OpenSSL is linked into libxmlsec1-openssl itself; linking another copy here would
+# load a second, unused library.
+native_build=(cc -std=c11 -O2 -Wall -Wextra -Werror "${xmlsec_cflags[@]}" "${libxml_cflags[@]}"
+  benchmarks/libxmlsec1-library.c -L"$XMLSEC1_PREFIX/lib" -lxmlsec1-openssl -lxmlsec1 -lxslt -lxml2)
+"${native_build[@]}" -o "$native/libxmlsec1-library"
+export LIBRARY_XMLSEC_BIN="$target/competitors/library/release/xml-sec-library"
+export LIBRARY_BERGSHAMRA_BIN="$target/competitors/library/release/bergshamra-library"
+export LIBRARY_LIBXMLSEC1_BIN="$native/libxmlsec1-library"
+export LIBRARY_XMLSEC_PROFILE_BIN="$target/competitors/library-profile/release/xml-sec-library"
+export LIBRARY_BERGSHAMRA_PROFILE_BIN="$target/competitors/library-profile/release/bergshamra-library"
+# Counting every native allocation replaces glibc's malloc family; elsewhere the
+# native allocation profile is reported as not measured.
+if [[ $(uname -s) == Linux ]]; then
+  "${native_build[@]}" -DLIBRARY_PROFILE -o "$native/libxmlsec1-library-profile"
+  export LIBRARY_LIBXMLSEC1_PROFILE_BIN="$native/libxmlsec1-library-profile"
+fi
 [[ $before == "$(source_identity)" ]] || { printf 'Source changed during build; discard binaries\n' >&2; exit 3; }
-locks_before=$(shasum -a 256 Cargo.lock "$source/Cargo.lock")
+locks_before=$(shasum -a 256 Cargo.lock "$source/Cargo.lock" benchmarks/competitors/Cargo.lock)
 case "$(uname -s)" in
   Darwin) export DYLD_LIBRARY_PATH="$XMLSEC1_PREFIX/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}" ;;
   Linux) export LD_LIBRARY_PATH="$XMLSEC1_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
 esac
 node scripts/compare-security.mjs "$output" "$samples" "$heap"
+node scripts/compare-library.mjs "$output" "$samples"
 after=$(source_identity)
 [[ $before == "$after" ]] || { printf 'Source changed during measurement; discard results\n' >&2; exit 3; }
-[[ $locks_before == "$(shasum -a 256 Cargo.lock "$source/Cargo.lock")" ]] || { printf 'Dependency graph changed during measurement; discard results\n' >&2; exit 3; }
+[[ $locks_before == "$(shasum -a 256 Cargo.lock "$source/Cargo.lock" benchmarks/competitors/Cargo.lock)" ]] || { printf 'Dependency graph changed during measurement; discard results\n' >&2; exit 3; }
 cp Cargo.lock "$output/xml-sec.Cargo.lock"
 cp "$source/Cargo.lock" "$output/bergshamra.Cargo.lock"
+cp benchmarks/competitors/Cargo.lock "$output/competitors.Cargo.lock"
+cargo metadata --locked --manifest-path "$competitors" --format-version 1 > "$output/competitors.dependencies.json"
 printf '%s\n' "$before" > "$output/source-sha256.txt"
 cargo metadata --locked --features benchmark-internals --format-version 1 > "$output/xml-sec.dependencies.json"
 cargo metadata --locked --manifest-path "$source/Cargo.toml" --no-default-features --features rustcrypto --format-version 1 > "$output/bergshamra.dependencies.json"
@@ -64,8 +95,8 @@ cargo metadata --locked --manifest-path "$source/Cargo.toml" --no-default-featur
   uname -a
   uptime
   if [[ $(uname -s) == Darwin ]]; then
-    otool -L "$XMLSEC1_BIN"
+    otool -L "$XMLSEC1_BIN" "$LIBRARY_LIBXMLSEC1_BIN"
   else
-    ldd "$XMLSEC1_BIN"
+    ldd "$XMLSEC1_BIN" "$LIBRARY_LIBXMLSEC1_BIN"
   fi
 } > "$output/build-environment.txt"

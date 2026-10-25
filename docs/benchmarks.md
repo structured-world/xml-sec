@@ -108,16 +108,23 @@ The oracle CLI's `--repeat` CPU time excludes parsing and result writing. Do not
 compare it directly with this suite's end-to-end wall time. Comparative native/C/ABI
 measurements require separately matched boundaries and build configurations.
 
-## Comparative CLI Dashboard
+## Comparative Dashboard
 
 ```sh
-# External competitor binary only; never a dependency of xml-sec.
+# Competitors are built outside the product dependency graph.
 bash scripts/benchmark-compare.sh target/performance/comparison 30
 # Linux: separately profile malloc-family allocations and peak heap, including C.
 bash scripts/benchmark-compare.sh target/performance/comparison-heap 30 --heap
 node scripts/build-benchmark-dashboard.mjs target/performance/comparison target/performance/site
-node --test scripts/compare-security.test.mjs
+node --test scripts/compare-security.test.mjs scripts/compare-library.test.mjs
 ```
+
+The comparison has two levels, reported in separate dashboard sections and never
+ranked against each other: command-line processes, where launch and key loading
+dominate small documents, and library operations, which isolate the cost of one
+operation inside a process.
+
+### Command-line process
 
 The runner builds the pinned Bergshamra 0.9.2 source (RustCrypto only) and the
 existing libxmlsec1 1.3.13 oracle, independently of the product dependency graph.
@@ -168,6 +175,53 @@ used as latency samples; they are not directly comparable to Divan counters.
 The raw logs, commands, source/binary identities, lockfiles and feature graphs
 are retained in CI artifacts. Missing metrics are displayed as not measured.
 
+### Library operation
+
+The same corpus and keys drive one in-process harness per engine:
+
+- xml-sec through its Rust API (`SignContext`, `VerifyContext`,
+  `EncryptedDataBuilder`, `DecryptContext`, xmloxide backend, RustCrypto);
+- Bergshamra 0.9.2 through its Rust API, linked only from
+  `benchmarks/competitors`, a project outside the xml-sec workspace with its own
+  `Cargo.lock` and the revision pinned in
+  `compatibility/bergshamra-0.9.2-benchmark-commit.txt`;
+- libxmlsec1 1.3.13 through its C API (`benchmarks/libxmlsec1-library.c`),
+  linked against the oracle build and the OpenSSL inside it.
+
+Each process loads keys, trust anchors and settings once, validates its first
+result, runs three warmups and then times every sample around the operation
+alone. Two boundaries are measured:
+
+| Boundary | Inside each sample |
+|----------|--------------------|
+| Parse and operation | Parsing the serialized input, the operation and serializing its result. |
+| Prepared document | The operation on an already parsed document, without serialization. A mutating operation receives a fresh parsed copy outside the timer. libxml2 registers declared IDs while preparing the document. |
+
+Each engine is configured for the same workload, as its own command line would be:
+
+| Engine | Configuration beyond defaults |
+|--------|-------------------------------|
+| xml-sec | Chain validation of `X509Data` to the trusted root (`key_trust.verify_x509_chains`); libxmlsec1 XSLT stylesheet semantics; encryption and decryption policies permitting exactly AES-256-GCM with RSA-OAEP MGF1-SHA1, the one key transport all engines share. |
+| Bergshamra | `DsigContext::new_permissive` with `enabled_key_data_x509` and `strict_verification`, trusted root and untrusted intermediate, as `verify --trusted --untrusted --enabled-key-data x509 --strict`. |
+| libxmlsec1 | The keys and trust of the command-line comparison, a 256-bit AES session key, and declared IDs registered with duplicates refused. |
+
+Before timing, every result each engine produces at either boundary is consumed
+by every other engine: signatures verified, ciphertexts decrypted to the
+original document. Every verifier must reject the changed signed value and the
+wrapped SAML forgery. A harness answers an operation its engine lacks with the
+reason (exit status 3); the runner records it as unsupported and never times it.
+Bergshamra signs no X509Data, has no XSLT 1.0 transform, cannot encrypt in place,
+and encrypts or decrypts only serialized XML.
+
+Every process is wrapped by system `time` for RSS, which covers the whole
+process including key loading and warmups. Allocation counts come from separate
+instrumented builds whose timings are never reported: the Rust harnesses'
+`allocation-profile` feature installs a counting global allocator, and on glibc
+the C harness replaces the malloc family. Both count every heap allocation in the
+process during one operation: calls, requested bytes and the peak of live bytes
+above the operation's start. Elsewhere the C allocation profile is reported as
+not measured.
+
 CI uses the shared comparison workflow to build dashboard artifacts on PRs;
 Benchmark Observatory publishes only validated default-branch results to GitHub Pages. One-sample PR
 runs prove correctness, not performance. Shared runners and 30-sample runs do
@@ -177,6 +231,7 @@ and external resources are not ranked without matching processor boundaries.
 
 References: [Bergshamra CLI](https://github.com/kushaldas/bergshamra/blob/v0.9.2/crates/bergshamra/src/main.rs),
 [Valgrind Massif](https://valgrind.org/docs/manual/ms-manual.html),
+[Replacing malloc in glibc](https://www.gnu.org/software/libc/manual/html_node/Replacing-malloc.html),
 [GitHub Pages workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
 
 `benchmarks/Dockerfile` supplies the Linux profiling tools. Mount source read-only

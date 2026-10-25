@@ -147,6 +147,9 @@ test('published package includes every shared benchmark entry point', () => {
     const report = { schema: 2, results: Array.from({ length: 224 }, (_, index) => index < 8
       ? { unsupported: 'not available' } : { commands: ['private path'], repetitions: [{}] }) };
     fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify(report));
+    const library = { schema: 1, results: Array.from({ length: 96 }, (_, index) => index < 4
+      ? { unsupported: 'not available' } : { repetitions: [{}] }) };
+    fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify(library));
     const output = path.join(directory, 'site');
     const built = spawnSync(process.execPath, [builder, directory, output],
       { cwd: directory, encoding: 'utf8' });
@@ -158,6 +161,7 @@ test('published package includes every shared benchmark entry point', () => {
     const published = JSON.parse(fs.readFileSync(path.join(output, 'comparison.json'), 'utf8'));
     assert.equal(published.results.length, 224);
     assert.ok(published.results.every(entry => !Object.hasOwn(entry, 'commands')));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'library.json'), 'utf8')).results.length, 96);
   } finally {
     fs.rmSync(directory, { recursive: true });
   }
@@ -215,12 +219,18 @@ test('incomplete reports cannot publish a dashboard', () => {
   try {
     const output = path.join(directory, 'site');
     const complete = Array.from({ length: 224 }, () => ({ repetitions: [{}] }));
-    // Missing entries, and a supported entry without measurements, are both incomplete.
-    for (const results of [[], [...complete.slice(1), { engine: 'unmeasured' }]]) {
-      fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 2, results }));
+    const library = Array.from({ length: 96 }, () => ({ repetitions: [{}] }));
+    const unmeasured = list => [...list.slice(1), { engine: 'unmeasured' }];
+    // Missing entries, and a supported entry without measurements, are both incomplete
+    // at either level; a complete pair is the control that the builder accepts.
+    for (const [cli, inProcess, accepted] of [[[], library, false], [unmeasured(complete), library, false],
+      [complete, [], false], [complete, unmeasured(library), false], [complete, library, true]]) {
+      fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 2, results: cli }));
+      fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify({ schema: 1, results: inProcess }));
       const result = spawnSync(process.execPath, ['scripts/build-benchmark-dashboard.mjs', directory, output], { cwd: root });
-      assert.notEqual(result.status, 0);
-      assert.equal(fs.existsSync(output), false);
+      assert.equal(result.status === 0, accepted);
+      assert.equal(fs.existsSync(output), accepted);
+      fs.rmSync(output, { recursive: true, force: true });
     }
   } finally {
     fs.rmSync(directory, { recursive: true });
