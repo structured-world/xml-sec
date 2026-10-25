@@ -2657,6 +2657,65 @@ fn xml_data_moved_template_keeps_its_absent_default_namespace() {
 }
 
 #[test]
+fn xml_data_moved_template_keeps_its_own_default_undeclaration() {
+    // A template that already undeclares the default namespace must not get a
+    // second `xmlns=""`: Namespaces in XML 1.0 section 6.3 forbids duplicates.
+    let data = r#"<Order xmlns="urn:order"><Payment>secret</Payment></Order>"#;
+    let template = r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns=""><xenc:CipherData><xenc:CipherValue>AAAA</xenc:CipherValue></xenc:CipherData><xenc:EncryptionProperties><xenc:EncryptionProperty><Audit/></xenc:EncryptionProperty></xenc:EncryptionProperties></xenc:EncryptedData>"#;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    let output = place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    )
+    .expect("an existing undeclaration is kept as is");
+    assert_eq!(output.matches("xmlns=\"\"").count(), 1, "{output}");
+}
+
+#[test]
+fn xml_data_references_stay_unambiguous_in_the_data_document() {
+    // A reference that resolves inside the template can become ambiguous once the
+    // EncryptedData joins a data document holding the same ID; decryption resolves
+    // it there, so the assembled document must be checked.
+    let data = r#"<Order><Payment>secret</Payment><Info Id="recipient-info"/></Order>"#;
+    let template = r##"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#" Id="recipient-info"><KeyInfoReference xmlns="http://www.w3.org/2009/xmldsig11#" URI="#recipient-info"/></KeyInfo><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"##;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    let result = place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    );
+    assert!(
+        result.is_err(),
+        "ambiguous reference was written: {result:?}"
+    );
+}
+
+#[test]
 fn xml_data_template_references_resolve_xpointer_forms() {
     // Only EncryptedData moves into the data document, so an XPointer
     // reference to a node outside it would dangle exactly like a bare ID.
@@ -2668,12 +2727,15 @@ fn xml_data_template_references_resolve_xpointer_forms() {
             r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="data"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyInfoReference xmlns="http://www.w3.org/2009/xmldsig11#" URI="{uri}"/></KeyInfo><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#
         )
     };
-    assert!(ensure_self_contained(&filled("#xpointer(id('mechanism'))"), &command).is_err());
-    assert!(ensure_self_contained(&filled("#mechanism"), &command).is_err());
+    let check = |uri: &str| {
+        let xml = filled(uri);
+        ensure_self_contained(&xml, 0..xml.len(), &command)
+    };
+    assert!(check("#xpointer(id('mechanism'))").is_err());
+    assert!(check("#mechanism").is_err());
     // After the move, the whole template document is no longer what `/` selects.
-    assert!(ensure_self_contained(&filled("#xpointer(/)"), &command).is_err());
-    ensure_self_contained(&filled("#xpointer(id('data'))"), &command)
-        .expect("a reference inside EncryptedData stays resolvable");
+    assert!(check("#xpointer(/)").is_err());
+    check("#xpointer(id('data'))").expect("a reference inside EncryptedData stays resolvable");
 }
 
 #[test]

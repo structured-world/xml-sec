@@ -3579,7 +3579,12 @@ fn place_encrypted_data(
         EncryptedDataType::Content => Some(target),
         _ => target.parent_element(),
     };
-    if !has_default(encrypted_data) && context.is_some_and(has_default) {
+    // An undeclaration the template already carries (`xmlns=""`) is kept as is; a second
+    // one would be a duplicate attribute (section 6.3).
+    let opening_end = opening_tag_end(&filled)
+        .ok_or_else(|| CommandError::Encryption("EncryptedData has no opening tag".into()))?;
+    let declares_default = owned_namespace_declarations(&filled[..opening_end])?.contains("");
+    if !declares_default && !has_default(encrypted_data) && context.is_some_and(has_default) {
         let name_end = filled[1..]
             .find(|character: char| {
                 character.is_whitespace() || character == '>' || character == '/'
@@ -3587,10 +3592,16 @@ fn place_encrypted_data(
             .map_or(filled.len(), |end| end + 1);
         filled.insert_str(name_end, " xmlns=\"\"");
     }
-    ensure_self_contained(&filled, command)?;
-    let (range, replacement) = match encrypted_type {
-        EncryptedDataType::Content => replace_element_text(data, target, &filled)?,
-        _ => (target.range(), filled),
+    let filled_len = filled.len();
+    let (range, replacement, filled_offset) = match encrypted_type {
+        EncryptedDataType::Content => {
+            let (range, replacement) = replace_element_text(data, target, &filled)?;
+            let offset = replacement.find(filled.as_str()).ok_or_else(|| {
+                CommandError::Encryption("EncryptedData is missing from its replacement".into())
+            })?;
+            (range, replacement, offset)
+        }
+        _ => (target.range(), filled, 0),
     };
     // The data document fits the policy, but the EncryptedData can be larger than the
     // node it replaces; output the CLI could not read back must not be written.
@@ -3606,6 +3617,8 @@ fn place_encrypted_data(
     output.push_str(&data[..range.start]);
     output.push_str(&replacement);
     output.push_str(&data[range.end..]);
+    let moved_start = range.start + filled_offset;
+    ensure_self_contained(&output, moved_start..moved_start + filled_len, command)?;
     // Both inputs passed their own checks, but the moved EncryptedData can still take
     // the result past the depth, node or namespace limits; parse it under the full
     // operation policy, as decryption will, and hand the same string back.
@@ -3616,25 +3629,41 @@ fn place_encrypted_data(
 
 /// Only the filled `EncryptedData` moves into the data document (`xmlSecReplaceNode`), so a
 /// same-document reference to another template node would dangle and the output could not
-/// be decrypted. Refuse it instead of writing that output.
-fn ensure_self_contained(filled: &str, command: &EncryptCommand<'_>) -> Result<(), CommandError> {
+/// be decrypted. Refuse it instead of writing that output. References are resolved in the
+/// assembled document `xml`, where decryption resolves them, and must reach an element
+/// inside the moved range: a data-document ID can duplicate a template ID there.
+fn ensure_self_contained(
+    xml: &str,
+    moved: std::ops::Range<usize>,
+    command: &EncryptCommand<'_>,
+) -> Result<(), CommandError> {
     let document = parse_encryption_document(
-        filled,
+        xml,
         command.policy.xml,
         &command.policy.resources,
         command.xml_backend,
     )?;
+    let inside = |node: Node<'_, '_>| {
+        let range = node.range();
+        moved.start <= range.start && range.end <= moved.end
+    };
     let resolver = UriReferenceResolver::with_id_registrations(&document, command.id_attributes);
-    let dangling = document.descendants().find_map(|node| {
-        let uri = node.attribute("URI")?;
-        uri.strip_prefix('#')?;
-        // The same element resolution the core key-source parser uses, for bare IDs and
-        // `#xpointer(id('x'))` alike, without projecting the target's subtree per URI.
-        // `#xpointer(/)` names the document node, which after the move is the data
-        // document, so it is refused like any other target outside the moved element.
-        let reachable = matches!(resolver.node_for_same_document_reference(uri), Ok(Some(_)));
-        (!reachable).then_some(uri)
-    });
+    let dangling = document
+        .descendants()
+        .filter(|node| inside(*node))
+        .find_map(|node| {
+            let uri = node.attribute("URI")?;
+            uri.strip_prefix('#')?;
+            // The same element resolution the core key-source parser uses, for bare IDs and
+            // `#xpointer(id('x'))` alike, without projecting the target's subtree per URI. An
+            // ambiguous ID resolves to nothing. `#xpointer(/)` names the document node, which
+            // after the move is the data document, so it is refused like any outside target.
+            let reachable = matches!(
+                resolver.node_for_same_document_reference(uri),
+                Ok(Some(target)) if inside(target)
+            );
+            (!reachable).then_some(uri)
+        });
     match dangling {
         Some(uri) => Err(CommandError::Encryption(format!(
             "template EncryptedData references {uri} outside itself; with --xml-data only the EncryptedData moves into the data document"
