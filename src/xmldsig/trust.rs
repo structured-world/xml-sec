@@ -152,6 +152,17 @@ impl TrustedPublicKey {
     pub fn evidence(&self) -> &X509TrustEvidence {
         &self.evidence
     }
+
+    /// Refuse use under a trust policy other than the one that validated it.
+    fn ensure_trust(&self, policy: &VerificationPolicy) -> Result<(), DsigError> {
+        if self.trust != policy.key_trust {
+            return Err(PolicyViolation::KeyTrust {
+                reason: "validated key belongs to a different trust policy",
+            }
+            .into());
+        }
+        Ok(())
+    }
 }
 
 impl VerifyingKey for TrustedPublicKey {
@@ -182,14 +193,9 @@ impl VerifyingKey for TrustedPublicKey {
         self.key
             .verify_with_context(algorithm, context, data, signature)
     }
-    fn validate_policy(&self, policy: &VerificationPolicy) -> Result<(), DsigError> {
-        if self.trust != policy.key_trust {
-            return Err(PolicyViolation::KeyTrust {
-                reason: "validated key belongs to a different trust policy",
-            }
-            .into());
-        }
-        self.key.validate_policy(policy)
+    fn validate_policy(&self, scope: &super::VerificationScope<'_>) -> Result<(), DsigError> {
+        self.ensure_trust(scope.policy())?;
+        self.key.validate_policy(scope)
     }
 
     fn validate_signature_value(
@@ -202,13 +208,13 @@ impl VerifyingKey for TrustedPublicKey {
 
     fn validate_signature_value_with_policy(
         &self,
-        policy: &VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        self.validate_policy(policy)?;
+        self.validate_policy(scope)?;
         self.key
-            .validate_signature_value_with_policy(policy, algorithm, signature)
+            .validate_signature_value_with_policy(scope, algorithm, signature)
     }
 
     fn verify(
@@ -222,14 +228,15 @@ impl VerifyingKey for TrustedPublicKey {
 
     fn verify_with_policy(
         &self,
-        policy: &VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        self.validate_policy(policy)?;
+        self.validate_policy(scope)?;
         self.key
-            .verify_with_policy(policy, algorithm, data, signature)
+            .verify_with_policy(scope, algorithm, context, data, signature)
     }
 }
 
@@ -275,7 +282,9 @@ impl<'a> ResolvedVerificationKey<'a> {
             .into()),
             Self::CallerTrusted(_) => Ok(KeyTrustEvidence::CallerTrusted),
             Self::Validated(key) => {
-                key.validate_policy(policy)?;
+                // Key strength is checked with the operation's account before
+                // the key verifies anything; authorization binds trust only.
+                key.ensure_trust(policy)?;
                 Ok(KeyTrustEvidence::ValidatedX509(key.evidence.clone()))
             }
         }
@@ -300,6 +309,7 @@ impl<'a> Deref for ResolvedVerificationKey<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::VerificationScope;
     use super::*;
 
     struct NeverExecuted;
@@ -321,16 +331,21 @@ mod tests {
         policy.key_trust.verify_x509_chains = true;
         let key =
             TrustedPublicKey::new(Box::new(NeverExecuted), policy.key_trust.clone(), evidence);
-        assert!(key.validate_policy(&policy).is_err());
+        let certificates = super::super::pkix::CertificateSession::standalone();
+        assert!(
+            key.validate_policy(&VerificationScope::new(&policy, &certificates))
+                .is_err()
+        );
         policy.key_trust.verification_time = Some(time);
-        key.validate_policy(&policy)
+        key.validate_policy(&VerificationScope::new(&policy, &certificates))
             .expect("the exact captured snapshot must match");
         let mut changed = policy.clone();
         changed.key_trust.verification_time = Some(time + std::time::Duration::from_secs(1));
         assert!(
             key.verify_with_policy(
-                &changed,
+                &VerificationScope::new(&changed, &certificates),
                 SignatureAlgorithm::RsaSha256,
+                &super::super::SignatureContext::default(),
                 b"data",
                 b"signature"
             )
@@ -341,9 +356,15 @@ mod tests {
             .key_trust
             .allowed_extended_key_usages
             .insert(crate::policy::ExtendedKeyPurpose::CodeSigning);
-        assert!(key.validate_policy(&changed).is_err());
+        assert!(
+            key.validate_policy(&VerificationScope::new(&changed, &certificates))
+                .is_err()
+        );
         changed = policy;
         changed.key_trust.check_crls = true;
-        assert!(key.validate_policy(&changed).is_err());
+        assert!(
+            key.validate_policy(&VerificationScope::new(&changed, &certificates))
+                .is_err()
+        );
     }
 }

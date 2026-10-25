@@ -10,7 +10,6 @@
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
 //!   string and verified with `RustCrypto` curve crates (`p256`/`p384`/`p521`).
 
-use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
@@ -25,7 +24,7 @@ use signature::Verifier;
 
 use super::parse::SignatureAlgorithm;
 use super::pkix::{CertificateSession, SpkiAlgorithm};
-use crate::policy::{EcdsaSignatureValueEncoding, ResourcePolicy};
+use crate::policy::EcdsaSignatureValueEncoding;
 
 pub(crate) fn signature_value_matches_algorithm(
     algorithm: SignatureAlgorithm,
@@ -131,17 +130,40 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
     }
 }
 
-pub(crate) fn signature_value_matches_spki(
-    algorithm: SignatureAlgorithm,
-    public_key_spki_der: &[u8],
-    signature_value: &[u8],
-) -> Result<bool, SignatureVerificationError> {
-    signature_value_matches_spki_with_encoding(
-        algorithm,
-        public_key_spki_der,
-        signature_value,
-        EcdsaSignatureValueEncoding::XmlDsig,
+/// A shared-reader refusal of key material read under `session`: resource
+/// exhaustion is that account's typed policy violation, anything else a
+/// malformed key.
+pub(crate) fn key_read_error(
+    session: &CertificateSession,
+    error: &structured_pkix::Error,
+) -> SignatureVerificationError {
+    session.resource_violation(error).map_or(
+        SignatureVerificationError::InvalidKeyDer,
+        SignatureVerificationError::KeyPolicy,
     )
+}
+
+/// The RSA key of `spki` admitted for `pss`, read under `session`.
+pub(crate) fn read_rsa_public_key<'a>(
+    session: &'a CertificateSession,
+    spki: &'a [u8],
+    pss: Option<super::RsaPssParameters>,
+) -> Result<structured_pkix::key::rsa::PublicKey<'a>, SignatureVerificationError> {
+    session
+        .rsa_public_key(spki, pss)
+        .map_err(|error| key_read_error(session, &error))?
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
+}
+
+/// The software RSA key of an SPKI, read under `session` with the bare
+/// decoder's admission rules.
+fn software_rsa_public_key(
+    session: &CertificateSession,
+    spki: &[u8],
+) -> Result<rsa::RsaPublicKey, SignatureVerificationError> {
+    crate::rsa_encoding::read_spki_public_key(session, spki)
+        .map_err(|error| key_read_error(session, &error))?
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
 }
 
 pub(crate) fn signature_value_matches_spki_with_encoding(
@@ -149,15 +171,16 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
     public_key_spki_der: &[u8],
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
+    session: &CertificateSession,
 ) -> Result<bool, SignatureVerificationError> {
     if let Some(length) = algorithm.eddsa_signature_len() {
-        super::modern::validate_public_key(algorithm, public_key_spki_der)?;
+        super::modern::validate_public_key(algorithm, public_key_spki_der, session)?;
         return Ok(signature_value.len() == length);
     }
     if let SignatureAlgorithm::PostQuantum(algorithm) = algorithm {
         #[cfg(feature = "experimental-pq")]
         {
-            super::post_quantum::validate_public_key(algorithm, public_key_spki_der)?;
+            super::post_quantum::validate_public_key(algorithm, public_key_spki_der, session)?;
             return Ok(signature_value.len() == algorithm.signature_len());
         }
         #[cfg(not(feature = "experimental-pq"))]
@@ -167,12 +190,9 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             });
         }
     }
-    let session = CertificateSession::new(&ResourcePolicy::default());
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        let modulus = session
-            .rsa_public_key(public_key_spki_der, Some(parameters))
-            .ok_or(SignatureVerificationError::InvalidKeyDer)?
-            .modulus();
+        let modulus =
+            read_rsa_public_key(session, public_key_spki_der, Some(parameters))?.modulus();
         let bits = usize::try_from(modulus.bits())
             .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
         return Ok(
@@ -181,13 +201,13 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
     }
     let family = session
         .spki_algorithm(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+        .map_err(|error| key_read_error(session, &error))?;
     match (algorithm, family) {
         (
             algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
             SpkiAlgorithm::Dsa,
         ) => {
-            let key = decode_dsa_verifying_key(public_key_spki_der)?;
+            let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
             let component_len = usize::try_from(key.components().q().bits_vartime())
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
                 .div_ceil(8);
@@ -195,12 +215,11 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
                 && signature_value.len() == component_len * 2)
         }
         (method, SpkiAlgorithm::RsaEncryption) if method.is_rsa() => {
-            let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+            let key = software_rsa_public_key(session, public_key_spki_der)?;
             Ok(signature_value.len() == key.size())
         }
         (method, SpkiAlgorithm::Ec) if method.ecdsa_digest().is_some() => {
-            let (curve, _) = ecdsa_public_key(&session, public_key_spki_der)?;
+            let (curve, _) = ecdsa_public_key(session, public_key_spki_der)?;
             let component_len = curve.component_len();
             match encoding {
                 EcdsaSignatureValueEncoding::XmlDsig
@@ -381,12 +400,19 @@ pub(crate) fn verify_rsa_signature_spki_with_minimum(
     signature_value: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<bool, SignatureVerificationError> {
-    validate_rsa_signature_spki_with_minimum(algorithm, public_key_spki_der, minimum_modulus_bits)?;
+    let session = CertificateSession::standalone();
+    validate_rsa_signature_spki_with_minimum(
+        algorithm,
+        public_key_spki_der,
+        minimum_modulus_bits,
+        &session,
+    )?;
     verify_rsa_signature_spki_primitive(
         algorithm,
         public_key_spki_der,
         signed_data,
         signature_value,
+        &session,
     )
 }
 
@@ -394,22 +420,20 @@ pub(crate) fn validate_rsa_signature_spki_with_minimum(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
     minimum_modulus_bits: usize,
+    session: &CertificateSession,
 ) -> Result<(), SignatureVerificationError> {
-    let session = CertificateSession::new(&ResourcePolicy::default());
     let pss = algorithm.rsa_pss_parameters();
     if pss.is_none()
         && session
             .spki_algorithm(public_key_spki_der)
-            .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+            .map_err(|error| key_read_error(session, &error))?
             != SpkiAlgorithm::RsaEncryption
     {
         return Err(SignatureVerificationError::KeyAlgorithmMismatch {
             uri: algorithm.uri().to_string(),
         });
     }
-    let key = session
-        .rsa_public_key(public_key_spki_der, pss)
-        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    let key = read_rsa_public_key(session, public_key_spki_der, pss)?;
     validate_rsa_public_key(
         key.modulus(),
         key.exponent().as_bytes(),
@@ -423,11 +447,11 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
     public_key_spki_der: &[u8],
     signed_data: &[u8],
     signature_value: &[u8],
+    session: &CertificateSession,
 ) -> Result<bool, SignatureVerificationError> {
     ensure_rsa_signature_algorithm(algorithm)?;
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        let key = crate::provider::rsa_pss::public_key(public_key_spki_der, parameters)
-            .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+        let key = crate::provider::rsa_pss::public_key(public_key_spki_der, parameters, session)?;
         return Ok(crate::provider::rsa_pss::verify(
             &key,
             parameters,
@@ -435,8 +459,7 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
             signature_value,
         ));
     }
-    let key = rsa::RsaPublicKey::from_public_key_der(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    let key = software_rsa_public_key(session, public_key_spki_der)?;
     let Ok(signature) = RsaPkcs1v15Signature::try_from(signature_value) else {
         return Ok(false);
     };
@@ -502,20 +525,23 @@ pub(crate) fn verify_dsa_signature_spki_with_minimum(
     signature_value: &[u8],
     minimum_modulus_bits: usize,
 ) -> Result<bool, SignatureVerificationError> {
-    validate_dsa_signature_spki_with_minimum(public_key_spki_der, minimum_modulus_bits)?;
+    let session = CertificateSession::standalone();
+    validate_dsa_signature_spki_with_minimum(public_key_spki_der, minimum_modulus_bits, &session)?;
     verify_dsa_signature_spki_primitive(
         algorithm,
         public_key_spki_der,
         signed_data,
         signature_value,
+        &session,
     )
 }
 
 pub(crate) fn validate_dsa_signature_spki_with_minimum(
     public_key_spki_der: &[u8],
     minimum_modulus_bits: usize,
+    session: &CertificateSession,
 ) -> Result<(), SignatureVerificationError> {
-    let key = decode_dsa_verifying_key(public_key_spki_der)?;
+    let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
     let modulus_bits = usize::try_from(key.components().p().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     crate::policy::DsaKeyPolicy {
@@ -534,13 +560,13 @@ pub(crate) struct BorrowedDsaPublicParameters<'a> {
 
 pub(crate) fn decode_dsa_verifying_key(
     bytes: &[u8],
+    session: &CertificateSession,
 ) -> Result<dsa::VerifyingKey, SignatureVerificationError> {
     // The shared PKIX reader owns SPKI and Dss-Parms syntax (RFC 3279 2.3.2);
     // a standalone key must write its own parameters.
-    let session = CertificateSession::new(&ResourcePolicy::default());
     let key = session
         .read_dsa_public_key(bytes)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+        .map_err(|error| key_read_error(session, &error))?;
     let parameters = key
         .parameters()
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
@@ -590,6 +616,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
     public_key_spki_der: &[u8],
     signed_data: &[u8],
     signature_value: &[u8],
+    session: &CertificateSession,
 ) -> Result<bool, SignatureVerificationError> {
     if !matches!(
         algorithm,
@@ -599,7 +626,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
             uri: algorithm.uri().to_string(),
         });
     }
-    let key = decode_dsa_verifying_key(public_key_spki_der)?;
+    let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
     let component_len = usize::try_from(key.components().q().bits_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
         .div_ceil(8);
@@ -664,19 +691,36 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
     signature_value: &[u8],
     encoding: EcdsaSignatureValueEncoding,
 ) -> Result<bool, SignatureVerificationError> {
+    verify_ecdsa_signature_spki_in(
+        algorithm,
+        public_key_spki_der,
+        signed_data,
+        signature_value,
+        encoding,
+        &CertificateSession::standalone(),
+    )
+}
+
+pub(crate) fn verify_ecdsa_signature_spki_in(
+    algorithm: SignatureAlgorithm,
+    public_key_spki_der: &[u8],
+    signed_data: &[u8],
+    signature_value: &[u8],
+    encoding: EcdsaSignatureValueEncoding,
+    session: &CertificateSession,
+) -> Result<bool, SignatureVerificationError> {
     let digest_algorithm = algorithm.ecdsa_digest().ok_or_else(|| {
         SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_string(),
         }
     })?;
 
-    let session = CertificateSession::new(&ResourcePolicy::default());
     match session
         .spki_algorithm(public_key_spki_der)
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
+        .map_err(|error| key_read_error(session, &error))?
     {
         SpkiAlgorithm::Ec => {
-            let (curve, public_key) = ecdsa_public_key(&session, public_key_spki_der)?;
+            let (curve, public_key) = ecdsa_public_key(session, public_key_spki_der)?;
             let component_len = curve.component_len();
             let signature_encoding = match encoding {
                 EcdsaSignatureValueEncoding::XmlDsig => {
@@ -711,26 +755,6 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
             uri: algorithm.uri().to_string(),
         }),
     }
-}
-
-/// Verify the ASN.1 DER ECDSA representation required by X.509 signatures.
-///
-/// This is intentionally separate from the `XMLDSig` policy-aware entry point:
-/// certificate signature framing is fixed by X.509 and must not inherit the
-/// document's `SignatureValue` compatibility mode.
-pub(crate) fn verify_ecdsa_signature_spki_asn1_der(
-    algorithm: SignatureAlgorithm,
-    public_key_spki_der: &[u8],
-    signed_data: &[u8],
-    signature_value: &[u8],
-) -> Result<bool, SignatureVerificationError> {
-    verify_ecdsa_signature_spki_with_encoding(
-        algorithm,
-        public_key_spki_der,
-        signed_data,
-        signature_value,
-        EcdsaSignatureValueEncoding::XmlSecAsn1Der,
-    )
 }
 
 fn validate_rsa_public_key(
@@ -828,6 +852,7 @@ fn ecdsa_public_key<'a>(
 ) -> Result<(EcCurve, &'a [u8]), SignatureVerificationError> {
     let (curve, range) = session
         .ec_named_point(spki)
+        .map_err(|error| key_read_error(session, &error))?
         .ok_or(SignatureVerificationError::InvalidKeyDer)?;
     let point = spki
         .get(range)
@@ -1168,6 +1193,16 @@ mod tests {
 
     #[test]
     fn spki_signature_framing_uses_the_resolved_key_width() {
+        let session = CertificateSession::standalone();
+        let signature_value_matches_spki = |algorithm, spki: &[u8], value: &[u8]| {
+            signature_value_matches_spki_with_encoding(
+                algorithm,
+                spki,
+                value,
+                EcdsaSignatureValueEncoding::XmlDsig,
+                &session,
+            )
+        };
         let rsa = parse_public_key_pem(include_str!(
             "../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"
         ))

@@ -2233,10 +2233,9 @@ pub(crate) mod rustcrypto_x509 {
     use signature::{Verifier as _, hazmat::PrehashVerifier as _};
 
     use super::{ProviderError, X509SignatureAlgorithm};
-    use crate::xmldsig::signature::verify_ecdsa_signature_spki_asn1_der;
-    use crate::xmldsig::{
-        DigestAlgorithm, DsigError, SignatureAlgorithm, VerificationKey, VerifyingKey as _,
-    };
+    use crate::xmldsig::pkix::CertificateSession;
+    use crate::xmldsig::signature::verify_ecdsa_signature_spki_in;
+    use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 
     pub(super) fn verify_signature(
         algorithm: X509SignatureAlgorithm,
@@ -2244,12 +2243,16 @@ pub(crate) mod rustcrypto_x509 {
         signature: &[u8],
         issuer_spki_der: &[u8],
     ) -> Result<bool, ProviderError> {
+        // The provider trait hands no account here; the issuer SPKI was
+        // already admitted under the chain's own session by its caller.
+        let session = CertificateSession::standalone();
         match algorithm {
             X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1) => {
                 // Certificate signatures are ASN.1 DER integers sized by the
                 // issuer's q parameter. XMLDSig's fixed 20-byte r||s framing
                 // applies only to SignatureValue, never to X.509 signatures.
-                let Ok(key) = crate::xmldsig::signature::decode_dsa_verifying_key(issuer_spki_der)
+                let Ok(key) =
+                    crate::xmldsig::signature::decode_dsa_verifying_key(issuer_spki_der, &session)
                 else {
                     return Ok(false);
                 };
@@ -2263,7 +2266,17 @@ pub(crate) mod rustcrypto_x509 {
                 let Some(xml_algorithm) = xml_signature_algorithm(algorithm) else {
                     return unsupported(algorithm);
                 };
-                verify_xml_signature(xml_algorithm, signed_data, signature, issuer_spki_der)
+                // A refused key or framing is a non-matching signature.
+                Ok(
+                    crate::xmldsig::signature::verify_rsa_signature_spki_primitive(
+                        xml_algorithm,
+                        issuer_spki_der,
+                        signed_data,
+                        signature,
+                        &session,
+                    )
+                    .unwrap_or(false),
+                )
             }
             X509SignatureAlgorithm::Ecdsa(_) => {
                 let Some(xml_algorithm) = xml_signature_algorithm(algorithm) else {
@@ -2271,15 +2284,15 @@ pub(crate) mod rustcrypto_x509 {
                 };
                 // RFC 5280 ECDSA certificate signatures are always ASN.1 DER;
                 // XMLDSig's SignatureValue framing policy is irrelevant here.
-                match verify_ecdsa_signature_spki_asn1_der(
+                Ok(verify_ecdsa_signature_spki_in(
                     xml_algorithm,
                     issuer_spki_der,
                     signed_data,
                     signature,
-                ) {
-                    Ok(verified) => Ok(verified),
-                    Err(_) => Ok(false),
-                }
+                    crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+                    &session,
+                )
+                .unwrap_or(false))
             }
             X509SignatureAlgorithm::RsaPss {
                 digest,
@@ -2289,7 +2302,8 @@ pub(crate) mod rustcrypto_x509 {
                 // RFC 4055 key restrictions are part of signature validity. Check
                 // them before provider capability so an incompatible key is a
                 // deterministic non-match even when the requested MGF is unsupported.
-                let Some(key) = compatible_rsa_pss_public_key_from_spki(issuer_spki_der, algorithm)
+                let Some(key) =
+                    compatible_rsa_pss_public_key_from_spki(issuer_spki_der, algorithm, &session)
                 else {
                     return Ok(false);
                 };
@@ -2299,7 +2313,8 @@ pub(crate) mod rustcrypto_x509 {
                 verify_rsa_pss(digest, salt_len, signed_data, signature, key)
             }
             X509SignatureAlgorithm::Ed25519 => {
-                let Some(key) = crate::xmldsig::modern::ed25519_verifying_key(issuer_spki_der)
+                let Ok(key) =
+                    crate::xmldsig::modern::ed25519_verifying_key(issuer_spki_der, &session)
                 else {
                     return Ok(false);
                 };
@@ -2311,7 +2326,9 @@ pub(crate) mod rustcrypto_x509 {
             X509SignatureAlgorithm::Ed448 => {
                 // RFC 8410 sections 3 and 6 select pure Ed448 without context
                 // or external prehash: https://www.rfc-editor.org/rfc/rfc8410.html#section-6
-                let Some(key) = crate::xmldsig::modern::ed448_verifying_key(issuer_spki_der) else {
+                let Ok(key) =
+                    crate::xmldsig::modern::ed448_verifying_key(issuer_spki_der, &session)
+                else {
                     return Ok(false);
                 };
                 let Ok(signature) = ed448_goldilocks::Signature::try_from(signature) else {
@@ -2331,29 +2348,11 @@ pub(crate) mod rustcrypto_x509 {
                     &crate::xmldsig::SignatureContext::default(),
                     signed_data,
                     signature,
+                    &session,
                 )
                 .unwrap_or(false))
             }
             _ => unsupported(algorithm),
-        }
-    }
-
-    fn verify_xml_signature(
-        algorithm: SignatureAlgorithm,
-        signed_data: &[u8],
-        signature: &[u8],
-        issuer_spki_der: &[u8],
-    ) -> Result<bool, ProviderError> {
-        let key = VerificationKey {
-            algorithm,
-            public_key_bytes: issuer_spki_der.to_vec(),
-            certificate_der: None,
-            name: None,
-        };
-        match key.verify(algorithm, signed_data, signature) {
-            Ok(verified) => Ok(verified),
-            Err(DsigError::Provider(error)) => Err(error),
-            Err(_) => Ok(false),
         }
     }
 
@@ -2415,6 +2414,7 @@ pub(crate) mod rustcrypto_x509 {
     pub(crate) fn compatible_rsa_pss_public_key_from_spki(
         spki_der: &[u8],
         signature_algorithm: X509SignatureAlgorithm,
+        session: &CertificateSession,
     ) -> Option<RsaPublicKey> {
         let X509SignatureAlgorithm::RsaPss {
             digest,
@@ -2431,7 +2431,9 @@ pub(crate) mod rustcrypto_x509 {
                 mgf_digest,
                 salt_len,
             },
+            session,
         )
+        .ok()
     }
 
     /// The `XMLDSig` algorithm whose verifier also checks this RSA PKCS#1 v1.5

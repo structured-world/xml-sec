@@ -257,16 +257,16 @@ macro_rules! parameter_sets {
             }
         }
 
-        pub(crate) fn validate_public_key(algorithm: PqAlgorithm, der: &[u8]) -> Result<(), SignatureVerificationError> {
-            with_public_octets(algorithm, der, |octets| match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_octets(octets).map(|_| ())),+ })
+        pub(crate) fn validate_public_key(algorithm: PqAlgorithm, der: &[u8], session: &super::pkix::CertificateSession) -> Result<(), SignatureVerificationError> {
+            with_public_octets(algorithm, der, session, |octets| match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_octets(octets).map(|_| ())),+ })?
                 .ok_or(SignatureVerificationError::InvalidKeyDer)
         }
 
-        pub(crate) fn verify(algorithm: PqAlgorithm, der: &[u8], context: &SignatureContext, message: &[u8], signature: &[u8]) -> Result<bool, SignatureVerificationError> {
-            with_public_octets(algorithm, der, |octets| {
+        pub(crate) fn verify(algorithm: PqAlgorithm, der: &[u8], context: &SignatureContext, message: &[u8], signature: &[u8], session: &super::pkix::CertificateSession) -> Result<bool, SignatureVerificationError> {
+            with_public_octets(algorithm, der, session, |octets| {
                 if signature.len() != algorithm.signature_len() { return Some(Ok(false)); }
                 match algorithm { $(PqAlgorithm::$variant => <$verifying>::from_public_octets(octets).map(|key| key.verify_context(context.as_bytes(), message, signature))),+ }
-            })
+            })?
                 .ok_or(SignatureVerificationError::InvalidKeyDer)?
         }
 
@@ -309,31 +309,33 @@ parameter_sets! {
     SlhDsaSha2_256s: slh_dsa::SigningKey<slh_dsa::Sha2_256s> => slh_dsa::VerifyingKey<slh_dsa::Sha2_256s>,
 }
 
-/// Hands the raw public key of a standalone `algorithm` SPKI, read by the
-/// shared PKIX reader, to `use_key`; `None` for any other or malformed SPKI.
-/// RFC 9881 section 2 / RFC 9909 section 3: the exact OID, parameters absent.
-/// <https://www.rfc-editor.org/rfc/rfc9881.html#section-2>
+/// Hands the raw public key of an `algorithm` SPKI, read by the shared PKIX
+/// reader under `session`, to `use_key`; `None` for any other or malformed
+/// SPKI. RFC 9881 section 2 / RFC 9909 section 3: the exact OID, parameters
+/// absent. <https://www.rfc-editor.org/rfc/rfc9881.html#section-2>
 fn with_public_octets<T>(
     algorithm: PqAlgorithm,
     der: &[u8],
+    session: &super::pkix::CertificateSession,
     use_key: impl FnOnce(&[u8]) -> Option<T>,
-) -> Option<T> {
-    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-    session
-        .with_public_key_info(der, |info, _| {
-            let identifier = info.algorithm();
-            Ok(
-                if identifier.parameters().is_none()
-                    && identifier.algorithm().as_bytes() == algorithm.object_oid().as_bytes()
-                {
-                    info.key_octets().and_then(use_key)
-                } else {
-                    None
-                },
-            )
-        })
-        .ok()
-        .flatten()
+) -> Result<Option<T>, SignatureVerificationError> {
+    let read = session.with_public_key_info(der, |info, _| {
+        let identifier = info.algorithm();
+        Ok(
+            if identifier.parameters().is_none()
+                && identifier.algorithm().as_bytes() == algorithm.object_oid().as_bytes()
+            {
+                info.key_octets().and_then(use_key)
+            } else {
+                None
+            },
+        )
+    });
+    match read {
+        Ok(value) => Ok(value),
+        Err(error) if error.is_resource() => Err(super::signature::key_read_error(session, &error)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Verifying-key construction from raw public octets (FIPS 204 pkDecode,

@@ -73,6 +73,7 @@ fn rsa_verifier_checks_exact_bit_boundaries_without_bigints() {
                 algorithm,
                 &spki,
                 crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+                &crate::xmldsig::pkix::CertificateSession::standalone(),
             );
             if accepted {
                 assert!(result.is_ok(), "{bits} {algorithm:?}");
@@ -98,7 +99,8 @@ fn malformed_rsa_spki_is_not_a_capability_failure() {
         verification_algorithm(
             SignatureAlgorithm::RsaSha256,
             b"not DER",
-            crate::policy::EcdsaSignatureValueEncoding::XmlDsig
+            crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+            &crate::xmldsig::pkix::CertificateSession::standalone(),
         ),
         Err(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)
     ));

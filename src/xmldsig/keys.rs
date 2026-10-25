@@ -16,10 +16,9 @@ use zeroize::Zeroizing;
 
 use super::pkix::X509DataSource;
 use super::signature::{
-    signature_value_matches_spki, signature_value_matches_spki_with_encoding,
-    validate_dsa_signature_spki_with_minimum, validate_rsa_signature_spki_with_minimum,
-    verify_dsa_signature_spki_primitive, verify_dsa_signature_spki_with_minimum,
-    verify_rsa_signature_spki_primitive, verify_rsa_signature_spki_with_minimum,
+    signature_value_matches_spki_with_encoding, validate_dsa_signature_spki_with_minimum,
+    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
+    verify_ecdsa_signature_spki_in, verify_rsa_signature_spki_primitive,
 };
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
@@ -30,7 +29,6 @@ use super::{
         build_x509_certificate_paths_to_trusted_prefix, x509_certificate_matches_any_selector,
         x509_data_has_lookup_identifiers, x509_selector_categories_match_candidates,
     },
-    verify_ecdsa_signature_spki, verify_ecdsa_signature_spki_with_encoding,
     x509::verify_x509_certificate_chain_in_session,
 };
 use super::{ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
@@ -186,8 +184,9 @@ impl HmacVerificationKey {
 }
 
 impl VerifyingKey for HmacVerificationKey {
-    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
-        policy
+    fn validate_policy(&self, scope: &super::VerificationScope<'_>) -> Result<(), DsigError> {
+        scope
+            .policy()
             .hmac
             .validate_key_bytes(self.secret.len())
             .map_err(Into::into)
@@ -208,11 +207,11 @@ impl VerifyingKey for HmacVerificationKey {
 
     fn validate_signature_value_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        self.validate_output(policy.hmac, algorithm, signature_value)?;
+        self.validate_output(scope.policy().hmac, algorithm, signature_value)?;
         Ok(true)
     }
 
@@ -232,12 +231,16 @@ impl VerifyingKey for HmacVerificationKey {
 
     fn verify_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        self.verify_with_hmac_policy(policy.hmac, algorithm, signed_data, signature_value)
+        if !context.as_bytes().is_empty() {
+            return self.verify_with_context(algorithm, context, signed_data, signature_value);
+        }
+        self.verify_with_hmac_policy(scope.policy().hmac, algorithm, signed_data, signature_value)
     }
 }
 
@@ -257,55 +260,22 @@ pub struct VerificationKey {
     pub name: Option<String>,
 }
 
-impl VerifyingKey for VerificationKey {
-    fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
-        if algorithm == self.algorithm {
-            Some(&self.public_key_bytes)
-        } else {
-            None
-        }
-    }
-    fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
-        if algorithm != self.algorithm {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        Ok(Some(&self.public_key_bytes))
-    }
-    fn verify_with_context(
+impl VerificationKey {
+    /// Strength checks of this key's SPKI, read under `session`.
+    fn validate_in(
         &self,
-        algorithm: SignatureAlgorithm,
-        context: &super::SignatureContext,
-        data: &[u8],
-        signature: &[u8],
-    ) -> Result<bool, DsigError> {
-        if algorithm != self.algorithm {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        if algorithm.eddsa_signature_len().is_some()
-            || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
-        {
-            return super::modern::verify_with_context(
-                algorithm,
-                &self.public_key_bytes,
-                context,
-                data,
-                signature,
-            )
-            .map_err(DsigError::Crypto);
-        }
-        if !context.as_bytes().is_empty() {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        self.verify(algorithm, data, signature)
-    }
-    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+        rsa_minimum_bits: usize,
+        dsa_minimum_bits: usize,
+        session: &super::pkix::CertificateSession,
+    ) -> Result<(), DsigError> {
         let result = match self.algorithm {
             #[cfg(feature = "legacy-algorithms")]
             SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
                 validate_rsa_signature_spki_with_minimum(
                     self.algorithm,
                     &self.public_key_bytes,
-                    policy.key_trust.rsa_keys.minimum_modulus_bits,
+                    rsa_minimum_bits,
+                    session,
                 )
             }
             #[cfg(feature = "legacy-algorithms")]
@@ -318,12 +288,13 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::Ed448
             | SignatureAlgorithm::Ed448Ph
             | SignatureAlgorithm::PostQuantum(_) => {
-                super::modern::validate_public_key(self.algorithm, &self.public_key_bytes)
+                super::modern::validate_public_key(self.algorithm, &self.public_key_bytes, session)
             }
             SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
                 validate_dsa_signature_spki_with_minimum(
                     &self.public_key_bytes,
-                    policy.key_trust.dsa_keys.minimum_modulus_bits,
+                    dsa_minimum_bits,
+                    session,
                 )
             }
             SignatureAlgorithm::RsaSha1
@@ -343,7 +314,8 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::RsaPss(_) => validate_rsa_signature_spki_with_minimum(
                 self.algorithm,
                 &self.public_key_bytes,
-                policy.key_trust.rsa_keys.minimum_modulus_bits,
+                rsa_minimum_bits,
+                session,
             ),
             SignatureAlgorithm::HmacSha1
             | SignatureAlgorithm::HmacSha224
@@ -363,23 +335,14 @@ impl VerifyingKey for VerificationKey {
         result.map_err(DsigError::Crypto)
     }
 
-    fn validate_signature_value(
+    /// `SignatureValue` framing check under `encoding`, reading the SPKI
+    /// under `session`.
+    fn signature_value_in(
         &self,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
-    ) -> Result<bool, DsigError> {
-        if algorithm != self.algorithm {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        signature_value_matches_spki(algorithm, &self.public_key_bytes, signature_value)
-            .map_err(DsigError::Crypto)
-    }
-
-    fn validate_signature_value_with_policy(
-        &self,
-        policy: &crate::policy::VerificationPolicy,
-        algorithm: SignatureAlgorithm,
-        signature_value: &[u8],
+        encoding: crate::policy::EcdsaSignatureValueEncoding,
+        session: &super::pkix::CertificateSession,
     ) -> Result<bool, DsigError> {
         if algorithm != self.algorithm {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
@@ -388,18 +351,30 @@ impl VerifyingKey for VerificationKey {
             algorithm,
             &self.public_key_bytes,
             signature_value,
-            policy.ecdsa_signature_value_encoding,
+            encoding,
+            session,
         )
         .map_err(DsigError::Crypto)
     }
 
-    fn verify(
+    /// Signature check under `encoding`, reading the SPKI under `session`.
+    /// Only `EdDSA` and post-quantum methods accept a non-empty `context`.
+    fn verify_in(
         &self,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         signed_data: &[u8],
         signature_value: &[u8],
+        encoding: crate::policy::EcdsaSignatureValueEncoding,
+        session: &super::pkix::CertificateSession,
     ) -> Result<bool, DsigError> {
         if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        if !context.as_bytes().is_empty()
+            && algorithm.eddsa_signature_len().is_none()
+            && !matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+        {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let result = match algorithm {
@@ -410,14 +385,17 @@ impl VerifyingKey for VerificationKey {
                     &self.public_key_bytes,
                     signed_data,
                     signature_value,
+                    session,
                 )
             }
             #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::EcdsaRipemd160 => verify_ecdsa_signature_spki(
+            SignatureAlgorithm::EcdsaRipemd160 => verify_ecdsa_signature_spki_in(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,
                 signature_value,
+                encoding,
+                session,
             ),
             #[cfg(feature = "legacy-algorithms")]
             SignatureAlgorithm::HmacMd5 | SignatureAlgorithm::HmacRipemd160 => {
@@ -428,11 +406,13 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::Ed25519Ph
             | SignatureAlgorithm::Ed448
             | SignatureAlgorithm::Ed448Ph
-            | SignatureAlgorithm::PostQuantum(_) => super::modern::verify(
+            | SignatureAlgorithm::PostQuantum(_) => super::modern::verify_with_context(
                 algorithm,
                 &self.public_key_bytes,
+                context,
                 signed_data,
                 signature_value,
+                session,
             ),
             SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
                 verify_dsa_signature_spki_primitive(
@@ -440,6 +420,7 @@ impl VerifyingKey for VerificationKey {
                     &self.public_key_bytes,
                     signed_data,
                     signature_value,
+                    session,
                 )
             }
             SignatureAlgorithm::HmacSha1
@@ -468,6 +449,7 @@ impl VerifyingKey for VerificationKey {
                 &self.public_key_bytes,
                 signed_data,
                 signature_value,
+                session,
             ),
             SignatureAlgorithm::EcdsaSha1
             | SignatureAlgorithm::EcdsaSha224
@@ -477,37 +459,117 @@ impl VerifyingKey for VerificationKey {
             | SignatureAlgorithm::EcdsaSha3_224
             | SignatureAlgorithm::EcdsaSha3_256
             | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512 => verify_ecdsa_signature_spki(
+            | SignatureAlgorithm::EcdsaSha3_512 => verify_ecdsa_signature_spki_in(
                 algorithm,
                 &self.public_key_bytes,
                 signed_data,
                 signature_value,
+                encoding,
+                session,
             ),
         };
         result.map_err(DsigError::Crypto)
     }
+}
 
-    fn verify_with_policy(
+impl VerifyingKey for VerificationKey {
+    fn association_spki(&self, algorithm: SignatureAlgorithm) -> Option<&[u8]> {
+        if algorithm == self.algorithm {
+            Some(&self.public_key_bytes)
+        } else {
+            None
+        }
+    }
+    fn verification_spki(&self, algorithm: SignatureAlgorithm) -> Result<Option<&[u8]>, DsigError> {
+        if algorithm != self.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        Ok(Some(&self.public_key_bytes))
+    }
+    // The hooks without a scope serve standalone use outside any operation,
+    // so they read the key under the standalone account.
+    fn verify_with_context(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.verify_in(
+            algorithm,
+            context,
+            data,
+            signature,
+            crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+            &super::pkix::CertificateSession::standalone(),
+        )
+    }
+    fn validate_policy(&self, scope: &super::VerificationScope<'_>) -> Result<(), DsigError> {
+        let trust = &scope.policy().key_trust;
+        self.validate_in(
+            trust.rsa_keys.minimum_modulus_bits,
+            trust.dsa_keys.minimum_modulus_bits,
+            scope.certificates(),
+        )
+    }
+
+    fn validate_signature_value(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.signature_value_in(
+            algorithm,
+            signature_value,
+            crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+            &super::pkix::CertificateSession::standalone(),
+        )
+    }
+
+    fn validate_signature_value_with_policy(
+        &self,
+        scope: &super::VerificationScope<'_>,
+        algorithm: SignatureAlgorithm,
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.signature_value_in(
+            algorithm,
+            signature_value,
+            scope.policy().ecdsa_signature_value_encoding,
+            scope.certificates(),
+        )
+    }
+
+    fn verify(
+        &self,
         algorithm: SignatureAlgorithm,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if algorithm != self.algorithm {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        if algorithm.ecdsa_digest().is_some() {
-            return verify_ecdsa_signature_spki_with_encoding(
-                algorithm,
-                &self.public_key_bytes,
-                signed_data,
-                signature_value,
-                policy.ecdsa_signature_value_encoding,
-            )
-            .map_err(DsigError::Crypto);
-        }
-        self.verify(algorithm, signed_data, signature_value)
+        self.verify_with_context(
+            algorithm,
+            &super::SignatureContext::default(),
+            signed_data,
+            signature_value,
+        )
+    }
+
+    fn verify_with_policy(
+        &self,
+        scope: &super::VerificationScope<'_>,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.verify_in(
+            algorithm,
+            context,
+            signed_data,
+            signature_value,
+            scope.policy().ecdsa_signature_value_encoding,
+            scope.certificates(),
+        )
     }
 }
 
@@ -515,8 +577,57 @@ struct PolicyBoundVerificationKey {
     key: VerificationKey,
     rsa_minimum_bits: usize,
     dsa_minimum_bits: usize,
+    /// The resolving operation's account; reads of this key charge it.
+    certificates: super::pkix::CertificateSession,
     // Last field: key storage is released before its accounting guards.
     _storage: Option<VerificationKeyStorage>,
+}
+
+impl PolicyBoundVerificationKey {
+    /// Strength checks bound at resolution, then the signature check, all
+    /// reading the SPKI under `session`.
+    fn verify_in(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        signed_data: &[u8],
+        signature_value: &[u8],
+        encoding: crate::policy::EcdsaSignatureValueEncoding,
+        session: &super::pkix::CertificateSession,
+    ) -> Result<bool, DsigError> {
+        if algorithm != self.key.algorithm {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        }
+        // RSA and DSA accept no context, so the key check below refuses a
+        // non-empty one before any strength check.
+        if context.as_bytes().is_empty() {
+            match algorithm {
+                SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
+                    validate_dsa_signature_spki_with_minimum(
+                        &self.key.public_key_bytes,
+                        self.dsa_minimum_bits,
+                        session,
+                    )
+                }
+                algorithm if algorithm.is_rsa() => validate_rsa_signature_spki_with_minimum(
+                    algorithm,
+                    &self.key.public_key_bytes,
+                    self.rsa_minimum_bits,
+                    session,
+                ),
+                _ => Ok(()),
+            }
+            .map_err(DsigError::Crypto)?;
+        }
+        self.key.verify_in(
+            algorithm,
+            context,
+            signed_data,
+            signature_value,
+            encoding,
+            session,
+        )
+    }
 }
 
 struct VerificationKeyStorage {
@@ -583,6 +694,7 @@ impl VerifyingKey for PolicyBoundVerificationKey {
                 algorithm,
                 &self.key.public_key_bytes,
                 self.rsa_minimum_bits,
+                &self.certificates,
             )
             .map_err(DsigError::Crypto)?;
         }
@@ -595,29 +707,36 @@ impl VerifyingKey for PolicyBoundVerificationKey {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        if context.as_bytes().is_empty() {
-            return self.verify(algorithm, data, signature);
-        }
-        self.key
-            .verify_with_context(algorithm, context, data, signature)
+        self.verify_in(
+            algorithm,
+            context,
+            data,
+            signature,
+            crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+            &self.certificates,
+        )
     }
     fn validate_signature_value(
         &self,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        self.key
-            .validate_signature_value(algorithm, signature_value)
+        self.key.signature_value_in(
+            algorithm,
+            signature_value,
+            crate::policy::EcdsaSignatureValueEncoding::XmlDsig,
+            &self.certificates,
+        )
     }
 
     fn validate_signature_value_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
         self.key
-            .validate_signature_value_with_policy(policy, algorithm, signature_value)
+            .validate_signature_value_with_policy(scope, algorithm, signature_value)
     }
 
     fn verify(
@@ -626,44 +745,30 @@ impl VerifyingKey for PolicyBoundVerificationKey {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if algorithm != self.key.algorithm {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        let result = match algorithm {
-            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
-                verify_dsa_signature_spki_with_minimum(
-                    algorithm,
-                    &self.key.public_key_bytes,
-                    signed_data,
-                    signature_value,
-                    self.dsa_minimum_bits,
-                )
-            }
-            algorithm if algorithm.is_rsa() => verify_rsa_signature_spki_with_minimum(
-                algorithm,
-                &self.key.public_key_bytes,
-                signed_data,
-                signature_value,
-                self.rsa_minimum_bits,
-            ),
-            _ => return self.key.verify(algorithm, signed_data, signature_value),
-        };
-        result.map_err(DsigError::Crypto)
+        self.verify_with_context(
+            algorithm,
+            &super::SignatureContext::default(),
+            signed_data,
+            signature_value,
+        )
     }
 
     fn verify_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        scope: &super::VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        if algorithm.ecdsa_digest().is_some() {
-            return self
-                .key
-                .verify_with_policy(policy, algorithm, signed_data, signature_value);
-        }
-        self.verify(algorithm, signed_data, signature_value)
+        self.verify_in(
+            algorithm,
+            context,
+            signed_data,
+            signature_value,
+            scope.policy().ecdsa_signature_value_encoding,
+            scope.certificates(),
+        )
     }
 }
 
@@ -772,12 +877,17 @@ struct SourceCandidate {
 impl SourceCandidate {
     /// Bind the operation's key-strength minimums and classify trust: path
     /// evidence, then caller trust; cryptographic-only mode trusts nothing.
-    fn bind(self, policy: &crate::policy::VerificationPolicy) -> ResolvedVerificationKey<'static> {
+    fn bind(
+        self,
+        policy: &crate::policy::VerificationPolicy,
+        certificates: &super::pkix::CertificateSession,
+    ) -> ResolvedVerificationKey<'static> {
         let trust = &policy.key_trust;
         let key = Box::new(PolicyBoundVerificationKey {
             key: self.key,
             rsa_minimum_bits: trust.rsa_keys.minimum_modulus_bits,
             dsa_minimum_bits: trust.dsa_keys.minimum_modulus_bits,
+            certificates: certificates.share(),
             _storage: self.storage,
         });
         if trust.mode == crate::policy::VerificationTrustMode::CryptographicOnly {
@@ -906,6 +1016,21 @@ impl<'a> InspectedKeyCandidateBudget<'a> {
     #[must_use]
     pub fn execution(&self) -> &structured_asn1::memory::Memory {
         self.certificates.memory()
+    }
+
+    pub(crate) fn certificates(&self) -> &super::pkix::CertificateSession {
+        &self.certificates
+    }
+
+    /// The scope a resolver passes to [`VerifyingKey::validate_policy`] when
+    /// it checks a candidate before returning it, so the check reads key
+    /// material under this operation's account.
+    #[must_use]
+    pub fn verification_scope<'s>(
+        &'s self,
+        policy: &'s crate::policy::VerificationPolicy,
+    ) -> super::VerificationScope<'s> {
+        super::VerificationScope::new(policy, &self.certificates)
     }
 
     pub(crate) fn bind_policy(
@@ -1908,7 +2033,7 @@ impl DefaultKeyResolver {
             };
             if let Some(candidate) = candidate {
                 return Ok(SourceResolution {
-                    key: Some(candidate.bind(policy)),
+                    key: Some(candidate.bind(policy, &candidate_budget.certificates)),
                     deferred_error: None,
                 });
             }
@@ -2152,14 +2277,14 @@ fn validate_spki_algorithm(
         // https://www.rfc-editor.org/rfc/rfc4055.html#section-1.2
         // Eight bits is structural validation only; the selected policy's
         // strength minimum is enforced on the resolved key before execution.
-        return validate_rsa_signature_spki_with_minimum(algorithm, public_key_bytes, 8)
-            .map_err(|_| KeyResolutionError::InvalidPublicKey);
+        return validate_rsa_signature_spki_with_minimum(algorithm, public_key_bytes, 8, session)
+            .map_err(spki_check_error);
     }
     if algorithm.eddsa_signature_len().is_some()
         || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
     {
-        return super::modern::validate_public_key(algorithm, public_key_bytes)
-            .map_err(|_| KeyResolutionError::InvalidPublicKey);
+        return super::modern::validate_public_key(algorithm, public_key_bytes, session)
+            .map_err(spki_check_error);
     }
     let family = session
         .spki_algorithm(public_key_bytes)
@@ -2194,8 +2319,9 @@ pub(crate) fn supported_spki_is_rsa(
         SpkiAlgorithm::Ed448 => SignatureAlgorithm::Ed448,
         SpkiAlgorithm::RsaEncryption => {
             validate_rsa_spki(session, public_key_bytes)?;
-            rsa::RsaPublicKey::from_public_key_der(public_key_bytes)
-                .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+            crate::rsa_encoding::read_spki_public_key(session, public_key_bytes)
+                .map_err(|error| structured_key_error(session, error))?
+                .ok_or(KeyResolutionError::InvalidPublicKey)?;
             return Ok(true);
         }
         SpkiAlgorithm::Dsa => {
@@ -2210,9 +2336,20 @@ pub(crate) fn supported_spki_is_rsa(
             return Err(KeyResolutionError::AlgorithmMismatch);
         }
     };
-    super::modern::validate_public_key(modern, public_key_bytes)
-        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    super::modern::validate_public_key(modern, public_key_bytes, session)
+        .map_err(spki_check_error)?;
     Ok(false)
+}
+
+/// A shared SPKI check's refusal: exhausting the session stays a resource
+/// failure; any other refusal is an invalid key.
+fn spki_check_error(error: super::SignatureVerificationError) -> KeyResolutionError {
+    match error {
+        super::SignatureVerificationError::KeyPolicy(
+            violation @ crate::policy::PolicyViolation::ResourceLimitExceeded { .. },
+        ) => certificate_resolution_error(violation.into()),
+        _ => KeyResolutionError::InvalidPublicKey,
+    }
 }
 
 /// Exhausting the session stays a resource failure; every other refusal of the
@@ -2852,14 +2989,14 @@ mod tests {
             subject_public_key: der::asn1::BitStringRef::new(0, &y).expect("bit string"),
         };
         let encoded = der::Encode::to_der(&spki).expect("SPKI encodes");
+        let session =
+            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
         assert!(matches!(
-            super::super::signature::decode_dsa_verifying_key(&encoded),
+            super::super::signature::decode_dsa_verifying_key(&encoded, &session),
             Err(super::super::signature::SignatureVerificationError::InvalidKeyDer)
         ));
         // Ordinary verification must use the same borrowed preflight, not
         // reject only after an allocating crypto decoder reports mismatch.
-        let session =
-            super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
         assert!(matches!(
             validate_spki_algorithm(&session, &encoded, SignatureAlgorithm::DsaSha256),
             Err(KeyResolutionError::InvalidPublicKey)
@@ -3405,18 +3542,28 @@ mod tests {
             },
             ..crate::policy::VerificationPolicy::default()
         };
+        let certificates = super::super::pkix::CertificateSession::standalone();
+        let scope = super::super::VerificationScope::new(&policy, &certificates);
+        let context = super::super::SignatureContext::default();
         assert!(
             key.verify_with_policy(
-                &policy,
+                &scope,
                 SignatureAlgorithm::HmacSha1,
+                &context,
                 b"data",
                 &expected[..10],
             )
             .expect("the compatibility policy and algorithm match")
         );
         assert!(
-            !key.verify_with_policy(&policy, SignatureAlgorithm::HmacSha1, b"data", &[0_u8; 10],)
-                .expect("a mismatched truncated MAC must be rejected")
+            !key.verify_with_policy(
+                &scope,
+                SignatureAlgorithm::HmacSha1,
+                &context,
+                b"data",
+                &[0_u8; 10],
+            )
+            .expect("a mismatched truncated MAC must be rejected")
         );
     }
 

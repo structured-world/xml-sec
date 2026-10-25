@@ -85,6 +85,7 @@ fn verify_leaf(
     algorithm: SignatureAlgorithm,
     data: &[u8],
     signature_value: &[u8],
+    session: &crate::xmldsig::pkix::CertificateSession,
 ) -> Result<bool, DsigError> {
     let spki = key
         .verification_spki(algorithm)?
@@ -92,10 +93,9 @@ fn verify_leaf(
     if !key.validate_signature_value(algorithm, signature_value)? {
         return Ok(false);
     }
-    let native = verification_algorithm(algorithm, spki, key.ecdsa_encoding())?;
+    let native = verification_algorithm(algorithm, spki, key.ecdsa_encoding(), session)?;
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        let encoded = super::rsa_pss::encoded_public_key(spki, parameters)
-            .ok_or(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?;
+        let encoded = super::rsa_pss::encoded_public_key(spki, parameters, session)?;
         return Ok(signature::UnparsedPublicKey::new(native, encoded)
             .verify(data, signature_value)
             .is_ok());
@@ -116,8 +116,10 @@ impl CryptoProvider for AwsLcFipsProvider {
             return Err(verification_unsupported(input.algorithm).into());
         }
         self.require_capability(ProviderCapability::Verify(input.algorithm))?;
-        super::key_association::observed_leaf(key, observer, &|key| {
-            verify_leaf(key, input.algorithm, input.data, input.signature)
+        input.with_session(|session| {
+            super::key_association::observed_leaf(key, observer, &|key| {
+                verify_leaf(key, input.algorithm, input.data, input.signature, session)
+            })
         })
     }
 
@@ -226,8 +228,10 @@ impl CryptoProvider for AwsLcFipsProvider {
         if !self.supports(ProviderCapability::Verify(algorithm)) {
             return Err(verification_unsupported(algorithm).into());
         }
+        // The bare provider entry point belongs to no operation.
+        let session = crate::xmldsig::pkix::CertificateSession::standalone();
         super::key_association::observed_leaf(key, &mut |_| Ok(()), &|key| {
-            verify_leaf(key, algorithm, data, signature)
+            verify_leaf(key, algorithm, data, signature, &session)
         })
     }
 
@@ -243,10 +247,13 @@ impl CryptoProvider for AwsLcFipsProvider {
         // RFC 5758 §3.2: ECDSA certificate signatures use DER, independently
         // of the XMLDSig operation's SignatureValue compatibility encoding.
         // https://www.rfc-editor.org/rfc/rfc5758#section-3.2
+        // The provider trait hands no account here; the issuer SPKI was
+        // already admitted under the chain's own session by its caller.
         let native = match verification_algorithm(
             method,
             issuer_spki,
             crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der,
+            &crate::xmldsig::pkix::CertificateSession::standalone(),
         ) {
             Ok(native) => native,
             Err(crate::xmldsig::SignatureVerificationError::UnsupportedAlgorithm { .. }) => {
@@ -644,17 +651,19 @@ fn curve_oid_name(bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn spki_curve(spki: &[u8]) -> Result<&'static str, crate::xmldsig::SignatureVerificationError> {
+fn spki_curve(
+    spki: &[u8],
+    session: &crate::xmldsig::pkix::CertificateSession,
+) -> Result<&'static str, crate::xmldsig::SignatureVerificationError> {
     use crate::xmldsig::pkix::PublicKey;
     use structured_pkix::key::ec::Curve;
-    let session =
-        crate::xmldsig::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
     match session.read_public_key(spki) {
         Ok(PublicKey::Ec(key)) => match key.curve() {
             Curve::Named(oid) => curve_oid_name(oid.as_bytes()),
             Curve::Implicit | Curve::Specified(_) => None,
         },
-        Ok(PublicKey::Rsa(_)) | Err(_) => None,
+        Ok(PublicKey::Rsa(_)) => None,
+        Err(error) => return Err(crate::xmldsig::signature::key_read_error(session, &error)),
     }
     .ok_or(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)
 }
@@ -663,6 +672,7 @@ fn verification_algorithm(
     algorithm: SignatureAlgorithm,
     spki: &[u8],
     encoding: crate::policy::EcdsaSignatureValueEncoding,
+    session: &crate::xmldsig::pkix::CertificateSession,
 ) -> Result<&'static dyn signature::VerificationAlgorithm, crate::xmldsig::SignatureVerificationError>
 {
     use SignatureAlgorithm as A;
@@ -688,13 +698,12 @@ fn verification_algorithm(
         _ => None,
     };
     if let Some(rsa) = rsa {
-        let session = crate::xmldsig::pkix::CertificateSession::new(
-            &crate::policy::ResourcePolicy::default(),
-        );
-        let modulus = session
-            .rsa_public_key(spki, algorithm.rsa_pss_parameters())
-            .ok_or(crate::xmldsig::SignatureVerificationError::InvalidKeyDer)?
-            .modulus();
+        let modulus = crate::xmldsig::signature::read_rsa_public_key(
+            session,
+            spki,
+            algorithm.rsa_pss_parameters(),
+        )?
+        .modulus();
         // These are the selected native verifier's capabilities, not strength
         // policy. AWS-LC defers this check until verify_sig and uses the same
         // error for a size it cannot handle and a bad signature; distinguish
@@ -706,7 +715,7 @@ fn verification_algorithm(
         }
         return Ok(rsa);
     }
-    let curve = spki_curve(spki)?;
+    let curve = spki_curve(spki, session)?;
     let der = encoding == crate::policy::EcdsaSignatureValueEncoding::XmlSecAsn1Der;
     // XMLDSig 1.1 §6.4.3 uses fixed-width r || s; ASN.1 is an explicit
     // compatibility-policy choice, never inferred from attacker-controlled bytes.
@@ -821,13 +830,18 @@ fn signing_public_key_info(
 ) -> Result<crate::xmldsig::SigningPublicKeyInfo, SigningKeyError> {
     use crate::xmldsig::pkix::PublicKey;
     enum Components {
-        Rsa { modulus: Vec<u8>, exponent: Vec<u8> },
-        Ec { point: Vec<u8> },
+        Rsa {
+            modulus: Vec<u8>,
+            exponent: Vec<u8>,
+        },
+        Ec {
+            curve_oid: &'static str,
+            point: Vec<u8>,
+        },
     }
     let components = {
-        let session = crate::xmldsig::pkix::CertificateSession::new(
-            &crate::policy::ResourcePolicy::default(),
-        );
+        // A key the provider generated itself belongs to no operation.
+        let session = crate::xmldsig::pkix::CertificateSession::standalone();
         match session
             .read_public_key(&spki)
             .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
@@ -837,6 +851,11 @@ fn signing_public_key_info(
                 exponent: rsa.exponent().as_bytes().to_vec(),
             },
             PublicKey::Ec(ec) => Components::Ec {
+                curve_oid: match ec.curve() {
+                    structured_pkix::key::ec::Curve::Named(oid) => curve_oid_name(oid.as_bytes()),
+                    _ => None,
+                }
+                .ok_or(SigningKeyError::InvalidPublicKeyInfo)?,
                 point: ec.as_bytes().to_vec(),
             },
         }
@@ -847,8 +866,8 @@ fn signing_public_key_info(
             exponent,
             spki_der: spki,
         },
-        Components::Ec { point } => crate::xmldsig::SigningPublicKeyInfo::Ec {
-            curve_oid: spki_curve(&spki).map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?,
+        Components::Ec { curve_oid, point } => crate::xmldsig::SigningPublicKeyInfo::Ec {
+            curve_oid,
             public_key: point,
             spki_der: spki,
         },
@@ -950,11 +969,12 @@ impl AwsLcRsaPrivateKey {
             .public_key()
             .as_der()
             .map_err(|_| initialization("RSA public key"))?;
-        let session = crate::xmldsig::pkix::CertificateSession::new(
-            &crate::policy::ResourcePolicy::default(),
-        );
+        // Import is not an operation: the generated SPKI reads standalone.
+        let session = crate::xmldsig::pkix::CertificateSession::standalone();
         let rsa = session
             .rsa_public_key(public.as_ref(), None)
+            .ok()
+            .flatten()
             .ok_or_else(|| initialization("RSA public key"))?;
         let exponent = rsa
             .exponent()

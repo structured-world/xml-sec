@@ -901,16 +901,22 @@ pub(crate) fn validate_issuer_spki_policy(
     position: usize,
     rsa_keys: RsaKeyPolicy,
     dsa_keys: DsaKeyPolicy,
+    session: &super::pkix::CertificateSession,
 ) -> Result<(), X509ChainError> {
     use super::pkix::SpkiAlgorithm;
-    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
     let malformed = |message: &str| X509ChainError::InvalidDer {
         kind: "issuer SubjectPublicKeyInfo",
         message: message.into(),
     };
+    // Exhausting the chain's account stays a typed resource refusal.
+    let refused = |error: structured_pkix::Error, message: &str| {
+        session
+            .resource_violation(&error)
+            .map_or_else(|| malformed(message), X509ChainError::Policy)
+    };
     let family = session
         .spki_algorithm(encoded)
-        .map_err(|_| malformed("malformed SubjectPublicKeyInfo"))?;
+        .map_err(|error| refused(error, "malformed SubjectPublicKeyInfo"))?;
     // RFC 5280 4.1.2.7 makes key encoding algorithm-specific. An opaque
     // algorithm's BIT STRING must not acquire RSA's octet-alignment rule.
     // https://www.rfc-editor.org/rfc/rfc5280.html#section-4.1.2.7
@@ -921,12 +927,13 @@ pub(crate) fn validate_issuer_spki_policy(
         SpkiAlgorithm::RsaEncryption | SpkiAlgorithm::RsaPss => {
             if !session
                 .with_public_key_info(encoded, |info, _| Ok(info.key_octets().is_some()))
-                .unwrap_or(false)
+                .map_err(|error| refused(error, "RSA public key is not octet-aligned"))?
             {
                 return Err(malformed("RSA public key is not octet-aligned"));
             }
             let key = session
                 .admitted_rsa_public_key(encoded, |_, _| Ok(true))
+                .map_err(|error| refused(error, "malformed RSA public key"))?
                 .ok_or_else(|| X509ChainError::InvalidDer {
                     kind: "RSA issuer SubjectPublicKeyInfo",
                     message: "malformed RSA public key".into(),
@@ -944,8 +951,12 @@ pub(crate) fn validate_issuer_spki_policy(
             match super::signature::validate_dsa_signature_spki_with_minimum(
                 encoded,
                 dsa_keys.minimum_modulus_bits,
+                session,
             ) {
                 Ok(()) => Ok(()),
+                Err(super::SignatureVerificationError::KeyPolicy(
+                    violation @ crate::policy::PolicyViolation::ResourceLimitExceeded { .. },
+                )) => Err(X509ChainError::Policy(violation)),
                 Err(super::SignatureVerificationError::KeyPolicy(source)) => {
                     Err(X509ChainError::KeyPolicy { position, source })
                 }
@@ -1530,12 +1541,14 @@ mod tests {
             subject_public_key: der::asn1::BitStringRef::from_bytes(&public)?,
         }
         .to_der()?;
+        let session = super::super::pkix::CertificateSession::standalone();
         assert!(matches!(
             validate_issuer_spki_policy(
                 &encoded,
                 7,
                 RsaKeyPolicy::default(),
-                DsaKeyPolicy::default()
+                DsaKeyPolicy::default(),
+                &session,
             ),
             Err(X509ChainError::KeyPolicy { position: 7, .. }),
         ));
@@ -1551,7 +1564,13 @@ mod tests {
         }
         .to_der()?;
         assert!(matches!(
-            validate_issuer_spki_policy(&pss, 7, RsaKeyPolicy::default(), DsaKeyPolicy::default()),
+            validate_issuer_spki_policy(
+                &pss,
+                7,
+                RsaKeyPolicy::default(),
+                DsaKeyPolicy::default(),
+                &session,
+            ),
             Err(X509ChainError::KeyPolicy { position: 7, .. }),
         ));
         let mut trailing = encoded.clone();
@@ -1561,7 +1580,8 @@ mod tests {
                 &trailing,
                 7,
                 RsaKeyPolicy::default(),
-                DsaKeyPolicy::default()
+                DsaKeyPolicy::default(),
+                &session,
             ),
             Err(X509ChainError::InvalidDer {
                 kind: "issuer SubjectPublicKeyInfo",
@@ -1578,7 +1598,8 @@ mod tests {
                 &unaligned,
                 7,
                 RsaKeyPolicy::default(),
-                DsaKeyPolicy::default()
+                DsaKeyPolicy::default(),
+                &session,
             ),
             Err(X509ChainError::InvalidDer {
                 kind: "issuer SubjectPublicKeyInfo",
@@ -1595,7 +1616,13 @@ mod tests {
             subject_public_key: der::asn1::BitStringRef::new(1, &[0])?,
         }
         .to_der()?;
-        validate_issuer_spki_policy(&opaque, 7, RsaKeyPolicy::default(), DsaKeyPolicy::default())?;
+        validate_issuer_spki_policy(
+            &opaque,
+            7,
+            RsaKeyPolicy::default(),
+            DsaKeyPolicy::default(),
+            &session,
+        )?;
         Ok(())
     }
 

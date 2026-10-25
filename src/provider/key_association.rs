@@ -17,6 +17,7 @@ pub enum KeyAssociation {
 
 /// Borrowed input to one original signature verification, never a second pass.
 #[derive(Clone, Copy)]
+#[non_exhaustive]
 pub struct SignatureVerificationInput<'a> {
     /// Originally parsed method and effective parameters.
     pub algorithm: SignatureAlgorithm,
@@ -26,6 +27,58 @@ pub struct SignatureVerificationInput<'a> {
     pub data: &'a [u8],
     /// Original decoded `SignatureValue`.
     pub signature: &'a [u8],
+    /// The verification operation's key-material account, when the input
+    /// comes from one; a standalone provider call reads under its own. Only
+    /// the native provider reads SPKI itself; the software provider reads it
+    /// through the operation-scoped key hooks.
+    #[cfg(feature = "aws-lc-fips")]
+    certificates: Option<&'a crate::xmldsig::pkix::CertificateSession>,
+}
+
+impl<'a> SignatureVerificationInput<'a> {
+    /// Input for a standalone verification outside a [`VerifyContext`] operation.
+    ///
+    /// [`VerifyContext`]: crate::xmldsig::VerifyContext
+    #[must_use]
+    pub fn new(
+        algorithm: SignatureAlgorithm,
+        context: &'a SignatureContext,
+        data: &'a [u8],
+        signature: &'a [u8],
+    ) -> Self {
+        Self {
+            algorithm,
+            context,
+            data,
+            signature,
+            #[cfg(feature = "aws-lc-fips")]
+            certificates: None,
+        }
+    }
+
+    #[cfg(feature = "aws-lc-fips")]
+    pub(crate) fn with_certificates(
+        self,
+        certificates: &'a crate::xmldsig::pkix::CertificateSession,
+    ) -> Self {
+        Self {
+            certificates: Some(certificates),
+            ..self
+        }
+    }
+
+    /// Reads `use_session` under the operation's account, or a standalone
+    /// hard-ceiling account when this input belongs to no operation.
+    #[cfg(feature = "aws-lc-fips")]
+    pub(crate) fn with_session<T>(
+        &self,
+        use_session: impl FnOnce(&crate::xmldsig::pkix::CertificateSession) -> T,
+    ) -> T {
+        match self.certificates {
+            Some(session) => use_session(session),
+            None => use_session(&crate::xmldsig::pkix::CertificateSession::standalone()),
+        }
+    }
 }
 
 /// Provider observations; only a successful leaf can supply key evidence.
@@ -143,8 +196,9 @@ fn compare_with_points(
         .ok_or(MemoryError::WorkExceeded)?;
     charge(size)?;
     // The shared PKIX reader owns the actual SPKI syntax, as it does the expected key's.
-    let session =
-        crate::xmldsig::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+    // The operation was charged for this whole scan above through `charge`;
+    // the reader's own account only bounds the borrowed decode.
+    let session = crate::xmldsig::pkix::CertificateSession::standalone();
     session
         .with_public_key_info(actual, |actual, execution| {
             Ok(associate(

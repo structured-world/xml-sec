@@ -190,7 +190,9 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     }
 
     /// Certificate-path signature checks for `chain` and `anchor` through this
-    /// operation's provider and certificate trust policy.
+    /// operation's provider and certificate trust policy. Issuer key material
+    /// is read on a fresh account bounded by this operation's X.509 resource
+    /// policy, as [`Self::certificate_parser`] is.
     pub fn certificate_path_verifier<'a, 'p>(
         &'p self,
         chain: &'p [&'a structured_pkix::Certificate<'a>],
@@ -201,6 +203,7 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
             &self.context.policy.key_trust,
             chain,
             anchor,
+            super::super::super::pkix::CertificateSession::new(&self.context.policy.resources),
         )
     }
 }

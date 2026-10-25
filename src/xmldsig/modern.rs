@@ -160,11 +160,12 @@ impl SigningKey for EdDsaSigningKey {
 pub(crate) fn validate_public_key(
     algorithm: SignatureAlgorithm,
     der: &[u8],
+    session: &super::pkix::CertificateSession,
 ) -> Result<(), super::SignatureVerificationError> {
     if let SignatureAlgorithm::PostQuantum(algorithm) = algorithm {
         #[cfg(feature = "experimental-pq")]
         {
-            return super::post_quantum::validate_public_key(algorithm, der);
+            return super::post_quantum::validate_public_key(algorithm, der, session);
         }
         #[cfg(not(feature = "experimental-pq"))]
         {
@@ -174,37 +175,60 @@ pub(crate) fn validate_public_key(
         }
     }
     match algorithm.eddsa_key_algorithm() {
-        Some(SignatureAlgorithm::Ed25519) => ed25519_verifying_key(der).map(|_| ()),
-        Some(SignatureAlgorithm::Ed448) => ed448_verifying_key(der).map(|_| ()),
-        _ => {
-            return Err(super::SignatureVerificationError::UnsupportedAlgorithm {
-                uri: algorithm.uri().to_owned(),
-            });
-        }
+        Some(SignatureAlgorithm::Ed25519) => ed25519_verifying_key(der, session).map(|_| ()),
+        Some(SignatureAlgorithm::Ed448) => ed448_verifying_key(der, session).map(|_| ()),
+        _ => Err(super::SignatureVerificationError::UnsupportedAlgorithm {
+            uri: algorithm.uri().to_owned(),
+        }),
     }
-    .ok_or(super::SignatureVerificationError::InvalidKeyDer)
+}
+
+/// RFC 8410 raw public key of `algorithm` in `der`, read under `session`.
+fn rfc8410_public_octets<'a>(
+    der: &'a [u8],
+    algorithm: structured_pkix::key::rfc8410::Algorithm,
+    session: &'a super::pkix::CertificateSession,
+) -> Result<&'a [u8], super::SignatureVerificationError> {
+    let key = session
+        .rfc8410_public_key(der)
+        .map_err(|error| super::signature::key_read_error(session, &error))?
+        .filter(|key| key.algorithm() == algorithm)
+        .ok_or(super::SignatureVerificationError::InvalidKeyDer)?;
+    Ok(key.as_bytes())
 }
 
 /// RFC 8410 Ed25519 SPKI read by the shared PKIX reader, then point-decoded.
-pub(crate) fn ed25519_verifying_key(der: &[u8]) -> Option<ed25519_dalek::VerifyingKey> {
-    use structured_pkix::key::rfc8410::Algorithm;
-    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-    let key = session.rfc8410_public_key(der)?;
-    if key.algorithm() != Algorithm::Ed25519 {
-        return None;
-    }
-    ed25519_dalek::VerifyingKey::from_bytes(key.as_bytes().try_into().ok()?).ok()
+pub(crate) fn ed25519_verifying_key(
+    der: &[u8],
+    session: &super::pkix::CertificateSession,
+) -> Result<ed25519_dalek::VerifyingKey, super::SignatureVerificationError> {
+    let octets = rfc8410_public_octets(
+        der,
+        structured_pkix::key::rfc8410::Algorithm::Ed25519,
+        session,
+    )?;
+    octets
+        .try_into()
+        .ok()
+        .and_then(|octets| ed25519_dalek::VerifyingKey::from_bytes(octets).ok())
+        .ok_or(super::SignatureVerificationError::InvalidKeyDer)
 }
 
 /// RFC 8410 Ed448 SPKI read by the shared PKIX reader, then point-decoded.
-pub(crate) fn ed448_verifying_key(der: &[u8]) -> Option<ed448_goldilocks::VerifyingKey> {
-    use structured_pkix::key::rfc8410::Algorithm;
-    let session = super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
-    let key = session.rfc8410_public_key(der)?;
-    if key.algorithm() != Algorithm::Ed448 {
-        return None;
-    }
-    ed448_goldilocks::VerifyingKey::from_bytes(key.as_bytes().try_into().ok()?).ok()
+pub(crate) fn ed448_verifying_key(
+    der: &[u8],
+    session: &super::pkix::CertificateSession,
+) -> Result<ed448_goldilocks::VerifyingKey, super::SignatureVerificationError> {
+    let octets = rfc8410_public_octets(
+        der,
+        structured_pkix::key::rfc8410::Algorithm::Ed448,
+        session,
+    )?;
+    octets
+        .try_into()
+        .ok()
+        .and_then(|octets| ed448_goldilocks::VerifyingKey::from_bytes(octets).ok())
+        .ok_or(super::SignatureVerificationError::InvalidKeyDer)
 }
 
 pub(crate) fn verify(
@@ -212,6 +236,7 @@ pub(crate) fn verify(
     der: &[u8],
     message: &[u8],
     signature: &[u8],
+    session: &super::pkix::CertificateSession,
 ) -> Result<bool, super::SignatureVerificationError> {
     verify_with_context(
         algorithm,
@@ -219,6 +244,7 @@ pub(crate) fn verify(
         &super::SignatureContext::default(),
         message,
         signature,
+        session,
     )
 }
 
@@ -228,12 +254,15 @@ pub(crate) fn verify_with_context(
     context: &super::SignatureContext,
     message: &[u8],
     signature: &[u8],
+    session: &super::pkix::CertificateSession,
 ) -> Result<bool, super::SignatureVerificationError> {
     use super::SignatureVerificationError as Error;
     if let SignatureAlgorithm::PostQuantum(algorithm) = algorithm {
         #[cfg(feature = "experimental-pq")]
         {
-            return super::post_quantum::verify(algorithm, der, context, message, signature);
+            return super::post_quantum::verify(
+                algorithm, der, context, message, signature, session,
+            );
         }
         #[cfg(not(feature = "experimental-pq"))]
         {
@@ -246,7 +275,7 @@ pub(crate) fn verify_with_context(
         SignatureAlgorithm::Ed25519
         | SignatureAlgorithm::Ed25519Ctx
         | SignatureAlgorithm::Ed25519Ph => {
-            let key = ed25519_verifying_key(der).ok_or(Error::InvalidKeyDer)?;
+            let key = ed25519_verifying_key(der, session)?;
             let signature = ed25519_dalek::Signature::try_from(signature)
                 .map_err(|_| Error::InvalidSignatureFormat)?;
             Ok(match algorithm {
@@ -273,7 +302,7 @@ pub(crate) fn verify_with_context(
             })
         }
         SignatureAlgorithm::Ed448 | SignatureAlgorithm::Ed448Ph => {
-            let key = ed448_verifying_key(der).ok_or(Error::InvalidKeyDer)?;
+            let key = ed448_verifying_key(der, session)?;
             let signature = ed448_goldilocks::Signature::try_from(signature)
                 .map_err(|_| Error::InvalidSignatureFormat)?;
             Ok(if algorithm == SignatureAlgorithm::Ed448 {

@@ -399,9 +399,8 @@ impl RustCryptoMlKemPublicKey {
         // The shared PKIX reader owns SPKI syntax; RFC 9935 section 3 requires
         // absent parameters (not even NULL) and an octet-aligned key.
         // https://www.rfc-editor.org/rfc/rfc9935.html#section-3
-        let session = crate::xmldsig::pkix::CertificateSession::new(
-            &crate::policy::ResourcePolicy::default(),
-        );
+        // Key import belongs to no operation: the provider trait hands no account.
+        let session = crate::xmldsig::pkix::CertificateSession::standalone();
         let (algorithm, key) = session
             .with_public_key_info(bytes, |info, _| {
                 let identifier = info.algorithm();

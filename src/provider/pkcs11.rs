@@ -573,9 +573,13 @@ impl VerifyingKey for Pkcs11RsaKey {
     fn provider_binding(&self) -> Option<&ProviderBinding> {
         Some(&self.token.binding)
     }
-    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
+    fn validate_policy(
+        &self,
+        scope: &crate::xmldsig::VerificationScope<'_>,
+    ) -> Result<(), DsigError> {
         // Reuse the policy's component validator without copying or reparsing SPKI.
-        policy
+        scope
+            .policy()
             .key_trust
             .rsa_keys
             .validate_components("verification", &self.modulus, &self.exponent)

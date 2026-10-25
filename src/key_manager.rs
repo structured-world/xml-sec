@@ -17,8 +17,6 @@ use dsa::{
 };
 mod pkcs12_import;
 use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
-#[cfg(feature = "xmlenc")]
-use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
 use pkcs12_import::Limits as Pkcs12Limits;
 use rsa::RsaPrivateKey;
@@ -492,14 +490,20 @@ impl StoredPublicKey {
                     }
                     let raw = session
                         .rsa_public_key(der, None)
+                        .map_err(|error| match session.error(error) {
+                            crate::xmldsig::X509ChainError::Policy(error) => {
+                                KeyStoreError::Policy(error)
+                            }
+                            _ => KeyStoreError::Selection("invalid RSA encryption key"),
+                        })?
                         .ok_or(KeyStoreError::Selection("invalid RSA encryption key"))?;
-                    rsa_recipient_preflight(
+                    // The shared reader already admitted the SPKI; build the
+                    // key from its components instead of parsing it again.
+                    rsa_recipient_from_components(
                         raw.modulus().as_bytes(),
                         raw.exponent().as_bytes(),
                         policy,
-                    )?;
-                    RsaPublicKey::from_public_key_der(der)
-                        .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))
+                    )
                 }
                 KeyInfoSource::X509Data(data) if data.parsed_certificates.len() == 1 => {
                     if let Some(certificate) = data.certificates.first() {

@@ -110,6 +110,75 @@ fn certificate_writer_obeys_signing_resource_snapshot() {
 }
 
 #[test]
+fn preset_verification_keys_charge_the_operation_certificate_account() {
+    // A caller-provided key's SPKI is read under the operation's X.509
+    // allowance. A fresh default account would ignore the configured limit and
+    // report its refusal as a malformed key instead of a typed policy violation.
+    let rsa =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .unwrap();
+    let ec = EcdsaP256SigningKey::from_pkcs8_pem(&read_fixture(
+        "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
+    ))
+    .unwrap();
+    let ec_spki = match ec.public_key_info().expect("public key info") {
+        SigningPublicKeyInfo::Ec { spki_der, .. } => spki_der,
+        _ => panic!("P-256 key must expose EC public-key info"),
+    };
+    let cases: [(&dyn SigningKey, SignatureAlgorithm, Vec<u8>); 2] = [
+        (&rsa, SignatureAlgorithm::RsaSha256, rsa_spki(&rsa)),
+        (&ec, SignatureAlgorithm::EcdsaSha256, ec_spki),
+    ];
+    for (signing_key, algorithm, spki_der) in cases {
+        // No KeyInfo: the key's own SPKI is the only X.509 work.
+        let builder = SignatureBuilder::new(exclusive_c14n(), algorithm).add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+        let signed = SignContext::new(signing_key)
+            .sign_with_builder(
+                "<root><payload Id=\"payload\">signed</payload></root>",
+                &builder,
+            )
+            .expect("signing");
+        let key = VerificationKey {
+            algorithm,
+            public_key_bytes: spki_der,
+            certificate_der: None,
+            name: None,
+        };
+        let verified = VerifyContext::new()
+            .key(&key)
+            .verify(&signed)
+            .expect("default allowance");
+        assert_eq!(verified.status, DsigStatus::Valid, "{algorithm:?}");
+        let mut policy = VerificationPolicy::default();
+        policy.resources.max_x509_work = 1;
+        let result = VerifyContext::new()
+            .key(&key)
+            .policy(policy)
+            .verify(&signed);
+        // Key-material refusals surface like key-strength refusals: a typed
+        // key-policy violation naming the exhausted allowance.
+        assert!(
+            matches!(
+                &result,
+                Err(xml_sec::xmldsig::DsigError::Crypto(
+                    xml_sec::xmldsig::SignatureVerificationError::KeyPolicy(
+                        xml_sec::policy::PolicyViolation::ResourceLimitExceeded {
+                            resource: "X.509 work",
+                            maximum: 1,
+                        }
+                    )
+                ))
+            ),
+            "{algorithm:?}: {result:?}"
+        );
+    }
+}
+
+#[test]
 fn public_xpath_id_uses_request_registration() {
     // A URI and XPath id() must select the same registered, namespace-scoped
     // target; an empty XPath selection must not silently authenticate nothing.

@@ -295,33 +295,15 @@ impl RsaPublicKeyEncoding for RsaPublicKey {
     }
 
     fn from_public_key_der(bytes: &[u8]) -> pkcs8::spki::Result<Self> {
-        // The shared PKIX reader owns SPKI and RSAPublicKey syntax; this
-        // standalone key is charged to its own hard-ceiling account.
-        let session = crate::xmldsig::pkix::CertificateSession::new(
-            &crate::policy::ResourcePolicy::default(),
-        );
-        let key = session
-            .admitted_rsa_public_key(bytes, |identifier, _| {
-                let algorithm = identifier.algorithm();
-                // RFC 3279 section 2.3.1: rsaEncryption parameters SHALL be NULL.
-                // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.1
-                // RFC 4055 sections 1.2 and 3.1 allow absent PSS parameters.
-                // https://www.rfc-editor.org/rfc/rfc4055#section-3.1
-                // Preserve sad-rsa's parameter-unconstrained import contract;
-                // explicit restrictions cannot be retained by its bare RSA type
-                // and are therefore not silently discarded by this decoder.
-                Ok(if algorithm == structured_pkix::oid::RSA_ENCRYPTION {
-                    identifier.has_null_parameter()
-                } else {
-                    algorithm == structured_pkix::oid::RSASSA_PSS && identifier.has_no_parameters()
-                })
-            })
-            .ok_or(pkcs8::spki::Error::KeyMalformed)?;
-        let modulus = key.modulus().as_bytes();
-        let exponent = key.exponent().as_bytes();
-        let n = uint(modulus, width(modulus).map_err(public_error)?).map_err(public_error)?;
-        let e = uint(exponent, width(exponent).map_err(public_error)?).map_err(public_error)?;
-        Self::new(n, e).map_err(|_| pkcs8::spki::Error::KeyMalformed)
+        // A bare decoder belongs to no operation: it reads under its own
+        // standalone hard-ceiling account.
+        read_spki_public_key(
+            &crate::xmldsig::pkix::CertificateSession::standalone(),
+            bytes,
+        )
+        .ok()
+        .flatten()
+        .ok_or(pkcs8::spki::Error::KeyMalformed)
     }
 
     fn to_public_key_der(&self) -> pkcs8::spki::Result<Document> {
@@ -332,6 +314,43 @@ impl RsaPublicKeyEncoding for RsaPublicKey {
         }
         .try_into()
     }
+}
+
+/// The software RSA key of an SPKI read under `session`; `None` for another
+/// algorithm, a refused identifier or malformed key material.
+///
+/// # Errors
+/// The shared reader's resource refusal under `session`'s account.
+pub(crate) fn read_spki_public_key(
+    session: &crate::xmldsig::pkix::CertificateSession,
+    bytes: &[u8],
+) -> Result<Option<RsaPublicKey>, structured_pkix::Error> {
+    // The shared PKIX reader owns SPKI and RSAPublicKey syntax.
+    let Some(key) = session.admitted_rsa_public_key(bytes, |identifier, _| {
+        let algorithm = identifier.algorithm();
+        // RFC 3279 section 2.3.1: rsaEncryption parameters SHALL be NULL.
+        // https://www.rfc-editor.org/rfc/rfc3279#section-2.3.1
+        // RFC 4055 sections 1.2 and 3.1 allow absent PSS parameters.
+        // https://www.rfc-editor.org/rfc/rfc4055#section-3.1
+        // Preserve sad-rsa's parameter-unconstrained import contract;
+        // explicit restrictions cannot be retained by its bare RSA type
+        // and are therefore not silently discarded by this decoder.
+        Ok(if algorithm == structured_pkix::oid::RSA_ENCRYPTION {
+            identifier.has_null_parameter()
+        } else {
+            algorithm == structured_pkix::oid::RSASSA_PSS && identifier.has_no_parameters()
+        })
+    })?
+    else {
+        return Ok(None);
+    };
+    let modulus = key.modulus().as_bytes();
+    let exponent = key.exponent().as_bytes();
+    let integer = |bytes: &[u8]| width(bytes).and_then(|bits| uint(bytes, bits)).ok();
+    let (Some(n), Some(e)) = (integer(modulus), integer(exponent)) else {
+        return Ok(None);
+    };
+    Ok(RsaPublicKey::new(n, e).ok())
 }
 
 fn verify_algorithm_id(algorithm: &pkcs8::AlgorithmIdentifierRef<'_>) -> pkcs8::spki::Result<()> {

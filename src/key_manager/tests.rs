@@ -1,4 +1,3 @@
-#[cfg(not(feature = "xmlenc"))]
 use crate::rsa_encoding::RsaPublicKeyEncoding as _;
 use pkcs8::EncodePublicKey as _;
 use rand_chacha::{ChaCha8Rng, rand_core::SeedableRng as _};

@@ -64,6 +64,40 @@ use capture::{CapturedOperation, ScopedCapture, VerificationCapture};
 
 const MAX_SIGNATURE_VALUE_LEN: usize = 8192;
 const MAX_RETRIEVAL_METHOD_COUNT: usize = 64;
+
+/// One verification operation's immutable policy and its key-material account.
+///
+/// Policy-aware [`VerifyingKey`] hooks receive this scope so that reading a
+/// key's public material is charged to the operation's X.509 allowance and
+/// reported as a typed policy violation, never to a fresh account.
+#[derive(Clone, Copy)]
+pub struct VerificationScope<'a> {
+    policy: &'a crate::policy::VerificationPolicy,
+    certificates: &'a super::pkix::CertificateSession,
+}
+
+impl<'a> VerificationScope<'a> {
+    pub(crate) fn new(
+        policy: &'a crate::policy::VerificationPolicy,
+        certificates: &'a super::pkix::CertificateSession,
+    ) -> Self {
+        Self {
+            policy,
+            certificates,
+        }
+    }
+
+    /// The operation's immutable verification policy.
+    #[must_use]
+    pub fn policy(&self) -> &'a crate::policy::VerificationPolicy {
+        self.policy
+    }
+
+    pub(crate) fn certificates(&self) -> &'a super::pkix::CertificateSession {
+        self.certificates
+    }
+}
+
 /// Cryptographic verifier used by [`VerifyContext`].
 ///
 /// This trait intentionally has no `Send + Sync` supertraits so lightweight
@@ -132,16 +166,14 @@ pub trait VerifyingKey {
     /// Validate this key against the operation's immutable trust policy.
     ///
     /// Built-in keys override this hook so pre-resolved and resolver-produced
-    /// keys enforce identical strength constraints. Custom opaque keys may
-    /// retain their own policy enforcement by accepting the default no-op.
+    /// keys enforce identical strength constraints, reading their public
+    /// material under the scope's account. Custom opaque keys may retain their
+    /// own policy enforcement by accepting the default no-op.
     ///
     /// # Errors
     /// Implementations return policy refusals for incompatible key strength,
-    /// permitted usage, encoding or trust constraints.
-    fn validate_policy(
-        &self,
-        _policy: &crate::policy::VerificationPolicy,
-    ) -> Result<(), DsigError> {
+    /// permitted usage, encoding, trust or resource constraints.
+    fn validate_policy(&self, _scope: &VerificationScope<'_>) -> Result<(), DsigError> {
         Ok(())
     }
 
@@ -178,11 +210,10 @@ pub trait VerifyingKey {
     /// mismatches are `Ok(false)` under the selected wire contract.
     fn validate_signature_value_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        _scope: &VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let _ = policy;
         self.validate_signature_value(algorithm, signature_value)
     }
 
@@ -200,22 +231,23 @@ pub trait VerifyingKey {
 
     /// Verify after applying operation-scoped compatibility semantics.
     ///
-    /// The default delegates to [`VerifyingKey::verify`]. Custom keys whose
-    /// provider input depends on compatibility policy must override this hook
-    /// consistently with [`VerifyingKey::validate_signature_value_with_policy`].
+    /// The default delegates to [`VerifyingKey::verify_with_context`]. Custom
+    /// keys whose provider input depends on compatibility policy must override
+    /// this hook consistently with
+    /// [`VerifyingKey::validate_signature_value_with_policy`].
     ///
     /// # Errors
     /// Propagates policy, unsupported-method and verification-processing failures;
     /// a completed cryptographic mismatch remains `Ok(false)`.
     fn verify_with_policy(
         &self,
-        policy: &crate::policy::VerificationPolicy,
+        _scope: &VerificationScope<'_>,
         algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        let _ = policy;
-        self.verify(algorithm, signed_data, signature_value)
+        self.verify_with_context(algorithm, context, signed_data, signature_value)
     }
 }
 
@@ -1900,12 +1932,14 @@ pub fn verify_signature_with_pem_key(
             if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
                 return Err(SignatureVerificationError::InvalidKeyPem.into());
             }
+            // Like any opaque caller key, this PEM key reads its own material.
             Ok(super::modern::verify_with_context(
                 algorithm,
                 &pem.contents,
                 context,
                 signed_data,
                 signature_value,
+                &super::pkix::CertificateSession::standalone(),
             )?)
         }
 
@@ -2965,12 +2999,17 @@ fn verify_operation_authenticator<C: VerificationCapture>(
     capture: &C,
     input: crate::provider::SignatureVerificationInput<'_>,
 ) -> Result<bool, DsigError> {
-    verifier.validate_policy(&ctx.policy)?;
-    if !verifier.validate_signature_value_with_policy(
-        &ctx.policy,
-        input.algorithm,
-        input.signature,
-    )? {
+    // A handle on the operation's certificate account: key reads below share
+    // its allowance and usage without holding the candidate budget borrowed.
+    let certificates = operation
+        .budgets()
+        .key_candidates
+        .borrow()
+        .certificates()
+        .share();
+    let scope = VerificationScope::new(&ctx.policy, &certificates);
+    verifier.validate_policy(&scope)?;
+    if !verifier.validate_signature_value_with_policy(&scope, input.algorithm, input.signature)? {
         return Ok::<_, SignatureVerificationPipelineError>(false);
     }
     ctx.provider
@@ -2978,10 +3017,12 @@ fn verify_operation_authenticator<C: VerificationCapture>(
     let candidate_refusal = RefCell::new(None);
     let policy_verifier = PolicyVerifyingKey {
         key: verifier,
-        policy: &ctx.policy,
+        scope,
         candidates: &operation.budgets().key_candidates,
         candidate_refusal: &candidate_refusal,
     };
+    #[cfg(feature = "aws-lc-fips")]
+    let input = input.with_certificates(&certificates);
     let result = capture.verify(ctx.provider, &policy_verifier, input);
     if let Some(error) = candidate_refusal.into_inner() {
         return Err(error.into());
@@ -3126,12 +3167,12 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             ctx,
             operation,
             verification.capture,
-            crate::provider::SignatureVerificationInput {
-                algorithm: completion.signed_info.signature_method,
-                context: &completion.signed_info.signature_context,
-                data: &completion.canonical_signed_info,
-                signature: &signature_value,
-            },
+            crate::provider::SignatureVerificationInput::new(
+                completion.signed_info.signature_method,
+                &completion.signed_info.signature_context,
+                &completion.canonical_signed_info,
+                &signature_value,
+            ),
         )
     })?;
     if !signature_valid {
@@ -3275,7 +3316,7 @@ fn verify_signature_node<'a, C: VerificationCapture>(
 
 struct PolicyVerifyingKey<'a, 'inputs> {
     key: &'a dyn VerifyingKey,
-    policy: &'a crate::policy::VerificationPolicy,
+    scope: VerificationScope<'a>,
     candidates: &'a RefCell<super::InspectedKeyCandidateBudget<'inputs>>,
     candidate_refusal: &'a RefCell<Option<crate::policy::PolicyViolation>>,
 }
@@ -3301,10 +3342,10 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
                 *self.candidate_refusal.borrow_mut() = Some(error.clone());
                 return Err(error.into());
             }
-            key.validate_policy(self.policy)?;
+            key.validate_policy(&self.scope)?;
             verify(&PolicyVerifyingKey {
                 key,
-                policy: self.policy,
+                scope: self.scope,
                 candidates: self.candidates,
                 candidate_refusal: self.candidate_refusal,
             })
@@ -3315,7 +3356,7 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
     }
 
     fn ecdsa_encoding(&self) -> crate::policy::EcdsaSignatureValueEncoding {
-        self.policy.ecdsa_signature_value_encoding
+        self.scope.policy().ecdsa_signature_value_encoding
     }
     fn verify_with_context(
         &self,
@@ -3324,15 +3365,11 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
         data: &[u8],
         signature: &[u8],
     ) -> Result<bool, DsigError> {
-        if context.as_bytes().is_empty() {
-            self.verify(algorithm, data, signature)
-        } else {
-            self.key
-                .verify_with_context(algorithm, context, data, signature)
-        }
+        self.key
+            .verify_with_policy(&self.scope, algorithm, context, data, signature)
     }
-    fn validate_policy(&self, policy: &crate::policy::VerificationPolicy) -> Result<(), DsigError> {
-        self.key.validate_policy(policy)
+    fn validate_policy(&self, scope: &VerificationScope<'_>) -> Result<(), DsigError> {
+        self.key.validate_policy(scope)
     }
 
     fn validate_signature_value(
@@ -3341,7 +3378,7 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
         self.key
-            .validate_signature_value_with_policy(self.policy, algorithm, signature_value)
+            .validate_signature_value_with_policy(&self.scope, algorithm, signature_value)
     }
 
     fn verify(
@@ -3350,8 +3387,12 @@ impl VerifyingKey for PolicyVerifyingKey<'_, '_> {
         signed_data: &[u8],
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
-        self.key
-            .verify_with_policy(self.policy, algorithm, signed_data, signature_value)
+        self.verify_with_context(
+            algorithm,
+            &super::SignatureContext::default(),
+            signed_data,
+            signature_value,
+        )
     }
 }
 
@@ -5929,6 +5970,7 @@ fn verify_with_algorithm(
                 &pem.contents,
                 signed_data,
                 signature_value,
+                &super::pkix::CertificateSession::standalone(),
             )?)
         }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {

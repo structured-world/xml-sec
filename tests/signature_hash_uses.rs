@@ -265,9 +265,9 @@ impl VerifyingKey for CountedKey {
     }
     fn validate_policy(
         &self,
-        policy: &xml_sec::policy::VerificationPolicy,
+        scope: &xml_sec::xmldsig::VerificationScope<'_>,
     ) -> Result<(), DsigError> {
-        self.key.validate_policy(policy)
+        self.key.validate_policy(scope)
     }
 }
 

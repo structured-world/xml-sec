@@ -62,28 +62,40 @@ fn valid_key(parameters: RsaPssParameters, key: &impl PublicKeyParts) -> bool {
     bits <= crate::hard_limits::RSA_MODULUS_BIT_CEILING && parameters.fits_modulus_bits(bits)
 }
 
-pub(crate) fn public_key(spki: &[u8], parameters: RsaPssParameters) -> Option<RsaPublicKey> {
+pub(crate) fn public_key(
+    spki: &[u8],
+    parameters: RsaPssParameters,
+    session: &crate::xmldsig::pkix::CertificateSession,
+) -> Result<RsaPublicKey, crate::xmldsig::SignatureVerificationError> {
     // RFC 4055 section 3.3: a PSS SPKI restricts hashes/trailer and sets a
     // minimum salt length; absent parameters permit any supported PSS tuple.
     // https://www.rfc-editor.org/rfc/rfc4055.html#section-3.3
-    RsaPublicKey::from_pkcs1_der(encoded_public_key(spki, parameters)?).ok()
+    RsaPublicKey::from_pkcs1_der(encoded_public_key(spki, parameters, session)?)
+        .map_err(|_| crate::xmldsig::SignatureVerificationError::InvalidKeyDer)
 }
 
 /// Borrow the RSA bit string after checking its algorithm restrictions. Native
 /// providers share this preflight without allocating software RSA bigints.
-pub(crate) fn encoded_public_key(spki: &[u8], parameters: RsaPssParameters) -> Option<&[u8]> {
-    // The shared PKIX reader owns SPKI and RSASSA-PSS-params syntax; this
-    // standalone key is charged to its own hard-ceiling account.
-    let session =
-        crate::xmldsig::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
+pub(crate) fn encoded_public_key<'a>(
+    spki: &'a [u8],
+    parameters: RsaPssParameters,
+    session: &crate::xmldsig::pkix::CertificateSession,
+) -> Result<&'a [u8], crate::xmldsig::SignatureVerificationError> {
+    use crate::xmldsig::SignatureVerificationError;
+    // The shared PKIX reader owns SPKI and RSASSA-PSS-params syntax.
     // The SPKI is read at document offset zero, so its source span indexes it.
-    let span = session
-        .rsa_public_key(spki, Some(parameters))?
+    let span = crate::xmldsig::signature::read_rsa_public_key(session, spki, Some(parameters))?
         .element()
         .span();
-    let start = usize::try_from(span.start).ok()?;
-    let length = usize::try_from(span.length).ok()?;
-    spki.get(start..start.checked_add(length)?)
+    let range = usize::try_from(span.start).ok().and_then(|start| {
+        usize::try_from(span.length)
+            .ok()
+            .and_then(|length| start.checked_add(length))
+            .map(|end| start..end)
+    });
+    range
+        .and_then(|range| spki.get(range))
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
 }
 
 pub(crate) fn sign(

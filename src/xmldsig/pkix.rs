@@ -626,6 +626,7 @@ pub(crate) fn validate_supplied_path<'a>(
         anchor,
         rsa_keys: options.rsa_keys,
         dsa_keys: options.dsa_keys,
+        certificates: session.share(),
     };
     let context = ValidationContext {
         execution: session.memory(),
@@ -1088,6 +1089,8 @@ pub struct CertificatePathVerifier<'a, 'p> {
     anchor: &'a Certificate<'a>,
     rsa_keys: crate::policy::RsaKeyPolicy,
     dsa_keys: crate::policy::DsaKeyPolicy,
+    /// Account that reads issuer key material for the strength checks.
+    certificates: CertificateSession,
 }
 
 impl<'a, 'p> CertificatePathVerifier<'a, 'p> {
@@ -1096,6 +1099,7 @@ impl<'a, 'p> CertificatePathVerifier<'a, 'p> {
         trust: &'p crate::policy::KeyTrustPolicy,
         chain: &'p [&'a Certificate<'a>],
         anchor: &'a Certificate<'a>,
+        certificates: CertificateSession,
     ) -> Self {
         Self {
             signatures: ProviderVerifier {
@@ -1106,6 +1110,7 @@ impl<'a, 'p> CertificatePathVerifier<'a, 'p> {
             anchor,
             rsa_keys: trust.rsa_keys,
             dsa_keys: trust.dsa_keys,
+            certificates,
         }
     }
 }
@@ -1156,6 +1161,7 @@ impl<W: Work> structured_pkix::path::Verify<W> for CertificatePathVerifier<'_, '
                     position,
                     self.rsa_keys,
                     self.dsa_keys,
+                    &self.certificates,
                 )
             },
         )
@@ -1199,6 +1205,14 @@ impl CertificateSession {
             .min(crate::hard_limits::X509_WORKSPACE_BYTE_CEILING);
         let memory = Memory::new(Arc::new(MemoryAccount::new(memory_limit, work_limit)));
         Self::with_account(work_limit, memory_limit, memory)
+    }
+
+    /// Account for a standalone entry point that belongs to no operation, such
+    /// as a direct verification helper or a key constructor: the default
+    /// resource policy under the hard ceilings. Operation paths never use it;
+    /// they read under the account derived from their compiled policy.
+    pub(crate) fn standalone() -> Self {
+        Self::new(&ResourcePolicy::default())
     }
 
     /// The bounded parser, keeping its fresh policy-limited account.
@@ -1292,11 +1306,14 @@ impl CertificateSession {
     /// both digests and the trailer and set a minimum salt. Readable written
     /// DEFAULT fields are recognized as RFC 4055 section 3.1 requires.
     /// <https://www.rfc-editor.org/rfc/rfc4055.html#section-3.3>
+    ///
+    /// # Errors
+    /// The reader's resource refusal under this session's account.
     pub(crate) fn rsa_public_key<'a>(
         &'a self,
         spki: &'a [u8],
         pss: Option<super::RsaPssParameters>,
-    ) -> Option<structured_pkix::key::rsa::PublicKey<'a>> {
+    ) -> Result<Option<structured_pkix::key::rsa::PublicKey<'a>>, structured_pkix::Error> {
         use structured_asn1::digest::Resolution;
         self.admitted_rsa_public_key(spki, |identifier, execution| {
             let algorithm = identifier.algorithm();
@@ -1328,14 +1345,16 @@ impl CertificateSession {
 
     /// RFC 8410 raw public key of a standalone SPKI, or `None` for another
     /// algorithm, present parameters or a wrong key width.
+    ///
+    /// # Errors
+    /// The reader's resource refusal under this session's account.
     pub(crate) fn rfc8410_public_key<'a>(
         &'a self,
         spki: &'a [u8],
-    ) -> Option<structured_pkix::key::rfc8410::PublicKey<'a>> {
-        self.with_public_key_info(spki, |info, execution| {
+    ) -> Result<Option<structured_pkix::key::rfc8410::PublicKey<'a>>, structured_pkix::Error> {
+        refused_as_none(self.with_public_key_info(spki, |info, execution| {
             structured_pkix::key::rfc8410::read(info, execution)
-        })
-        .ok()
+        }))
     }
 
     /// Key family named by a standalone SPKI's algorithm identifier.
@@ -1370,24 +1389,37 @@ impl CertificateSession {
 
     /// Supported named curve and range of the SEC1 point inside a standalone
     /// EC SPKI; `None` for another key, curve choice or malformed encoding.
+    ///
+    /// # Errors
+    /// The reader's resource refusal under this session's account.
     pub(crate) fn ec_named_point(
         &self,
         spki: &[u8],
-    ) -> Option<(super::signature::EcCurve, core::ops::Range<usize>)> {
-        let PublicKey::Ec(key) = self.read_public_key(spki).ok()? else {
-            return None;
+    ) -> Result<Option<(super::signature::EcCurve, core::ops::Range<usize>)>, structured_pkix::Error>
+    {
+        let Some(PublicKey::Ec(key)) = refused_as_none(self.read_public_key(spki))? else {
+            return Ok(None);
         };
         let structured_pkix::key::ec::Curve::Named(curve) = key.curve() else {
-            return None;
+            return Ok(None);
         };
-        let curve = super::signature::EcCurve::from_oid_bytes(curve.as_bytes())?;
+        let Some(curve) = super::signature::EcCurve::from_oid_bytes(curve.as_bytes()) else {
+            return Ok(None);
+        };
         // The SPKI is read at document offset zero, so source offsets index it.
-        let start = usize::try_from(key.offset()).ok()?;
-        Some((curve, start..start.checked_add(key.as_bytes().len())?))
+        let Ok(start) = usize::try_from(key.offset()) else {
+            return Ok(None);
+        };
+        Ok(start
+            .checked_add(key.as_bytes().len())
+            .map(|end| (curve, start..end)))
     }
 
     /// RSA key of a standalone SPKI whose algorithm identifier `admit` accepts.
     /// `None` is a refused identifier or a malformed key.
+    ///
+    /// # Errors
+    /// The reader's resource refusal under this session's account.
     pub(crate) fn admitted_rsa_public_key<'a>(
         &'a self,
         spki: &'a [u8],
@@ -1395,15 +1427,14 @@ impl CertificateSession {
             structured_pkix::AlgorithmIdentifier<'a>,
             &structured_asn1::memory::Execution<'_>,
         ) -> Result<bool, structured_pkix::Error>,
-    ) -> Option<structured_pkix::key::rsa::PublicKey<'a>> {
-        self.with_public_key_info(spki, |info, execution| {
+    ) -> Result<Option<structured_pkix::key::rsa::PublicKey<'a>>, structured_pkix::Error> {
+        refused_as_none(self.with_public_key_info(spki, |info, execution| {
             if !admit(info.algorithm(), execution)? {
                 return Ok(None);
             }
             structured_pkix::key::rsa::read(info, execution).map(Some)
-        })
-        .ok()
-        .flatten()
+        }))
+        .map(Option::flatten)
     }
 
     /// Reads exactly one standalone SPKI under this session's work and hands
@@ -1466,31 +1497,54 @@ impl CertificateSession {
     }
 
     pub(crate) fn error(&self, error: structured_pkix::Error) -> X509ChainError {
-        if error.is_resource() {
-            use structured_asn1::{ErrorCode, Limit};
-            let memory = matches!(
-                error.code(),
-                structured_pkix::ErrorCode::Encoding(
-                    ErrorCode::LimitExceeded(Limit::Memory)
-                        | ErrorCode::AllocatorExhausted
-                        | ErrorCode::CapacityOverflow
-                )
-            );
-            return PolicyViolation::ResourceLimitExceeded {
-                resource: if memory {
-                    resource_name::X509_WORKSPACE_BYTES
-                } else {
-                    resource_name::X509_WORK
-                },
-                maximum: if memory {
-                    self.memory_limit
-                } else {
-                    self.work_limit
-                },
-            }
-            .into();
+        match self.resource_violation(&error) {
+            Some(violation) => violation.into(),
+            None => X509ChainError::Processing(error),
         }
-        X509ChainError::Processing(error)
+    }
+
+    /// The policy violation a shared-reader resource refusal represents under
+    /// this session's limits; `None` for any other refusal.
+    pub(crate) fn resource_violation(
+        &self,
+        error: &structured_pkix::Error,
+    ) -> Option<PolicyViolation> {
+        if !error.is_resource() {
+            return None;
+        }
+        use structured_asn1::{ErrorCode, Limit};
+        let memory = matches!(
+            error.code(),
+            structured_pkix::ErrorCode::Encoding(
+                ErrorCode::LimitExceeded(Limit::Memory)
+                    | ErrorCode::AllocatorExhausted
+                    | ErrorCode::CapacityOverflow
+            )
+        );
+        Some(PolicyViolation::ResourceLimitExceeded {
+            resource: if memory {
+                resource_name::X509_WORKSPACE_BYTES
+            } else {
+                resource_name::X509_WORK
+            },
+            maximum: if memory {
+                self.memory_limit
+            } else {
+                self.work_limit
+            },
+        })
+    }
+}
+
+/// A reader result where only a resource refusal stays an error; any other
+/// refusal (another algorithm, a malformed encoding) is an absent key.
+fn refused_as_none<T>(
+    result: Result<T, structured_pkix::Error>,
+) -> Result<Option<T>, structured_pkix::Error> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.is_resource() => Err(error),
+        Err(_) => Ok(None),
     }
 }
 
