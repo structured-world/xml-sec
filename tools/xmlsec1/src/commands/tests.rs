@@ -2716,6 +2716,34 @@ fn xml_data_references_stay_unambiguous_in_the_data_document() {
 }
 
 #[test]
+fn xml_data_ignores_uri_attributes_of_extension_metadata() {
+    // XMLEnc 1.1 section 3.7 allows foreign content in EncryptionProperty without
+    // giving its URI attributes reference semantics; decryption never resolves
+    // them, so they must not make the template look dangling.
+    let data = "<Order><Payment>secret</Payment></Order>";
+    let template = r##"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><CipherData><CipherValue>AAAA</CipherValue></CipherData><EncryptionProperties><EncryptionProperty><audit:Event xmlns:audit="urn:audit" URI="#event"/></EncryptionProperty></EncryptionProperties></EncryptedData>"##;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    )
+    .expect("application metadata is preserved, not resolved");
+}
+
+#[test]
 fn xml_data_template_references_resolve_xpointer_forms() {
     // Only EncryptedData moves into the data document, so an XPointer
     // reference to a node outside it would dangle exactly like a bare ID.

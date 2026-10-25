@@ -171,6 +171,7 @@ const DECRYPT_OPTIONS: &[&str] = &[
 const KEYS_OPTIONS: &[&str] = &["gen-key"];
 const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const XMLENC_NS: &str = "http://www.w3.org/2001/04/xmlenc#";
+const XMLDSIG11_NS: &str = "http://www.w3.org/2009/xmldsig11#";
 const XMLSEC_COMPATIBILITY_HERE_SEMANTICS: XPathHereSemantics = XPathHereSemantics::XmlSecLegacy;
 const XMLSEC_COMPATIBILITY_XSLT_STYLESHEETS: xml_sec::policy::XsltStylesheetSemantics =
     xml_sec::policy::XsltStylesheetSemantics::Libxmlsec1;
@@ -3647,10 +3648,21 @@ fn ensure_self_contained(
         let range = node.range();
         moved.start <= range.start && range.end <= moved.end
     };
+    // The elements whose URI decryption resolves: cipher, key-retrieval and key-info
+    // references, and the ReferenceList entries that associate keys with data. Other
+    // `URI` attributes, such as application metadata in EncryptionProperty (XMLEnc 1.1
+    // section 3.7), carry no reference semantics and are preserved as they are.
+    let resolved_reference = |node: Node<'_, '_>| {
+        node.has_tag_name((XMLENC_NS, "CipherReference"))
+            || node.has_tag_name((XMLENC_NS, "DataReference"))
+            || node.has_tag_name((XMLENC_NS, "KeyReference"))
+            || node.has_tag_name((XMLDSIG_NS, "RetrievalMethod"))
+            || node.has_tag_name((XMLDSIG11_NS, "KeyInfoReference"))
+    };
     let resolver = UriReferenceResolver::with_id_registrations(&document, command.id_attributes);
     let dangling = document
         .descendants()
-        .filter(|node| inside(*node))
+        .filter(|node| inside(*node) && resolved_reference(*node))
         .find_map(|node| {
             let uri = node.attribute("URI")?;
             uri.strip_prefix('#')?;
