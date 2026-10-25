@@ -321,10 +321,12 @@ not in the template), else the first element in document order matching
 namespace URI only un-namespaced elements match), or the document element without
 either. An `Element` template replaces that element with the filled
 `EncryptedData`; a `Content` template replaces only its children. The result is
-the updated `DATA` document, so decryption restores it, and it must fit the XML
-document limit. Only the `EncryptedData` moves into `DATA`, so a template whose
-`EncryptedData` refers by `#id` or `#xpointer(...)` to other template nodes is
-rejected rather than producing output with a dangling reference.
+the updated `DATA` document, so decryption restores it, and it must satisfy the
+same XML input limits (size, depth, nodes, namespaces) that decryption applies.
+Only the `EncryptedData` moves into `DATA`, so a template whose `EncryptedData`
+refers by `#id` or `#xpointer(...)` to nodes outside itself is rejected rather
+than producing output with a dangling reference. A template without a default
+namespace keeps none when its new parent declares one (`xmlns=""` is added).
 `--session-key aes-128|aes-192|aes-256` names the content key that the
 template's `EncryptedKey` recipients transport. It must match the template's AES
 `EncryptionMethod`; the key is always freshly generated, with or without the option.

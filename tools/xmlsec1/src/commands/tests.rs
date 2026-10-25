@@ -2589,6 +2589,74 @@ fn xml_data_output_obeys_the_document_limit() {
 }
 
 #[test]
+fn xml_data_output_obeys_the_structural_limits() {
+    // Replacing a leaf at the depth limit with EncryptedData nests its children
+    // deeper than the policy allows; the assembled document must be refused.
+    let data = "<a><b><c/></b></a>";
+    let policy = EncryptionPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_depth: 3,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..EncryptionPolicy::default()
+    };
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let leaf = document
+        .descendants()
+        .find(|node| node.has_tag_name("c"))
+        .expect("the data has a leaf");
+    let template = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#;
+
+    let result = place_encrypted_data(&command, data, leaf, &EncryptedDataType::Element, template);
+    assert!(result.is_err(), "too deep output was produced: {result:?}");
+}
+
+#[test]
+fn xml_data_moved_template_keeps_its_absent_default_namespace() {
+    // Namespaces in XML 1.0 section 6.2: an unprefixed name takes the default
+    // namespace in scope. A template without one, moved under a data element
+    // that declares one, must keep its unprefixed names out of that namespace.
+    let data = r#"<Order xmlns="urn:order"><Payment>secret</Payment></Order>"#;
+    let template = r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"><xenc:CipherData><xenc:CipherValue>AAAA</xenc:CipherValue></xenc:CipherData><xenc:EncryptionProperties><xenc:EncryptionProperty><Audit/></xenc:EncryptionProperty></xenc:EncryptionProperties></xenc:EncryptedData>"#;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    let output = place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    )
+    .expect("the template moves into the data document");
+    let placed = parse_encryption_document(
+        &output,
+        policy.xml,
+        &policy.resources,
+        XmlBackend::default(),
+    )
+    .unwrap();
+    let audit = placed
+        .descendants()
+        .find(|node| node.tag_name().name() == "Audit")
+        .expect("the template metadata is preserved");
+    assert_eq!(audit.tag_name().namespace(), None, "{output}");
+    assert!(placed.root_element().has_tag_name(("urn:order", "Order")));
+}
+
+#[test]
 fn xml_data_template_references_resolve_xpointer_forms() {
     // Only EncryptedData moves into the data document, so an XPointer
     // reference to a node outside it would dangle exactly like a bare ID.
@@ -2602,6 +2670,8 @@ fn xml_data_template_references_resolve_xpointer_forms() {
     };
     assert!(ensure_self_contained(&filled("#xpointer(id('mechanism'))"), &command).is_err());
     assert!(ensure_self_contained(&filled("#mechanism"), &command).is_err());
+    // After the move, the whole template document is no longer what `/` selects.
+    assert!(ensure_self_contained(&filled("#xpointer(/)"), &command).is_err());
     ensure_self_contained(&filled("#xpointer(id('data'))"), &command)
         .expect("a reference inside EncryptedData stays resolvable");
 }

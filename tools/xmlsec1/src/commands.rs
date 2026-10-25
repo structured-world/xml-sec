@@ -3566,10 +3566,27 @@ fn place_encrypted_data(
         command.xml_backend,
     )?;
     // The template may declare namespaces on a wrapper; the moved element keeps them.
-    let filled = standalone_element(
-        rendered_template,
-        select_encrypted_data(&rendered, None, command.id_attributes)?,
-    )?;
+    let encrypted_data = select_encrypted_data(&rendered, None, command.id_attributes)?;
+    let mut filled = standalone_element(rendered_template, encrypted_data)?;
+    // An unprefixed name takes the default namespace in scope (Namespaces in XML 1.0,
+    // section 6.2). Without one in the template, the moved element undeclares the one
+    // its new parent provides, so its unprefixed descendants keep their expanded names.
+    let has_default = |node: Node<'_, '_>| {
+        node.namespaces()
+            .any(|namespace| namespace.name().is_none() && !namespace.uri().is_empty())
+    };
+    let context = match encrypted_type {
+        EncryptedDataType::Content => Some(target),
+        _ => target.parent_element(),
+    };
+    if !has_default(encrypted_data) && context.is_some_and(has_default) {
+        let name_end = filled[1..]
+            .find(|character: char| {
+                character.is_whitespace() || character == '>' || character == '/'
+            })
+            .map_or(filled.len(), |end| end + 1);
+        filled.insert_str(name_end, " xmlns=\"\"");
+    }
     ensure_self_contained(&filled, command)?;
     let (range, replacement) = match encrypted_type {
         EncryptedDataType::Content => replace_element_text(data, target, &filled)?,
@@ -3589,7 +3606,12 @@ fn place_encrypted_data(
     output.push_str(&data[..range.start]);
     output.push_str(&replacement);
     output.push_str(&data[range.end..]);
-    Ok(output)
+    // Both inputs passed their own checks, but the moved EncryptedData can still take
+    // the result past the depth, node or namespace limits; parse it under the full
+    // operation policy, as decryption will, and hand the same string back.
+    xml_sec::XmlDocument::parse_with_policy_and_backend(output, command.policy, command.xml_backend)
+        .map(xml_sec::XmlDocument::into_xml)
+        .map_err(|error| CommandError::Encryption(error.to_string()))
 }
 
 /// Only the filled `EncryptedData` moves into the data document (`xmlSecReplaceNode`), so a
@@ -3605,14 +3627,12 @@ fn ensure_self_contained(filled: &str, command: &EncryptCommand<'_>) -> Result<(
     let resolver = UriReferenceResolver::with_id_registrations(&document, command.id_attributes);
     let dangling = document.descendants().find_map(|node| {
         let uri = node.attribute("URI")?;
-        let fragment = uri.strip_prefix('#')?;
-        // XPointer fragments (`#xpointer(id('x'))`) are resolved by the same
-        // dereferencing the core uses for them; bare names are XML IDs.
-        let reachable = if fragment.contains('(') {
-            resolver.dereference(uri).is_ok()
-        } else {
-            resolver.node_for_id(fragment).is_some()
-        };
+        uri.strip_prefix('#')?;
+        // The same element resolution the core key-source parser uses, for bare IDs and
+        // `#xpointer(id('x'))` alike, without projecting the target's subtree per URI.
+        // `#xpointer(/)` names the document node, which after the move is the data
+        // document, so it is refused like any other target outside the moved element.
+        let reachable = matches!(resolver.node_for_same_document_reference(uri), Ok(Some(_)));
         (!reachable).then_some(uri)
     });
     match dangling {
