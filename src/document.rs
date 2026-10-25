@@ -1046,12 +1046,24 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<DocumentCell, XmlDocumentError> {
-        let (range, parent) = self.with_view(|view| {
+        let (range, parent, folded) = self.with_view(|view| {
             let node = view.resolve_mutation_node(target)?;
             if shape == ReplacementShape::SingleElement && !node.is_element() {
                 return Err(XmlDocumentError::TargetNotElement);
             }
-            Ok((node.range(), node.parent_element().map(Node::range)))
+            // Decoded lengths of the neighbouring text that replacement text
+            // folds into; the candidate keeps these values unchanged.
+            let text_len = |sibling: Option<Node<'_, '_>>| {
+                sibling
+                    .filter(Node::is_text)
+                    .and_then(Node::text)
+                    .map_or(0, str::len)
+            };
+            let folded = FoldedText {
+                before: text_len(node.prev_sibling()),
+                after: text_len(node.next_sibling()),
+            };
+            Ok((node.range(), node.parent_element().map(Node::range), folded))
         })?;
         let output = self.replaced_range(range.clone(), replacement, settings.max_bytes)?;
         let next = build_cell(output, settings, budget).map_err(|error| match error {
@@ -1068,7 +1080,7 @@ impl XmlDocument {
         let parent =
             parent.map(|parent| parent.start..parent.end - range.len() + replacement.len());
         next.with_dependent(|xml, parsed| {
-            validate_replacement_slot(xml, &parsed.document, slot, parent, shape)
+            validate_replacement_slot(xml, &parsed.document, slot, parent, folded, shape)
         })?;
         Ok(next)
     }
@@ -3703,6 +3715,13 @@ enum ReplacementShape {
     Fragment,
 }
 
+/// Decoded byte lengths of the text siblings around a replaced node.
+#[derive(Clone, Copy)]
+struct FoldedText {
+    before: usize,
+    after: usize,
+}
+
 /// Check on a parsed candidate that the bytes at `slot` are complete children
 /// of the parent (`None`: the document node) that held the replaced node.
 ///
@@ -3717,6 +3736,7 @@ fn validate_replacement_slot(
     document: &Document<'_>,
     slot: std::ops::Range<usize>,
     parent: Option<std::ops::Range<usize>>,
+    folded: FoldedText,
     shape: ReplacementShape,
 ) -> Result<(), XmlDocumentError> {
     let escaped = || {
@@ -3760,18 +3780,30 @@ fn validate_replacement_slot(
         }
         covered = covered.max(part.end);
         if part != range {
-            if !child.is_text() {
+            if !child.is_text() || !text_tokens_complete(&xml[part]) {
                 return Err(escaped());
             }
-            let complete = match shape {
-                ReplacementShape::SingleElement => blank(part),
-                ReplacementShape::Fragment => text_tokens_complete(&xml[part]),
-            };
-            if !complete {
-                return Err(match shape {
-                    ReplacementShape::SingleElement => not_single_element(),
-                    ReplacementShape::Fragment => escaped(),
-                });
+            if shape == ReplacementShape::SingleElement {
+                // With every token complete, the folded neighbours keep their
+                // decoded values, so the replacement's text is what remains
+                // between them.
+                let value = child.text().unwrap_or_default();
+                let start = if range.start < slot.start {
+                    folded.before
+                } else {
+                    0
+                };
+                let end = if range.end > slot.end {
+                    value.len().checked_sub(folded.after)
+                } else {
+                    Some(value.len())
+                };
+                let own = end
+                    .and_then(|end| value.get(start..end))
+                    .ok_or_else(escaped)?;
+                if !own.trim().is_empty() {
+                    return Err(not_single_element());
+                }
             }
         } else if child.is_element() {
             elements += 1;

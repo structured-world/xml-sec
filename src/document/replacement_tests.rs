@@ -50,6 +50,23 @@ fn element_replacement_accepts_one_element_with_markup_around_it() {
 }
 
 #[test]
+fn element_replacement_reads_folded_whitespace_by_value() {
+    // Whitespace written as a character reference or CDATA section is still
+    // whitespace when it folds into the neighbouring text.
+    for (replacement, expected) in [
+        ("&#32;<x/>", "<r>a&#32;<x/>b</r>"),
+        ("<![CDATA[ ]]><x/>", "<r>a<![CDATA[ ]]><x/>b</r>"),
+        ("<x/>&#x9;", "<r>a<x/>&#x9;b</r>"),
+    ] {
+        assert_eq!(
+            replaced(r#"<r>a<t ID="target"/>b</r>"#, replacement, false)
+                .unwrap_or_else(|error| panic!("{replacement:?}: {error:?}")),
+            expected
+        );
+    }
+}
+
+#[test]
 fn element_replacement_rejects_other_shapes() {
     // An Element replacement is exactly one element: no sibling element, no
     // character data, nothing that closes or reopens an ancestor.
