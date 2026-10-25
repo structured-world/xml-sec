@@ -331,6 +331,32 @@ pub(crate) fn canonicalize_bounded_with_xml_base_budget(
     Ok(())
 }
 
+/// [`canonicalize_bounded_with_xml_base_budget`] that also reports where each
+/// tracked element's start tag begins in `output`.
+#[cfg(feature = "xmldsig")]
+pub(crate) fn canonicalize_bounded_with_xml_base_budget_and_positions(
+    doc: &Document,
+    node_set: &dyn Fn(Node) -> bool,
+    algo: &C14nAlgorithm,
+    tracked_elements: &[NodeId],
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut Vec<u8>,
+) -> Result<Vec<(NodeId, usize)>, C14nError> {
+    let visibility = ClosureVisibility {
+        predicate: node_set,
+    };
+    canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
+        doc,
+        Some(&visibility),
+        algo,
+        tracked_elements,
+        max_output_bytes,
+        xml_base_resolution,
+        output,
+    )
+}
+
 /// Same bounded serializer for terminal streams and retained collecting output.
 /// The supplied initial offset preserves absolute positions for append callers.
 #[cfg(feature = "xmldsig")]
