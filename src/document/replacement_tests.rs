@@ -104,6 +104,39 @@ fn replacement_may_hold_references_that_expand_to_nothing() {
 }
 
 #[test]
+fn entity_expansions_count_toward_the_replacement_shape() {
+    // XML 1.0 section 4.4.2: markup in replacement text is recognized in the usual
+    // way, so an element an entity expands to is part of the replacement wherever
+    // the backend records its source range.
+    let xml = r#"<!DOCTYPE r [<!ENTITY extra '<y/>'>]><r>a<t ID="target"/>b</r>"#;
+    let backends = [
+        #[cfg(feature = "xml-backend-xmloxide")]
+        XmlBackend::Xmloxide,
+        #[cfg(feature = "xml-backend-roxmltree")]
+        XmlBackend::Roxmltree,
+    ];
+    for backend in backends {
+        for (replacement, accepted) in [("&extra;", true), ("<x/>&extra;", false)] {
+            let settings = DocumentParseSettings::new(
+                true,
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            )
+            .with_backend(backend);
+            let mut document =
+                XmlDocument::parse_with_settings(xml.to_owned(), settings).expect("fixture");
+            let target = target_of(&document);
+            let result = document.replace_element(target, replacement);
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "{backend:?} {replacement:?}: {result:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn element_replacement_rejects_other_shapes() {
     // An Element replacement is exactly one element: no sibling element, no
     // character data, nothing that closes or reopens an ancestor.

@@ -1079,10 +1079,64 @@ impl XmlDocument {
         let slot = range.start..range.start + replacement.len();
         let parent =
             parent.map(|parent| parent.start..parent.end - range.len() + replacement.len());
-        next.with_dependent(|xml, parsed| {
+        let checked = next.with_dependent(|xml, parsed| {
+            // The slot check reads source ranges. Nodes expanded from an internal DTD
+            // entity may carry a range inside the declaration instead of at their
+            // reference (roxmltree), so such documents parse the replacement inside
+            // a validation wrapper, which counts expansions where they occur. Without
+            // a DTD only predefined and character references expand, and their
+            // nodes keep the reference's own range.
+            if settings.allow_dtd
+                && !parsed
+                    .document
+                    .descendants()
+                    .all(Node::has_actionable_range)
+            {
+                return Ok(false);
+            }
             validate_replacement_slot(xml, &parsed.document, slot, parent, folded, shape)
+                .map(|()| true)
         })?;
+        if !checked {
+            self.validate_in_wrapper(target, replacement, shape, settings, budget)?;
+        }
         Ok(next)
+    }
+
+    /// Parse `replacement` inside a validation wrapper at the position of `target`,
+    /// then check its shape on the wrapper's children.
+    fn validate_in_wrapper(
+        &self,
+        target: NodeIdentity,
+        replacement: &str,
+        shape: ReplacementShape,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<(), XmlDocumentError> {
+        let range =
+            self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
+        let maximum = budget.map(|_| settings.nodes_limit as usize);
+        let (parsed, wrapper_range) =
+            self.parse_wrapped_range(range, replacement, maximum, settings, budget)?;
+        if shape == ReplacementShape::Fragment {
+            return Ok(());
+        }
+        parsed.with_dependent(|_, parsed| {
+            let wrapper = validation_wrapper(parsed, wrapper_range.clone())?;
+            if wrapper.children().filter(Node::is_element).count() != 1
+                || wrapper.children().any(|node| {
+                    !node.is_element()
+                        && !node.is_comment()
+                        && !node.is_pi()
+                        && node.text().is_none_or(|text| !text.trim().is_empty())
+                })
+            {
+                return Err(XmlDocumentError::InvalidReplacement(
+                    "element replacement must contain exactly one element".into(),
+                ));
+            }
+            Ok(())
+        })
     }
 
     /// Replace all children of one element with a well-formed XML fragment.
