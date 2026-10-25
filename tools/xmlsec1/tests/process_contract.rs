@@ -5322,42 +5322,52 @@ fn encryption_preserves_template_metadata_and_supports_id_selection() {
     );
 }
 
-#[test]
-fn encryption_node_id_selects_one_template_subtree() {
-    // --node-id selects the operation start node, not EncryptedData/@Id. The
-    // first descendant is filled and later templates remain untouched.
-    let temp = tempfile::tempdir().unwrap();
-    let template = temp.path().join("multiple-templates.xml");
-    let plaintext = temp.path().join("plaintext.bin");
+/// Encrypt `data` with the first `EncryptedData` of `template` under a fixed AES-128 key,
+/// selecting the data node by `--node-id`, and return the process output.
+fn encrypt_xml_data_node(
+    temp: &tempfile::TempDir,
+    template: &str,
+    data: &str,
+    node_id: &str,
+) -> std::process::Output {
+    let template_path = temp.path().join("template.xml");
+    let data_path = temp.path().join("data.xml");
     let key = temp.path().join("key.bin");
-    let encrypted_data = |id: &str| {
-        format!(
-            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="{id}" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#
-        )
-    };
-    fs::write(
-        &template,
-        format!(
-            "<Document><Envelope Id=\"first\">{}{}</Envelope><Envelope Id=\"second\">{}</Envelope></Document>",
-            encrypted_data("first-template"),
-            encrypted_data("later-first-subtree-template"),
-            encrypted_data("second-template")
-        ),
-    )
-    .unwrap();
-    fs::write(&plaintext, b"<selected>payload</selected>").unwrap();
+    fs::write(&template_path, template).unwrap();
+    fs::write(&data_path, data).unwrap();
     fs::write(&key, b"0123456789abcdef").unwrap();
-
-    let output = Command::new(binary())
+    Command::new(binary())
         .args(["encrypt", "--aes-key"])
         .arg(&key)
+        .args(["--id-attr:Id", "Payment", "--id-attr:Id", "Envelope"])
         .args(["--xml-data"])
-        .arg(&plaintext)
-        .args(["--node-id", "first"])
-        .arg(&template)
+        .arg(&data_path)
+        .args(["--node-id", node_id])
+        .arg(&template_path)
         .output()
-        .unwrap();
+        .unwrap()
+}
 
+fn aes128_gcm_template(id: &str, encrypted_type: &str) -> String {
+    format!(
+        r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="{id}" Type="http://www.w3.org/2001/04/xmlenc#{encrypted_type}"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData>"#
+    )
+}
+
+const PAYMENT_ORDER: &str = r#"<Order><Customer>alice</Customer><Payment Id="payment"><Card>4111</Card><Amount>10</Amount></Payment><Note>kept</Note></Order>"#;
+
+#[test]
+fn xml_data_node_id_encrypts_the_selected_element_in_place() {
+    // libxmlsec1 resolves --node-id in the --xml-data document, encrypts that element and
+    // writes the data document with EncryptedData in its place (apps/xmlsec.c,
+    // xmlSecAppEncryptTmpl and xmlSecAppXmlDataCreate); decryption restores the document.
+    let temp = tempfile::tempdir().unwrap();
+    let output = encrypt_xml_data_node(
+        &temp,
+        &aes128_gcm_template("generated", "Element"),
+        PAYMENT_ORDER,
+        "payment",
+    );
     assert!(
         output.status.success(),
         "{}",
@@ -5365,46 +5375,151 @@ fn encryption_node_id_selects_one_template_subtree() {
     );
     let encrypted = String::from_utf8(output.stdout).unwrap();
     let document = roxmltree::Document::parse(&encrypted).unwrap();
-    let values = document
-        .descendants()
-        .filter(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "CipherValue")))
-        .map(|node| node.text().unwrap_or_default())
+    let root = document.root_element();
+    assert!(root.has_tag_name("Order"));
+    let children = root
+        .children()
+        .filter(roxmltree::Node::is_element)
+        .map(|node| node.tag_name().name())
         .collect::<Vec<_>>();
-    assert_ne!(values[0].trim(), "");
-    assert_eq!(values[1].trim(), "");
-    assert_eq!(values[2].trim(), "");
+    assert_eq!(children, ["Customer", "EncryptedData", "Note"]);
+    assert!(
+        !encrypted.contains("4111"),
+        "the selected element must not stay in clear"
+    );
 
-    let missing = Command::new(binary())
-        .args(["encrypt", "--aes-key"])
-        .arg(&key)
-        .args(["--xml-data"])
-        .arg(&plaintext)
-        .args(["--node-id", "missing"])
-        .arg(&template)
+    let encrypted_path = temp.path().join("encrypted.xml");
+    fs::write(&encrypted_path, &encrypted).unwrap();
+    let decrypted = Command::new(binary())
+        .args(["decrypt", "--aes-key"])
+        .arg(temp.path().join("key.bin"))
+        .arg(&encrypted_path)
         .output()
         .unwrap();
+    assert!(
+        decrypted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&decrypted.stderr)
+    );
+    assert_eq!(String::from_utf8(decrypted.stdout).unwrap(), PAYMENT_ORDER);
+}
+
+#[test]
+fn xml_data_node_id_encrypts_only_the_selected_content() {
+    // A Content template replaces the selected element's children and keeps the element.
+    let temp = tempfile::tempdir().unwrap();
+    let output = encrypt_xml_data_node(
+        &temp,
+        &aes128_gcm_template("generated", "Content"),
+        PAYMENT_ORDER,
+        "payment",
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let encrypted = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&encrypted).unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the selected element remains");
+    assert_eq!(payment.attribute("Id"), Some("payment"));
+    let children = payment
+        .children()
+        .filter(roxmltree::Node::is_element)
+        .map(|node| node.tag_name().name())
+        .collect::<Vec<_>>();
+    assert_eq!(children, ["EncryptedData"]);
+    assert!(!encrypted.contains("4111"));
+}
+
+#[test]
+fn session_key_must_match_the_template_and_have_a_recipient() {
+    // libxmlsec1 scripts pass --session-key for EncryptedKey templates. It is accepted
+    // when it names the template's content key; a mismatched type or a template without
+    // a recipient to carry the generated key is a usage error before any output.
+    let temp = tempfile::tempdir().unwrap();
+    let data = temp.path().join("data.xml");
+    let certificate = project_root().join("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    fs::write(&data, PAYMENT_ORDER).unwrap();
+    let with_recipient = |algorithm: &str| {
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#{algorithm}"/><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><EncryptedKey xmlns="http://www.w3.org/2001/04/xmlenc#"><EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"/><CipherData><CipherValue/></CipherData></EncryptedKey></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>"#
+        )
+    };
+    let run = |template: &str, session_key: &str| {
+        let path = temp.path().join("template.xml");
+        fs::write(&path, template).unwrap();
+        Command::new(binary())
+            .args(["encrypt", "--pubkey-cert-pem"])
+            .arg(&certificate)
+            .args(["--session-key", session_key, "--xml-data"])
+            .arg(&data)
+            .arg(&path)
+            .output()
+            .unwrap()
+    };
+
+    let accepted = run(&with_recipient("aes256-gcm"), "aes-256");
+    assert!(
+        accepted.status.success(),
+        "{}",
+        String::from_utf8_lossy(&accepted.stderr)
+    );
+    for (template, session_key, message) in [
+        (with_recipient("aes256-gcm"), "aes-128", "does not match"),
+        (
+            with_recipient("aes256-gcm"),
+            "des-192",
+            "unsupported --session-key type",
+        ),
+        (
+            aes128_gcm_template("generated", "Element"),
+            "aes-128",
+            "requires an EncryptedKey",
+        ),
+    ] {
+        let rejected = run(&template, session_key);
+        assert!(!rejected.status.success(), "{session_key} must be refused");
+        assert!(rejected.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&rejected.stderr).contains(message),
+            "{}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+    }
+}
+
+#[test]
+fn encryption_template_is_the_first_encrypted_data_and_node_id_names_data() {
+    // The template is the first EncryptedData of its document; an ID that exists only in
+    // the template is absent from the data document and fails as it does in libxmlsec1.
+    let temp = tempfile::tempdir().unwrap();
+    let template = format!(
+        "<Document><Envelope Id=\"first\">{}</Envelope><Envelope Id=\"second\">{}</Envelope></Document>",
+        aes128_gcm_template("first-template", "Element"),
+        aes128_gcm_template("second-template", "Element"),
+    );
+    let output = encrypt_xml_data_node(&temp, &template, PAYMENT_ORDER, "payment");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let encrypted = String::from_utf8(output.stdout).unwrap();
+    let document = roxmltree::Document::parse(&encrypted).unwrap();
+    let data = document
+        .descendants()
+        .find(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData")))
+        .expect("the filled template replaces the selected element");
+    assert_eq!(data.attribute("Id"), Some("first-template"));
+    assert!(document.root_element().has_tag_name("Order"));
+
+    let missing = encrypt_xml_data_node(&temp, &template, PAYMENT_ORDER, "second");
     assert!(!missing.status.success());
     assert!(String::from_utf8_lossy(&missing.stderr).contains("missing or ambiguous"));
-
-    let duplicate = temp.path().join("duplicate-start.xml");
-    fs::write(
-        &duplicate,
-        fs::read_to_string(&template)
-            .unwrap()
-            .replace("Id=\"second\"", "Id=\"first\""),
-    )
-    .unwrap();
-    let ambiguous = Command::new(binary())
-        .args(["encrypt", "--aes-key"])
-        .arg(&key)
-        .args(["--xml-data"])
-        .arg(&plaintext)
-        .args(["--node-id", "first"])
-        .arg(&duplicate)
-        .output()
-        .unwrap();
-    assert!(!ambiguous.status.success());
-    assert!(String::from_utf8_lossy(&ambiguous.stderr).contains("missing or ambiguous"));
 }
 
 #[test]
@@ -5635,13 +5750,10 @@ fn xml_data_encrypts_the_parsed_document_node() {
             "{encrypted_type}: {}",
             String::from_utf8_lossy(&decryption.stderr)
         );
+        // The encrypted node is replaced in the data document, so decryption restores
+        // that document in both modes.
         let decrypted = String::from_utf8(decryption.stdout).unwrap();
-        let wrapped = if encrypted_type == "Element" {
-            decrypted
-        } else {
-            format!("<probe>{decrypted}</probe>")
-        };
-        let document = roxmltree::Document::parse(&wrapped)
+        let document = roxmltree::Document::parse(&decrypted)
             .expect("decrypted XML must preserve inherited namespace bindings");
         let value = document
             .descendants()
@@ -5705,10 +5817,11 @@ fn xml_data_content_preserves_cdata_as_text() {
         "{}",
         String::from_utf8_lossy(&decryption.stderr)
     );
+    // Content encryption keeps the data root and replaces only its children, as
+    // libxmlsec1 does, so decryption restores the whole data document.
     let decrypted = String::from_utf8(decryption.stdout).unwrap();
-    assert_eq!(decrypted, "<![CDATA[<secret/> & text]]>");
-    let wrapped = format!("<probe>{decrypted}</probe>");
-    let document = roxmltree::Document::parse(&wrapped)
+    assert_eq!(decrypted, "<wrapper><![CDATA[<secret/> & text]]></wrapper>");
+    let document = roxmltree::Document::parse(&decrypted)
         .expect("decrypted Content plaintext must remain well-formed XML content");
     let root = document.root_element();
     assert_eq!(root.text(), Some("<secret/> & text"));
@@ -7795,18 +7908,18 @@ fn mixed_named_and_unnamed_rsa_recipients_keep_distinct_key_identities() {
 
 #[test]
 fn encryption_node_id_accepts_namespaced_id_attributes() {
-    // CLI node selection shares local-name ID semantics with reference
-    // resolution, including profile-standard qualified wsu:Id attributes.
+    // Data-node selection shares local-name ID semantics with reference resolution,
+    // including profile-standard qualified wsu:Id attributes.
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("namespaced-node-id-template.xml");
-    let plaintext = temp.path().join("plaintext.bin");
+    let plaintext = temp.path().join("plaintext.xml");
     let aes_key = temp.path().join("aes.key");
+    fs::write(&template, aes128_gcm_template("generated", "Element")).unwrap();
     fs::write(
-        &template,
-        r#"<root xmlns:wsu="urn:wsu"><scope wsu:Id="target"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></scope></root>"#,
+        &plaintext,
+        r#"<root xmlns:wsu="urn:wsu"><scope wsu:Id="target"><selected>namespaced node ID</selected></scope></root>"#,
     )
     .unwrap();
-    fs::write(&plaintext, b"<selected>namespaced node ID</selected>").unwrap();
     fs::write(&aes_key, [7_u8; 16]).unwrap();
 
     let encrypt = Command::new(binary())
@@ -7823,24 +7936,27 @@ fn encryption_node_id_accepts_namespaced_id_attributes() {
         "{}",
         String::from_utf8_lossy(&encrypt.stderr)
     );
-    assert!(String::from_utf8_lossy(&encrypt.stdout).contains("wsu:Id=\"target\""));
+    let output = String::from_utf8(encrypt.stdout).unwrap();
+    assert!(output.starts_with("<root xmlns:wsu=\"urn:wsu\"><EncryptedData "));
+    assert!(!output.contains("namespaced node ID"));
 }
 
 #[test]
 fn global_id_attribute_selects_encrypt_and_decrypt_subtrees() {
     // --add-id-attr applies one local attribute name to every element, and the
-    // registration must survive both CLI-side template parsing and core decrypt.
+    // registration must select the data node for encryption and the EncryptedData
+    // start node for decryption. Content keeps the selected element in place.
     let temp = tempfile::tempdir().unwrap();
     let template = temp.path().join("custom-id-template.xml");
     let plaintext = temp.path().join("plaintext.xml");
     let encrypted = temp.path().join("encrypted.xml");
     let key = temp.path().join("aes.key");
+    fs::write(&template, aes128_gcm_template("generated", "Content")).unwrap();
     fs::write(
-        &template,
-        r#"<root><scope Token="target"><EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue/></CipherData></EncryptedData></scope></root>"#,
+        &plaintext,
+        b"<root><scope Token=\"target\"><secret>registered</secret></scope></root>",
     )
     .unwrap();
-    fs::write(&plaintext, b"<secret>registered</secret>").unwrap();
     fs::write(&key, b"0123456789abcdef").unwrap();
 
     let encrypt = Command::new(binary())

@@ -144,6 +144,7 @@ const ENCRYPT_OPTIONS: &[&str] = &[
     "node-xpath",
     "id-attr",
     "add-id-attr",
+    "session-key",
 ];
 const DECRYPT_OPTIONS: &[&str] = &[
     #[cfg(feature = "legacy-algorithms")]
@@ -3325,24 +3326,20 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let template = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
-    let metadata = encryption_template(
-        &template,
-        start_node_id,
-        &id_attributes,
-        &policy,
-        xml_backend,
+    // libxmlsec1 fills the first EncryptedData of the template and resolves --node-id in
+    // the --xml-data document (apps/xmlsec.c, xmlSecAppEncryptTmpl, xmlSecAppXmlDataCreate).
+    let metadata = encryption_template(&template, None, &id_attributes, &policy, xml_backend)?;
+    check_session_key(
+        invocation,
+        metadata.algorithm,
+        metadata.has_encrypted_key_recipient,
     )?;
     let algorithm = metadata.algorithm;
     let encrypted_type = metadata.encrypted_type;
     let explicit_xml_type = metadata.explicit_xml_type;
     let template_placement = metadata.placement;
     let mut builder = EncryptedDataBuilder::new(algorithm)
-        .provider(match provider.name() {
-            "rustcrypto" => std::sync::Arc::new(xml_sec::provider::RustCryptoProvider),
-            #[cfg(feature = "aws-lc-fips")]
-            "aws-lc-fips" => std::sync::Arc::new(xml_sec::provider::AwsLcFipsProvider),
-            name => return Err(CommandError::UnsupportedProvider(name.to_owned())),
-        })
+        .provider(shared_provider(provider)?)
         .policy(policy.clone())
         .xml_backend(xml_backend);
     if let Some(parameters) = metadata.chacha {
@@ -3351,7 +3348,7 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let command = EncryptCommand {
         invocation,
         template: &template,
-        start_node_id,
+        start_node_id: None,
         id_attributes: &id_attributes,
         policy: &policy,
         xml_backend,
@@ -3369,22 +3366,24 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
         },
     )?;
     builder = builder.encryption_type(encrypted_type.clone());
+    let data = invocation
+        .last_value("xml-data")
+        .map(|path| read_xml_data(path, maximum_document_bytes))
+        .transpose()?;
+    let data_document = data
+        .as_deref()
+        .map(|data| parse_encryption_document(data, policy.xml, &policy.resources, xml_backend))
+        .transpose()?;
+    let target = data_document
+        .as_ref()
+        .map(|document| xml_data_target(document, start_node_id, &id_attributes))
+        .transpose()?;
     let result = if let Some(path) = invocation.last_value("binary-data") {
-        if template_placement == EncryptionTemplatePlacement::Embedded {
-            return Err(CommandError::Usage(
-                "--binary-data requires a standalone EncryptedData template; embedded templates require --xml-data so decryption can replace XML".into(),
-            ));
-        }
-        if explicit_xml_type {
-            return Err(CommandError::Usage(
-                "--binary-data cannot be used with an XML Element or Content template Type".into(),
-            ));
-        }
+        ensure_binary_template(template_placement, explicit_xml_type)?;
         let data = read_plaintext(path, maximum_plaintext_bytes)?;
         builder.encrypt_binary(&data)
-    } else if let Some(path) = invocation.last_value("xml-data") {
-        let data = read_xml_data(path, maximum_document_bytes)?;
-        let plaintext = xml_data_plaintext(&data, &encrypted_type, &policy, xml_backend)?;
+    } else if let (Some(data), Some(target)) = (data.as_deref(), target) {
+        let plaintext = xml_data_plaintext(data, target, &encrypted_type, &policy)?;
         builder.encrypt_xml(plaintext.as_ref())
     } else {
         return Err(CommandError::Usage(
@@ -3395,11 +3394,19 @@ fn encrypt(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Comman
     let rendered = apply_encryption_template(
         &template,
         &result.encrypted_data_xml,
-        start_node_id,
+        None,
         &id_attributes,
         &policy,
         xml_backend,
     )?;
+    // The filled EncryptedData replaces the selected data node (Element) or its children
+    // (Content), and the data document is the result.
+    let rendered = match (data.as_deref(), target) {
+        (Some(data), Some(target)) => {
+            place_encrypted_data(&command, data, target, &encrypted_type, &rendered)?
+        }
+        _ => rendered,
+    };
     write_result_then_stdout_diagnostics(invocation, rendered.as_bytes(), stdout, |stdout| {
         write_encryption_diagnostics(invocation, algorithm, stdout)
     })
@@ -3415,32 +3422,105 @@ fn load_symmetric_with_budget(
     key_material::decode_symmetric(bytes, expected).map_err(CommandError::from)
 }
 
+fn shared_provider(
+    provider: &dyn xml_sec::provider::CryptoProvider,
+) -> Result<std::sync::Arc<dyn xml_sec::provider::CryptoProvider>, CommandError> {
+    Ok(match provider.name() {
+        "rustcrypto" => std::sync::Arc::new(xml_sec::provider::RustCryptoProvider),
+        #[cfg(feature = "aws-lc-fips")]
+        "aws-lc-fips" => std::sync::Arc::new(xml_sec::provider::AwsLcFipsProvider),
+        name => return Err(CommandError::UnsupportedProvider(name.to_owned())),
+    })
+}
+
+/// libxmlsec1 `--session-key` generates the content key of the named type, and the template's
+/// `EncryptedKey` recipients transport it. The content key is always fresh here, so the option
+/// only has to agree with the template algorithm and have a recipient to carry it.
+fn check_session_key(
+    invocation: &Invocation,
+    algorithm: DataEncryptionAlgorithm,
+    has_encrypted_key_recipient: bool,
+) -> Result<(), CommandError> {
+    let Some(spec) = option_text(invocation, "session-key")? else {
+        return Ok(());
+    };
+    let key_len = capabilities::generated_key_len(spec)
+        .ok_or_else(|| CommandError::Usage(format!("unsupported --session-key type: {spec}")))?;
+    if !algorithm.uri().contains("#aes") || key_len != algorithm.key_len() {
+        return Err(CommandError::Usage(format!(
+            "--session-key {spec} does not match the template EncryptionMethod {}",
+            algorithm.uri()
+        )));
+    }
+    if !has_encrypted_key_recipient {
+        return Err(CommandError::Usage(
+            "--session-key requires an EncryptedKey recipient in the template".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_binary_template(
+    placement: EncryptionTemplatePlacement,
+    explicit_xml_type: bool,
+) -> Result<(), CommandError> {
+    if placement == EncryptionTemplatePlacement::Embedded {
+        return Err(CommandError::Usage(
+            "--binary-data requires a standalone EncryptedData template; embedded templates require --xml-data so decryption can replace XML".into(),
+        ));
+    }
+    if explicit_xml_type {
+        return Err(CommandError::Usage(
+            "--binary-data cannot be used with an XML Element or Content template Type".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The --xml-data node libxmlsec1 encrypts: the `--node-id` element of the data document,
+/// or its root element (`apps/xmlsec.c`, `xmlSecAppXmlDataCreate`).
+fn xml_data_target<'a>(
+    document: &'a Document<'a>,
+    start_node_id: Option<&str>,
+    id_attributes: &[IdAttributeRegistration],
+) -> Result<Node<'a, 'a>, CommandError> {
+    let Some(id) = start_node_id else {
+        return Ok(document.root_element());
+    };
+    UriReferenceResolver::with_id_registrations(document, id_attributes)
+        .node_for_id(id)
+        .filter(Node::is_element)
+        .ok_or_else(|| {
+            CommandError::Encryption(format!("selected node ID is missing or ambiguous: {id}"))
+        })
+}
+
 fn xml_data_plaintext<'a>(
     xml: &'a str,
+    target: Node<'_, '_>,
     encrypted_type: &EncryptedDataType,
     policy: &EncryptionPolicy,
-    xml_backend: XmlBackend,
 ) -> Result<Cow<'a, str>, CommandError> {
-    // libxmlsec1 parses --xml-data into a document and passes its root node to
-    // xmlSecEncCtxXmlEncrypt. Element serializes that node; Content serializes
-    // only its children. The document declaration and boundary nodes therefore
-    // never become encrypted replacement plaintext.
-    let document = parse_encryption_document(xml, policy.xml, &policy.resources, xml_backend)?;
-    let root = document.root_element();
-    let element = &xml[root.range()];
+    // xmlSecEncCtxXmlEncrypt serializes the selected node for Element and only its
+    // children for Content. The document declaration and boundary nodes therefore never
+    // become encrypted replacement plaintext.
+    let maximum = policy.resources.max_encryption_plaintext_bytes;
     match encrypted_type {
-        EncryptedDataType::Element => {
-            ensure_plaintext_capacity(
-                0,
-                element.len(),
-                policy.resources.max_encryption_plaintext_bytes,
-            )?;
+        EncryptedDataType::Element if target.parent_element().is_none() => {
+            // The root has no ancestors, so its source text is already standalone.
+            let element = &xml[target.range()];
+            ensure_plaintext_capacity(0, element.len(), maximum)?;
             Ok(Cow::Borrowed(element))
         }
+        EncryptedDataType::Element => {
+            // A nested element carries the namespaces it inherits from its ancestors.
+            let mut element = String::with_capacity(target.range().len().min(maximum));
+            append_standalone_element(&mut element, xml, target, maximum)?;
+            Ok(Cow::Owned(element))
+        }
         EncryptedDataType::Content => {
-            let maximum = policy.resources.max_encryption_plaintext_bytes;
-            let mut content = String::with_capacity(element.len().min(maximum));
-            for child in root.children() {
+            let mut content = String::with_capacity(target.range().len().min(maximum));
+            for child in target.children() {
                 append_serialized_xml_child(&mut content, xml, child, maximum)?;
             }
             Ok(Cow::Owned(content))
@@ -3448,6 +3528,62 @@ fn xml_data_plaintext<'a>(
         EncryptedDataType::Other(_) => Err(CommandError::Encryption(
             "unsupported EncryptedData Type for XML data".into(),
         )),
+    }
+}
+
+/// Write `data` with the filled template `EncryptedData` in place of the selected node
+/// (Element) or of its children (Content), as `xmlSecEncCtxXmlEncrypt` replaces them.
+fn place_encrypted_data(
+    command: &EncryptCommand<'_>,
+    data: &str,
+    target: Node<'_, '_>,
+    encrypted_type: &EncryptedDataType,
+    rendered_template: &str,
+) -> Result<String, CommandError> {
+    let rendered = parse_encryption_document(
+        rendered_template,
+        command.policy.xml,
+        &command.policy.resources,
+        command.xml_backend,
+    )?;
+    // The template may declare namespaces on a wrapper; the moved element keeps them.
+    let filled = standalone_element(
+        rendered_template,
+        select_encrypted_data(&rendered, None, command.id_attributes)?,
+    )?;
+    ensure_self_contained(&filled, command)?;
+    let (range, replacement) = match encrypted_type {
+        EncryptedDataType::Content => replace_element_text(data, target, &filled)?,
+        _ => (target.range(), filled),
+    };
+    let mut output = String::with_capacity(data.len() - range.len() + replacement.len());
+    output.push_str(&data[..range.start]);
+    output.push_str(&replacement);
+    output.push_str(&data[range.end..]);
+    Ok(output)
+}
+
+/// Only the filled `EncryptedData` moves into the data document (`xmlSecReplaceNode`), so a
+/// same-document reference to another template node would dangle and the output could not
+/// be decrypted. Refuse it instead of writing that output.
+fn ensure_self_contained(filled: &str, command: &EncryptCommand<'_>) -> Result<(), CommandError> {
+    let document = parse_encryption_document(
+        filled,
+        command.policy.xml,
+        &command.policy.resources,
+        command.xml_backend,
+    )?;
+    let resolver = UriReferenceResolver::with_id_registrations(&document, command.id_attributes);
+    let dangling = document.descendants().find_map(|node| {
+        let id = node.attribute("URI")?.strip_prefix('#')?;
+        // XPointer fragments are expressions, not bare IDs.
+        (!id.contains('(') && resolver.node_for_id(id).is_none()).then_some(id)
+    });
+    match dangling {
+        Some(id) => Err(CommandError::Encryption(format!(
+            "template EncryptedData references #{id} outside itself; with --xml-data only the EncryptedData moves into the data document"
+        ))),
+        None => Ok(()),
     }
 }
 

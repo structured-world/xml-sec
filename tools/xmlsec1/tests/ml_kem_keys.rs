@@ -249,18 +249,12 @@ fn kem_encryption_template(directory: &std::path::Path, size: u16) -> std::path:
 
 /// Decrypt our CLI's ciphertext with the independent oracle, when enabled.
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
-fn oracle_decrypts_kem_output(directory: &std::path::Path, size: u16, encrypted: &std::path::Path) {
+fn oracle_decrypts_kem_output(size: u16, encrypted: &std::path::Path) {
     let Some(oracle) = std::env::var_os("XMLSEC1_BIN") else {
         return;
     };
-    // libxmlsec1 replaces Type=Content in the owning XML document,
-    // unlike our byte-returning CLI. Supply its actual parent context:
-    // top-level text alone cannot be serialized as an XML document.
-    let oracle_input = directory.join(format!("oracle-{size}.xml"));
-    let encrypted_xml = std::fs::read_to_string(encrypted).unwrap();
-    let element = &encrypted_xml[encrypted_xml.find("<EncryptedData").unwrap()
-        ..encrypted_xml.find("</EncryptedData>").unwrap() + "</EncryptedData>".len()];
-    std::fs::write(&oracle_input, format!("<test>{element}</test>")).unwrap();
+    // Both CLIs replace Type=Content inside the owning data document, so the oracle
+    // decrypts our output file unchanged.
     let raw = fixture_path(&format!("xmldsig/keys/ml-kem/ml-kem-{size}-key.pem"));
     let output = std::process::Command::new(oracle)
         .args([
@@ -270,7 +264,7 @@ fn oracle_decrypts_kem_output(directory: &std::path::Path, size: u16, encrypted:
             &format!("--privkey-pem:TestKeyName-ml-kem-{size}"),
         ])
         .arg(raw)
-        .arg(&oracle_input)
+        .arg(encrypted)
         .output()
         .unwrap();
     assert!(
@@ -320,10 +314,13 @@ fn cli_establishes_keys_for_sign_verify_encrypt_decrypt() {
             decrypted.as_os_str(),
             encrypted.as_os_str(),
         ]);
-        // These donor templates specify Type=Content, so the wrapper element
-        // is not part of the encrypted/decrypted payload.
-        assert_eq!(std::fs::read(decrypted).unwrap(), b"ML-KEM CLI plaintext");
-        oracle_decrypts_kem_output(directory, size, &encrypted);
+        // These donor templates specify Type=Content: like libxmlsec1, encryption keeps
+        // the data root and decryption restores the whole data document.
+        assert_eq!(
+            std::fs::read(decrypted).unwrap(),
+            b"<test>ML-KEM CLI plaintext</test>"
+        );
+        oracle_decrypts_kem_output(size, &encrypted);
     }
 }
 
@@ -2022,9 +2019,11 @@ fn all_donor_key_formats_preserve_the_exact_key_pair() {
 
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
 #[test]
-fn cli_encrypts_referenced_recipient_metadata() {
-    // Both levels of reference must select the named key and mutate the same
-    // mechanism. A wrong first store entry exposes lost recipient names.
+fn cli_refuses_xml_data_template_with_referenced_recipient_metadata() {
+    // With --xml-data only the filled EncryptedData moves into the data document, as
+    // libxmlsec1's xmlSecReplaceNode does. Mechanism metadata referenced from elsewhere
+    // in the template would dangle, so the CLI refuses instead of writing output that
+    // no implementation can decrypt.
     use base64::Engine as _;
     use std::fmt::Write as _;
     let directory = tempfile::tempdir().unwrap();
@@ -2046,29 +2045,13 @@ fn cli_encrypts_referenced_recipient_metadata() {
     let template = directory.path().join("template.xml");
     let plaintext = directory.path().join("plaintext.xml");
     let encrypted = directory.path().join("encrypted.xml");
-    let private = directory.path().join("private.der");
-    std::fs::write(
-        &private,
-        wanted
-            .to_pkcs8_der(MlKemPrivateKeyEncoding::Seed)
-            .unwrap()
-            .as_bytes(),
-    )
-    .unwrap();
     std::fs::write(&plaintext, "<message>referenced recipient</message>").unwrap();
     std::fs::write(&template, format!(
         "<root xmlns:x=\"http://www.w3.org/2001/04/xmlenc#\" xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:i=\"http://www.w3.org/2009/xmldsig11#\" xmlns:k=\"{}\"><x:EncryptedData Id=\"data\"><x:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes128-gcm\"/><d:KeyInfo><i:KeyInfoReference URI=\"#mechanism\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></x:EncryptedData><d:KeyInfo Id=\"mechanism\"><k:EncapsulationMechanism Algorithm=\"{}\"><d:KeyInfo><i:KeyInfoReference URI=\"#recipient\"/></d:KeyInfo><x:CipherData><x:CipherValue/></x:CipherData></k:EncapsulationMechanism></d:KeyInfo><d:KeyInfo custom=\"recipient\"><d:KeyName>wanted</d:KeyName></d:KeyInfo></root>",
         xml_sec::key_establishment::ENCAPSULATION_NS, algorithm.uri(),
     )).unwrap();
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-        .args([
-            "encrypt",
-            "--node-id",
-            "data",
-            "--add-id-attr",
-            "custom",
-            "--keys-file",
-        ])
+        .args(["encrypt", "--add-id-attr", "custom", "--keys-file"])
         .arg(&store)
         .arg("--xml-data")
         .arg(&plaintext)
@@ -2077,42 +2060,13 @@ fn cli_encrypts_referenced_recipient_metadata() {
         .arg(&template)
         .output()
         .unwrap();
+    assert!(!result.status.success());
     assert!(
-        result.status.success(),
+        String::from_utf8_lossy(&result.stderr).contains("references #mechanism outside itself"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"))
-        .args([
-            "decrypt",
-            "--node-id",
-            "data",
-            "--add-id-attr",
-            "custom",
-            "--pkcs8-der:wanted",
-        ])
-        .arg(&private)
-        .arg(&encrypted)
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let output = String::from_utf8(result.stdout).unwrap();
-    let document = xml_sec::XmlDomDocument::parse(&output).unwrap();
-    let message = document
-        .root_element()
-        .children()
-        .find(|node| node.has_tag_name("message"))
-        .unwrap();
-    assert_eq!(message.text(), Some("referenced recipient"));
-    assert!(
-        !document
-            .descendants()
-            .any(|node| node.has_tag_name(("http://www.w3.org/2001/04/xmlenc#", "EncryptedData")))
-    );
+    assert!(!encrypted.exists(), "a refused encryption writes no output");
 }
 
 /// The CLI must refuse this encryption template before creating output;

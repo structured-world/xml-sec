@@ -314,6 +314,17 @@ accepts both standalone `EncryptedData` and encrypted elements embedded in a
 larger XML document; `--node-id` selects an ID-bearing operation start node and
 then operates on the first `EncryptedData` descendant in document order, matching
 the donor command's selection behavior.
+`encrypt --xml-data DATA` fills the first `EncryptedData` of the template and
+encrypts a node of `DATA`: the element named by `--node-id` (resolved in `DATA`,
+not in the template), or the document element without it. An `Element` template
+replaces that element with the filled `EncryptedData`; a `Content` template
+replaces only its children. The result is the updated `DATA` document, so
+decryption restores it. Only the `EncryptedData` moves into `DATA`, so a template
+whose `EncryptedData` refers by `#id` to other template nodes is rejected rather
+than producing output with a dangling reference.
+`--session-key aes-128|aes-192|aes-256` names the content key that the
+template's `EncryptedKey` recipients transport. It must match the template's AES
+`EncryptionMethod`; the key is always freshly generated, with or without the option.
 Encryption preserves the template's `Id`, `Type`, `MimeType`, existing `KeyInfo`
 metadata, `EncryptionProperties`, and RSA-OAEP parameters. It may populate an
 empty `KeyInfo` placeholder with generated key or recipient metadata while

@@ -846,6 +846,70 @@ fn cipher_reference_has_reciprocal_libxmlsec1_interoperability() {
     );
 }
 
+/// The document without the XML declaration and trailing newline libxmlsec1 adds on output.
+fn document_body(output: &[u8]) -> String {
+    let text = String::from_utf8(output.to_vec()).expect("UTF-8 output");
+    let body = match text.strip_prefix("<?xml") {
+        Some(rest) => rest[rest.find("?>").expect("closed declaration") + 2..].to_owned(),
+        None => text,
+    };
+    body.trim().to_owned()
+}
+
+#[test]
+fn element_encryption_in_place_has_reciprocal_libxmlsec1_interoperability() {
+    // `encrypt --xml-data DOC --node-id ID` encrypts that element inside DOC and writes DOC,
+    // with RSA-OAEP key transport of a fresh AES-256-GCM key; each CLI decrypts the other's
+    // output back to the original document.
+    require_key_establishment_oracle();
+    let order = r#"<Order><Customer>alice</Customer><Payment Id="payment"><Card>4111</Card></Payment><Note>kept</Note></Order>"#;
+    let template = TemporaryFile::write("element-template", "xml", br#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><xenc:EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes256-gcm"/><ds:KeyInfo xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm="http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/></xenc:EncryptionMethod><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>"#);
+    let data = TemporaryFile::write("element-order", "xml", order.as_bytes());
+    let certificate = fixture_name!("tests/fixtures/keys/rsa/rsa-2048-cert.pem");
+    let private = fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let encrypt = |command: &mut std::process::Command, output: &Path| {
+        command
+            .args(["encrypt", "--pubkey-cert-pem:recipient", certificate])
+            .args(["--session-key", "aes-256", "--id-attr:Id", "Payment"])
+            .arg("--xml-data")
+            .arg(&data.path)
+            .args(["--node-id", "payment", "--output"])
+            .arg(output)
+            .arg(&template.path);
+    };
+    let decrypt = |command: &mut std::process::Command, input: &Path| {
+        command
+            .args(["decrypt", "--privkey-pem:recipient", private])
+            .arg(input);
+    };
+    let run = |command: &mut std::process::Command| {
+        let output = command.output().expect("CLI runs");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+
+    let ours = TemporaryFile::path("element-ours", "xml");
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"));
+    encrypt(&mut command, &ours.path);
+    run(&mut command);
+    assert!(!fs::read_to_string(&ours.path).unwrap().contains("4111"));
+    let mut command = xmlsec1::command();
+    decrypt(&mut command, &ours.path);
+    assert_eq!(document_body(&run(&mut command)), order);
+
+    let donor = TemporaryFile::path("element-donor", "xml");
+    let mut command = xmlsec1::command();
+    encrypt(&mut command, &donor.path);
+    run(&mut command);
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_xmlsec1"));
+    decrypt(&mut command, &donor.path);
+    assert_eq!(document_body(&run(&mut command)), order);
+}
+
 const KDF_SECRET: &[u8] = b"xml-sec public interoperability test secret";
 const KDF_PLAINTEXT: &[u8] = b"independent XML key derivation interoperability";
 

@@ -997,7 +997,8 @@ fn cli_lax_store_encryption_preserves_policy_denial() {
     let mut decrypted = Vec::new();
     execute(&invocation(&decrypt_args), &mut decrypted, &mut Vec::new())
         .expect("strict decryption uses the fallback recipient name");
-    assert_eq!(decrypted, b"lax RSA fallback payload");
+    // Content encryption keeps the data root, so decryption restores the data document.
+    assert_eq!(decrypted, b"<root>lax RSA fallback payload</root>");
 }
 
 #[test]
@@ -2522,12 +2523,16 @@ fn xml_content_serialization_enforces_the_plaintext_limit_while_rendering() {
         ..EncryptionPolicy::default()
     };
 
+    let document =
+        parse_encryption_document(xml, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+
     assert!(matches!(
         xml_data_plaintext(
             xml,
+            document.root_element(),
             &EncryptedDataType::Content,
             &policy,
-            XmlBackend::default(),
         ),
         Err(CommandError::PlaintextTooLarge { maximum: 32 })
     ));
