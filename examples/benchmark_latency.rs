@@ -65,88 +65,110 @@ fn measure(
     (start.elapsed().as_nanos(), std::hint::black_box(bytes))
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.len() == 2 && args[0] == "--export" {
-        let directory = std::path::Path::new(&args[1]);
-        std::fs::create_dir(directory)?;
+/// Report-only `f64` from two exact 32-bit limbs with a single rounding.
+fn real<T>(value: T) -> f64
+where
+    u64: TryFrom<T>,
+    <u64 as TryFrom<T>>::Error: std::fmt::Debug,
+{
+    let bytes = u64::try_from(value)
+        .expect("benchmark counters fit 64 bits")
+        .to_le_bytes();
+    let low = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let high = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    f64::from(high) * 4_294_967_296.0 + f64::from(low)
+}
+
+/// Write the shared keys, templates and cases consumed by external CLIs.
+fn export(directory: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    std::fs::create_dir(directory)?;
+    std::fs::write(
+        directory.join("private.pem"),
+        include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+    )?;
+    std::fs::write(
+        directory.join("public.pem"),
+        include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+    )?;
+    let aes = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42; 32]);
+    std::fs::write(
+        directory.join("keys.xml"),
+        format!(
+            "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{aes}</AESKeyValue></KeyValue></KeyInfo></Keys>"
+        ),
+    )?;
+    std::fs::write(
+        directory.join("encryption.xml"),
+        "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
+    )?;
+    let mut cases = Vec::new();
+    for spec in support::specs().filter(|s| {
+        matches!(s.engine, Engine::RustCrypto)
+            && s.backend == XmlBackend::Xmloxide
+            && [0, 1, 2, 3, 7].contains(&s.shape)
+    }) {
+        let fixture = Fixture::new(spec);
+        let name = format!("{}-{}", SHAPES[spec.shape], spec.units);
+        // A named, caller-supplied key avoids differing CLI defaults for
+        // missing KeyInfo; KeyInfo is outside the signed payload/SignedInfo.
+        let key_info = "<ds:KeyInfo><ds:KeyName>bench</ds:KeyName></ds:KeyInfo></ds:Signature>";
         std::fs::write(
-            directory.join("private.pem"),
-            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+            directory.join(format!("{name}.template.xml")),
+            fixture.template.replace("</ds:Signature>", key_info),
         )?;
         std::fs::write(
-            directory.join("public.pem"),
-            include_bytes!("../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+            directory.join(format!("{name}.signed.xml")),
+            fixture.signed.replace("</ds:Signature>", key_info),
         )?;
-        let aes = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [0x42; 32]);
+        // All CLIs receive the same octets, not different XML reserializations.
         std::fs::write(
-            directory.join("keys.xml"),
-            format!(
-                "<Keys xmlns=\"http://www.aleksey.com/xmlsec/2002\"><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName><KeyValue><AESKeyValue xmlns=\"http://www.aleksey.com/xmlsec/2002\">{aes}</AESKeyValue></KeyValue></KeyInfo></Keys>"
-            ),
+            directory.join(format!("{name}.plain.xml")),
+            format!("<?xml version=\"1.0\"?>{}", fixture.unsigned),
         )?;
-        std::fs::write(
-            directory.join("encryption.xml"),
-            "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
-        )?;
-        let mut cases = Vec::new();
-        for spec in support::specs().filter(|s| {
-            matches!(s.engine, Engine::RustCrypto)
-                && s.backend == XmlBackend::Xmloxide
-                && [0, 1, 2, 3, 7].contains(&s.shape)
-        }) {
-            let fixture = Fixture::new(spec);
-            let name = format!("{}-{}", SHAPES[spec.shape], spec.units);
-            // A named, caller-supplied key avoids differing CLI defaults for
-            // missing KeyInfo; KeyInfo is outside the signed payload/SignedInfo.
-            let key_info = "<ds:KeyInfo><ds:KeyName>bench</ds:KeyName></ds:KeyInfo></ds:Signature>";
-            std::fs::write(
-                directory.join(format!("{name}.template.xml")),
-                fixture.template.replace("</ds:Signature>", key_info),
-            )?;
-            std::fs::write(
-                directory.join(format!("{name}.signed.xml")),
-                fixture.signed.replace("</ds:Signature>", key_info),
-            )?;
-            // All CLIs receive the same octets, not different XML reserializations.
-            std::fs::write(
-                directory.join(format!("{name}.plain.xml")),
-                format!("<?xml version=\"1.0\"?>{}", fixture.unsigned),
-            )?;
-            cases.push(
-                serde_json::json!({"name": name, "shape": SHAPES[spec.shape], "units": spec.units}),
+        cases.push(
+            serde_json::json!({"name": name, "shape": SHAPES[spec.shape], "units": spec.units}),
+        );
+    }
+    std::fs::write(
+        directory.join("cases.json"),
+        serde_json::to_vec_pretty(&cases)?,
+    )?;
+    Ok(())
+}
+
+/// Print every measurable operation, shape, backend and provider combination.
+fn list() {
+    for spec in support::specs() {
+        let backend = match spec.backend {
+            XmlBackend::Xmloxide => "xmloxide",
+            XmlBackend::Roxmltree => "roxmltree",
+            XmlBackend::Differential => "differential",
+        };
+        let provider = match spec.engine {
+            Engine::RustCrypto => "rustcrypto",
+            #[cfg(feature = "aws-lc-fips")]
+            Engine::AwsLcFips => "aws-lc-fips",
+        };
+        for operation in OPERATIONS.into_iter().chain(PHASES) {
+            if operation == "projection" && spec.backend == XmlBackend::Differential {
+                continue;
+            }
+            println!(
+                "{operation} {} {} {backend} {provider}",
+                SHAPES[spec.shape], spec.units
             );
         }
-        std::fs::write(
-            directory.join("cases.json"),
-            serde_json::to_vec_pretty(&cases)?,
-        )?;
-        return Ok(());
     }
-    if args == ["--list"] {
-        for spec in support::specs() {
-            let backend = match spec.backend {
-                XmlBackend::Xmloxide => "xmloxide",
-                XmlBackend::Roxmltree => "roxmltree",
-                XmlBackend::Differential => "differential",
-            };
-            let provider = match spec.engine {
-                Engine::RustCrypto => "rustcrypto",
-                #[cfg(feature = "aws-lc-fips")]
-                Engine::AwsLcFips => "aws-lc-fips",
-            };
-            for operation in OPERATIONS.into_iter().chain(PHASES) {
-                if operation == "projection" && spec.backend == XmlBackend::Differential {
-                    continue;
-                }
-                println!(
-                    "{operation} {} {} {backend} {provider}",
-                    SHAPES[spec.shape], spec.units
-                );
-            }
-        }
-        return Ok(());
-    }
+}
+
+/// One validated measurement request from the command line.
+struct Request<'a> {
+    operation: &'a str,
+    spec: Spec,
+    samples: usize,
+}
+
+fn parse_request(args: &[String]) -> Result<Request<'_>, Box<dyn Error>> {
     if args.len() != 6 {
         return Err("usage: benchmark_latency <operation> <shape> <units> <backend> <provider> <samples> (or --list)".into());
     }
@@ -181,12 +203,34 @@ fn main() -> Result<(), Box<dyn Error>> {
     if !(1..=100_000).contains(&samples) {
         return Err("samples must be 1..=100000".into());
     }
-    let fixture = Fixture::new(Spec {
-        shape,
-        units,
-        backend,
-        engine,
-    });
+    Ok(Request {
+        operation,
+        spec: Spec {
+            shape,
+            units,
+            backend,
+            engine,
+        },
+        samples,
+    })
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "--export" {
+        return export(std::path::Path::new(&args[1]));
+    }
+    if args == ["--list"] {
+        list();
+        return Ok(());
+    }
+    let Request {
+        operation,
+        spec,
+        samples,
+    } = parse_request(&args)?;
+    let (units, backend) = (spec.units, spec.backend);
+    let fixture = Fixture::new(spec);
     let projection = if operation == "projection" {
         Some(xml_sec::benchmark_support::Projection::new(
             &fixture.unsigned,
@@ -223,7 +267,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         fixture.input_bytes(operation)
     };
     let amplification = if ["c14n", "sign", "encrypt", "decrypt"].contains(&operation) {
-        Some(output_bytes as f64 / input_bytes as f64)
+        Some(real(output_bytes) / real(input_bytes))
     } else {
         None
     };
@@ -238,8 +282,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             "validation_included": true, "input_bytes": input_bytes, "output_bytes": output_bytes,
             "output_amplification": amplification, "p50_ns": percentile(&timings, 50),
             "p95_ns": percentile(&timings, 95), "p99_ns": percentile(&timings, 99), "raw_ns": raw,
-            "operations_per_second": samples as f64 * 1e9 / total as f64,
-            "input_bytes_per_second": input_bytes as f64 * samples as f64 * 1e9 / total as f64
+            "operations_per_second": real(samples) * 1e9 / real(total),
+            "input_bytes_per_second": real(input_bytes) * real(samples) * 1e9 / real(total)
         })
     );
     Ok(())

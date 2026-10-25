@@ -34,7 +34,7 @@ fn documented_schema_sample_restricts_and_round_trips() {
             .compile("effective", &RustCryptoProvider, &context, None)
             .unwrap();
         assert_eq!(restored.to_toml().unwrap(), text);
-        assert!(effective.diff(&restored).is_empty());
+        assert_eq!(effective.diff(&restored), []);
     }
     // A plausible child ceiling cannot undo inherited restrictions.
     let wider = source.replace("max_xml_nodes = 1000\n", "max_xml_nodes = 20000\n");

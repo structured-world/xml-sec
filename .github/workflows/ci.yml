@@ -41,14 +41,10 @@ jobs:
         with:
           domain: ordinary
       - run: node --test scripts/check-hardening.test.mjs
-      - run: node --test scripts/check-xml-kernels.test.mjs scripts/check-xslt.test.mjs scripts/check-security.test.mjs
       - run: node --test scripts/ci-test-blocks.test.mjs scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
       - run: node scripts/security-corpus.mjs --check
       - run: bash scripts/check-hardening.sh dependencies
       - run: bash scripts/check-hardening.sh safety
-      - run: node scripts/check-xml-kernels.mjs
-      - run: node scripts/check-xslt.mjs
-      - run: node scripts/check-security.mjs
 
   coverage:
     name: canonical line coverage (85%)
@@ -283,11 +279,12 @@ jobs:
         with:
           toolchain: "1.92.0"
           targets: thumbv7em-none-eabihf,wasm32-unknown-unknown
+          components: clippy
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: alloc-targets
           save: 'true'
-      - run: cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
+      - run: cargo +1.92.0 clippy -p xml-sec-xml-input --lib --no-default-features -- -D warnings
       - run: >-
           cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf

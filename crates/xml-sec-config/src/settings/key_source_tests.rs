@@ -13,9 +13,18 @@ fn all_key_source_subsets_preserve_the_toml_contract() {
         ("key_info_reference", KeySourceKind::KeyInfoReference),
     ];
     for subset in 0_u8..64 {
-        let expected = Value::Table(Table::from_iter(fields.iter().enumerate().map(
-            |(index, (name, _))| (name.to_string(), Value::Boolean(subset & (1 << index) != 0)),
-        )));
+        let expected = Value::Table(
+            fields
+                .iter()
+                .enumerate()
+                .map(|(index, (name, _))| {
+                    (
+                        (*name).to_string(),
+                        Value::Boolean(subset & (1 << index) != 0),
+                    )
+                })
+                .collect(),
+        );
         let mut policy = KeySourcePolicy::ALL;
         key_sources(&mut policy, &expected).unwrap();
         for (index, (_, kind)) in fields.iter().enumerate() {

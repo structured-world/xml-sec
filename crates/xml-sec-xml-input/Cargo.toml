@@ -16,3 +16,6 @@ std = ["thiserror/std", "xmlparser/std"]
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
 xmlparser = { version = "0.13.6", default-features = false }
+
+[lints]
+workspace = true

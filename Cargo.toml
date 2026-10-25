@@ -44,6 +44,15 @@ members = [
 ]
 resolver = "3"
 
+# Every member inherits one lint contract, so each existing clippy run in CI
+# enforces it on its own toolchain and feature graph.
+[workspace.lints.rust]
+# Sources shared through `#[path]` test features that only some members declare.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded", "raw-pointer-backend", "__internal_expose_string_pool"))'] }
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
 # The complete libxslt oracle includes multi-megabyte DocBook transforms. Keep
 # production-equivalent XSLT/XPath code generation in the test profile so the
 # per-case watchdog measures algorithmic stalls rather than debug arithmetic.
@@ -309,5 +318,5 @@ experimental-pq = ["xmldsig", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ct
 no-unsafe = []
 embedded = []
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("raw-pointer-backend", "__internal_expose_string_pool"))'] }
+[lints]
+workspace = true

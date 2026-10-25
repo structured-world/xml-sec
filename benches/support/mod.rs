@@ -1,6 +1,6 @@
 //! Shared deterministic workloads and correctness checks for every measurement mode.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, sync::Arc};
 use xml_sec::{
     XmlBackend, XmlDocument,
     c14n::{C14nAlgorithm, C14nMode, canonicalize_document},
@@ -91,18 +91,18 @@ fn body(shape: usize, units: usize) -> String {
         "saml" => {
             xml.push_str("<saml:Assertion xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" Version=\"2.0\"><saml:Subject><saml:NameID>benchmark@example.invalid</saml:NameID></saml:Subject><saml:AttributeStatement>");
             for i in 0..units {
-                xml.push_str(&format!("<saml:Attribute Name=\"attribute-{i}\"><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>"));
+                write!(xml, "<saml:Attribute Name=\"attribute-{i}\"><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>").expect("writing to a String cannot fail");
             }
             xml.push_str("</saml:AttributeStatement></saml:Assertion>");
         }
         "namespaces" => {
             for i in 0..units {
-                xml.push_str(&format!("<n:v xmlns:n=\"urn:bench:{i}\" xmlns:a=\"urn:attribute:{i}\" a:x=\"v\"><n:child/></n:v>"));
+                write!(xml, "<n:v xmlns:n=\"urn:bench:{i}\" xmlns:a=\"urn:attribute:{i}\" a:x=\"v\"><n:child/></n:v>").expect("writing to a String cannot fail");
             }
         }
         "attributes" => {
             for i in 0..units {
-                xml.push_str(&format!("<v a=\"{i}\" b=\"value\" c=\"&amp;&quot;&#xA;\" d=\"4\" e=\"5\" f=\"6\" g=\"7\" h=\"8\"/>"));
+                write!(xml, "<v a=\"{i}\" b=\"value\" c=\"&amp;&quot;&#xA;\" d=\"4\" e=\"5\" f=\"6\" g=\"7\" h=\"8\"/>").expect("writing to a String cannot fail");
             }
         }
         "bulk" => {
@@ -124,6 +124,92 @@ fn body(shape: usize, units: usize) -> String {
     }
     xml.push_str("</Payload></Envelope>");
     xml
+}
+
+/// The provider and its RSA-2048 signing key for one measured engine.
+fn engine_signer(engine: Engine) -> (Arc<dyn CryptoProvider>, Box<dyn SigningKey>) {
+    match engine {
+        Engine::RustCrypto => (
+            Arc::new(RustCryptoProvider),
+            Box::new(
+                RsaSigningKey::from_pkcs8_pem(include_str!(
+                    "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+                ))
+                .expect("test key"),
+            ),
+        ),
+        #[cfg(feature = "aws-lc-fips")]
+        Engine::AwsLcFips => {
+            let der = pem::parse(include_str!(
+                "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
+            ))
+            .expect("test PEM")
+            .into_contents();
+            (
+                Arc::new(xml_sec::provider::AwsLcFipsProvider),
+                Box::new(
+                    xml_sec::provider::AwsLcSigningKey::from_pkcs8_der(
+                        SignatureAlgorithm::RsaSha256,
+                        &der,
+                    )
+                    .expect("native test key"),
+                ),
+            )
+        }
+    }
+}
+
+/// `signed` with the first `SignatureValue` character flipped: still XML, never valid.
+fn corrupted_signature(signed: &str, backend: XmlBackend) -> XmlDocument {
+    let mut corrupted = signed.to_owned();
+    let offset = corrupted
+        .find("<ds:SignatureValue>")
+        .expect("signature value")
+        + "<ds:SignatureValue>".len();
+    let replacement = if corrupted.as_bytes()[offset] == b'A' {
+        "B"
+    } else {
+        "A"
+    };
+    corrupted.replace_range(offset..=offset, replacement);
+    XmlDocument::parse_with_backend(corrupted, backend).expect("corrupted signature remains XML")
+}
+
+/// `unsigned` with the signature template(s) for `shape` appended to its
+/// envelope, and the number of signatures to fill.
+fn signature_template(
+    shape: &str,
+    unsigned: &str,
+    uri: &str,
+    policy: &SigningPolicy,
+) -> (String, usize) {
+    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let signature = SignatureBuilder::new(algorithm, SignatureAlgorithm::RsaSha256)
+        .ns_prefix("ds")
+        .signature_id("signature-0")
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(uri))
+        .build_template_with_policy(policy)
+        .expect("template");
+    let signature = if shape == "nested_manifest" {
+        let reference = |uri| {
+            format!(
+                "<ds:Reference URI=\"{uri}\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue/></ds:Reference>"
+            )
+        };
+        signature.replace("</ds:Signature>", &format!("<ds:Object><ds:Manifest Id=\"outer\">{}</ds:Manifest><ds:Manifest Id=\"inner\">{}</ds:Manifest></ds:Object></ds:Signature>", reference("#inner"), reference("#payload")))
+    } else {
+        signature
+    };
+    let count = if shape == "multi_signature" { 4 } else { 1 };
+    let mut signatures = String::with_capacity(signature.len() * count);
+    signatures.push_str(&signature);
+    for index in 1..count {
+        signatures.push_str(&signature.replace("signature-0", &format!("signature-{index}")));
+    }
+    (
+        unsigned.replace("</Envelope>", &format!("{signatures}</Envelope>")),
+        count,
+    )
 }
 
 pub struct Fixture {
@@ -162,35 +248,7 @@ impl Fixture {
     }
 
     pub fn new(spec: Spec) -> Self {
-        let (provider, key): (Arc<dyn CryptoProvider>, Box<dyn SigningKey>) = match spec.engine {
-            Engine::RustCrypto => (
-                Arc::new(RustCryptoProvider),
-                Box::new(
-                    RsaSigningKey::from_pkcs8_pem(include_str!(
-                        "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-                    ))
-                    .expect("test key"),
-                ),
-            ),
-            #[cfg(feature = "aws-lc-fips")]
-            Engine::AwsLcFips => {
-                let der = pem::parse(include_str!(
-                    "../../tests/fixtures/keys/rsa/rsa-2048-key.pem"
-                ))
-                .expect("test PEM")
-                .into_contents();
-                (
-                    Arc::new(xml_sec::provider::AwsLcFipsProvider),
-                    Box::new(
-                        xml_sec::provider::AwsLcSigningKey::from_pkcs8_der(
-                            SignatureAlgorithm::RsaSha256,
-                            &der,
-                        )
-                        .expect("native test key"),
-                    ),
-                )
-            }
-        };
+        let (provider, key) = engine_signer(spec.engine);
         let verification_key = VerificationKey {
             algorithm: SignatureAlgorithm::RsaSha256,
             public_key_bytes: key
@@ -220,38 +278,8 @@ impl Fixture {
             }
             _ => "#payload",
         };
-        let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
-        let signature = SignatureBuilder::new(algorithm, SignatureAlgorithm::RsaSha256)
-            .ns_prefix("ds")
-            .signature_id("signature-0")
-            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(uri))
-            .build_template_with_policy(&sign_policy)
-            .expect("template");
-        let signature = if SHAPES[spec.shape] == "nested_manifest" {
-            let reference = |uri| {
-                format!(
-                    "<ds:Reference URI=\"{uri}\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/><ds:DigestValue/></ds:Reference>"
-                )
-            };
-            signature.replace("</ds:Signature>", &format!("<ds:Object><ds:Manifest Id=\"outer\">{}</ds:Manifest><ds:Manifest Id=\"inner\">{}</ds:Manifest></ds:Object></ds:Signature>", reference("#inner"), reference("#payload")))
-        } else {
-            signature
-        };
-        let mut template = unsigned.replace("</Envelope>", &format!("{signature}</Envelope>"));
-        let count = if SHAPES[spec.shape] == "multi_signature" {
-            4
-        } else {
-            1
-        };
-        for index in 1..count {
-            template = template.replace(
-                "</Envelope>",
-                &format!(
-                    "{}</Envelope>",
-                    signature.replace("signature-0", &format!("signature-{index}"))
-                ),
-            );
-        }
+        let (template, count) =
+            signature_template(SHAPES[spec.shape], &unsigned, uri, &sign_policy);
         let mut signed = template.clone();
         for index in 0..count {
             signed = SignContext::new(key.as_ref())
@@ -265,19 +293,7 @@ impl Fixture {
         }
         let document =
             XmlDocument::parse_with_backend(signed.clone(), spec.backend).expect("signed document");
-        let mut corrupted = signed.clone();
-        let offset = corrupted
-            .find("<ds:SignatureValue>")
-            .expect("signature value")
-            + "<ds:SignatureValue>".len();
-        let replacement = if corrupted.as_bytes()[offset] == b'A' {
-            "B"
-        } else {
-            "A"
-        };
-        corrupted.replace_range(offset..=offset, replacement);
-        let rejected_document = XmlDocument::parse_with_backend(corrupted, spec.backend)
-            .expect("corrupted signature remains XML");
+        let rejected_document = corrupted_signature(&signed, spec.backend);
         let canonical = canonicalize_document(
             &document,
             &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
@@ -414,7 +430,7 @@ impl Fixture {
                         assert_eq!(xml, self.unsigned);
                         xml.len()
                     }
-                    _ => panic!("expected XML"),
+                    DecryptedContent::Bytes(_) => panic!("expected XML"),
                 }
             }
             _ => panic!("unknown operation"),

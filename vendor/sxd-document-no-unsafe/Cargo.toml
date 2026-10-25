@@ -26,8 +26,8 @@ raw-pointer-backend = []
 name = "sxd_document_no_unsafe"
 path = "../../src/sxd_document/lib.rs"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded"))'] }
+[lints]
+workspace = true
 
 [dependencies]
 peresil = "0.3.0"

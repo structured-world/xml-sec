@@ -110,6 +110,10 @@ impl Base {
 
 impl Configuration {
     /// Parse only caller-provided text. Check the byte bound before TOML work.
+    ///
+    /// # Errors
+    /// Returns a schema error for exceeded limits, an unsupported version,
+    /// invalid profile settings or inheritance, and a TOML error for bad syntax.
     pub fn from_str(text: &str, limits: LoadLimits) -> Result<Self, Error> {
         if text.len() > limits.max_bytes {
             return Err(Error::Schema("configuration byte limit exceeded".into()));
@@ -145,6 +149,10 @@ impl Configuration {
     }
 
     /// Explicit bounded reader, with a one-byte stack probe at the boundary.
+    ///
+    /// # Errors
+    /// Returns read failures, a schema error for oversized or non-UTF-8 input,
+    /// and every [`Configuration::from_str`] refusal.
     pub fn from_reader(mut reader: impl Read, limits: LoadLimits) -> Result<Self, Error> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 4096];
@@ -170,6 +178,9 @@ impl Configuration {
     }
 
     /// Open exactly this caller-selected path; no search paths or include files.
+    ///
+    /// # Errors
+    /// Returns the open failure and every [`Configuration::from_reader`] refusal.
     pub fn from_path(path: impl AsRef<Path>, limits: LoadLimits) -> Result<Self, Error> {
         Self::from_reader(std::fs::File::open(path)?, limits)
     }
@@ -204,6 +215,10 @@ impl Configuration {
 
     /// Compile against the one caller-selected engine. Authorization is supplied
     /// by trusted application code, never fabricated from configuration metadata.
+    ///
+    /// # Errors
+    /// Returns an unknown or cyclic profile, invalid layer settings, and every
+    /// policy compilation or authorization refusal.
     pub fn compile(
         &self,
         name: &str,
@@ -222,9 +237,12 @@ impl Configuration {
             settings::apply(profile, &mut layer)?;
             compiler = compiler.restrict(&layer)?;
         }
-        let compiled = compiler.compile(context)?;
-        let document = settings::snapshot(&compiled)?;
-        Ok(EffectivePolicy { compiled, document })
+        let policies = compiler.compile(context)?;
+        let document = settings::snapshot(&policies)?;
+        Ok(EffectivePolicy {
+            compiled: policies,
+            document,
+        })
     }
 }
 
@@ -251,31 +269,7 @@ fn reserve_input(bytes: &mut Vec<u8>, additional: usize, maximum: usize) -> Resu
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fragmented_ingestion_has_bounded_geometric_growth() {
-        // An adversarially short reader cannot induce quadratic buffer copies;
-        // reaching the ceiling does not request a single extra heap byte.
-        let mut bytes = Vec::new();
-        let maximum = 16384;
-        let mut growths = 0;
-        for _ in 0..maximum {
-            let before = bytes.capacity();
-            reserve_input(&mut bytes, 1, maximum).unwrap();
-            if before != bytes.capacity() {
-                growths += 1;
-            }
-            bytes.push(b' ');
-            assert!(bytes.capacity() <= maximum);
-        }
-        assert_eq!(growths, 3);
-        let capacity = bytes.capacity();
-        assert!(reserve_input(&mut bytes, 1, maximum).is_err());
-        assert_eq!(capacity, bytes.capacity());
-    }
-}
+mod tests;
 
 impl Profile {
     fn tables(&self) -> impl Iterator<Item = (&'static str, &toml::Table)> {
@@ -298,10 +292,14 @@ pub struct EffectivePolicy {
 
 impl EffectivePolicy {
     /// Pass these snapshots to existing processing contexts.
+    #[must_use]
     pub const fn compiled(&self) -> &CompiledPolicies {
         &self.compiled
     }
-    /// Stable field and set order, independent of TOML layout or HashSet order.
+    /// Stable field and set order, independent of TOML layout or `HashSet` order.
+    ///
+    /// # Errors
+    /// Returns a TOML serialization failure.
     pub fn to_toml(&self) -> Result<String, Error> {
         #[derive(Serialize)]
         struct Profiles<'a> {
@@ -324,6 +322,7 @@ impl EffectivePolicy {
     /// reported as one constraint change. Non-ordered interpretation changes
     /// are conservatively relaxing and require operator review, never a silent
     /// claim that two different processing models are equally restrictive.
+    #[must_use]
     pub fn diff(&self, next: &Self) -> Vec<Change> {
         settings::diff(&self.document, &next.document)
     }

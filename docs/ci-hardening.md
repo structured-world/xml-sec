@@ -50,30 +50,24 @@ refusal. Test/benchmark diagnostic allocator probes are not product library
 permission to use unsafe. Native dependencies retain their separate upstream
 safety and FIPS/module boundaries; this check is not an audit of external code.
 
-## XML Kernel Pedantic Lint
+## Pedantic Lint
 
-```sh
-node --test scripts/check-xml-kernels.test.mjs
-node scripts/check-xml-kernels.mjs
-```
+`clippy::pedantic` is part of the workspace lint table in the root
+`Cargo.toml`, and every workspace member inherits it with
+`[lints] workspace = true`. Locally it reports warnings; every CI lint invocation
+denies them with `-D warnings`, so there is no accepted-warning baseline.
 
-The required hardening job checks XML input, both maintained parser kernels,
-semantic DOM/document code, C14N, and the safe SXD document/XPath implementation.
-It checks the full-feature workspace, the default workspace, an isolated minimal
-core graph, and the separate alloc-only XML-input crate. Root no-default builds
-are not root alloc-only claims. Physical source identities join standalone and
-embedded paths;
-macro expansion callsites cannot hide diagnostics. `--force-warn clippy::pedantic`
-exposes diagnostics even behind an existing local lint attribute. Every warning
-in these implementations fails the gate; there is no accepted-warning baseline.
-Compiler errors, missing build completion, malformed diagnostic output and Cargo
-failures are terminal regardless of source scope.
+The lint matrix in `scripts/ci-test-blocks.mjs` resolves each feature graph
+separately: the default, backend, all-feature, experimental, FIPS and XSLT
+workspace graphs, plus library-only minimal graphs for `xmldsig`, `xmlenc` and
+`xslt` on the differential backend. The alloc-only job lints the separate
+XML-input crate without default features. MSRV lint invocations allow
+`clippy::large_stack_arrays`, which clippy 1.92 reports without a span for the
+libtest descriptor array (rust-lang/rust-clippy#13774); stable lint keeps it.
 
 The standalone legacy `raw-pointer-backend` is not selected by the product or by
 the safe workspace all-feature graph and is not claimed as pedantic-qualified.
-Other subsystems retain the existing warning-denying Clippy matrix; this scoped
-gate does not claim their independent pedantic qualification. Comparable
-performance regression reporting remains a separate check.
+Comparable performance regression reporting remains a separate check.
 
 ## Grouped Qualification
 

@@ -39,7 +39,7 @@ fn earliest_signed_verification_time_round_trips_effective_policy() {
         let restored = Configuration::from_str(&output, LoadLimits::default()).unwrap();
         let restored = effective(&restored, "effective");
         assert_eq!(output, restored.to_toml().unwrap());
-        assert!(original.diff(&restored).is_empty());
+        assert_eq!(original.diff(&restored), []);
     }
 }
 
@@ -64,7 +64,7 @@ fn all_ordinary_profiles_round_trip_effective_policy() {
         let parsed = Configuration::from_str(&output, LoadLimits::default()).unwrap();
         let restored = effective(&parsed, "effective");
         assert_eq!(output, restored.to_toml().unwrap());
-        assert!(original.diff(&restored).is_empty());
+        assert_eq!(original.diff(&restored), []);
     }
 }
 
@@ -435,7 +435,7 @@ fn effective_time_preserves_fractional_and_negative_unix_time() {
         "team",
     );
     let expected = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)
-        + std::time::Duration::from_nanos(123456789);
+        + std::time::Duration::from_nanos(123_456_789);
     assert_eq!(
         original
             .compiled()
@@ -457,7 +457,7 @@ fn effective_time_preserves_fractional_and_negative_unix_time() {
             .verification_time,
         Some(expected)
     );
-    assert!(original.diff(&restored).is_empty());
+    assert_eq!(original.diff(&restored), []);
 }
 
 #[test]
@@ -591,7 +591,7 @@ fn legacy_authority_must_come_from_caller_and_retains_exact_interval() {
             .as_ref(),
         Some(&grant)
     );
-    assert!(policy.diff(&restored).is_empty());
+    assert_eq!(policy.diff(&restored), []);
 }
 
 #[test]
@@ -704,9 +704,9 @@ fn configured_snapshots_enforce_real_sign_and_verify_limits() {
     };
     let input = r##"<root ID="target"><payload>protected</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
     let policies = effective(&config(""), "team");
-    let signer = HmacSigningKey::new(vec![7; 32]).unwrap();
+    let signing_key = HmacSigningKey::new(vec![7; 32]).unwrap();
     let verifier = HmacVerificationKey::new(vec![7; 32]).unwrap();
-    let signed = SignContext::new(&signer)
+    let signed = SignContext::new(&signing_key)
         .policy(policies.compiled().signing().unwrap().clone())
         .sign_template(input)
         .unwrap();
@@ -723,7 +723,7 @@ fn configured_snapshots_enforce_real_sign_and_verify_limits() {
         "team",
     );
     assert!(
-        SignContext::new(&signer)
+        SignContext::new(&signing_key)
             .policy(restricted.compiled().signing().unwrap().clone())
             .sign_template(input)
             .is_err()

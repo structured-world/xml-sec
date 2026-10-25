@@ -1,17 +1,56 @@
 //! Local interoperability evidence, using only public verified-session APIs.
 use std::{
+    fmt::Write as _,
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime},
 };
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, KeyResolverConfig, ReplayMode, ReplayOutcome, VerificationRequest,
-    VerifyContext, XPathHereSemantics, with_verified_request,
+    VerifyContext, VerifyResult, XPathHereSemantics, with_verified_request,
 };
 use xml_sec::{XmlDocument, policy::VerificationPolicy};
 use xml_sec_xades::validate_basic;
+
+/// Chain-validating policy at a fixed instant with the requested `here()` mode.
+fn verification_policy(here: &str) -> Result<VerificationPolicy, Box<dyn std::error::Error>> {
+    let mut policy = VerificationPolicy::default();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time =
+        Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
+    policy.transforms.xpath_here_semantics = match here {
+        "spec" => XPathHereSemantics::Specification,
+        "legacy" => XPathHereSemantics::XmlSecLegacy,
+        _ => return Err("here mode must be spec or legacy".into()),
+    };
+    Ok(policy)
+}
+
+/// Record one signature's status and references and write its pre-digest bytes.
+fn report_signature(report: &mut String, output: &Path, ordinal: usize, result: &VerifyResult) {
+    write!(
+        report,
+        "signature.{ordinal}.status={:?}\nkey_trust={:?}\n",
+        result.status, result.key_trust
+    )
+    .expect("String write");
+    if let Some(bytes) = &result.canonicalized_signed_info {
+        fs::write(output.join(format!("signature-{ordinal}.bin")), bytes).unwrap();
+    }
+    for (index, reference) in result.signed_info_references.iter().enumerate() {
+        write!(
+            report,
+            "reference.{index}.status={:?}\nreference.{index}.coverage={:?}\n",
+            reference.status, reference.coverage
+        )
+        .expect("String write");
+        if let Some(bytes) = &reference.pre_digest_data {
+            fs::write(output.join(format!("reference-{index}.bin")), bytes).unwrap();
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -27,17 +66,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         trusted_certs: vec![root.clone()],
         ..Default::default()
     });
-    let mut policy = VerificationPolicy::default();
-    policy.key_trust.verify_x509_chains = true;
-    policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000));
-    policy.transforms.xpath_here_semantics = match args[4].as_str() {
-        "spec" => XPathHereSemantics::Specification,
-        "legacy" => XPathHereSemantics::XmlSecLegacy,
-        _ => return Err("here mode must be spec or legacy".into()),
-    };
     let context = VerifyContext::new()
-        .policy(policy)
+        .policy(verification_policy(&args[4])?)
         .key_resolver(&resolver)
         .store_pre_digest(true);
     let document = XmlDocument::parse(fs::read_to_string(&args[1])?)?;
@@ -55,40 +85,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     let work = Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 30)));
+    // Writing into a String cannot fail; each expect states that invariant.
     let mut report = format!("here={}\n", args[4]);
     let run = with_verified_request(&document, &context, &request, &work, |session| {
-        report.push_str(&format!(
+        write!(
+            report,
             "accepted={}\nall_valid={}\n",
             session.evidence().accepted(&document)?,
             session.evidence().all_valid()
-        ));
+        )
+        .expect("String write");
         for (ordinal, entry) in session.evidence().signatures().iter().enumerate() {
             match entry.result() {
-                Err(error) => report.push_str(&format!("signature.{ordinal}.error={error:?}\n")),
-                Ok(result) => {
-                    report.push_str(&format!(
-                        "signature.{ordinal}.status={:?}\nkey_trust={:?}\n",
-                        result.status, result.key_trust
-                    ));
-                    if let Some(bytes) = &result.canonicalized_signed_info {
-                        fs::write(output.join(format!("signature-{ordinal}.bin")), bytes).unwrap();
-                    }
-                    for (index, reference) in result.signed_info_references.iter().enumerate() {
-                        report.push_str(&format!(
-                            "reference.{index}.status={:?}\nreference.{index}.coverage={:?}\n",
-                            reference.status, reference.coverage
-                        ));
-                        if let Some(bytes) = &reference.pre_digest_data {
-                            fs::write(output.join(format!("reference-{index}.bin")), bytes)
-                                .unwrap();
-                        }
-                    }
+                Err(error) => {
+                    writeln!(report, "signature.{ordinal}.error={error:?}").expect("String write");
                 }
+                Ok(result) => report_signature(&mut report, &output, ordinal, result),
             }
             // Selection and replay remain gated by original authentication;
             // failed signatures cannot be promoted into authenticated evidence.
             match session.select_signature(entry.identity()) {
-                Err(error) => report.push_str(&format!("replay.refused={error:?}\n")),
+                Err(error) => writeln!(report, "replay.refused={error:?}").expect("String write"),
                 Ok(selected) => {
                     let mut index = 0;
                     let catalogue = selected.visit_authenticated_references(|reference| {
@@ -101,14 +118,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 Ok::<_, ()>(())
                             },
                         );
-                        report.push_str(&format!("replay.{index}={outcome:?}\n"));
+                        writeln!(report, "replay.{index}={outcome:?}").expect("String write");
                         if matches!(outcome, Ok(ReplayOutcome::Complete)) {
                             fs::write(output.join(format!("replay-{index}.bin")), bytes).unwrap();
                         }
                         index += 1;
                         Ok::<_, ()>(())
                     });
-                    report.push_str(&format!("catalogue={catalogue:?}\n"));
+                    writeln!(report, "catalogue={catalogue:?}").expect("String write");
                     let xades =
                         validate_basic(&session, entry.identity(), &[root.as_slice()], |report| {
                             (
@@ -116,16 +133,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 report.inputs().certificate.is_bound(),
                             )
                         });
-                    report.push_str(&format!("xades={xades:?}\n"));
+                    writeln!(report, "xades={xades:?}").expect("String write");
                 }
             }
         }
         Ok(())
     });
-    report.push_str(&format!(
-        "request={run:?}\nretained_bytes={}\n",
-        work.used()
-    ));
+    write!(report, "request={run:?}\nretained_bytes={}\n", work.used()).expect("String write");
     fs::write(output.join("result.txt"), report)?;
     Ok(())
 }

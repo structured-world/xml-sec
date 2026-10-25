@@ -230,6 +230,9 @@ pub(crate) struct XmlParseWorkBudget {
     remaining: Cell<usize>,
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     maximum: usize,
+    /// Only XML Security operations own a budget; DOM and C14N graphs have none.
+    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+    uninhabited: core::convert::Infallible,
 }
 
 impl XmlParseWorkBudget {
@@ -261,6 +264,11 @@ impl XmlParseWorkBudget {
         self.charge_policy(bytes).map_err(Into::into)
     }
 
+    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+    fn charge(&self, _bytes: usize) -> Result<(), XmlDocumentError> {
+        match self.uninhabited {}
+    }
+
     /// Parser work still admissible, for a parser that meters its own passes.
     #[cfg(feature = "xslt")]
     pub(crate) fn remaining(&self) -> usize {
@@ -285,12 +293,9 @@ fn charge_parse_work(
     budget: Option<&XmlParseWorkBudget>,
     bytes: usize,
 ) -> Result<(), XmlDocumentError> {
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     if let Some(budget) = budget {
         budget.charge(bytes)?;
     }
-    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-    let _ = (budget, bytes);
     Ok(())
 }
 

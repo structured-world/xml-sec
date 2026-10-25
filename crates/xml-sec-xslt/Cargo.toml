@@ -28,8 +28,8 @@ path = "../../benchmarks/xslt-alloc.rs"
 harness = false
 required-features = ["benchmark-internals"]
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("embedded"))'] }
+[lints]
+workspace = true
 
 [dependencies]
 encoding_rs = "0.8"

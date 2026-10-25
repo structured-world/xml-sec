@@ -1,9 +1,15 @@
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[path = "../tools/xmlsec1/src/args.rs"]
+// Loading `args.rs` through a directory module keeps it a non-`mod.rs` file, so
+// its `mod tests;` resolves to `args/tests.rs` exactly as in the CLI crate.
+#[path = "../tools/xmlsec1/src"]
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
-mod cli_args;
+mod cli_src {
+    pub mod args;
+}
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+use cli_src::args as cli_args;
 
 const LEDGER_JSON: &str = include_str!("../compatibility/libxmlsec1-1.3.13.json");
 const DONOR_COMMIT: &str = include_str!("../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
@@ -461,7 +467,7 @@ fn assert_native_uri_support(item: &Item) {
             );
         }
         "xmlSecHrefBase64" | "xmlSecHrefEnveloped" | "xmlSecXPath2Ns" | "xmlSecXPathNs" => {
-            assert_transform_uri_parses(uri)
+            assert_transform_uri_parses(uri);
         }
         "xmlSecHrefRelationship" => {
             let xml = format!(
@@ -1011,12 +1017,9 @@ fn xmldsig_second_edition_family_is_exhaustively_classified() {
     assert!(suite.contains("second_edition_template_materializes_c14n11_and_signs_detached_xml"));
 }
 
-#[test]
+/// Every runtime command is a complete, behavior-compatible donor entry.
 #[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
-fn native_cli_claims_match_process_and_upstream_runner_tests() {
-    // Commands are complete dispatch entries; individual options remain explicit
-    // when their format or policy mapping has not been implemented yet.
-    let ledger = ledger();
+fn assert_cli_commands_match(ledger: &Ledger) {
     let runtime_commands: BTreeSet<_> = cli_args::Command::ALL
         .iter()
         .map(|command| command.canonical_name())
@@ -1039,8 +1042,47 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             "missing runtime command {}",
             item.name
         );
-        assert_eq!(classification(&ledger, item).outcome, "behavior-compatible");
+        assert_eq!(classification(ledger, item).outcome, "behavior-compatible");
     }
+}
+
+/// Donor exit statuses keep their classification and numeric code.
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+fn assert_cli_exit_statuses_match(ledger: &Ledger) {
+    let ledger_statuses: BTreeSet<_> = ledger
+        .items
+        .iter()
+        .filter(|item| item.kind == "cli-exit-status")
+        .map(|item| item.name.as_str())
+        .collect();
+    assert_eq!(
+        ledger_statuses,
+        BTreeSet::from(["failure", "success", "unknown-command"])
+    );
+
+    for (status, outcome, code) in [
+        ("success", "behavior-compatible", 0),
+        ("failure", "behavior-compatible", 1),
+        ("unknown-command", "planned", 0),
+    ] {
+        let item = ledger
+            .items
+            .iter()
+            .find(|item| item.kind == "cli-exit-status" && item.name == status)
+            .unwrap_or_else(|| panic!("missing CLI status {status}"));
+        assert_eq!(classification(ledger, item).outcome, outcome);
+        assert_eq!(item.exit_code, Some(code), "wrong exit code for {status}");
+    }
+}
+
+#[test]
+#[cfg(all(feature = "xmldsig", feature = "xmlenc", feature = "c14n"))]
+fn native_cli_claims_match_process_and_upstream_runner_tests() {
+    // Commands are complete dispatch entries; individual options remain explicit
+    // when their format or policy mapping has not been implemented yet.
+    let ledger = ledger();
+    assert_cli_commands_match(&ledger);
+    assert_cli_exit_statuses_match(&ledger);
     let behavior_compatible = BTreeSet::from([
         "add-id-attr",
         "binary-data",
@@ -1141,30 +1183,6 @@ fn native_cli_claims_match_process_and_upstream_runner_tests() {
             expected,
             "CLI option {option} has the wrong compatibility classification"
         );
-    }
-    let ledger_statuses: BTreeSet<_> = ledger
-        .items
-        .iter()
-        .filter(|item| item.kind == "cli-exit-status")
-        .map(|item| item.name.as_str())
-        .collect();
-    assert_eq!(
-        ledger_statuses,
-        BTreeSet::from(["failure", "success", "unknown-command"])
-    );
-
-    for (status, outcome, code) in [
-        ("success", "behavior-compatible", 0),
-        ("failure", "behavior-compatible", 1),
-        ("unknown-command", "planned", 0),
-    ] {
-        let item = ledger
-            .items
-            .iter()
-            .find(|item| item.kind == "cli-exit-status" && item.name == status)
-            .unwrap_or_else(|| panic!("missing CLI status {status}"));
-        assert_eq!(classification(&ledger, item).outcome, outcome);
-        assert_eq!(item.exit_code, Some(code), "wrong exit code for {status}");
     }
 }
 
