@@ -1509,10 +1509,10 @@ impl CertificateSession {
         &self,
         error: &structured_pkix::Error,
     ) -> Option<PolicyViolation> {
+        use structured_asn1::{ErrorCode, Limit};
         if !error.is_resource() {
             return None;
         }
-        use structured_asn1::{ErrorCode, Limit};
         let memory = matches!(
             error.code(),
             structured_pkix::ErrorCode::Encoding(

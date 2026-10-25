@@ -371,102 +371,51 @@ impl VerificationKey {
         if algorithm != self.algorithm {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
-        if !context.as_bytes().is_empty()
-            && algorithm.eddsa_signature_len().is_none()
-            && !matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
+        let key = &self.public_key_bytes;
+        let result = if algorithm.eddsa_signature_len().is_some()
+            || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
         {
-            return Err(KeyResolutionError::AlgorithmMismatch.into());
-        }
-        let result = match algorithm {
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::RsaMd5 | SignatureAlgorithm::RsaRipemd160 => {
-                verify_rsa_signature_spki_primitive(
-                    algorithm,
-                    &self.public_key_bytes,
-                    signed_data,
-                    signature_value,
-                    session,
-                )
-            }
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::EcdsaRipemd160 => verify_ecdsa_signature_spki_in(
+            super::modern::verify_with_context(
                 algorithm,
-                &self.public_key_bytes,
-                signed_data,
-                signature_value,
-                encoding,
-                session,
-            ),
-            #[cfg(feature = "legacy-algorithms")]
-            SignatureAlgorithm::HmacMd5 | SignatureAlgorithm::HmacRipemd160 => {
-                return Err(KeyResolutionError::AlgorithmMismatch.into());
-            }
-            SignatureAlgorithm::Ed25519
-            | SignatureAlgorithm::Ed25519Ctx
-            | SignatureAlgorithm::Ed25519Ph
-            | SignatureAlgorithm::Ed448
-            | SignatureAlgorithm::Ed448Ph
-            | SignatureAlgorithm::PostQuantum(_) => super::modern::verify_with_context(
-                algorithm,
-                &self.public_key_bytes,
+                key,
                 context,
                 signed_data,
                 signature_value,
                 session,
-            ),
-            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
-                verify_dsa_signature_spki_primitive(
-                    algorithm,
-                    &self.public_key_bytes,
-                    signed_data,
-                    signature_value,
-                    session,
-                )
-            }
-            SignatureAlgorithm::HmacSha1
-            | SignatureAlgorithm::HmacSha224
-            | SignatureAlgorithm::HmacSha256
-            | SignatureAlgorithm::HmacSha384
-            | SignatureAlgorithm::HmacSha512 => {
-                return Err(KeyResolutionError::AlgorithmMismatch.into());
-            }
-            SignatureAlgorithm::RsaSha1
-            | SignatureAlgorithm::RsaSha224
-            | SignatureAlgorithm::RsaSha256
-            | SignatureAlgorithm::RsaSha384
-            | SignatureAlgorithm::RsaSha512
-            | SignatureAlgorithm::RsaPssSha1
-            | SignatureAlgorithm::RsaPssSha224
-            | SignatureAlgorithm::RsaPssSha256
-            | SignatureAlgorithm::RsaPssSha384
-            | SignatureAlgorithm::RsaPssSha512
-            | SignatureAlgorithm::RsaPssSha3_224
-            | SignatureAlgorithm::RsaPssSha3_256
-            | SignatureAlgorithm::RsaPssSha3_384
-            | SignatureAlgorithm::RsaPssSha3_512
-            | SignatureAlgorithm::RsaPss(_) => verify_rsa_signature_spki_primitive(
+            )
+        } else if !context.as_bytes().is_empty() {
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
+        } else if algorithm.is_rsa() {
+            verify_rsa_signature_spki_primitive(
                 algorithm,
-                &self.public_key_bytes,
+                key,
                 signed_data,
                 signature_value,
                 session,
-            ),
-            SignatureAlgorithm::EcdsaSha1
-            | SignatureAlgorithm::EcdsaSha224
-            | SignatureAlgorithm::EcdsaSha256
-            | SignatureAlgorithm::EcdsaSha384
-            | SignatureAlgorithm::EcdsaSha512
-            | SignatureAlgorithm::EcdsaSha3_224
-            | SignatureAlgorithm::EcdsaSha3_256
-            | SignatureAlgorithm::EcdsaSha3_384
-            | SignatureAlgorithm::EcdsaSha3_512 => verify_ecdsa_signature_spki_in(
+            )
+        } else if algorithm.ecdsa_digest().is_some() {
+            verify_ecdsa_signature_spki_in(
                 algorithm,
-                &self.public_key_bytes,
+                key,
                 signed_data,
                 signature_value,
                 encoding,
                 session,
-            ),
+            )
+        } else if matches!(
+            algorithm,
+            SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256
+        ) {
+            verify_dsa_signature_spki_primitive(
+                algorithm,
+                key,
+                signed_data,
+                signature_value,
+                session,
+            )
+        } else {
+            // HMAC methods need a secret, not a public key.
+            return Err(KeyResolutionError::AlgorithmMismatch.into());
         };
         result.map_err(DsigError::Crypto)
     }

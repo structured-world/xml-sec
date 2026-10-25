@@ -121,9 +121,11 @@ fn preset_verification_keys_charge_the_operation_certificate_account() {
         "tests/fixtures/keys/ec/ec-prime256v1-key.pem",
     ))
     .unwrap();
-    let ec_spki = match ec.public_key_info().expect("public key info") {
-        SigningPublicKeyInfo::Ec { spki_der, .. } => spki_der,
-        _ => panic!("P-256 key must expose EC public-key info"),
+    let SigningPublicKeyInfo::Ec {
+        spki_der: ec_spki, ..
+    } = ec.public_key_info().expect("public key info")
+    else {
+        panic!("P-256 key must expose EC public-key info");
     };
     let cases: [(&dyn SigningKey, SignatureAlgorithm, Vec<u8>); 2] = [
         (&rsa, SignatureAlgorithm::RsaSha256, rsa_spki(&rsa)),
