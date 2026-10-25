@@ -573,6 +573,40 @@ impl<P, B> OperationExecutionContext<P, B> {
         }
     }
 
+    /// Run several ready nodes as one read of the planned document generation.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn run_document_batch_with_budgets<T, E>(
+        &mut self,
+        nodes: &[OperationNodeId],
+        document: &XmlDocument,
+        action: impl FnOnce(&XmlDocument, &mut B) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        document
+            .with_view(|view| self.validate_document_view(view))
+            .map_err(E::from)?;
+        for node in nodes {
+            self.validate_ready(*node, None).map_err(E::from)?;
+        }
+        match action(document, &mut self.budgets) {
+            Ok(value) => {
+                for node in nodes {
+                    self.executed.borrow_mut().insert(*node);
+                    self.record(*node, true, self.completion_reason(*node));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                for node in nodes {
+                    self.record(*node, false, OperationDecisionReason::ActionRejected);
+                }
+                Err(error)
+            }
+        }
+    }
+
     #[cfg(feature = "xmlenc")]
     pub(crate) fn run_batch<T, E>(
         &self,
@@ -679,6 +713,25 @@ impl<P, B> OperationExecutionContext<P, B> {
             self.record(*node, true, self.completion_reason(*node));
         }
         Ok(value)
+    }
+
+    /// Run a mutation whose next generation is handed to the caller as its
+    /// serialization instead of being committed to `document`.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn run_document_projection<T, E>(
+        &self,
+        node: OperationNodeId,
+        document: &XmlDocument,
+        action: impl FnOnce(&XmlDocument) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<OperationPlanError>,
+    {
+        document
+            .with_view(|view| self.validate_document_view(view))
+            .map_err(E::from)?;
+        self.validate_ready(node, None).map_err(E::from)?;
+        self.run_ready(node, || action(document))
     }
 
     fn run_ready<T, E>(
