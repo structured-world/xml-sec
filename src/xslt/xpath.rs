@@ -23,7 +23,7 @@ use super::budget::{
 };
 use super::compiler::{
     DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, Pattern,
-    StylesheetDocumentId, normalize_xpath_for_sxd,
+    StylesheetDocumentId, normalize_xpath_for_sxd, normalized_xpath_len,
 };
 use super::expression::innermost_namespaced_call;
 use super::lexical::{
@@ -3760,71 +3760,94 @@ fn xpath_namespace_binding_bytes(expression: &Expression) -> usize {
         .saturating_add("http://www.w3.org/XML/1998/namespace".len())
 }
 
-/// Workspace of text created during execution, which is prepared per evaluation.
+/// Workspace of text created during execution, which is prepared per evaluation and
+/// then bound into the scoped context.
 fn xpath_preparation_workspace_upper_bound(expression: &Expression) -> usize {
-    let source = expression.source.as_str();
-    let source_bytes = source.len();
-    let normalizes =
-        source.chars().any(super::lexical::is_xml_whitespace) || source.as_bytes().contains(&b'*');
-    let normalized_bytes = if normalizes {
-        // One wildcard can expand from one byte to `child::*` (eight bytes). Account for the
-        // allocator's geometric String growth while the normalized buffer remains live.
-        source_bytes.saturating_mul(16)
+    let workspace = xpath_preparation_workspace(&expression.source, &expression.namespaces);
+    workspace
+        .buffers
+        .saturating_add(xpath_namespace_binding_bytes(expression))
+        .saturating_add(workspace.context_binding)
+}
+
+/// Upper bound of the buffers `PreparedXPath::new` allocates for this text, admitted
+/// before compilation prepares a stylesheet expression.
+pub(crate) fn xpath_preparation_bytes(source: &str, namespaces: &[(String, String)]) -> usize {
+    xpath_preparation_workspace(source, namespaces)
+        .buffers
+        .saturating_add(std::mem::size_of::<XPathRewrite>())
+}
+
+struct PreparationWorkspace {
+    /// Every preparation stage that allocates, live together, plus the private names.
+    buffers: usize,
+    /// Scoped-context entry of the private outer-context binding, when one is needed.
+    context_binding: usize,
+}
+
+/// Each stage is charged only when it allocates. Normalization is measured exactly and
+/// allocated at that capacity; the axis and context rewrites may double their capacity while
+/// growing and then shrink into the retained text, so they are charged twice plus that copy.
+fn xpath_preparation_workspace(
+    source: &str,
+    namespaces: &[(String, String)],
+) -> PreparationWorkspace {
+    let normalized = normalized_xpath_len(source);
+    let normalized_bytes = normalized.unwrap_or(source.len());
+    // Projection hiding rewrites `..` and axis steps; wildcard expansion can add `child::`.
+    let isolates = source.contains("..") || source.contains("::") || normalized.is_some();
+    let axis_rewrites = source
+        .matches("..")
+        .count()
+        .saturating_add(source.matches("::").count())
+        .saturating_add(source.matches('*').count());
+    let isolated_bytes = if isolates {
+        normalized_bytes.saturating_add(axis_rewrites.saturating_mul(192))
     } else {
-        source_bytes
+        normalized_bytes
     };
-    let normalization_peak = if normalizes {
-        source_bytes.saturating_mul(20)
-    } else {
-        0
-    };
-    let axis_rewrites = [
-        "ancestor-or-self::",
-        "ancestor::",
-        "following::",
-        "following-sibling::",
-        "preceding::",
-        "preceding-sibling::",
-        "parent::",
-        "self::",
-    ]
-    .into_iter()
-    .fold(source.matches("..").count(), |count, axis| {
-        count.saturating_add(source.matches(axis).count())
-    });
-    let isolated_bytes = normalized_bytes
-        .saturating_add(axis_rewrites.saturating_mul(192))
-        .saturating_mul(2);
-    let internal_prefix_bytes = expression
-        .namespaces
+    let internal_prefix_bytes = namespaces
         .iter()
         .map(|(prefix, _)| prefix.len())
         .max()
         .unwrap_or(0)
         .max("__xml_sec_ctx".len())
         .saturating_add(1);
+    // `unused_internal_name` pads a colliding preferred name past the longest existing one.
+    let internal_namespace_bytes = namespaces
+        .iter()
+        .map(|(_, namespace)| namespace.len())
+        .max()
+        .unwrap_or(0)
+        .max(CONTEXT_NS.len())
+        .saturating_add(1);
     let context_calls = source
         .matches("position")
         .count()
         .saturating_add(source.matches("last").count());
-    let rewritten_bytes = isolated_bytes
-        .saturating_add(context_calls.saturating_mul(internal_prefix_bytes.saturating_add(2)))
-        .saturating_mul(2);
-    let namespace_bytes =
-        xpath_namespace_binding_bytes(expression).saturating_add(if context_calls != 0 {
+    let growing_stage = |bytes: usize| bytes.saturating_mul(3);
+    let mut buffers = normalized.unwrap_or(0);
+    if isolates {
+        buffers = buffers.saturating_add(growing_stage(isolated_bytes));
+    }
+    if context_calls != 0 {
+        let rewritten_bytes = isolated_bytes
+            .saturating_add(context_calls.saturating_mul(internal_prefix_bytes.saturating_add(2)));
+        buffers = buffers
+            .saturating_add(growing_stage(rewritten_bytes))
+            .saturating_add(internal_prefix_bytes)
+            .saturating_add(internal_namespace_bytes);
+    }
+    PreparationWorkspace {
+        buffers,
+        context_binding: if context_calls != 0 {
             hash_table_entry_bytes::<(String, String)>()
                 .saturating_add(internal_prefix_bytes)
-                .saturating_add(CONTEXT_NS.len())
+                .saturating_add(internal_namespace_bytes)
         } else {
             0
-        });
-    normalization_peak.max(
-        normalized_bytes
-            .saturating_add(isolated_bytes)
-            .saturating_add(rewritten_bytes)
-            .saturating_add(namespace_bytes)
-            .saturating_add(internal_prefix_bytes.saturating_mul(2)),
-    )
+        },
+    }
 }
 
 fn xpath_context_workspace_upper_bound(
