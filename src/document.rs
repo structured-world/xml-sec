@@ -3896,6 +3896,9 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
 }
 
 #[cfg(test)]
+mod entity_ceiling_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::fmt::Write as _;
