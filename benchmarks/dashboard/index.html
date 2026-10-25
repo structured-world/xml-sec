@@ -17,7 +17,7 @@
 <div class="controls" aria-label="Command-line filters">
 <label>Operation<select data-section="cli" data-field="operation"><option>verify</option><option>sign</option><option>encrypt</option><option>decrypt</option></select></label>
 <label>Document<select data-section="cli" data-field="shape"><optgroup label="Signed payload, symmetric encryption"><option>saml</option><option>namespaces</option><option>text</option><option>attributes</option><option>adversarial</option></optgroup><optgroup label="Workloads"><option value="assertion">SAML assertion, X.509 chain</option><option value="element">Element, RSA-OAEP recipient</option><option value="element_in_place">Element in place, RSA-OAEP recipient</option><option value="xslt">XSLT-transformed reference</option></optgroup></select></label>
-<label>Size<select data-section="cli" data-field="units"><option>16</option><option>256</option></select></label>
+<label>Size<select data-section="cli" data-field="units"><option>16</option><option>256</option><option>16384</option></select></label>
 <label>Metric<select data-section="cli" data-field="metric"><option value="p50_ns">p50 latency (ms)</option><option value="p99_ns">p99 latency (ms)</option><option value="cpu_seconds">CPU (ms)</option><option value="rss_bytes">Peak RSS (MiB)</option><option value="allocation_calls">Allocation calls</option><option value="allocated_bytes">Allocated bytes (MiB)</option><option value="peak_heap_bytes">Peak heap (MiB)</option><option value="throughput">Input throughput (MiB/s)</option></select></label>
 </div>
 <div id="cli-chart" class="chart" aria-label="Command-line measurements"></div>
@@ -30,7 +30,7 @@
 <div class="controls controls-wide" aria-label="Library filters">
 <label>Operation<select data-section="library" data-field="operation"><option>verify</option><option>sign</option><option>encrypt</option><option>decrypt</option></select></label>
 <label>Workload<select data-section="library" data-field="shape"><option value="assertion">SAML assertion, X.509 chain</option><option value="element">Element, RSA-OAEP recipient</option><option value="element_in_place">Element in place, RSA-OAEP recipient</option><option value="xslt">XSLT-transformed reference</option></select></label>
-<label>Size<select data-section="library" data-field="units"><option>16</option><option>256</option></select></label>
+<label>Size<select data-section="library" data-field="units"><option>16</option><option>256</option><option>16384</option></select></label>
 <label>Boundary<select data-section="library" data-field="boundary"><option value="parse">Parse and operation</option><option value="prepared">Prepared document</option></select></label>
 <label>Metric<select data-section="library" data-field="metric"><option value="p50_ns">p50 latency (ms)</option><option value="p99_ns">p99 latency (ms)</option><option value="rss_bytes">Peak RSS (MiB)</option><option value="allocation_calls">Allocation calls</option><option value="allocated_bytes">Allocated bytes (MiB)</option><option value="peak_heap_bytes">Peak heap (MiB)</option><option value="throughput">Input throughput (MiB/s)</option></select></label>
 </div>

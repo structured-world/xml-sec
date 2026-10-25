@@ -130,11 +130,16 @@ The runner builds the pinned Bergshamra 0.9.2 source (RustCrypto only) and the
 existing libxmlsec1 1.3.13 oracle, independently of the product dependency graph.
 It compares both xml-sec XML backends against those CLIs: single-reference
 RSA-2048/SHA-256 sign/verify and AES-256-GCM encrypt/decrypt of identical plaintext
-octets, at two sizes for five deterministic document shapes. AES keys use the
+octets, at three sizes for five deterministic document shapes. AES keys use the
 same named XML key store; RSA keys use named PEM imports. These payload cases
 are byte-oriented encryption, not element selection.
 
-Four workloads, at 16 and 256 repeated units, cover the main application uses:
+Every case runs at 16, 256 and 16384 repeated units. The largest size is a
+production-sized document (the 16384-attribute SAML response is about 1.7 MB):
+there the cost of each byte outweighs process launch and key loading, which
+dominate the two small sizes.
+
+Four workloads cover the main application uses:
 
 | Workload | Operations | Configuration |
 |----------|------------|---------------|

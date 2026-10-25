@@ -6,6 +6,11 @@ use std::{error::Error, fmt::Write as _, time::Instant};
 use support::{Engine, Fixture, OPERATIONS, SHAPES, Spec};
 use xml_sec::XmlBackend;
 
+/// Workload sizes compared against other engines. The largest is a production-sized
+/// document (a 16384-attribute SAML response is about 1.7 MB), where per-byte cost
+/// outweighs the fixed cost of starting a process and loading keys.
+const COMPARISON_UNITS: [usize; 3] = [16, 256, 16_384];
+
 const PHASES: [&str; 4] = [
     "projection",
     "plan_compile",
@@ -102,7 +107,7 @@ fn export(directory: &std::path::Path) -> Result<(), Box<dyn Error>> {
         "<EncryptedData xmlns=\"http://www.w3.org/2001/04/xmlenc#\"><EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\"><KeyName>bench</KeyName></KeyInfo><CipherData><CipherValue/></CipherData></EncryptedData>",
     )?;
     let mut cases = Vec::new();
-    for spec in support::specs().filter(|s| {
+    for spec in support::specs_for(&COMPARISON_UNITS).filter(|s| {
         matches!(s.engine, Engine::RustCrypto)
             && s.backend == XmlBackend::Xmloxide
             && [0, 1, 2, 3, 7].contains(&s.shape)
@@ -181,7 +186,7 @@ fn export_scenarios(
         directory.join("element.template.xml"),
         "<xenc:EncryptedData xmlns:xenc=\"http://www.w3.org/2001/04/xmlenc#\" Type=\"http://www.w3.org/2001/04/xmlenc#Element\"><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2009/xmlenc11#aes256-gcm\"/><ds:KeyInfo xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><xenc:EncryptedKey><xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#rsa-oaep-mgf1p\"><ds:DigestMethod Algorithm=\"http://www.w3.org/2000/09/xmldsig#sha1\"/></xenc:EncryptionMethod><ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedKey></ds:KeyInfo><xenc:CipherData><xenc:CipherValue/></xenc:CipherData></xenc:EncryptedData>",
     )?;
-    for units in [16, 256] {
+    for units in COMPARISON_UNITS {
         let mut attributes = String::new();
         let mut items = String::new();
         for index in 0..units {
@@ -277,8 +282,8 @@ fn parse_request(args: &[String]) -> Result<Request<'_>, Box<dyn Error>> {
         .position(|shape| *shape == args[1])
         .ok_or("unknown shape")?;
     let units = args[2].parse::<usize>()?;
-    if ![16, 256].contains(&units) {
-        return Err("units must be 16 or 256".into());
+    if !COMPARISON_UNITS.contains(&units) {
+        return Err("units must be 16, 256 or 16384".into());
     }
     let backend = match args[3].as_str() {
         "xmloxide" => XmlBackend::Xmloxide,
