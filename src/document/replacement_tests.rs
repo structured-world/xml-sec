@@ -67,6 +67,43 @@ fn element_replacement_reads_folded_whitespace_by_value() {
 }
 
 #[test]
+fn replacement_may_hold_references_that_expand_to_nothing() {
+    // XML 1.0 section 2.3 [9] permits an empty entity value. A reference to it
+    // is complete markup that leaves no node behind, on either backend.
+    let xml = r#"<!DOCTYPE r [<!ENTITY empty "">]><r>a<t ID="target"/>b</r>"#;
+    let backends = [
+        #[cfg(feature = "xml-backend-xmloxide")]
+        XmlBackend::Xmloxide,
+        #[cfg(feature = "xml-backend-roxmltree")]
+        XmlBackend::Roxmltree,
+    ];
+    for backend in backends {
+        for (replacement, fragment) in [
+            ("<x/>&empty;", false),
+            ("&empty;<x/>&empty;", false),
+            ("&empty;", true),
+            ("<x/>&empty;<y/>", true),
+        ] {
+            let settings = DocumentParseSettings::new(
+                true,
+                crate::hard_limits::XML_DOCUMENT_NODE_CEILING,
+                crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
+            )
+            .with_backend(backend);
+            let mut document =
+                XmlDocument::parse_with_settings(xml.to_owned(), settings).expect("fixture");
+            let target = target_of(&document);
+            let result = if fragment {
+                document.replace_node_with_fragment(target, replacement)
+            } else {
+                document.replace_element(target, replacement)
+            };
+            result.unwrap_or_else(|error| panic!("{backend:?} {replacement:?}: {error:?}"));
+        }
+    }
+}
+
+#[test]
 fn element_replacement_rejects_other_shapes() {
     // An Element replacement is exactly one element: no sibling element, no
     // character data, nothing that closes or reopens an ancestor.

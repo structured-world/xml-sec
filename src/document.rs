@@ -3761,7 +3761,6 @@ fn validate_replacement_slot(
                 .ok_or_else(escaped)?;
         }
     }
-    let blank = |range: std::ops::Range<usize>| xml[range].trim().is_empty();
     let mut elements = 0_usize;
     let mut covered = slot.start;
     for child in container.children() {
@@ -3773,9 +3772,8 @@ fn validate_replacement_slot(
             break;
         }
         let part = range.start.max(slot.start)..range.end.min(slot.end);
-        // Bytes no node covers are whitespace the parser dropped at document
-        // level. Nodes expanded from one entity reference share its range.
-        if !blank(covered..part.start.max(covered)) {
+        // Nodes expanded from one entity reference share its range.
+        if !leaves_no_node(&xml[covered..part.start.max(covered)]) {
             return Err(escaped());
         }
         covered = covered.max(part.end);
@@ -3817,7 +3815,7 @@ fn validate_replacement_slot(
             return Err(escaped());
         }
     }
-    if !blank(covered..slot.end) {
+    if !leaves_no_node(&xml[covered..slot.end]) {
         return Err(escaped());
     }
     if shape == ReplacementShape::SingleElement && elements != 1 {
@@ -3829,8 +3827,24 @@ fn validate_replacement_slot(
 /// Whether character data starting on a token boundary also ends on one: every
 /// CDATA section and reference it opens is closed inside it.
 fn text_tokens_complete(text: &str) -> bool {
+    scan_text_tokens(text, |_| true)
+}
+
+/// Whether source bytes no node covers are markup that leaves no node: whitespace
+/// the parser drops at document level, or complete references to an empty entity
+/// (XML 1.0 section 2.3 [9] permits an empty entity value).
+fn leaves_no_node(source: &str) -> bool {
+    scan_text_tokens(source, |literal| literal.trim().is_empty())
+}
+
+/// Walk character data token by token: every CDATA section and reference must
+/// close inside `text`, and `literal` must accept each run of plain characters.
+fn scan_text_tokens(text: &str, literal: impl Fn(&str) -> bool) -> bool {
     let mut rest = text;
     while let Some(start) = rest.find(['&', '<']) {
+        if !literal(&rest[..start]) {
+            return false;
+        }
         rest = &rest[start..];
         let close = if rest.starts_with("<![CDATA[") {
             "]]>"
@@ -3844,7 +3858,7 @@ fn text_tokens_complete(text: &str) -> bool {
         };
         rest = &rest[end + close.len()..];
     }
-    true
+    literal(rest)
 }
 
 fn wrapped_fragment(replacement: &str) -> String {
