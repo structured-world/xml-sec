@@ -440,6 +440,55 @@ fn many_distinct_local_bindings_compile_with_one_scope_index() {
 }
 
 #[test]
+fn expression_preparation_is_admitted_before_its_buffers_exist() {
+    // Stylesheet text decides how large the engine-form buffers grow: a long in-scope prefix
+    // makes the private context prefix just as long, and every outer position() repeats it.
+    // Compilation must admit that workspace before preparing, not only the retained result.
+    let namespaces = Arc::new(vec![
+        ("__xml_sec_ctx".to_owned(), "urn:collision".to_owned()),
+        (format!("p{}", "x".repeat(512)), "urn:long".to_owned()),
+    ]);
+    let source = vec!["position()"; 64].join("+");
+    let compile = |limit| {
+        let retained = Cell::new(0usize);
+        let workspace = CompileWorkspace {
+            limit,
+            occupied: 0,
+            retained: &retained,
+        };
+        Expression::new_with_namespaces_and_base(
+            &source,
+            Arc::clone(&namespaces),
+            None,
+            StylesheetDocumentId::PRINCIPAL,
+            64,
+            workspace,
+            workspace,
+        )
+        .map(|expression| (expression, retained.get()))
+    };
+    let (expression, retained) = compile(usize::MAX).expect("unbounded compilation succeeds");
+    let prepared = expression
+        .prepared
+        .as_ref()
+        .expect("compiled expressions carry their engine form");
+    assert!(
+        prepared.retained_bytes() > 512,
+        "the long private prefix is retained"
+    );
+    let admitted =
+        retained - prepared.retained_bytes() + xpath_preparation_bytes(&source, &namespaces);
+    assert!(matches!(
+        compile(admitted - 1),
+        Err(Error::Budget {
+            kind: BudgetKind::OwnedBytes,
+            ..
+        })
+    ));
+    compile(admitted).expect("the admitted preparation workspace suffices");
+}
+
+#[test]
 fn local_binding_index_reserves_and_releases_compile_workspace() {
     // The temporary scope index is attacker-controlled compiler state and must remain charged
     // for exactly the lifetime of the shared index.

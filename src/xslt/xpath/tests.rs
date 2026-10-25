@@ -1551,6 +1551,79 @@ fn outer_context_functions_accept_xpath_whitespace() {
 }
 
 #[test]
+fn prepared_expressions_admit_only_the_bindings_evaluation_copies() {
+    // Compiled text carries its engine form, so its evaluation workspace is exactly the
+    // namespace bindings copied into the scoped context. Text created during execution is
+    // still prepared per evaluation and must keep admitting those buffers first.
+    let source = "count(../item) + position()";
+    let namespaces: Vec<(String, String)> =
+        vec![("prefix".into(), "urn:namespace:retained".into())];
+    let deferred = Expression::generated(source, namespaces.clone());
+    let mut compiled = deferred.clone();
+    compiled.prepared = Some(PreparedXPath::new(source, &namespaces));
+    let rewrite = compiled
+        .prepared
+        .as_ref()
+        .and_then(|prepared| prepared.rewrite.as_deref())
+        .expect("a parent step and an outer position() need an engine form");
+    let (prefix, namespace) = rewrite
+        .context_namespace()
+        .expect("outer position() is bound privately");
+    assert_eq!(
+        (prefix, namespace),
+        ("__xml_sec_ctx", CONTEXT_NS),
+        "an unused prefix keeps its preferred spelling"
+    );
+    assert_eq!(
+        rewrite.text(source),
+        evaluation_rewrite(&deferred, false)
+            .expect("runtime text is prepared during evaluation")
+            .text(source),
+        "both paths must evaluate the same engine text"
+    );
+    assert_eq!(
+        xpath_adapter_workspace_upper_bound(&compiled),
+        xpath_namespace_binding_bytes(&compiled)
+            + hash_table_entry_bytes::<(String, String)>()
+            + prefix.len()
+            + namespace.len()
+    );
+    assert!(
+        xpath_adapter_workspace_upper_bound(&deferred)
+            > xpath_adapter_workspace_upper_bound(&compiled)
+    );
+}
+
+#[test]
+fn plain_expressions_retain_no_engine_form() {
+    // Text the engine evaluates unchanged must not cost a heap form per compiled expression,
+    // while a rewritten form is retained and charged at its exact size.
+    let plain = PreparedXPath::new("root/item", &[]);
+    assert!(plain.rewrite.is_none());
+    assert_eq!(plain.retained_bytes(), 0);
+    let current = PreparedXPath::new("current()/item", &[]);
+    assert!(xpath_uses_current(&Expression {
+        prepared: Some(current.clone()),
+        ..Expression::generated("current()/item", Vec::new())
+    }));
+    assert_eq!(
+        current.retained_bytes(),
+        std::mem::size_of::<XPathRewrite>()
+    );
+    let spaced = PreparedXPath::new("count \r( * )", &[]);
+    let text = spaced
+        .rewrite
+        .as_deref()
+        .and_then(|rewrite| rewrite.text.as_deref())
+        .expect("call spacing and wildcards are normalized for the engine");
+    assert_eq!(text, "count( child::* )");
+    assert_eq!(
+        spaced.retained_bytes(),
+        std::mem::size_of::<XPathRewrite>() + text.len()
+    );
+}
+
+#[test]
 fn outer_context_rewrite_respects_unicode_ncname_boundaries() {
     // XML Names permits combining marks after the first NCName character. A built-in-looking
     // suffix inside such a QName must remain a call to that QName, not become an outer-context

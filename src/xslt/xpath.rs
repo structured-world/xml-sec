@@ -23,7 +23,7 @@ use super::budget::{
 };
 use super::compiler::{
     DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, Pattern,
-    StylesheetDocumentId, normalize_xpath_for_sxd,
+    StylesheetDocumentId, normalize_xpath_for_sxd, normalized_xpath_len,
 };
 use super::expression::innermost_namespaced_call;
 use super::lexical::{
@@ -2206,8 +2206,7 @@ impl Evaluator {
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
         let (context_node, context_path) = self.xpath_context_node(node, meter)?;
-        let uses_current =
-            super::expression::has_unprefixed_function_call(&expression.source, "current");
+        let uses_current = xpath_uses_current(expression);
         // XPath 1.0 section 3.2 requires '(' in every FunctionCall. Synthesized axis
         // predicates use only the core functions already supplied by ScopedContext::new().
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#section-Function-Calls
@@ -2222,17 +2221,14 @@ impl Evaluator {
             context_path,
             meter,
         )?;
-        let normalized = normalize_xpath_for_sxd(&expression.source);
-        let isolated = hide_projection_elements_from_axes(&normalized);
-        let context_namespace =
-            (isolated.contains("position") || isolated.contains("last")).then(|| {
-                unused_internal_namespace(&expression.namespaces, "__xml_sec_ctx", CONTEXT_NS)
+        let rewrite = evaluation_rewrite(expression, uses_current);
+        let rewritten = rewrite
+            .as_deref()
+            .map_or(expression.source.as_str(), |rewrite| {
+                rewrite.text(&expression.source)
             });
-        let rewritten = context_namespace.as_ref().map_or_else(
-            || Cow::Borrowed(isolated.as_ref()),
-            |(prefix, _)| rewrite_outer_context_functions(&isolated, prefix),
-        );
-        self.cache_xpath(expression, &rewritten, adapter_workspace, meter)?;
+        let context_namespace = rewrite.as_deref().and_then(XPathRewrite::context_namespace);
+        self.cache_xpath(expression, rewritten, adapter_workspace, meter)?;
         // Context construction owns QName indexes, registered function objects, namespace
         // strings, and variable slots. Their complete representation bound is included in the
         // adapter preflight above, before any of these allocations can occur. Runtime QName
@@ -2256,7 +2252,7 @@ impl Evaluator {
         bind_xpath_namespaces(
             &mut context,
             expression,
-            context_namespace.as_ref(),
+            context_namespace,
             position,
             size,
             uses_current,
@@ -2301,7 +2297,7 @@ impl Evaluator {
         self.execute_cached_xpath(
             &context,
             CompiledXPathInput {
-                source: &rewritten,
+                source: rewritten,
                 context_node,
                 operations: (xpath_operations, xpath_operations_limit),
                 extensions: (extension_operations, extension_operations_limit),
@@ -3730,55 +3726,27 @@ impl Evaluator {
 }
 
 fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
-    let source = expression.source.as_str();
-    let source_bytes = source.len();
-    let normalizes =
-        source.chars().any(super::lexical::is_xml_whitespace) || source.as_bytes().contains(&b'*');
-    let normalized_bytes = if normalizes {
-        // One wildcard can expand from one byte to `child::*` (eight bytes). Account for the
-        // allocator's geometric String growth while the normalized buffer remains live.
-        source_bytes.saturating_mul(16)
-    } else {
-        source_bytes
+    let Some(prepared) = &expression.prepared else {
+        return xpath_preparation_workspace_upper_bound(expression);
     };
-    let normalization_peak = if normalizes {
-        source_bytes.saturating_mul(20)
-    } else {
-        0
-    };
-    let axis_rewrites = [
-        "ancestor-or-self::",
-        "ancestor::",
-        "following::",
-        "following-sibling::",
-        "preceding::",
-        "preceding-sibling::",
-        "parent::",
-        "self::",
-    ]
-    .into_iter()
-    .fold(source.matches("..").count(), |count, axis| {
-        count.saturating_add(source.matches(axis).count())
-    });
-    let isolated_bytes = normalized_bytes
-        .saturating_add(axis_rewrites.saturating_mul(192))
-        .saturating_mul(2);
-    let internal_prefix_bytes = expression
-        .namespaces
-        .iter()
-        .map(|(prefix, _)| prefix.len())
-        .max()
-        .unwrap_or(0)
-        .max("__xml_sec_ctx".len())
-        .saturating_add(1);
-    let context_calls = source
-        .matches("position")
-        .count()
-        .saturating_add(source.matches("last").count());
-    let rewritten_bytes = isolated_bytes
-        .saturating_add(context_calls.saturating_mul(internal_prefix_bytes.saturating_add(2)))
-        .saturating_mul(2);
-    let namespace_bytes = expression
+    // A compiled expression carries its engine text, so evaluation only copies its
+    // namespace bindings, including the private context binding, into the scoped context.
+    xpath_namespace_binding_bytes(expression).saturating_add(
+        prepared
+            .rewrite
+            .as_deref()
+            .and_then(XPathRewrite::context_namespace)
+            .map_or(0, |(prefix, namespace)| {
+                hash_table_entry_bytes::<(String, String)>()
+                    .saturating_add(prefix.len())
+                    .saturating_add(namespace.len())
+            }),
+    )
+}
+
+/// Namespace bindings every evaluation copies into its scoped context.
+fn xpath_namespace_binding_bytes(expression: &Expression) -> usize {
+    expression
         .namespaces
         .iter()
         .fold(0usize, |bytes, (prefix, uri)| {
@@ -3790,20 +3758,96 @@ fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
         .saturating_add(hash_table_entry_bytes::<(String, String)>())
         .saturating_add("xml".len())
         .saturating_add("http://www.w3.org/XML/1998/namespace".len())
-        .saturating_add(if context_calls != 0 {
+}
+
+/// Workspace of text created during execution, which is prepared per evaluation and
+/// then bound into the scoped context.
+fn xpath_preparation_workspace_upper_bound(expression: &Expression) -> usize {
+    let workspace = xpath_preparation_workspace(&expression.source, &expression.namespaces);
+    workspace
+        .buffers
+        .saturating_add(xpath_namespace_binding_bytes(expression))
+        .saturating_add(workspace.context_binding)
+}
+
+/// Upper bound of the buffers `PreparedXPath::new` allocates for this text, admitted
+/// before compilation prepares a stylesheet expression.
+pub(crate) fn xpath_preparation_bytes(source: &str, namespaces: &[(String, String)]) -> usize {
+    xpath_preparation_workspace(source, namespaces)
+        .buffers
+        .saturating_add(std::mem::size_of::<XPathRewrite>())
+}
+
+struct PreparationWorkspace {
+    /// Every preparation stage that allocates, live together, plus the private names.
+    buffers: usize,
+    /// Scoped-context entry of the private outer-context binding, when one is needed.
+    context_binding: usize,
+}
+
+/// Each stage is charged only when it allocates. Normalization is measured exactly and
+/// allocated at that capacity; the axis and context rewrites may double their capacity while
+/// growing and then shrink into the retained text, so they are charged twice plus that copy.
+fn xpath_preparation_workspace(
+    source: &str,
+    namespaces: &[(String, String)],
+) -> PreparationWorkspace {
+    let normalized = normalized_xpath_len(source);
+    let normalized_bytes = normalized.unwrap_or(source.len());
+    // Projection hiding rewrites `..` and axis steps; wildcard expansion can add `child::`.
+    let isolates = source.contains("..") || source.contains("::") || normalized.is_some();
+    let axis_rewrites = source
+        .matches("..")
+        .count()
+        .saturating_add(source.matches("::").count())
+        .saturating_add(source.matches('*').count());
+    let isolated_bytes = if isolates {
+        normalized_bytes.saturating_add(axis_rewrites.saturating_mul(192))
+    } else {
+        normalized_bytes
+    };
+    let internal_prefix_bytes = namespaces
+        .iter()
+        .map(|(prefix, _)| prefix.len())
+        .max()
+        .unwrap_or(0)
+        .max("__xml_sec_ctx".len())
+        .saturating_add(1);
+    // `unused_internal_name` pads a colliding preferred name past the longest existing one.
+    let internal_namespace_bytes = namespaces
+        .iter()
+        .map(|(_, namespace)| namespace.len())
+        .max()
+        .unwrap_or(0)
+        .max(CONTEXT_NS.len())
+        .saturating_add(1);
+    let context_calls = source
+        .matches("position")
+        .count()
+        .saturating_add(source.matches("last").count());
+    let growing_stage = |bytes: usize| bytes.saturating_mul(3);
+    let mut buffers = normalized.unwrap_or(0);
+    if isolates {
+        buffers = buffers.saturating_add(growing_stage(isolated_bytes));
+    }
+    if context_calls != 0 {
+        let rewritten_bytes = isolated_bytes
+            .saturating_add(context_calls.saturating_mul(internal_prefix_bytes.saturating_add(2)));
+        buffers = buffers
+            .saturating_add(growing_stage(rewritten_bytes))
+            .saturating_add(internal_prefix_bytes)
+            .saturating_add(internal_namespace_bytes);
+    }
+    PreparationWorkspace {
+        buffers,
+        context_binding: if context_calls != 0 {
             hash_table_entry_bytes::<(String, String)>()
                 .saturating_add(internal_prefix_bytes)
-                .saturating_add(CONTEXT_NS.len())
+                .saturating_add(internal_namespace_bytes)
         } else {
             0
-        });
-    normalization_peak.max(
-        normalized_bytes
-            .saturating_add(isolated_bytes)
-            .saturating_add(rewritten_bytes)
-            .saturating_add(namespace_bytes)
-            .saturating_add(internal_prefix_bytes.saturating_mul(2)),
-    )
+        },
+    }
 }
 
 fn xpath_context_workspace_upper_bound(
@@ -6767,7 +6811,7 @@ fn admit_xpath_workspace(
 fn bind_xpath_namespaces(
     context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'_, '_>,
     expression: &Expression,
-    context_namespace: Option<&(Cow<'_, str>, Cow<'_, str>)>,
+    context_namespace: Option<(&str, &str)>,
     position: usize,
     size: usize,
     uses_current: bool,
@@ -6779,11 +6823,8 @@ fn bind_xpath_namespaces(
     context.set_namespace("xml", "http://www.w3.org/XML/1998/namespace");
     if let Some((prefix, namespace)) = context_namespace {
         context.set_namespace(prefix, namespace);
-        context.set_variable(
-            (namespace.as_ref(), "position"),
-            super::number::size(position),
-        );
-        context.set_variable((namespace.as_ref(), "last"), super::number::size(size));
+        context.set_variable((namespace, "position"), super::number::size(position));
+        context.set_variable((namespace, "last"), super::number::size(size));
     }
     if uses_current {
         // Reuse projected identity instead of rescanning siblings for every evaluation.
@@ -6896,6 +6937,7 @@ fn prepare_extension_expression(
         variable_references: Arc::clone(&expression.variable_references),
         static_base_uri: expression.static_base_uri.clone(),
         stylesheet_document: expression.stylesheet_document,
+        prepared: None,
     };
     let source = expression.source.clone();
     Ok((prepared_expression, source))
@@ -7276,6 +7318,123 @@ fn for_each_exslt_replacement_segment(
         }
     }
     Ok(())
+}
+
+/// The engine form of an expression and the bindings it needs. It depends only on the
+/// expression's text and in-scope namespaces, so it is derived once rather than per evaluation.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedXPath {
+    /// Out of line and absent for the common expression that evaluates its own text
+    /// without extra bindings, so every compiled expression grows by one pointer only.
+    rewrite: Option<Box<XPathRewrite>>,
+}
+
+#[derive(Debug, Clone)]
+struct XPathRewrite {
+    /// Engine text, kept only when it differs from the expression's own text.
+    text: Option<Box<str>>,
+    /// Private binding for the outer `position()` and `last()` values.
+    context_namespace: Option<(Box<str>, Box<str>)>,
+    uses_current: bool,
+}
+
+impl XPathRewrite {
+    fn new(source: &str, namespaces: &[(String, String)], uses_current: bool) -> Self {
+        let normalized = normalize_xpath_for_sxd(source);
+        let isolated = hide_projection_elements_from_axes(&normalized);
+        let context_namespace = (isolated.contains("position") || isolated.contains("last"))
+            .then(|| unused_internal_namespace(namespaces, "__xml_sec_ctx", CONTEXT_NS));
+        let rewritten =
+            context_namespace.as_ref().and_then(
+                |(prefix, _)| match rewrite_outer_context_functions(&isolated, prefix) {
+                    Cow::Owned(text) => Some(text),
+                    Cow::Borrowed(_) => None,
+                },
+            );
+        // Take the last owned stage instead of copying it; each stage borrows only when
+        // it left its input unchanged.
+        let isolated = match isolated {
+            Cow::Owned(text) => Some(text),
+            Cow::Borrowed(_) => None,
+        };
+        let text = rewritten.or(isolated).or(match normalized {
+            Cow::Owned(text) => Some(text),
+            Cow::Borrowed(_) => None,
+        });
+        Self {
+            text: text
+                .filter(|text| text != source)
+                .map(String::into_boxed_str),
+            context_namespace: context_namespace.map(|(prefix, namespace)| {
+                (prefix.into_owned().into(), namespace.into_owned().into())
+            }),
+            uses_current,
+        }
+    }
+
+    fn text<'a>(&'a self, source: &'a str) -> &'a str {
+        self.text.as_deref().unwrap_or(source)
+    }
+
+    fn context_namespace(&self) -> Option<(&str, &str)> {
+        self.context_namespace
+            .as_ref()
+            .map(|(prefix, namespace)| (prefix.as_ref(), namespace.as_ref()))
+    }
+}
+
+fn xpath_uses_current(expression: &Expression) -> bool {
+    expression.prepared.as_ref().map_or_else(
+        || super::expression::has_unprefixed_function_call(&expression.source, "current"),
+        PreparedXPath::uses_current,
+    )
+}
+
+/// The engine form of `expression`. Text created during execution is prepared here, after
+/// its evaluation workspace has been admitted.
+fn evaluation_rewrite(
+    expression: &Expression,
+    uses_current: bool,
+) -> Option<Cow<'_, XPathRewrite>> {
+    match &expression.prepared {
+        Some(prepared) => prepared.rewrite.as_deref().map(Cow::Borrowed),
+        None => Some(Cow::Owned(XPathRewrite::new(
+            &expression.source,
+            &expression.namespaces,
+            uses_current,
+        ))),
+    }
+}
+
+impl PreparedXPath {
+    pub(crate) fn new(source: &str, namespaces: &[(String, String)]) -> Self {
+        let uses_current = super::expression::has_unprefixed_function_call(source, "current");
+        let rewrite = XPathRewrite::new(source, namespaces, uses_current);
+        Self {
+            rewrite: (rewrite.text.is_some()
+                || rewrite.context_namespace.is_some()
+                || rewrite.uses_current)
+                .then(|| Box::new(rewrite)),
+        }
+    }
+
+    fn uses_current(&self) -> bool {
+        self.rewrite
+            .as_ref()
+            .is_some_and(|rewrite| rewrite.uses_current)
+    }
+
+    /// Heap bytes owned beyond the expression's own text.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.rewrite.as_ref().map_or(0, |rewrite| {
+            std::mem::size_of::<XPathRewrite>()
+                + rewrite.text.as_ref().map_or(0, |text| text.len())
+                + rewrite
+                    .context_namespace
+                    .as_ref()
+                    .map_or(0, |(prefix, namespace)| prefix.len() + namespace.len())
+        })
+    }
 }
 
 fn unused_internal_namespace<'a>(

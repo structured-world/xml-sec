@@ -1900,10 +1900,9 @@ impl<'a> Execution<'a> {
             self.evaluate_with_params(parameters, &node, position, size, depth, precedence)?;
         let target = self
             .stylesheet
-            .templates
-            .iter()
-            .filter(|candidate| candidate.name.as_ref() == Some(name))
-            .max_by_key(|candidate| (candidate.precedence, candidate.order))
+            .named_template_index
+            .get(name)
+            .map(|index| &self.stylesheet.templates[*index])
             .ok_or_else(|| Error::Dynamic(format!("named template {} not found", name.local)))?;
         tasks.push(
             TemplateTask::enter_template(

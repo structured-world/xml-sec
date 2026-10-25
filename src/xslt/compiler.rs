@@ -14,6 +14,7 @@ use super::lexical::{
 };
 use super::model::{parser_workspace_bytes, prepare_xml_frontend_bounded};
 use super::resolver::decode_resource;
+use super::xpath::{PreparedXPath, xpath_preparation_bytes};
 use super::{
     BudgetKind, CompileBudget, Document, Error, ExpandedName, Namespace, NodeKind,
     OutputDefinition, OutputMethod, ParseBudget, ParseUsage, Reported, ResolvePurpose,
@@ -1106,6 +1107,9 @@ pub(crate) struct Expression {
     pub static_base_uri: Option<Arc<str>>,
     /// Stable identity of the stylesheet document containing this expression.
     pub(crate) stylesheet_document: StylesheetDocumentId,
+    /// Engine form prepared under the compile budget. Text created during execution is
+    /// prepared per evaluation instead, after its workspace is admitted.
+    pub(crate) prepared: Option<PreparedXPath>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Pattern {
@@ -1360,12 +1364,18 @@ impl Expression {
             workspace.retain(source.len())?;
         }
         let variable_references = referenced_variables_bounded(source, &namespaces, workspace)?;
+        // Stylesheet text sizes the preparation buffers, so they are admitted before they
+        // exist. They are gone once the form is built; only the form stays retained.
+        workspace.reserve(xpath_preparation_bytes(source, &namespaces))?;
+        let prepared = PreparedXPath::new(source, &namespaces);
+        workspace.retain(prepared.retained_bytes())?;
         Ok(Self {
             source: source.to_owned(),
             namespaces,
             static_base_uri,
             stylesheet_document,
             variable_references,
+            prepared: Some(prepared),
         })
     }
 
@@ -1400,6 +1410,7 @@ impl Expression {
             variable_references,
             static_base_uri,
             stylesheet_document,
+            prepared: None,
         }
     }
 }
@@ -1682,6 +1693,16 @@ pub(crate) fn normalize_xpath_for_sxd(source: &str) -> Cow<'_, str> {
     visit_normalized_xpath(source, |part| output.push_str(part));
     debug_assert_eq!(output.len(), length);
     Cow::Owned(output)
+}
+
+/// Exact length `normalize_xpath_for_sxd` allocates for `source`, or `None` when it borrows,
+/// measured without allocating.
+pub(crate) fn normalized_xpath_len(source: &str) -> Option<usize> {
+    if !source.chars().any(super::lexical::is_xml_whitespace) && !source.contains('*') {
+        return None;
+    }
+    let mut length = 0usize;
+    visit_normalized_xpath(source, |part| length += part.len()).then_some(length)
 }
 
 // The measuring and writing passes share token handling; neither materializes a character array.

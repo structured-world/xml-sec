@@ -3298,6 +3298,48 @@ fn import_precedence_overrides_but_include_keeps_equal_precedence() {
 }
 
 #[test]
+fn call_template_selects_the_highest_import_precedence_and_rejects_unknown_names() {
+    // XSLT 1.0 section 6: a call resolves to the named template of highest import
+    // precedence; an imported definition must not win over the importing module's one.
+    // https://www.w3.org/TR/1999/REC-xslt-19991116#named-templates
+    let resolver = Arc::new(MemoryResolver::default());
+    resolver.resources.lock().expect("test resolver mutex is not poisoned").insert(
+        "base.xsl".into(),
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="greet"><imported/></xsl:template><xsl:template name="only-imported"><fallback/></xsl:template></xsl:stylesheet>"#.into(),
+    );
+    let execute = |body: &str| {
+        Compiler::new(resolver.clone(), CompileBudget::new(1 << 20, 8, 256, 1 << 20))
+            .compile(
+                &format!(r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:import href="base.xsl"/><xsl:output omit-xml-declaration="yes"/><xsl:template name="greet"><local/></xsl:template><xsl:template match="/"><out>{body}</out></xsl:template></xsl:stylesheet>"#),
+                Some("memory:main.xsl"),
+            )
+            .expect("import graph must compile")
+            .execute(
+                &Document::parse("<root/>", None).expect("source must parse"),
+                &Parameters::new(),
+                resolver.clone(),
+                ExecutionOptions {
+                    budget: execution_budget(1024),
+                    initial_mode: None,
+                    initial_template: None,
+                },
+            )
+    };
+    let output =
+        execute(r#"<xsl:call-template name="greet"/><xsl:call-template name="only-imported"/>"#)
+            .expect("named calls must execute");
+    assert_eq!(
+        String::from_utf8(output.serialized.bytes).expect("UTF-8 output"),
+        "<out><local/><fallback/></out>\n"
+    );
+    let error = execute(r#"<xsl:call-template name="missing"/>"#)
+        .expect_err("an unknown named template must not execute");
+    assert!(
+        matches!(error, Error::Dynamic(ref message) if message == "named template missing not found")
+    );
+}
+
+#[test]
 fn serializer_honors_doctype_cdata_html_and_text_contracts() {
     // Serializer method selection changes exact transform bytes, not only presentation.
     let default_xml = r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"><root/></xsl:template></xsl:stylesheet>"#;
