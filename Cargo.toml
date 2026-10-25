@@ -148,7 +148,7 @@ cryptoki = { version = "0.12.1", optional = true }
 # bindgen 0.73 can resolve incompatible syn/prettyplease major versions.
 # The sys dependency only constrains resolution; provider calls use aws-lc-rs.
 aws-lc-rs = { version = "=1.18.2", default-features = false, features = ["fips"], optional = true }
-aws-lc-fips-sys = { version = "=0.14.2", default-features = false, optional = true }
+aws-lc-fips-sys = { version = "=0.14.3", default-features = false, optional = true }
 rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
