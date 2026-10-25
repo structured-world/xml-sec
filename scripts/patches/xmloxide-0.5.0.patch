@@ -1149,7 +1149,7 @@
          self.parse_reference_into(&mut buf)?;
          Ok(buf)
      }
-@@ -1190,34 +1154,46 @@
+@@ -1190,34 +1154,47 @@
      ///
      /// Returns the resolved text as a `&str` slice of `buf` (the portion
      /// that was appended), which callers can use for validation.
@@ -1170,10 +1170,13 @@
 +        let reference_start = self.pos;
          self.expect_byte(b'&')?;
  
-         // Fast path: recognize builtin entities at byte level
+-        // Fast path: recognize builtin entities at byte level
++        // Fast path: recognize builtin entities at byte level. Predefined and
++        // character references substitute no declared entity: each spends at
++        // least four input bytes on one character, so the document byte limit
++        // bounds them and they are not charged as entity expansions.
          let remaining = &self.input[self.pos..];
          if let Some(result) = match_builtin_entity(remaining) {
-+            self.count_entity_expansion()?;
              let advance_len = result.1;
 -            self.advance_counting_lines(advance_len);
 +            self.advance_counting_lines(advance_len)?;
@@ -1184,7 +1187,6 @@
          }
  
          if self.peek() == Some(b'#') {
-+            self.count_entity_expansion()?;
              // Character reference
 -            self.advance(1);
 +            self.advance(1)?;
@@ -1205,7 +1207,7 @@
                  if dec.is_empty() {
                      return Err(self.fatal("empty decimal character reference"));
                  }
-@@ -1226,68 +1202,191 @@
+@@ -1226,68 +1203,191 @@
              };
              self.expect_byte(b';')?;
  
@@ -1446,7 +1448,7 @@
          }
      }
  
-@@ -1295,196 +1394,130 @@
+@@ -1295,196 +1395,132 @@
      ///
      /// Per XML 1.0 §4.4, when an entity's replacement text is included,
      /// character references and entity references within it are resolved.
@@ -1604,10 +1606,19 @@
                          }
 -                        "apos" => {
 -                            result.push('\'');
--                            continue;
 +                        let name = std::str::from_utf8(&bytes[start..i])
 +                            .map_err(|_| self.fatal("invalid UTF-8 in entity name"))?;
 +                        i += 1; // skip ';'
++
++                        // Fast path: builtin entities push directly, no allocation.
++                        // They expand nothing and the replacement-work limit bounds
++                        // them, so only declared entities are charged below.
++                        if self.append_builtin_replacement(name, result)? {
+                             continue;
+                         }
+-                        "quot" => {
+-                            result.push('"');
+-                            continue;
 +
 +                        self.entity_expansions += 1;
 +                        if self.entity_expansions > self.max_entity_expansions {
@@ -1615,13 +1626,6 @@
 +                                "entity expansion limit exceeded ({})",
 +                                self.max_entity_expansions
 +                            )));
-                         }
--                        "quot" => {
--                            result.push('"');
-+
-+                        // Fast path: builtin entities push directly, no allocation
-+                        if self.append_builtin_replacement(name, result)? {
-                             continue;
                          }
 -                        _ => {}
 -                    }
@@ -1746,7 +1750,7 @@
      // -- Attribute value parsing (XML 1.0 §3.3.3) --
  
      /// Parses a quoted attribute value with entity resolution and
-@@ -1493,18 +1526,22 @@
+@@ -1493,18 +1529,22 @@
      /// Uses bulk scanning to find the next `&`, `<`, or quote character,
      /// then extracts safe chunks with a single `push_str()` instead of
      /// processing character by character.
@@ -1772,7 +1776,7 @@
                  let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
                      .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
                  // Fast byte-level pre-check: only validate when bytes suggest
-@@ -1516,30 +1553,18 @@
+@@ -1516,30 +1556,18 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -1810,7 +1814,7 @@
              }
  
              if self.at_end() {
-@@ -1548,57 +1573,45 @@
+@@ -1548,57 +1576,45 @@
  
              let b = self.input[self.pos];
              if b == quote {
@@ -1882,7 +1886,7 @@
          self.expect_byte(quote)?;
          Ok(value)
      }
-@@ -1606,21 +1619,44 @@
+@@ -1606,21 +1622,44 @@
      // -- Error helpers --
  
      /// Creates a fatal `ParseError` at the current location.
@@ -1935,7 +1939,7 @@
      }
  }
  
-@@ -1630,100 +1666,111 @@
+@@ -1630,100 +1669,111 @@
  
  /// Manages namespace scope for XML parsers.
  ///
@@ -2105,7 +2109,7 @@
      }
  }
  
-@@ -1736,54 +1783,56 @@
+@@ -1736,54 +1786,56 @@
  /// The opening `<!--` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.5 production `[15]`.
@@ -2189,7 +2193,7 @@
                  } else {
                      return Err(input.fatal("'--' not allowed inside comments"));
                  }
-@@ -1793,8 +1842,6 @@
+@@ -1793,8 +1845,6 @@
              }
          }
      }
@@ -2198,7 +2202,7 @@
  }
  
  /// Parses a CDATA section (`<![CDATA[ ... ]]>`), returning the content text.
-@@ -1802,32 +1849,34 @@
+@@ -1802,32 +1852,34 @@
  /// The opening `<![CDATA[` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.7 production `[18]`.
@@ -2250,7 +2254,7 @@
              Ok(content)
          }
          None => Err(input.fatal("unexpected end of input in CDATA section")),
-@@ -1840,9 +1889,9 @@
+@@ -1840,9 +1892,9 @@
  /// The opening `<?` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.6 production `[16]`.
@@ -2263,7 +2267,7 @@
      input.expect_str(b"<?")?;
      let target = input.parse_name()?;
  
-@@ -1852,39 +1901,35 @@
+@@ -1852,39 +1904,35 @@
      }
  
      // Namespaces in XML 1.0 §3: PI targets must be NCNames (no colons).
@@ -2321,7 +2325,7 @@
              }
              None => {
                  return Err(input.fatal("unexpected end of input in processing instruction"));
-@@ -1900,11 +1945,11 @@
+@@ -1900,11 +1948,11 @@
  
  /// Parsed XML declaration data.
  #[derive(Debug, Clone)]
@@ -2336,7 +2340,7 @@
      /// Optional standalone declaration.
      pub standalone: Option<bool>,
  }
-@@ -1916,37 +1961,41 @@
+@@ -1916,37 +1964,41 @@
  /// verified by the caller via `looking_at`).
  ///
  /// See XML 1.0 §2.8 production `[23]`.
@@ -2388,7 +2392,7 @@
          }
  
          Some(enc)
-@@ -1958,17 +2007,17 @@
+@@ -1958,17 +2010,17 @@
      // If encoding was present, we need fresh whitespace before standalone.
      // If encoding was absent, the whitespace consumed when looking for
      // encoding already separates version from standalone.
@@ -2410,7 +2414,7 @@
              "yes" => Some(true),
              "no" => Some(false),
              _ => return Err(input.fatal("standalone must be 'yes' or 'no'")),
-@@ -1977,7 +2026,7 @@
+@@ -1977,7 +2029,7 @@
          None
      };
  
@@ -2419,7 +2423,7 @@
      input.expect_str(b"?>")?;
  
      Ok(XmlDeclaration {
-@@ -2024,9 +2073,9 @@
+@@ -2024,9 +2076,9 @@
          let mut input = ParserInput::new("abc");
          assert_eq!(input.peek(), Some(b'a'));
          assert_eq!(input.peek_at(1), Some(b'b'));
@@ -2431,7 +2435,7 @@
          assert!(input.at_end());
      }
  
-@@ -2035,9 +2084,9 @@
+@@ -2035,9 +2087,9 @@
          let mut input = ParserInput::new("ab\ncd");
          assert_eq!(input.location().line, 1);
          assert_eq!(input.location().column, 1);
@@ -2443,7 +2447,7 @@
          assert_eq!(input.location().line, 2);
          assert_eq!(input.location().column, 1);
      }
-@@ -2058,13 +2107,29 @@
+@@ -2058,13 +2110,29 @@
      }
  
      #[test]
@@ -2474,7 +2478,34 @@
      }
  
      #[test]
-@@ -2145,6 +2210,14 @@
+@@ -2112,9 +2180,25 @@
+         assert_eq!(input.diagnostics.len(), 1);
+     }
+ 
++    /// Input whose `&e;` references a declared internal entity, the substitution
++    /// the expansion limit counts.
++    fn input_with_declared_entity(text: &str) -> ParserInput<'_> {
++        let mut input = ParserInput::new(text);
++        Names::insert(
++            &mut input.entity_map,
++            "e".to_owned(),
++            EntityDecl {
++                name: String::new(),
++                kind: EntityKind::Internal("x".to_owned()),
++            },
++        )
++        .unwrap();
++        input
++    }
++
+     #[test]
+     fn test_entity_expansion_limit() {
+-        let mut input = ParserInput::new("&amp;&amp;&amp;");
++        let mut input = input_with_declared_entity("&e;&e;&e;");
+         input.set_max_entity_expansions(2);
+         assert!(input.parse_reference().is_ok());
+         assert!(input.parse_reference().is_ok());
+@@ -2145,6 +2229,14 @@
      }
  
      #[test]
@@ -2489,7 +2520,7 @@
      fn test_parse_quoted_value() {
          let mut input = ParserInput::new("'hello'");
          let value = input.parse_quoted_value().unwrap();
-@@ -2154,7 +2227,7 @@
+@@ -2154,7 +2246,7 @@
      #[test]
      fn test_skip_whitespace() {
          let mut input = ParserInput::new("  \t\n  abc");
@@ -2498,7 +2529,7 @@
          assert_eq!(input.peek(), Some(b'a'));
      }
  
-@@ -2168,12 +2241,211 @@
+@@ -2168,12 +2260,211 @@
      #[test]
      fn test_take_while() {
          let mut input = ParserInput::new("12345abc");
@@ -2711,7 +2742,7 @@
      fn test_split_name() {
          assert_eq!(split_name("foo:bar"), (Some("foo"), "bar"));
          assert_eq!(split_name("bar"), (None, "bar"));
-@@ -2182,37 +2454,94 @@
+@@ -2182,37 +2473,94 @@
  
      #[test]
      fn test_namespace_resolver() {
@@ -2723,6 +2754,14 @@
 -        assert_eq!(ns.resolve(None), None); // no default namespace
 +        assert_eq!(ns.resolve(Some("xml")).unwrap(), Some(XML_NAMESPACE));
 +        assert_eq!(ns.resolve(None).unwrap(), None); // no default namespace
++
++        ns.push_scope().unwrap();
++        ns.bind(None, "http://default".to_string()).unwrap();
++        ns.bind(Some("foo".to_string()), "http://foo".to_string())
++            .unwrap();
++
++        assert_eq!(ns.resolve(None).unwrap(), Some("http://default"));
++        assert_eq!(ns.resolve(Some("foo")).unwrap(), Some("http://foo"));
  
 -        ns.push_scope();
 -        ns.bind(None, "http://default".to_string());
@@ -2734,14 +2773,6 @@
 -        ns.pop_scope();
 -        assert_eq!(ns.resolve(None), None);
 -        assert_eq!(ns.resolve(Some("foo")), None);
-+        ns.push_scope().unwrap();
-+        ns.bind(None, "http://default".to_string()).unwrap();
-+        ns.bind(Some("foo".to_string()), "http://foo".to_string())
-+            .unwrap();
-+
-+        assert_eq!(ns.resolve(None).unwrap(), Some("http://default"));
-+        assert_eq!(ns.resolve(Some("foo")).unwrap(), Some("http://foo"));
-+
 +        ns.pop_scope().unwrap();
 +        assert_eq!(ns.resolve(None).unwrap(), None);
 +        assert_eq!(ns.resolve(Some("foo")).unwrap(), None);
@@ -2829,7 +2860,7 @@
      }
  
      #[test]
-@@ -2234,7 +2563,7 @@
+@@ -2234,7 +2582,7 @@
          let mut input = ParserInput::new("<?target data?>");
          let (target, data) = parse_pi_content(&mut input).unwrap();
          assert_eq!(target, "target");
@@ -2838,7 +2869,7 @@
      }
  
      #[test]
-@@ -2250,7 +2579,7 @@
+@@ -2250,7 +2598,7 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
          let decl = parse_xml_decl(&mut input).unwrap();
          assert_eq!(decl.version, "1.0");
@@ -2847,7 +2878,7 @@
          assert_eq!(decl.standalone, None);
      }
  
-@@ -2301,7 +2630,10 @@
+@@ -2301,7 +2649,10 @@
          input.set_max_depth(1);
          assert!(input.increment_depth().is_ok()); // depth = 1
          let err = input.increment_depth().unwrap_err();
@@ -2859,7 +2890,7 @@
      }
  
      #[test]
-@@ -2310,7 +2642,10 @@
+@@ -2310,7 +2661,10 @@
          let mut input = ParserInput::new("");
          input.set_max_depth(0);
          let err = input.increment_depth().unwrap_err();
@@ -2871,7 +2902,14 @@
      }
  
      #[test]
-@@ -2351,7 +2686,10 @@
+@@ -2345,64 +2699,75 @@
+     #[test]
+     fn test_entity_expansion_limit_exact_boundary() {
+         // max_entity_expansions = 3 means exactly 3 are allowed
+-        let mut input = ParserInput::new("&amp;&amp;&amp;&amp;");
++        let mut input = input_with_declared_entity("&e;&e;&e;&e;");
+         input.set_max_entity_expansions(3);
+         assert!(input.parse_reference().is_ok()); // expansion 1
          assert!(input.parse_reference().is_ok()); // expansion 2
          assert!(input.parse_reference().is_ok()); // expansion 3
          let err = input.parse_reference().unwrap_err();
@@ -2883,8 +2921,10 @@
      }
  
      #[test]
-@@ -2360,7 +2698,10 @@
-         let mut input = ParserInput::new("&amp;");
+     fn test_entity_expansion_limit_zero() {
+         // max_entity_expansions = 0 means no expansions allowed
+-        let mut input = ParserInput::new("&amp;");
++        let mut input = input_with_declared_entity("&e;");
          input.set_max_entity_expansions(0);
          let err = input.parse_reference().unwrap_err();
 -        assert!(err.message.contains("entity expansion limit exceeded"));
@@ -2895,7 +2935,9 @@
      }
  
      #[test]
-@@ -2369,7 +2710,10 @@
+     fn test_entity_expansion_limit_one() {
+-        let mut input = ParserInput::new("&amp;&lt;");
++        let mut input = input_with_declared_entity("&e;&e;");
          input.set_max_entity_expansions(1);
          assert!(input.parse_reference().is_ok());
          let err = input.parse_reference().unwrap_err();
@@ -2907,24 +2949,34 @@
      }
  
      #[test]
-@@ -2380,29 +2724,34 @@
-         assert!(input.parse_reference().is_ok()); // &#65; → A
-         assert!(input.parse_reference().is_ok()); // &#66; → B
-         let err = input.parse_reference().unwrap_err();
+-    fn test_entity_expansion_counter_includes_char_refs() {
+-        // Character references also increment the entity expansion counter
+-        let mut input = ParserInput::new("&#65;&#66;&#67;");
+-        input.set_max_entity_expansions(2);
+-        assert!(input.parse_reference().is_ok()); // &#65; → A
+-        assert!(input.parse_reference().is_ok()); // &#66; → B
+-        let err = input.parse_reference().unwrap_err();
 -        assert!(err.message.contains("entity expansion limit exceeded"));
-+        assert!(
-+            err.syntax_message()
-+                .contains("entity expansion limit exceeded")
-+        );
++    fn test_predefined_and_character_references_are_not_expansions() {
++        // Neither substitutes a declared entity, so a zero limit admits them.
++        let mut input = ParserInput::new("&#65;&amp;&#x42;&lt;");
++        input.set_max_entity_expansions(0);
++        for expected in ["A", "&", "B", "<"] {
++            assert_eq!(input.parse_reference().unwrap(), expected);
++        }
++        assert_eq!(input.entity_expansions, 0);
      }
  
      #[test]
      fn test_entity_expansion_limit_via_parse_str() {
 -        use crate::parser::{parse_str_with_options, ParseOptions};
+-        // Test through the high-level API: document with many char refs
+-        let refs: String = (0..50).map(|_| "&#65;").collect();
+-        let xml = format!("<r>{refs}</r>");
 +        use crate::parser_xmloxide::parser::{ParseOptions, parse_str_with_options};
-         // Test through the high-level API: document with many char refs
-         let refs: String = (0..50).map(|_| "&#65;").collect();
-         let xml = format!("<r>{refs}</r>");
++        // Test through the high-level API: document with many declared-entity refs
++        let refs: String = (0..50).map(|_| "&e;").collect();
++        let xml = format!(r#"<!DOCTYPE r [<!ENTITY e "x">]><r>{refs}</r>"#);
          let opts = ParseOptions::default().max_entity_expansions(10);
          let result = parse_str_with_options(&xml, &opts);
          assert!(result.is_err());
@@ -2949,7 +3001,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY greet "Hello">
  ]>
-@@ -2414,7 +2763,7 @@
+@@ -2414,7 +2779,7 @@
  
      #[test]
      fn test_entity_expansion_nested_dtd_entities() {
@@ -2958,7 +3010,7 @@
          // Entity "b" references entity "a". The nested reference is parsed
          // as content (XML 1.0 §4.4), so the entity expansion is visible
          // through text_content.
-@@ -2430,7 +2779,7 @@
+@@ -2430,7 +2795,7 @@
  
      #[test]
      fn test_entity_expansion_limit_nested_dtd_entities_in_attributes() {
@@ -2967,7 +3019,7 @@
          // In attribute values, entity references ARE fully expanded through
          // parse_reference_into + expand_entity_text. Each expansion counts
          // against the limit. Chain: c -> 3*b -> 9*a = 13 total expansions.
-@@ -2443,17 +2792,19 @@
+@@ -2443,17 +2808,19 @@
          let opts = ParseOptions::default().max_entity_expansions(5);
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -2992,7 +3044,7 @@
          // Classic billion laughs pattern in an attribute value where
          // entities ARE fully expanded. Each entity references the
          // previous one multiple times, causing exponential expansion.
-@@ -2470,15 +2821,15 @@
+@@ -2470,15 +2837,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3011,7 +3063,7 @@
          // When entity replacement text contains '<', the parser must expand
          // it (to validate the markup), which triggers entity expansion
          // counting. This tests the billion laughs pattern for text content
-@@ -2494,9 +2845,9 @@
+@@ -2494,9 +2861,9 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3023,7 +3075,7 @@
          );
      }
  
-@@ -2504,7 +2855,7 @@
+@@ -2504,7 +2871,7 @@
  
      #[test]
      fn test_xxe_external_entity_rejected_by_default() {
@@ -3032,7 +3084,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/passwd">
  ]>
-@@ -2513,15 +2864,15 @@
+@@ -2513,15 +2880,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3051,7 +3103,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe PUBLIC "-//Evil//EN" "http://evil.com/payload">
  ]>
-@@ -2530,15 +2881,15 @@
+@@ -2530,15 +2897,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3070,7 +3122,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/shadow">
  ]>
-@@ -2549,7 +2900,7 @@
+@@ -2549,7 +2916,7 @@
  
      #[test]
      fn test_xxe_multiple_external_entities_all_rejected() {
@@ -3079,7 +3131,7 @@
          // Even if one entity is internal, the external one should fail
          let xml = r#"<!DOCTYPE r [
  <!ENTITY safe "ok">
-@@ -2568,9 +2919,9 @@
+@@ -2568,9 +2935,9 @@
          let mut input = ParserInput::new("&#0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3091,7 +3143,7 @@
          );
      }
  
-@@ -2579,9 +2930,9 @@
+@@ -2579,9 +2946,9 @@
          let mut input = ParserInput::new("&#x0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3103,7 +3155,7 @@
          );
      }
  
-@@ -2619,17 +2970,17 @@
+@@ -2619,17 +2986,17 @@
          let mut input = ParserInput::new("&#xD800;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3125,7 +3177,7 @@
          );
      }
  
-@@ -2639,17 +2990,17 @@
+@@ -2639,17 +3006,17 @@
          let mut input = ParserInput::new("&#xFFFE;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3147,7 +3199,7 @@
          );
      }
  
-@@ -2668,9 +3019,9 @@
+@@ -2668,9 +3035,9 @@
          let mut input = ParserInput::new("&#x110000;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3159,7 +3211,7 @@
          );
      }
  
-@@ -2680,9 +3031,10 @@
+@@ -2680,9 +3047,10 @@
          let mut input = ParserInput::new("&#99999999999;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3172,7 +3224,7 @@
          );
      }
  
-@@ -2692,9 +3044,10 @@
+@@ -2692,9 +3060,10 @@
          let mut input = ParserInput::new("&#xFFFFFFFFFF;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3185,7 +3237,7 @@
          );
      }
  
-@@ -2703,9 +3056,10 @@
+@@ -2703,9 +3072,10 @@
          let mut input = ParserInput::new("&#;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3198,7 +3250,7 @@
          );
      }
  
-@@ -2714,9 +3068,10 @@
+@@ -2714,9 +3084,10 @@
          let mut input = ParserInput::new("&#x;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3211,7 +3263,7 @@
          );
      }
  
-@@ -2760,7 +3115,7 @@
+@@ -2760,7 +3131,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name();
          assert!(result.is_err());
@@ -3220,7 +3272,7 @@
      }
  
      #[test]
-@@ -2806,7 +3161,7 @@
+@@ -2806,7 +3177,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq("something");
          assert!(result.is_err());
@@ -3229,7 +3281,7 @@
      }
  
      #[test]
-@@ -2817,7 +3172,59 @@
+@@ -2817,7 +3188,59 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq_parts(None, "something");
          assert!(result.is_err());
@@ -3290,7 +3342,7 @@
      }
  
      // -- Comment boundary edge cases --
-@@ -2829,7 +3236,10 @@
+@@ -2829,7 +3252,10 @@
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
          assert!(
@@ -3302,7 +3354,7 @@
              "double dash inside comment should be rejected"
          );
      }
-@@ -2848,10 +3258,12 @@
+@@ -2848,10 +3274,12 @@
          let mut input = ParserInput::new("<!-- no end");
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
@@ -3319,7 +3371,7 @@
      }
  
      #[test]
-@@ -2893,10 +3305,12 @@
+@@ -2893,10 +3321,12 @@
          let mut input = ParserInput::new("<![CDATA[no end");
          let result = parse_cdata_content(&mut input);
          assert!(result.is_err());
@@ -3336,7 +3388,7 @@
      }
  
      #[test]
-@@ -2937,10 +3351,12 @@
+@@ -2937,10 +3367,12 @@
          let mut input = ParserInput::new("<?xml data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3353,7 +3405,7 @@
      }
  
      #[test]
-@@ -2959,10 +3375,12 @@
+@@ -2959,10 +3391,12 @@
          let mut input = ParserInput::new("<?ns:target data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3370,7 +3422,7 @@
      }
  
      #[test]
-@@ -2988,10 +3406,12 @@
+@@ -2988,10 +3422,12 @@
          let mut input = ParserInput::new("\"abc<def\"");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3387,7 +3439,7 @@
      }
  
      #[test]
-@@ -2999,10 +3419,12 @@
+@@ -2999,10 +3435,12 @@
          let mut input = ParserInput::new("\"no closing quote");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3404,7 +3456,7 @@
      }
  
      #[test]
-@@ -3010,10 +3432,12 @@
+@@ -3010,10 +3448,12 @@
          let mut input = ParserInput::new("unquoted");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3421,7 +3473,7 @@
      }
  
      #[test]
-@@ -3024,22 +3448,19 @@
+@@ -3024,22 +3464,19 @@
      }
  
      #[test]
@@ -3453,7 +3505,7 @@
      }
  
      // -- Invalid XML character detection --
-@@ -3076,10 +3497,12 @@
+@@ -3076,10 +3513,12 @@
          let mut input = ParserInput::new(input_bytes);
          let result = input.next_char();
          assert!(result.is_err());
@@ -3470,7 +3522,7 @@
      }
  
      #[test]
-@@ -3101,138 +3524,150 @@
+@@ -3101,138 +3540,150 @@
      fn test_scan_char_data_cdata_end_marker() {
          // `]]>` in character data is not allowed — the scanner should stop before it
          let input = ParserInput::new("text]]>more");
@@ -3677,7 +3729,7 @@
      }
  
      // -- QName validation edge cases --
-@@ -3265,34 +3700,46 @@
+@@ -3265,34 +3716,46 @@
          assert!(result.unwrap().contains("empty prefix or local part"));
      }
  
@@ -3734,7 +3786,7 @@
      }
  
      // -- XML declaration edge cases --
-@@ -3302,10 +3749,12 @@
+@@ -3302,10 +3765,12 @@
          let mut input = ParserInput::new("<?xml version=\"2.0\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3751,7 +3803,7 @@
      }
  
      #[test]
-@@ -3313,10 +3762,12 @@
+@@ -3313,10 +3778,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"123bad\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3768,7 +3820,7 @@
      }
  
      #[test]
-@@ -3324,10 +3775,12 @@
+@@ -3324,10 +3791,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" standalone=\"maybe\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3785,7 +3837,7 @@
      }
  
      #[test]
-@@ -3342,10 +3795,10 @@
+@@ -3342,10 +3811,10 @@
      #[test]
      fn test_save_restore_position() {
          let mut input = ParserInput::new("abcdef");
@@ -3798,7 +3850,7 @@
          assert_eq!(input.peek(), Some(b'f'));
          input.restore_position(saved);
          assert_eq!(input.peek(), Some(b'd'));
-@@ -3357,7 +3810,7 @@
+@@ -3357,7 +3826,7 @@
  
      #[test]
      fn test_depth_limit_via_parse_str_with_options() {
@@ -3807,7 +3859,7 @@
          // 3 levels with limit 3 should succeed
          let xml = "<a><b><c/></b></a>";
          let opts = ParseOptions::default().max_depth(3);
-@@ -3367,7 +3820,7 @@
+@@ -3367,7 +3836,7 @@
          let xml = "<a><b><c><d/></c></b></a>";
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -3816,7 +3868,7 @@
      }
  
      // -- Builtin entity matching edge cases --
-@@ -3403,12 +3856,24 @@
+@@ -3403,12 +3872,24 @@
      fn test_expand_entity_text_counts_against_limit() {
          // Set up a ParserInput with entity_map containing nested references
          let mut input = ParserInput::new("");
@@ -3847,7 +3899,7 @@
          input.set_max_entity_expansions(2);
  
          // Expanding "b" should expand &a; twice, hitting the limit
-@@ -3465,6 +3930,54 @@
+@@ -3465,6 +3946,54 @@
          assert_eq!(result, "<![CDATA[&amp; not expanded]]>");
      }
  
