@@ -106,16 +106,22 @@ function main() {
     if (scenario === 'assertion')
       for (const entry of produced)
         if (!fs.readFileSync(entry.out, 'utf8').includes('X509Certificate>')) throw Error(`No signer certificate: ${entry.engine.name}, ${name}`);
+    // XML results may differ only in the declaration and surrounding whitespace.
+    const checkPlaintext = (out, origin, engine, boundary) => {
+      if (plain && documentBody(fs.readFileSync(out)) !== documentBody(plain))
+        throw Error(`Plaintext mismatch: ${origin} -> ${engine.name} ${boundary}, ${name}`);
+    };
     for (const engine of engines) for (const boundary of BOUNDARIES) {
-      if (!probe(engine, consuming, boundary, canonical.out, scratch(`${name}.${consuming}-probe.xml`))) continue;
+      // Each boundary is timed on its own, so the result of each is checked on its own.
+      const probed = scratch(`${name}.${consuming}-probe-${engine.id}-${boundary}.xml`);
+      if (!probe(engine, consuming, boundary, canonical.out, probed)) continue;
+      checkPlaintext(probed, `${canonical.engine.name} ${canonical.boundary}`, engine, boundary);
       if (boundary !== 'parse') continue;
       for (const entry of produced) {
         const out = scratch(`${name}.${consuming}-${engine.id}.xml`);
         const outcome = harnessOutcome(invoke(engine.binary, item, consuming, 'parse', entry.out, out, 1));
         if (outcome.kind !== 'measured') throw Error(`${engine.name} cannot ${consuming} ${entry.engine.name} ${entry.boundary} output, ${name}: ${outcome.reason ?? 'rejected'}`);
-        // XML results may differ only in the declaration and surrounding whitespace.
-        if (plain && documentBody(fs.readFileSync(out)) !== documentBody(plain))
-          throw Error(`Plaintext mismatch: ${entry.engine.name} ${entry.boundary} -> ${engine.name}, ${name}`);
+        checkPlaintext(out, `${entry.engine.name} ${entry.boundary}`, engine, 'parse');
       }
       if (consuming === 'verify') {
         const signed = fs.readFileSync(canonical.out, 'utf8');

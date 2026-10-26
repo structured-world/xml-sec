@@ -69,7 +69,8 @@ test('invalid runner arguments are refused before any work', () => {
 
 /**
  * A fake harness following the request protocol. `behaviour` selects one defect:
- * accept a forgery, return the wrong plaintext, or lack signing (exit 3).
+ * accept a forgery, return the wrong plaintext (on every boundary or only on
+ * `prepared`), or lack signing (exit 3).
  */
 function fakeHarness(directory, name, behaviour) {
   const file = path.join(directory, name);
@@ -87,7 +88,8 @@ if (operation === 'reject') {
   process.exit(0);
 }
 const result = { sign: signed, encrypt: '<EncryptedData/>',
-  decrypt: behaviour === 'wrong-plaintext' ? '<Other/>' : fs.readFileSync(corpus + '/element-16.plain.xml', 'utf8') }[operation];
+  decrypt: behaviour === 'wrong-plaintext' || (behaviour === 'wrong-prepared-plaintext' && boundary === 'prepared')
+    ? '<Other/>' : fs.readFileSync(corpus + '/element-16.plain.xml', 'utf8') }[operation];
 if (result !== undefined && output !== '-') fs.writeFileSync(output, result);
 console.log(JSON.stringify({ engine: ${JSON.stringify(name)}, scenario, operation, boundary,
   samples_ns: Array.from({ length: Number(samples) }, () => 1000), allocations: null, input_bytes: 10,
@@ -123,6 +125,14 @@ test('a decryptor that returns other plaintext stops the run before any timing',
   const { result, report } = runFakeComparison('element', { libxmlsec1: 'wrong-plaintext' });
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Plaintext mismatch: .* -> libxmlsec1/);
+  assert.equal(report, null);
+});
+
+test('a prepared decryptor that returns other plaintext stops the run before any timing', () => {
+  // The prepared boundary is timed separately, so its result is checked on its own.
+  const { result, report } = runFakeComparison('element', { 'xml-sec': 'wrong-prepared-plaintext' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /Plaintext mismatch: .* -> xml-sec \/ .* prepared/);
   assert.equal(report, null);
 });
 

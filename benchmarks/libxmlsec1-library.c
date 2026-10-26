@@ -55,6 +55,8 @@ extern void __libc_free(void *);
 static size_t allocation_calls, allocated_bytes;
 static long long live_bytes, peak_bytes;
 static int counting;
+/* Live bytes are usable block sizes, as the Rust harnesses' profile counts them,
+ * so every engine's peak includes allocator rounding. */
 static void observe(void *block, size_t requested, size_t released) {
     if (!counting || block == NULL) return;
     ++allocation_calls; allocated_bytes += requested;

@@ -28,6 +28,9 @@ use std::time::Instant;
 /// Untimed runs before the samples, matching the other benchmark harnesses.
 const WARMUPS: usize = 3;
 
+#[cfg(all(test, feature = "allocation-profile"))]
+mod tests;
+
 #[cfg(feature = "allocation-profile")]
 mod profile {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -44,14 +47,41 @@ mod profile {
     static LIVE: AtomicIsize = AtomicIsize::new(0);
     static PEAK: AtomicIsize = AtomicIsize::new(0);
 
-    fn observe_growth(bytes: usize, released: usize) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe extern "C" {
+        fn malloc_usable_size(pointer: *mut core::ffi::c_void) -> usize;
+    }
+
+    #[cfg(target_os = "macos")]
+    unsafe extern "C" {
+        fn malloc_size(pointer: *const core::ffi::c_void) -> usize;
+    }
+
+    #[cfg(not(any(all(target_os = "linux", target_env = "gnu"), target_os = "macos")))]
+    compile_error!("allocation profiling reads block sizes from glibc or the macOS allocator");
+
+    /// Bytes the system allocator reserves for a live block. Live and peak bytes
+    /// count these, as the glibc profile of the C harness does, so every engine's
+    /// peak includes allocator rounding the same way.
+    fn usable(pointer: *mut u8) -> usize {
+        // SAFETY: `pointer` is a live block that `System` returned, which on these
+        // targets comes from the platform malloc family.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let size = unsafe { malloc_usable_size(pointer.cast()) };
+        // SAFETY: as above.
+        #[cfg(target_os = "macos")]
+        let size = unsafe { malloc_size(pointer.cast_const().cast()) };
+        size
+    }
+
+    fn observe_growth(bytes: usize, reserved: usize, released: usize) {
         if !COUNTING.load(Relaxed) {
             return;
         }
         CALLS.fetch_add(1, Relaxed);
         BYTES.fetch_add(bytes, Relaxed);
-        // Layout sizes never exceed isize::MAX, so the casts and difference cannot overflow.
-        let delta = bytes.cast_signed() - released.cast_signed();
+        // Block sizes never exceed isize::MAX, so the casts and difference cannot overflow.
+        let delta = reserved.cast_signed() - released.cast_signed();
         PEAK.fetch_max(LIVE.fetch_add(delta, Relaxed) + delta, Relaxed);
     }
 
@@ -61,8 +91,8 @@ mod profile {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             // SAFETY: forwarded contract.
             let pointer = unsafe { System.alloc(layout) };
-            if !pointer.is_null() {
-                observe_growth(layout.size(), 0);
+            if !pointer.is_null() && COUNTING.load(Relaxed) {
+                observe_growth(layout.size(), usable(pointer), 0);
             }
             pointer
         }
@@ -70,25 +100,28 @@ mod profile {
         unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
             // SAFETY: forwarded contract.
             let pointer = unsafe { System.alloc_zeroed(layout) };
-            if !pointer.is_null() {
-                observe_growth(layout.size(), 0);
+            if !pointer.is_null() && COUNTING.load(Relaxed) {
+                observe_growth(layout.size(), usable(pointer), 0);
             }
             pointer
         }
 
         unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // The block size is read while the block is still live.
+            if COUNTING.load(Relaxed) {
+                LIVE.fetch_sub(usable(pointer).cast_signed(), Relaxed);
+            }
             // SAFETY: forwarded contract.
             unsafe { System.dealloc(pointer, layout) };
-            if COUNTING.load(Relaxed) {
-                LIVE.fetch_sub(layout.size().cast_signed(), Relaxed);
-            }
         }
 
         unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let counting = COUNTING.load(Relaxed);
+            let released = if counting { usable(pointer) } else { 0 };
             // SAFETY: forwarded contract.
             let moved = unsafe { System.realloc(pointer, layout, new_size) };
-            if !moved.is_null() {
-                observe_growth(new_size, layout.size());
+            if !moved.is_null() && counting {
+                observe_growth(new_size, usable(moved), released);
             }
             moved
         }

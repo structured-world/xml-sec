@@ -224,8 +224,9 @@ instrumented builds whose timings are never reported: the Rust harnesses'
 `allocation-profile` feature installs a counting global allocator, and on glibc
 the C harness replaces the malloc family. Both count every heap allocation in the
 process during one operation: calls, requested bytes and the peak of live bytes
-above the operation's start. Elsewhere the C allocation profile is reported as
-not measured.
+above the operation's start. Live bytes are the allocator's usable block sizes
+for every engine, so the peak includes allocator rounding the same way.
+Elsewhere the C allocation profile is reported as not measured.
 
 CI uses the shared comparison workflow to build dashboard artifacts on PRs;
 Benchmark Observatory publishes only validated default-branch results to GitHub Pages. One-sample PR
