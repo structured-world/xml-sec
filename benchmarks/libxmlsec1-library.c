@@ -24,6 +24,7 @@
 #include <xmlsec/xmldsig.h>
 #include <xmlsec/xmlenc.h>
 #include <xmlsec/keysmngr.h>
+#include <xmlsec/parser.h>
 #include <xmlsec/crypto.h>
 #include <limits.h>
 #include <stddef.h>
@@ -153,8 +154,12 @@ static int register_ids(xmlDocPtr doc) {
     return 0;
 }
 
+/* The parser options of the xmlsec1 command line. They include XML_PARSE_NODICT:
+ * encryption moves the template node into the data document, and a name interned
+ * in the template's dictionary would be freed as heap memory with the data
+ * document (glibc aborts on it with libxml2 2.9). */
 static xmlDocPtr parse_document(const char *bytes, int length) {
-    xmlDocPtr doc = xmlReadMemory(bytes, length, "urn:benchmark:input", NULL, XML_PARSE_NONET);
+    xmlDocPtr doc = xmlReadMemory(bytes, length, "urn:benchmark:input", NULL, xmlSecParserGetDefaultOptions());
     if (doc == NULL) return NULL;
     if (register_ids(doc) != 0) { xmlFreeDoc(doc); return NULL; }
     return doc;
