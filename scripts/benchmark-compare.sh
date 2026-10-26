@@ -35,10 +35,7 @@ source_identity() {
     sort -zu | xargs -0 shasum -a 256
 }
 competitors=benchmarks/competitors/Cargo.toml
-# The competitor lockfile pins Bergshamra but also records the product crate it
-# builds from this checkout. Follow only that entry, so a release or dependency
-# update of the product leaves every other locked version as recorded.
-cargo update --manifest-path "$competitors" -p xml-sec
+bash scripts/refresh-competitor-lock.sh
 before=$(source_identity)
 # The library repository does not track Cargo.lock. Resolve once, then freeze
 # the resulting graph for measurement and retain it with the evidence.
