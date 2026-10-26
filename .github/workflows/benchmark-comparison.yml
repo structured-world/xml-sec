@@ -63,6 +63,8 @@ jobs:
           name: benchmark-comparison
           path: ${{ env.COMPARISON_OUTPUT }}
           if-no-files-found: error
+          # Evidence for inspecting a recent run; the dashboard is published to Pages.
+          retention-days: 7
       - uses: actions/upload-pages-artifact@v5
         if: inputs.publish && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         with:

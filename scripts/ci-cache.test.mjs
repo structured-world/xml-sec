@@ -60,6 +60,12 @@ test('legacy corpus cache identities remain independently restorable', () => {
   assert.match(action, /provider_operations-\$\{\{ inputs.fips \}\}/);
 });
 
+test('a failed fuzz run keeps its grown corpus although the cache is not saved', () => {
+  // actions/cache saves only on success; the artifact is the failed run's only copy.
+  const workflow = source('.github/workflows/fuzz.yml');
+  assert.match(workflow, /if: failure\(\)\n\s+uses: actions\/upload-artifact@v7\n\s+with:\n\s+name: fuzz-corpus-[^\n]+\n\s+path: fuzz\/corpus\n/);
+});
+
 test('ordinary jobs have one matrix writer per compiler and separate instrumented domains', () => {
   // Compatible readers share dependencies without partial feature writers racing.
   const workflow = source('.github/workflows/ci.yml');
