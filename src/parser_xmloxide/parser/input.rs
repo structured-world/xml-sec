@@ -1169,10 +1169,12 @@ impl<S: NameStorage> ParserInput<'_, S> {
         let reference_start = self.pos;
         self.expect_byte(b'&')?;
 
-        // Fast path: recognize builtin entities at byte level
+        // Fast path: recognize builtin entities at byte level. Predefined and
+        // character references substitute no declared entity: each spends at
+        // least four input bytes on one character, so the document byte limit
+        // bounds them and they are not charged as entity expansions.
         let remaining = &self.input[self.pos..];
         if let Some(result) = match_builtin_entity(remaining) {
-            self.count_entity_expansion()?;
             let advance_len = result.1;
             self.advance_counting_lines(advance_len)?;
             let start = buf.len();
@@ -1181,7 +1183,6 @@ impl<S: NameStorage> ParserInput<'_, S> {
         }
 
         if self.peek() == Some(b'#') {
-            self.count_entity_expansion()?;
             // Character reference
             self.advance(1)?;
             let value = if self.peek() == Some(b'x') {
@@ -1456,17 +1457,19 @@ impl<S: NameStorage> ParserInput<'_, S> {
                             .map_err(|_| self.fatal("invalid UTF-8 in entity name"))?;
                         i += 1; // skip ';'
 
+                        // Fast path: builtin entities push directly, no allocation.
+                        // They expand nothing and the replacement-work limit bounds
+                        // them, so only declared entities are charged below.
+                        if self.append_builtin_replacement(name, result)? {
+                            continue;
+                        }
+
                         self.entity_expansions += 1;
                         if self.entity_expansions > self.max_entity_expansions {
                             return Err(self.fatal(format_args!(
                                 "entity expansion limit exceeded ({})",
                                 self.max_entity_expansions
                             )));
-                        }
-
-                        // Fast path: builtin entities push directly, no allocation
-                        if self.append_builtin_replacement(name, result)? {
-                            continue;
                         }
 
                         let declaration = self.entity_map.get(name, self.storage)?;
@@ -2177,9 +2180,25 @@ mod tests {
         assert_eq!(input.diagnostics.len(), 1);
     }
 
+    /// Input whose `&e;` references a declared internal entity, the substitution
+    /// the expansion limit counts.
+    fn input_with_declared_entity(text: &str) -> ParserInput<'_> {
+        let mut input = ParserInput::new(text);
+        Names::insert(
+            &mut input.entity_map,
+            "e".to_owned(),
+            EntityDecl {
+                name: String::new(),
+                kind: EntityKind::Internal("x".to_owned()),
+            },
+        )
+        .unwrap();
+        input
+    }
+
     #[test]
     fn test_entity_expansion_limit() {
-        let mut input = ParserInput::new("&amp;&amp;&amp;");
+        let mut input = input_with_declared_entity("&e;&e;&e;");
         input.set_max_entity_expansions(2);
         assert!(input.parse_reference().is_ok());
         assert!(input.parse_reference().is_ok());
@@ -2680,7 +2699,7 @@ mod tests {
     #[test]
     fn test_entity_expansion_limit_exact_boundary() {
         // max_entity_expansions = 3 means exactly 3 are allowed
-        let mut input = ParserInput::new("&amp;&amp;&amp;&amp;");
+        let mut input = input_with_declared_entity("&e;&e;&e;&e;");
         input.set_max_entity_expansions(3);
         assert!(input.parse_reference().is_ok()); // expansion 1
         assert!(input.parse_reference().is_ok()); // expansion 2
@@ -2695,7 +2714,7 @@ mod tests {
     #[test]
     fn test_entity_expansion_limit_zero() {
         // max_entity_expansions = 0 means no expansions allowed
-        let mut input = ParserInput::new("&amp;");
+        let mut input = input_with_declared_entity("&e;");
         input.set_max_entity_expansions(0);
         let err = input.parse_reference().unwrap_err();
         assert!(
@@ -2706,7 +2725,7 @@ mod tests {
 
     #[test]
     fn test_entity_expansion_limit_one() {
-        let mut input = ParserInput::new("&amp;&lt;");
+        let mut input = input_with_declared_entity("&e;&e;");
         input.set_max_entity_expansions(1);
         assert!(input.parse_reference().is_ok());
         let err = input.parse_reference().unwrap_err();
@@ -2717,25 +2736,22 @@ mod tests {
     }
 
     #[test]
-    fn test_entity_expansion_counter_includes_char_refs() {
-        // Character references also increment the entity expansion counter
-        let mut input = ParserInput::new("&#65;&#66;&#67;");
-        input.set_max_entity_expansions(2);
-        assert!(input.parse_reference().is_ok()); // &#65; → A
-        assert!(input.parse_reference().is_ok()); // &#66; → B
-        let err = input.parse_reference().unwrap_err();
-        assert!(
-            err.syntax_message()
-                .contains("entity expansion limit exceeded")
-        );
+    fn test_predefined_and_character_references_are_not_expansions() {
+        // Neither substitutes a declared entity, so a zero limit admits them.
+        let mut input = ParserInput::new("&#65;&amp;&#x42;&lt;");
+        input.set_max_entity_expansions(0);
+        for expected in ["A", "&", "B", "<"] {
+            assert_eq!(input.parse_reference().unwrap(), expected);
+        }
+        assert_eq!(input.entity_expansions, 0);
     }
 
     #[test]
     fn test_entity_expansion_limit_via_parse_str() {
         use crate::parser_xmloxide::parser::{ParseOptions, parse_str_with_options};
-        // Test through the high-level API: document with many char refs
-        let refs: String = (0..50).map(|_| "&#65;").collect();
-        let xml = format!("<r>{refs}</r>");
+        // Test through the high-level API: document with many declared-entity refs
+        let refs: String = (0..50).map(|_| "&e;").collect();
+        let xml = format!(r#"<!DOCTYPE r [<!ENTITY e "x">]><r>{refs}</r>"#);
         let opts = ParseOptions::default().max_entity_expansions(10);
         let result = parse_str_with_options(&xml, &opts);
         assert!(result.is_err());

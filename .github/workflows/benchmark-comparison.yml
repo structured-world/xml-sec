@@ -1,4 +1,4 @@
-name: Comparable CLI measurements
+name: Comparable CLI and library measurements
 on:
   workflow_call:
     inputs:
@@ -33,6 +33,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92.0"
+          components: clippy, rustfmt
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
@@ -45,8 +46,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config valgrind jq
       - name: Test metric interpretation
-        run: node --test scripts/compare-security.test.mjs
-      - name: Validate interoperability and compare identical CLI work
+        run: node --test scripts/compare-security.test.mjs scripts/compare-library.test.mjs
+      - name: Lint the in-process competitor harnesses
+        run: |
+          cargo fmt --manifest-path benchmarks/competitors/Cargo.toml --check
+          cargo clippy --locked --manifest-path benchmarks/competitors/Cargo.toml --target-dir target/competitors/library-profile --all-targets --features allocation-profile -- -D warnings
+      - name: Validate interoperability and compare identical CLI and library work
         env:
           SAMPLES: ${{ inputs.samples }}
         run: bash scripts/benchmark-compare.sh "$COMPARISON_OUTPUT" "$SAMPLES" --heap

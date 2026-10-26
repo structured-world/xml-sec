@@ -5,7 +5,84 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { percentile, resources, heapStats, createEvidenceDirectory } from './compare-security.mjs';
+import {
+  percentile, resources, heapStats, createEvidenceDirectory,
+  SCENARIOS, unsupported, documentBody, tamper, wrap, engineArguments, caseFiles, policyRefusal,
+} from './compare-security.mjs';
+
+test('only a default resource-limit refusal is recorded instead of failing', () => {
+  // An engine over its own default limit is reported with its reason; any other failure,
+  // including an invalid signature, must still stop the comparison.
+  assert.equal(
+    policyRefusal('Error: XML signature operation failed: signing policy violation: XSLT workspace bytes exceeds policy maximum 67108864: got 67280426\n'),
+    'XSLT workspace bytes exceeds policy maximum 67108864: got 67280426',
+  );
+  assert.equal(policyRefusal('Error: signature verification failed: digest mismatch\n'), undefined);
+  assert.equal(policyRefusal('verification policy violation: signing policy rejects algorithm sha1\n'), undefined);
+});
+
+test('wrapping places an unsigned forgery with the signed ID before the signed assertion', () => {
+  // Engines are checked to reject this; a no-op wrap would check an intact document.
+  const signed = '<samlp:Response><saml:Assertion ID="assertion"><ds:Signature xmlns:ds="d"><ds:SignedInfo/></ds:Signature>'
+    + '<saml:Subject><saml:NameID>user@example.invalid</saml:NameID></saml:Subject></saml:Assertion></samlp:Response>';
+  const wrapped = wrap(signed);
+  const forged = wrapped.indexOf('attacker@example.invalid');
+  const original = wrapped.indexOf('user@example.invalid');
+  assert.ok(forged > 0 && original > forged);
+  assert.equal(wrapped.split('ID="assertion"').length, 3);
+  assert.equal(wrapped.split('<ds:Signature').length, 2);
+  assert.throws(() => wrap('<samlp:Response/>'), /Signed assertion missing/);
+});
+
+test('unsupported work is recorded per operation, not per workload', () => {
+  // Bergshamra verifies assertions and decrypts in-place documents it cannot produce.
+  assert.ok(unsupported('bergshamra', 'assertion', 'sign'));
+  assert.equal(unsupported('bergshamra', 'assertion', 'verify'), undefined);
+  assert.ok(unsupported('bergshamra', 'element_in_place', 'encrypt'));
+  assert.equal(unsupported('bergshamra', 'element_in_place', 'decrypt'), undefined);
+  assert.equal(unsupported('xml-sec', 'xslt', 'sign'), undefined);
+});
+
+test('tampering changes a signed value in every signing workload', () => {
+  // A replacement that matches nothing would make the rejection check verify an intact document.
+  const signed = {
+    payload: '<Doc><Payload Id="payload">x</Payload></Doc>',
+    assertion: '<saml:Attribute><saml:AttributeValue>value</saml:AttributeValue></saml:Attribute>',
+    xslt: '<List Id="list"><Item n="0">value</Item></List>',
+  };
+  for (const [scenario, operations] of Object.entries(SCENARIOS)) {
+    if (!operations.includes('verify')) continue;
+    const changed = tamper(signed[scenario], scenario);
+    assert.notEqual(changed, signed[scenario], scenario);
+  }
+  assert.throws(() => tamper('<Doc/>', 'assertion'), /Tamper target missing/);
+});
+
+test('XML round trips ignore only the declaration and outer whitespace', () => {
+  const plain = Buffer.from('<?xml version="1.0"?><Order><Payment/></Order>');
+  assert.equal(documentBody(Buffer.from('<Order><Payment/></Order>\n')), documentBody(plain));
+  assert.notEqual(documentBody(Buffer.from('<Order><Payment> </Payment></Order>')), documentBody(plain));
+});
+
+test('every measured engine has arguments for each workload operation', () => {
+  // A missing combination would throw mid-run after minutes of earlier measurements.
+  const files = { template: 't', signed: 's', plain: 'p', encrypted: 'e', destination: 'd', corpus: 'c' };
+  for (const [scenario, operations] of Object.entries(SCENARIOS)) {
+    for (const engine of [['xmlsec', 'xml-sec'], ['xmlsec', 'libxmlsec1'], ['berg', 'bergshamra']]) {
+      for (const operation of operations) {
+        if (unsupported(engine[1], scenario, operation)) continue;
+        const args = engineArguments(engine[0], scenario, operation, files);
+        assert.ok(Array.isArray(args) && args[0] === operation, `${engine[1]} ${scenario} ${operation}`);
+      }
+    }
+  }
+});
+
+test('in-place encryption reads the whole document, standalone reads the element', () => {
+  assert.equal(caseFiles({ name: 'element_in_place-16', scenario: 'element_in_place', units: 16 }).plain, 'order-16.plain.xml');
+  assert.equal(caseFiles({ name: 'element-16', scenario: 'element', units: 16 }).plain, 'element-16.plain.xml');
+  assert.equal(caseFiles({ name: 'saml-16', scenario: 'payload', units: 16 }).plain, 'saml-16.plain.xml');
+});
 
 test('fresh nested evidence directories work without overwriting prior results', () => {
   // Clean CI has no performance directory; only parents may be reused.
@@ -78,8 +155,12 @@ test('published package includes every shared benchmark entry point', () => {
       fs.mkdirSync(path.dirname(destination), { recursive: true });
       fs.copyFileSync(path.join(root, file), destination);
     }
-    const report = { schema: 1, results: Array.from({ length: 160 }, () => ({ commands: ['private path'] })) };
+    const report = { schema: 2, results: Array.from({ length: 336 }, (_, index) => index < 8
+      ? { unsupported: 'not available' } : { commands: ['private path'], repetitions: [{}] }) };
     fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify(report));
+    const library = { schema: 1, results: Array.from({ length: 144 }, (_, index) => index < 4
+      ? { unsupported: 'not available' } : { repetitions: [{}] }) };
+    fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify(library));
     const output = path.join(directory, 'site');
     const built = spawnSync(process.execPath, [builder, directory, output],
       { cwd: directory, encoding: 'utf8' });
@@ -89,8 +170,9 @@ test('published package includes every shared benchmark entry point', () => {
         fs.readFileSync(path.join(root, 'benchmarks/dashboard', file)));
     }
     const published = JSON.parse(fs.readFileSync(path.join(output, 'comparison.json'), 'utf8'));
-    assert.equal(published.results.length, 160);
+    assert.equal(published.results.length, 336);
     assert.ok(published.results.every(entry => !Object.hasOwn(entry, 'commands')));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'library.json'), 'utf8')).results.length, 144);
   } finally {
     fs.rmSync(directory, { recursive: true });
   }
@@ -146,11 +228,21 @@ test('incomplete reports cannot publish a dashboard', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-dashboard-test-'));
   const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
   try {
-    fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 1, results: [] }));
     const output = path.join(directory, 'site');
-    const result = spawnSync(process.execPath, ['scripts/build-benchmark-dashboard.mjs', directory, output], { cwd: root });
-    assert.notEqual(result.status, 0);
-    assert.equal(fs.existsSync(output), false);
+    const complete = Array.from({ length: 336 }, () => ({ repetitions: [{}] }));
+    const library = Array.from({ length: 144 }, () => ({ repetitions: [{}] }));
+    const unmeasured = list => [...list.slice(1), { engine: 'unmeasured' }];
+    // Missing entries, and a supported entry without measurements, are both incomplete
+    // at either level; a complete pair is the control that the builder accepts.
+    for (const [cli, inProcess, accepted] of [[[], library, false], [unmeasured(complete), library, false],
+      [complete, [], false], [complete, unmeasured(library), false], [complete, library, true]]) {
+      fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 2, results: cli }));
+      fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify({ schema: 1, results: inProcess }));
+      const result = spawnSync(process.execPath, ['scripts/build-benchmark-dashboard.mjs', directory, output], { cwd: root });
+      assert.equal(result.status === 0, accepted);
+      assert.equal(fs.existsSync(output), accepted);
+      fs.rmSync(output, { recursive: true, force: true });
+    }
   } finally {
     fs.rmSync(directory, { recursive: true });
   }
