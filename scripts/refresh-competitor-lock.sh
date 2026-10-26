@@ -10,9 +10,13 @@ manifest="$root/benchmarks/competitors/Cargo.toml"
 lock="$root/benchmarks/competitors/Cargo.lock"
 # Every [[package]] block except xml-sec's; Cargo.lock separates blocks by blank lines.
 others() { awk 'BEGIN { RS = "" } !/^\[\[package\]\]\nname = "xml-sec"\n/' "$lock"; }
+# A rejected refresh puts the lockfile back, so a rerun cannot take the
+# rewritten graph as its baseline and accept what this run refused.
+saved=$(mktemp)
+trap 'rm -f "$saved"' EXIT
+cp "$lock" "$saved"
+reject() { cp "$saved" "$lock"; printf '%s\n' "$1" >&2; exit 1; }
 before=$(others)
-cargo update --manifest-path "$manifest" -p xml-sec
-[[ $before == "$(others)" ]] || {
-  printf 'Refreshing xml-sec changed other entries of %s; update and commit that lockfile deliberately\n' "$lock" >&2
-  exit 1
-}
+cargo update --manifest-path "$manifest" -p xml-sec || reject "Refreshing xml-sec in $lock failed"
+[[ $before == "$(others)" ]] ||
+  reject "Refreshing xml-sec changed other entries of $lock; update and commit that lockfile deliberately"
