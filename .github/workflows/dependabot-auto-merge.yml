@@ -47,7 +47,10 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
           # Least privilege: `pull-requests` to approve, to read whether
           # auto-merge is armed and to disarm it; `contents` because the
-          # squash merge writes to the default branch.
+          # squash merge writes to the default branch. `workflows` is not
+          # requested: the App installation does not grant it, so asking for it
+          # would fail token creation for every update, and enabling auto-merge
+          # with this scope also lands updates that touch workflow files.
           permission-contents: write
           permission-pull-requests: write
 
