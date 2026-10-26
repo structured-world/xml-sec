@@ -9,7 +9,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 // Environment that changes what Cargo or the C compiler build, beyond the manifest.
-const OVERRIDE = /^(RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_INCREMENTAL|CARGO_BUILD_[A-Z0-9_]+|CARGO_PROFILE_[A-Z0-9_]+|CARGO_TARGET_[A-Z0-9_]+|CC|CFLAGS|RUSTC)$/;
+const OVERRIDE = /^(RUSTFLAGS|RUSTDOCFLAGS|CARGO_ENCODED_RUSTFLAGS|CARGO_INCREMENTAL|CARGO_BUILD_[A-Z0-9_]+|CARGO_PROFILE_[A-Z0-9_]+|CARGO_TARGET_[A-Z0-9_]+|CC|CFLAGS|RUSTC|RUSTC_WRAPPER)$/;
 
 const version = (command, args) => {
   const result = spawnSync(command, args, { encoding: 'utf8' });
@@ -17,17 +17,26 @@ const version = (command, args) => {
   return result.stdout.split('\n')[0].trim();
 };
 
-/** Digests of every Cargo configuration file Cargo would read from this directory. */
+/**
+ * Every Cargo configuration file Cargo would read from this directory, highest
+ * precedence first, each with its place (levels above the run directory, or
+ * CARGO_HOME) so swapping contents between places changes the identity.
+ */
 export function cargoConfigs(directory, environment) {
   const candidates = [];
-  for (let current = path.resolve(directory); ; current = path.dirname(current)) {
-    candidates.push(path.join(current, '.cargo', 'config.toml'), path.join(current, '.cargo', 'config'));
+  let levels = 0;
+  for (let current = path.resolve(directory); ; current = path.dirname(current), levels += 1) {
+    for (const file of ['config.toml', 'config'])
+      candidates.push({ file: path.join(current, '.cargo', file), role: { location: 'directory', levels, file } });
     if (path.dirname(current) === current) break;
   }
   const home = environment.CARGO_HOME ?? path.join(os.homedir(), '.cargo');
-  candidates.push(path.join(home, 'config.toml'), path.join(home, 'config'));
-  return [...new Set(candidates)].filter(file => fs.existsSync(file))
-    .map(file => createHash('sha256').update(fs.readFileSync(file)).digest('hex')).sort();
+  for (const file of ['config.toml', 'config'])
+    candidates.push({ file: path.join(home, file), role: { location: 'cargo_home', file } });
+  // Cargo reads a CARGO_HOME that is also an ancestor's `.cargo` once, at the ancestor's place.
+  const seen = new Set();
+  return candidates.filter(({ file }) => !seen.has(file) && seen.add(file) && fs.existsSync(file))
+    .map(({ file, role }) => ({ ...role, sha256: createHash('sha256').update(fs.readFileSync(file)).digest('hex') }));
 }
 
 /** The identity object; throws when a required part cannot be recorded. */

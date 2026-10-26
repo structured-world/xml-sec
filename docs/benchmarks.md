@@ -244,7 +244,8 @@ The report compares two comparison runs, each a directory with `comparison.json`
 compiler versions, the features of every binary, native flags, the heap-profiling
 mode and the pinned competitor revisions, every environment override of the build
 (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `CC`,
-`CFLAGS` and similar) and digests of the Cargo configuration files that apply. A
+`RUSTC_WRAPPER`, `CFLAGS` and similar) and digests of the Cargo configuration
+files that apply, in Cargo's precedence order with each file's place. A
 run whose identity cannot be recorded fails. The report writes
 `regression.json` with every case of either run and a short `regression.md`.
 

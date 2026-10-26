@@ -72,6 +72,12 @@ test('a reason string with parentheses or quotes does not hide a suppression', (
   assert.deepEqual(suppressions('lib.rs', text).map(found => found.split(':').slice(0, 2).join(':')), ['lib.rs:1', 'lib.rs:2']);
 });
 
+test('whitespace around the path separator does not hide a suppression', () => {
+  // Rust tokenizes `clippy :: pedantic` as the same lint path as `clippy::pedantic`.
+  const text = ['#[allow(clippy :: used_underscore_binding)]', '#![expect(clippy::\n  pedantic)]', '#[allow(clippy :: unwrap_used)]'].join('\n');
+  assert.deepEqual(suppressions('lib.rs', text).map(found => found.split(':').slice(0, 2).join(':')), ['lib.rs:1', 'lib.rs:2']);
+});
+
 test('a local allow of any forbidden pedantic lint fails the lint gate', () => {
   // The workspace lint table, applied to a crate that allows every listed lint
   // locally, must make clippy fail with E0453 for each of them; without the

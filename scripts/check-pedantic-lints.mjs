@@ -68,7 +68,8 @@ export function suppressions(path, text) {
   for (const match of text.matchAll(/\b(?:allow|expect)\s*\(((?:[^()"]|"(?:[^"\\]|\\.)*")*)\)/g)) {
     // A reason's own text is not a lint name, however it is worded.
     for (const item of match[1].replace(/"(?:[^"\\]|\\.)*"/g, '""').split(',')) {
-      const lint = item.trim();
+      // Whitespace between path tokens is insignificant: `clippy :: pedantic` is the same lint.
+      const lint = item.replace(/\s+/g, '');
       if (lint.startsWith('clippy::') && names.has(normalize(lint))) {
         const line = text.slice(0, match.index).split('\n').length;
         found.push(`${path}:${line}: ${match[0]}`);

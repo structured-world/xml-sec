@@ -19,7 +19,8 @@ test('a release-profile or flag override changes the build identity', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-build-identity-'));
   try {
     const plain = buildIdentity({ cli: 'x' }, { CARGO_HOME: directory }, directory);
-    for (const override of [{ CARGO_PROFILE_RELEASE_LTO: 'thin' }, { CARGO_ENCODED_RUSTFLAGS: '-Ctarget-cpu=native' }, { CC: 'clang-18' }]) {
+    for (const override of [{ CARGO_PROFILE_RELEASE_LTO: 'thin' }, { CARGO_ENCODED_RUSTFLAGS: '-Ctarget-cpu=native' }, { CC: 'clang-18' },
+      { RUSTC_WRAPPER: 'sccache' }]) {
       const changed = buildIdentity({ cli: 'x' }, { CARGO_HOME: directory, ...override }, directory);
       assert.deepEqual(changed.environment, override);
       assert.deepEqual(incomparability(runWith(plain), runWith(changed)), ['build environment differs']);
@@ -42,6 +43,27 @@ test('Cargo configuration files that apply are part of the identity', () => {
     fs.writeFileSync(path.join(home, 'config.toml'), '[build]\njobs = 2\n');
     const after = cargoConfigs(project, { CARGO_HOME: home });
     assert.equal(after.length, before.length + 2);
+  } finally { fs.rmSync(directory, { recursive: true }); }
+});
+
+test('swapping configuration between the project and CARGO_HOME changes the identity', () => {
+  // The deeper directory wins in Cargo, so the same two files in swapped places build differently.
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'xml-sec-build-identity-'));
+  try {
+    const home = path.join(directory, 'home');
+    const project = path.join(directory, 'project');
+    fs.mkdirSync(home);
+    fs.mkdirSync(path.join(project, '.cargo'), { recursive: true });
+    const write = (projectLevel, homeLevel) => {
+      fs.writeFileSync(path.join(project, '.cargo', 'config.toml'), `[profile.release]\nopt-level = ${projectLevel}\n`);
+      fs.writeFileSync(path.join(home, 'config.toml'), `[profile.release]\nopt-level = ${homeLevel}\n`);
+      return cargoConfigs(project, { CARGO_HOME: home });
+    };
+    const projectOptimized = write(3, 0);
+    const homeOptimized = write(0, 3);
+    assert.notDeepEqual(projectOptimized, homeOptimized);
+    assert.deepEqual(projectOptimized.map(({ sha256, ...role }) => role).slice(-1), [{ location: 'cargo_home', file: 'config.toml' }]);
+    assert.deepEqual(projectOptimized[0], { ...projectOptimized[0], location: 'directory', levels: 0, file: 'config.toml' });
   } finally { fs.rmSync(directory, { recursive: true }); }
 });
 
