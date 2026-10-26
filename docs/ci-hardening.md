@@ -87,7 +87,8 @@ libtest descriptor array (rust-lang/rust-clippy#13774); stable lint keeps it.
 
 The standalone legacy `raw-pointer-backend` is not selected by the product or by
 the safe workspace all-feature graph and is not claimed as pedantic-qualified.
-Comparable performance regression reporting remains a separate check.
+Performance regression reports compare only matching runs and apply no threshold;
+see [benchmarks](benchmarks.md#regression-report).
 
 ## Grouped Qualification
 

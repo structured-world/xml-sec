@@ -161,6 +161,8 @@ test('published package includes every shared benchmark entry point', () => {
     const library = { schema: 1, results: Array.from({ length: 144 }, (_, index) => index < 4
       ? { unsupported: 'not available' } : { repetitions: [{}] }) };
     fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify(library));
+    fs.writeFileSync(path.join(directory, 'build.json'), JSON.stringify({ schema: 1, rustc: 'rustc 1.92.0' }));
+    fs.writeFileSync(path.join(directory, 'regression.md'), 'report\n');
     const output = path.join(directory, 'site');
     const built = spawnSync(process.execPath, [builder, directory, output],
       { cwd: directory, encoding: 'utf8' });
@@ -173,6 +175,10 @@ test('published package includes every shared benchmark entry point', () => {
     assert.equal(published.results.length, 336);
     assert.ok(published.results.every(entry => !Object.hasOwn(entry, 'commands')));
     assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'library.json'), 'utf8')).results.length, 144);
+    // The next run's baseline needs the build identity; a report is published when present.
+    assert.equal(JSON.parse(fs.readFileSync(path.join(output, 'build.json'), 'utf8')).rustc, 'rustc 1.92.0');
+    assert.equal(fs.readFileSync(path.join(output, 'regression.md'), 'utf8'), 'report\n');
+    assert.equal(fs.existsSync(path.join(output, 'regression.json')), false);
   } finally {
     fs.rmSync(directory, { recursive: true });
   }
@@ -188,6 +194,10 @@ test('CI benchmark evidence stays outside the restored build cache', () => {
   assert.ok(comparison.includes('"$RUNNER_TEMP/benchmark-site-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'));
   assert.ok(comparison.includes('benchmark-compare.sh "$COMPARISON_OUTPUT"'));
   assert.ok(comparison.includes('build-benchmark-dashboard.mjs "$COMPARISON_OUTPUT" "$SITE_OUTPUT"'));
+  // The regression report runs before the dashboard, so the site publishes it.
+  assert.ok(comparison.includes('"$RUNNER_TEMP/benchmark-baseline-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"'));
+  const report = comparison.indexOf('compare-regression.mjs "$BASELINE_OUTPUT" "$COMPARISON_OUTPUT" "$COMPARISON_OUTPUT"');
+  assert.ok(report > 0 && report < comparison.indexOf('build-benchmark-dashboard.mjs'));
   assert.ok(comparison.includes('path: ${{ env.COMPARISON_OUTPUT }}'));
   assert.ok(comparison.includes('path: ${{ env.SITE_OUTPUT }}'));
   assert.equal(comparison.includes('target/performance/'), false);
@@ -234,10 +244,12 @@ test('incomplete reports cannot publish a dashboard', () => {
     const unmeasured = list => [...list.slice(1), { engine: 'unmeasured' }];
     // Missing entries, and a supported entry without measurements, are both incomplete
     // at either level; a complete pair is the control that the builder accepts.
-    for (const [cli, inProcess, accepted] of [[[], library, false], [unmeasured(complete), library, false],
-      [complete, [], false], [complete, unmeasured(library), false], [complete, library, true]]) {
+    // A run without its build identity is incomplete too: the next baseline needs it.
+    for (const [cli, inProcess, accepted, build = { schema: 1 }] of [[[], library, false], [unmeasured(complete), library, false],
+      [complete, [], false], [complete, unmeasured(library), false], [complete, library, false, { schema: 2 }], [complete, library, true]]) {
       fs.writeFileSync(path.join(directory, 'comparison.json'), JSON.stringify({ schema: 2, results: cli }));
       fs.writeFileSync(path.join(directory, 'library.json'), JSON.stringify({ schema: 1, results: inProcess }));
+      fs.writeFileSync(path.join(directory, 'build.json'), JSON.stringify(build));
       const result = spawnSync(process.execPath, ['scripts/build-benchmark-dashboard.mjs', directory, output], { cwd: root });
       assert.equal(result.status === 0, accepted);
       assert.equal(fs.existsSync(output), accepted);

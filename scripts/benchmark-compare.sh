@@ -39,13 +39,19 @@ bash scripts/refresh-competitor-lock.sh
 before=$(source_identity)
 # The library repository does not track Cargo.lock. Resolve once, then freeze
 # the resulting graph for measurement and retain it with the evidence.
-cargo build --release -p xml-sec-cli --bin xmlsec1 --features benchmark-internals,xslt
-cargo build --release -p xml-sec --example benchmark_latency --features benchmark-internals
-cargo build --release --locked --manifest-path "$source/Cargo.toml" -p bergshamra --no-default-features --features rustcrypto --target-dir "$target/competitors/bergshamra"
+# Feature selections are recorded in build.json; a regression report compares
+# only runs built the same way.
+cli_features=benchmark-internals,xslt
+latency_features=benchmark-internals
+bergshamra_features=rustcrypto
+profile_features=allocation-profile
+cargo build --release -p xml-sec-cli --bin xmlsec1 --features "$cli_features"
+cargo build --release -p xml-sec --example benchmark_latency --features "$latency_features"
+cargo build --release --locked --manifest-path "$source/Cargo.toml" -p bergshamra --no-default-features --features "$bergshamra_features" --target-dir "$target/competitors/bergshamra"
 # Library level: in-process harnesses from a project outside the product workspace.
 # Timing and allocation counting are separate builds.
 cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library"
-cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library-profile" --features allocation-profile
+cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library-profile" --features "$profile_features"
 native="$target/competitors/libxmlsec1"
 mkdir -p "$native"
 read -r -a xmlsec_cflags <<< "$(PKG_CONFIG_PATH="$XMLSEC1_PREFIX/lib/pkgconfig" pkg-config --cflags xmlsec1-openssl)"
@@ -55,7 +61,8 @@ case "$(uname -s)" in
 esac
 # OpenSSL is linked into libxmlsec1-openssl itself; linking another copy here would
 # load a second, unused library.
-native_build=(cc -std=c11 -O2 -Wall -Wextra -Werror "${xmlsec_cflags[@]}" "${libxml_cflags[@]}"
+native_flags=(-std=c11 -O2)
+native_build=(cc "${native_flags[@]}" -Wall -Wextra -Werror "${xmlsec_cflags[@]}" "${libxml_cflags[@]}"
   benchmarks/libxmlsec1-library.c -L"$XMLSEC1_PREFIX/lib" -lxmlsec1-openssl -lxmlsec1 -lxslt -lxml2)
 "${native_build[@]}" -o "$native/libxmlsec1-library"
 export LIBRARY_XMLSEC_BIN="$target/competitors/library/release/xml-sec-library"
@@ -101,3 +108,15 @@ cargo metadata --locked --manifest-path "$source/Cargo.toml" --no-default-featur
     ldd "$XMLSEC1_BIN" "$LIBRARY_LIBXMLSEC1_BIN"
   fi
 } > "$output/build-environment.txt"
+# The build identity a regression report requires to match between two runs.
+cc_version=$(cc --version)
+jq -n --arg rustc "$(rustc -V)" --arg cc "${cc_version%%$'\n'*}" \
+  --arg rustflags "${RUSTFLAGS:-}" --arg cflags "${CFLAGS:-}" --arg native "${native_flags[*]}" \
+  --arg cli "$cli_features" --arg latency "$latency_features" --arg bergshamra "$bergshamra_features" \
+  --arg allocation "$profile_features" --arg bergshamra_revision "$revision" \
+  --arg libxmlsec1_revision "$(cat compatibility/libxmlsec1-1.3.13-donor-commit.txt)" \
+  --argjson heap "$([[ $heap == --heap ]] && echo true || echo false)" \
+  '{schema: 1, profile: "release", rustc: $rustc, rustflags: $rustflags, cc: $cc, cflags: $cflags,
+    native_flags: $native, heap_profile: $heap,
+    features: {cli: $cli, latency: $latency, bergshamra: $bergshamra, library: "", library_profile: $allocation},
+    competitors: {bergshamra: $bergshamra_revision, libxmlsec1: $libxmlsec1_revision}}' > "$output/build.json"

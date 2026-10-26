@@ -232,6 +232,36 @@ above the operation's start. Live bytes are the allocator's usable block sizes
 for every engine, so the peak includes allocator rounding the same way.
 Elsewhere the C allocation profile is reported as not measured.
 
+### Regression report
+
+```sh
+node scripts/compare-regression.mjs BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
+node --test scripts/compare-regression.test.mjs
+```
+
+The report compares two comparison runs, each a directory with `comparison.json`,
+`library.json` and `build.json` (compiler, flags, profile, the features of every
+binary, the heap-profiling mode and the pinned competitor revisions). It writes
+`regression.json` with every case of either run and a short `regression.md`.
+
+Runs are compared only when both have more than one sample and at least three
+repetitions, and they match in platform, architecture, CPU model, sample and
+repetition counts, build identity and corpus digests. Otherwise every case is
+reported as incomparable with the reasons; a one-sample run proves that the
+harness works, not how fast anything is. A case one run lacks, an unsupported
+operation and a missing allocation profile are stated as such, never as zero.
+
+For comparable cases the report keeps each repetition's p50/p95/p99 and peak RSS
+from both runs, their medians and ratio, the change in allocation counts, and
+whether the candidate's repetitions lie above, below or within the baseline's.
+It applies no threshold and gives no pass or fail verdict: thresholds need
+repeated comparable baselines on a controlled host, which shared runners are not.
+
+CI fetches the last published default-branch run from Pages as the baseline,
+writes the report into the comparison artifact and the job summary, and the
+dashboard publishes it with the run. When the published site has no usable run,
+the report says that no baseline exists.
+
 CI uses the shared comparison workflow to build dashboard artifacts on PRs;
 Benchmark Observatory publishes only validated default-branch results to GitHub Pages. One-sample PR
 runs prove correctness, not performance. Shared runners and 30-sample runs do
