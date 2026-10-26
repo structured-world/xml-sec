@@ -834,15 +834,13 @@ fn certificate_parse_write_error(error: super::parse::ParseError) -> KeyInfoWrit
 }
 
 fn parse_certificate_pem(certificate_pem: &str) -> Result<Vec<u8>, KeyInfoWriteError> {
-    let (rest, pem) = x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes())
-        .map_err(|_| KeyInfoWriteError::InvalidCertificatePem)?;
-    if !rest.iter().all(u8::is_ascii_whitespace) {
-        return Err(KeyInfoWriteError::InvalidCertificatePem);
-    }
+    let mut pem = super::signature::PemBlock::decode(certificate_pem)
+        .ok_or(KeyInfoWriteError::InvalidCertificatePem)?;
     if pem.label != "CERTIFICATE" {
         return Err(KeyInfoWriteError::InvalidCertificateFormat { label: pem.label });
     }
-    Ok(pem.contents)
+    // A certificate is public; take the buffer instead of copying it.
+    Ok(std::mem::take(&mut *pem.contents))
 }
 
 impl KeyInfoWriter for X509CertificateKeyInfoWriter {
@@ -4446,15 +4444,12 @@ fn parse_signing_document<'a>(
 }
 
 fn parse_private_key_pem(private_key_pem: &str) -> Result<Zeroizing<Vec<u8>>, SigningKeyError> {
-    let (rest, pem) = x509_parser::pem::parse_x509_pem(private_key_pem.as_bytes())
-        .map_err(|_| SigningKeyError::InvalidKeyPem)?;
-    if !rest.iter().all(u8::is_ascii_whitespace) {
-        return Err(SigningKeyError::InvalidKeyPem);
-    }
+    let pem = super::signature::PemBlock::decode(private_key_pem)
+        .ok_or(SigningKeyError::InvalidKeyPem)?;
     if pem.label != "PRIVATE KEY" {
         return Err(SigningKeyError::InvalidKeyFormat { label: pem.label });
     }
-    Ok(Zeroizing::new(pem.contents))
+    Ok(pem.contents)
 }
 
 #[derive(Clone, Copy)]

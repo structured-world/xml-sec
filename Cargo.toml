@@ -334,16 +334,15 @@ cbc = { version = "0.2.1", optional = true }
 des = { version = "0.9", optional = true }
 md-5 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zeroize"], optional = true }
-pem = { version = "4", optional = true }
 pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"], optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates
-x509-parser = { version = "0.18", optional = true }
 structured-asn1 = { version = "0.15.2", default-features = false, features = ["alloc"], optional = true }
 structured-pkix = { version = "0.15.2", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
-der = { version = "0.8", optional = true }
+# `pem` is RFC 7468 decoding of caller key and certificate text.
+der = { version = "0.8", features = ["pem"], optional = true }
 crypto-bigint = { version = "0.7", features = ["zeroize"], optional = true }
 crypto-primes = { version = "0.7.2", default-features = false, optional = true }
 
@@ -367,8 +366,11 @@ ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "pk
 hex-literal = "1"
 roxmltree = { version = "0.21", features = ["positions"] }
 rcgen = "0.14.6"
-# Test-only certificate/CRL construction; production parsing uses structured-pkix.
+# Test-only certificate/CRL construction and independent reading; production
+# parsing uses structured-pkix and RFC 7468 decoding through `der`.
 x509-cert = { version = "0.3", default-features = false }
+x509-parser = "0.18"
+pem = "4"
 rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -404,7 +406,6 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:getrandom",
     "dep:hmac",
     "dep:md-5",
-    "dep:pem",
     "dep:pkcs12",
     "dep:pbkdf2",
     "dep:aes",
@@ -423,7 +424,6 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:signature",
     "dep:snafu",
     "dep:subtle",
-    "dep:x509-parser",
     "dep:structured-asn1",
     "dep:structured-pkix",
     "dep:tinyvec",

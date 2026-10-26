@@ -1927,11 +1927,9 @@ pub fn verify_signature_with_pem_key(
                 }
                 .into());
             }
-            let (rest, pem) = x509_parser::pem::parse_x509_pem(self.public_key_pem.as_bytes())
-                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-            if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
-                return Err(SignatureVerificationError::InvalidKeyPem.into());
-            }
+            let pem = super::signature::PemBlock::decode(self.public_key_pem)
+                .filter(|pem| pem.label == "PUBLIC KEY")
+                .ok_or(SignatureVerificationError::InvalidKeyPem)?;
             // Like any opaque caller key, this PEM key reads its own material.
             Ok(super::modern::verify_with_context(
                 algorithm,
@@ -5960,11 +5958,9 @@ fn verify_with_algorithm(
         | SignatureAlgorithm::Ed448
         | SignatureAlgorithm::Ed448Ph
         | SignatureAlgorithm::PostQuantum(_) => {
-            let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
-                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-            if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
-                return Err(SignatureVerificationError::InvalidKeyPem.into());
-            }
+            let pem = super::signature::PemBlock::decode(public_key_pem)
+                .filter(|pem| pem.label == "PUBLIC KEY")
+                .ok_or(SignatureVerificationError::InvalidKeyPem)?;
             Ok(super::modern::verify(
                 algorithm,
                 &pem.contents,
@@ -5974,11 +5970,9 @@ fn verify_with_algorithm(
             )?)
         }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
-            let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
-                .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-            if !rest.iter().all(u8::is_ascii_whitespace) || pem.label != "PUBLIC KEY" {
-                return Err(SignatureVerificationError::InvalidKeyPem.into());
-            }
+            let pem = super::signature::PemBlock::decode(public_key_pem)
+                .filter(|pem| pem.label == "PUBLIC KEY")
+                .ok_or(SignatureVerificationError::InvalidKeyPem)?;
             Ok(verify_dsa_signature_spki(
                 algorithm,
                 &pem.contents,
