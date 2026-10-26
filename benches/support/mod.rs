@@ -65,7 +65,15 @@ impl std::fmt::Debug for Spec {
     }
 }
 
+/// Workload sizes of the in-repository benches.
+const UNITS: [usize; 2] = [16, 256];
+
 pub fn specs() -> impl Iterator<Item = Spec> {
+    specs_for(&UNITS)
+}
+
+/// Every shape, backend and provider at each of `sizes`.
+pub fn specs_for(sizes: &'static [usize]) -> impl Iterator<Item = Spec> {
     let engines = [
         Engine::RustCrypto,
         #[cfg(feature = "aws-lc-fips")]
@@ -74,7 +82,7 @@ pub fn specs() -> impl Iterator<Item = Spec> {
     XmlBackend::available().flat_map(move |backend| {
         engines.into_iter().flat_map(move |engine| {
             (0..BULK).flat_map(move |shape| {
-                [16, 256].map(move |units| Spec {
+                sizes.iter().map(move |&units| Spec {
                     shape,
                     units,
                     backend,
