@@ -1113,11 +1113,12 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
 
     // -- Reference parsing (XML 1.0 §4.1) --
 
-    /// Counts one entity expansion against the security limit.
+    /// Checks the counted entity expansions against the security limit.
     ///
+    /// Callers increment `entity_expansions` themselves, after the declaration
+    /// lookup, while the looked-up declaration still borrows the entity map.
     /// Returns an error if the configured maximum is exceeded.
-    pub fn count_entity_expansion(&mut self) -> Result<(), ParseError<S>> {
-        self.entity_expansions += 1;
+    pub(crate) fn check_entity_expansions(&self) -> Result<(), ParseError<S>> {
         if self.entity_expansions > self.max_entity_expansions {
             return Err(self.fatal(format_args!(
                 "entity expansion limit exceeded ({})",
@@ -1464,16 +1465,12 @@ impl<S: NameStorage> ParserInput<'_, S> {
                             continue;
                         }
 
-                        self.entity_expansions += 1;
-                        if self.entity_expansions > self.max_entity_expansions {
-                            return Err(self.fatal(format_args!(
-                                "entity expansion limit exceeded ({})",
-                                self.max_entity_expansions
-                            )));
-                        }
-
                         let declaration = self.entity_map.get(name, self.storage)?;
                         let replacement = if let Some(declaration) = declaration {
+                            // A tolerated undeclared reference substitutes nothing,
+                            // so the charge follows the declaration lookup.
+                            self.entity_expansions += 1;
+                            self.check_entity_expansions()?;
                             self.declared_replacement(name, declaration, context)?
                         } else if self.recover || self.has_pe_references || self.has_external_dtd {
                             let diagnostic = ParseDiagnostic {

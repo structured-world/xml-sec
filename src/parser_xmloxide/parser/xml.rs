@@ -1049,11 +1049,13 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         let name = self.input.parse_name()?;
         self.input.expect_byte(b';')?;
 
-        // Count this reference against the expansion limit.
-        self.input.count_entity_expansion()?;
-
-        // Resolve the replacement text (XML 1.0 §4.5).
+        // Resolve the replacement text (XML 1.0 §4.5). Only a declared entity
+        // substitutes anything, so only it counts against the expansion limit.
         let declaration = self.input.entity_map.get(name, self.storage)?;
+        if declaration.is_some() {
+            self.input.entity_expansions += 1;
+            self.input.check_entity_expansions()?;
+        }
         let replacement: Option<S::Text> =
             if let Some(crate::parser_xmloxide::validation::dtd::EntityDecl {
                 kind: EntityKind::Internal(raw),
