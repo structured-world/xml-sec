@@ -115,6 +115,7 @@ jobs:
           name: canonical-coverage
           path: ${{ runner.temp }}/coverage
           if-no-files-found: error
+          retention-days: 7
 
   feature-contract:
     name: feature contract (${{ matrix.rust }}, ${{ matrix.os }})
@@ -192,6 +193,7 @@ jobs:
         with:
           name: benchmark-smoke-${{ matrix.rust }}-rustcrypto
           path: ${{ runner.temp }}/benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
 
   benchmark-comparison:
     uses: ./.github/workflows/benchmark-comparison.yml
@@ -393,6 +395,7 @@ jobs:
         with:
           name: benchmark-smoke-1.92.0-aws-lc-fips
           path: ${{ runner.temp }}/benchmark-smoke-fips-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 7
 
   test:
     runs-on: ubuntu-latest
@@ -468,6 +471,7 @@ jobs:
           name: xades-interop-results
           path: ${{ runner.temp }}/xades-interop
           if-no-files-found: error
+          retention-days: 7
       - name: Qualify XSLT engine, signature chains and failure contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
@@ -492,6 +496,7 @@ jobs:
           name: xslt-performance
           path: ${{ runner.temp }}/xslt-performance
           if-no-files-found: error
+          retention-days: 7
 
   clippy:
     runs-on: ubuntu-latest
