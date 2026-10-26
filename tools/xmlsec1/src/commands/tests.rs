@@ -997,7 +997,8 @@ fn cli_lax_store_encryption_preserves_policy_denial() {
     let mut decrypted = Vec::new();
     execute(&invocation(&decrypt_args), &mut decrypted, &mut Vec::new())
         .expect("strict decryption uses the fallback recipient name");
-    assert_eq!(decrypted, b"lax RSA fallback payload");
+    // Content encryption keeps the data root, so decryption restores the data document.
+    assert_eq!(decrypted, b"<root>lax RSA fallback payload</root>");
 }
 
 #[test]
@@ -2522,15 +2523,247 @@ fn xml_content_serialization_enforces_the_plaintext_limit_while_rendering() {
         ..EncryptionPolicy::default()
     };
 
+    let document =
+        parse_encryption_document(xml, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+
     assert!(matches!(
         xml_data_plaintext(
             xml,
+            document.root_element(),
             &EncryptedDataType::Content,
             &policy,
-            XmlBackend::default(),
         ),
         Err(CommandError::PlaintextTooLarge { maximum: 32 })
     ));
+}
+
+const XML_DATA_TEMPLATE: &str = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Type="http://www.w3.org/2001/04/xmlenc#Element"><EncryptionMethod Algorithm="http://www.w3.org/2009/xmlenc11#aes128-gcm"/><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#;
+
+fn xml_data_command<'a>(
+    invocation: &'a Invocation,
+    policy: &'a EncryptionPolicy,
+) -> EncryptCommand<'a> {
+    EncryptCommand {
+        invocation,
+        template: XML_DATA_TEMPLATE,
+        start_node_id: None,
+        id_attributes: &[],
+        policy,
+        xml_backend: XmlBackend::default(),
+        provider: &xml_sec::provider::RustCryptoProvider,
+    }
+}
+
+#[test]
+fn xml_data_output_obeys_the_document_limit() {
+    // The data document fits the policy, but replacing a small node with the
+    // filled EncryptedData grows it past the limit; the CLI must refuse
+    // rather than write output it cannot read back.
+    let data = format!("<root><t/>{}</root>", "x".repeat(400));
+    let policy = EncryptionPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_document_bytes: data.len() + 16,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..EncryptionPolicy::default()
+    };
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(&data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let target = document
+        .root_element()
+        .first_element_child()
+        .expect("the data has a target element");
+
+    let result = place_encrypted_data(
+        &command,
+        &data,
+        target,
+        &EncryptedDataType::Element,
+        XML_DATA_TEMPLATE,
+    );
+    assert!(result.is_err(), "oversized output was produced: {result:?}");
+}
+
+#[test]
+fn xml_data_output_obeys_the_structural_limits() {
+    // Replacing a leaf at the depth limit with EncryptedData nests its children
+    // deeper than the policy allows; the assembled document must be refused.
+    let data = "<a><b><c/></b></a>";
+    let policy = EncryptionPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_depth: 3,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..EncryptionPolicy::default()
+    };
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let leaf = document
+        .descendants()
+        .find(|node| node.has_tag_name("c"))
+        .expect("the data has a leaf");
+    let template = r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#;
+
+    let result = place_encrypted_data(&command, data, leaf, &EncryptedDataType::Element, template);
+    assert!(result.is_err(), "too deep output was produced: {result:?}");
+}
+
+#[test]
+fn xml_data_moved_template_keeps_its_absent_default_namespace() {
+    // Namespaces in XML 1.0 section 6.2: an unprefixed name takes the default
+    // namespace in scope. A template without one, moved under a data element
+    // that declares one, must keep its unprefixed names out of that namespace.
+    let data = r#"<Order xmlns="urn:order"><Payment>secret</Payment></Order>"#;
+    let template = r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#"><xenc:CipherData><xenc:CipherValue>AAAA</xenc:CipherValue></xenc:CipherData><xenc:EncryptionProperties><xenc:EncryptionProperty><Audit/></xenc:EncryptionProperty></xenc:EncryptionProperties></xenc:EncryptedData>"#;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    let output = place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    )
+    .expect("the template moves into the data document");
+    let placed = parse_encryption_document(
+        &output,
+        policy.xml,
+        &policy.resources,
+        XmlBackend::default(),
+    )
+    .unwrap();
+    let audit = placed
+        .descendants()
+        .find(|node| node.tag_name().name() == "Audit")
+        .expect("the template metadata is preserved");
+    assert_eq!(audit.tag_name().namespace(), None, "{output}");
+    assert!(placed.root_element().has_tag_name(("urn:order", "Order")));
+}
+
+#[test]
+fn xml_data_moved_template_keeps_its_own_default_undeclaration() {
+    // A template that already undeclares the default namespace must not get a
+    // second `xmlns=""`: Namespaces in XML 1.0 section 6.3 forbids duplicates.
+    let data = r#"<Order xmlns="urn:order"><Payment>secret</Payment></Order>"#;
+    let template = r#"<xenc:EncryptedData xmlns:xenc="http://www.w3.org/2001/04/xmlenc#" xmlns=""><xenc:CipherData><xenc:CipherValue>AAAA</xenc:CipherValue></xenc:CipherData><xenc:EncryptionProperties><xenc:EncryptionProperty><Audit/></xenc:EncryptionProperty></xenc:EncryptionProperties></xenc:EncryptedData>"#;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    let output = place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    )
+    .expect("an existing undeclaration is kept as is");
+    assert_eq!(output.matches("xmlns=\"\"").count(), 1, "{output}");
+}
+
+#[test]
+fn xml_data_references_stay_unambiguous_in_the_data_document() {
+    // A reference that resolves inside the template can become ambiguous once the
+    // EncryptedData joins a data document holding the same ID; decryption resolves
+    // it there, so the assembled document must be checked.
+    let data = r#"<Order><Payment>secret</Payment><Info Id="recipient-info"/></Order>"#;
+    let template = r##"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#" Id="recipient-info"><KeyInfoReference xmlns="http://www.w3.org/2009/xmldsig11#" URI="#recipient-info"/></KeyInfo><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"##;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    let result = place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    );
+    assert!(
+        result.is_err(),
+        "ambiguous reference was written: {result:?}"
+    );
+}
+
+#[test]
+fn xml_data_ignores_uri_attributes_of_extension_metadata() {
+    // XMLEnc 1.1 section 3.7 allows foreign content in EncryptionProperty without
+    // giving its URI attributes reference semantics; decryption never resolves
+    // them, so they must not make the template look dangling.
+    let data = "<Order><Payment>secret</Payment></Order>";
+    let template = r##"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#"><CipherData><CipherValue>AAAA</CipherValue></CipherData><EncryptionProperties><EncryptionProperty><audit:Event xmlns:audit="urn:audit" URI="#event"/></EncryptionProperty></EncryptionProperties></EncryptedData>"##;
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let document =
+        parse_encryption_document(data, policy.xml, &policy.resources, XmlBackend::default())
+            .unwrap();
+    let payment = document
+        .descendants()
+        .find(|node| node.has_tag_name("Payment"))
+        .expect("the data has a payment");
+
+    place_encrypted_data(
+        &command,
+        data,
+        payment,
+        &EncryptedDataType::Element,
+        template,
+    )
+    .expect("application metadata is preserved, not resolved");
+}
+
+#[test]
+fn xml_data_template_references_resolve_xpointer_forms() {
+    // Only EncryptedData moves into the data document, so an XPointer
+    // reference to a node outside it would dangle exactly like a bare ID.
+    let policy = xmlsec_compatibility_encryption_policy();
+    let invocation = invocation(&["xmlsec1", "encrypt"]);
+    let command = xml_data_command(&invocation, &policy);
+    let filled = |uri: &str| {
+        format!(
+            r#"<EncryptedData xmlns="http://www.w3.org/2001/04/xmlenc#" Id="data"><KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><KeyInfoReference xmlns="http://www.w3.org/2009/xmldsig11#" URI="{uri}"/></KeyInfo><CipherData><CipherValue>AAAA</CipherValue></CipherData></EncryptedData>"#
+        )
+    };
+    let check = |uri: &str| {
+        let xml = filled(uri);
+        ensure_self_contained(&xml, 0..xml.len(), &command)
+    };
+    assert!(check("#xpointer(id('mechanism'))").is_err());
+    assert!(check("#mechanism").is_err());
+    // After the move, the whole template document is no longer what `/` selects.
+    assert!(check("#xpointer(/)").is_err());
+    check("#xpointer(id('data'))").expect("a reference inside EncryptedData stays resolvable");
 }
 
 #[test]
