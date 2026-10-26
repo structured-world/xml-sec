@@ -44,6 +44,26 @@ fn predefined_references_inside_replacement_text_are_not_charged() {
     }
 }
 
+#[cfg(feature = "xml-backend-xmloxide")]
+#[test]
+fn tolerated_undeclared_references_are_not_charged() {
+    // With an external subset an undeclared reference is tolerated and expands
+    // nothing, so only the declared entity around it is a substitution: each use of
+    // `e` costs one expansion, not two, in content and attributes alike.
+    let uses = CEILING / 2 + 1;
+    let wrapped = "&e;".repeat(uses);
+    let bare = "&missing;".repeat(CEILING + 1);
+    let subset = r#"<!DOCTYPE r SYSTEM "urn:absent" [<!ENTITY e "&missing;">]>"#;
+    for xml in [
+        format!("{subset}<r>{wrapped}</r>"),
+        format!(r#"{subset}<r a="{wrapped}"/>"#),
+        format!("{subset}<r>{bare}</r>"),
+    ] {
+        parse(xml.clone(), XmlBackend::Xmloxide)
+            .unwrap_or_else(|error| panic!("{error:?}: {}", &xml[..80]));
+    }
+}
+
 #[test]
 fn declared_entity_references_still_reach_the_ceiling() {
     // The accounting for declared entities is unchanged, in content and attributes.
