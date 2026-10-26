@@ -42,6 +42,11 @@ jobs:
           domain: ordinary
       - run: node --test scripts/check-hardening.test.mjs
       - run: node --test scripts/ci-test-blocks.test.mjs scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
+      # The per-lint pedantic forbid list must match the pedantic group of both
+      # lint toolchains, and a local allow of a listed lint must fail clippy.
+      - run: rustup toolchain install stable --profile minimal --component clippy
+      - run: node --test scripts/check-pedantic-lints.test.mjs
+      - run: node scripts/check-pedantic-lints.mjs 1.92.0 stable
       - run: node scripts/security-corpus.mjs --check
       - run: bash scripts/check-hardening.sh dependencies
       - run: bash scripts/check-hardening.sh safety
@@ -246,10 +251,11 @@ jobs:
           domain: ordinary
       - name: Check native CLI upstream fixture snapshot
         run: scripts/import-xmlsec1-cli-fixtures.sh --check
-      - name: Check maintained XML parser kernels
+      - name: Check maintained XML parser kernels and the vendored ML-DSA
         run: |
           bash scripts/import-xml-backends.sh roxmltree --verify
           bash scripts/import-xml-backends.sh xmloxide --verify
+          bash scripts/import-rustcrypto-ml-dsa.sh --verify
       - run: >-
           cargo run -p xml-sec-capability-ledger -- check
           donors/xmlsec

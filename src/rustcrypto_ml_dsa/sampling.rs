@@ -226,7 +226,6 @@ where
 
 #[cfg(test)]
 #[allow(clippy::as_conversions)]
-#[allow(clippy::cast_possible_truncation)]
 mod test {
     use super::*;
     use hybrid_array::typenum::{U16, U256};

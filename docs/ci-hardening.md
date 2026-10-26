@@ -57,6 +57,26 @@ safety and FIPS/module boundaries; this check is not an audit of external code.
 `[lints] workspace = true`. Locally it reports warnings; every CI lint invocation
 denies them with `-D warnings`, so there is no accepted-warning baseline.
 
+No source can opt out of a pedantic lint. The table forbids every pedantic lint
+by name, so a local `#[allow]` or `#[expect]` of one is error E0453. A forbidden
+group is not enough: rustc lets a member allow override it and only warns
+(`forbidden_lint_groups`). The list covers the pedantic group of clippy 1.92 and
+of stable, limited to names both toolchains know; a lint only one of them knows
+is caught there as an unknown or renamed lint. Two lints stay out of the list:
+`used_underscore_binding`, which thiserror's derive allows in its own expansion,
+and `large_stack_arrays` (see below). The same check rejects any source that
+allows either of them or the whole pedantic group.
+
+```sh
+node scripts/check-pedantic-lints.mjs 1.92.0 stable
+node --test scripts/check-pedantic-lints.test.mjs
+```
+
+The check fails when either toolchain's pedantic group has a lint the list does
+not cover, or the list names a lint a toolchain does not know. The test proves
+on clippy 1.92 that a local allow of each listed lint fails, and that a forbidden
+group alone would not have.
+
 The lint matrix in `scripts/ci-test-blocks.mjs` resolves each feature graph
 separately: the default, backend, all-feature, experimental, FIPS and XSLT
 workspace graphs, plus library-only minimal graphs for `xmldsig`, `xmlenc` and
