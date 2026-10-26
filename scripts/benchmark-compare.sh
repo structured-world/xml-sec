@@ -109,14 +109,7 @@ cargo metadata --locked --manifest-path "$source/Cargo.toml" --no-default-featur
   fi
 } > "$output/build-environment.txt"
 # The build identity a regression report requires to match between two runs.
-cc_version=$(cc --version)
-jq -n --arg rustc "$(rustc -V)" --arg cc "${cc_version%%$'\n'*}" \
-  --arg rustflags "${RUSTFLAGS:-}" --arg cflags "${CFLAGS:-}" --arg native "${native_flags[*]}" \
-  --arg cli "$cli_features" --arg latency "$latency_features" --arg bergshamra "$bergshamra_features" \
-  --arg allocation "$profile_features" --arg bergshamra_revision "$revision" \
-  --arg libxmlsec1_revision "$(cat compatibility/libxmlsec1-1.3.13-donor-commit.txt)" \
-  --argjson heap "$([[ $heap == --heap ]] && echo true || echo false)" \
-  '{schema: 1, profile: "release", rustc: $rustc, rustflags: $rustflags, cc: $cc, cflags: $cflags,
-    native_flags: $native, heap_profile: $heap,
-    features: {cli: $cli, latency: $latency, bergshamra: $bergshamra, library: "", library_profile: $allocation},
-    competitors: {bergshamra: $bergshamra_revision, libxmlsec1: $libxmlsec1_revision}}' > "$output/build.json"
+node scripts/build-identity.mjs "cli_features=$cli_features" "latency_features=$latency_features" \
+  "bergshamra_features=$bergshamra_features" "library_profile_features=$profile_features" \
+  "native_flags=${native_flags[*]}" "heap=${heap:-none}" "bergshamra=$revision" \
+  "libxmlsec1=$(cat compatibility/libxmlsec1-1.3.13-donor-commit.txt)" > "$output/build.json"

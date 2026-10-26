@@ -64,8 +64,10 @@ export function listProblems(forbidden, toolchains) {
 export function suppressions(path, text) {
   const found = [];
   const names = new Set(['pedantic', ...EXEMPT.keys()]);
-  for (const match of text.matchAll(/\b(?:allow|expect)\s*\(([^()]*)\)/g)) {
-    for (const item of match[1].split(',')) {
+  // Arguments may hold quoted reasons with parentheses or escaped quotes.
+  for (const match of text.matchAll(/\b(?:allow|expect)\s*\(((?:[^()"]|"(?:[^"\\]|\\.)*")*)\)/g)) {
+    // A reason's own text is not a lint name, however it is worded.
+    for (const item of match[1].replace(/"(?:[^"\\]|\\.)*"/g, '""').split(',')) {
       const lint = item.trim();
       if (lint.startsWith('clippy::') && names.has(normalize(lint))) {
         const line = text.slice(0, match.index).split('\n').length;

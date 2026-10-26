@@ -240,8 +240,12 @@ node --test scripts/compare-regression.test.mjs
 ```
 
 The report compares two comparison runs, each a directory with `comparison.json`,
-`library.json` and `build.json` (compiler, flags, profile, the features of every
-binary, the heap-profiling mode and the pinned competitor revisions). It writes
+`library.json` and `build.json`. `scripts/build-identity.mjs` writes the latter:
+compiler versions, the features of every binary, native flags, the heap-profiling
+mode and the pinned competitor revisions, every environment override of the build
+(`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `CC`,
+`CFLAGS` and similar) and digests of the Cargo configuration files that apply. A
+run whose identity cannot be recorded fails. The report writes
 `regression.json` with every case of either run and a short `regression.md`.
 
 Runs are compared only when both have more than one sample and at least three
@@ -250,6 +254,8 @@ repetition counts, build identity and corpus digests. Otherwise every case is
 reported as incomparable with the reasons; a one-sample run proves that the
 harness works, not how fast anything is. A case one run lacks, an unsupported
 operation and a missing allocation profile are stated as such, never as zero.
+A supported case without the run's number of repetitions, or with a missing or
+non-positive percentile, makes a baseline unusable and fails the candidate.
 
 For comparable cases the report keeps each repetition's p50/p95/p99 and peak RSS
 from both runs, their medians and ratio, the change in allocation counts, and

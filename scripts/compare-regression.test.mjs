@@ -39,6 +39,13 @@ test('a candidate slower in every repetition is reported as an observation, not 
   assert.equal(ordering([5, 6], [1, 2]), 'lower in every repetition');
 });
 
+test('a separated case keeps its four table cells in the summary', () => {
+  // The case identity must not split the Markdown row into extra columns.
+  const report = regressionReport(run([entry('saml-16', [100, 110, 105])]), run([entry('saml-16', [200, 210, 205])]));
+  const row = summary(report).split('\n').find(line => line.includes('saml-16'));
+  assert.equal(row.split(/(?<!\\)\|/).length - 2, 4, row);
+});
+
 test('a one-sample or under-repeated run proves harness operation only', () => {
   // The contract needs at least three repetitions of more than one sample.
   const results = [entry('saml-16', [100])];
@@ -108,6 +115,20 @@ test('an unusable baseline is reported as missing evidence, never as a compariso
       assert.equal(report.baseline, null);
       assert.match(report.incomparable_reasons[0], reason);
       assert.deepEqual(report.counts, { 'no baseline': 1 });
+    }
+  });
+});
+
+test('malformed case measurements make a baseline unusable and a candidate fail', () => {
+  // Schema-valid files can still carry empty, short or non-numeric repetitions.
+  const valid = run([entry('saml-16', [1, 2, 3])]);
+  withRuns(write => {
+    for (const results of [[entry('saml-16', [])], [entry('saml-16', [100, null, 105])], [entry('saml-16', [100, 110])]]) {
+      const malformed = loadRun(write(`malformed-${Math.random()}`, run(results)));
+      const report = regressionReport(malformed, valid);
+      assert.equal(report.comparable, false);
+      assert.match(report.incomparable_reasons[0], /no usable baseline: comparison.json case .*saml-16/);
+      assert.throws(() => regressionReport(valid, malformed), /candidate run is unusable: comparison.json case .*saml-16/);
     }
   });
 });

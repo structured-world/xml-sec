@@ -23,10 +23,32 @@ export function loadRun(directory) {
     try { value = JSON.parse(fs.readFileSync(location, 'utf8')); }
     catch { return { missing: `${file} is not valid JSON` }; }
     if (value?.schema !== schema) return { missing: `${file} has schema ${value?.schema}, expected ${schema}` };
-    if (key !== 'build' && !Array.isArray(value.results)) return { missing: `${file} has no results` };
+    if (key !== 'build') {
+      if (!Array.isArray(value.results)) return { missing: `${file} has no results` };
+      const invalid = invalidCase(value);
+      if (invalid) return { missing: `${file} case ${invalid}` };
+    }
     run[key] = value;
   }
   return run;
+}
+
+const measurement = value => Number.isFinite(value) && value >= 0;
+
+/** The first supported case whose measurements the runners would never write, if any. */
+export function invalidCase(report) {
+  const expected = report.environment?.repetitions;
+  for (const entry of report.results) {
+    if (entry.unsupported) continue;
+    const reason = !Array.isArray(entry.repetitions) || entry.repetitions.length !== expected
+      ? `has ${entry.repetitions?.length ?? 'no'} repetitions, expected ${expected}`
+      : entry.repetitions.some(item => !PERCENTILES.every(field => measurement(item?.[field]) && item[field] > 0))
+        ? 'has a missing or non-positive percentile'
+        : entry.memory && !ALLOCATIONS.every(field => measurement(entry.memory[field]))
+          ? 'has an incomplete allocation profile' : null;
+    if (reason) return `${key(entry)} ${reason}`;
+  }
+  return null;
 }
 
 const same = (left, right) => JSON.stringify(left) === JSON.stringify(right);
@@ -131,7 +153,8 @@ export function summary(report) {
   if (separated.length > 0) {
     lines.push('', '| Case | p50 | baseline median ns | candidate median ns |', '|---|---|---|---|');
     for (const entry of separated)
-      lines.push(`| ${entry.case} | ${entry.latency.p50_ns.ordering} | ${Math.round(entry.latency.p50_ns.baseline_median)} | ${Math.round(entry.latency.p50_ns.candidate_median)} |`);
+      // The case identity joins its parts with pipes, which a table cell must escape.
+      lines.push(`| ${entry.case.replaceAll('|', '\\|')} | ${entry.latency.p50_ns.ordering} | ${Math.round(entry.latency.p50_ns.baseline_median)} | ${Math.round(entry.latency.p50_ns.candidate_median)} |`);
   }
   return `${lines.join('\n')}\n`;
 }

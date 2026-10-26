@@ -62,6 +62,16 @@ test('sources may not suppress an exempt lint or the whole pedantic group', () =
   ]);
 });
 
+test('a reason string with parentheses or quotes does not hide a suppression', () => {
+  // Clippy accepts these attributes, so the scanner must see past quoted text.
+  const text = [
+    '#[allow(clippy::used_underscore_binding, reason = "compatibility (upstream)")]',
+    '#[expect(clippy::pedantic, reason = "see \\"foo()\\" here")]',
+    '#[allow(clippy::unwrap_used, reason = "not clippy::pedantic, nor clippy::large_stack_arrays")]',
+  ].join('\n');
+  assert.deepEqual(suppressions('lib.rs', text).map(found => found.split(':').slice(0, 2).join(':')), ['lib.rs:1', 'lib.rs:2']);
+});
+
 test('a local allow of any forbidden pedantic lint fails the lint gate', () => {
   // The workspace lint table, applied to a crate that allows every listed lint
   // locally, must make clippy fail with E0453 for each of them; without the
