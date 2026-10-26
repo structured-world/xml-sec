@@ -34,6 +34,11 @@ source_identity() {
   git ls-files -c -o --exclude-standard -z -- Cargo.toml rust-toolchain.toml src crates vendor benches examples scripts benchmarks compatibility/bergshamra-0.9.2-benchmark-commit.txt compatibility/libxmlsec1-1.3.13-donor-commit.txt tests/fixtures/keys/rsa tests/fixtures/keys/cacert.pem tests/fixtures/keys/ca2cert.pem |
     sort -zu | xargs -0 shasum -a 256
 }
+competitors=benchmarks/competitors/Cargo.toml
+# The competitor lockfile pins Bergshamra but also records the product crate it
+# builds from this checkout. Follow only that entry, so a release or dependency
+# update of the product leaves every other locked version as recorded.
+cargo update --manifest-path "$competitors" -p xml-sec
 before=$(source_identity)
 # The library repository does not track Cargo.lock. Resolve once, then freeze
 # the resulting graph for measurement and retain it with the evidence.
@@ -42,7 +47,6 @@ cargo build --release -p xml-sec --example benchmark_latency --features benchmar
 cargo build --release --locked --manifest-path "$source/Cargo.toml" -p bergshamra --no-default-features --features rustcrypto --target-dir "$target/competitors/bergshamra"
 # Library level: in-process harnesses from a project outside the product workspace.
 # Timing and allocation counting are separate builds.
-competitors=benchmarks/competitors/Cargo.toml
 cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library"
 cargo build --release --locked --manifest-path "$competitors" --target-dir "$target/competitors/library-profile" --features allocation-profile
 native="$target/competitors/libxmlsec1"

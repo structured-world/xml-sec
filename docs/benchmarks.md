@@ -189,7 +189,9 @@ The same corpus and keys drive one in-process harness per engine:
 - Bergshamra 0.9.2 through its Rust API, linked only from
   `benchmarks/competitors`, a project outside the xml-sec workspace with its own
   `Cargo.lock` and the revision pinned in
-  `compatibility/bergshamra-0.9.2-benchmark-commit.txt`;
+  `compatibility/bergshamra-0.9.2-benchmark-commit.txt`. Before building, the
+  runner refreshes only that lockfile's entry for xml-sec itself, so a new
+  product version or dependency leaves the Bergshamra graph as locked;
 - libxmlsec1 1.3.13 through its C API (`benchmarks/libxmlsec1-library.c`),
   linked against the oracle build and the OpenSSL inside it.
 

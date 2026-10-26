@@ -50,6 +50,9 @@ jobs:
       - name: Lint the in-process competitor harnesses
         run: |
           cargo fmt --manifest-path benchmarks/competitors/Cargo.toml --check
+          # The lockfile pins Bergshamra; only the product's own entry follows
+          # this checkout, as in scripts/benchmark-compare.sh.
+          cargo update --manifest-path benchmarks/competitors/Cargo.toml -p xml-sec
           cargo clippy --locked --manifest-path benchmarks/competitors/Cargo.toml --target-dir target/competitors/library-profile --all-targets --features allocation-profile -- -D warnings
       - name: Validate interoperability and compare identical CLI and library work
         env:
