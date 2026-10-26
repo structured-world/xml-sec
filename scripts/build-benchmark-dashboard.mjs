@@ -4,6 +4,9 @@ const [input, output] = process.argv.slice(2);
 if (!input || !output) throw Error('Usage: build-benchmark-dashboard.mjs COMPARISON_DIR NEW_SITE_DIR');
 const report = JSON.parse(fs.readFileSync(path.join(input, 'comparison.json')));
 const library = JSON.parse(fs.readFileSync(path.join(input, 'library.json')));
+// The next run's regression report needs this run's build identity as its baseline.
+const build = JSON.parse(fs.readFileSync(path.join(input, 'build.json')));
+if (build.schema !== 1) throw Error('Expected build identity schema 1');
 // CLI: 5 payload shapes x 3 sizes x 4 operations x 4 engines, plus 4 workloads x 3 sizes
 // x 2 operations x 4 engines. Library: 4 workloads x 3 sizes x 2 operations x 2
 // boundaries x 3 engines. An engine without the capability has an unsupported entry.
@@ -18,3 +21,7 @@ fs.mkdirSync(output);
 for (const file of ['index.html', 'app.js', 'style.css']) fs.copyFileSync(path.join('benchmarks/dashboard', file), path.join(output, file));
 fs.writeFileSync(path.join(output, 'comparison.json'), JSON.stringify(report));
 fs.writeFileSync(path.join(output, 'library.json'), JSON.stringify(library));
+fs.writeFileSync(path.join(output, 'build.json'), JSON.stringify(build));
+// Published with the run that produced it; a run without a report publishes none.
+for (const file of ['regression.json', 'regression.md'])
+  if (fs.existsSync(path.join(input, file))) fs.copyFileSync(path.join(input, file), path.join(output, file));

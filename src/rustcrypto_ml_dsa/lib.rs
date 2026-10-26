@@ -1,7 +1,5 @@
 #![doc = include_str!("README.md")]
 #![allow(non_snake_case)] // Allow notation matching the spec
-#![allow(clippy::similar_names)] // Allow notation matching the spec
-#![allow(clippy::many_single_char_names)] // Allow notation matching the spec
 #![allow(clippy::clone_on_copy)] // Be explicit about moving data
 
 //! # Usage
