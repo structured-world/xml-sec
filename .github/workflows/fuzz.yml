@@ -108,7 +108,9 @@ jobs:
           TARGET: ${{ matrix.target }}
           MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'campaign' || 'smoke' }}
         run: bash scripts/fuzz-security.sh "$TARGET" "$MODE" --cache-managed
-      - name: Preserve reproducers, commands and coverage corpus
+      # The corpus is not uploaded: the fuzz-corpus cache above already carries it
+      # to the next run.
+      - name: Preserve reproducers and commands
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -116,8 +118,8 @@ jobs:
           path: |
             ${{ runner.temp }}/fuzz-evidence
             fuzz/artifacts
-            fuzz/corpus
           if-no-files-found: error
+          retention-days: 7
 
   differential:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
