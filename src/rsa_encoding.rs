@@ -25,22 +25,26 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-use crypto_bigint::{BoxedUint, NonZero, Resize};
+use crypto_bigint::BoxedUint;
+#[cfg(feature = "xmldsig-sign")]
+use crypto_bigint::{NonZero, Resize};
 use pkcs8::{
-    Document, SecretDocument,
+    Document,
     der::{
         Decode,
-        asn1::OctetStringRef,
         pem::{LineEnding, PemLabel},
     },
 };
-use rsa::{
-    RsaPrivateKey, RsaPublicKey,
-    traits::{PrivateKeyParts, PublicKeyParts},
-};
+#[cfg(feature = "xmldsig-sign")]
+use pkcs8::{SecretDocument, der::asn1::OctetStringRef};
+#[cfg(feature = "xmldsig-sign")]
+use rsa::{RsaPrivateKey, traits::PrivateKeyParts};
+use rsa::{RsaPublicKey, traits::PublicKeyParts};
+#[cfg(feature = "xmldsig-sign")]
 use zeroize::Zeroizing;
 
 /// PKCS#1 and PKCS#8 codecs without enabling the RSA dependency's codecs.
+#[cfg(feature = "xmldsig-sign")]
 pub trait RsaPrivateKeyEncoding: Sized {
     /// Decode a two-prime PKCS#1 key and validate it with `sad-rsa`.
     ///
@@ -194,6 +198,7 @@ fn width(data: &[u8]) -> pkcs1::Result<u32> {
         .ok_or(pkcs1::Error::KeyMalformed)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl RsaPrivateKeyEncoding for RsaPrivateKey {
     fn from_pkcs1_der(bytes: &[u8]) -> pkcs1::Result<Self> {
         let key = pkcs1::RsaPrivateKeyRef::from_der(bytes)?;
@@ -353,6 +358,7 @@ pub(crate) fn read_spki_public_key(
     Ok(RsaPublicKey::new(n, e).ok())
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn verify_algorithm_id(algorithm: &pkcs8::AlgorithmIdentifierRef<'_>) -> pkcs8::spki::Result<()> {
     match algorithm.oid {
         pkcs1::ALGORITHM_OID => {
@@ -377,6 +383,7 @@ fn verify_algorithm_id(algorithm: &pkcs8::AlgorithmIdentifierRef<'_>) -> pkcs8::
     Ok(())
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn private_error(error: pkcs1::Error) -> pkcs8::Error {
     match error {
         pkcs1::Error::Asn1(error) => pkcs8::Error::Asn1(error),

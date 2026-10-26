@@ -1,4 +1,4 @@
-#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+#![cfg(all(feature = "xmldsig-sign", feature = "c14n"))]
 
 use std::collections::HashSet;
 

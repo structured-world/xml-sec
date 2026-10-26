@@ -1,4 +1,4 @@
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 //! Terminal C14N streams into the Reference digest: verifying a large payload
 //! never holds its whole canonical output in memory.
 

@@ -62,10 +62,14 @@ cargo install --git https://github.com/structured-world/xml-sec xml-sec-cli
 xmlsec1 version
 ```
 
-Applications can build only the capabilities they need:
+Applications can build only the capabilities they need. `xmldsig` verifies;
+`xmldsig-sign` adds signing and private-key import:
 
 ```toml
+# Verification only: no private-key import, password derivation or randomness source.
 xml-sec = { version = "0.2", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
+# Verification and signing.
+xml-sec = { version = "0.2", default-features = false, features = ["xmldsig-sign", "c14n", "xml-backend-xmloxide"] }
 ```
 
 See [feature and provider qualification](docs/features.md) for supported combinations,

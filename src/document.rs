@@ -323,14 +323,14 @@ struct SelfClosingContentEdit {
     qualified_name: String,
 }
 
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "xmldsig-sign")]
 fn is_unescaped_base64_text(value: &str) -> bool {
     value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
 }
 
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "xmldsig-sign")]
 fn validate_base64_replacements(
     replacements: &[(NodeIdentity, String)],
 ) -> Result<(), XmlDocumentError> {
@@ -903,7 +903,7 @@ impl XmlDocument {
         self.cell.into_owner()
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn staged_copy_with_budget(
         &self,
         settings: DocumentParseSettings,
@@ -912,7 +912,7 @@ impl XmlDocument {
         Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn commit_staged(&mut self, staged: Self) -> Result<(), XmlDocumentError> {
         // Signing mutates and validates every staged generation under the active
         // policy. Moving that retained cell preserves atomicity without parsing
@@ -1246,7 +1246,7 @@ impl XmlDocument {
         self.replace_contents_inner(replacements, settings, true, true, Some(budget))
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn replace_base64_contents_with_budget(
         &mut self,
         replacements: &[(NodeIdentity, String)],
@@ -1260,7 +1260,7 @@ impl XmlDocument {
         self.replace_contents_inner(replacements, settings, true, false, Some(budget))
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn project_base64_contents(
         &self,
         replacements: &[(NodeIdentity, String)],
@@ -1276,7 +1276,7 @@ impl XmlDocument {
     /// `settings` would produce, without parsing it. Base64 character data cannot
     /// change element structure, so the commit parse would only recheck the
     /// projected size and node count, which are checked here instead.
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn project_base64_commit(
         &self,
         replacements: &[(NodeIdentity, String)],
@@ -1517,7 +1517,7 @@ impl XmlDocument {
         )
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn append_generated_child_with_budget(
         &mut self,
         target: NodeIdentity,
@@ -1625,7 +1625,7 @@ impl XmlDocument {
         Ok(())
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn projected_content_replacement_len(
         &self,
         target: NodeIdentity,

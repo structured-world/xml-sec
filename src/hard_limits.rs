@@ -87,7 +87,7 @@ pub(crate) const KEY_ESTABLISHMENT_MODULAR_WORK_CEILING: usize = 1_000_000_000;
 #[cfg(feature = "xmldsig")]
 pub(crate) const KEY_ENCAPSULATION_OPERATION_CEILING: usize = 4_096;
 /// Stack-safety ceiling for BER construction and nested PKCS#12 safe bags.
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) const PKCS12_NESTING_CEILING: usize = 32;
 /// Maximum byte length of one imported DSA integer before big-integer work.
 #[cfg(feature = "xmldsig")]

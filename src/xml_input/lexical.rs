@@ -1316,7 +1316,7 @@ mod tests {
         // happen before output or stack mutation so the caller can still close the open element.
         let mut orphan = Writer::new(Vec::new());
         assert!(orphan.end("root").is_err());
-        assert_eq!(orphan.into_inner(), []);
+        assert_eq!(orphan.into_inner(), [] as [u8; 0]);
 
         let mut writer = Writer::new(Vec::new());
         writer.start("root", []).expect("root opens");
@@ -1352,7 +1352,7 @@ mod tests {
                 .empty("root", [("id", "one"), ("id", "two")])
                 .is_err()
         );
-        assert_eq!(writer.into_inner(), []);
+        assert_eq!(writer.into_inner(), [] as [u8; 0]);
     }
 
     #[test]
@@ -1373,7 +1373,7 @@ mod tests {
                 )
                 .is_err()
         );
-        assert_eq!(writer.into_inner(), []);
+        assert_eq!(writer.into_inner(), [] as [u8; 0]);
 
         let mut writer = Writer::new(Vec::new());
         writer
@@ -1401,7 +1401,7 @@ mod tests {
         ] {
             let mut writer = Writer::new(Vec::new());
             assert!(writer.empty(name, attributes).is_err(), "accepted {name}");
-            assert_eq!(writer.into_inner(), []);
+            assert_eq!(writer.into_inner(), [] as [u8; 0]);
         }
 
         let mut writer = Writer::new(Vec::new());
@@ -1422,7 +1422,7 @@ mod tests {
     fn writer_rejects_characters_forbidden_by_xml_1_0() {
         let mut writer = Writer::new(Vec::new());
         assert!(writer.text("before\0after").is_err());
-        assert_eq!(writer.into_inner(), []);
+        assert_eq!(writer.into_inner(), [] as [u8; 0]);
 
         let mut writer = Writer::new(Vec::new());
         assert!(

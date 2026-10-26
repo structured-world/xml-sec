@@ -210,11 +210,11 @@ opt-level = 2
 [[test]]
 name = "xmlsec1_interop"
 path = "tests/xmlsec1_interop.rs"
-required-features = ["xmldsig", "c14n"]
+required-features = ["xmldsig-sign", "c14n"]
 
 [[test]]
 name = "signing_digest"
-required-features = ["xmldsig", "c14n"]
+required-features = ["xmldsig-sign", "c14n"]
 
 [[test]]
 name = "signature_pipeline_integration"
@@ -226,15 +226,15 @@ required-features = ["xmldsig"]
 
 [[test]]
 name = "xpath_transform_integration"
-required-features = ["xmldsig", "c14n"]
+required-features = ["xmldsig-sign", "c14n"]
 
 [[test]]
 name = "base64_transform_integration"
-required-features = ["xmldsig", "c14n"]
+required-features = ["xmldsig-sign", "c14n"]
 
 [[test]]
 name = "xslt_transform_integration"
-required-features = ["xslt", "c14n"]
+required-features = ["xslt", "xmldsig-sign", "c14n"]
 
 [[test]]
 name = "merlin_interop"
@@ -254,7 +254,7 @@ required-features = ["xmlenc"]
 
 [[example]]
 name = "sign"
-required-features = ["xmldsig", "c14n"]
+required-features = ["xmldsig-sign", "c14n"]
 
 [[example]]
 name = "verify"
@@ -310,11 +310,16 @@ shake = { version = "0.1", default-features = false, optional = true }
 const-oid = { version = "0.10", default-features = false, features = ["db"], optional = true }
 slh-dsa = { version = "=0.2.0-rc.5", default-features = false, features = ["alloc", "zeroize"], optional = true }
 ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"], optional = true }
-p256 = { version = "0.14", features = ["ecdsa"], optional = true }
-p384 = { version = "0.14", features = ["ecdsa"], optional = true }
-p521 = { version = "0.14", features = ["ecdsa"], optional = true }
+# Without the curves' `std`/`getrandom`: every random draw goes through the
+# selected CryptoProvider, so no build carries an operating-system RNG here.
+p256 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem", "precomputed-tables"], optional = true }
+p384 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem", "precomputed-tables"], optional = true }
+p521 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem", "precomputed-tables"], optional = true }
+# Only selects `std` for the curves' lazily built basepoint tables, which the
+# curves' own `std` would couple to `getrandom`; no API of this crate is used.
+primeorder = { version = "0.14", default-features = false, features = ["std"], optional = true }
 dsa = { version = "0.7", features = ["hazmat"], optional = true }
-pkcs8 = { version = "0.11", features = ["encryption", "pem"], optional = true }
+pkcs8 = { version = "0.11", features = ["pem"], optional = true }
 pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["alloc", "pem"], optional = true }
 ed25519-dalek = { version = "3", default-features = false, features = ["alloc", "digest", "fast", "hazmat", "pkcs8", "zeroize"], optional = true }
 # Expose the same curve primitive already used by dalek for RFC 8032 Ed25519ctx.
@@ -371,6 +376,8 @@ rcgen = "0.14.6"
 x509-cert = { version = "0.3", default-features = false }
 x509-parser = "0.18"
 pem = "4"
+# The vendored ML-DSA tests draw random polynomials in every feature set.
+getrandom = { version = "0.4", features = ["sys_rng"] }
 rand_chacha = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -382,7 +389,7 @@ tempfile = "3"
 benchmark-internals = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
 legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
-default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
+default = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["thiserror/std", "xmlparser/std", "structured-asn1?/std", "structured-pkix?/std"]
 aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs", "dep:aws-lc-fips-sys"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
@@ -392,28 +399,23 @@ xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
 # Compatibility alias for existing CI/fuzz builds. Unlike `xml-backends-all`,
 # this also selects differential parsing as the default runtime mode.
 xml-backend-differential = ["xml-backends-all"]
-xmldsig = [            # XML Digital Signatures (sign + verify)
+xmldsig = [            # XML Digital Signature verification and public-key inventory
     "std",
     "no-unsafe",
     "embedded",
     "dep:der",
     "dep:crypto-bigint",
     "dep:dsa",
-    "dep:des",
     "dep:ed25519-dalek",
     "dep:curve25519-dalek",
     "dep:ed448-goldilocks",
-    "dep:getrandom",
     "dep:hmac",
     "dep:md-5",
-    "dep:pkcs12",
-    "dep:pbkdf2",
-    "dep:aes",
-    "dep:cbc",
     "dep:peresil",
     "dep:p256",
     "dep:p384",
     "dep:p521",
+    "dep:primeorder",
     "dep:pkcs8",
     "dep:pkcs1",
     "dep:rsa",
@@ -429,10 +431,25 @@ xmldsig = [            # XML Digital Signatures (sign + verify)
     "dep:tinyvec",
     "dep:zeroize",
 ]
+# Signing, signing randomness and private-key import (PEM/PKCS#8, encrypted
+# PKCS#8, PKCS#12) on top of verification.
+xmldsig-sign = [
+    "xmldsig",
+    "dep:getrandom",
+    "dep:pkcs12",
+    "dep:pbkdf2",
+    "dep:aes",
+    "dep:cbc",
+    "dep:des",
+    # The signer's DSA KeyValue writer derives its parameter encoder.
+    "der/derive",
+    "pkcs8/encryption",
+]
 xmlenc = [             # XML Encryption (encrypt + decrypt)
     "std",
-    # The shared key inventory stores XMLDSig KeyInfo for named RSA recipients.
-    "xmldsig",
+    # The shared key inventory stores XMLDSig KeyInfo for named RSA recipients,
+    # and decryption reads private keys.
+    "xmldsig-sign",
     "dep:aes",
     "dep:aes-gcm",
     "dep:aes-kw",
@@ -456,7 +473,7 @@ c14n = []              # XML Canonicalization (inclusive + exclusive)
 # XMLDSig XSLT transform (http://www.w3.org/TR/1999/REC-xslt-19991116).
 xslt = ["xmldsig", "dep:icu_collator", "dep:icu_locale", "dep:roxmltree", "dep:time", "dep:url"]
 # Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
-experimental-pq = ["xmldsig", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
+experimental-pq = ["xmldsig", "der/derive", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 no-unsafe = []
 embedded = []
 

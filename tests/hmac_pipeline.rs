@@ -1,5 +1,5 @@
 //! HMAC policy and complete `XMLDSig` pipeline regression coverage.
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 #[path = "common/xmlsec1.rs"]
 mod xmlsec1;

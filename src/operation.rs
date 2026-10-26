@@ -1,6 +1,6 @@
 //! Shared compilation and execution state for one XML Security operation.
 
-#[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+#[cfg(not(feature = "xmldsig-sign"))]
 use std::marker::PhantomData;
 use std::{
     cell::{Cell, RefCell},
@@ -9,7 +9,9 @@ use std::{
 
 #[cfg(feature = "xmldsig")]
 use crate::NodeIdentity;
-use crate::{DocumentIdentity, DocumentView, XmlDocument};
+#[cfg(feature = "xmldsig-sign")]
+use crate::XmlDocument;
+use crate::{DocumentIdentity, DocumentView};
 
 /// Stable identifier assigned in deterministic discovery order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -35,6 +37,7 @@ pub(crate) enum OperationStage {
     #[cfg(feature = "xmldsig")]
     AuthenticatedDependency,
     Evidence,
+    #[cfg(feature = "xmldsig-sign")]
     Mutation,
 }
 
@@ -59,6 +62,7 @@ pub(crate) enum OperationNodeKind {
     Canonicalization,
     Crypto,
     Evidence,
+    #[cfg(feature = "xmldsig-sign")]
     Mutation,
 }
 
@@ -131,6 +135,7 @@ pub(crate) enum OperationPlanError {
     StaleGeneration { planned: u64, current: u64 },
     #[error("operation resource identity changed after plan compilation")]
     StaleResourceIdentity,
+    #[cfg(feature = "xmldsig-sign")]
     #[error("operation mutation did not advance the document by exactly one generation")]
     InvalidGenerationTransition,
     #[error("operation node {node:?} executed before dependency {requires:?}")]
@@ -283,6 +288,7 @@ pub(crate) enum OperationDecisionReason {
     #[cfg(feature = "xmldsig")]
     SignatureRejected,
     EvidenceFinalized,
+    #[cfg(feature = "xmldsig-sign")]
     MutationCommitted,
     ActionRejected,
 }
@@ -300,9 +306,10 @@ pub(crate) struct OperationDecision {
 /// Single owner of immutable policy, cumulative budgets, identity state and
 /// execution evidence for one operation.
 pub(crate) struct OperationExecutionContext<P, B> {
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    // Only mutating operations read the bound policy back from the context.
+    #[cfg(feature = "xmldsig-sign")]
     policy: P,
-    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+    #[cfg(not(feature = "xmldsig-sign"))]
     _policy: PhantomData<P>,
     budgets: B,
     builder: Option<OperationPlanBuilder>,
@@ -317,12 +324,12 @@ pub(crate) struct OperationExecutionContext<P, B> {
 
 impl<P, B> OperationExecutionContext<P, B> {
     pub(crate) fn new(policy: P, budgets: B, document: Option<(DocumentIdentity, u64)>) -> Self {
-        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        #[cfg(not(feature = "xmldsig-sign"))]
         drop(policy);
         Self {
-            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+            #[cfg(feature = "xmldsig-sign")]
             policy,
-            #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+            #[cfg(not(feature = "xmldsig-sign"))]
             _policy: PhantomData,
             budgets,
             builder: Some(OperationPlanBuilder::default()),
@@ -336,7 +343,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         }
     }
 
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn policy(&self) -> &P {
         &self.policy
     }
@@ -345,7 +352,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         &self.budgets
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn budgets_mut(&mut self) -> &mut B {
         &mut self.budgets
     }
@@ -529,6 +536,7 @@ impl<P, B> OperationExecutionContext<P, B> {
             OperationNodeKind::Digest { .. } => OperationDecisionReason::ReferenceDigestVerified,
             OperationNodeKind::Crypto => OperationDecisionReason::SignatureVerified,
             OperationNodeKind::Evidence => OperationDecisionReason::EvidenceFinalized,
+            #[cfg(feature = "xmldsig-sign")]
             OperationNodeKind::Mutation => OperationDecisionReason::MutationCommitted,
             OperationNodeKind::Document => OperationDecisionReason::Completed,
             #[cfg(feature = "xmldsig")]
@@ -550,7 +558,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_ready(node, action)
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn run_with_budgets<T, E>(
         &mut self,
         node: OperationNodeId,
@@ -574,7 +582,7 @@ impl<P, B> OperationExecutionContext<P, B> {
     }
 
     /// Run several ready nodes as one read of the planned document generation.
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn run_document_batch_with_budgets<T, E>(
         &mut self,
         nodes: &[OperationNodeId],
@@ -649,6 +657,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_ready(node, action)
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn run_document_transition<T, E>(
         &mut self,
         node: OperationNodeId,
@@ -661,7 +670,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_document_transition_nodes(&[node], document, action)
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn run_document_transition_batch_with_budgets<T, E>(
         &mut self,
         nodes: &[OperationNodeId],
@@ -674,6 +683,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         self.run_document_transition_nodes(nodes, document, action)
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     fn run_document_transition_nodes<T, E>(
         &mut self,
         nodes: &[OperationNodeId],
@@ -717,7 +727,7 @@ impl<P, B> OperationExecutionContext<P, B> {
 
     /// Run a mutation whose next generation is handed to the caller as its
     /// serialization instead of being committed to `document`.
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn run_document_projection<T, E>(
         &self,
         node: OperationNodeId,

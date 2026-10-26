@@ -294,7 +294,7 @@ fn generated_info(certificates: Vec<Vec<u8>>) -> X509DataInfo {
 }
 
 #[test]
-#[cfg(feature = "experimental-pq")]
+#[cfg(all(feature = "experimental-pq", feature = "xmldsig-sign"))]
 fn pq_issuer_path_requires_the_independent_certificate_allowlist() {
     use der::asn1::{Any, ObjectIdentifier};
     use xml_sec::provider::X509SignatureAlgorithm;

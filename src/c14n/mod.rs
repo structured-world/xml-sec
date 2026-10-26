@@ -333,7 +333,7 @@ pub(crate) fn canonicalize_bounded_with_xml_base_budget(
 
 /// [`canonicalize_bounded_with_xml_base_budget`] that also reports where each
 /// tracked element's start tag begins in `output`.
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn canonicalize_bounded_with_xml_base_budget_and_positions(
     doc: &Document,
     node_set: &dyn Fn(Node) -> bool,

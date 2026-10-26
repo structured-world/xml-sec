@@ -3864,6 +3864,8 @@ pub struct SignatureKeyInfoMetadata {
     pub key_info: KeyInfo,
     /// Exact KEM parameter set, if the resolved graph contains one mechanism.
     pub encapsulation: Option<crate::provider::KeyEncapsulationAlgorithm>,
+    /// Signing fills this `CipherValue`; verification only validates its target.
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) cipher_value: Option<NodeId>,
 }
 
@@ -3894,6 +3896,7 @@ pub(crate) fn has_same_document_encapsulation_with_budget(
     )
 }
 
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn has_signing_encapsulation_with_budget(
     node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
@@ -4343,13 +4346,17 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
         } else {
             None
         };
+    #[cfg(not(feature = "xmldsig-sign"))]
+    let _ = cipher_value;
     Ok(SignatureKeyInfoMetadata {
         key_info,
         encapsulation,
+        #[cfg(feature = "xmldsig-sign")]
         cipher_value,
     })
 }
 
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn inspect_signing_key_info_with_budgets(
     node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,

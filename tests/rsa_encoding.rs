@@ -1,4 +1,4 @@
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use der::{Decode, Encode};
 use rsa::{RsaPrivateKey, RsaPublicKey, traits::PublicKeyParts};

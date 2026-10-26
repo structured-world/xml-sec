@@ -10,8 +10,9 @@ and ECDSA SHA-1/SHA-224/SHA-256/SHA-384/SHA-512 methods implemented by the
 `hmac_output_length_bits`. Both public types are non-exhaustive; consumers should
 use wildcard match arms and obtain `SignedInfo` through the parser.
 
-The `xmldsig` feature provides signing and verification pipelines for same-document XML
-signatures and detached references whose payloads the caller supplies. It supports inclusive and
+The `xmldsig` feature provides the verification pipeline, and `xmldsig-sign` adds the signing
+pipeline, for same-document XML signatures and detached references whose payloads the caller
+supplies. It supports inclusive and
 exclusive canonicalization, enveloped signatures,
 Base64, `XPath` 1.0, and `XPath` Filter 2.0 transforms, XSLT transforms with the optional `xslt`
 feature, RSA PKCS#1 v1.5, RSA-PSS, DSA,

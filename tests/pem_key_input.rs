@@ -23,7 +23,9 @@ fn rewrapped(label: &str, width: usize) -> String {
         text.push_str(std::str::from_utf8(chunk).expect("base64 is ASCII"));
         text.push('\n');
     }
-    text.push_str(&format!("-----END {label}-----\n"));
+    text.push_str("-----END ");
+    text.push_str(label);
+    text.push_str("-----\n");
     text
 }
 

@@ -1,6 +1,6 @@
 //! `XMLDSig` 1.1 and Second Edition donor interoperability coverage.
 
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use std::{
     collections::{HashMap, HashSet},

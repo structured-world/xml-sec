@@ -15,7 +15,8 @@ thiserror = "2"
 
 [features]
 default = ["xmlenc", "xml-backend-xmloxide"]
-xmlenc = ["xml-sec/xmlenc"]
+xmldsig-sign = ["xml-sec/xmldsig-sign"]
+xmlenc = ["xmldsig-sign", "xml-sec/xmlenc"]
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
 xml-backends-all = ["xml-sec/xml-backends-all"]
