@@ -4930,7 +4930,7 @@ fn load_pkcs12_recipient(
     let inner = if provider.name() == "rustcrypto" {
         PrivateKeyDecryptor::new(key_material::decode_rsa_private_with_password(
             path,
-            &imported.pkcs8_der,
+            imported.pkcs8_der(),
             key_material::PrivateKeyFormat::Pkcs8Der,
             None,
             policy_resources,
@@ -4938,7 +4938,7 @@ fn load_pkcs12_recipient(
     } else {
         PrivateKeyDecryptor::provider_key(
             provider
-                .import_recovery_key(&imported.pkcs8_der)
+                .import_recovery_key(imported.pkcs8_der())
                 .map_err(|error| CommandError::Encryption(error.to_string()))?,
         )
     };
@@ -4978,7 +4978,7 @@ fn load_provider_recipient(
         .last()
         .ok_or_else(|| CommandError::Usage("no RSA private key imported".into()))?;
     let key = selected_provider(command.invocation)?
-        .import_recovery_key(&imported.pkcs8_der)
+        .import_recovery_key(imported.pkcs8_der())
         .map_err(|error| CommandError::Encryption(error.to_string()))?;
     if !certificate_paths.is_empty() {
         let certificates = load_certificate_companions(

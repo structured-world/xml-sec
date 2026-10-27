@@ -370,13 +370,31 @@ impl KeyUsages {
     }
 }
 
+/// PKCS#8 DER of a stored private key; both forms wipe on drop.
+#[cfg(feature = "xmldsig-sign")]
+enum PrivateKeyDer {
+    Owned(Zeroizing<Vec<u8>>),
+    /// A decrypted PKCS#12 key kept in place, with its import memory charge.
+    Retained(structured_cms::personal::Plaintext),
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl core::ops::Deref for PrivateKeyDer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Retained(plaintext) => plaintext.as_bytes(),
+        }
+    }
+}
+
 /// Private key encoded as provider-neutral PKCS#8 DER.
 #[cfg(feature = "xmldsig-sign")]
 pub struct StoredPrivateKey {
     /// Opaque caller-assigned name.
     pub name: String,
-    /// Private key bytes; zeroized on drop.
-    pub pkcs8_der: Zeroizing<Vec<u8>>,
+    pkcs8_der: PrivateKeyDer,
     /// Allowed operations.
     pub usages: KeyUsages,
     /// Associated certificates, leaf first when a matching leaf exists.
@@ -386,6 +404,12 @@ pub struct StoredPrivateKey {
 
 #[cfg(feature = "xmldsig-sign")]
 impl StoredPrivateKey {
+    /// Private key bytes as PKCS#8 DER; zeroized on drop.
+    #[must_use]
+    pub fn pkcs8_der(&self) -> &[u8] {
+        &self.pkcs8_der
+    }
+
     /// Import an explicitly selected recipient into the operation's crypto engine.
     ///
     /// # Errors
@@ -1305,7 +1329,7 @@ impl KeyInventory {
                 "key is not authorized for signing",
             ));
         }
-        let der = entry.pkcs8_der.as_slice();
+        let der = entry.pkcs8_der();
         check_operation_material_size(der.len(), &policy.resources)?;
         if let Ok(info) = PrivateKeyInfoRef::try_from(der)
             && info.algorithm.oid == dsa::OID
@@ -1381,7 +1405,7 @@ impl KeyInventory {
         check_selected_material_size(entry.pkcs8_der.len(), &policy.resources)?;
         // Borrow public PKCS#1 components before bigint decoding: import
         // permission is not an exemption from the decryption snapshot.
-        let info = PrivateKeyInfoRef::try_from(entry.pkcs8_der.as_slice())
+        let info = PrivateKeyInfoRef::try_from(entry.pkcs8_der())
             .map_err(|_| KeyStoreError::Selection("incompatible RSA decryption key"))?;
         if let Some(algorithm) =
             crate::provider::KeyEncapsulationAlgorithm::from_oid(info.algorithm.oid)
@@ -1815,7 +1839,7 @@ impl KeyInventory {
         )?;
         self.private_keys.push(StoredPrivateKey {
             name,
-            pkcs8_der: der,
+            pkcs8_der: PrivateKeyDer::Owned(der),
             usages,
             certificate_chain: Vec::new(),
             has_matching_leaf: false,
@@ -2151,7 +2175,7 @@ impl KeyInventory {
             "PKCS#12 bundle must contain exactly one private key",
         ))?;
         let mut certificates = contents.certificates;
-        let identity = PrivateKeyIdentity::decode(private_key.as_ref())?;
+        let identity = PrivateKeyIdentity::decode(&private_key)?;
         if auto_decrypt {
             usages = identity.automatic_usages();
         } else if usages.allows(KeyUsage::Decrypt) && !identity.can_decrypt() {
@@ -2567,10 +2591,10 @@ impl KeyInventory {
             } => {
                 let key_info = dsa_store_key_info(&name, public, session)?;
                 #[cfg(feature = "xmldsig-sign")]
-                if let Some(pkcs8_der) = private {
+                if let Some(der) = private {
                     self.private_keys.push(StoredPrivateKey {
                         name: name.clone(),
-                        pkcs8_der,
+                        pkcs8_der: PrivateKeyDer::Owned(der),
                         usages: KeyUsages::SIGN,
                         certificate_chain: Vec::new(),
                         has_matching_leaf: false,

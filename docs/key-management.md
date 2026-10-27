@@ -216,6 +216,8 @@ PBES2/PBKDF2 with AES-CBC and legacy SHA-1/3DES containers, plus SHA-1/SHA-2 MAC
 Unsupported digest, PRF, KDF, and cipher algorithms, PBMAC1, public-key
 integrity, enveloped privacy and CRL, secret or SDSI bags return a selection
 error, not a protected-container error; RC2 containers are not supported.
+A decrypted PrivateKeyInfo that is already DER is stored in its decryption
+buffer, without a second copy, and keeps that buffer's import memory charge.
 A BER PrivateKeyInfo is stored as DER by rewriting its framing only; algorithm
 parameters that are not already DER are refused rather than re-encoded.
 Private keys and decrypted temporary buffers are zeroized. Every bag, nested

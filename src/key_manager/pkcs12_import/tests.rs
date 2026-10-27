@@ -333,7 +333,7 @@ fn ber_key_bag_reaches_public_inventory() {
             &ResourcePolicy::default(),
         )
         .expect("public BER import");
-    assert_eq!(inventory.private_keys()[0].pkcs8_der.as_slice(), private);
+    assert_eq!(inventory.private_keys()[0].pkcs8_der(), private);
 }
 
 #[test]
@@ -753,7 +753,34 @@ fn pbes2_ber_iv_forms_preserve_decryption() {
         inventory
             .add_pkcs12("key".into(), &bytes, "secret", &ResourcePolicy::default())
             .expect("all BER IV forms import");
-        assert_eq!(inventory.private_keys()[0].pkcs8_der.as_slice(), private);
+        assert_eq!(inventory.private_keys()[0].pkcs8_der(), private);
+    }
+}
+
+#[test]
+fn a_decrypted_der_key_is_kept_and_a_ber_key_rewritten() {
+    // A DER PrivateKeyInfo is stored in its decrypted buffer, without a second
+    // copy; RFC 7292 4.2.1 BER framing is still rewritten to DER.
+    let private = private_key();
+    let mut ber = vec![0x30, 0x80];
+    ber.extend_from_slice(&private[4..]);
+    ber.extend_from_slice(&[0, 0]);
+    let iv = [7; 16];
+    for (plain, kept) in [(&private, true), (&ber, false)] {
+        let ciphertext = aes128_pbes2_ciphertext(b"secret", b"12345678", iv, plain);
+        let bytes = pfx(&[data(&sequence(&[bag(
+            pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+            &sequence(&[
+                pbes2_aes128(b"12345678", integer(2), encoded(4, &iv)),
+                encoded(4, &ciphertext),
+            ]),
+        )]))]);
+        let contents = run(&bytes, &limits(64), "secret").expect("shrouded import");
+        assert_eq!(imported_key(&contents), private);
+        assert_eq!(
+            matches!(contents.private_key, Some(PrivateKeyDer::Retained(_))),
+            kept
+        );
     }
 }
 

@@ -14,6 +14,15 @@ fn xml_policy(resources: ResourcePolicy) -> crate::policy::VerificationPolicy {
 }
 
 #[test]
+fn inventories_stay_shareable_across_threads() {
+    // A kept decrypted PKCS#12 buffer must not cost the inventory Send/Sync.
+    fn shareable<T: Send + Sync>() {}
+    shareable::<KeyInventory>();
+    #[cfg(feature = "xmldsig-sign")]
+    shareable::<StoredPrivateKey>();
+}
+
+#[test]
 fn inventory_merge_preserves_import_work() {
     // Moving inventories must not discard work spent before the merge.
     let resources = ResourcePolicy {
@@ -586,7 +595,9 @@ fn kem_pkcs12_auto_usage_is_decrypt_only() {
         .to_pkcs8_der(crate::provider::MlKemPrivateKeyEncoding::Seed)
         .expect("seed PKCS#8 export");
     let contents = || pkcs12_import::Contents {
-        private_key: Some(Zeroizing::new(der.as_bytes().to_vec())),
+        private_key: Some(PrivateKeyDer::Owned(Zeroizing::new(
+            der.as_bytes().to_vec(),
+        ))),
         certificates: Vec::new(),
     };
     let resources = ResourcePolicy::default();

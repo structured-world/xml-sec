@@ -22,7 +22,7 @@ use structured_cms::personal::{
 use structured_pkix::AlgorithmIdentifier;
 use zeroize::Zeroizing;
 
-use super::KeyStoreError;
+use super::{KeyStoreError, PrivateKeyDer};
 use crate::policy::{PolicyViolation, ResourcePolicy, resource_name};
 
 type Result<T> = core::result::Result<T, KeyStoreError>;
@@ -35,7 +35,7 @@ pub(super) struct Limits {
 }
 
 pub(super) struct Contents {
-    pub private_key: Option<Zeroizing<Vec<u8>>>,
+    pub private_key: Option<PrivateKeyDer>,
     pub certificates: Vec<Vec<u8>>,
 }
 
@@ -116,6 +116,7 @@ pub(super) fn import<S: Secret, F: FnOnce() -> Option<S>>(
         bmp: None,
         charges: Charges::new(limits, ceilings, *work),
         key: None,
+        keep_decrypted: false,
         certificates: Vec::new(),
         reservations: Vec::new(),
     };
@@ -745,6 +746,35 @@ fn private_key_der(
     Ok((output, reservation))
 }
 
+/// Whether the whole original `PrivateKeyInfo` is already DER, so its decrypted
+/// buffer can be stored as is. A rule violation means BER, not a refusal.
+fn der_conforms(key: &PrivateKey<'_>, query: &Reader<'_>, ceilings: Ceilings) -> Result<bool> {
+    let mut reader = key
+        .original
+        .reader_in(query)
+        .map_err(|e| ceilings.refuse(&e))?;
+    let element = reader
+        .next_element()
+        .map_err(|e| ceilings.refuse(&e))?
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let mut strict = match reader.reread(&element, Encoding::Der) {
+        Ok(strict) => strict,
+        Err(e) if e.is_resource() => return Err(ceilings.refuse(&e)),
+        Err(_) => return Ok(false),
+    };
+    let original = match strict.next_element() {
+        Ok(Some(original)) => original,
+        Ok(None) => return malformed(),
+        Err(e) if e.is_resource() => return Err(ceilings.refuse(&e)),
+        Err(_) => return Ok(false),
+    };
+    match structured_pkix::der::conforms(&strict, &original, FIELD) {
+        Ok(()) => Ok(true),
+        Err(e) if e.is_resource() => Err(ceilings.refuse(&e)),
+        Err(_) => Ok(false),
+    }
+}
+
 /// The caller's password, requested once and only when a step needs it.
 struct Password<F, S> {
     request: Option<F>,
@@ -783,9 +813,12 @@ struct Adapter<'l, F, S> {
     /// RFC 7292 B.1 `BMPString` form, derived on the first legacy use.
     bmp: Option<Plaintext>,
     charges: Charges<'l>,
-    key: Option<Zeroizing<Vec<u8>>>,
+    key: Option<PrivateKeyDer>,
+    /// The decrypted key inspected by `key` is DER and `retain_key` keeps it.
+    keep_decrypted: bool,
     certificates: Vec<Vec<u8>>,
-    /// Charges for `key` and `certificates`, held until the import returns.
+    /// Charges for a rewritten `key` and `certificates`, held until the
+    /// import returns; a kept decrypted key carries its own.
     reservations: Vec<MemoryReservation>,
 }
 
@@ -806,11 +839,11 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Adapter<'_, F, S> {
         Ok(())
     }
 
-    fn retain_key(&mut self, key: &PrivateKey<'_>, query: &Reader<'_>) -> Result<()> {
+    fn rewrite_key(&mut self, key: &PrivateKey<'_>, query: &Reader<'_>) -> Result<()> {
         self.one_key()?;
         let (der, reservation) = private_key_der(key, query, self.charges.ceilings)?;
         self.reservations.push(reservation);
-        self.key = Some(der);
+        self.key = Some(PrivateKeyDer::Owned(der));
         Ok(())
     }
 
@@ -1028,7 +1061,8 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Backend for Adapter<'_, F, S> {
     fn bag(&mut self, bag: &Bag<'_>, query: &Reader<'_>, _: &Source<'_>) -> Result<()> {
         self.charges.count()?;
         match &bag.value {
-            BagValue::Key(key) => self.retain_key(key, query),
+            // A clear key borrows the input, so it is copied once either way.
+            BagValue::Key(key) => self.rewrite_key(key, query),
             // Refuse a second key before spending its KDF work.
             BagValue::Shrouded(_) => self.one_key(),
             BagValue::Certificate(certificate) => self.retain_certificate(certificate, query),
@@ -1038,7 +1072,25 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Backend for Adapter<'_, F, S> {
     }
 
     fn key(&mut self, key: &PrivateKey<'_>, query: &Reader<'_>, _: &Source<'_>) -> Result<()> {
-        self.retain_key(key, query)
+        self.one_key()?;
+        if der_conforms(key, query, self.charges.ceilings)? {
+            self.keep_decrypted = true;
+            Ok(())
+        } else {
+            self.rewrite_key(key, query)
+        }
+    }
+
+    fn retain_key(&mut self, plaintext: Plaintext) -> Result<()> {
+        use der::Decode as _;
+        if !core::mem::take(&mut self.keep_decrypted) {
+            // The BER original was rewritten; its buffer is released here.
+            return Ok(());
+        }
+        pkcs8::PrivateKeyInfoRef::from_der(plaintext.as_bytes())
+            .map_err(|_| KeyStoreError::ProtectedContainer)?;
+        self.key = Some(PrivateKeyDer::Retained(plaintext));
+        Ok(())
     }
 }
 
