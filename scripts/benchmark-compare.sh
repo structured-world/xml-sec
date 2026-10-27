@@ -27,9 +27,6 @@ export BERGSHAMRA_BIN="$target/competitors/bergshamra/release/bergshamra"
 export XMLSEC1_PREFIX=${XMLSEC1_PREFIX:-$root/.tools/xmlsec1-1.3.13-$(cut -c1-12 compatibility/libxmlsec1-1.3.13-donor-commit.txt)}
 export XMLSEC1_BIN="$XMLSEC1_PREFIX/bin/xmlsec1"
 bash scripts/install-xmlsec1.sh
-# Both Rust binaries use the same declared compiler, including in containers
-# where the project's `stable` override would otherwise download another one.
-export RUSTUP_TOOLCHAIN=${BENCH_RUST_TOOLCHAIN:-1.92.0}
 source_identity() {
   git ls-files -c -o --exclude-standard -z -- Cargo.toml rust-toolchain.toml src crates vendor benches examples scripts benchmarks compatibility/bergshamra-0.9.2-benchmark-commit.txt compatibility/libxmlsec1-1.3.13-donor-commit.txt tests/fixtures/keys/rsa tests/fixtures/keys/cacert.pem tests/fixtures/keys/ca2cert.pem |
     sort -zu | xargs -0 shasum -a 256

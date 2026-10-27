@@ -33,7 +33,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
           components: clippy, rustfmt
       - uses: actions/setup-node@v7
         with:

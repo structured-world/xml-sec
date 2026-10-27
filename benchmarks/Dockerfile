@@ -1,4 +1,4 @@
-FROM rust:1.92-bookworm
+FROM rust:bookworm
 
 RUN apt-get update && apt-get install --yes --no-install-recommends \
     autoconf automake build-essential curl jq libltdl-dev libssl-dev libtool \

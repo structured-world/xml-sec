@@ -286,8 +286,8 @@ References: [Bergshamra CLI](https://github.com/kushaldas/bergshamra/blob/v0.9.2
 `benchmarks/Dockerfile` supplies the Linux profiling tools. Mount source read-only
 and a separate writable output/build directory; select it through `CARGO_TARGET_DIR`
 and `XMLSEC1_PREFIX`. Resolve `Cargo.lock` before mounting source read-only
-(`cargo +1.92.0 generate-lockfile`). The competitor checkout must be clean and match the pinned
+(`cargo generate-lockfile`). The competitor checkout must be clean and match the pinned
 revision. Container results describe that container's architecture, not the host.
-Both Rust binaries use Rust 1.92.0 by default (`BENCH_RUST_TOOLCHAIN` selects
-another installed toolchain for both). Keep build artifacts on a Linux-native
-volume when running Docker on macOS; only source and exported reports need bind mounts.
+Both Rust binaries are built with the same stable compiler, recorded in `build.json`.
+Keep build artifacts on a Linux-native volume when running Docker on macOS; only
+source and exported reports need bind mounts.

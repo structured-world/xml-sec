@@ -51,13 +51,13 @@ test('exempt lints are neither required nor forbidden, and non-pedantic names ar
 test('sources may not suppress an exempt lint or the whole pedantic group', () => {
   const text = [
     '#[allow(clippy::used_underscore_binding)]', 'fn a() {}',
-    '#[cfg_attr(test, expect(clippy::large_stack_arrays, reason = "x"))]', 'fn b() {}',
+    '#[cfg_attr(test, expect(clippy::used_underscore_binding, reason = "x"))]', 'fn b() {}',
     '#![allow(clippy::pedantic)]',
     '#[allow(clippy::unwrap_used)]', 'fn c() { value.expect("clippy::pedantic is fine in a message"); }',
   ].join('\n');
   assert.deepEqual(suppressions('lib.rs', text), [
     'lib.rs:1: allow(clippy::used_underscore_binding)',
-    'lib.rs:3: expect(clippy::large_stack_arrays, reason = "x")',
+    'lib.rs:3: expect(clippy::used_underscore_binding, reason = "x")',
     'lib.rs:5: allow(clippy::pedantic)',
   ]);
 });
@@ -67,7 +67,7 @@ test('a reason string with parentheses or quotes does not hide a suppression', (
   const text = [
     '#[allow(clippy::used_underscore_binding, reason = "compatibility (upstream)")]',
     '#[expect(clippy::pedantic, reason = "see \\"foo()\\" here")]',
-    '#[allow(clippy::unwrap_used, reason = "not clippy::pedantic, nor clippy::large_stack_arrays")]',
+    '#[allow(clippy::unwrap_used, reason = "not clippy::pedantic, nor clippy::used_underscore_binding")]',
   ].join('\n');
   assert.deepEqual(suppressions('lib.rs', text).map(found => found.split(':').slice(0, 2).join(':')), ['lib.rs:1', 'lib.rs:2']);
 });
@@ -94,7 +94,7 @@ test('a local allow of any forbidden pedantic lint fails the lint gate', () => {
       writeFileSync(join(directory, 'Cargo.toml'),
         `[package]\nname = "pedantic-probe"\nversion = "0.0.0"\nedition = "2024"\npublish = false\n\n[workspace]\n\n${table}`);
       writeFileSync(join(directory, 'src/lib.rs'), source);
-      return spawnSync('cargo', ['+1.92.0', 'clippy', '--quiet', '--', '-D', 'warnings'], { cwd: directory, encoding: 'utf8' });
+      return spawnSync('cargo', ['clippy', '--quiet', '--', '-D', 'warnings'], { cwd: directory, encoding: 'utf8' });
     };
     // Forbidding only the group is not enough: rustc lets a member allow
     // override it with a forbidden_lint_groups warning, and the lint is silenced.

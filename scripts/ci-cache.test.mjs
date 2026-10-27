@@ -86,10 +86,10 @@ test('the benchmark observatory deletes its site artifact after deploying it', (
   assert.match(workflow, /actions: write/);
 });
 
-test('ordinary jobs have one matrix writer per compiler and separate instrumented domains', () => {
+test('ordinary jobs have one matrix writer and separate instrumented domains', () => {
   // Compatible readers share dependencies without partial feature writers racing.
   const workflow = source('.github/workflows/ci.yml');
-  assert.match(workflow, /save: \$\{\{ matrix.block == 'msrv-extended' \|\| matrix.block == 'stable-extended' \}\}/);
+  assert.match(workflow, /save: \$\{\{ matrix.block == 'extended' \}\}/);
   assert.match(workflow, /save: \$\{\{ !matrix.minimal \}\}/);
   assert.match(workflow, /domain: coverage\n\s+save: 'true'/);
   assert.match(workflow, /check-xslt-conformance.sh --cache-managed/);

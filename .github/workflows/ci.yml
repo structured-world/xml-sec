@@ -29,7 +29,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
           components: clippy
       - uses: actions/setup-node@v7
         with:
@@ -42,11 +41,10 @@ jobs:
           domain: ordinary
       - run: node --test scripts/check-hardening.test.mjs
       - run: node --test scripts/ci-test-blocks.test.mjs scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
-      # The per-lint pedantic forbid list must match the pedantic group of both
-      # lint toolchains, and a local allow of a listed lint must fail clippy.
-      - run: rustup toolchain install stable --profile minimal --component clippy
+      # The per-lint pedantic forbid list must match clippy's pedantic group,
+      # and a local allow of a listed lint must fail clippy.
       - run: node --test scripts/check-pedantic-lints.test.mjs
-      - run: node scripts/check-pedantic-lints.mjs 1.92.0 stable
+      - run: node scripts/check-pedantic-lints.mjs stable
       - run: node scripts/security-corpus.mjs --check
       - run: bash scripts/check-hardening.sh dependencies
       - run: bash scripts/check-hardening.sh safety
@@ -83,7 +81,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
@@ -118,7 +115,7 @@ jobs:
           retention-days: 7
 
   feature-contract:
-    name: feature contract (${{ matrix.rust }}, ${{ matrix.os }})
+    name: feature contract (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     env:
       CARGO_INCREMENTAL: '0'
@@ -128,23 +125,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - rust: "1.92.0"
-            os: ubuntu-latest
+          - os: ubuntu-latest
             minimal: true
-          - rust: stable
-            os: ubuntu-latest
-            minimal: true
-          - rust: stable
-            os: macos-latest
-          - rust: stable
-            os: windows-latest
+          - os: macos-latest
+          - os: windows-latest
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: clippy
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-node@v7
@@ -153,7 +143,6 @@ jobs:
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
-          toolchain: ${{ matrix.rust }}
           save: ${{ !matrix.minimal }}
       - name: Check the matrix runner
         if: runner.os != 'Windows'
@@ -191,7 +180,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: matrix.minimal
         with:
-          name: benchmark-smoke-${{ matrix.rust }}-rustcrypto
+          name: benchmark-smoke-rustcrypto
           path: ${{ runner.temp }}/benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 1
 
@@ -207,7 +196,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
           components: clippy
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-build-cache
@@ -246,7 +234,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
           components: rustfmt
       - uses: ./.github/actions/rust-build-cache
         with:
@@ -285,26 +272,21 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.92.0"
           targets: thumbv7em-none-eabihf,wasm32-unknown-unknown
           components: clippy
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: alloc-targets
           save: 'true'
-      - run: cargo +1.92.0 clippy -p xml-sec-xml-input --lib --no-default-features -- -D warnings
+      - run: cargo clippy -p xml-sec-xml-input --lib --no-default-features -- -D warnings
       - run: >-
-          cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
+          cargo check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
       - run: bash scripts/check-shared-pkix.sh
-        env:
-          RUSTUP_TOOLCHAIN: "1.92.0"
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
       - run: bash scripts/test-wasm-c14n.sh
-        env:
-          RUSTUP_TOOLCHAIN: "1.92.0"
 
   test-matrix:
     name: test block (${{ matrix.block }})
@@ -318,18 +300,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - block: stable-core
-            rust: stable
-          - block: msrv-core
-            rust: "1.92.0"
-          - block: msrv-extended
-            rust: "1.92.0"
+          - block: core
+          - block: extended
             token: true
-          - block: stable-extended
-            rust: stable
-            token: true
-          - block: msrv-fips
-            rust: "1.92.0"
+          - block: experimental
+          - block: fips
     steps:
       - uses: actions/checkout@v7
         with:
@@ -348,7 +323,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ matrix.rust }}
           components: clippy
       - uses: taiki-e/install-action@nextest
       - uses: actions/setup-node@v7
@@ -374,26 +348,25 @@ jobs:
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
-          toolchain: ${{ matrix.rust }}
-          # One complete dependency graph per compiler owns writes, not a race
-          # between partial feature matrices for the same immutable entry.
-          save: ${{ matrix.block == 'msrv-extended' || matrix.block == 'stable-extended' }}
+          # One complete dependency graph owns writes, not a race between
+          # partial feature matrices for the same immutable entry.
+          save: ${{ matrix.block == 'extended' }}
       - name: Qualify isolated build, lint, tests and doctests
         env:
           PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
           BLOCK: ${{ matrix.block }}
         run: node scripts/ci-test-blocks.mjs "$BLOCK"
       - name: Qualify FIPS benchmark contracts and measurement runner
-        if: matrix.block == 'msrv-fips'
+        if: matrix.block == 'fips'
         run: |
           cargo nextest run --test benchmark_contract --example benchmark_latency --features benchmark-internals,aws-lc-fips
           cargo clippy --bench security --example benchmark_latency --features benchmark-internals,aws-lc-fips,benchmark-alloc -- -D warnings
           node --test scripts/compare-security.test.mjs
           bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-fips-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1 aws-lc-fips
       - uses: actions/upload-artifact@v7
-        if: matrix.block == 'msrv-fips'
+        if: matrix.block == 'fips'
         with:
-          name: benchmark-smoke-1.92.0-aws-lc-fips
+          name: benchmark-smoke-aws-lc-fips
           path: ${{ runner.temp }}/benchmark-smoke-fips-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 1
 
@@ -422,7 +395,6 @@ jobs:
     env:
       JAVA_HOME: /usr/lib/jvm/java-21-openjdk-amd64
       PYTHONDONTWRITEBYTECODE: "1"
-      RUSTUP_TOOLCHAIN: "1.92.0"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -440,8 +412,6 @@ jobs:
           path: donors/libxslt
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: "1.92.0"
       - uses: taiki-e/install-action@nextest
       - name: Verify vendored oracle fixtures
         env:

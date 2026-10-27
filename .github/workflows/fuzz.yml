@@ -41,7 +41,6 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: '1.92.0'
           components: clippy
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-build-cache
@@ -140,8 +139,6 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: '1.92.0'
       - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-build-cache
         with:

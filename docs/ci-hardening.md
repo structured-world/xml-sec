@@ -60,30 +60,29 @@ denies them with `-D warnings`, so there is no accepted-warning baseline.
 No source can opt out of a pedantic lint. The table forbids every pedantic lint
 by name, so a local `#[allow]` or `#[expect]` of one is error E0453. A forbidden
 group is not enough: rustc lets a member allow override it and only warns
-(`forbidden_lint_groups`). The list covers the pedantic group of clippy 1.92 and
-of stable, limited to names both toolchains know; a lint only one of them knows
-is caught there as an unknown or renamed lint. Two lints stay out of the list:
-`used_underscore_binding`, which thiserror's derive allows in its own expansion,
-and `large_stack_arrays` (see below). The same check rejects any source that
-allows either of them or the whole pedantic group.
+(`forbidden_lint_groups`). The list covers the pedantic group of stable clippy.
+One lint stays out of the list: `used_underscore_binding`, which thiserror's
+derive allows in its own expansion. The same check rejects any source that
+allows it or the whole pedantic group.
 
 ```sh
-node scripts/check-pedantic-lints.mjs 1.92.0 stable
+node scripts/check-pedantic-lints.mjs stable
 node --test scripts/check-pedantic-lints.test.mjs
 ```
 
-The check fails when either toolchain's pedantic group has a lint the list does
-not cover, or the list names a lint a toolchain does not know. The test proves
-on clippy 1.92 that a local allow of each listed lint fails, and that a forbidden
-group alone would not have.
+The check fails when stable clippy's pedantic group has a lint the list does not
+cover, or the list names a lint clippy does not know. The test proves that a
+local allow of each listed lint fails, and that a forbidden group alone would
+not have.
 
-The lint matrix in `scripts/ci-test-blocks.mjs` resolves each feature graph
-separately: the default, backend, all-feature, experimental, FIPS and XSLT
-workspace graphs, plus library-only minimal graphs for `xmldsig`, `xmldsig-sign`,
-`xmlenc` and `xslt` on the differential backend. The alloc-only job lints the separate
-XML-input crate without default features. MSRV lint invocations allow
-`clippy::large_stack_arrays`, which clippy 1.92 reports without a span for the
-libtest descriptor array (rust-lang/rust-clippy#13774); stable lint keeps it.
+CI builds, lints and tests with the stable channel only and names no compiler
+release; `rust-version` is the declared minimum, and clippy's `incompatible_msrv`
+lint keeps standard-library use within it. The lint matrix in
+`scripts/ci-test-blocks.mjs` resolves each feature graph separately: the default,
+backend, all-feature, experimental, FIPS and XSLT workspace graphs, plus
+library-only minimal graphs for `xmldsig`, `xmldsig-sign`, `xmlenc` and `xslt` on
+the differential backend. The alloc-only job lints the separate XML-input crate
+without default features.
 
 The standalone legacy `raw-pointer-backend` is not selected by the product or by
 the safe workspace all-feature graph and is not claimed as pedantic-qualified.
@@ -92,14 +91,13 @@ see [benchmarks](benchmarks.md#regression-report).
 
 ## Grouped Qualification
 
-`node scripts/ci-test-blocks.mjs BLOCK` runs one of `stable-core`, `msrv-core`,
-`msrv-extended`, `stable-extended`, or `msrv-fips`. These blocks retain separate
-Cargo invocations for every toolchain/feature/backend profile; grouping does not
-union their features. Builds, lint, tests and doctests share runner and oracle
+`node scripts/ci-test-blocks.mjs BLOCK` runs one of `core`, `extended`,
+`experimental`, or `fips`. These blocks retain separate Cargo invocations for
+every feature/backend profile; grouping does not union their features. Builds, lint, tests and doctests share runner and oracle
 setup. The XMLenc inventory build still resolves only the core package, and
 all-feature tests still require an explicit disposable SoftHSM module.
 
-Documentation and benchmark-contract checks run in their matching toolchain
+Documentation and benchmark-contract checks run in their matching feature
 blocks. Token-only backend checks share a separate job; corpus provenance runs
 with native safety/dependency checks. Coverage, long-running fuzz campaigns,
 cross-platform feature checks and independent oracle/performance measurements

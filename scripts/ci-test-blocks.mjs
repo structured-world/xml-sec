@@ -4,57 +4,50 @@ import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const core = backend => `xmldsig,xmlenc,c14n,${backend === 'fat-runtime' ? 'xml-backends-all' : `xml-backend-${backend}`}`;
-const profile = (rust, name, features, extra = {}) => ({ rust, name, features, ...extra });
-const ordinary = (rust, backend) => profile(rust, backend, core(backend), { build: true, lint: rust === 'stable' });
-const all = rust => profile(rust, 'all-features', undefined, { all: true, build: true, lint: true });
+const profile = (name, features, extra = {}) => ({ name, features, ...extra });
+const ordinary = backend => profile(backend, core(backend), { build: true, lint: true });
 // Library-only lint graphs whose cfg combinations no tested profile resolves.
-const minimal = feature => profile('stable', `${feature}-minimal`, `${feature},xml-backend-differential`,
+const minimal = feature => profile(`${feature}-minimal`, `${feature},xml-backend-differential`,
   { lint: true, lintOnly: true });
-// clippy 1.92 reports the libtest descriptor array of a large test crate as a
-// spanless large_stack_arrays finding (rust-lang/rust-clippy#13774, fixed by
-// rust-lang/rust-clippy#16347); stable lint keeps the check for real arrays.
-const harnessLint = rust => rust === 'stable' ? [] : ['-A', 'clippy::large_stack_arrays'];
 
 // Each profile remains a distinct Cargo invocation: a block shares runner/setup,
 // not enabled features. Keep expensive FIPS compilation in its own block.
 export const blocks = {
-  'stable-core': { rust: 'stable', profiles: [
-    profile('stable', 'default-features', undefined, { lint: true }),
-    ...['xmloxide', 'roxmltree', 'differential', 'fat-runtime'].map(backend => ordinary('stable', backend)),
+  core: [
+    profile('default-features', undefined, { lint: true }),
+    ...['xmloxide', 'roxmltree', 'differential', 'fat-runtime'].map(ordinary),
     ...['xmldsig', 'xmldsig-sign', 'xmlenc', 'xslt'].map(minimal),
-  ] },
-  'msrv-core': { rust: '1.92.0', profiles: ['xmloxide', 'roxmltree'].map(backend => ordinary('1.92.0', backend)) },
-  'msrv-extended': { rust: '1.92.0', profiles: [
-    all('1.92.0'),
-    ...['xmloxide', 'roxmltree', 'differential'].map(backend => profile('1.92.0',
-      `experimental-pq-${backend}`, `${core(backend)},legacy-algorithms,experimental-pq`, { pq: true, lint: true })),
-    profile('1.92.0', 'xslt-xmloxide', `${core('xmloxide')},xslt`, { lint: true }),
-  ] },
-  'stable-extended': { rust: 'stable', profiles: [
-    all('stable'),
-    profile('stable', 'legacy-fat-runtime', `${core('fat-runtime')},legacy-algorithms`),
-    profile('stable', 'xslt-fat-runtime', `${core('fat-runtime')},xslt`, { lint: true }),
-  ] },
-  'msrv-fips': { rust: '1.92.0', profiles: [
-    profile('1.92.0', 'legacy-aws-fips', 'aws-lc-fips,xmlenc,c14n,xml-backend-xmloxide,legacy-algorithms', { fips: true, lint: true }),
-    ...['xmloxide', 'roxmltree', 'differential', 'fat-runtime'].map(backend => profile('1.92.0',
-      `aws-fips-${backend}`, `aws-lc-fips,xmlenc,c14n,${backend === 'fat-runtime' ? 'xml-backends-all' : `xml-backend-${backend}`}`,
+  ],
+  extended: [
+    profile('all-features', undefined, { all: true, build: true, lint: true }),
+    profile('legacy-fat-runtime', `${core('fat-runtime')},legacy-algorithms`),
+    profile('xslt-fat-runtime', `${core('fat-runtime')},xslt`, { lint: true }),
+  ],
+  experimental: [
+    ...['xmloxide', 'roxmltree', 'differential'].map(backend => profile(`experimental-pq-${backend}`,
+      `${core(backend)},legacy-algorithms,experimental-pq`, { pq: true, lint: true })),
+    profile('xslt-xmloxide', `${core('xmloxide')},xslt`, { lint: true }),
+  ],
+  fips: [
+    profile('legacy-aws-fips', 'aws-lc-fips,xmlenc,c14n,xml-backend-xmloxide,legacy-algorithms', { fips: true, lint: true }),
+    ...['xmloxide', 'roxmltree', 'differential', 'fat-runtime'].map(backend => profile(`aws-fips-${backend}`,
+      `aws-lc-fips,xmlenc,c14n,${backend === 'fat-runtime' ? 'xml-backends-all' : `xml-backend-${backend}`}`,
       { fips: true, lint: true })),
-  ] },
+  ],
 };
 
 export function plan(name, module) {
   if (!Object.hasOwn(blocks, name)) throw new Error(`Unknown CI test block: ${name}`);
   const commands = [];
   const add = (label, file, args) => commands.push({ label, file, args });
-  if (name === 'msrv-fips') add('FIPS without encryption', 'cargo', ['check', '--no-default-features', '--features', 'aws-lc-fips,xml-backend-xmloxide']);
-  if (name === 'stable-core') add('xmlenc-inventory: build', 'cargo', ['build', '-p', 'xml-sec', '--no-default-features', '--features', 'xmlenc,xml-backend-xmloxide']);
-  for (const profile of blocks[name].profiles) {
+  if (name === 'fips') add('FIPS without encryption', 'cargo', ['check', '--no-default-features', '--features', 'aws-lc-fips,xml-backend-xmloxide']);
+  if (name === 'core') add('xmlenc-inventory: build', 'cargo', ['build', '-p', 'xml-sec', '--no-default-features', '--features', 'xmlenc,xml-backend-xmloxide']);
+  for (const profile of blocks[name]) {
     const args = profile.all ? ['--all-features'] : profile.features ? ['--no-default-features', '--features', profile.features] : [];
     if (profile.build) add(`${profile.name}: build`, 'cargo', ['build', '--workspace', ...args]);
     const scope = profile.lintOnly ? ['-p', 'xml-sec', '--lib']
       : [...(profile.pq || profile.fips ? [] : ['--workspace']), '--all-targets'];
-    if (profile.lint) add(`${profile.name}: lint`, 'cargo', ['clippy', ...scope, ...args, '--', '-D', 'warnings', ...harnessLint(profile.rust)]);
+    if (profile.lint) add(`${profile.name}: lint`, 'cargo', ['clippy', ...scope, ...args, '--', '-D', 'warnings']);
     if (profile.lintOnly) continue;
     const tests = ['--workspace', ...args, '-E', 'not binary(libxslt_oracle)'];
     if (profile.all) {
@@ -83,9 +76,7 @@ function main() {
   const name = process.argv[2];
   const commands = plan(name, process.env.PKCS11_MODULE);
   const root = resolve(import.meta.dirname, '..');
-  execute(commands, command => spawnSync(command.file, command.args, {
-    cwd: root, stdio: 'inherit', env: { ...process.env, RUSTUP_TOOLCHAIN: blocks[name].rust },
-  }));
+  execute(commands, command => spawnSync(command.file, command.args, { cwd: root, stdio: 'inherit' }));
 }
 
 if (process.argv[1] && realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url))) {
