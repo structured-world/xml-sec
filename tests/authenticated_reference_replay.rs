@@ -5,7 +5,7 @@
 use std::{collections::HashMap, sync::Arc};
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::xmldsig::{
-    CatalogueCompleteness, CatalogueError, DsigError, DsigStatus, HmacSigningKey,
+    CatalogueCompleteness, CatalogueError, DsigError, DsigStatus, FailureReason, HmacSigningKey,
     HmacVerificationKey, LexicalSource, ReferenceParent, ReferenceResolution, ReplayError,
     ReplayMode, ReplayOutcome, SignContext, UriTypeSet, VerificationRequest, VerifyContext,
     with_verified_request,
@@ -848,19 +848,26 @@ fn unsigned_manifest_and_ambiguous_ids_cannot_authorize_replay() {
         &VerificationRequest::default(),
         &account(),
         |session| {
-            assert!(
-                session
-                    .select_signature(session.evidence().signatures()[0].identity())
-                    .is_err()
+            // The signature is verified first; the ambiguous ID then fails
+            // only its own Reference, which stays reported as such.
+            let signature = &session.evidence().signatures()[0];
+            let result = signature
+                .result()
+                .as_ref()
+                .expect("an ambiguous ID is a verification status");
+            assert_eq!(
+                result.status,
+                DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
             );
+            assert!(result.manifest_references.is_empty());
             Ok(())
         },
     )
     .unwrap();
     assert_eq!(
         key.calls.get(),
-        0,
-        "ambiguous resource must fail before signature crypto"
+        1,
+        "the signature is verified before any Reference"
     );
 }
 

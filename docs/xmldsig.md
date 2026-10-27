@@ -276,6 +276,30 @@ key-materialization, and canonicalization accounting across signatures. Authenti
 signature-local, so one signature cannot authorize another signature's Manifest. X.509 validation
 captures one operation time for every candidate path and signature.
 
+## Verification Order and Reference Results
+
+Verification follows
+[W3C XML Signature Best Practices BP1](https://www.w3.org/TR/xmldsig-bestpractices/#bp-authenticate-signature-first):
+the key is resolved and its trust established, `SignedInfo` is canonicalized and `SignatureValue`
+is verified, and only then are References dereferenced and transformed.
+[XMLDSig 1.1 §3.2](https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-CoreValidation)
+keeps reference and signature validation independent, so a document that passes both gets the same
+result in either order.
+
+- No key, or a `SignatureValue` that does not verify: `status` names that failure and every
+  `signed_info_references` entry is `DsigStatus::NotProcessed`, bound to its `Reference` element.
+  No URI is dereferenced and no transform runs.
+- A verified signature: every `Reference` gets its own result, without stopping at the first
+  failure. `ReferenceDigestMismatch`, `ReferenceProcessingFailure` (dereference or transform),
+  `ReferencePolicyViolation` and `ReferenceUnavailable` (an external URI whose bytes the caller has
+  not supplied) are distinct. `status` is `Valid` only when every `Reference` passes; otherwise it is
+  the first failing `Reference` in document order. Manifests are processed only after that.
+- Exhausted operation budgets, refused shared execution, provider failures and XSLT failures end
+  the whole operation with an error instead of a per-`Reference` result.
+
+When both a `Reference` and the signature are bad, libxmlsec1 reports the `Reference` and xml-sec
+reports the signature; the document is rejected either way.
+
 ## Provider Dispatch
 
 `SignContext::provider` selects both digest primitives and operation randomness. Built-in ECDSA

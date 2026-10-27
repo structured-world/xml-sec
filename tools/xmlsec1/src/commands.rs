@@ -2371,10 +2371,13 @@ fn donor_dsig_status(status: DsigStatus) -> (&'static str, &'static str) {
         DsigStatus::Invalid(
             FailureReason::ReferenceDigestMismatch { .. }
             | FailureReason::ReferencePolicyViolation { .. }
-            | FailureReason::ReferenceProcessingFailure { .. },
+            | FailureReason::ReferenceProcessingFailure { .. }
+            | FailureReason::ReferenceUnavailable { .. },
         ) => ("FAILED", "REFERENCE"),
         DsigStatus::Invalid(FailureReason::SignatureMismatch) => ("FAILED", "SIGNATURE"),
         DsigStatus::Invalid(FailureReason::KeyNotFound) => ("FAILED", "KEY-NOT-FOUND"),
+        // Includes an unprocessed Reference: libxmlsec1's xmlSecDSigStatusUnknown,
+        // which xmlSecDSigCtxGetStatusString renders as "ERROR".
         _ => ("ERROR", "UNKNOWN"),
     }
 }

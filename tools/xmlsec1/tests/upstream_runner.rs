@@ -57,10 +57,15 @@ fn run_upstream(script: &str, selected_test: &str) -> String {
 
 #[test]
 fn unmodified_dsig_runner_observes_failure_status() {
-    // This upstream negative vector proves that digest tampering reaches the
-    // native process and is reported with the status expected by testrun.sh.
+    // This upstream negative vector reaches the native process and is reported
+    // with the failure status testrun.sh expects. The key is resolved before
+    // SignedInfo or any Reference, so the refusal is its MD5-signed
+    // certificate chain (md5WithRSAEncryption), not the tampered digest.
     let log = run_upstream("testDSig.sh", "signature-rsa-enveloped-bad-digest-val");
-    assert!(log.contains("Error: signature is invalid"), "{log}");
+    assert!(
+        log.contains("unsupported X.509 signature algorithm: 1.2.840.113549.1.1.4"),
+        "{log}"
+    );
     assert!(!log.contains("unsupported option"), "{log}");
 }
 

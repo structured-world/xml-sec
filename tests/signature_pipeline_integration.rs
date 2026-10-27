@@ -106,6 +106,15 @@ fn all_signed_info_refs_valid(results: &[xml_sec::xmldsig::ReferenceResult]) -> 
         .all(|reference| matches!(reference.status, DsigStatus::Valid))
 }
 
+/// An unauthenticated `SignedInfo` leaves every Reference undereferenced, while
+/// still reporting one entry per Reference.
+fn all_signed_info_refs_unprocessed(results: &[xml_sec::xmldsig::ReferenceResult]) -> bool {
+    !results.is_empty()
+        && results
+            .iter()
+            .all(|reference| reference.status == DsigStatus::NotProcessed)
+}
+
 fn inject_invalid_base64_in_signature_value(xml: &str) -> String {
     replace_ds_tag_content_with(xml, "SignatureValue", |chars| {
         if let Some((index, _)) = chars
@@ -296,7 +305,8 @@ fn donor_ecdsa_sha256_full_pipeline_matches() {
 }
 
 #[test]
-fn tampered_signature_value_fails_after_references_pass() {
+fn tampered_signature_value_leaves_references_unprocessed() {
+    // The signature is checked first; its references are never dereferenced.
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
     ));
@@ -306,10 +316,9 @@ fn tampered_signature_value_fails_after_references_pass() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("pipeline should still run for invalid signature bytes");
 
-    assert!(
-        all_signed_info_refs_valid(&result.signed_info_references),
-        "digest stage should still pass when only signature bytes are tampered"
-    );
+    assert!(all_signed_info_refs_unprocessed(
+        &result.signed_info_references
+    ));
     assert!(matches!(
         result.status,
         DsigStatus::Invalid(FailureReason::SignatureMismatch)
@@ -317,7 +326,9 @@ fn tampered_signature_value_fails_after_references_pass() {
 }
 
 #[test]
-fn tampered_digest_value_fails_before_signature_stage() {
+fn tampered_digest_value_breaks_the_signature_over_signed_info() {
+    // DigestValue is part of SignedInfo, so tampering with it is caught by
+    // SignatureValue before any reference work.
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml",
     ));
@@ -325,20 +336,19 @@ fn tampered_digest_value_fails_before_signature_stage() {
     let tampered_xml = mutate_ds_tag_content(&xml, "DigestValue");
 
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
-        .expect("pipeline should return structured invalid result on digest mismatch");
+        .expect("a tampered SignedInfo is a verification status");
 
-    assert!(
-        !all_signed_info_refs_valid(&result.signed_info_references),
-        "digest mismatch must invalidate SignedInfo references"
-    );
+    assert!(all_signed_info_refs_unprocessed(
+        &result.signed_info_references
+    ));
     assert!(matches!(
         result.status,
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
     ));
 }
 
 #[test]
-fn tampered_signature_value_fails_after_references_pass_ecdsa() {
+fn tampered_signature_value_leaves_references_unprocessed_ecdsa() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
     ));
@@ -348,10 +358,9 @@ fn tampered_signature_value_fails_after_references_pass_ecdsa() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("pipeline should still run for invalid signature bytes");
 
-    assert!(
-        all_signed_info_refs_valid(&result.signed_info_references),
-        "digest stage should still pass when only signature bytes are tampered"
-    );
+    assert!(all_signed_info_refs_unprocessed(
+        &result.signed_info_references
+    ));
     assert!(matches!(
         result.status,
         DsigStatus::Invalid(FailureReason::SignatureMismatch)
@@ -369,7 +378,9 @@ fn malformed_ecdsa_signature_value_returns_invalid_not_error() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("malformed-but-base64 SignatureValue should be reported as invalid signature");
 
-    assert!(all_signed_info_refs_valid(&result.signed_info_references));
+    assert!(all_signed_info_refs_unprocessed(
+        &result.signed_info_references
+    ));
     assert!(matches!(
         result.status,
         DsigStatus::Invalid(FailureReason::SignatureMismatch)
@@ -377,7 +388,7 @@ fn malformed_ecdsa_signature_value_returns_invalid_not_error() {
 }
 
 #[test]
-fn tampered_digest_value_fails_before_signature_stage_ecdsa() {
+fn tampered_digest_value_breaks_the_signature_over_signed_info_ecdsa() {
     let xml = read_fixture(Path::new(
         "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloped-sha256-ecdsa-sha256.xml",
     ));
@@ -385,15 +396,14 @@ fn tampered_digest_value_fails_before_signature_stage_ecdsa() {
     let tampered_xml = mutate_ds_tag_content(&xml, "DigestValue");
 
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
-        .expect("pipeline should return structured invalid result on digest mismatch");
+        .expect("a tampered SignedInfo is a verification status");
 
-    assert!(
-        !all_signed_info_refs_valid(&result.signed_info_references),
-        "digest mismatch must invalidate SignedInfo references"
-    );
+    assert!(all_signed_info_refs_unprocessed(
+        &result.signed_info_references
+    ));
     assert!(matches!(
         result.status,
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
     ));
 }
 
@@ -634,7 +644,9 @@ fn empty_signature_value_is_not_reported_as_missing_element() {
     let result = verify_signature_with_pem_key(&tampered_xml, &public_key_pem, false)
         .expect("empty SignatureValue should not be treated as missing element");
 
-    assert!(all_signed_info_refs_valid(&result.signed_info_references));
+    assert!(all_signed_info_refs_unprocessed(
+        &result.signed_info_references
+    ));
     assert!(matches!(
         result.status,
         DsigStatus::Invalid(FailureReason::SignatureMismatch)

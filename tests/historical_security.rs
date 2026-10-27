@@ -8,9 +8,9 @@ use xml_sec::policy::{
 };
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DsigError, DsigStatus, HmacSigningKey, HmacVerificationKey, KeyInfo,
-    KeyInfoSource, KeyResolutionError, KeyResolver, KeyValueInfo, SignContext, SignatureAlgorithm,
-    VerificationRequest, VerifyContext,
+    DefaultKeyResolver, DsigError, DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey,
+    KeyInfo, KeyInfoSource, KeyResolutionError, KeyResolver, KeyValueInfo, SignContext,
+    SignatureAlgorithm, VerificationRequest, VerifyContext,
 };
 
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -164,8 +164,10 @@ fn duplicate_ids_never_choose_an_attacker_controlled_first_or_last_match() {
                         .clone(),
                 );
                 assert_eq!(context.verify(&original).unwrap().status, DsigStatus::Valid);
-                assert!(
-                    context.verify(&attack).is_err(),
+                // The ambiguous ID fails its Reference; no match is chosen.
+                assert_eq!(
+                    context.verify(&attack).unwrap().status,
+                    DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 }),
                     "{backend:?}/{placement}/{text}"
                 );
             }

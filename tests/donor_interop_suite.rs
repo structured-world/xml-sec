@@ -975,7 +975,7 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
     assert!(matches!(
         missing,
         Err(SigningError::Digest(SigningDigestError::Transform(
-            TransformError::UnsupportedUri(ref uri),
+            TransformError::ExternalResourceUnavailable(ref uri),
         ))) if uri == "c14n11/xml-base-input.xml"
     ));
 

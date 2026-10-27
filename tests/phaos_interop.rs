@@ -10,8 +10,8 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use xml_sec::policy::VerificationPolicy;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, FailureReason, HmacSha1VerificationKey,
-    KeyResolverConfig, ParseError, ReferenceProcessingError, SignatureAlgorithm, TransformError,
-    UriTypeSet, VerificationKey, VerifyContext, X509ChainError,
+    KeyResolverConfig, ParseError, SignatureAlgorithm, UriTypeSet, VerificationKey, VerifyContext,
+    X509ChainError,
 };
 
 const PHAOS: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
@@ -39,7 +39,9 @@ enum Expected {
     },
     #[cfg(not(feature = "xslt"))]
     ValidWithManifestFailure,
-    BadDigest,
+    /// `SignedInfo` changed after signing: the signature is checked before any
+    /// Reference, so it fails first and no Reference is dereferenced.
+    TamperedSignedInfo,
     #[cfg(feature = "legacy-algorithms")]
     MissingDigestValue,
     UnsupportedSignature(&'static str),
@@ -172,7 +174,7 @@ const CASES: &[Case] = &[
     Case {
         name: "signature-rsa-enveloped-bad-digest-val.xml",
         setup: Setup::Rsa,
-        expected: Expected::BadDigest,
+        expected: Expected::TamperedSignedInfo,
     },
     Case {
         name: "signature-rsa-enveloped-bad-sig.xml",
@@ -423,9 +425,12 @@ fn check_expected(
                         ref_index: 0,
                     })
         }
-        (Expected::BadDigest, Ok(result)) => {
-            result.status
-                == DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+        (Expected::TamperedSignedInfo, Ok(result)) => {
+            result.status == DsigStatus::Invalid(FailureReason::SignatureMismatch)
+                && result
+                    .signed_info_references
+                    .iter()
+                    .all(|reference| reference.status == DsigStatus::NotProcessed)
         }
         #[cfg(feature = "legacy-algorithms")]
         (
@@ -454,7 +459,7 @@ fn check_expected(
         (
             Expected::UnsupportedTransform(uri),
             Err(DsigError::ParseSignedInfo(ParseError::Transform(
-                TransformError::UnsupportedTransform(actual),
+                xml_sec::xmldsig::TransformError::UnsupportedTransform(actual),
             ))),
         ) => actual == uri,
         (
@@ -589,21 +594,21 @@ fn detached_resources_are_caller_owned_and_required() {
     // The public API never performs implicit I/O for a donor URI.
     let xml = document("signature-rsa-detached.xml");
     let key = verification_key();
-    let error = VerifyContext::new()
+    let result = VerifyContext::new()
         .policy(policy(SignatureAlgorithm::RsaSha1, false))
         .key(&key)
         .process_manifests(true)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&HashMap::new())
         .verify(&xml)
-        .expect_err("missing caller resource must fail closed");
-    assert!(
-        matches!(
-        error,
-        DsigError::Reference(ReferenceProcessingError::UriDereference(
-            TransformError::UnsupportedUri(ref uri)
-        )) if uri == "http://www.ietf.org/rfc/rfc3161.txt"
-        ),
-        "unexpected missing-resource error: {error:?}"
+        .expect("a missing caller resource is a verification status");
+    // Fails closed as this Reference's Unavailable outcome, never a fetch.
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
+    assert_eq!(
+        result.signed_info_references[0].uri,
+        "http://www.ietf.org/rfc/rfc3161.txt"
     );
 }

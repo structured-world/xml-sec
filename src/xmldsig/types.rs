@@ -449,6 +449,10 @@ pub enum TransformError {
     #[error("unsupported URI: {0}")]
     AccountedUnsupportedUri(structured_asn1::memory::OwnedText),
 
+    /// The caller supplied no bytes for this external URI.
+    #[error("external resource not supplied: {0}")]
+    ExternalResourceUnavailable(String),
+
     /// Malformed same-document syntax, requiring no diagnostic allocation.
     #[error("unsupported URI: invalid same-document fragment")]
     InvalidFragment,

@@ -11,8 +11,8 @@ use xml_sec::provider::{
     ProviderError,
 };
 use xml_sec::xmldsig::{
-    DigestAlgorithm, DsigStatus, HmacSigningKey, HmacVerificationKey, ReferenceBuilder,
-    SignatureAlgorithm, SignatureBuilder, Transform, VerificationRequest,
+    DigestAlgorithm, DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey,
+    ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, Transform, VerificationRequest,
 };
 use xml_sec::{XmlDocument, XmlSecError, XmlSecurity, api::Operation};
 
@@ -653,7 +653,15 @@ fn detached_signatures_use_only_request_supplied_external_bytes() {
         .verify(&document, &VerificationRequest::default())
         .unwrap();
     assert!(!absent.accepted(&document).unwrap());
-    assert!(absent.signatures()[0].result().is_err());
+    // Omitted caller input is the Reference's own Unavailable outcome.
+    let absent_result = absent.signatures()[0]
+        .result()
+        .as_ref()
+        .expect("unsupplied bytes are a verification status");
+    assert_eq!(
+        absent_result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
     let changed =
         std::collections::HashMap::from([("urn:test:input".into(), b"changed bytes".to_vec())]);
     assert!(

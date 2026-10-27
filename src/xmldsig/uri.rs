@@ -587,13 +587,14 @@ impl<'a> UriReferenceResolver<'a> {
     /// | `"#xpointer(/)"` | Entire document, comments included |
     /// | `"#xpointer(id('foo'))"` | Subtree rooted at element with ID `foo`, comments included |
     /// | external URI in caller map | `TransformData::Resource` borrowing the mapped bytes and their resolved map key |
+    /// | external URI not in caller map | `Err(ExternalResourceUnavailable)` |
     /// | other | `Err(UnsupportedUri)` |
     ///
     /// # Errors
     ///
     /// Returns [`TransformError`] for an unsupported or malformed URI, an ID
-    /// that matches no element or several elements, or an external resource
-    /// outside the caller-supplied map or its byte limits.
+    /// that matches no element or several elements, an external resource
+    /// absent from the caller-supplied map, or one beyond its byte limits.
     pub fn dereference(&self, uri: &str) -> Result<TransformData<'a>, TransformError> {
         self.dereference_with_optional_budget(uri, None)
     }
@@ -695,7 +696,7 @@ impl<'a> UriReferenceResolver<'a> {
                     ReferenceInput::Binary { bytes, uri } => TransformData::Resource { bytes, uri },
                     ReferenceInput::Xml { .. } => unreachable!("external resources are octets"),
                 })
-                .ok_or_else(|| TransformError::UnsupportedUri(uri.to_string()))
+                .ok_or_else(|| TransformError::ExternalResourceUnavailable(uri.to_string()))
         }
     }
 
@@ -1621,18 +1622,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_external_uri() {
+    fn external_uri_without_caller_bytes_is_unavailable() {
+        // No I/O: an external URI resolves only from caller-supplied bytes,
+        // and their absence is reported as such, not as an unsupported URI.
         let xml = "<root/>";
         let doc = Document::parse(xml).unwrap();
         let resolver = UriReferenceResolver::new(&doc);
 
         let result = resolver.dereference("http://example.com/doc.xml");
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            TransformError::UnsupportedUri(uri) => {
+        match result {
+            Err(TransformError::ExternalResourceUnavailable(uri)) => {
                 assert_eq!(uri, "http://example.com/doc.xml");
             }
-            other => panic!("expected UnsupportedUri, got: {other:?}"),
+            other => panic!("expected ExternalResourceUnavailable, got: {other:?}"),
         }
     }
 
