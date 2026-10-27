@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/structured-world/xml-sec/compare/v0.2.0...v0.3.0) - 2026-10-27
+
+### Added
+
+- *(xmldsig)* [**breaking**] split verification from signing ([#320](https://github.com/structured-world/xml-sec/pull/320))
+- *(api)* [**breaking**] bind Rust operations to policy ([#267](https://github.com/structured-world/xml-sec/pull/267))
+
+### Documentation
+
+- qualify public API and migration guides ([#271](https://github.com/structured-world/xml-sec/pull/271))
+
+### Fixed
+
+- *(xml)* charge only declared entities to the expansion ceiling ([#312](https://github.com/structured-world/xml-sec/pull/312))
+- *(cli)* select the encrypted node in --xml-data ([#300](https://github.com/structured-world/xml-sec/pull/300))
+- *(xslt)* skip unused function registry setup ([#288](https://github.com/structured-world/xml-sec/pull/288))
+- *(interop)* make corpus execution reproducible ([#285](https://github.com/structured-world/xml-sec/pull/285))
+
+### Performance
+
+- *(bench)* compare against competitors at CLI and library level ([#314](https://github.com/structured-world/xml-sec/pull/314))
+- *(xmlenc)* decrypt without redundant document parses ([#307](https://github.com/structured-world/xml-sec/pull/307))
+- *(xmldsig)* sign without reparsing each step ([#305](https://github.com/structured-world/xml-sec/pull/305))
+- *(xslt)* resolve per-call static work once ([#297](https://github.com/structured-world/xml-sec/pull/297))
+- *(xslt)* add phase and reuse measurements ([#260](https://github.com/structured-world/xml-sec/pull/260))
+
+### Refactored
+
+- *(key-manager)* [**breaking**] read PKCS#12 with the shared reader ([#323](https://github.com/structured-world/xml-sec/pull/323))
+- *(security)* [**breaking**] qualify orchestration lint ([#294](https://github.com/structured-world/xml-sec/pull/294))
+- *(xslt)* qualify compiler and runtime ([#293](https://github.com/structured-world/xml-sec/pull/293))
+- *(xml)* [**breaking**] qualify kernels and group ci ([#289](https://github.com/structured-world/xml-sec/pull/289))
+- *(pkix)* [**breaking**] use shared spki framing ([#283](https://github.com/structured-world/xml-sec/pull/283))
+
 ### Documentation
 
 - Add executable policy-bound and low-level API examples, expected-target
