@@ -24,9 +24,6 @@ if [[ $* == *'--no-default-features'* && $* != *'--features'* ]]; then
   exit 101
 fi
 `, { mode: 0o755 });
-    writeFileSync(join(bin, 'rustc'), `#!/usr/bin/env bash
-printf 'rustc %s (fixture)\\n' "\${RUSTC_VERSION:-1.95.0}"
-`, { mode: 0o755 });
     const result = spawnSync(shell, [script, profile, phase], {
       encoding: 'utf8',
       env: {
@@ -131,18 +128,6 @@ test('each minimal profile selects only its declared feature graph', () => {
     assert.deepEqual(result.commands, [
       ...graph,
       `clippy -p xml-sec --no-default-features --features ${features} --all-targets -- -D warnings`,
-    ]);
-  }
-});
-
-test('only clippy releases with the harness false positive relax it', () => {
-  // Older clippy flags the generated libtest array; current clippy must keep
-  // large_stack_arrays for real arrays, so the relaxation is version-bound.
-  for (const [version, extra] of [['1.92.0', ' -A clippy::large_stack_arrays'], ['1.94.1', '']]) {
-    const result = run('dsig-sign-xmloxide', 'lint', { RUSTC_VERSION: version });
-    assert.equal(result.status, 0, result.stderr);
-    assert.deepEqual(result.commands, [
-      `clippy -p xml-sec --no-default-features --features xmldsig-sign,xml-backend-xmloxide --all-targets -- -D warnings${extra}`,
     ]);
   }
 });

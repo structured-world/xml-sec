@@ -6,7 +6,7 @@ inputs:
     required: true
   toolchain:
     description: Installed compiler used by this job
-    default: '1.92.0'
+    default: stable
   workspace:
     description: Cargo workspace relative to the checkout
     default: '.'

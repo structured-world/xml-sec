@@ -9,7 +9,6 @@ import { fileURLToPath } from 'node:url';
 // Pedantic lints that stay out of the forbid list, each with its reason.
 export const EXEMPT = new Map([
   ['used_underscore_binding', "thiserror's derive allows it in its own expansion"],
-  ['large_stack_arrays', 'clippy 1.92 reports the libtest harness (rust-lang/rust-clippy#13774); CI allows it on that toolchain'],
 ]);
 
 const normalize = name => name.trim().replace(/^clippy::/, '').replaceAll('-', '_');

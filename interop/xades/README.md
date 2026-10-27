@@ -21,7 +21,7 @@ All validation runs are local; fixtures are never uploaded to online validators.
   Versioned expectations are in `dss-evidence/expectations.json` and
   `dss-investigation/*expectations.json`; CI compares fresh observations with them.
   Dependency trees, actual outputs and full reports are run artifacts, excluded from Git and the bundle.
-  CI uses native libxmlsec1 1.3.13 from the repository's pinned installer, Rust 1.92.0 and JDK 21.
+  CI uses native libxmlsec1 1.3.13 from the repository's pinned installer, stable Rust and JDK 21.
 
 The Rust probe uses `with_verified_request`, original `SignatureEvidence`,
 `select_signature`, `visit_authenticated_references`, and
@@ -154,9 +154,9 @@ captures. Verification commands:
 cargo nextest run -p xml-sec -p xml-sec-xades --no-fail-fast --status-level fail --final-status-level fail
 cargo clippy -p xml-sec-xades --example interop_probe -- -D warnings
 cargo fmt -p xml-sec-xades --check
-cargo +1.92.0 check -p xml-sec-xml-input --no-default-features
-rustup target add --toolchain 1.92.0 thumbv7em-none-eabihf
-cargo +1.92.0 check -p xml-sec-xml-input --no-default-features --target thumbv7em-none-eabihf
+cargo check -p xml-sec-xml-input --no-default-features
+rustup target add thumbv7em-none-eabihf
+cargo check -p xml-sec-xml-input --no-default-features --target thumbv7em-none-eabihf
 cargo clean
 ```
 

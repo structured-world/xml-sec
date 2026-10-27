@@ -60,18 +60,7 @@ if [[ ( "$profile" == dsig-xmloxide || "$profile" == dsig-roxmltree ) && ( "$pha
     done
 fi
 if [[ "$phase" == all || "$phase" == lint ]]; then
-    # clippy before 1.94 reports the libtest descriptor array of a large test
-    # crate as a spanless large_stack_arrays finding (rust-lang/rust-clippy#13774,
-    # fixed by rust-lang/rust-clippy#16347); newer clippy keeps the check.
-    harness_lint=()
-    rustc_minor=$(rustc --version)
-    rustc_minor=${rustc_minor#rustc 1.}
-    rustc_minor=${rustc_minor%%.*}
-    if (( rustc_minor < 94 )); then
-        harness_lint=(-A clippy::large_stack_arrays)
-    fi
-    # Bash 3.2 treats an empty array expansion as unset under nounset.
-    cargo clippy "${args[@]}" --all-targets -- -D warnings ${harness_lint[@]+"${harness_lint[@]}"}
+    cargo clippy "${args[@]}" --all-targets -- -D warnings
 fi
 if [[ "$phase" == all || "$phase" == test ]]; then
     if [[ "$profile" == pkcs11 ]]; then
