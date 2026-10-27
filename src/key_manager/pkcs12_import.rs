@@ -1,20 +1,32 @@
-//! Borrowed BER import orchestration; `RustCrypto` supplies cryptographic primitives.
+//! PKCS#12 import over the shared `structured_cms::personal` container reader.
+//!
+//! The shared reader owns PFX, safe and bag framing and authenticates the whole
+//! safe before extraction. This adapter owns the password, the MAC, KDF and
+//! cipher work and their admission under the compiled resource policy.
+
+use std::sync::Arc;
 
 use aes::cipher::{BlockModeDecrypt, KeyIvInit, block_padding::Pkcs7};
-use core::ops::Deref;
 use der::asn1::ObjectIdentifier as Oid;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use pkcs12::kdf::{Pkcs12KeyType, derive_key};
+use structured_asn1::length::DerLength;
+use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, MemoryReservation};
+use structured_asn1::{Encoding, Integer, Limit, Parser, Reader, Tag};
+use structured_cms::Octets;
+use structured_cms::personal::protection::{Prf, Protection, Salt};
+use structured_cms::personal::{
+    self, Backend, Bag, BagValue, Cause, Decision, Failure, Integrity, MacData, Pfx, Plaintext,
+    PrivateKey, Safe, ShroudedKey, Source,
+};
+use structured_pkix::AlgorithmIdentifier;
 use zeroize::Zeroizing;
 
-use super::KeyStoreError;
+use super::{KeyStoreError, PrivateKeyDer};
 use crate::policy::{PolicyViolation, ResourcePolicy, resource_name};
 
 type Result<T> = core::result::Result<T, KeyStoreError>;
-const DATA: Oid = Oid::new_unwrap("1.2.840.113549.1.7.1");
-const ENCRYPTED_DATA: Oid = Oid::new_unwrap("1.2.840.113549.1.7.6");
-const PBES2: Oid = Oid::new_unwrap("1.2.840.113549.1.5.13");
-const PBKDF2: Oid = Oid::new_unwrap("1.2.840.113549.1.5.12");
+const FIELD: &str = "PKCS#12 import";
 
 pub(super) struct Limits {
     pub resources: ResourcePolicy,
@@ -23,15 +35,102 @@ pub(super) struct Limits {
 }
 
 pub(super) struct Contents {
-    pub private_keys: Vec<Zeroizing<Vec<u8>>>,
+    pub private_key: Option<PrivateKeyDer>,
     pub certificates: Vec<Vec<u8>>,
 }
 
-struct Budget<'a> {
-    limits: &'a Limits,
-    work: usize,
-    memory: usize,
-    candidates: usize,
+/// A password and the capacity of the buffer that holds it; that buffer stays
+/// live for the whole import.
+pub(super) trait Secret {
+    fn text(&self) -> &str;
+    fn capacity(&self) -> usize;
+}
+
+impl Secret for &str {
+    fn text(&self) -> &str {
+        self
+    }
+    fn capacity(&self) -> usize {
+        self.len()
+    }
+}
+
+impl Secret for Zeroizing<String> {
+    fn text(&self) -> &str {
+        self.as_str()
+    }
+    fn capacity(&self) -> usize {
+        String::capacity(self)
+    }
+}
+
+/// Import one PFX in a single pass. `password` is called once, when the MAC or
+/// a decryption first needs it and after that step's KDF and memory admission;
+/// a container that needs no password never calls it. Work spent is kept in
+/// `work` on failure too.
+pub(super) fn import<S: Secret, F: FnOnce() -> Option<S>>(
+    bytes: &[u8],
+    limits: &Limits,
+    work: &mut usize,
+    password: F,
+) -> Result<Contents> {
+    let maximum = limits.resources.max_key_import_kdf_work;
+    if *work > maximum {
+        return Err(denial(resource_name::KEY_IMPORT_KDF_WORK, maximum));
+    }
+    let ceilings = Ceilings {
+        memory: limits.resources.max_external_resource_total_bytes,
+        work: limits
+            .resources
+            .max_x509_work
+            .min(crate::hard_limits::X509_WORK_CEILING),
+    };
+    let parser = Parser::new(
+        Encoding::Ber,
+        structured_asn1::Limits {
+            max_depth: crate::hard_limits::ASN1_DEPTH_CEILING,
+            max_elements: ceilings.work as u64,
+            // The caller already bounded the input; nested plaintext is
+            // bounded by the memory account below.
+            max_element_length: u64::MAX,
+            max_work: ceilings.work as u64,
+        },
+        Memory::new(Arc::new(MemoryAccount::new(
+            limits.memory_available,
+            ceilings.work,
+        ))),
+    );
+    let mut reader = parser.read(bytes, 0).map_err(|e| ceilings.refuse(&e))?;
+    let pfx = Pfx::read(&mut reader).map_err(|e| {
+        if e.code() == structured_cms::ErrorCode::UnexpectedContentType {
+            KeyStoreError::Selection("unsupported PKCS#12 integrity mode")
+        } else {
+            ceilings.refuse(&e)
+        }
+    })?;
+    let mut adapter = Adapter {
+        password: Password {
+            request: Some(password),
+            secret: None,
+        },
+        bmp: None,
+        charges: Charges::new(limits, ceilings, *work),
+        key: None,
+        keep_decrypted: false,
+        certificates: Vec::new(),
+        reservations: Vec::new(),
+    };
+    let outcome = personal::process(&pfx, &reader, &mut adapter);
+    // Work is not refunded by password, encoding or later association failures.
+    *work = adapter.charges.work;
+    match outcome {
+        Ok(Decision::Accept) => Ok(adapter.into_contents()),
+        Ok(Decision::Reject) => Err(KeyStoreError::ProtectedContainer),
+        Ok(Decision::Unsupported) => Err(KeyStoreError::Selection(
+            "unsupported PKCS#12 integrity mode",
+        )),
+        Err(failure) => Err(ceilings.failure(failure)),
+    }
 }
 
 fn denial(resource: &'static str, maximum: usize) -> KeyStoreError {
@@ -42,36 +141,126 @@ fn malformed<T>() -> Result<T> {
     Err(KeyStoreError::ProtectedContainer)
 }
 
-impl<'a> Budget<'a> {
-    fn new(limits: &'a Limits) -> Self {
+fn remaining(memory: &Memory) -> usize {
+    memory.limit() - memory.used()
+}
+
+/// A shared-reader refusal: its reader code and whether it is a resource limit.
+trait Refusal {
+    fn reader_code(&self) -> Option<structured_asn1::ErrorCode>;
+    fn is_resource(&self) -> bool;
+}
+
+impl Refusal for structured_asn1::Error {
+    fn reader_code(&self) -> Option<structured_asn1::ErrorCode> {
+        Some(self.code())
+    }
+    fn is_resource(&self) -> bool {
+        structured_asn1::Error::is_resource(self)
+    }
+}
+
+impl Refusal for structured_pkix::Error {
+    fn reader_code(&self) -> Option<structured_asn1::ErrorCode> {
+        match self.code() {
+            structured_pkix::ErrorCode::Encoding(code) => Some(code),
+            _ => None,
+        }
+    }
+    fn is_resource(&self) -> bool {
+        structured_pkix::Error::is_resource(self)
+    }
+}
+
+impl Refusal for structured_cms::Error {
+    fn reader_code(&self) -> Option<structured_asn1::ErrorCode> {
+        match self.code() {
+            structured_cms::ErrorCode::Encoding(code)
+            | structured_cms::ErrorCode::Pkix(structured_pkix::ErrorCode::Encoding(code)) => {
+                Some(code)
+            }
+            _ => None,
+        }
+    }
+    fn is_resource(&self) -> bool {
+        structured_cms::Error::is_resource(self)
+    }
+}
+
+/// The policy ceilings a shared-reader resource refusal is reported against.
+#[derive(Clone, Copy)]
+struct Ceilings {
+    memory: usize,
+    work: usize,
+}
+
+impl Ceilings {
+    fn refuse(self, error: &impl Refusal) -> KeyStoreError {
+        use structured_asn1::ErrorCode as Code;
+        let code = error.reader_code();
+        // Excess nesting describes the encoding, not an exhausted allowance.
+        if !error.is_resource() || matches!(code, Some(Code::LimitExceeded(Limit::Depth))) {
+            return KeyStoreError::ProtectedContainer;
+        }
+        if matches!(
+            code,
+            Some(
+                Code::LimitExceeded(Limit::Memory)
+                    | Code::AllocatorExhausted
+                    | Code::CapacityOverflow
+            )
+        ) {
+            denial(
+                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                self.memory,
+            )
+        } else {
+            denial(resource_name::X509_WORK, self.work)
+        }
+    }
+
+    fn memory(self, error: MemoryError) -> KeyStoreError {
+        if error == MemoryError::WorkExceeded {
+            denial(resource_name::X509_WORK, self.work)
+        } else {
+            denial(
+                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                self.memory,
+            )
+        }
+    }
+
+    fn failure(self, failure: Failure<KeyStoreError>) -> KeyStoreError {
+        match failure.cause {
+            Cause::Callback(error) => error,
+            // An AuthenticatedSafe member of any content type other than
+            // data or encrypted data names a privacy mode this import lacks.
+            Cause::Processing(error)
+                if error.code() == structured_cms::ErrorCode::UnexpectedContentType =>
+            {
+                KeyStoreError::Selection("unsupported PKCS#12 privacy mode")
+            }
+            Cause::Processing(error) => self.refuse(&error),
+        }
+    }
+}
+
+/// Bag count and KDF work of one pass over the container.
+struct Charges<'l> {
+    limits: &'l Limits,
+    ceilings: Ceilings,
+    work: usize,
+    candidates: usize,
+}
+
+impl<'l> Charges<'l> {
+    fn new(limits: &'l Limits, ceilings: Ceilings, work: usize) -> Self {
         Self {
             limits,
-            work: 0,
-            memory: 0,
+            ceilings,
+            work,
             candidates: 0,
         }
-    }
-
-    fn check_allocation(&self, size: usize) -> Result<()> {
-        let maximum = self.limits.resources.max_external_resource_total_bytes;
-        if size > self.limits.memory_available - self.memory {
-            return Err(denial(
-                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                maximum,
-            ));
-        }
-        Ok(())
-    }
-
-    fn allocate(&mut self, size: usize) -> Result<()> {
-        self.check_allocation(size)?;
-        self.memory += size;
-        Ok(())
-    }
-
-    fn copy(&mut self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        self.allocate(bytes.len())?;
-        Ok(Zeroizing::new(bytes.to_vec()))
     }
 
     fn count(&mut self) -> Result<()> {
@@ -85,15 +274,12 @@ impl<'a> Budget<'a> {
         Ok(())
     }
 
-    fn kdf(&mut self, rounds: u32, blocks: usize, salt: &[u8]) -> Result<()> {
-        let maximum = self.limits.resources.max_key_import_kdf_work;
-        if rounds == 0 || u64::from(rounds) > maximum as u64 || rounds > i32::MAX as u32 {
-            return Err(PolicyViolation::KdfIterationsOutsideLimit { maximum }.into());
-        }
+    fn kdf(&mut self, rounds: u32, blocks: usize, salt: usize) -> Result<()> {
         let salt_maximum = self.limits.resources.max_external_resource_bytes;
-        if salt.len() > salt_maximum {
+        if salt > salt_maximum {
             return Err(denial("PKCS#12 salt bytes", salt_maximum));
         }
+        let maximum = self.limits.resources.max_key_import_kdf_work;
         let work = (rounds as usize)
             .checked_mul(blocks)
             .ok_or_else(|| denial(resource_name::KEY_IMPORT_KDF_WORK, maximum))?;
@@ -104,275 +290,70 @@ impl<'a> Budget<'a> {
         Ok(())
     }
 
+    fn admit(&mut self, scheme: &Scheme<'_, '_>) -> Result<()> {
+        let blocks = match scheme.prf {
+            Some(prf) => scheme.cipher.key_len().div_ceil(prf.size()),
+            // Appendix B.2 derives key and IV separately; 24-byte SHA-1
+            // keys need two digest blocks, not one iteration charge.
+            None => scheme.cipher.key_len().div_ceil(20) + 1,
+        };
+        self.kdf(scheme.rounds, blocks, scheme.salt.len())
+    }
+
+    /// Product work accounting matches PKCS#8: password-keyed HMAC
+    /// preprocessing is charged for each PBES2 derivation, hidden bags included.
+    fn hash_password(&mut self, password: usize) -> Result<()> {
+        let maximum = self.limits.resources.max_key_import_kdf_work;
+        let work = password.div_ceil(64);
+        if work > maximum - self.work {
+            return Err(denial(resource_name::KEY_IMPORT_KDF_WORK, maximum));
+        }
+        self.work += work;
+        Ok(())
+    }
+
     fn legacy_workspace(
         &self,
-        salt: &[u8],
-        password: &[u8],
+        salt: usize,
+        password: usize,
         block: usize,
         output: usize,
+        memory: &Memory,
     ) -> Result<()> {
         // RFC 7292 B.2 rounds salt and password up to digest blocks. Account
         // for the KDF's I, diversifier and output before RustCrypto allocates.
         // https://www.rfc-editor.org/rfc/rfc7292#appendix-B.2
+        let maximum = self.limits.resources.max_key_import_kdf_memory_bytes;
         let size = salt
-            .len()
             .div_ceil(block)
-            .checked_add(password.len().div_ceil(block))
+            .checked_add(password.div_ceil(block))
             .and_then(|n| n.checked_mul(block))
             .and_then(|n| n.checked_add(block + output))
-            .ok_or_else(|| {
-                denial(
-                    resource_name::KEY_IMPORT_KDF_MEMORY,
-                    self.limits.resources.max_key_import_kdf_memory_bytes,
-                )
-            })?;
-        if size > self.limits.resources.max_key_import_kdf_memory_bytes {
-            return Err(denial(
-                resource_name::KEY_IMPORT_KDF_MEMORY,
-                self.limits.resources.max_key_import_kdf_memory_bytes,
-            ));
+            .ok_or_else(|| denial(resource_name::KEY_IMPORT_KDF_MEMORY, maximum))?;
+        if size > maximum {
+            return Err(denial(resource_name::KEY_IMPORT_KDF_MEMORY, maximum));
         }
-        if size > self.limits.memory_available - self.memory {
+        if size > remaining(memory) {
             return Err(denial(
                 resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
-                self.limits.resources.max_external_resource_total_bytes,
+                self.ceilings.memory,
             ));
         }
         Ok(())
     }
 }
 
-/// A TLV view never creates an ASN.1 object tree. Indefinite BER is accepted
-/// as required by RFC 7292 4.1; recursion has an absolute stack-safety ceiling.
-#[derive(Clone, Copy)]
-struct Tlv<'a> {
-    tag: u8,
-    value: &'a [u8],
-}
-
-fn tlv(bytes: &[u8], depth: usize) -> Result<(Tlv<'_>, &[u8])> {
-    if depth >= crate::hard_limits::PKCS12_NESTING_CEILING || bytes.len() < 2 {
-        return malformed();
-    }
-    let tag = bytes[0];
-    if tag == 0 {
-        return malformed();
-    }
-    let mut identifier_end = 1;
-    if tag & 0x1f == 0x1f {
-        // X.690 (2021) 8.1.2.4: high tags use nonzero base-128 groups.
-        // Unknown attribute tags need framing, not an integer materialization;
-        // scanning borrowed octets also accepts numbers wider than usize.
-        // https://www.itu.int/rec/T-REC-X.690-202102-I/en
-        let first = bytes[identifier_end];
-        if first.trailing_zeros() >= 7 || first < 31 {
-            return malformed();
-        }
-        loop {
-            let byte = *bytes
-                .get(identifier_end)
-                .ok_or(KeyStoreError::ProtectedContainer)?;
-            identifier_end += 1;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-    }
-    let length_octet = *bytes
-        .get(identifier_end)
-        .ok_or(KeyStoreError::ProtectedContainer)?;
-    let mut start = identifier_end + 1;
-    let end;
-    let consumed;
-    if length_octet == 0x80 {
-        if tag & 0x20 == 0 {
-            return malformed();
-        }
-        let mut remaining = &bytes[start..];
-        loop {
-            if remaining.starts_with(&[0, 0]) {
-                end = bytes.len() - remaining.len();
-                consumed = end + 2;
-                break;
-            }
-            remaining = tlv(remaining, depth + 1)?.1;
-        }
-    } else {
-        let mut length = usize::from(length_octet);
-        if length & 0x80 != 0 {
-            let count = length & 0x7f;
-            if count == 0 || count > core::mem::size_of::<usize>() || count > bytes.len() - start {
-                return malformed();
-            }
-            length = 0;
-            for byte in &bytes[start..start + count] {
-                length = length
-                    .checked_mul(256)
-                    .and_then(|v| v.checked_add(usize::from(*byte)))
-                    .ok_or(KeyStoreError::ProtectedContainer)?;
-            }
-            start += count;
-        }
-        if length > bytes.len() - start {
-            return malformed();
-        }
-        end = start + length;
-        consumed = end;
-    }
-    Ok((
-        Tlv {
-            tag,
-            value: &bytes[start..end],
-        },
-        &bytes[consumed..],
-    ))
-}
-
-struct Reader<'a>(&'a [u8]);
-impl<'a> Reader<'a> {
-    fn take(&mut self, tag: u8) -> Result<Tlv<'a>> {
-        let (value, rest) = tlv(self.0, 0)?;
-        if value.tag != tag {
-            return malformed();
-        }
-        self.0 = rest;
-        Ok(value)
-    }
-    fn sequence(bytes: &'a [u8]) -> Result<Self> {
-        let mut outer = Self(bytes);
-        let sequence = outer.take(0x30)?;
-        outer.finish()?;
-        Ok(Self(sequence.value))
-    }
-    fn finish(self) -> Result<()> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            malformed()
-        }
-    }
-    fn oid(&mut self) -> Result<Oid> {
-        Oid::from_bytes(self.take(6)?.value).map_err(|_| KeyStoreError::ProtectedContainer)
-    }
-    fn nonnegative_integer(&mut self) -> Result<&'a [u8]> {
-        let bytes = self.take(2)?.value;
-        // X.690 8.3.2 forbids redundant sign octets in BER INTEGER too,
-        // not only DER; all these fields require nonnegative values.
-        // https://www.itu.int/rec/T-REC-X.690-202102-I/en
-        if bytes.is_empty()
-            || bytes[0] & 0x80 != 0
-            || (bytes.len() > 1 && bytes[0] == 0 && bytes[1] & 0x80 == 0)
-        {
-            return malformed();
-        }
-        Ok(bytes)
-    }
-    fn integer(&mut self) -> Result<u32> {
-        let bytes = self.nonnegative_integer()?;
-        bytes
-            .iter()
-            .try_fold(0_u32, |n, b| {
-                n.checked_mul(256)
-                    .and_then(|n| n.checked_add(u32::from(*b)))
-            })
-            .ok_or(KeyStoreError::ProtectedContainer)
-    }
-    fn kdf_iterations(&mut self, budget: &Budget<'_>) -> Result<u32> {
-        let bytes = self.nonnegative_integer()?;
-        let significant = if bytes[0] == 0 { &bytes[1..] } else { bytes };
-        let maximum = budget.limits.resources.max_key_import_kdf_work;
-        // RFC 7292 section 4 uses BER INTEGERs, not machine-width counters.
-        // A canonical positive value beyond the application's work ceiling
-        // is a policy denial; malformed sign encoding remains a format error.
-        // https://www.rfc-editor.org/rfc/rfc7292#section-4
-        if significant.len() > 4 {
-            return Err(PolicyViolation::KdfIterationsOutsideLimit { maximum }.into());
-        }
-        let mut rounds = 0_u32;
-        for byte in significant {
-            rounds = rounds * 256 + u32::from(*byte);
-        }
-        if rounds == 0 || u64::from(rounds) > maximum as u64 || rounds > i32::MAX as u32 {
-            return Err(PolicyViolation::KdfIterationsOutsideLimit { maximum }.into());
-        }
-        Ok(rounds)
-    }
-    fn null_or_absent(&mut self) -> Result<()> {
-        if !self.0.is_empty() && !self.take(5)?.value.is_empty() {
-            return malformed();
-        }
-        Self(self.0).finish()
-    }
-}
-
-enum Bytes<'a> {
-    Borrowed(&'a [u8]),
-    Owned(Zeroizing<Vec<u8>>),
-}
-impl Deref for Bytes<'_> {
-    type Target = [u8];
-    fn deref(&self) -> &[u8] {
-        match self {
-            Self::Borrowed(v) => v,
-            Self::Owned(v) => v,
-        }
-    }
-}
-impl Bytes<'_> {
-    fn owned_capacity(&self) -> usize {
-        match self {
-            Self::Borrowed(_) => 0,
-            Self::Owned(v) => v.capacity(),
-        }
-    }
-    fn release(&self, budget: &mut Budget<'_>) {
-        if let Self::Owned(v) = self {
-            budget.memory -= v.capacity();
-        }
-    }
-}
-
-fn octet_visit<F>(value: Tlv<'_>, primitive: u8, depth: usize, visit: &mut F) -> Result<()>
-where
-    F: FnMut(&[u8]) -> Result<()>,
-{
-    if depth >= crate::hard_limits::PKCS12_NESTING_CEILING {
-        return malformed();
-    }
-    if value.tag == primitive {
-        return visit(value.value);
-    }
-    if value.tag != primitive | 0x20 {
-        return malformed();
-    }
-    let mut children = value.value;
-    while !children.is_empty() {
-        let (child, rest) = tlv(children, depth)?;
-        // Constructed implicit [0] OCTET STRING has universal OCTET children.
-        octet_visit(child, 4, depth + 1, visit)?;
-        children = rest;
-    }
-    Ok(())
-}
-
-fn octets<'a>(value: Tlv<'a>, primitive: u8, budget: &mut Budget<'_>) -> Result<Bytes<'a>> {
-    if value.tag == primitive {
-        return Ok(Bytes::Borrowed(value.value));
-    }
-    let mut size = 0_usize;
-    octet_visit(value, primitive, 0, &mut |bytes| {
-        size = size
-            .checked_add(bytes.len())
-            .ok_or(KeyStoreError::ProtectedContainer)?;
-        Ok(())
-    })?;
-    budget.allocate(size)?;
-    let mut output = Zeroizing::new(Vec::with_capacity(size));
-    octet_visit(value, primitive, 0, &mut |bytes| {
-        output.extend_from_slice(bytes);
-        Ok(())
-    })?;
-    Ok(Bytes::Owned(output))
+/// RFC 7292 section 4 uses BER INTEGERs, not machine-width counters. A
+/// positive value beyond the work ceiling is a policy denial; the shared reader
+/// has already refused malformed, zero and negative encodings.
+/// <https://www.rfc-editor.org/rfc/rfc7292#section-4>
+fn rounds(value: Integer<'_>, maximum: usize) -> Result<u32> {
+    value
+        .as_u64()
+        .filter(|rounds| *rounds <= maximum as u64)
+        .and_then(|rounds| i32::try_from(rounds).ok())
+        .and_then(|rounds| u32::try_from(rounds).ok())
+        .ok_or_else(|| PolicyViolation::KdfIterationsOutsideLimit { maximum }.into())
 }
 
 #[derive(Clone, Copy)]
@@ -383,7 +364,30 @@ enum Hash {
     Sha384,
     Sha512,
 }
+
 impl Hash {
+    const ALL: [Self; 5] = [
+        Self::Sha1,
+        Self::Sha224,
+        Self::Sha256,
+        Self::Sha384,
+        Self::Sha512,
+    ];
+    const DIGESTS: [Oid; 5] = [
+        Oid::new_unwrap("1.3.14.3.2.26"),
+        Oid::new_unwrap("2.16.840.1.101.3.4.2.4"),
+        Oid::new_unwrap("2.16.840.1.101.3.4.2.1"),
+        Oid::new_unwrap("2.16.840.1.101.3.4.2.2"),
+        Oid::new_unwrap("2.16.840.1.101.3.4.2.3"),
+    ];
+    const HMACS: [Oid; 5] = [
+        Oid::new_unwrap("1.2.840.113549.2.7"),
+        Oid::new_unwrap("1.2.840.113549.2.8"),
+        Oid::new_unwrap("1.2.840.113549.2.9"),
+        Oid::new_unwrap("1.2.840.113549.2.10"),
+        Oid::new_unwrap("1.2.840.113549.2.11"),
+    ];
+
     fn size(self) -> usize {
         match self {
             Self::Sha1 => 20,
@@ -393,46 +397,20 @@ impl Hash {
             Self::Sha512 => 64,
         }
     }
+
     fn block(self) -> usize {
         match self {
             Self::Sha384 | Self::Sha512 => 128,
             _ => 64,
         }
     }
-    fn from_oid(oid: Oid, hmac: bool) -> Result<Self> {
-        let choices = if hmac {
-            [
-                "1.2.840.113549.2.7",
-                "1.2.840.113549.2.8",
-                "1.2.840.113549.2.9",
-                "1.2.840.113549.2.10",
-                "1.2.840.113549.2.11",
-            ]
-        } else {
-            [
-                "1.3.14.3.2.26",
-                "2.16.840.1.101.3.4.2.4",
-                "2.16.840.1.101.3.4.2.1",
-                "2.16.840.1.101.3.4.2.2",
-                "2.16.840.1.101.3.4.2.3",
-            ]
-        };
-        for (text, hash) in choices.into_iter().zip([
-            Self::Sha1,
-            Self::Sha224,
-            Self::Sha256,
-            Self::Sha384,
-            Self::Sha512,
-        ]) {
-            if oid == Oid::new_unwrap(text) {
-                return Ok(hash);
-            }
-        }
-        Err(KeyStoreError::Selection(if hmac {
-            "unsupported PKCS#12 PRF algorithm"
-        } else {
-            "unsupported PKCS#12 digest algorithm"
-        }))
+
+    fn select(oid: &[u8], table: &[Oid; 5], unsupported: &'static str) -> Result<Self> {
+        table
+            .iter()
+            .zip(Self::ALL)
+            .find_map(|(known, hash)| (known.as_bytes() == oid).then_some(hash))
+            .ok_or(KeyStoreError::Selection(unsupported))
     }
 }
 
@@ -463,66 +441,6 @@ macro_rules! with_hash {
     };
 }
 
-struct Mac<'a> {
-    hash: Hash,
-    digest: Bytes<'a>,
-    salt: Bytes<'a>,
-    rounds: u32,
-}
-impl<'a> Mac<'a> {
-    fn parse(encoded: Tlv<'a>, budget: &mut Budget<'_>) -> Result<Self> {
-        let mut mac = Reader(encoded.value);
-        let mut digest_info = Reader(mac.take(0x30)?.value);
-        let mut algorithm = Reader(digest_info.take(0x30)?.value);
-        let hash = Hash::from_oid(algorithm.oid()?, false)?;
-        algorithm.null_or_absent()?;
-        let (value, rest) = tlv(digest_info.0, 0)?;
-        let digest = octets(value, 4, budget)?;
-        digest_info.0 = rest;
-        digest_info.finish()?;
-        if digest.len() != hash.size() {
-            return malformed();
-        }
-        let (salt_tlv, rest) = tlv(mac.0, 0)?;
-        let salt = octets(salt_tlv, 4, budget)?;
-        mac.0 = rest;
-        let rounds = if mac.0.is_empty() {
-            1
-        } else {
-            mac.kdf_iterations(budget)?
-        };
-        mac.finish()?;
-        budget.kdf(rounds, 1, &salt)?;
-        Ok(Self {
-            hash,
-            digest,
-            salt,
-            rounds,
-        })
-    }
-    fn verify(&self, bytes: &[u8], password: &[u8], budget: &Budget<'_>) -> Result<()> {
-        budget.legacy_workspace(&self.salt, password, self.hash.block(), self.hash.size())?;
-        let key = Zeroizing::new(with_hash!(
-            self.hash,
-            D,
-            derive_key::<D>(
-                password,
-                &self.salt,
-                Pkcs12KeyType::Mac,
-                i32::try_from(self.rounds).expect("KDF admission limits iterations to i32::MAX"),
-                self.hash.size()
-            )
-        ));
-        with_hash!(self.hash, D, {
-            let mut mac =
-                Hmac::<D>::new_from_slice(&key).map_err(|_| KeyStoreError::ProtectedContainer)?;
-            mac.update(bytes);
-            mac.verify_slice(&self.digest)
-                .map_err(|_| KeyStoreError::ProtectedContainer)
-        })
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Cipher {
     Aes128,
@@ -531,6 +449,7 @@ enum Cipher {
     TripleDes,
     DoubleDes,
 }
+
 impl Cipher {
     fn key_len(self) -> usize {
         match self {
@@ -539,6 +458,7 @@ impl Cipher {
             Self::Aes256 => 32,
         }
     }
+
     fn block(self) -> usize {
         match self {
             Self::TripleDes | Self::DoubleDes => 8,
@@ -547,717 +467,630 @@ impl Cipher {
     }
 }
 
-struct Encryption<'a> {
+/// One supported password-protection scheme, read before any password work.
+struct Scheme<'s, 'a> {
     cipher: Cipher,
-    salt: Bytes<'a>,
+    salt: &'s Octets<'a>,
     rounds: u32,
-    hash: Option<Hash>,
+    /// PBES2 PRF; `None` selects the RFC 7292 Appendix B KDF.
+    prf: Option<Hash>,
     iv: [u8; 16],
 }
-impl<'a> Encryption<'a> {
-    fn parse(encoded: Tlv<'a>, budget: &mut Budget<'_>) -> Result<Self> {
-        let mut algorithm = Reader(encoded.value);
-        let oid = algorithm.oid()?;
-        let mut params = Reader(algorithm.take(0x30)?.value);
-        algorithm.finish()?;
-        let (cipher, salt, rounds, hash, iv);
-        if oid == PBES2 {
-            let mut kdf = Reader(params.take(0x30)?.value);
-            if kdf.oid()? != PBKDF2 {
-                return Err(KeyStoreError::Selection(
-                    "unsupported PKCS#12 PBES2 KDF algorithm",
-                ));
-            }
-            let mut derivation = Reader(kdf.take(0x30)?.value);
-            kdf.finish()?;
-            let (value, rest) = tlv(derivation.0, 0)?;
-            salt = octets(value, 4, budget)?;
-            derivation.0 = rest;
-            rounds = derivation.kdf_iterations(budget)?;
-            let length = if derivation.0.first() == Some(&2) {
-                Some(derivation.integer()?)
-            } else {
-                None
+
+fn scheme<'s, 'a>(
+    protection: &'s Protection<'a>,
+    algorithm: AlgorithmIdentifier<'a>,
+    query: &Reader<'_>,
+    limits: &Limits,
+    ceilings: Ceilings,
+) -> Result<Scheme<'s, 'a>> {
+    let maximum = limits.resources.max_key_import_kdf_work;
+    match protection {
+        Protection::Pbes2(pair) => {
+            let kdf = pair.pbkdf2.as_ref().ok_or(KeyStoreError::Selection(
+                "unsupported PKCS#12 PBES2 KDF algorithm",
+            ))?;
+            let Salt::Specified(salt) = &kdf.salt else {
+                return malformed();
             };
-            let mut prf = Hash::Sha1;
-            if !derivation.0.is_empty() {
-                let mut algorithm = Reader(derivation.take(0x30)?.value);
-                prf = Hash::from_oid(algorithm.oid()?, true)?;
-                algorithm.null_or_absent()?;
-            }
-            derivation.finish()?;
-            let mut scheme = Reader(params.take(0x30)?.value);
-            let oid = scheme.oid()?;
-            cipher = if oid == pkcs8::pkcs5::pbes2::AES_128_CBC_OID {
-                Cipher::Aes128
-            } else if oid == pkcs8::pkcs5::pbes2::AES_192_CBC_OID {
-                Cipher::Aes192
-            } else if oid == pkcs8::pkcs5::pbes2::AES_256_CBC_OID {
-                Cipher::Aes256
-            } else {
-                return Err(KeyStoreError::Selection(
-                    "unsupported PKCS#12 PBES2 encryption scheme",
-                ));
+            let rounds = rounds(kdf.iterations, maximum)?;
+            let prf = match kdf.prf {
+                Prf::DefaultSha1 => Hash::Sha1,
+                Prf::Written(written) => Hash::select(
+                    written.algorithm().as_bytes(),
+                    &Hash::HMACS,
+                    "unsupported PKCS#12 PRF algorithm",
+                )?,
             };
-            let (value, rest) = tlv(scheme.0, 0)?;
-            // RFC 7292 section 4 requires BER, whose OCTET STRINGs may be
-            // constructed (X.690 8.7.1, 8.7.3). AES IVs are exactly 16 bytes;
-            // stream segments into fixed cipher state rather than flattening
-            // attacker-controlled segmentation into a temporary heap buffer.
-            // https://www.itu.int/rec/T-REC-X.690-202102-I/en
-            let mut decoded_iv = [0; 16];
-            let mut length_so_far = 0;
-            octet_visit(value, 4, 0, &mut |segment| {
-                if segment.len() > decoded_iv.len() - length_so_far {
-                    return malformed();
-                }
-                decoded_iv[length_so_far..length_so_far + segment.len()].copy_from_slice(segment);
-                length_so_far += segment.len();
-                Ok(())
-            })?;
-            if length_so_far != decoded_iv.len() {
+            let scheme_oid = pair.scheme.algorithm();
+            let cipher = [
+                (pkcs8::pkcs5::pbes2::AES_128_CBC_OID, Cipher::Aes128),
+                (pkcs8::pkcs5::pbes2::AES_192_CBC_OID, Cipher::Aes192),
+                (pkcs8::pkcs5::pbes2::AES_256_CBC_OID, Cipher::Aes256),
+            ]
+            .into_iter()
+            .find_map(|(oid, cipher)| (oid.as_bytes() == scheme_oid.as_bytes()).then_some(cipher))
+            .ok_or(KeyStoreError::Selection(
+                "unsupported PKCS#12 PBES2 encryption scheme",
+            ))?;
+            let iv = aes_iv(pair.scheme, query, ceilings)?;
+            if kdf
+                .key_length
+                .is_some_and(|length| length.as_u64() != Some(cipher.key_len() as u64))
+            {
                 return malformed();
             }
-            iv = decoded_iv;
-            scheme.0 = rest;
-            scheme.finish()?;
-            if length.is_some_and(|length| length as usize != cipher.key_len()) {
-                return malformed();
-            }
-            hash = Some(prf);
-            budget.kdf(rounds, cipher.key_len().div_ceil(prf.size()), &salt)?;
-        } else {
-            cipher = if oid == pkcs12::PKCS_12_PBE_WITH_SHAAND3_KEY_TRIPLE_DES_CBC {
+            Ok(Scheme {
+                cipher,
+                salt,
+                rounds,
+                prf: Some(prf),
+                iv,
+            })
+        }
+        Protection::Pkcs12(legacy) => {
+            let oid = algorithm.algorithm();
+            let cipher = if oid.as_bytes()
+                == pkcs12::PKCS_12_PBE_WITH_SHAAND3_KEY_TRIPLE_DES_CBC.as_bytes()
+            {
                 Cipher::TripleDes
-            } else if oid == pkcs12::PKCS_12_PBE_WITH_SHAAND2_KEY_TRIPLE_DES_CBC {
+            } else if oid.as_bytes()
+                == pkcs12::PKCS_12_PBE_WITH_SHAAND2_KEY_TRIPLE_DES_CBC.as_bytes()
+            {
                 Cipher::DoubleDes
             } else {
                 return Err(KeyStoreError::Selection(
                     "unsupported PKCS#12 encryption algorithm",
                 ));
             };
-            let (value, rest) = tlv(params.0, 0)?;
-            salt = octets(value, 4, budget)?;
-            params.0 = rest;
-            rounds = params.kdf_iterations(budget)?;
-            hash = None;
-            iv = [0; 16];
-            // Appendix B.2 derives key and IV separately; 24-byte SHA-1
-            // keys need two digest blocks, not one iteration charge.
-            budget.kdf(rounds, cipher.key_len().div_ceil(20) + 1, &salt)?;
+            Ok(Scheme {
+                cipher,
+                salt: &legacy.salt,
+                rounds: rounds(legacy.iterations, maximum)?,
+                prf: None,
+                iv: [0; 16],
+            })
         }
-        params.finish()?;
-        Ok(Self {
-            cipher,
-            salt,
-            rounds,
-            hash,
-            iv,
-        })
+        Protection::Pbes1(_) | Protection::Other(_) => Err(KeyStoreError::Selection(
+            "unsupported PKCS#12 encryption algorithm",
+        )),
+    }
+}
+
+/// RFC 8018 B.2.5 makes the AES-CBC parameter the 16-octet IV. RFC 7292
+/// section 4 requires BER, whose OCTET STRINGs may be constructed (X.690
+/// 8.7.1, 8.7.3); segments are copied into fixed cipher state.
+/// <https://www.rfc-editor.org/rfc/rfc8018#appendix-B.2.5>
+fn aes_iv(
+    scheme: AlgorithmIdentifier<'_>,
+    query: &Reader<'_>,
+    ceilings: Ceilings,
+) -> Result<[u8; 16]> {
+    let mut reader = scheme
+        .parameters_reader_in(query, FIELD)
+        .map_err(|e| ceilings.refuse(&e))?
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let element = reader
+        .next_element()
+        .map_err(|e| ceilings.refuse(&e))?
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let octets = Octets::read(&reader, &element, FIELD).map_err(|e| ceilings.refuse(&e))?;
+    if !reader.is_empty() || octets.len() != 16 {
+        return malformed();
+    }
+    let mut iv = [0; 16];
+    let mut at = 0;
+    for piece in octets.pieces() {
+        let bytes = piece.as_bytes();
+        iv[at..at + bytes.len()].copy_from_slice(bytes);
+        at += bytes.len();
+    }
+    Ok(iv)
+}
+
+/// The legacy MAC scheme, admitted against the KDF budget before the password.
+struct MacScheme<'s, 'a> {
+    hash: Hash,
+    salt: &'s Octets<'a>,
+    digest: &'s Octets<'a>,
+    rounds: u32,
+}
+
+fn mac_scheme<'s, 'a>(
+    mac: &'s MacData<'a>,
+    charges: &mut Charges<'_>,
+) -> Result<MacScheme<'s, 'a>> {
+    if mac.pbmac1.is_some() {
+        return Err(KeyStoreError::Selection(
+            "unsupported PKCS#12 MAC algorithm",
+        ));
+    }
+    let hash = Hash::select(
+        mac.algorithm.algorithm().as_bytes(),
+        &Hash::DIGESTS,
+        "unsupported PKCS#12 digest algorithm",
+    )?;
+    if mac.digest.len() != hash.size() {
+        return malformed();
+    }
+    let maximum = charges.limits.resources.max_key_import_kdf_work;
+    let rounds = match mac.iterations {
+        None => 1,
+        Some(value) => rounds(value, maximum)?,
+    };
+    charges.kdf(rounds, 1, mac.salt.len())?;
+    Ok(MacScheme {
+        hash,
+        salt: &mac.salt,
+        digest: &mac.digest,
+        rounds,
+    })
+}
+
+/// Logical octets as one slice: borrowed when the encoding has one segment.
+enum Contiguous<'a> {
+    Borrowed(&'a [u8]),
+    Joined(Plaintext),
+}
+
+impl core::ops::Deref for Contiguous<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Joined(plain) => plain.as_bytes(),
+        }
+    }
+}
+
+fn contiguous<'a>(
+    octets: &Octets<'a>,
+    query: &Reader<'_>,
+    ceilings: Ceilings,
+) -> Result<Contiguous<'a>> {
+    if let [piece] = octets.pieces() {
+        return Ok(Contiguous::Borrowed(piece.as_bytes()));
+    }
+    Plaintext::copy_octets(octets, query)
+        .map(Contiguous::Joined)
+        .map_err(|e| ceilings.refuse(&e))
+}
+
+fn header_len(length: usize) -> usize {
+    1 + DerLength::new(length as u64).as_bytes().len()
+}
+
+fn framed(length: usize) -> Option<usize> {
+    length.checked_add(header_len(length))
+}
+
+fn header(output: &mut Vec<u8>, tag: u8, length: usize) {
+    output.push(tag);
+    output.extend_from_slice(DerLength::new(length as u64).as_bytes());
+}
+
+/// RFC 7292 4.2.1 permits a BER `PrivateKeyInfo`; the key decoders read DER.
+/// Only framing is rewritten: algorithm parameters must already be DER, as for
+/// the shared effective-SPKI framing, and attributes are validated, not kept.
+/// <https://www.rfc-editor.org/rfc/rfc7292#section-4.2.1>
+fn private_key_der(
+    key: &PrivateKey<'_>,
+    query: &Reader<'_>,
+    ceilings: Ceilings,
+) -> Result<(Zeroizing<Vec<u8>>, MemoryReservation)> {
+    use der::Decode as _;
+    let algorithm = key.algorithm;
+    let parameters = algorithm.parameters().unwrap_or(&[]);
+    if !parameters.is_empty() && !algorithm.encoding().is_der() {
+        let mut reader = algorithm
+            .parameters_reader_in(query, FIELD)
+            .map_err(|e| ceilings.refuse(&e))?
+            .ok_or(KeyStoreError::ProtectedContainer)?;
+        let element = reader
+            .next_element()
+            .map_err(|e| ceilings.refuse(&e))?
+            .ok_or(KeyStoreError::ProtectedContainer)?;
+        let mut strict = reader
+            .reread(&element, Encoding::Der)
+            .map_err(|_| KeyStoreError::ProtectedContainer)?;
+        let original = strict
+            .next_element()
+            .map_err(|_| KeyStoreError::ProtectedContainer)?
+            .ok_or(KeyStoreError::ProtectedContainer)?;
+        structured_pkix::der::conforms(&strict, &original, FIELD)
+            .map_err(|e| ceilings.refuse(&e))?;
+    }
+    // The shared reader admits a constructed BER public key; contents of a
+    // primitive [1] BIT STRING are already its DER contents.
+    let public = match &key.public_key {
+        None => None,
+        Some(value) if value.element().tag() == Tag::context(false, 1) => {
+            Some(value.element().contents())
+        }
+        Some(_) => return malformed(),
+    };
+    let oid = algorithm.algorithm().as_bytes();
+    let version = u8::try_from(key.version).map_err(|_| KeyStoreError::ProtectedContainer)?;
+    let identifier = framed(oid.len())
+        .and_then(|n| n.checked_add(parameters.len()))
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let body = framed(identifier)
+        .and_then(|n| n.checked_add(3))
+        .and_then(|n| n.checked_add(framed(key.secret.len())?))
+        .and_then(|n| n.checked_add(public.map_or(Some(0), |p| framed(p.len()))?))
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let total = framed(body).ok_or(KeyStoreError::ProtectedContainer)?;
+    let reservation = query
+        .memory()
+        .reserve(total)
+        .map_err(|e| ceilings.memory(e))?;
+    query
+        .charge(total as u64)
+        .map_err(|e| ceilings.refuse(&e))?;
+    let mut output = Zeroizing::new(Vec::with_capacity(total));
+    header(&mut output, 0x30, body);
+    output.extend_from_slice(&[2, 1, version]);
+    header(&mut output, 0x30, identifier);
+    header(&mut output, 6, oid.len());
+    output.extend_from_slice(oid);
+    output.extend_from_slice(parameters);
+    header(&mut output, 4, key.secret.len());
+    for piece in key.secret.pieces() {
+        output.extend_from_slice(piece.as_bytes());
+    }
+    if let Some(public) = public {
+        header(&mut output, 0x81, public.len());
+        output.extend_from_slice(public);
+    }
+    pkcs8::PrivateKeyInfoRef::from_der(&output).map_err(|_| KeyStoreError::ProtectedContainer)?;
+    Ok((output, reservation))
+}
+
+/// Whether the whole original `PrivateKeyInfo` is already DER, so its decrypted
+/// buffer can be stored as is. A rule violation means BER, not a refusal.
+fn der_conforms(key: &PrivateKey<'_>, query: &Reader<'_>, ceilings: Ceilings) -> Result<bool> {
+    let mut reader = key
+        .original
+        .reader_in(query)
+        .map_err(|e| ceilings.refuse(&e))?;
+    let element = reader
+        .next_element()
+        .map_err(|e| ceilings.refuse(&e))?
+        .ok_or(KeyStoreError::ProtectedContainer)?;
+    let mut strict = match reader.reread(&element, Encoding::Der) {
+        Ok(strict) => strict,
+        Err(e) if e.is_resource() => return Err(ceilings.refuse(&e)),
+        Err(_) => return Ok(false),
+    };
+    let original = match strict.next_element() {
+        Ok(Some(original)) => original,
+        Ok(None) => return malformed(),
+        Err(e) if e.is_resource() => return Err(ceilings.refuse(&e)),
+        Err(_) => return Ok(false),
+    };
+    match structured_pkix::der::conforms(&strict, &original, FIELD) {
+        Ok(()) => Ok(true),
+        Err(e) if e.is_resource() => Err(ceilings.refuse(&e)),
+        Err(_) => Ok(false),
+    }
+}
+
+/// The caller's password, requested once and only when a step needs it.
+struct Password<F, S> {
+    request: Option<F>,
+    /// The obtained password and the live charge for its whole buffer.
+    secret: Option<(S, MemoryReservation)>,
+}
+
+impl<S: Secret, F: FnOnce() -> Option<S>> Password<F, S> {
+    fn text(&mut self, limits: &Limits, ceilings: Ceilings, query: &Reader<'_>) -> Result<&str> {
+        if self.secret.is_none() {
+            let request = self
+                .request
+                .take()
+                .ok_or(KeyStoreError::ProtectedContainer)?;
+            let secret = request().ok_or(KeyStoreError::ProtectedContainer)?;
+            let maximum = limits.resources.max_external_resource_bytes;
+            if secret.text().len() > maximum {
+                return Err(denial(resource_name::EXTERNAL_RESOURCE_BYTES, maximum));
+            }
+            // A callback can return spare capacity; the whole buffer stays live.
+            let reservation = query
+                .memory()
+                .reserve(secret.capacity())
+                .map_err(|e| ceilings.memory(e))?;
+            self.secret = Some((secret, reservation));
+        }
+        Ok(self.secret.as_ref().map_or("", |(secret, _)| secret.text()))
+    }
+}
+
+/// The selected container backend: `RustCrypto` MAC, KDF and cipher work over a
+/// caller password. Retained outputs keep their memory reservation until the
+/// import returns them.
+struct Adapter<'l, F, S> {
+    password: Password<F, S>,
+    /// RFC 7292 B.1 `BMPString` form, derived on the first legacy use.
+    bmp: Option<Plaintext>,
+    charges: Charges<'l>,
+    key: Option<PrivateKeyDer>,
+    /// The decrypted key inspected by `key` is DER and `retain_key` keeps it.
+    keep_decrypted: bool,
+    certificates: Vec<Vec<u8>>,
+    /// Charges for a rewritten `key` and `certificates`, held until the
+    /// import returns; a kept decrypted key carries its own.
+    reservations: Vec<MemoryReservation>,
+}
+
+impl<S: Secret, F: FnOnce() -> Option<S>> Adapter<'_, F, S> {
+    fn into_contents(self) -> Contents {
+        Contents {
+            private_key: self.key,
+            certificates: self.certificates,
+        }
+    }
+
+    fn one_key(&self) -> Result<()> {
+        if self.key.is_some() {
+            return Err(KeyStoreError::Selection(
+                "PKCS#12 bundle must contain exactly one private key",
+            ));
+        }
+        Ok(())
+    }
+
+    fn rewrite_key(&mut self, key: &PrivateKey<'_>, query: &Reader<'_>) -> Result<()> {
+        self.one_key()?;
+        let (der, reservation) = private_key_der(key, query, self.charges.ceilings)?;
+        self.reservations.push(reservation);
+        self.key = Some(PrivateKeyDer::Owned(der));
+        Ok(())
+    }
+
+    fn retain_certificate(&mut self, certificate: &Octets<'_>, query: &Reader<'_>) -> Result<()> {
+        let ceilings = self.charges.ceilings;
+        let size = certificate.len()
+            + core::mem::size_of::<Vec<u8>>()
+            + core::mem::size_of::<MemoryReservation>();
+        let reservation = query
+            .memory()
+            .reserve(size)
+            .map_err(|e| ceilings.memory(e))?;
+        query
+            .charge(certificate.len() as u64)
+            .map_err(|e| ceilings.refuse(&e))?;
+        let mut copy = Vec::with_capacity(certificate.len());
+        for piece in certificate.pieces() {
+            copy.extend_from_slice(piece.as_bytes());
+        }
+        self.reservations.push(reservation);
+        self.certificates.push(copy);
+        Ok(())
     }
 
     fn decrypt(
-        &self,
-        ciphertext: &[u8],
-        password: &mut Password<'_>,
-        budget: &mut Budget<'_>,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(self.cipher.block()) {
+        &mut self,
+        protection: &Protection<'_>,
+        algorithm: AlgorithmIdentifier<'_>,
+        ciphertext: &Octets<'_>,
+        query: &Reader<'_>,
+    ) -> Result<Plaintext> {
+        let ceilings = self.charges.ceilings;
+        let scheme = scheme(protection, algorithm, query, self.charges.limits, ceilings)?;
+        let block = scheme.cipher.block();
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(block) {
             return malformed();
         }
-        // Preflight output before KDF work; allocate/charge it only when live,
-        // rather than invent overlap with the legacy KDF's temporary workspace.
-        budget.check_allocation(ciphertext.len())?;
+        // KDF work and the plaintext copy are admitted before the password is
+        // requested, so a refused step never prompts for one.
+        self.charges.admit(&scheme)?;
+        if ciphertext.len() > remaining(query.memory()) {
+            return Err(denial(
+                resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
+                ceilings.memory,
+            ));
+        }
+        let password = self.password.text(self.charges.limits, ceilings, query)?;
+        if scheme.prf.is_some() {
+            self.charges.hash_password(password.len())?;
+        }
+        let salt = contiguous(scheme.salt, query, ceilings)?;
+        let key_len = scheme.cipher.key_len();
+        let rounds =
+            i32::try_from(scheme.rounds).expect("KDF admission limits iterations to i32::MAX");
         let mut key = Zeroizing::new([0_u8; 32]);
         let mut iv = Zeroizing::new([0_u8; 16]);
-        if let Some(hash) = self.hash {
-            // Product work accounting matches PKCS#8: charge password-keyed
-            // HMAC preprocessing for each derivation, including hidden bags.
-            let work = password.utf8.len().div_ceil(64);
-            let maximum = budget.limits.resources.max_key_import_kdf_work;
-            if work > maximum - budget.work {
-                return Err(denial(resource_name::KEY_IMPORT_KDF_WORK, maximum));
-            }
-            budget.work += work;
+        if let Some(prf) = scheme.prf {
             with_hash!(
-                hash,
+                prf,
                 D,
                 pbkdf2::pbkdf2_hmac::<D>(
-                    password.utf8.as_bytes(),
-                    &self.salt,
-                    self.rounds,
-                    &mut key[..self.cipher.key_len()]
+                    password.as_bytes(),
+                    &salt,
+                    scheme.rounds,
+                    &mut key[..key_len]
                 )
             );
-            iv.copy_from_slice(&self.iv);
+            iv.copy_from_slice(&scheme.iv);
         } else {
-            let bmp = password.bmp(budget)?;
-            budget.check_allocation(ciphertext.len())?;
-            budget.legacy_workspace(&self.salt, bmp, 64, self.cipher.key_len())?;
+            let bmp = legacy_password(&mut self.bmp, password, query, ceilings)?;
+            self.charges
+                .legacy_workspace(salt.len(), bmp.len(), 64, key_len, query.memory())?;
             let derived = Zeroizing::new(derive_key::<sha1::Sha1>(
                 bmp,
-                &self.salt,
+                &salt,
                 Pkcs12KeyType::EncryptionKey,
-                i32::try_from(self.rounds).expect("KDF admission limits iterations to i32::MAX"),
-                self.cipher.key_len(),
+                rounds,
+                key_len,
             ));
-            key[..derived.len()].copy_from_slice(&derived);
-            drop(derived);
+            key[..key_len].copy_from_slice(&derived);
             let derived = Zeroizing::new(derive_key::<sha1::Sha1>(
                 bmp,
-                &self.salt,
+                &salt,
                 Pkcs12KeyType::Iv,
-                i32::try_from(self.rounds).expect("KDF admission limits iterations to i32::MAX"),
+                rounds,
                 8,
             ));
             iv[..8].copy_from_slice(&derived);
-            drop(derived);
         }
-        let mut plaintext = budget.copy(ciphertext)?;
+        drop(salt);
+        let mut plain =
+            Plaintext::copy_octets(ciphertext, query).map_err(|e| ceilings.refuse(&e))?;
+        query
+            .charge(ciphertext.len() as u64)
+            .map_err(|e| ceilings.refuse(&e))?;
         macro_rules! decrypt {
             ($cipher:ty) => {
-                cbc::Decryptor::<$cipher>::new_from_slices(
-                    &key[..self.cipher.key_len()],
-                    &iv[..self.cipher.block()],
-                )
-                .map_err(|_| KeyStoreError::ProtectedContainer)?
-                .decrypt_padded::<Pkcs7>(&mut plaintext)
-                .map_err(|_| KeyStoreError::ProtectedContainer)?
-                .len()
+                cbc::Decryptor::<$cipher>::new_from_slices(&key[..key_len], &iv[..block])
+                    .map_err(|_| KeyStoreError::ProtectedContainer)?
+                    .decrypt_padded::<Pkcs7>(plain.as_mut_bytes())
+                    .map_err(|_| KeyStoreError::ProtectedContainer)?
+                    .len()
             };
         }
-        let length = match self.cipher {
+        let length = match scheme.cipher {
             Cipher::Aes128 => decrypt!(aes::Aes128Dec),
             Cipher::Aes192 => decrypt!(aes::Aes192Dec),
             Cipher::Aes256 => decrypt!(aes::Aes256Dec),
             Cipher::TripleDes => decrypt!(des::TdesEde3),
             Cipher::DoubleDes => decrypt!(des::TdesEde2),
         };
-        plaintext.truncate(length);
-        Ok(plaintext)
+        plain.truncate(length);
+        Ok(plain)
     }
 }
 
-fn content_info(encoded: Tlv<'_>) -> Result<(Oid, Tlv<'_>)> {
-    let mut info = Reader(encoded.value);
-    let oid = info.oid()?;
-    let explicit = info.take(0xa0)?;
-    info.finish()?;
-    let (content, rest) = tlv(explicit.value, 0)?;
-    Reader(rest).finish()?;
-    Ok((oid, content))
+/// The RFC 7292 B.1 password form, shared by the legacy MAC and legacy
+/// encryption even when another layer of the same PFX uses PBES2.
+/// <https://www.rfc-editor.org/rfc/rfc7292#appendix-B.1>
+fn legacy_password<'s>(
+    slot: &'s mut Option<Plaintext>,
+    password: &str,
+    query: &Reader<'_>,
+    ceilings: Ceilings,
+) -> Result<&'s [u8]> {
+    if slot.is_none() {
+        *slot = Some(personal::legacy_password(password, query).map_err(|e| ceilings.refuse(&e))?);
+    }
+    Ok(slot.as_ref().map_or(&[][..], Plaintext::as_bytes))
 }
 
-fn encrypted_content<'a>(
-    encoded: Tlv<'a>,
-    budget: &mut Budget<'_>,
-) -> Result<(Encryption<'a>, Bytes<'a>)> {
-    if encoded.tag != 0x30 {
-        return malformed();
-    }
-    let mut data = Reader(encoded.value);
-    let version = data.integer()?;
-    let mut info = Reader(data.take(0x30)?.value);
-    let attributes_present = !data.0.is_empty();
-    if attributes_present {
-        let attributes = data.take(0xa1)?;
-        // UnprotectedAttributes is SET SIZE (1..MAX) OF Attribute (6.1).
-        // https://www.rfc-editor.org/rfc/rfc5652#section-6.1
-        if attributes.value.is_empty() {
-            return malformed();
-        }
-        validate_attributes(Reader(attributes.value))?;
-    }
-    data.finish()?;
-    // RFC 5652 8: version is 2 with unprotectedAttrs, otherwise 0.
-    // Unknown metadata does not affect key selection, but must be well framed.
-    // https://www.rfc-editor.org/rfc/rfc5652#section-8
-    if version != if attributes_present { 2 } else { 0 } {
-        return malformed();
-    }
-    if info.oid()? != DATA {
-        return malformed();
-    }
-    let encryption = Encryption::parse(info.take(0x30)?, budget)?;
-    let (value, rest) = tlv(info.0, 0)?;
-    Reader(rest).finish()?;
-    Ok((encryption, octets(value, 0x80, budget)?))
-}
+impl<S: Secret, F: FnOnce() -> Option<S>> Backend for Adapter<'_, F, S> {
+    type Error = KeyStoreError;
 
-struct Password<'a> {
-    utf8: &'a str,
-    bmp: Option<Zeroizing<Vec<u8>>>,
-}
-
-impl Password<'_> {
-    fn bmp(&mut self, budget: &mut Budget<'_>) -> Result<&[u8]> {
-        if self.bmp.is_none() {
-            // RFC 7292 B.1 requires BMPString for both the legacy encryption
-            // KDF and the legacy MAC, even when encryption itself is PBES2.
-            // BMPString is not UTF-16: supplementary characters cannot be
-            // represented by surrogate pairs. PBES2-only (no legacy MAC/KDF)
-            // uses UTF-8 directly; RFC 9879 section 6 distinguishes PBMAC1.
-            // https://www.rfc-editor.org/rfc/rfc7292#appendix-B.1
-            // https://www.rfc-editor.org/rfc/rfc9879#section-6
-            let mut units = 1_usize;
-            for ch in self.utf8.chars() {
-                if u32::from(ch) > u32::from(u16::MAX) {
-                    return malformed();
-                }
-                units = units
-                    .checked_add(1)
-                    .ok_or(KeyStoreError::ProtectedContainer)?;
-            }
-            let size = units
-                .checked_mul(2)
-                .ok_or(KeyStoreError::ProtectedContainer)?;
-            budget.allocate(size)?;
-            let mut bmp = Zeroizing::new(Vec::with_capacity(size));
-            for ch in self.utf8.chars() {
-                bmp.extend_from_slice(
-                    &u16::try_from(u32::from(ch))
-                        .expect("the preceding pass accepts only BMP scalars")
-                        .to_be_bytes(),
-                );
-            }
-            bmp.extend_from_slice(&[0, 0]);
-            self.bmp = Some(bmp);
-        }
-        self.bmp
-            .as_deref()
-            .map(Vec::as_slice)
-            .ok_or(KeyStoreError::ProtectedContainer)
-    }
-}
-
-fn validate_attribute_values(mut bytes: &[u8], depth: usize) -> Result<()> {
-    if depth >= crate::hard_limits::PKCS12_NESTING_CEILING {
-        return malformed();
-    }
-    while !bytes.is_empty() {
-        let (value, rest) = tlv(bytes, depth)?;
-        if value.tag & 0x20 != 0 {
-            validate_attribute_values(value.value, depth + 1)?;
-        }
-        bytes = rest;
-    }
-    Ok(())
-}
-
-fn validate_attributes(mut attributes: Reader<'_>) -> Result<()> {
-    // RFC 7292 4.2 and RFC 5652 5.3 define attributes as an OID and
-    // a SET OF values, with no generic minimum number of values. The
-    // SIZE (1..MAX) constraint in CMS 6.1 is on UnprotectedAttributes,
-    // not attrValues: do not reject an empty SET for an unknown attribute.
-    // Ignoring its meaning does not waive framing; validate borrowed bytes.
-    // https://www.rfc-editor.org/rfc/rfc7292#section-4.2
-    // https://www.rfc-editor.org/rfc/rfc5652#section-5.3
-    while !attributes.0.is_empty() {
-        let mut attribute = Reader(attributes.take(0x30)?.value);
-        attribute.oid()?;
-        validate_attribute_values(attribute.take(0x31)?.value, 0)?;
-        attribute.finish()?;
-    }
-    Ok(())
-}
-
-fn der_header_length(length: usize) -> usize {
-    if length < 128 {
-        2
-    } else {
-        2 + (usize::BITS - length.leading_zeros()).div_ceil(8) as usize
-    }
-}
-
-fn append_der_header(output: &mut Vec<u8>, tag: u8, length: usize) {
-    output.push(tag);
-    if length < 128 {
-        output.push(u8::try_from(length).expect("short DER lengths fit one octet"));
-    } else {
-        let bytes = length.to_be_bytes();
-        let first = bytes
-            .iter()
-            .position(|byte| *byte != 0)
-            .unwrap_or(bytes.len());
-        output.push(
-            0x80 | u8::try_from(bytes.len() - first)
-                .expect("a usize length uses at most eight octets"),
-        );
-        output.extend_from_slice(&bytes[first..]);
-    }
-}
-
-// AlgorithmIdentifier parameters used by supported keys are primitive values
-// or a SEQUENCE of integers (DSA). Normalize framing without a heap object tree.
-fn parameter_length(value: Tlv<'_>, depth: usize) -> Result<usize> {
-    let length = parameter_body_length(value, depth)?;
-    length
-        .checked_add(der_header_length(length))
-        .ok_or(KeyStoreError::ProtectedContainer)
-}
-
-fn parameter_body_length(value: Tlv<'_>, depth: usize) -> Result<usize> {
-    if depth >= crate::hard_limits::PKCS12_NESTING_CEILING || value.tag & 0x1f == 0x1f {
-        return malformed();
-    }
-    let mut length = value.value.len();
-    if value.tag & 0x20 != 0 {
-        if value.tag != 0x30 {
-            return malformed();
-        }
-        length = 0;
-        let mut children = value.value;
-        while !children.is_empty() {
-            let (child, rest) = tlv(children, depth + 1)?;
-            length = length
-                .checked_add(parameter_length(child, depth + 1)?)
-                .ok_or(KeyStoreError::ProtectedContainer)?;
-            children = rest;
-        }
-    }
-    Ok(length)
-}
-
-fn append_parameter(output: &mut Vec<u8>, value: Tlv<'_>, depth: usize) -> Result<()> {
-    let body = parameter_body_length(value, depth)?;
-    append_der_header(output, value.tag, body);
-    if value.tag == 0x30 {
-        let mut children = value.value;
-        while !children.is_empty() {
-            let (child, rest) = tlv(children, depth + 1)?;
-            append_parameter(output, child, depth + 1)?;
-            children = rest;
-        }
-    } else {
-        output.extend_from_slice(value.value);
-    }
-    Ok(())
-}
-
-fn normalize_private_key(bytes: &[u8], budget: &mut Budget<'_>) -> Result<Zeroizing<Vec<u8>>> {
-    use der::Decode as _;
-    if pkcs8::PrivateKeyInfoRef::from_der(bytes).is_ok() {
-        return budget.copy(bytes);
-    }
-    // RFC 7292 4/4.2.1 permits BER KeyBag PrivateKeyInfo. Rebuild its
-    // framing and flatten OCTET STRING fragments before DER-only decoding.
-    // Attributes are ignored by the key decoder, but validated before discard.
-    // https://www.rfc-editor.org/rfc/rfc7292#section-4.2.1
-    let mut key = Reader::sequence(bytes)?;
-    let version = key.integer()?;
-    if version > 1 {
-        return malformed();
-    }
-    let algorithm = key.take(0x30)?;
-    let (secret, rest) = tlv(key.0, 0)?;
-    key.0 = rest;
-    let mut secret_length = 0usize;
-    octet_visit(secret, 4, 0, &mut |part| {
-        secret_length = secret_length
-            .checked_add(part.len())
-            .ok_or(KeyStoreError::ProtectedContainer)?;
-        Ok(())
-    })?;
-    if key.0.first() == Some(&0xa0) {
-        validate_attributes(Reader(key.take(0xa0)?.value))?;
-    }
-    let public = if key.0.is_empty() {
-        None
-    } else {
-        Some(key.take(0x81)?)
-    };
-    key.finish()?;
-    if (version == 1) != public.is_some() {
-        return malformed();
-    }
-    let public_length = public.map_or(0, |value| {
-        value.value.len() + der_header_length(value.value.len())
-    });
-    let body_length = 3usize
-        .checked_add(parameter_length(algorithm, 0)?)
-        .and_then(|length| length.checked_add(secret_length))
-        .and_then(|length| length.checked_add(der_header_length(secret_length)))
-        .and_then(|length| length.checked_add(public_length))
-        .ok_or(KeyStoreError::ProtectedContainer)?;
-    let length = body_length
-        .checked_add(der_header_length(body_length))
-        .ok_or(KeyStoreError::ProtectedContainer)?;
-    budget.allocate(length)?;
-    let mut output = Zeroizing::new(Vec::with_capacity(length));
-    append_der_header(&mut output, 0x30, body_length);
-    output.extend_from_slice(&[
-        2,
-        1,
-        u8::try_from(version).expect("PrivateKeyInfo version was checked to be zero or one"),
-    ]);
-    append_parameter(&mut output, algorithm, 0)?;
-    append_der_header(&mut output, 4, secret_length);
-    octet_visit(secret, 4, 0, &mut |part| {
-        output.extend_from_slice(part);
-        Ok(())
-    })?;
-    if let Some(public) = public {
-        append_der_header(&mut output, 0x81, public.value.len());
-        output.extend_from_slice(public.value);
-    }
-    pkcs8::PrivateKeyInfoRef::from_der(&output).map_err(|_| KeyStoreError::ProtectedContainer)?;
-    Ok(output)
-}
-
-fn safe_contents(
-    bytes: &[u8],
-    budget: &mut Budget<'_>,
-    mut password: Option<&mut Password<'_>>,
-    contents: &mut Contents,
-    depth: usize,
-) -> Result<()> {
-    use der::Decode as _;
-    if depth >= crate::hard_limits::PKCS12_NESTING_CEILING {
-        return malformed();
-    }
-    let mut safe = Reader::sequence(bytes)?;
-    while !safe.0.is_empty() {
-        budget.count()?;
-        let mut bag = Reader(safe.take(0x30)?.value);
-        let oid = bag.oid()?;
-        let value = bag.take(0xa0)?.value;
-        if !bag.0.is_empty() {
-            validate_attributes(Reader(bag.take(0x31)?.value))?;
-        }
-        bag.finish()?;
-        if oid == pkcs12::PKCS_12_SAFE_CONTENTS_BAG_OID {
-            safe_contents(value, budget, password.as_deref_mut(), contents, depth + 1)?;
-        } else if oid == pkcs12::PKCS_12_PKCS8_KEY_BAG_OID {
-            let mut key = Reader::sequence(value)?;
-            let encryption = Encryption::parse(key.take(0x30)?, budget)?;
-            let (encrypted, rest) = tlv(key.0, 0)?;
-            Reader(rest).finish()?;
-            let encrypted = octets(encrypted, 4, budget)?;
-            if let Some(password) = password.as_deref_mut() {
-                if !contents.private_keys.is_empty() {
-                    return Err(KeyStoreError::Selection(
-                        "PKCS#12 bundle must contain exactly one private key",
-                    ));
-                }
-                budget.allocate(core::mem::size_of::<Zeroizing<Vec<u8>>>())?;
-                contents.private_keys.reserve_exact(1);
-                let plaintext = encryption.decrypt(&encrypted, password, budget)?;
-                let private_key = if pkcs8::PrivateKeyInfoRef::from_der(&plaintext).is_ok() {
-                    plaintext
-                } else {
-                    let normalized = normalize_private_key(&plaintext, budget)?;
-                    budget.memory -= plaintext.capacity();
-                    normalized
-                };
-                contents.private_keys.push(private_key);
-            }
-            encrypted.release(budget);
-            encryption.salt.release(budget);
-        } else if oid == pkcs12::PKCS_12_KEY_BAG_OID {
-            if password.is_some() {
-                if !contents.private_keys.is_empty() {
-                    return Err(KeyStoreError::Selection(
-                        "PKCS#12 bundle must contain exactly one private key",
-                    ));
-                }
-                budget.allocate(core::mem::size_of::<Zeroizing<Vec<u8>>>())?;
-                contents.private_keys.reserve_exact(1);
-                contents
-                    .private_keys
-                    .push(normalize_private_key(value, budget)?);
-            }
-        } else if oid == pkcs12::PKCS_12_CERT_BAG_OID {
-            let mut cert = Reader::sequence(value)?;
-            if cert.oid()? != pkcs12::PKCS_12_X509_CERT_OID {
-                return malformed();
-            }
-            let explicit = cert.take(0xa0)?;
-            cert.finish()?;
-            let (value, rest) = tlv(explicit.value, 0)?;
-            Reader(rest).finish()?;
-            let certificate = octets(value, 4, budget)?;
-            if password.is_some() {
-                if contents.certificates.capacity() == 0 {
-                    // Reserve the bounded bag allowance only when a certificate
-                    // actually exists, avoiding speculative allocation for
-                    // key-only containers and growth during hidden-bag traversal.
-                    budget.allocate(budget.limits.candidates * core::mem::size_of::<Vec<u8>>())?;
-                    contents
-                        .certificates
-                        .reserve_exact(budget.limits.candidates);
-                }
-                // Retained public certificate is independent of temporary decrypted bags.
-                budget.allocate(certificate.len())?;
-                contents.certificates.push(certificate.to_vec());
-            }
-            certificate.release(budget);
-        } else {
-            return Err(KeyStoreError::Selection("unsupported PKCS#12 bag type"));
-        }
-    }
-    Ok(())
-}
-
-fn walk_safe(
-    bytes: &[u8],
-    budget: &mut Budget<'_>,
-    mut password: Option<&mut Password<'_>>,
-    contents: &mut Contents,
-) -> Result<()> {
-    let mut safe = Reader::sequence(bytes)?;
-    while !safe.0.is_empty() {
-        budget.count()?;
-        let (oid, content) = content_info(safe.take(0x30)?)?;
-        if oid == DATA {
-            let data = octets(content, 4, budget)?;
-            safe_contents(&data, budget, password.as_deref_mut(), contents, 0)?;
-            data.release(budget);
-        } else if oid == ENCRYPTED_DATA {
-            let (encryption, encrypted) = encrypted_content(content, budget)?;
-            if let Some(password) = password.as_deref_mut() {
-                let data = encryption.decrypt(&encrypted, password, budget)?;
-                // RFC 7292 4.1/4.2.2 allows shrouded bags inside encrypted
-                // SafeContents. Their parameters cannot be known before the
-                // password; the shared budget checks them before their KDF.
-                // https://www.rfc-editor.org/rfc/rfc7292#section-4.1
-                safe_contents(&data, budget, Some(password), contents, 0)?;
-                budget.memory -= data.capacity();
-            }
-            encrypted.release(budget);
-            encryption.salt.release(budget);
-        } else {
-            return Err(KeyStoreError::Selection("unsupported PKCS#12 privacy mode"));
-        }
-    }
-    Ok(())
-}
-
-struct Pfx<'a> {
-    safe: Bytes<'a>,
-    mac: Option<Mac<'a>>,
-}
-impl<'a> Pfx<'a> {
-    fn parse(bytes: &'a [u8], budget: &mut Budget<'_>) -> Result<Self> {
-        let mut pfx = Reader::sequence(bytes)?;
-        if pfx.integer()? != 3 {
-            return malformed();
-        }
-        let (oid, content) = content_info(pfx.take(0x30)?)?;
-        if oid != DATA {
-            return Err(KeyStoreError::Selection(
-                "unsupported PKCS#12 integrity mode",
-            ));
-        }
-        let safe = octets(content, 4, budget)?;
-        let mac = if pfx.0.is_empty() {
-            None
-        } else {
-            Some(Mac::parse(pfx.take(0x30)?, budget)?)
+    fn authenticate(&mut self, integrity: &Integrity<'_>, query: &Reader<'_>) -> Result<Decision> {
+        let Integrity::Password { safe, mac } = integrity else {
+            return Ok(Decision::Unsupported);
         };
-        pfx.finish()?;
-        Ok(Self { safe, mac })
-    }
-}
-
-pub(super) struct Prepared<'a, 'l> {
-    pfx: Pfx<'a>,
-    limits: &'l Limits,
-}
-
-#[cfg(test)]
-pub(super) fn prepare<'a, 'l>(bytes: &'a [u8], limits: &'l Limits) -> Result<Prepared<'a, 'l>> {
-    prepare_with_work(bytes, limits, 0)
-}
-
-pub(super) fn prepare_with_work<'a, 'l>(
-    bytes: &'a [u8],
-    limits: &'l Limits,
-    work: usize,
-) -> Result<Prepared<'a, 'l>> {
-    let mut budget = Budget::new(limits);
-    if work > limits.resources.max_key_import_kdf_work {
-        return Err(denial(
-            resource_name::KEY_IMPORT_KDF_WORK,
-            limits.resources.max_key_import_kdf_work,
+        // RFC 7292 section 4 makes MacData OPTIONAL; a PFX without it has
+        // always been imported, so its absence is accepted here explicitly.
+        let Some(mac) = mac else {
+            return Ok(Decision::Accept);
+        };
+        let ceilings = self.charges.ceilings;
+        let scheme = mac_scheme(mac, &mut self.charges)?;
+        let salt = contiguous(scheme.salt, query, ceilings)?;
+        let expected = contiguous(scheme.digest, query, ceilings)?;
+        query
+            .charge(safe.len() as u64)
+            .map_err(|e| ceilings.refuse(&e))?;
+        let password = self.password.text(self.charges.limits, ceilings, query)?;
+        let bmp = legacy_password(&mut self.bmp, password, query, ceilings)?;
+        self.charges.legacy_workspace(
+            salt.len(),
+            bmp.len(),
+            scheme.hash.block(),
+            scheme.hash.size(),
+            query.memory(),
+        )?;
+        let rounds =
+            i32::try_from(scheme.rounds).expect("KDF admission limits iterations to i32::MAX");
+        let key = Zeroizing::new(with_hash!(
+            scheme.hash,
+            D,
+            derive_key::<D>(bmp, &salt, Pkcs12KeyType::Mac, rounds, scheme.hash.size())
         ));
-    }
-    budget.work = work;
-    let pfx = Pfx::parse(bytes, &mut budget)?;
-    walk_safe(
-        &pfx.safe,
-        &mut budget,
-        None,
-        &mut Contents {
-            private_keys: Vec::new(),
-            certificates: Vec::new(),
-        },
-    )?;
-    Ok(Prepared { pfx, limits })
-}
-
-impl Prepared<'_, '_> {
-    #[cfg(test)]
-    pub(super) fn decrypt(self, password: &str) -> Result<Contents> {
-        self.decrypt_with_password_capacity(password, password.len())
+        let verified = with_hash!(scheme.hash, D, {
+            let mut mac =
+                Hmac::<D>::new_from_slice(&key).map_err(|_| KeyStoreError::ProtectedContainer)?;
+            for piece in safe.pieces() {
+                mac.update(piece.as_bytes());
+            }
+            mac.verify_slice(&expected).is_ok()
+        });
+        Ok(if verified {
+            Decision::Accept
+        } else {
+            Decision::Reject
+        })
     }
 
-    #[cfg(test)]
-    pub(super) fn decrypt_with_password_capacity(
-        self,
-        password: &str,
-        capacity: usize,
-    ) -> Result<Contents> {
-        self.decrypt_with_work(password, capacity, &mut 0)
+    fn decrypt_safe(
+        &mut self,
+        safe: &Safe<'_>,
+        query: &Reader<'_>,
+        _: &Source<'_>,
+    ) -> Result<Plaintext> {
+        let Safe::Encrypted(encrypted) = safe else {
+            return Err(KeyStoreError::Selection("unsupported PKCS#12 privacy mode"));
+        };
+        // Decrypting a safe is key-source expansion; its bags count separately.
+        self.charges.count()?;
+        let ciphertext = encrypted
+            .content
+            .ciphertext
+            .as_ref()
+            .ok_or(KeyStoreError::ProtectedContainer)?;
+        self.decrypt(
+            &encrypted.protection,
+            encrypted.content.algorithm,
+            ciphertext,
+            query,
+        )
     }
 
-    pub(super) fn decrypt_with_work(
-        self,
-        password: &str,
-        capacity: usize,
-        work: &mut usize,
-    ) -> Result<Contents> {
-        let Self { pfx, limits } = self;
-        let mut budget = Budget::new(limits);
-        if *work > limits.resources.max_key_import_kdf_work {
-            return Err(denial(
-                resource_name::KEY_IMPORT_KDF_WORK,
-                limits.resources.max_key_import_kdf_work,
-            ));
+    fn decrypt_key(
+        &mut self,
+        key: &ShroudedKey<'_>,
+        query: &Reader<'_>,
+        _: &Source<'_>,
+    ) -> Result<Plaintext> {
+        self.decrypt(&key.protection, key.algorithm, &key.encrypted, query)
+    }
+
+    fn bag(&mut self, bag: &Bag<'_>, query: &Reader<'_>, _: &Source<'_>) -> Result<()> {
+        self.charges.count()?;
+        match &bag.value {
+            // A clear key borrows the input, so it is copied once either way.
+            BagValue::Key(key) => self.rewrite_key(key, query),
+            // Refuse a second key before spending its KDF work.
+            BagValue::Shrouded(_) => self.one_key(),
+            BagValue::Certificate(certificate) => self.retain_certificate(certificate, query),
+            BagValue::Contents(_) => Ok(()),
+            _ => Err(KeyStoreError::Selection("unsupported PKCS#12 bag type")),
         }
-        budget.work = *work;
-        let result = (|| {
-            // The original UTF-8 buffer remains live alongside BER views, BMP
-            // conversion, and decrypted contents; a callback can retain spare capacity.
-            if password.len() > limits.resources.max_external_resource_bytes {
-                return Err(denial(
-                    resource_name::EXTERNAL_RESOURCE_BYTES,
-                    limits.resources.max_external_resource_bytes,
-                ));
-            }
-            debug_assert!(capacity >= password.len());
-            budget.allocate(capacity)?;
-            budget.allocate(pfx.safe.owned_capacity())?;
-            if let Some(mac) = &pfx.mac {
-                budget.allocate(mac.salt.owned_capacity() + mac.digest.owned_capacity())?;
-                budget.kdf(mac.rounds, 1, &mac.salt)?;
-            }
-            let mut password = Password {
-                utf8: password,
-                bmp: None,
-            };
-            if let Some(mac) = &pfx.mac {
-                mac.verify(&pfx.safe, password.bmp(&mut budget)?, &budget)?;
-            }
-            let mut contents = Contents {
-                private_keys: Vec::new(),
-                certificates: Vec::new(),
-            };
-            walk_safe(&pfx.safe, &mut budget, Some(&mut password), &mut contents)?;
-            Ok(contents)
-        })();
-        // Work is not refunded by password, DER, or later association failures.
-        *work = budget.work;
-        result
+    }
+
+    fn key(&mut self, key: &PrivateKey<'_>, query: &Reader<'_>, _: &Source<'_>) -> Result<()> {
+        self.one_key()?;
+        if der_conforms(key, query, self.charges.ceilings)? {
+            self.keep_decrypted = true;
+            Ok(())
+        } else {
+            self.rewrite_key(key, query)
+        }
+    }
+
+    fn retain_key(&mut self, plaintext: Plaintext) -> Result<()> {
+        use der::Decode as _;
+        if !core::mem::take(&mut self.keep_decrypted) {
+            // The BER original was rewritten; its buffer is released here.
+            return Ok(());
+        }
+        pkcs8::PrivateKeyInfoRef::from_der(plaintext.as_bytes())
+            .map_err(|_| KeyStoreError::ProtectedContainer)?;
+        self.key = Some(PrivateKeyDer::Retained(plaintext));
+        Ok(())
     }
 }
 

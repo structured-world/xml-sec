@@ -1443,7 +1443,7 @@ pub fn decode_rsa_private_with_inventory(
         return inventory
             .private_keys()
             .first()
-            .and_then(|entry| RsaPrivateKey::from_pkcs8_der(&entry.pkcs8_der).ok())
+            .and_then(|entry| RsaPrivateKey::from_pkcs8_der(entry.pkcs8_der()).ok())
             .ok_or_else(|| KeyMaterialError::UnsupportedPrivateKey(path.to_owned()));
     }
     let pem_der;

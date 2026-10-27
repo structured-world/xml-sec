@@ -98,8 +98,8 @@ into the chosen engine. Native private handles reject use through another provid
 public SPKI bytes can be verified by either engine. There is no automatic fallback.
 
 Key-container decoding remains a distinct inventory import boundary: encrypted
-PKCS#8 and PKCS#12 password-based container processing uses the existing RustCrypto
-importer. Selecting AWS-LC does not turn that importer into an approved FIPS service.
+PKCS#8 and PKCS#12 password-based container processing uses RustCrypto MAC, KDF
+and cipher primitives, with PKCS#12 framing read by the shared container reader. Selecting AWS-LC does not turn that importer into an approved FIPS service.
 RSA key-container codecs use current RustCrypto `pkcs1`/`pkcs8` types through
 `rsa_encoding::{RsaPrivateKeyEncoding, RsaPublicKeyEncoding}` extension traits.
 These traits operate on the existing `sad-rsa` keys; its bundled encoding feature

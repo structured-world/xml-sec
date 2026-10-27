@@ -146,12 +146,13 @@ permission and a resolver selected under a weaker policy do not weaken a later o
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
 Incompatible or empty private-key usages are rejected before requesting a password.
-`add_pkcs12_with_password_callback` obtains a zeroizing string password before
-decoding the bundle, after checking encoded size, visible bag/container counts,
-and all visible MAC/encryption KDF parameters against one aggregate work budget.
-KDF parameters inside encrypted SafeContents cannot be inspected without the
-password: they are checked immediately after outer decryption, before running
-the inner derivation (RFC 7292 sections 4.1 and 4.2.2). A missing
+`add_pkcs12_with_password_callback` reads the bundle in one pass and calls the
+callback once, when the MAC or the first decryption needs the password, after
+that step's KDF work and output memory are admitted against the aggregate
+budget. A bundle with neither a MAC nor encrypted content never calls it. The
+MAC is checked before any bag is read; KDF parameters inside encrypted
+SafeContents are checked when that content is decrypted, before running the
+inner derivation (RFC 7292 sections 4.1 and 4.2.2). A missing
 or wrong password returns a redacted error and never
 triggers an unprotected fallback. PEM private-key labels must match their
 payload: `ENCRYPTED PRIVATE KEY` cannot contain plaintext PKCS#8, and
@@ -206,13 +207,22 @@ The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource
 rejection also returns a typed policy error.
-The importer uses RustCrypto primitives with borrowed BER views; it supports
+The importer reads the container with the shared `structured-cms` PKCS#12
+reader, which authenticates the whole AuthenticatedSafe before any bag is
+extracted; RustCrypto supplies the MAC, KDF and cipher primitives. Reading work
+counts against `ResourcePolicy::max_x509_work`, the budget of the shared ASN.1
+readers, and its buffers against the aggregate live-byte limit. It supports
 PBES2/PBKDF2 with AES-CBC and legacy SHA-1/3DES containers, plus SHA-1/SHA-2 MACs.
-Unsupported digest, PRF, KDF, and cipher algorithms return a selection error,
-not a protected-container error; RC2 containers are not supported.
-Private keys and decrypted temporary buffers are zeroized. Nested safe bags
-share the same candidate and KDF budgets with ContentInfo records; a count
-denial is not a password error. Lax CLI verification also shares one inspection
+Unsupported digest, PRF, KDF, and cipher algorithms, PBMAC1, public-key
+integrity, enveloped privacy and CRL, secret or SDSI bags return a selection
+error, not a protected-container error; RC2 containers are not supported.
+A decrypted PrivateKeyInfo that is already DER is stored in its decryption
+buffer, without a second copy, and keeps that buffer's import memory charge.
+A BER PrivateKeyInfo is stored as DER by rewriting its framing only; algorithm
+parameters that are not already DER are refused rather than re-encoded.
+Private keys and decrypted temporary buffers are zeroized. Every bag, nested
+or inside encrypted content, and every decrypted safe share one candidate and
+KDF budget; a count denial is not a password error. Lax CLI verification also shares one inspection
 budget across all stored candidates and stops on a policy denial even after
 another candidate resolved. Custom bag attributes accept BER high-tag-number
 identifiers (X.690 section 8.1.2.4) without retaining their values.
