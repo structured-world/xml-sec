@@ -785,6 +785,85 @@ fn a_decrypted_der_key_is_kept_and_a_ber_key_rewritten() {
 }
 
 #[test]
+fn reader_work_limit_reaches_container_and_decrypted_content() {
+    // max_x509_work bounds the shared reader through the public import, both
+    // before the password and while reading what decryption produced. The
+    // bundle holds one key and no certificate, so no X.509 parse is charged.
+    let (password, salt, iv) = (b"secret", b"12345678", [7; 16]);
+    let private = private_key();
+    let shrouded = bag(
+        pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+        &sequence(&[
+            pbes2_aes128(salt, integer(2), encoded(4, &iv)),
+            encoded(4, &aes128_pbes2_ciphertext(password, salt, iv, &private)),
+        ]),
+    );
+    let safe = aes128_pbes2_ciphertext(password, salt, iv, &sequence(&[shrouded]));
+    let bytes = pfx(&[sequence(&[
+        oid(ENCRYPTED_DATA),
+        encoded(
+            0xa0,
+            &sequence(&[
+                integer(0),
+                sequence(&[
+                    oid(DATA),
+                    pbes2_aes128(salt, integer(2), encoded(4, &iv)),
+                    encoded(0x80, &safe),
+                ]),
+            ]),
+        ),
+    ])]);
+    let import = |max_x509_work: usize| {
+        let calls = Cell::new(0);
+        let mut inventory = super::super::KeyInventory::default();
+        let result = inventory.add_pkcs12_with_password_callback(
+            "key".into(),
+            &bytes,
+            || {
+                calls.set(calls.get() + 1);
+                Some(Zeroizing::new("secret".to_owned()))
+            },
+            super::super::KeyUsages::SIGN,
+            &ResourcePolicy {
+                max_x509_work,
+                ..ResourcePolicy::default()
+            },
+        );
+        if result.is_ok() {
+            assert_eq!(inventory.private_keys()[0].pkcs8_der(), private);
+        }
+        (result, calls.get())
+    };
+    let denied = |result: core::result::Result<(), KeyStoreError>, limit: usize| {
+        matches!(
+            result,
+            Err(KeyStoreError::Policy(PolicyViolation::ResourceLimitExceeded {
+                resource: resource_name::X509_WORK,
+                maximum,
+            })) if maximum == limit
+        )
+    };
+    let (mut refused, mut admitted) = (0_usize, ResourcePolicy::default().max_x509_work);
+    assert!(import(admitted).0.is_ok(), "the default admits the bundle");
+    while admitted - refused > 1 {
+        let middle = refused + (admitted - refused) / 2;
+        if import(middle).0.is_ok() {
+            admitted = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    // The last unit of reader work is spent inside the decrypted key.
+    let (result, calls) = import(refused);
+    assert!(denied(result, refused), "one unit short of the bundle");
+    assert_eq!(calls, 1, "refused after decryption");
+    // The outer container alone exceeds a single unit, before any password.
+    let (result, calls) = import(1);
+    assert!(denied(result, 1));
+    assert_eq!(calls, 0, "refused before the password");
+}
+
+#[test]
 fn pbes2_ber_iv_rejects_invalid_segments_and_lengths() {
     // Segmentation changes framing, never AES's required IV length or
     // the universal OCTET STRING type of each component.
