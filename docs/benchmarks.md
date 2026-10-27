@@ -267,7 +267,9 @@ repeated comparable baselines on a controlled host, which shared runners are not
 CI fetches the last published default-branch run from Pages as the baseline,
 writes the report into the comparison artifact and the job summary, and the
 dashboard publishes it with the run. When the published site has no usable run,
-the report says that no baseline exists.
+the report says that no baseline exists. Comparison, benchmark-smoke and fuzz
+artifacts are kept for one day, for inspecting a recent run; no later run reads
+them. The observatory deletes its site artifact once Pages has deployed it.
 
 CI uses the shared comparison workflow to build dashboard artifacts on PRs;
 Benchmark Observatory publishes only validated default-branch results to GitHub Pages. One-sample PR
