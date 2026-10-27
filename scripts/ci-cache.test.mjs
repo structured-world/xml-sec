@@ -66,6 +66,26 @@ test('a failed fuzz run keeps its grown corpus although the cache is not saved',
   assert.match(workflow, /if: failure\(\)\n\s+uses: actions\/upload-artifact@v7\n\s+with:\n\s+name: fuzz-corpus-[^\n]+\n\s+path: fuzz\/corpus\n/);
 });
 
+test('benchmark and fuzz evidence is kept for one day', () => {
+  // These artifacts serve inspection of a recent run only; no later run reads them.
+  const uploads = ['ci.yml', 'benchmark-comparison.yml', 'fuzz.yml'].flatMap(file =>
+    [...source(`.github/workflows/${file}`).matchAll(/uses: actions\/upload-artifact@v7\n(?:\s+if: [^\n]+\n)?\s+with:\n\s+name: ([^\n]+)\n[\s\S]*?retention-days: (\d+)/g)]
+      .map(([, name, days]) => [name, days]));
+  const evidence = uploads.filter(([name]) => /^(benchmark-comparison|benchmark-smoke-|fuzz-)/.test(name));
+  assert.equal(evidence.length, 5);
+  for (const [name, days] of evidence) assert.equal(days, '1', name);
+});
+
+test('the benchmark observatory deletes its site artifact after deploying it', () => {
+  // The Pages artifact is consumed by the deployment of the same run only.
+  const workflow = source('.github/workflows/benchmarks.yml');
+  const deployed = workflow.indexOf('uses: actions/deploy-pages@v5');
+  const deleted = workflow.indexOf('gh api --method DELETE "repos/$GITHUB_REPOSITORY/actions/artifacts/$id"');
+  assert.ok(deployed >= 0 && deleted > deployed);
+  assert.ok(workflow.includes('actions/runs/$GITHUB_RUN_ID/artifacts?name=github-pages'));
+  assert.match(workflow, /actions: write/);
+});
+
 test('ordinary jobs have one matrix writer per compiler and separate instrumented domains', () => {
   // Compatible readers share dependencies without partial feature writers racing.
   const workflow = source('.github/workflows/ci.yml');

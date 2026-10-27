@@ -193,7 +193,7 @@ jobs:
         with:
           name: benchmark-smoke-${{ matrix.rust }}-rustcrypto
           path: ${{ runner.temp }}/benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 7
+          retention-days: 1
 
   benchmark-comparison:
     uses: ./.github/workflows/benchmark-comparison.yml
@@ -395,7 +395,7 @@ jobs:
         with:
           name: benchmark-smoke-1.92.0-aws-lc-fips
           path: ${{ runner.temp }}/benchmark-smoke-fips-${{ github.run_id }}-${{ github.run_attempt }}
-          retention-days: 7
+          retention-days: 1
 
   test:
     runs-on: ubuntu-latest

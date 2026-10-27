@@ -117,7 +117,7 @@ jobs:
             ${{ runner.temp }}/fuzz-evidence
             fuzz/artifacts
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
       # A successful run's corpus reaches the next run through the fuzz-corpus cache
       # above. That cache is saved only when the job succeeds, so a failed run keeps
       # its grown corpus here instead.
@@ -128,7 +128,7 @@ jobs:
           name: fuzz-corpus-${{ matrix.target }}-${{ matrix.fips }}
           path: fuzz/corpus
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 1
 
   differential:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
