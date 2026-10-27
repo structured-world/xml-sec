@@ -146,12 +146,13 @@ permission and a resolver selected under a weaker policy do not weaken a later o
 `add_private_der_with_password_callback` asks the caller for a zeroizing byte
 password only for encrypted PKCS#8; plaintext input does not invoke it.
 Incompatible or empty private-key usages are rejected before requesting a password.
-`add_pkcs12_with_password_callback` obtains a zeroizing string password before
-decoding the bundle, after checking encoded size, visible bag/container counts,
-and all visible MAC/encryption KDF parameters against one aggregate work budget.
-KDF parameters inside encrypted SafeContents cannot be inspected without the
-password: they are checked immediately after outer decryption, before running
-the inner derivation (RFC 7292 sections 4.1 and 4.2.2). A missing
+`add_pkcs12_with_password_callback` reads the bundle in one pass and calls the
+callback once, when the MAC or the first decryption needs the password, after
+that step's KDF work and output memory are admitted against the aggregate
+budget. A bundle with neither a MAC nor encrypted content never calls it. The
+MAC is checked before any bag is read; KDF parameters inside encrypted
+SafeContents are checked when that content is decrypted, before running the
+inner derivation (RFC 7292 sections 4.1 and 4.2.2). A missing
 or wrong password returns a redacted error and never
 triggers an unprotected fallback. PEM private-key labels must match their
 payload: `ENCRYPTED PRIVATE KEY` cannot contain plaintext PKCS#8, and
@@ -217,9 +218,9 @@ integrity, enveloped privacy and CRL, secret or SDSI bags return a selection
 error, not a protected-container error; RC2 containers are not supported.
 A BER PrivateKeyInfo is stored as DER by rewriting its framing only; algorithm
 parameters that are not already DER are refused rather than re-encoded.
-Private keys and decrypted temporary buffers are zeroized. Nested safe bags
-share the same candidate and KDF budgets with ContentInfo records; a count
-denial is not a password error. Lax CLI verification also shares one inspection
+Private keys and decrypted temporary buffers are zeroized. Every bag, nested
+or inside encrypted content, and every decrypted safe share one candidate and
+KDF budget; a count denial is not a password error. Lax CLI verification also shares one inspection
 budget across all stored candidates and stops on a policy denial even after
 another candidate resolved. Custom bag attributes accept BER high-tag-number
 identifiers (X.690 section 8.1.2.4) without retaining their values.

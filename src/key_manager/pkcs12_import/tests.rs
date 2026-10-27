@@ -590,9 +590,9 @@ fn redundant_integer_octets_are_not_ber() {
 }
 
 #[test]
-fn content_infos_and_bags_share_candidate_count() {
-    // Two safes and two bags are four inspections; bags in separate safes
-    // cannot each start a new allowance.
+fn bags_share_one_candidate_count() {
+    // Bags in separate safes cannot each start a new allowance. An unencrypted
+    // safe is not expansion work; its bags are its candidates.
     let key = bag(pkcs12::PKCS_12_KEY_BAG_OID, &private_key());
     let certificate = bag(
         pkcs12::PKCS_12_CERT_BAG_OID,
@@ -602,18 +602,18 @@ fn content_infos_and_bags_share_candidate_count() {
         ]),
     );
     let bytes = pfx(&[data(&sequence(&[certificate])), data(&sequence(&[key]))]);
-    let (result, calls) = import_counting(&bytes, &limits(3), &mut 0, "secret");
+    let (result, calls) = import_counting(&bytes, &limits(1), &mut 0, "secret");
     assert!(matches!(
         result,
         Err(KeyStoreError::Policy(
             PolicyViolation::ResourceLimitExceeded {
                 resource: resource_name::KEY_CANDIDATES,
-                maximum: 3
+                maximum: 1
             }
         ))
     ));
-    assert_eq!(calls, 0);
-    let contents = run(&bytes, &limits(4), "secret").expect("four inspections fit");
+    assert_eq!(calls, 0, "an unprotected container needs no password");
+    let contents = run(&bytes, &limits(2), "secret").expect("two bags fit");
     assert_eq!(contents.certificates, [b"certificate".to_vec()]);
 }
 
@@ -624,15 +624,15 @@ fn nested_bags_share_candidate_count() {
     let nested = bag(pkcs12::PKCS_12_SAFE_CONTENTS_BAG_OID, &sequence(&[key]));
     let bytes = pfx(&[data(&sequence(&[nested]))]);
     assert!(matches!(
-        run(&bytes, &limits(2), "secret"),
+        run(&bytes, &limits(1), "secret"),
         Err(KeyStoreError::Policy(
             PolicyViolation::ResourceLimitExceeded {
                 resource: resource_name::KEY_CANDIDATES,
-                maximum: 2
+                maximum: 1
             }
         ))
     ));
-    let contents = run(&bytes, &limits(3), "secret").expect("nested key");
+    let contents = run(&bytes, &limits(2), "secret").expect("nested key");
     assert_eq!(imported_key(&contents), private_key());
 }
 
@@ -1026,14 +1026,37 @@ fn pbes2_cipher_prf_matrix_accepts_utf8_passwords_without_legacy_kdf() {
 }
 
 #[test]
-fn absent_password_is_refused_after_inspection() {
-    // A callback that declines leaves the container unopened.
-    let bytes = pfx(&[data(&sequence(&[bag(
+fn the_password_is_requested_only_when_a_step_needs_it() {
+    // One pass: an unprotected container never asks; a declined password
+    // stops at the first step that needs it and leaves it unopened.
+    let plain = pfx(&[data(&sequence(&[bag(
         pkcs12::PKCS_12_KEY_BAG_OID,
         &private_key(),
     )]))]);
+    let contents = import::<&str, _>(&plain, &limits(64), &mut 0, || {
+        panic!("no step of an unprotected container needs a password")
+    })
+    .expect("unprotected import");
+    assert_eq!(imported_key(&contents), private_key());
+    let iv = [7; 16];
+    let shrouded = pfx(&[data(&sequence(&[bag(
+        pkcs12::PKCS_12_PKCS8_KEY_BAG_OID,
+        &sequence(&[
+            pbes2_aes128(b"salt", integer(2), encoded(4, &iv)),
+            encoded(
+                4,
+                &aes128_pbes2_ciphertext(b"secret", b"salt", iv, &private_key()),
+            ),
+        ]),
+    )]))]);
     assert!(matches!(
-        import::<&str>(&bytes, &limits(64), &mut 0, || None),
+        import::<&str, _>(&shrouded, &limits(64), &mut 0, || None),
         Err(KeyStoreError::ProtectedContainer)
     ));
+    let (result, calls) = import_counting(&shrouded, &limits(64), &mut 0, "secret");
+    assert_eq!(
+        imported_key(&result.expect("shrouded import")),
+        private_key()
+    );
+    assert_eq!(calls, 1, "requested once");
 }

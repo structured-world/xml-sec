@@ -11,8 +11,8 @@ use der::asn1::ObjectIdentifier as Oid;
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use pkcs12::kdf::{Pkcs12KeyType, derive_key};
 use structured_asn1::length::DerLength;
-use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, MemoryReservation, Work as _};
-use structured_asn1::{Encoding, Integer, Limit, Parser, Reader, Tag, universal};
+use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, MemoryReservation};
+use structured_asn1::{Encoding, Integer, Limit, Parser, Reader, Tag};
 use structured_cms::Octets;
 use structured_cms::personal::protection::{Prf, Protection, Salt};
 use structured_cms::personal::{
@@ -64,13 +64,15 @@ impl Secret for Zeroizing<String> {
     }
 }
 
-/// Import one PFX. Parameters visible without the password are admitted before
-/// `password` is called; work spent after it is kept in `work` on failure too.
-pub(super) fn import<S: Secret>(
+/// Import one PFX in a single pass. `password` is called once, when the MAC or
+/// a decryption first needs it and after that step's KDF and memory admission;
+/// a container that needs no password never calls it. Work spent is kept in
+/// `work` on failure too.
+pub(super) fn import<S: Secret, F: FnOnce() -> Option<S>>(
     bytes: &[u8],
     limits: &Limits,
     work: &mut usize,
-    password: impl FnOnce() -> Option<S>,
+    password: F,
 ) -> Result<Contents> {
     let maximum = limits.resources.max_key_import_kdf_work;
     if *work > maximum {
@@ -106,23 +108,13 @@ pub(super) fn import<S: Secret>(
             ceilings.refuse(&e)
         }
     })?;
-    let safes = inspect(&pfx, &reader, &mut Charges::new(limits, ceilings, *work))?;
-    let secret = password().ok_or(KeyStoreError::ProtectedContainer)?;
-    let maximum = limits.resources.max_external_resource_bytes;
-    if secret.text().len() > maximum {
-        return Err(denial(resource_name::EXTERNAL_RESOURCE_BYTES, maximum));
-    }
-    // A callback can return spare capacity; the whole buffer stays live.
-    let _password = parser
-        .memory()
-        .reserve(secret.capacity())
-        .map_err(|e| ceilings.memory(e))?;
-    let mut charges = Charges::new(limits, ceilings, *work);
-    charges.candidates = safes;
     let mut adapter = Adapter {
-        password: secret.text(),
+        password: Password {
+            request: Some(password),
+            secret: None,
+        },
         bmp: None,
-        charges,
+        charges: Charges::new(limits, ceilings, *work),
         key: None,
         certificates: Vec::new(),
         reservations: Vec::new(),
@@ -663,140 +655,6 @@ fn contiguous<'a>(
         .map_err(|e| ceilings.refuse(&e))
 }
 
-/// Read carried `SafeContents`/`AuthenticatedSafe` octets with the shared reader.
-fn within<R>(
-    octets: &Octets<'_>,
-    parent: &Reader<'_>,
-    ceilings: Ceilings,
-    body: impl FnOnce(&mut Reader<'_>) -> Result<R>,
-) -> Result<R> {
-    let joined;
-    let (bytes, base) = if let [piece] = octets.pieces() {
-        (piece.as_bytes(), piece.span().start)
-    } else {
-        joined = Plaintext::copy_octets(octets, parent).map_err(|e| ceilings.refuse(&e))?;
-        (joined.as_bytes(), 0)
-    };
-    let mut reader = parent
-        .parser()
-        .read_nested_query_in(parent, bytes, base, Encoding::Ber, parent.depth())
-        .map_err(|e| ceilings.refuse(&e))?;
-    body(&mut reader)
-}
-
-/// The members of the single SEQUENCE OF that a carried value holds.
-fn members<'a>(reader: &mut Reader<'a>, ceilings: Ceilings) -> Result<Reader<'a>> {
-    let root = reader
-        .next_element()
-        .map_err(|e| ceilings.refuse(&e))?
-        .ok_or(KeyStoreError::ProtectedContainer)?;
-    if root.tag() != Tag::constructed(universal::SEQUENCE) || !reader.is_empty() {
-        return malformed();
-    }
-    reader.enter(&root).map_err(|e| ceilings.refuse(&e))
-}
-
-/// A bag type this import does not extract, refused whether or not encrypted.
-fn supported(value: &BagValue<'_>) -> Result<()> {
-    match value {
-        BagValue::Key(_)
-        | BagValue::Shrouded(_)
-        | BagValue::Certificate(_)
-        | BagValue::Contents(_) => Ok(()),
-        _ => Err(KeyStoreError::Selection("unsupported PKCS#12 bag type")),
-    }
-}
-
-/// Before the password: admit the MAC and every protection visible outside
-/// encrypted safes, count safes and visible bags and refuse unsupported types.
-/// Reading is inspection, not authentication; nothing is extracted here.
-/// Returns the safe count, which the processing pass starts from: safes are
-/// key-source expansion, and that pass reports only bags.
-fn inspect(pfx: &Pfx<'_>, query: &Reader<'_>, charges: &mut Charges<'_>) -> Result<usize> {
-    let Integrity::Password { safe, mac } = pfx.integrity() else {
-        return Err(KeyStoreError::Selection(
-            "unsupported PKCS#12 integrity mode",
-        ));
-    };
-    if let Some(mac) = mac {
-        mac_scheme(mac, charges)?;
-    }
-    let ceilings = charges.ceilings;
-    within(safe, query, ceilings, |reader| {
-        let mut safes = members(reader, ceilings)?;
-        let mut count = 0;
-        while let Some(element) = safes.next_element().map_err(|e| ceilings.refuse(&e))? {
-            charges.count()?;
-            count += 1;
-            match Safe::read(&safes, &element).map_err(|e| ceilings.refuse(&e))? {
-                Safe::Data(bags) => {
-                    within(&bags, &safes, ceilings, |reader| {
-                        inspect_bags(reader, charges)
-                    })?;
-                }
-                Safe::Encrypted(encrypted) => {
-                    let scheme = scheme(
-                        &encrypted.protection,
-                        encrypted.content.algorithm,
-                        &safes,
-                        charges.limits,
-                        ceilings,
-                    )?;
-                    charges.admit(&scheme)?;
-                }
-                Safe::Enveloped(_) | Safe::Other { .. } => {
-                    return Err(KeyStoreError::Selection("unsupported PKCS#12 privacy mode"));
-                }
-            }
-        }
-        Ok(count)
-    })
-}
-
-fn inspect_bags(reader: &mut Reader<'_>, charges: &mut Charges<'_>) -> Result<()> {
-    let ceilings = charges.ceilings;
-    let first = members(reader, ceilings)?;
-    let execution = reader.execution();
-    let mut frames = execution.vector();
-    frames.try_push(first).map_err(|e| ceilings.memory(e))?;
-    while let Some(frame) = frames.last_mut() {
-        let Some(element) = frame.next_element().map_err(|e| ceilings.refuse(&e))? else {
-            frames.pop();
-            continue;
-        };
-        let bag = Bag::read(frame, &element).map_err(|e| ceilings.refuse(&e))?;
-        charges.count()?;
-        supported(&bag.value)?;
-        let nested = match &bag.value {
-            BagValue::Contents(value) => {
-                // The value sits inside SafeBag.[0]; reopen its saved context.
-                let original = value.reader_in(frame).map_err(|e| ceilings.refuse(&e))?;
-                Some(
-                    original
-                        .enter(value.element())
-                        .map_err(|e| ceilings.refuse(&e))?,
-                )
-            }
-            BagValue::Shrouded(key) => {
-                let scheme = scheme(
-                    &key.protection,
-                    key.algorithm,
-                    frame,
-                    charges.limits,
-                    ceilings,
-                )?;
-                charges.admit(&scheme)?;
-                None
-            }
-            _ => None,
-        };
-        if let Some(nested) = nested {
-            frames.try_push(nested).map_err(|e| ceilings.memory(e))?;
-        }
-    }
-    Ok(())
-}
-
 fn header_len(length: usize) -> usize {
     1 + DerLength::new(length as u64).as_bytes().len()
 }
@@ -887,11 +745,41 @@ fn private_key_der(
     Ok((output, reservation))
 }
 
+/// The caller's password, requested once and only when a step needs it.
+struct Password<F, S> {
+    request: Option<F>,
+    /// The obtained password and the live charge for its whole buffer.
+    secret: Option<(S, MemoryReservation)>,
+}
+
+impl<S: Secret, F: FnOnce() -> Option<S>> Password<F, S> {
+    fn text(&mut self, limits: &Limits, ceilings: Ceilings, query: &Reader<'_>) -> Result<&str> {
+        if self.secret.is_none() {
+            let request = self
+                .request
+                .take()
+                .ok_or(KeyStoreError::ProtectedContainer)?;
+            let secret = request().ok_or(KeyStoreError::ProtectedContainer)?;
+            let maximum = limits.resources.max_external_resource_bytes;
+            if secret.text().len() > maximum {
+                return Err(denial(resource_name::EXTERNAL_RESOURCE_BYTES, maximum));
+            }
+            // A callback can return spare capacity; the whole buffer stays live.
+            let reservation = query
+                .memory()
+                .reserve(secret.capacity())
+                .map_err(|e| ceilings.memory(e))?;
+            self.secret = Some((secret, reservation));
+        }
+        Ok(self.secret.as_ref().map_or("", |(secret, _)| secret.text()))
+    }
+}
+
 /// The selected container backend: `RustCrypto` MAC, KDF and cipher work over a
 /// caller password. Retained outputs keep their memory reservation until the
 /// import returns them.
-struct Adapter<'p, 'l> {
-    password: &'p str,
+struct Adapter<'l, F, S> {
+    password: Password<F, S>,
     /// RFC 7292 B.1 `BMPString` form, derived on the first legacy use.
     bmp: Option<Plaintext>,
     charges: Charges<'l>,
@@ -901,7 +789,7 @@ struct Adapter<'p, 'l> {
     reservations: Vec<MemoryReservation>,
 }
 
-impl Adapter<'_, '_> {
+impl<S: Secret, F: FnOnce() -> Option<S>> Adapter<'_, F, S> {
     fn into_contents(self) -> Contents {
         Contents {
             private_key: self.key,
@@ -960,16 +848,18 @@ impl Adapter<'_, '_> {
         if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(block) {
             return malformed();
         }
+        // KDF work and the plaintext copy are admitted before the password is
+        // requested, so a refused step never prompts for one.
         self.charges.admit(&scheme)?;
-        if scheme.prf.is_some() {
-            self.charges.hash_password(self.password.len())?;
-        }
-        // Preflight the plaintext copy before any password work.
         if ciphertext.len() > remaining(query.memory()) {
             return Err(denial(
                 resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
                 ceilings.memory,
             ));
+        }
+        let password = self.password.text(self.charges.limits, ceilings, query)?;
+        if scheme.prf.is_some() {
+            self.charges.hash_password(password.len())?;
         }
         let salt = contiguous(scheme.salt, query, ceilings)?;
         let key_len = scheme.cipher.key_len();
@@ -982,7 +872,7 @@ impl Adapter<'_, '_> {
                 prf,
                 D,
                 pbkdf2::pbkdf2_hmac::<D>(
-                    self.password.as_bytes(),
+                    password.as_bytes(),
                     &salt,
                     scheme.rounds,
                     &mut key[..key_len]
@@ -990,7 +880,7 @@ impl Adapter<'_, '_> {
             );
             iv.copy_from_slice(&scheme.iv);
         } else {
-            let bmp = legacy_password(&mut self.bmp, self.password, query, ceilings)?;
+            let bmp = legacy_password(&mut self.bmp, password, query, ceilings)?;
             self.charges
                 .legacy_workspace(salt.len(), bmp.len(), 64, key_len, query.memory())?;
             let derived = Zeroizing::new(derive_key::<sha1::Sha1>(
@@ -1052,7 +942,7 @@ fn legacy_password<'s>(
     Ok(slot.as_ref().map_or(&[][..], Plaintext::as_bytes))
 }
 
-impl Backend for Adapter<'_, '_> {
+impl<S: Secret, F: FnOnce() -> Option<S>> Backend for Adapter<'_, F, S> {
     type Error = KeyStoreError;
 
     fn authenticate(&mut self, integrity: &Integrity<'_>, query: &Reader<'_>) -> Result<Decision> {
@@ -1071,7 +961,8 @@ impl Backend for Adapter<'_, '_> {
         query
             .charge(safe.len() as u64)
             .map_err(|e| ceilings.refuse(&e))?;
-        let bmp = legacy_password(&mut self.bmp, self.password, query, ceilings)?;
+        let password = self.password.text(self.charges.limits, ceilings, query)?;
+        let bmp = legacy_password(&mut self.bmp, password, query, ceilings)?;
         self.charges.legacy_workspace(
             salt.len(),
             bmp.len(),
@@ -1110,6 +1001,8 @@ impl Backend for Adapter<'_, '_> {
         let Safe::Encrypted(encrypted) = safe else {
             return Err(KeyStoreError::Selection("unsupported PKCS#12 privacy mode"));
         };
+        // Decrypting a safe is key-source expansion; its bags count separately.
+        self.charges.count()?;
         let ciphertext = encrypted
             .content
             .ciphertext
@@ -1140,7 +1033,7 @@ impl Backend for Adapter<'_, '_> {
             BagValue::Shrouded(_) => self.one_key(),
             BagValue::Certificate(certificate) => self.retain_certificate(certificate, query),
             BagValue::Contents(_) => Ok(()),
-            other => supported(other),
+            _ => Err(KeyStoreError::Selection("unsupported PKCS#12 bag type")),
         }
     }
 

@@ -55,15 +55,17 @@ fn repeated_pkcs12_imports_share_kdf_work() {
         max_key_import_kdf_work: 10_000,
         ..ResourcePolicy::default()
     };
-    let mut inventory = KeyInventory::default();
-    inventory
+    let mut single = KeyInventory::default();
+    single
         .add_pkcs12("first".into(), bytes, "secret", &resources)
         .expect("first bundle fits");
+    let work = single.key_import_kdf_work();
     assert!(matches!(
-        inventory.add_pkcs12("second".into(), bytes, "secret", &resources),
+        single.add_pkcs12("second".into(), bytes, "secret", &resources),
         Err(KeyStoreError::Policy(_))
     ));
-    let work = inventory.key_import_kdf_work();
+    // Work already spent by the refused import is not refunded.
+    assert!(single.key_import_kdf_work() > work);
     let exact = ResourcePolicy {
         max_key_import_kdf_work: work * 2,
         ..resources
@@ -143,9 +145,10 @@ fn pkcs12_kdf_limit_is_a_typed_policy_denial() {
 }
 
 #[test]
-fn pkcs12_visible_encryption_kdf_is_checked_before_password() {
-    // Raising an unencrypted PBES2 iteration count must deny the import
-    // before asking for a secret, even when MacData is within the limit.
+fn pkcs12_mac_rejects_altered_safe_before_decryption() {
+    // The MAC covers the whole AuthenticatedSafe and is checked first:
+    // altering a protection parameter inside it is caught as an
+    // unauthenticated container before that parameter is used.
     let mut bytes =
         include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12").to_vec();
     let offset = bytes
@@ -160,17 +163,18 @@ fn pkcs12_visible_encryption_kdf_is_checked_before_password() {
     let result = KeyInventory::default().add_pkcs12_with_password_callback(
         "limited".into(),
         &bytes,
-        || panic!("visible KDF must be checked first"),
+        || Some(Zeroizing::new("secret".to_owned())),
         KeyUsages::SIGN,
         &resources,
     );
-    assert!(matches!(result, Err(KeyStoreError::Policy(_))));
+    assert!(matches!(result, Err(KeyStoreError::ProtectedContainer)));
 }
 
 #[test]
 fn pkcs12_content_count_denial_is_not_a_password_error() {
-    // AuthenticatedSafe has two content infos; its count is public and
-    // must report the candidate policy rather than request a password.
+    // An encrypted safe and the bags it carries exceed one candidate; with
+    // the right password the refusal is the candidate policy, not a password
+    // or container error.
     let bytes = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
     let resources = ResourcePolicy {
         max_key_candidates: 1,
@@ -179,7 +183,7 @@ fn pkcs12_content_count_denial_is_not_a_password_error() {
     let result = KeyInventory::default().add_pkcs12_with_password_callback(
         "limited".into(),
         bytes,
-        || panic!("container limit must be checked first"),
+        || Some(Zeroizing::new("secret".to_owned())),
         KeyUsages::SIGN,
         &resources,
     );
