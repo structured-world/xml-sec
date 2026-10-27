@@ -582,7 +582,7 @@ fn kem_pkcs12_auto_usage_is_decrypt_only() {
         .to_pkcs8_der(crate::provider::MlKemPrivateKeyEncoding::Seed)
         .expect("seed PKCS#8 export");
     let contents = || pkcs12_import::Contents {
-        private_keys: vec![Zeroizing::new(der.as_bytes().to_vec())],
+        private_key: Some(Zeroizing::new(der.as_bytes().to_vec())),
         certificates: Vec::new(),
     };
     let resources = ResourcePolicy::default();

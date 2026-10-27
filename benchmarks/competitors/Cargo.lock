@@ -2464,6 +2464,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "structured-cms"
+version = "0.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45dc43a1e584981527f1cb2146a12c8bb30cf3f6e344b4e7b4e8d65e46059bcd"
+dependencies = [
+ "structured-asn1",
+ "structured-pkix",
+ "zeroize",
+]
+
+[[package]]
 name = "structured-email-address"
 version = "0.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2950,6 +2961,7 @@ dependencies = [
  "snafu",
  "sponge-cursor",
  "structured-asn1",
+ "structured-cms",
  "structured-pkix",
  "subtle",
  "thiserror",

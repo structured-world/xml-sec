@@ -206,10 +206,17 @@ The CLI applies the same pre-decryption KDF limits to explicit protected PKCS#8
 PEM/DER keys, including the generic private-key options, as to inventory imports.
 When the PKCS#12 parser rejects an oversized salt, that distinct resource
 rejection also returns a typed policy error.
-The importer uses RustCrypto primitives with borrowed BER views; it supports
+The importer reads the container with the shared `structured-cms` PKCS#12
+reader, which authenticates the whole AuthenticatedSafe before any bag is
+extracted; RustCrypto supplies the MAC, KDF and cipher primitives. Reading work
+counts against `ResourcePolicy::max_x509_work`, the budget of the shared ASN.1
+readers, and its buffers against the aggregate live-byte limit. It supports
 PBES2/PBKDF2 with AES-CBC and legacy SHA-1/3DES containers, plus SHA-1/SHA-2 MACs.
-Unsupported digest, PRF, KDF, and cipher algorithms return a selection error,
-not a protected-container error; RC2 containers are not supported.
+Unsupported digest, PRF, KDF, and cipher algorithms, PBMAC1, public-key
+integrity, enveloped privacy and CRL, secret or SDSI bags return a selection
+error, not a protected-container error; RC2 containers are not supported.
+A BER PrivateKeyInfo is stored as DER by rewriting its framing only; algorithm
+parameters that are not already DER are refused rather than re-encoded.
 Private keys and decrypted temporary buffers are zeroized. Nested safe bags
 share the same candidate and KDF budgets with ContentInfo records; a count
 denial is not a password error. Lax CLI verification also shares one inspection

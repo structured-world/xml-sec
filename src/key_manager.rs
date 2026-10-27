@@ -2102,10 +2102,7 @@ impl KeyInventory {
         F: FnOnce() -> Option<Zeroizing<String>>,
     {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
-        let prepared = pkcs12_import::prepare_with_work(bytes, &limits, self.kdf_work)?;
-        let secret = password().ok_or(KeyStoreError::ProtectedContainer)?;
-        let contents =
-            prepared.decrypt_with_work(&secret, secret.capacity(), &mut self.kdf_work)?;
+        let contents = pkcs12_import::import(bytes, &limits, &mut self.kdf_work, password)?;
         self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, false)
     }
 
@@ -2135,8 +2132,8 @@ impl KeyInventory {
         auto_decrypt: bool,
     ) -> Result<(), KeyStoreError> {
         let limits = self.pkcs12_import_limits(&name, bytes, usages, resources)?;
-        let contents = pkcs12_import::prepare_with_work(bytes, &limits, self.kdf_work)?
-            .decrypt_with_work(password, password.len(), &mut self.kdf_work)?;
+        let contents =
+            pkcs12_import::import(bytes, &limits, &mut self.kdf_work, || Some(password))?;
         self.add_pkcs12_contents(name, bytes.len(), contents, usages, resources, auto_decrypt)
     }
 
@@ -2144,20 +2141,15 @@ impl KeyInventory {
         &mut self,
         name: String,
         encoded_len: usize,
-        mut contents: pkcs12_import::Contents,
+        contents: pkcs12_import::Contents,
         mut usages: KeyUsages,
         resources: &ResourcePolicy,
         auto_decrypt: bool,
     ) -> Result<(), KeyStoreError> {
-        if contents.private_keys.len() != 1 {
-            return Err(KeyStoreError::Selection(
-                "PKCS#12 bundle must contain exactly one private key",
-            ));
-        }
-        let private_key = contents
-            .private_keys
-            .pop()
-            .ok_or(KeyStoreError::ProtectedContainer)?;
+        // The importer refuses a second key; a key-less bundle is refused here.
+        let private_key = contents.private_key.ok_or(KeyStoreError::Selection(
+            "PKCS#12 bundle must contain exactly one private key",
+        ))?;
         let mut certificates = contents.certificates;
         let identity = PrivateKeyIdentity::decode(private_key.as_ref())?;
         if auto_decrypt {

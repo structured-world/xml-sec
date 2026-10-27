@@ -345,6 +345,8 @@ pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], opti
 # X.509 certificates
 structured-asn1 = { version = "0.15.2", default-features = false, features = ["alloc"], optional = true }
 structured-pkix = { version = "0.15.2", default-features = false, features = ["alloc"], optional = true }
+# PKCS#12 container framing; this crate keeps the password, KDF and cipher work.
+structured-cms = { version = "0.15.2", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", features = ["pem"], optional = true }
@@ -437,6 +439,7 @@ xmldsig-sign = [
     "xmldsig",
     "dep:getrandom",
     "dep:pkcs12",
+    "dep:structured-cms",
     "dep:pbkdf2",
     "dep:aes",
     "dep:cbc",

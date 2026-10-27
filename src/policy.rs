@@ -546,6 +546,7 @@ pub struct ResourcePolicy {
     pub max_key_candidates: usize,
     /// Maximum cumulative work charged by the shared certificate mechanism
     /// in a processing session, across its candidates and nested decodes.
+    /// A PKCS#12 import charges its shared container reading here too.
     pub max_x509_work: usize,
     /// Maximum live allocation capacity retained by the shared certificate
     /// mechanism, including path search, Name processing and CRL evaluation.
