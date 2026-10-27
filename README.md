@@ -63,12 +63,18 @@ xmlsec1 version
 ```
 
 Applications can build only the capabilities they need. `xmldsig` verifies;
-`xmldsig-sign` adds signing and private-key import:
+`xmldsig-sign` adds signing and private-key import. Choose one of the two
+declarations.
+
+Verification only, with no private-key import, password derivation or randomness source:
 
 ```toml
-# Verification only: no private-key import, password derivation or randomness source.
 xml-sec = { version = "0.2", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
-# Verification and signing.
+```
+
+Verification and signing:
+
+```toml
 xml-sec = { version = "0.2", default-features = false, features = ["xmldsig-sign", "c14n", "xml-backend-xmloxide"] }
 ```
 

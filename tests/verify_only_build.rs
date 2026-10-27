@@ -51,6 +51,24 @@ fn the_bundled_provider_compiles_no_entropy_source() {
     );
 }
 
+#[cfg(feature = "experimental-pq")]
+#[test]
+fn the_bundled_provider_decapsulates_but_does_not_encapsulate() {
+    // ML-KEM encapsulation draws its message from the provider CSPRNG
+    // (FIPS 203 section 7.2), which this build does not compile; decapsulation
+    // is deterministic and stays available.
+    use xml_sec::provider::KeyEncapsulationAlgorithm;
+    let provider = default_provider();
+    for algorithm in [
+        KeyEncapsulationAlgorithm::MlKem512,
+        KeyEncapsulationAlgorithm::MlKem768,
+        KeyEncapsulationAlgorithm::MlKem1024,
+    ] {
+        assert!(!provider.supports(ProviderCapability::Encapsulate(algorithm)));
+        assert!(provider.supports(ProviderCapability::Decapsulate(algorithm)));
+    }
+}
+
 #[test]
 fn the_bundled_provider_imports_no_signing_key() {
     // A well-formed PKCS#8 key is still refused: private-key import is not compiled.

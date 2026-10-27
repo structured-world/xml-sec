@@ -185,7 +185,7 @@ mod tests {
         let algorithm = KeyEncapsulationAlgorithm::MlKem768;
         assert_eq!(
             RustCryptoProvider.supports(ProviderCapability::Encapsulate(algorithm)),
-            cfg!(feature = "experimental-pq")
+            cfg!(all(feature = "experimental-pq", feature = "xmldsig-sign"))
         );
         assert_eq!(
             RustCryptoProvider.supports(ProviderCapability::Decapsulate(algorithm)),
@@ -198,17 +198,20 @@ mod tests {
         let decapsulation = RustCryptoProvider
             .decapsulate_key(&key, &vec![0; algorithm.ciphertext_len()])
             .expect_err("foreign key");
-        if cfg!(feature = "experimental-pq") {
+        if cfg!(all(feature = "experimental-pq", feature = "xmldsig-sign")) {
             assert_eq!(
                 encapsulation,
                 ProviderError::External(ExternalProviderError::Binding)
             );
+        } else {
+            assert!(matches!(encapsulation, ProviderError::Unsupported { .. }));
+        }
+        if cfg!(feature = "experimental-pq") {
             assert_eq!(
                 decapsulation,
                 ProviderError::External(ExternalProviderError::Binding)
             );
         } else {
-            assert!(matches!(encapsulation, ProviderError::Unsupported { .. }));
             assert!(matches!(decapsulation, ProviderError::Unsupported { .. }));
         }
     }

@@ -1940,10 +1940,15 @@ impl CryptoProvider for RustCryptoProvider {
 
     fn supports(&self, capability: ProviderCapability<'_>) -> bool {
         match capability {
+            // FIPS 203 section 7.2: encapsulation draws its message from the
+            // provider CSPRNG, which only `xmldsig-sign` compiles; decapsulation
+            // is deterministic.
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Encapsulate(_) | ProviderCapability::Decapsulate(_) => {
-                cfg!(feature = "experimental-pq")
+            ProviderCapability::Encapsulate(_) => {
+                cfg!(all(feature = "experimental-pq", feature = "xmldsig-sign"))
             }
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::Decapsulate(_) => cfg!(feature = "experimental-pq"),
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Digest(_) => true,
             #[cfg(feature = "xmldsig")]
