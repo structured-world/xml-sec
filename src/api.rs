@@ -6,15 +6,20 @@
 //! the feature-gated `xmlenc` module.
 #![doc = include_str!("../docs/rust-api.md")]
 
+#[cfg(feature = "xmldsig-sign")]
 use crate::key_manager::KeyInventory;
 use crate::policy::CompiledPolicies;
 use crate::provider::CryptoProvider;
+#[cfg(feature = "xmldsig-sign")]
 use crate::xmldsig::{
-    KeyInfoWriter, KeyResolver, SignContext, SignatureAlgorithm, SignatureBuilder,
-    SignatureTemplateSelection, SigningKey, VerificationRequest, VerifyContext, VerifyEvidence,
-    VerifyResult, VerifyingKey,
+    KeyInfoWriter, SignContext, SignatureAlgorithm, SignatureBuilder, SignatureTemplateSelection,
+    SigningKey,
+};
+use crate::xmldsig::{
+    KeyResolver, VerificationRequest, VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
 };
 use crate::{IdAttributeRegistration, XmlBackend, XmlDocument, XmlSecError};
+#[cfg(feature = "xmldsig-sign")]
 use std::collections::HashMap;
 
 /// The operation whose immutable policy governs document preparation.
@@ -24,6 +29,7 @@ pub enum Operation {
     /// `XMLDSig` verification.
     Verify,
     /// `XMLDSig` signature generation.
+    #[cfg(feature = "xmldsig-sign")]
     Sign,
     /// XML Encryption generation.
     #[cfg(feature = "xmlenc")]
@@ -93,6 +99,7 @@ impl<'a> XmlSecurity<'a> {
                 self.policies.verification().ok_or(missing)?,
                 self.backend,
             )?,
+            #[cfg(feature = "xmldsig-sign")]
             Operation::Sign => XmlDocument::parse_with_policy_and_backend(
                 xml,
                 self.policies.signing().ok_or(missing)?,
@@ -134,6 +141,7 @@ impl<'a> XmlSecurity<'a> {
     ///
     /// # Errors
     /// Returns `OperationDisabled` when the compiled snapshot disables signing.
+    #[cfg(feature = "xmldsig-sign")]
     pub fn signer<'s>(&self, key: &'s dyn SigningKey) -> Result<Signer<'s>, XmlSecError>
     where
         'a: 's,
@@ -155,6 +163,7 @@ impl<'a> XmlSecurity<'a> {
     /// # Errors
     /// Returns `OperationDisabled`, or inventory selection, key import and
     /// signing-policy failures without selecting another provider.
+    #[cfg(feature = "xmldsig-sign")]
     pub fn signing_key(
         &self,
         inventory: &KeyInventory,
@@ -290,10 +299,12 @@ impl<'a> Verifier<'a> {
 }
 
 /// Signing request binding over the existing operation-plan/mutation pipeline.
+#[cfg(feature = "xmldsig-sign")]
 pub struct Signer<'a> {
     context: SignContext<'a>,
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<'a> Signer<'a> {
     /// Fill a template's `KeyInfo` placeholder through its existing writer.
     /// Builder-based calls must request that placeholder with `key_info(true)`.

@@ -1,5 +1,5 @@
 //! Public facade contracts: real crypto, policy boundaries and document provenance.
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{

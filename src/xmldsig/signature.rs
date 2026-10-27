@@ -356,16 +356,33 @@ pub fn verify_ecdsa_signature_pem_with_encoding(
 }
 
 fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerificationError> {
-    let (rest, pem) = x509_parser::pem::parse_x509_pem(public_key_pem.as_bytes())
-        .map_err(|_| SignatureVerificationError::InvalidKeyPem)?;
-    if !rest.iter().all(u8::is_ascii_whitespace) {
-        return Err(SignatureVerificationError::InvalidKeyPem);
+    let mut block =
+        PemBlock::decode(public_key_pem).ok_or(SignatureVerificationError::InvalidKeyPem)?;
+    if block.label != "PUBLIC KEY" {
+        return Err(SignatureVerificationError::InvalidKeyFormat { label: block.label });
     }
-    if pem.label != "PUBLIC KEY" {
-        return Err(SignatureVerificationError::InvalidKeyFormat { label: pem.label });
-    }
+    // Public material needs no wiping; take the buffer instead of copying it.
+    Ok(std::mem::take(&mut *block.contents))
+}
 
-    Ok(pem.contents)
+/// One decoded PEM block of caller-supplied key or certificate text.
+pub(crate) struct PemBlock {
+    /// Type label of the pre-encapsulation boundary.
+    pub(crate) label: String,
+    /// Decoded contents; private keys pass through here, so they are wiped on drop.
+    pub(crate) contents: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl PemBlock {
+    /// Decodes exactly one block under RFC 7468 section 2: explanatory text may
+    /// precede it, only whitespace may follow, and both boundaries carry the same label.
+    pub(crate) fn decode(text: &str) -> Option<Self> {
+        let mut decoder = der::pem::Decoder::new_detect_wrap(text.trim_end().as_bytes()).ok()?;
+        let label = decoder.type_label().to_owned();
+        let mut contents = zeroize::Zeroizing::new(Vec::with_capacity(decoder.remaining_len()));
+        decoder.decode_to_end(&mut contents).ok()?;
+        Some(Self { label, contents })
+    }
 }
 
 /// Verify an RSA `XMLDSig` signature using DER-encoded SPKI public key bytes.
@@ -551,6 +568,7 @@ pub(crate) fn validate_dsa_signature_spki_with_minimum(
     .map_err(SignatureVerificationError::KeyPolicy)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 #[derive(der::Sequence)]
 pub(crate) struct BorrowedDsaPublicParameters<'a> {
     pub(crate) p: der::asn1::UintRef<'a>,
@@ -969,6 +987,7 @@ enum EcdsaSignatureEncoding {
     Asn1Der,
 }
 
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn encode_ecdsa_signature_as_der(signature: &[u8]) -> Option<Vec<u8>> {
     if signature.is_empty() || !signature.len().is_multiple_of(2) {
         return None;
@@ -985,6 +1004,7 @@ pub(crate) fn encode_ecdsa_signature_as_der(signature: &[u8]) -> Option<Vec<u8>>
     Some(encoded)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn maximum_ecdsa_der_signature_len(raw_signature_len: usize) -> Option<usize> {
     if raw_signature_len == 0 || !raw_signature_len.is_multiple_of(2) {
         return None;
@@ -1000,6 +1020,7 @@ pub(crate) fn maximum_ecdsa_der_signature_len(raw_signature_len: usize) -> Optio
         .checked_add(sequence_content_len)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn encode_der_integer(component: &[u8], output: &mut Vec<u8>) {
     let first_nonzero = component
         .iter()
@@ -1015,6 +1036,7 @@ fn encode_der_integer(component: &[u8], output: &mut Vec<u8>) {
     output.extend_from_slice(magnitude);
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn encode_der_length(len: usize, output: &mut Vec<u8>) {
     if len < 128 {
         output.push(u8::try_from(len).expect("short DER lengths fit one octet"));
@@ -1033,6 +1055,7 @@ fn encode_der_length(len: usize, output: &mut Vec<u8>) {
     output.extend_from_slice(encoded);
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn der_length_octets(len: usize) -> Option<usize> {
     if len < 128 {
         return Some(1);
@@ -1284,6 +1307,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn fixed_width_ecdsa_is_encoded_as_canonical_der() {
         // Leading zeroes are stripped, while a high-bit magnitude receives the
@@ -1308,6 +1332,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn maximum_der_length_covers_supported_curve_widths() {
         // Signing preflight must reserve the worst-case canonical DER framing

@@ -14,14 +14,15 @@ case "$profile" in
     dom-roxmltree) features=xml-backend-roxmltree ;;
     c14n-xmloxide) features=c14n,xml-backend-xmloxide ;;
     c14n-roxmltree) features=c14n,xml-backend-roxmltree ;;
-    dsig-xmloxide) features=xmldsig,xml-backend-xmloxide ;;
-    dsig-roxmltree) features=xmldsig,xml-backend-roxmltree ;;
+    dsig-xmloxide) features=xmldsig,xml-backend-xmloxide; tests+=(--test verify_only_build) ;;
+    dsig-roxmltree) features=xmldsig,xml-backend-roxmltree; tests+=(--test verify_only_build) ;;
+    dsig-sign-xmloxide) features=xmldsig-sign,xml-backend-xmloxide ;;
     xmlenc-xmloxide) features=xmlenc,xml-backend-xmloxide ;;
     xmlenc-roxmltree) features=xmlenc,xml-backend-roxmltree ;;
     xslt) features=xslt,xml-backend-xmloxide ;;
-    legacy) features=xmldsig,legacy-algorithms,xml-backend-xmloxide ;;
-    experimental) features=experimental-pq,xml-backend-xmloxide ;;
-    fips-dsig) features=aws-lc-fips,xml-backend-xmloxide; tests+=(--test aws_lc_provider) ;;
+    legacy) features=xmldsig-sign,legacy-algorithms,xml-backend-xmloxide ;;
+    experimental) features=experimental-pq,xmldsig-sign,xml-backend-xmloxide ;;
+    fips-dsig) features=aws-lc-fips,xmldsig-sign,xml-backend-xmloxide; tests+=(--test aws_lc_provider) ;;
     pkcs11) features=pkcs11,xml-backend-xmloxide ;;
     no-backend)
         diagnostic=$(mktemp "${TMPDIR:-/tmp}/xml-sec-no-backend.XXXXXXXX")
@@ -40,11 +41,23 @@ if [[ -n "$features" ]]; then
     args+=(--no-default-features --features "$features")
 fi
 case "$profile" in
-    default|dom-*|c14n-*) ;;
+    # The facade test signs; verification-only profiles run their own target.
+    default|dom-*|c14n-*|dsig-xmloxide|dsig-roxmltree) ;;
     *) tests+=(--test rust_api) ;;
 esac
 if [[ "$profile" == pkcs11 && ( "$phase" == all || "$phase" == test ) ]]; then
     : "${PKCS11_MODULE:?pass an explicit disposable-test SoftHSM module via PKCS11_MODULE}"
+fi
+if [[ ( "$profile" == dsig-xmloxide || "$profile" == dsig-roxmltree ) && ( "$phase" == all || "$phase" == lint ) ]]; then
+    # Verification alone must not compile signing, private-key import,
+    # password derivation, an OS randomness source or a second certificate reader.
+    graph=$(cargo tree "${args[@]}" -e normal --prefix none --format '{p}')
+    for crate in pkcs12 pkcs5 pbkdf2 scrypt cms x509-cert x509-parser getrandom; do
+        if grep -q "^$crate v" <<<"$graph"; then
+            echo "verification-only graph contains $crate" >&2
+            exit 1
+        fi
+    done
 fi
 if [[ "$phase" == all || "$phase" == lint ]]; then
     # clippy before 1.94 reports the libtest descriptor array of a large test

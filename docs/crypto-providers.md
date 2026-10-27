@@ -153,7 +153,9 @@ With `experimental-pq`, RustCrypto provides ML-KEM-512/768/1024 through
 `CryptoProvider::{import_encapsulation_key, import_decapsulation_key,
 encapsulate_key, decapsulate_key}` and opaque recipient handles. Generation and
 encapsulation use the selected provider's CSPRNG; unavailable providers never
-fall back to RustCrypto. AWS-LC FIPS and PKCS#11 do not advertise these KEM paths.
+fall back to RustCrypto. The bundled provider compiles that CSPRNG only with
+`xmldsig-sign`, so without it RustCrypto advertises decapsulation but not
+encapsulation. AWS-LC FIPS and PKCS#11 do not advertise these KEM paths.
 Private keys and shared secrets use zeroizing storage and redacted diagnostics.
 
 `RustCryptoMlKemPrivateKey` imports all [RFC 9935 section 6](https://www.rfc-editor.org/rfc/rfc9935.html#section-6)

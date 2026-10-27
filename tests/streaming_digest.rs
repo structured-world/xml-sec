@@ -1,4 +1,4 @@
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 //! Incremental digests at the provider boundary and in Reference processing.
 
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};

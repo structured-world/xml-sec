@@ -253,6 +253,7 @@ impl XsltStylesheet {
     }
 
     /// The length of [`Self::markup`], without materializing it.
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn markup_len(&self) -> usize {
         match &self.parsed {
             Some(parsed) => parsed.document.len() + parsed.inherited.len(),

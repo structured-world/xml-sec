@@ -2,34 +2,44 @@
 
 use std::collections::HashSet;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xmldsig-sign"))]
 use crate::xmldsig::DsaSigningKey;
-#[cfg(test)]
+#[cfg(all(test, feature = "xmldsig-sign"))]
 use base64::Engine as _;
+#[cfg(feature = "xmldsig-sign")]
 use crypto_bigint::{
     BoxedUint,
     modular::{BoxedMontyForm, BoxedMontyParams},
 };
 use der::Decode as _;
+#[cfg(feature = "xmldsig-sign")]
 use dsa::{
     Components as DsaComponents, SigningKey as NativeDsaSigningKey,
     VerifyingKey as DsaVerifyingKey, pkcs8::EncodePrivateKey as _,
 };
+// Private-key and protected-container import compile only with signing.
+#[cfg(feature = "xmldsig-sign")]
 mod pkcs12_import;
+#[cfg(feature = "xmldsig-sign")]
 use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
+#[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey as _, EncryptedPrivateKeyInfoRef, PrivateKeyInfoRef};
+#[cfg(feature = "xmldsig-sign")]
 use pkcs12_import::Limits as Pkcs12Limits;
+#[cfg(feature = "xmldsig-sign")]
 use rsa::RsaPrivateKey;
 #[cfg(feature = "xmlenc")]
 use rsa::RsaPublicKey;
-#[cfg(test)]
+#[cfg(all(test, feature = "xmldsig-sign"))]
 use x509_parser::prelude::FromDer as _;
-#[cfg(test)]
+#[cfg(all(test, feature = "xmldsig-sign"))]
 use x509_parser::prelude::X509Certificate;
 use zeroize::Zeroizing;
 
 #[cfg(feature = "xmlenc")]
 use crate::xmldsig::parse::X509PublicKeyInfo;
+#[cfg(feature = "xmldsig-sign")]
+use crate::xmldsig::{HmacSigningKey, SigningKey, validate_signing_key};
 use crate::{
     XmlBackend, XmlDomNode as Node,
     document::{
@@ -39,9 +49,8 @@ use crate::{
     xmldsig::keys::InspectedKeyCandidateBudget,
     xmldsig::parse::XMLDSIG11_NS,
     xmldsig::{
-        DefaultKeyResolver, DsigError, HmacSigningKey, HmacVerificationKey, KeyInfo, KeyInfoSource,
-        KeyResolver, KeyResolverConfig, KeyValueInfo, SignatureAlgorithm, SigningKey, VerifyingKey,
-        X509DataInfo, validate_signing_key,
+        DefaultKeyResolver, DsigError, HmacVerificationKey, KeyInfo, KeyInfoSource, KeyResolver,
+        KeyResolverConfig, KeyValueInfo, SignatureAlgorithm, VerifyingKey, X509DataInfo,
     },
 };
 
@@ -210,6 +219,7 @@ pub struct KeyInventory {
     /// Supported public keys.
     public_keys: Vec<StoredPublicKey>,
     /// Private PKCS#8 keys imported from caller-owned byte sources.
+    #[cfg(feature = "xmldsig-sign")]
     private_keys: Vec<StoredPrivateKey>,
     /// Untrusted certificates available for key lookup or path construction.
     lookup_certificates: Vec<Vec<u8>>,
@@ -218,6 +228,8 @@ pub struct KeyInventory {
     /// Caller-supplied DER certificate revocation lists.
     crls: Vec<Vec<u8>>,
     material_bytes: usize,
+    /// Password-derivation work reserved by protected-container imports.
+    #[cfg(feature = "xmldsig-sign")]
     kdf_work: usize,
 }
 
@@ -306,6 +318,7 @@ impl<'a, P: crate::document::XmlDocumentPolicy> XmlKeyStoreImporter<'a, P> {
 }
 
 /// Candidate inspections shared by named signing lookups in one operation.
+#[cfg(feature = "xmldsig-sign")]
 #[derive(Default)]
 pub struct SigningLookupBudget {
     inspected: usize,
@@ -358,6 +371,7 @@ impl KeyUsages {
 }
 
 /// Private key encoded as provider-neutral PKCS#8 DER.
+#[cfg(feature = "xmldsig-sign")]
 pub struct StoredPrivateKey {
     /// Opaque caller-assigned name.
     pub name: String,
@@ -370,6 +384,7 @@ pub struct StoredPrivateKey {
     has_matching_leaf: bool,
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl StoredPrivateKey {
     /// Import an explicitly selected recipient into the operation's crypto engine.
     ///
@@ -888,11 +903,14 @@ enum ParsedMaterial {
     Symmetric(SymmetricKeyKind, Zeroizing<Vec<u8>>),
     Public(KeyValueInfo),
     PublicDer(Vec<u8>),
-    Dsa(KeyValueInfo, Option<Zeroizing<Vec<u8>>>),
+    Dsa {
+        public: KeyValueInfo,
+        /// PKCS#8 form of the store's `X`; a verification-only build keeps none.
+        #[cfg(feature = "xmldsig-sign")]
+        private: Option<Zeroizing<Vec<u8>>>,
+    },
     Unsupported,
 }
-
-type ParsedDsaKey = (KeyValueInfo, Option<Zeroizing<Vec<u8>>>);
 
 #[cfg(feature = "xmlenc")]
 struct InventoryDirectSymmetric {
@@ -978,6 +996,7 @@ impl KeyInventory {
     /// Work reserved before password derivation, including unsuccessful imports.
     /// An operation importing through temporary inventories must carry this
     /// usage forward rather than resetting its remaining KDF allowance.
+    #[cfg(feature = "xmldsig-sign")]
     #[must_use]
     pub fn key_import_kdf_work(&self) -> usize {
         self.kdf_work
@@ -995,6 +1014,7 @@ impl KeyInventory {
             add(key.name.len())?;
             add(key.bytes.len())?;
         }
+        #[cfg(feature = "xmldsig-sign")]
         for key in &self.private_keys {
             add(key.name.len())?;
             add(key.pkcs8_der.len())?;
@@ -1061,9 +1081,19 @@ impl KeyInventory {
     }
 
     /// Imported private keys, without mutable access to inventory bounds.
+    #[cfg(feature = "xmldsig-sign")]
     #[must_use]
     pub fn private_keys(&self) -> &[StoredPrivateKey] {
         &self.private_keys
+    }
+
+    fn has_key_name(&self, name: &str) -> bool {
+        #[cfg(feature = "xmldsig-sign")]
+        if self.private_keys.iter().any(|key| key.name == name) {
+            return true;
+        }
+        self.symmetric_keys.iter().any(|key| key.name == name)
+            || self.public_keys.iter().any(|key| key.name == name)
     }
 
     /// Combine two caller-owned imports after checking aggregate bytes,
@@ -1078,6 +1108,7 @@ impl KeyInventory {
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
+        #[cfg(feature = "xmldsig-sign")]
         let work = self
             .kdf_work
             .checked_add(other.kdf_work)
@@ -1114,23 +1145,23 @@ impl KeyInventory {
             .iter()
             .map(|entry| entry.name.as_str())
             .chain(other.public_keys.iter().map(|entry| entry.name.as_str()))
-            .chain(other.private_keys.iter().map(|entry| entry.name.as_str()))
         {
             names.insert(name);
         }
-        if names.iter().any(|name| {
-            self.symmetric_keys.iter().any(|entry| entry.name == *name)
-                || self.public_keys.iter().any(|entry| entry.name == *name)
-                || self.private_keys.iter().any(|entry| entry.name == *name)
-        }) {
+        #[cfg(feature = "xmldsig-sign")]
+        names.extend(other.private_keys.iter().map(|entry| entry.name.as_str()));
+        if names.iter().any(|name| self.has_key_name(name)) {
             return Err(KeyStoreError::Selection("duplicate key name"));
         }
         self.entry_count = candidates;
         self.material_bytes = bytes;
-        self.kdf_work = work;
         self.symmetric_keys.append(&mut other.symmetric_keys);
         self.public_keys.append(&mut other.public_keys);
-        self.private_keys.append(&mut other.private_keys);
+        #[cfg(feature = "xmldsig-sign")]
+        {
+            self.kdf_work = work;
+            self.private_keys.append(&mut other.private_keys);
+        }
         self.lookup_certificates
             .append(&mut other.lookup_certificates);
         self.trusted_certificates
@@ -1168,6 +1199,7 @@ impl KeyInventory {
     /// # Errors
     /// Returns policy/resource refusal, a missing or unauthorized key,
     /// incompatible method/key material or default-provider import failure.
+    #[cfg(feature = "xmldsig-sign")]
     pub fn signing_key(
         &self,
         name: &str,
@@ -1182,6 +1214,7 @@ impl KeyInventory {
     /// # Errors
     /// Returns policy or cumulative lookup/material budget refusal, missing
     /// authorization, incompatible key/method metadata or provider import failure.
+    #[cfg(feature = "xmldsig-sign")]
     pub fn signing_key_with_budget(
         &self,
         name: &str,
@@ -1203,6 +1236,7 @@ impl KeyInventory {
     /// # Errors
     /// Returns policy/resource refusal, an unavailable provider capability,
     /// a missing/unauthorized key or incompatible provider key material.
+    #[cfg(feature = "xmldsig-sign")]
     pub fn signing_key_with_provider(
         &self,
         name: &str,
@@ -1224,6 +1258,7 @@ impl KeyInventory {
     /// # Errors
     /// Returns policy, capability or cumulative budget refusal, missing key
     /// authorization, invalid key metadata or selected-provider import failure.
+    #[cfg(feature = "xmldsig-sign")]
     pub fn signing_key_with_provider_and_budget(
         &self,
         name: &str,
@@ -1728,7 +1763,11 @@ impl KeyInventory {
         self.material_bytes = charged_total;
         Ok(())
     }
+}
 
+/// Private-key and protected-container import.
+#[cfg(feature = "xmldsig-sign")]
+impl KeyInventory {
     /// Import a DER private key as PKCS#8 (plain or encrypted) or RSA PKCS#1.
     /// Passwords are consulted only for a structurally encrypted container;
     /// a wrong password never retries a plaintext decoder.
@@ -2226,7 +2265,9 @@ impl KeyInventory {
             memory_available: resources.max_external_resource_total_bytes - retained_with_input,
         })
     }
+}
 
+impl KeyInventory {
     fn check_new_name(&self, name: &str, resources: &ResourcePolicy) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
         if name.is_empty() {
@@ -2245,15 +2286,13 @@ impl KeyInventory {
             ));
         }
         self.check_material_capacity(name.len(), resources)?;
-        if self.symmetric_keys.iter().any(|key| key.name == name)
-            || self.public_keys.iter().any(|key| key.name == name)
-            || self.private_keys.iter().any(|key| key.name == name)
-        {
+        if self.has_key_name(name) {
             return Err(KeyStoreError::Selection("duplicate key name"));
         }
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     fn remaining_kdf_resources(
         &self,
         resources: &ResourcePolicy,
@@ -2423,8 +2462,7 @@ impl KeyInventory {
                 value = Some(if let Some(kind) = material {
                     ParsedMaterial::Symmetric(kind, decode_xml_base64_secret(key)?)
                 } else if key.has_tag_name((XMLDSIG_NS, "DSAKeyValue")) {
-                    let (public, private) = parse_xmlsec_dsa_key_value(key, material_budget)?;
-                    ParsedMaterial::Dsa(public, private)
+                    parse_xmlsec_dsa_key_value(key, material_budget)?
                 } else if key.has_tag_name((XMLDSIG_NS, "RSAKeyValue"))
                     // XMLDSig 1.1 section 4.5.2.3 places ECKeyValue in dsig11:
                     // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-ECKeyValue
@@ -2530,19 +2568,13 @@ impl KeyInventory {
                     usages,
                 });
             }
-            ParsedMaterial::Dsa(public, private) => {
-                // This inventory has no external DSA parameter inheritance;
-                // its stored public tuple must be independently resolvable.
-                crate::xmldsig::keys::supported_key_value_is_rsa(session, &public).map_err(
-                    |error| {
-                        key_import_error(error, || {
-                            KeyStoreError::Invalid("invalid public DSAKeyValue".into())
-                        })
-                    },
-                )?;
-                let mut key_info = KeyInfo::default();
-                key_info.sources.push(KeyInfoSource::KeyName(name.clone()));
-                key_info.sources.push(KeyInfoSource::KeyValue(public));
+            ParsedMaterial::Dsa {
+                public,
+                #[cfg(feature = "xmldsig-sign")]
+                private,
+            } => {
+                let key_info = dsa_store_key_info(&name, public, session)?;
+                #[cfg(feature = "xmldsig-sign")]
                 if let Some(pkcs8_der) = private {
                     self.private_keys.push(StoredPrivateKey {
                         name: name.clone(),
@@ -2665,6 +2697,27 @@ fn key_import_error(
     }
 }
 
+/// The named `KeyInfo` of a store's public DSA tuple, once it resolves alone.
+fn dsa_store_key_info(
+    name: &str,
+    public: KeyValueInfo,
+    session: &crate::xmldsig::pkix::CertificateSession,
+) -> Result<KeyInfo, KeyStoreError> {
+    // This inventory has no external DSA parameter inheritance;
+    // its stored public tuple must be independently resolvable.
+    crate::xmldsig::keys::supported_key_value_is_rsa(session, &public).map_err(|error| {
+        key_import_error(error, || {
+            KeyStoreError::Invalid("invalid public DSAKeyValue".into())
+        })
+    })?;
+    let mut key_info = KeyInfo::default();
+    key_info
+        .sources
+        .push(KeyInfoSource::KeyName(name.to_owned()));
+    key_info.sources.push(KeyInfoSource::KeyValue(public));
+    Ok(key_info)
+}
+
 /// Whether DER is an SPKI naming an RFC 9935 ML-KEM parameter set. Exhausting
 /// the shared import account is an error, never a format fallback.
 #[cfg(feature = "experimental-pq")]
@@ -2691,6 +2744,7 @@ fn certificate_import_error(error: crate::xmldsig::X509ChainError) -> KeyStoreEr
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn validate_private_key_usages(usages: KeyUsages) -> Result<(), KeyStoreError> {
     let permitted = KeyUsages::SIGN.union(KeyUsages::DECRYPT);
     if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
@@ -2779,6 +2833,7 @@ fn rsa_recipient_from_components(
     .map_err(|_| KeyStoreError::Selection("invalid RSA encryption key"))
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn signing_policy_error(error: crate::xmldsig::SigningError) -> KeyStoreError {
     match error {
         crate::xmldsig::SigningError::Policy(violation) => violation.into(),
@@ -2790,6 +2845,7 @@ fn ensure_resource_policy(resources: &ResourcePolicy) -> Result<(), KeyStoreErro
     resources.validate().map_err(Into::into)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn find_named_entry<'a, T>(
     entries: &'a [T],
     name: &str,
@@ -2823,6 +2879,7 @@ fn named_material_length(
 
 // Public identity stays borrowed (RSA), native (DSA), or stack-sized (EC).
 // Import validation must not serialize an unaccounted SPKI beside live input.
+#[cfg(feature = "xmldsig-sign")]
 #[cfg_attr(
     feature = "experimental-pq",
     expect(
@@ -2860,6 +2917,7 @@ enum PrivateKeyIdentity<'a> {
     },
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<'a> PrivateKeyIdentity<'a> {
     fn automatic_usages(&self) -> KeyUsages {
         match self {
@@ -3052,6 +3110,7 @@ impl<'a> PrivateKeyIdentity<'a> {
 /// # Errors
 /// Returns malformed RSA DER or an above-ceiling modulus/component width
 /// before native bigint decoding.
+#[cfg(feature = "xmldsig-sign")]
 pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
     let key = pkcs1::RsaPrivateKeyRef::from_der(der)
         .map_err(|_| KeyStoreError::Selection("invalid RSA private key"))?;
@@ -3090,6 +3149,7 @@ pub fn preflight_rsa_pkcs1_components(der: &[u8]) -> Result<(), KeyStoreError> {
     Ok(())
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn preflight_dsa_pkcs8_components(info: &PrivateKeyInfoRef<'_>) -> Result<(), KeyStoreError> {
     crate::xmldsig::sign::preflight_dsa_private_key(info)
         .map_err(|_| KeyStoreError::Selection("invalid or oversized DSA private key"))
@@ -3221,7 +3281,7 @@ impl std::io::Read for PemBase64Reader<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "xmldsig-sign"))]
 fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreError> {
     if bytes.len() > maximum {
         return Err(import_resource_limit(
@@ -3247,6 +3307,7 @@ fn single_pem_block(bytes: &[u8], maximum: usize) -> Result<pem::Pem, KeyStoreEr
     Ok(block)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn enforce_pkcs8_kdf_policy(
     encrypted: &EncryptedPrivateKeyInfoRef<'_>,
     resources: &ResourcePolicy,
@@ -3315,6 +3376,7 @@ fn enforce_pkcs8_kdf_policy(
     Ok(work)
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn enforce_pkcs8_password_policy(
     encrypted: &EncryptedPrivateKeyInfoRef<'_>,
     password: &[u8],
@@ -3371,6 +3433,7 @@ fn enforce_pkcs8_password_policy(
         })
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn enforce_scrypt_kdf_limits(
     n: u64,
     r: u64,
@@ -3420,6 +3483,7 @@ fn enforce_scrypt_kdf_limits(
     )
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn kdf_policy_violation(
     resource: &'static str,
     maximum: usize,
@@ -3584,6 +3648,7 @@ fn preflight_xml_material(
     Ok(())
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn encode_xmlsec_dsa_private(
     modulus: &[u8],
     order: &[u8],
@@ -3653,7 +3718,7 @@ fn encode_xmlsec_dsa_private(
 fn parse_xmlsec_dsa_key_value(
     node: Node<'_, '_>,
     budget: &mut XmlImportMaterialBudget,
-) -> Result<ParsedDsaKey, KeyStoreError> {
+) -> Result<ParsedMaterial, KeyStoreError> {
     let mut p = None;
     let mut q = None;
     let mut g = None;
@@ -3729,6 +3794,7 @@ fn parse_xmlsec_dsa_key_value(
         ));
     }
     let y = y.ok_or_else(|| KeyStoreError::Invalid("DSAKeyValue requires Y".into()))?;
+    #[cfg(feature = "xmldsig-sign")]
     let private = if let Some(x) = private_x {
         let (Some(p), Some(q), Some(g)) = (&p, &q, &g) else {
             return Err(KeyStoreError::Invalid(
@@ -3739,8 +3805,16 @@ fn parse_xmlsec_dsa_key_value(
     } else {
         None
     };
-    Ok((KeyValueInfo::Dsa { p, q, g, y }, private))
+    // A verification-only inventory keeps the public tuple and wipes X.
+    #[cfg(not(feature = "xmldsig-sign"))]
+    drop((private_x, budget));
+    Ok(ParsedMaterial::Dsa {
+        public: KeyValueInfo::Dsa { p, q, g, y },
+        #[cfg(feature = "xmldsig-sign")]
+        private,
+    })
 }
 
-#[cfg(test)]
+// The inventory tests import private keys and select signers.
+#[cfg(all(test, feature = "xmldsig-sign"))]
 mod tests;

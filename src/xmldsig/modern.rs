@@ -1,9 +1,13 @@
 //! RustCrypto-owned modern key handles used only behind provider dispatch.
 
-use super::{SignatureAlgorithm, SigningKey, SigningKeyError, SigningPublicKeyInfo};
+use super::SignatureAlgorithm;
+#[cfg(feature = "xmldsig-sign")]
+use super::{SigningKey, SigningKeyError, SigningPublicKeyInfo};
+#[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use sha2::digest::Update;
 
+#[cfg(feature = "xmldsig-sign")]
 #[expect(
     clippy::large_enum_variant,
     reason = "fixed-size inline private keys avoid a second secret allocation and indirection"
@@ -14,8 +18,10 @@ enum EdDsaPrivateKey {
 }
 
 /// Opaque `EdDSA` private key. Private bytes are zeroized by the primitive on drop.
+#[cfg(feature = "xmldsig-sign")]
 pub struct EdDsaSigningKey(EdDsaPrivateKey);
 
+#[cfg(feature = "xmldsig-sign")]
 impl EdDsaSigningKey {
     /// Import a strict RFC 8410 PKCS#8 key for the explicitly selected algorithm.
     ///
@@ -63,6 +69,7 @@ impl EdDsaSigningKey {
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl SigningKey for EdDsaSigningKey {
     fn sign_with_provider_context(
         &self,
@@ -338,6 +345,7 @@ fn ed25519ctx_hash(context: &super::SignatureContext) -> sha2::Sha512 {
         .chain_update(context.as_bytes())
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn sign_ed25519ctx(
     key: &ed25519_dalek::SigningKey,
     context: &super::SignatureContext,

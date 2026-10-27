@@ -31,6 +31,7 @@ use crate::c14n::xml_base::{
     XmlBaseResolutionBudget, resolve_uri_from_node_with_document_base_with_budget,
 };
 
+#[cfg(any(test, feature = "xmldsig-sign"))]
 pub(crate) use crate::hard_limits::SIGNATURE_REFERENCE_CEILING as MAX_REFERENCES_PER_SIGNATURE;
 #[cfg(test)]
 use crate::hard_limits::X509_CHAIN_DEPTH_CEILING as MAX_X509_CHAIN_DEPTH;
@@ -1585,9 +1586,11 @@ impl KeyInfoParseUsage {
 }
 
 impl<'a> KeyInfoParsingSession<'a> {
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn resources(&self) -> &crate::policy::ResourcePolicy {
         self.resources
     }
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn with_certificate_account(
         resources: &'a crate::policy::ResourcePolicy,
         certificates: &super::pkix::CertificateSession,
@@ -4092,7 +4095,7 @@ mod tests {
         let mut session = super::KeyInfoParsingSession::new(&resources).expect("resource policy");
         session
             .with_certificate_public_key(&der, |spki| {
-                assert_ne!(spki, []);
+                assert_ne!(spki, [] as [u8; 0]);
                 assert!(spki.as_ptr() >= der.as_ptr());
                 assert!(spki.as_ptr() as usize + spki.len() <= der.as_ptr() as usize + der.len());
             })

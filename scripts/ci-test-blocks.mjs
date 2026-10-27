@@ -21,7 +21,7 @@ export const blocks = {
   'stable-core': { rust: 'stable', profiles: [
     profile('stable', 'default-features', undefined, { lint: true }),
     ...['xmloxide', 'roxmltree', 'differential', 'fat-runtime'].map(backend => ordinary('stable', backend)),
-    ...['xmldsig', 'xmlenc', 'xslt'].map(minimal),
+    ...['xmldsig', 'xmldsig-sign', 'xmlenc', 'xslt'].map(minimal),
   ] },
   'msrv-core': { rust: '1.92.0', profiles: ['xmloxide', 'roxmltree'].map(backend => ordinary('1.92.0', backend)) },
   'msrv-extended': { rust: '1.92.0', profiles: [

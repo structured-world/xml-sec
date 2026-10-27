@@ -2418,6 +2418,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
+    #[cfg(feature = "xmldsig-sign")]
     use der::Decode as _;
     use pkcs8::DecodePublicKey as _;
     use rcgen::{
@@ -2644,6 +2645,7 @@ mod tests {
     }
 
     /// A DSA root and a leaf whose SPKI omits the parameters it inherits.
+    #[cfg(feature = "xmldsig-sign")]
     struct InheritedDsaPath {
         private: der::SecretDocument,
         public: der::Document,
@@ -2651,6 +2653,7 @@ mod tests {
         leaf: Vec<u8>,
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     fn inherited_dsa_path() -> Result<InheritedDsaPath, Box<dyn std::error::Error>> {
         use der::{Decode as _, Encode as _};
         use dsa::pkcs8::DecodePrivateKey as _;
@@ -2749,6 +2752,7 @@ mod tests {
     /// Receipt association consumes the same effective PKIX state. The
     /// identical original leaf has insufficient standing parameters but
     /// becomes provable after the existing authenticated DSA transition.
+    #[cfg(feature = "xmldsig-sign")]
     fn assert_inherited_dsa_receipt(
         original: &super::super::pkix::CertificateSession,
         path: &InheritedDsaPath,
@@ -2808,6 +2812,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn authenticated_dsa_target_uses_the_paths_effective_parameters()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2916,6 +2921,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn oversized_dsa_spki_parameter_is_rejected_before_bigint_decode() {
         // A bounded SPKI may still contain a parameter much larger than the

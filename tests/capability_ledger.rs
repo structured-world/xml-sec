@@ -725,26 +725,31 @@ fn legacy_algorithm_claims_are_policy_gated() {
         .expect("explicit compatibility policy must execute SHA-1 verification");
     assert_eq!(result.status, xml_sec::xmldsig::DsigStatus::Valid);
 
-    let builder = xml_sec::xmldsig::SignatureBuilder::new(
-        xml_sec::c14n::C14nAlgorithm::new(xml_sec::c14n::C14nMode::Exclusive1_0, false),
-        xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
-    )
-    .add_reference(
-        xml_sec::xmldsig::ReferenceBuilder::new(xml_sec::xmldsig::DigestAlgorithm::Sha1).uri(""),
-    );
-    assert!(builder.build_template().is_err());
-    let signing_policy = xml_sec::policy::SigningPolicy {
-        signature_algorithms: Some(std::collections::HashSet::from([
+    // Template construction exists only where signing is compiled.
+    #[cfg(feature = "xmldsig-sign")]
+    {
+        let builder = xml_sec::xmldsig::SignatureBuilder::new(
+            xml_sec::c14n::C14nAlgorithm::new(xml_sec::c14n::C14nMode::Exclusive1_0, false),
             xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
-        ])),
-        digest_algorithms: Some(std::collections::HashSet::from([
-            xml_sec::xmldsig::DigestAlgorithm::Sha1,
-        ])),
-        ..xml_sec::policy::SigningPolicy::default()
-    };
-    builder
-        .build_template_with_policy(&signing_policy)
-        .expect("explicit compatibility policy must enable SHA-1 template construction");
+        )
+        .add_reference(
+            xml_sec::xmldsig::ReferenceBuilder::new(xml_sec::xmldsig::DigestAlgorithm::Sha1)
+                .uri(""),
+        );
+        assert!(builder.build_template().is_err());
+        let signing_policy = xml_sec::policy::SigningPolicy {
+            signature_algorithms: Some(std::collections::HashSet::from([
+                xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
+            ])),
+            digest_algorithms: Some(std::collections::HashSet::from([
+                xml_sec::xmldsig::DigestAlgorithm::Sha1,
+            ])),
+            ..xml_sec::policy::SigningPolicy::default()
+        };
+        builder
+            .build_template_with_policy(&signing_policy)
+            .expect("explicit compatibility policy must enable SHA-1 template construction");
+    }
 }
 
 #[cfg(feature = "xmldsig")]

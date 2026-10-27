@@ -1,5 +1,5 @@
 //! Deterministic historical attack classes; sources and scope: docs/historical-security.md.
-#![cfg(all(feature = "xmldsig", feature = "c14n"))]
+#![cfg(all(feature = "xmldsig-sign", feature = "c14n"))]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use xml_sec::XmlDocument;

@@ -2,19 +2,23 @@
 
 use crate::rustcrypto_ml_dsa as ml_dsa;
 
-use super::{
-    PqAlgorithm, SignatureAlgorithm, SignatureContext, SignatureVerificationError, SigningKey,
-    SigningKeyError, SigningPublicKeyInfo,
-};
+use super::{PqAlgorithm, SignatureContext, SignatureVerificationError};
+#[cfg(feature = "xmldsig-sign")]
+use super::{SignatureAlgorithm, SigningKey, SigningKeyError, SigningPublicKeyInfo};
+#[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+#[cfg(feature = "xmldsig-sign")]
 use signature::Keypair;
+#[cfg(feature = "xmldsig-sign")]
 use zeroize::Zeroizing;
 
+#[cfg(feature = "xmldsig-sign")]
 enum MlPrivateKey<P: ml_dsa::MlDsaParams> {
     Seed(ml_dsa::SigningKey<P>),
     Expanded(Box<ml_dsa::ExpandedSigningKey<P>>, ml_dsa::VerifyingKey<P>),
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P: ml_dsa::MlDsaParams> MlPrivateKey<P> {
     fn expanded_key(&self) -> &ml_dsa::ExpandedSigningKey<P> {
         match self {
@@ -31,6 +35,7 @@ impl<P: ml_dsa::MlDsaParams> MlPrivateKey<P> {
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P> TryFrom<pkcs8::PrivateKeyInfoRef<'_>> for MlPrivateKey<P>
 where
     P: ml_dsa::MlDsaParams
@@ -92,6 +97,7 @@ where
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P> EncodePrivateKey for MlPrivateKey<P>
 where
     P: ml_dsa::MlDsaParams
@@ -126,10 +132,12 @@ where
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 trait PublicBytes {
     fn copy_public(&self, output: &mut [u8; 2592]) -> usize;
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P: ml_dsa::MlDsaParams> PublicBytes for MlPrivateKey<P> {
     fn copy_public(&self, output: &mut [u8; 2592]) -> usize {
         let encoded = self.verifying_key().encode();
@@ -138,6 +146,7 @@ impl<P: ml_dsa::MlDsaParams> PublicBytes for MlPrivateKey<P> {
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P: slh_dsa::ParameterSet> PublicBytes for slh_dsa::SigningKey<P> {
     fn copy_public(&self, output: &mut [u8; 2592]) -> usize {
         let encoded = self.verifying_key().to_bytes();
@@ -146,10 +155,12 @@ impl<P: slh_dsa::ParameterSet> PublicBytes for slh_dsa::SigningKey<P> {
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 trait ContextSigner {
     fn sign_context(&self, context: &[u8], message: &[u8]) -> Result<Vec<u8>, SigningKeyError>;
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P: ml_dsa::MlDsaParams> ContextSigner for MlPrivateKey<P> {
     fn sign_context(&self, context: &[u8], message: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
         // FIPS 204 section 5.2, algorithm 2: deterministic signing uses
@@ -162,6 +173,7 @@ impl<P: ml_dsa::MlDsaParams> ContextSigner for MlPrivateKey<P> {
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<P: slh_dsa::ParameterSet> ContextSigner for slh_dsa::SigningKey<P> {
     fn sign_context(&self, context: &[u8], message: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
         // FIPS 205 section 10.2, algorithm 22 permits deterministic opt_rand.
@@ -214,8 +226,10 @@ impl<P: slh_dsa::ParameterSet> ContextVerifier for slh_dsa::VerifyingKey<P> {
 
 macro_rules! parameter_sets {
     ($($variant:ident: $signing:ty => $verifying:ty),+ $(,)?) => {
+        #[cfg(feature = "xmldsig-sign")]
         enum PrivateKey { $($variant($signing)),+ }
 
+        #[cfg(feature = "xmldsig-sign")]
         impl PostQuantumSigningKey {
             /// Strict PKCS#8 import for the explicitly selected parameter set.
             ///
@@ -270,6 +284,7 @@ macro_rules! parameter_sets {
                 .ok_or(SignatureVerificationError::InvalidKeyDer)?
         }
 
+        #[cfg(feature = "xmldsig-sign")]
         impl SigningKey for PostQuantumSigningKey {
             fn sign(&self, algorithm: SignatureAlgorithm, message: &[u8]) -> Result<Vec<u8>, SigningKeyError> {
                 crate::provider::default_provider().sign(self, algorithm, message)
@@ -292,6 +307,7 @@ macro_rules! parameter_sets {
 }
 
 /// Opaque experimental PQ signing key; built-in primitives zeroize secrets on drop.
+#[cfg(feature = "xmldsig-sign")]
 pub struct PostQuantumSigningKey {
     algorithm: PqAlgorithm,
     key: PrivateKey,

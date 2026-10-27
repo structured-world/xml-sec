@@ -14,15 +14,19 @@
 //! Build an enveloped signature with a modern algorithm, then verify it with
 //! the embedded certificate. Secure defaults require SHA-224 or stronger;
 //! legacy SHA-1 methods require an explicit operation policy opt-in.
+//! Signing requires the `xmldsig-sign` feature; `xmldsig` alone verifies.
 //!
 //! ```no_run
+//! # #[cfg(feature = "xmldsig-sign")]
 //! use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+//! # #[cfg(feature = "xmldsig-sign")]
 //! use xml_sec::xmldsig::{
 //!     DefaultKeyResolver, DigestAlgorithm, ReferenceBuilder, RsaSigningKey,
 //!     SignContext, SignatureAlgorithm, SignatureBuilder, Transform, VerifyContext,
 //!     X509CertificateKeyInfoWriter,
 //! };
 //!
+//! # #[cfg(feature = "xmldsig-sign")]
 //! # fn example(private_key_pem: &str, certificate_pem: &str) -> Result<(), Box<dyn std::error::Error>> {
 //! let c14n = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
 //! let template = SignatureBuilder::new(c14n.clone(), SignatureAlgorithm::RsaSha256)
@@ -52,6 +56,7 @@
 //! ```
 #![doc = include_str!("../../docs/xmldsig.md")]
 
+#[cfg(feature = "xmldsig-sign")]
 pub mod builder;
 pub mod digest;
 pub mod extension;
@@ -60,14 +65,17 @@ pub(crate) mod modern;
 #[cfg(feature = "experimental-pq")]
 pub(crate) mod post_quantum;
 mod pq_algorithm;
-#[cfg(feature = "experimental-pq")]
+#[cfg(all(feature = "experimental-pq", feature = "xmldsig-sign"))]
 pub use post_quantum::PostQuantumSigningKey;
 pub use pq_algorithm::PqAlgorithm;
+#[cfg(feature = "xmldsig-sign")]
 pub mod mutation;
 pub mod parse;
 pub(crate) mod pkix;
+#[cfg(feature = "xmldsig-sign")]
 pub mod sign;
 pub mod signature;
+mod signing_key;
 pub mod transforms;
 pub mod trust;
 pub mod types;
@@ -77,12 +85,14 @@ pub(crate) mod whitespace;
 pub mod x509;
 mod xpath;
 
+#[cfg(feature = "xmldsig-sign")]
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
 pub use digest::{DigestAlgorithm, compute_digest, compute_digest_with_provider, constant_time_eq};
 pub use keys::{
     DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, InspectedKeyCandidateBudget,
     KeyResolutionError, KeyResolverConfig, VerificationKey,
 };
+#[cfg(feature = "xmldsig-sign")]
 pub use modern::EdDsaSigningKey;
 pub use parse::{
     KeyInfo, KeyInfoSource, KeyValueInfo, ParseError, Reference, RetrievalMethodTransforms,
@@ -91,19 +101,20 @@ pub use parse::{
     x509_certificate_matches_selectors,
 };
 pub use pkix::CertificatePathVerifier;
+#[cfg(feature = "xmldsig-sign")]
 pub use sign::{
     ComputedReferenceDigest, DerEncodedKeyValueInfoWriter, DsaSigningKey, EcdsaP256SigningKey,
     EcdsaP384SigningKey, EcdsaP521SigningKey, HmacSigningKey, KeyInfoWriteError, KeyInfoWriter,
     KeyValueInfoWriter, RsaSigningKey, SignContext, SignatureTemplateSelection, SigningDigestError,
-    SigningError, SigningKey, SigningKeyError, SigningPublicKeyInfo, X509CertificateKeyInfoWriter,
-    X509DigestKeyInfoWriter, compute_reference_digest_values, fill_reference_digest_values,
-    validate_signing_key,
+    SigningError, X509CertificateKeyInfoWriter, X509DigestKeyInfoWriter,
+    compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
 };
 pub use signature::{
     SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
     verify_ecdsa_signature_pem_with_encoding, verify_ecdsa_signature_spki,
     verify_ecdsa_signature_spki_with_encoding, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
+pub use signing_key::{SigningKey, SigningKeyError, SigningPublicKeyInfo};
 #[cfg(feature = "xslt")]
 pub use transforms::XsltStylesheet;
 pub use transforms::{

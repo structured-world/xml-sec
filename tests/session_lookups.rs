@@ -1,6 +1,6 @@
 //! Operation-bound lookups a verified session offers extension formats.
 
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use std::collections::HashSet;
 use std::sync::Arc;

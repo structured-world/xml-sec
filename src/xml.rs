@@ -223,7 +223,7 @@ impl<'a> XmlIdIndex<'a> {
 }
 
 /// Return whether a Unicode scalar is permitted by XML 1.0 Fifth Edition [2].
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn is_xml_1_0_character(character: char) -> bool {
     // Rust `char` cannot represent the surrogate range between D7FF and E000,
     // but the split keeps that exclusion explicit alongside XML's upper bound.
@@ -250,11 +250,13 @@ pub(crate) fn is_xml_ncname(value: &str) -> bool {
 mod tests {
     use crate::xml::dom::{Document, ParsingOptions};
 
+    #[cfg(feature = "xmldsig-sign")]
+    use super::is_xml_1_0_character;
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    use super::is_xml_ncname;
     use super::{IdAttributeRegistration, XmlIdIndex};
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-    use super::{is_xml_1_0_character, is_xml_ncname};
 
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn xml_1_0_character_boundaries_match_production_two() {
         // Exercise each explicit singleton/range boundary in XML 1.0 [2].
