@@ -1,5 +1,5 @@
 //! Profile compilation and real operation gates; fixtures are generated locally.
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use std::{
     collections::HashSet,

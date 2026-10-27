@@ -79,8 +79,8 @@ group alone would not have.
 
 The lint matrix in `scripts/ci-test-blocks.mjs` resolves each feature graph
 separately: the default, backend, all-feature, experimental, FIPS and XSLT
-workspace graphs, plus library-only minimal graphs for `xmldsig`, `xmlenc` and
-`xslt` on the differential backend. The alloc-only job lints the separate
+workspace graphs, plus library-only minimal graphs for `xmldsig`, `xmldsig-sign`,
+`xmlenc` and `xslt` on the differential backend. The alloc-only job lints the separate
 XML-input crate without default features. MSRV lint invocations allow
 `clippy::large_stack_arrays`, which clippy 1.92 reports without a span for the
 libtest descriptor array (rust-lang/rust-clippy#13774); stable lint keeps it.

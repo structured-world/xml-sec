@@ -1,4 +1,4 @@
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 //! RSA-PSS public pipeline, parameter grammar and independent primitive coverage.
 

@@ -84,6 +84,7 @@ pub const DEFAULT_IMPLICIT_C14N_URI: &str = "http://www.w3.org/TR/2001/REC-xml-c
 pub const MAX_TRANSFORMS_PER_REFERENCE: usize = crate::hard_limits::REFERENCE_TRANSFORM_CEILING;
 /// xmlsec1 donor vectors use this `XPath` expression as a compatibility form of
 /// enveloped-signature exclusion.
+#[cfg(feature = "xmldsig-sign")]
 pub(super) const ENVELOPED_SIGNATURE_XPATH_PREFIX: &str = "dsig";
 pub(super) const ENVELOPED_SIGNATURE_XPATH_EXPR: &str = "not(ancestor-or-self::dsig:Signature)";
 pub(super) const MAX_XPATH_EXPRESSION_BYTES: usize =
@@ -464,6 +465,7 @@ impl TransformExecutionBudget {
         self.c14n.remaining()
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn c14n_output_limit(&self) -> usize {
         self.c14n.max_bytes
     }
@@ -680,6 +682,7 @@ pub enum XPathFilterOperation {
 }
 
 impl XPathFilterOperation {
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Intersect => "intersect",
@@ -1474,12 +1477,15 @@ pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
 }
 
 /// Mutable signing fields that can affect a transform output.
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: HashSet<usize>,
 }
 
 struct TransformChainOutput<T> {
     output: T,
+    /// Signing reads which tracked template fields reached the output.
+    #[cfg(feature = "xmldsig-sign")]
     dependencies: HashSet<usize>,
 }
 
@@ -1784,7 +1790,9 @@ impl TransformTerminal<Native> for CollectTerminal {
 
 /// Dependency analysis reads which tracked nodes stay visible, which the chain
 /// settles before its terminal; the final output itself is never needed.
+#[cfg(feature = "xmldsig-sign")]
 struct DiscardTerminal;
+#[cfg(feature = "xmldsig-sign")]
 impl TransformTerminal<Native> for DiscardTerminal {
     type Output = ();
     type Error = TransformError;
@@ -2279,6 +2287,7 @@ fn canonicalize_tracked<S: TransformScratch, K: super::types::projection::Keys, 
 /// Dependency analysis deliberately shares this executor with digest
 /// computation so binary-to-node-set adaptation and later `XPath` filters cannot
 /// drift into a second, incomplete transform model.
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     signature_node: Node<'a, 'a>,
     initial_data: TransformData<'a>,
@@ -2508,6 +2517,7 @@ where
         let output = finalize.finish(data, None, context.budget)?;
         return Ok(TransformChainOutput {
             output,
+            #[cfg(feature = "xmldsig-sign")]
             dependencies: dependency_indexes(dependency_tracking),
         });
     };
@@ -2581,6 +2591,7 @@ where
             let output = finalize.finish(data, Some((algo, prefixes)), context.budget)?;
             return Ok(TransformChainOutput {
                 output,
+                #[cfg(feature = "xmldsig-sign")]
                 dependencies: dependency_indexes(dependency_tracking),
             });
         }
@@ -2650,6 +2661,7 @@ fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> T
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
     let Some(tracking) = tracking else {
         return HashSet::new();
@@ -2760,6 +2772,7 @@ pub(crate) fn map_c14n_resource_policy_violation(
     }
 }
 
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn validate_signing_transform_policy(
     initial_binary: bool,
     transforms: &[Transform],
@@ -3280,6 +3293,7 @@ impl Default for XPathSignatureParseBudget {
 }
 
 impl XPathSignatureParseBudget {
+    #[cfg(feature = "xmldsig-sign")]
     pub(crate) fn validate_relationship_selectors(
         &self,
         selectors: &[RelationshipSelector],
@@ -3287,6 +3301,7 @@ impl XPathSignatureParseBudget {
         relationship::validate_owned_selectors(selectors, &self.opc_workspace)
     }
 
+    #[cfg(any(test, feature = "xmldsig-sign"))]
     pub(crate) fn from_resources(resources: &crate::policy::ResourcePolicy) -> Self {
         Self::from_resource_parts(
             resources,
@@ -3475,6 +3490,7 @@ fn collect_xpath_namespaces_with_limits(
         .collect())
 }
 
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn validate_xpath_namespace_budget_with_resources(
     transforms: &[Transform],
     inherited_namespace: Option<(&str, &str)>,
@@ -3488,6 +3504,7 @@ pub(crate) fn validate_xpath_namespace_budget_with_resources(
     )
 }
 
+#[cfg(feature = "xmldsig-sign")]
 fn validate_xpath_namespace_budget_with_limits(
     transforms: &[Transform],
     inherited_namespace: Option<(&str, &str)>,
@@ -4974,6 +4991,7 @@ mod tests {
         assert!(!output.contains("discard"));
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn dependency_tracking_retains_structurally_excluded_nodes_for_later_xpath() {
         // A structural XPath may hide a mutable node from the current set, but
@@ -5014,6 +5032,7 @@ mod tests {
         assert_eq!(output.dependencies, HashSet::from([7]));
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn dependency_tracking_discards_dormant_nodes_at_binary_boundary() {
         // C14N serializes only the current node set. A later XPath reparses

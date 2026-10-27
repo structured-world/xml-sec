@@ -1,6 +1,6 @@
 //! Public request/evidence integration with real cryptographic verification.
 
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use std::collections::HashMap;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};

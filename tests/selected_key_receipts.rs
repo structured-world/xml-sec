@@ -1,4 +1,4 @@
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use std::{cell::Cell, sync::Arc};
 use structured_asn1::{

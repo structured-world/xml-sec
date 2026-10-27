@@ -6,8 +6,8 @@ import { blocks, execute, plan } from './ci-test-blocks.mjs';
 test('grouping retains every isolated test graph and toolchain', () => {
   // Batching must not turn separate Cargo feature resolutions into a union.
   const profiles = Object.values(blocks).flatMap(block => block.profiles);
-  assert.equal(profiles.length, 23);
-  assert.equal(new Set(profiles.map(profile => `${profile.rust}:${profile.name}`)).size, 23);
+  assert.equal(profiles.length, 24);
+  assert.equal(new Set(profiles.map(profile => `${profile.rust}:${profile.name}`)).size, 24);
   assert.deepEqual(profiles.map(profile => `${profile.rust}:${profile.name}`).sort(), [
     '1.92.0:all-features', '1.92.0:aws-fips-differential', '1.92.0:aws-fips-fat-runtime',
     '1.92.0:aws-fips-roxmltree', '1.92.0:aws-fips-xmloxide',
@@ -16,7 +16,7 @@ test('grouping retains every isolated test graph and toolchain', () => {
     '1.92.0:roxmltree', '1.92.0:xmloxide', '1.92.0:xslt-xmloxide',
     'stable:all-features', 'stable:default-features', 'stable:differential',
     'stable:fat-runtime', 'stable:legacy-fat-runtime', 'stable:roxmltree',
-    'stable:xmldsig-minimal', 'stable:xmlenc-minimal', 'stable:xmloxide',
+    'stable:xmldsig-minimal', 'stable:xmldsig-sign-minimal', 'stable:xmlenc-minimal', 'stable:xmloxide',
     'stable:xslt-fat-runtime', 'stable:xslt-minimal',
   ]);
   assert.deepEqual(profiles.filter(profile => profile.all).map(profile => profile.rust).sort(), ['1.92.0', 'stable']);
@@ -45,11 +45,11 @@ test('build and lint contracts remain separately resolved', () => {
   const inventory = commands.find(command => command.label === 'xmlenc-inventory: build');
   assert.deepEqual(inventory.args, ['build', '-p', 'xml-sec', '--no-default-features', '--features', 'xmlenc,xml-backend-xmloxide']);
   const lints = commands.filter(command => command.label.endsWith(': lint'));
-  assert.equal(lints.length, 20);
+  assert.equal(lints.length, 21);
   // Workspace lints carry clippy::pedantic; every lint denies its warnings.
   for (const lint of lints) assert.deepEqual(lint.args.slice(lint.args.indexOf('--'), lint.args.indexOf('--') + 3), ['--', '-D', 'warnings']);
   // Former scoped pedantic gates remain separately resolved library graphs.
-  for (const feature of ['xmldsig', 'xmlenc', 'xslt']) {
+  for (const feature of ['xmldsig', 'xmldsig-sign', 'xmlenc', 'xslt']) {
     const lint = lints.find(command => command.label === `${feature}-minimal: lint`);
     assert.deepEqual(lint.args, ['clippy', '-p', 'xml-sec', '--lib', '--no-default-features', '--features',
       `${feature},xml-backend-differential`, '--', '-D', 'warnings']);

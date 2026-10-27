@@ -1,6 +1,6 @@
 //! Scoped continuation qualification with actual HMAC signatures, not accepting
 //! mock providers. Payload validity is deliberately separate from instruction authentication.
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use std::{collections::HashMap, sync::Arc};
 use structured_asn1::memory::{Memory, MemoryAccount};

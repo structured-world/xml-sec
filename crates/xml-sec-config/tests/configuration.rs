@@ -695,6 +695,7 @@ fn xslt_stylesheet_semantics_comes_from_the_base_profile() {
     ));
 }
 
+#[cfg(feature = "xmldsig-sign")]
 #[test]
 fn configured_snapshots_enforce_real_sign_and_verify_limits() {
     // The loader must deliver enforced core snapshots, not a parallel config

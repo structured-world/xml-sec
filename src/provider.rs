@@ -238,9 +238,12 @@ pub use aws_lc::{AwsLcFipsProvider, AwsLcSigningKey};
 #[cfg(feature = "xmlenc")]
 use std::borrow::Cow;
 
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-use getrandom::rand_core::TryCryptoRng;
-use getrandom::{SysRng, rand_core::TryRng};
+// Randomness serves signing and encryption only; verification never draws it.
+#[cfg(feature = "xmldsig-sign")]
+use getrandom::{
+    SysRng,
+    rand_core::{TryCryptoRng, TryRng},
+};
 
 #[cfg(feature = "xmldsig")]
 use crate::xmldsig::DigestAlgorithm;
@@ -1734,10 +1737,10 @@ pub fn default_provider() -> &'static dyn CryptoProvider {
 }
 
 /// Adapter used when a `RustCrypto` primitive requires a fallible RNG object.
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) struct ProviderRng<'a>(pub(crate) &'a dyn CryptoProvider);
 
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[cfg(feature = "xmldsig-sign")]
 impl TryRng for ProviderRng<'_> {
     type Error = ProviderError;
 
@@ -1758,7 +1761,7 @@ impl TryRng for ProviderRng<'_> {
     }
 }
 
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+#[cfg(feature = "xmldsig-sign")]
 impl TryCryptoRng for ProviderRng<'_> {}
 
 #[cfg(feature = "xmldsig")]
@@ -1895,7 +1898,8 @@ impl CryptoProvider for RustCryptoProvider {
         Ok(std::sync::Arc::new(RustCryptoRsaPrivateKey::new(key)))
     }
 
-    #[cfg(feature = "xmldsig")]
+    // Without `xmldsig-sign` the trait default reports signing unsupported.
+    #[cfg(feature = "xmldsig-sign")]
     fn import_signing_key(
         &self,
         algorithm: crate::xmldsig::SignatureAlgorithm,
@@ -1936,10 +1940,15 @@ impl CryptoProvider for RustCryptoProvider {
 
     fn supports(&self, capability: ProviderCapability<'_>) -> bool {
         match capability {
+            // FIPS 203 section 7.2: encapsulation draws its message from the
+            // provider CSPRNG, which only `xmldsig-sign` compiles; decapsulation
+            // is deterministic.
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Encapsulate(_) | ProviderCapability::Decapsulate(_) => {
-                cfg!(feature = "experimental-pq")
+            ProviderCapability::Encapsulate(_) => {
+                cfg!(all(feature = "experimental-pq", feature = "xmldsig-sign"))
             }
+            #[cfg(feature = "xmldsig")]
+            ProviderCapability::Decapsulate(_) => cfg!(feature = "experimental-pq"),
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Digest(_) => true,
             #[cfg(feature = "xmldsig")]
@@ -1974,7 +1983,7 @@ impl CryptoProvider for RustCryptoProvider {
             }
             #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
             ProviderCapability::Pkcs1v15Transport | ProviderCapability::Pkcs1v15Recovery => true,
-            ProviderCapability::Random => true,
+            ProviderCapability::Random => cfg!(feature = "xmldsig-sign"),
             ProviderCapability::KeyAgreement(parameters) => {
                 #[cfg(feature = "xmlenc")]
                 {
@@ -2008,9 +2017,21 @@ impl CryptoProvider for RustCryptoProvider {
     }
 
     fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError> {
-        SysRng
-            .try_fill_bytes(output)
-            .map_err(|error| ProviderError::Random(error.to_string()))
+        #[cfg(feature = "xmldsig-sign")]
+        {
+            SysRng
+                .try_fill_bytes(output)
+                .map_err(|error| ProviderError::Random(error.to_string()))
+        }
+        // A verification-only build compiles no entropy source.
+        #[cfg(not(feature = "xmldsig-sign"))]
+        {
+            let _ = output;
+            Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Random,
+                algorithm: None,
+            })
+        }
     }
 
     fn derive_key(
@@ -3462,7 +3483,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn x509_digest_key_info_uses_the_selected_provider() {
         use crate::xmldsig::{
@@ -3500,7 +3521,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn x509_digest_writer_rejects_trailing_certificate_der() {
         use crate::xmldsig::{DigestAlgorithm, KeyInfoWriteError, X509DigestKeyInfoWriter};
@@ -3603,7 +3624,7 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn rsa_signing_uses_the_selected_providers_randomness() {
         use crate::xmldsig::{RsaSigningKey, SignatureAlgorithm};
@@ -3629,7 +3650,7 @@ mod tests {
         assert!(provider.random_calls.load(Ordering::Relaxed) > 0);
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn ecdsa_signing_uses_the_selected_providers_digest() {
         use crate::xmldsig::{
@@ -3687,7 +3708,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn ecdsa_signing_rejects_provider_digests_with_the_wrong_length() {
         use crate::xmldsig::{

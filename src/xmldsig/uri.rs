@@ -124,6 +124,7 @@ impl FragmentFailure<'_> {
 }
 
 /// Validate signing URI policy independently of request-scoped resource bytes.
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn validate_signing_reference_uri(
     uri: &str,
     policy: &crate::policy::SigningPolicy,
@@ -138,6 +139,7 @@ pub(crate) fn validate_signing_reference_uri(
 }
 
 /// Require a request resource boundary before processing a detached signing URI.
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) fn validate_signing_reference_request(
     uri: &str,
     has_external_resources: bool,
@@ -200,11 +202,13 @@ pub(crate) fn validate_external_resource_map(
 /// Signing reparses its staged document while filling dependent digests. This
 /// context keeps the external-resource budget continuous across every resolver
 /// rebound instead of silently resetting it for each parsed generation.
+#[cfg(feature = "xmldsig-sign")]
 pub(crate) struct ExternalResourceContext<'a> {
     resources: Option<&'a HashMap<String, Vec<u8>>>,
     budget: Rc<ExternalResourceBudget>,
 }
 
+#[cfg(feature = "xmldsig-sign")]
 impl<'a> ExternalResourceContext<'a> {
     pub(crate) fn new(
         resources: Option<&'a HashMap<String, Vec<u8>>>,

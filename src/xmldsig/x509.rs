@@ -2070,7 +2070,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "experimental-pq")]
+    #[cfg(all(feature = "experimental-pq", feature = "xmldsig-sign"))]
     fn pq_certificate_verification_requires_explicit_trust_permission() {
         use super::super::{
             PostQuantumSigningKey, PqAlgorithm, SignatureAlgorithm, SignatureContext, SigningKey,

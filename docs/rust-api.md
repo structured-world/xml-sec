@@ -88,7 +88,8 @@ single parse+operation cumulative-budget path, without an extra facade parse.
 `XmlSecurity` is `Send + Sync`; individual handles do not impose additional bounds
 on non-thread-safe caller keys/resolvers. Share immutable policies/providers using
 application-owned storage or `Arc`, not a global registry. The facade requires
-`xmldsig` (which currently requires `std`); C14N-only and alloc-only XML input
+`xmldsig` (which currently requires `std`); its signer, `Operation::Sign` and the
+signing error variant need `xmldsig-sign`. C14N-only and alloc-only XML input
 remain independent. It does not claim alloc-only `XMLDSig`.
 
 `XmlSecError` is now a non-exhaustive typed sum of original document, policy,

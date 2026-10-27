@@ -323,6 +323,7 @@ fn resource_bound_node_requires_an_observed_identity() {
     );
 }
 
+#[cfg(feature = "xmldsig-sign")]
 #[test]
 fn controlled_mutations_advance_the_expected_generation() {
     let mut document = XmlDocument::parse("<root/>").expect("document");

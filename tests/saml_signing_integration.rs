@@ -4,7 +4,7 @@
 //! the response issuer. These tests ensure the generic `XMLDSig` signing API can
 //! fill a SAML-shaped template without moving that schema-significant element.
 
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use roxmltree::Document;
 

@@ -21,7 +21,9 @@ separately naming `xmldsig`.
 The inventory accepts raw HMAC and AES secrets, public SPKI DER or PEM (also
 PKCS#1 RSA public PEM), private PKCS#8 DER or PEM (including password-protected
 PKCS#8), RSA PKCS#1 private DER or PEM, PKCS#12 bundles, DER X.509 certificates
-and CRLs, and libxmlsec1 `keys.xml` bytes. The `keys.xml` importer recognizes
+and CRLs, and libxmlsec1 `keys.xml` bytes. Private-key and PKCS#12 import and
+signer selection need the `xmldsig-sign` feature; `xmldsig` alone imports public
+material, certificates, CRLs and symmetric keys. The `keys.xml` importer recognizes
 HMAC, AES, public RSA/EC, and libxmlsec1's private DSA extension. RSA private
 keys are imported through the PEM/DER or PKCS#12 APIs, not `RSAKeyValue`.
 DES key entries

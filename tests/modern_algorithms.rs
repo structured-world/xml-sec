@@ -1,5 +1,5 @@
 //! Modern `XMLDSig` algorithms must work through the public provider and policy paths.
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "xmldsig-sign")]
 
 use xml_sec::xmldsig::{DigestAlgorithm, compute_digest};
 

@@ -23,7 +23,7 @@ pub enum XmlSecError {
     #[error(transparent)]
     Verification(#[from] crate::xmldsig::DsigError),
     /// Signature generation failed.
-    #[cfg(feature = "xmldsig")]
+    #[cfg(feature = "xmldsig-sign")]
     #[error(transparent)]
     Signing(#[from] crate::xmldsig::SigningError),
     /// Caller-owned key inventory selection or import failed.
