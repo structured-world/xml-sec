@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Run the actual existing WASM C14N path rather than treating compilation as execution.
+# Run the actual WASM C14N and XMLDSig verification paths rather than treating
+# compilation as execution.
 set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly root
@@ -13,4 +14,6 @@ const bytes = await readFile(process.argv[2]);
 const { instance } = await WebAssembly.instantiate(bytes);
 assert.equal(instance.exports.xml_sec_wasm_smoke(), 1, 'WASM canonicalization must produce exact expected bytes');
 console.log('WASM C14N execution passed');
+assert.equal(instance.exports.xml_sec_wasm_verify(), 1, 'WASM XMLDSig verification must accept the signed response and reject tampering');
+console.log('WASM XMLDSig verification passed');
 JS
