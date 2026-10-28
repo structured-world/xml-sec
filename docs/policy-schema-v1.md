@@ -27,6 +27,7 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | `signature_constraints` | verify, sign | `General`, `Saml`, `WsSecurity`, `Xades` |
 | `ecdsa_signature_value_encoding` | verify, sign | `XmlDsig`, `XmlSecAsn1Der` |
 | `manifest_processing` | verify, sign | `Ignore`, `Process` |
+| `detached_digest_attestation` | verify | `Forbidden`, `Accepted` |
 | `hmac` | verify, sign | `minimum_key_bits`, `minimum_output_bits` (nonnegative integers) |
 | `uris`, `transforms` | verify, sign, decrypt | Nested tables below |
 | `key_trust`, `key_sources` | verify | Nested tables below |
@@ -127,6 +128,7 @@ raise a hard safety ceiling. Their complete names are grouped here for lookup:
 | XML | `max_xml_nodes`, `max_xml_depth`, `max_xml_namespace_bindings`, `max_xml_document_bytes`, `max_xml_parse_work_bytes` |
 | References | `max_references`, `max_signatures`, `max_transforms_per_reference`, `max_xml_base_components`, `max_xml_base_resolution_bytes`, `max_canonicalized_bytes` |
 | External bytes | `max_external_resource_bytes`, `max_external_resource_total_bytes` |
+| Streamed detached payloads | `max_detached_payload_bytes`, `max_detached_payload_total_bytes` |
 | Encryption | `max_encryption_plaintext_bytes`, `max_encryption_recipients`, `max_encryption_metadata_bytes` |
 | Keys and certificates | `max_key_candidates`, `max_x509_work`, `max_x509_workspace_bytes`, `max_key_import_kdf_work`, `max_key_import_kdf_memory_bytes`, `max_key_info_reference_depth` |
 | Base64 | `max_base64_transform_input_bytes`, `max_base64_transform_output_bytes` |

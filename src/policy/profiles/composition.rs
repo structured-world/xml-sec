@@ -1,10 +1,10 @@
 use super::{PolicySet, PolicyValidity, SignatureConstraints, configuration};
 use crate::policy::{
-    CertificateSignatureAlgorithms, DsaKeyPolicy, HmacPolicy, KemContentAuthentication,
-    KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourcePolicy, KeyTrustPolicy,
-    ManifestProcessing, PolicyViolation, ResourcePolicy, RsaKeyPolicy, RsaPssPermission,
-    SigningPolicy, TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode,
-    XmlInputPolicy,
+    CertificateSignatureAlgorithms, DetachedDigestAttestation, DsaKeyPolicy, HmacPolicy,
+    KemContentAuthentication, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourcePolicy,
+    KeyTrustPolicy, ManifestProcessing, PolicyViolation, ResourcePolicy, RsaKeyPolicy,
+    RsaPssPermission, SigningPolicy, TransformPolicy, UriPolicy, VerificationPolicy,
+    VerificationTrustMode, XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -347,6 +347,8 @@ fn resources(a: &ResourcePolicy, b: &ResourcePolicy) -> ResourcePolicy {
         max_canonicalized_bytes,
         max_external_resource_bytes,
         max_external_resource_total_bytes,
+        max_detached_payload_bytes,
+        max_detached_payload_total_bytes,
         max_encryption_plaintext_bytes,
         max_xml_document_bytes,
         max_xml_parse_work_bytes,
@@ -498,9 +500,24 @@ fn verification(
         uris: uris(a.uris, b.uris),
         transforms: transforms(&a.transforms, &b.transforms)?,
         manifest_processing: manifests(a.manifest_processing, b.manifest_processing),
+        detached_digest_attestation: attestation(
+            a.detached_digest_attestation,
+            b.detached_digest_attestation,
+        ),
         xml: xml(a.xml, b.xml),
         resources: resources(&a.resources, &b.resources),
     })
+}
+/// A caller-attested digest is accepted only when both layers accept it.
+fn attestation(
+    a: DetachedDigestAttestation,
+    b: DetachedDigestAttestation,
+) -> DetachedDigestAttestation {
+    if a == DetachedDigestAttestation::Accepted && b == DetachedDigestAttestation::Accepted {
+        DetachedDigestAttestation::Accepted
+    } else {
+        DetachedDigestAttestation::Forbidden
+    }
 }
 fn signing(a: &SigningPolicy, b: &SigningPolicy) -> Result<SigningPolicy, PolicyViolation> {
     Ok(SigningPolicy {

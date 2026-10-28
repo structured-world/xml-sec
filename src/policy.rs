@@ -77,6 +77,8 @@ pub(crate) mod resource_name {
     pub const CANONICALIZED_BYTES: &str = "canonicalized bytes";
     pub const EXTERNAL_RESOURCE_BYTES: &str = "external resource bytes";
     pub const AGGREGATE_EXTERNAL_RESOURCE_BYTES: &str = "aggregate external resource bytes";
+    pub const DETACHED_PAYLOAD_BYTES: &str = "streamed detached payload bytes";
+    pub const AGGREGATE_DETACHED_PAYLOAD_BYTES: &str = "aggregate streamed detached payload bytes";
     pub const ENCRYPTION_PLAINTEXT_BYTES: &str = "encryption plaintext bytes";
     #[cfg(feature = "xmlenc")]
     pub const AGGREGATE_ENCRYPTION_CIPHER_VALUE_BYTES: &str =
@@ -531,6 +533,11 @@ pub struct ResourcePolicy {
     pub max_external_resource_bytes: usize,
     /// Maximum bytes in the complete external map and cumulatively dereferenced.
     pub max_external_resource_total_bytes: usize,
+    /// Maximum caller-streamed bytes of one detached payload. Streaming keeps
+    /// no input resident, so this bounds hashing work, not memory.
+    pub max_detached_payload_bytes: usize,
+    /// Maximum caller-streamed detached payload bytes in one verified session.
+    pub max_detached_payload_total_bytes: usize,
     /// Maximum `XMLEnc` plaintext bytes.
     pub max_encryption_plaintext_bytes: usize,
     /// Maximum caller-owned XML bytes accepted by any document operation.
@@ -624,6 +631,9 @@ impl Default for ResourcePolicy {
             max_external_resource_bytes: crate::hard_limits::EXTERNAL_RESOURCE_BYTE_CEILING,
             max_external_resource_total_bytes:
                 crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+            max_detached_payload_bytes: crate::hard_limits::DETACHED_PAYLOAD_BYTE_CEILING,
+            max_detached_payload_total_bytes:
+                crate::hard_limits::DETACHED_PAYLOAD_TOTAL_BYTE_CEILING,
             max_encryption_plaintext_bytes: crate::hard_limits::ENCRYPTION_PLAINTEXT_BYTE_CEILING,
             max_xml_document_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
             max_xml_parse_work_bytes: crate::hard_limits::XML_PARSE_WORK_BYTE_CEILING,
@@ -746,6 +756,16 @@ impl ResourcePolicy {
             resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
             self.max_external_resource_total_bytes,
             crate::hard_limits::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING,
+        )?;
+        Self::within(
+            resource_name::DETACHED_PAYLOAD_BYTES,
+            self.max_detached_payload_bytes,
+            crate::hard_limits::DETACHED_PAYLOAD_BYTE_CEILING,
+        )?;
+        Self::within(
+            resource_name::AGGREGATE_DETACHED_PAYLOAD_BYTES,
+            self.max_detached_payload_total_bytes,
+            crate::hard_limits::DETACHED_PAYLOAD_TOTAL_BYTE_CEILING,
         )?;
         Self::within(
             resource_name::ENCRYPTION_PLAINTEXT_BYTES,
@@ -1313,6 +1333,19 @@ pub enum ManifestProcessing {
     Process,
 }
 
+/// Whether a detached Reference may be completed with a digest the caller
+/// computed over the payload it paired, instead of bytes streamed through the
+/// selected provider. The result records which happened.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DetachedDigestAttestation {
+    /// Only bytes digested by this operation complete a detached Reference.
+    #[default]
+    Forbidden,
+    /// A caller-attested digest completes a Reference with no transforms.
+    Accepted,
+}
+
 /// Immutable policy snapshot for `XMLDSig` verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
@@ -1346,6 +1379,8 @@ pub struct VerificationPolicy {
     pub transforms: TransformPolicy,
     /// Whether authenticated Manifest references are processed.
     pub manifest_processing: ManifestProcessing,
+    /// Whether a caller-attested digest may complete a detached Reference.
+    pub detached_digest_attestation: DetachedDigestAttestation,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.
@@ -1814,6 +1849,10 @@ mod tests {
                 => max_external_resource_bytes;
             AGGREGATE_EXTERNAL_RESOURCE_BYTES: limit::EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING
                 => max_external_resource_total_bytes;
+            DETACHED_PAYLOAD_BYTES: limit::DETACHED_PAYLOAD_BYTE_CEILING
+                => max_detached_payload_bytes;
+            AGGREGATE_DETACHED_PAYLOAD_BYTES: limit::DETACHED_PAYLOAD_TOTAL_BYTE_CEILING
+                => max_detached_payload_total_bytes;
             ENCRYPTION_PLAINTEXT_BYTES: limit::ENCRYPTION_PLAINTEXT_BYTE_CEILING
                 => max_encryption_plaintext_bytes;
             XML_DOCUMENT: limit::XML_DOCUMENT_BYTE_CEILING => max_xml_document_bytes;
@@ -1897,6 +1936,8 @@ mod tests {
             max_canonicalized_bytes: 0,
             max_external_resource_bytes: 0,
             max_external_resource_total_bytes: 0,
+            max_detached_payload_bytes: 0,
+            max_detached_payload_total_bytes: 0,
             max_encryption_plaintext_bytes: 0,
             max_xml_document_bytes: 0,
             max_xml_parse_work_bytes: 0,
