@@ -822,6 +822,29 @@ impl<P, B> OperationExecutionContext<P, B> {
         action()
     }
 
+    /// The executed digest node of the Reference at `index`: `SignedInfo`
+    /// digests depend directly on the crypto node, Manifest digests on their Manifest.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn reference_digest_node(
+        &self,
+        index: usize,
+        manifest: bool,
+    ) -> Option<OperationNodeId> {
+        let plan = self.plan();
+        plan.edges.iter().find_map(|edge| {
+            let parent = plan.nodes.get(edge.requires.index())?;
+            let parent_matches = if manifest {
+                matches!(parent.kind, OperationNodeKind::Manifest { .. })
+            } else {
+                parent.kind == OperationNodeKind::Crypto
+            };
+            (parent_matches
+                && plan.kind(edge.dependent) == &OperationNodeKind::Digest { index }
+                && self.is_executed(edge.dependent))
+            .then_some(edge.dependent)
+        })
+    }
+
     #[cfg(feature = "xmldsig")]
     pub(crate) fn is_executed(&self, node: OperationNodeId) -> bool {
         self.executed.borrow().contains(&node)

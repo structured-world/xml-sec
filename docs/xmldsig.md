@@ -301,6 +301,114 @@ result in either order.
 When both a `Reference` and the signature are bad, libxmlsec1 reports the `Reference` and xml-sec
 reports the signature; the document is rejected either way.
 
+## Detached Payloads
+
+Resident bytes in `external_resources` are limited by `max_external_resource_bytes` and
+`max_external_resource_total_bytes`. A payload too large to hold, or one the caller paired by
+digest rather than by file name, is completed after verification instead, inside the same
+`with_verified_request` session: its provider, policy and remaining budgets decide the result, and
+the library performs no I/O.
+
+`pending_detached` lists the `ReferenceUnavailable` References of authenticated signatures whose
+chain consumes octets: no transforms (`DetachedChain::Octets`) or a single Base64 transform
+(`DetachedChain::Base64`). Each entry gives the URI resolved against its XML Base and the declared
+`DigestMethod`; choosing the payload is the caller's decision. A chain that needs XML keeps the
+resident path and its ceilings.
+
+- `detached_payload` opens one stream for every pending Reference the caller pairs with a payload.
+  `update` takes chunks in order; one pass digests them for every listed Reference, sharing a state
+  between equal digest methods, decodes a Base64 chain on the fly with the resident transform's
+  rules (RFC 2045 §6.8 alphabet, `STANDARD` padding) and computes the SHA-256
+  `external_resource_fingerprint`. `finish` records each Reference's own result with
+  `ExternalPayload::Streamed`. A refusal (limit, work, provider) is sticky: the payload yields no
+  result and its References stay unavailable.
+- `attest_detached` completes a Reference without transforms with a digest the caller computed over
+  the payload it paired. `VerificationPolicy::detached_digest_attestation` must be `Accepted`
+  (default `Forbidden`); the result records `ExternalPayload::Attested` and no fingerprint, so a
+  report never presents it as bytes this library hashed.
+- Streamed bytes are bounded by `max_detached_payload_bytes` per payload and
+  `max_detached_payload_total_bytes` per session. Streaming retains no input, so these bound hashing
+  work, not memory.
+
+`DetachedCompletion::Complete` gives every Reference its own result. `DetachedCompletion::FailFast`
+requests no payload for a signature whose core validation already failed and, after the first
+failed detached Reference, leaves every remaining pending one `DsigStatus::NotProcessed`. When the
+last `SignedInfo` Reference passes, core validation succeeds and the authenticated Manifests are
+processed as during verification; the request's acceptance is recomputed after each completion.
+`store_pre_digest` does not retain streamed bytes.
+
+```rust
+# #[cfg(feature = "xmldsig-sign")]
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+use std::collections::HashMap;
+use std::sync::Arc;
+use structured_asn1::memory::{Memory, MemoryAccount};
+use xml_sec::XmlDocument;
+use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::{SigningPolicy, VerificationPolicy};
+use xml_sec::xmldsig::{
+    DetachedCompletion, DigestAlgorithm, DsigStatus, ExternalPayload, HmacSigningKey,
+    HmacVerificationKey, ReferenceBuilder, SignContext, SignatureAlgorithm, SignatureBuilder,
+    UriTypeSet, VerificationRequest, VerifyContext, with_verified_request,
+};
+
+let secret = vec![0x5a; 32];
+let payload = b"a large file, read in chunks".repeat(1000);
+let mut signing = SigningPolicy::default();
+signing.uris.references = UriTypeSet::ALL;
+let signed = SignContext::new(&HmacSigningKey::new(secret.clone())?)
+    .policy(signing)
+    .external_resources(&HashMap::from([(
+        "https://example.test/report.pdf".to_owned(),
+        payload.clone(),
+    )]))
+    .sign_with_builder(
+        "<root/>",
+        &SignatureBuilder::new(
+            C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+            SignatureAlgorithm::HmacSha256,
+        )
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("https://example.test/report.pdf"),
+        ),
+    )?;
+
+let document = XmlDocument::parse(signed)?;
+let key = HmacVerificationKey::new(secret)?;
+let mut policy = VerificationPolicy::default();
+policy.uris.references = UriTypeSet::ALL;
+let context = VerifyContext::new().policy(policy).key(&key);
+let work = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 26)));
+let evidence = with_verified_request(
+    &document,
+    &context,
+    &VerificationRequest::default(),
+    &work,
+    |mut session| {
+        let pending = session.pending_detached(DetachedCompletion::Complete)?;
+        assert_eq!(pending[0].uri(), "https://example.test/report.pdf");
+        let reference = pending[0].reference();
+        let mut stream = session.detached_payload(&[reference], DetachedCompletion::Complete)?;
+        for chunk in payload.chunks(8192) {
+            stream.update(chunk)?;
+        }
+        stream.finish()?;
+        Ok(session.into_evidence())
+    },
+)?;
+let result = evidence.signatures()[0].result().as_ref().map_err(|error| error.to_string())?;
+assert_eq!(result.status, DsigStatus::Valid);
+assert_eq!(
+    result.signed_info_references[0].external_payload,
+    Some(ExternalPayload::Streamed)
+);
+assert!(evidence.accepted(&document)?);
+# Ok(())
+# }
+# #[cfg(not(feature = "xmldsig-sign"))]
+# fn main() {}
+```
+
 ## Provider Dispatch
 
 `SignContext::provider` selects both digest primitives and operation randomness. Built-in ECDSA

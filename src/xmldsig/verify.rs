@@ -875,60 +875,66 @@ impl<V: std::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
         document: &XmlDocument,
         target: NodeIdentity,
     ) -> Result<bool, DsigError> {
-        document.with_view(|view| {
-            view.resolve_node(self.document)?;
-            let target_node = view.resolve_node(target)?;
-            if !target_node.is_element() {
-                return Err(DsigError::InvalidRequest {
-                    reason: "coverage target must be an element",
-                });
+        document.with_view(|view| self.covers_element_in(view, target))
+    }
+
+    fn covers_element_in(
+        &self,
+        view: DocumentView<'_>,
+        target: NodeIdentity,
+    ) -> Result<bool, DsigError> {
+        view.resolve_node(self.document)?;
+        let target_node = view.resolve_node(target)?;
+        if !target_node.is_element() {
+            return Err(DsigError::InvalidRequest {
+                reason: "coverage target must be an element",
+            });
+        }
+        let target_id = target_node.id().get();
+        for signature in self.signatures() {
+            let Ok(result) = &signature.result else {
+                continue;
+            };
+            if result.status != DsigStatus::Valid
+                || !matches!(
+                    result.key_trust,
+                    super::KeyTrustEvidence::CallerTrusted
+                        | super::KeyTrustEvidence::ValidatedX509(_)
+                )
+            {
+                continue;
             }
-            let target_id = target_node.id().get();
-            for signature in self.signatures() {
-                let Ok(result) = &signature.result else {
+            let signature_node = view.resolve_node(signature.identity)?;
+            for reference in result
+                .signed_info_references
+                .iter()
+                .chain(&result.manifest_references)
+            {
+                if reference.status != DsigStatus::Valid {
+                    continue;
+                }
+                let Some(root) = reference.target_identity else {
                     continue;
                 };
-                if result.status != DsigStatus::Valid
-                    || !matches!(
-                        result.key_trust,
-                        super::KeyTrustEvidence::CallerTrusted
-                            | super::KeyTrustEvidence::ValidatedX509(_)
-                    )
+                if reference.coverage == ReferenceCoverage::TransformedData {
+                    continue;
+                }
+                let root = view.resolve_node(root)?;
+                // The normalized arena assigns contiguous preorder IDs;
+                // reuse the same subtree contract as node-set subtraction,
+                // rather than walking depth for every report/target pair.
+                if !subtree_node_id_range(root).contains(&target_id) {
+                    continue;
+                }
+                if reference.coverage == ReferenceCoverage::EnvelopedElementContent
+                    && subtree_node_id_range(signature_node).contains(&target_id)
                 {
                     continue;
                 }
-                let signature_node = view.resolve_node(signature.identity)?;
-                for reference in result
-                    .signed_info_references
-                    .iter()
-                    .chain(&result.manifest_references)
-                {
-                    if reference.status != DsigStatus::Valid {
-                        continue;
-                    }
-                    let Some(root) = reference.target_identity else {
-                        continue;
-                    };
-                    if reference.coverage == ReferenceCoverage::TransformedData {
-                        continue;
-                    }
-                    let root = view.resolve_node(root)?;
-                    // The normalized arena assigns contiguous preorder IDs;
-                    // reuse the same subtree contract as node-set subtraction,
-                    // rather than walking depth for every report/target pair.
-                    if !subtree_node_id_range(root).contains(&target_id) {
-                        continue;
-                    }
-                    if reference.coverage == ReferenceCoverage::EnvelopedElementContent
-                        && subtree_node_id_range(signature_node).contains(&target_id)
-                    {
-                        continue;
-                    }
-                    return Ok(true);
-                }
+                return Ok(true);
             }
-            Ok(false)
-        })
+        }
+        Ok(false)
     }
 
     /// Outcomes in document order, including malformed signatures.
@@ -974,6 +980,9 @@ pub struct ReferenceResult {
     /// SHA-256 identity of resolved external bytes before transforms. This is
     /// provenance, not signer authorization or an original-element proof.
     pub external_resource_fingerprint: Option<[u8; 32]>,
+    /// How the bytes of an external Reference reached this result; `None` for
+    /// a same-document Reference or one without completed external bytes.
+    pub external_payload: Option<ExternalPayload>,
     /// What can be proven about original element-content coverage.
     pub coverage: ReferenceCoverage,
     /// Whether this reference came from `<SignedInfo>` or `<Manifest>`.
@@ -988,6 +997,21 @@ pub struct ReferenceResult {
     pub status: DsigStatus,
     /// Pre-digest bytes (populated when `store_pre_digest` is enabled).
     pub pre_digest_data: Option<Vec<u8>>,
+}
+
+/// Provenance of an external Reference's bytes. A report must not present an
+/// attested digest as bytes this library hashed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ExternalPayload {
+    /// Resident bytes from the caller's external resource map.
+    Resident,
+    /// Bytes the caller streamed through a verified session and the selected
+    /// provider digested; `external_resource_fingerprint` covers them.
+    Streamed,
+    /// A digest the caller computed over the payload it paired with this
+    /// Reference. No byte passed through this library.
+    Attested,
 }
 
 /// Conservative coverage classification for the original semantic document.
@@ -1185,6 +1209,7 @@ fn bind_reference_evidence(
     result.reference_identity = origin.map(|node| view.node_identity(node));
     if let OperationResourceIdentity::External { fingerprint, .. } = observed {
         result.external_resource_fingerprint = Some(*fingerprint);
+        result.external_payload = Some(ExternalPayload::Resident);
     }
     if let OperationResourceIdentity::DocumentNode(target) = observed {
         result.target_identity = Some(*target);
@@ -1561,6 +1586,7 @@ fn process_reference_with_options<C: VerificationCapture>(
         reference_identity: None,
         target_identity: None,
         external_resource_fingerprint: None,
+        external_payload: None,
         coverage: ReferenceCoverage::TransformedData,
         reference_set,
         reference_index,
@@ -1652,6 +1678,7 @@ fn reference_failure_result(
         reference_identity: None,
         target_identity: None,
         external_resource_fingerprint: None,
+        external_payload: None,
         coverage: ReferenceCoverage::TransformedData,
         reference_set,
         reference_index,
@@ -2335,12 +2362,15 @@ fn validate_verification_request(
     Ok(())
 }
 
+/// Apply the request's cardinality and target requirements to the outcomes.
+/// A verified session calls this again after completing detached References.
 fn accept_verification_evidence<V: std::ops::Deref<Target = [SignatureEvidence]>>(
-    document: &XmlDocument,
-    request: &VerificationRequest<'_>,
+    view: DocumentView<'_>,
+    requirement: SignatureRequirement,
+    expected_targets: &[NodeIdentity],
     evidence: &mut VerifyEvidence<V>,
-    count: usize,
 ) -> Result<(), DsigError> {
+    let count = evidence.signatures.len();
     let valid = evidence
         .signatures
         .iter()
@@ -2354,13 +2384,13 @@ fn accept_verification_evidence<V: std::ops::Deref<Target = [SignatureEvidence]>
             })
         })
         .count();
-    evidence.accepted = match request.signatures {
+    evidence.accepted = match requirement {
         SignatureRequirement::All => valid > 0 && valid == count,
         SignatureRequirement::AtLeast(minimum) => valid >= minimum,
         SignatureRequirement::Exactly(required) => valid == required && count == required,
     };
-    for target in request.expected_targets {
-        if !evidence.covers_element(document, *target)? {
+    for target in expected_targets {
+        if !evidence.covers_element_in(view, *target)? {
             evidence.accepted = false;
             break;
         }
@@ -2479,7 +2509,12 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
             accepted: false,
             correlation: request.correlation,
         };
-        accept_verification_evidence(document, request, &mut evidence, count)?;
+        accept_verification_evidence(
+            view,
+            request.signatures,
+            request.expected_targets,
+            &mut evidence,
+        )?;
         continuation(view, ctx, &budgets, evidence, operations, resolver)
     })
 }
@@ -3264,23 +3299,57 @@ fn finish_authenticated_verification<C: VerificationCapture>(
     // Manifest frontier depend on all of them.
     let mut core_validation = signed_info_digests;
     core_validation.push(completion.plan_nodes.crypto);
+    let manifest_references = finish_core_validation(
+        operation,
+        view,
+        signature_node,
+        resolver,
+        verification,
+        completion.remaining_reference_capacity,
+        core_validation,
+    )?;
+    Ok(VerifyResult {
+        key_trust,
+        status: DsigStatus::Valid,
+        signed_info_references: references.results,
+        manifest_references,
+        canonicalized_signed_info,
+    })
+}
+
+/// Core validation succeeded (`XMLDSig` 1.1 §3.2): process the authenticated
+/// Manifests and finalize the evidence node. `core_validation` holds every
+/// `SignedInfo` digest node and the accepted crypto node.
+fn finish_core_validation<C: VerificationCapture>(
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    verification: &ManifestVerification<'_, '_, C>,
+    remaining_reference_capacity: usize,
+    core_validation: Vec<OperationNodeId>,
+) -> Result<Vec<ReferenceResult>, SignatureVerificationPipelineError> {
     // Manifest syntax and references are authenticated content. Delay parsing
     // until core validation succeeds, then extend the same operation graph with
     // the newly trusted dependency subgraph and its evidence node.
-    let (manifest_references, manifest_digests) =
-        if ctx.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
-            process_authenticated_manifest_references(
-                operation,
-                view,
-                signature_node,
-                resolver,
-                verification,
-                completion.remaining_reference_capacity,
-                &core_validation,
-            )?
-        } else {
-            (Vec::new(), Vec::new())
-        };
+    let (manifest_references, manifest_digests) = if verification.context.policy.manifest_processing
+        == crate::policy::ManifestProcessing::Process
+    {
+        process_authenticated_manifest_references(
+            operation,
+            view,
+            signature_node,
+            resolver,
+            verification,
+            remaining_reference_capacity,
+            &core_validation,
+        )?
+    } else {
+        (Vec::new(), Vec::new())
+    };
     operation.extend();
     let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
     for prerequisite in core_validation.into_iter().chain(manifest_digests) {
@@ -3289,15 +3358,8 @@ fn finish_authenticated_verification<C: VerificationCapture>(
             .map_err(map_verification_plan_error)?;
     }
     operation.compile().map_err(map_verification_plan_error)?;
-    operation.run(evidence, || {
-        Ok::<_, SignatureVerificationPipelineError>(VerifyResult {
-            key_trust,
-            status: DsigStatus::Valid,
-            signed_info_references: references.results,
-            manifest_references,
-            canonicalized_signed_info,
-        })
-    })
+    operation.run(evidence, || Ok::<_, SignatureVerificationPipelineError>(()))?;
+    Ok(manifest_references)
 }
 
 fn verify_signature_authenticator<C: VerificationCapture>(
@@ -5583,6 +5645,7 @@ fn parse_manifest_references(
                             reference_identity: Some(view.node_identity(child)),
                             target_identity: None,
                             external_resource_fingerprint: None,
+                            external_payload: None,
                             coverage: ReferenceCoverage::TransformedData,
                             reference_set: ReferenceSet::Manifest,
                             reference_index,

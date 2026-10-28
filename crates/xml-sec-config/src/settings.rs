@@ -1358,10 +1358,17 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         };
     }
     match (old.and_then(Value::as_str), new.and_then(Value::as_str)) {
-        (_, Some("RequireTrustedKey" | "Process" | "RequireAuthenticatedCipher" | "ExactOnly")) => {
-            Restrictive
-        }
-        (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
+        (
+            _,
+            Some(
+                "RequireTrustedKey"
+                | "Process"
+                | "RequireAuthenticatedCipher"
+                | "ExactOnly"
+                | "Forbidden",
+            ),
+        )
+        | (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
         _ => Relaxing,
     }
 }

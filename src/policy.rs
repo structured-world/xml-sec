@@ -142,6 +142,11 @@ pub enum PolicyViolation {
     #[cfg(feature = "xmldsig")]
     #[error("Manifest reference processing is disabled by policy")]
     ManifestProcessingDisabled,
+    /// The policy forbids completing a detached Reference with a digest the
+    /// caller attests instead of bytes this operation digests.
+    #[cfg(feature = "xmldsig")]
+    #[error("verification policy forbids caller-attested detached digests")]
+    AttestedDigestForbidden,
     /// Untrusted XML does not satisfy the selected signature profile.
     #[cfg(feature = "xmldsig")]
     #[error("{profile:?} signature profile rejects document: {reason}")]

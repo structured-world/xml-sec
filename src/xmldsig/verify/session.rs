@@ -12,6 +12,8 @@ use super::{
 };
 use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, Work};
 
+mod detached;
+pub use detached::*;
 mod hash_uses;
 pub use hash_uses::*;
 mod key_receipt;
@@ -36,6 +38,13 @@ pub struct VerifiedSession<'view, 'scope, 'inputs, W: Work> {
     resolver: UriReferenceResolver<'view>,
     work: &'scope W,
     replay_active: Cell<bool>,
+    // The request's acceptance inputs, applied again after detached completion.
+    requirement: super::SignatureRequirement,
+    expected_targets: &'inputs [NodeIdentity],
+    // Streamed detached bytes across the session, against the aggregate limit.
+    detached_streamed: Cell<usize>,
+    // Fail-fast completion stopped after a failed detached Reference.
+    detached_stopped: bool,
 }
 
 /// Verify once, then continue within the same document generation, selected
@@ -70,6 +79,10 @@ pub fn with_verified_request<'inputs, W: Work, R>(
                 resolver,
                 work,
                 replay_active: Cell::new(false),
+                requirement: request.signatures,
+                expected_targets: request.expected_targets,
+                detached_streamed: Cell::new(0),
+                detached_stopped: false,
             })
         },
     )
