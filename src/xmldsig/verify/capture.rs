@@ -1,10 +1,12 @@
 //! Original execution facts retained only by scoped verification.
 
 use super::{
-    Cell, DigestAlgorithm, DocumentView, DsigError, Node, NodeId, NodeIdentity,
-    OperationExecutionContext, RefCell, SignatureAlgorithm, VerifyingKey, XMLDSIG_NS,
+    Cell, DigestAlgorithm, DocumentView, DsigError, KeyInfo, KeyInfoOrigin, KeyInfoReading, Node,
+    NodeId, NodeIdentity, OperationExecutionContext, RefCell, SignatureAlgorithm, SourceOrigin,
+    VerifyingKey, XMLDSIG_NS,
 };
-use structured_asn1::memory::{MemoryError, OwnedMap, OwnedVec, Work};
+use crate::xmldsig::parse::{KeyInfoSource, KeyValueInfo};
+use structured_asn1::memory::{MemoryError, MemoryReservation, OwnedMap, OwnedVec, Work};
 
 /// Original parsed method, not a reconstruction from an algorithm URI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -16,6 +18,10 @@ pub struct SelectedSignatureMethod {
 }
 
 pub(super) trait VerificationCapture {
+    /// Whether [`Self::key_info`] keeps the candidates, so verification tracks
+    /// each source's element while materializing `KeyInfo`.
+    const RETAINS_KEY_INFO: bool = false;
+
     fn verify(
         &self,
         provider: &dyn crate::provider::CryptoProvider,
@@ -48,9 +54,98 @@ pub(super) trait VerificationCapture {
     fn computed_digest(&self, _reference: Option<NodeId>) -> Result<(), MemoryError> {
         Ok(())
     }
+    /// The authenticated Signature's `KeyInfo` as key selection consumed it.
+    /// `origins` is present only when [`Self::RETAINS_KEY_INFO`] is set.
+    fn key_info(
+        &self,
+        _view: DocumentView<'_>,
+        _reading: KeyInfoReading,
+        _key_info: Option<KeyInfo>,
+        _origins: Option<Vec<SourceOrigin>>,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 impl VerificationCapture for () {}
+
+/// Key material a verified Signature's `KeyInfo` offered, moved from parsing.
+pub(super) enum RetainedMaterial {
+    Certificate(Vec<u8>),
+    KeyValue(KeyValueInfo),
+    SubjectPublicKeyInfo(Vec<u8>),
+    Unmaterialized {
+        uri: String,
+        resource_type: Option<String>,
+    },
+}
+
+impl RetainedMaterial {
+    /// Heap bytes this material keeps alive.
+    fn capacity(&self) -> Result<usize, MemoryError> {
+        fn sum(sizes: &[usize]) -> Result<usize, MemoryError> {
+            sizes.iter().try_fold(0usize, |total, size| {
+                total
+                    .checked_add(*size)
+                    .ok_or(MemoryError::CapacityOverflow)
+            })
+        }
+        let vector = |value: &Option<Vec<u8>>| value.as_ref().map_or(0, Vec::capacity);
+        match self {
+            Self::Certificate(der) | Self::SubjectPublicKeyInfo(der) => Ok(der.capacity()),
+            Self::KeyValue(KeyValueInfo::Rsa { modulus, exponent }) => {
+                sum(&[modulus.capacity(), exponent.capacity()])
+            }
+            Self::KeyValue(KeyValueInfo::Dsa { p, q, g, y }) => {
+                sum(&[vector(p), vector(q), vector(g), y.capacity()])
+            }
+            Self::KeyValue(KeyValueInfo::Dh {
+                p,
+                q,
+                generator,
+                public,
+                seed,
+                pgen_counter,
+            }) => sum(&[
+                vector(p),
+                vector(q),
+                vector(generator),
+                public.capacity(),
+                vector(seed),
+                vector(pgen_counter),
+            ]),
+            Self::KeyValue(KeyValueInfo::Ec {
+                curve_oid,
+                public_key,
+            }) => sum(&[curve_oid.capacity(), public_key.capacity()]),
+            Self::KeyValue(KeyValueInfo::Unsupported {
+                namespace,
+                local_name,
+            }) => sum(&[
+                namespace.as_ref().map_or(0, String::capacity),
+                local_name.capacity(),
+            ]),
+            Self::KeyValue(KeyValueInfo::InvalidEcKeyValue) => Ok(0),
+            Self::Unmaterialized { uri, resource_type } => sum(&[
+                uri.capacity(),
+                resource_type.as_ref().map_or(0, String::capacity),
+            ]),
+        }
+    }
+}
+
+/// One candidate with the reservation accounting for its moved material.
+/// Fields drop in order: the material is freed before its charge is released.
+pub(super) struct RetainedCandidate {
+    pub(super) origin: KeyInfoOrigin,
+    pub(super) material: RetainedMaterial,
+    _reservation: MemoryReservation,
+}
+
+pub(super) struct RetainedKeyInfo<W: Work> {
+    pub(super) reading: KeyInfoReading,
+    pub(super) candidates: OwnedVec<RetainedCandidate, W>,
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct CapturedDigest {
@@ -65,6 +160,8 @@ pub(super) struct ScopedCapture<'work, W: Work> {
     // Arena ordinals are private to the retained original operation, never
     // compared across parses or exposed as public provenance.
     pub(super) digests: RefCell<OwnedMap<usize, CapturedDigest, W>>,
+    // Set once, for an authenticated Signature only.
+    pub(super) key_info: RefCell<Option<RetainedKeyInfo<W>>>,
     pub(super) failure: Cell<Option<MemoryError>>,
     work: &'work W,
 }
@@ -86,8 +183,84 @@ impl<'work, W: Work> ScopedCapture<'work, W> {
             }),
             method: Cell::new(None),
             digests: RefCell::new(work.map()),
+            key_info: RefCell::new(None),
             failure: Cell::new(None),
             work,
+        }
+    }
+
+    /// Move one material into accounted retention: the reservation covers the
+    /// capacity the material keeps alive, so no byte is copied.
+    fn retain_material(
+        &self,
+        candidates: &mut OwnedVec<RetainedCandidate, W>,
+        origin: KeyInfoOrigin,
+        material: RetainedMaterial,
+    ) -> Result<(), MemoryError> {
+        let reservation = self.work.memory().reserve(material.capacity()?)?;
+        candidates.try_push(RetainedCandidate {
+            origin,
+            material,
+            _reservation: reservation,
+        })
+    }
+
+    fn retain_source(
+        &self,
+        view: DocumentView<'_>,
+        candidates: &mut OwnedVec<RetainedCandidate, W>,
+        source: KeyInfoSource,
+        origin: SourceOrigin,
+    ) -> Result<(), MemoryError> {
+        let (element, retrieved) = match origin {
+            SourceOrigin::Element(node) => (node, None),
+            SourceOrigin::Retrieved(node) => (
+                node,
+                Some(KeyInfoOrigin::Retrieved(view.node_identity_by_id(node))),
+            ),
+        };
+        let own = || retrieved.unwrap_or(KeyInfoOrigin::Element(view.node_identity_by_id(element)));
+        match source {
+            KeyInfoSource::X509Data(info) => {
+                // The parser keeps one certificate per X509Certificate child,
+                // in document order; each certificate names its own element.
+                let node = view
+                    .document()
+                    .get_node(element)
+                    .expect("retained KeyInfo source belongs to the verified document");
+                let mut elements = node
+                    .children()
+                    .filter(|child| child.has_tag_name((XMLDSIG_NS, "X509Certificate")));
+                for der in info.certificates {
+                    self.work.charge_work(1)?;
+                    let origin = retrieved.unwrap_or_else(|| {
+                        let certificate = elements
+                            .next()
+                            .expect("one X509Certificate element per parsed certificate");
+                        KeyInfoOrigin::Element(view.node_identity(certificate))
+                    });
+                    self.retain_material(candidates, origin, RetainedMaterial::Certificate(der))?;
+                }
+                Ok(())
+            }
+            KeyInfoSource::KeyValue(value) => {
+                self.retain_material(candidates, own(), RetainedMaterial::KeyValue(value))
+            }
+            KeyInfoSource::DerEncodedKeyValue(der) => self.retain_material(
+                candidates,
+                own(),
+                RetainedMaterial::SubjectPublicKeyInfo(der),
+            ),
+            KeyInfoSource::RetrievalMethod {
+                uri, resource_type, ..
+            } => self.retain_material(
+                candidates,
+                own(),
+                RetainedMaterial::Unmaterialized { uri, resource_type },
+            ),
+            // A name selects caller-held material; KeyInfo offers none itself.
+            // References are expanded or refused before key selection.
+            KeyInfoSource::KeyName(_) | KeyInfoSource::KeyInfoReference { .. } => Ok(()),
         }
     }
 
@@ -112,6 +285,31 @@ impl<'work, W: Work> ScopedCapture<'work, W> {
 }
 
 impl<W: Work> VerificationCapture for ScopedCapture<'_, W> {
+    const RETAINS_KEY_INFO: bool = true;
+
+    fn key_info(
+        &self,
+        view: DocumentView<'_>,
+        reading: KeyInfoReading,
+        key_info: Option<KeyInfo>,
+        origins: Option<Vec<SourceOrigin>>,
+    ) -> Result<(), MemoryError> {
+        self.retain_failure((|| {
+            let mut candidates = self.work.vector();
+            if let (Some(key_info), Some(origins)) = (key_info, origins) {
+                debug_assert_eq!(key_info.sources.len(), origins.len());
+                for (source, origin) in key_info.sources.into_iter().zip(origins) {
+                    self.retain_source(view, &mut candidates, source, origin)?;
+                }
+            }
+            *self.key_info.borrow_mut() = Some(RetainedKeyInfo {
+                reading,
+                candidates,
+            });
+            Ok(())
+        })())
+    }
+
     fn verify(
         &self,
         provider: &dyn crate::provider::CryptoProvider,

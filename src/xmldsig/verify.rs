@@ -35,7 +35,7 @@ use super::parse::MAX_REFERENCES_PER_SIGNATURE;
 use super::parse::parse_key_info;
 use super::parse::{
     KeyInfo, MAX_X509_DATA_TOTAL_BINARY_LEN, MAX_X509_DECODED_BINARY_LEN, ParseError, Reference,
-    RetrievalMethodTransforms, SignatureAlgorithm, XMLDSIG_NS,
+    RetrievalMethodTransforms, SignatureAlgorithm, SourceOrigin, XMLDSIG_NS,
 };
 use super::parse::{
     parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
@@ -2876,6 +2876,7 @@ fn materialize_verification_hints(
     resolver: &UriReferenceResolver<'_>,
     should_parse_key_info: bool,
     key_info: &mut Option<KeyInfo>,
+    mut origins: Option<&mut Vec<SourceOrigin>>,
 ) -> Result<RetrievalMaterialization, DsigError> {
     let mut materialization = budgets.key_info_materialization.borrow_mut();
     materialization.collect_encapsulation = true;
@@ -2925,6 +2926,7 @@ fn materialize_verification_hints(
         };
         let mut outcome = materialize_key_info_references_with_budgets(
             info,
+            origins.as_deref_mut(),
             resolver,
             &ctx.policy,
             ctx.provider,
@@ -2933,6 +2935,7 @@ fn materialize_verification_hints(
         )?;
         outcome.merge(materialize_retrieval_methods_with_budgets(
             info,
+            origins,
             resolver,
             &ctx.policy,
             ctx.provider,
@@ -3017,6 +3020,8 @@ struct PreparedVerificationSignature<'a> {
     children: SignatureChildNodes<'a, 'a>,
     signed_info: super::parse::SignedInfo,
     key_info: Option<KeyInfo>,
+    // Source elements of `key_info`, kept only when the capture retains it.
+    key_info_origins: Option<Vec<SourceOrigin>>,
     should_parse_key_info: bool,
     remaining_reference_capacity: usize,
 }
@@ -3062,6 +3067,7 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
             (None, Some(resolver)) => resolver.consumes_document_key_info(),
             (None, None) => true,
         };
+    let mut key_info_origins = C::RETAINS_KEY_INFO.then(Vec::new);
     let key_info = if should_parse_key_info {
         signature_children
             .key_info
@@ -3074,7 +3080,10 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
                     ctx.provider,
                     operation.budgets().transforms.xml_base_resolution(),
                     &ctx.policy.resources,
-                    None,
+                    super::parse::SourceContext {
+                        document_base: None,
+                        origins: key_info_origins.as_mut(),
+                    },
                     ctx.policy
                         .key_trust
                         .certificate_signature_algorithms
@@ -3087,6 +3096,7 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
     } else {
         None
     };
+    let key_info_origins = key_info.as_ref().and(key_info_origins);
 
     let signed_info = parse_signed_info_with_xpath_budget(
         signed_info_node,
@@ -3107,6 +3117,7 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
         children: signature_children,
         signed_info,
         key_info,
+        key_info_origins,
         should_parse_key_info,
         remaining_reference_capacity,
     })
@@ -3143,6 +3154,8 @@ struct VerificationCompletion<'a> {
     signature_value_node: Node<'a, 'a>,
     signed_info: super::parse::SignedInfo,
     key_info: Option<KeyInfo>,
+    key_info_origins: Option<Vec<SourceOrigin>>,
+    key_info_reading: KeyInfoReading,
     plan_nodes: VerificationPlanNodes,
     encapsulation: Option<ResolvedEncapsulation>,
     retrieval_materialization: RetrievalMaterialization,
@@ -3372,7 +3385,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
     resolver: &UriReferenceResolver<'_>,
     verification: &ManifestVerification<'_, '_, C>,
     key: Option<&dyn VerifyingKey>,
-    completion: VerificationCompletion<'_>,
+    mut completion: VerificationCompletion<'_>,
 ) -> Result<VerifyResult, DsigError> {
     let ctx = verification.context;
     let signature_value = decode_signature_value(
@@ -3458,6 +3471,13 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             FailureReason::SignatureMismatch,
         ));
     }
+    // Only an authenticated Signature's candidates outlive key selection.
+    verification.capture.key_info(
+        view,
+        completion.key_info_reading,
+        completion.key_info.take(),
+        completion.key_info_origins.take(),
+    )?;
     finish_authenticated_verification(
         operation,
         view,
@@ -3489,9 +3509,15 @@ fn verify_signature_node<'a, C: VerificationCapture>(
         children: signature_children,
         signed_info,
         mut key_info,
+        mut key_info_origins,
         should_parse_key_info,
         remaining_reference_capacity,
     } = prepare_verification_signature(view, signature_node, key, &verification, operation)?;
+    let key_info_reading = match (signature_children.key_info, should_parse_key_info) {
+        (None, _) => KeyInfoReading::Absent,
+        (Some(_), false) => KeyInfoReading::NotRead,
+        (Some(_), true) => KeyInfoReading::Read,
+    };
     let signed_info_node = signature_children.signed_info;
     let plan_nodes =
         compile_verification_operation_plan(operation, view, signature_node, resolver)?;
@@ -3514,6 +3540,7 @@ fn verify_signature_node<'a, C: VerificationCapture>(
                 resolver,
                 should_parse_key_info,
                 &mut key_info,
+                key_info_origins.as_mut(),
             )
         },
     )?;
@@ -3539,6 +3566,8 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             signature_value_node: signature_children.signature_value,
             signed_info,
             key_info,
+            key_info_origins,
+            key_info_reading,
             plan_nodes,
             encapsulation,
             retrieval_materialization,
@@ -3828,6 +3857,7 @@ struct KeyInfoReferenceMaterializationContext<'a, 'budget, P> {
 
 fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
     key_info: &mut KeyInfo,
+    origins: Option<&mut Vec<SourceOrigin>>,
     resolver: &UriReferenceResolver<'_>,
     policy: &P,
     provider: &dyn crate::provider::CryptoProvider,
@@ -3840,7 +3870,14 @@ fn materialize_key_info_references_with_budgets<P: KeyInfoReferencePolicy>(
         budgets,
     };
     let depth = materialization.reference_depth_base;
-    materialize_key_info_visit(key_info, resolver, &mut context, materialization, depth)
+    materialize_key_info_visit(
+        key_info,
+        origins,
+        resolver,
+        &mut context,
+        materialization,
+        depth,
+    )
 }
 
 fn parse_referenced_key_info<P: KeyInfoReferencePolicy>(
@@ -3849,7 +3886,7 @@ fn parse_referenced_key_info<P: KeyInfoReferencePolicy>(
     context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
     materialization: &mut KeyInfoMaterializationState,
     depth: usize,
-    document_base: Option<&str>,
+    source: super::parse::SourceContext<'_>,
 ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
     materialization.observe_encapsulation(node, resolver, depth)?;
     if let Some(mechanism) = &materialization.encapsulation {
@@ -3867,7 +3904,7 @@ fn parse_referenced_key_info<P: KeyInfoReferencePolicy>(
         context.provider,
         context.budgets.execution.xml_base_resolution(),
         context.policy.resources(),
-        document_base,
+        source,
         context.policy.certificate_signature_algorithms(),
         &mut context.budgets.key_info_parse.borrow_mut(),
     )
@@ -3946,10 +3983,14 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
             context,
             materialization,
             next_depth,
-            Some(resource_uri),
+            super::parse::SourceContext {
+                document_base: Some(resource_uri),
+                origins: None,
+            },
         )?;
         let mut nested_outcome = materialize_key_info_visit(
             &mut referenced,
+            None,
             &external_resolver,
             context,
             materialization,
@@ -3957,6 +3998,7 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
         )?;
         nested_outcome.merge(materialize_retrieval_methods_with_budgets(
             &mut referenced,
+            None,
             &external_resolver,
             context.policy,
             context.provider,
@@ -3972,16 +4014,63 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
     })
 }
 
+/// Parse the `KeyInfo` a same-document `KeyInfoReference` selects, with the
+/// element of each source when `track` is set.
+fn parse_same_document_key_info<P: KeyInfoReferencePolicy>(
+    uri: &str,
+    track: bool,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    materialization: &mut KeyInfoMaterializationState,
+    depth: usize,
+) -> Result<(KeyInfo, Option<Vec<SourceOrigin>>), SignatureVerificationPipelineError> {
+    let node = resolver
+        .node_for_same_document_reference(uri)
+        .map_err(|error| {
+            SignatureVerificationPipelineError::from(ReferenceProcessingError::UriDereference(
+                error,
+            ))
+        })?
+        .ok_or(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfoReference target is missing or ambiguous",
+        })?;
+    if !node.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
+        return Err(SignatureVerificationPipelineError::InvalidStructure {
+            reason: "KeyInfoReference target must be KeyInfo",
+        });
+    }
+    let mut origins = track.then(Vec::new);
+    let referenced = parse_referenced_key_info(
+        node,
+        resolver,
+        context,
+        materialization,
+        depth,
+        super::parse::SourceContext {
+            document_base: None,
+            origins: origins.as_mut(),
+        },
+    )?;
+    Ok((referenced, origins))
+}
+
 fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
     key_info: &mut KeyInfo,
+    mut origins: Option<&mut Vec<SourceOrigin>>,
     resolver: &UriReferenceResolver<'_>,
     context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
     materialization: &mut KeyInfoMaterializationState,
     depth: usize,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let mut materialized = Vec::new();
+    // Origins, when tracked, stay index for index with the sources.
+    let mut pending = origins
+        .as_deref_mut()
+        .map(|origins| std::mem::take(origins).into_iter());
+    let mut materialized_origins = Vec::new();
     let mut outcome = RetrievalMaterialization::default();
     for source in std::mem::take(&mut key_info.sources) {
+        let origin = pending.as_mut().and_then(Iterator::next);
         let source_work = match &source {
             super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
             _ => 1,
@@ -3994,6 +4083,7 @@ fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
 
         let super::parse::KeyInfoSource::KeyInfoReference { uri } = source else {
             materialized.push(source);
+            materialized_origins.extend(origin);
             continue;
         };
         if !context.policy.key_info_reference_source_enabled() {
@@ -4022,39 +4112,33 @@ fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
         }
 
         let is_same_document = uri.is_empty() || uri.starts_with('#');
-        let (mut referenced, mut nested_outcome) = if is_same_document {
-            let node = resolver
-                .node_for_same_document_reference(&uri)
-                .map_err(|error| {
-                    SignatureVerificationPipelineError::from(
-                        ReferenceProcessingError::UriDereference(error),
-                    )
-                })?
-                .ok_or(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "KeyInfoReference target is missing or ambiguous",
-                })?;
-            if !node.has_tag_name((XMLDSIG_NS, "KeyInfo")) {
-                return Err(SignatureVerificationPipelineError::InvalidStructure {
-                    reason: "KeyInfoReference target must be KeyInfo",
-                });
-            }
-            (
-                parse_referenced_key_info(
-                    node,
-                    resolver,
-                    context,
-                    materialization,
-                    next_depth,
-                    None,
-                )?,
-                RetrievalMaterialization::default(),
-            )
+        let (mut referenced, mut referenced_origins, mut nested_outcome) = if is_same_document {
+            let (referenced, origins) = parse_same_document_key_info(
+                &uri,
+                origin.is_some(),
+                resolver,
+                context,
+                materialization,
+                next_depth,
+            )?;
+            (referenced, origins, RetrievalMaterialization::default())
         } else {
-            materialize_external_key_info(&uri, resolver, context, materialization, next_depth)?
+            let (referenced, outcome) = materialize_external_key_info(
+                &uri,
+                resolver,
+                context,
+                materialization,
+                next_depth,
+            )?;
+            // Material from another document has no element in this one;
+            // it is attributed to the instruction that retrieved it.
+            let origins = origin.map(|origin| vec![origin.retrieved(); referenced.sources.len()]);
+            (referenced, origins, outcome)
         };
         if is_same_document {
             nested_outcome.merge(materialize_key_info_visit(
                 &mut referenced,
+                referenced_origins.as_mut(),
                 resolver,
                 context,
                 materialization,
@@ -4064,8 +4148,13 @@ fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
         outcome.merge(nested_outcome);
         materialization.active.remove(&cycle_key);
         materialized.extend(referenced.sources);
+        materialized_origins.extend(referenced_origins.into_iter().flatten());
     }
     key_info.sources = materialized;
+    if let Some(origins) = origins {
+        debug_assert_eq!(materialized_origins.len(), key_info.sources.len());
+        *origins = materialized_origins;
+    }
     context
         .policy
         .resources()
@@ -4523,13 +4612,14 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
         provider,
         budgets.execution.xml_base_resolution(),
         policy.resources(),
-        None,
+        super::parse::SourceContext::default(),
         policy.certificate_signature_algorithms(),
         &mut budgets.key_info_parse.borrow_mut(),
     )
     .map_err(map_key_info_parse_error)?;
     materialize_key_info_references_with_budgets(
         &mut key_info,
+        None,
         resolver,
         policy,
         provider,
@@ -4561,7 +4651,7 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
                     provider,
                     budgets.execution.xml_base_resolution(),
                     policy.resources(),
-                    None,
+                    super::parse::SourceContext::default(),
                     policy.certificate_signature_algorithms(),
                     &mut budgets.key_info_parse.borrow_mut(),
                 )
@@ -4571,6 +4661,7 @@ fn inspect_signature_key_info_with_budgets<P: KeyInfoReferencePolicy>(
                 materialization.reference_depth_base = materialization.encapsulation_depth;
                 materialize_key_info_references_with_budgets(
                     &mut key_info,
+                    None,
                     resolver,
                     policy,
                     provider,
@@ -4766,6 +4857,7 @@ fn materialize_key_info_references_for_policy<P: KeyInfoReferencePolicy>(
     // entry point cannot know whether a later key-selection stage needs them.
     materialize_key_info_references_with_budgets(
         key_info,
+        None,
         &resolver,
         policy,
         provider,
@@ -4928,12 +5020,13 @@ fn materialize_raw_certificate<P: KeyInfoReferencePolicy>(
     ))
 }
 
+/// The materialized source and, when read, the selected `X509Data` element.
 fn materialize_x509_data<P: KeyInfoReferencePolicy>(
     hint: RetrievalHint,
     resolver: &UriReferenceResolver<'_>,
     context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
     usage: &mut RetrievalUsage<'_>,
-) -> Result<super::parse::KeyInfoSource, DsigError> {
+) -> Result<(super::parse::KeyInfoSource, Option<NodeId>), DsigError> {
     let RetrievalHint {
         uri: resolved_uri,
         resource_type,
@@ -4963,11 +5056,14 @@ fn materialize_x509_data<P: KeyInfoReferencePolicy>(
                 reason: "X509Data RetrievalMethod target is missing or ambiguous",
             },
         );
-        return Ok(super::parse::KeyInfoSource::RetrievalMethod {
-            uri: resolved_uri,
-            resource_type,
-            transforms,
-        });
+        return Ok((
+            super::parse::KeyInfoSource::RetrievalMethod {
+                uri: resolved_uri,
+                resource_type,
+                transforms,
+            },
+            None,
+        ));
     };
     let node = match transforms {
         RetrievalMethodTransforms::None if target.has_tag_name((XMLDSIG_NS, "X509Data")) => target,
@@ -5011,11 +5107,12 @@ fn materialize_x509_data<P: KeyInfoReferencePolicy>(
         &budgets.key_info_parse.borrow().certificates,
     )
     .map_err(map_key_info_parse_error)?;
-    Ok(super::parse::KeyInfoSource::X509Data(data))
+    Ok((super::parse::KeyInfoSource::X509Data(data), Some(node.id())))
 }
 
 fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     key_info: &mut KeyInfo,
+    mut origins: Option<&mut Vec<SourceOrigin>>,
     resolver: &UriReferenceResolver<'_>,
     policy: &P,
     provider: &dyn crate::provider::CryptoProvider,
@@ -5036,8 +5133,14 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
     let mut seen = HashSet::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
+    // Origins, when tracked, stay index for index with the sources.
+    let mut pending = origins
+        .as_deref_mut()
+        .map(|origins| std::mem::take(origins).into_iter());
+    let mut materialized_origins = Vec::new();
     let mut outcome = RetrievalMaterialization::default();
     for source in std::mem::take(&mut key_info.sources) {
+        let origin = pending.as_mut().and_then(Iterator::next);
         let super::parse::KeyInfoSource::RetrievalMethod {
             uri: resolved_uri,
             resource_type,
@@ -5045,6 +5148,7 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
         } = source
         else {
             materialized.push(source);
+            materialized_origins.extend(origin);
             continue;
         };
 
@@ -5072,24 +5176,41 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
             candidate_work,
             outcome: &mut outcome,
         };
-        let source = if hint.resource_type.as_deref()
+        let (source, element) = if hint.resource_type.as_deref()
             == Some("http://www.w3.org/2000/09/xmldsig#rawX509Certificate")
         {
-            materialize_raw_certificate(hint, resolver, &mut context, &mut usage)?
+            (
+                materialize_raw_certificate(hint, resolver, &mut context, &mut usage)?,
+                None,
+            )
         } else if hint.resource_type.as_deref()
             == Some("http://www.w3.org/2000/09/xmldsig#X509Data")
         {
             materialize_x509_data(hint, resolver, &mut context, &mut usage)?
         } else {
-            super::parse::KeyInfoSource::RetrievalMethod {
-                uri: hint.uri,
-                resource_type: hint.resource_type,
-                transforms: hint.transforms,
-            }
+            (
+                super::parse::KeyInfoSource::RetrievalMethod {
+                    uri: hint.uri,
+                    resource_type: hint.resource_type,
+                    transforms: hint.transforms,
+                },
+                None,
+            )
         };
+        // A selected X509Data element of this document is the source; a raw
+        // external certificate is attributed to its RetrievalMethod.
+        materialized_origins.extend(origin.map(|origin| match (&source, element) {
+            (_, Some(element)) => SourceOrigin::Element(element),
+            (super::parse::KeyInfoSource::RetrievalMethod { .. }, None) => origin,
+            (_, None) => origin.retrieved(),
+        }));
         materialized.push(source);
     }
     key_info.sources = materialized;
+    if let Some(origins) = origins {
+        debug_assert_eq!(materialized_origins.len(), key_info.sources.len());
+        *origins = materialized_origins;
+    }
     Ok(outcome)
 }
 
@@ -5160,6 +5281,7 @@ fn materialize_retrieval_methods(
     policy.transforms.allowed_algorithms = allowed_transforms.cloned();
     materialize_retrieval_methods_with_budgets(
         key_info,
+        None,
         resolver,
         &policy,
         provider,
