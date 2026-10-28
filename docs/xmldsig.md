@@ -290,7 +290,8 @@ result in either order.
   `signed_info_references` entry is `DsigStatus::NotProcessed`, bound to its `Reference` element.
   No URI is dereferenced and no transform runs.
 - A verified signature: every `Reference` gets its own result, without stopping at the first
-  failure. `ReferenceDigestMismatch`, `ReferenceProcessingFailure` (dereference or transform),
+  failure. `ReferenceDigestMismatch`, `ReferenceProcessingFailure` (dereference or transform,
+  including malformed or undecodable XML content),
   `ReferencePolicyViolation` and `ReferenceUnavailable` (an external URI whose bytes the caller has
   not supplied) are distinct. `status` is `Valid` only when every `Reference` passes; otherwise it is
   the first failing `Reference` in document order. Manifests are processed only after that.

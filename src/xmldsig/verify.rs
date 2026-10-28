@@ -1743,6 +1743,16 @@ impl ReferenceProcessingError {
 /// exhaustion, stays terminal.
 fn is_reference_local_transform_error(error: &TransformError) -> bool {
     use crate::c14n::C14nError;
+    use crate::document::XmlDocumentError;
+    use crate::encoding::XmlEncodingError;
+    // Undecodable content belongs to its Reference; only the decoded-size
+    // ceiling is a resource refusal and stays terminal.
+    if let TransformError::XmlParse(XmlDocumentError::Encoding(encoding)) = error {
+        return !matches!(encoding, XmlEncodingError::DecodedLimit { .. });
+    }
+    if let TransformError::AccountedXmlEncoding(encoding) = error {
+        return !matches!(encoding, XmlEncodingError::DecodedLimit { .. });
+    }
     matches!(
         error,
         TransformError::TypeMismatch { .. }
@@ -1765,7 +1775,7 @@ fn is_reference_local_transform_error(error: &TransformError) -> bool {
                     | C14nError::RelativeNamespace
                     | C14nError::UnsupportedAlgorithm(_)
             )
-            | TransformError::XmlParse(crate::document::XmlDocumentError::Parse(_))
+            | TransformError::XmlParse(XmlDocumentError::Parse(_))
     )
 }
 

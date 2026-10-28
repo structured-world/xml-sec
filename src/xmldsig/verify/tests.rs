@@ -4406,6 +4406,59 @@ fn valid_signature_gives_every_reference_its_own_result() {
 }
 
 #[test]
+fn undecodable_detached_xml_fails_only_its_reference() {
+    // Malformed UTF-8 and an unknown declared encoding are properties of one
+    // Reference's content. A node-set transform over them fails that Reference
+    // and still gives the following Reference its own result.
+    let c14n_reference = |uri: &str| {
+        format!(
+            r#"<ds:Reference URI="{uri}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference>"#
+        )
+    };
+    let payload = b"payload";
+    let payload_digest = base64::engine::general_purpose::STANDARD.encode(
+        crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
+    );
+    let xml = signature_with_references(&[
+        &c14n_reference("urn:invalid-utf8"),
+        &c14n_reference("urn:unknown-encoding"),
+        &sha1_reference("urn:payload", &payload_digest),
+    ]);
+    let resources = HashMap::from([
+        ("urn:invalid-utf8".to_owned(), b"<a>\xC3\x28</a>".to_vec()),
+        (
+            "urn:unknown-encoding".to_owned(),
+            br#"<?xml version="1.0" encoding="x-unknown-encoding"?><a/>"#.to_vec(),
+        ),
+        ("urn:payload".to_owned(), payload.to_vec()),
+    ]);
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(external_reference_policy())
+        .external_resources(&resources)
+        .verify(&xml)
+        .expect("undecodable Reference content is a verification status");
+
+    let statuses: Vec<_> = result
+        .signed_info_references
+        .iter()
+        .map(|reference| reference.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 }),
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 }),
+            DsigStatus::Valid,
+        ]
+    );
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+    );
+}
+
+#[test]
 fn unavailable_detached_payload_does_not_hide_a_valid_signature() {
     // A detached Reference whose bytes the caller has not supplied yet is
     // Unavailable, distinct from a mismatch; the signature over SignedInfo
