@@ -29,9 +29,11 @@ The Rust probe uses `with_verified_request`, original `SignatureEvidence`,
 It records `accepted(document)` separately from `all_valid()`. It never reconstructs a
 verification context to bypass failed authentication or requests replay on an unauthenticated
 instruction. `store_pre_digest(true)` captures the original attempt's diagnostic octets and
-SignedInfo; authenticated replay bytes are compared separately. Failed references may stop the
-pipeline before later references or SignedInfo; those artifacts are **not run or blocked**.
-In particular a failed digest does not make replay an authenticated evidence channel.
+SignedInfo; authenticated replay bytes are compared separately. The signature over SignedInfo is
+verified before any Reference; when it fails, no Reference runs and those artifacts are **not run
+or blocked**. After a verified signature every Reference produces its own result, and XAdES
+refuses a signature whose core status is invalid. A failed digest does not make replay an
+authenticated evidence channel.
 
 ## Inputs and byte evidence
 
@@ -79,7 +81,7 @@ The documented `here()` difference is retained, not normalized away.
 The frozen run contains 96 matching Reference-octet pairs and 41 matching SignedInfo
 pairs across the two explicit modes. These include negative cases that remain processable;
 they are not counts of fully valid signatures. Authentication failures retain their typed
-causes, and later fail-fast steps remain unexecuted.
+causes, and References behind an unverified signature remain unexecuted.
 
 libxmlsec1 1.3.12 needs `--verbose --store-references --store-signatures` to print the
 buffers. They are **hex dumps**, not serialized XML. `debug_buffer` decodes them without
@@ -225,7 +227,7 @@ certificate engine, C14N, transform or XAdES implementation. Existing work was i
 - [#221 — closed authenticated replay](https://github.com/structured-world/xml-sec/issues/221):
   existing verified-session API used for every authenticated replay.
 - [#248 — independent reference/signature outcomes](https://github.com/structured-world/xml-sec/issues/248):
-  current fail-fast behavior explains unexecuted diagnostics after a failed reference.
+  the signature is verified first, then every Reference reports its own outcome.
 - [#250 — verification/import isolation](https://github.com/structured-world/xml-sec/issues/250)
   and [#282 — complete XAdES levels](https://github.com/structured-world/xml-sec/issues/282):
   existing boundaries; this corpus does not close them.

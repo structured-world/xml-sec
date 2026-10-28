@@ -74,7 +74,7 @@
       "positive": [
         {
           "file": "tests/signature_pipeline_integration.rs",
-          "test": "tampered_signature_value_fails_after_references_pass",
+          "test": "tampered_signature_value_leaves_references_unprocessed",
           "description": "Cryptographic mismatch returns an invalid verification result."
         }
       ],
