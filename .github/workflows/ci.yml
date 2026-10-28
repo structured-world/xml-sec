@@ -295,6 +295,13 @@ jobs:
           cargo clippy -p xml-sec --lib --no-default-features
           --features xmldsig,xml-backend-roxmltree
           --target thumbv7em-none-eabihf -- -D warnings
+      - uses: taiki-e/install-action@nextest
+      - name: Target coverage on the build without std
+        run: |
+          for backend in xmloxide roxmltree; do
+            cargo nextest run -p xml-sec --no-default-features \
+              --features "xmldsig,xml-backend-$backend" --test alloc_only_verification
+          done
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
