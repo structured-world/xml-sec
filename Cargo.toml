@@ -290,8 +290,9 @@ memchr = { version = "2", default-features = false, optional = true }
 self_cell = "1.3"
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
 xmlparser = { version = "0.13.6", default-features = false }
-peresil = { version = "0.3", optional = true }
-snafu = { version = "0.9", optional = true }
+# The XPath tokenizer's parser combinators.
+winnow = { version = "1.0.4", default-features = false, features = ["parser"], optional = true }
+snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
 cryptoki = { version = "0.12.1", optional = true }
@@ -321,12 +322,12 @@ slh-dsa = { version = "=0.2.0-rc.5", default-features = false, features = ["allo
 ml-kem = { version = "0.3.2", default-features = false, features = ["alloc", "zeroize"], optional = true }
 # Without the curves' `std`/`getrandom`: every random draw goes through the
 # selected CryptoProvider, so no build carries an operating-system RNG here.
-p256 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem", "precomputed-tables"], optional = true }
-p384 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem", "precomputed-tables"], optional = true }
-p521 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem", "precomputed-tables"], optional = true }
-# Only selects `std` for the curves' lazily built basepoint tables, which the
+p256 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem"], optional = true }
+p384 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem"], optional = true }
+p521 = { version = "0.14", default-features = false, features = ["alloc", "ecdsa", "pem"], optional = true }
+# Only lets `std` select the curves' lazily built basepoint tables, which the
 # curves' own `std` would couple to `getrandom`; no API of this crate is used.
-primeorder = { version = "0.14", default-features = false, features = ["std"], optional = true }
+primeorder = { version = "0.14", default-features = false, optional = true }
 dsa = { version = "0.7", features = ["hazmat"], optional = true }
 pkcs8 = { version = "0.11", features = ["pem"], optional = true }
 pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["alloc", "pem"], optional = true }
@@ -338,7 +339,7 @@ hkdf = { version = "0.13", default-features = false, optional = true }
 x25519-dalek = { version = "3", default-features = false, features = ["static_secrets", "zeroize"], optional = true }
 x448 = { version = "=0.14.0-pre.12", default-features = false, features = ["static_secrets"], optional = true }
 signature = { version = "3", optional = true }
-subtle = { version = "2", optional = true }
+subtle = { version = "2", default-features = false, optional = true }
 getrandom = { version = "0.4", features = ["sys_rng"], optional = true }
 zeroize = { version = "1", optional = true }
 aes = { version = "0.9.2", optional = true }
@@ -358,7 +359,7 @@ structured-pkix = { version = "0.16.0", default-features = false, features = ["a
 structured-cms = { version = "0.16.0", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
-der = { version = "0.8", features = ["pem"], optional = true }
+der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
 crypto-bigint = { version = "0.7", features = ["zeroize"], optional = true }
 crypto-primes = { version = "0.7.2", default-features = false, optional = true }
 
@@ -370,12 +371,14 @@ time = { version = "0.3.55", features = ["local-offset"], optional = true }
 url = { version = "2", optional = true }
 
 # Base64 encoding/decoding
-base64 = "0.23"
+base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 
 # Error handling
-thiserror = "2"
+thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
+# The embedded XPath engine's tests build documents with its XML parser.
+peresil = "0.3"
 sha3 = { version = "0.12", default-features = false, features = ["oid", "zeroize"] }
 divan = "=0.1.21"
 ml-dsa = { version = "0.1.1", default-features = false, features = ["alloc", "pkcs8", "rand_core", "zeroize"] }
@@ -401,7 +404,21 @@ benchmark-internals = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
 legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
 default = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
-std = ["thiserror/std", "xmlparser/std", "structured-asn1?/std", "structured-pkix?/std"]
+std = [
+    "thiserror/std",
+    "xmlparser/std",
+    "structured-asn1?/std",
+    "structured-pkix?/std",
+    "base64/std",
+    "snafu?/std",
+    "der?/std",
+    "subtle?/std",
+    # Lazily built basepoint tables need std's LazyLock without critical-section.
+    "primeorder?/std",
+    "p256?/precomputed-tables",
+    "p384?/precomputed-tables",
+    "p521?/precomputed-tables",
+]
 aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs", "dep:aws-lc-fips-sys"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = []
@@ -411,7 +428,6 @@ xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
 # this also selects differential parsing as the default runtime mode.
 xml-backend-differential = ["xml-backends-all"]
 xmldsig = [            # XML Digital Signature verification and public-key inventory
-    "std",
     "no-unsafe",
     "embedded",
     "dep:der",
@@ -422,7 +438,7 @@ xmldsig = [            # XML Digital Signature verification and public-key inven
     "dep:ed448-goldilocks",
     "dep:hmac",
     "dep:md-5",
-    "dep:peresil",
+    "dep:winnow",
     "dep:p256",
     "dep:p384",
     "dep:p521",

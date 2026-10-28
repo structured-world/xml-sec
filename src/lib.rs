@@ -34,12 +34,14 @@
 //! # }
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![deny(unsafe_code)]
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
 extern crate alloc;
-#[cfg(feature = "xmldsig")]
+// The embedded XPath engine's XML parser only builds test documents.
+#[cfg(all(test, feature = "xmldsig"))]
 #[macro_use]
 extern crate peresil;
 

@@ -52,8 +52,10 @@ workspace = true
 name = "integration"
 path = "tests/integration.rs"
 
-[dependencies.peresil]
-version = "0.3.0"
+[dependencies.winnow]
+version = "1.0.4"
+default-features = false
+features = ["parser"]
 
 [dependencies.snafu]
 version = "0.9"

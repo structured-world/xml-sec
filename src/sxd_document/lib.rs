@@ -147,7 +147,9 @@ pub fn estimated_storage_bytes(requirements: StorageRequirements) -> usize {
 mod lazy_hash_map;
 #[cfg(feature = "no-unsafe")]
 mod namespace_storage;
-pub(crate) mod str;
+// XML character classes, shared with the XPath tokenizer.
+#[doc(hidden)]
+pub mod str;
 mod str_ext;
 
 #[cfg(not(feature = "no-unsafe"))]
@@ -183,6 +185,9 @@ pub mod thindom;
 #[path = "writer_no_unsafe.rs"]
 pub mod writer;
 
+// Embedded in xml-sec, the XML parser only builds test documents; documents
+// under verification come from xml-sec's own parsers.
+#[cfg(any(test, not(feature = "embedded")))]
 pub mod parser;
 
 #[cfg(not(feature = "no-unsafe"))]
