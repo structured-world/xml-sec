@@ -1,16 +1,14 @@
-use std::{
-    borrow::Borrow,
-    collections::{HashMap, hash_map},
-    hash::Hash,
-};
+use core::borrow::Borrow;
+
+use crate::collections::{Key, Map, map};
 
 pub struct LazyHashMap<K, V> {
-    map: Option<HashMap<K, V>>,
+    map: Option<Map<K, V>>,
 }
 
 impl<K, V> LazyHashMap<K, V>
 where
-    K: ::std::hash::Hash + Eq,
+    K: Key,
 {
     pub fn new() -> LazyHashMap<K, V> {
         LazyHashMap { map: None }
@@ -19,7 +17,7 @@ where
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Key + ?Sized,
     {
         self.map.as_ref().is_some_and(|m| m.contains_key(key))
     }
@@ -27,7 +25,7 @@ where
     pub fn get<Q>(&self, key: &Q) -> Option<&V>
     where
         K: Borrow<Q>,
-        Q: Hash + Eq + ?Sized,
+        Q: Key + ?Sized,
     {
         self.map.as_ref().and_then(|m| m.get(key))
     }
@@ -35,7 +33,7 @@ where
     pub fn insert(&mut self, key: K, val: V) -> Option<V> {
         self.map = match self.map.take() {
             Some(m) => Some(m),
-            None => Some(HashMap::new()),
+            None => Some(Map::new()),
         };
 
         self.map.as_mut().and_then(|m| m.insert(key, val))
@@ -47,11 +45,13 @@ where
 
     #[cfg(feature = "embedded")]
     pub fn capacity(&self) -> usize {
-        self.map.as_ref().map_or(0, HashMap::capacity)
+        self.map
+            .as_ref()
+            .map_or(0, crate::collections::Table::entry_capacity)
     }
 }
 
-pub struct Iter<'a, K, V>(Option<hash_map::Iter<'a, K, V>>);
+pub struct Iter<'a, K, V>(Option<map::Iter<'a, K, V>>);
 
 impl<'a, K: 'a, V: 'a> Iterator for Iter<'a, K, V> {
     type Item = (&'a K, &'a V);

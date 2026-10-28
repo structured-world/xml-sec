@@ -1,10 +1,7 @@
 //! ECMA-376 Part 2 relationship normalization, with one MCE semantic path.
 
-use std::{
-    cell::Cell,
-    io::{self, Write},
-    mem::size_of,
-};
+use alloc::string::String;
+use core::{cell::Cell, mem::size_of};
 
 #[cfg(test)]
 use super::Transform;
@@ -315,7 +312,7 @@ impl<S: Scratch> CurrentBudget<'_, S> {
         Ok(None)
     }
 }
-impl<S: Scratch> std::ops::Deref for CurrentBudget<'_, S> {
+impl<S: Scratch> core::ops::Deref for CurrentBudget<'_, S> {
     type Target = TransformExecutionBudget;
     fn deref(&self) -> &Self::Target {
         self.original
@@ -690,70 +687,66 @@ fn write_normalized<S: Scratch, D: crate::xml::dom::storage::Storage>(
         budget,
         failure: None,
     };
-    let result: Result<(), TransformError> = (|| {
-        for node in scan.before.iter() {
-            write_instruction(*node, &mut output)?;
-        }
-        output
-            .write_all(b"<Relationships xmlns=\"")
-            .map_err(output_error)?;
-        output.write_all(REL.as_bytes()).map_err(output_error)?;
-        output.write_all(b"\">").map_err(output_error)?;
-        let mut records = scan.records.iter();
-        let mut slots_seen = 0;
-        for event in scan.events.iter() {
-            let record = match event {
-                Event::Instruction(node) => {
-                    // 2012 §13.2.4.24 step 3 removes all edge characters,
-                    // whereas 2021 §10.6 step 3 removes text/comments only:
-                    // https://ecma-international.org/publications-and-standards/standards/ecma-376/
-                    if edition == OpcRelationshipEdition::Ecma2021
-                        || selected
-                            .is_some_and(|(first, last)| slots_seen > first && slots_seen <= last)
-                    {
-                        write_instruction(*node, &mut output)?;
-                    }
-                    continue;
+    for node in scan.before.iter() {
+        write_instruction(*node, &mut output)?;
+    }
+    output.write_all(b"<Relationships xmlns=\"")?;
+    output.write_all(REL.as_bytes())?;
+    output.write_all(b"\">")?;
+    let mut records = scan.records.iter();
+    let mut slots_seen = 0;
+    for event in scan.events.iter() {
+        let record = match event {
+            Event::Instruction(node) => {
+                // 2012 §13.2.4.24 step 3 removes all edge characters,
+                // whereas 2021 §10.6 step 3 removes text/comments only:
+                // https://ecma-international.org/publications-and-standards/standards/ecma-376/
+                if edition == OpcRelationshipEdition::Ecma2021
+                    || selected
+                        .is_some_and(|(first, last)| slots_seen > first && slots_seen <= last)
+                {
+                    write_instruction(*node, &mut output)?;
                 }
-                Event::Relationship => records
-                    .next()
-                    .ok_or_else(|| invalid("relationship slot mismatch"))?,
-            };
-            slots_seen += 1;
-            if !record.selected {
                 continue;
             }
-            output.write_all(b"<Relationship").map_err(output_error)?;
-            for (name, value) in [
-                ("Id", record.id),
-                ("Target", record.target),
-                ("TargetMode", record.mode),
-                ("Type", record.kind),
-            ] {
-                write!(output, " {name}=\"").map_err(output_error)?;
-                crate::c14n::escape_attr(value, &mut output).map_err(output_error)?;
-                output.write_all(b"\"").map_err(output_error)?;
-            }
-            output.write_all(b">").map_err(output_error)?;
-            if edition == OpcRelationshipEdition::Ecma2021 {
-                for instruction in record.instructions.iter() {
-                    write_instruction(*instruction, &mut output)?;
-                }
-            }
-            output.write_all(b"</Relationship>").map_err(output_error)?;
+            Event::Relationship => records
+                .next()
+                .ok_or_else(|| invalid("relationship slot mismatch"))?,
+        };
+        slots_seen += 1;
+        if !record.selected {
+            continue;
         }
-        output
-            .write_all(b"</Relationships>")
-            .map_err(output_error)?;
-        for node in scan.after.iter() {
-            write_instruction(*node, &mut output)?;
+        output.write_all(b"<Relationship")?;
+        for (name, value) in [
+            ("Id", record.id),
+            ("Target", record.target),
+            ("TargetMode", record.mode),
+            ("Type", record.kind),
+        ] {
+            output.write_all(b" ")?;
+            output.write_all(name.as_bytes())?;
+            output.write_all(b"=\"")?;
+            if crate::c14n::escape_attr(value, &mut output).is_err() {
+                return Err(output
+                    .failure
+                    .take()
+                    .unwrap_or_else(|| invalid("relationship output failed")));
+            }
+            output.write_all(b"\"")?;
         }
-        Ok(())
-    })();
-    if let Some(error) = output.failure {
-        return Err(error);
+        output.write_all(b">")?;
+        if edition == OpcRelationshipEdition::Ecma2021 {
+            for instruction in record.instructions.iter() {
+                write_instruction(*instruction, &mut output)?;
+            }
+        }
+        output.write_all(b"</Relationship>")?;
     }
-    result?;
+    output.write_all(b"</Relationships>")?;
+    for node in scan.after.iter() {
+        write_instruction(*node, &mut output)?;
+    }
     Ok(output.bytes)
 }
 
@@ -764,52 +757,46 @@ fn write_instruction<B: crate::c14n::scratch::Bytes, D: crate::xml::dom::storage
     let instruction = node
         .pi()
         .ok_or_else(|| invalid("expected processing instruction"))?;
-    write!(output, "<?{}", instruction.target).map_err(output_error)?;
+    output.write_all(b"<?")?;
+    output.write_all(instruction.target.as_bytes())?;
     if let Some(value) = instruction.value {
-        write!(output, " {value}").map_err(output_error)?;
+        output.write_all(b" ")?;
+        output.write_all(value.as_bytes())?;
     }
-    output.write_all(b"?>").map_err(output_error)
-}
-
-fn output_error(_: io::Error) -> TransformError {
-    // Output retains the original typed failure, checked before returning from
-    // normalize_in. The io::Write boundary needs no boxed diagnostic allocation.
-    invalid("relationship output failed")
+    output.write_all(b"?>")
 }
 
 struct Output<'a, B: crate::c14n::scratch::Bytes> {
     bytes: B,
     budget: &'a TransformExecutionBudget,
+    /// The typed cause of a refusal reported through the canonical byte sink.
     failure: Option<TransformError>,
 }
 
-impl<B: crate::c14n::scratch::Bytes> Write for Output<'_, B> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if self.failure.is_some() {
-            return Err(io::ErrorKind::Other.into());
+impl<B: crate::c14n::scratch::Bytes> Output<'_, B> {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), TransformError> {
+        self.budget.charge_c14n_output_policy(bytes.len())?;
+        if bytes.len() > self.bytes.capacity() - self.bytes.len() {
+            let capacity = self
+                .bytes
+                .len()
+                .checked_add(bytes.len())
+                .and_then(usize::checked_next_power_of_two)
+                .ok_or_else(|| invalid("output overflow"))?;
+            self.budget.opc_workspace.charge(capacity)?;
+            self.bytes.reserve(capacity - self.bytes.len())?;
         }
-        let result = (|| {
-            self.budget.charge_c14n_output_policy(bytes.len())?;
-            if bytes.len() > self.bytes.capacity() - self.bytes.len() {
-                let capacity = self
-                    .bytes
-                    .len()
-                    .checked_add(bytes.len())
-                    .and_then(usize::checked_next_power_of_two)
-                    .ok_or_else(|| invalid("output overflow"))?;
-                self.budget.opc_workspace.charge(capacity)?;
-                self.bytes.reserve(capacity - self.bytes.len())?;
-            }
-            self.bytes.append(bytes)?;
-            Ok::<_, TransformError>(bytes.len())
-        })();
-        result.map_err(|error| {
-            self.failure = Some(error);
-            io::ErrorKind::Other.into()
-        })
-    }
-    fn flush(&mut self) -> io::Result<()> {
+        self.bytes.append(bytes)?;
         Ok(())
+    }
+}
+
+impl<B: crate::c14n::scratch::Bytes> crate::c14n::sink::ByteSink for Output<'_, B> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), crate::c14n::C14nError> {
+        self.write_all(bytes).map_err(|error| {
+            self.failure = Some(error);
+            crate::c14n::C14nError::OutputRefused
+        })
     }
 }
 
@@ -1244,7 +1231,7 @@ fn valid_iri_authority(authority: &str) -> bool {
         {
             return false;
         }
-        if address.parse::<std::net::Ipv6Addr>().is_ok() {
+        if address.parse::<core::net::Ipv6Addr>().is_ok() {
             return true;
         }
         if let Some(future) = address.strip_prefix(['v', 'V'])

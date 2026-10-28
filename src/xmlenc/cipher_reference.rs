@@ -1,6 +1,6 @@
 //! Source-anchored `XMLEnc` `CipherReference` processing.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::xml::dom::Node;
 use crate::xmldsig::transforms::{
@@ -282,7 +282,7 @@ impl<'a> CipherReferenceContext<'a> {
     /// Returns [`XmlEncError`] when `policy` fails validation.
     pub fn new(
         policy: &'a crate::policy::DecryptionPolicy,
-        resources: Option<&'a HashMap<String, Vec<u8>>>,
+        resources: Option<&'a BTreeMap<String, Vec<u8>>>,
         backend: crate::XmlBackend,
         id_attributes: &'a [crate::IdAttributeRegistration],
     ) -> Result<Self, XmlEncError> {
@@ -483,7 +483,7 @@ mod tests {
         let xml = format!("<root>{}</root>", reference("urn:cipher", ""));
         let document = Document::parse(&xml).expect("source XML");
         let foreign = Document::parse(&xml).expect("independent XML");
-        let resources = HashMap::from([("urn:cipher".into(), b"ciphertext".to_vec())]);
+        let resources = BTreeMap::from([("urn:cipher".into(), b"ciphertext".to_vec())]);
         let policy = crate::policy::DecryptionPolicy {
             uris: crate::policy::UriPolicy {
                 references: UriTypeSet::ALL,
@@ -548,7 +548,7 @@ mod tests {
         // an inline CipherValue's base64 conversion must not be inherited.
         let xml = reference("urn:cipher", "");
         let document = Document::parse(&xml).expect("reference XML");
-        let resources = HashMap::from([("urn:cipher".into(), b"YWJj".to_vec())]);
+        let resources = BTreeMap::from([("urn:cipher".into(), b"YWJj".to_vec())]);
         let mut policy = crate::policy::DecryptionPolicy::default();
         policy.uris.references = UriTypeSet::ALL;
         let context = CipherReferenceContext::new(
@@ -574,7 +574,7 @@ mod tests {
             &format!("<Transforms><ds:Transform Algorithm='{BASE64}'/></Transforms>"),
         );
         let document = Document::parse(&xml).expect("reference XML");
-        let resources = HashMap::from([("urn:cipher".into(), b"YWJj".to_vec())]);
+        let resources = BTreeMap::from([("urn:cipher".into(), b"YWJj".to_vec())]);
         let mut policy = crate::policy::DecryptionPolicy::default();
         policy.uris.references = UriTypeSet::ALL;
         let context = CipherReferenceContext::new(
@@ -596,7 +596,7 @@ mod tests {
     fn malformed_reference_does_not_spend_external_budget() {
         // Syntax rejection precedes resource resolution, leaving the sole
         // permitted read available for the subsequent valid reference.
-        let resources = HashMap::from([("urn:cipher".into(), b"abc".to_vec())]);
+        let resources = BTreeMap::from([("urn:cipher".into(), b"abc".to_vec())]);
         let mut policy = crate::policy::DecryptionPolicy::default();
         policy.uris.references = UriTypeSet::ALL;
         policy.resources.max_external_resource_total_bytes = 3;
@@ -644,7 +644,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name((XMLENC_NS, "CipherReference")))
             .expect("reference");
-        let resources = HashMap::from([("https://example.invalid/cipher".into(), vec![1, 2, 3])]);
+        let resources = BTreeMap::from([("https://example.invalid/cipher".into(), vec![1, 2, 3])]);
         let mut policy = crate::policy::DecryptionPolicy::default();
         policy.uris.references = UriTypeSet::ALL;
         let context = CipherReferenceContext::new(
@@ -720,7 +720,7 @@ mod tests {
             &format!("<Transforms>invalid<ds:Transform Algorithm='{BASE64}'/></Transforms>"),
         );
         let document = Document::parse(&xml).expect("reference XML");
-        let resources = HashMap::from([("urn:cipher".into(), b"YWJj".to_vec())]);
+        let resources = BTreeMap::from([("urn:cipher".into(), b"YWJj".to_vec())]);
         let mut policy = crate::policy::DecryptionPolicy::default();
         policy.uris.references = UriTypeSet::ALL;
         let context = CipherReferenceContext::new(

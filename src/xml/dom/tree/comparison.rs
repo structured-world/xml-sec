@@ -1,17 +1,19 @@
 //! One semantic comparator for native and current-query DOM construction.
 
-use std::{collections::HashMap, ops::Range};
+use alloc::string::String;
+use core::ops::Range;
 
 use super::{
     AttributeData, Document, NamespaceData, NodeData, NodeKind, XML_NAMESPACE_URI,
     source_ranges_equivalent,
 };
+use crate::collections::{Map, Table};
 use crate::xml::dom::{
     ParseError,
     storage::{Native, Storage},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NamespaceKey<'a>(Option<&'a str>, &'a str);
 
 pub(crate) trait ComparisonStorage: Storage {
@@ -26,11 +28,11 @@ pub(crate) trait Counts<'a, S: Storage> {
 }
 
 impl ComparisonStorage for Native {
-    type Counts<'a> = HashMap<NamespaceKey<'a>, usize>;
+    type Counts<'a> = Map<NamespaceKey<'a>, usize>;
     fn counts<'a>(&self, capacity: usize) -> Result<Self::Counts<'a>, ParseError> {
-        let mut counts = HashMap::new();
+        let mut counts = Map::new();
         counts
-            .try_reserve(capacity)
+            .try_reserve_entries(capacity)
             .map_err(|_| ParseError::AllocationFailed)?;
         Ok(counts)
     }
@@ -39,7 +41,7 @@ impl ComparisonStorage for Native {
     }
 }
 
-impl<'a> Counts<'a, Native> for HashMap<NamespaceKey<'a>, usize> {
+impl<'a> Counts<'a, Native> for Map<NamespaceKey<'a>, usize> {
     fn increment(&mut self, key: NamespaceKey<'a>, _: Native) -> Result<(), ParseError> {
         // The complete input axis length was reserved at construction.
         *self.entry(key).or_insert(0) += 1;

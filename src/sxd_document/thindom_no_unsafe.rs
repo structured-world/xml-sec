@@ -1,4 +1,5 @@
-use std::{fmt, hash, marker::PhantomData};
+use alloc::vec::Vec;
+use core::{fmt, hash, marker::PhantomData};
 
 use super::{QName, raw};
 use crate::string_pool::InternedString;
@@ -353,7 +354,7 @@ impl Element<'_> {
 }
 
 impl fmt::Debug for Element<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Element {{ idx: {:?} }}", self.node)
     }
 }

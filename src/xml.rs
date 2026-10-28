@@ -2,8 +2,10 @@
 
 pub mod dom;
 
+use alloc::{borrow::ToOwned, string::String};
+
 #[cfg(any(feature = "xmldsig", test))]
-use std::collections::{HashMap, HashSet, hash_map::Entry};
+use crate::collections::{Entry, Map, Set};
 
 #[cfg(any(feature = "xmldsig", test))]
 use crate::xml::dom::Document;
@@ -156,7 +158,7 @@ pub(crate) fn is_id_attribute<S: dom::storage::Storage>(
 /// Duplicate-safe index of XML ID attributes in one parsed document.
 #[cfg(any(feature = "xmldsig", test))]
 pub(crate) struct XmlIdIndex<'a> {
-    nodes: HashMap<&'a str, Node<'a, 'a>>,
+    nodes: Map<&'a str, Node<'a, 'a>>,
 }
 
 #[cfg(any(feature = "xmldsig", test))]
@@ -166,8 +168,8 @@ impl<'a> XmlIdIndex<'a> {
         document: &'a Document<'a>,
         registrations: &[IdAttributeRegistration],
     ) -> Self {
-        let mut nodes = HashMap::new();
-        let mut duplicates = HashSet::new();
+        let mut nodes = Map::new();
+        let mut duplicates = Set::new();
         for node in document.descendants().filter(Node::is_element) {
             // ID registration is local-name based: qualified profile attributes
             // such as wsu:Id and xml:id participate alongside unqualified Id.
@@ -214,7 +216,7 @@ impl<'a> XmlIdIndex<'a> {
     }
 
     #[cfg(feature = "xmldsig")]
-    pub(crate) fn into_node_ids(self) -> HashMap<String, NodeId> {
+    pub(crate) fn into_node_ids(self) -> Map<String, NodeId> {
         self.nodes
             .into_iter()
             .map(|(value, node)| (value.to_owned(), node.id()))

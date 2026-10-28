@@ -290,8 +290,10 @@ memchr = { version = "2", default-features = false, optional = true }
 self_cell = "1.3"
 encoding_rs = { version = "0.8", default-features = false, features = ["alloc"] }
 xmlparser = { version = "0.13.6", default-features = false }
+# XPath floor/ceiling without std, where core has no float rounding.
+libm = { version = "0.2.16", optional = true }
 # The XPath tokenizer's parser combinators.
-winnow = { version = "1.0.4", default-features = false, features = ["parser"], optional = true }
+winnow ={ version = "1.0.4", default-features = false, features = ["parser"], optional = true }
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
@@ -376,6 +378,10 @@ base64 = { version = "0.23", default-features = false, features = ["alloc"] }
 # Error handling
 thiserror = { version = "2", default-features = false }
 
+# The process-wide document identity counter on targets without 64-bit atomics.
+[target.'cfg(not(target_has_atomic = "64"))'.dependencies]
+portable-atomic = { version = "1.15", default-features = false, features = ["fallback"] }
+
 [dev-dependencies]
 # The embedded XPath engine's tests build documents with its XML parser.
 peresil = "0.3"
@@ -439,6 +445,7 @@ xmldsig = [            # XML Digital Signature verification and public-key inven
     "dep:hmac",
     "dep:md-5",
     "dep:winnow",
+    "dep:libm",
     "dep:p256",
     "dep:p384",
     "dep:p521",
@@ -462,6 +469,8 @@ xmldsig = [            # XML Digital Signature verification and public-key inven
 # PKCS#8, PKCS#12) on top of verification.
 xmldsig-sign = [
     "xmldsig",
+    # Signing randomness and the signature writer need the host.
+    "std",
     "dep:getrandom",
     "dep:pkcs12",
     "dep:structured-cms",

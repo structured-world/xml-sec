@@ -118,7 +118,7 @@ fn reference_resolution_uses_each_elements_effective_xml_base() {
         .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
         .unwrap();
     let signed_info = parse_signed_info(signed_info_node).unwrap();
-    let resources = HashMap::from([
+    let resources = BTreeMap::from([
         (
             "https://example.test/base/one/payload.bin".into(),
             first.to_vec(),
@@ -163,7 +163,7 @@ fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
   </ds:Signature>
 </root>"#
     );
-    let resources = HashMap::from([("urn:detached-dtd".to_owned(), detached.to_vec())]);
+    let resources = BTreeMap::from([("urn:detached-dtd".to_owned(), detached.to_vec())]);
     let key = AcceptingKey;
 
     // A refused detached parse is this Reference's own processing failure.
@@ -190,7 +190,7 @@ fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
             <!ENTITY ext SYSTEM "file:///etc/passwd">
         ]><payload>&ext;</payload>"#;
     let external_entity_resources =
-        HashMap::from([("urn:detached-dtd".to_owned(), external_entity.to_vec())]);
+        BTreeMap::from([("urn:detached-dtd".to_owned(), external_entity.to_vec())]);
     let external_entity_result = VerifyContext::new()
         .key(&key)
         .allowed_uri_types(UriTypeSet::ALL)
@@ -485,7 +485,7 @@ fn manifest_processing_stops_after_c14n_budget_exhaustion() {
     let xml = format!(
         r##"<root xmlns:ds="{XMLDSIG_NS}"><payload Id="payload">too large</payload><ds:Signature><ds:Object Id="signed-object"><ds:Manifest><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="urn:small"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
     );
-    let resources = HashMap::from([("urn:small".to_owned(), b"small".to_vec())]);
+    let resources = BTreeMap::from([("urn:small".to_owned(), b"small".to_vec())]);
     let transform_budget = TransformExecutionBudget::with_c14n_limit(8);
     let ctx = VerifyContext::new()
         .allowed_uri_types(UriTypeSet::ALL)
@@ -555,7 +555,7 @@ fn verification_policy_bounds_detached_xml_nodes() {
     let xml = format!(
         r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="urn:detached-nodes"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#
     );
-    let resources = HashMap::from([("urn:detached-nodes".to_owned(), detached.into_bytes())]);
+    let resources = BTreeMap::from([("urn:detached-nodes".to_owned(), detached.into_bytes())]);
     let policy = crate::policy::VerificationPolicy {
         uris: crate::policy::UriPolicy {
             references: UriTypeSet::ALL,
@@ -614,7 +614,7 @@ fn query_only_reference_resolves_against_relative_xml_base() {
         .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
         .unwrap();
     let signed_info = parse_signed_info(signed_info_node).unwrap();
-    let resources = HashMap::from([("a/b?new".to_string(), payload.to_vec())]);
+    let resources = BTreeMap::from([("a/b?new".to_string(), payload.to_vec())]);
     let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
 
     let result = process_all_references(&signed_info.references, &resolver, signature, false)
@@ -647,7 +647,7 @@ fn manifest_reference_resolution_uses_its_effective_xml_base() {
         .find(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
         .unwrap();
     let reference = super::super::parse::parse_reference(reference_node).unwrap();
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.test/manifests/payload.bin".to_string(),
         payload.to_vec(),
     )]);
@@ -703,7 +703,7 @@ fn manifest_reference_index_ignores_nested_manifest_descendants() {
         .find(|node| node.has_tag_name((XMLDSIG_NS, "Reference")))
         .unwrap();
     let reference = super::super::parse::parse_reference(direct_reference_node).unwrap();
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.test/direct/payload.bin".to_string(),
         payload.to_vec(),
     )]);
@@ -1453,7 +1453,7 @@ fn verify_request_rejects_conflicting_resource_owners() {
     // There is no implicit override between request bytes and old builder
     // configuration: ownership must be explicit before resolver work.
     let document = XmlDocument::parse("<root/>").unwrap();
-    let resources = HashMap::new();
+    let resources = BTreeMap::new();
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..VerificationRequest::default()
@@ -1558,7 +1558,7 @@ fn verify_context_bounds_effective_xml_base_components() {
     for _ in 0..65 {
         xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
     }
-    let resources = HashMap::new();
+    let resources = BTreeMap::new();
     let error = VerifyContext::new()
         .key(&AcceptingKey)
         .allowed_uri_types(UriTypeSet::ALL)
@@ -1584,7 +1584,7 @@ fn verify_context_bounds_cumulative_xml_base_resolution_bytes() {
     for _ in 0..2 {
         xml = format!(r#"<n xml:base="segment/">{xml}</n>"#);
     }
-    let resources = HashMap::new();
+    let resources = BTreeMap::new();
     let mut policy = crate::policy::VerificationPolicy::default();
     policy.resources.max_xml_base_resolution_bytes = 32;
     let error = VerifyContext::new()
@@ -1701,7 +1701,7 @@ fn verify_context_meters_repeated_external_dereferences() {
     let xml = format!(
         r#"<ds:Signature xmlns:ds="{XMLDSIG_NS}"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{reference}{reference}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature>"#
     );
-    let resources = HashMap::from([("urn:payload".to_owned(), payload.to_vec())]);
+    let resources = BTreeMap::from([("urn:payload".to_owned(), payload.to_vec())]);
     let policy = crate::policy::VerificationPolicy {
         uris: crate::policy::UriPolicy {
             references: UriTypeSet::ALL,
@@ -2325,7 +2325,7 @@ fn verify_context_applies_digest_policy_to_manifest_references() {
     // same digest allowlist as SignedInfo references.
     let policy = crate::policy::VerificationPolicy {
         manifest_processing: crate::policy::ManifestProcessing::Process,
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         ..crate::policy::VerificationPolicy::default()
     };
     let xml = signature_with_manifest_xml_with_manifest_mutation(true, |mut xml| {
@@ -2587,7 +2587,7 @@ fn manifest_reference_limit_counts_unsupported_entries() {
             Some((view.identity(), view.generation())),
         );
         operation.authenticate(view.node_identity(object));
-        let mut processed = HashSet::new();
+        let mut processed = Set::new();
         let mut remaining = MAX_REFERENCES_PER_SIGNATURE;
         let mut next_index = 0;
         let mut xpath_parse = XPathSignatureParseBudget::default();
@@ -2630,7 +2630,7 @@ fn unsigned_manifest_discovery_cannot_bypass_the_filter_work_budget() {
             &budgets,
             Some((view.identity(), view.generation())),
         );
-        let mut processed = HashSet::new();
+        let mut processed = Set::new();
         let mut remaining = 1;
         let mut index = 0;
         let mut xpath = XPathSignatureParseBudget::default();
@@ -2677,7 +2677,7 @@ fn unsigned_manifest_remains_eligible_after_trust_expands() {
             Some((view.identity(), view.generation())),
         );
         operation.authenticate(view.node_identity(outer));
-        let mut processed = HashSet::new();
+        let mut processed = Set::new();
         let mut remaining = 2;
         let mut next_index = 0;
         let mut xpath_budget = XPathSignatureParseBudget::default();
@@ -3177,7 +3177,7 @@ fn raw_x509_retrieval_method_uses_inherited_xml_base() {
         "../../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
     )
     .to_vec();
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.test/keys/signer.der".to_string(),
         certificate,
     )]);
@@ -3335,7 +3335,7 @@ fn retrieval_method_materialization_bounds_repeated_sources() {
         "../../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
     )
     .to_vec();
-    let resources = HashMap::from([("urn:certificate".to_string(), certificate)]);
+    let resources = BTreeMap::from([("urn:certificate".to_string(), certificate)]);
     let mut key_info = KeyInfo {
         sources: (0..=64)
             .map(|_| super::super::parse::KeyInfoSource::RetrievalMethod {
@@ -3426,7 +3426,7 @@ fn raw_certificate_retrieval_retains_spent_operation_work() {
         .expect("empty SAN list")
         .self_signed(&pair)
         .expect("test certificate signing");
-    let external = HashMap::from([("urn:cert".to_owned(), cert.der().to_vec())]);
+    let external = BTreeMap::from([("urn:cert".to_owned(), cert.der().to_vec())]);
     let document = Document::parse("<root/>").expect("test XML");
     let resolver = UriReferenceResolver::new(&document).with_external_resources(&external);
     let mut policy = crate::policy::VerificationPolicy::default();
@@ -3546,7 +3546,7 @@ fn key_info_materialization_shares_candidate_work_across_source_kinds() {
         "../../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
     )
     .to_vec();
-    let resources = HashMap::from([("signer.der".to_owned(), certificate)]);
+    let resources = BTreeMap::from([("signer.der".to_owned(), certificate)]);
     let mut key_info = KeyInfo {
         sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
             uri: "#target".into(),
@@ -3619,7 +3619,7 @@ fn public_key_info_materialization_binds_external_resource_policy() {
     let external = format!(
         r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
     );
-    let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+    let resources = BTreeMap::from([("key.xml".to_owned(), external.into_bytes())]);
     let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
     let mut key_info = KeyInfo {
         sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
@@ -3660,7 +3660,7 @@ fn public_key_info_materialization_uses_the_selected_backend() {
     let external = format!(
         r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>external</ds:KeyName></ds:KeyInfo>"#
     );
-    let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+    let resources = BTreeMap::from([("key.xml".to_owned(), external.into_bytes())]);
     let document = Document::parse("<root/>").unwrap();
 
     for backend in [crate::XmlBackend::Xmloxide, crate::XmlBackend::Roxmltree] {
@@ -3701,7 +3701,7 @@ fn public_key_info_materialization_defers_nested_retrieval_failure() {
     let external = format!(
         r#"<ds:KeyInfo xmlns:ds="{XMLDSIG_NS}"><ds:KeyName>usable</ds:KeyName><ds:RetrievalMethod URI="missing.der" Type="{RAW_X509_TYPE}"/></ds:KeyInfo>"#
     );
-    let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+    let resources = BTreeMap::from([("key.xml".to_owned(), external.into_bytes())]);
     let document = Document::parse("<root/>").unwrap();
 
     for operation in ["signing", "verification"] {
@@ -3764,7 +3764,7 @@ fn public_key_info_materialization_binds_xpath_policy() {
                 <ds:X509Data Id="target"><ds:X509SubjectName>CN=leaf</ds:X509SubjectName></ds:X509Data>
             </ds:KeyInfo>"##
     );
-    let resources = HashMap::from([("key.xml".to_owned(), external.into_bytes())]);
+    let resources = BTreeMap::from([("key.xml".to_owned(), external.into_bytes())]);
     let document = Document::parse("<root/>").unwrap();
 
     for operation in ["signing", "verification"] {
@@ -3835,7 +3835,7 @@ fn materialize_external_key_info_chain(
                 <ds:KeyInfo ID="next">{terminal_reference}</ds:KeyInfo>
             </doc>"##
     );
-    let resources = HashMap::from([
+    let resources = BTreeMap::from([
         ("a.xml".to_owned(), a.into_bytes()),
         ("b.xml".to_owned(), b.into_bytes()),
     ]);
@@ -3888,7 +3888,7 @@ fn materialize_external_key_info_bytes_with_limit(
     encoded: Vec<u8>,
     maximum_document_bytes: usize,
 ) -> Result<KeyInfo, SignatureVerificationPipelineError> {
-    let resources = HashMap::from([("key.xml".to_owned(), encoded)]);
+    let resources = BTreeMap::from([("key.xml".to_owned(), encoded)]);
     let document = XmlDocument::parse("<root/>").unwrap();
     let mut key_info = KeyInfo {
         sources: vec![super::super::parse::KeyInfoSource::KeyInfoReference {
@@ -4033,7 +4033,7 @@ fn retrieval_method_materialization_deduplicates_within_count_limit() {
         "../../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
     )
     .to_vec();
-    let resources = HashMap::from([("urn:certificate".to_string(), certificate)]);
+    let resources = BTreeMap::from([("urn:certificate".to_string(), certificate)]);
     let mut key_info = KeyInfo {
         sources: (0..MAX_RETRIEVAL_METHOD_COUNT)
             .map(|_| super::super::parse::KeyInfoSource::RetrievalMethod {
@@ -4066,7 +4066,7 @@ fn retrieval_method_candidate_budget_includes_embedded_key_values() {
     // A previously parsed KeyValue consumes the sole candidate slot, so
     // malformed retrieved DER must be rejected by policy before X.509 parsing.
     const RAW_X509_TYPE: &str = "http://www.w3.org/2000/09/xmldsig#rawX509Certificate";
-    let resources = HashMap::from([("urn:certificate".to_string(), vec![1, 2, 3])]);
+    let resources = BTreeMap::from([("urn:certificate".to_string(), vec![1, 2, 3])]);
     let mut key_info = KeyInfo {
         sources: vec![
             super::super::parse::KeyInfoSource::KeyValue(
@@ -4134,7 +4134,7 @@ fn raw_x509_retrieval_rejects_empty_same_document_uri() {
         "../../../tests/fixtures/xmldsig/merlin-xmldsig-twenty-three/certs/balor.der"
     )
     .to_vec();
-    let resources = HashMap::from([(String::new(), certificate)]);
+    let resources = BTreeMap::from([(String::new(), certificate)]);
     let mut key_info = KeyInfo {
         sources: vec![super::super::parse::KeyInfoSource::RetrievalMethod {
             uri: String::new(),
@@ -4382,7 +4382,7 @@ fn valid_signature_gives_every_reference_its_own_result() {
         &sha1_reference("urn:absent", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
         &sha1_reference("urn:payload", &payload_digest),
     ]);
-    let resources = HashMap::from([("urn:payload".to_owned(), payload.to_vec())]);
+    let resources = BTreeMap::from([("urn:payload".to_owned(), payload.to_vec())]);
     let result = VerifyContext::new()
         .key(&AcceptingKey)
         .policy(external_reference_policy())
@@ -4432,7 +4432,7 @@ fn undecodable_detached_xml_fails_only_its_reference() {
         &c14n_reference("urn:unknown-encoding"),
         &sha1_reference("urn:payload", &payload_digest),
     ]);
-    let resources = HashMap::from([
+    let resources = BTreeMap::from([
         ("urn:invalid-utf8".to_owned(), b"<a>\xC3\x28</a>".to_vec()),
         (
             "urn:unknown-encoding".to_owned(),
@@ -4854,7 +4854,7 @@ fn verify_context_does_not_eagerly_parse_unused_retrieval_fallback() {
     </ds:KeyInfo>
   </ds:Signature>"#,
         );
-    let resources = HashMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
+    let resources = BTreeMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
 
     let result = VerifyContext::new()
         .key_resolver(&EarlyKeyInfoResolver)
@@ -4905,7 +4905,7 @@ fn verify_context_reports_malformed_retrieval_when_no_key_source_resolves() {
     </ds:KeyInfo>
   </ds:Signature>"#,
         );
-    let resources = HashMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
+    let resources = BTreeMap::from([("malformed.der".to_string(), b"not DER".to_vec())]);
 
     let error = VerifyContext::new()
         .key_resolver(&ConsumingKeyInfoResolver)
@@ -4974,11 +4974,11 @@ fn enforce_reference_policies_rejects_missing_uri_before_uri_type_checks() {
 #[test]
 fn enforce_reference_policies_checks_only_terminal_binary_output() {
     let c14n = C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI).unwrap();
-    let allowed = HashSet::from([
+    let allowed = BTreeSet::from([
         BASE64_TRANSFORM_URI.to_owned(),
         DEFAULT_IMPLICIT_C14N_URI.to_owned(),
     ]);
-    let without_implicit_c14n = HashSet::from([BASE64_TRANSFORM_URI.to_owned()]);
+    let without_implicit_c14n = BTreeSet::from([BASE64_TRANSFORM_URI.to_owned()]);
 
     for transforms in [
         vec![Transform::Base64Decode, Transform::C14n(c14n)],
@@ -5043,7 +5043,7 @@ fn enforce_reference_policies_checks_only_terminal_binary_output() {
     let error = enforce_reference_policies(
         std::slice::from_ref(&external_xpath),
         UriTypeSet::ALL,
-        Some(&HashSet::from([XPATH_TRANSFORM_URI.to_owned()])),
+        Some(&BTreeSet::from([XPATH_TRANSFORM_URI.to_owned()])),
     )
     .expect_err("external XML converted to a node-set must require implicit C14N");
     assert!(matches!(
@@ -5076,7 +5076,7 @@ fn stored_pre_digest_budget_counts_repeated_external_references() {
             )
         })
         .collect::<Vec<_>>();
-    let resources = HashMap::from([("urn:repeated".to_owned(), payload)]);
+    let resources = BTreeMap::from([("urn:repeated".to_owned(), payload)]);
     let resolver = UriReferenceResolver::new(&document).with_external_resources(&resources);
     let transform_budget = TransformExecutionBudget::default();
     let canonicalized_data_budget = CanonicalizedDataBudget::with_limit(32);
@@ -5193,7 +5193,7 @@ fn operation_memoizes_repeated_external_resource_identity() {
     // The external resource map is immutably borrowed for the operation,
     // so one content fingerprint safely identifies every repeated URI.
     let document = XmlDocument::parse("<root/>").expect("fixture must parse");
-    let resources = HashMap::from([("urn:repeated".to_owned(), vec![b'x'; 8 * 1_024])]);
+    let resources = BTreeMap::from([("urn:repeated".to_owned(), vec![b'x'; 8 * 1_024])]);
     let reference = make_reference(
         "urn:repeated",
         Vec::new(),

@@ -1,14 +1,11 @@
 //! Profile compilation and real operation gates; fixtures are generated locally.
 #![cfg(feature = "xmldsig-sign")]
 
-use std::{
-    collections::HashSet,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeSet, time::SystemTime};
 use xml_sec::XmlDocument;
 use xml_sec::policy::{
-    PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet, PolicyValidity,
-    PolicyViolation, SignatureConstraints,
+    Instant, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet, PolicyValidity,
+    PolicyViolation, SignatureConstraints, instant_from_system_time,
 };
 use xml_sec::provider::RustCryptoProvider;
 #[cfg(feature = "xmlenc")]
@@ -32,9 +29,14 @@ fn grant() -> PolicyValidity {
         authorization_id: "test-grant".into(),
         authority: "caller".into(),
         reason: "local interoperability".into(),
-        not_before: SystemTime::UNIX_EPOCH,
-        expires_at: SystemTime::now() + Duration::from_secs(3600),
+        not_before: Instant::new(0, 0).unwrap(),
+        expires_at: seconds_later(instant_from_system_time(SystemTime::now()).unwrap(), 3600),
     }
+}
+
+/// `time` moved forward by whole `seconds`.
+fn seconds_later(time: Instant, seconds: i64) -> Instant {
+    Instant::new(time.seconds() + seconds, time.nanos()).unwrap()
 }
 
 #[test]
@@ -205,7 +207,7 @@ fn compiler_rejects_unavailable_certificate_allowlist() {
     trust.verify_x509_chains = true;
     trust.certificate_signature_algorithms =
         Some(xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(
-            HashSet::from([xml_sec::provider::X509SignatureAlgorithm::RsaPkcs1v15(
+            BTreeSet::from([xml_sec::provider::X509SignatureAlgorithm::RsaPkcs1v15(
                 xml_sec::xmldsig::DigestAlgorithm::Sha256,
             )]),
         ));
@@ -224,7 +226,7 @@ fn denying_certificate_signatures_keeps_trusted_preset_keys_usable() {
     let trust = &mut layer.verification.as_mut().unwrap().key_trust;
     trust.verify_x509_chains = true;
     trust.certificate_signature_algorithms = Some(
-        xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::new()),
+        xml_sec::policy::CertificateSignatureAlgorithms::Allowlist(BTreeSet::new()),
     );
     let compiled = initial
         .restrict(&layer)
@@ -293,11 +295,11 @@ fn decryption_profile_uses_only_inbound_provider_capabilities() {
         let policy = compiled.decryption().unwrap();
         assert_eq!(
             policy.data_algorithms.as_ref().unwrap(),
-            &HashSet::from([DataEncryptionAlgorithm::Aes128Gcm])
+            &BTreeSet::from([DataEncryptionAlgorithm::Aes128Gcm])
         );
         assert_eq!(
             policy.key_wrap_algorithms.as_ref().unwrap(),
-            &HashSet::from([KeyWrapAlgorithm::AesKw128])
+            &BTreeSet::from([KeyWrapAlgorithm::AesKw128])
         );
         let key = [0x31; 16];
         let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
@@ -333,7 +335,7 @@ fn assert_inbound_round_trip(
     let mut builder = EncryptedDataBuilder::new(algorithm)
         .direct_key(key.as_slice())
         .policy(EncryptionPolicy {
-            data_algorithms: Some(HashSet::from([algorithm])),
+            data_algorithms: Some(BTreeSet::from([algorithm])),
             ..Default::default()
         });
     if matches!(algorithm, Data::ChaCha20 | Data::ChaCha20Poly1305) {
@@ -450,7 +452,7 @@ fn permitted_oaep_method_requires_a_usable_parameter_tuple() {
     // An empty digest set cannot silently leave a permitted transport unusable.
     let initial = compiler(PolicyProfile::Modern);
     let mut layer = initial.policies().clone();
-    layer.encryption.as_mut().unwrap().oaep_digests = Some(HashSet::new());
+    layer.encryption.as_mut().unwrap().oaep_digests = Some(BTreeSet::new());
     assert!(matches!(
         initial.restrict(&layer).unwrap().compile(&context()),
         Err(PolicyViolation::Configuration { .. })
@@ -524,7 +526,7 @@ fn layers_intersect_permissions_minima_and_resource_caps() {
     let initial = compiler(PolicyProfile::Modern);
     let mut layer = initial.policies().clone();
     let policy = layer.verification.as_mut().unwrap();
-    policy.signature_algorithms = Some(HashSet::from([
+    policy.signature_algorithms = Some(BTreeSet::from([
         SignatureAlgorithm::HmacSha256,
         SignatureAlgorithm::HmacSha1,
     ]));
@@ -551,7 +553,7 @@ fn layers_intersect_permissions_minima_and_resource_caps() {
     let policy = compiled.verification().unwrap();
     assert_eq!(
         policy.signature_algorithms.as_ref().unwrap(),
-        &HashSet::from([SignatureAlgorithm::HmacSha256])
+        &BTreeSet::from([SignatureAlgorithm::HmacSha256])
     );
     assert_eq!(policy.hmac.minimum_key_bits, 512);
     assert_eq!(policy.resources.max_references, 2);
@@ -584,7 +586,7 @@ fn compiler_rejects_impossible_hmac_and_missing_request_contracts() {
     let initial = compiler(PolicyProfile::Modern);
     let mut layer = initial.policies().clone();
     let policy = layer.verification.as_mut().unwrap();
-    policy.signature_algorithms = Some(HashSet::from([SignatureAlgorithm::HmacSha256]));
+    policy.signature_algorithms = Some(BTreeSet::from([SignatureAlgorithm::HmacSha256]));
     policy.hmac.minimum_output_bits = 512;
     assert!(
         initial
@@ -617,8 +619,8 @@ fn compiler_requires_a_usable_canonicalization_method() {
     // unknown URI sets must fail compilation for either enabled operation.
     for signing in [false, true] {
         for methods in [
-            HashSet::new(),
-            HashSet::from([
+            BTreeSet::new(),
+            BTreeSet::from([
                 "http://www.w3.org/2000/09/xmldsig#enveloped-signature".to_owned(),
                 "urn:unknown:c14n".to_owned(),
             ]),
@@ -655,7 +657,7 @@ fn compiler_requires_a_usable_canonicalization_method() {
         .as_mut()
         .unwrap()
         .transforms
-        .allowed_algorithms = Some(HashSet::from([
+        .allowed_algorithms = Some(BTreeSet::from([
         "http://www.w3.org/2001/10/xml-exc-c14n#".into()
     ]));
     initial
@@ -679,7 +681,7 @@ fn saml_compiler_requires_its_enveloped_transform() {
             layer.signing = None;
             &mut layer.verification.as_mut().unwrap().transforms
         };
-        transforms.allowed_algorithms = Some(HashSet::from([
+        transforms.allowed_algorithms = Some(BTreeSet::from([
             "http://www.w3.org/2001/10/xml-exc-c14n#".into(),
         ]));
         assert!(matches!(
@@ -716,7 +718,7 @@ fn relaxation_requires_valid_grant_and_preserves_earlier_expiration() {
         .resources
         .max_references = 32;
     let mut later = earlier.clone();
-    later.expires_at += Duration::from_secs(3600);
+    later.expires_at = seconds_later(later.expires_at, 3600);
     let compiled = initial
         .authorize_replacement(replacement, &later)
         .unwrap()
@@ -733,7 +735,7 @@ fn relaxation_requires_valid_grant_and_preserves_earlier_expiration() {
         Err(PolicyViolation::AuthorizationExpired)
     ));
     let mut expired = policy.clone();
-    expired.validity.as_mut().unwrap().expires_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+    expired.validity.as_mut().unwrap().expires_at = Instant::new(1, 0).unwrap();
     assert!(
         VerifyContext::new()
             .policy(expired)

@@ -24,7 +24,7 @@ impl XmlBackendImplementation for DifferentialBackend {
 fn parse_pair<'input>(
     left: impl FnOnce() -> Result<Document<'input>, ParseError>,
     right: impl FnOnce() -> Result<Document<'input>, ParseError>,
-    doctype: Option<&std::ops::Range<usize>>,
+    doctype: Option<&core::ops::Range<usize>>,
 ) -> Result<Document<'input>, ParseError> {
     parse_pair_in(left, right, doctype, super::storage::Native)
 }
@@ -47,7 +47,7 @@ pub(super) fn parse_in<'input, 'w, W: structured_asn1::memory::Work>(
 fn parse_pair_in<'input, S: super::tree::comparison::ComparisonStorage>(
     left: impl FnOnce() -> Result<Document<'input, S>, S::ParseFailure>,
     right: impl FnOnce() -> Result<Document<'input, S>, S::ParseFailure>,
-    doctype: Option<&std::ops::Range<usize>>,
+    doctype: Option<&core::ops::Range<usize>>,
     storage: S,
 ) -> Result<Document<'input, S>, S::ParseFailure>
 where

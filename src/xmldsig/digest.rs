@@ -6,13 +6,14 @@
 //! Operation digest computation uses the selected `CryptoProvider`; the built-in
 //! standalone convenience path uses `RustCrypto`.
 
+use alloc::{boxed::Box, vec::Vec};
 use subtle::ConstantTimeEq;
 
 /// Digest algorithms supported by `XMLDSig`.
 ///
 /// SHA-1 is disabled for signing by default and requires explicit policy opt-in.
 /// SHA-256 is the recommended default for new signatures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DigestAlgorithm {
     /// MD5 compatibility capability; operation policy must explicitly permit it.
     #[cfg(feature = "legacy-algorithms")]

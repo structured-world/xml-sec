@@ -51,7 +51,9 @@ where
     }
 }
 
-pub trait SplitKeepingDelimiterExt: ::std::ops::Index<::std::ops::RangeFull, Output = str> {
+pub trait SplitKeepingDelimiterExt:
+    ::core::ops::Index<::core::ops::RangeFull, Output = str>
+{
     fn split_keeping_delimiter<F>(&self, chars: F) -> SplitKeepingDelimiter<'_, F>
     where
         F: Fn(char) -> bool,

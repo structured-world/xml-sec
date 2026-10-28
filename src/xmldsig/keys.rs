@@ -1,6 +1,7 @@
 //! Configuration and key material for `XMLDSig` key resolution.
 
-use std::{collections::HashMap, fmt, time::SystemTime};
+use alloc::{boxed::Box, collections::BTreeMap, string::String, vec::Vec};
+use core::fmt;
 
 #[cfg(test)]
 use super::parse::parse_x509_certificate;
@@ -743,7 +744,8 @@ pub enum KeyResolutionError {
     /// Embedded certificate path validation failed.
     #[error("certificate chain validation failed: {0}")]
     Chain(#[from] super::X509ChainError),
-    /// System time was unavailable for certificate validation.
+    /// Certificate validation has no time: the caller supplied none and the
+    /// host clock is unavailable or outside the representable range.
     #[error("system time is unavailable")]
     SystemTime,
 }
@@ -764,7 +766,7 @@ pub struct KeyResolverConfig {
     /// Caller-owned revocation evidence applied without copying it into each XML source.
     pub crls: Vec<Vec<u8>>,
     /// Verification keys addressable by `<KeyName>` content.
-    pub named_keys: HashMap<String, VerificationKey>,
+    pub named_keys: BTreeMap<String, VerificationKey>,
 }
 
 /// Configuration-driven resolver for embedded certificates, DER keys, and key names.
@@ -793,7 +795,7 @@ impl ResolutionScope {
     }
 
     /// The `KeyInfo` source positions this scope scans out of `len`.
-    fn source_range(self, len: usize) -> std::ops::Range<usize> {
+    fn source_range(self, len: usize) -> core::ops::Range<usize> {
         let start = match self {
             Self::DocumentSuffix(start) | Self::TrustedSuffix(start) => start,
             _ => 0,
@@ -1211,7 +1213,9 @@ impl DefaultKeyResolver {
         let trust = if trust.verify_x509_chains && trust.verification_time.is_none() {
             effective_trust = {
                 let mut captured = trust.clone();
-                captured.verification_time = Some(SystemTime::now());
+                // Without a host clock this stays `None`, and evidence
+                // construction reports the missing verification time.
+                captured.verification_time = crate::policy::clock::host_now();
                 captured
             };
             &effective_trust
@@ -1333,7 +1337,10 @@ impl DefaultKeyResolver {
         let options = X509ChainOptions {
             utc_facts: budget.utc_facts().copied(),
             trusted_certs: &self.config.trusted_certs,
-            verification_time: trust.verification_time.unwrap_or_else(SystemTime::now),
+            verification_time: trust
+                .verification_time
+                .or_else(crate::policy::clock::host_now)
+                .ok_or(KeyResolutionError::SystemTime)?,
             max_chain_depth: trust.max_x509_chain_depth,
             check_crls: trust.check_crls,
             allowed_extended_key_usages: Some(&trust.allowed_extended_key_usages),
@@ -2415,6 +2422,7 @@ pub(crate) fn supported_key_value_is_rsa(
 #[cfg(test)]
 mod tests {
     use crate::xml::dom as roxmltree;
+    use alloc::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use base64::{Engine, engine::general_purpose::STANDARD};
@@ -3137,7 +3145,7 @@ mod tests {
         })
     }
 
-    fn chain_policy_at(verification_time: SystemTime) -> crate::policy::KeyTrustPolicy {
+    fn chain_policy_at(verification_time: crate::policy::Instant) -> crate::policy::KeyTrustPolicy {
         crate::policy::KeyTrustPolicy {
             verification_time: Some(verification_time),
             ..chain_policy()
@@ -3208,9 +3216,13 @@ mod tests {
         )
     }
 
-    fn fixture_certificate_time() -> SystemTime {
+    fn fixture_certificate_time() -> crate::policy::Instant {
         // 2027-01-15 UTC, inside the donor certificates' 2026-2126 validity window.
-        SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(500_000)
+        hours_after_epoch(500_000)
+    }
+
+    fn hours_after_epoch(hours: i64) -> crate::policy::Instant {
+        crate::policy::Instant::new(hours * 3600, 0).expect("test time")
     }
 
     fn public_key_der(pem_text: &str) -> Vec<u8> {
@@ -3381,7 +3393,7 @@ mod tests {
         ));
 
         policy.key_trust.allowed_extended_key_usages =
-            std::collections::HashSet::from([crate::policy::ExtendedKeyPurpose::ServerAuth]);
+            BTreeSet::from([crate::policy::ExtendedKeyPurpose::ServerAuth]);
         assert!(
             resolver
                 .resolve_with_policy(Some(&key_info), SignatureAlgorithm::EcdsaSha256, &policy,)
@@ -3718,7 +3730,7 @@ mod tests {
         });
         let error = super::super::VerifyContext::new()
             .policy(verification_policy_with_trust(chain_policy_at(
-                SystemTime::UNIX_EPOCH,
+                hours_after_epoch(0),
             )))
             .key_resolver(&resolver)
             .verify(&x509_signature_with_leaf_subject())
@@ -4147,7 +4159,7 @@ mod tests {
         });
         let mut trust = chain_policy();
         trust.allowed_extended_key_usages =
-            std::collections::HashSet::from([crate::policy::ExtendedKeyPurpose::CodeSigning]);
+            BTreeSet::from([crate::policy::ExtendedKeyPurpose::CodeSigning]);
         let measured =
             super::super::pkix::CertificateSession::new(&crate::policy::ResourcePolicy::default());
         let candidates = build_x509_certificate_paths_to_trusted_prefix(
@@ -4518,7 +4530,6 @@ mod tests {
     #[test]
     fn x509_path_builder_skips_policy_rejected_alternatives() {
         use crate::provider::X509SignatureAlgorithm;
-        use std::collections::HashSet;
         // One cross-signed issuer has a forbidden parent-edge algorithm;
         // neither its position nor traversal order may hide a permitted path.
         let root = rcgen::CertifiedIssuer::self_signed(
@@ -4543,7 +4554,7 @@ mod tests {
             .signed_by(&rcgen::KeyPair::generate().expect("leaf key"), &shared)
             .expect("leaf certificate");
         let rejected = rejected.der().to_vec();
-        let allowed = crate::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::from([
+        let allowed = crate::policy::CertificateSignatureAlgorithms::Allowlist(BTreeSet::from([
             X509SignatureAlgorithm::Ecdsa(super::super::DigestAlgorithm::Sha256),
         ]));
         for rejected_first in [true, false] {
@@ -4783,7 +4794,7 @@ mod tests {
         let policy = verification_policy_with_trust(crate::policy::KeyTrustPolicy {
             check_crls: true,
             max_x509_chain_depth: 3,
-            ..chain_policy_at(SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(492_768))
+            ..chain_policy_at(hours_after_epoch(492_768))
         });
 
         let error = super::super::VerifyContext::new()
@@ -4868,7 +4879,7 @@ mod tests {
         let policy = verification_policy_with_trust(crate::policy::KeyTrustPolicy {
             check_crls: true,
             max_x509_chain_depth: 3,
-            ..chain_policy_at(SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(492_768))
+            ..chain_policy_at(hours_after_epoch(492_768))
         });
 
         let mut budget = InspectedKeyCandidateBudget::new_with_utc_facts(
@@ -5936,7 +5947,7 @@ mod tests {
             },
         ];
         let resolver = DefaultKeyResolver::new(KeyResolverConfig {
-            named_keys: HashMap::from([("legacy".into(), named_key.clone())]),
+            named_keys: BTreeMap::from([("legacy".into(), named_key.clone())]),
             ..KeyResolverConfig::default()
         });
         let mut policy = crate::policy::VerificationPolicy::default();

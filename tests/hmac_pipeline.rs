@@ -40,7 +40,7 @@ fn every_hmac_algorithm_and_legal_octet_length_round_trips() {
         (SignatureAlgorithm::HmacSha512, 512),
     ] {
         let mut policy = VerificationPolicy {
-            signature_algorithms: Some(std::collections::HashSet::from([algorithm])),
+            signature_algorithms: Some(std::collections::BTreeSet::from([algorithm])),
             ..VerificationPolicy::default()
         };
         policy
@@ -48,7 +48,7 @@ fn every_hmac_algorithm_and_legal_octet_length_round_trips() {
             .allowed_legacy_signature_algorithms
             .insert(algorithm);
         let signing_policy = SigningPolicy {
-            signature_algorithms: Some(std::collections::HashSet::from([algorithm])),
+            signature_algorithms: Some(std::collections::BTreeSet::from([algorithm])),
             ..SigningPolicy::default()
         };
         for output in (128usize.max(width / 2)..=width)
@@ -171,7 +171,7 @@ fn all_hmac_methods_interoperate_bidirectionally_with_xmlsec1() {
         (SignatureAlgorithm::HmacRipemd160, 128, 160),
     ] {
         let signing_policy = SigningPolicy {
-            signature_algorithms: Some(std::collections::HashSet::from([algorithm])),
+            signature_algorithms: Some(std::collections::BTreeSet::from([algorithm])),
             ..SigningPolicy::default()
         };
         let mut verification_policy = VerificationPolicy {

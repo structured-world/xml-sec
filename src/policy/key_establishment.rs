@@ -2,10 +2,10 @@
 
 use super::PolicyViolation;
 use crate::xmldsig::DigestAlgorithm;
-use std::collections::HashSet;
+use alloc::{borrow::ToOwned, collections::BTreeSet};
 
 /// Agreement mechanisms identified by their XML algorithm URI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyAgreementAlgorithm {
     /// Named-curve ECDH-ES.
     EcdhEs,
@@ -48,7 +48,7 @@ impl KeyAgreementAlgorithm {
 }
 
 /// KDF mechanisms accepted by the shared policy domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyDerivationAlgorithm {
     /// `XMLEnc` 1.1 `ConcatKDF` with bit-string context.
     ConcatKdf,
@@ -102,18 +102,18 @@ pub enum KemContentAuthentication {
 #[derive(Debug, Clone)]
 pub struct KeyEstablishmentPolicy {
     /// Exact experimental KEM permissions. Empty denies all parameter sets.
-    pub encapsulation_algorithms: HashSet<crate::provider::KeyEncapsulationAlgorithm>,
+    pub encapsulation_algorithms: BTreeSet<crate::provider::KeyEncapsulationAlgorithm>,
     /// Separate permission for unauthenticated direct KEM content composition.
     pub kem_content_authentication: KemContentAuthentication,
     /// Cumulative KEM attempts; failed provider calls consume allowance too.
     pub max_encapsulation_operations: usize,
     /// Exact agreement permissions. None permits only ECDH-ES and X25519.
-    pub agreement_algorithms: Option<HashSet<KeyAgreementAlgorithm>>,
+    pub agreement_algorithms: Option<BTreeSet<KeyAgreementAlgorithm>>,
     /// Exact KDF permissions. None permits `ConcatKDF`/HKDF/PBKDF2, not legacy DH.
-    pub derivation_algorithms: Option<HashSet<KeyDerivationAlgorithm>>,
+    pub derivation_algorithms: Option<BTreeSet<KeyDerivationAlgorithm>>,
     /// Underlying digest permission, including HMAC PRFs. None permits SHA-2.
     /// SHA-1 requires an explicit grant even when required by a legacy profile.
-    pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    pub digest_algorithms: Option<BTreeSet<DigestAlgorithm>>,
     /// Cumulative conservative hash compression-block allowance per operation.
     pub max_hash_blocks: usize,
     /// Cumulative shared-secret, derived-key and finite-field validation
@@ -135,7 +135,7 @@ pub struct KeyEstablishmentPolicy {
 impl Default for KeyEstablishmentPolicy {
     fn default() -> Self {
         Self {
-            encapsulation_algorithms: HashSet::new(),
+            encapsulation_algorithms: BTreeSet::new(),
             kem_content_authentication: KemContentAuthentication::default(),
             max_encapsulation_operations: 64,
             agreement_algorithms: None,

@@ -7,7 +7,8 @@
 //! The parser supports **error recovery mode**: it collects errors into a
 //! `Vec<ParseDiagnostic>` while still producing a (possibly partial) tree.
 
-use std::fmt;
+use alloc::{string::String, vec::Vec};
+use core::fmt;
 
 /// Severity level for a parse diagnostic, matching libxml2's `xmlErrorLevel`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -115,8 +116,8 @@ impl<L: fmt::Display, D> fmt::Display for ParseError<L, D> {
     }
 }
 
-impl<L: fmt::Debug + fmt::Display, D: fmt::Debug> std::error::Error for ParseError<L, D> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+impl<L: fmt::Debug + fmt::Display, D: fmt::Debug> core::error::Error for ParseError<L, D> {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Resource(error) => Some(error),
             Self::Syntax { .. } => None,

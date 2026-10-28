@@ -1123,7 +1123,7 @@ fn every_ecdsa_curve_and_modern_digest_runs_the_full_pipeline() {
 
 #[test]
 fn sha3_capability_never_overrides_the_operation_policy() {
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
     use xml_sec::policy::{SigningPolicy, VerificationPolicy};
     use xml_sec::xmldsig::{
         EcdsaP256SigningKey, SignContext, SignatureAlgorithm, SigningKey, VerificationKey,
@@ -1139,11 +1139,11 @@ fn sha3_capability_never_overrides_the_operation_policy() {
     let xml = template(algorithm);
     for policy in [
         SigningPolicy {
-            signature_algorithms: Some(HashSet::from([SignatureAlgorithm::EcdsaSha256])),
+            signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::EcdsaSha256])),
             ..Default::default()
         },
         SigningPolicy {
-            digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha256])),
+            digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha256])),
             ..Default::default()
         },
     ] {
@@ -1163,11 +1163,11 @@ fn sha3_capability_never_overrides_the_operation_policy() {
     };
     for policy in [
         VerificationPolicy {
-            signature_algorithms: Some(HashSet::from([SignatureAlgorithm::EcdsaSha256])),
+            signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::EcdsaSha256])),
             ..Default::default()
         },
         VerificationPolicy {
-            digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha256])),
+            digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha256])),
             ..Default::default()
         },
     ] {

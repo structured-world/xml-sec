@@ -6,6 +6,7 @@ use super::{
     VerifyingKey, XMLDSIG_NS,
 };
 use crate::xmldsig::parse::{KeyInfoSource, KeyValueInfo};
+use alloc::{string::String, vec::Vec};
 use structured_asn1::memory::{MemoryError, MemoryReservation, OwnedMap, OwnedVec, Work};
 
 /// Original parsed method, not a reconstruction from an algorithm URI.

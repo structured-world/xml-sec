@@ -823,9 +823,9 @@ fn dsa_policies(
     let mut verification = VerificationPolicy::default();
     verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     if bits == 1024 {
-        signing.signature_algorithms = Some(std::collections::HashSet::from([algorithm]));
-        signing.digest_algorithms = Some(std::collections::HashSet::from([digest]));
-        verification.digest_algorithms = Some(std::collections::HashSet::from([digest]));
+        signing.signature_algorithms = Some(std::collections::BTreeSet::from([algorithm]));
+        signing.digest_algorithms = Some(std::collections::BTreeSet::from([digest]));
+        verification.digest_algorithms = Some(std::collections::BTreeSet::from([digest]));
         signing.dsa_keys.minimum_modulus_bits = 1024;
         verification
             .key_trust

@@ -1,6 +1,7 @@
 //! XML name-keyed indexes with allocation-free borrowed queries.
 
 use super::{Native, Storage};
+use crate::collections::{Map, Table};
 use crate::xml::dom::ParseError;
 
 pub(crate) trait NameStorage: Storage {
@@ -28,18 +29,20 @@ pub(crate) trait Names<K, V, S: Storage> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Name<T>(T);
-impl<T: AsRef<str>> std::fmt::Display for Name<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: AsRef<str>> core::fmt::Display for Name<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.0.as_ref().fmt(f)
     }
 }
-impl<T: AsRef<str>> std::borrow::Borrow<str> for Name<T> {
+// Equality, ordering and hashing all follow the borrowed `str`, as the
+// `Borrow` lookups of both table kinds require.
+impl<T: AsRef<str>> core::borrow::Borrow<str> for Name<T> {
     fn borrow(&self) -> &str {
         self.0.as_ref()
     }
 }
-impl<T: AsRef<str>> std::hash::Hash for Name<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<T: AsRef<str>> core::hash::Hash for Name<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.0.as_ref().hash(state);
     }
 }
@@ -49,6 +52,16 @@ impl<T: AsRef<str>> PartialEq for Name<T> {
     }
 }
 impl<T: AsRef<str>> Eq for Name<T> {}
+impl<T: AsRef<str>> PartialOrd for Name<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T: AsRef<str>> Ord for Name<T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.0.as_ref().cmp(other.0.as_ref())
+    }
+}
 
 #[cfg(feature = "xmldsig")]
 impl<T: AsRef<str>> structured_asn1::memory::HashWork for Name<T> {
@@ -60,29 +73,29 @@ impl<T: AsRef<str>> structured_asn1::memory::HashWork for Name<T> {
 }
 
 impl NameStorage for Native {
-    type Names<K: AsRef<str>, V> = std::collections::HashMap<Name<K>, V>;
+    type Names<K: AsRef<str>, V> = Map<Name<K>, V>;
     fn names<K: AsRef<str>, V>(&self) -> Self::Names<K, V> {
-        std::collections::HashMap::new()
+        Map::new()
     }
 }
 
-impl<K: AsRef<str>, V> Names<K, V, Native> for std::collections::HashMap<Name<K>, V> {
+impl<K: AsRef<str>, V> Names<K, V, Native> for Map<Name<K>, V> {
     fn len(&self) -> usize {
-        std::collections::HashMap::len(self)
+        Map::len(self)
     }
     fn get(&self, name: &str, _: Native) -> Result<Option<&V>, ParseError> {
-        Ok(std::collections::HashMap::get(self, name))
+        Ok(Map::get(self, name))
     }
     fn get_mut(&mut self, name: &str, _: Native) -> Result<Option<&mut V>, ParseError> {
-        Ok(std::collections::HashMap::get_mut(self, name))
+        Ok(Map::get_mut(self, name))
     }
     fn insert(&mut self, name: K, value: V) -> Result<Option<V>, ParseError> {
-        self.try_reserve(1)
+        self.try_reserve_entries(1)
             .map_err(|_| ParseError::AllocationFailed)?;
-        Ok(std::collections::HashMap::insert(self, Name(name), value))
+        Ok(Map::insert(self, Name(name), value))
     }
     fn remove(&mut self, name: &str, _: Native) -> Result<Option<V>, ParseError> {
-        Ok(std::collections::HashMap::remove(self, name))
+        Ok(Map::remove(self, name))
     }
     #[cfg(feature = "xml-backend-xmloxide")]
     fn entries<'a>(

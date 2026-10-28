@@ -116,13 +116,13 @@ const ITEMS: &str = r#"<root><item ID="payload">b</item><item>a</item></root>"#;
 fn detached_entity_uri_survives_sign_verify_and_current_query_replay() {
     // XSLT's unparsed entity map belongs to the detached XML resource. An
     // inherited XML Base on Reference resolves its identity before all three paths.
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::BTreeMap, sync::Arc};
     use structured_asn1::memory::{Memory, MemoryAccount};
     use xml_sec::xmldsig::{
         HmacSigningKey, HmacVerificationKey, ReplayMode, ReplayOutcome, UriTypeSet,
         VerificationRequest, VerifyContext, with_verified_request,
     };
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.org/data/input.xml".to_owned(),
         br#"<!DOCTYPE root [<!NOTATION image SYSTEM "image"><!ENTITY logo SYSTEM "images/logo.png" NDATA image>]><root/>"#.to_vec(),
     )]);

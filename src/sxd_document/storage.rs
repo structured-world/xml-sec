@@ -1,6 +1,7 @@
 //! Concrete arena ownership behind the stable SXD node handles.
 
-use std::ops::{Deref, DerefMut};
+use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
 #[cfg(feature = "embedded")]
 use structured_asn1::memory::{MemoryError, OwnedVec, Work};
 
@@ -121,7 +122,7 @@ impl<T> DerefMut for Values<T> {
 
 impl<'a, T> IntoIterator for &'a Values<T> {
     type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
+    type IntoIter = core::slice::Iter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }

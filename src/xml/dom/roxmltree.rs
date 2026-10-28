@@ -107,7 +107,7 @@ enum ProjectionFrame<'document, 'input, R: Storage> {
 fn project_document<R: Storage, S: Storage, P: Storage>(
     target: &mut TreeBuilder<'_, S>,
     root: backend::Node<'_, '_, R>,
-    doctype: Option<&std::ops::Range<usize>>,
+    doctype: Option<&core::ops::Range<usize>>,
     preflight: &LexicalPreflight<'_, P>,
 ) -> Result<(), ParseError> {
     let storage = target.storage();

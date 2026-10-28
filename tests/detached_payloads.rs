@@ -2,7 +2,7 @@
 
 #![cfg(feature = "xmldsig-sign")]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -59,7 +59,7 @@ fn signed(detached: &[Detached<'_>], local_tampered: bool) -> XmlDocument {
                 false,
             ))),
     );
-    let mut resources = HashMap::new();
+    let mut resources = BTreeMap::new();
     for reference in detached {
         let mut item = ReferenceBuilder::new(reference.digest).uri(reference.uri);
         if reference.base64 {
@@ -344,7 +344,7 @@ fn base64_chain_decodes_the_stream_with_the_resident_rules() {
     encoded.extend_from_slice(b"QQ==");
     for malformed in [encoded.as_slice(), truncated.as_slice()] {
         let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
-        let resident = HashMap::from([(
+        let resident = BTreeMap::from([(
             "https://example.test/data/payload.b64".to_owned(),
             malformed.to_vec(),
         )]);
@@ -384,7 +384,7 @@ fn base64_chain_decodes_the_stream_with_the_resident_rules() {
 fn chain_needing_xml_is_not_offered_for_streaming() {
     // A canonicalization transform needs the bytes parsed as XML, so the
     // Reference keeps the bounded resident path and is not pending here.
-    let mut resources = HashMap::new();
+    let mut resources = BTreeMap::new();
     resources.insert(
         "https://example.test/data/doc.xml".to_owned(),
         b"<doc/>".to_vec(),
@@ -759,7 +759,7 @@ fn completing_core_validation_processes_the_authenticated_manifest() {
     );
     let mut signing = signing_policy();
     signing.manifest_processing = ManifestProcessing::Process;
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.test/data/part.bin".to_owned(),
         payload.to_vec(),
     )]);
@@ -938,7 +938,7 @@ fn streamed_base64_obeys_the_operation_base64_budgets() {
             policy.resources.max_base64_transform_output_bytes = output;
         }
         let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
-        let resident = HashMap::from([(
+        let resident = BTreeMap::from([(
             "https://example.test/data/payload.b64".to_owned(),
             encoded.as_bytes().to_vec(),
         )]);
@@ -1028,7 +1028,7 @@ fn listing_does_not_reparse_chains_that_cannot_stream() {
     let template = format!(
         r#"<root xml:base="https://example.test/data/"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="doc.xml"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"#
     );
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.test/data/doc.xml".to_owned(),
         payload.to_vec(),
     )]);

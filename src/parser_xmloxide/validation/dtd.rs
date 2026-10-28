@@ -18,9 +18,16 @@
 //!
 //! See XML 1.0 section 3.2 for the full content model specification.
 
-use std::collections::HashSet;
-use std::fmt;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::fmt;
 
+// The upstream name keeps the embedded kernel's delta small.
+use crate::collections::Set as HashSet;
 use crate::parser_xmloxide::error::ParseError;
 use crate::parser_xmloxide::parser::input::ParserInput;
 use crate::parser_xmloxide::tree::{Document, NodeId, NodeKind};
@@ -812,7 +819,7 @@ fn write_entity_value<S: Storage>(
             // Check if this is a valid entity or character reference — if so, pass through.
             if let Some(ref_end) = find_reference_end(bytes, i) {
                 // Copy the reference as-is
-                let ref_str = std::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
+                let ref_str = core::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
                 out.push_str(ref_str)?;
                 i = ref_end + 1;
             } else {
@@ -1959,7 +1966,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
             if self.looking_at(b"-->") {
                 self.storage.charge(self.input.pos() - start)?;
                 let text = self.storage.text(
-                    std::str::from_utf8(self.input.slice(start, self.input.pos()))
+                    core::str::from_utf8(self.input.slice(start, self.input.pos()))
                         .expect("comment ends at an ASCII UTF-8 boundary"),
                 )?;
                 self.advance(3)?;
@@ -2008,7 +2015,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
                 self.storage.charge(self.input.pos() - start)?;
                 self.storage.charge(self.input.pos() - start)?;
                 let data = self.storage.text(
-                    std::str::from_utf8(self.input.slice(start, self.input.pos()))
+                    core::str::from_utf8(self.input.slice(start, self.input.pos()))
                         .expect("PI ends at an ASCII UTF-8 boundary")
                         .trim(),
                 )?;
@@ -2057,7 +2064,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
             while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
                 i += 1;
             }
-            let hex_str = std::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
+            let hex_str = core::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
             u32::from_str_radix(hex_str, 16).unwrap_or(0)
         } else {
             let dec_start = i;
@@ -2067,7 +2074,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
             while i < bytes.len() && bytes[i].is_ascii_digit() {
                 i += 1;
             }
-            let dec_str = std::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
+            let dec_str = core::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
             dec_str.parse::<u32>().unwrap_or(0)
         };
         if i >= bytes.len() || bytes[i] != b';' {
@@ -2144,7 +2151,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
                             return Err(self.fatal("malformed entity reference in entity value"));
                         }
                         // Validate the entity name starts with a NameStartChar
-                        let name_str = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                        let name_str = core::str::from_utf8(&bytes[start..i]).unwrap_or("");
                         if let Some(first_char) = name_str.chars().next()
                             && !is_name_start_char(first_char)
                         {
@@ -2215,7 +2222,7 @@ impl<'a, S: NameStorage> DtdParser<'a, S> {
                             i += 1;
                         }
                         if i > start && i < bytes.len() {
-                            let name = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+                            let name = core::str::from_utf8(&bytes[start..i]).unwrap_or("");
                             // Built-in entities are always available
                             let is_builtin = matches!(name, "amp" | "lt" | "gt" | "apos" | "quot");
                             if !is_builtin && self.dtd.entities.get(name, self.storage)?.is_none() {
@@ -2403,14 +2410,14 @@ pub(crate) fn expand_char_refs_only<S: Storage>(
                 while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
                     i += 1;
                 }
-                let hex = std::str::from_utf8(&bytes[start..i]).unwrap_or("0");
+                let hex = core::str::from_utf8(&bytes[start..i]).unwrap_or("0");
                 u32::from_str_radix(hex, 16).unwrap_or(0)
             } else {
                 let start = i;
                 while i < bytes.len() && bytes[i].is_ascii_digit() {
                     i += 1;
                 }
-                let dec = std::str::from_utf8(&bytes[start..i]).unwrap_or("0");
+                let dec = core::str::from_utf8(&bytes[start..i]).unwrap_or("0");
                 dec.parse::<u32>().unwrap_or(0)
             };
             if i < bytes.len() && bytes[i] == b';' {

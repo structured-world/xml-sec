@@ -17,7 +17,14 @@
 //! ```
 
 use crate::xml::dom::{Document, Node, NodeId};
-use std::collections::BTreeMap;
+use alloc::{
+    borrow::ToOwned,
+    collections::BTreeMap,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 #[cfg(test)]
 use super::digest::compute_digest;
@@ -98,7 +105,7 @@ const MAX_X509_DATA_ENTRY_COUNT: usize = 64;
 pub(crate) const MAX_X509_DATA_TOTAL_BINARY_LEN: usize = 1_048_576;
 
 /// Parameters of RFC 9231 section 2.3.9 RSA-PSS, not algorithm permissions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RsaPssParameters {
     /// Hash applied to the message and PSS encoding.
     pub digest: DigestAlgorithm,
@@ -137,7 +144,7 @@ impl RsaPssParameters {
 pub(crate) const RSA_PSS_NS: &str = "http://www.w3.org/2007/05/xmldsig-more#";
 
 /// Signature algorithms supported for signing and verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum SignatureAlgorithm {
     /// RSA PKCS#1 v1.5 with MD5; explicit compatibility permission required.
@@ -673,7 +680,7 @@ pub enum KeyInfoSource {
 }
 
 /// Transform forms accepted on `<RetrievalMethod>`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum RetrievalMethodTransforms {
     /// No transform chain is present.

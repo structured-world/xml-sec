@@ -2,10 +2,7 @@
 
 #![cfg(feature = "xmldsig")]
 
-use std::{
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime},
-};
+use std::path::{Path, PathBuf};
 
 use xml_sec::policy::VerificationPolicy;
 use xml_sec::xmldsig::{
@@ -172,7 +169,7 @@ fn donor_full_verification_suite_accepts_every_supported_case() {
                 operation_policy.key_trust.verify_x509_chains = true;
                 // 2027-01-15 UTC, inside the donor chain's 2026-2126 validity window.
                 operation_policy.key_trust.verification_time =
-                    Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
+                    xml_sec::policy::Instant::new(500_000 * 3600, 0);
                 DefaultKeyResolver::new(KeyResolverConfig {
                     trusted_certs: vec![read_pem_der(&root.join(trust_anchor_path), "CERTIFICATE")],
                     ..KeyResolverConfig::default()

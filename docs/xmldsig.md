@@ -343,7 +343,7 @@ processed as during verification; the request's acceptance is recomputed after e
 ```rust
 # #[cfg(feature = "xmldsig-sign")]
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::XmlDocument;
@@ -361,7 +361,7 @@ let mut signing = SigningPolicy::default();
 signing.uris.references = UriTypeSet::ALL;
 let signed = SignContext::new(&HmacSigningKey::new(secret.clone())?)
     .policy(signing)
-    .external_resources(&HashMap::from([(
+    .external_resources(&BTreeMap::from([(
         "https://example.test/report.pdf".to_owned(),
         payload.clone(),
     )]))
@@ -993,7 +993,7 @@ A `VerifiedSession` also answers operation-bound lookups for extension formats:
   certificate processing. `execution` lends the request's own execution, so a
   continuation can spend it instead of a separately supplied account.
 
-`X509TrustEvidence::validation_instant` returns the exact instant the path
+`X509TrustEvidence::verification_time` returns the exact instant the path
 processor used, and `X509TrustEvidence::certificate_identity_in` computes a
 certificate's path identity with the mechanism that recorded
 `certificate_fingerprints`. A consumer re-checking a validated path finds the

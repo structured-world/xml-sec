@@ -2,7 +2,7 @@
 
 #![cfg(feature = "xmldsig-sign")]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
     CallerTrustedSignatureKey, DigestAlgorithm, DsigError, DsigStatus, HmacSigningKey,
@@ -444,7 +444,7 @@ fn external_evidence_identifies_resolved_bytes_not_the_lexical_uri() {
     let secret = vec![0x31; 32];
     let signing_key = HmacSigningKey::new(secret.clone()).unwrap();
     let key = HmacVerificationKey::new(secret).unwrap();
-    let resources = HashMap::from([
+    let resources = BTreeMap::from([
         (
             "https://example.test/data/payload".to_owned(),
             b"authenticated bytes".to_vec(),

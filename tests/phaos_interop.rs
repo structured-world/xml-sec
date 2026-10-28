@@ -2,9 +2,8 @@
 
 #![cfg(feature = "xmldsig")]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
 
 use x509_parser::prelude::{FromDer, X509Certificate};
 use xml_sec::policy::VerificationPolicy;
@@ -16,7 +15,7 @@ use xml_sec::xmldsig::{
 
 const PHAOS: &str = "tests/fixtures/xmldsig/phaos-xmldsig-three";
 const RFC3161: &str = "tests/fixtures/xmldsig/external-data/rfc3161.txt";
-const VERIFY_2009: u64 = 1_230_804_000;
+const VERIFY_2009: i64 = 1_230_804_000;
 #[cfg(not(feature = "xslt"))]
 const XSLT_URI: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
 #[cfg(not(feature = "legacy-algorithms"))]
@@ -292,8 +291,7 @@ fn policy(algorithm: SignatureAlgorithm, verify_x509_chains: bool) -> Verificati
         policy.hmac.minimum_output_bits = 40;
     }
     policy.key_trust.verify_x509_chains = verify_x509_chains;
-    policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2009));
+    policy.key_trust.verification_time = xml_sec::policy::Instant::new(VERIFY_2009, 0);
     policy.uris.retrieval_methods = UriTypeSet::ALL;
     // The corpus signer compiled each stylesheet from the `<Transform>` content
     // alone, as libxmlsec1 does; read as an element of the signed document, its
@@ -306,8 +304,8 @@ fn policy(algorithm: SignatureAlgorithm, verify_x509_chains: bool) -> Verificati
     policy
 }
 
-fn resources() -> HashMap<String, Vec<u8>> {
-    HashMap::from([
+fn resources() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([
         (
             "document.xml".into(),
             bytes(Path::new(PHAOS).join("document.xml")),
@@ -599,7 +597,7 @@ fn detached_resources_are_caller_owned_and_required() {
         .key(&key)
         .process_manifests(true)
         .allowed_uri_types(UriTypeSet::ALL)
-        .external_resources(&HashMap::new())
+        .external_resources(&BTreeMap::new())
         .verify(&xml)
         .expect("a missing caller resource is a verification status");
     // Fails closed as this Reference's Unavailable outcome, never a fetch.

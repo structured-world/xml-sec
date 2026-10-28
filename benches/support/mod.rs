@@ -1,6 +1,6 @@
 //! Shared deterministic workloads and correctness checks for every measurement mode.
 
-use std::{collections::HashMap, fmt::Write as _, sync::Arc};
+use std::{collections::BTreeMap, fmt::Write as _, sync::Arc};
 use xml_sec::{
     XmlBackend, XmlDocument,
     c14n::{C14nAlgorithm, C14nMode, canonicalize_document},
@@ -234,7 +234,7 @@ pub struct Fixture {
     verification_key: VerificationKey,
     sign_policy: SigningPolicy,
     verify_policy: VerificationPolicy,
-    resources: HashMap<String, Vec<u8>>,
+    resources: BTreeMap<String, Vec<u8>>,
     decryptor: SymmetricKeyDecryptor,
 }
 
@@ -271,7 +271,7 @@ impl Fixture {
         let unsigned = body(spec.shape, spec.units);
         let mut sign_policy = SigningPolicy::default();
         let mut verify_policy = VerificationPolicy::default();
-        let mut resources = HashMap::new();
+        let mut resources = BTreeMap::new();
         let uri = match SHAPES[spec.shape] {
             "nested_manifest" => {
                 sign_policy.manifest_processing = ManifestProcessing::Process;

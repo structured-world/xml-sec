@@ -3,7 +3,7 @@
 //! In exclusive mode, only **visibly utilized** namespace prefixes are emitted
 //! on each element (plus any prefixes forced by the `InclusiveNamespaces PrefixList`).
 
-use std::collections::HashSet;
+use alloc::{collections::BTreeSet, string::String};
 
 use crate::xml::dom::Node;
 use crate::xml::dom::storage::Storage as DomStorage;
@@ -25,7 +25,7 @@ pub(crate) struct ExclusiveNsRenderer<'a> {
 }
 
 enum Prefixes<'a> {
-    Stored(&'a HashSet<String>),
+    Stored(&'a BTreeSet<String>),
     #[cfg(feature = "xmldsig")]
     Lexical(&'a str),
 }
@@ -46,7 +46,7 @@ impl Prefixes<'_> {
     }
     fn work(&self, prefix: &str) -> usize {
         let probes = match self {
-            Self::Stored(set) => set.capacity(),
+            Self::Stored(set) => set.len(),
             #[cfg(feature = "xmldsig")]
             Self::Lexical(list) => list.len(),
         };
@@ -60,7 +60,7 @@ impl Prefixes<'_> {
 }
 
 impl<'a> ExclusiveNsRenderer<'a> {
-    pub(crate) fn new(inclusive_prefixes: &'a HashSet<String>) -> Self {
+    pub(crate) fn new(inclusive_prefixes: &'a BTreeSet<String>) -> Self {
         Self {
             inclusive_prefixes: Prefixes::Stored(inclusive_prefixes),
         }
@@ -218,7 +218,6 @@ mod tests {
     };
     use super::*;
     use crate::xml::dom::Document;
-    use std::collections::HashSet;
 
     struct NamespaceGapVisibility;
 
@@ -246,7 +245,7 @@ mod tests {
         }
     }
 
-    fn exc_c14n(xml: &str, prefix_list: &HashSet<String>) -> String {
+    fn exc_c14n(xml: &str, prefix_list: &BTreeSet<String>) -> String {
         let doc = Document::parse(xml).expect("parse");
         let renderer = ExclusiveNsRenderer::new(prefix_list);
         let mut out = Vec::new();
@@ -268,7 +267,7 @@ mod tests {
     #[test]
     fn only_utilized_ns_rendered() {
         let xml = r#"<root xmlns:a="http://a.com" xmlns:b="http://b.com"><a:child/></root>"#;
-        let result = exc_c14n(xml, &HashSet::new());
+        let result = exc_c14n(xml, &BTreeSet::new());
         // root uses no prefix → no ns decls on root.
         // a:child uses a: → xmlns:a on child.
         // b: is not utilized anywhere → not rendered.
@@ -279,7 +278,7 @@ mod tests {
     #[test]
     fn forced_prefix_via_prefix_list() {
         let xml = r#"<root xmlns:a="http://a.com" xmlns:b="http://b.com"><child/></root>"#;
-        let mut forced = HashSet::new();
+        let mut forced = BTreeSet::new();
         forced.insert("b".to_string());
         let result = exc_c14n(xml, &forced);
         // b: is forced via PrefixList → should appear on root.
@@ -289,7 +288,7 @@ mod tests {
     #[test]
     fn sibling_elements_redeclare() {
         let xml = r#"<root xmlns:a="http://a.com"><a:one/><a:two/></root>"#;
-        let result = exc_c14n(xml, &HashSet::new());
+        let result = exc_c14n(xml, &BTreeSet::new());
         // In exclusive mode, each sibling must independently declare a:.
         assert!(result.contains(r#"<a:one xmlns:a="http://a.com">"#));
         assert!(result.contains(r#"<a:two xmlns:a="http://a.com">"#));
@@ -298,7 +297,7 @@ mod tests {
     #[test]
     fn default_ns_utilized() {
         let xml = r#"<root xmlns="http://example.com"><child/></root>"#;
-        let result = exc_c14n(xml, &HashSet::new());
+        let result = exc_c14n(xml, &BTreeSet::new());
         // Both root and child use the default ns.
         assert!(result.contains(r#"<root xmlns="http://example.com">"#));
         // child inherits → parent already rendered → not redeclared.
@@ -313,7 +312,7 @@ mod tests {
         // child undeclares default ns with xmlns="". In exclusive C14N,
         // the default namespace must be visibly utilized so xmlns="" is emitted.
         let xml = r#"<root xmlns="http://example.com"><child xmlns=""/></root>"#;
-        let result = exc_c14n(xml, &HashSet::new());
+        let result = exc_c14n(xml, &BTreeSet::new());
         assert!(
             result.contains(r#"<child xmlns="">"#),
             "xmlns=\"\" must be emitted for undeclaration. Got: {result}"
@@ -327,7 +326,7 @@ mod tests {
         // p namespace node, `leaf` must redeclare p at the first discontinuity.
         let xml = r#"<p:root xmlns:p="urn:p"><p:gap><p:leaf/></p:gap></p:root>"#;
         let doc = Document::parse(xml).expect("parse");
-        let prefix_list = HashSet::new();
+        let prefix_list = BTreeSet::new();
         let renderer = ExclusiveNsRenderer::new(&prefix_list);
         let mut out = Vec::new();
         serialize_canonical_visible_with_position(

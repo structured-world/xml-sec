@@ -1,6 +1,6 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
-use std::fmt;
+use core::fmt;
 
 use crate::context;
 use crate::expression::Error;
@@ -118,7 +118,7 @@ impl<'c, 'd, R: Runtime> CompleteNodeTest<'c, 'd, R> {
                         .namespace_text(uri)
                         .map_err(|source| Error::FunctionEvaluation { source })?,
                 }))?;
-                Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
+                Ok::<_, Error>(core::ops::ControlFlow::Continue(()))
             })?;
         }
         Ok(())

@@ -40,6 +40,8 @@
 #![warn(missing_docs)]
 
 extern crate alloc;
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
 // The embedded XPath engine's XML parser only builds test documents.
 #[cfg(all(test, feature = "xmldsig"))]
 #[macro_use]
@@ -56,6 +58,7 @@ pub mod api;
 #[doc(hidden)]
 pub mod benchmark_support;
 pub mod c14n;
+mod collections;
 pub mod document;
 pub mod encoding;
 pub mod error;

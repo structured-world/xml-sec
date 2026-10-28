@@ -2,7 +2,7 @@
 
 #![cfg(feature = "xmldsig-sign")]
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::policy::{PolicyViolation, SameDocumentIdSemantics, VerificationPolicy};
@@ -33,7 +33,7 @@ fn with_session_in(
         XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
     let key = HmacVerificationKey::new(vec![0x61; 32]).unwrap();
     let mut policy = VerificationPolicy {
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha256])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha256])),
         ..VerificationPolicy::default()
     };
     configure(&mut policy);

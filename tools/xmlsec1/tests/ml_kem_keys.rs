@@ -474,7 +474,7 @@ fn pinned_kem_recipient_ignores_unrelated_key_hints() {
                 "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"{uri}\"/></KeyInfo>"
             );
             let signed = xml.replacen(original, &reference, 1);
-            let resources = std::collections::HashMap::from([(
+            let resources = std::collections::BTreeMap::from([(
                 "https://example.test/recipient.xml".to_owned(),
                 target.as_bytes().to_vec(),
             )]);
@@ -659,7 +659,7 @@ fn check_external_key_info_reference(
         &key_info_reference("https://example.test/recipient.xml"),
         1,
     );
-    let resources = std::collections::HashMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         "https://example.test/recipient.xml".to_owned(),
         target.into_bytes(),
     )]);
@@ -755,7 +755,7 @@ fn check_ordinary_signer_rejects_referenced_mechanism(
         "URI=\"#recipient\"",
         "URI=\"https://example.test/recipient.xml\"",
     );
-    let mut resources = std::collections::HashMap::from([(
+    let mut resources = std::collections::BTreeMap::from([(
         "https://example.test/recipient.xml".to_owned(),
         target.as_bytes().to_vec(),
     )]);
@@ -1161,7 +1161,7 @@ fn pinned_hmac_rejects_referenced_encapsulation() {
     );
     // Caller-supplied external resources use the same gate and shared budgets.
     let external = signed.replace("<KeyInfo/>", "<KeyInfo><KeyInfoReference xmlns=\"http://www.w3.org/2009/xmldsig11#\" URI=\"https://example.test/recipient.xml\"/></KeyInfo>");
-    let resources = std::collections::HashMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         "https://example.test/recipient.xml".to_owned(),
         format!("<d:KeyInfo xmlns:d=\"http://www.w3.org/2000/09/xmldsig#\"><k:EncapsulationMechanism xmlns:k=\"{}\"/></d:KeyInfo>", xml_sec::key_establishment::ENCAPSULATION_NS).into_bytes(),
     )]);
@@ -1659,7 +1659,7 @@ fn decrypt_resolves_external_encapsulation_recipient() {
         .policy(policy.clone())
         .decrypt_document(&xml, Some("ED"))
         .unwrap();
-    let resources = std::collections::HashMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         "https://example.test/recipient.xml".to_owned(),
         target.into_bytes(),
     )]);
@@ -1707,7 +1707,7 @@ impl ExternalRecipientCheck<'_> {
     fn decrypt(
         &self,
         input: &str,
-        resources: &std::collections::HashMap<String, Vec<u8>>,
+        resources: &std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<String, xml_sec::xmlenc::XmlEncError> {
         self.decrypt_with(input, self.policy.clone(), resources)
     }
@@ -1716,7 +1716,7 @@ impl ExternalRecipientCheck<'_> {
         &self,
         input: &str,
         policy: xml_sec::policy::DecryptionPolicy,
-        resources: &std::collections::HashMap<String, Vec<u8>>,
+        resources: &std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Result<String, xml_sec::xmlenc::XmlEncError> {
         xml_sec::xmlenc::DecryptContext::new(self.resolver)
             .policy(policy)
@@ -1728,7 +1728,7 @@ impl ExternalRecipientCheck<'_> {
     /// context and reject ambiguous IDs before private-key dispatch.
     fn selects_fragments_and_bounds_chains(
         &self,
-        mut resources: std::collections::HashMap<String, Vec<u8>>,
+        mut resources: std::collections::BTreeMap<String, Vec<u8>>,
     ) {
         let input = &self.input;
         let expected = &self.expected;
@@ -1768,7 +1768,7 @@ impl ExternalRecipientCheck<'_> {
         bounded.resources.max_external_resource_bytes = 1;
         assert!(self.decrypt_with(input, bounded, &resources).is_err());
         assert!(
-            self.decrypt(input, &std::collections::HashMap::new())
+            self.decrypt(input, &std::collections::BTreeMap::new())
                 .is_err()
         );
         resources.insert(

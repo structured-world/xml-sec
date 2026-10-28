@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Write as _;
 
 #[path = "support/cryptographic.rs"]
@@ -1281,7 +1281,7 @@ fn signing_policy_rejects_disallowed_reference_transform() {
         append_signature_to_root("<root><payload/></root>", &template).expect("append signature");
     let policy = SigningPolicy {
         transforms: xml_sec::policy::TransformPolicy {
-            allowed_algorithms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+            allowed_algorithms: Some(BTreeSet::from([exclusive_c14n().uri().to_owned()])),
             ..xml_sec::policy::TransformPolicy::default()
         },
         ..SigningPolicy::default()
@@ -1989,7 +1989,7 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
 
     let implicit_disallowed = SigningPolicy {
         transforms: xml_sec::policy::TransformPolicy {
-            allowed_algorithms: Some(HashSet::from([exclusive_c14n().uri().to_owned()])),
+            allowed_algorithms: Some(BTreeSet::from([exclusive_c14n().uri().to_owned()])),
             ..xml_sec::policy::TransformPolicy::default()
         },
         ..SigningPolicy::default()
@@ -2005,7 +2005,7 @@ fn signing_policy_covers_implicit_and_signed_info_canonicalization() {
 
     let signed_info_disallowed = SigningPolicy {
         transforms: xml_sec::policy::TransformPolicy {
-            allowed_algorithms: Some(HashSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
+            allowed_algorithms: Some(BTreeSet::from([DEFAULT_IMPLICIT_C14N_URI.to_owned()])),
             ..xml_sec::policy::TransformPolicy::default()
         },
         ..SigningPolicy::default()
@@ -3393,8 +3393,8 @@ fn explicit_legacy_sha1_policy_builds_signs_and_verifies() {
     );
 
     let signing_policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::RsaSha1])),
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::RsaSha1])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         ..SigningPolicy::default()
     };
     let signed = SignContext::new(&private_key)
@@ -3443,7 +3443,7 @@ fn historical_rsa_methods_require_independent_digest_permission() {
         assert!(builder.build_template().is_err());
         let source = "<root><payload ID=\"payload\">historical interop</payload></root>";
         let mut signing = SigningPolicy {
-            signature_algorithms: Some(HashSet::from([method])),
+            signature_algorithms: Some(BTreeSet::from([method])),
             ..SigningPolicy::default()
         };
         assert!(
@@ -3452,7 +3452,7 @@ fn historical_rsa_methods_require_independent_digest_permission() {
                 .sign_with_builder(source, &builder)
                 .is_err()
         );
-        signing.digest_algorithms = Some(HashSet::from([digest]));
+        signing.digest_algorithms = Some(BTreeSet::from([digest]));
         let signed = SignContext::new(&key)
             .policy(signing)
             .key_info_writer(&KeyValueInfoWriter)
@@ -3467,7 +3467,7 @@ fn historical_rsa_methods_require_independent_digest_permission() {
         );
         let mut verification = VerificationPolicy::default();
         verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
-        verification.signature_algorithms = Some(HashSet::from([method]));
+        verification.signature_algorithms = Some(BTreeSet::from([method]));
         assert!(
             VerifyContext::new()
                 .policy(verification.clone())
@@ -3475,7 +3475,7 @@ fn historical_rsa_methods_require_independent_digest_permission() {
                 .verify(&signed)
                 .is_err()
         );
-        verification.digest_algorithms = Some(HashSet::from([digest]));
+        verification.digest_algorithms = Some(BTreeSet::from([digest]));
         assert_eq!(
             VerifyContext::new()
                 .policy(verification.clone())

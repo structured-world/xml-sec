@@ -1,5 +1,7 @@
 //! Internal XML whitespace helpers shared across `XMLDSig` parsing and verification.
 
+use alloc::{string::String, vec, vec::Vec};
+
 /// Borrow XML text and validate its exact decoded size without normalizing it
 /// into a second heap buffer. Callers reserve this size before calling decode.
 pub(crate) struct XmlBase64Payload<'a, 'input> {
@@ -123,41 +125,67 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
     }
 
     pub(crate) fn decode_into(&self, output: &mut [u8]) -> Result<(), &'static str> {
-        use std::io::Read as _;
-        let input = self.normalized_bytes();
-        let mut decoder = base64::read::DecoderReader::new(
-            Base64ByteReader(input),
-            &base64::engine::general_purpose::STANDARD,
-        );
-        decoder
-            .read_exact(output)
-            .map_err(|_| "invalid base64 padding or trailing bits")?;
-        let mut eof = [0];
-        if decoder
-            .read(&mut eof)
-            .map_err(|_| "invalid base64 padding or trailing bits")?
-            != 0
-        {
-            return Err("invalid base64 length");
-        }
-        Ok(())
+        decode_base64_into(self.normalized_bytes(), output).map_err(|error| match error {
+            Base64DecodeError::Invalid => "invalid base64 padding or trailing bits",
+            Base64DecodeError::Length => "invalid base64 length",
+        })
     }
 }
 
-struct Base64ByteReader<I>(I);
+/// Failure of [`decode_base64_into`].
+pub(crate) enum Base64DecodeError {
+    /// Malformed quartets, or fewer bytes than the output holds.
+    Invalid,
+    /// More bytes than the output holds.
+    Length,
+}
 
-impl<I: Iterator<Item = u8>> std::io::Read for Base64ByteReader<I> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let mut written = 0;
-        for slot in buffer {
-            let Some(byte) = self.0.next() else {
-                break;
-            };
-            *slot = byte;
-            written += 1;
+/// Decodes standard base64 from `input` to exactly fill `output`.
+///
+/// The caller has checked that `input` is a whole number of quartets with
+/// padding only in the final one. Whole quartets decode independently, so
+/// every chunk boundary is a quartet boundary and only the last chunk can
+/// carry padding.
+pub(crate) fn decode_base64_into(
+    input: impl Iterator<Item = u8>,
+    output: &mut [u8],
+) -> Result<(), Base64DecodeError> {
+    const CHUNK: usize = 1024;
+    let mut chunk = [0_u8; CHUNK];
+    let mut filled = 0;
+    let mut written = 0;
+    for byte in input {
+        chunk[filled] = byte;
+        filled += 1;
+        if filled == CHUNK {
+            written = decode_chunk(&chunk, output, written)?;
+            filled = 0;
         }
-        Ok(written)
     }
+    written = decode_chunk(&chunk[..filled], output, written)?;
+    if written != output.len() {
+        return Err(Base64DecodeError::Invalid);
+    }
+    Ok(())
+}
+
+/// Decodes whole quartets into `output` at `written`; returns the new offset.
+fn decode_chunk(
+    input: &[u8],
+    output: &mut [u8],
+    written: usize,
+) -> Result<usize, Base64DecodeError> {
+    use base64::Engine as _;
+    let mut decoded = [0_u8; 1024 / 4 * 3];
+    let length = base64::engine::general_purpose::STANDARD
+        .decode_slice(input, &mut decoded)
+        .map_err(|_| Base64DecodeError::Invalid)?;
+    let end = written + length;
+    output
+        .get_mut(written..end)
+        .ok_or(Base64DecodeError::Length)?
+        .copy_from_slice(&decoded[..length]);
+    Ok(end)
 }
 
 /// Return `true` when the text contains only XML 1.0 whitespace chars.

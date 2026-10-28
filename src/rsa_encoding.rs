@@ -25,6 +25,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
+use alloc::string::String;
+#[cfg(feature = "xmldsig-sign")]
+use alloc::vec;
 use crypto_bigint::BoxedUint;
 #[cfg(feature = "xmldsig-sign")]
 use crypto_bigint::{NonZero, Resize};

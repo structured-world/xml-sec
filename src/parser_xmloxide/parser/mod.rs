@@ -17,7 +17,7 @@ pub(crate) use xml::XmlParser;
 
 pub use push::PushParser;
 
-use std::sync::Arc;
+use alloc::{string::String, sync::Arc};
 
 use crate::parser_xmloxide::error::ParseError;
 use crate::parser_xmloxide::tree::Document;
@@ -109,8 +109,8 @@ impl Clone for ParseOptions {
     }
 }
 
-impl std::fmt::Debug for ParseOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for ParseOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ParseOptions")
             .field("recover", &self.recover)
             .field("no_blanks", &self.no_blanks)

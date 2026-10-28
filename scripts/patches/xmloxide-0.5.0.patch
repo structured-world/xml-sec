@@ -54,7 +54,8 @@
  
  pub use push::PushParser;
  
- use std::sync::Arc;
+-use std::sync::Arc;
++use alloc::{string::String, sync::Arc};
  
 -use crate::error::ParseError;
 -use crate::tree::Document;
@@ -76,6 +77,17 @@
  /// use xmloxide::parser::ParseOptions;
  ///
  /// let opts = ParseOptions::default()
+@@ -108,8 +109,8 @@
+     }
+ }
+ 
+-impl std::fmt::Debug for ParseOptions {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++impl core::fmt::Debug for ParseOptions {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+         f.debug_struct("ParseOptions")
+             .field("recover", &self.recover)
+             .field("no_blanks", &self.no_blanks)
 @@ -238,6 +239,6 @@
  /// Returns `ParseError` if the input is not well-formed XML and recovery
  /// mode is not enabled.
@@ -86,12 +98,13 @@
  }
 --- a/xmloxide/src/parser/input.rs
 +++ b/xmloxide/src/parser/input.rs
-@@ -19,10 +19,97 @@
+@@ -19,10 +19,99 @@
  //!
  //! No external entity loading is performed (immune to XXE).
  
 -use std::collections::HashMap;
--
++use alloc::string::String;
+ 
 -use crate::error::{ErrorSeverity, ParseDiagnostic, ParseError, SourceLocation};
 -use crate::parser::{EntityResolver, ExternalEntityRequest};
 +use crate::xml::dom::storage::Values;
@@ -188,7 +201,7 @@
  
  // -------------------------------------------------------------------------
  // Security defaults
-@@ -177,26 +264,6 @@
+@@ -177,26 +266,6 @@
      }
  }
  
@@ -215,7 +228,7 @@
  /// Validates that a name is a legal `QName` per Namespaces in XML 1.0 §4.
  ///
  /// A `QName` has at most one colon, and neither prefix nor local part may be
-@@ -228,22 +295,6 @@
+@@ -228,22 +297,6 @@
      )
  }
  
@@ -238,7 +251,7 @@
  // -------------------------------------------------------------------------
  // Position checkpointing (for backtracking)
  // -------------------------------------------------------------------------
-@@ -266,22 +317,19 @@
+@@ -266,22 +319,19 @@
  // ParserInput
  // -------------------------------------------------------------------------
  
@@ -268,7 +281,7 @@
      /// The input bytes (must be valid UTF-8).
      input: &'a [u8],
  
-@@ -313,16 +361,11 @@
+@@ -313,16 +363,11 @@
      recover: bool,
  
      /// Accumulated diagnostics (warnings and recoverable errors).
@@ -287,7 +300,7 @@
  
      /// Whether the DTD internal subset contained parameter entity references.
      /// Per XML 1.0 §4.1 WFC: Entity Declared, undeclared entity references
-@@ -336,10 +379,6 @@
+@@ -336,10 +381,6 @@
      /// external DTD subset that was not read.
      pub(crate) has_external_dtd: bool,
  
@@ -298,7 +311,7 @@
      /// Optional callback for resolving external entities.
      entity_resolver: Option<EntityResolver>,
  }
-@@ -347,7 +386,28 @@
+@@ -347,7 +388,28 @@
  impl<'a> ParserInput<'a> {
      /// Creates a new `ParserInput` from a UTF-8 string with default limits.
      pub fn new(input: &'a str) -> Self {
@@ -328,7 +341,7 @@
              input: input.as_bytes(),
              pos: 0,
              line: 1,
-@@ -358,19 +418,12 @@
+@@ -358,19 +420,12 @@
              entity_expansions: 0,
              max_entity_expansions: DEFAULT_MAX_ENTITY_EXPANSIONS,
              recover: false,
@@ -351,7 +364,7 @@
      }
  
      /// Sets the maximum nesting depth.
-@@ -398,13 +451,32 @@
+@@ -398,13 +453,32 @@
          self.recover
      }
  
@@ -386,7 +399,7 @@
                  "maximum nesting depth exceeded ({})",
                  self.max_depth
              )));
-@@ -458,7 +530,7 @@
+@@ -458,7 +532,7 @@
      /// Returns a slice of the raw input bytes from `start` to `end`.
      #[allow(dead_code)]
      #[inline]
@@ -395,7 +408,16 @@
          &self.input[start..end]
      }
  
-@@ -537,9 +609,10 @@
+@@ -528,7 +602,7 @@
+         if remaining.len() < len {
+             return None;
+         }
+-        std::str::from_utf8(&remaining[..len])
++        core::str::from_utf8(&remaining[..len])
+             .ok()
+             .and_then(|s| s.chars().next())
+     }
+@@ -537,9 +611,10 @@
  
      /// Advances the position by `count` bytes, updating line/column.
      #[inline]
@@ -407,7 +429,7 @@
              if self.pos < self.input.len() {
                  if self.input[self.pos] == b'\n' {
                      self.line += 1;
-@@ -549,15 +622,16 @@
+@@ -549,15 +624,16 @@
                  }
                  self.pos += 1;
              }
@@ -427,7 +449,7 @@
          if ch == '\n' {
              self.line += 1;
              self.column = 1;
-@@ -565,23 +639,25 @@
+@@ -565,23 +641,25 @@
              self.column += 1;
          }
          self.pos += len;
@@ -456,7 +478,7 @@
          if self.pos >= self.input.len() {
              return Err(self.fatal("unexpected end of input"));
          }
-@@ -608,11 +684,11 @@
+@@ -608,11 +686,11 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -471,7 +493,7 @@
                          );
                      }
                  }
-@@ -623,16 +699,16 @@
+@@ -623,16 +701,16 @@
          let ch = self
              .peek_char()
              .ok_or_else(|| self.fatal("unexpected end of input"))?;
@@ -492,7 +514,7 @@
              }
          }
          Ok(ch)
-@@ -640,31 +716,46 @@
+@@ -640,31 +718,46 @@
  
      // -- Bulk scanning --
  
@@ -553,7 +575,7 @@
      }
  
      /// Scans forward to find the next attribute value delimiter: the given
-@@ -672,22 +763,16 @@
+@@ -672,22 +765,16 @@
      /// Returns the number of safe bytes before the delimiter.
      /// Avoids the 256-byte lookup table of `scan_until_any`.
      #[inline]
@@ -581,7 +603,7 @@
      }
  
      /// Scans forward to find the next occurrence of any of the given marker
-@@ -696,63 +781,72 @@
+@@ -696,63 +783,72 @@
      /// Uses a 256-byte lookup table for O(1) per-byte matching instead of
      /// linear `contains()` on the marker slice.
      #[allow(dead_code)]
@@ -681,7 +703,7 @@
          let end = self.pos + count;
          let slice = &self.input[self.pos..end];
          // Fast path: if no newlines in the slice, just bump column
-@@ -766,22 +860,21 @@
+@@ -766,22 +862,21 @@
                  }
              }
          } else {
@@ -709,7 +731,7 @@
                  "expected '{}', found '{}'",
                  expected as char, b as char
              )));
-@@ -791,12 +884,13 @@
+@@ -791,12 +886,13 @@
  
      /// Consumes bytes and asserts they match the `expected` sequence.
      #[inline]
@@ -725,7 +747,7 @@
          } else {
              // Fall back to per-byte for precise error reporting
              for &b in expected {
-@@ -828,51 +922,30 @@
+@@ -828,51 +924,30 @@
  
      /// Skips whitespace characters. Returns `true` if any were consumed.
      #[inline]
@@ -778,7 +800,7 @@
 +        self.storage.charge(self.pos - start)?;
          // Whitespace bytes are valid ASCII/UTF-8, so this conversion is safe.
 -        std::str::from_utf8(&self.input[start..self.pos]).unwrap_or_default()
-+        Ok(std::str::from_utf8(&self.input[start..self.pos])
++        Ok(core::str::from_utf8(&self.input[start..self.pos])
 +            .expect("whitespace scanner consumes ASCII"))
      }
  
@@ -790,7 +812,7 @@
              return Err(self.fatal("whitespace required"));
          }
          Ok(())
-@@ -880,23 +953,18 @@
+@@ -880,23 +955,18 @@
  
      // -- Take while --
  
@@ -818,12 +840,12 @@
 -        std::str::from_utf8(&self.input[start..self.pos])
 -            .unwrap_or("")
 -            .to_string()
-+        Ok(std::str::from_utf8(&self.input[start..self.pos])
++        Ok(core::str::from_utf8(&self.input[start..self.pos])
 +            .expect("numeric scanners consume ASCII on UTF-8 boundaries"))
      }
  
      // -- Name parsing (XML 1.0 §2.3) --
-@@ -910,7 +978,16 @@
+@@ -910,7 +980,16 @@
      /// Uses an ASCII fast path that scans name characters as bytes,
      /// avoiding per-character UTF-8 decoding for the common case.
      #[inline]
@@ -841,7 +863,7 @@
          let start = self.pos;
          if self.pos >= self.input.len() {
              return Err(self.fatal("expected name, found end of input"));
-@@ -919,26 +996,31 @@
+@@ -919,26 +998,31 @@
          let first = self.input[self.pos];
  
          // ASCII fast path: most XML names are pure ASCII
@@ -872,15 +894,16 @@
                      )));
                  }
                  // Input is guaranteed valid UTF-8 and we only consumed ASCII bytes
+-                let name = std::str::from_utf8(&self.input[start..self.pos])
 +                self.storage.charge(len)?;
-                 let name = std::str::from_utf8(&self.input[start..self.pos])
++                let name = core::str::from_utf8(&self.input[start..self.pos])
                      .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
 -                return Ok(name.to_string());
 +                return Ok(name);
              }
              // Fall through: hit a non-ASCII continuation byte, continue
              // with the char-by-char path below.
-@@ -948,16 +1030,22 @@
+@@ -948,16 +1032,22 @@
              let ch = self
                  .peek_char()
                  .ok_or_else(|| self.fatal("expected name"))?;
@@ -908,7 +931,7 @@
              } else {
                  break;
              }
-@@ -965,90 +1053,32 @@
+@@ -965,90 +1055,32 @@
  
          let len = self.pos - start;
          if len > self.max_name_length {
@@ -919,8 +942,9 @@
              )));
          }
  
+-        let name = std::str::from_utf8(&self.input[start..self.pos])
 +        self.storage.charge(len)?;
-         let name = std::str::from_utf8(&self.input[start..self.pos])
++        let name = core::str::from_utf8(&self.input[start..self.pos])
              .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
 -        Ok(name.to_string())
 +        Ok(name)
@@ -1009,7 +1033,7 @@
      }
  
      /// Parses a name and checks whether it matches the given prefix + local
-@@ -1060,111 +1090,46 @@
+@@ -1060,111 +1092,46 @@
          &mut self,
          prefix: Option<&str>,
          local: &str,
@@ -1141,7 +1165,7 @@
      /// Parses an entity or character reference (`&...;`).
      ///
      /// Handles the five built-in XML entities (`amp`, `lt`, `gt`, `apos`,
-@@ -1175,8 +1140,8 @@
+@@ -1175,8 +1142,8 @@
      /// Increments the entity expansion counter and returns an error if the
      /// limit is exceeded.
      #[cfg(test)]
@@ -1152,7 +1176,7 @@
          self.parse_reference_into(&mut buf)?;
          Ok(buf)
      }
-@@ -1190,34 +1155,47 @@
+@@ -1190,34 +1157,47 @@
      ///
      /// Returns the resolved text as a `&str` slice of `buf` (the portion
      /// that was appended), which callers can use for validation.
@@ -1210,7 +1234,7 @@
                  if dec.is_empty() {
                      return Err(self.fatal("empty decimal character reference"));
                  }
-@@ -1226,68 +1204,191 @@
+@@ -1226,68 +1206,191 @@
              };
              self.expect_byte(b';')?;
  
@@ -1240,7 +1264,7 @@
              self.expect_byte(b';')?;
 +            let start = buf.len();
 +            self.storage.charge(self.pos - reference_start)?;
-+            let reference = std::str::from_utf8(self.slice(reference_start, self.pos))
++            let reference = core::str::from_utf8(self.slice(reference_start, self.pos))
 +                .expect("a parsed reference preserves UTF-8 boundaries");
 +            self.expand_entity_into(reference, buf, context)?;
 +            Ok(&buf[start..])
@@ -1299,7 +1323,7 @@
 +            while *position < bytes.len() && bytes[*position].is_ascii_hexdigit() {
 +                *position += 1;
 +            }
-+            let hex = std::str::from_utf8(&bytes[start..*position])
++            let hex = core::str::from_utf8(&bytes[start..*position])
 +                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
 +            u32::from_str_radix(hex, 16)
 +                .map_err(|_| self.fatal("invalid hex character reference"))?
@@ -1308,7 +1332,7 @@
 +            while *position < bytes.len() && bytes[*position].is_ascii_digit() {
 +                *position += 1;
 +            }
-+            let dec = std::str::from_utf8(&bytes[start..*position])
++            let dec = core::str::from_utf8(&bytes[start..*position])
 +                .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
 +            dec.parse::<u32>()
 +                .map_err(|_| self.fatal("invalid decimal character reference"))?
@@ -1451,7 +1475,7 @@
          }
      }
  
-@@ -1295,196 +1396,128 @@
+@@ -1295,196 +1398,128 @@
      ///
      /// Per XML 1.0 §4.4, when an entity's replacement text is included,
      /// character references and entity references within it are resolved.
@@ -1596,24 +1620,12 @@
 -                        "amp" => {
 -                            result.push('&');
 -                            continue;
--                        }
--                        "lt" => {
--                            result.push('<');
--                            continue;
--                        }
--                        "gt" => {
--                            result.push('>');
--                            continue;
--                        }
--                        "apos" => {
--                            result.push('\'');
--                            continue;
 +                        if i >= bytes.len() {
 +                            return Err(self.fatal("incomplete entity reference in entity value"));
                          }
--                        "quot" => {
--                            result.push('"');
-+                        let name = std::str::from_utf8(&bytes[start..i])
+-                        "lt" => {
+-                            result.push('<');
++                        let name = core::str::from_utf8(&bytes[start..i])
 +                            .map_err(|_| self.fatal("invalid UTF-8 in entity name"))?;
 +                        i += 1; // skip ';'
 +
@@ -1623,6 +1635,18 @@
 +                        if self.append_builtin_replacement(name, result)? {
                              continue;
                          }
+-                        "gt" => {
+-                            result.push('>');
+-                            continue;
+-                        }
+-                        "apos" => {
+-                            result.push('\'');
+-                            continue;
+-                        }
+-                        "quot" => {
+-                            result.push('"');
+-                            continue;
+-                        }
 -                        _ => {}
 -                    }
  
@@ -1750,7 +1774,7 @@
      // -- Attribute value parsing (XML 1.0 §3.3.3) --
  
      /// Parses a quoted attribute value with entity resolution and
-@@ -1493,18 +1526,22 @@
+@@ -1493,19 +1528,23 @@
      /// Uses bulk scanning to find the next `&`, `<`, or quote character,
      /// then extracts safe chunks with a single `push_str()` instead of
      /// processing character by character.
@@ -1769,14 +1793,16 @@
 +            let safe_len = self.scan_attr_value(quote)?;
              if safe_len > 0 {
                  let start = self.pos;
+-                let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
 +                self.storage.charge(safe_len)?;
 +                self.storage.charge(safe_len)?;
 +                self.storage.charge(safe_len)?;
 +                self.storage.charge(safe_len)?;
-                 let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
++                let chunk = core::str::from_utf8(&self.input[start..start + safe_len])
                      .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
                  // Fast byte-level pre-check: only validate when bytes suggest
-@@ -1516,30 +1553,18 @@
+                 // possible invalid chars (0x7F or U+FFFE/U+FFFF sequences).
+@@ -1516,30 +1555,18 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -1814,7 +1840,7 @@
              }
  
              if self.at_end() {
-@@ -1548,57 +1573,45 @@
+@@ -1548,57 +1575,45 @@
  
              let b = self.input[self.pos];
              if b == quote {
@@ -1875,18 +1901,19 @@
 -        while !self.at_end() && self.peek() != Some(quote) {
 -            self.advance(1);
 -        }
+-        let value = std::str::from_utf8(&self.input[start..self.pos])
+-            .map_err(|_| self.fatal("invalid UTF-8 in quoted value"))?
+-            .to_string();
 +        let count =
 +            self.scan_bytes(self.input.len() - self.pos, 1, |bytes, i| bytes[i] == quote)?;
 +        self.advance_counting_lines(count)?;
 +        self.storage.charge(count)?;
-         let value = std::str::from_utf8(&self.input[start..self.pos])
--            .map_err(|_| self.fatal("invalid UTF-8 in quoted value"))?
--            .to_string();
++        let value = core::str::from_utf8(&self.input[start..self.pos])
 +            .map_err(|_| self.fatal("invalid UTF-8 in quoted value"))?;
          self.expect_byte(quote)?;
          Ok(value)
      }
-@@ -1606,21 +1619,44 @@
+@@ -1606,21 +1621,44 @@
      // -- Error helpers --
  
      /// Creates a fatal `ParseError` at the current location.
@@ -1895,7 +1922,7 @@
 -            message: message.into(),
 -            location: self.location(),
 -            diagnostics: self.diagnostics.clone(),
-+    pub fn fatal(&self, message: impl std::fmt::Display) -> ParseError<S> {
++    pub fn fatal(&self, message: impl core::fmt::Display) -> ParseError<S> {
 +        let snapshot = || -> Result<_, crate::xml::dom::ParseError> {
 +            let message = S::freeze(self.storage.formatted(format_args!("{message}"))?);
 +            self.storage.charge(self.diagnostics.len())?;
@@ -1925,7 +1952,7 @@
 +    pub fn push_diagnostic(
 +        &mut self,
 +        severity: ErrorSeverity,
-+        message: impl std::fmt::Display,
++        message: impl core::fmt::Display,
 +    ) -> Result<(), ParseError<S>> {
 +        let message = S::freeze(self.storage.formatted(format_args!("{message}"))?);
 +        let diagnostic = ParseDiagnostic {
@@ -1939,7 +1966,7 @@
      }
  }
  
-@@ -1630,100 +1666,111 @@
+@@ -1630,100 +1668,111 @@
  
  /// Manages namespace scope for XML parsers.
  ///
@@ -2109,7 +2136,7 @@
      }
  }
  
-@@ -1736,54 +1783,56 @@
+@@ -1736,54 +1785,56 @@
  /// The opening `<!--` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.5 production `[15]`.
@@ -2136,7 +2163,7 @@
                      // Validate XML chars using byte-level pre-check
                      let has_bad =
                          may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
-                     let chunk = std::str::from_utf8(input.slice(start, start + safe_len))
+-                    let chunk = std::str::from_utf8(input.slice(start, start + safe_len))
 -                        .map_err(|_| input.fatal("invalid UTF-8 in comment"))?
 -                        .to_string();
 -                    if has_bad {
@@ -2152,6 +2179,7 @@
 -                                    bad as u32
 -                                )));
 -                            }
++                    let chunk = core::str::from_utf8(input.slice(start, start + safe_len))
 +                        .map_err(|_| input.fatal("invalid UTF-8 in comment"))?;
 +                    if has_bad && let Some(bad) = find_invalid_xml_char(chunk) {
 +                        if input.recover() {
@@ -2174,7 +2202,7 @@
                  if input.looking_at(b"-->") {
 -                    input.advance_counting_lines(3);
 -                    break;
-+                    let content = std::str::from_utf8(input.slice(content_start, input.pos()))
++                    let content = core::str::from_utf8(input.slice(content_start, input.pos()))
 +                        .map_err(|_| input.fatal("invalid UTF-8 in comment"))?;
 +                    input.advance_counting_lines(3)?;
 +                    return Ok(content);
@@ -2193,7 +2221,7 @@
                  } else {
                      return Err(input.fatal("'--' not allowed inside comments"));
                  }
-@@ -1793,8 +1842,6 @@
+@@ -1793,8 +1844,6 @@
              }
          }
      }
@@ -2202,7 +2230,7 @@
  }
  
  /// Parses a CDATA section (`<![CDATA[ ... ]]>`), returning the content text.
-@@ -1802,32 +1849,34 @@
+@@ -1802,32 +1851,34 @@
  /// The opening `<![CDATA[` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.7 production `[18]`.
@@ -2221,7 +2249,7 @@
 +            input.storage.charge(safe_len)?;
 +            input.storage.charge(safe_len)?;
              let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
-             let content = std::str::from_utf8(input.slice(start, start + safe_len))
+-            let content = std::str::from_utf8(input.slice(start, start + safe_len))
 -                .map_err(|_| input.fatal("invalid UTF-8 in CDATA section"))?
 -                .to_string();
 -            if has_bad {
@@ -2236,6 +2264,7 @@
 -                            input.fatal(format!("invalid XML character: U+{:04X}", bad as u32))
 -                        );
 -                    }
++            let content = core::str::from_utf8(input.slice(start, start + safe_len))
 +                .map_err(|_| input.fatal("invalid UTF-8 in CDATA section"))?;
 +            if has_bad && let Some(bad) = find_invalid_xml_char(content) {
 +                if input.recover() {
@@ -2254,7 +2283,7 @@
              Ok(content)
          }
          None => Err(input.fatal("unexpected end of input in CDATA section")),
-@@ -1840,9 +1889,9 @@
+@@ -1840,9 +1891,9 @@
  /// The opening `<?` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.6 production `[16]`.
@@ -2267,7 +2296,7 @@
      input.expect_str(b"<?")?;
      let target = input.parse_name()?;
  
-@@ -1852,39 +1901,35 @@
+@@ -1852,39 +1903,35 @@
      }
  
      // Namespaces in XML 1.0 §3: PI targets must be NCNames (no colons).
@@ -2287,7 +2316,7 @@
 +                input.storage.charge(data_len)?;
 +                input.storage.charge(data_len)?;
                  let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + data_len));
-                 let data = std::str::from_utf8(input.slice(start, start + data_len))
+-                let data = std::str::from_utf8(input.slice(start, start + data_len))
 -                    .map_err(|_| input.fatal("invalid UTF-8 in processing instruction"))?
 -                    .to_string();
 -                if has_bad {
@@ -2302,6 +2331,7 @@
 -                                input.fatal(format!("invalid XML character: U+{:04X}", bad as u32))
 -                            );
 -                        }
++                let data = core::str::from_utf8(input.slice(start, start + data_len))
 +                    .map_err(|_| input.fatal("invalid UTF-8 in processing instruction"))?;
 +                if has_bad && let Some(bad) = find_invalid_xml_char(data) {
 +                    if input.recover() {
@@ -2325,7 +2355,7 @@
              }
              None => {
                  return Err(input.fatal("unexpected end of input in processing instruction"));
-@@ -1900,11 +1945,11 @@
+@@ -1900,11 +1947,11 @@
  
  /// Parsed XML declaration data.
  #[derive(Debug, Clone)]
@@ -2340,7 +2370,7 @@
      /// Optional standalone declaration.
      pub standalone: Option<bool>,
  }
-@@ -1916,37 +1961,41 @@
+@@ -1916,37 +1963,41 @@
  /// verified by the caller via `looking_at`).
  ///
  /// See XML 1.0 §2.8 production `[23]`.
@@ -2392,7 +2422,7 @@
          }
  
          Some(enc)
-@@ -1958,17 +2007,17 @@
+@@ -1958,17 +2009,17 @@
      // If encoding was present, we need fresh whitespace before standalone.
      // If encoding was absent, the whitespace consumed when looking for
      // encoding already separates version from standalone.
@@ -2414,7 +2444,7 @@
              "yes" => Some(true),
              "no" => Some(false),
              _ => return Err(input.fatal("standalone must be 'yes' or 'no'")),
-@@ -1977,7 +2026,7 @@
+@@ -1977,7 +2028,7 @@
          None
      };
  
@@ -2423,7 +2453,7 @@
      input.expect_str(b"?>")?;
  
      Ok(XmlDeclaration {
-@@ -2024,9 +2073,9 @@
+@@ -2024,9 +2075,9 @@
          let mut input = ParserInput::new("abc");
          assert_eq!(input.peek(), Some(b'a'));
          assert_eq!(input.peek_at(1), Some(b'b'));
@@ -2435,7 +2465,7 @@
          assert!(input.at_end());
      }
  
-@@ -2035,9 +2084,9 @@
+@@ -2035,9 +2086,9 @@
          let mut input = ParserInput::new("ab\ncd");
          assert_eq!(input.location().line, 1);
          assert_eq!(input.location().column, 1);
@@ -2447,7 +2477,7 @@
          assert_eq!(input.location().line, 2);
          assert_eq!(input.location().column, 1);
      }
-@@ -2058,13 +2107,29 @@
+@@ -2058,13 +2109,29 @@
      }
  
      #[test]
@@ -2478,7 +2508,7 @@
      }
  
      #[test]
-@@ -2112,9 +2177,25 @@
+@@ -2112,9 +2179,25 @@
          assert_eq!(input.diagnostics.len(), 1);
      }
  
@@ -2505,7 +2535,7 @@
          input.set_max_entity_expansions(2);
          assert!(input.parse_reference().is_ok());
          assert!(input.parse_reference().is_ok());
-@@ -2145,6 +2226,14 @@
+@@ -2145,6 +2228,14 @@
      }
  
      #[test]
@@ -2520,7 +2550,7 @@
      fn test_parse_quoted_value() {
          let mut input = ParserInput::new("'hello'");
          let value = input.parse_quoted_value().unwrap();
-@@ -2154,7 +2243,7 @@
+@@ -2154,7 +2245,7 @@
      #[test]
      fn test_skip_whitespace() {
          let mut input = ParserInput::new("  \t\n  abc");
@@ -2529,7 +2559,7 @@
          assert_eq!(input.peek(), Some(b'a'));
      }
  
-@@ -2168,12 +2257,211 @@
+@@ -2168,12 +2259,211 @@
      #[test]
      fn test_take_while() {
          let mut input = ParserInput::new("12345abc");
@@ -2742,7 +2772,7 @@
      fn test_split_name() {
          assert_eq!(split_name("foo:bar"), (Some("foo"), "bar"));
          assert_eq!(split_name("bar"), (None, "bar"));
-@@ -2182,37 +2470,94 @@
+@@ -2182,37 +2472,94 @@
  
      #[test]
      fn test_namespace_resolver() {
@@ -2860,7 +2890,7 @@
      }
  
      #[test]
-@@ -2234,7 +2579,7 @@
+@@ -2234,7 +2581,7 @@
          let mut input = ParserInput::new("<?target data?>");
          let (target, data) = parse_pi_content(&mut input).unwrap();
          assert_eq!(target, "target");
@@ -2869,7 +2899,7 @@
      }
  
      #[test]
-@@ -2250,7 +2595,7 @@
+@@ -2250,7 +2597,7 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
          let decl = parse_xml_decl(&mut input).unwrap();
          assert_eq!(decl.version, "1.0");
@@ -2878,7 +2908,7 @@
          assert_eq!(decl.standalone, None);
      }
  
-@@ -2301,7 +2646,10 @@
+@@ -2301,7 +2648,10 @@
          input.set_max_depth(1);
          assert!(input.increment_depth().is_ok()); // depth = 1
          let err = input.increment_depth().unwrap_err();
@@ -2890,7 +2920,7 @@
      }
  
      #[test]
-@@ -2310,7 +2658,10 @@
+@@ -2310,7 +2660,10 @@
          let mut input = ParserInput::new("");
          input.set_max_depth(0);
          let err = input.increment_depth().unwrap_err();
@@ -2902,7 +2932,7 @@
      }
  
      #[test]
-@@ -2345,64 +2696,75 @@
+@@ -2345,64 +2698,75 @@
      #[test]
      fn test_entity_expansion_limit_exact_boundary() {
          // max_entity_expansions = 3 means exactly 3 are allowed
@@ -3001,7 +3031,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY greet "Hello">
  ]>
-@@ -2414,7 +2776,7 @@
+@@ -2414,7 +2778,7 @@
  
      #[test]
      fn test_entity_expansion_nested_dtd_entities() {
@@ -3010,7 +3040,7 @@
          // Entity "b" references entity "a". The nested reference is parsed
          // as content (XML 1.0 §4.4), so the entity expansion is visible
          // through text_content.
-@@ -2430,7 +2792,7 @@
+@@ -2430,7 +2794,7 @@
  
      #[test]
      fn test_entity_expansion_limit_nested_dtd_entities_in_attributes() {
@@ -3019,7 +3049,7 @@
          // In attribute values, entity references ARE fully expanded through
          // parse_reference_into + expand_entity_text. Each expansion counts
          // against the limit. Chain: c -> 3*b -> 9*a = 13 total expansions.
-@@ -2443,17 +2805,19 @@
+@@ -2443,17 +2807,19 @@
          let opts = ParseOptions::default().max_entity_expansions(5);
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -3044,7 +3074,7 @@
          // Classic billion laughs pattern in an attribute value where
          // entities ARE fully expanded. Each entity references the
          // previous one multiple times, causing exponential expansion.
-@@ -2470,15 +2834,15 @@
+@@ -2470,15 +2836,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3063,7 +3093,7 @@
          // When entity replacement text contains '<', the parser must expand
          // it (to validate the markup), which triggers entity expansion
          // counting. This tests the billion laughs pattern for text content
-@@ -2494,9 +2858,9 @@
+@@ -2494,9 +2860,9 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3075,7 +3105,7 @@
          );
      }
  
-@@ -2504,7 +2868,7 @@
+@@ -2504,7 +2870,7 @@
  
      #[test]
      fn test_xxe_external_entity_rejected_by_default() {
@@ -3084,7 +3114,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/passwd">
  ]>
-@@ -2513,15 +2877,15 @@
+@@ -2513,15 +2879,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3103,7 +3133,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe PUBLIC "-//Evil//EN" "http://evil.com/payload">
  ]>
-@@ -2530,15 +2894,15 @@
+@@ -2530,15 +2896,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3122,7 +3152,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/shadow">
  ]>
-@@ -2549,7 +2913,7 @@
+@@ -2549,7 +2915,7 @@
  
      #[test]
      fn test_xxe_multiple_external_entities_all_rejected() {
@@ -3131,7 +3161,7 @@
          // Even if one entity is internal, the external one should fail
          let xml = r#"<!DOCTYPE r [
  <!ENTITY safe "ok">
-@@ -2568,9 +2932,9 @@
+@@ -2568,9 +2934,9 @@
          let mut input = ParserInput::new("&#0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3143,7 +3173,7 @@
          );
      }
  
-@@ -2579,9 +2943,9 @@
+@@ -2579,9 +2945,9 @@
          let mut input = ParserInput::new("&#x0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3155,7 +3185,7 @@
          );
      }
  
-@@ -2619,17 +2983,17 @@
+@@ -2619,17 +2985,17 @@
          let mut input = ParserInput::new("&#xD800;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3177,7 +3207,7 @@
          );
      }
  
-@@ -2639,17 +3003,17 @@
+@@ -2639,17 +3005,17 @@
          let mut input = ParserInput::new("&#xFFFE;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3199,7 +3229,7 @@
          );
      }
  
-@@ -2668,9 +3032,9 @@
+@@ -2668,9 +3034,9 @@
          let mut input = ParserInput::new("&#x110000;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3211,7 +3241,7 @@
          );
      }
  
-@@ -2680,9 +3044,10 @@
+@@ -2680,9 +3046,10 @@
          let mut input = ParserInput::new("&#99999999999;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3224,7 +3254,7 @@
          );
      }
  
-@@ -2692,9 +3057,10 @@
+@@ -2692,9 +3059,10 @@
          let mut input = ParserInput::new("&#xFFFFFFFFFF;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3237,7 +3267,7 @@
          );
      }
  
-@@ -2703,9 +3069,10 @@
+@@ -2703,9 +3071,10 @@
          let mut input = ParserInput::new("&#;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3250,7 +3280,7 @@
          );
      }
  
-@@ -2714,9 +3081,10 @@
+@@ -2714,9 +3083,10 @@
          let mut input = ParserInput::new("&#x;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3263,7 +3293,7 @@
          );
      }
  
-@@ -2760,7 +3128,7 @@
+@@ -2760,7 +3130,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name();
          assert!(result.is_err());
@@ -3272,7 +3302,7 @@
      }
  
      #[test]
-@@ -2806,7 +3174,7 @@
+@@ -2806,7 +3176,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq("something");
          assert!(result.is_err());
@@ -3281,7 +3311,7 @@
      }
  
      #[test]
-@@ -2817,7 +3185,59 @@
+@@ -2817,7 +3187,59 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq_parts(None, "something");
          assert!(result.is_err());
@@ -3342,7 +3372,7 @@
      }
  
      // -- Comment boundary edge cases --
-@@ -2829,7 +3249,10 @@
+@@ -2829,7 +3251,10 @@
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
          assert!(
@@ -3354,7 +3384,7 @@
              "double dash inside comment should be rejected"
          );
      }
-@@ -2848,10 +3271,12 @@
+@@ -2848,10 +3273,12 @@
          let mut input = ParserInput::new("<!-- no end");
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
@@ -3371,7 +3401,7 @@
      }
  
      #[test]
-@@ -2893,10 +3318,12 @@
+@@ -2893,10 +3320,12 @@
          let mut input = ParserInput::new("<![CDATA[no end");
          let result = parse_cdata_content(&mut input);
          assert!(result.is_err());
@@ -3388,7 +3418,7 @@
      }
  
      #[test]
-@@ -2937,10 +3364,12 @@
+@@ -2937,10 +3366,12 @@
          let mut input = ParserInput::new("<?xml data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3405,7 +3435,7 @@
      }
  
      #[test]
-@@ -2959,10 +3388,12 @@
+@@ -2959,10 +3390,12 @@
          let mut input = ParserInput::new("<?ns:target data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3422,7 +3452,7 @@
      }
  
      #[test]
-@@ -2988,10 +3419,12 @@
+@@ -2988,10 +3421,12 @@
          let mut input = ParserInput::new("\"abc<def\"");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3439,7 +3469,7 @@
      }
  
      #[test]
-@@ -2999,10 +3432,12 @@
+@@ -2999,10 +3434,12 @@
          let mut input = ParserInput::new("\"no closing quote");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3456,7 +3486,7 @@
      }
  
      #[test]
-@@ -3010,10 +3445,12 @@
+@@ -3010,10 +3447,12 @@
          let mut input = ParserInput::new("unquoted");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3473,7 +3503,7 @@
      }
  
      #[test]
-@@ -3024,22 +3461,19 @@
+@@ -3024,22 +3463,19 @@
      }
  
      #[test]
@@ -3505,7 +3535,7 @@
      }
  
      // -- Invalid XML character detection --
-@@ -3076,10 +3510,12 @@
+@@ -3076,10 +3512,12 @@
          let mut input = ParserInput::new(input_bytes);
          let result = input.next_char();
          assert!(result.is_err());
@@ -3522,7 +3552,7 @@
      }
  
      #[test]
-@@ -3101,138 +3537,150 @@
+@@ -3101,138 +3539,150 @@
      fn test_scan_char_data_cdata_end_marker() {
          // `]]>` in character data is not allowed — the scanner should stop before it
          let input = ParserInput::new("text]]>more");
@@ -3729,7 +3759,7 @@
      }
  
      // -- QName validation edge cases --
-@@ -3265,34 +3713,46 @@
+@@ -3265,34 +3715,46 @@
          assert!(result.unwrap().contains("empty prefix or local part"));
      }
  
@@ -3786,7 +3816,7 @@
      }
  
      // -- XML declaration edge cases --
-@@ -3302,10 +3762,12 @@
+@@ -3302,10 +3764,12 @@
          let mut input = ParserInput::new("<?xml version=\"2.0\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3803,7 +3833,7 @@
      }
  
      #[test]
-@@ -3313,10 +3775,12 @@
+@@ -3313,10 +3777,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"123bad\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3820,7 +3850,7 @@
      }
  
      #[test]
-@@ -3324,10 +3788,12 @@
+@@ -3324,10 +3790,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" standalone=\"maybe\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3837,7 +3867,7 @@
      }
  
      #[test]
-@@ -3342,10 +3808,10 @@
+@@ -3342,10 +3810,10 @@
      #[test]
      fn test_save_restore_position() {
          let mut input = ParserInput::new("abcdef");
@@ -3850,7 +3880,7 @@
          assert_eq!(input.peek(), Some(b'f'));
          input.restore_position(saved);
          assert_eq!(input.peek(), Some(b'd'));
-@@ -3357,7 +3823,7 @@
+@@ -3357,7 +3825,7 @@
  
      #[test]
      fn test_depth_limit_via_parse_str_with_options() {
@@ -3859,7 +3889,7 @@
          // 3 levels with limit 3 should succeed
          let xml = "<a><b><c/></b></a>";
          let opts = ParseOptions::default().max_depth(3);
-@@ -3367,7 +3833,7 @@
+@@ -3367,7 +3835,7 @@
          let xml = "<a><b><c><d/></c></b></a>";
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -3868,7 +3898,7 @@
      }
  
      // -- Builtin entity matching edge cases --
-@@ -3403,12 +3869,24 @@
+@@ -3403,12 +3871,24 @@
      fn test_expand_entity_text_counts_against_limit() {
          // Set up a ParserInput with entity_map containing nested references
          let mut input = ParserInput::new("");
@@ -3899,7 +3929,7 @@
          input.set_max_entity_expansions(2);
  
          // Expanding "b" should expand &a; twice, hitting the limit
-@@ -3465,6 +3943,54 @@
+@@ -3465,6 +3945,54 @@
          assert_eq!(result, "<![CDATA[&amp; not expanded]]>");
      }
  
@@ -3995,8 +4025,8 @@
 +    local: &'a str,
 +}
 +
-+impl std::fmt::Display for QualifiedName<'_> {
-+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++impl core::fmt::Display for QualifiedName<'_> {
++    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 +        if let Some(prefix) = self.prefix {
 +            write!(output, "{prefix}:")?;
 +        }
@@ -4230,7 +4260,7 @@
 +                .fatal("unexpected end of input in internal subset"));
 +        }
 +        let end = self.input.pos() - 1;
-+        std::str::from_utf8(self.input.slice(start, end))
++        core::str::from_utf8(self.input.slice(start, end))
 +            .map_err(|_| self.input.fatal("invalid UTF-8 in internal subset"))
 +    }
 +
@@ -4904,7 +4934,7 @@
 -                                .fatal("the xmlns namespace must not be bound to any prefix"));
 -                        }
 -                    }
-+    fn namespace_error(&mut self, message: impl std::fmt::Display) -> Result<(), ParseError<S>> {
++    fn namespace_error(&mut self, message: impl core::fmt::Display) -> Result<(), ParseError<S>> {
 +        if self.options.recover {
 +            self.input.push_diagnostic(ErrorSeverity::Error, message)
 +        } else {
@@ -5344,7 +5374,7 @@
      }
  
      /// Normalizes an attribute value based on its DTD-declared type.
-@@ -921,65 +920,30 @@
+@@ -921,105 +920,58 @@
          element_name: &str,
          attr_name: &str,
          value: &str,
@@ -5423,8 +5453,9 @@
 +            let safe_len = self.input.scan_char_data()?;
              if safe_len > 0 {
                  let start = self.input.pos();
-                 let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
-@@ -987,39 +951,27 @@
+-                let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
++                let chunk = core::str::from_utf8(self.input.slice(start, start + safe_len))
+                     .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
                  // Fast byte-level pre-check for invalid XML chars (0x7F,
                  // U+FFFE, U+FFFF). Skips the expensive char-by-char
                  // validation for the 99.9% of chunks that are clean.
@@ -5502,7 +5533,7 @@
 -                        });
 +                        let empty = self.storage.text("")?;
 +                        let text_id = self.doc.try_create_node(NodeKind::Text {
-+                            content: std::mem::replace(&mut text, empty),
++                            content: core::mem::replace(&mut text, empty),
 +                        })?;
                          self.doc.append_child(parent, text_id);
                      }
@@ -5712,15 +5743,16 @@
          // Move shared state into the sub-parser (returned below).
 -        sub.input.entity_map = std::mem::take(&mut self.input.entity_map);
 -        sub.input.entity_external = std::mem::take(&mut self.input.entity_external);
-+        std::mem::swap(&mut sub.input.entity_map, &mut self.input.entity_map);
++        core::mem::swap(&mut sub.input.entity_map, &mut self.input.entity_map);
          sub.input.has_pe_references = self.input.has_pe_references;
          sub.input.has_external_dtd = self.input.has_external_dtd;
          sub.input.entity_expansions = self.input.entity_expansions;
 -        sub.attr_types = std::mem::take(&mut self.attr_types);
 -        sub.attr_defaults = std::mem::take(&mut self.attr_defaults);
-+        std::mem::swap(&mut sub.attr_types, &mut self.attr_types);
-+        std::mem::swap(&mut sub.attr_defaults, &mut self.attr_defaults);
-         std::mem::swap(&mut sub.ns, &mut self.ns);
+-        std::mem::swap(&mut sub.ns, &mut self.ns);
++        core::mem::swap(&mut sub.attr_types, &mut self.attr_types);
++        core::mem::swap(&mut sub.attr_defaults, &mut self.attr_defaults);
++        core::mem::swap(&mut sub.ns, &mut self.ns);
  
          let sub_root = sub.doc.root();
          let result = sub.parse_content_fragment(sub_root);
@@ -5728,13 +5760,14 @@
          // Restore shared state regardless of outcome.
 -        self.input.entity_map = std::mem::take(&mut sub.input.entity_map);
 -        self.input.entity_external = std::mem::take(&mut sub.input.entity_external);
-+        std::mem::swap(&mut self.input.entity_map, &mut sub.input.entity_map);
++        core::mem::swap(&mut self.input.entity_map, &mut sub.input.entity_map);
          self.input.entity_expansions = sub.input.entity_expansions;
 -        self.attr_types = std::mem::take(&mut sub.attr_types);
 -        self.attr_defaults = std::mem::take(&mut sub.attr_defaults);
-+        std::mem::swap(&mut self.attr_types, &mut sub.attr_types);
-+        std::mem::swap(&mut self.attr_defaults, &mut sub.attr_defaults);
-         std::mem::swap(&mut self.ns, &mut sub.ns);
+-        std::mem::swap(&mut self.ns, &mut sub.ns);
++        core::mem::swap(&mut self.attr_types, &mut sub.attr_types);
++        core::mem::swap(&mut self.attr_defaults, &mut sub.attr_defaults);
++        core::mem::swap(&mut self.ns, &mut sub.ns);
          self.expansion_size = sub.expansion_size;
          if !sub.input.diagnostics.is_empty() {
 -            self.input.diagnostics.append(&mut sub.input.diagnostics);
@@ -5907,7 +5940,7 @@
 +            self.storage.charge(raw_bytes.len())?;
              if raw_bytes.contains(&b'&') {
 -                let raw_str = std::str::from_utf8(raw_bytes).ok().map(str::to_string);
-+                let raw_str = std::str::from_utf8(raw_bytes)
++                let raw_str = core::str::from_utf8(raw_bytes)
 +                    .map_err(|_| self.input.fatal("invalid UTF-8 in raw attribute value"))?;
                  // Only store raw_value if it differs from the expanded value
                  // (i.e., it contained entity references that got expanded) AND
@@ -6308,7 +6341,7 @@
  //! use xmloxide::parser::PushParser;
  //!
  //! let mut parser = PushParser::new();
-@@ -30,10 +30,10 @@
+@@ -30,10 +30,12 @@
  //! assert_eq!(doc.node_name(root), Some("root"));
  //! ```
  
@@ -6316,6 +6349,8 @@
 -use crate::error::{ParseError, SourceLocation};
 -use crate::parser::ParseOptions;
 -use crate::tree::Document;
++use alloc::vec::Vec;
++
 +use crate::parser_xmloxide::encoding::decode_to_utf8;
 +use crate::parser_xmloxide::error::{ParseError, SourceLocation};
 +use crate::parser_xmloxide::parser::ParseOptions;
@@ -6323,7 +6358,7 @@
  
  /// A push-based (incremental) XML parser.
  ///
-@@ -50,7 +50,7 @@
+@@ -50,7 +52,7 @@
  ///
  /// Basic usage with multiple chunks:
  ///
@@ -6332,7 +6367,7 @@
  /// use xmloxide::parser::PushParser;
  ///
  /// let mut parser = PushParser::new();
-@@ -67,7 +67,7 @@
+@@ -67,7 +69,7 @@
  ///
  /// With parse options:
  ///
@@ -6341,7 +6376,7 @@
  /// use xmloxide::parser::{ParseOptions, PushParser};
  ///
  /// let opts = ParseOptions::default().recover(true);
-@@ -92,7 +92,7 @@
+@@ -92,7 +94,7 @@
      ///
      /// # Examples
      ///
@@ -6350,7 +6385,7 @@
      /// use xmloxide::parser::PushParser;
      ///
      /// let mut parser = PushParser::new();
-@@ -112,7 +112,7 @@
+@@ -112,7 +114,7 @@
      ///
      /// # Examples
      ///
@@ -6359,7 +6394,7 @@
      /// use xmloxide::parser::{ParseOptions, PushParser};
      ///
      /// let parser = PushParser::with_options(
-@@ -140,7 +140,7 @@
+@@ -140,7 +142,7 @@
      ///
      /// # Examples
      ///
@@ -6368,7 +6403,7 @@
      /// use xmloxide::parser::PushParser;
      ///
      /// let mut parser = PushParser::new();
-@@ -168,7 +168,7 @@
+@@ -168,7 +170,7 @@
      ///
      /// # Examples
      ///
@@ -6377,7 +6412,7 @@
      /// use xmloxide::parser::PushParser;
      ///
      /// let mut parser = PushParser::new();
-@@ -178,13 +178,13 @@
+@@ -178,13 +180,13 @@
      pub fn finish(mut self) -> Result<Document, ParseError> {
          self.finished = true;
  
@@ -6393,7 +6428,7 @@
      }
  
      /// Returns the number of bytes currently buffered.
-@@ -194,7 +194,7 @@
+@@ -194,7 +196,7 @@
      ///
      /// # Examples
      ///
@@ -6402,7 +6437,7 @@
      /// use xmloxide::parser::PushParser;
      ///
      /// let mut parser = PushParser::new();
-@@ -211,7 +211,7 @@
+@@ -211,7 +213,7 @@
      ///
      /// # Examples
      ///
@@ -6411,7 +6446,7 @@
      /// use xmloxide::parser::PushParser;
      ///
      /// let mut parser = PushParser::new();
-@@ -232,7 +232,7 @@
+@@ -232,7 +234,7 @@
      ///
      /// # Examples
      ///
@@ -6420,7 +6455,18 @@
      /// use xmloxide::parser::PushParser;
      ///
      /// let mut parser = PushParser::new();
-@@ -268,7 +268,6 @@
+@@ -254,8 +256,8 @@
+     }
+ }
+ 
+-impl std::fmt::Debug for PushParser {
+-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++impl core::fmt::Debug for PushParser {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+         f.debug_struct("PushParser")
+             .field("buffered_bytes", &self.buffer.len())
+             .field("options", &self.options)
+@@ -268,7 +270,6 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -6428,7 +6474,7 @@
  
      #[test]
      fn test_push_parser_single_chunk() {
-@@ -469,7 +468,7 @@
+@@ -469,7 +470,7 @@
          parser.push(&input[10..25]);
          parser.push(&input[25..]);
          let doc = parser.finish().unwrap();
@@ -6439,19 +6485,27 @@
              std::str::from_utf8(input).unwrap()
 --- a/xmloxide/src/tree/mod.rs
 +++ b/xmloxide/src/tree/mod.rs
-@@ -19,8 +19,9 @@
+@@ -19,9 +19,16 @@
  
  pub use node::NodeKind;
  
 -use crate::error::{ParseDiagnostic, ParseError};
 -use std::collections::HashMap;
+-use std::num::NonZeroU32;
 +use crate::parser_xmloxide::error::{ParseDiagnostic, ParseError};
 +use crate::xml::dom::storage::names::{NameStorage, Names};
 +use crate::xml::dom::storage::{Native, Storage, Values};
- use std::num::NonZeroU32;
++use alloc::{
++    format,
++    string::{String, ToString},
++    vec,
++    vec::Vec,
++};
++use core::num::NonZeroU32;
  
  /// A typed index into the document's node arena.
-@@ -36,11 +37,16 @@
+ ///
+@@ -36,11 +43,16 @@
      ///
      /// # Panics
      ///
@@ -6471,7 +6525,7 @@
      }
  
      /// Returns the raw index as a `usize` for indexing into the arena.
-@@ -72,10 +78,10 @@
+@@ -72,10 +84,10 @@
  /// Each node stores its kind (element, text, comment, etc.) and links to
  /// parent, children, and siblings for tree navigation. Access individual
  /// nodes via [`Document::node`].
@@ -6485,7 +6539,7 @@
      /// Parent node, if any. The document root node has no parent.
      pub parent: Option<NodeId>,
      /// First child node.
-@@ -88,8 +94,8 @@
+@@ -88,8 +100,8 @@
      pub prev_sibling: Option<NodeId>,
  }
  
@@ -6496,7 +6550,7 @@
          Self {
              kind,
              parent: None,
-@@ -101,21 +107,34 @@
+@@ -101,21 +113,34 @@
      }
  }
  
@@ -6537,7 +6591,7 @@
  }
  
  /// An XML document.
-@@ -126,33 +145,53 @@
+@@ -126,33 +151,53 @@
  ///
  /// # Examples
  ///
@@ -6578,8 +6632,8 @@
 +    storage: S,
 +}
 +
-+impl<S: NameStorage> std::fmt::Debug for Document<S> {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++impl<S: NameStorage> core::fmt::Debug for Document<S> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 +        f.debug_struct("Document")
 +            .field("nodes", &&self.nodes[..])
 +            .field("root", &self.root)
@@ -6599,7 +6653,7 @@
  }
  
  impl Document {
-@@ -167,21 +206,7 @@
+@@ -167,21 +212,7 @@
      /// Creates a new empty document with pre-allocated capacity for `n` nodes.
      #[must_use]
      pub fn with_capacity(n: usize) -> Self {
@@ -6622,7 +6676,7 @@
      }
  
      /// Parses an XML string into a `Document`.
-@@ -192,7 +217,7 @@
+@@ -192,7 +223,7 @@
      ///
      /// # Examples
      ///
@@ -6631,7 +6685,7 @@
      /// use xmloxide::Document;
      ///
      /// let doc = Document::parse_str("<root><child/></root>").unwrap();
-@@ -208,9 +233,9 @@
+@@ -208,9 +239,9 @@
              let enc_lower = enc.to_ascii_lowercase();
              if had_bom && enc_lower != "utf-8" {
                  // UTF-8 BOM present but encoding is not UTF-8.
@@ -6643,7 +6697,7 @@
                      diagnostics: Vec::new(),
                  });
              }
-@@ -222,11 +247,11 @@
+@@ -222,11 +253,11 @@
                  || enc_lower.starts_with("ucs")
                  || enc_lower == "ebcdic";
              if incompatible {
@@ -6657,7 +6711,7 @@
                      diagnostics: Vec::new(),
                  });
              }
-@@ -237,15 +262,15 @@
+@@ -237,15 +268,15 @@
                  && enc_lower != "ascii"
                  && encoding_rs::Encoding::for_label(enc.as_bytes()).is_none()
              {
@@ -6676,7 +6730,7 @@
      }
  
      /// Extracts the encoding value from an XML declaration, if present.
-@@ -275,7 +300,7 @@
+@@ -275,7 +306,7 @@
      ///
      /// Uses BOM sniffing and XML declaration inspection to determine the
      /// encoding, then transcodes to UTF-8 before parsing. See
@@ -6685,7 +6739,7 @@
      ///
      /// # Errors
      ///
-@@ -284,7 +309,7 @@
+@@ -284,7 +315,7 @@
      ///
      /// # Examples
      ///
@@ -6694,7 +6748,7 @@
      /// use xmloxide::Document;
      ///
      /// let doc = Document::parse_bytes(b"<root/>").unwrap();
-@@ -292,10 +317,10 @@
+@@ -292,10 +323,10 @@
      /// assert_eq!(doc.node_name(root), Some("root"));
      /// ```
      pub fn parse_bytes(input: &[u8]) -> Result<Self, ParseError> {
@@ -6708,7 +6762,7 @@
              message: e.message,
              location: SourceLocation::default(),
              diagnostics: Vec::new(),
-@@ -304,7 +329,7 @@
+@@ -304,7 +335,7 @@
          // Skip BOM and encoding checks — decode_to_utf8 already handled
          // encoding detection and transcoding. Go directly to the parser.
          let text = utf8.strip_prefix('\u{FEFF}').unwrap_or(&utf8);
@@ -6717,7 +6771,7 @@
      }
  
      /// Parses an XML file from the filesystem.
-@@ -319,21 +344,45 @@
+@@ -319,21 +350,46 @@
      ///
      /// # Examples
      ///
@@ -6727,6 +6781,7 @@
      ///
      /// let doc = Document::parse_file("document.xml").unwrap();
      /// ```
++    #[cfg(feature = "std")]
      pub fn parse_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ParseError> {
 -        use crate::error::SourceLocation;
 +        use crate::parser_xmloxide::error::SourceLocation;
@@ -6766,7 +6821,7 @@
  
      /// Returns the document root `NodeId`.
      ///
-@@ -365,13 +414,13 @@
+@@ -365,13 +421,13 @@
      /// Panics if `id` does not refer to a valid node in this document.
      #[must_use]
      #[inline]
@@ -6782,7 +6837,7 @@
          &mut self.nodes[id.as_index()]
      }
  
-@@ -438,7 +487,9 @@
+@@ -438,7 +494,9 @@
              _ => None,
          }
      }
@@ -6792,7 +6847,7 @@
      /// Returns the concatenated text content of a node and all its descendants.
      ///
      /// Recursively collects text from all descendant text and CDATA nodes.
-@@ -476,14 +527,16 @@
+@@ -476,14 +534,16 @@
              }
          }
      }
@@ -6810,7 +6865,7 @@
          match &self.node(id).kind {
              NodeKind::Element { attributes, .. } => attributes,
              _ => &[],
-@@ -499,10 +552,12 @@
+@@ -499,10 +559,12 @@
      pub fn attribute(&self, id: NodeId, name: &str) -> Option<&str> {
          self.attributes(id)
              .iter()
@@ -6825,7 +6880,7 @@
      // --- ID lookup ---
  
      /// Associates an ID value with an element node.
-@@ -511,7 +566,7 @@
+@@ -511,7 +573,7 @@
      /// Subsequent calls to [`element_by_id`](Document::element_by_id) will
      /// return the associated node.
      pub fn set_id(&mut self, id: &str, node: NodeId) {
@@ -6834,7 +6889,7 @@
      }
  
      /// Looks up an element by its ID attribute value.
-@@ -523,6 +578,36 @@
+@@ -523,6 +585,36 @@
      pub fn element_by_id(&self, id: &str) -> Option<NodeId> {
          self.id_map.get(id).copied()
      }
@@ -6871,7 +6926,7 @@
  
      // --- Navigation ---
  
-@@ -566,7 +651,7 @@
+@@ -566,7 +658,7 @@
      /// Yields each child `NodeId` in document order (first child to last).
      /// For a depth-first traversal that includes nested descendants, use
      /// [`descendants`](Self::descendants).
@@ -6880,7 +6935,7 @@
          Children {
              doc: self,
              next: self.node(id).first_child,
-@@ -578,7 +663,7 @@
+@@ -578,7 +670,7 @@
      ///
      /// The first item yielded is `id` itself, followed by its parent, then
      /// grandparent, and so on up to the document root node.
@@ -6889,7 +6944,7 @@
          Ancestors {
              doc: self,
              next: Some(id),
-@@ -591,14 +676,16 @@
+@@ -591,14 +683,16 @@
      /// Does *not* yield `id` itself — only its children, grandchildren, etc.
      /// For iterating only the direct children, use
      /// [`children`](Self::children).
@@ -6907,7 +6962,7 @@
      // --- Mutation ---
  
      /// Allocates a new node in the arena and returns its `NodeId`.
-@@ -608,9 +695,69 @@
+@@ -608,9 +702,69 @@
      /// [`prepend_child`](Self::prepend_child), or
      /// [`insert_before`](Self::insert_before) to attach it to the tree.
      pub fn create_node(&mut self, kind: NodeKind) -> NodeId {
@@ -6979,7 +7034,7 @@
      }
  
      /// Appends a child node to the end of a parent's child list.
-@@ -723,7 +870,9 @@
+@@ -723,7 +877,9 @@
          self.node_mut(id).prev_sibling = None;
          self.node_mut(id).next_sibling = None;
      }
@@ -6989,7 +7044,7 @@
      /// Deep-copies a node and all its descendants within this document.
      ///
      /// The cloned subtree is detached (has no parent). If `deep` is `false`,
-@@ -731,7 +880,7 @@
+@@ -731,7 +887,7 @@
      ///
      /// # Examples
      ///
@@ -6998,7 +7053,7 @@
      /// use xmloxide::Document;
      ///
      /// let mut doc = Document::parse_str("<root><child>Hello</child></root>").unwrap();
-@@ -764,7 +913,7 @@
+@@ -764,7 +920,7 @@
      ///
      /// # Examples
      ///
@@ -7007,7 +7062,7 @@
      /// use xmloxide::Document;
      ///
      /// let mut doc = Document::parse_str("<root>old</root>").unwrap();
-@@ -777,15 +926,9 @@
+@@ -777,15 +933,9 @@
          match &self.node(id).kind {
              NodeKind::Text { .. } | NodeKind::CData { .. } | NodeKind::Comment { .. } => {
                  match &mut self.node_mut(id).kind {
@@ -7026,7 +7081,7 @@
                          *c = content.to_string();
                      }
                      _ => unreachable!(),
-@@ -944,7 +1087,9 @@
+@@ -944,7 +1094,9 @@
              false
          }
      }
@@ -7036,7 +7091,7 @@
      /// Returns the total number of nodes in the document.
      ///
      /// This includes all node types (elements, text, comments, etc.) but
-@@ -968,12 +1113,12 @@
+@@ -968,12 +1120,12 @@
  ///
  /// Created by [`Document::children`]. Yields each child's `NodeId` in
  /// document order by following `next_sibling` links.
@@ -7052,7 +7107,7 @@
      type Item = NodeId;
  
      #[inline]
-@@ -988,12 +1133,12 @@
+@@ -988,12 +1140,12 @@
  ///
  /// Created by [`Document::ancestors`]. The first item yielded is the starting
  /// node itself, followed by its parent, grandparent, etc.
@@ -7068,7 +7123,7 @@
      type Item = NodeId;
  
      #[inline]
-@@ -1008,13 +1153,13 @@
+@@ -1008,13 +1160,13 @@
  ///
  /// Created by [`Document::descendants`]. Yields every node in the subtree
  /// below the starting node, but does *not* yield the starting node itself.
@@ -7085,7 +7140,7 @@
      type Item = NodeId;
  
      #[inline]
-@@ -1141,7 +1286,7 @@
+@@ -1141,7 +1293,7 @@
      fn test_children_iterator_empty() {
          let doc = Document::new();
          let children: Vec<NodeId> = doc.children(doc.root()).collect();
@@ -7094,7 +7149,7 @@
      }
  
      #[test]
-@@ -2033,7 +2178,12 @@
+@@ -2033,7 +2185,12 @@
      fn test_parse_file_nonexistent() {
          let result = Document::parse_file("/nonexistent/path.xml");
          assert!(result.is_err());
@@ -7203,8 +7258,8 @@
      },
  }
 +
-+impl<S: Storage> std::fmt::Debug for NodeKind<S> {
-+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++impl<S: Storage> core::fmt::Debug for NodeKind<S> {
++    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
 +        match self {
 +            Self::Document => f.write_str("Document"),
 +            Self::Element {
@@ -7251,7 +7306,17 @@
 +}
 --- a/xmloxide/src/error/mod.rs
 +++ b/xmloxide/src/error/mod.rs
-@@ -52,16 +52,16 @@
+@@ -7,7 +7,8 @@
+ //! The parser supports **error recovery mode**: it collects errors into a
+ //! `Vec<ParseDiagnostic>` while still producing a (possibly partial) tree.
+ 
+-use std::fmt;
++use alloc::{string::String, vec::Vec};
++use core::fmt;
+ 
+ /// Severity level for a parse diagnostic, matching libxml2's `xmlErrorLevel`.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+@@ -52,16 +53,16 @@
  /// Diagnostics are collected when the parser operates in recovery mode,
  /// allowing it to produce a partial tree even when the input is malformed.
  #[derive(Debug, Clone)]
@@ -7271,7 +7336,7 @@
      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
          write!(
              f,
-@@ -73,29 +73,76 @@
+@@ -73,29 +74,76 @@
  
  /// The error type returned when XML parsing fails.
  #[derive(Debug, Clone)]
@@ -7328,8 +7393,8 @@
  }
  
 -impl std::error::Error for ParseError {}
-+impl<L: fmt::Debug + fmt::Display, D: fmt::Debug> std::error::Error for ParseError<L, D> {
-+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++impl<L: fmt::Debug + fmt::Display, D: fmt::Debug> core::error::Error for ParseError<L, D> {
++    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
 +        match self {
 +            Self::Resource(error) => Some(error),
 +            Self::Syntax { .. } => None,
@@ -7359,7 +7424,7 @@
      fn test_source_location_display() {
          let loc = SourceLocation {
              line: 10,
-@@ -107,7 +154,7 @@
+@@ -107,7 +155,7 @@
  
      #[test]
      fn test_parse_error_display() {
@@ -7368,7 +7433,7 @@
              message: "unexpected end of input".to_string(),
              location: SourceLocation {
                  line: 1,
-@@ -148,7 +195,7 @@
+@@ -148,7 +196,7 @@
  
      #[test]
      fn test_parse_error_is_error_trait() {
@@ -7379,7 +7444,29 @@
              diagnostics: vec![],
 --- a/xmloxide/src/encoding/mod.rs
 +++ b/xmloxide/src/encoding/mod.rs
-@@ -51,7 +51,7 @@
+@@ -12,7 +12,11 @@
+ //! 4. After initial decoding, inspect the XML declaration's `encoding=` attribute
+ //!    to confirm or override the detected encoding.
+ 
+-use std::fmt;
++use alloc::{
++    format,
++    string::{String, ToString},
++};
++use core::fmt;
+ 
+ /// An error that occurs during encoding detection or transcoding.
+ #[derive(Debug, Clone)]
+@@ -36,7 +40,7 @@
+     }
+ }
+ 
+-impl std::error::Error for EncodingError {}
++impl core::error::Error for EncodingError {}
+ 
+ /// Detects the encoding of an XML byte stream by inspecting the Byte Order Mark.
+ ///
+@@ -51,7 +55,7 @@
  ///
  /// # Examples
  ///
@@ -7388,7 +7475,7 @@
  /// use xmloxide::encoding::detect_encoding;
  ///
  /// let (enc, skip) = detect_encoding(b"\xEF\xBB\xBFhello");
-@@ -88,7 +88,7 @@
+@@ -88,7 +92,7 @@
  ///
  /// # Examples
  ///
@@ -7397,7 +7484,7 @@
  /// use xmloxide::encoding::transcode;
  ///
  /// let result = transcode(b"hello", "UTF-8").unwrap();
-@@ -158,7 +158,7 @@
+@@ -158,7 +162,7 @@
  ///
  /// # Examples
  ///
@@ -7406,7 +7493,16 @@
  /// use xmloxide::encoding::decode_to_utf8;
  ///
  /// let xml = b"<?xml version=\"1.0\"?><root/>";
-@@ -429,7 +429,7 @@
+@@ -172,7 +176,7 @@
+     // Fast path: if the BOM says UTF-8 (or no BOM, which defaults to UTF-8),
+     // try to validate directly without transcoding.
+     if bom_encoding == "UTF-8" {
+-        if let Ok(s) = std::str::from_utf8(content_bytes) {
++        if let Ok(s) = core::str::from_utf8(content_bytes) {
+             // Valid UTF-8. Check for an encoding declaration that might
+             // indicate a different encoding (unusual but permitted).
+             if let Some(declared) = extract_xml_decl_encoding(s) {
+@@ -429,7 +433,7 @@
  
      #[test]
      fn test_parse_bytes_utf8() {
@@ -7415,7 +7511,7 @@
  
          let result = Document::parse_bytes(b"<root/>");
          assert!(result.is_ok());
-@@ -440,7 +440,7 @@
+@@ -440,7 +444,7 @@
  
      #[test]
      fn test_parse_bytes_utf8_with_bom() {
@@ -7426,7 +7522,7 @@
          bytes.extend_from_slice(b"<root/>");
 --- a/xmloxide/src/validation/mod.rs
 +++ b/xmloxide/src/validation/mod.rs
-@@ -15,9 +15,6 @@
+@@ -15,11 +15,9 @@
  //! - Schematron validation (`schematron` submodule) for ISO Schematron rule-based validation
  
  pub mod dtd;
@@ -7434,9 +7530,13 @@
 -pub mod schematron;
 -pub mod xsd;
  
- use std::fmt;
+-use std::fmt;
++use alloc::{string::String, vec::Vec};
++use core::fmt;
  
-@@ -28,7 +25,7 @@
+ /// Result of validating a document against a schema (DTD, `RelaxNG`, XSD, etc.).
+ ///
+@@ -28,7 +26,7 @@
  ///
  /// # Examples
  ///
@@ -7447,16 +7547,25 @@
  /// let result = ValidationResult {
 --- a/xmloxide/src/validation/dtd.rs
 +++ b/xmloxide/src/validation/dtd.rs
-@@ -18,11 +18,14 @@
+@@ -18,11 +18,21 @@
  //!
  //! See XML 1.0 section 3.2 for the full content model specification.
  
 -use std::collections::{HashMap, HashSet};
-+use std::collections::HashSet;
- use std::fmt;
- 
+-use std::fmt;
+-
 -use crate::error::{ParseError, SourceLocation};
 -use crate::tree::{Document, NodeId, NodeKind};
++use alloc::{
++    format,
++    string::{String, ToString},
++    vec,
++    vec::Vec,
++};
++use core::fmt;
++
++// The upstream name keeps the embedded kernel's delta small.
++use crate::collections::Set as HashSet;
 +use crate::parser_xmloxide::error::ParseError;
 +use crate::parser_xmloxide::parser::input::ParserInput;
 +use crate::parser_xmloxide::tree::{Document, NodeId, NodeKind};
@@ -7465,7 +7574,7 @@
  
  use super::{ValidationError, ValidationResult};
  
-@@ -33,57 +36,83 @@
+@@ -33,57 +43,83 @@
  /// A parsed DTD containing all declarations from the internal subset.
  ///
  /// This is the result of [`parse_dtd`] and serves as input to [`validate`].
@@ -7571,7 +7680,7 @@
      /// The element must have no children (no elements, no text).
      /// Declared as `<!ELEMENT name EMPTY>`.
      Empty,
-@@ -94,10 +123,10 @@
+@@ -94,10 +130,10 @@
      /// Declared as `<!ELEMENT name (#PCDATA)>` or `<!ELEMENT name (#PCDATA|a|b)*>`.
      ///
      /// The `Vec<String>` contains the allowed element names (empty for `#PCDATA` only).
@@ -7584,7 +7693,7 @@
  }
  
  /// A content specification for element-only content models.
-@@ -106,23 +135,21 @@
+@@ -106,23 +142,21 @@
  /// with occurrence indicators.
  ///
  /// See XML 1.0 section 3.2.1 and 3.2.2.
@@ -7614,7 +7723,7 @@
  }
  
  /// Occurrence indicator for a content particle.
-@@ -143,23 +170,21 @@
+@@ -143,23 +177,21 @@
  /// An attribute declaration from `<!ATTLIST element-name attr-name type default>`.
  ///
  /// See XML 1.0 section 3.3.
@@ -7644,7 +7753,7 @@
      /// Character data (`CDATA`).
      CData,
      /// A unique identifier (`ID`).
-@@ -177,66 +202,181 @@
+@@ -177,66 +209,181 @@
      /// Space-separated list of name tokens (`NMTOKENS`).
      NmTokens,
      /// A notation type with allowed notation names (`NOTATION (a|b|c)`).
@@ -7830,9 +7939,8 @@
 +            },
 +        })
 +    }
- }
- 
--impl fmt::Display for ContentModel {
++}
++
 +impl<S: Storage> NotationDecl<S> {
 +    fn copy_in(&self, storage: S) -> Result<Self, crate::xml::dom::ParseError> {
 +        Ok(Self {
@@ -7841,13 +7949,14 @@
 +            public_id: storage.optional_text(self.public_id.as_deref())?,
 +        })
 +    }
-+}
-+
+ }
+ 
+-impl fmt::Display for ContentModel {
 +impl<S: Storage> fmt::Display for ContentModel<S> {
      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
          match self {
              Self::Empty => write!(f, "EMPTY"),
-@@ -245,7 +385,11 @@
+@@ -245,7 +392,11 @@
                  if names.is_empty() {
                      write!(f, "(#PCDATA)")
                  } else {
@@ -7860,7 +7969,7 @@
                  }
              }
              Self::Children(spec) => write!(f, "{spec}"),
-@@ -253,7 +397,7 @@
+@@ -253,7 +404,7 @@
      }
  }
  
@@ -7869,7 +7978,7 @@
      fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
          match &self.kind {
              ContentSpecKind::Name(name) => write!(f, "{name}")?,
-@@ -288,6 +432,149 @@
+@@ -288,6 +439,149 @@
      }
  }
  
@@ -8019,7 +8128,7 @@
  // ---------------------------------------------------------------------------
  // DTD Serializer
  // ---------------------------------------------------------------------------
-@@ -298,108 +585,112 @@
+@@ -298,108 +592,112 @@
  /// Each declaration appears on its own line. The output does NOT include
  /// the surrounding `[` and `]>` — the caller adds those.
  #[must_use]
@@ -8185,7 +8294,7 @@
                  last_was_comment = false;
              }
          }
-@@ -407,79 +698,85 @@
+@@ -407,79 +705,85 @@
  
      // libxml2 adds a newline before ]> unless the last item was a comment.
      if !last_was_comment && !dtd.declarations.is_empty() {
@@ -8307,7 +8416,7 @@
  }
  
  /// Escapes an entity value for DTD serialization.
-@@ -488,7 +785,15 @@
+@@ -488,7 +792,15 @@
  /// the value are preserved as-is (matching libxml2 behavior). Only standalone
  /// `&` characters are escaped. The quote character is chosen to minimize
  /// escaping: single quotes when the value contains double quotes.
@@ -8324,7 +8433,7 @@
      // Choose quote character: use single quotes if value contains double quotes
      // but not single quotes (avoids escaping). Otherwise use double quotes.
      let quote = if value.contains('"') && !value.contains('\'') {
-@@ -496,7 +801,7 @@
+@@ -496,7 +808,7 @@
      } else {
          '"'
      };
@@ -8333,11 +8442,13 @@
  
      let bytes = value.as_bytes();
      let len = bytes.len();
-@@ -508,27 +813,27 @@
+@@ -507,28 +819,28 @@
+             // Check if this is a valid entity or character reference — if so, pass through.
              if let Some(ref_end) = find_reference_end(bytes, i) {
                  // Copy the reference as-is
-                 let ref_str = std::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
+-                let ref_str = std::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
 -                out.push_str(ref_str);
++                let ref_str = core::str::from_utf8(&bytes[i..=ref_end]).unwrap_or("&amp;");
 +                out.push_str(ref_str)?;
                  i = ref_end + 1;
              } else {
@@ -8367,7 +8478,7 @@
                  i += c.len_utf8();
              } else {
                  i += 1;
-@@ -536,7 +841,8 @@
+@@ -536,7 +848,8 @@
          }
      }
  
@@ -8377,7 +8488,7 @@
  }
  
  /// Finds the end position (inclusive, the `;`) of an entity or character
-@@ -618,49 +924,64 @@
+@@ -618,49 +931,64 @@
  ///
  /// # Examples
  ///
@@ -8439,9 +8550,10 @@
 -            dtd: Dtd::default(),
 -        }
 +        Self::with_storage(input, Native).expect("empty native DTD does not allocate")
-+    }
+     }
 +}
-+
+ 
+-    fn parse(&mut self) -> Result<Dtd, ParseError> {
 +impl<'a, S: NameStorage> DtdParser<'a, S> {
 +    fn with_storage(input: &'a str, storage: S) -> Result<Self, DtdError<S>> {
 +        Ok(Self {
@@ -8455,9 +8567,8 @@
 +            dtd: Dtd::with_storage(storage)?,
 +            storage,
 +        })
-     }
- 
--    fn parse(&mut self) -> Result<Dtd, ParseError> {
++    }
++
 +    fn parse(mut self) -> Result<Dtd<S>, DtdError<S>> {
          loop {
 -            self.skip_whitespace();
@@ -8465,7 +8576,7 @@
              if self.at_end() {
                  break;
              }
-@@ -681,7 +1002,7 @@
+@@ -681,7 +1009,7 @@
                  // Parameter entity reference — skip it since we don't expand
                  self.skip_pe_reference()?;
              } else {
@@ -8474,7 +8585,7 @@
                      "unexpected character '{}' in DTD",
                      self.peek().map_or('?', |b| b as char)
                  )));
-@@ -690,7 +1011,7 @@
+@@ -690,7 +1018,7 @@
  
          self.post_validate()?;
  
@@ -8483,7 +8594,7 @@
      }
  
      /// Post-parse validation checks that require the complete entity map.
-@@ -698,21 +1019,21 @@
+@@ -698,21 +1026,21 @@
      /// Detects entity recursion (WFC: No Recursion), validates that entity
      /// references in attribute defaults refer to internal parsed entities,
      /// and checks for `<` in entity replacement text used in attributes.
@@ -8512,7 +8623,7 @@
              }
          }
  
-@@ -720,17 +1041,17 @@
+@@ -720,17 +1048,17 @@
          // PE values may contain encoded PE references via &#37; (which is '%').
          // After char ref expansion, if %name; appears in its own value, that's
          // direct or indirect recursion.
@@ -8537,7 +8648,7 @@
              }
          }
  
-@@ -738,9 +1059,9 @@
+@@ -738,9 +1066,9 @@
          // expansion (XML 1.0 §4.5). Character references in entity
          // values are expanded at declaration time. The resulting
          // replacement text must be well-formed when re-parsed.
@@ -8549,7 +8660,7 @@
              }
          }
  
-@@ -757,9 +1078,10 @@
+@@ -757,9 +1085,10 @@
          // Validate entity references in ATTLIST defaults. `checked`
          // memoizes entities already validated so shared references are
          // walked once (the reference graph is acyclic at this point).
@@ -8563,7 +8674,7 @@
                  let (AttributeDefault::Default(default_value)
                  | AttributeDefault::Fixed(default_value)) = &attr.default
                  else {
-@@ -778,7 +1100,7 @@
+@@ -778,7 +1107,7 @@
      /// Per XML 1.0 §4.6: "If the entities lt or amp are declared, they MUST
      /// be declared as internal entities whose replacement text is a character
      /// reference to the respective character."
@@ -8572,7 +8683,7 @@
          // Per XML 1.0 §4.6: lt and amp MUST use character references.
          // gt, apos, and quot may use either the literal character or a
          // character reference.
-@@ -790,13 +1112,16 @@
+@@ -790,13 +1119,16 @@
              ("quot", "\"", &["\"", "&#34;", "&#x22;"]),
          ];
          for &(name, _char_val, valid_refs) in expected {
@@ -8592,7 +8703,7 @@
                                  "predefined entity '{name}' must be declared as \
                                   a character reference (e.g., '{}')",
                                  valid_refs[0]
-@@ -804,7 +1129,7 @@
+@@ -804,7 +1136,7 @@
                          }
                      }
                      EntityKind::External { .. } => {
@@ -8601,7 +8712,7 @@
                              "predefined entity '{name}' must be an internal entity"
                          )));
                      }
-@@ -821,24 +1146,26 @@
+@@ -821,24 +1153,26 @@
      /// references), then checks the resulting replacement text for basic
      /// well-formedness: bare `&` characters from `&#38;` expansion that
      /// don't form valid references are rejected.
@@ -8631,7 +8742,7 @@
                          "entity '{entity_name}' replacement text contains \
                           bare '&' at end of text"
                      )));
-@@ -861,7 +1188,7 @@
+@@ -861,7 +1195,7 @@
                          i > start
                      };
                      if !has_digits || i >= bytes.len() || bytes[i] != b';' {
@@ -8640,7 +8751,7 @@
                              "entity '{entity_name}' replacement text contains \
                               incomplete character reference"
                          )));
-@@ -873,14 +1200,14 @@
+@@ -873,14 +1207,14 @@
                          i += 1;
                      }
                      if i >= bytes.len() {
@@ -8657,7 +8768,7 @@
                          "entity '{entity_name}' replacement text contains \
                           bare '&' not followed by a valid reference"
                      )));
-@@ -892,74 +1219,102 @@
+@@ -892,74 +1226,102 @@
          Ok(())
      }
  
@@ -8806,7 +8917,7 @@
          while i < bytes.len() {
              if bytes[i] == b'%' {
                  i += 1;
-@@ -969,62 +1324,73 @@
+@@ -969,62 +1331,73 @@
                          i += 1;
                      }
                      if i < bytes.len() && bytes[i] == b';' && i > start {
@@ -8899,7 +9010,7 @@
                      }
                  },
              }
-@@ -1036,65 +1402,34 @@
+@@ -1036,65 +1409,34 @@
      ///
      /// Returns an iterator over entity names found in `&name;` patterns,
      /// excluding character references (`&#...;`).
@@ -8973,7 +9084,7 @@
          if self.looking_at(b"EMPTY") {
              self.expect_str(b"EMPTY")?;
              return Ok(ContentModel::Empty);
-@@ -1106,32 +1441,32 @@
+@@ -1106,32 +1448,32 @@
  
          // Must be Mixed or Children, both start with '('
          self.expect_byte(b'(')?;
@@ -9015,7 +9126,7 @@
              }
  
              self.expect_byte(b')')?;
-@@ -1142,137 +1477,141 @@
+@@ -1142,137 +1484,141 @@
  
          // Element-only content: parse as a content spec group. The opening
          // '(' has already been consumed, so we are one level deep.
@@ -9259,7 +9370,7 @@
                  break;
              }
  
-@@ -1283,7 +1622,7 @@
+@@ -1283,7 +1629,7 @@
              let default = self.parse_attribute_default()?;
  
              let decl = AttributeDecl {
@@ -9268,7 +9379,7 @@
                  attribute_name,
                  attribute_type,
                  default,
-@@ -1291,22 +1630,44 @@
+@@ -1291,22 +1637,44 @@
  
              // Per XML 1.0 §3.3, the first attribute declaration is binding;
              // subsequent declarations for the same attribute are ignored.
@@ -9320,7 +9431,7 @@
          if self.looking_at(b"CDATA") {
              self.expect_str(b"CDATA")?;
              Ok(AttributeType::CData)
-@@ -1344,30 +1705,30 @@
+@@ -1344,30 +1712,30 @@
          }
      }
  
@@ -9360,7 +9471,7 @@
          if self.looking_at(b"#REQUIRED") {
              self.expect_str(b"#REQUIRED")?;
              Ok(AttributeDefault::Required)
-@@ -1390,75 +1751,82 @@
+@@ -1390,75 +1758,82 @@
      // --- ENTITY declaration ---
      // See XML 1.0 §4.2: [70] EntityDecl
  
@@ -9502,7 +9613,7 @@
          }
          self.skip_whitespace_required()?;
  
-@@ -1491,7 +1859,7 @@
+@@ -1491,7 +1866,7 @@
              return Err(self.fatal("expected entity value or external ID"));
          };
  
@@ -9511,7 +9622,7 @@
  
          // Handle optional NDATA for unparsed external entities (XML 1.0 §4.2.2)
          if self.looking_at(b"NDATA") {
-@@ -1506,7 +1874,7 @@
+@@ -1506,7 +1881,7 @@
              self.expect_str(b"NDATA")?;
              self.skip_whitespace_required()?;
              let _notation_name = self.parse_name()?;
@@ -9520,7 +9631,7 @@
          }
  
          self.expect_byte(b'>')?;
-@@ -1514,26 +1882,30 @@
+@@ -1514,26 +1889,30 @@
          // Per XML 1.0 §4.2, the first entity declaration is binding;
          // subsequent declarations of the same entity are ignored.
          let decl = EntityDecl {
@@ -9556,7 +9667,7 @@
          }
          self.skip_whitespace_required()?;
  
-@@ -1548,7 +1920,7 @@
+@@ -1548,7 +1927,7 @@
              let pid = self.parse_quoted_value()?;
              self.validate_public_id(&pid)?;
              // System ID is optional for notations with PUBLIC
@@ -9565,7 +9676,7 @@
              let sid = if self.peek() == Some(b'"') || self.peek() == Some(b'\'') {
                  Some(self.parse_quoted_value()?)
              } else {
-@@ -1559,45 +1931,47 @@
+@@ -1559,45 +1938,47 @@
              return Err(self.fatal("expected SYSTEM or PUBLIC in NOTATION declaration"));
          };
  
@@ -9608,7 +9719,7 @@
 -                self.dtd.declarations.push(DtdDeclaration::Comment(text));
 +                self.storage.charge(self.input.pos() - start)?;
 +                let text = self.storage.text(
-+                    std::str::from_utf8(self.input.slice(start, self.input.pos()))
++                    core::str::from_utf8(self.input.slice(start, self.input.pos()))
 +                        .expect("comment ends at an ASCII UTF-8 boundary"),
 +                )?;
 +                self.advance(3)?;
@@ -9626,7 +9737,7 @@
          self.expect_str(b"<?")?;
  
          // Parse and validate the PI target name (XML 1.0 §2.6)
-@@ -1610,8 +1984,10 @@
+@@ -1610,8 +1991,10 @@
  
          // If we're immediately at ?>, no data — that's fine
          if self.looking_at(b"?>") {
@@ -9639,7 +9750,7 @@
              return Ok(());
          }
  
-@@ -1623,26 +1999,31 @@
+@@ -1623,26 +2006,31 @@
              return Err(self.fatal("space required between PI target and data"));
          }
  
@@ -9658,7 +9769,7 @@
 +                self.storage.charge(self.input.pos() - start)?;
 +                self.storage.charge(self.input.pos() - start)?;
 +                let data = self.storage.text(
-+                    std::str::from_utf8(self.input.slice(start, self.input.pos()))
++                    core::str::from_utf8(self.input.slice(start, self.input.pos()))
 +                        .expect("PI ends at an ASCII UTF-8 boundary")
 +                        .trim(),
 +                )?;
@@ -9680,7 +9791,7 @@
          self.expect_byte(b'%')?;
          // Read the name
          let _name = self.parse_name()?;
-@@ -1652,110 +2033,75 @@
+@@ -1652,110 +2040,75 @@
  
      // --- Name / token parsing ---
  
@@ -9770,7 +9881,7 @@
 +                i += 1;
              }
 -            // Fall through to slow path
-+            let hex_str = std::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
++            let hex_str = core::str::from_utf8(&bytes[hex_start..i]).unwrap_or("");
 +            u32::from_str_radix(hex_str, 16).unwrap_or(0)
          } else {
 -            let ch = self
@@ -9787,7 +9898,7 @@
 +            while i < bytes.len() && bytes[i].is_ascii_digit() {
 +                i += 1;
 +            }
-+            let dec_str = std::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
++            let dec_str = core::str::from_utf8(&bytes[dec_start..i]).unwrap_or("");
 +            dec_str.parse::<u32>().unwrap_or(0)
 +        };
 +        if i >= bytes.len() || bytes[i] != b';' {
@@ -9844,7 +9955,7 @@
                      "invalid XML character U+{:04X} in entity value",
                      c as u32
                  )));
-@@ -1767,7 +2113,7 @@
+@@ -1767,7 +2120,7 @@
          // of external parsed entities.
          if value.starts_with("<?xml") {
              let after = value.as_bytes().get(5).copied();
@@ -9853,7 +9964,7 @@
                  return Err(self.fatal("text declaration is not allowed in internal entity value"));
              }
          }
-@@ -1783,52 +2129,7 @@
+@@ -1783,52 +2136,7 @@
                          return Err(self.fatal("incomplete reference in entity value: '&' at end"));
                      }
                      if bytes[i] == b'#' {
@@ -9907,16 +10018,18 @@
                      } else {
                          // Entity reference — must be Name followed by ';'
                          let start = i;
-@@ -1844,12 +2145,12 @@
+@@ -1843,13 +2151,13 @@
+                             return Err(self.fatal("malformed entity reference in entity value"));
                          }
                          // Validate the entity name starts with a NameStartChar
-                         let name_str = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+-                        let name_str = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
 -                        if let Some(first_char) = name_str.chars().next() {
 -                            if !is_name_start_char(first_char) {
 -                                return Err(self.fatal(format!(
 -                                    "entity reference name must start with a letter or underscore, found '{first_char}'"
 -                                )));
 -                            }
++                        let name_str = core::str::from_utf8(&bytes[start..i]).unwrap_or("");
 +                        if let Some(first_char) = name_str.chars().next()
 +                            && !is_name_start_char(first_char)
 +                        {
@@ -9926,7 +10039,7 @@
                          }
                          i += 1;
                      }
-@@ -1886,7 +2187,9 @@
+@@ -1886,7 +2194,9 @@
      /// Checks that entity references within the default value refer to
      /// entities that have already been declared (WFC: Entity Declared).
      /// Also rejects `<` in default values (WFC: No `<` in Attribute Values).
@@ -9937,8 +10050,12 @@
          let bytes = value.as_bytes();
          let mut i = 0;
          while i < bytes.len() {
-@@ -1915,8 +2218,8 @@
-                             let name = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
+@@ -1912,11 +2222,11 @@
+                             i += 1;
+                         }
+                         if i > start && i < bytes.len() {
+-                            let name = std::str::from_utf8(&bytes[start..i]).unwrap_or("");
++                            let name = core::str::from_utf8(&bytes[start..i]).unwrap_or("");
                              // Built-in entities are always available
                              let is_builtin = matches!(name, "amp" | "lt" | "gt" | "apos" | "quot");
 -                            if !is_builtin && !self.dtd.entities.contains_key(name) {
@@ -9948,7 +10065,7 @@
                                      "undeclared entity '{name}' in attribute default value"
                                  )));
                              }
-@@ -1936,7 +2239,8 @@
+@@ -1936,7 +2246,8 @@
  
      /// Validates that a public ID string contains only valid `PubidChar`s
      /// per XML 1.0 §2.3 `[13]`.
@@ -9958,7 +10075,7 @@
          for c in pid.chars() {
              let valid = matches!(c,
                  ' ' | '\r' | '\n' |
-@@ -1945,7 +2249,7 @@
+@@ -1945,7 +2256,7 @@
                  '=' | '?' | ';' | '!' | '*' | '#' | '@' | '$' | '_' | '%'
              );
              if !valid {
@@ -9967,7 +10084,7 @@
                      "invalid character in public ID: U+{:04X}",
                      c as u32
                  )));
-@@ -1954,169 +2258,144 @@
+@@ -1954,169 +2265,144 @@
          Ok(())
      }
  
@@ -10233,7 +10350,23 @@
              i += 2;
              let char_val = if i < bytes.len() && bytes[i] == b'x' {
                  i += 1;
-@@ -2138,16 +2417,21 @@
+@@ -2124,30 +2410,35 @@
+                 while i < bytes.len() && bytes[i].is_ascii_hexdigit() {
+                     i += 1;
+                 }
+-                let hex = std::str::from_utf8(&bytes[start..i]).unwrap_or("0");
++                let hex = core::str::from_utf8(&bytes[start..i]).unwrap_or("0");
+                 u32::from_str_radix(hex, 16).unwrap_or(0)
+             } else {
+                 let start = i;
+                 while i < bytes.len() && bytes[i].is_ascii_digit() {
+                     i += 1;
+                 }
+-                let dec = std::str::from_utf8(&bytes[start..i]).unwrap_or("0");
++                let dec = core::str::from_utf8(&bytes[start..i]).unwrap_or("0");
+                 dec.parse::<u32>().unwrap_or(0)
+             };
+             if i < bytes.len() && bytes[i] == b';' {
                  i += 1;
              }
              if let Some(ch) = char::from_u32(char_val) {
@@ -10261,7 +10394,7 @@
  }
  
  /// Replaces entity references (`&name;`) with spaces, leaving character
-@@ -2250,7 +2534,7 @@
+@@ -2250,7 +2541,7 @@
  ///
  /// # Examples
  ///
@@ -10270,7 +10403,7 @@
  /// use xmloxide::Document;
  /// use xmloxide::validation::dtd::{parse_dtd, validate};
  ///
-@@ -2311,21 +2595,19 @@
+@@ -2311,21 +2602,19 @@
          }
      });
  
@@ -10305,7 +10438,7 @@
      }
  }
  
-@@ -2347,7 +2629,7 @@
+@@ -2347,7 +2636,7 @@
  
      // Check if element is declared
      let has_element_decls = !dtd.elements.is_empty();
@@ -10314,7 +10447,7 @@
          errors.push(ValidationError {
              message: format!("element '{elem_name}' is not declared in the DTD"),
              line: None,
-@@ -2356,7 +2638,7 @@
+@@ -2356,7 +2645,7 @@
      }
  
      // Check content model
@@ -10323,7 +10456,7 @@
          validate_content_model(doc, node_id, &elem_name, &elem_decl.content_model, errors);
      }
  
-@@ -2455,22 +2737,22 @@
+@@ -2455,22 +2744,22 @@
          ContentModel::Mixed(allowed_names) => {
              // Text is always allowed. Check that element children are in the allowed list.
              for &child_id in &content_children {
@@ -10362,7 +10495,7 @@
                  }
              }
          }
-@@ -2930,7 +3212,167 @@
+@@ -2930,7 +3219,167 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -10531,7 +10664,7 @@
  
      // --- DTD Parsing Tests ---
  
-@@ -3574,15 +4016,18 @@
+@@ -3574,15 +4023,18 @@
  
      #[test]
      fn test_content_model_display() {
@@ -10555,7 +10688,7 @@
              kind: ContentSpecKind::Seq(vec![
                  ContentSpec {
                      kind: ContentSpecKind::Name("a".to_string()),
-@@ -3715,6 +4160,25 @@
+@@ -3715,6 +4167,25 @@
      }
  
      #[test]
@@ -10581,7 +10714,7 @@
      fn test_content_model_deep_nesting_is_bounded() {
          // Regression test for CVE-2026-61727 (GHSA-7jmw-29gc-ffx4): a content
          // model with deeply nested '(' must return a normal error instead of
-@@ -3731,9 +4195,9 @@
+@@ -3731,9 +4202,9 @@
              panic!("expected deep content model to be rejected, got Ok");
          };
          assert!(
@@ -10593,7 +10726,7 @@
          );
      }
  
-@@ -3750,9 +4214,9 @@
+@@ -3750,9 +4221,9 @@
      fn test_entity_recursion_direct_cycle_rejected() {
          let err = parse_dtd("<!ENTITY x \"&x;\">").unwrap_err();
          assert!(
@@ -10605,7 +10738,7 @@
          );
      }
  
-@@ -3761,9 +4225,9 @@
+@@ -3761,9 +4232,9 @@
          let err =
              parse_dtd("<!ENTITY a \"&b;\"><!ENTITY b \"&c;\"><!ENTITY c \"&a;\">").unwrap_err();
          assert!(
@@ -10617,7 +10750,7 @@
          );
      }
  
-@@ -3779,9 +4243,9 @@
+@@ -3779,9 +4250,9 @@
          )
          .unwrap_err();
          assert!(
@@ -10629,7 +10762,7 @@
          );
      }
  
-@@ -3820,13 +4284,109 @@
+@@ -3820,13 +4291,109 @@
      }
  
      #[test]
@@ -10741,7 +10874,7 @@
          );
      }
  
-@@ -3834,9 +4394,10 @@
+@@ -3834,9 +4401,10 @@
      fn test_pe_recursion_indirect_cycle_rejected() {
          let err = parse_dtd("<!ENTITY % p \"&#37;q;\"><!ENTITY % q \"&#37;p;\">").unwrap_err();
          assert!(

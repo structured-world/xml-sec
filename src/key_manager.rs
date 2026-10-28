@@ -1,6 +1,15 @@
 //! Caller-owned, provider-neutral key inventory and xmlsec key-store import.
 
-use std::collections::HashSet;
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{String, ToString},
+    sync::Arc,
+    vec,
+    vec::Vec,
+};
+
+use crate::collections::Set;
 
 #[cfg(all(test, feature = "xmldsig-sign"))]
 use crate::xmldsig::DsaSigningKey;
@@ -421,7 +430,7 @@ impl StoredPrivateKey {
         algorithm: crate::provider::KeyEncapsulationAlgorithm,
         policy: &crate::policy::KeyEstablishmentPolicy,
         resources: &ResourcePolicy,
-    ) -> Result<std::sync::Arc<dyn crate::provider::KeyDecapsulationKey>, KeyStoreError> {
+    ) -> Result<Arc<dyn crate::provider::KeyDecapsulationKey>, KeyStoreError> {
         policy.validate()?;
         policy.check_encapsulation(algorithm)?;
         if !self.usages.allows(KeyUsage::Decrypt) {
@@ -464,7 +473,7 @@ impl StoredPublicKey {
         algorithm: crate::provider::KeyEncapsulationAlgorithm,
         policy: &crate::policy::KeyEstablishmentPolicy,
         resources: &ResourcePolicy,
-    ) -> Result<std::sync::Arc<dyn crate::provider::KeyEncapsulationKey>, KeyStoreError> {
+    ) -> Result<Arc<dyn crate::provider::KeyEncapsulationKey>, KeyStoreError> {
         policy.validate()?;
         policy.check_encapsulation(algorithm)?;
         if !self.usages.allows(KeyUsage::Encrypt) {
@@ -1163,7 +1172,7 @@ impl KeyInventory {
                 resources.max_external_resource_total_bytes,
             ));
         }
-        let mut names = HashSet::new();
+        let mut names = Set::new();
         for name in other
             .symmetric_keys
             .iter()
@@ -2659,7 +2668,7 @@ impl KeyInventory {
             used: live_material + bytes.len(),
             maximum: resources.max_external_resource_total_bytes,
         };
-        let mut names = HashSet::new();
+        let mut names = Set::new();
         let mut store = Self::default();
         let mut entry_count = 0_usize;
         // One account for every public key read while loading this store.
@@ -3188,7 +3197,7 @@ impl<'a> BorrowedPem<'a> {
             ));
         }
         let invalid = || KeyStoreError::Selection("invalid PEM key");
-        let text = std::str::from_utf8(bytes)
+        let text = core::str::from_utf8(bytes)
             .map_err(|_| invalid())?
             .trim_matches(|character: char| character.is_ascii_whitespace());
         let (label, rest) = text
@@ -3251,49 +3260,12 @@ impl<'a> BorrowedPem<'a> {
     }
 
     fn decode_into(&self, output: &mut [u8]) -> Result<(), KeyStoreError> {
-        use std::io::Read as _;
-        let input = PemBase64Reader {
-            parts: self.data.split_whitespace(),
-            current: &[],
-        };
-        let mut decoder =
-            base64::read::DecoderReader::new(input, &base64::engine::general_purpose::STANDARD);
-        decoder
-            .read_exact(output)
-            .map_err(|_| KeyStoreError::Selection("invalid PEM key"))?;
-        let mut eof = [0];
-        if decoder
-            .read(&mut eof)
-            .map_err(|_| KeyStoreError::Selection("invalid PEM key"))?
-            != 0
-        {
-            return Err(KeyStoreError::Selection("invalid PEM key"));
-        }
-        Ok(())
-    }
-}
-
-struct PemBase64Reader<'a> {
-    parts: std::str::SplitWhitespace<'a>,
-    current: &'a [u8],
-}
-
-impl std::io::Read for PemBase64Reader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let mut written = 0;
-        while written < buffer.len() {
-            if self.current.is_empty() {
-                let Some(part) = self.parts.next() else {
-                    break;
-                };
-                self.current = part.as_bytes();
-            }
-            let length = self.current.len().min(buffer.len() - written);
-            buffer[written..written + length].copy_from_slice(&self.current[..length]);
-            self.current = &self.current[length..];
-            written += length;
-        }
-        Ok(written)
+        // `parse` admitted whole quartets with padding only at the end.
+        crate::xmldsig::whitespace::decode_base64_into(
+            self.data.split_whitespace().flat_map(str::bytes),
+            output,
+        )
+        .map_err(|_| KeyStoreError::Selection("invalid PEM key"))
     }
 }
 
@@ -3709,7 +3681,7 @@ fn encode_xmlsec_dsa_private(
         .map_err(|_| KeyStoreError::Selection("key material size overflow"))?;
     // DER length headers and the PKCS#8 algorithm identifier fit this
     // checked bound: each header is at most 1 tag + 1 count + sizeof(usize).
-    let header = 2 + std::mem::size_of::<usize>();
+    let header = 2 + core::mem::size_of::<usize>();
     let x_der_len = x_bytes_len
         .checked_add(header + 1)
         .ok_or(KeyStoreError::Selection("key material size overflow"))?;

@@ -3,6 +3,8 @@
 //! The provider trait names these types in every `XMLDSig` build, so they exist
 //! without `xmldsig-sign`; key types and the signing pipeline need that feature.
 
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+
 use super::parse::SignatureAlgorithm;
 
 /// Errors while parsing or using `XMLDSig` signing keys.

@@ -3,7 +3,7 @@
 #![cfg(feature = "xmlenc")]
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -450,8 +450,7 @@ fn decrypts_ecdh_concat_hashes_with_the_pinned_recipient_keys() {
         ("sha3_512", DigestAlgorithm::Sha3_512),
     ] {
         let mut policy = policy.clone();
-        policy.key_establishment.digest_algorithms =
-            Some(std::collections::HashSet::from([digest]));
+        policy.key_establishment.digest_algorithms = Some(BTreeSet::from([digest]));
         let name = format!("enc_ecdh_p256_concatkdf_{name}_kw_aes256_aes128gcm");
         let descriptor = format!(
             "<x:KeyDerivationMethod xmlns:x='http://www.w3.org/2009/xmlenc11#' Algorithm='http://www.w3.org/2009/xmlenc11#ConcatKDF'><x:ConcatKDFParams AlgorithmID='00123456' PartyUInfo='00123456' PartyVInfo='00123456'><d:DigestMethod xmlns:d='http://www.w3.org/2000/09/xmldsig#' Algorithm='{}'/></x:ConcatKDFParams></x:KeyDerivationMethod>",
@@ -957,7 +956,6 @@ fn donor_xdh_kdf_xml(family: &str, hash: &str) -> String {
 
 #[test]
 fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
-    use std::collections::HashSet;
     use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
     use xml_sec::xmlenc::{
         AgreementDecryptor, AgreementMethod, KeyWrapAlgorithm, parse_key_derivation_method,
@@ -971,7 +969,7 @@ fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
         let (_originator, peer) = pinned_xdh_key(curve, "first");
         let (recipient, _recipient_public) = pinned_xdh_key(curve, "second");
         let mut policy = DecryptionPolicy::default();
-        policy.key_establishment.agreement_algorithms = Some(HashSet::from([algorithm]));
+        policy.key_establishment.agreement_algorithms = Some(BTreeSet::from([algorithm]));
         for (family, hash) in [
             ("concatkdf", "sha256"),
             ("concatkdf", "sha384"),
@@ -1854,7 +1852,7 @@ fn verifies_merlin_signatures_after_authenticated_symmetric_key_unwrap() {
     // The application selects the KEK independently. Unwrapping a message's
     // key is not implicit signer authorization or certificate chain trust.
     let keys = read_merlin_aes_keys();
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "http://www.w3.org/TR/xml-stylesheet".to_owned(),
         std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
     )]);
@@ -1973,7 +1971,7 @@ fn validates_merlin_rsa_transported_hmac_keys_without_exporting_recovered_keys()
     policy.rsa_keys.minimum_modulus_bits = 1024;
     let context = DecryptContext::new(&resolver).policy(policy);
     let verification_key = HmacVerificationKey::new(secret.to_vec()).unwrap();
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "http://www.w3.org/TR/xml-stylesheet".to_owned(),
         std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
     )]);
@@ -2232,7 +2230,7 @@ fn verifies_merlin_dh_signatures(dh: &MerlinDh) {
         VerifyContext,
     };
     use xml_sec::xmlenc::{KeyEstablishmentBudget, KeyWrapAlgorithm as W};
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "http://www.w3.org/TR/xml-stylesheet".to_owned(),
         std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
     )]);
@@ -2312,7 +2310,7 @@ fn assert_documented_dh_hmac_departure(
     xml: &str,
     name: &str,
     verifier: &xml_sec::xmldsig::HmacVerificationKey,
-    resources: &HashMap<String, Vec<u8>>,
+    resources: &BTreeMap<String, Vec<u8>>,
 ) {
     use xml_sec::xmldsig::{
         DsigStatus, FailureReason, SignatureAlgorithm, UriTypeSet, VerifyContext, VerifyingKey as _,

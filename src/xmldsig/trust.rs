@@ -1,9 +1,10 @@
 //! Key discovery and authorization are distinct from signature validation.
 
-use std::{ops::Deref, time::SystemTime};
+use alloc::boxed::Box;
+use core::ops::Deref;
 
 use super::{DsigError, SignatureAlgorithm, VerifyingKey};
-use crate::policy::{KeyTrustPolicy, PolicyViolation, VerificationPolicy};
+use crate::policy::{Instant, KeyTrustPolicy, PolicyViolation, VerificationPolicy};
 
 /// Evidence of key authorization, independent of the signature's validity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,14 +30,14 @@ pub enum KeyTrustEvidence {
 pub struct X509TrustEvidence {
     fingerprints: [[u8; 32]; crate::hard_limits::X509_CHAIN_DEPTH_CEILING],
     path_len: usize,
-    verification_time: SystemTime,
+    verification_time: Instant,
     revocation_checked: bool,
 }
 
 impl X509TrustEvidence {
     pub(crate) fn new(
         certificates: impl ExactSizeIterator<Item = impl AsRef<[u8]>>,
-        verification_time: SystemTime,
+        verification_time: Instant,
         revocation_checked: bool,
     ) -> Result<Self, DsigError> {
         let path_len = certificates.len();
@@ -96,23 +97,12 @@ impl X509TrustEvidence {
         &self.fingerprints[self.path_len - 1]
     }
 
-    /// The single time captured for all candidate-path validation in the operation.
+    /// The single time captured for all candidate-path validation in the
+    /// operation, at the precision the path processor used; consumers that
+    /// re-check this exact path use the same instant.
     #[must_use]
-    pub fn verification_time(&self) -> SystemTime {
+    pub fn verification_time(&self) -> Instant {
         self.verification_time
-    }
-
-    /// The same validation instant the path processor used, at nanosecond
-    /// precision, for consumers that re-check this exact path.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`super::X509ChainError::CertificateNotValid`] when the captured
-    /// time is outside the representable instant range.
-    pub fn validation_instant(
-        &self,
-    ) -> Result<structured_pkix::temporal::Instant, super::X509ChainError> {
-        super::pkix::verification_instant(self.verification_time)
     }
 
     /// Whether the policy requested and validation enforced CRL processing.
@@ -323,7 +313,7 @@ mod tests {
     fn validated_key_is_bound_to_time_purpose_and_policy() {
         // A validated key must not be reusable under another time or purpose,
         // or through a caller policy whose implicit clock has not been captured.
-        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(500_000);
+        let time = Instant::new(500_000 * 3600, 0).expect("test time");
         let evidence =
             X509TrustEvidence::new([b"bounded certificate identity"].into_iter(), time, false)
                 .expect("a one-certificate proof fits the hard path bound");
@@ -340,7 +330,8 @@ mod tests {
         key.validate_policy(&VerificationScope::new(&policy, &certificates))
             .expect("the exact captured snapshot must match");
         let mut changed = policy.clone();
-        changed.key_trust.verification_time = Some(time + std::time::Duration::from_secs(1));
+        changed.key_trust.verification_time =
+            Some(Instant::new(time.seconds() + 1, 0).expect("test time"));
         assert!(
             key.verify_with_policy(
                 &VerificationScope::new(&changed, &certificates),

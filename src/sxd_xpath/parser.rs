@@ -1,5 +1,6 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
+use alloc::{boxed::Box, string::String, vec::Vec};
 use snafu::Snafu;
 
 use super::grammar::{self, Binary, Builder, Fault, Node, Test};
@@ -34,7 +35,7 @@ impl<'a> Parser<'a> {
     }
 
     fn boxed<T: expression::Expression + 'static>(&self, value: T) -> Result<SubExpression, Error> {
-        self.charge(std::mem::size_of::<T>())?;
+        self.charge(core::mem::size_of::<T>())?;
         Ok(Box::new(value))
     }
 
@@ -45,7 +46,7 @@ impl<'a> Parser<'a> {
             // Allocate beside the old buffer so the reservation models the real overlap.
             let mut replacement = Vec::with_capacity(capacity);
             replacement.append(values);
-            let old_bytes = values.capacity() * std::mem::size_of::<T>();
+            let old_bytes = values.capacity() * core::mem::size_of::<T>();
             *values = replacement;
             if let Some(budget) = self.budget {
                 budget.release(old_bytes);
@@ -62,7 +63,7 @@ impl<'a> Parser<'a> {
         };
         let capacity = old_capacity.checked_mul(2).ok_or_else(overflow)?.max(4);
         let bytes = capacity
-            .checked_mul(std::mem::size_of::<T>())
+            .checked_mul(core::mem::size_of::<T>())
             .ok_or_else(overflow)?;
         if bytes > isize::MAX as usize {
             return Err(overflow());
@@ -191,12 +192,12 @@ impl Builder for Parser<'_> {
                 .boxed(expression::Negation { expression })
                 .map_err(|error| native_failure(&error)),
             Node::Path(start, steps) => {
-                self.charge(std::mem::size_of::<expression::Path>())
+                self.charge(core::mem::size_of::<expression::Path>())
                     .map_err(|error| native_failure(&error))?;
                 Ok(expression::Path::new(start, steps))
             }
             Node::Filter(selector, predicate) => {
-                self.charge(std::mem::size_of::<expression::Filter>())
+                self.charge(core::mem::size_of::<expression::Filter>())
                     .map_err(|error| native_failure(&error))?;
                 Ok(expression::Filter::new(selector, predicate))
             }
@@ -205,54 +206,57 @@ impl Builder for Parser<'_> {
                     usize,
                     fn(SubExpression, SubExpression) -> SubExpression,
                 ) = match operation {
-                    Binary::Or => (std::mem::size_of::<expression::Or>(), expression::Or::new),
-                    Binary::And => (std::mem::size_of::<expression::And>(), expression::And::new),
+                    Binary::Or => (core::mem::size_of::<expression::Or>(), expression::Or::new),
+                    Binary::And => (
+                        core::mem::size_of::<expression::And>(),
+                        expression::And::new,
+                    ),
                     Binary::Equal => (
-                        std::mem::size_of::<expression::Equal>(),
+                        core::mem::size_of::<expression::Equal>(),
                         expression::Equal::new,
                     ),
                     Binary::NotEqual => (
-                        std::mem::size_of::<expression::NotEqual>(),
+                        core::mem::size_of::<expression::NotEqual>(),
                         expression::NotEqual::new,
                     ),
                     Binary::Less => (
-                        std::mem::size_of::<expression::Relational>(),
+                        core::mem::size_of::<expression::Relational>(),
                         expression::Relational::less_than,
                     ),
                     Binary::LessEqual => (
-                        std::mem::size_of::<expression::Relational>(),
+                        core::mem::size_of::<expression::Relational>(),
                         expression::Relational::less_than_or_equal,
                     ),
                     Binary::Greater => (
-                        std::mem::size_of::<expression::Relational>(),
+                        core::mem::size_of::<expression::Relational>(),
                         expression::Relational::greater_than,
                     ),
                     Binary::GreaterEqual => (
-                        std::mem::size_of::<expression::Relational>(),
+                        core::mem::size_of::<expression::Relational>(),
                         expression::Relational::greater_than_or_equal,
                     ),
                     Binary::Add => (
-                        std::mem::size_of::<expression::Math>(),
+                        core::mem::size_of::<expression::Math>(),
                         expression::Math::addition,
                     ),
                     Binary::Subtract => (
-                        std::mem::size_of::<expression::Math>(),
+                        core::mem::size_of::<expression::Math>(),
                         expression::Math::subtraction,
                     ),
                     Binary::Multiply => (
-                        std::mem::size_of::<expression::Math>(),
+                        core::mem::size_of::<expression::Math>(),
                         expression::Math::multiplication,
                     ),
                     Binary::Divide => (
-                        std::mem::size_of::<expression::Math>(),
+                        core::mem::size_of::<expression::Math>(),
                         expression::Math::division,
                     ),
                     Binary::Remainder => (
-                        std::mem::size_of::<expression::Math>(),
+                        core::mem::size_of::<expression::Math>(),
                         expression::Math::remainder,
                     ),
                     Binary::Union => (
-                        std::mem::size_of::<expression::Union>(),
+                        core::mem::size_of::<expression::Union>(),
                         expression::Union::new,
                     ),
                 };

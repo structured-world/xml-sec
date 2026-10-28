@@ -2,7 +2,13 @@ use super::{QName, namespace_storage::Bindings};
 
 use super::storage::Values;
 use crate::string_pool::{InternedString, StringPool};
-use std::{cell::RefCell, marker::PhantomData};
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::{cell::RefCell, marker::PhantomData};
 
 #[cfg(feature = "embedded")]
 #[path = "raw_no_unsafe/current.rs"]
@@ -18,7 +24,7 @@ pub(crate) fn estimated_storage_bytes(r: crate::StorageRequirements) -> usize {
                 .unwrap_or(usize::MAX)
                 .max(4)
         };
-        slots.saturating_mul(std::mem::size_of::<T>())
+        slots.saturating_mul(core::mem::size_of::<T>())
     }
 
     arena_bytes::<Root>(r.roots)
@@ -31,19 +37,19 @@ pub(crate) fn estimated_storage_bytes(r: crate::StorageRequirements) -> usize {
         ))
         .saturating_add(
             r.child_edges
-                .saturating_mul(std::mem::size_of::<ChildOfElement>().saturating_mul(4)),
+                .saturating_mul(core::mem::size_of::<ChildOfElement>().saturating_mul(4)),
         )
         .saturating_add(
             r.attributes
-                .saturating_mul(std::mem::size_of::<Index<Attribute>>().saturating_mul(4)),
+                .saturating_mul(core::mem::size_of::<Index<Attribute>>().saturating_mul(4)),
         )
         .saturating_add(r.namespace_bindings.saturating_mul(
-            std::mem::size_of::<(InternedString, InternedString)>().saturating_mul(4),
+            core::mem::size_of::<(InternedString, InternedString)>().saturating_mul(4),
         ))
         .saturating_add(
             r.interned_strings.saturating_mul(
-                std::mem::size_of::<InternedString>()
-                    .saturating_add(std::mem::size_of::<usize>())
+                core::mem::size_of::<InternedString>()
+                    .saturating_add(core::mem::size_of::<usize>())
                     .saturating_mul(2),
             ),
         )
@@ -69,13 +75,23 @@ impl<T> PartialEq for Index<T> {
     }
 }
 impl<T> Eq for Index<T> {}
-impl<T> std::hash::Hash for Index<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl<T> PartialOrd for Index<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl<T> Ord for Index<T> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.idx.cmp(&other.idx)
+    }
+}
+impl<T> core::hash::Hash for Index<T> {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.idx.hash(state);
     }
 }
-impl<T> std::fmt::Debug for Index<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T> core::fmt::Debug for Index<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "Index({})", self.idx)
     }
 }
@@ -138,8 +154,8 @@ impl QNameValue {
     }
 }
 
-impl std::fmt::Debug for QNameValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for QNameValue {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.get().fmt(f)
     }
 }
@@ -1051,7 +1067,7 @@ impl Connections {
             .iter()
             .size_hint()
             .0
-            .saturating_mul(std::mem::size_of::<(InternedString, InternedString)>())
+            .saturating_mul(core::mem::size_of::<(InternedString, InternedString)>())
     }
 
     #[cfg(feature = "embedded")]
@@ -1242,7 +1258,7 @@ impl Connections {
 // --- NamespacesInScope iterator ---
 
 pub struct NamespacesInScope {
-    iter: std::vec::IntoIter<(String, String)>,
+    iter: vec::IntoIter<(String, String)>,
 }
 
 impl Iterator for NamespacesInScope {

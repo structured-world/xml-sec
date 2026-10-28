@@ -1,5 +1,6 @@
 //! Trusted profile selection and compilation; no configuration discovery or I/O.
 
+use super::clock::Instant;
 #[cfg(feature = "xmlenc")]
 use super::{
     DataEncryptionAlgorithm, DecryptionPolicy, EncryptionPolicy, KeyTransportAlgorithm,
@@ -11,7 +12,7 @@ use super::{
     UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, ProviderCapability};
-use std::{collections::HashSet, time::SystemTime};
+use alloc::{borrow::ToOwned, collections::BTreeSet, string::String};
 
 mod composition;
 mod constraints;
@@ -46,9 +47,9 @@ pub struct PolicyValidity {
     /// Non-secret justification retained for audit.
     pub reason: String,
     /// Inclusive beginning of validity.
-    pub not_before: SystemTime,
+    pub not_before: Instant,
     /// Exclusive expiration; cached policies cannot outlive this boundary.
-    pub expires_at: SystemTime,
+    pub expires_at: Instant,
 }
 
 impl PolicyValidity {
@@ -57,7 +58,25 @@ impl PolicyValidity {
     /// # Errors
     /// Returns a configuration violation for incomplete audit metadata or an
     /// empty interval, and authorization expiry outside the half-open interval.
-    pub fn validate_at(&self, now: SystemTime) -> Result<(), PolicyViolation> {
+    pub fn validate_at(&self, now: Instant) -> Result<(), PolicyViolation> {
+        self.validate_metadata()?;
+        if now < self.not_before || now >= self.expires_at {
+            return Err(PolicyViolation::AuthorizationExpired);
+        }
+        Ok(())
+    }
+
+    /// Compile-time check: the interval at the host clock with `std`. Without
+    /// a clock only the metadata is checked here; operations check the
+    /// interval at the caller's verification time.
+    pub(crate) fn validate_now(&self) -> Result<(), PolicyViolation> {
+        #[cfg(feature = "std")]
+        return self.validate_at(super::clock::authorization_time(None)?);
+        #[cfg(not(feature = "std"))]
+        return self.validate_metadata();
+    }
+
+    fn validate_metadata(&self) -> Result<(), PolicyViolation> {
         if self.authorization_id.trim().is_empty()
             || self.authority.trim().is_empty()
             || self.reason.trim().is_empty()
@@ -66,9 +85,6 @@ impl PolicyValidity {
             return Err(configuration(
                 "authorization needs identity, authority, reason and a nonempty validity interval",
             ));
-        }
-        if now < self.not_before || now >= self.expires_at {
-            return Err(PolicyViolation::AuthorizationExpired);
         }
         Ok(())
     }
@@ -187,7 +203,7 @@ impl<'a> PolicyCompiler<'a> {
             ));
         }
         if let Some(validity) = &authorization {
-            validity.validate_at(SystemTime::now())?;
+            validity.validate_now()?;
         }
         let policies = profile_policies(profile, provider, authorization);
         Ok(Self {
@@ -219,7 +235,7 @@ impl<'a> PolicyCompiler<'a> {
         mut replacement: PolicySet,
         authorization: &PolicyValidity,
     ) -> Result<Self, PolicyViolation> {
-        authorization.validate_at(SystemTime::now())?;
+        authorization.validate_now()?;
         replacement.bind_authorization(authorization, &self.policies)?;
         self.policies = replacement;
         Ok(self)
@@ -293,7 +309,7 @@ fn verification_profile(
     constraints: SignatureConstraints,
     validity: Option<&PolicyValidity>,
 ) -> (VerificationPolicy, TransformPolicy) {
-    let signatures: HashSet<_> = SignatureAlgorithm::ALL
+    let signatures: BTreeSet<_> = SignatureAlgorithm::ALL
         .into_iter()
         .filter(|a| provider.supports(ProviderCapability::Verify(*a)))
         .filter(|a| {
@@ -302,7 +318,7 @@ fn verification_profile(
         })
         .filter(|a| !matches!(a, SignatureAlgorithm::PostQuantum(_)))
         .collect();
-    let digests: HashSet<_> = DigestAlgorithm::ALL
+    let digests: BTreeSet<_> = DigestAlgorithm::ALL
         .into_iter()
         .filter(|a| provider.supports(ProviderCapability::Digest(*a)))
         .filter(|a| compatibility || (a.signing_allowed() && a.output_len() >= 32))
@@ -500,14 +516,14 @@ fn encryption_profile(
                 .filter(|a| provider.supports(ProviderCapability::Encrypt(*a)))
                 .collect(),
         ),
-        key_transport_algorithms: Some(HashSet::from([KeyTransportAlgorithm::RsaOaep11])),
+        key_transport_algorithms: Some(BTreeSet::from([KeyTransportAlgorithm::RsaOaep11])),
         key_wrap_algorithms: Some(
             MODERN_WRAP_METHODS
                 .into_iter()
                 .filter(|a| provider.supports(ProviderCapability::KeyWrap(*a)))
                 .collect(),
         ),
-        oaep_digests: Some(HashSet::from(MODERN_OAEP_DIGESTS)),
+        oaep_digests: Some(BTreeSet::from(MODERN_OAEP_DIGESTS)),
         ..EncryptionPolicy::default()
     }
 }
@@ -540,7 +556,7 @@ fn decryption_profile(
             .filter_map(|digest| OaepDigestAlgorithm::from_uri(digest.uri()))
             .collect()
     } else {
-        HashSet::from(MODERN_OAEP_DIGESTS)
+        BTreeSet::from(MODERN_OAEP_DIGESTS)
     };
     let transports = if compatibility {
         COMPATIBLE_TRANSPORT_METHODS
@@ -549,7 +565,7 @@ fn decryption_profile(
             .filter(|method| recovery_method_available(provider, *method, &oaep_digests))
             .collect()
     } else {
-        HashSet::from([KeyTransportAlgorithm::RsaOaep11])
+        BTreeSet::from([KeyTransportAlgorithm::RsaOaep11])
     };
     DecryptionPolicy {
         validity,
@@ -584,7 +600,7 @@ fn decryption_profile(
 fn recovery_method_available(
     provider: &dyn CryptoProvider,
     method: KeyTransportAlgorithm,
-    digests: &HashSet<OaepDigestAlgorithm>,
+    digests: &BTreeSet<OaepDigestAlgorithm>,
 ) -> bool {
     #[cfg(feature = "legacy-algorithms")]
     if method == KeyTransportAlgorithm::RsaPkcs1v15 {

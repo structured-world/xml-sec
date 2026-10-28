@@ -738,10 +738,10 @@ fn legacy_algorithm_claims_are_policy_gated() {
         );
         assert!(builder.build_template().is_err());
         let signing_policy = xml_sec::policy::SigningPolicy {
-            signature_algorithms: Some(std::collections::HashSet::from([
+            signature_algorithms: Some(std::collections::BTreeSet::from([
                 xml_sec::xmldsig::SignatureAlgorithm::RsaSha1,
             ])),
-            digest_algorithms: Some(std::collections::HashSet::from([
+            digest_algorithms: Some(std::collections::BTreeSet::from([
                 xml_sec::xmldsig::DigestAlgorithm::Sha1,
             ])),
             ..xml_sec::policy::SigningPolicy::default()

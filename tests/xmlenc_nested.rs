@@ -242,7 +242,7 @@ fn derived_retrieval_accepts_both_specification_identifiers() {
             .encrypt_binary(b"external derived")
             .unwrap();
         let ciphertext = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
-        let resources = std::collections::HashMap::from([(
+        let resources = std::collections::BTreeMap::from([(
             "https://example.test/derived.b64".into(),
             STANDARD.encode(derived).into_bytes(),
         )]);
@@ -741,7 +741,7 @@ fn external_retrieval_and_transforms_share_caller_owned_resources() {
         .encrypt_binary(b"retrieved external key")
         .unwrap();
     let parsed = parse_encrypted_data(&generated.encrypted_data_xml).unwrap();
-    let mut resources = std::collections::HashMap::new();
+    let mut resources = std::collections::BTreeMap::new();
     resources.insert(
         "https://example.test/keys/transport.xml".into(),
         transport.as_bytes().to_vec(),
@@ -832,7 +832,7 @@ fn containing_cipher_syntax_and_algorithm_are_checked_before_key_retrieval() {
             .decrypt(&invalid),
         Err(XmlEncError::Base64(_))
     ));
-    policy.data_algorithms = Some(std::collections::HashSet::new());
+    policy.data_algorithms = Some(std::collections::BTreeSet::new());
     assert!(matches!(
         DecryptContext::new(&resolver).policy(policy).decrypt(&wire),
         Err(XmlEncError::Policy(
@@ -853,7 +853,7 @@ fn external_retrieval_cycles_and_shared_limits_are_not_reset_per_document() {
         &format!("<x:EncryptedKey xmlns:x='{X}' xmlns:d='{D}'>"),
     );
     let b = a.replace("b.xml", "a.xml");
-    let resources = std::collections::HashMap::from([
+    let resources = std::collections::BTreeMap::from([
         ("https://example.test/a.xml".into(), a.as_bytes().to_vec()),
         ("https://example.test/b.xml".into(), b.as_bytes().to_vec()),
     ]);

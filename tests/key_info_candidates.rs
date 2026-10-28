@@ -2,7 +2,7 @@
 //! Key material a verified Signature's `KeyInfo` offered, visited through the
 //! verified session without a second parse and without a trust decision.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
@@ -236,7 +236,7 @@ fn external_material_is_attributed_to_its_retrieving_instruction() {
         "<KeyInfo xmlns=\"{DS}\"><X509Data>{}</X509Data></KeyInfo>",
         certificate_element("elsewhere", &signing_certificate()),
     );
-    let resources = HashMap::from([
+    let resources = BTreeMap::from([
         (
             "https://example.test/leaf.der".to_owned(),
             signing_certificate(),
@@ -295,7 +295,7 @@ fn an_unread_hint_inside_external_key_info_is_still_a_candidate() {
            Type=\"http://www.w3.org/2000/09/xmldsig#rawX509Certificate\"/></KeyInfo>",
         certificate_element("elsewhere", &signing_certificate()),
     );
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.test/keyinfo.xml".to_owned(),
         external_key_info.into_bytes(),
     )]);

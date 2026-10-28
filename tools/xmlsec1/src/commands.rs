@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Write},
@@ -1027,8 +1027,8 @@ fn xmlsec_compatibility_signing_policy(invocation: &Invocation) -> SigningPolicy
     let mut policy = SigningPolicy {
         key_establishment: xmlsec_compatibility_key_establishment_policy(),
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
-        signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
-        digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
+        signature_algorithms: Some(BTreeSet::from(SignatureAlgorithm::ALL)),
+        digest_algorithms: Some(BTreeSet::from(DigestAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
             ManifestProcessing::Ignore
         } else {
@@ -1545,11 +1545,11 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
     let mut policy = VerificationPolicy {
         key_establishment: xmlsec_compatibility_key_establishment_policy(),
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
-        digest_algorithms: Some(HashSet::from(DigestAlgorithm::ALL)),
+        digest_algorithms: Some(BTreeSet::from(DigestAlgorithm::ALL)),
         // The compatibility executable explicitly permits every compiled XML
         // signature method, including experimental PQ methods. Library defaults
         // remain restrictive; provider capability still gates execution.
-        signature_algorithms: Some(HashSet::from(SignatureAlgorithm::ALL)),
+        signature_algorithms: Some(BTreeSet::from(SignatureAlgorithm::ALL)),
         manifest_processing: if invocation.flag("ignore-manifests") {
             ManifestProcessing::Ignore
         } else {
@@ -1572,7 +1572,7 @@ fn xmlsec_compatibility_verification_policy(invocation: &Invocation) -> Verifica
         ecdsa_signature_value_encoding: ecdsa_signature_value_encoding(invocation),
         ..VerificationPolicy::default()
     };
-    policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
+    policy.key_trust.allowed_legacy_signature_algorithms = BTreeSet::from([
         SignatureAlgorithm::RsaSha1,
         SignatureAlgorithm::RsaPssSha1,
         SignatureAlgorithm::DsaSha1,
@@ -1991,11 +1991,11 @@ fn load_mapped_reference_resources(
     invocation: &Invocation,
     resources: &ResourcePolicy,
     budget: &mut ExternalMaterialBudget,
-) -> Result<HashMap<String, Vec<u8>>, CommandError> {
+) -> Result<BTreeMap<String, Vec<u8>>, CommandError> {
     // libxmlsec1's --url-map:<url> <file> is an exact mapping. Only these
     // explicit files are acquired; unmapped document URIs never cause I/O.
     // Payload is moved once into the map and borrowed by every reference.
-    let mut mapped = HashMap::new();
+    let mut mapped = BTreeMap::new();
     for option in invocation.values("url-map") {
         let uri = option
             .parameter

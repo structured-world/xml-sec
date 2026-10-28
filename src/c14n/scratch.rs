@@ -1,11 +1,13 @@
 //! Storage strategy for the one canonicalization kernel. The ordinary API
 //! retains native storage; scoped `XMLDSig` uses the caller's actual execution.
 
-use std::{cmp::Ordering, collections::HashMap, ops::Deref};
+use alloc::{string::String, vec::Vec};
+use core::{cmp::Ordering, ops::Deref};
 
 use super::C14nError;
+use crate::collections::Map;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NamespaceKey<'a> {
     pub prefix: &'a str,
     pub utilizer: bool,
@@ -50,7 +52,7 @@ pub(crate) trait NamespaceMap<'a>: Sized {
     fn copy(&self) -> Result<Self, C14nError>;
 }
 
-pub(crate) trait List<T>: Deref<Target = [T]> + std::ops::DerefMut {
+pub(crate) trait List<T>: Deref<Target = [T]> + core::ops::DerefMut {
     #[cfg(feature = "xmldsig")]
     fn capacity(&self) -> usize;
     #[cfg(feature = "xmldsig")]
@@ -76,7 +78,7 @@ pub(crate) trait TextBuilder {
 }
 
 #[cfg(feature = "xmldsig")]
-pub(crate) trait Bytes: Deref<Target = [u8]> + std::ops::DerefMut {
+pub(crate) trait Bytes: Deref<Target = [u8]> + core::ops::DerefMut {
     fn capacity(&self) -> usize;
     fn reserve(&mut self, additional: usize) -> Result<(), C14nError>;
     fn append(&mut self, bytes: &[u8]) -> Result<(), C14nError>;
@@ -208,7 +210,7 @@ impl<T> List<T> for Vec<T> {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct NativeNamespaces<'a>(HashMap<NamespaceKey<'a>, Option<&'a str>>);
+pub(crate) struct NativeNamespaces<'a>(Map<NamespaceKey<'a>, Option<&'a str>>);
 
 #[cfg(test)]
 impl<'a> NativeNamespaces<'a> {

@@ -62,8 +62,22 @@ compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 #[cfg(not(feature = "embedded"))]
 #[macro_use]
 extern crate peresil;
+#[cfg(not(feature = "embedded"))]
+extern crate alloc;
 
-use std::{
+// The standalone crate always has std; embedded, the tables follow xml-sec's build.
+#[cfg(not(feature = "embedded"))]
+mod collections {
+    pub(crate) use std::collections::{HashMap as Map, HashSet as Set, hash_map as map};
+
+    pub(crate) trait Key: core::hash::Hash + Eq {}
+    impl<T: core::hash::Hash + Eq + ?Sized> Key for T {}
+}
+
+#[cfg(feature = "embedded")]
+use alloc::borrow::ToOwned;
+use alloc::string::String;
+use core::{
     fmt,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -181,12 +195,12 @@ pub mod dom;
 #[path = "thindom_no_unsafe.rs"]
 #[doc(hidden)]
 pub mod thindom;
-#[cfg(feature = "no-unsafe")]
+// Embedded in xml-sec, the writer and the XML parser only serve tests;
+// documents under verification come from xml-sec's own parsers.
+#[cfg(all(feature = "no-unsafe", any(test, not(feature = "embedded"))))]
 #[path = "writer_no_unsafe.rs"]
 pub mod writer;
 
-// Embedded in xml-sec, the XML parser only builds test documents; documents
-// under verification come from xml-sec's own parsers.
 #[cfg(any(test, not(feature = "embedded")))]
 pub mod parser;
 
@@ -313,7 +327,7 @@ impl From<&str> for NamespaceText {
     }
 }
 #[cfg(feature = "embedded")]
-impl std::ops::Deref for NamespaceText {
+impl core::ops::Deref for NamespaceText {
     type Target = str;
     fn deref(&self) -> &str {
         match self {
@@ -338,7 +352,19 @@ impl PartialEq for NamespaceText {
 #[cfg(feature = "embedded")]
 impl Eq for NamespaceText {}
 #[cfg(feature = "embedded")]
-impl std::borrow::Borrow<str> for NamespaceText {
+impl PartialOrd for NamespaceText {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+#[cfg(feature = "embedded")]
+impl Ord for NamespaceText {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (**self).cmp(&**other)
+    }
+}
+#[cfg(feature = "embedded")]
+impl core::borrow::Borrow<str> for NamespaceText {
     fn borrow(&self) -> &str {
         self
     }
@@ -350,9 +376,9 @@ impl structured_asn1::memory::HashWork for NamespaceText {
     }
 }
 #[cfg(feature = "embedded")]
-impl std::hash::Hash for NamespaceText {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::hash::Hash::hash(&**self, state);
+impl core::hash::Hash for NamespaceText {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        core::hash::Hash::hash(&**self, state);
     }
 }
 
@@ -493,7 +519,7 @@ impl Package {
     pub fn as_thin_document(&self) -> (thindom::Storage<'_>, thindom::Connections<'_>) {
         // The returned handles borrow this Package, so its address is a stable runtime brand
         // for rejecting nodes created by a different arena before index or pointer access.
-        let identity = std::ptr::from_ref(self).addr();
+        let identity = core::ptr::from_ref(self).addr();
         let s = thindom::Storage::new(&self.storage, identity);
         #[cfg(not(feature = "no-unsafe"))]
         let c = thindom::Connections::new(&self.connections, identity);
@@ -505,7 +531,7 @@ impl Package {
 
 impl PartialEq for Package {
     fn eq(&self, other: &Package) -> bool {
-        std::ptr::eq(self, other)
+        core::ptr::eq(self, other)
     }
 }
 

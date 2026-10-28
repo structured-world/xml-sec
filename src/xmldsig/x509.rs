@@ -1,6 +1,10 @@
 //! X.509 certificate path and revocation validation.
 
-use std::{collections::HashSet, time::SystemTime};
+use alloc::{
+    collections::BTreeSet,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 #[cfg(test)]
 use x509_parser::x509::AlgorithmIdentifier;
@@ -12,7 +16,7 @@ use x509_parser::{
 
 use super::X509DataInfo;
 use super::pkix::X509DataSource;
-use crate::policy::{DsaKeyPolicy, ExtendedKeyPurpose, RsaKeyPolicy};
+use crate::policy::{DsaKeyPolicy, ExtendedKeyPurpose, Instant, RsaKeyPolicy};
 #[cfg(test)]
 use crate::provider::X509SignatureAlgorithm;
 
@@ -25,13 +29,13 @@ pub struct X509ChainOptions<'a> {
     /// DER-encoded certificates accepted as trust anchors.
     pub trusted_certs: &'a [Vec<u8>],
     /// Time used for certificate, CRL, and revocation checks.
-    pub verification_time: SystemTime,
+    pub verification_time: Instant,
     /// Maximum number of certificates in the validated path, including the anchor.
     pub max_chain_depth: usize,
     /// Whether parsed `<X509CRL>` entries are enforced.
     pub check_crls: bool,
     /// Purposes accepted when any path certificate carries `ExtendedKeyUsage`.
-    pub allowed_extended_key_usages: Option<&'a HashSet<ExtendedKeyPurpose>>,
+    pub allowed_extended_key_usages: Option<&'a BTreeSet<ExtendedKeyPurpose>>,
     /// RSA strength requirements for every issuer key used by the path.
     pub rsa_keys: RsaKeyPolicy,
     /// DSA strength requirements for every issuer key used by the path.
@@ -453,7 +457,7 @@ fn validate_path(
         if decoded.is_empty() {
             // Fail the target's time gate before examining issuer permissions,
             // as shared path discovery also does before entering its pool.
-            let at = super::pkix::verification_instant(options.verification_time)?;
+            let at = options.verification_time;
             let validity = certificate.tbs().validity();
             if at < validity.not_before().instant() || at > validity.not_after().instant() {
                 return Err(X509ChainError::CertificateNotValid(0));
@@ -538,7 +542,7 @@ fn validate_path_profile(
         }
     }
     let mut anchor_limit = None;
-    let at = super::pkix::verification_instant(options.verification_time)?;
+    let at = options.verification_time;
     for (position, cert) in decoded.iter().enumerate() {
         validate_positive_serial_bytes(
             cert.tbs().serial().as_bytes(),
@@ -1006,9 +1010,9 @@ fn mailbox_domain_has_valid_syntax(domain: &str) -> bool {
         .get(..5)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("IPv6:"))
     {
-        literal[5..].parse::<std::net::Ipv6Addr>().is_ok()
+        literal[5..].parse::<core::net::Ipv6Addr>().is_ok()
     } else {
-        literal.parse::<std::net::Ipv4Addr>().is_ok()
+        literal.parse::<core::net::Ipv4Addr>().is_ok()
     }
 }
 
@@ -1460,8 +1464,9 @@ fn parse_certificate(der: &[u8]) -> Result<X509Certificate<'_>, X509ChainError> 
 }
 
 #[cfg(test)]
-fn system_time_to_asn1(time: SystemTime) -> Result<ASN1Time, X509ChainError> {
-    let instant = super::pkix::verification_instant(time)?;
+fn system_time_to_asn1(time: std::time::SystemTime) -> Result<ASN1Time, X509ChainError> {
+    let instant = crate::policy::instant_from_system_time(time)
+        .ok_or(X509ChainError::CertificateNotValid(0))?;
     // RFC 5280 6.1.3(a)(2) compares the actual validation time, not its
     // whole-second truncation. Keep the same instant for CRL freshness.
     // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.3
@@ -1520,8 +1525,12 @@ mod tests {
     use p256::pkcs8::EncodePublicKey;
     use sha2::{Digest, Sha256, Sha384};
     use signature::hazmat::PrehashSigner;
-    use std::time::{Duration, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use x509_parser::oid_registry::{OID_SIG_ECDSA_WITH_SHA256, OID_SIG_ECDSA_WITH_SHA384, Oid};
+
+    fn instant(time: SystemTime) -> Instant {
+        crate::policy::instant_from_system_time(time).expect("representable test time")
+    }
 
     #[test]
     fn issuer_spki_preflight_checks_borrowed_components_and_exact_der()
@@ -1661,7 +1670,7 @@ mod tests {
         };
         let options = X509ChainOptions {
             trusted_certs: &anchors,
-            verification_time: SystemTime::now(),
+            verification_time: instant(SystemTime::now()),
             max_chain_depth: 1,
             utc_facts: None,
             check_crls: false,
@@ -1805,7 +1814,7 @@ mod tests {
     fn verify_generated_path_with_eku(
         certificates: Vec<Vec<u8>>,
         trusted_anchor: Vec<u8>,
-        allowed_extended_key_usages: Option<&HashSet<ExtendedKeyPurpose>>,
+        allowed_extended_key_usages: Option<&BTreeSet<ExtendedKeyPurpose>>,
     ) -> Result<(), X509ChainError> {
         let info = X509DataInfo {
             certificate_chain: (0..certificates.len()).collect(),
@@ -1818,7 +1827,7 @@ mod tests {
             &X509ChainOptions {
                 trusted_certs: &anchors,
                 utc_facts: None,
-                verification_time: SystemTime::now(),
+                verification_time: instant(SystemTime::now()),
                 max_chain_depth: info.certificate_chain.len(),
                 check_crls: false,
                 allowed_extended_key_usages,
@@ -1866,7 +1875,7 @@ mod tests {
         let options = X509ChainOptions {
             trusted_certs: &[],
             utc_facts: None,
-            verification_time: SystemTime::now(),
+            verification_time: instant(SystemTime::now()),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,
@@ -1941,7 +1950,7 @@ mod tests {
             })
         ));
 
-        let allowed = HashSet::from([ExtendedKeyPurpose::ServerAuth]);
+        let allowed = BTreeSet::from([ExtendedKeyPurpose::ServerAuth]);
         verify_generated_path_with_eku(vec![leaf_der, root_der.clone()], root_der, Some(&allowed))
             .expect("an explicitly approved leaf purpose must be accepted");
     }
@@ -1971,7 +1980,7 @@ mod tests {
                 &root,
             )
             .expect("root should sign leaf certificate");
-        let allowed = HashSet::from([ExtendedKeyPurpose::ServerAuth]);
+        let allowed = BTreeSet::from([ExtendedKeyPurpose::ServerAuth]);
 
         verify_generated_path_with_eku(
             vec![leaf.der().to_vec(), root.der().to_vec()],
@@ -2019,7 +2028,7 @@ mod tests {
                     &root,
                 )
                 .expect("root should sign leaf certificate");
-            let allowed = HashSet::from([
+            let allowed = BTreeSet::from([
                 ExtendedKeyPurpose::ServerAuth,
                 ExtendedKeyPurpose::ClientAuth,
             ]);
@@ -2121,7 +2130,7 @@ mod tests {
             "default certificate policy must reject PQ before provider verification"
         );
         let permitted =
-            crate::policy::CertificateSignatureAlgorithms::Allowlist(HashSet::from([algorithm]));
+            crate::policy::CertificateSignatureAlgorithms::Allowlist(BTreeSet::from([algorithm]));
         assert!(
             verify_x509_signed_object_with_provider(
                 &identifier,
@@ -2143,7 +2152,7 @@ mod tests {
                 spki,
                 provider,
                 Some(&crate::policy::CertificateSignatureAlgorithms::Allowlist(
-                    HashSet::new()
+                    BTreeSet::new()
                 ))
             ),
             Err(X509ChainError::Policy(_))
@@ -2542,7 +2551,7 @@ mod tests {
         };
         let options = X509ChainOptions {
             trusted_certs: &anchors,
-            verification_time: UNIX_EPOCH + Duration::from_hours(306_828),
+            verification_time: instant(UNIX_EPOCH + Duration::from_hours(306_828)),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,
@@ -2575,7 +2584,7 @@ mod tests {
         };
         let options = X509ChainOptions {
             trusted_certs: &anchors,
-            verification_time: UNIX_EPOCH + Duration::from_hours(306_828),
+            verification_time: instant(UNIX_EPOCH + Duration::from_hours(306_828)),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,

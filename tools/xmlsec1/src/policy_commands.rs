@@ -1,12 +1,6 @@
 //! Explicit operator policy commands, separate from the donor XML grammar.
-use std::{
-    collections::BTreeMap,
-    ffi::OsString,
-    io::Write,
-    path::PathBuf,
-    time::{Duration, UNIX_EPOCH},
-};
-use xml_sec::policy::{PolicyCompileContext, PolicyValidity};
+use std::{collections::BTreeMap, ffi::OsString, io::Write, path::PathBuf};
+use xml_sec::policy::{Instant, PolicyCompileContext, PolicyValidity};
 use xml_sec_config::{Configuration, LoadLimits};
 
 pub(crate) fn execute(
@@ -101,20 +95,13 @@ fn authorization(values: &BTreeMap<String, OsString>) -> Result<Option<PolicyVal
             .ok_or_else(|| format!("{key} is required"))?
             .to_owned())
     };
-    let time = |key| -> Result<std::time::SystemTime, String> {
+    let time = |key| -> Result<Instant, String> {
         let seconds = utf8(values, key)?
             .ok_or_else(|| format!("{key} is required"))?
             .parse::<i64>()
             .map_err(|_| format!("{key} requires signed Unix seconds"))?;
-        // Match the configuration's signed epoch model; unsigned_abs also
-        // handles i64::MIN without a signed negation overflow.
-        let duration = Duration::from_secs(seconds.unsigned_abs());
-        let time = if seconds < 0 {
-            UNIX_EPOCH.checked_sub(duration)
-        } else {
-            UNIX_EPOCH.checked_add(duration)
-        };
-        time.ok_or_else(|| format!("{key} overflows SystemTime"))
+        // The configuration's signed epoch model: every i64 second is an instant.
+        Instant::new(seconds, 0).ok_or_else(|| format!("{key} is not a valid instant"))
     };
     Ok(Some(PolicyValidity {
         authorization_id: text("--authorization-id")?,

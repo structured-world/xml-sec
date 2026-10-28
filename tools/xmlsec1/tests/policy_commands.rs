@@ -85,8 +85,8 @@ fn assert_effective_validity(effective: &str, grant: &xml_sec::policy::PolicyVal
 fn policy_commands_accept_pre_epoch_authorization() {
     // The native boundary must accept a currently valid grant whose lower
     // bound precedes epoch, preserve it exactly, and still reject expired grants.
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-    use xml_sec::policy::PolicyValidity;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use xml_sec::policy::{Instant, PolicyValidity};
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("policy.toml");
     std::fs::write(&file, "schema_version=1\n[profiles.team]\nbase='Modern'").unwrap();
@@ -132,8 +132,8 @@ fn policy_commands_accept_pre_epoch_authorization() {
         authorization_id: "test-grant".into(),
         authority: "test-application".into(),
         reason: "historical start".into(),
-        not_before: UNIX_EPOCH - Duration::from_secs(1),
-        expires_at: UNIX_EPOCH + Duration::from_secs(expires.parse().unwrap()),
+        not_before: Instant::new(-1, 0).unwrap(),
+        expires_at: Instant::new(expires.parse().unwrap(), 0).unwrap(),
     };
     assert_effective_validity(&output, &grant);
     let diff = run("diff", "-1", &expires)

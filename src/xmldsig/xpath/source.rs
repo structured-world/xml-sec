@@ -3,7 +3,7 @@
 use crate::c14n::scratch::{Scratch, Text, TextBuilder};
 use crate::sxd_document::XmlChar as _;
 use crate::xmldsig::types::TransformError;
-use std::ops::Range;
+use core::ops::Range;
 
 pub(super) enum Normalized<'a, T> {
     Original(&'a str),

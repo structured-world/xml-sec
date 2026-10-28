@@ -3,9 +3,9 @@
 //! Walks an XML document tree in document order, emitting canonical bytes.
 //! Namespace rendering is delegated to the caller via [`NsRenderer`] trait.
 
+use alloc::vec::Vec;
 #[cfg(test)]
 use std::collections::HashSet;
-use std::io::{self, Write};
 
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId, NodeType};
@@ -15,6 +15,7 @@ use super::ClosureVisibility;
 use super::escape::{escape_attr, escape_cr, escape_text};
 use super::prefix::{attribute_prefix, element_prefix};
 use super::scratch::{List, NamespaceMap, NamespaceRendering, Native, Scratch, Text};
+use super::sink::ByteSink;
 use super::xml_base::{
     XmlBaseResolutionBudget, XmlBaseResolutionError, preserves_xml_base_context,
 };
@@ -33,11 +34,12 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 type TrackedPositions = Vec<(NodeId, usize)>;
 
-struct CanonicalOutput<'a, W: Write + ?Sized, S: Scratch = Native> {
+struct CanonicalOutput<'a, W: ByteSink + ?Sized, S: Scratch = Native> {
     writer: &'a mut W,
     position: usize,
     max_len: usize,
-    limit_exceeded: bool,
+    /// The caller's limit, reported when `max_len` is reached.
+    max_output_bytes: usize,
     tracked_element: Option<NodeId>,
     tracked_position: Option<usize>,
     tracked_elements: Option<&'a [NodeId]>,
@@ -59,24 +61,23 @@ impl<T: Text> AttributeValue<'_, T> {
     }
 }
 
-impl<W: Write + ?Sized, S: Scratch> Write for CanonicalOutput<'_, W, S> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        debug_assert!(self.position <= self.max_len);
-        if bytes.len() > self.max_len - self.position {
-            self.limit_exceeded = true;
-            return Err(io::ErrorKind::OutOfMemory.into());
-        }
-        self.writer.write_all(bytes)?;
-        self.position += bytes.len();
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+impl<W: ByteSink + ?Sized, S: Scratch> ByteSink for CanonicalOutput<'_, W, S> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
+        self.write_all(bytes)
     }
 }
 
-impl<W: Write + ?Sized, S: Scratch> CanonicalOutput<'_, W, S> {
+impl<W: ByteSink + ?Sized, S: Scratch> CanonicalOutput<'_, W, S> {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
+        debug_assert!(self.position <= self.max_len);
+        if bytes.len() > self.max_len - self.position {
+            return Err(output_limit_error(self.max_output_bytes));
+        }
+        self.writer.write_bytes(bytes)?;
+        self.position += bytes.len();
+        Ok(())
+    }
+
     fn track<D: DomStorage>(&mut self, node: Node<'_, '_, D>) {
         if self.tracked_element == Some(node.id()) {
             self.tracked_position = Some(self.position);
@@ -323,7 +324,7 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded<D: DomStorage>(
 // positions while a terminal writer starts at zero, on the same traversal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<
-    W: Write + ?Sized,
+    W: ByteSink + ?Sized,
     D: DomStorage,
 >(
     doc: &Document<'_, D>,
@@ -349,7 +350,7 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch, D: DomStorage>(
+pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     doc: &Document<'_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
@@ -371,7 +372,7 @@ pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch, D: DomStorag
         writer: output,
         position: initial_offset,
         max_len,
-        limit_exceeded: false,
+        max_output_bytes: options.max_output_bytes.unwrap_or(usize::MAX),
         tracked_element: options.tracked_element,
         tracked_position: None,
         tracked_elements: options.tracked_elements,
@@ -379,7 +380,7 @@ pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch, D: DomStorag
         xml_base_resolution: options.xml_base_resolution,
         scratch,
     };
-    let result = serialize_children(
+    serialize_children(
         root,
         visibility,
         with_comments,
@@ -387,18 +388,12 @@ pub(super) fn serialize_with_scratch<W: Write + ?Sized, S: Scratch, D: DomStorag
         config,
         &scratch.namespaces(),
         &mut output,
-    );
-    if output.limit_exceeded {
-        return Err(output_limit_error(
-            options.max_output_bytes.unwrap_or(usize::MAX),
-        ));
-    }
-    result?;
+    )?;
     Ok((output.tracked_position, output.tracked_positions))
 }
 
 /// Serialize children of a node in document order.
-fn serialize_children<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     parent: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
@@ -518,7 +513,12 @@ fn serialize_children<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
     Ok(())
 }
 
-fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_selected_axes_of_omitted_element<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+>(
     owner: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     ns_renderer: &dyn NsRenderer<S, D>,
@@ -600,7 +600,7 @@ fn serialize_selected_axes_of_omitted_element<'n, W: Write + ?Sized, S: Scratch,
 }
 
 /// Serialize a single element node (start tag + children + end tag).
-fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_element<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     node: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
@@ -632,7 +632,7 @@ fn serialize_element<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
     Ok(())
 }
 
-fn serialize_start_tag<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     node: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     ns_renderer: &dyn NsRenderer<S, D>,
@@ -767,7 +767,7 @@ fn serialize_start_tag<'n, W: Write + ?Sized, S: Scratch, D: DomStorage>(
     Ok(rendered)
 }
 
-fn effective_parent_base<W: Write + ?Sized, S: Scratch, D: DomStorage>(
+fn effective_parent_base<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     node: Node<'_, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     config: C14nConfig,
@@ -812,11 +812,11 @@ pub(super) fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
 }
 
 /// Emit the separator preceding a document-level comment or PI.
-fn write_doc_level_prefix<W: Write + ?Sized, S: Scratch>(
+fn write_doc_level_prefix<W: ByteSink + ?Sized, S: Scratch>(
     is_doc_root: bool,
     follows_document_element: bool,
     output: &mut CanonicalOutput<'_, W, S>,
-) -> io::Result<()> {
+) -> Result<(), C14nError> {
     if is_doc_root && follows_document_element {
         output.write_all(b"\n")?;
     }
@@ -824,11 +824,11 @@ fn write_doc_level_prefix<W: Write + ?Sized, S: Scratch>(
 }
 
 /// Emit the separator following a document-level comment or PI.
-fn write_doc_level_suffix<W: Write + ?Sized, S: Scratch>(
+fn write_doc_level_suffix<W: ByteSink + ?Sized, S: Scratch>(
     is_doc_root: bool,
     follows_document_element: bool,
     output: &mut CanonicalOutput<'_, W, S>,
-) -> io::Result<()> {
+) -> Result<(), C14nError> {
     if is_doc_root && !follows_document_element {
         output.write_all(b"\n")?;
     }
@@ -945,10 +945,10 @@ fn collect_inherited_xml_attrs<'a, S: Scratch, D: DomStorage>(
 ///
 /// Extracts the lexical prefix from the source XML via byte-range positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn write_qualified_name<W: Write + ?Sized, S: Scratch, D: DomStorage>(
+fn write_qualified_name<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     node: Node<'_, '_, D>,
     output: &mut CanonicalOutput<'_, W, S>,
-) -> io::Result<()> {
+) -> Result<(), C14nError> {
     let prefix = element_prefix(node);
     if !prefix.is_empty() {
         output.write_all(prefix.as_bytes())?;
@@ -964,6 +964,7 @@ mod tests {
     use super::super::ns_inclusive::InclusiveNsRenderer;
     use super::*;
     use crate::xml::dom::NodeId;
+    use std::io::{self, Write};
 
     #[test]
     fn visibility_refusal_precedes_output_and_preserves_cause() {

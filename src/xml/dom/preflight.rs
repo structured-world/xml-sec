@@ -1,7 +1,8 @@
 //! Shared lexical preflight and source-position sidecar for every DOM backend.
 
+use crate::collections::{Map, Table};
 use crate::xml_input as xml_sec_xml_input;
-use std::ops::Range;
+use core::ops::Range;
 
 use xml_sec_xml_input::lexical::{Event, Scanner};
 
@@ -23,7 +24,7 @@ struct SourceNode {
     range: Range<usize>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DtdAttributeName<'a>(Option<&'a str>, &'a str, Option<&'a str>, &'a str);
 
 #[cfg(feature = "xmldsig")]
@@ -65,9 +66,7 @@ pub trait Declarations<'input, S: Storage> {
     ) -> Result<(), ParseError>;
 }
 
-impl<'input> Declarations<'input, Native>
-    for std::collections::HashMap<DtdAttributeName<'input>, DtdAttributeInfo>
-{
+impl<'input> Declarations<'input, Native> for Map<DtdAttributeName<'input>, DtdAttributeInfo> {
     fn lookup(
         &self,
         key: &DtdAttributeName<'_>,
@@ -80,16 +79,16 @@ impl<'input> Declarations<'input, Native>
         key: &DtdAttributeName<'input>,
         _: Native,
     ) -> Result<Option<&mut DtdAttributeInfo>, ParseError> {
-        Ok(std::collections::HashMap::get_mut(self, key))
+        Ok(Map::get_mut(self, key))
     }
     fn insert(
         &mut self,
         key: DtdAttributeName<'input>,
         value: DtdAttributeInfo,
     ) -> Result<(), ParseError> {
-        self.try_reserve(1)
+        self.try_reserve_entries(1)
             .map_err(|_| ParseError::AllocationFailed)?;
-        std::collections::HashMap::insert(self, key, value);
+        Map::insert(self, key, value);
         Ok(())
     }
 }

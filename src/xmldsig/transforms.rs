@@ -19,9 +19,18 @@
 //! | XPath 1.0 | NodeSet → NodeSet | P1 |
 //! | XPath Filter 2.0 | NodeSet → NodeSet | P1 |
 
+use crate::collections::Set;
 use crate::xml_input_shared::DecodeStorage as _;
-use std::cell::Cell;
-use std::collections::{BTreeMap, HashSet};
+#[cfg(feature = "xslt")]
+use alloc::rc::Rc;
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    string::String,
+    vec::Vec,
+};
+use core::cell::Cell;
 
 mod parameters;
 mod relationship;
@@ -145,7 +154,7 @@ pub(crate) struct TransformExecutionBudget {
     state: TransformChainState,
     opc_workspace: relationship::WorkspaceBudget,
     #[cfg(feature = "xslt")]
-    xslt: std::rc::Rc<xslt::Allowance>,
+    xslt: Rc<xslt::Allowance>,
 }
 
 impl Default for TransformExecutionBudget {
@@ -361,7 +370,7 @@ impl TransformExecutionBudget {
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
             #[cfg(feature = "xslt")]
-            xslt: std::rc::Rc::default(),
+            xslt: Rc::default(),
         }
     }
 
@@ -383,7 +392,7 @@ impl TransformExecutionBudget {
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
             #[cfg(feature = "xslt")]
-            xslt: std::rc::Rc::default(),
+            xslt: Rc::default(),
         }
     }
 
@@ -402,7 +411,7 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
             #[cfg(feature = "xslt")]
-            xslt: std::rc::Rc::default(),
+            xslt: Rc::default(),
         }
     }
 
@@ -441,7 +450,7 @@ impl TransformExecutionBudget {
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::new(resources.max_opc_workspace_bytes),
             #[cfg(feature = "xslt")]
-            xslt: std::rc::Rc::new(xslt::Allowance::new(resources)),
+            xslt: Rc::new(xslt::Allowance::new(resources)),
         }
     }
 
@@ -602,7 +611,7 @@ impl TransformChainState {
         &self,
         document: &Document<'_, D>,
     ) -> XPathDocumentIdentity {
-        let document_key = std::ptr::from_ref(document).cast::<()>();
+        let document_key = core::ptr::from_ref(document).cast::<()>();
         if let Some(cached) = self.xpath_document_identity.get()
             && cached.document == document_key
         {
@@ -1048,9 +1057,9 @@ fn apply_transform_with_context<
             // xmlsec1 equivalent:
             //   xmlSecNodeSetGetChildren(doc, signatureNode, 1, 1)  // inverted tree
             //   xmlSecNodeSetAdd(inNodes, children, Intersection)   // intersect = subtract
-            if !std::ptr::eq(
-                std::ptr::from_ref(signature_node.document()).cast::<()>(),
-                std::ptr::from_ref(nodes.document()).cast::<()>(),
+            if !core::ptr::eq(
+                core::ptr::from_ref(signature_node.document()).cast::<()>(),
+                core::ptr::from_ref(nodes.document()).cast::<()>(),
             ) {
                 return Err(TransformError::CrossDocumentSignatureNode);
             }
@@ -1070,7 +1079,7 @@ fn apply_transform_with_context<
             let document_relation = xpath_document_relation(
                 signature_node.document(),
                 nodes.document(),
-                std::iter::once(xpath),
+                core::iter::once(xpath),
                 state,
             );
             Ok(ExecutionData::Nodes(
@@ -1491,14 +1500,14 @@ pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
 /// Mutable signing fields that can affect a transform output.
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) struct TransformDependencyOutput {
-    pub(crate) dependencies: HashSet<usize>,
+    pub(crate) dependencies: Set<usize>,
 }
 
 struct TransformChainOutput<T> {
     output: T,
     /// Signing reads which tracked template fields reached the output.
     #[cfg(feature = "xmldsig-sign")]
-    dependencies: HashSet<usize>,
+    dependencies: Set<usize>,
 }
 
 fn retain_visible_dependencies<K: super::types::projection::Keys, D: DomStorage>(
@@ -1912,21 +1921,14 @@ impl<'p> DigestWriter<'p> {
     }
 }
 
-impl std::io::Write for DigestWriter<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.failure.is_some() {
-            return Err(std::io::ErrorKind::Other.into());
-        }
-        match self.absorb(bytes) {
-            Ok(()) => Ok(bytes.len()),
-            Err(error) => {
-                self.failure = Some(error);
-                Err(std::io::ErrorKind::Other.into())
-            }
-        }
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+// The serializer stops at the refusal; the terminal reports the retained
+// provider failure instead of the serializer's error.
+impl c14n::sink::ByteSink for DigestWriter<'_> {
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), c14n::C14nError> {
+        self.absorb(bytes).map_err(|error| {
+            self.failure = Some(error);
+            c14n::C14nError::OutputRefused
+        })
     }
 }
 
@@ -2046,10 +2048,10 @@ struct DependencyTracking {
     // serialization transforms. XPath can still read them through absolute or
     // document-scanning expressions, so retain their indexes until that choice
     // is known rather than treating them as active input provenance.
-    dormant_indexes: HashSet<usize>,
+    dormant_indexes: Set<usize>,
     // Base64 decoding destroys XML identity. Dependencies that crossed that
     // boundary remain conservative because later XPath cannot recover origin.
-    opaque_dependencies: HashSet<usize>,
+    opaque_dependencies: Set<usize>,
     canonical_positions: Option<Vec<CanonicalDependencyPosition>>,
 }
 
@@ -2145,8 +2147,11 @@ impl DependencyTracking {
         preserve_excluded_as_opaque: bool,
     ) -> Result<(), TransformError> {
         if preserve_excluded_as_opaque {
+            // Copy, then clear: a hash set keeps its capacity this way, and
+            // the ordered set has no `drain`.
             self.opaque_dependencies
-                .extend(self.dormant_indexes.drain());
+                .extend(self.dormant_indexes.iter().copied());
+            self.dormant_indexes.clear();
         }
         let mut active_nodes = Vec::with_capacity(self.active_nodes.len());
         for tracked in self.active_nodes.drain(..) {
@@ -2237,7 +2242,7 @@ fn tracked_signature_element<K: super::types::projection::Keys, D: DomStorage>(
 ) -> Result<Option<NodeId>, TransformError> {
     Ok(match enveloped_signature {
         Some(signature)
-            if std::ptr::eq(signature.document(), nodes.document())
+            if core::ptr::eq(signature.document(), nodes.document())
                 && nodes.contains_tree(signature)? =>
         {
             Some(signature.id())
@@ -2312,8 +2317,8 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
     let mut active_nodes = Vec::with_capacity(tracked_nodes.len());
-    let mut opaque_dependencies = HashSet::new();
-    let mut dormant_indexes = HashSet::new();
+    let mut opaque_dependencies = Set::new();
+    let mut dormant_indexes = Set::new();
     for (index, node_id) in tracked_nodes {
         if let Some(node) = signature_node.document().get_node(node_id) {
             let belongs_to_input = match &initial_data {
@@ -2674,9 +2679,9 @@ fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> T
 }
 
 #[cfg(feature = "xmldsig-sign")]
-fn dependency_indexes(tracking: Option<DependencyTracking>) -> HashSet<usize> {
+fn dependency_indexes(tracking: Option<DependencyTracking>) -> Set<usize> {
     let Some(tracking) = tracking else {
-        return HashSet::new();
+        return Set::new();
     };
     tracking
         .active_nodes
@@ -2742,7 +2747,7 @@ pub(crate) fn transform_chain_uses_implicit_c14n<I: Instruction>(
         if !binary && matches!(transform.view(), InstructionView::Xslt(_)) {
             return true;
         }
-        binary = transform_chain_produces_binary(binary, std::slice::from_ref(transform));
+        binary = transform_chain_produces_binary(binary, core::slice::from_ref(transform));
     }
     !binary
 }
@@ -2788,7 +2793,7 @@ pub(crate) fn map_c14n_resource_policy_violation(
 pub(crate) fn validate_signing_transform_policy(
     initial_binary: bool,
     transforms: &[Transform],
-    allowed: Option<&HashSet<String>>,
+    allowed: Option<&BTreeSet<String>>,
 ) -> Result<(), crate::policy::PolicyViolation> {
     validate_transform_policy(initial_binary, transforms, allowed, "signing transform")
 }
@@ -2796,7 +2801,7 @@ pub(crate) fn validate_signing_transform_policy(
 fn validate_transform_policy(
     initial_binary: bool,
     transforms: &[Transform],
-    allowed: Option<&HashSet<String>>,
+    allowed: Option<&BTreeSet<String>>,
     operation: &'static str,
 ) -> Result<(), crate::policy::PolicyViolation> {
     let Some(allowed) = allowed else {
@@ -3274,7 +3279,7 @@ impl<'a> XPathParseState<'a> {
 /// repeated Manifest parses required by dependency-ordered signing.
 pub(crate) struct XPathSignatureParseBudget {
     #[cfg(feature = "xslt")]
-    xslt: std::rc::Rc<xslt::Allowance>,
+    xslt: Rc<xslt::Allowance>,
     opc_workspace: relationship::WorkspaceBudget,
     expressions: usize,
     max_expressions: usize,
@@ -3289,7 +3294,7 @@ impl Default for XPathSignatureParseBudget {
     fn default() -> Self {
         Self {
             #[cfg(feature = "xslt")]
-            xslt: std::rc::Rc::default(),
+            xslt: Rc::default(),
             opc_workspace: relationship::WorkspaceBudget::parameters(
                 crate::hard_limits::OPC_PARAMETER_BYTE_CEILING,
             ),
@@ -3318,13 +3323,13 @@ impl XPathSignatureParseBudget {
         Self::from_resource_parts(
             resources,
             #[cfg(feature = "xslt")]
-            std::rc::Rc::new(xslt::Allowance::new(resources)),
+            Rc::new(xslt::Allowance::new(resources)),
         )
     }
 
     fn from_resource_parts(
         resources: &crate::policy::ResourcePolicy,
-        #[cfg(feature = "xslt")] xslt: std::rc::Rc<xslt::Allowance>,
+        #[cfg(feature = "xslt")] xslt: Rc<xslt::Allowance>,
     ) -> Self {
         Self {
             #[cfg(feature = "xslt")]
@@ -3351,7 +3356,7 @@ impl XPathSignatureParseBudget {
         Self::from_resource_parts(
             resources,
             #[cfg(feature = "xslt")]
-            std::rc::Rc::clone(&execution.xslt),
+            Rc::clone(&execution.xslt),
         )
     }
 
@@ -5041,7 +5046,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output.dependencies, HashSet::from([7]));
+        assert_eq!(output.dependencies, Set::from([7]));
     }
 
     #[cfg(feature = "xmldsig-sign")]

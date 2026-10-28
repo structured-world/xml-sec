@@ -246,7 +246,7 @@ impl<W: Work> Text<'_, W> {
         match self {
             Self::Borrowed(text) => text,
             Self::Joined(bytes) => {
-                std::str::from_utf8(bytes).expect("only UTF-8 fragments appended")
+                core::str::from_utf8(bytes).expect("only UTF-8 fragments appended")
             }
         }
     }

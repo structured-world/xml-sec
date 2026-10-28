@@ -29,7 +29,7 @@ fn expected() -> AgreementMethod {
 
 #[test]
 fn x448_public_encryption_and_decryption_obey_typed_permission() {
-    use std::collections::HashSet;
+    use std::collections::BTreeSet;
     use xml_sec::provider::RustCryptoX448Key;
     // The actual XML pipeline must preserve X448 identity, enforce permission
     // on both operations, and authenticate the result with AES-GCM.
@@ -38,7 +38,7 @@ fn x448_public_encryption_and_decryption_obey_typed_permission() {
     let sender_public = sender.public_key();
     let mut encryption = xml_sec::policy::EncryptionPolicy::default();
     encryption.key_establishment.agreement_algorithms =
-        Some(HashSet::from([KeyAgreementAlgorithm::X448]));
+        Some(BTreeSet::from([KeyAgreementAlgorithm::X448]));
     let wire = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .agreement_key(
             method(),
@@ -71,7 +71,7 @@ fn x448_public_encryption_and_decryption_obey_typed_permission() {
     ));
     let mut decryption = DecryptionPolicy::default();
     decryption.key_establishment.agreement_algorithms =
-        Some(HashSet::from([KeyAgreementAlgorithm::X448]));
+        Some(BTreeSet::from([KeyAgreementAlgorithm::X448]));
     assert_eq!(
         DecryptContext::new(&resolver)
             .policy(decryption)
@@ -112,7 +112,7 @@ fn ecdh_preflight_rejection_does_not_consume_the_sender() {
         recipient.public_key(),
     );
     let mut policy = xml_sec::policy::EncryptionPolicy::default();
-    policy.key_establishment.agreement_algorithms = Some(std::collections::HashSet::default());
+    policy.key_establishment.agreement_algorithms = Some(std::collections::BTreeSet::default());
     assert!(
         builder
             .clone()

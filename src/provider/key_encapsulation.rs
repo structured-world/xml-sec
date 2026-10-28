@@ -2,10 +2,11 @@
 //! live outside the primitive; no key handle exposes its secret through Debug.
 
 use super::{CryptoProvider, ProviderBinding, ProviderError};
+use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
 /// Experimental libxmlsec1 ML-KEM parameter sets (not signature algorithms).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyEncapsulationAlgorithm {
     /// FIPS 203 category 1.
     MlKem512,

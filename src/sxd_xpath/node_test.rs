@@ -1,6 +1,7 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
-use std::fmt;
+use alloc::{borrow::ToOwned, boxed::Box, string::String};
+use core::fmt;
 
 use sxd_document_no_unsafe::QName;
 
@@ -78,7 +79,7 @@ impl<T> From<super::grammar::Test<T>> for SubNodeTest<T> {
     }
 }
 
-impl<T: AsRef<str> + std::fmt::Debug> NodeTest for SubNodeTest<T> {
+impl<T: AsRef<str> + core::fmt::Debug> NodeTest for SubNodeTest<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         match self {
             Self::Attribute(test) => test.validate(context),
@@ -164,7 +165,7 @@ impl<T> Attribute<T> {
     }
 }
 
-impl<T: AsRef<str> + std::fmt::Debug> NodeTest for Attribute<T> {
+impl<T: AsRef<str> + core::fmt::Debug> NodeTest for Attribute<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         self.name_test.validate(context)
     }
@@ -190,7 +191,7 @@ impl<T> Namespace<T> {
     }
 }
 
-impl<T: AsRef<str> + std::fmt::Debug> NodeTest for Namespace<T> {
+impl<T: AsRef<str> + core::fmt::Debug> NodeTest for Namespace<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         self.name_test.validate(context)
     }
@@ -214,7 +215,7 @@ impl<T> Element<T> {
     }
 }
 
-impl<T: AsRef<str> + std::fmt::Debug> NodeTest for Element<T> {
+impl<T: AsRef<str> + core::fmt::Debug> NodeTest for Element<T> {
     fn validate(&self, context: &context::Evaluation<'_, '_>) -> Result<(), Error> {
         self.name_test.validate(context)
     }
@@ -270,7 +271,7 @@ impl<T> ProcessingInstruction<T> {
     }
 }
 
-impl<T: AsRef<str> + std::fmt::Debug> NodeTest for ProcessingInstruction<T> {
+impl<T: AsRef<str> + core::fmt::Debug> NodeTest for ProcessingInstruction<T> {
     fn matches(&self, context: &context::Evaluation<'_, '_>) -> Result<bool, Error> {
         if let nodeset::Node::ProcessingInstruction(pi) = &context.node {
             return Ok(self

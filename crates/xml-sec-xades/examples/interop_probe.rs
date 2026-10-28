@@ -4,7 +4,6 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime},
 };
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::xmldsig::{
@@ -18,8 +17,7 @@ use xml_sec_xades::validate_basic;
 fn verification_policy(here: &str) -> Result<VerificationPolicy, Box<dyn std::error::Error>> {
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
-    policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
+    policy.key_trust.verification_time = xml_sec::policy::Instant::new(500_000 * 3600, 0);
     policy.transforms.xpath_here_semantics = match here {
         "spec" => XPathHereSemantics::Specification,
         "legacy" => XPathHereSemantics::XmlSecLegacy,
