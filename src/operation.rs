@@ -29,7 +29,9 @@ impl OperationNodeId {
 pub(crate) enum OperationStage {
     Parse,
     Resolve,
-    #[cfg(feature = "xmldsig")]
+    // Signing digests References before SignedInfo exists; verification
+    // digests them as authenticated dependencies after the signature.
+    #[cfg(feature = "xmldsig-sign")]
     Digest,
     #[cfg(feature = "xmldsig")]
     Canonicalization,
@@ -864,7 +866,7 @@ impl<P, B> OperationExecutionContext<P, B> {
         }
     }
 
-    #[cfg(feature = "xmldsig")]
+    #[cfg(all(test, feature = "xmldsig"))]
     pub(crate) fn first_failure(&self) -> Option<OperationDecision> {
         self.first_failure.borrow().clone()
     }

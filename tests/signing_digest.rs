@@ -391,8 +391,18 @@ fn public_sign_and_verify_enforce_configured_node_set_boundary() {
         .sign_with_builder(&xml, &builder)
         .expect("raised signing policy must accept the same document");
     let resolver = DefaultKeyResolver::default();
+    // The embedded certificate is untrusted; the mathematical mode lets the
+    // verified signature reach the Reference whose node set is bounded.
+    let cryptographic_only = xml_sec::policy::KeyTrustPolicy {
+        mode: xml_sec::policy::VerificationTrustMode::CryptographicOnly,
+        ..xml_sec::policy::KeyTrustPolicy::default()
+    };
     let default_error = VerifyContext::new()
         .key_resolver(&resolver)
+        .policy(VerificationPolicy {
+            key_trust: cryptographic_only.clone(),
+            ..VerificationPolicy::default()
+        })
         .verify(&signed)
         .expect_err("default verification policy must bound node-set materialization");
     assert!(default_error.to_string().contains("node-set entries"));
@@ -400,10 +410,7 @@ fn public_sign_and_verify_enforce_configured_node_set_boundary() {
         .key_resolver(&resolver)
         .policy(VerificationPolicy {
             resources,
-            key_trust: xml_sec::policy::KeyTrustPolicy {
-                mode: xml_sec::policy::VerificationTrustMode::CryptographicOnly,
-                ..xml_sec::policy::KeyTrustPolicy::default()
-            },
+            key_trust: cryptographic_only,
             ..VerificationPolicy::default()
         })
         .verify(&signed)

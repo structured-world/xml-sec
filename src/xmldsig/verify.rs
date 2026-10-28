@@ -1024,6 +1024,9 @@ pub enum DsigStatus {
     Valid,
     /// Signature/reference is invalid with a concrete reason.
     Invalid(FailureReason),
+    /// A `<Reference>` was not dereferenced or transformed because the
+    /// signature over `<SignedInfo>` did not verify. Never an overall status.
+    NotProcessed,
 }
 
 /// Why `XMLDSig` verification failed.
@@ -1053,6 +1056,11 @@ pub enum FailureReason {
         /// Zero-based index of the failing `<Reference>` in its processed set.
         ref_index: usize,
     },
+    /// External `<Reference>` whose bytes the caller has not supplied.
+    ReferenceUnavailable {
+        /// Zero-based index of the unavailable `<Reference>` in its processed set.
+        ref_index: usize,
+    },
     /// `<SignatureValue>` does not match canonicalized `<SignedInfo>`.
     SignatureMismatch,
     /// No verification key was configured or could be resolved.
@@ -1064,10 +1072,9 @@ pub enum FailureReason {
 #[non_exhaustive]
 #[must_use = "check first_failure/results before accepting the reference set"]
 pub struct ReferencesResult {
-    /// Per-reference results (one per `<Reference>` in order).
-    /// On fail-fast, only references up to and including the failed one are present.
+    /// Per-reference results, one per `<Reference>` in order.
     pub results: Vec<ReferenceResult>,
-    /// Index of the first failed reference, if any.
+    /// Index of the first reference that did not pass, if any.
     pub first_failure: Option<usize>,
 }
 
@@ -1348,11 +1355,14 @@ struct VerificationPlanNodes {
     document: OperationNodeId,
     key_materialization: OperationNodeId,
     key: OperationNodeId,
-    digests: Vec<OperationNodeId>,
     canonicalization: OperationNodeId,
     crypto: OperationNodeId,
 }
 
+/// Plan `SignedInfo` authentication only. Reference digests are added after the
+/// signature verifies, as dependencies of the accepted crypto node (W3C XML
+/// Signature Best Practices BP1): their URIs are not resolved before that.
+/// <https://www.w3.org/TR/xmldsig-bestpractices/#bp-authenticate-signature-first>
 fn compile_verification_operation_plan(
     operation: &mut OperationExecutionContext<
         &crate::policy::VerificationPolicy,
@@ -1360,7 +1370,6 @@ fn compile_verification_operation_plan(
     >,
     view: DocumentView<'_>,
     signature_node: Node<'_, '_>,
-    references: &[Reference],
     resolver: &UriReferenceResolver<'_>,
 ) -> Result<VerificationPlanNodes, SignatureVerificationPipelineError> {
     operation
@@ -1390,35 +1399,14 @@ fn compile_verification_operation_plan(
     operation
         .add_dependency(key_node, key_materialization)
         .map_err(map_verification_plan_error)?;
-    let mut digests = Vec::with_capacity(references.len());
-    for (index, reference) in references.iter().enumerate() {
-        let resource = operation.budgets().resource_identity_for_reference(
-            reference,
-            index,
-            resolver,
-            view,
-            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
-        );
-        let digest_node = operation.add_node(
-            OperationNodeKind::Digest { index },
-            OperationStage::Digest,
-            Some(resource.clone()),
-        );
-        operation
-            .add_dependency(digest_node, document_node)
-            .map_err(map_verification_plan_error)?;
-        digests.push(digest_node);
-    }
     let canonicalization = operation.add_node(
         OperationNodeKind::Canonicalization,
         OperationStage::Canonicalization,
         None,
     );
-    for digest in &digests {
-        operation
-            .add_dependency(canonicalization, *digest)
-            .map_err(map_verification_plan_error)?;
-    }
+    operation
+        .add_dependency(canonicalization, document_node)
+        .map_err(map_verification_plan_error)?;
     let crypto = operation.add_node(OperationNodeKind::Crypto, OperationStage::Crypto, None);
     operation
         .add_dependency(crypto, key_node)
@@ -1431,7 +1419,6 @@ fn compile_verification_operation_plan(
         document: document_node,
         key_materialization,
         key: key_node,
-        digests,
         canonicalization,
         crypto,
     })
@@ -1584,17 +1571,19 @@ fn process_reference_with_options<C: VerificationCapture>(
     })
 }
 
-/// Process all `<Reference>` elements in a `<SignedInfo>`, with fail-fast
-/// on the first digest mismatch.
+/// Process every `<Reference>` element in a `<SignedInfo>`, each with its own
+/// result (`XMLDSig` 1.1 §3.2.1).
 ///
-/// Per `XMLDSig` spec: if any reference fails, the entire signature is invalid.
-/// Processing stops at the first failure for efficiency.
+/// A digest mismatch, a policy violation, an unavailable external resource
+/// and a URI/transform failure are per-reference results;
+/// `ReferencesResult::first_failure` names the first of them. This does not
+/// verify `SignatureValue`: callers verifying a signature must authenticate
+/// `SignedInfo` before trusting these instructions.
 ///
 /// # Errors
 ///
-/// Returns `Err` only for processing failures (malformed XML, unsupported
-/// transform, etc.). Digest mismatches are reported via
-/// `ReferencesResult::first_failure`.
+/// Returns `Err` for a resource refusal or provider failure, which stops all
+/// remaining references.
 pub fn process_all_references(
     references: &[Reference],
     resolver: &UriReferenceResolver<'_>,
@@ -1621,7 +1610,7 @@ fn process_all_references_with_options(
     execution: &ReferenceExecutionContext<'_>,
 ) -> Result<ReferencesResult, ReferenceProcessingError> {
     let mut results = Vec::with_capacity(references.len());
-
+    let mut first_failure = None;
     for (i, reference) in references.iter().enumerate() {
         let result = process_reference_with_options(
             reference,
@@ -1631,22 +1620,49 @@ fn process_all_references_with_options(
             i,
             reference_origin_node(signature_node, ReferenceSet::SignedInfo, i),
             execution,
-        )?;
-        let failed = matches!(result.status, DsigStatus::Invalid(_));
-        results.push(result);
-
-        if failed {
-            return Ok(ReferencesResult {
-                results,
-                first_failure: Some(i),
-            });
+        )
+        .or_else(|error| {
+            let reason = error.into_reference_failure(i)?;
+            Ok::<_, ReferenceProcessingError>(reference_failure_result(
+                reference,
+                ReferenceSet::SignedInfo,
+                i,
+                DsigStatus::Invalid(reason),
+            ))
+        })?;
+        if result.status != DsigStatus::Valid && first_failure.is_none() {
+            first_failure = Some(i);
         }
+        results.push(result);
     }
-
     Ok(ReferencesResult {
         results,
-        first_failure: None,
+        first_failure,
     })
+}
+
+/// Result of a `<Reference>` that produced no digest, before evidence binding.
+fn reference_failure_result(
+    reference: &Reference,
+    reference_set: ReferenceSet,
+    reference_index: usize,
+    status: DsigStatus,
+) -> ReferenceResult {
+    ReferenceResult {
+        reference_identity: None,
+        target_identity: None,
+        external_resource_fingerprint: None,
+        coverage: ReferenceCoverage::TransformedData,
+        reference_set,
+        reference_index,
+        uri: reference
+            .uri
+            .clone()
+            .unwrap_or_else(|| "<omitted>".to_owned()),
+        digest_algorithm: reference.digest_method,
+        status,
+        pre_digest_data: None,
+    }
 }
 
 /// Errors during reference processing.
@@ -1688,6 +1704,79 @@ impl ReferenceProcessingError {
             error => Err(error),
         }
     }
+
+    /// `Ok` is this Reference's own outcome (`XMLDSig` 1.1 §3.2.1 validates each
+    /// Reference independently); `Err` stays terminal for the whole operation.
+    fn into_reference_failure(self, ref_index: usize) -> Result<FailureReason, Self> {
+        use crate::policy::PolicyViolation;
+        match self {
+            // Every Reference draws on the same operation budgets, so a later
+            // result after an exhausted budget would be a refusal, not a finding.
+            Self::Policy(PolicyViolation::ResourceLimit { .. })
+            | Self::UriDereference(TransformError::Policy(PolicyViolation::ResourceLimit {
+                ..
+            }))
+            | Self::Transform(TransformError::Policy(PolicyViolation::ResourceLimit { .. }))
+            | Self::SharedExecution(_)
+            | Self::Provider(_) => Err(self),
+            Self::Policy(_)
+            | Self::UriDereference(TransformError::Policy(_))
+            | Self::Transform(TransformError::Policy(_)) => {
+                Ok(FailureReason::ReferencePolicyViolation { ref_index })
+            }
+            Self::UriDereference(TransformError::ExternalResourceUnavailable(_)) => {
+                Ok(FailureReason::ReferenceUnavailable { ref_index })
+            }
+            Self::MissingUri => Ok(FailureReason::ReferenceProcessingFailure { ref_index }),
+            Self::UriDereference(error) | Self::Transform(error)
+                if is_reference_local_transform_error(&error) =>
+            {
+                Ok(FailureReason::ReferenceProcessingFailure { ref_index })
+            }
+            error => Err(error),
+        }
+    }
+}
+
+/// Failures determined by one Reference's own URI, transforms or content.
+/// Anything else, including stringly typed XSLT errors that can carry work
+/// exhaustion, stays terminal.
+fn is_reference_local_transform_error(error: &TransformError) -> bool {
+    use crate::c14n::C14nError;
+    use crate::document::XmlDocumentError;
+    use crate::encoding::XmlEncodingError;
+    // Undecodable content belongs to its Reference; only the decoded-size
+    // ceiling is a resource refusal and stays terminal.
+    if let TransformError::XmlParse(XmlDocumentError::Encoding(encoding)) = error {
+        return !matches!(encoding, XmlEncodingError::DecodedLimit { .. });
+    }
+    if let TransformError::AccountedXmlEncoding(encoding) = error {
+        return !matches!(encoding, XmlEncodingError::DecodedLimit { .. });
+    }
+    matches!(
+        error,
+        TransformError::TypeMismatch { .. }
+            | TransformError::ElementNotFound(_)
+            | TransformError::AccountedElementNotFound(_)
+            | TransformError::UnsupportedUri(_)
+            | TransformError::AccountedUnsupportedUri(_)
+            | TransformError::InvalidFragment
+            | TransformError::UnsupportedTransform(_)
+            | TransformError::AccountedUnsupportedTransform(_)
+            | TransformError::Base64(_)
+            | TransformError::XPath(_)
+            | TransformError::AccountedXPath(_)
+            | TransformError::Relationship(_)
+            | TransformError::CrossDocumentSignatureNode
+            | TransformError::CrossDocumentNodeSetInput
+            | TransformError::C14n(
+                C14nError::Parse(_)
+                    | C14nError::InvalidNode
+                    | C14nError::RelativeNamespace
+                    | C14nError::UnsupportedAlgorithm(_)
+            )
+            | TransformError::XmlParse(XmlDocumentError::Parse(_))
+    )
 }
 
 /// End-to-end `XMLDSig` verification result for one `<Signature>`.
@@ -1702,9 +1791,9 @@ pub struct VerifyResult {
     /// Manifest reference failures do not alter this field; inspect
     /// [`Self::manifest_references`] before accepting Manifest-backed data.
     pub status: DsigStatus,
-    /// `<Reference>` verification results from `<SignedInfo>`.
-    /// On fail-fast, this includes references up to and including
-    /// the first digest mismatch only.
+    /// One result per `<SignedInfo>` `<Reference>`, in order. Each Reference
+    /// has its own outcome once `SignatureValue` verifies; before that, none
+    /// is dereferenced and each reports [`DsigStatus::NotProcessed`].
     pub signed_info_references: Vec<ReferenceResult>,
     /// `<Manifest>` reference results.
     /// Populated only when `VerifyContext::process_manifests(true)` is enabled
@@ -2545,6 +2634,43 @@ fn canonicalize_verification_signed_info(
     Ok::<_, SignatureVerificationPipelineError>(canonical_signed_info)
 }
 
+/// The accepted signature authenticates these instructions; only now are
+/// their URIs resolved into resource identities and planned.
+fn plan_signed_info_digests(
+    operation: &mut OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    resolver: &UriReferenceResolver<'_>,
+    signed_info_references: &[Reference],
+    crypto: OperationNodeId,
+) -> Result<Vec<OperationNodeId>, DsigError> {
+    operation.extend();
+    let mut digests = Vec::with_capacity(signed_info_references.len());
+    for (index, reference) in signed_info_references.iter().enumerate() {
+        let resource = operation.budgets().resource_identity_for_reference(
+            reference,
+            index,
+            resolver,
+            view,
+            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
+        );
+        let digest = operation.add_node(
+            OperationNodeKind::Digest { index },
+            OperationStage::AuthenticatedDependency,
+            Some(resource),
+        );
+        operation
+            .add_dependency(digest, crypto)
+            .map_err(map_verification_plan_error)?;
+        digests.push(digest);
+    }
+    operation.compile().map_err(map_verification_plan_error)?;
+    Ok(digests)
+}
+
 fn process_signed_info_references<C: VerificationCapture>(
     operation: &mut OperationExecutionContext<
         &crate::policy::VerificationPolicy,
@@ -2555,10 +2681,18 @@ fn process_signed_info_references<C: VerificationCapture>(
     resolver: &UriReferenceResolver<'_>,
     verification: &ManifestVerification<'_, '_, C>,
     signed_info_references: &[Reference],
-    digests: &[OperationNodeId],
-) -> Result<ReferencesResult, DsigError> {
+    crypto: OperationNodeId,
+) -> Result<(ReferencesResult, Vec<OperationNodeId>), DsigError> {
     let ctx = verification.context;
     let capture = verification.capture;
+    let digests = plan_signed_info_digests(
+        operation,
+        view,
+        signature_node,
+        resolver,
+        signed_info_references,
+        crypto,
+    )?;
     let mut reference_results = Vec::with_capacity(signed_info_references.len());
     let mut first_failure = None;
     for (index, (node, reference)) in digests
@@ -2593,6 +2727,15 @@ fn process_signed_info_references<C: VerificationCapture>(
                 reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
                 &execution,
             )
+            .or_else(|error| {
+                let reason = error.into_reference_failure(index)?;
+                Ok::<_, ReferenceProcessingError>(reference_failure_result(
+                    reference,
+                    ReferenceSet::SignedInfo,
+                    index,
+                    DsigStatus::Invalid(reason),
+                ))
+            })
             .map_err(SignatureVerificationPipelineError::from)
         })?;
         bind_reference_evidence(
@@ -2626,20 +2769,69 @@ fn process_signed_info_references<C: VerificationCapture>(
             debug_assert!(operation.is_authenticated(identity));
         }
         reference_results.push(result);
-        if !accepted {
+        if !accepted && first_failure.is_none() {
             first_failure = Some(index);
-            break;
         }
     }
-    debug_assert!(
-        digests[reference_results.len()..]
-            .iter()
-            .all(|node| !operation.is_executed(*node))
-    );
-    Ok(ReferencesResult {
-        results: reference_results,
-        first_failure,
-    })
+    Ok((
+        ReferencesResult {
+            results: reference_results,
+            first_failure,
+        },
+        digests,
+    ))
+}
+
+/// Result of a signature whose `SignedInfo` was not authenticated.
+fn unauthenticated_result(
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    completion: VerificationCompletion<'_>,
+    store_pre_digest: bool,
+    key_trust: super::KeyTrustEvidence,
+    reason: FailureReason,
+) -> VerifyResult {
+    VerifyResult {
+        key_trust,
+        status: DsigStatus::Invalid(reason),
+        signed_info_references: unprocessed_signed_info_references(
+            view,
+            signature_node,
+            &completion.signed_info.references,
+        ),
+        manifest_references: Vec::new(),
+        canonicalized_signed_info: store_pre_digest.then_some(completion.canonical_signed_info),
+    }
+}
+
+/// `SignedInfo` References of a signature that did not verify: reported, never
+/// dereferenced or transformed (W3C XML Signature Best Practices BP1).
+fn unprocessed_signed_info_references(
+    view: DocumentView<'_>,
+    signature_node: Node<'_, '_>,
+    references: &[Reference],
+) -> Vec<ReferenceResult> {
+    // Parsed references follow the SignedInfo Reference children in order.
+    let mut origins = signature_node
+        .children()
+        .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
+        .into_iter()
+        .flat_map(Node::children)
+        .filter(|node| node.has_tag_name((XMLDSIG_NS, "Reference")));
+    references
+        .iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            let mut result = reference_failure_result(
+                reference,
+                ReferenceSet::SignedInfo,
+                index,
+                DsigStatus::NotProcessed,
+            );
+            result.reference_identity = origins.next().map(|node| view.node_identity(node));
+            result
+        })
+        .collect()
 }
 
 fn materialize_verification_hints(
@@ -2919,7 +3111,6 @@ struct VerificationCompletion<'a> {
     plan_nodes: VerificationPlanNodes,
     encapsulation: Option<ResolvedEncapsulation>,
     retrieval_materialization: RetrievalMaterialization,
-    references: ReferencesResult,
     canonical_signed_info: Vec<u8>,
     remaining_reference_capacity: usize,
 }
@@ -3037,18 +3228,44 @@ fn finish_authenticated_verification<C: VerificationCapture>(
     signature_node: Node<'_, '_>,
     resolver: &UriReferenceResolver<'_>,
     verification: &ManifestVerification<'_, '_, C>,
-    resolved_key: &ResolvedVerifyingKey<'_>,
+    key_trust: super::KeyTrustEvidence,
     completion: VerificationCompletion<'_>,
 ) -> Result<VerifyResult, DsigError> {
     let ctx = verification.context;
-    let capture = verification.capture;
     operation.set_outcome(
         completion.plan_nodes.crypto,
         true,
         OperationDecisionReason::SignatureVerified,
     );
+    let (references, signed_info_digests) = process_signed_info_references(
+        operation,
+        view,
+        signature_node,
+        resolver,
+        verification,
+        &completion.signed_info.references,
+        completion.plan_nodes.crypto,
+    )?;
+    let canonicalized_signed_info = ctx
+        .store_pre_digest
+        .then_some(completion.canonical_signed_info);
+    if let Some(first_failure) = references.first_failure {
+        // Core validation failed (XMLDSig 1.1 §3.2): Manifest content stays
+        // unparsed, while the verified signature keeps its key evidence.
+        return Ok(VerifyResult {
+            key_trust,
+            status: references.results[first_failure].status,
+            signed_info_references: references.results,
+            manifest_references: Vec::new(),
+            canonicalized_signed_info,
+        });
+    }
+    // Every node core validation completed: the evidence and the first
+    // Manifest frontier depend on all of them.
+    let mut core_validation = signed_info_digests;
+    core_validation.push(completion.plan_nodes.crypto);
     // Manifest syntax and references are authenticated content. Delay parsing
-    // until SignatureValue succeeds, then extend the same operation graph with
+    // until core validation succeeds, then extend the same operation graph with
     // the newly trusted dependency subgraph and its evidence node.
     let (manifest_references, manifest_digests) =
         if ctx.policy.manifest_processing == crate::policy::ManifestProcessing::Process {
@@ -3057,38 +3274,28 @@ fn finish_authenticated_verification<C: VerificationCapture>(
                 view,
                 signature_node,
                 resolver,
-                &ManifestVerification {
-                    context: ctx,
-                    capture,
-                },
+                verification,
                 completion.remaining_reference_capacity,
-                completion.plan_nodes.crypto,
+                &core_validation,
             )?
         } else {
             (Vec::new(), Vec::new())
         };
     operation.extend();
     let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
-    operation
-        .add_dependency(evidence, completion.plan_nodes.crypto)
-        .map_err(map_verification_plan_error)?;
-    for digest in manifest_digests {
+    for prerequisite in core_validation.into_iter().chain(manifest_digests) {
         operation
-            .add_dependency(evidence, digest)
+            .add_dependency(evidence, prerequisite)
             .map_err(map_verification_plan_error)?;
     }
     operation.compile().map_err(map_verification_plan_error)?;
     operation.run(evidence, || {
         Ok::<_, SignatureVerificationPipelineError>(VerifyResult {
-            key_trust: resolved_key.evidence(&ctx.policy)?,
+            key_trust,
             status: DsigStatus::Valid,
-            signed_info_references: completion.references.results,
+            signed_info_references: references.results,
             manifest_references,
-            canonicalized_signed_info: if ctx.store_pre_digest {
-                Some(completion.canonical_signed_info)
-            } else {
-                None
-            },
+            canonicalized_signed_info,
         })
     })
 }
@@ -3141,23 +3348,24 @@ fn verify_signature_authenticator<C: VerificationCapture>(
         if let Some(error) = completion.retrieval_materialization.deferred_error {
             return Err(error);
         }
-        return Ok(VerifyResult {
-            key_trust: super::KeyTrustEvidence::NotEvaluated,
-            status: DsigStatus::Invalid(FailureReason::KeyNotFound),
-            signed_info_references: completion.references.results,
-            manifest_references: Vec::new(),
-            canonicalized_signed_info: if ctx.store_pre_digest {
-                Some(completion.canonical_signed_info)
-            } else {
-                None
-            },
-        });
+        return Ok(unauthenticated_result(
+            view,
+            signature_node,
+            completion,
+            ctx.store_pre_digest,
+            super::KeyTrustEvidence::NotEvaluated,
+            FailureReason::KeyNotFound,
+        ));
     };
     operation.set_outcome(
         completion.plan_nodes.key,
         true,
         OperationDecisionReason::KeyResolved,
     );
+    // BP1 establishes trust in the key before SignedInfo or any Reference is
+    // validated with it; an unauthorized key costs no crypto or transform work.
+    // <https://www.w3.org/TR/xmldsig-bestpractices/#bp-authenticate-signature-first>
+    let key_trust = resolved_key.evidence(&ctx.policy)?;
     let verifier = resolved_key.as_ref();
     let signature_valid = operation.run(completion.plan_nodes.crypto, || {
         verify_operation_authenticator(
@@ -3179,17 +3387,14 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             false,
             OperationDecisionReason::SignatureRejected,
         );
-        return Ok(VerifyResult {
-            key_trust: resolved_key.evidence(&ctx.policy)?,
-            status: DsigStatus::Invalid(FailureReason::SignatureMismatch),
-            signed_info_references: completion.references.results,
-            manifest_references: Vec::new(),
-            canonicalized_signed_info: if ctx.store_pre_digest {
-                Some(completion.canonical_signed_info)
-            } else {
-                None
-            },
-        });
+        return Ok(unauthenticated_result(
+            view,
+            signature_node,
+            completion,
+            ctx.store_pre_digest,
+            key_trust,
+            FailureReason::SignatureMismatch,
+        ));
     }
     finish_authenticated_verification(
         operation,
@@ -3197,7 +3402,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
         signature_node,
         resolver,
         verification,
-        &resolved_key,
+        key_trust,
         completion,
     )
 }
@@ -3226,13 +3431,8 @@ fn verify_signature_node<'a, C: VerificationCapture>(
         remaining_reference_capacity,
     } = prepare_verification_signature(view, signature_node, key, &verification, operation)?;
     let signed_info_node = signature_children.signed_info;
-    let plan_nodes = compile_verification_operation_plan(
-        operation,
-        view,
-        signature_node,
-        &signed_info.references,
-        resolver,
-    )?;
+    let plan_nodes =
+        compile_verification_operation_plan(operation, view, signature_node, resolver)?;
     let signature_identity =
         OperationResourceIdentity::DocumentNode(view.node_identity(signature_node));
     operation.run_with_resource(plan_nodes.document, &signature_identity, || {
@@ -3262,31 +3462,6 @@ fn verify_signature_node<'a, C: VerificationCapture>(
         .encapsulation
         .take();
     check_verification_encapsulation(encapsulation.as_ref(), ctx)?;
-    let references = process_signed_info_references(
-        operation,
-        view,
-        signature_node,
-        resolver,
-        &ManifestVerification {
-            context: ctx,
-            capture,
-        },
-        &signed_info.references,
-        &plan_nodes.digests,
-    )?;
-
-    if let Some(first_failure) = references.first_failure {
-        debug_assert!(operation.first_failure().is_some());
-        let status = references.results[first_failure].status;
-        return Ok(VerifyResult {
-            key_trust: super::KeyTrustEvidence::NotEvaluated,
-            status,
-            signed_info_references: references.results,
-            manifest_references: Vec::new(),
-            canonicalized_signed_info: None,
-        });
-    }
-
     let canonical_signed_info = operation.run(plan_nodes.canonicalization, || {
         canonicalize_verification_signed_info(signed_info_node, &signed_info.c14n_method, operation)
     })?;
@@ -3305,7 +3480,6 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             plan_nodes,
             encapsulation,
             retrieval_materialization,
-            references,
             canonical_signed_info,
             remaining_reference_capacity,
         },
@@ -4975,6 +5149,13 @@ fn manifest_reference_failure_reason(
     error: ReferenceProcessingError,
     ref_index: usize,
 ) -> FailureReason {
+    // Same Unavailable outcome as a SignedInfo Reference without caller bytes.
+    if matches!(
+        error,
+        ReferenceProcessingError::UriDereference(TransformError::ExternalResourceUnavailable(_))
+    ) {
+        return FailureReason::ReferenceUnavailable { ref_index };
+    }
     match error.into_policy_violation() {
         Ok(_) => FailureReason::ReferencePolicyViolation { ref_index },
         Err(_) => FailureReason::ReferenceProcessingFailure { ref_index },
@@ -5219,7 +5400,9 @@ fn process_authenticated_manifest_references<C: VerificationCapture>(
     resolver: &UriReferenceResolver<'_>,
     verification: &ManifestVerification<'_, '_, C>,
     mut remaining_reference_capacity: usize,
-    crypto: OperationNodeId,
+    // The accepted crypto node and the SignedInfo digests that authenticate
+    // the first Manifest frontier.
+    core_validation: &[OperationNodeId],
 ) -> Result<(Vec<ReferenceResult>, Vec<OperationNodeId>), SignatureVerificationPipelineError> {
     let ctx = verification.context;
     let mut processed_manifests = HashSet::new();
@@ -5236,10 +5419,7 @@ fn process_authenticated_manifest_references<C: VerificationCapture>(
             OperationStage::AuthenticatedDependency,
             None,
         );
-        operation
-            .add_dependency(discovery, crypto)
-            .map_err(map_verification_plan_error)?;
-        for digest in &completed_digests {
+        for digest in core_validation.iter().chain(&completed_digests) {
             operation
                 .add_dependency(discovery, *digest)
                 .map_err(map_verification_plan_error)?;
@@ -5301,21 +5481,12 @@ fn manifest_reference_invalid_result(
     index: usize,
     reason: FailureReason,
 ) -> ReferenceResult {
-    ReferenceResult {
-        reference_identity: None,
-        target_identity: None,
-        external_resource_fingerprint: None,
-        coverage: ReferenceCoverage::TransformedData,
-        reference_set: ReferenceSet::Manifest,
-        reference_index: index,
-        uri: reference
-            .uri
-            .clone()
-            .unwrap_or_else(|| "<omitted>".to_owned()),
-        digest_algorithm: reference.digest_method,
-        status: DsigStatus::Invalid(reason),
-        pre_digest_data: None,
-    }
+    reference_failure_result(
+        reference,
+        ReferenceSet::Manifest,
+        index,
+        DsigStatus::Invalid(reason),
+    )
 }
 
 fn parse_manifest_references(

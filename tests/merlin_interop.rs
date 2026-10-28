@@ -417,19 +417,23 @@ fn rejects_missing_or_tampered_external_resources() {
     let default = DefaultKeyResolver::default();
     let document = xml("signature-external-dsa");
     let missing = HashMap::new();
+    let absent = VerifyContext::new()
+        .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
+        .key_resolver(&default)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .external_resources(&missing)
+        .verify(&document)
+        .expect("an absent caller resource is a verification status");
+    let unavailable = absent
+        .signed_info_references
+        .iter()
+        .find(|reference| reference.uri == "http://www.w3.org/TR/xml-stylesheet")
+        .expect("the detached Reference is reported");
     assert!(matches!(
-        VerifyContext::new()
-            .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
-            .key_resolver(&default)
-            .allowed_uri_types(UriTypeSet::ALL)
-            .external_resources(&missing)
-            .verify(&document),
-        Err(DsigError::Reference(
-            xml_sec::xmldsig::ReferenceProcessingError::UriDereference(
-                xml_sec::xmldsig::TransformError::UnsupportedUri(uri)
-            )
-        )) if uri == "http://www.w3.org/TR/xml-stylesheet"
+        unavailable.status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { .. })
     ));
+    assert_ne!(absent.status, DsigStatus::Valid);
 
     let mut tampered = external_resources();
     tampered.insert(

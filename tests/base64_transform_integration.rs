@@ -8,11 +8,10 @@ mod cryptographic;
 use base64::Engine;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::xmldsig::{
-    BASE64_TRANSFORM_URI, DefaultKeyResolver, DigestAlgorithm, DsigError, DsigStatus,
-    FailureReason, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey, SignContext,
-    SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError, Transform,
-    TransformError, VerifyContext, X509CertificateKeyInfoWriter, XPathExpression, XPathFilter,
-    XPathFilterOperation,
+    BASE64_TRANSFORM_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus, FailureReason,
+    ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder,
+    SigningDigestError, SigningError, Transform, TransformError, X509CertificateKeyInfoWriter,
+    XPathExpression, XPathFilter, XPathFilterOperation,
 };
 
 const ENCODED_XML: &str = r#"<root>
@@ -132,7 +131,9 @@ fn base64_reference_tampering_is_a_digest_mismatch() {
     );
     let resolver = DefaultKeyResolver::default();
 
-    let verified = VerifyContext::new()
+    // The KeyInfo certificate is untrusted: only the mathematical mode lets
+    // verification reach the Reference after the signature.
+    let verified = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&tampered)
         .expect("well-formed tampered Base64 must complete verification");
@@ -146,22 +147,20 @@ fn base64_reference_tampering_is_a_digest_mismatch() {
 #[test]
 fn malformed_base64_reference_fails_before_digest_comparison() {
     // Invalid encoded content has no well-defined digest input and therefore
-    // must remain a processing error, distinct from a valid-but-changed value.
+    // must remain a processing failure, distinct from a valid-but-changed value.
     let signed = sign_encoded_xml(ENCODED_XML);
     let malformed = signed.replacen("dmVyaWZpZXIgY29udHJhY3Q=", "not!base64", 1);
     let resolver = DefaultKeyResolver::default();
 
-    let error = VerifyContext::new()
+    let verified = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&malformed)
-        .expect_err("malformed Base64 transform input must fail closed");
+        .expect("malformed Base64 is this Reference's own failure");
 
-    assert!(matches!(
-        error,
-        DsigError::Reference(ReferenceProcessingError::Transform(TransformError::Base64(
-            _
-        )))
-    ));
+    assert_eq!(
+        verified.status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+    );
 }
 
 #[test]
@@ -200,7 +199,7 @@ fn decoded_xml_is_adapted_to_a_node_set_for_xpath() {
     assert_eq!(excluded_result.status, DsigStatus::Valid);
 
     let included = signed.replacen(DECODED_XML_BASE64, DECODED_INCLUDED_TAMPER_BASE64, 1);
-    let included_result = VerifyContext::new()
+    let included_result = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&included)
         .expect("included decoded XML tampering remains processable");

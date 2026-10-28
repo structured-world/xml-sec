@@ -11,7 +11,7 @@ use roxmltree::Document;
 #[path = "support/cryptographic.rs"]
 mod cryptographic;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DsigStatus, FailureReason, RsaSigningKey, SignContext, VerifyContext,
+    DefaultKeyResolver, DsigStatus, FailureReason, RsaSigningKey, SignContext,
     X509CertificateKeyInfoWriter,
 };
 
@@ -109,8 +109,10 @@ fn rejects_tampered_saml_assertion_before_signature_verification() {
         "tampering must alter the signed assertion"
     );
 
+    // The embedded certificate is untrusted: the mathematical mode lets the
+    // verified signature reach its Reference.
     let key_resolver = DefaultKeyResolver::default();
-    let result = VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&key_resolver)
         .verify(&tampered)
         .expect("digest mismatch must return an Invalid status");

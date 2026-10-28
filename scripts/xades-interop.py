@@ -404,8 +404,16 @@ def run_all(results):
             # 5.2.2 (first certificate reference identifies the signer).
             # These expectations are normative, not copied from DSS labels:
             # https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf
-            if not expected_valid:
+            # The signature is verified before any Reference (W3C XML Signature
+            # Best Practices BP1). When it fails, or verification stops before
+            # it, XAdES never runs; a verified signature with a failing
+            # Reference reaches XAdES, which refuses its invalid status.
+            signature_level = name in ["signature-value-tampered", "keyinfo-certificate-substituted",
+                                       "unknown-algorithm", "malformed-xpath", "external-http", "external-file"]
+            if not expected_valid and signature_level:
                 xades_ok = xades == "not run or blocked"
+            elif not expected_valid:
+                xades_ok = xades.startswith("Err(Prepare(Binding(Signature {") and xades.endswith("status: Invalid })))")
             elif name == "baseline-wrong-target":
                 xades_ok = "Binding(Target" in xades
             elif name in ["baseline-untyped-signed-properties", "wrong-properties-type"]:
@@ -419,7 +427,7 @@ def run_all(results):
                 "unknown-algorithm": "ParseSignedInfo(Transform(UnsupportedTransform(",
                 "malformed-xpath": "ParseSignedInfo(Transform(XPath(",
                 "external-http": "Policy(Uri {", "external-file": "Policy(Uri {",
-                "duplicate-id": 'Reference(UriDereference(ElementNotFound("payload")))',
+                "duplicate-id": "Invalid(ReferenceProcessingFailure { ref_index: 0 })",
                 "keyinfo-certificate-substituted": "KeyResolution(",
                 "signature-value-tampered": "Invalid(SignatureMismatch)",
             }

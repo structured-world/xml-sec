@@ -10,7 +10,7 @@
       "negative": [{"file":"tests/behavioral_compatibility.rs","test":"pinned_c_oracle_reports_context_callback_and_dom_contracts","description":"The probe measures callback-abort error state and its retained failed reference, distinguishing processing errors from invalid results."},{"file":"tests/behavioral_compatibility.rs","test":"c_boundary_behaviors_are_not_claimed_as_native","description":"The ledger prevents native Rust APIs from implying C object-state parity."}]
     },
     "error-invalid": {
-      "positive": [{"file":"tests/signature_pipeline_integration.rs","test":"tampered_signature_value_fails_after_references_pass","description":"Cryptographic mismatch returns an invalid verification result."}],
+      "positive": [{"file":"tests/signature_pipeline_integration.rs","test":"tampered_signature_value_leaves_references_unprocessed","description":"Cryptographic mismatch returns an invalid verification result."}],
       "negative": [{"file":"tests/signature_pipeline_integration.rs","test":"malformed_signature_value_base64_returns_decode_error","description":"Malformed wire syntax remains a processing error."},{"file":"tests/donor_negative_vectors.rs","test":"phaos_bad_signature_artifact_fails_on_its_unsupported_md5_reference","description":"An unsupported Reference digest algorithm remains a typed processing error rather than an invalid verification result."}]
     },
     "here-semantics": {

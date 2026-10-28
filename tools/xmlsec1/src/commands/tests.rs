@@ -2799,3 +2799,19 @@ fn verification_diagnostics_aggregate_manifest_failures() {
 
     assert_eq!(donor_dsig_status(aggregate), ("FAILED", "REFERENCE"));
 }
+
+#[test]
+fn verification_diagnostics_name_unavailable_and_unprocessed_references() {
+    // An unsupplied detached payload is a Reference failure; a Reference left
+    // unprocessed behind an invalid signature keeps the donor's unknown status.
+    assert_eq!(
+        donor_dsig_status(DsigStatus::Invalid(FailureReason::ReferenceUnavailable {
+            ref_index: 0
+        })),
+        ("FAILED", "REFERENCE")
+    );
+    assert_eq!(
+        donor_dsig_status(DsigStatus::NotProcessed),
+        ("ERROR", "UNKNOWN")
+    );
+}

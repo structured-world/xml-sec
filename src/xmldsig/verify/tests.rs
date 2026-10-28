@@ -166,18 +166,15 @@ fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
     let resources = HashMap::from([("urn:detached-dtd".to_owned(), detached.to_vec())]);
     let key = AcceptingKey;
 
-    let default_error = VerifyContext::new()
+    // A refused detached parse is this Reference's own processing failure.
+    let refused = DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 });
+    let default_result = VerifyContext::new()
         .key(&key)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources)
         .verify(&xml)
-        .expect_err("internal DTD parsing must remain disabled by default");
-    assert!(matches!(
-        default_error,
-        SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-            crate::xmldsig::TransformError::XmlParse(_)
-        ))
-    ));
+        .expect("a refused detached parse is a verification status");
+    assert_eq!(default_result.status, refused);
 
     let result = VerifyContext::new()
         .key(&key)
@@ -194,19 +191,14 @@ fn internal_dtd_opt_in_applies_to_detached_xml_transforms() {
         ]><payload>&ext;</payload>"#;
     let external_entity_resources =
         HashMap::from([("urn:detached-dtd".to_owned(), external_entity.to_vec())]);
-    let external_entity_error = VerifyContext::new()
+    let external_entity_result = VerifyContext::new()
         .key(&key)
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&external_entity_resources)
         .allow_internal_dtd(true)
         .verify(&xml)
-        .expect_err("the internal-DTD opt-in must not resolve external entities");
-    assert!(matches!(
-        external_entity_error,
-        SignatureVerificationPipelineError::Reference(ReferenceProcessingError::Transform(
-            crate::xmldsig::TransformError::XmlParse(_)
-        ))
-    ));
+        .expect("the internal-DTD opt-in must not resolve external entities");
+    assert_eq!(external_entity_result.status, refused);
 }
 
 #[test]
@@ -539,7 +531,7 @@ fn manifest_processing_stops_after_c14n_budget_exhaustion() {
                     capture: &(),
                 },
                 2,
-                crypto,
+                &[crypto],
             )
             .map(|(results, _)| results)
         })
@@ -824,7 +816,7 @@ impl KeyResolver for PanicResolver {
         _key_info: Option<&KeyInfo>,
         _algorithm: SignatureAlgorithm,
     ) -> Result<Option<Box<dyn VerifyingKey + 'a>>, SignatureVerificationPipelineError> {
-        panic!("resolver should not be called when references already fail");
+        panic!("resolver must not be dispatched in this test");
     }
 }
 
@@ -2276,7 +2268,7 @@ fn verify_context_skips_manifest_parsing_when_signedinfo_reference_fails() {
     );
     let broken_xml = format!("{broken_signed_info_prefix}<ds:Object>{object_suffix}");
     let result = VerifyContext::new()
-        .key(&RejectingKey)
+        .key(&AcceptingKey)
         .process_manifests(true)
         .verify(&broken_xml)
         .expect("SignedInfo digest failure should return without parsing Manifests");
@@ -2450,6 +2442,26 @@ fn verify_context_records_manifest_missing_uri_with_accepting_key() {
         DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
     ));
     assert!(matches!(result.status, DsigStatus::Valid));
+}
+
+#[test]
+fn manifest_reference_without_caller_bytes_is_unavailable() {
+    // An external Reference whose bytes the caller has not supplied has the
+    // same Unavailable outcome in a Manifest as in SignedInfo.
+    let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+        xml.replacen("URI=\"#target\"", "URI=\"urn:absent\"", 1)
+    });
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .process_manifests(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .verify(&xml)
+        .expect("an unavailable Manifest payload is a per-reference result");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert_eq!(
+        result.manifest_references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
 }
 
 #[test]
@@ -4243,19 +4255,18 @@ fn verify_context_skips_ambiguous_manifest_id_blocks() {
             "</ds:Object><ds:Object><ds:Manifest ID=\"manifest\">junk<ds:Foo/></ds:Manifest></ds:Object>",
             1,
         );
-    let err = VerifyContext::new()
-        .key(&RejectingKey)
+    // An ambiguous ID fails only the SignedInfo Reference that names it; no
+    // Manifest is processed because core validation did not succeed.
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
         .process_manifests(true)
         .verify(&xml)
-        .expect_err("ambiguous manifest IDs should make SignedInfo #manifest dereference fail");
-    assert!(matches!(
-        err,
-        SignatureVerificationPipelineError::Reference(
-            ReferenceProcessingError::UriDereference(
-                crate::xmldsig::types::TransformError::ElementNotFound(id)
-            )
-        ) if id == "manifest"
-    ));
+        .expect("ambiguous manifest IDs fail the #manifest Reference");
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+    );
+    assert!(result.manifest_references.is_empty());
 }
 
 #[test]
@@ -4275,44 +4286,230 @@ fn verify_context_rejects_implicit_default_c14n_when_not_allowlisted() {
     ));
 }
 
-#[test]
-fn verify_context_skips_resolver_when_reference_processing_fails() {
-    let xml = minimal_signature_xml("", "");
-    let result = VerifyContext::new()
-        .key_resolver(&PanicResolver)
-        .verify(&xml)
-        .expect("reference digest mismatch should short-circuit before resolver");
-    assert!(matches!(
-        result.status,
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-    ));
+/// One Signature over `references`, each an already serialized `ds:Reference`.
+fn signature_with_references(references: &[&str]) -> String {
+    format!(
+        r#"<root xmlns:ds="{XMLDSIG_NS}"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>{}</ds:SignedInfo><ds:SignatureValue>AQ==</ds:SignatureValue></ds:Signature></root>"#,
+        references.concat()
+    )
+}
+
+fn sha1_reference(uri: &str, digest_b64: &str) -> String {
+    format!(
+        r#"<ds:Reference URI="{uri}"><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>{digest_b64}</ds:DigestValue></ds:Reference>"#
+    )
+}
+
+fn external_reference_policy() -> crate::policy::VerificationPolicy {
+    crate::policy::VerificationPolicy {
+        uris: crate::policy::UriPolicy {
+            references: UriTypeSet::ALL,
+            ..crate::policy::UriPolicy::default()
+        },
+        ..crate::policy::VerificationPolicy::default()
+    }
 }
 
 #[test]
-fn verify_context_leaves_fail_fast_reference_tail_unexecuted() {
-    // A mismatch on the first Reference must not produce graph evidence for
-    // the second Reference, which was never dereferenced or digested.
-    let second_reference = r#"
-    <ds:Reference URI="">
-      <ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/>
-      <ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue>
-    </ds:Reference>"#;
-    let xml = minimal_signature_xml("", "").replacen(
-        "  </ds:SignedInfo>",
-        &format!("{second_reference}\n  </ds:SignedInfo>"),
-        1,
+fn verify_context_resolves_key_before_reference_processing() {
+    // W3C XML Signature Best Practices BP1: the key and SignedInfo come first,
+    // so an unresolvable key ends verification before any Reference runs.
+    // The Reference names a missing ID that would fail if it were dereferenced.
+    let xml =
+        signature_with_references(&[&sha1_reference("#missing", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")]);
+    let result = VerifyContext::new()
+        .key_resolver(&MissingKeyResolver)
+        .verify(&xml)
+        .expect("a missing key is a verification status");
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::KeyNotFound)
     );
+    assert_eq!(result.signed_info_references.len(), 1);
+    assert_eq!(
+        result.signed_info_references[0].status,
+        DsigStatus::NotProcessed
+    );
+}
 
+#[test]
+fn signature_is_verified_before_any_reference_is_dereferenced() {
+    // BP1: a Reference of an unauthenticated SignedInfo is never dereferenced
+    // or transformed. A missing ID would fail processing if it were touched;
+    // the result reports the signature and leaves the Reference unprocessed.
+    let xml = signature_with_references(&[
+        &sha1_reference("#missing", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        &sha1_reference("", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+    ]);
+    let result = VerifyContext::new()
+        .key(&RejectingKey)
+        .verify(&xml)
+        .expect("an invalid signature is a verification status");
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::SignatureMismatch)
+    );
+    assert_eq!(result.signed_info_references.len(), 2);
+    for (index, reference) in result.signed_info_references.iter().enumerate() {
+        assert_eq!(reference.reference_index, index);
+        assert_eq!(reference.status, DsigStatus::NotProcessed);
+        assert_eq!(reference.target_identity, None);
+        assert_eq!(reference.pre_digest_data, None);
+    }
+    assert_eq!(result.signed_info_references[0].uri, "#missing");
+}
+
+#[test]
+fn valid_signature_gives_every_reference_its_own_result() {
+    // XMLDSig 1.1 §3.2.1: each Reference is validated on its own. A failing
+    // Reference no longer hides the later ones; the overall status names the
+    // first failure in document order and stays Invalid.
+    let payload = b"payload";
+    let payload_digest = base64::engine::general_purpose::STANDARD.encode(
+        crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
+    );
+    let xml = signature_with_references(&[
+        &sha1_reference("", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        &sha1_reference("#missing", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        &sha1_reference("urn:absent", "AAAAAAAAAAAAAAAAAAAAAAAAAAA="),
+        &sha1_reference("urn:payload", &payload_digest),
+    ]);
+    let resources = HashMap::from([("urn:payload".to_owned(), payload.to_vec())]);
     let result = VerifyContext::new()
         .key(&AcceptingKey)
+        .policy(external_reference_policy())
+        .external_resources(&resources)
         .verify(&xml)
-        .expect("digest mismatch must remain a verification result");
+        .expect("reference outcomes are verification statuses");
 
-    assert_eq!(result.signed_info_references.len(), 1);
-    assert!(matches!(
-        result.signed_info_references[0].status,
+    assert_eq!(
+        result.status,
         DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    );
+    let statuses: Vec<_> = result
+        .signed_info_references
+        .iter()
+        .map(|reference| reference.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 }),
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 }),
+            DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 2 }),
+            DsigStatus::Valid,
+        ]
+    );
+    let detached = &result.signed_info_references[3];
+    assert!(detached.external_resource_fingerprint.is_some());
+    assert!(result.manifest_references.is_empty());
+}
+
+#[test]
+fn undecodable_detached_xml_fails_only_its_reference() {
+    // Malformed UTF-8 and an unknown declared encoding are properties of one
+    // Reference's content. A node-set transform over them fails that Reference
+    // and still gives the following Reference its own result.
+    let c14n_reference = |uri: &str| {
+        format!(
+            r#"<ds:Reference URI="{uri}"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><ds:DigestValue>AAAAAAAAAAAAAAAAAAAAAAAAAAA=</ds:DigestValue></ds:Reference>"#
+        )
+    };
+    let payload = b"payload";
+    let payload_digest = base64::engine::general_purpose::STANDARD.encode(
+        crate::xmldsig::compute_digest(DigestAlgorithm::Sha1, payload),
+    );
+    let xml = signature_with_references(&[
+        &c14n_reference("urn:invalid-utf8"),
+        &c14n_reference("urn:unknown-encoding"),
+        &sha1_reference("urn:payload", &payload_digest),
+    ]);
+    let resources = HashMap::from([
+        ("urn:invalid-utf8".to_owned(), b"<a>\xC3\x28</a>".to_vec()),
+        (
+            "urn:unknown-encoding".to_owned(),
+            br#"<?xml version="1.0" encoding="x-unknown-encoding"?><a/>"#.to_vec(),
+        ),
+        ("urn:payload".to_owned(), payload.to_vec()),
+    ]);
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(external_reference_policy())
+        .external_resources(&resources)
+        .verify(&xml)
+        .expect("undecodable Reference content is a verification status");
+
+    let statuses: Vec<_> = result
+        .signed_info_references
+        .iter()
+        .map(|reference| reference.status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 }),
+            DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 }),
+            DsigStatus::Valid,
+        ]
+    );
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
+    );
+}
+
+#[test]
+fn unavailable_detached_payload_does_not_hide_a_valid_signature() {
+    // A detached Reference whose bytes the caller has not supplied yet is
+    // Unavailable, distinct from a mismatch; the signature over SignedInfo
+    // and the same-document Reference are still reported as verified.
+    let xml = signature_with_target_content("AQ==", "payload").replacen(
+        "</ds:SignedInfo>",
+        &format!(
+            "{}</ds:SignedInfo>",
+            sha1_reference("urn:later", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        ),
+        1,
+    );
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .policy(external_reference_policy())
+        .verify(&xml)
+        .expect("an unavailable payload is a verification status");
+    assert_eq!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 1 })
+    );
+    assert_eq!(result.signed_info_references[0].status, DsigStatus::Valid);
+    assert_eq!(
+        result.signed_info_references[1].status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 1 })
+    );
+}
+
+#[test]
+fn reference_failure_does_not_unlock_manifest_processing() {
+    // Manifest content is processed only after core validation succeeds;
+    // per-reference reporting must not let a failed SignedInfo Reference
+    // through to Manifest parsing.
+    let xml = signature_with_manifest_xml(true).replacen(
+        "</ds:SignedInfo>",
+        &format!(
+            "{}</ds:SignedInfo>",
+            sha1_reference("", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+        ),
+        1,
+    );
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .process_manifests(true)
+        .verify(&xml)
+        .expect("a reference mismatch is a verification status");
+    assert!(matches!(
+        result.status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
     ));
+    assert!(result.manifest_references.is_empty());
 }
 
 #[test]
@@ -4326,15 +4523,18 @@ fn verify_context_reports_key_not_found_when_resolver_misses() {
         result.status,
         DsigStatus::Invalid(FailureReason::KeyNotFound)
     ));
+    // Without a key nothing authenticates SignedInfo: each Reference is
+    // still reported, bound to its original element, and left unprocessed.
+    assert_eq!(result.signed_info_references.len(), 1);
     assert_eq!(
-        result.signed_info_references.len(),
-        1,
-        "KeyNotFound path must preserve SignedInfo reference diagnostics",
-    );
-    assert!(matches!(
         result.signed_info_references[0].status,
-        DsigStatus::Valid
-    ));
+        DsigStatus::NotProcessed
+    );
+    assert!(
+        result.signed_info_references[0]
+            .reference_identity
+            .is_some()
+    );
 }
 
 #[test]
@@ -5486,7 +5686,9 @@ fn reference_processing_shares_node_set_materialization_across_references() {
 }
 
 #[test]
-fn fail_fast_on_first_mismatch() {
+fn every_reference_is_processed_after_a_mismatch() {
+    // XMLDSig 1.1 §3.2.1 validates each Reference on its own: the first
+    // mismatch is recorded, the remaining references still get results.
     let xml = "<root><child>text</child></root>";
     let doc = Document::parse(xml).unwrap();
     let resolver = UriReferenceResolver::new(&doc);
@@ -5494,19 +5696,21 @@ fn fail_fast_on_first_mismatch() {
     let wrong_digest = vec![0u8; 32];
     let refs = vec![
         make_reference("", vec![], DigestAlgorithm::Sha256, wrong_digest.clone()),
-        // Second reference should NOT be processed
-        make_reference("", vec![], DigestAlgorithm::Sha256, wrong_digest),
+        make_reference("#missing", vec![], DigestAlgorithm::Sha256, wrong_digest),
     ];
 
     let result = process_all_references(&refs, &resolver, doc.root_element(), false).unwrap();
     assert!(!result.all_valid());
     assert_eq!(result.first_failure, Some(0));
-    // Only first reference should be in results (fail-fast)
-    assert_eq!(result.results.len(), 1);
-    assert!(matches!(
+    assert_eq!(result.results.len(), 2);
+    assert_eq!(
         result.results[0].status,
         DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
-    ));
+    );
+    assert_eq!(
+        result.results[1].status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 })
+    );
 }
 
 #[test]

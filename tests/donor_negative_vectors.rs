@@ -14,9 +14,9 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use xml_sec::XmlDomDocument as Document;
 use xml_sec::policy::PolicyViolation;
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, DsigError, DsigStatus, FailureReason, KeyInfoSource, KeyResolverConfig,
-    ParseError, SignatureAlgorithm, SignatureVerificationError, VerificationKey, VerifyContext,
-    X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info, verify_signature_with_pem_key,
+    DefaultKeyResolver, DsigError, DsigStatus, KeyInfoSource, KeyResolverConfig, ParseError,
+    SignatureAlgorithm, SignatureVerificationError, VerificationKey, VerifyContext, X509ChainError,
+    X509ChainOptions, X509DataInfo, parse_key_info, verify_signature_with_pem_key,
     verify_x509_certificate_chain,
 };
 
@@ -70,10 +70,10 @@ fn phaos_verification_key() -> VerificationKey {
 }
 
 #[test]
-fn phaos_bad_digest_reports_reference_mismatch_before_key_use() {
-    // Supplying a caller key mirrors xmlsec1/Samael semantics: document KeyInfo
-    // is advisory. The unrelated strong key is never used because digest
-    // validation fails first, proving the exact fail-fast boundary.
+fn phaos_bad_digest_vector_is_refused_at_the_key_before_any_reference() {
+    // The key is checked before SignedInfo or any Reference (W3C XML Signature
+    // Best Practices BP1): the donor's 1024-bit RSA key fails the default size
+    // policy, so the altered DigestValue is never reached.
     let xml = read_vector("signature-rsa-enveloped-bad-digest-val.xml");
     let mut policy = xml_sec::policy::VerificationPolicy::default();
     policy
@@ -81,18 +81,24 @@ fn phaos_bad_digest_reports_reference_mismatch_before_key_use() {
         .allowed_legacy_signature_algorithms
         .insert(SignatureAlgorithm::RsaSha1);
     let key = phaos_verification_key();
-    let result = VerifyContext::new()
+    let error = VerifyContext::new()
         .policy(policy)
         .key(&key)
         .verify(&xml)
-        .expect("bad DigestValue must be a completed invalid verification");
+        .expect_err("an undersized key is refused before reference work");
 
-    assert_eq!(
-        result.status,
-        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 0 })
+    assert!(
+        matches!(
+            error,
+            DsigError::Crypto(SignatureVerificationError::KeyPolicy(
+                PolicyViolation::KeySize {
+                    actual_bits: 1024,
+                    ..
+                }
+            ))
+        ),
+        "unexpected refusal: {error:?}"
     );
-    assert_eq!(result.signed_info_references.len(), 1);
-    assert_eq!(result.signed_info_references[0].status, result.status);
 }
 
 #[test]

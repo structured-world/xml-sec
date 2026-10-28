@@ -1049,23 +1049,28 @@ fn verification_reports_xslt_failures_as_reference_errors() {
         transform_error(sign(ITEMS, &builder(reference)).expect_err("terminating message aborts"));
     assert!(matches!(error, TransformError::Xslt(_)), "{error:?}");
 
+    // The stylesheet is authenticated with SignedInfo, so it must fail on the
+    // referenced data: it terminates only when that data gains a <stop/>.
+    let conditional = stylesheet(
+        r#"<xsl:template match="/"><xsl:if test="//stop"><xsl:message terminate="yes">stop</xsl:message></xsl:if><out/></xsl:template>"#,
+    );
     let signed = sign(
         ITEMS,
         &builder(
             ReferenceBuilder::new(DigestAlgorithm::Sha256)
                 .uri("")
                 .transform(Transform::Enveloped)
-                .transform(Transform::Xslt(values())),
+                .transform(Transform::Xslt(conditional)),
         ),
     )
-    .expect("valid stylesheet signs");
-    let broken = signed.replacen("<xsl:sort select=\".\"/>", "<xsl:sort select=\"(\"/>", 1);
+    .expect("the stylesheet runs to completion over the signed data");
+    let broken = signed.replacen("<item>a</item>", "<item>a</item><stop/>", 1);
     assert_ne!(broken, signed);
     let resolver = DefaultKeyResolver::default();
     let error = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&broken)
-        .expect_err("invalid XPath in the stylesheet");
+        .expect_err("a terminating stylesheet stops verification");
     assert!(
         matches!(
             error,

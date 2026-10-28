@@ -106,8 +106,8 @@ fn compile_is_deterministic_and_rejects_cycles() {
     // Stable discovery order makes equal-priority nodes deterministic while
     // a cycle is rejected before any operation stage can execute.
     let mut builder = OperationPlanBuilder::default();
-    let first = node(&mut builder, OperationStage::Digest);
-    let second = node(&mut builder, OperationStage::Digest);
+    let first = node(&mut builder, OperationStage::Canonicalization);
+    let second = node(&mut builder, OperationStage::Canonicalization);
     let final_node = node(&mut builder, OperationStage::Crypto);
     builder
         .add_dependency(final_node, second)
@@ -119,8 +119,8 @@ fn compile_is_deterministic_and_rejects_cycles() {
     assert_eq!(plan.order(), &[first, second, final_node]);
 
     let mut cyclic = OperationPlanBuilder::default();
-    let left = node(&mut cyclic, OperationStage::Digest);
-    let right = node(&mut cyclic, OperationStage::Digest);
+    let left = node(&mut cyclic, OperationStage::Canonicalization);
+    let right = node(&mut cyclic, OperationStage::Canonicalization);
     cyclic.add_dependency(left, right).expect("same-stage edge");
     cyclic.add_dependency(right, left).expect("same-stage edge");
     assert_eq!(
@@ -279,7 +279,7 @@ fn resource_identity_is_checked_before_the_action_runs() {
     let mut context = OperationExecutionContext::new((), (), None);
     let node = context.add_node(
         OperationNodeKind::Digest { index: 0 },
-        OperationStage::Digest,
+        OperationStage::AuthenticatedDependency,
         Some(expected),
     );
     context.compile().expect("plan");
@@ -304,7 +304,7 @@ fn resource_bound_node_requires_an_observed_identity() {
     let mut context = OperationExecutionContext::new((), (), None);
     let node = context.add_node(
         OperationNodeKind::Digest { index: 0 },
-        OperationStage::Digest,
+        OperationStage::AuthenticatedDependency,
         Some(expected),
     );
     context.compile().expect("plan");
