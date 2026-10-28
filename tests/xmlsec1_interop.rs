@@ -295,11 +295,15 @@ fn visa3d_direct_id_compatibility_matches_pinned_xmlsec1() {
         )
         .expect("Visa3D compatibility signing must succeed");
 
-    assert!(
-        VerifyContext::new()
-            .key(&verification_key)
-            .verify(&signed)
-            .is_err()
+    // The signature verifies first; the default semantics then cannot resolve
+    // the apostrophe ID, which fails only that Reference.
+    let default = VerifyContext::new()
+        .key(&verification_key)
+        .verify(&signed)
+        .expect("default verification must report the Reference result");
+    assert_eq!(
+        default.status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 0 })
     );
     let native = VerifyContext::new()
         .key(&verification_key)
@@ -1020,9 +1024,9 @@ fn xml_sec_verifies_xmlsec1_signatures_with_embedded_certificates() {
 }
 
 #[test]
-fn xml_sec_rejects_tampered_xmlsec1_signature_before_crypto_verification() {
-    // Mutating the signed Object must fail reference validation before the
-    // verifier reaches SignatureValue cryptography, matching XMLDSig fail-fast.
+fn xml_sec_rejects_tampered_xmlsec1_object_after_signature_verification() {
+    // Mutating the signed Object leaves SignatureValue valid, so the verifier
+    // authenticates SignedInfo first and then reports the Reference digest.
     if !xmlsec1::is_available() {
         eprintln!("{}", xmlsec1::skip_reason());
         return;
@@ -1036,7 +1040,7 @@ fn xml_sec_rejects_tampered_xmlsec1_signature_before_crypto_verification() {
     );
     let tampered = signed.replacen("some text", "modified text", 1);
     let resolver = DefaultKeyResolver::default();
-    let result = VerifyContext::new()
+    let result = cryptographic::context()
         .key_resolver(&resolver)
         .verify(&tampered)
         .expect("tampered XMLDSig must be a completed invalid verification");
