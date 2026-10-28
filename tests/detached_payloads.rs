@@ -804,3 +804,137 @@ fn completing_core_validation_processes_the_authenticated_manifest() {
     assert!(evidence.all_valid());
     assert!(evidence.accepted(&document).unwrap());
 }
+
+#[test]
+fn attested_digest_is_not_reported_as_computed_hash_use() {
+    // Hash-use inspection reports what the operation actually hashed. An
+    // attested digest was never computed here, unlike a streamed payload.
+    use xml_sec::xmldsig::HashUseState;
+    let payload = b"payload the caller paired by digest";
+    let document = signed(
+        &[Detached {
+            uri: "payload.bin",
+            base64: false,
+            digest: DigestAlgorithm::Sha256,
+            payload,
+        }],
+        false,
+    );
+    let mut policy = verification_policy();
+    policy.detached_digest_attestation = DetachedDigestAttestation::Accepted;
+    let digest = Sha256::digest(payload).to_vec();
+    for attest in [true, false] {
+        let (state, _, _) = session(&document, policy.clone(), |session| {
+            let reference = pending_references(session, DetachedCompletion::Complete)[0];
+            if attest {
+                session.attest_detached(reference, &digest, DetachedCompletion::Complete)?;
+            } else {
+                stream(
+                    session,
+                    &[reference],
+                    payload,
+                    8,
+                    DetachedCompletion::Complete,
+                )?;
+            }
+            let signature = session.evidence().signatures()[0].identity();
+            let selected = session.select_signature(signature)?;
+            let mut state = None;
+            selected
+                .visit_hash_uses(|usage| {
+                    if usage.instruction == reference {
+                        state = Some(usage.state);
+                    }
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            Ok(state)
+        });
+        let expected = if attest {
+            HashUseState::Unprocessed
+        } else {
+            HashUseState::Complete
+        };
+        assert_eq!(state, Some(expected), "attested: {attest}");
+    }
+}
+
+#[test]
+fn fail_fast_stops_inside_one_grouped_payload() {
+    // One payload paired with several References: under fail-fast the first
+    // failure in the caller's order leaves the following References
+    // unprocessed even when the same bytes would match them.
+    let document = signed(
+        &[
+            Detached {
+                uri: "a.bin",
+                base64: false,
+                digest: DigestAlgorithm::Sha256,
+                payload: b"first",
+            },
+            Detached {
+                uri: "b.bin",
+                base64: false,
+                digest: DigestAlgorithm::Sha256,
+                payload: b"second",
+            },
+        ],
+        false,
+    );
+    let ((), references, accepted) = session(&document, verification_policy(), |session| {
+        let pending = pending_references(session, DetachedCompletion::FailFast);
+        stream(
+            session,
+            &pending,
+            b"second",
+            3,
+            DetachedCompletion::FailFast,
+        )
+    });
+    assert_eq!(
+        references[1].status,
+        DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { ref_index: 1 })
+    );
+    assert_eq!(references[2].status, DsigStatus::NotProcessed);
+    assert!(!accepted);
+}
+
+#[test]
+fn listing_does_not_reparse_chains_that_cannot_stream() {
+    // A detached Reference with an XPath transform needs its bytes as XML, so
+    // it is never offered for streaming; listing must not parse its transforms
+    // again and spend the operation's XPath allowance on every call.
+    let payload = b"<doc/>";
+    let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(b"<doc/>"));
+    let template = format!(
+        r#"<root xml:base="https://example.test/data/"><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="doc.xml"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"#
+    );
+    let resources = HashMap::from([(
+        "https://example.test/data/doc.xml".to_owned(),
+        payload.to_vec(),
+    )]);
+    let xml = SignContext::new(&HmacSigningKey::new(SECRET.to_vec()).unwrap())
+        .policy(signing_policy())
+        .external_resources(&resources)
+        .sign_template(&template)
+        .unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
+    let mut policy = verification_policy();
+    policy.resources.max_xpath_expressions = 1;
+    let (listed, references, _) = session(&document, policy, |session| {
+        let mut listed = Vec::new();
+        for _ in 0..3 {
+            listed.push(
+                session
+                    .pending_detached(DetachedCompletion::Complete)?
+                    .len(),
+            );
+        }
+        Ok(listed)
+    });
+    assert_eq!(listed, [0, 0, 0]);
+    assert_eq!(
+        references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
+}

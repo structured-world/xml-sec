@@ -324,8 +324,9 @@ resident path and its ceilings.
   result and its References stay unavailable.
 - `attest_detached` completes a Reference without transforms with a digest the caller computed over
   the payload it paired. `VerificationPolicy::detached_digest_attestation` must be `Accepted`
-  (default `Forbidden`); the result records `ExternalPayload::Attested` and no fingerprint, so a
-  report never presents it as bytes this library hashed.
+  (default `Forbidden`); the result records `ExternalPayload::Attested` and no fingerprint, and
+  hash-use inspection does not report it as a computed digest, so a report never presents it as
+  bytes this library hashed.
 - Streamed bytes are bounded by `max_detached_payload_bytes` per payload and
   `max_detached_payload_total_bytes` per session. Streaming retains no input, so these bound hashing
   work, not memory.

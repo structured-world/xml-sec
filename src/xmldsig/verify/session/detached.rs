@@ -450,16 +450,22 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
                     .ok_or(MemoryError::WorkExceeded)?,
             )?;
         }
+        // Classify from the element layout first: a chain that cannot stream is
+        // never parsed again, so listing it spends no XPath parse allowance.
+        let Some(chain) = self.streamable_chain(node)? else {
+            return Ok(None);
+        };
         let reference = super::super::super::parse::parse_reference_with_xpath_budget(
             node,
             &mut self.budgets.xpath_parse.borrow_mut(),
         )
         .map_err(DsigError::ParseManifestReference)?;
-        let chain = match reference.transforms.as_slice() {
-            [] => DetachedChain::Octets,
-            [Transform::Base64Decode] => DetachedChain::Base64,
-            _ => return Ok(None),
-        };
+        if !matches!(
+            (chain, reference.transforms.as_slice()),
+            (DetachedChain::Octets, []) | (DetachedChain::Base64, [Transform::Base64Decode])
+        ) {
+            return Ok(None);
+        }
         let reference_index = match &self.evidence.signatures()[signature].result {
             Ok(result) => match set {
                 ReferenceSet::SignedInfo => result.signed_info_references[ordinal].reference_index,
@@ -477,6 +483,37 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             expected: reference.digest_value,
             chain,
         }))
+    }
+
+    /// The streamable chain a Reference's `Transforms` layout declares: none, or
+    /// exactly one Base64 transform. Anything else needs XML or other work.
+    fn streamable_chain(
+        &self,
+        node: crate::xml::dom::Node<'_, '_>,
+    ) -> Result<Option<DetachedChain>, DsigError> {
+        let Ok((transforms, _, _)) = super::super::super::parse::inspect_reference_layout(node)
+        else {
+            return Ok(None);
+        };
+        let Some(transforms) = transforms else {
+            return Ok(Some(DetachedChain::Octets));
+        };
+        let mut chain = None;
+        for child in transforms
+            .children()
+            .filter(crate::xml::dom::Node::is_element)
+        {
+            self.work.charge_work(1)?;
+            if chain.is_some()
+                || !child.has_tag_name((super::super::XMLDSIG_NS, "Transform"))
+                || child.attribute("Algorithm")
+                    != Some(super::super::super::transforms::BASE64_TRANSFORM_URI)
+            {
+                return Ok(None);
+            }
+            chain = Some(DetachedChain::Base64);
+        }
+        Ok(chain)
     }
 
     fn select_targets(
@@ -539,8 +576,15 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
                     crate::operation::OperationDecisionReason::ReferenceDigestRejected
                 },
             );
-            let node = self.view.resolve_node(target.reference)?;
-            super::super::VerificationCapture::computed_digest(&retained.capture, Some(node.id()))?;
+            // Hash-use inspection reports what this operation hashed; an
+            // attested digest was computed by the caller, not here.
+            if payload == ExternalPayload::Streamed {
+                let node = self.view.resolve_node(target.reference)?;
+                super::super::VerificationCapture::computed_digest(
+                    &retained.capture,
+                    Some(node.id()),
+                )?;
+            }
             let entry = &mut self.evidence.signatures[target.signature];
             let Ok(result) = &mut entry.result else {
                 continue;
@@ -555,6 +599,11 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             failed |= !accepted;
             if !affected.contains(&target.signature) {
                 affected.push(target.signature);
+            }
+            // Fail-fast stops at the first failure in the caller's order; the
+            // rest of this payload's References stay pending for stop_detached.
+            if failed && completion == DetachedCompletion::FailFast {
+                break;
             }
         }
         if failed && completion == DetachedCompletion::FailFast {
