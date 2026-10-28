@@ -82,7 +82,9 @@ The CLI offers explicit authorization metadata and signed Unix-second interval f
 the operator/application is responsible for authenticating the authority.
 Time settings accept signed Unix seconds or `{ seconds = -1, nanoseconds = 0 }`;
 effective output uses the exact seconds/nanoseconds form, including dates before
-1970. These are explicit clock values, not a civil-time/leap-second conversion.
+1970. These are explicit clock values, not a civil-time/leap-second conversion;
+they become `xml_sec::policy::Instant` labels, which cover every signed second
+on every platform.
 
 `PolicyCompileContext` promises external maps and expected-target integration.
 It does not supply keys, document targets, URI bytes, UTC facts or trust anchors.
@@ -95,8 +97,8 @@ configuration never changes global or already constructed processing contexts.
 `LoadLimits`. Defaults bound source bytes to 1 MiB and profiles to 256. Readers
 admit bytes before buffer growth and use a one-byte stack probe at the limit.
 These are loader limits for trusted configuration, not XML resource policy.
-The current XMLDSig graph still requires std; this task does not claim a new
-alloc-only XMLDSig path or remove existing alloc-only core/input configurations.
+Loading configuration needs `std`; the compiled policies it produces are the
+same typed values the core uses without `std`.
 
 `compile` receives a profile name, borrowed selected provider, compile context
 and optional application grant. `EffectivePolicy::compiled` exposes the actual

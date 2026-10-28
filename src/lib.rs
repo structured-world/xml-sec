@@ -17,6 +17,9 @@
 //! - **`XMLEnc`**: XML Encryption (encrypt + decrypt)
 //! - **X.509** — Certificate-based key extraction
 //!
+//! Without the default `std` feature, C14N and `XMLDSig` verification build on
+//! `core` and `alloc` alone; the caller then supplies the verification time.
+//!
 //! ## Quick Start
 //!
 //! ```rust

@@ -44,6 +44,6 @@ all-feature rustdoc, but no network oracle or token.
 `bash scripts/check-documentation.sh docs` runs only the core/config rustdoc gate.
 
 Public core rustdoc covers exported library items, not the unpublished private
-XPath/parser implementation kernels. Independent alloc-only XML-input and
-native-provider qualification remain separate gates; a documentation pass does
+XPath/parser implementation kernels. Alloc-only (no `std`) and native-provider
+qualification remain separate gates; a documentation pass does
 not replace interoperability, fuzzing or an audit.

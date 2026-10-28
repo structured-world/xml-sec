@@ -815,7 +815,7 @@ minimum salt length, and trailer field. Implicit external resource loading is no
 generation, selected provider, immutable policy, captured external resource map,
 authentication state and remaining operation budgets. Additional scoped storage,
 scalar inspection and terminal C14N scratch use the supplied current shared `Work`.
-This does not introduce alloc-only `XMLDSig` support.
+Sessions, like the rest of verification, are available without `std`.
 
 Select the exact successful Signature with `select_signature` when continuing
 under the producer's original Work. For an independently funded continuation, use
