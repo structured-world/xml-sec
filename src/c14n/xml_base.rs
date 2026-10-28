@@ -9,6 +9,7 @@
 //! This module provides a minimal RFC 3986 relative URI resolver — just
 //! enough for `xml:base` fixup. It is NOT a general-purpose URI library.
 
+#[cfg(any(feature = "xmldsig", test))]
 use alloc::string::String;
 use core::cell::Cell;
 

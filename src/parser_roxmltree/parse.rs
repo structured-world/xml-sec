@@ -358,12 +358,7 @@ impl<E> From<crate::xml::dom::ParseError> for Error<E> {
     }
 }
 
-#[cfg(feature = "std")]
-impl<E: fmt::Display + fmt::Debug> std::error::Error for Error<E> {
-    fn description(&self) -> &'static str {
-        "an XML parsing error"
-    }
-}
+impl<E: fmt::Display + fmt::Debug> core::error::Error for Error<E> {}
 
 /// Parsing options.
 pub struct ParsingOptions<'input> {

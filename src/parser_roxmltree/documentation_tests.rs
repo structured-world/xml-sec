@@ -369,7 +369,7 @@ fn lib_rs_example_30() -> impl std::process::Termination {
     assert_eq!(p.tail(), Some("\n    text2\n"));
 }
 
-// parse.rs:462; original runnable example.
+// parse.rs:457; original runnable example.
 #[test]
 fn parse_rs_example_1() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -377,7 +377,7 @@ fn parse_rs_example_1() -> impl std::process::Termination {
     assert_eq!(doc.descendants().count(), 2); // root node + `e` element node
 }
 
-// parse.rs:478; original runnable example.
+// parse.rs:473; original runnable example.
 #[test]
 fn parse_rs_example_2() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;

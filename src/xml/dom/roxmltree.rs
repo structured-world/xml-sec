@@ -2,6 +2,7 @@
 
 use super::storage::{Native, Storage, Values};
 use crate::parser_roxmltree as backend;
+use alloc::string::ToString;
 
 use super::{
     Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,

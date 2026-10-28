@@ -6,17 +6,13 @@
 
 use alloc::collections::TryReserveError;
 #[cfg(not(feature = "std"))]
-pub(crate) use alloc::collections::{
-    BTreeMap as Map, BTreeSet as Set,
-    btree_map::{self as map, Entry},
-    btree_set as set,
-};
+pub(crate) use alloc::collections::{BTreeMap as Map, BTreeSet as Set, btree_map::Entry};
+#[cfg(all(not(feature = "std"), feature = "xmldsig"))]
+pub(crate) use alloc::collections::{btree_map as map, btree_set as set};
 #[cfg(feature = "std")]
-pub(crate) use std::collections::{
-    HashMap as Map, HashSet as Set,
-    hash_map::{self as map, Entry},
-    hash_set as set,
-};
+pub(crate) use std::collections::{HashMap as Map, HashSet as Set, hash_map::Entry};
+#[cfg(all(feature = "std", feature = "xmldsig"))]
+pub(crate) use std::collections::{hash_map as map, hash_set as set};
 
 /// What [`Map`] and [`Set`] require of their keys in this build.
 #[cfg(feature = "std")]
@@ -40,6 +36,7 @@ pub(crate) trait Table: Sized {
 
     /// Entries the table holds storage for: allocated slots of a hash table,
     /// stored entries of a tree.
+    #[cfg(feature = "xmldsig")]
     fn entry_capacity(&self) -> usize;
 }
 
@@ -53,6 +50,7 @@ impl<K: Key, V> Table for Map<K, V> {
         self.try_reserve(additional)
     }
 
+    #[cfg(feature = "xmldsig")]
     fn entry_capacity(&self) -> usize {
         self.capacity()
     }
@@ -68,6 +66,7 @@ impl<T: Key> Table for Set<T> {
         self.try_reserve(additional)
     }
 
+    #[cfg(feature = "xmldsig")]
     fn entry_capacity(&self) -> usize {
         self.capacity()
     }
@@ -83,6 +82,7 @@ impl<K: Key, V> Table for Map<K, V> {
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig")]
     fn entry_capacity(&self) -> usize {
         self.len()
     }
@@ -98,6 +98,7 @@ impl<T: Key> Table for Set<T> {
         Ok(())
     }
 
+    #[cfg(feature = "xmldsig")]
     fn entry_capacity(&self) -> usize {
         self.len()
     }

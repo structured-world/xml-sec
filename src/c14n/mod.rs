@@ -41,6 +41,7 @@ use alloc::{
     vec::Vec,
 };
 
+#[cfg(feature = "xmldsig")]
 use sink::ByteSink;
 
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
