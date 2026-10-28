@@ -178,6 +178,56 @@ fn directional_diff_covers_minima_limits_and_disabled_operations() {
 }
 
 #[test]
+fn detached_payload_settings_compose_restrictively() {
+    // An ordinary layer only restricts: it cannot accept caller-attested
+    // digests the base profile forbids, just as it cannot enable external URIs.
+    // The streamed byte limits narrow like every other resource ceiling and
+    // both settings survive effective output.
+    use xml_sec::policy::DetachedDigestAttestation;
+    let old = effective(&config(""), "team");
+    let next = effective(
+        &config(
+            "[profiles.team.verification]\ndetached_digest_attestation='Accepted'\n[profiles.team.verification.resources]\nmax_detached_payload_bytes=1024\nmax_detached_payload_total_bytes=4096",
+        ),
+        "team",
+    );
+    let verification = next.compiled().verification().unwrap();
+    assert_eq!(
+        verification.detached_digest_attestation,
+        DetachedDigestAttestation::Forbidden
+    );
+    assert_eq!(verification.resources.max_detached_payload_bytes, 1024);
+    assert_eq!(
+        verification.resources.max_detached_payload_total_bytes,
+        4096
+    );
+    let changes = old.diff(&next);
+    for field in [
+        "verification.resources.max_detached_payload_bytes",
+        "verification.resources.max_detached_payload_total_bytes",
+    ] {
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.field == field && c.direction == Direction::Restrictive),
+            "{field}: {changes:?}"
+        );
+    }
+    let output = next.to_toml().unwrap();
+    assert!(output.contains("detached_digest_attestation = \"Forbidden\""));
+    let restored = Configuration::from_str(&output, LoadLimits::default()).unwrap();
+    assert_eq!(effective(&restored, "effective").to_toml().unwrap(), output);
+    assert!(
+        Configuration::from_str(
+            "schema_version=1\n[profiles.a]\nbase='Modern'\n[profiles.a.signing]\ndetached_digest_attestation='Accepted'",
+            LoadLimits::default(),
+        )
+        .is_err(),
+        "attestation applies to verification only"
+    );
+}
+
+#[test]
 fn bounded_readers_and_paths_admit_bytes_before_parsing() {
     // The exact boundary passes, one extra byte fails without heap growth for
     // that byte, and caller-selected paths are the only files consulted.

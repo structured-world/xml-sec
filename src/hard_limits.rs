@@ -36,6 +36,20 @@ pub(crate) const CANONICALIZED_SIGNATURE_DATA_BYTE_CEILING: usize = 32 * 1024 * 
 pub(crate) const EXTERNAL_RESOURCE_BYTE_CEILING: usize = 8 * 1024 * 1024;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const EXTERNAL_RESOURCE_TOTAL_BYTE_CEILING: usize = 32 * 1024 * 1024;
+/// Streamed detached payload bytes per Reference. Streaming retains no input,
+/// so this bounds hashing work only: 1 TiB, or the address width below 64 bits.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const DETACHED_PAYLOAD_BYTE_CEILING: usize = match 1_usize.checked_shl(40) {
+    Some(bytes) => bytes,
+    None => usize::MAX - 1,
+};
+/// Streamed detached payload bytes across one verified session: 4 TiB, or the
+/// address width below 64 bits.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+pub(crate) const DETACHED_PAYLOAD_TOTAL_BYTE_CEILING: usize = match 1_usize.checked_shl(42) {
+    Some(bytes) => bytes,
+    None => usize::MAX - 1,
+};
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 pub(crate) const ENCRYPTION_CIPHER_VALUE_BASE64_BYTE_CEILING: usize = XML_DOCUMENT_BYTE_CEILING;
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]

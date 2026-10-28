@@ -483,6 +483,10 @@ fn external_evidence_identifies_resolved_bytes_not_the_lexical_uri() {
         .signed_info_references[0];
     let expected: [u8; 32] = Sha256::digest(b"authenticated bytes").into();
     assert_eq!(reference.external_resource_fingerprint, Some(expected));
+    assert_eq!(
+        reference.external_payload,
+        Some(xml_sec::xmldsig::ExternalPayload::Resident)
+    );
     assert_eq!(reference.target_identity, None);
 }
 

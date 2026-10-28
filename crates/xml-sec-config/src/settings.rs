@@ -12,7 +12,7 @@ use xml_sec::xmlenc::{
 };
 use xml_sec::{
     policy::{
-        CertificateSignatureAlgorithms, CompiledPolicies, DsaKeyPolicy,
+        CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
         EcdsaSignatureValueEncoding, ExtendedKeyPurpose, HmacPolicy, KemContentAuthentication,
         KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind,
         KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition, PolicySet,
@@ -207,6 +207,7 @@ macro_rules! resource_fields {
         max_xml_nodes, max_xml_depth, max_xml_namespace_bindings, max_references, max_signatures,
         max_transforms_per_reference, max_xml_base_components, max_xml_base_resolution_bytes,
         max_canonicalized_bytes, max_external_resource_bytes, max_external_resource_total_bytes,
+        max_detached_payload_bytes, max_detached_payload_total_bytes,
         max_encryption_plaintext_bytes, max_xml_document_bytes, max_xml_parse_work_bytes,
         max_encryption_recipients, max_encryption_metadata_bytes, max_key_candidates,
         max_x509_work, max_x509_workspace_bytes, max_key_import_kdf_work, max_key_import_kdf_memory_bytes,
@@ -536,6 +537,14 @@ fn verification(p: &mut VerificationPolicy, t: &Table, syntax_only: bool) -> Res
         match key.as_str() {
             "key_trust" => key_trust(&mut p.key_trust, value)?,
             "key_sources" => key_sources(&mut p.key_sources, value)?,
+            "detached_digest_attestation" => {
+                p.detached_digest_attestation = choice!(
+                    value,
+                    key,
+                    DetachedDigestAttestation::Forbidden,
+                    DetachedDigestAttestation::Accepted
+                );
+            }
             _ => signature_fields!(p, key, value),
         }
     }
@@ -1060,12 +1069,17 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         uris: _,
         transforms: _,
         manifest_processing: _,
+        detached_digest_attestation: _,
         xml: _,
         resources: _,
     } = p;
     let mut t = signature_snapshot!(p);
     t.insert("key_trust".into(), trust_snapshot(&p.key_trust)?);
     t.insert("key_sources".into(), source_snapshot(p.key_sources));
+    t.insert(
+        "detached_digest_attestation".into(),
+        named(p.detached_digest_attestation),
+    );
     Ok(Value::Table(t))
 }
 
@@ -1344,10 +1358,17 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
         };
     }
     match (old.and_then(Value::as_str), new.and_then(Value::as_str)) {
-        (_, Some("RequireTrustedKey" | "Process" | "RequireAuthenticatedCipher" | "ExactOnly")) => {
-            Restrictive
-        }
-        (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
+        (
+            _,
+            Some(
+                "RequireTrustedKey"
+                | "Process"
+                | "RequireAuthenticatedCipher"
+                | "ExactOnly"
+                | "Forbidden",
+            ),
+        )
+        | (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
         _ => Relaxing,
     }
 }
