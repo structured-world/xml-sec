@@ -900,6 +900,125 @@ fn fail_fast_stops_inside_one_grouped_payload() {
 }
 
 #[test]
+fn streamed_base64_obeys_the_operation_base64_budgets() {
+    // The Base64 input and output allowances bound every Base64 transform of
+    // the operation; streaming the bytes instead of supplying them resident
+    // must reach the same refusal. A resource refusal ends the resident
+    // signature's processing, and it refuses the streamed payload, leaving
+    // its Reference unavailable.
+    let encoded = base64::engine::general_purpose::STANDARD.encode(b"decoded payload bytes");
+    let document = signed(
+        &[Detached {
+            uri: "payload.b64",
+            base64: true,
+            digest: DigestAlgorithm::Sha256,
+            payload: encoded.as_bytes(),
+        }],
+        false,
+    );
+    let refused = |error: &DsigError, expected: &str| {
+        matches!(
+            error,
+            DsigError::Policy(PolicyViolation::ResourceLimit { resource, .. }) if *resource == expected
+        )
+    };
+    for (input, output, resource) in [
+        (usize::MAX, 0, "Base64 transform output bytes"),
+        (
+            encoded.len() - 1,
+            usize::MAX,
+            "Base64 transform input bytes",
+        ),
+    ] {
+        let mut policy = verification_policy();
+        if input != usize::MAX {
+            policy.resources.max_base64_transform_input_bytes = input;
+        }
+        if output != usize::MAX {
+            policy.resources.max_base64_transform_output_bytes = output;
+        }
+        let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
+        let resident = HashMap::from([(
+            "https://example.test/data/payload.b64".to_owned(),
+            encoded.as_bytes().to_vec(),
+        )]);
+        let resident = VerifyContext::new()
+            .policy(policy.clone())
+            .key(&key)
+            .external_resources(&resident)
+            .verify_request(&document, &VerificationRequest::default())
+            .unwrap();
+        let resident_error = resident.signatures()[0].result().as_ref().unwrap_err();
+        assert!(
+            refused(resident_error, resource),
+            "resident: {resident_error:?}"
+        );
+        let (streamed, references, _) = session(&document, policy, |session| {
+            let reference = pending_references(session, DetachedCompletion::Complete)[0];
+            Ok(stream(
+                session,
+                &[reference],
+                encoded.as_bytes(),
+                5,
+                DetachedCompletion::Complete,
+            ))
+        });
+        let streamed_error = streamed.unwrap_err();
+        assert!(
+            refused(&streamed_error, resource),
+            "streamed: {streamed_error:?}"
+        );
+        assert_eq!(
+            references[1].status,
+            DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 1 })
+        );
+    }
+}
+
+#[test]
+fn undecodable_streamed_base64_is_not_a_computed_hash_use() {
+    // A Base64 chain that failed to decode produced no complete digest input;
+    // hash-use inspection must not report its digest as computed.
+    use xml_sec::xmldsig::HashUseState;
+    let document = signed(
+        &[Detached {
+            uri: "payload.b64",
+            base64: true,
+            digest: DigestAlgorithm::Sha256,
+            payload: b"cGF5bG9hZA==",
+        }],
+        false,
+    );
+    let (state, references, _) = session(&document, verification_policy(), |session| {
+        let reference = pending_references(session, DetachedCompletion::Complete)[0];
+        stream(
+            session,
+            &[reference],
+            b"cGF5bG9hZA==QQ==",
+            4,
+            DetachedCompletion::Complete,
+        )?;
+        let signature = session.evidence().signatures()[0].identity();
+        let selected = session.select_signature(signature)?;
+        let mut state = None;
+        selected
+            .visit_hash_uses(|usage| {
+                if usage.instruction == reference {
+                    state = Some(usage.state);
+                }
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        Ok(state)
+    });
+    assert_eq!(
+        references[1].status,
+        DsigStatus::Invalid(FailureReason::ReferenceProcessingFailure { ref_index: 1 })
+    );
+    assert_eq!(state, Some(HashUseState::Unprocessed));
+}
+
+#[test]
 fn listing_does_not_reparse_chains_that_cannot_stream() {
     // A detached Reference with an XPath transform needs its bytes as XML, so
     // it is never offered for streaming; listing must not parse its transforms

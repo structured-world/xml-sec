@@ -470,6 +470,18 @@ impl TransformExecutionBudget {
         self.c14n.max_bytes
     }
 
+    /// Charge encoded bytes a streamed Base64 transform accepts, against the
+    /// same operation allowance as resident Base64 input.
+    pub(crate) fn charge_base64_input(&self, bytes: usize) -> Result<(), TransformError> {
+        self.base64.charge_input(bytes)
+    }
+
+    /// Charge decoded bytes a streamed Base64 transform emits, against the
+    /// same operation allowance as resident Base64 output.
+    pub(crate) fn charge_base64_output(&self, bytes: usize) -> Result<(), TransformError> {
+        self.base64.charge_output(bytes)
+    }
+
     pub(crate) fn node_set_materialization(&self) -> &NodeSetMaterializationBudget {
         &self.node_set_materialization
     }

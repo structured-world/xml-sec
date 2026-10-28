@@ -130,6 +130,11 @@ impl Base64Stream {
         }
     }
 
+    /// Whether decoding still runs; a decoding error ends it.
+    fn active(&self) -> bool {
+        self.failure.is_none()
+    }
+
     /// Decode `chunk` and hand each decoded block to `sink`. A decoding error
     /// is kept and stops this stream only; octet digests continue.
     fn feed(
@@ -576,9 +581,16 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
                     crate::operation::OperationDecisionReason::ReferenceDigestRejected
                 },
             );
-            // Hash-use inspection reports what this operation hashed; an
-            // attested digest was computed by the caller, not here.
-            if payload == ExternalPayload::Streamed {
+            // Hash-use inspection reports what this operation hashed: not an
+            // attested digest, and not a chain that failed before a complete
+            // digest input existed. A mismatch was still computed.
+            if payload == ExternalPayload::Streamed
+                && matches!(
+                    status,
+                    DsigStatus::Valid
+                        | DsigStatus::Invalid(FailureReason::ReferenceDigestMismatch { .. })
+                )
+            {
                 let node = self.view.resolve_node(target.reference)?;
                 super::super::VerificationCapture::computed_digest(
                     &retained.capture,
@@ -732,6 +744,36 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
     }
 }
 
+/// Charge one decoded Base64 block against the operation's Base64 output
+/// allowance, then feed it to every Base64 digest state.
+fn feed_base64_states(
+    states: &mut [StreamState<'_>],
+    budget: &super::TransformExecutionBudget,
+    decoded: &[u8],
+) -> Result<(), DsigError> {
+    budget
+        .charge_base64_output(decoded.len())
+        .map_err(base64_budget_error)?;
+    for state in states {
+        if state.chain == DetachedChain::Base64 {
+            state
+                .state
+                .update(decoded)
+                .map_err(|error| DsigError::Reference(error.into()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A Base64 allowance refusal is a resource refusal of the whole completion,
+/// as it is of the whole operation on the resident path.
+fn base64_budget_error(error: super::TransformError) -> DsigError {
+    match error {
+        super::TransformError::Policy(violation) => DsigError::Policy(violation),
+        error => DsigError::Reference(super::ReferenceProcessingError::Transform(error)),
+    }
+}
+
 fn is_raw_sha256(state: &StreamState<'_>) -> bool {
     state.algorithm == DigestAlgorithm::Sha256 && state.chain == DetachedChain::Octets
 }
@@ -824,14 +866,17 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
             }
         }
         if let Some(base64) = &mut self.base64 {
+            let budget = &self.session.budgets.transforms;
+            if base64.active() {
+                // The raw encoded bytes are charged before filtering, exactly as
+                // the resident Base64 transform charges its input.
+                budget
+                    .charge_base64_input(chunk.len())
+                    .map_err(base64_budget_error)?;
+            }
             let states = &mut self.states;
             base64.feed(chunk, &mut |decoded| {
-                for state in states.iter_mut() {
-                    if state.chain == DetachedChain::Base64 {
-                        state.state.update(decoded).map_err(provider_error)?;
-                    }
-                }
-                Ok(())
+                feed_base64_states(states, budget, decoded)
             })?;
         }
         Ok(())
@@ -860,16 +905,10 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
         }
         let provider_error =
             |error: crate::provider::ProviderError| DsigError::Reference(error.into());
+        let budget = &session.budgets.transforms;
         let base64_failure = match base64 {
             Some(base64) => base64
-                .finish(&mut |decoded| {
-                    for state in &mut states {
-                        if state.chain == DetachedChain::Base64 {
-                            state.state.update(decoded).map_err(provider_error)?;
-                        }
-                    }
-                    Ok(())
-                })?
+                .finish(&mut |decoded| feed_base64_states(&mut states, budget, decoded))?
                 .is_some(),
             None => false,
         };

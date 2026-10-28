@@ -329,7 +329,9 @@ resident path and its ceilings.
   bytes this library hashed.
 - Streamed bytes are bounded by `max_detached_payload_bytes` per payload and
   `max_detached_payload_total_bytes` per session. Streaming retains no input, so these bound hashing
-  work, not memory.
+  work, not memory. A Base64 chain also spends the operation's
+  `max_base64_transform_input_bytes` and `max_base64_transform_output_bytes`, like a resident Base64
+  transform; exceeding them refuses the payload, as it ends resident processing.
 
 `DetachedCompletion::Complete` gives every Reference its own result. `DetachedCompletion::FailFast`
 requests no payload for a signature whose core validation already failed and, after the first
