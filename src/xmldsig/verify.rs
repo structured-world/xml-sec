@@ -5139,6 +5139,13 @@ fn manifest_reference_failure_reason(
     error: ReferenceProcessingError,
     ref_index: usize,
 ) -> FailureReason {
+    // Same Unavailable outcome as a SignedInfo Reference without caller bytes.
+    if matches!(
+        error,
+        ReferenceProcessingError::UriDereference(TransformError::ExternalResourceUnavailable(_))
+    ) {
+        return FailureReason::ReferenceUnavailable { ref_index };
+    }
     match error.into_policy_violation() {
         Ok(_) => FailureReason::ReferencePolicyViolation { ref_index },
         Err(_) => FailureReason::ReferenceProcessingFailure { ref_index },

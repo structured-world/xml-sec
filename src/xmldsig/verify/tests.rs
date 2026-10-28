@@ -2445,6 +2445,26 @@ fn verify_context_records_manifest_missing_uri_with_accepting_key() {
 }
 
 #[test]
+fn manifest_reference_without_caller_bytes_is_unavailable() {
+    // An external Reference whose bytes the caller has not supplied has the
+    // same Unavailable outcome in a Manifest as in SignedInfo.
+    let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+        xml.replacen("URI=\"#target\"", "URI=\"urn:absent\"", 1)
+    });
+    let result = VerifyContext::new()
+        .key(&AcceptingKey)
+        .process_manifests(true)
+        .allowed_uri_types(UriTypeSet::ALL)
+        .verify(&xml)
+        .expect("an unavailable Manifest payload is a per-reference result");
+    assert_eq!(result.status, DsigStatus::Valid);
+    assert_eq!(
+        result.manifest_references[0].status,
+        DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
+    );
+}
+
+#[test]
 fn verify_context_processes_authenticated_nested_manifests_in_object() {
     // XMLDSig §5.1 does not impose a direct Object-child restriction.
     // The original Reference authenticates this exact wrapped Manifest.
