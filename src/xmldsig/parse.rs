@@ -1757,7 +1757,10 @@ impl<'a> KeyInfoParsingSession<'a> {
             provider,
             &self.xml_base,
             self.resources,
-            document_base,
+            SourceContext {
+                document_base,
+                origins: None,
+            },
             None,
             &mut self.usage,
         )
@@ -1785,7 +1788,7 @@ impl<'a> KeyInfoParsingSession<'a> {
             provider,
             &self.xml_base,
             self.resources,
-            None,
+            SourceContext::default(),
             None,
             &mut self.usage,
         )
@@ -1818,10 +1821,38 @@ pub(crate) fn parse_key_info_with_policy_budgets(
         provider,
         xml_base_budget,
         resources,
-        None,
+        SourceContext::default(),
         allowed,
         &mut KeyInfoParseUsage::new(resources),
     )
+}
+
+/// Where a `KeyInfo` source came from, as a node of the document whose list
+/// holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceOrigin {
+    /// The source element itself.
+    Element(NodeId),
+    /// The `KeyInfoReference` or `RetrievalMethod` that read it from a
+    /// resource outside that document.
+    Retrieved(NodeId),
+}
+
+impl SourceOrigin {
+    pub(crate) fn retrieved(self) -> Self {
+        match self {
+            Self::Element(node) | Self::Retrieved(node) => Self::Retrieved(node),
+        }
+    }
+}
+
+/// Where parsed `KeyInfo` sources come from.
+#[derive(Default)]
+pub(crate) struct SourceContext<'a> {
+    /// Base for source URIs when the node has no XML Base of its own.
+    pub(crate) document_base: Option<&'a str>,
+    /// Receives the element of each returned source, index for index.
+    pub(crate) origins: Option<&'a mut Vec<SourceOrigin>>,
 }
 
 pub(crate) fn parse_key_info_in_session(
@@ -1829,7 +1860,7 @@ pub(crate) fn parse_key_info_in_session(
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
-    document_base: Option<&str>,
+    context: SourceContext<'_>,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
     usage: &mut KeyInfoParseUsage,
 ) -> Result<KeyInfo, ParseError> {
@@ -1840,7 +1871,7 @@ pub(crate) fn parse_key_info_in_session(
         provider,
         xml_base_budget,
         resources,
-        document_base,
+        context,
         allowed,
         usage,
     )
@@ -1851,10 +1882,14 @@ fn parse_key_info_contents_in_session(
     provider: &dyn crate::provider::CryptoProvider,
     xml_base_budget: &XmlBaseResolutionBudget,
     resources: &crate::policy::ResourcePolicy,
-    document_base: Option<&str>,
+    context: SourceContext<'_>,
     allowed: Option<&crate::policy::CertificateSignatureAlgorithms>,
     usage: &mut KeyInfoParseUsage,
 ) -> Result<KeyInfo, ParseError> {
+    let SourceContext {
+        document_base,
+        mut origins,
+    } = context;
     let mut sources = Vec::new();
     // KeyInfo is parsed before source selection, so preflight the cardinality
     // of every embedded key before decoding or algorithm-specific parsing.
@@ -1865,53 +1900,47 @@ fn parse_key_info_contents_in_session(
                 "KeyInfo contains too many child elements".into(),
             ));
         }
-        match (child.tag_name().namespace(), child.tag_name().name()) {
+        let source = match (child.tag_name().namespace(), child.tag_name().name()) {
             (Some(XMLDSIG_NS), "KeyName") => {
                 ensure_no_element_children(child, "KeyName")?;
                 let key_name =
                     collect_text_content_bounded(child, MAX_KEY_NAME_TEXT_LEN, "KeyName")?;
-                sources.push(KeyInfoSource::KeyName(key_name));
+                KeyInfoSource::KeyName(key_name)
             }
             (Some(XMLDSIG_NS), "KeyValue") => {
                 charge_embedded_key_candidate(&mut usage.embedded_candidates, resources)?;
-                let key_value = parse_key_value_dispatch(child)?;
-                sources.push(KeyInfoSource::KeyValue(key_value));
+                KeyInfoSource::KeyValue(parse_key_value_dispatch(child)?)
             }
-            (Some(XMLDSIG_NS), "X509Data") => {
-                let x509 = parse_x509_data_in_session(
-                    child,
-                    &mut usage.x509_binary_bytes,
-                    &mut usage.embedded_candidates,
-                    provider,
-                    resources,
-                    allowed,
-                    &usage.certificates,
-                )?;
-                sources.push(KeyInfoSource::X509Data(x509));
-            }
+            (Some(XMLDSIG_NS), "X509Data") => KeyInfoSource::X509Data(parse_x509_data_in_session(
+                child,
+                &mut usage.x509_binary_bytes,
+                &mut usage.embedded_candidates,
+                provider,
+                resources,
+                allowed,
+                &usage.certificates,
+            )?),
             (Some(XMLDSIG_NS), "RetrievalMethod") => {
                 ensure_no_non_whitespace_text(child, "RetrievalMethod")?;
-                sources.push(parse_retrieval_method_source(
-                    child,
-                    document_base,
-                    xml_base_budget,
-                    resources,
-                )?);
+                parse_retrieval_method_source(child, document_base, xml_base_budget, resources)?
             }
             (Some(XMLDSIG11_NS), "DEREncodedKeyValue") => {
                 charge_embedded_key_candidate(&mut usage.embedded_candidates, resources)?;
                 ensure_no_element_children(child, "DEREncodedKeyValue")?;
-                let der = decode_der_encoded_key_value_base64(child)?;
-                sources.push(KeyInfoSource::DerEncodedKeyValue(der));
+                KeyInfoSource::DerEncodedKeyValue(decode_der_encoded_key_value_base64(child)?)
             }
             (Some(XMLDSIG11_NS), "KeyInfoReference") => {
                 ensure_no_element_children(child, "KeyInfoReference")?;
                 ensure_no_non_whitespace_text(child, "KeyInfoReference")?;
                 let uri =
                     key_info_source_uri(child, "KeyInfoReference", document_base, xml_base_budget)?;
-                sources.push(KeyInfoSource::KeyInfoReference { uri });
+                KeyInfoSource::KeyInfoReference { uri }
             }
-            _ => {}
+            _ => continue,
+        };
+        sources.push(source);
+        if let Some(origins) = origins.as_deref_mut() {
+            origins.push(SourceOrigin::Element(child.id()));
         }
     }
 

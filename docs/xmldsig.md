@@ -1099,6 +1099,42 @@ absolute candidate ceiling. Direct `verify_with_key_receipt` calls preserve an
 observer's `WorkExceeded` from either event as terminal, even when a composite
 swallows it: no later leaf or observer callback runs and no success is returned.
 
+## `KeyInfo` Candidates
+
+A consumer that builds certificate paths with its own trust inputs needs the key material a
+verified signature offered, bound to the exact elements that verification read.
+`VerifiedSession::visit_key_info_candidates_in(signature, work, visitor)` (or
+`SelectedSignature::visit_key_info_candidates`) visits it for an authenticated Signature, in
+document order, as core verification parsed and materialized it under the operation's policy,
+budgets and provider. Nothing is parsed again and nothing is trusted: a candidate is evidence,
+never an anchor, and the receipt above is what tells which key verified.
+
+Each `KeyInfoCandidate` carries its `KeyInfoMaterial`:
+
+- `Certificate`: DER from an `X509Certificate`, or from a raw certificate `RetrievalMethod`.
+- `SubjectPublicKeyInfo`: DER from `dsig11:DEREncodedKeyValue`.
+- `KeyValue`: the parsed public parameters, including ones no supported algorithm can use.
+- `Unmaterialized`: a `RetrievalMethod` verification did not read, because its type is not
+  materialized or the caller supplied no resource for it.
+
+and its `KeyInfoOrigin`: `Element` names the material's own element (each certificate its
+`X509Certificate`, also when a same-document `KeyInfoReference` or `X509Data` `RetrievalMethod`
+led to it); `Retrieved` names the `KeyInfoReference` or `RetrievalMethod` that read the material
+from a caller-supplied resource, which has no element in this document. A `RetrievalMethod` that
+an external `KeyInfo` left unread is still a candidate, attributed to the reference that read that
+`KeyInfo`; these follow the document-order candidates. `KeyName` offers no material and is not a
+candidate.
+
+The call returns a `KeyInfoReading`: `Read` when every offered material was visited, `Absent` when
+the Signature has no `KeyInfo`, and `NotRead` when the key came from the caller, a resolver that
+ignores document hints, or a recipient mechanism, so verification never consulted `KeyInfo`. An
+empty visit therefore never stands for an unreadable `KeyInfo`. A Signature that did not
+authenticate is not selectable and offers no candidates.
+
+Scoped verification keeps the material by moving the parsed buffers into the session and reserving
+their capacity on its account, without copying; the reservation ends with the session, and
+collecting verification retains nothing. Each visit charges the supplied query `Work`.
+
 ## RSA-PSS Parameters
 
 The nine fixed RSA-PSS methods use MGF1 with the signature digest and a salt of that digest's

@@ -16,6 +16,8 @@ mod detached;
 pub use detached::*;
 mod hash_uses;
 pub use hash_uses::*;
+mod key_info;
+pub use key_info::*;
 mod key_receipt;
 pub use key_receipt::*;
 mod lookup;

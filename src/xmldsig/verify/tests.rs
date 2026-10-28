@@ -3401,6 +3401,7 @@ fn key_info_reference_materializes_an_allowed_empty_uri() {
         .with_view(|view| {
             materialize_key_info_references_with_budgets(
                 &mut key_info,
+                None,
                 &UriReferenceResolver::with_document_view(view, &[]),
                 &policy,
                 crate::provider::default_provider(),
@@ -3459,6 +3460,7 @@ fn raw_certificate_retrieval_retains_spent_operation_work() {
     };
     let result = materialize_retrieval_methods_with_budgets(
         &mut info,
+        None,
         &resolver,
         &policy,
         crate::provider::default_provider(),
@@ -3513,6 +3515,7 @@ fn empty_key_info_reference_participates_in_cycle_detection() {
         .with_view(|view| {
             materialize_key_info_references_with_budgets(
                 &mut key_info,
+                None,
                 &UriReferenceResolver::with_document_view(view, &[]),
                 &policy,
                 crate::provider::default_provider(),
@@ -3578,6 +3581,7 @@ fn key_info_materialization_shares_candidate_work_across_source_kinds() {
                 .with_external_resources(&resources);
             let mut outcome = materialize_key_info_references_with_budgets(
                 &mut key_info,
+                None,
                 &resolver,
                 &policy,
                 crate::provider::default_provider(),
@@ -3586,6 +3590,7 @@ fn key_info_materialization_shares_candidate_work_across_source_kinds() {
             )?;
             outcome.merge(materialize_retrieval_methods_with_budgets(
                 &mut key_info,
+                None,
                 &resolver,
                 &policy,
                 crate::provider::default_provider(),
@@ -3867,6 +3872,7 @@ fn materialize_external_key_info_chain(
             UriReferenceResolver::with_document_view(view, &[]).with_external_resources(&resources);
         materialize_key_info_references_with_budgets(
             &mut key_info,
+            None,
             &resolver,
             &policy,
             crate::provider::default_provider(),
@@ -3917,6 +3923,7 @@ fn materialize_external_key_info_bytes_with_limit(
             UriReferenceResolver::with_document_view(view, &[]).with_external_resources(&resources);
         materialize_key_info_references_with_budgets(
             &mut key_info,
+            None,
             &resolver,
             &policy,
             crate::provider::default_provider(),
@@ -4099,6 +4106,7 @@ fn retrieval_method_candidate_budget_includes_embedded_key_values() {
     policy.uris.retrieval_methods = UriTypeSet::ALL;
     let error = materialize_retrieval_methods_with_budgets(
         &mut key_info,
+        None,
         &resolver,
         &policy,
         crate::provider::default_provider(),
