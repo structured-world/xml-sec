@@ -54,14 +54,16 @@ pub(super) trait VerificationCapture {
     fn computed_digest(&self, _reference: Option<NodeId>) -> Result<(), MemoryError> {
         Ok(())
     }
-    /// The authenticated Signature's `KeyInfo` as key selection consumed it.
-    /// `origins` is present only when [`Self::RETAINS_KEY_INFO`] is set.
+    /// The authenticated Signature's `KeyInfo` as key selection consumed it,
+    /// then the hints external `KeyInfo` documents left unread. `origins` and
+    /// `unread` are filled only when [`Self::RETAINS_KEY_INFO`] is set.
     fn key_info(
         &self,
         _view: DocumentView<'_>,
         _reading: KeyInfoReading,
         _key_info: Option<KeyInfo>,
         _origins: Option<Vec<SourceOrigin>>,
+        _unread: Vec<(KeyInfoSource, Option<SourceOrigin>)>,
     ) -> Result<(), MemoryError> {
         Ok(())
     }
@@ -293,6 +295,7 @@ impl<W: Work> VerificationCapture for ScopedCapture<'_, W> {
         reading: KeyInfoReading,
         key_info: Option<KeyInfo>,
         origins: Option<Vec<SourceOrigin>>,
+        unread: Vec<(KeyInfoSource, Option<SourceOrigin>)>,
     ) -> Result<(), MemoryError> {
         self.retain_failure((|| {
             let mut candidates = self.work.vector();
@@ -301,6 +304,10 @@ impl<W: Work> VerificationCapture for ScopedCapture<'_, W> {
                 for (source, origin) in key_info.sources.into_iter().zip(origins) {
                     self.retain_source(view, &mut candidates, source, origin)?;
                 }
+            }
+            for (source, origin) in unread {
+                let origin = origin.expect("the retrieving reference attributes unread hints");
+                self.retain_source(view, &mut candidates, source, origin)?;
             }
             *self.key_info.borrow_mut() = Some(RetainedKeyInfo {
                 reading,

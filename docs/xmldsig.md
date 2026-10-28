@@ -1120,8 +1120,10 @@ Each `KeyInfoCandidate` carries its `KeyInfoMaterial`:
 and its `KeyInfoOrigin`: `Element` names the material's own element (each certificate its
 `X509Certificate`, also when a same-document `KeyInfoReference` or `X509Data` `RetrievalMethod`
 led to it); `Retrieved` names the `KeyInfoReference` or `RetrievalMethod` that read the material
-from a caller-supplied resource, which has no element in this document. `KeyName` offers no
-material and is not a candidate.
+from a caller-supplied resource, which has no element in this document. A `RetrievalMethod` that
+an external `KeyInfo` left unread is still a candidate, attributed to the reference that read that
+`KeyInfo`; these follow the document-order candidates. `KeyName` offers no material and is not a
+candidate.
 
 The call returns a `KeyInfoReading`: `Read` when every offered material was visited, `Absent` when
 the Signature has no `KeyInfo`, and `NotRead` when the key came from the caller, a resolver that

@@ -2881,6 +2881,7 @@ fn materialize_verification_hints(
     let mut materialization = budgets.key_info_materialization.borrow_mut();
     materialization.collect_encapsulation = true;
     materialization.encapsulation = None;
+    materialization.unread = origins.is_some().then(Vec::new);
     if let Some(node) = key_info_node {
         // A pinned key ignores lookup hints, not mechanism instructions.
         // Apply the same bounded reference discovery before key work.
@@ -3155,6 +3156,7 @@ struct VerificationCompletion<'a> {
     signed_info: super::parse::SignedInfo,
     key_info: Option<KeyInfo>,
     key_info_origins: Option<Vec<SourceOrigin>>,
+    key_info_unread: Vec<(super::parse::KeyInfoSource, Option<SourceOrigin>)>,
     key_info_reading: KeyInfoReading,
     plan_nodes: VerificationPlanNodes,
     encapsulation: Option<ResolvedEncapsulation>,
@@ -3477,6 +3479,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
         completion.key_info_reading,
         completion.key_info.take(),
         completion.key_info_origins.take(),
+        std::mem::take(&mut completion.key_info_unread),
     )?;
     finish_authenticated_verification(
         operation,
@@ -3544,12 +3547,13 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             )
         },
     )?;
-    let encapsulation = operation
-        .budgets()
-        .key_info_materialization
-        .borrow_mut()
-        .encapsulation
-        .take();
+    let (encapsulation, key_info_unread) = {
+        let mut materialization = operation.budgets().key_info_materialization.borrow_mut();
+        (
+            materialization.encapsulation.take(),
+            materialization.unread.take().unwrap_or_default(),
+        )
+    };
     check_verification_encapsulation(encapsulation.as_ref(), ctx)?;
     let canonical_signed_info = operation.run(plan_nodes.canonicalization, || {
         canonicalize_verification_signed_info(signed_info_node, &signed_info.c14n_method, operation)
@@ -3567,6 +3571,7 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             signed_info,
             key_info,
             key_info_origins,
+            key_info_unread,
             key_info_reading,
             plan_nodes,
             encapsulation,
@@ -3692,6 +3697,11 @@ struct KeyInfoMaterializationState {
     reference_depth_base: usize,
     encapsulation_target: Option<(super::uri::TraversalDocumentIdentity, NodeId, NodeId)>,
     encapsulation: Option<ResolvedEncapsulation>,
+    // Present while candidates are retained: RetrievalMethods left unread
+    // inside an external KeyInfo. They never reach key selection, which would
+    // resolve them against the wrong document; the top-level reference
+    // attributes them.
+    unread: Option<Vec<(super::parse::KeyInfoSource, Option<SourceOrigin>)>>,
 }
 
 struct ResolvedEncapsulation {
@@ -4007,9 +4017,17 @@ fn materialize_external_key_info<P: KeyInfoReferencePolicy>(
         )?);
         // RetrievalMethod nodes are meaningful only in the document
         // whose resolver owns their same-document URI context.
-        referenced.sources.retain(|source| {
-            !matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. })
-        });
+        let retrieval = |source: &super::parse::KeyInfoSource| {
+            matches!(source, super::parse::KeyInfoSource::RetrievalMethod { .. })
+        };
+        if let Some(unread) = materialization.unread.as_mut() {
+            let removed = referenced
+                .sources
+                .extract_if(.., |source| retrieval(source));
+            unread.extend(removed.map(|source| (source, None)));
+        } else {
+            referenced.sources.retain(|source| !retrieval(source));
+        }
         Ok((referenced, nested_outcome))
     })
 }
@@ -4052,6 +4070,34 @@ fn parse_same_document_key_info<P: KeyInfoReferencePolicy>(
         },
     )?;
     Ok((referenced, origins))
+}
+
+/// Materialize an external `KeyInfoReference`. Material from another document
+/// has no element in this one: when `origin` is tracked, it is attributed to
+/// the instruction that retrieved it, as are the hints that document left unread.
+fn materialize_attributed_external_key_info<P: KeyInfoReferencePolicy>(
+    uri: &str,
+    origin: Option<SourceOrigin>,
+    resolver: &UriReferenceResolver<'_>,
+    context: &mut KeyInfoReferenceMaterializationContext<'_, '_, P>,
+    materialization: &mut KeyInfoMaterializationState,
+    depth: usize,
+) -> Result<
+    (KeyInfo, Option<Vec<SourceOrigin>>, RetrievalMaterialization),
+    SignatureVerificationPipelineError,
+> {
+    let unread_before = materialization.unread.as_ref().map_or(0, Vec::len);
+    let (referenced, outcome) =
+        materialize_external_key_info(uri, resolver, context, materialization, depth)?;
+    let origins = origin.map(|origin| {
+        if let Some(unread) = materialization.unread.as_mut() {
+            for (_, unread) in &mut unread[unread_before..] {
+                *unread = Some(origin.retrieved());
+            }
+        }
+        vec![origin.retrieved(); referenced.sources.len()]
+    });
+    Ok((referenced, origins, outcome))
 }
 
 fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
@@ -4123,17 +4169,14 @@ fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
             )?;
             (referenced, origins, RetrievalMaterialization::default())
         } else {
-            let (referenced, outcome) = materialize_external_key_info(
+            materialize_attributed_external_key_info(
                 &uri,
+                origin,
                 resolver,
                 context,
                 materialization,
                 next_depth,
-            )?;
-            // Material from another document has no element in this one;
-            // it is attributed to the instruction that retrieved it.
-            let origins = origin.map(|origin| vec![origin.retrieved(); referenced.sources.len()]);
-            (referenced, origins, outcome)
+            )?
         };
         if is_same_document {
             nested_outcome.merge(materialize_key_info_visit(

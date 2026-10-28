@@ -277,6 +277,50 @@ fn external_material_is_attributed_to_its_retrieving_instruction() {
 }
 
 #[test]
+fn an_unread_hint_inside_external_key_info_is_still_a_candidate() {
+    // An external KeyInfo may offer a certificate next to a RetrievalMethod
+    // whose resource the caller did not supply. Verification succeeds with the
+    // certificate; the unread hint must still be reported, attributed to the
+    // reference that read that KeyInfo, so `Read` stays complete.
+    let key_info = format!(
+        "<KeyInfo xmlns=\"{DS}\">\
+         <dsig11:KeyInfoReference xmlns:dsig11=\"{DS11}\" Id=\"external\" \
+           URI=\"https://example.test/keyinfo.xml\"/>\
+         </KeyInfo>"
+    );
+    let document = signed_with(&key_info, "");
+    let external_key_info = format!(
+        "<KeyInfo xmlns=\"{DS}\"><X509Data>{}</X509Data>\
+         <RetrievalMethod URI=\"https://example.test/missing.der\" \
+           Type=\"http://www.w3.org/2000/09/xmldsig#rawX509Certificate\"/></KeyInfo>",
+        certificate_element("elsewhere", &signing_certificate()),
+    );
+    let resources = HashMap::from([(
+        "https://example.test/keyinfo.xml".to_owned(),
+        external_key_info.into_bytes(),
+    )]);
+    let mut policy = cryptographic_only();
+    policy.uris.retrieval_methods = UriTypeSet::ALL;
+    policy.uris.key_info_references = UriTypeSet::ALL;
+    let resolver = DefaultKeyResolver::default();
+    let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..VerificationRequest::default()
+    };
+    let (reading, seen) = visit(&document, &context, &request);
+    assert_eq!(reading, KeyInfoReading::Read);
+    let external = KeyInfoOrigin::Retrieved(id(&document, "external"));
+    assert_eq!(
+        seen,
+        [
+            Seen::Certificate(external, signing_certificate()),
+            Seen::Unmaterialized(external, "https://example.test/missing.der".to_owned()),
+        ]
+    );
+}
+
+#[test]
 fn unauthenticated_signatures_offer_no_candidates() {
     // A Signature that failed verification is not selectable: its KeyInfo
     // claims stay unanswered rather than looking like offered keys.

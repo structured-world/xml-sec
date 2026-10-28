@@ -6,6 +6,7 @@ use crate::xmldsig::parse::KeyValueInfo;
 
 /// Whether core verification read the Signature's `KeyInfo`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyInfoReading {
     /// The Signature has no `KeyInfo`.
     Absent,
@@ -19,12 +20,14 @@ pub enum KeyInfoReading {
 
 /// Where an offered key material is in the verified document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum KeyInfoOrigin {
     /// Its own element: `X509Certificate`, `KeyValue`, `DEREncodedKeyValue`,
     /// or a `RetrievalMethod` verification did not read.
     Element(NodeIdentity),
-    /// Read from a caller-supplied resource through this `KeyInfoReference`
-    /// or `RetrievalMethod`; the material has no element in this document.
+    /// Found in a caller-supplied resource read through this
+    /// `KeyInfoReference` or `RetrievalMethod`, including a hint an external
+    /// `KeyInfo` left unread; the material has no element in this document.
     Retrieved(NodeIdentity),
 }
 
@@ -52,6 +55,7 @@ pub enum KeyInfoMaterial<'a> {
 
 /// One offered key material and where it is.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct KeyInfoCandidate<'a> {
     /// Element or retrieving instruction in the verified document.
     pub origin: KeyInfoOrigin,
@@ -82,8 +86,9 @@ impl RetainedCandidate {
 
 impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     /// Visit the key material an authenticated Signature's `KeyInfo` offered,
-    /// in document order, as core verification read it: no second parse, no
-    /// trust decision. Selection and each visit charge `work`.
+    /// as core verification read it: no second parse, no trust decision.
+    /// Sources come in document order, followed by the hints external
+    /// `KeyInfo` documents left unread. Selection and each visit charge `work`.
     ///
     /// Returns whether verification read `KeyInfo`; candidates exist only for
     /// [`KeyInfoReading::Read`].
