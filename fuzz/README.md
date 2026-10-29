@@ -37,7 +37,7 @@ cargo nextest run --manifest-path fuzz/Cargo.toml --lib
 ```
 
 `xmlsec_oracle` requires an explicit `XMLSEC1_BIN` built by
-`scripts/install-xmlsec1.sh`, including its reported library path. It runs only
+`cargo run -p xml-sec-tools -- install-xmlsec1`, including its library path. It runs only
 fixed offline operations in an isolated temporary directory; a missing oracle,
 nonzero exit or ten-second timeout is a failure, never an implicit skip. Native
 C code is an independent test oracle only, not a product dependency.

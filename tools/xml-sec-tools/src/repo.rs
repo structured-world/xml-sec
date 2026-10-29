@@ -14,7 +14,8 @@ pub(crate) fn root() -> PathBuf {
 }
 
 /// One planned process: a label for logs, the program, its arguments, the
-/// environment it adds and the inherited variables it removes.
+/// environment it adds, the inherited variables it removes and the directory
+/// it runs in (the repository root unless given).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Step {
     pub(crate) label: String,
@@ -22,6 +23,7 @@ pub(crate) struct Step {
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
     pub(crate) unset: Vec<String>,
+    pub(crate) directory: Option<PathBuf>,
 }
 
 impl Step {
@@ -32,7 +34,14 @@ impl Step {
             args: args.iter().map(|&arg| arg.to_owned()).collect(),
             env: Vec::new(),
             unset: Vec::new(),
+            directory: None,
         }
+    }
+
+    /// Runs the step in `directory` instead of the repository root.
+    pub(crate) fn in_directory(mut self, directory: &Path) -> Self {
+        self.directory = Some(directory.to_owned());
+        self
     }
 
     /// Adds `key=value` to the step's environment.
@@ -74,8 +83,11 @@ pub(crate) fn command(step: &Step) -> Result<Command, String> {
     let mut command = Command::new(program);
     command
         .args(&step.args)
-        .envs(step.env.iter().map(|(key, value)| (key, value)))
-        .current_dir(root());
+        .envs(step.env.iter().map(|(key, value)| (key, value)));
+    match &step.directory {
+        Some(directory) => command.current_dir(directory),
+        None => command.current_dir(root()),
+    };
     for key in &step.unset {
         command.env_remove(key);
     }

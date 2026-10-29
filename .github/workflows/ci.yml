@@ -96,7 +96,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2 cmake zlib1g-dev liblzma-dev
-          bash scripts/install-xmlsec1.sh
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Execute every workspace target and enforce canonical coverage
         run: cargo run --quiet -p xml-sec-tools -- hardening coverage "$RUNNER_TEMP/coverage"
@@ -314,21 +314,21 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
-      - name: Build pinned xmlsec1 for external-oracle tests
-        env:
-          XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
-          XMLSEC1_MODERN_ORACLE: "1"
-        run: |
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-          scripts/install-xmlsec1.sh
-          "$XMLSEC1_BIN" --version
-          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
           # One complete dependency graph owns writes, not a race between
           # partial feature matrices for the same immutable entry.
           save: ${{ matrix.block == 'extended' }}
+      - name: Build pinned xmlsec1 for external-oracle tests
+        env:
+          XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
+          XMLSEC1_MODERN_ORACLE: "1"
+        run: |
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
+          "$XMLSEC1_BIN" --version
+          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Qualify isolated build, lint, tests and doctests
         env:
           PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
@@ -403,7 +403,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config openjdk-21-jdk
-          bash scripts/install-xmlsec1.sh
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
       - name: Verify live XMLDSig and XAdES corpus results
         run: cargo run --quiet -p xml-sec-tools -- xades check --output "$RUNNER_TEMP/xades-interop"
       - uses: actions/upload-artifact@v7

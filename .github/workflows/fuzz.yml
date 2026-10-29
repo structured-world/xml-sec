@@ -89,7 +89,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-          bash scripts/install-xmlsec1.sh
+          cargo +nightly run --quiet -p xml-sec-tools -- install-xmlsec1
           {
             echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
             echo "LD_LIBRARY_PATH=$XMLSEC1_PREFIX/lib"
@@ -150,7 +150,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2
-          bash scripts/install-xmlsec1.sh
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           {
             echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
             echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl"

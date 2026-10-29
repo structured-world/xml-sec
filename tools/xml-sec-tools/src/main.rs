@@ -8,6 +8,7 @@ mod documentation;
 mod donor_fixtures;
 mod fuzz_security;
 mod hardening;
+mod install_xmlsec1;
 mod kernel_examples;
 mod libxslt_fixtures;
 mod pedantic_lints;
@@ -44,6 +45,7 @@ commands:
   donor-fixtures [--xmlenc-corpora | PATH...]
   fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
   hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]
+  install-xmlsec1
   kernel-examples roxmltree|xmloxide ROOT SOURCE...
   libxslt-fixtures [--check]
   pedantic-lints TOOLCHAIN...
@@ -73,6 +75,7 @@ fn main() -> ExitCode {
         Some("donor-fixtures") => donor_fixtures::run(args),
         Some("fuzz-security") => fuzz_security::run(args),
         Some("hardening") => hardening::run(args),
+        Some("install-xmlsec1") => install_xmlsec1::run(args),
         Some("kernel-examples") => kernel_examples::run(args).map_err(Failure::from),
         Some("libxslt-fixtures") => libxslt_fixtures::run(args),
         Some("pedantic-lints") => pedantic_lints::run(args),

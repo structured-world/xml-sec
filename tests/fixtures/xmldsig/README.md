@@ -7,7 +7,7 @@ the commit recorded in the canonical
 [`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
 pin; upstream had bumped the
 version but had not published a release tag when this snapshot was pinned.
-`scripts/install-xmlsec1.sh` verifies both that source commit and the live
+`xml-sec-tools install-xmlsec1` verifies both that source commit and the live
 `xmlsec1 --version` output before reusing a cached development installation.
 
 ## Importing Vectors

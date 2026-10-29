@@ -558,10 +558,9 @@ fn execute(request: &Request) -> Result<(), Failure> {
             },
             PathBuf::from,
         );
-    status_in(
+    tool_step(
         &root,
-        "bash",
-        &["scripts/install-xmlsec1.sh"],
+        &["install-xmlsec1"],
         &[("XMLSEC1_PREFIX".into(), prefix.display().to_string())],
     )?;
     refresh_competitor_lock(&root)?;

@@ -173,7 +173,7 @@ After checking out the revision in `compatibility/libxmlsec1-1.3.13-donor-commit
 the macOS readiness commands are:
 
 ```sh
-XMLSEC1_SOURCE_DIR="$PWD/donors/xmlsec" XMLSEC1_PREFIX="$PWD/.tools/xmlsec1-pr" XMLSEC1_MODERN_ORACLE=1 bash scripts/install-xmlsec1.sh
+XMLSEC1_SOURCE_DIR="$PWD/donors/xmlsec" XMLSEC1_PREFIX="$PWD/.tools/xmlsec1-pr" XMLSEC1_MODERN_ORACLE=1 cargo run -p xml-sec-tools -- install-xmlsec1
 XMLSEC1_BIN="$PWD/.tools/xmlsec1-pr/bin/xmlsec1" OPENSSL_BIN="$PWD/.tools/xmlsec1-pr/bin/openssl" DYLD_LIBRARY_PATH="$PWD/.tools/xmlsec1-pr/lib" cargo nextest run --workspace --no-fail-fast --status-level fail --final-status-level fail
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
