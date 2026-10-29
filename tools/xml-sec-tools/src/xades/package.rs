@@ -166,10 +166,28 @@ pub(crate) fn tracked(root: &Path, pathspec: &str) -> Result<Vec<String>, String
         .collect())
 }
 
+/// Variables that make Git use another repository than its working directory.
+pub(crate) const GIT_LOCATION: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+];
+
+/// Git on the repository at `root`.
+pub(crate) fn git_command(root: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    for variable in GIT_LOCATION {
+        command.env_remove(variable);
+    }
+    command.args(args).current_dir(root);
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
+    let output = git_command(root, args)
         .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|error| format!("git: {error}"))?;
@@ -215,6 +233,25 @@ pub(crate) fn source_commit(root: &Path, names: &[String]) -> Result<String, Str
     Ok(String::from_utf8_lossy(&head).trim_end().to_owned())
 }
 
+/// The archived files at `names` followed by the `COMMIT` file, and that
+/// commit; refused unless every file is committed unchanged.
+pub(crate) fn archive_entries(
+    root: &Path,
+    names: &[String],
+) -> Result<(Vec<Entry>, String), String> {
+    let commit = source_commit(root, names)?;
+    let mut entries = names
+        .iter()
+        .map(|name| Entry::file(root, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.push(Entry {
+        name: COMMIT.into(),
+        data: format!("{commit}\n").into_bytes(),
+        mode: 0o644,
+    });
+    Ok((entries, commit))
+}
+
 /// One archived file.
 pub(crate) struct Entry {
     name: String,
@@ -231,6 +268,12 @@ impl Entry {
             data: read(&path)?,
             mode: mode(&path)?,
         })
+    }
+
+    /// The archived name and bytes.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&str, &[u8]) {
+        (&self.name, &self.data)
     }
 }
 
@@ -377,16 +420,7 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
         .strip_prefix(&corpus.root)
         .map_err(|error| error.to_string())?;
     names.push(inventoried.display().to_string());
-    let commit = source_commit(&corpus.root, &names)?;
-    let mut entries = names
-        .iter()
-        .map(|name| Entry::file(&corpus.root, name))
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.push(Entry {
-        name: COMMIT.into(),
-        data: format!("{commit}\n").into_bytes(),
-        mode: 0o644,
-    });
+    let (entries, commit) = archive_entries(&corpus.root, &names)?;
     let listing = listing(&entries);
     archive(&output, &entries, &listing)?;
     println!(

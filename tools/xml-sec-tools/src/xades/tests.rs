@@ -1,14 +1,20 @@
 use super::binding::{analyze_octets, binding_facts};
 use super::check::{check_expectations, check_goldens, check_inventory};
 use super::dss::profile_binding;
-use super::package::{Evidence, source_commit};
+use super::package::{Entry, Evidence, GIT_LOCATION, archive_entries, git_command, source_commit};
 use super::{Corpus, DS, compare, debug_buffer, probe_executable, resolved_versions};
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
+use std::ffi::OsStr;
 use std::path::Path;
 
 fn git(root: &Path, args: &[&str]) -> String {
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    // An inherited repository location would redirect the temporary repository.
+    for variable in GIT_LOCATION {
+        command.env_remove(variable);
+    }
+    let output = command
         .args([
             "-c",
             "user.name=test",
@@ -21,6 +27,53 @@ fn git(root: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(output.status.success(), "git {args:?}");
     String::from_utf8(output.stdout).unwrap()
+}
+
+#[test]
+fn packaging_git_ignores_an_inherited_repository_location() {
+    // GIT_DIR or GIT_WORK_TREE from a hook or a parent Git command would
+    // override the working directory and record another tree's HEAD.
+    let command = git_command(Path::new("/repo"), &["rev-parse", "HEAD"]);
+    let removed: Vec<&OsStr> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(key, _)| key)
+        .collect();
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        assert!(removed.contains(&OsStr::new(variable)), "{variable}");
+    }
+    assert_eq!(command.get_current_dir(), Some(Path::new("/repo")));
+}
+
+#[test]
+fn the_archive_entries_carry_their_commit_and_refuse_changed_files() {
+    // The packager's own entry list names HEAD in COMMIT, and refuses to be
+    // built from a file that differs from that commit.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    write(&root.join("corpus/a.xml"), "<a/>");
+    git(root, &["add", "corpus/a.xml"]);
+    git(root, &["commit", "--quiet", "-m", "corpus"]);
+    let names = vec!["corpus/a.xml".to_owned()];
+    let (entries, commit) = archive_entries(root, &names).unwrap();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(commit, head.trim_end());
+    let recorded: Vec<(&str, &[u8])> = entries.iter().map(Entry::parts).collect();
+    assert_eq!(
+        recorded,
+        [
+            ("corpus/a.xml", &b"<a/>"[..]),
+            ("COMMIT", format!("{commit}\n").as_bytes())
+        ]
+    );
+    write(&root.join("corpus/a.xml"), "<b/>");
+    assert!(archive_entries(root, &names).is_err());
 }
 
 #[test]
