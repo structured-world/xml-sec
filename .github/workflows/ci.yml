@@ -223,7 +223,7 @@ jobs:
         with:
           domain: ordinary
       - name: Check native CLI upstream fixture snapshot
-        run: scripts/import-xmlsec1-cli-fixtures.sh --check
+        run: cargo run --quiet -p xml-sec-tools -- donor-fixtures --cli --check
       - name: Check maintained XML parser kernels and the vendored ML-DSA
         run: |
           bash scripts/import-xml-backends.sh roxmltree --verify

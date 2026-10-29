@@ -1,10 +1,12 @@
-//! `donor-fixtures [--xmlenc-corpora | PATH...]`: copies libxmlsec1 donor test
-//! data into `tests/fixtures`. Each target is staged completely and then
-//! swapped in, so a failed import keeps the last known-good copy.
+//! `donor-fixtures [--xmlenc-corpora | PATH... | --cli [--check]]`: copies
+//! libxmlsec1 donor test data into the repository. Each target is staged
+//! completely and then swapped in, so a failed import keeps the last
+//! known-good copy.
 
 use crate::repo::{Failure, root};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod cli;
 #[cfg(test)]
 mod tests;
 
@@ -365,13 +367,13 @@ pub(crate) fn execute(
 }
 
 pub(crate) fn run(args: impl Iterator<Item = String>) -> Result<(), Failure> {
+    let args: Vec<String> = args.collect();
+    if let Some(rest) = args.strip_prefix(&["--cli".to_owned()]) {
+        return Ok(cli::run(rest)?);
+    }
     let root = root();
     let donor_root = std::env::var_os("XMLSEC_DONOR_ROOT")
         .filter(|path| !path.is_empty())
         .map_or_else(|| root.join("donors/xmlsec/tests"), PathBuf::from);
-    Ok(execute(
-        &donor_root,
-        &root.join("tests/fixtures"),
-        args.collect(),
-    )?)
+    Ok(execute(&donor_root, &root.join("tests/fixtures"), args)?)
 }
