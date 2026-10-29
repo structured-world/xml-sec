@@ -13,14 +13,15 @@ pub(crate) fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// One planned process: a label for logs, the program, its arguments and
-/// the environment it adds.
+/// One planned process: a label for logs, the program, its arguments, the
+/// environment it adds and the inherited variables it removes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Step {
     pub(crate) label: String,
     pub(crate) program: String,
     pub(crate) args: Vec<String>,
     pub(crate) env: Vec<(String, String)>,
+    pub(crate) unset: Vec<String>,
 }
 
 impl Step {
@@ -30,12 +31,19 @@ impl Step {
             program: program.into(),
             args: args.iter().map(|&arg| arg.to_owned()).collect(),
             env: Vec::new(),
+            unset: Vec::new(),
         }
     }
 
     /// Adds `key=value` to the step's environment.
     pub(crate) fn with_env(mut self, key: &str, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Removes `key` from the environment the step inherits.
+    pub(crate) fn without_env(mut self, key: &str) -> Self {
+        self.unset.push(key.into());
         self
     }
 }
@@ -68,6 +76,9 @@ pub(crate) fn command(step: &Step) -> Result<Command, String> {
         .args(&step.args)
         .envs(step.env.iter().map(|(key, value)| (key, value)))
         .current_dir(root());
+    for key in &step.unset {
+        command.env_remove(key);
+    }
     Ok(command)
 }
 

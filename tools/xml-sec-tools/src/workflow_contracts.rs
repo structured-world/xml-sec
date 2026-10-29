@@ -195,7 +195,7 @@ fn ordinary_jobs_have_one_matrix_writer_and_separate_instrumented_domains() {
     assert!(workflow.contains("save: ${{ matrix.block == 'extended' }}"));
     assert!(workflow.contains("save: ${{ !matrix.minimal }}"));
     assert!(pattern(r"domain: coverage\n\s+save: 'true'").is_match(&workflow));
-    assert!(workflow.contains("check-xslt-conformance.sh --cache-managed"));
+    assert!(workflow.contains("xslt-conformance --cache-managed"));
     assert!(!workflow.contains("run: cargo clean"));
     assert!(workflow.contains("CARGO_TARGET_DIR: ${{ runner.temp }}/xslt-measurement"));
 }

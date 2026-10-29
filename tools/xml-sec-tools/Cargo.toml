@@ -14,6 +14,8 @@ serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11"
 tar = "0.4"
 tempfile = "3"
+# Executes the WebAssembly smoke build without a JavaScript host.
+wasmi = { version = "2", default-features = false, features = ["std", "validate"] }
 # XML reports and fixtures are read with the product's own parser.
 xml-sec = { path = "../..", default-features = false, features = ["std", "xml-backend-roxmltree"] }
 

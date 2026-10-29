@@ -8,6 +8,7 @@ mod documentation;
 mod fuzz_security;
 mod hardening;
 mod kernel_examples;
+mod libxslt_fixtures;
 mod pedantic_lints;
 mod pkcs11;
 mod repo;
@@ -15,9 +16,11 @@ mod security_corpus;
 mod shared_pkix;
 #[cfg(test)]
 mod test_support;
+mod wasm_c14n;
 #[cfg(test)]
 mod workflow_contracts;
 mod xades;
+mod xslt_conformance;
 
 use repo::Failure;
 use std::process::ExitCode;
@@ -39,11 +42,14 @@ commands:
   fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
   hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]
   kernel-examples roxmltree|xmloxide ROOT SOURCE...
+  libxslt-fixtures [--check]
   pedantic-lints TOOLCHAIN...
   pkcs11-tests MODULE [--workspace] ARGS...
   security-corpus check|report|import LIBXML2_SOURCE DATA_DIR LIBXSLT_SOURCE
   shared-pkix
-  xades check|corpus|dss|binding|package ...";
+  wasm-c14n
+  xades check|corpus|dss|binding|package ...
+  xslt-conformance [--cache-managed]";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -63,11 +69,14 @@ fn main() -> ExitCode {
         Some("fuzz-security") => fuzz_security::run(args),
         Some("hardening") => hardening::run(args),
         Some("kernel-examples") => kernel_examples::run(args).map_err(Failure::from),
+        Some("libxslt-fixtures") => libxslt_fixtures::run(args),
         Some("pedantic-lints") => pedantic_lints::run(args),
         Some("pkcs11-tests") => pkcs11::run(args),
         Some("security-corpus") => security_corpus::run(args),
         Some("shared-pkix") => shared_pkix::run(args),
+        Some("wasm-c14n") => wasm_c14n::run(args),
         Some("xades") => xades::run(args),
+        Some("xslt-conformance") => xslt_conformance::run(args),
         _ => Err(Failure {
             code: 2,
             message: USAGE.into(),

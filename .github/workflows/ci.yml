@@ -267,10 +267,7 @@ jobs:
           cargo check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
       - run: cargo run --quiet -p xml-sec-tools -- shared-pkix
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - run: bash scripts/test-wasm-c14n.sh
+      - run: cargo run --quiet -p xml-sec-tools -- wasm-c14n
 
   test-matrix:
     name: test block (${{ matrix.block }})
@@ -392,18 +389,13 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
-      - name: Verify vendored oracle fixtures
-        env:
-          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: scripts/import-libxslt-oracle-fixtures.sh --check
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-      - name: Check conformance admission and failure propagation
-        run: node --test scripts/check-xslt-conformance.test.mjs
+      - name: Verify vendored oracle fixtures
+        env:
+          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
+        run: cargo run --quiet -p xml-sec-tools -- libxslt-fixtures --check
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: legacy
@@ -424,7 +416,7 @@ jobs:
       - name: Qualify XSLT engine, signature chains and failure contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: bash scripts/check-xslt-conformance.sh --cache-managed
+        run: cargo run --quiet -p xml-sec-tools -- xslt-conformance --cache-managed
       - name: Check XSLT phase and concurrent reuse contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
