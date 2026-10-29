@@ -6,8 +6,9 @@ publish = false
 
 [dependencies]
 regex = "1"
-# Summaries keep the field order they are written in.
-serde_json = { version = "1", features = ["preserve_order"] }
+# Summaries keep the field order they are written in, and measured values
+# survive a read and rewrite unchanged.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11"
 tempfile = "3"
 

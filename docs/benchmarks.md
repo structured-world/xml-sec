@@ -13,12 +13,12 @@ unstable, hidden measurement entry points, not application APIs.
 ```sh
 cargo bench --bench security --features benchmark-internals
 cargo bench --bench security --features benchmark-alloc
-bash scripts/benchmark-security.sh target/performance/run-1 1000
+cargo run -p xml-sec-tools -- bench-latency target/performance/run-1 1000
 # Optional native FIPS provider, never a fallback to RustCrypto:
-bash scripts/benchmark-security.sh target/performance/fips-1 1000 aws-lc-fips
+cargo run -p xml-sec-tools -- bench-latency target/performance/fips-1 1000 aws-lc-fips
 ```
 
-The runner requires macOS or Linux, `jq`, and `/usr/bin/time`; initial compilation resolves
+The runner requires macOS or Linux and `/usr/bin/time`; initial compilation resolves
 the graph and records the lockfile and dependency metadata; subsequent runs within
 that invocation are locked. Set `CARGO_TARGET_DIR` consistently if using another
 build directory. Results belong in an ignored directory, not the source tree.
@@ -112,11 +112,11 @@ measurements require separately matched boundaries and build configurations.
 
 ```sh
 # Competitors are built outside the product dependency graph.
-bash scripts/benchmark-compare.sh target/performance/comparison 30
+cargo run -p xml-sec-tools -- bench-compare target/performance/comparison 30
 # Linux: separately profile malloc-family allocations and peak heap, including C.
-bash scripts/benchmark-compare.sh target/performance/comparison-heap 30 --heap
-node scripts/build-benchmark-dashboard.mjs target/performance/comparison target/performance/site
-node --test scripts/compare-security.test.mjs scripts/compare-library.test.mjs
+cargo run -p xml-sec-tools -- bench-compare target/performance/comparison-heap 30 --heap
+cargo run -p xml-sec-tools -- bench-dashboard target/performance/comparison target/performance/site
+cargo nextest run -p xml-sec-tools bench
 ```
 
 The comparison has two levels, reported in separate dashboard sections and never
@@ -191,7 +191,7 @@ The same corpus and keys drive one in-process harness per engine:
   `Cargo.lock` and the revision pinned in
   `compatibility/bergshamra-0.9.2-benchmark-commit.txt`. Before building, the
   runner refreshes only that lockfile's entry for xml-sec itself
-  (`scripts/refresh-competitor-lock.sh`), so a new product version leaves the
+  (`cargo run -p xml-sec-tools -- competitor-lock`), so a new product version leaves the
   Bergshamra graph as locked; a product dependency the locked graph cannot
   satisfy stops the run until the lockfile is updated and committed;
 - libxmlsec1 1.3.13 through its C API (`benchmarks/libxmlsec1-library.c`),
@@ -235,12 +235,13 @@ Elsewhere the C allocation profile is reported as not measured.
 ### Regression report
 
 ```sh
-node scripts/compare-regression.mjs BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
-node --test scripts/compare-regression.test.mjs
+cargo run -p xml-sec-tools -- bench-regression BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
+cargo nextest run -p xml-sec-tools bench::regression
 ```
 
 The report compares two comparison runs, each a directory with `comparison.json`,
-`library.json` and `build.json`. `scripts/build-identity.mjs` writes the latter:
+`library.json` and `build.json`. The comparison runner writes the latter
+(`cargo run -p xml-sec-tools -- bench-identity NAME=VALUE...` prints it alone):
 compiler versions, the features of every binary, native flags, the heap-profiling
 mode and the pinned competitor revisions, every environment override of the build
 (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `CC`,

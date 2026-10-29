@@ -131,9 +131,6 @@ jobs:
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
@@ -161,10 +158,9 @@ jobs:
         run: |
           cargo nextest run --test benchmark_contract --example benchmark_latency --features benchmark-internals
           cargo clippy --bench security --example benchmark_latency --features benchmark-internals,benchmark-alloc -- -D warnings
-          node --test scripts/compare-security.test.mjs
       - name: Exercise measurement runner (not a performance threshold)
         if: matrix.minimal
-        run: bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1
+        run: cargo run --quiet -p xml-sec-tools -- bench-latency "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1
       - uses: actions/upload-artifact@v7
         if: matrix.minimal
         with:
@@ -313,9 +309,6 @@ jobs:
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - name: Refresh apt package index
         run: sudo apt-get update
       - name: Provision all-feature token tests
@@ -349,8 +342,7 @@ jobs:
         run: |
           cargo nextest run --test benchmark_contract --example benchmark_latency --features benchmark-internals,aws-lc-fips
           cargo clippy --bench security --example benchmark_latency --features benchmark-internals,aws-lc-fips,benchmark-alloc -- -D warnings
-          node --test scripts/compare-security.test.mjs
-          bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-fips-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1 aws-lc-fips
+          cargo run --quiet -p xml-sec-tools -- bench-latency "$RUNNER_TEMP/benchmark-smoke-fips-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1 aws-lc-fips
       - uses: actions/upload-artifact@v7
         if: matrix.block == 'fips'
         with:
@@ -439,15 +431,13 @@ jobs:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: |
           sudo apt-get install --yes valgrind cmake zlib1g-dev liblzma-dev
-          node --test scripts/benchmark-xslt.test.mjs
           cargo nextest run -p xml-sec-xslt --all-features --test phase_contract
       - name: Measure XSLT phases against libxslt
         env:
           XSLT_BENCH_HEAP: '1'
           CARGO_TARGET_DIR: ${{ runner.temp }}/xslt-measurement
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: |
-          node scripts/benchmark-xslt.mjs "$RUNNER_TEMP/xslt-performance" 1
+        run: cargo run --quiet -p xml-sec-tools -- bench-xslt "$RUNNER_TEMP/xslt-performance" 1
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -1,14 +1,14 @@
 # XSLT Phase Measurements
 
 ```sh
-node --test scripts/benchmark-xslt.test.mjs
+cargo nextest run -p xml-sec-tools bench::xslt
 cargo nextest run -p xml-sec-xslt --all-features --test phase_contract
 cargo clean
 LIBXSLT_SOURCE_DIR=/path/to/pinned/libxslt RUSTC_WRAPPER= \
-  node scripts/benchmark-xslt.mjs /tmp/xslt-measurement 100
+  cargo run -p xml-sec-tools -- bench-xslt /tmp/xslt-measurement 100
 ```
 
-Requires Rust 1.92+, Node, CMake, a C compiler, pkg-config development files for
+Requires Rust 1.92+, CMake, a C compiler, pkg-config development files for
 libxml2 and macOS/Linux `time`. `LIBXSLT_SOURCE_DIR` must match the committed
 libxslt source pin; the runner builds that native oracle separately. On macOS
 select non-Apple libxml2 consistently through `CMAKE_PREFIX_PATH` and

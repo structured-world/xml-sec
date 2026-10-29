@@ -1,5 +1,6 @@
 //! Repository tooling: one subcommand per responsibility.
 
+mod bench;
 mod check_features;
 mod ci_blocks;
 mod coverage;
@@ -22,8 +23,17 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage: xml-sec-tools COMMAND [ARGS...]
 commands:
+  bench-cli NEW_OUTPUT_DIR [SAMPLES] [--heap]
+  bench-compare NEW_OUTPUT_DIR [SAMPLES] [--heap]
+  bench-dashboard COMPARISON_DIR NEW_SITE_DIR
+  bench-identity NAME=VALUE...
+  bench-latency OUTPUT_DIR [SAMPLES] [EXTRA_FEATURES]
+  bench-library COMPARISON_DIR SAMPLES
+  bench-regression BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
+  bench-xslt NEW_OUTPUT [SAMPLES]
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
+  competitor-lock
   documentation [all|docs]
   fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
   hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]
@@ -36,8 +46,17 @@ commands:
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let result: Result<(), Failure> = match args.next().as_deref() {
+        Some("bench-cli") => bench::cli::run(args),
+        Some("bench-compare") => bench::compare::run(args),
+        Some("bench-dashboard") => bench::dashboard::run(args),
+        Some("bench-identity") => bench::identity::run(args),
+        Some("bench-latency") => bench::latency::run(args),
+        Some("bench-library") => bench::library::run(args),
+        Some("bench-regression") => bench::regression::run(args),
+        Some("bench-xslt") => bench::xslt::run(args),
         Some("check-features") => check_features::run(args),
         Some("ci-blocks") => ci_blocks::run(args).map_err(Failure::from),
+        Some("competitor-lock") => bench::compare::run_lock(args),
         Some("documentation") => documentation::run(args),
         Some("fuzz-security") => fuzz_security::run(args),
         Some("hardening") => hardening::run(args),
