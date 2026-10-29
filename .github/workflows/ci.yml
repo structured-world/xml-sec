@@ -36,11 +36,14 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.19.0
+      - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
+      # Repository tooling and its contracts on workflows and scripts.
+      - run: cargo nextest run -p xml-sec-tools
       - run: node --test scripts/check-hardening.test.mjs
-      - run: node --test scripts/ci-test-blocks.test.mjs scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
+      - run: node --test scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
       # The per-lint pedantic forbid list must match clippy's pedantic group,
       # and a local allow of a listed lint must fail clippy.
       - run: node --test scripts/check-pedantic-lints.test.mjs
@@ -355,7 +358,7 @@ jobs:
         env:
           PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
           BLOCK: ${{ matrix.block }}
-        run: node scripts/ci-test-blocks.mjs "$BLOCK"
+        run: cargo run --quiet -p xml-sec-tools -- ci-blocks "$BLOCK"
       - name: Qualify FIPS benchmark contracts and measurement runner
         if: matrix.block == 'fips'
         run: |

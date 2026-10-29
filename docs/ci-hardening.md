@@ -77,8 +77,8 @@ not have.
 
 CI builds, lints and tests with the stable channel only and names no compiler
 release; `rust-version` is the declared minimum, and clippy's `incompatible_msrv`
-lint keeps standard-library use within it. The lint matrix in
-`scripts/ci-test-blocks.mjs` resolves each feature graph separately: the default,
+lint keeps standard-library use within it. The lint matrix of the `ci-blocks`
+tool command resolves each feature graph separately: the default,
 backend, all-feature, experimental, FIPS and XSLT workspace graphs, plus
 library-only minimal graphs for `xmldsig`, `xmldsig-sign`, `xmlenc` and `xslt` on
 the differential backend. The alloc-only job lints the separate XML-input crate
@@ -91,7 +91,7 @@ see [benchmarks](benchmarks.md#regression-report).
 
 ## Grouped Qualification
 
-`node scripts/ci-test-blocks.mjs BLOCK` runs one of `core`, `extended`,
+`cargo run -p xml-sec-tools -- ci-blocks BLOCK` runs one of `core`, `extended`,
 `experimental`, or `fips`. These blocks retain separate Cargo invocations for
 every feature/backend profile; grouping does not union their features. Builds, lint, tests and doctests share runner and oracle
 setup. The XMLenc inventory build still resolves only the core package, and
