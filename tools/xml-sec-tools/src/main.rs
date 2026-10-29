@@ -5,6 +5,7 @@ mod check_features;
 mod ci_blocks;
 mod coverage;
 mod documentation;
+mod donor_fixtures;
 mod fuzz_security;
 mod hardening;
 mod kernel_examples;
@@ -40,6 +41,7 @@ commands:
   ci-blocks BLOCK
   competitor-lock
   documentation [all|docs]
+  donor-fixtures [--xmlenc-corpora | PATH...]
   fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
   hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]
   kernel-examples roxmltree|xmloxide ROOT SOURCE...
@@ -68,6 +70,7 @@ fn main() -> ExitCode {
         Some("ci-blocks") => ci_blocks::run(args).map_err(Failure::from),
         Some("competitor-lock") => bench::compare::run_lock(args),
         Some("documentation") => documentation::run(args),
+        Some("donor-fixtures") => donor_fixtures::run(args),
         Some("fuzz-security") => fuzz_security::run(args),
         Some("hardening") => hardening::run(args),
         Some("kernel-examples") => kernel_examples::run(args).map_err(Failure::from),

@@ -344,7 +344,7 @@ is truncated in the donor itself; tests use the complete published p/q/g/x
 from its unchanged `key.txt` instead. These tests grant legacy DH, SHA-1 and
 legacy content algorithms explicitly, without broadening product defaults.
 
-`bash scripts/import-donor-fixtures.sh --xmlenc-corpora` imports the complete
+`cargo run -p xml-sec-tools -- donor-fixtures --xmlenc-corpora` imports the complete
 Merlin, Phaos and Aleksey directories and their shared agreement credentials.
 `tests/fixtures/xmlenc/corpora.sha256` pins every imported file's bytes; tests
 reject changed, missing and additional files. The all-feature
