@@ -34,7 +34,8 @@ const CEK: [u8; 16] = [0x72; 16];
 fn isolated_token() -> (&'static Pkcs11, Slot, AuthPin, AuthPin) {
     // Refuse initialization unless the maintained harness supplies a disposable store.
     // This prevents accidentally resetting a real token on a developer machine.
-    let store = std::env::var("XML_SEC_PKCS11_TEST_STORE").expect("run scripts/test-pkcs11.sh");
+    let store = std::env::var("XML_SEC_PKCS11_TEST_STORE")
+        .expect("run `cargo run -p xml-sec-tools -- pkcs11-tests`");
     let config = std::env::var("SOFTHSM2_CONF").expect("isolated configuration");
     assert_eq!(
         std::path::Path::new(&config).parent(),

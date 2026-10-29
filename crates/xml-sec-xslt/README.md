@@ -111,6 +111,6 @@ in [XSLT conformance](../../docs/xslt-conformance.md).
 Refresh or verify the snapshot from a matching donor checkout with:
 
 ```console
-LIBXSLT_SOURCE_DIR=/path/to/libxslt scripts/import-libxslt-oracle-fixtures.sh
-LIBXSLT_SOURCE_DIR=/path/to/libxslt scripts/import-libxslt-oracle-fixtures.sh --check
+LIBXSLT_SOURCE_DIR=/path/to/libxslt cargo run -p xml-sec-tools -- libxslt-fixtures
+LIBXSLT_SOURCE_DIR=/path/to/libxslt cargo run -p xml-sec-tools -- libxslt-fixtures --check
 ```

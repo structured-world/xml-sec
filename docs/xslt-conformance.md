@@ -33,14 +33,14 @@ pre-digest output and digest mismatch instead of silently skipping it.
 
 ## Reproduce
 
-Provision the existing pinned oracle with `bash scripts/install-xmlsec1.sh` and
+Provision the existing pinned oracle with `cargo run -p xml-sec-tools -- install-xmlsec1` and
 set its reported library path. Use a checkout of the libxslt commit recorded in
 `compatibility/libxslt-1.1.45-donor-commit.txt`:
 
 ```sh
 LIBXSLT_SOURCE_DIR=/path/to/pinned/libxslt \
 XMLSEC1_BIN=/path/to/provisioned/bin/xmlsec1 \
-bash scripts/check-xslt-conformance.sh
+cargo run -p xml-sec-tools -- xslt-conformance
 ```
 
 The command verifies source/fixture provenance, requires xmlsec1 1.3.13 with its

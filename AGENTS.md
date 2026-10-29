@@ -119,7 +119,7 @@ These are reference requirements, not a claim that every feature of every docume
 | Names / requirements | RFC 4514, RFC 9525; BCP 14 = RFC 2119 + RFC 8174 |
 
 Exact dated publisher URLs are in [`docs/standards-sources.tsv`](docs/standards-sources.tsv).
-Run `bash scripts/fetch-standards.sh` to download publisher texts and RFC status metadata into
+Run `cargo run -p xml-sec-tools -- fetch-standards` to download publisher texts and RFC status metadata into
 gitignored `.refs/standards/`, with retrieval time and SHA-256 checksums. Preserve notices; do not
 commit third-party full texts. Check `obsoleted_by`, `updated_by`, and errata status before relying
 on an RFC: a reported erratum is not automatically a normative correction.

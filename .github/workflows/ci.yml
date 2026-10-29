@@ -30,24 +30,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.19.0
+      - uses: taiki-e/install-action@nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
-      - run: node --test scripts/check-hardening.test.mjs
-      - run: node --test scripts/ci-test-blocks.test.mjs scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
-      # The per-lint pedantic forbid list must match clippy's pedantic group,
-      # and a local allow of a listed lint must fail clippy.
-      - run: node --test scripts/check-pedantic-lints.test.mjs
-      - run: node scripts/check-pedantic-lints.mjs stable
-      - run: node scripts/security-corpus.mjs --check
-      - run: bash scripts/check-hardening.sh dependencies
-      - run: bash scripts/check-hardening.sh safety
+      # Repository tooling and its contracts on workflows and scripts.
+      - run: cargo nextest run -p xml-sec-tools
+      # The per-lint pedantic forbid list must match clippy's pedantic group;
+      # the tool's tests prove a local allow of a listed lint fails clippy.
+      - run: cargo run --quiet -p xml-sec-tools -- pedantic-lints stable
+      - run: cargo run --quiet -p xml-sec-tools -- security-corpus check
+      - run: cargo run --quiet -p xml-sec-tools -- hardening dependencies
+      - run: cargo run --quiet -p xml-sec-tools -- hardening safety
 
   coverage:
     name: canonical line coverage (85%)
@@ -85,9 +82,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov@0.8.5,cargo-nextest
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: coverage
@@ -102,10 +96,10 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2 cmake zlib1g-dev liblzma-dev
-          bash scripts/install-xmlsec1.sh
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Execute every workspace target and enforce canonical coverage
-        run: bash scripts/check-hardening.sh coverage "$RUNNER_TEMP/coverage"
+        run: cargo run --quiet -p xml-sec-tools -- hardening coverage "$RUNNER_TEMP/coverage"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -137,19 +131,12 @@ jobs:
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
           save: ${{ !matrix.minimal }}
-      - name: Check the matrix runner
-        if: runner.os != 'Windows'
-        run: node --test scripts/check-features.test.mjs
       - name: Qualify actual core defaults
-        shell: bash
-        run: bash scripts/check-features.sh default
+        run: cargo run --quiet -p xml-sec-tools -- check-features default
       - name: Provision isolated token provider
         if: matrix.minimal
         run: sudo apt-get update && sudo apt-get install -y softhsm2
@@ -160,23 +147,20 @@ jobs:
         run: |
           for profile in dom-xmloxide dom-roxmltree c14n-xmloxide c14n-roxmltree dsig-xmloxide dsig-roxmltree dsig-sign-xmloxide xmlenc-xmloxide xmlenc-roxmltree xslt legacy experimental fips-dsig pkcs11 no-backend; do
             echo "::group::$profile"
-            bash scripts/check-features.sh "$profile"
+            cargo run --quiet -p xml-sec-tools -- check-features "$profile"
             echo '::endgroup::'
           done
       - name: Qualify documentation and executable examples
         if: matrix.minimal
-        run: |
-          node --test scripts/check-documentation.test.mjs
-          bash scripts/check-documentation.sh
+        run: cargo run --quiet -p xml-sec-tools -- documentation
       - name: Qualify benchmark contracts and lint
         if: matrix.minimal
         run: |
           cargo nextest run --test benchmark_contract --example benchmark_latency --features benchmark-internals
           cargo clippy --bench security --example benchmark_latency --features benchmark-internals,benchmark-alloc -- -D warnings
-          node --test scripts/compare-security.test.mjs
       - name: Exercise measurement runner (not a performance threshold)
         if: matrix.minimal
-        run: bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1
+        run: cargo run --quiet -p xml-sec-tools -- bench-latency "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1
       - uses: actions/upload-artifact@v7
         if: matrix.minimal
         with:
@@ -210,7 +194,7 @@ jobs:
             cargo clippy --no-default-features --features "pkcs11,c14n,xml-backend-$backend" --all-targets -- -D warnings
             cargo nextest run --lib --no-default-features --features "pkcs11,c14n,xml-backend-$backend"
             cargo nextest run -p xml-sec-config --no-default-features --features "pkcs11,xml-backend-$backend"
-            bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --no-default-features --features "c14n,xml-backend-$backend"
+            cargo run --quiet -p xml-sec-tools -- pkcs11-tests /usr/lib/softhsm/libsofthsm2.so --no-default-features --features "c14n,xml-backend-$backend"
             echo '::endgroup::'
           done
 
@@ -239,7 +223,7 @@ jobs:
         with:
           domain: ordinary
       - name: Check native CLI upstream fixture snapshot
-        run: scripts/import-xmlsec1-cli-fixtures.sh --check
+        run: cargo run --quiet -p xml-sec-tools -- donor-fixtures --cli --check
       - name: Check maintained XML parser kernels and the vendored ML-DSA
         run: |
           bash scripts/import-xml-backends.sh roxmltree --verify
@@ -284,7 +268,7 @@ jobs:
       - run: >-
           cargo check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
-      - run: bash scripts/check-shared-pkix.sh
+      - run: cargo run --quiet -p xml-sec-tools -- shared-pkix
       - run: >-
           cargo clippy -p xml-sec --lib --no-default-features
           --features c14n,xml-backend-xmloxide
@@ -304,10 +288,7 @@ jobs:
             cargo nextest run -p xml-sec --no-default-features \
               --features "xmldsig,xml-backend-$backend" --test alloc_only_verification
           done
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-      - run: bash scripts/test-wasm.sh
+      - run: cargo run --quiet -p xml-sec-tools -- wasm-smoke
 
   test-matrix:
     name: test block (${{ matrix.block }})
@@ -346,9 +327,6 @@ jobs:
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - name: Refresh apt package index
         run: sudo apt-get update
       - name: Provision all-feature token tests
@@ -357,33 +335,32 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
-      - name: Build pinned xmlsec1 for external-oracle tests
-        env:
-          XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
-          XMLSEC1_MODERN_ORACLE: "1"
-        run: |
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-          scripts/install-xmlsec1.sh
-          "$XMLSEC1_BIN" --version
-          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
           # One complete dependency graph owns writes, not a race between
           # partial feature matrices for the same immutable entry.
           save: ${{ matrix.block == 'extended' }}
+      - name: Build pinned xmlsec1 for external-oracle tests
+        env:
+          XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
+          XMLSEC1_MODERN_ORACLE: "1"
+        run: |
+          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
+          "$XMLSEC1_BIN" --version
+          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Qualify isolated build, lint, tests and doctests
         env:
           PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
           BLOCK: ${{ matrix.block }}
-        run: node scripts/ci-test-blocks.mjs "$BLOCK"
+        run: cargo run --quiet -p xml-sec-tools -- ci-blocks "$BLOCK"
       - name: Qualify FIPS benchmark contracts and measurement runner
         if: matrix.block == 'fips'
         run: |
           cargo nextest run --test benchmark_contract --example benchmark_latency --features benchmark-internals,aws-lc-fips
           cargo clippy --bench security --example benchmark_latency --features benchmark-internals,aws-lc-fips,benchmark-alloc -- -D warnings
-          node --test scripts/compare-security.test.mjs
-          bash scripts/benchmark-security.sh "$RUNNER_TEMP/benchmark-smoke-fips-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1 aws-lc-fips
+          cargo run --quiet -p xml-sec-tools -- bench-latency "$RUNNER_TEMP/benchmark-smoke-fips-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1 aws-lc-fips
       - uses: actions/upload-artifact@v7
         if: matrix.block == 'fips'
         with:
@@ -415,7 +392,6 @@ jobs:
     runs-on: ubuntu-latest
     env:
       JAVA_HOME: /usr/lib/jvm/java-21-openjdk-amd64
-      PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - uses: actions/checkout@v7
         with:
@@ -434,18 +410,13 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
-      - name: Verify vendored oracle fixtures
-        env:
-          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: scripts/import-libxslt-oracle-fixtures.sh --check
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-      - name: Check conformance admission and failure propagation
-        run: node --test scripts/check-xslt-conformance.test.mjs
+      - name: Verify vendored oracle fixtures
+        env:
+          LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
+        run: cargo run --quiet -p xml-sec-tools -- libxslt-fixtures --check
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: legacy
@@ -453,9 +424,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config openjdk-21-jdk
-          bash scripts/install-xmlsec1.sh
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
       - name: Verify live XMLDSig and XAdES corpus results
-        run: python3 scripts/check-xades-interop.py --output "$RUNNER_TEMP/xades-interop"
+        run: cargo run --quiet -p xml-sec-tools -- xades check --output "$RUNNER_TEMP/xades-interop"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -466,21 +437,19 @@ jobs:
       - name: Qualify XSLT engine, signature chains and failure contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: bash scripts/check-xslt-conformance.sh --cache-managed
+        run: cargo run --quiet -p xml-sec-tools -- xslt-conformance --cache-managed
       - name: Check XSLT phase and concurrent reuse contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: |
           sudo apt-get install --yes valgrind cmake zlib1g-dev liblzma-dev
-          node --test scripts/benchmark-xslt.test.mjs
           cargo nextest run -p xml-sec-xslt --all-features --test phase_contract
       - name: Measure XSLT phases against libxslt
         env:
           XSLT_BENCH_HEAP: '1'
           CARGO_TARGET_DIR: ${{ runner.temp }}/xslt-measurement
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: |
-          node scripts/benchmark-xslt.mjs "$RUNNER_TEMP/xslt-performance" 1
+        run: cargo run --quiet -p xml-sec-tools -- bench-xslt "$RUNNER_TEMP/xslt-performance" 1
       - uses: actions/upload-artifact@v7
         if: always()
         with:

@@ -6,9 +6,8 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 url='https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Algorithm-Validation-Program/documents/sha3/sha-3bittestvectors.zip'
 curl --fail --location "$url" --output "$stage/vectors.zip"
-actual="$(shasum -a 256 "$stage/vectors.zip")"
 expected='339454bb4b96e299fefcad403797523f1952462a28d2418c108aea30263643ae'
-if [[ "${actual%% *}" != "$expected" ]]; then
+if ! printf '%s  %s\n' "$expected" "$stage/vectors.zip" | shasum -a 256 --check --status; then
     printf '%s\n' 'NIST SHA-3 archive changed; review provenance before importing.' >&2
     exit 1
 fi

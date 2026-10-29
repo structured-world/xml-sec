@@ -12,4 +12,4 @@ runs:
     - uses: actions/cache@v6
       with:
         path: ${{ env.XMLSEC1_PREFIX }}
-        key: xmlsec-oracle-${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.identity }}-${{ inputs.profile }}-${{ hashFiles('scripts/install-xmlsec1.sh', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt') }}
+        key: xmlsec-oracle-${{ runner.os }}-${{ runner.arch }}-${{ steps.image.outputs.identity }}-${{ inputs.profile }}-${{ hashFiles('tools/xml-sec-tools/src/install_xmlsec1.rs', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt') }}

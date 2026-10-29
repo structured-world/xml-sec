@@ -2,7 +2,7 @@
 
 Checked on 2026-09-07. The edition baseline is in [AGENTS.md](../AGENTS.md), and
 [standards-sources.tsv](standards-sources.tsv) records the exact publisher URLs.
-`bash scripts/fetch-standards.sh` obtains local reference copies, RFC status metadata,
+`cargo run -p xml-sec-tools -- fetch-standards` obtains local reference copies, RFC status metadata,
 the RFC errata registry, and retrieval checksums without adding third-party texts to Git.
 
 ## Findings and applicability

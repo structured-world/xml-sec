@@ -539,7 +539,7 @@ The integration suite invokes a minimal checked-in snapshot of libxmlsec1 1.3.13
 `testDSig.sh`, `testEnc.sh`, and `testKeys.sh` files without modification or a
 Python translation layer. Covered runner cases include signature failure
 classification, an AES-GCM decrypt/encrypt/decrypt cycle, and AES key-store
-generation. `scripts/import-xmlsec1-cli-fixtures.sh` refreshes only those
+generation. `cargo run -p xml-sec-tools -- donor-fixtures --cli` refreshes only those
 scripts and selected vectors from the pinned donor commit; CI verifies the
 snapshot in the donor-backed ledger job. The native CLI package tests require
 no network checkout or system `xmlsec1`; separate workspace interoperability

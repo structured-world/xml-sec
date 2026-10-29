@@ -159,13 +159,13 @@ selected signing certificate. The tested adapter behavior matches these contract
 ## Reproduce
 
 From the checkout root with this package's source overlay, first bootstrap the pinned
-Maven dependencies with `python3 scripts/xades-dss.py --results target/xades-dss-recheck`.
+Maven dependencies with `cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck`.
 Only public build dependencies are downloaded; no XML is uploaded. Then use a fresh
 output directory to preserve the supplied evidence:
 
 ```sh
-XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 python3 scripts/investigate-xades-dss.py --output target/xades-binding-repro
-python3 scripts/investigate-xades-dss.py --output target/xades-binding-repro --strict-policy
+XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 cargo run -p xml-sec-tools -- xades binding --output target/xades-binding-repro
+cargo run -p xml-sec-tools -- xades binding --output target/xades-binding-repro --strict-policy
 ```
 
 On another machine, set the path to native libxmlsec1; the Rust CLI is not an oracle.
@@ -183,7 +183,7 @@ octets, comparison summaries and full DSS reports are generated only as run arti
 Recheck retained octets without running either engine:
 
 ```sh
-python3 scripts/investigate-xades-dss.py --output target/xades-binding-repro --analyze
+cargo run -p xml-sec-tools -- xades binding --output target/xades-binding-repro --analyze
 ```
 
 [source-audit.json](source-audit.json) records the source-jar URLs, SHA-256 hashes,
