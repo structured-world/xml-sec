@@ -182,6 +182,26 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 /// The commit the archive is built from. Every archived file must be
 /// committed unchanged there, so the recorded commit reproduces the archive.
 pub(crate) fn source_commit(root: &Path, names: &[String]) -> Result<String, String> {
+    // Status hides ignored files, and untracked ones under
+    // status.showUntrackedFiles=no, so presence in HEAD is checked directly.
+    let mut tree = vec!["ls-tree", "-r", "-z", "--name-only", "HEAD", "--"];
+    tree.extend(names.iter().map(String::as_str));
+    let listed = git(root, &tree)?;
+    let committed: BTreeSet<&str> = std::str::from_utf8(&listed)
+        .map_err(|error| error.to_string())?
+        .split('\0')
+        .collect();
+    let missing: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
+        .filter(|name| !committed.contains(name))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "commit the archived files first: {}",
+            missing.join(" ")
+        ));
+    }
     let mut status = vec!["status", "--porcelain", "-z", "--"];
     status.extend(names.iter().map(String::as_str));
     let changed = git(root, &status)?;

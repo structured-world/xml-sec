@@ -47,6 +47,29 @@ fn the_archive_records_the_commit_its_files_come_from() {
     assert!(source_commit(root, &untracked).is_err());
 }
 
+#[test]
+fn a_file_outside_head_is_refused_whatever_status_shows() {
+    // Status hides ignored files, and every untracked file once the repository
+    // sets showUntrackedFiles=no; neither is in the recorded commit.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    write(&root.join(".gitignore"), "ignored.xml\n");
+    write(&root.join("corpus/a.xml"), "<a/>");
+    git(root, &["add", ".gitignore", "corpus/a.xml"]);
+    git(root, &["commit", "--quiet", "-m", "corpus"]);
+    write(&root.join("corpus/ignored.xml"), "<i/>");
+    let ignored = vec!["corpus/a.xml".to_owned(), "corpus/ignored.xml".to_owned()];
+    let error = source_commit(root, &ignored).unwrap_err();
+    assert!(error.contains("corpus/ignored.xml"), "{error}");
+
+    git(root, &["config", "status.showUntrackedFiles", "no"]);
+    write(&root.join("corpus/hidden.xml"), "<h/>");
+    let hidden = vec!["corpus/hidden.xml".to_owned()];
+    let error = source_commit(root, &hidden).unwrap_err();
+    assert!(error.contains("corpus/hidden.xml"), "{error}");
+}
+
 fn object(value: Value) -> Map<String, Value> {
     let Value::Object(map) = value else {
         panic!("not an object: {value}");
