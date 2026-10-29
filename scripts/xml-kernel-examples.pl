@@ -7,11 +7,20 @@ use warnings;
 sub extract {
     my ($source, $file) = @_;
     my ($fenced, $example, $no_run) = (0, 0, 0);
-    my (@rewritten, @examples, @body);
+    my (@rewritten, @examples, @body, @pending);
     my $start = 0;
     my $line_number = 0;
     for my $line (split /(?<=\n)/, $source) {
         ++$line_number;
+        # An example exists only where its documented item is compiled, so the
+        # item's `cfg` attributes gate the generated test too.
+        if (@pending && $line !~ /^[ \t]*(?:\/\/\/|\/\/!)/) {
+            if ($line =~ /^[ \t]*#\[(cfg\(.*\))\][ \t]*\r?\n?$/) {
+                push @{ $_->{cfgs} }, $1 for @pending;
+            } elsif ($line !~ /^[ \t]*#\[/) {
+                @pending = ();
+            }
+        }
         if ($line =~ /^([ \t]*(?:\/\/\/|\/\/!)) ?([^\r\n]*)(?:\r?\n)?$/) {
             my ($prefix, $content) = ($1, $2);
             if ($content =~ /^```([^`]*)$/) {
@@ -31,7 +40,8 @@ sub extract {
                 } else {
                     die "$file:$line_number: unterminated documentation fence\n" if $label ne '';
                     if ($example) {
-                        push @examples, { line => $start, body => join("\n", @body), no_run => $no_run };
+                        push @examples, { line => $start, body => join("\n", @body), no_run => $no_run, cfgs => [] };
+                        push @pending, $examples[-1];
                     }
                     ($fenced, $example) = (0, 0);
                 }
@@ -58,6 +68,10 @@ if (@ARGV == 1 && $ARGV[0] eq '--self-test') {
     die "lost compile-only semantics\n" unless $examples->[1]{no_run};
     my ($again, $roundtrip) = extract($rewritten, 'sample.rs');
     die "non-idempotent import\n" unless $again eq $rewritten && @$roundtrip == 2;
+    my $gated = "/// ```\n/// f();\n/// ```\n#[cfg(feature = \"std\")]\n#[must_use]\npub fn f() {}\n/// ```\n/// g();\n/// ```\npub fn g() {}\n";
+    my (undef, $items) = extract($gated, 'gated.rs');
+    die "lost the documented item's cfg\n" unless "@{ $items->[0]{cfgs} }" eq 'cfg(feature = "std")';
+    die "leaked a cfg to the next item\n" if @{ $items->[1]{cfgs} };
     print "XML kernel example extraction passed\n";
     exit 0;
 }
@@ -86,6 +100,7 @@ for my $file (@files) {
         ++$ordinal;
         (my $name = $file) =~ s/[^A-Za-z0-9]/_/g;
         $tests .= "\n// $file:$example->{line}; original " . ($example->{no_run} ? 'compile-only' : 'runnable') . " example.\n";
+        $tests .= "#[$_]\n" for @{ $example->{cfgs} };
         $tests .= "#[test]\nfn ${name}_example_${ordinal}() -> impl std::process::Termination {\n";
         $tests .= "    use crate::parser_$backend as $backend;\n";
         $tests .= "    let _ = || {\n" if $example->{no_run};
