@@ -66,8 +66,8 @@ derive allows in its own expansion. The same check rejects any source that
 allows it or the whole pedantic group.
 
 ```sh
-node scripts/check-pedantic-lints.mjs stable
-node --test scripts/check-pedantic-lints.test.mjs
+cargo run -p xml-sec-tools -- pedantic-lints stable
+cargo nextest run -p xml-sec-tools pedantic_lints
 ```
 
 The check fails when stable clippy's pedantic group has a lint the list does not
@@ -146,7 +146,7 @@ the same run; sharing does not impose a producer dependency on the critical path
 The XML-oracle block runs both the live XMLDSig/XAdES corpus and XSLT conformance
 with their original independent validators and separate evidence artifacts.
 Shared mechanisms are resolved as one registry version across ASN.1, PKIX, CMS,
-LTV and XAdES. `scripts/check-shared-pkix.sh` rejects duplicate generations and
+LTV and XAdES. The `shared-pkix` tool command rejects duplicate generations and
 path/git substitutes, then independently checks the PKIX and XAdES alloc graphs
 on bare-metal and WASM targets. Core XMLDSig still requires `std`; the shared
 dependency qualification is not a root alloc-only claim.

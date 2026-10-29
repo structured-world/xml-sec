@@ -5,13 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
+regex = "1"
 # Summaries keep the field order they are written in.
 serde_json = { version = "1", features = ["preserve_order"] }
 tempfile = "3"
-
-[dev-dependencies]
-# Contracts on workflow text are stated as the patterns the files must keep.
-regex = "1"
 
 [lints]
 workspace = true

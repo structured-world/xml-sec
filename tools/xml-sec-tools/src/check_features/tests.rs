@@ -1,5 +1,5 @@
-use super::{Action, Runner, VERIFY_ONLY_FORBIDDEN, execute, forbidden_crate, plan};
-use crate::repo::{Failure, Step};
+use super::{Action, VERIFY_ONLY_FORBIDDEN, execute, forbidden_crate, plan};
+use crate::repo::{Failure, Run, Step};
 use std::os::unix::process::ExitStatusExt as _;
 use std::process::ExitStatus;
 
@@ -38,7 +38,7 @@ impl Recorded {
     }
 }
 
-impl Runner for Recorded {
+impl Run for Recorded {
     fn status(&mut self, _: &Step) -> Result<ExitStatus, String> {
         Ok(self.next())
     }

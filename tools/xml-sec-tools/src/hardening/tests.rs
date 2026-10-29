@@ -1,5 +1,5 @@
 use super::{Action, Coverage, Runner, execute, parse_env, plan, remapped_flags};
-use crate::repo::{Failure, Step};
+use crate::repo::{Failure, Run, Step, require};
 use serde_json::{Value, json};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
@@ -33,16 +33,12 @@ fn line(step: &Step) -> String {
     format!("{} {}", step.program, step.args.join(" "))
 }
 
-impl Runner for Recorder {
-    fn status(&mut self, step: &Step, _: &[(String, String)]) -> Result<ExitStatus, String> {
+impl Run for Recorder {
+    fn status(&mut self, step: &Step) -> Result<ExitStatus, String> {
         Ok(self.outcome(line(step)))
     }
 
-    fn stdout(
-        &mut self,
-        step: &Step,
-        _: &[(String, String)],
-    ) -> Result<(ExitStatus, String), String> {
+    fn stdout(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
         let status = self.outcome(line(step));
         Ok((
             status,
@@ -50,6 +46,12 @@ impl Runner for Recorder {
         ))
     }
 
+    fn combined(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
+        self.stdout(step)
+    }
+}
+
+impl Runner for Recorder {
     fn token_tests(
         &mut self,
         module: &str,
@@ -58,11 +60,7 @@ impl Runner for Recorder {
     ) -> Result<(), Failure> {
         let status = self.outcome(format!("tokens {module} {}", args.join(" ")));
         self.env_seen_by_tests = env.to_vec();
-        if status.success() {
-            Ok(())
-        } else {
-            Err(Failure::of(status))
-        }
+        require(status)
     }
 
     fn create_dir(&mut self, path: &Path) -> Result<(), String> {

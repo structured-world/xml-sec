@@ -2,9 +2,7 @@
 //! feature profile of the core package alone. Workspace feature unification
 //! could otherwise hide a broken gate.
 
-use crate::repo::{Failure, Step, TOOL, command};
-use std::io::Read as _;
-use std::process::{ExitStatus, Stdio};
+use crate::repo::{Failure, Run, Step, System, TOOL, require};
 
 #[cfg(test)]
 mod tests;
@@ -242,73 +240,14 @@ pub(crate) fn forbidden_crate(graph: &str) -> Option<&'static str> {
     })
 }
 
-/// How the actions reach processes; tests substitute recorded outcomes.
-pub(crate) trait Runner {
-    /// Runs with inherited output.
-    fn status(&mut self, step: &Step) -> Result<ExitStatus, String>;
-    /// Runs with stdout captured and stderr inherited.
-    fn stdout(&mut self, step: &Step) -> Result<(ExitStatus, String), String>;
-    /// Runs with stdout and stderr captured together, in order.
-    fn combined(&mut self, step: &Step) -> Result<(ExitStatus, String), String>;
-}
-
-struct Processes;
-
-impl Runner for Processes {
-    fn status(&mut self, step: &Step) -> Result<ExitStatus, String> {
-        crate::repo::spawn(step)
-    }
-
-    fn stdout(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
-        let output = command(step)?
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|error| format!("{}: {error}", step.label))?;
-        Ok((
-            output.status,
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ))
-    }
-
-    fn combined(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
-        let (mut reader, writer) =
-            std::io::pipe().map_err(|error| format!("{}: {error}", step.label))?;
-        let duplicate = writer
-            .try_clone()
-            .map_err(|error| format!("{}: {error}", step.label))?;
-        let mut child = command(step)?
-            .stdout(writer)
-            .stderr(duplicate)
-            .spawn()
-            .map_err(|error| format!("{}: {error}", step.label))?;
-        // The command holds the only write ends; dropping it lets the read end
-        // see end of file when the child exits.
-        let mut text = Vec::new();
-        reader
-            .read_to_end(&mut text)
-            .map_err(|error| format!("{}: {error}", step.label))?;
-        let status = child
-            .wait()
-            .map_err(|error| format!("{}: {error}", step.label))?;
-        Ok((status, String::from_utf8_lossy(&text).into_owned()))
-    }
-}
-
 /// Executes `actions` in order; the first failure stops qualification.
-pub(crate) fn execute(actions: &[Action], runner: &mut impl Runner) -> Result<(), Failure> {
+pub(crate) fn execute(actions: &[Action], runner: &mut impl Run) -> Result<(), Failure> {
     for action in actions {
         match action {
-            Action::Run(step) => {
-                let status = runner.status(step)?;
-                if !status.success() {
-                    return Err(Failure::of(status));
-                }
-            }
+            Action::Run(step) => require(runner.status(step)?)?,
             Action::VerifyOnlyGraph(step) => {
                 let (status, graph) = runner.stdout(step)?;
-                if !status.success() {
-                    return Err(Failure::of(status));
-                }
+                require(status)?;
                 if let Some(name) = forbidden_crate(&graph) {
                     return Err(format!("verification-only graph contains {name}").into());
                 }
@@ -338,5 +277,5 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure>
     let phase = args.next().unwrap_or_else(|| "all".into());
     let module = std::env::var("PKCS11_MODULE").ok();
     let actions = plan(&profile, &phase, module.as_deref())?;
-    execute(&actions, &mut Processes)
+    execute(&actions, &mut System)
 }

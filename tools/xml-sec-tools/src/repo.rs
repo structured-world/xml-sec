@@ -1,7 +1,8 @@
 //! Locations and process helpers shared by the subcommands.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Command, ExitStatus, Stdio};
 
 /// The repository root, independent of the directory the tool runs from.
 pub(crate) fn root() -> PathBuf {
@@ -12,12 +13,14 @@ pub(crate) fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// One planned process: a label for logs, the program and its arguments.
+/// One planned process: a label for logs, the program, its arguments and
+/// the environment it adds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Step {
     pub(crate) label: String,
     pub(crate) program: String,
     pub(crate) args: Vec<String>,
+    pub(crate) env: Vec<(String, String)>,
 }
 
 impl Step {
@@ -26,7 +29,14 @@ impl Step {
             label: label.into(),
             program: program.into(),
             args: args.iter().map(|&arg| arg.to_owned()).collect(),
+            env: Vec::new(),
         }
+    }
+
+    /// Adds `key=value` to the step's environment.
+    pub(crate) fn with_env(mut self, key: &str, value: impl Into<String>) -> Self {
+        self.env.push((key.into(), value.into()));
+        self
     }
 }
 
@@ -54,7 +64,10 @@ pub(crate) fn command(step: &Step) -> Result<Command, String> {
         PathBuf::from(&step.program)
     };
     let mut command = Command::new(program);
-    command.args(&step.args).current_dir(root());
+    command
+        .args(&step.args)
+        .envs(step.env.iter().map(|(key, value)| (key, value)))
+        .current_dir(root());
     Ok(command)
 }
 
@@ -63,6 +76,68 @@ pub(crate) fn spawn(step: &Step) -> Result<ExitStatus, String> {
     command(step)?
         .status()
         .map_err(|error| format!("{}: {error}", step.label))
+}
+
+/// How subcommands reach processes; tests substitute recorded outcomes.
+pub(crate) trait Run {
+    /// Runs with inherited output.
+    fn status(&mut self, step: &Step) -> Result<ExitStatus, String>;
+    /// Runs with stdout captured and stderr inherited.
+    fn stdout(&mut self, step: &Step) -> Result<(ExitStatus, String), String>;
+    /// Runs with stdout and stderr captured together, in order.
+    fn combined(&mut self, step: &Step) -> Result<(ExitStatus, String), String>;
+}
+
+/// The operating system's processes.
+pub(crate) struct System;
+
+impl Run for System {
+    fn status(&mut self, step: &Step) -> Result<ExitStatus, String> {
+        spawn(step)
+    }
+
+    fn stdout(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
+        let output = command(step)?
+            .stderr(Stdio::inherit())
+            .output()
+            .map_err(|error| format!("{}: {error}", step.label))?;
+        Ok((
+            output.status,
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+        ))
+    }
+
+    fn combined(&mut self, step: &Step) -> Result<(ExitStatus, String), String> {
+        let (mut reader, writer) =
+            std::io::pipe().map_err(|error| format!("{}: {error}", step.label))?;
+        let duplicate = writer
+            .try_clone()
+            .map_err(|error| format!("{}: {error}", step.label))?;
+        let mut child = command(step)?
+            .stdout(writer)
+            .stderr(duplicate)
+            .spawn()
+            .map_err(|error| format!("{}: {error}", step.label))?;
+        // The command held the only write ends; with it dropped the read end
+        // sees end of file when the child exits.
+        let mut text = Vec::new();
+        reader
+            .read_to_end(&mut text)
+            .map_err(|error| format!("{}: {error}", step.label))?;
+        let status = child
+            .wait()
+            .map_err(|error| format!("{}: {error}", step.label))?;
+        Ok((status, String::from_utf8_lossy(&text).into_owned()))
+    }
+}
+
+/// Turns a failed child into the tool's failure.
+pub(crate) fn require(status: ExitStatus) -> Result<(), Failure> {
+    if status.success() {
+        Ok(())
+    } else {
+        Err(Failure::of(status))
+    }
 }
 
 /// A refusal and the exit code it ends the tool with.

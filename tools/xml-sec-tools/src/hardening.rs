@@ -2,10 +2,9 @@
 //! policy, native safety and canonical line coverage. Coverage evidence is
 //! kept outside build output.
 
-use crate::repo::{Failure, Step, command};
+use crate::repo::{Failure, Run, Step, System, require};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Stdio};
 
 #[cfg(test)]
 mod tests;
@@ -224,14 +223,8 @@ pub(crate) fn parse_env(listing: &str) -> Result<Vec<(String, String)>, String> 
     Ok(env)
 }
 
-/// How the actions reach processes and files; tests substitute a recorder.
-pub(crate) trait Runner {
-    fn status(&mut self, step: &Step, env: &[(String, String)]) -> Result<ExitStatus, String>;
-    fn stdout(
-        &mut self,
-        step: &Step,
-        env: &[(String, String)],
-    ) -> Result<(ExitStatus, String), String>;
+/// The coverage-specific effects; tests substitute a recorder.
+pub(crate) trait Runner: Run {
     fn token_tests(
         &mut self,
         module: &str,
@@ -243,32 +236,7 @@ pub(crate) trait Runner {
     fn write(&mut self, path: &Path, text: &str) -> Result<(), String>;
 }
 
-struct Processes;
-
-impl Runner for Processes {
-    fn status(&mut self, step: &Step, env: &[(String, String)]) -> Result<ExitStatus, String> {
-        command(step)?
-            .envs(env.iter().map(|(key, value)| (key, value)))
-            .status()
-            .map_err(|error| format!("{}: {error}", step.label))
-    }
-
-    fn stdout(
-        &mut self,
-        step: &Step,
-        env: &[(String, String)],
-    ) -> Result<(ExitStatus, String), String> {
-        let output = command(step)?
-            .envs(env.iter().map(|(key, value)| (key, value)))
-            .stderr(Stdio::inherit())
-            .output()
-            .map_err(|error| format!("{}: {error}", step.label))?;
-        Ok((
-            output.status,
-            String::from_utf8_lossy(&output.stdout).into_owned(),
-        ))
-    }
-
+impl Runner for System {
     fn token_tests(
         &mut self,
         module: &str,
@@ -291,12 +259,11 @@ impl Runner for Processes {
     }
 }
 
-fn require(status: ExitStatus) -> Result<(), Failure> {
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Failure::of(status))
-    }
+/// `step` with the environment accumulated by earlier actions.
+fn under(step: &Step, env: &[(String, String)]) -> Step {
+    let mut step = step.clone();
+    step.env.extend_from_slice(env);
+    step
 }
 
 /// Executes `actions` in order; the first failure stops qualification.
@@ -309,14 +276,14 @@ pub(crate) fn execute(
     for action in actions {
         let measured = || coverage.ok_or_else(|| Failure::from("coverage inputs are missing"));
         match action {
-            Action::Run(step) => require(runner.status(step, &env)?)?,
+            Action::Run(step) => require(runner.status(&under(step, &env))?)?,
             Action::CreateEvidence => {
                 let coverage = measured()?;
                 runner.create_dir(&coverage.evidence)?;
                 env.push(("CARGO_ENCODED_RUSTFLAGS".into(), coverage.flags.clone()));
             }
             Action::ShowEnv(step) => {
-                let (status, listing) = runner.stdout(step, &env)?;
+                let (status, listing) = runner.stdout(&under(step, &env))?;
                 require(status)?;
                 env.extend(parse_env(&listing)?);
             }
@@ -326,7 +293,7 @@ pub(crate) fn execute(
                 println!("{summary}");
             }
             Action::Record(step, name) => {
-                let (status, text) = runner.stdout(step, &env)?;
+                let (status, text) = runner.stdout(&under(step, &env))?;
                 require(status)?;
                 runner.write(&measured()?.evidence.join(name), &text)?;
             }
@@ -356,5 +323,5 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure>
         _ => None,
     };
     let actions = plan(&phase, coverage.as_ref())?;
-    execute(&actions, coverage.as_ref(), &mut Processes)
+    execute(&actions, coverage.as_ref(), &mut System)
 }

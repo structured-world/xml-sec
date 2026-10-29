@@ -42,11 +42,10 @@ jobs:
           domain: ordinary
       # Repository tooling and its contracts on workflows and scripts.
       - run: cargo nextest run -p xml-sec-tools
-      - run: node --test scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
-      # The per-lint pedantic forbid list must match clippy's pedantic group,
-      # and a local allow of a listed lint must fail clippy.
-      - run: node --test scripts/check-pedantic-lints.test.mjs
-      - run: node scripts/check-pedantic-lints.mjs stable
+      - run: node --test scripts/security-corpus.test.mjs
+      # The per-lint pedantic forbid list must match clippy's pedantic group;
+      # the tool's tests prove a local allow of a listed lint fails clippy.
+      - run: cargo run --quiet -p xml-sec-tools -- pedantic-lints stable
       - run: node scripts/security-corpus.mjs --check
       - run: cargo run --quiet -p xml-sec-tools -- hardening dependencies
       - run: cargo run --quiet -p xml-sec-tools -- hardening safety
@@ -160,9 +159,7 @@ jobs:
           done
       - name: Qualify documentation and executable examples
         if: matrix.minimal
-        run: |
-          node --test scripts/check-documentation.test.mjs
-          bash scripts/check-documentation.sh
+        run: cargo run --quiet -p xml-sec-tools -- documentation
       - name: Qualify benchmark contracts and lint
         if: matrix.minimal
         run: |
@@ -277,7 +274,7 @@ jobs:
       - run: >-
           cargo check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
-      - run: bash scripts/check-shared-pkix.sh
+      - run: cargo run --quiet -p xml-sec-tools -- shared-pkix
       - uses: actions/setup-node@v7
         with:
           node-version: "24"

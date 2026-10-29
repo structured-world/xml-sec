@@ -56,8 +56,8 @@ pedantic = { level = "warn", priority = -1 }
 # Every pedantic lint is forbidden by name, so a local `#[allow]` or `#[expect]`
 # of one is error E0453. Forbidding the group would not do that: rustc lets a
 # member allow override a forbidden group (`forbidden_lint_groups`).
-# The list is the pedantic group of stable clippy; scripts/check-pedantic-lints.mjs
-# keeps it complete. One is left out and the same check rejects any source that
+# The list is the pedantic group of stable clippy; the `pedantic-lints` command
+# of xml-sec-tools keeps it complete. One is left out and the same check rejects any source that
 # allows it: `used_underscore_binding`, which thiserror's derive allows in its
 # expansion.
 assert_is_empty = "forbid"
