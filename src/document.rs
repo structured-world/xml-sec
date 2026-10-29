@@ -294,10 +294,49 @@ impl XmlParseWorkBudget {
         }
     }
 
-    #[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
-    pub(crate) fn consumed(&self) -> usize {
-        self.maximum.saturating_sub(self.remaining.get())
+    /// A budget that only counts, for parses that run without an operation.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn unlimited() -> Self {
+        Self {
+            remaining: Cell::new(usize::MAX),
+            maximum: usize::MAX,
+        }
     }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub(crate) fn consumed(&self) -> usize {
+        // `remaining` only decreases from `maximum`.
+        self.maximum - self.remaining.get()
+    }
+}
+
+/// Runs `work` against `budget`, or against a counting budget when there is
+/// none, and returns its result with the parser work it charged.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+fn metered<T>(
+    budget: Option<&XmlParseWorkBudget>,
+    work: impl FnOnce(Option<&XmlParseWorkBudget>) -> Result<T, XmlDocumentError>,
+) -> Result<(T, usize), XmlDocumentError> {
+    let counting;
+    let meter = if let Some(budget) = budget {
+        budget
+    } else {
+        counting = XmlParseWorkBudget::unlimited();
+        &counting
+    };
+    let before = meter.consumed();
+    let value = work(Some(meter))?;
+    Ok((value, meter.consumed() - before))
+}
+
+/// Without an XML Security operation no parse is budgeted or reused, so
+/// there is nothing to count.
+#[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+fn metered<T>(
+    budget: Option<&XmlParseWorkBudget>,
+    work: impl FnOnce(Option<&XmlParseWorkBudget>) -> Result<T, XmlDocumentError>,
+) -> Result<(T, usize), XmlDocumentError> {
+    Ok((work(budget)?, 0))
 }
 
 fn charge_parse_work(
@@ -469,6 +508,9 @@ struct ParsedDocument<'input> {
     max_depth: usize,
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     peak_namespace_bindings: usize,
+    /// Parser work charged to build this generation from its text.
+    #[cfg(feature = "xmldsig-sign")]
+    parse_work: usize,
 }
 
 self_cell!(
@@ -813,10 +855,24 @@ impl XmlDocument {
                 actual: xml.len(),
             });
         }
-        let peak_namespace_bindings = preflight_document_limits(&xml, settings, budget)?;
-        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-        let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
-        let cell = build_cell_after_preflight(xml, settings, budget, peak_namespace_bindings)?;
+        let ((peak_namespace_bindings, requires_internal_dtd), preflight_work) =
+            metered(budget, |budget| {
+                let peak = preflight_document_limits(&xml, settings, budget)?;
+                #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+                let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
+                #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+                let requires_internal_dtd = ();
+                Ok((peak, requires_internal_dtd))
+            })?;
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let () = requires_internal_dtd;
+        let cell = build_cell_after_preflight(
+            xml,
+            settings,
+            budget,
+            peak_namespace_bindings,
+            preflight_work,
+        )?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
@@ -921,6 +977,12 @@ impl XmlDocument {
         budget: &XmlParseWorkBudget,
     ) -> Result<Self, XmlDocumentError> {
         Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
+    }
+
+    /// Parser work charged to build the current generation from its text.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) fn parse_work(&self) -> usize {
+        self.with_view(|view| view.parsed.parse_work)
     }
 
     #[cfg(feature = "xmldsig-sign")]
@@ -2212,27 +2274,49 @@ fn build_cell(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    let peak_namespace_bindings = preflight_document_limits(&xml, settings, budget)?;
-    build_cell_after_preflight(xml, settings, budget, peak_namespace_bindings)
+    let (peak_namespace_bindings, preflight_work) = metered(budget, |budget| {
+        preflight_document_limits(&xml, settings, budget)
+    })?;
+    build_cell_after_preflight(
+        xml,
+        settings,
+        budget,
+        peak_namespace_bindings,
+        preflight_work,
+    )
 }
 
+/// Builds a generation whose preflight already charged `preflight_work`.
 fn build_cell_after_preflight(
     xml: String,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
     peak_namespace_bindings: usize,
+    preflight_work: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    charge_semantic_parser_work(budget, xml.len())?;
-    build_semantic_cell(xml, settings, peak_namespace_bindings)
+    let ((), semantic_work) = metered(budget, |budget| {
+        charge_semantic_parser_work(budget, xml.len())
+    })?;
+    // Both terms are charges already admitted by one budget below usize::MAX.
+    build_semantic_cell(
+        xml,
+        settings,
+        peak_namespace_bindings,
+        preflight_work + semantic_work,
+    )
 }
 
 fn build_semantic_cell(
     xml: String,
     settings: DocumentParseSettings,
     peak_namespace_bindings: usize,
+    parse_work: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
     #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
     let _ = peak_namespace_bindings;
+    // Only signing reuses a handed-over parse and charges its work.
+    #[cfg(not(feature = "xmldsig-sign"))]
+    let _ = parse_work;
     DocumentCell::try_new(xml, |source| {
         let (document, metrics) = parse_semantic_document(source, settings)?;
         let indexes = DocumentIndexes::build(&document);
@@ -2244,6 +2328,8 @@ fn build_semantic_cell(
             max_depth: metrics.max_depth,
             #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             peak_namespace_bindings,
+            #[cfg(feature = "xmldsig-sign")]
+            parse_work,
         })
     })
 }
@@ -4535,7 +4621,7 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        let retained = build_semantic_cell(xml.to_owned(), settings, 1)
+        let retained = build_semantic_cell(xml.to_owned(), settings, 1, 0)
             .expect("selected backend semantic projection must parse");
         retained.with_dependent(|_, parsed| {
             assert!(parsed.indexes.default_ids.contains_key("target"));
@@ -5178,11 +5264,11 @@ mod tests {
     fn selected_backend_enforces_exact_depth_boundary() {
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        build_semantic_cell(accepted, settings, 0).expect("exact depth must parse");
+        build_semantic_cell(accepted, settings, 0, 0).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            build_semantic_cell(rejected, settings, 0),
+            build_semantic_cell(rejected, settings, 0, 0),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,

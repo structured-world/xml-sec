@@ -1979,6 +1979,85 @@ fn a_handed_over_parsed_template_signs_like_its_text() {
 }
 
 #[test]
+fn a_handed_over_template_charges_its_parse_to_the_operation() {
+    // Parser work is cumulative across the whole signing operation: handing
+    // over the parsed template must not give the signing passes a fresh
+    // allowance, so both entry points pass and fail at the same limit.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    // Canonical octets fed to a second canonicalization are parsed back into
+    // a node set, so signing itself spends parser work on this Reference.
+    let template = template_with_reference(
+        ReferenceBuilder::new(DigestAlgorithm::Sha256)
+            .uri("#payload")
+            .transform(Transform::C14n(exclusive_c14n()))
+            .transform(Transform::C14n(exclusive_c14n())),
+    );
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+    let limited = |limit: usize| SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: limit,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let parses = |limit: usize| {
+        XmlDocument::parse_with_policy_and_backend(
+            xml.as_str(),
+            &limited(limit),
+            xml_sec::XmlBackend::default(),
+        )
+        .is_ok()
+    };
+    let signs_text = |limit: usize| {
+        SignContext::new(&private_key)
+            .policy(limited(limit))
+            .sign_template(&xml)
+            .is_ok()
+    };
+    // The smallest allowance that passes `accepts`.
+    let smallest = |accepts: &dyn Fn(usize) -> bool| {
+        let (mut refused, mut accepted) = (0, 64 * xml.len());
+        assert!(accepts(accepted));
+        while accepted - refused > 1 {
+            let middle = refused + (accepted - refused) / 2;
+            if accepts(middle) {
+                accepted = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        accepted
+    };
+    let parse_only = smallest(&parses);
+    let whole = smallest(&signs_text);
+    assert!(
+        whole > parse_only,
+        "signing must itself spend parser work: {whole} <= {parse_only}"
+    );
+    // Between the two, the template parses but the operation exceeds its
+    // allowance, whichever entry point runs it.
+    for (limit, expected) in [(whole - 1, false), (whole, true)] {
+        let policy = limited(limit);
+        let document = XmlDocument::parse_with_policy_and_backend(
+            xml.as_str(),
+            &policy,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect("the template alone fits either allowance");
+        let outcome = SignContext::new(&private_key)
+            .policy(policy)
+            .sign_template_document(document);
+        assert_eq!(outcome.is_ok(), expected, "limit {limit}: {outcome:?}");
+    }
+}
+
+#[test]
 fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
     // SignedInfo canonicalization is part of the same operation as Reference
     // transforms and must not replace the compiled XML Base policy with hard

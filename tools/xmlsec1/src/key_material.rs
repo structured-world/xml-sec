@@ -186,8 +186,15 @@ pub fn parse_operation_document(
     policy: &impl xml_sec::XmlDocumentPolicy,
     xml_backend: xml_sec::XmlBackend,
 ) -> Result<xml_sec::XmlDocument, KeyMaterialError> {
-    xml_sec::XmlDocument::parse_with_policy_and_backend(xml, policy, xml_backend)
-        .map_err(|error| KeyMaterialError::Signature(error.to_string()))
+    xml_sec::XmlDocument::parse_with_policy_and_backend(xml, policy, xml_backend).map_err(|error| {
+        match error {
+            // Parser failures keep the parser's own text in CLI diagnostics.
+            xml_sec::XmlDocumentError::Parse(error) => {
+                KeyMaterialError::Signature(error.to_string())
+            }
+            error => KeyMaterialError::Signature(error.to_string()),
+        }
+    })
 }
 
 fn verification_metadata_in(

@@ -1013,5 +1013,10 @@ fn signature_discovery_obeys_the_verification_node_ceiling() {
     let Err(error) = parse_operation_document(xml, &policy, xml_sec::XmlBackend::default()) else {
         panic!("a document over the node ceiling must not parse");
     };
-    assert!(error.to_string().contains("nodes limit"), "{error}");
+    // The parser's own text, as the CLI reported it before discovery shared the
+    // operation's document; no document-layer prefix is added.
+    assert_eq!(
+        error.to_string(),
+        "invalid XML signature: nodes limit reached"
+    );
 }
