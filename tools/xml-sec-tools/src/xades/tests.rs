@@ -123,6 +123,24 @@ fn a_file_outside_head_is_refused_whatever_status_shows() {
     assert!(error.contains("corpus/hidden.xml"), "{error}");
 }
 
+#[test]
+fn bytes_the_index_hides_are_compared_with_the_commit() {
+    // A file marked assume-unchanged or skip-worktree can differ from HEAD
+    // while status reports nothing; the archived bytes must still be HEAD's.
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet"]);
+        write(&root.join("LICENSE"), "license");
+        git(root, &["add", "LICENSE"]);
+        git(root, &["commit", "--quiet", "-m", "notice"]);
+        git(root, &["update-index", flag, "LICENSE"]);
+        write(&root.join("LICENSE"), "altered");
+        let error = source_commit(root, &["LICENSE".to_owned()]).unwrap_err();
+        assert!(error.contains("LICENSE"), "{flag}: {error}");
+    }
+}
+
 fn object(value: Value) -> Map<String, Value> {
     let Value::Object(map) = value else {
         panic!("not an object: {value}");

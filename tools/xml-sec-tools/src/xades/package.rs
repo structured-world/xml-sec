@@ -4,7 +4,7 @@
 
 use super::{Corpus, digest, read, xml};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// License notices distributed with the corpus.
@@ -200,37 +200,50 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 /// The commit the archive is built from. Every archived file must be
 /// committed unchanged there, so the recorded commit reproduces the archive.
 pub(crate) fn source_commit(root: &Path, names: &[String]) -> Result<String, String> {
-    // Status hides ignored files, and untracked ones under
-    // status.showUntrackedFiles=no, so presence in HEAD is checked directly.
-    let mut tree = vec!["ls-tree", "-r", "-z", "--name-only", "HEAD", "--"];
+    let head = git(root, &["rev-parse", "--verify", "HEAD"])?;
+    let commit = String::from_utf8_lossy(&head).trim_end().to_owned();
+    // The working bytes are hashed and compared with the commit's blobs:
+    // status depends on the index, which hides ignored files, untracked ones
+    // under status.showUntrackedFiles=no and assume-unchanged or
+    // skip-worktree edits.
+    let mut tree = vec!["ls-tree", "-r", "-z", commit.as_str(), "--"];
     tree.extend(names.iter().map(String::as_str));
     let listed = git(root, &tree)?;
-    let committed: BTreeSet<&str> = std::str::from_utf8(&listed)
+    let committed: BTreeMap<&str, &str> = std::str::from_utf8(&listed)
         .map_err(|error| error.to_string())?
         .split('\0')
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            Some((path, meta.rsplit(' ').next()?))
+        })
         .collect();
-    let missing: Vec<&str> = names
+    let mut hash = vec!["hash-object", "--no-filters", "--"];
+    hash.extend(names.iter().map(String::as_str));
+    let hashed = git(root, &hash)?;
+    let actual: Vec<&str> = std::str::from_utf8(&hashed)
+        .map_err(|error| error.to_string())?
+        .lines()
+        .collect();
+    if actual.len() != names.len() {
+        return Err(format!(
+            "git hash-object returned {} ids for {} files",
+            actual.len(),
+            names.len()
+        ));
+    }
+    let differing: Vec<&str> = names
         .iter()
-        .map(String::as_str)
-        .filter(|name| !committed.contains(name))
+        .zip(&actual)
+        .filter(|(name, blob)| committed.get(name.as_str()) != Some(*blob))
+        .map(|(name, _)| name.as_str())
         .collect();
-    if !missing.is_empty() {
+    if !differing.is_empty() {
         return Err(format!(
             "commit the archived files first: {}",
-            missing.join(" ")
+            differing.join(" ")
         ));
     }
-    let mut status = vec!["status", "--porcelain", "-z", "--"];
-    status.extend(names.iter().map(String::as_str));
-    let changed = git(root, &status)?;
-    if !changed.is_empty() {
-        return Err(format!(
-            "commit the archived files first: {}",
-            String::from_utf8_lossy(&changed).replace('\0', " ")
-        ));
-    }
-    let head = git(root, &["rev-parse", "HEAD"])?;
-    Ok(String::from_utf8_lossy(&head).trim_end().to_owned())
+    Ok(commit)
 }
 
 /// The archived files at `names` followed by the `COMMIT` file, and that
