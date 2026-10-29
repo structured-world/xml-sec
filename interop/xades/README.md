@@ -136,8 +136,8 @@ Random new credentials change the signed bytes and hashes: archive the new set a
 corpus, rather than comparing its signatures with this one.
 
 The distributable archive contains this directory, license notices and a `COMMIT` file
-naming the commit it was built from; the packager refuses to build it from changed or
-untracked files, so a checkout of that commit holds the same corpus and the code that
+naming the commit it was built from; the packager requires every archived file to be
+committed unchanged in that commit, so a checkout of that commit holds the same corpus and the code that
 checks it. Verify corpus assets with `shasum -a 256 -c interop/xades/SHA256SUMS`.
 The archive also contains a root `SHA256SUMS` covering every archived file.
 Build it with `cargo run -p xml-sec-tools -- xades package /tmp/xades-interop-new.tar.gz`;
