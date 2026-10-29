@@ -449,7 +449,6 @@ impl ContentReplacementEdit<'_> {
 
 #[derive(Debug)]
 struct DocumentIndexes {
-    order: Map<NodeId, usize>,
     default_ids: Map<String, Option<NodeId>>,
     attributes_by_value: Map<(String, String), Vec<NodeId>>,
 }
@@ -2120,12 +2119,9 @@ impl<'a> DocumentView<'a> {
     /// Rejects foreign/stale identities or nodes absent from this generation.
     pub fn document_order(self, identity: NodeIdentity) -> Result<usize, XmlDocumentError> {
         self.validate_identity(identity)?;
-        self.parsed
-            .indexes
-            .order
-            .get(&self.resolve_node(identity)?.id())
-            .copied()
-            .ok_or(XmlDocumentError::MissingNode)
+        // The arena stores every subtree contiguously in preorder, so a node's
+        // arena index is its document position.
+        Ok(self.resolve_node(identity)?.id().get_usize())
     }
 
     /// Return a total order key for a current tree node.
@@ -4173,13 +4169,16 @@ fn validate_wrappers(
 
 impl DocumentIndexes {
     fn build(document: &Document<'_>) -> Self {
-        let mut order = Map::new();
         let mut default_ids = Map::new();
         let mut duplicate_ids = Set::new();
         let mut attributes_by_value: Map<(String, String), Vec<NodeId>> = Map::new();
 
         for (position, node) in document.descendants().enumerate() {
-            order.insert(node.id(), position);
+            debug_assert_eq!(
+                node.id().get_usize(),
+                position,
+                "document order must equal the preorder arena index"
+            );
             if !node.is_element() {
                 continue;
             }
@@ -4206,7 +4205,6 @@ impl DocumentIndexes {
             }
         }
         Self {
-            order,
             default_ids,
             attributes_by_value,
         }
