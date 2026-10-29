@@ -11,6 +11,7 @@ See [provider boundaries](crypto-providers.md) and [policy profiles](policy-prof
 | Defaults | `std`, `c14n`, `xmldsig`, `xmldsig-sign`, `xmlenc`, `xml-backend-xmloxide` |
 | `c14n` plus one XML backend | Canonicalization without signature/encryption dependencies; builds without `std` |
 | `xmldsig` plus one XML backend | Signature verification, policy and the public-key inventory; builds without `std` |
+| `cms` plus one XML backend | Adds the CMS `SignedData` and RFC 3161 timestamp signature provider over the selected crypto provider; implies `xmldsig`, not signing; builds without `std` |
 | `xmldsig-sign` plus one XML backend | Adds signing, signature templates, private-key import (PEM, PKCS#8, encrypted PKCS#8, PKCS#12) and the bundled randomness source; implies `xmldsig` and `std` |
 | `xmlenc` plus one XML backend | Encryption and its shared signature/key-inventory graph; implies `xmldsig-sign` and `std` |
 | `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` and `std` |
@@ -41,8 +42,8 @@ helpers remain available with an XML backend even without the `c14n` marker.
 
 ### Builds without `std`
 
-Without the `std` feature the crate is `no_std` with `alloc`: C14N and XMLDSig
-verification build for targets such as `thumbv7em-none-eabihf` and
+Without the `std` feature the crate is `no_std` with `alloc`: C14N, XMLDSig
+verification and the `cms` provider build for targets such as `thumbv7em-none-eabihf` and
 `wasm32-unknown-unknown`. Host-only capabilities keep requiring `std`: signing
 and its randomness (`xmldsig-sign`), `xmlenc`, native providers and PKCS#11.
 
@@ -69,8 +70,10 @@ public material, X.509 path and CRL validation and the public-key inventory.
 It compiles no signing pipeline, signature templates, private-key import,
 password-based key derivation or operating-system randomness: `pkcs12`,
 `pkcs5`, `scrypt`, `pbkdf2`, `cms`, `x509-cert`, `x509-parser` and `getrandom`
-are absent from its dependency graph. Certificates are read only through the
-shared PKIX reader and PEM through one RFC 7468 decoder.
+are absent from its dependency graph, and so is the `structured-cms` processor.
+Certificates are read only through the shared PKIX reader and PEM through one
+RFC 7468 decoder. The `cms` feature adds `structured-cms` for timestamp and
+`SignedData` checks and nothing from that signing and import list.
 
 `CryptoProvider` keeps one method set in every build, so an external provider
 compiles unchanged whichever features another crate enables. The bundled
@@ -100,10 +103,13 @@ dependency/setup errors cannot satisfy it.
 The `dsig-xmloxide` and `dsig-roxmltree` profiles are verification-only: before
 linting they fail if any crate listed above enters the normal dependency graph,
 and they run the library tests and `tests/verify_only_build.rs`. Tests that
-create their fixtures by signing run in the signing profiles.
+create their fixtures by signing run in the signing profiles. The
+`cms-xmloxide` profile applies the same graph check, admitting only
+`structured-cms`, and runs `tests/cms_timestamp.rs` over RFC 3161 tokens that
+`scripts/generate-cms-timestamp-fixtures.sh` obtains from OpenSSL.
 
 Other profiles are `dom-xmloxide`, `dom-roxmltree`, `c14n-xmloxide`,
-`dsig-xmloxide`, `dsig-sign-xmloxide`, `xmlenc-roxmltree`, `xslt`, `legacy`,
+`dsig-xmloxide`, `cms-xmloxide`, `dsig-sign-xmloxide`, `xmlenc-roxmltree`, `xslt`, `legacy`,
 `experimental`, `fips-dsig` and `pkcs11`. Native FIPS requirements are documented by
 [AWS](https://aws.github.io/aws-lc-rs/requirements/index.html).
 For token execution supply an explicit test module:

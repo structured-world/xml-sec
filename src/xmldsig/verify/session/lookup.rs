@@ -35,7 +35,19 @@ pub struct SessionDigest<'p> {
     state: Box<dyn crate::provider::DigestState + 'p>,
 }
 
-impl SessionDigest<'_> {
+impl<'p> SessionDigest<'p> {
+    /// Start `algorithm` on `provider` once `policy` permits it.
+    pub(crate) fn begin(
+        provider: &'p dyn crate::provider::CryptoProvider,
+        policy: &crate::policy::VerificationPolicy,
+        algorithm: DigestAlgorithm,
+    ) -> Result<Self, DsigError> {
+        policy.check_digest_algorithm(algorithm)?;
+        let state = super::super::super::digest::begin_digest(provider, algorithm)
+            .map_err(DsigError::from)?;
+        Ok(Self { algorithm, state })
+    }
+
     /// Required digest output width, independent of provider output.
     #[must_use]
     pub fn output_len(&self) -> usize {
@@ -161,10 +173,14 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     /// Returns an error for a digest denied by policy, an unavailable provider
     /// capability, or failure to create the provider's incremental state.
     pub fn begin_digest(&self, algorithm: DigestAlgorithm) -> Result<SessionDigest<'_>, DsigError> {
-        self.context.policy.check_digest_algorithm(algorithm)?;
-        let state = super::super::super::digest::begin_digest(self.context.provider, algorithm)
-            .map_err(DsigError::from)?;
-        Ok(SessionDigest { algorithm, state })
+        SessionDigest::begin(self.context.provider, &self.context.policy, algorithm)
+    }
+
+    /// CMS and RFC 3161 signature checks through this operation's provider,
+    /// digest and certificate-signature policy and RSA/DSA key policy.
+    #[cfg(feature = "cms")]
+    pub fn cms_provider(&self) -> crate::xmldsig::cms::CmsProvider<'_> {
+        crate::xmldsig::cms::CmsProvider::new(self.context.provider, &self.context.policy)
     }
 
     /// This verified request's own execution. A continuation that funds its

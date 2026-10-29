@@ -58,6 +58,8 @@
 
 #[cfg(feature = "xmldsig-sign")]
 pub mod builder;
+#[cfg(feature = "cms")]
+pub mod cms;
 pub mod digest;
 pub mod extension;
 pub mod keys;
