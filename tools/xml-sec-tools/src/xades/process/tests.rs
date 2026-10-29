@@ -103,13 +103,17 @@ fn a_timeout_stops_descendants_whether_or_not_their_parent_waits() {
 
 #[test]
 fn a_descendant_that_left_the_group_cannot_hold_the_deadline() {
-    // Job control moves the background job to its own group; the command
-    // still fails at its deadline instead of waiting for the open streams.
+    // Bash job control moves the background job to its own group; the
+    // command still fails at its deadline instead of waiting for the open
+    // streams. Bash, because not every `sh` offers job control to scripts.
     let directory = tempfile::tempdir().unwrap();
     let start = Instant::now();
-    let error = run_shell(
+    let script = "set -m; sleep 30 & echo $! > pid; echo ready; wait";
+    let error = run(
+        &["bash", "-c", script].map(OsString::from),
+        &directory.path().join("log"),
         directory.path(),
-        "set -m; sleep 30 & echo $! > pid; echo ready; wait",
+        &[],
         Duration::from_secs(1),
     )
     .unwrap_err();
