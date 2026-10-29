@@ -402,6 +402,14 @@ fn signing_template_with_key_info(key_info: &str, targets: &str) -> String {
     )
 }
 
+/// The operation document the commands parse once, under `policy`.
+fn operation_document(
+    xml: impl Into<String>,
+    policy: &impl xml_sec::XmlDocumentPolicy,
+) -> xml_sec::XmlDocument {
+    parse_operation_document(xml.into(), policy, xml_sec::XmlBackend::default()).unwrap()
+}
+
 #[test]
 fn signing_metadata_rejects_invalid_key_info_reference_graphs() {
     // Signing key selection must fail closed on the same malformed graph
@@ -431,7 +439,10 @@ fn signing_metadata_rejects_invalid_key_info_reference_graphs() {
     ];
     for (key_info, targets, expected) in cases {
         let error = signing_signature_metadata(
-            &signing_template_with_key_info(key_info, targets),
+            &operation_document(
+                signing_template_with_key_info(key_info, targets),
+                &SigningPolicy::default(),
+            ),
             None,
             &[],
             &SigningPolicy::default(),
@@ -460,9 +471,12 @@ fn signing_metadata_bounds_key_info_reference_depth() {
         })
         .collect::<String>();
     let error = signing_signature_metadata(
-        &signing_template_with_key_info(
-            "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#level-0\"/></ds:KeyInfo>",
-            &targets,
+        &operation_document(
+            signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#level-0\"/></ds:KeyInfo>",
+                &targets,
+            ),
+            &SigningPolicy::default(),
         ),
         None,
         &[],
@@ -486,9 +500,12 @@ fn signing_metadata_bounds_key_info_reference_candidate_work() {
     let mut policy = SigningPolicy::default();
     policy.resources.max_key_candidates = 2;
     let error = signing_signature_metadata(
-        &signing_template_with_key_info(
-            "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
-            "<ds:KeyInfo Id=\"target\"><ds:KeyName>one</ds:KeyName><ds:KeyName>two</ds:KeyName></ds:KeyInfo>",
+        &operation_document(
+            signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><ds:KeyName>one</ds:KeyName><ds:KeyName>two</ds:KeyName></ds:KeyInfo>",
+            ),
+            &policy,
         ),
         None,
         &[],
@@ -513,9 +530,12 @@ fn signing_metadata_enforces_key_info_reference_uri_policy() {
     let mut policy = SigningPolicy::default();
     policy.uris.key_info_references = xml_sec::xmldsig::UriTypeSet::new(false, false, false);
     let error = signing_signature_metadata(
-        &signing_template_with_key_info(
-            "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
-            "<ds:KeyInfo Id=\"target\"><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
+        &operation_document(
+            signing_template_with_key_info(
+                "<ds:KeyInfo><dsig11:KeyInfoReference URI=\"#target\"/></ds:KeyInfo>",
+                "<ds:KeyInfo Id=\"target\"><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
+            ),
+            &policy,
         ),
         None,
         &[],
@@ -851,7 +871,7 @@ fn selected_signature_controls_verification_key_algorithm() {
     );
 
     let metadata = verification_signature_metadata(
-        &xml,
+        &operation_document(xml, &VerificationPolicy::default()),
         Some("ec"),
         &[],
         &xml_sec::policy::VerificationPolicy::default(),
@@ -873,7 +893,7 @@ fn direct_verification_metadata_ignores_malformed_document_keys() {
     );
 
     let metadata = verification_signature_metadata(
-        &xml,
+        &operation_document(xml.as_str(), &VerificationPolicy::default()),
         None,
         &[],
         &VerificationPolicy::default(),
@@ -896,7 +916,7 @@ fn direct_verification_metadata_ignores_malformed_document_keys() {
         ),
     ] {
         let metadata = verification_signature_metadata(
-            &input,
+            &operation_document(input, &VerificationPolicy::default()),
             None,
             &[],
             &VerificationPolicy::default(),
@@ -920,7 +940,7 @@ fn signature_metadata_preserves_every_key_name_for_resolution() {
     );
 
     let metadata = verification_signature_metadata(
-        &xml,
+        &operation_document(xml, &VerificationPolicy::default()),
         None,
         &[],
         &xml_sec::policy::VerificationPolicy::default(),
@@ -942,8 +962,9 @@ fn verification_metadata_resolves_referenced_key_names() {
         r##"<root xmlns:ds="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI=""><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:SignedInfo><ds:SignatureValue>AA==</ds:SignatureValue><ds:KeyInfo><dsig11:KeyInfoReference URI="#target"/></ds:KeyInfo></ds:Signature><ds:KeyInfo Id="target"><ds:KeyName>wanted</ds:KeyName></ds:KeyInfo></root>"##
     );
 
+    let document = operation_document(xml, &VerificationPolicy::default());
     let metadata = verification_signature_metadata(
-        &xml,
+        &document,
         None,
         &[],
         &VerificationPolicy::default(),
@@ -960,7 +981,7 @@ fn verification_metadata_resolves_referenced_key_names() {
         .key_sources
         .remove(xml_sec::policy::KeySourceKind::KeyInfoReference);
     let error = verification_signature_metadata(
-        &xml,
+        &document,
         None,
         &[],
         &disabled,
@@ -988,15 +1009,9 @@ fn signature_discovery_obeys_the_verification_node_ceiling() {
         ..xml_sec::policy::VerificationPolicy::default()
     };
 
-    let error = verification_signature_metadata(
-        &xml,
-        None,
-        &[],
-        &policy,
-        VerificationKeyNameResolution::IgnoreDocumentKeyInfo,
-        xml_sec::XmlBackend::default(),
-        xml_sec::provider::default_provider(),
-    )
-    .unwrap_err();
-    assert!(error.to_string().contains("nodes limit"));
+    // Discovery reads the operation document, so its parse carries the ceiling.
+    let Err(error) = parse_operation_document(xml, &policy, xml_sec::XmlBackend::default()) else {
+        panic!("a document over the node ceiling must not parse");
+    };
+    assert!(error.to_string().contains("nodes limit"), "{error}");
 }

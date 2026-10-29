@@ -1922,6 +1922,63 @@ fn signing_policy_shares_canonicalization_budget_with_signed_info() {
 }
 
 #[test]
+fn a_handed_over_parsed_template_signs_like_its_text() {
+    // A caller that parsed the template to read its metadata signs that same
+    // document: the output and the operation's policy refusals match signing
+    // the text, which would parse it a second time.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let xml = append_signature_to_root(
+        "<root><payload ID=\"payload\">x</payload></root>",
+        &template,
+    )
+    .expect("append signature");
+    let policy = SigningPolicy::default();
+    let from_text = SignContext::new(&private_key)
+        .sign_template(&xml)
+        .expect("template must sign");
+    let document = XmlDocument::parse_with_policy_and_backend(
+        xml.as_str(),
+        &policy,
+        xml_sec::XmlBackend::default(),
+    )
+    .expect("template must parse under the signing policy");
+    let from_document = SignContext::new(&private_key)
+        .sign_template_document(document)
+        .expect("parsed template must sign");
+    assert_eq!(from_document, from_text);
+
+    let constrained = SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_canonicalized_bytes: 64,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let document = XmlDocument::parse_with_policy_and_backend(
+        xml.as_str(),
+        &constrained,
+        xml_sec::XmlBackend::default(),
+    )
+    .expect("template must parse under the constrained policy");
+    assert!(matches!(
+        SignContext::new(&private_key)
+            .policy(constrained)
+            .sign_template_document(document),
+        Err(SigningError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "canonicalized bytes",
+                maximum: 64,
+                ..
+            }
+        ))
+    ));
+}
+
+#[test]
 fn signing_policy_applies_xml_base_budget_to_signed_info_c14n() {
     // SignedInfo canonicalization is part of the same operation as Reference
     // transforms and must not replace the compiled XML Base policy with hard

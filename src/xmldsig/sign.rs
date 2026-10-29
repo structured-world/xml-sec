@@ -1819,6 +1819,29 @@ impl<'a> SignContext<'a> {
         self.sign_document_in_place::<SerializeText>(&mut document, &mut budgets)
     }
 
+    /// Sign a parsed template the caller hands over, and return the signed XML.
+    ///
+    /// The same pipeline as [`Self::sign_template`] on a document parsed under
+    /// this context's policy, for example with
+    /// [`XmlDocument::parse_with_policy_and_backend`], so a caller that already
+    /// read the template's metadata does not parse it twice. The document is
+    /// consumed: a failure leaves nothing to roll back.
+    ///
+    /// # Errors
+    /// Returns document provenance, template, policy/resource, key-info,
+    /// reference, selected-provider signing or final mutation failures.
+    pub fn sign_template_document(
+        &self,
+        mut document: XmlDocument,
+    ) -> Result<String, SigningError> {
+        self.validate_owned_document_input(&document)?;
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
+        self.sign_document_in_place::<SerializeText>(&mut document, &mut budgets)
+    }
+
     /// Sign a template in a reusable owned document.
     ///
     /// Signing is atomic: failures leave both serialization and generation

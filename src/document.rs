@@ -2093,7 +2093,12 @@ impl<'a> DocumentView<'a> {
         })
     }
 
-    pub(crate) fn document(self) -> &'a Document<'a> {
+    /// The semantic tree of this generation, read-only.
+    ///
+    /// Callers that inspect a document before an operation read the same
+    /// tree the operation then uses, instead of parsing the text again.
+    #[must_use]
+    pub fn document(self) -> &'a Document<'a> {
         &self.parsed.document
     }
 

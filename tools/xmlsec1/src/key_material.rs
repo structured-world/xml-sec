@@ -28,9 +28,7 @@ use xml_sec::xmldsig::{
     VerificationKey, find_signature_node, inspect_signing_key_info, inspect_verification_key_info,
     parse_signed_info, uri::UriReferenceResolver,
 };
-use xml_sec::{
-    XmlDomDocument as Document, XmlDomNode as Node, XmlDomParsingOptions as ParsingOptions,
-};
+use xml_sec::{XmlDomDocument as Document, XmlDomNode as Node};
 use zeroize::Zeroizing;
 
 // This is an absolute process-safety ceiling, not deployment policy. Parsed
@@ -159,7 +157,7 @@ pub fn read_with_limit(
 /// document references to the core resolver's `consumes_document_key_info`
 /// contract.
 pub fn verification_signature_metadata(
-    xml: &str,
+    document: &xml_sec::XmlDocument,
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &VerificationPolicy,
@@ -168,13 +166,40 @@ pub fn verification_signature_metadata(
     provider: &dyn xml_sec::provider::CryptoProvider,
 ) -> Result<SignatureMetadata, KeyMaterialError> {
     policy.validate()?;
-    let document = parse_signature_document(
-        xml,
-        policy.xml.allow_internal_dtd,
-        policy.resources.max_xml_nodes,
-        xml_backend,
-    )?;
-    let signature = select_signature(&document, start_node_id, id_attributes)?;
+    document.with_view(|view| {
+        verification_metadata_in(
+            view.document(),
+            start_node_id,
+            id_attributes,
+            policy,
+            key_name_resolution,
+            xml_backend,
+            provider,
+        )
+    })
+}
+
+/// Parse an operation's input once under its policy; the metadata readers and
+/// the operation itself all use this document.
+pub fn parse_operation_document(
+    xml: String,
+    policy: &impl xml_sec::XmlDocumentPolicy,
+    xml_backend: xml_sec::XmlBackend,
+) -> Result<xml_sec::XmlDocument, KeyMaterialError> {
+    xml_sec::XmlDocument::parse_with_policy_and_backend(xml, policy, xml_backend)
+        .map_err(|error| KeyMaterialError::Signature(error.to_string()))
+}
+
+fn verification_metadata_in(
+    document: &Document<'_>,
+    start_node_id: Option<&str>,
+    id_attributes: &[xml_sec::IdAttributeRegistration],
+    policy: &VerificationPolicy,
+    key_name_resolution: VerificationKeyNameResolution,
+    xml_backend: xml_sec::XmlBackend,
+    provider: &dyn xml_sec::provider::CryptoProvider,
+) -> Result<SignatureMetadata, KeyMaterialError> {
+    let signature = select_signature(document, start_node_id, id_attributes)?;
     let signed_info = signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
@@ -187,7 +212,7 @@ pub fn verification_signature_metadata(
     let ignore_hints = key_name_resolution == VerificationKeyNameResolution::IgnoreDocumentKeyInfo;
     let metadata = signature_key_info(signature)
         .map(|info| {
-            let resolver = UriReferenceResolver::with_id_registrations(&document, id_attributes);
+            let resolver = UriReferenceResolver::with_id_registrations(document, id_attributes);
             if ignore_hints {
                 xml_sec::xmldsig::inspect_pinned_verification_key_info(
                     info,
@@ -221,7 +246,7 @@ pub fn verification_signature_metadata(
 }
 
 pub fn signing_signature_metadata(
-    xml: &str,
+    document: &xml_sec::XmlDocument,
     start_node_id: Option<&str>,
     id_attributes: &[xml_sec::IdAttributeRegistration],
     policy: &SigningPolicy,
@@ -229,13 +254,27 @@ pub fn signing_signature_metadata(
     provider: &dyn xml_sec::provider::CryptoProvider,
 ) -> Result<SigningTemplateMetadata, KeyMaterialError> {
     policy.validate()?;
-    let document = parse_signature_document(
-        xml,
-        policy.xml.allow_internal_dtd,
-        policy.resources.max_xml_nodes,
-        xml_backend,
-    )?;
-    let signature = select_signature(&document, start_node_id, id_attributes)?;
+    document.with_view(|view| {
+        signing_metadata_in(
+            view.document(),
+            start_node_id,
+            id_attributes,
+            policy,
+            xml_backend,
+            provider,
+        )
+    })
+}
+
+fn signing_metadata_in(
+    document: &Document<'_>,
+    start_node_id: Option<&str>,
+    id_attributes: &[xml_sec::IdAttributeRegistration],
+    policy: &SigningPolicy,
+    xml_backend: xml_sec::XmlBackend,
+    provider: &dyn xml_sec::provider::CryptoProvider,
+) -> Result<SigningTemplateMetadata, KeyMaterialError> {
+    let signature = select_signature(document, start_node_id, id_attributes)?;
     let method = signature
         .children()
         .find(|node| node.has_tag_name(("http://www.w3.org/2000/09/xmldsig#", "SignedInfo")))
@@ -252,7 +291,7 @@ pub fn signing_signature_metadata(
         .map(|info| {
             inspect_signing_key_info(
                 info,
-                UriReferenceResolver::with_id_registrations(&document, id_attributes),
+                UriReferenceResolver::with_id_registrations(document, id_attributes),
                 policy,
                 provider,
                 xml_backend,
@@ -299,26 +338,6 @@ fn select_signature<'a>(
         None => find_signature_node(document),
     }
     .ok_or(KeyMaterialError::MissingSignedInfo)
-}
-
-fn parse_signature_document(
-    xml: &str,
-    allow_internal_dtd: bool,
-    max_xml_nodes: usize,
-    xml_backend: xml_sec::XmlBackend,
-) -> Result<Document<'_>, KeyMaterialError> {
-    let nodes_limit = u32::try_from(max_xml_nodes).map_err(|_| {
-        KeyMaterialError::Signature("XML node ceiling does not fit the parser limit".into())
-    })?;
-    Document::parse_with_options_and_backend(
-        xml,
-        ParsingOptions {
-            allow_dtd: allow_internal_dtd,
-            nodes_limit,
-        },
-        xml_backend,
-    )
-    .map_err(|error| KeyMaterialError::Signature(error.to_string()))
 }
 
 fn key_names(key_info: Option<&KeyInfo>) -> Vec<String> {
