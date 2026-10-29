@@ -6,6 +6,7 @@ mod ci_blocks;
 mod coverage;
 mod documentation;
 mod donor_fixtures;
+mod fetch_standards;
 mod fuzz_security;
 mod hardening;
 mod install_xmlsec1;
@@ -42,7 +43,8 @@ commands:
   ci-blocks BLOCK
   competitor-lock
   documentation [all|docs]
-  donor-fixtures [--xmlenc-corpora | PATH...]
+  donor-fixtures [--xmlenc-corpora | PATH... | --cli [--check]]
+  fetch-standards
   fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
   hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]
   install-xmlsec1
@@ -73,6 +75,7 @@ fn main() -> ExitCode {
         Some("competitor-lock") => bench::compare::run_lock(args),
         Some("documentation") => documentation::run(args),
         Some("donor-fixtures") => donor_fixtures::run(args),
+        Some("fetch-standards") => fetch_standards::run(args),
         Some("fuzz-security") => fuzz_security::run(args),
         Some("hardening") => hardening::run(args),
         Some("install-xmlsec1") => install_xmlsec1::run(args),
