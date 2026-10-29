@@ -1,24 +1,17 @@
-//! `xades package OUTPUT | --refresh-inventory`: archives the corpus with its
-//! source overlay, excluding tool caches, build outputs and run captures.
+//! `xades package OUTPUT | --refresh-inventory`: archives the corpus with the
+//! commit it was built from, excluding tool caches, build outputs and run
+//! captures.
 
 use super::{Corpus, digest, read, xml};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// Repository files distributed with the corpus besides the runner crate.
-const SOURCES: [&str; 6] = [
-    "LICENSE",
-    "LICENSE-THIRD-PARTY",
-    "README.md",
-    "interop/.gitignore",
-    ".github/workflows/ci.yml",
-    "crates/xml-sec-xades/examples/interop_probe.rs",
-];
+/// License notices distributed with the corpus.
+const NOTICES: [&str; 2] = ["LICENSE", "LICENSE-THIRD-PARTY"];
 
-/// The runner crate; every tracked file of it is distributed, since its
-/// binary compiles all subcommands.
-const RUNNER: &str = "tools/xml-sec-tools";
+/// The archived file naming the commit the archive was built from.
+const COMMIT: &str = "COMMIT";
 
 /// Maintained corpus files outside the per-case directories.
 const DOCUMENTS: [&str; 14] = [
@@ -186,48 +179,20 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
-/// The frozen implementation commit the corpus README records.
-pub(crate) fn baseline(readme: &str) -> Result<&str, String> {
-    let pattern =
-        regex::Regex::new(r"Repository: `structured-world/xml-sec`, commit `([0-9a-f]{40})`")
-            .map_err(|error| error.to_string())?;
-    pattern
-        .captures(readme)
-        .and_then(|found| found.get(1))
-        .map(|commit| commit.as_str())
-        .ok_or_else(|| "the corpus README records no baseline commit".to_owned())
-}
-
-/// The baseline's root manifest with whatever the runner needs and the
-/// baseline lacks: its workspace membership and a workspace lint table to
-/// inherit (empty, since lint enforcement is not part of a reproduction).
-/// The `xml-sec` package itself stays as frozen.
-pub(crate) fn workspace_manifest(frozen: &str) -> Result<String, String> {
-    let member = format!("\"{RUNNER}\"");
-    let mut manifest = String::with_capacity(frozen.len() + 128);
-    if frozen.contains(&member) {
-        manifest.push_str(frozen);
-    } else {
-        let members = frozen
-            .find("\nmembers = [\n")
-            .ok_or("the baseline manifest has no workspace member list")?;
-        let close = frozen[members..]
-            .find("\n]\n")
-            .map(|offset| members + offset + 1)
-            .ok_or("the baseline workspace member list is not closed")?;
-        manifest.push_str(&frozen[..close]);
-        manifest.push_str("    ");
-        manifest.push_str(&member);
-        manifest.push_str(",\n");
-        manifest.push_str(&frozen[close..]);
+/// The commit the archive is built from. Every archived file must be
+/// committed unchanged there, so the recorded commit reproduces the archive.
+pub(crate) fn source_commit(root: &Path, names: &[String]) -> Result<String, String> {
+    let mut status = vec!["status", "--porcelain", "-z", "--"];
+    status.extend(names.iter().map(String::as_str));
+    let changed = git(root, &status)?;
+    if !changed.is_empty() {
+        return Err(format!(
+            "commit the archived files first: {}",
+            String::from_utf8_lossy(&changed).replace('\0', " ")
+        ));
     }
-    if !frozen.contains("[workspace.lints") {
-        if !manifest.ends_with('\n') {
-            manifest.push('\n');
-        }
-        manifest.push_str("\n[workspace.lints.rust]\n");
-    }
-    Ok(manifest)
+    let head = git(root, &["rev-parse", "HEAD"])?;
+    Ok(String::from_utf8_lossy(&head).trim_end().to_owned())
 }
 
 /// One archived file.
@@ -366,8 +331,7 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
     if output.exists() || output.starts_with(&package) {
         return Err("choose a new archive path outside the corpus".into());
     }
-    let mut names: Vec<String> = SOURCES.iter().map(|&name| name.to_owned()).collect();
-    names.extend(tracked(&corpus.root, RUNNER)?);
+    let mut names: Vec<String> = NOTICES.iter().map(|&name| name.to_owned()).collect();
     for path in evidence.files()? {
         let relative = path
             .strip_prefix(&corpus.root)
@@ -389,34 +353,27 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
     if xml::read(&checksums)? != inventory(&corpus.root, &evidence.files()?)? {
         return Err("stale corpus inventory; refresh explicitly before packaging".into());
     }
+    let inventoried = checksums
+        .strip_prefix(&corpus.root)
+        .map_err(|error| error.to_string())?;
+    names.push(inventoried.display().to_string());
+    let commit = source_commit(&corpus.root, &names)?;
     let mut entries = names
         .iter()
         .map(|name| Entry::file(&corpus.root, name))
         .collect::<Result<Vec<_>, _>>()?;
-    // The overlay is extracted over the frozen baseline, whose workspace does
-    // not know the runner; the frozen manifest plus that registration does.
-    let commit = baseline(&xml::read(&package.join("README.md"))?)?.to_owned();
-    let frozen = git(&corpus.root, &["show", &format!("{commit}:Cargo.toml")])?;
-    let frozen = String::from_utf8(frozen).map_err(|error| error.to_string())?;
     entries.push(Entry {
-        name: "Cargo.toml".into(),
-        data: workspace_manifest(&frozen)?.into_bytes(),
+        name: COMMIT.into(),
+        data: format!("{commit}\n").into_bytes(),
         mode: 0o644,
     });
-    let inventoried = checksums
-        .strip_prefix(&corpus.root)
-        .map_err(|error| error.to_string())?;
-    entries.push(Entry::file(
-        &corpus.root,
-        &inventoried.display().to_string(),
-    )?);
     let listing = listing(&entries);
     archive(&output, &entries, &listing)?;
     println!(
-        "{}\nSHA256 {}\n{} inventoried files",
+        "{}\nSHA256 {}\ncommit {commit}\n{} inventoried files",
         output.display(),
         digest(&read(&output)?),
-        entries.len() - 1
+        entries.len()
     );
     Ok(())
 }

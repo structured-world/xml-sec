@@ -1,45 +1,50 @@
 use super::binding::{analyze_octets, binding_facts};
 use super::check::{check_expectations, check_goldens, check_inventory};
 use super::dss::profile_binding;
-use super::package::{Evidence, baseline, workspace_manifest};
+use super::package::{Evidence, source_commit};
 use super::{Corpus, DS, compare, debug_buffer, probe_executable, resolved_versions};
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
 use std::path::Path;
 
-#[test]
-fn the_archived_workspace_is_the_frozen_one_plus_the_runner() {
-    // The archive is extracted over the baseline, whose workspace does not
-    // know the runner; only the membership and the inherited lint table change.
-    let frozen = "[package]\nname = \"xml-sec\"\n\n[workspace]\nmembers = [\n    \".\",\n    \"tools/xmlsec1\",\n]\nresolver = \"3\"\n\n[dependencies]\nbase64 = \"0.23\"\n";
-    let manifest = workspace_manifest(frozen).unwrap();
-    assert_eq!(
-        manifest,
-        "[package]\nname = \"xml-sec\"\n\n[workspace]\nmembers = [\n    \".\",\n    \"tools/xmlsec1\",\n    \"tools/xml-sec-tools\",\n]\nresolver = \"3\"\n\n[dependencies]\nbase64 = \"0.23\"\n\n[workspace.lints.rust]\n"
-    );
-    // A baseline that already registers the runner and its lints is used as
-    // frozen; nothing is declared twice.
-    assert_eq!(workspace_manifest(&manifest).unwrap(), manifest);
-    assert!(workspace_manifest("[package]\nname = \"xml-sec\"\n").is_err());
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+        ])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap()
 }
 
 #[test]
-fn a_baseline_with_the_runner_but_no_lint_table_gets_only_the_table() {
-    // The runner inherits workspace lints, so their table must exist.
-    let frozen = "[workspace]\nmembers = [\n    \".\",\n    \"tools/xml-sec-tools\",\n]\n";
-    assert_eq!(
-        workspace_manifest(frozen).unwrap(),
-        format!("{frozen}\n[workspace.lints.rust]\n")
-    );
-}
+fn the_archive_records_the_commit_its_files_come_from() {
+    // The archive names the commit that reproduces it, never a pinned one;
+    // a changed or untracked archived file has no such commit.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    write(&root.join("corpus/a.xml"), "<a/>");
+    git(root, &["add", "corpus/a.xml"]);
+    git(root, &["commit", "--quiet", "-m", "corpus"]);
+    let names = vec!["corpus/a.xml".to_owned()];
+    let head = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(source_commit(root, &names).unwrap(), head.trim_end());
 
-#[test]
-fn the_baseline_commit_comes_from_the_corpus_readme() {
-    // One recorded commit decides both the README and the archived manifest.
-    let commit = "834c463798060dca613bb93dd78dcdc7f949c948";
-    let readme = format!("- Repository: `structured-world/xml-sec`, commit `{commit}`.\n");
-    assert_eq!(baseline(&readme).unwrap(), commit);
-    assert!(baseline("- Repository: `structured-world/xml-sec`, commit `834c`.\n").is_err());
+    write(&root.join("corpus/a.xml"), "<b/>");
+    let error = source_commit(root, &names).unwrap_err();
+    assert!(error.contains("corpus/a.xml"), "{error}");
+
+    git(root, &["checkout", "--quiet", "--", "corpus/a.xml"]);
+    write(&root.join("corpus/new.xml"), "<n/>");
+    let untracked = vec!["corpus/new.xml".to_owned()];
+    assert!(source_commit(root, &untracked).is_err());
 }
 
 fn object(value: Value) -> Map<String, Value> {

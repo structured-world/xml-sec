@@ -4,16 +4,14 @@ Transform/C14N and XMLDSig interoperability is **verified** for the cases below.
 This is not a claim of complete XAdES, trusted-signature or Business Central compatibility.
 All validation runs are local; fixtures are never uploaded to online validators.
 
-## Frozen baseline and API
+## Implementation under test and API
 
-- Repository: `structured-world/xml-sec`, commit `9ace0e8314f5e9d80492e52781b403d8ec0c5492`.
-  The frozen implementation baseline is independent of the accompanying test-tooling overlay.
-- `xml-sec 0.3.0`, `xml-sec-xades 0.1.0`; published `structured-{asn1,pkix,cms,ltv,xades} 0.17.1`.
+- The corpus checks the commit it runs on; CI runs it on every commit. Each live run
+  records that commit, its tool versions and the resolved dependency versions and
+  features in the output directory, outside Git.
 - Probe: `cargo build -p xml-sec-xades --example interop_probe`, default XAdES features.
   Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded,no-unsafe`.
   This probe does not enable XMLEnc, XSLT, FIPS, PKCS#11 or legacy crypto.
-- Recorded run: Rust/cargo 1.99.0. Each live run records its own tool versions and
-  dependency/features metadata in the output directory, outside Git.
 - Independent oracle: Homebrew **libxmlsec1 1.3.12 (openssl)**, native Mach-O binary.
   This is not this repository's Rust `tools/xmlsec1`. Its linked OpenSSL is **3.6.4**;
   the credential generator's separate `openssl` executable is **4.0.3**.
@@ -78,8 +76,8 @@ computed digests, first differing byte (zero-based), and 24 preceding / 25 follo
 bytes in hexadecimal. Absence is never counted as a byte match. All positive valid
 cases require two reference dumps, SignedInfo, matching DigestValues and completed replay.
 The documented `here()` difference is retained, not normalized away.
-The frozen run contains 93 matching Reference-octet pairs and 42 matching SignedInfo
-pairs across the two explicit modes. These include negative cases that remain processable;
+Each run's summary reports the matching Reference-octet and SignedInfo pairs across
+the two explicit modes. These include negative cases that remain processable;
 they are not counts of fully valid signatures. Authentication failures retain their typed
 causes, and References behind an unverified signature remain unexecuted.
 
@@ -92,7 +90,7 @@ Harness regression tests guard these evidence and output-directory boundaries.
 
 ## Reproduce
 
-Run from the repository root at the recorded commit, with this package's source overlay:
+Run from the repository root:
 
 ```sh
 XMLSEC1_BIN=/path/to/native/xmlsec1 cargo run -p xml-sec-tools -- xades check --output /tmp/xades-live-check
@@ -135,17 +133,16 @@ results directory; this also applies to the DSS runner's `--results` directory.
 test credentials when present. Starting with no `fixtures/` uses the existing
 `xades fixtures` generator to create a new random test chain and B-B variants.
 Random new credentials change the signed bytes and hashes: archive the new set as a new
-corpus, rather than comparing its signatures with this frozen run.
+corpus, rather than comparing its signatures with this one.
 
-The distributable archive contains this directory, the probe source, the complete runner
-crate, and license notices. Its root `Cargo.toml` is the baseline manifest with the runner
-added to the workspace; the `xml-sec` package itself is unchanged. Extract it over a
-checkout at the recorded baseline before building.
-Verify corpus assets with `shasum -a 256 -c interop/xades/SHA256SUMS`.
-The archive also contains a root `SHA256SUMS` covering its source overlay and corpus inventory.
-Repackage with `cargo run -p xml-sec-tools -- xades package /tmp/xades-interop-new.tar.gz`;
+The distributable archive contains this directory, license notices and a `COMMIT` file
+naming the commit it was built from; the packager refuses to build it from changed or
+untracked files, so a checkout of that commit holds the same corpus and the code that
+checks it. Verify corpus assets with `shasum -a 256 -c interop/xades/SHA256SUMS`.
+The archive also contains a root `SHA256SUMS` covering every archived file.
+Build it with `cargo run -p xml-sec-tools -- xades package /tmp/xades-interop-new.tar.gz`;
 the packager allows only declared inputs, independent vectors, expected DSS conclusions,
-provenance and source/docs. Actual outputs, builds, logs and unselected generator outputs
+provenance and docs. Actual outputs, builds, logs and unselected generator outputs
 are excluded. Update an intentionally changed corpus inventory explicitly with
 `cargo run -p xml-sec-tools -- xades package --refresh-inventory`; ordinary checks and
 packaging never rewrite it.
