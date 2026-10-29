@@ -111,7 +111,7 @@ fn pr_smoke_uses_three_jobs_while_long_campaigns_retain_target_parallelism() {
     );
     assert!(pattern(r"target: provider_operations\n\s+fips: true").is_match(&workflow));
     assert!(pattern(r"target: xmlsec_oracle\n\s+fips: false").is_match(&workflow));
-    assert!(workflow.contains(r#"fuzz-security.sh "$TARGET" "$MODE" --cache-managed"#));
+    assert!(workflow.contains(r#"fuzz-security "$TARGET" "$MODE" --cache-managed"#));
 }
 
 #[test]

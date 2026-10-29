@@ -4,11 +4,13 @@ mod check_features;
 mod ci_blocks;
 mod coverage;
 mod documentation;
+mod fuzz_security;
 mod hardening;
 mod kernel_examples;
 mod pedantic_lints;
 mod pkcs11;
 mod repo;
+mod security_corpus;
 mod shared_pkix;
 #[cfg(test)]
 mod test_support;
@@ -23,10 +25,12 @@ commands:
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
   documentation [all|docs]
+  fuzz-security TARGET|asan [smoke|campaign|replay] [--cache-managed]
   hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]
   kernel-examples roxmltree|xmloxide ROOT SOURCE...
   pedantic-lints TOOLCHAIN...
   pkcs11-tests MODULE [--workspace] ARGS...
+  security-corpus check|report|import LIBXML2_SOURCE DATA_DIR LIBXSLT_SOURCE
   shared-pkix";
 
 fn main() -> ExitCode {
@@ -35,10 +39,12 @@ fn main() -> ExitCode {
         Some("check-features") => check_features::run(args),
         Some("ci-blocks") => ci_blocks::run(args).map_err(Failure::from),
         Some("documentation") => documentation::run(args),
+        Some("fuzz-security") => fuzz_security::run(args),
         Some("hardening") => hardening::run(args),
         Some("kernel-examples") => kernel_examples::run(args).map_err(Failure::from),
         Some("pedantic-lints") => pedantic_lints::run(args),
         Some("pkcs11-tests") => pkcs11::run(args),
+        Some("security-corpus") => security_corpus::run(args),
         Some("shared-pkix") => shared_pkix::run(args),
         _ => Err(Failure {
             code: 2,

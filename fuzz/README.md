@@ -30,9 +30,9 @@ stopped by a blanket resolver denial.
 Install `cargo-fuzz` 0.13.2 and a nightly toolchain. From the repository root:
 
 ```sh
-bash scripts/fuzz-security.sh xml_semantics smoke
-bash scripts/fuzz-security.sh xml_semantics campaign
-bash scripts/fuzz-security.sh xml_semantics replay
+cargo run -p xml-sec-tools -- fuzz-security xml_semantics smoke
+cargo run -p xml-sec-tools -- fuzz-security xml_semantics campaign
+cargo run -p xml-sec-tools -- fuzz-security xml_semantics replay
 cargo nextest run --manifest-path fuzz/Cargo.toml --lib
 ```
 

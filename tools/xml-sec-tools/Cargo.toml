@@ -8,6 +8,7 @@ publish = false
 regex = "1"
 # Summaries keep the field order they are written in.
 serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.11"
 tempfile = "3"
 
 [lints]

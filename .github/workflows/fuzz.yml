@@ -26,11 +26,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-      - name: Check system Bash, corpus admission, failure propagation and replay
-        run: node --test scripts/fuzz-security.test.mjs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - name: Check corpus admission, failure propagation and replay
+        run: cargo nextest run -p xml-sec-tools fuzz_security
 
   harness:
     runs-on: ubuntu-latest
@@ -106,7 +105,7 @@ jobs:
           FUZZ_OUTPUT: ${{ runner.temp }}/fuzz-evidence
           TARGET: ${{ matrix.target }}
           MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'campaign' || 'smoke' }}
-        run: bash scripts/fuzz-security.sh "$TARGET" "$MODE" --cache-managed
+        run: cargo +nightly run --quiet -p xml-sec-tools -- fuzz-security "$TARGET" "$MODE" --cache-managed
       - name: Preserve reproducers and commands
         if: always()
         uses: actions/upload-artifact@v7
