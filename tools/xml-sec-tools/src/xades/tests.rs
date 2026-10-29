@@ -1,34 +1,144 @@
 use super::binding::{analyze_octets, binding_facts};
 use super::check::{check_expectations, check_goldens, check_inventory};
 use super::dss::profile_binding;
-use super::package::{Evidence, baseline, workspace_manifest};
+use super::package::{Entry, Evidence, GIT_LOCATION, archive_entries, git_command, source_commit};
 use super::{Corpus, DS, compare, debug_buffer, probe_executable, resolved_versions};
 use base64::Engine as _;
 use serde_json::{Map, Value, json};
+use std::ffi::OsStr;
 use std::path::Path;
 
-#[test]
-fn the_archived_workspace_is_the_frozen_one_plus_the_runner() {
-    // The archive is extracted over the baseline, whose workspace does not
-    // know the runner; only the membership and the inherited lint table change.
-    let frozen = "[package]\nname = \"xml-sec\"\n\n[workspace]\nmembers = [\n    \".\",\n    \"tools/xmlsec1\",\n]\nresolver = \"3\"\n\n[dependencies]\nbase64 = \"0.23\"\n";
-    let manifest = workspace_manifest(frozen).unwrap();
-    assert_eq!(
-        manifest,
-        "[package]\nname = \"xml-sec\"\n\n[workspace]\nmembers = [\n    \".\",\n    \"tools/xmlsec1\",\n    \"tools/xml-sec-tools\",\n]\nresolver = \"3\"\n\n[dependencies]\nbase64 = \"0.23\"\n\n[workspace.lints.rust]\n"
-    );
-    // A baseline that already carries either would be silently doubled.
-    assert!(workspace_manifest(&manifest).is_err());
-    assert!(workspace_manifest("[package]\nname = \"xml-sec\"\n").is_err());
+fn git(root: &Path, args: &[&str]) -> String {
+    let mut command = std::process::Command::new("git");
+    // An inherited repository location would redirect the temporary repository.
+    for variable in GIT_LOCATION {
+        command.env_remove(variable);
+    }
+    let output = command
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+        ])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}");
+    String::from_utf8(output.stdout).unwrap()
 }
 
 #[test]
-fn the_baseline_commit_comes_from_the_corpus_readme() {
-    // One recorded commit decides both the README and the archived manifest.
-    let commit = "834c463798060dca613bb93dd78dcdc7f949c948";
-    let readme = format!("- Repository: `structured-world/xml-sec`, commit `{commit}`.\n");
-    assert_eq!(baseline(&readme).unwrap(), commit);
-    assert!(baseline("- Repository: `structured-world/xml-sec`, commit `834c`.\n").is_err());
+fn packaging_git_ignores_an_inherited_repository_location() {
+    // GIT_DIR or GIT_WORK_TREE from a hook or a parent Git command would
+    // override the working directory and record another tree's HEAD.
+    let command = git_command(Path::new("/repo"), &["rev-parse", "HEAD"]);
+    let removed: Vec<&OsStr> = command
+        .get_envs()
+        .filter(|(_, value)| value.is_none())
+        .map(|(key, _)| key)
+        .collect();
+    for variable in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_COMMON_DIR",
+    ] {
+        assert!(removed.contains(&OsStr::new(variable)), "{variable}");
+    }
+    assert_eq!(command.get_current_dir(), Some(Path::new("/repo")));
+}
+
+#[test]
+fn the_archive_entries_carry_their_commit_and_refuse_changed_files() {
+    // The packager's own entry list names HEAD in COMMIT, and refuses to be
+    // built from a file that differs from that commit.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    write(&root.join("corpus/a.xml"), "<a/>");
+    git(root, &["add", "corpus/a.xml"]);
+    git(root, &["commit", "--quiet", "-m", "corpus"]);
+    let names = vec!["corpus/a.xml".to_owned()];
+    let (entries, commit) = archive_entries(root, &names).unwrap();
+    let head = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(commit, head.trim_end());
+    let recorded: Vec<(&str, &[u8])> = entries.iter().map(Entry::parts).collect();
+    assert_eq!(
+        recorded,
+        [
+            ("corpus/a.xml", &b"<a/>"[..]),
+            ("COMMIT", format!("{commit}\n").as_bytes())
+        ]
+    );
+    write(&root.join("corpus/a.xml"), "<b/>");
+    assert!(archive_entries(root, &names).is_err());
+}
+
+#[test]
+fn the_archive_records_the_commit_its_files_come_from() {
+    // The archive names the commit that reproduces it, never a pinned one;
+    // a changed or untracked archived file has no such commit.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    write(&root.join("corpus/a.xml"), "<a/>");
+    git(root, &["add", "corpus/a.xml"]);
+    git(root, &["commit", "--quiet", "-m", "corpus"]);
+    let names = vec!["corpus/a.xml".to_owned()];
+    let head = git(root, &["rev-parse", "HEAD"]);
+    assert_eq!(source_commit(root, &names).unwrap(), head.trim_end());
+
+    write(&root.join("corpus/a.xml"), "<b/>");
+    let error = source_commit(root, &names).unwrap_err();
+    assert!(error.contains("corpus/a.xml"), "{error}");
+
+    git(root, &["checkout", "--quiet", "--", "corpus/a.xml"]);
+    write(&root.join("corpus/new.xml"), "<n/>");
+    let untracked = vec!["corpus/new.xml".to_owned()];
+    assert!(source_commit(root, &untracked).is_err());
+}
+
+#[test]
+fn a_file_outside_head_is_refused_whatever_status_shows() {
+    // Status hides ignored files, and every untracked file once the repository
+    // sets showUntrackedFiles=no; neither is in the recorded commit.
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    git(root, &["init", "--quiet"]);
+    write(&root.join(".gitignore"), "ignored.xml\n");
+    write(&root.join("corpus/a.xml"), "<a/>");
+    git(root, &["add", ".gitignore", "corpus/a.xml"]);
+    git(root, &["commit", "--quiet", "-m", "corpus"]);
+    write(&root.join("corpus/ignored.xml"), "<i/>");
+    let ignored = vec!["corpus/a.xml".to_owned(), "corpus/ignored.xml".to_owned()];
+    let error = source_commit(root, &ignored).unwrap_err();
+    assert!(error.contains("corpus/ignored.xml"), "{error}");
+
+    git(root, &["config", "status.showUntrackedFiles", "no"]);
+    write(&root.join("corpus/hidden.xml"), "<h/>");
+    let hidden = vec!["corpus/hidden.xml".to_owned()];
+    let error = source_commit(root, &hidden).unwrap_err();
+    assert!(error.contains("corpus/hidden.xml"), "{error}");
+}
+
+#[test]
+fn bytes_the_index_hides_are_compared_with_the_commit() {
+    // A file marked assume-unchanged or skip-worktree can differ from HEAD
+    // while status reports nothing; the archived bytes must still be HEAD's.
+    for flag in ["--assume-unchanged", "--skip-worktree"] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet"]);
+        write(&root.join("LICENSE"), "license");
+        git(root, &["add", "LICENSE"]);
+        git(root, &["commit", "--quiet", "-m", "notice"]);
+        git(root, &["update-index", flag, "LICENSE"]);
+        write(&root.join("LICENSE"), "altered");
+        let error = source_commit(root, &["LICENSE".to_owned()]).unwrap_err();
+        assert!(error.contains("LICENSE"), "{flag}: {error}");
+    }
 }
 
 fn object(value: Value) -> Map<String, Value> {

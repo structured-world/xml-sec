@@ -1,24 +1,17 @@
-//! `xades package OUTPUT | --refresh-inventory`: archives the corpus with its
-//! source overlay, excluding tool caches, build outputs and run captures.
+//! `xades package OUTPUT | --refresh-inventory`: archives the corpus with the
+//! commit it was built from, excluding tool caches, build outputs and run
+//! captures.
 
 use super::{Corpus, digest, read, xml};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// Repository files distributed with the corpus besides the runner crate.
-const SOURCES: [&str; 6] = [
-    "LICENSE",
-    "LICENSE-THIRD-PARTY",
-    "README.md",
-    "interop/.gitignore",
-    ".github/workflows/ci.yml",
-    "crates/xml-sec-xades/examples/interop_probe.rs",
-];
+/// License notices distributed with the corpus.
+const NOTICES: [&str; 2] = ["LICENSE", "LICENSE-THIRD-PARTY"];
 
-/// The runner crate; every tracked file of it is distributed, since its
-/// binary compiles all subcommands.
-const RUNNER: &str = "tools/xml-sec-tools";
+/// The archived file naming the commit the archive was built from.
+const COMMIT: &str = "COMMIT";
 
 /// Maintained corpus files outside the per-case directories.
 const DOCUMENTS: [&str; 14] = [
@@ -173,10 +166,28 @@ pub(crate) fn tracked(root: &Path, pathspec: &str) -> Result<Vec<String>, String
         .collect())
 }
 
+/// Variables that make Git use another repository than its working directory.
+pub(crate) const GIT_LOCATION: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+];
+
+/// Git on the repository at `root`.
+pub(crate) fn git_command(root: &Path, args: &[&str]) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    for variable in GIT_LOCATION {
+        command.env_remove(variable);
+    }
+    command.args(args).current_dir(root);
+    command
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
+    let output = git_command(root, args)
         .stderr(std::process::Stdio::inherit())
         .output()
         .map_err(|error| format!("git: {error}"))?;
@@ -186,44 +197,72 @@ fn git(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     Ok(output.stdout)
 }
 
-/// The frozen implementation commit the corpus README records.
-pub(crate) fn baseline(readme: &str) -> Result<&str, String> {
-    let pattern =
-        regex::Regex::new(r"Repository: `structured-world/xml-sec`, commit `([0-9a-f]{40})`")
-            .map_err(|error| error.to_string())?;
-    pattern
-        .captures(readme)
-        .and_then(|found| found.get(1))
-        .map(|commit| commit.as_str())
-        .ok_or_else(|| "the corpus README records no baseline commit".to_owned())
+/// The commit the archive is built from. Every archived file must be
+/// committed unchanged there, so the recorded commit reproduces the archive.
+pub(crate) fn source_commit(root: &Path, names: &[String]) -> Result<String, String> {
+    let head = git(root, &["rev-parse", "--verify", "HEAD"])?;
+    let commit = String::from_utf8_lossy(&head).trim_end().to_owned();
+    // The working bytes are hashed and compared with the commit's blobs:
+    // status depends on the index, which hides ignored files, untracked ones
+    // under status.showUntrackedFiles=no and assume-unchanged or
+    // skip-worktree edits.
+    let mut tree = vec!["ls-tree", "-r", "-z", commit.as_str(), "--"];
+    tree.extend(names.iter().map(String::as_str));
+    let listed = git(root, &tree)?;
+    let committed: BTreeMap<&str, &str> = std::str::from_utf8(&listed)
+        .map_err(|error| error.to_string())?
+        .split('\0')
+        .filter_map(|line| {
+            let (meta, path) = line.split_once('\t')?;
+            Some((path, meta.rsplit(' ').next()?))
+        })
+        .collect();
+    let mut hash = vec!["hash-object", "--no-filters", "--"];
+    hash.extend(names.iter().map(String::as_str));
+    let hashed = git(root, &hash)?;
+    let actual: Vec<&str> = std::str::from_utf8(&hashed)
+        .map_err(|error| error.to_string())?
+        .lines()
+        .collect();
+    if actual.len() != names.len() {
+        return Err(format!(
+            "git hash-object returned {} ids for {} files",
+            actual.len(),
+            names.len()
+        ));
+    }
+    let differing: Vec<&str> = names
+        .iter()
+        .zip(&actual)
+        .filter(|(name, blob)| committed.get(name.as_str()) != Some(*blob))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if !differing.is_empty() {
+        return Err(format!(
+            "commit the archived files first: {}",
+            differing.join(" ")
+        ));
+    }
+    Ok(commit)
 }
 
-/// The baseline's root manifest with the runner registered in its workspace.
-/// The `xml-sec` package itself stays as frozen; the runner inherits an empty
-/// workspace lint table, since lint enforcement is not part of a reproduction.
-pub(crate) fn workspace_manifest(frozen: &str) -> Result<String, String> {
-    let member = format!("\"{RUNNER}\"");
-    if frozen.contains(&member) || frozen.contains("[workspace.lints") {
-        return Err("the baseline workspace already declares the runner or its lints".into());
-    }
-    let members = frozen
-        .find("\nmembers = [\n")
-        .ok_or("the baseline manifest has no workspace member list")?;
-    let close = frozen[members..]
-        .find("\n]\n")
-        .map(|offset| members + offset + 1)
-        .ok_or("the baseline workspace member list is not closed")?;
-    let mut manifest = String::with_capacity(frozen.len() + 128);
-    manifest.push_str(&frozen[..close]);
-    manifest.push_str("    ");
-    manifest.push_str(&member);
-    manifest.push_str(",\n");
-    manifest.push_str(&frozen[close..]);
-    if !manifest.ends_with('\n') {
-        manifest.push('\n');
-    }
-    manifest.push_str("\n[workspace.lints.rust]\n");
-    Ok(manifest)
+/// The archived files at `names` followed by the `COMMIT` file, and that
+/// commit; refused unless every file is committed unchanged.
+pub(crate) fn archive_entries(
+    root: &Path,
+    names: &[String],
+) -> Result<(Vec<Entry>, String), String> {
+    let commit = source_commit(root, names)?;
+    let mut entries = names
+        .iter()
+        .map(|name| Entry::file(root, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    entries.push(Entry {
+        name: COMMIT.into(),
+        data: format!("{commit}\n").into_bytes(),
+        mode: 0o644,
+    });
+    Ok((entries, commit))
 }
 
 /// One archived file.
@@ -242,6 +281,12 @@ impl Entry {
             data: read(&path)?,
             mode: mode(&path)?,
         })
+    }
+
+    /// The archived name and bytes.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&str, &[u8]) {
+        (&self.name, &self.data)
     }
 }
 
@@ -362,8 +407,7 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
     if output.exists() || output.starts_with(&package) {
         return Err("choose a new archive path outside the corpus".into());
     }
-    let mut names: Vec<String> = SOURCES.iter().map(|&name| name.to_owned()).collect();
-    names.extend(tracked(&corpus.root, RUNNER)?);
+    let mut names: Vec<String> = NOTICES.iter().map(|&name| name.to_owned()).collect();
     for path in evidence.files()? {
         let relative = path
             .strip_prefix(&corpus.root)
@@ -385,34 +429,18 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
     if xml::read(&checksums)? != inventory(&corpus.root, &evidence.files()?)? {
         return Err("stale corpus inventory; refresh explicitly before packaging".into());
     }
-    let mut entries = names
-        .iter()
-        .map(|name| Entry::file(&corpus.root, name))
-        .collect::<Result<Vec<_>, _>>()?;
-    // The overlay is extracted over the frozen baseline, whose workspace does
-    // not know the runner; the frozen manifest plus that registration does.
-    let commit = baseline(&xml::read(&package.join("README.md"))?)?.to_owned();
-    let frozen = git(&corpus.root, &["show", &format!("{commit}:Cargo.toml")])?;
-    let frozen = String::from_utf8(frozen).map_err(|error| error.to_string())?;
-    entries.push(Entry {
-        name: "Cargo.toml".into(),
-        data: workspace_manifest(&frozen)?.into_bytes(),
-        mode: 0o644,
-    });
     let inventoried = checksums
         .strip_prefix(&corpus.root)
         .map_err(|error| error.to_string())?;
-    entries.push(Entry::file(
-        &corpus.root,
-        &inventoried.display().to_string(),
-    )?);
+    names.push(inventoried.display().to_string());
+    let (entries, commit) = archive_entries(&corpus.root, &names)?;
     let listing = listing(&entries);
     archive(&output, &entries, &listing)?;
     println!(
-        "{}\nSHA256 {}\n{} inventoried files",
+        "{}\nSHA256 {}\ncommit {commit}\n{} inventoried files",
         output.display(),
         digest(&read(&output)?),
-        entries.len() - 1
+        entries.len()
     );
     Ok(())
 }

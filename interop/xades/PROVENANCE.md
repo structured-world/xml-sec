@@ -32,5 +32,5 @@ from Git and the distributable bundle.
 binding examples and compact DSS observations. They reuse the same public test keys and chain.
 Its source-audit manifest records upstream source URLs and hashes without bundling
 third-party source jars or normative full texts.
-The corpus `SHA256SUMS` pins its maintained assets. Packaging adds a separate root
-inventory for the complete source overlay and verifies all archived bytes.
+The corpus `SHA256SUMS` pins its maintained assets. Packaging records the commit the
+archive is built from, adds a separate root inventory and verifies all archived bytes.

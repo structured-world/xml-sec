@@ -1,10 +1,9 @@
 # XAdES binding investigation: DSS 6.5.1
 
-Checked locally on 23 October 2026 against xml-sec commit
-`834c463798060dca613bb93dd78dcdc7f949c948`: xml-sec 0.2.0,
-xml-sec-xades 0.1.0 and structured-xades 0.11.0. Independent implementations:
-native libxmlsec1 1.3.12 (OpenSSL) and EU DSS 6.5.1, with Maven 3.9.12 and
-Homebrew OpenJDK 21.0.12.1. This contribution changes test tooling and evidence.
+The xml-sec side is checked by `xades check` on every commit; each run records its
+commit and resolved versions. Independent implementations: native libxmlsec1 1.3.12
+(OpenSSL) and EU DSS 6.5.1, with Maven 3.9.12 and Homebrew OpenJDK 21.0.12.1.
+This contribution changes test tooling and evidence.
 
 **Finding:** the tested xml-sec binding checks agree with the normative requirements.
 Negative fixtures deliberately violate XAdES while retaining valid XMLDSig signatures.
@@ -151,15 +150,14 @@ does not restore signer association. StructuralValidation=FAIL also leaves ISC P
 This is a false-positive ISC result in DSS 6.5.1, contradicting §5.2.3.4's signer-digest
 comparison rather than merely a WARN-level profile constraint.
 
-Our `signature.rs:195–216` resolves Target through the verified session.
-structured-xades 0.11.0 `binding.rs:287–315` compares stable identity with the selected
-Signature; `certificate.rs:559–590` compares the first reference with the actual
-selected signing certificate. The tested adapter behavior matches these contracts.
+`qualifying_target` in `crates/xml-sec-xades/src/signature.rs` resolves Target through
+the verified session. structured-xades `binding::check_target` compares stable identity
+with the selected Signature; `certificate::check` compares the first reference with the
+actual selected signing certificate. The tested adapter behavior matches these contracts.
 
 ## Reproduce
 
-From the checkout root with this package's source overlay, first bootstrap the pinned
-Maven dependencies with `cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck`.
+From the repository root, first bootstrap the Maven dependencies with `cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck`.
 Only public build dependencies are downloaded; no XML is uploaded. Then use a fresh
 output directory to preserve the supplied evidence:
 
