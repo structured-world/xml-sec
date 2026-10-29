@@ -159,7 +159,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Exercise reciprocal signatures, encryption, transforms and every provider
         run: |
-          bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --workspace --all-features
+          cargo run --quiet -p xml-sec-tools -- pkcs11-tests /usr/lib/softhsm/libsofthsm2.so --workspace --all-features
       - name: Exercise XSLT-enabled backend and oracle paths
         run: |
           cargo nextest run --workspace --features xslt,xml-backends-all

@@ -67,7 +67,7 @@ engine, then verify operation policy separately. For the library, check
 `accepted(document)` against the expected identity and generation.
 
 Classify every unsupported case in the existing ledger rather than counting it
-as a passing interoperability vector. Run `bash scripts/check-features.sh PROFILE`
+as a passing interoperability vector. Run `cargo run -p xml-sec-tools -- check-features PROFILE`
 and the applicable oracle/provider suites. Use [benchmark artifacts](benchmarks.md)
 for performance claims; native results do not prove C bridge performance.
 

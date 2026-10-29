@@ -6,13 +6,13 @@ dependency/safety and coverage jobs. A green subset is not complete qualificatio
 
 ## Coverage
 
-Install cargo-llvm-cov 0.8.5, cargo-nextest, Node.js and the Rust toolchain's
+Install cargo-llvm-cov 0.8.5, cargo-nextest and the Rust toolchain's
 `llvm-tools-preview` component. Provision the [isolated SoftHSM harness](crypto-providers.md)
 and pinned [XML security](features.md) and [XSLT oracles](xslt-conformance.md), then run:
 
 ```sh
 PKCS11_MODULE=/absolute/path/to/libsofthsm2.so \
-  bash scripts/check-hardening.sh coverage /absolute/new/evidence-directory
+  cargo run -p xml-sec-tools -- hardening coverage /absolute/new/evidence-directory
 ```
 
 The evidence directory must be new and outside Cargo build output. All-feature
@@ -34,9 +34,9 @@ threshold failures stop qualification; they are never accepted as negative cases
 ## Dependencies And Native Safety
 
 ```sh
-bash scripts/check-hardening.sh dependencies
-bash scripts/check-hardening.sh safety
-node --test scripts/check-hardening.test.mjs
+cargo run -p xml-sec-tools -- hardening dependencies
+cargo run -p xml-sec-tools -- hardening safety
+cargo nextest run -p xml-sec-tools
 ```
 
 cargo-deny 0.19.0 checks both the production and fuzz graphs, including optional

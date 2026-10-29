@@ -1,7 +1,7 @@
 //! `ci-blocks BLOCK`: one CI test block, each profile a separate Cargo
 //! invocation. A block shares runner and setup, never enabled features.
 
-use crate::repo::{Step, describe, spawn};
+use crate::repo::{Step, TOOL, describe, spawn};
 use std::process::ExitStatus;
 
 #[cfg(test)]
@@ -225,8 +225,8 @@ pub(crate) fn plan(name: &str, module: Option<&str>) -> Result<Vec<Step>, String
             let module = module
                 .filter(|module| !module.is_empty())
                 .ok_or("PKCS11_MODULE is required for all-feature test blocks")?;
-            let args = [&["scripts/test-pkcs11.sh", module][..], &tests].concat();
-            steps.push(Step::new(label("tests"), "bash", &args));
+            let args = [&["pkcs11-tests", module][..], &tests].concat();
+            steps.push(Step::new(label("tests"), TOOL, &args));
         } else {
             let args = [&["nextest", "run"][..], &tests].concat();
             steps.push(Step::new(label("tests"), "cargo", &args));

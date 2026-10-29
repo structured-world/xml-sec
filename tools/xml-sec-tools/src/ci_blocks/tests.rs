@@ -68,7 +68,7 @@ fn grouping_retains_every_isolated_test_graph() {
                 ["-E", "not binary(libxslt_oracle)"]
             );
             let all = profile.graph == Graph::All;
-            assert_eq!(step.program == "bash", all);
+            assert_eq!(step.program == crate::repo::TOOL, all);
             if all {
                 assert!(step.args.iter().any(|arg| arg == "/test/token.so"));
             }

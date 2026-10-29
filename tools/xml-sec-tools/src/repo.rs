@@ -43,11 +43,65 @@ pub(crate) fn describe(status: ExitStatus) -> String {
     format!("status={code}, signal={signal}")
 }
 
+/// A step program that names this tool: the step runs another subcommand.
+pub(crate) const TOOL: &str = "xml-sec-tools";
+
+/// The process for `step`, from the repository root.
+pub(crate) fn command(step: &Step) -> Result<Command, String> {
+    let program = if step.program == TOOL {
+        std::env::current_exe().map_err(|error| format!("{}: {error}", step.label))?
+    } else {
+        PathBuf::from(&step.program)
+    };
+    let mut command = Command::new(program);
+    command.args(&step.args).current_dir(root());
+    Ok(command)
+}
+
 /// Runs `step` from the repository root with inherited output.
 pub(crate) fn spawn(step: &Step) -> Result<ExitStatus, String> {
-    Command::new(&step.program)
-        .args(&step.args)
-        .current_dir(root())
+    command(step)?
         .status()
         .map_err(|error| format!("{}: {error}", step.label))
+}
+
+/// A refusal and the exit code it ends the tool with.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub(crate) code: u8,
+    /// Printed to stderr unless empty: a failed child already reported itself.
+    pub(crate) message: String,
+}
+
+impl Failure {
+    /// Ends the tool the way a shell propagates a failed child: its exit code,
+    /// or 128 plus the terminating signal.
+    pub(crate) fn of(status: ExitStatus) -> Self {
+        #[cfg(unix)]
+        let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+        #[cfg(not(unix))]
+        let signal: Option<i32> = None;
+        let code = status
+            .code()
+            .or_else(|| signal.map(|signal| 128 + signal))
+            .and_then(|code| u8::try_from(code).ok())
+            .filter(|&code| code != 0)
+            .unwrap_or(1);
+        Self {
+            code,
+            message: String::new(),
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(message: String) -> Self {
+        Self { code: 1, message }
+    }
+}
+
+impl From<&str> for Failure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
 }

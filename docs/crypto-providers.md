@@ -76,7 +76,7 @@ ECDSA signing, certificate/CRL verification,
 private software key import, raw symmetric encryption, and KDF execution are
 not advertised by this adapter.
 
-Run `bash scripts/test-pkcs11.sh /absolute/path/to/libsofthsm2.so` for the
+Run `cargo run -p xml-sec-tools -- pkcs11-tests /absolute/path/to/libsofthsm2.so` for the
 integration suite, or add `--workspace` for all workspace tests with this
 feature. The harness creates and removes its own token store and cannot reset
 tokens from a normal SoftHSM configuration. Tests cover complete XML signature

@@ -64,11 +64,11 @@ there; its private `X` is not retained.
 Run from the repository root with Rust 1.92 or newer and cargo-nextest installed:
 
 ```sh
-bash scripts/check-features.sh default
-bash scripts/check-features.sh dsig-roxmltree
-bash scripts/check-features.sh xmlenc-xmloxide
-bash scripts/check-features.sh c14n-roxmltree
-bash scripts/check-features.sh no-backend
+cargo run -p xml-sec-tools -- check-features default
+cargo run -p xml-sec-tools -- check-features dsig-roxmltree
+cargo run -p xml-sec-tools -- check-features xmlenc-xmloxide
+cargo run -p xml-sec-tools -- check-features c14n-roxmltree
+cargo run -p xml-sec-tools -- check-features no-backend
 ```
 
 Each positive profile runs strict all-target clippy, library tests, applicable
@@ -90,7 +90,7 @@ Other profiles are `dom-xmloxide`, `dom-roxmltree`, `c14n-xmloxide`,
 For token execution supply an explicit test module:
 
 ```sh
-PKCS11_MODULE=/absolute/path/to/libsofthsm2.so bash scripts/check-features.sh pkcs11
+PKCS11_MODULE=/absolute/path/to/libsofthsm2.so cargo run -p xml-sec-tools -- check-features pkcs11
 ```
 
 The maintained token harness creates a disposable store; no existing token or

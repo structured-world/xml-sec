@@ -42,15 +42,14 @@ jobs:
           domain: ordinary
       # Repository tooling and its contracts on workflows and scripts.
       - run: cargo nextest run -p xml-sec-tools
-      - run: node --test scripts/check-hardening.test.mjs
-      - run: node --test scripts/ci-cache.test.mjs scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
+      - run: node --test scripts/security-corpus.test.mjs scripts/check-shared-pkix.test.mjs
       # The per-lint pedantic forbid list must match clippy's pedantic group,
       # and a local allow of a listed lint must fail clippy.
       - run: node --test scripts/check-pedantic-lints.test.mjs
       - run: node scripts/check-pedantic-lints.mjs stable
       - run: node scripts/security-corpus.mjs --check
-      - run: bash scripts/check-hardening.sh dependencies
-      - run: bash scripts/check-hardening.sh safety
+      - run: cargo run --quiet -p xml-sec-tools -- hardening dependencies
+      - run: cargo run --quiet -p xml-sec-tools -- hardening safety
 
   coverage:
     name: canonical line coverage (85%)
@@ -88,9 +87,6 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-llvm-cov@0.8.5,cargo-nextest
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: coverage
@@ -108,7 +104,7 @@ jobs:
           bash scripts/install-xmlsec1.sh
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Execute every workspace target and enforce canonical coverage
-        run: bash scripts/check-hardening.sh coverage "$RUNNER_TEMP/coverage"
+        run: cargo run --quiet -p xml-sec-tools -- hardening coverage "$RUNNER_TEMP/coverage"
       - uses: actions/upload-artifact@v7
         if: always()
         with:
@@ -147,12 +143,8 @@ jobs:
         with:
           domain: ordinary
           save: ${{ !matrix.minimal }}
-      - name: Check the matrix runner
-        if: runner.os != 'Windows'
-        run: node --test scripts/check-features.test.mjs
       - name: Qualify actual core defaults
-        shell: bash
-        run: bash scripts/check-features.sh default
+        run: cargo run --quiet -p xml-sec-tools -- check-features default
       - name: Provision isolated token provider
         if: matrix.minimal
         run: sudo apt-get update && sudo apt-get install -y softhsm2
@@ -163,7 +155,7 @@ jobs:
         run: |
           for profile in dom-xmloxide dom-roxmltree c14n-xmloxide c14n-roxmltree dsig-xmloxide dsig-roxmltree dsig-sign-xmloxide xmlenc-xmloxide xmlenc-roxmltree xslt legacy experimental fips-dsig pkcs11 no-backend; do
             echo "::group::$profile"
-            bash scripts/check-features.sh "$profile"
+            cargo run --quiet -p xml-sec-tools -- check-features "$profile"
             echo '::endgroup::'
           done
       - name: Qualify documentation and executable examples
@@ -213,7 +205,7 @@ jobs:
             cargo clippy --no-default-features --features "pkcs11,c14n,xml-backend-$backend" --all-targets -- -D warnings
             cargo nextest run --lib --no-default-features --features "pkcs11,c14n,xml-backend-$backend"
             cargo nextest run -p xml-sec-config --no-default-features --features "pkcs11,xml-backend-$backend"
-            bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --no-default-features --features "c14n,xml-backend-$backend"
+            cargo run --quiet -p xml-sec-tools -- pkcs11-tests /usr/lib/softhsm/libsofthsm2.so --no-default-features --features "c14n,xml-backend-$backend"
             echo '::endgroup::'
           done
 
