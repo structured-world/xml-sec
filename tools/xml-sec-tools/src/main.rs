@@ -11,6 +11,7 @@ mod kernel_examples;
 mod libxslt_fixtures;
 mod pedantic_lints;
 mod pkcs11;
+mod publish_crate;
 mod repo;
 mod security_corpus;
 mod shared_pkix;
@@ -45,6 +46,7 @@ commands:
   libxslt-fixtures [--check]
   pedantic-lints TOOLCHAIN...
   pkcs11-tests MODULE [--workspace] ARGS...
+  publish-crate PACKAGE
   security-corpus check|report|import LIBXML2_SOURCE DATA_DIR LIBXSLT_SOURCE
   shared-pkix
   wasm-c14n
@@ -72,6 +74,7 @@ fn main() -> ExitCode {
         Some("libxslt-fixtures") => libxslt_fixtures::run(args),
         Some("pedantic-lints") => pedantic_lints::run(args),
         Some("pkcs11-tests") => pkcs11::run(args),
+        Some("publish-crate") => publish_crate::run(args),
         Some("security-corpus") => security_corpus::run(args),
         Some("shared-pkix") => shared_pkix::run(args),
         Some("wasm-c14n") => wasm_c14n::run(args),

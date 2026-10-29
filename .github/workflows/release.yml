@@ -20,6 +20,6 @@ jobs:
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - name: Publish xml-sec to crates.io
-        run: bash .github/scripts/publish-crate.sh xml-sec
+        run: cargo run --quiet -p xml-sec-tools -- publish-crate xml-sec
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
