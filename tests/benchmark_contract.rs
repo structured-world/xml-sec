@@ -58,32 +58,3 @@ fn rejection_workloads_are_invalid_on_every_backend() {
         }
     }
 }
-
-#[cfg(unix)]
-#[test]
-fn runner_rejects_invalid_counts_and_existing_artifacts() {
-    // Bad arguments must fail before building; previous evidence must never be overwritten.
-    let directory = tempfile::tempdir().expect("temporary artifact directory");
-    let script =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/benchmark-security.sh");
-    let output = directory.path().join("results");
-    for samples in ["0", "-1", "100001", "99999999999999999999", "invalid"] {
-        let result = std::process::Command::new("bash")
-            .arg(&script)
-            .arg(&output)
-            .arg(samples)
-            .output()
-            .expect("bash runner");
-        assert_eq!(result.status.code(), Some(2));
-        assert!(!output.exists());
-    }
-    std::fs::create_dir(&output).expect("existing artifact directory");
-    let result = std::process::Command::new("bash")
-        .arg(&script)
-        .arg(&output)
-        .arg("1")
-        .output()
-        .expect("bash runner");
-    assert_eq!(result.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&result.stderr).contains("already exists"));
-}

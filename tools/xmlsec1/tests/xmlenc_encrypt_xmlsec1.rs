@@ -33,7 +33,7 @@ fn require_key_establishment_oracle() {
     // reporting success without an oracle would hide missing interoperability.
     assert!(
         xmlsec1::is_available(),
-        "key-establishment interoperability requires xmlsec1 >= 1.3.13; run bash scripts/install-xmlsec1.sh and set XMLSEC1_BIN (see docs/crypto-providers.md)"
+        "key-establishment interoperability requires xmlsec1 >= 1.3.13; run cargo run -p xml-sec-tools -- install-xmlsec1 and set XMLSEC1_BIN (see docs/crypto-providers.md)"
     );
 }
 

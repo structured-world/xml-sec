@@ -90,7 +90,7 @@ complete tree:
 
 ```sh
 XMLSEC_DONOR_ROOT=/path/to/xmlsec/tests \
-  scripts/import-donor-fixtures.sh \
+  cargo run -p xml-sec-tools -- donor-fixtures \
   xmlenc/01-phaos-xmlenc-3
 ```
 

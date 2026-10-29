@@ -95,7 +95,7 @@ Harness regression tests guard these evidence and output-directory boundaries.
 Run from the repository root at the recorded commit, with this package's source overlay:
 
 ```sh
-XMLSEC1_BIN=/path/to/native/xmlsec1 python3 scripts/check-xades-interop.py --output /tmp/xades-live-check
+XMLSEC1_BIN=/path/to/native/xmlsec1 cargo run -p xml-sec-tools -- xades check --output /tmp/xades-live-check
 ```
 
 This is the same entry point used by the required `XAdES interoperability corpus` CI job.
@@ -105,18 +105,18 @@ No part may skip on a missing oracle. The existing aggregate `test` job requires
 CI publishes actual octets, hashes, first-difference diagnostics and full DSS reports as
 `xades-interop-results` run artifacts. It never updates fixtures or expectations.
 
-The runners require POSIX process groups (Linux/macOS). Commands default to a 900-second
-deadline; nested commands share the enclosing phase's process group. A timeout aborts
-that group. Arguments are recorded before launch and streams are logged as commands run,
-preserving nested diagnostics when an enclosing deadline cancels the phase.
+The runners require POSIX process groups (Linux/macOS). Every command runs in its own
+process group with a 900-second deadline; a timeout stops that group, and a descendant
+that left it cannot hold the run past the deadline. Arguments are recorded before launch
+and streams are logged as commands run, so a cancelled phase keeps its diagnostics.
 
 Individual investigation commands:
 
 ```sh
-XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 python3 scripts/xades-interop.py --results /tmp/xml-sec-xades-recheck
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test-xades-interop.py
-python3 scripts/xades-dss.py --results target/xades-dss-recheck
-python3 scripts/xades-dss.py --results target/xades-dss-recheck --summarize
+XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 cargo run -p xml-sec-tools -- xades corpus --results /tmp/xml-sec-xades-recheck
+cargo nextest run -p xml-sec-tools xades
+cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck
+cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck --summarize
 ```
 
 Set XMLSEC1_BIN to native **1.3.12 or 1.3.13 openssl**; both are explicitly qualified
@@ -133,19 +133,21 @@ results directory; this also applies to the DSS runner's `--results` directory.
 `--summarize` explicitly reanalyzes existing DSS reports without rerunning the engine.
 `--generate` explicitly rebuilds synthetic variants, reusing retained
 test credentials when present. Starting with no `fixtures/` uses the existing
-`scripts/generate-xades-fixtures.sh` to create a new random test chain and B-B variants.
+`xades fixtures` generator to create a new random test chain and B-B variants.
 Random new credentials change the signed bytes and hashes: archive the new set as a new
 corpus, rather than comparing its signatures with this frozen run.
 
-The distributable archive contains this directory, the probe and runner source overlay,
-and license notices. Extract it over a checkout at the recorded baseline before building.
+The distributable archive contains this directory, the probe source, the complete runner
+crate, and license notices. Its root `Cargo.toml` is the baseline manifest with the runner
+added to the workspace; the `xml-sec` package itself is unchanged. Extract it over a
+checkout at the recorded baseline before building.
 Verify corpus assets with `shasum -a 256 -c interop/xades/SHA256SUMS`.
 The archive also contains a root `SHA256SUMS` covering its source overlay and corpus inventory.
-Repackage with `python3 scripts/package-xades-interop.py /tmp/xades-interop-new.tar.gz`;
+Repackage with `cargo run -p xml-sec-tools -- xades package /tmp/xades-interop-new.tar.gz`;
 the packager allows only declared inputs, independent vectors, expected DSS conclusions,
 provenance and source/docs. Actual outputs, builds, logs and unselected generator outputs
 are excluded. Update an intentionally changed corpus inventory explicitly with
-`python3 scripts/package-xades-interop.py --refresh-inventory`; ordinary checks and
+`cargo run -p xml-sec-tools -- xades package --refresh-inventory`; ordinary checks and
 packaging never rewrite it.
 
 The runners encode per-case oracle and probe commands. New runs also capture commands
@@ -173,7 +175,7 @@ After checking out the revision in `compatibility/libxmlsec1-1.3.13-donor-commit
 the macOS readiness commands are:
 
 ```sh
-XMLSEC1_SOURCE_DIR="$PWD/donors/xmlsec" XMLSEC1_PREFIX="$PWD/.tools/xmlsec1-pr" XMLSEC1_MODERN_ORACLE=1 bash scripts/install-xmlsec1.sh
+XMLSEC1_SOURCE_DIR="$PWD/donors/xmlsec" XMLSEC1_PREFIX="$PWD/.tools/xmlsec1-pr" XMLSEC1_MODERN_ORACLE=1 cargo run -p xml-sec-tools -- install-xmlsec1
 XMLSEC1_BIN="$PWD/.tools/xmlsec1-pr/bin/xmlsec1" OPENSSL_BIN="$PWD/.tools/xmlsec1-pr/bin/openssl" DYLD_LIBRARY_PATH="$PWD/.tools/xmlsec1-pr/lib" cargo nextest run --workspace --no-fail-fast --status-level fail --final-status-level fail
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check

@@ -3,6 +3,16 @@ description: Read the actual image family from the runner process environment
 outputs:
   identity:
     description: Hosted image family used to isolate ABI-sensitive build caches
+    value: ${{ steps.image.outputs.identity }}
 runs:
-  using: node24
-  main: identity.mjs
+  using: composite
+  steps:
+    - id: image
+      shell: bash
+      run: |
+        # ImageOS is process environment of hosted runners, not a workflow env entry.
+        if [[ ! ${ImageOS:-} =~ ^[a-zA-Z0-9_-]+$ ]]; then
+          echo 'A hosted runner ImageOS is required for build caching' >&2
+          exit 1
+        fi
+        echo "identity=$ImageOS" >> "$GITHUB_OUTPUT"

@@ -6,13 +6,13 @@ dependency/safety and coverage jobs. A green subset is not complete qualificatio
 
 ## Coverage
 
-Install cargo-llvm-cov 0.8.5, cargo-nextest, Node.js and the Rust toolchain's
+Install cargo-llvm-cov 0.8.5, cargo-nextest and the Rust toolchain's
 `llvm-tools-preview` component. Provision the [isolated SoftHSM harness](crypto-providers.md)
 and pinned [XML security](features.md) and [XSLT oracles](xslt-conformance.md), then run:
 
 ```sh
 PKCS11_MODULE=/absolute/path/to/libsofthsm2.so \
-  bash scripts/check-hardening.sh coverage /absolute/new/evidence-directory
+  cargo run -p xml-sec-tools -- hardening coverage /absolute/new/evidence-directory
 ```
 
 The evidence directory must be new and outside Cargo build output. All-feature
@@ -34,9 +34,9 @@ threshold failures stop qualification; they are never accepted as negative cases
 ## Dependencies And Native Safety
 
 ```sh
-bash scripts/check-hardening.sh dependencies
-bash scripts/check-hardening.sh safety
-node --test scripts/check-hardening.test.mjs
+cargo run -p xml-sec-tools -- hardening dependencies
+cargo run -p xml-sec-tools -- hardening safety
+cargo nextest run -p xml-sec-tools
 ```
 
 cargo-deny 0.19.0 checks both the production and fuzz graphs, including optional
@@ -66,8 +66,8 @@ derive allows in its own expansion. The same check rejects any source that
 allows it or the whole pedantic group.
 
 ```sh
-node scripts/check-pedantic-lints.mjs stable
-node --test scripts/check-pedantic-lints.test.mjs
+cargo run -p xml-sec-tools -- pedantic-lints stable
+cargo nextest run -p xml-sec-tools pedantic_lints
 ```
 
 The check fails when stable clippy's pedantic group has a lint the list does not
@@ -77,8 +77,8 @@ not have.
 
 CI builds, lints and tests with the stable channel only and names no compiler
 release; `rust-version` is the declared minimum, and clippy's `incompatible_msrv`
-lint keeps standard-library use within it. The lint matrix in
-`scripts/ci-test-blocks.mjs` resolves each feature graph separately: the default,
+lint keeps standard-library use within it. The lint matrix of the `ci-blocks`
+tool command resolves each feature graph separately: the default,
 backend, all-feature, experimental, FIPS and XSLT workspace graphs, plus
 library-only minimal graphs for `xmldsig`, `xmldsig-sign`, `xmlenc` and `xslt` on
 the differential backend. The alloc-only job lints the separate XML-input crate
@@ -92,7 +92,7 @@ see [benchmarks](benchmarks.md#regression-report).
 
 ## Grouped Qualification
 
-`node scripts/ci-test-blocks.mjs BLOCK` runs one of `core`, `extended`,
+`cargo run -p xml-sec-tools -- ci-blocks BLOCK` runs one of `core`, `extended`,
 `experimental`, or `fips`. These blocks retain separate Cargo invocations for
 every feature/backend profile; grouping does not union their features. Builds, lint, tests and doctests share runner and oracle
 setup. The XMLenc inventory build still resolves only the core package, and
@@ -147,7 +147,7 @@ the same run; sharing does not impose a producer dependency on the critical path
 The XML-oracle block runs both the live XMLDSig/XAdES corpus and XSLT conformance
 with their original independent validators and separate evidence artifacts.
 Shared mechanisms are resolved as one registry version across ASN.1, PKIX, CMS,
-LTV and XAdES. `scripts/check-shared-pkix.sh` rejects duplicate generations and
+LTV and XAdES. The `shared-pkix` tool command rejects duplicate generations and
 path/git substitutes, then independently checks the PKIX and XAdES alloc graphs
 on bare-metal and WASM targets. Core XMLDSig still requires `std`; the shared
 dependency qualification is not a root alloc-only claim.

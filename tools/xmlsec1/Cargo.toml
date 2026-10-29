@@ -18,11 +18,6 @@ path = "tests/process_contract.rs"
 required-features = ["xmldsig", "xmlenc", "c14n"]
 
 [[test]]
-name = "cli_import_snapshot"
-path = "tests/import_snapshot.rs"
-required-features = ["xmldsig", "xmlenc", "c14n"]
-
-[[test]]
 name = "cli_upstream_runner"
 path = "tests/upstream_runner.rs"
 required-features = ["xmldsig", "xmlenc", "c14n"]

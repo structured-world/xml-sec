@@ -26,11 +26,10 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-      - name: Check system Bash, corpus admission, failure propagation and replay
-        run: node --test scripts/fuzz-security.test.mjs
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - name: Check corpus admission, failure propagation and replay
+        run: cargo nextest run -p xml-sec-tools fuzz_security
 
   harness:
     runs-on: ubuntu-latest
@@ -90,7 +89,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
-          bash scripts/install-xmlsec1.sh
+          cargo +nightly run --quiet -p xml-sec-tools -- install-xmlsec1
           {
             echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
             echo "LD_LIBRARY_PATH=$XMLSEC1_PREFIX/lib"
@@ -106,7 +105,7 @@ jobs:
           FUZZ_OUTPUT: ${{ runner.temp }}/fuzz-evidence
           TARGET: ${{ matrix.target }}
           MODE: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && 'campaign' || 'smoke' }}
-        run: bash scripts/fuzz-security.sh "$TARGET" "$MODE" --cache-managed
+        run: cargo +nightly run --quiet -p xml-sec-tools -- fuzz-security "$TARGET" "$MODE" --cache-managed
       - name: Preserve reproducers and commands
         if: always()
         uses: actions/upload-artifact@v7
@@ -151,7 +150,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2
-          bash scripts/install-xmlsec1.sh
+          cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           {
             echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
             echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl"
@@ -159,7 +158,7 @@ jobs:
           } >> "$GITHUB_ENV"
       - name: Exercise reciprocal signatures, encryption, transforms and every provider
         run: |
-          bash scripts/test-pkcs11.sh /usr/lib/softhsm/libsofthsm2.so --workspace --all-features
+          cargo run --quiet -p xml-sec-tools -- pkcs11-tests /usr/lib/softhsm/libsofthsm2.so --workspace --all-features
       - name: Exercise XSLT-enabled backend and oracle paths
         run: |
           cargo nextest run --workspace --features xslt,xml-backends-all

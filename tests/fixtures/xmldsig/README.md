@@ -7,7 +7,7 @@ the commit recorded in the canonical
 [`libxmlsec1-1.3.13-donor-commit.txt`](../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt)
 pin; upstream had bumped the
 version but had not published a release tag when this snapshot was pinned.
-`scripts/install-xmlsec1.sh` verifies both that source commit and the live
+`xml-sec-tools install-xmlsec1` verifies both that source commit and the live
 `xmlsec1 --version` output before reusing a cached development installation.
 
 ## Importing Vectors
@@ -16,7 +16,7 @@ The source corpus is vendored under `donors/xmlsec/tests/` in development
 checkouts. Import a selected upstream file with the repository helper:
 
 ```sh
-scripts/import-donor-fixtures.sh \
+cargo run -p xml-sec-tools -- donor-fixtures \
   xmldsig/xmldsig11-interop-2012/signature-enveloping-p256_sha256.xml
 ```
 
@@ -137,7 +137,7 @@ single generic success condition.
 ## Adding a Fixture
 
 1. Identify the upstream file and the XMLDSig feature it covers.
-2. Import it with `scripts/import-donor-fixtures.sh`.
+2. Import it with `cargo run -p xml-sec-tools -- donor-fixtures PATH`.
 3. Add a positive assertion or an explicit fail-closed classification.
 4. Run the focused `cargo nextest run` target and the full suite against both XML backends.
 5. Update this document when the supported set changes.

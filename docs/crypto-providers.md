@@ -76,7 +76,7 @@ ECDSA signing, certificate/CRL verification,
 private software key import, raw symmetric encryption, and KDF execution are
 not advertised by this adapter.
 
-Run `bash scripts/test-pkcs11.sh /absolute/path/to/libsofthsm2.so` for the
+Run `cargo run -p xml-sec-tools -- pkcs11-tests /absolute/path/to/libsofthsm2.so` for the
 integration suite, or add `--workspace` for all workspace tests with this
 feature. The harness creates and removes its own token store and cannot reset
 tokens from a normal SoftHSM configuration. Tests cover complete XML signature
@@ -344,7 +344,7 @@ is truncated in the donor itself; tests use the complete published p/q/g/x
 from its unchanged `key.txt` instead. These tests grant legacy DH, SHA-1 and
 legacy content algorithms explicitly, without broadening product defaults.
 
-`bash scripts/import-donor-fixtures.sh --xmlenc-corpora` imports the complete
+`cargo run -p xml-sec-tools -- donor-fixtures --xmlenc-corpora` imports the complete
 Merlin, Phaos and Aleksey directories and their shared agreement credentials.
 `tests/fixtures/xmlenc/corpora.sha256` pins every imported file's bytes; tests
 reject changed, missing and additional files. The all-feature
@@ -414,7 +414,7 @@ than being loaded as UTF-8 strings.
 The key-establishment acceptance tests in `xmlenc_encrypt_xmlsec1` require the
 independent oracle, including local runs: an unavailable oracle is a setup
 failure, not a successful skipped check. Install it with
-`bash scripts/install-xmlsec1.sh` (it requires the libxml2 and libxslt development files, so
+`cargo run -p xml-sec-tools -- install-xmlsec1` (it requires the libxml2 and libxslt development files, so
 the oracle includes the XSLT transform), then set `XMLSEC1_BIN` to the reported
 installation's `bin/xmlsec1`. Set `DYLD_LIBRARY_PATH` (macOS) or
 `LD_LIBRARY_PATH` (Linux) to that installation's `lib` directory when required
