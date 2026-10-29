@@ -6,14 +6,14 @@ All validation runs are local; fixtures are never uploaded to online validators.
 
 ## Frozen baseline and API
 
-- Repository: `structured-world/xml-sec`, commit `834c463798060dca613bb93dd78dcdc7f949c948`.
+- Repository: `structured-world/xml-sec`, commit `9ace0e8314f5e9d80492e52781b403d8ec0c5492`.
   The frozen implementation baseline is independent of the accompanying test-tooling overlay.
-- `xml-sec 0.2.0`, `xml-sec-xades 0.1.0`; published `structured-{asn1,pkix,cms,ltv,xades} 0.11.0`.
+- `xml-sec 0.3.0`, `xml-sec-xades 0.1.0`; published `structured-{asn1,pkix,cms,ltv,xades} 0.17.1`.
 - Probe: `cargo build -p xml-sec-xades --example interop_probe`, default XAdES features.
   Core features: `std,xmldsig,c14n,xml-backend-xmloxide,embedded,no-unsafe`.
   This probe does not enable XMLEnc, XSLT, FIPS, PKCS#11 or legacy crypto.
-- Initial capture: Rust/cargo 1.99.0 and Python 3.11.9. Each live run records its own
-  tool versions and dependency/features metadata in the output directory, outside Git.
+- Recorded run: Rust/cargo 1.99.0. Each live run records its own tool versions and
+  dependency/features metadata in the output directory, outside Git.
 - Independent oracle: Homebrew **libxmlsec1 1.3.12 (openssl)**, native Mach-O binary.
   This is not this repository's Rust `tools/xmlsec1`. Its linked OpenSSL is **3.6.4**;
   the credential generator's separate `openssl` executable is **4.0.3**.
@@ -78,7 +78,7 @@ computed digests, first differing byte (zero-based), and 24 preceding / 25 follo
 bytes in hexadecimal. Absence is never counted as a byte match. All positive valid
 cases require two reference dumps, SignedInfo, matching DigestValues and completed replay.
 The documented `here()` difference is retained, not normalized away.
-The frozen run contains 96 matching Reference-octet pairs and 41 matching SignedInfo
+The frozen run contains 93 matching Reference-octet pairs and 42 matching SignedInfo
 pairs across the two explicit modes. These include negative cases that remain processable;
 they are not counts of fully valid signatures. Authentication failures retain their typed
 causes, and References behind an unverified signature remain unexecuted.

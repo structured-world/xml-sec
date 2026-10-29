@@ -1,8 +1,8 @@
 # XAdES binding investigation: DSS 6.5.1
 
-Checked locally on 23 October 2026 against xml-sec commit
-`834c463798060dca613bb93dd78dcdc7f949c948`: xml-sec 0.2.0,
-xml-sec-xades 0.1.0 and structured-xades 0.11.0. Independent implementations:
+Checked locally on 29 October 2026 against xml-sec commit
+`9ace0e8314f5e9d80492e52781b403d8ec0c5492`: xml-sec 0.3.0,
+xml-sec-xades 0.1.0 and structured-xades 0.17.1. Independent implementations:
 native libxmlsec1 1.3.12 (OpenSSL) and EU DSS 6.5.1, with Maven 3.9.12 and
 Homebrew OpenJDK 21.0.12.1. This contribution changes test tooling and evidence.
 
@@ -152,8 +152,8 @@ This is a false-positive ISC result in DSS 6.5.1, contradicting §5.2.3.4's sign
 comparison rather than merely a WARN-level profile constraint.
 
 Our `signature.rs:195–216` resolves Target through the verified session.
-structured-xades 0.11.0 `binding.rs:287–315` compares stable identity with the selected
-Signature; `certificate.rs:559–590` compares the first reference with the actual
+structured-xades 0.17.1 `binding.rs:287–315` compares stable identity with the selected
+Signature; `certificate.rs:569–600` compares the first reference with the actual
 selected signing certificate. The tested adapter behavior matches these contracts.
 
 ## Reproduce

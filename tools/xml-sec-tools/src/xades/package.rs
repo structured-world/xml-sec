@@ -198,31 +198,35 @@ pub(crate) fn baseline(readme: &str) -> Result<&str, String> {
         .ok_or_else(|| "the corpus README records no baseline commit".to_owned())
 }
 
-/// The baseline's root manifest with the runner registered in its workspace.
-/// The `xml-sec` package itself stays as frozen; the runner inherits an empty
-/// workspace lint table, since lint enforcement is not part of a reproduction.
+/// The baseline's root manifest with whatever the runner needs and the
+/// baseline lacks: its workspace membership and a workspace lint table to
+/// inherit (empty, since lint enforcement is not part of a reproduction).
+/// The `xml-sec` package itself stays as frozen.
 pub(crate) fn workspace_manifest(frozen: &str) -> Result<String, String> {
     let member = format!("\"{RUNNER}\"");
-    if frozen.contains(&member) || frozen.contains("[workspace.lints") {
-        return Err("the baseline workspace already declares the runner or its lints".into());
-    }
-    let members = frozen
-        .find("\nmembers = [\n")
-        .ok_or("the baseline manifest has no workspace member list")?;
-    let close = frozen[members..]
-        .find("\n]\n")
-        .map(|offset| members + offset + 1)
-        .ok_or("the baseline workspace member list is not closed")?;
     let mut manifest = String::with_capacity(frozen.len() + 128);
-    manifest.push_str(&frozen[..close]);
-    manifest.push_str("    ");
-    manifest.push_str(&member);
-    manifest.push_str(",\n");
-    manifest.push_str(&frozen[close..]);
-    if !manifest.ends_with('\n') {
-        manifest.push('\n');
+    if frozen.contains(&member) {
+        manifest.push_str(frozen);
+    } else {
+        let members = frozen
+            .find("\nmembers = [\n")
+            .ok_or("the baseline manifest has no workspace member list")?;
+        let close = frozen[members..]
+            .find("\n]\n")
+            .map(|offset| members + offset + 1)
+            .ok_or("the baseline workspace member list is not closed")?;
+        manifest.push_str(&frozen[..close]);
+        manifest.push_str("    ");
+        manifest.push_str(&member);
+        manifest.push_str(",\n");
+        manifest.push_str(&frozen[close..]);
     }
-    manifest.push_str("\n[workspace.lints.rust]\n");
+    if !frozen.contains("[workspace.lints") {
+        if !manifest.ends_with('\n') {
+            manifest.push('\n');
+        }
+        manifest.push_str("\n[workspace.lints.rust]\n");
+    }
     Ok(manifest)
 }
 

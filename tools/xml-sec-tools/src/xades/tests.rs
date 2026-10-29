@@ -17,9 +17,20 @@ fn the_archived_workspace_is_the_frozen_one_plus_the_runner() {
         manifest,
         "[package]\nname = \"xml-sec\"\n\n[workspace]\nmembers = [\n    \".\",\n    \"tools/xmlsec1\",\n    \"tools/xml-sec-tools\",\n]\nresolver = \"3\"\n\n[dependencies]\nbase64 = \"0.23\"\n\n[workspace.lints.rust]\n"
     );
-    // A baseline that already carries either would be silently doubled.
-    assert!(workspace_manifest(&manifest).is_err());
+    // A baseline that already registers the runner and its lints is used as
+    // frozen; nothing is declared twice.
+    assert_eq!(workspace_manifest(&manifest).unwrap(), manifest);
     assert!(workspace_manifest("[package]\nname = \"xml-sec\"\n").is_err());
+}
+
+#[test]
+fn a_baseline_with_the_runner_but_no_lint_table_gets_only_the_table() {
+    // The runner inherits workspace lints, so their table must exist.
+    let frozen = "[workspace]\nmembers = [\n    \".\",\n    \"tools/xml-sec-tools\",\n]\n";
+    assert_eq!(
+        workspace_manifest(frozen).unwrap(),
+        format!("{frozen}\n[workspace.lints.rust]\n")
+    );
 }
 
 #[test]
