@@ -1,6 +1,6 @@
 //! B-B validation of independently signed `XAdES` fixtures through the public entry.
 //!
-//! The fixtures come from scripts/generate-xades-fixtures.sh: xmlsec1 signs
+//! The fixtures come from `xml-sec-tools xades fixtures`: xmlsec1 signs
 //! every template with a real root -> intermediate -> signer path, so `XMLDSig`
 //! verification succeeds and only the `XAdES` properties differ.
 

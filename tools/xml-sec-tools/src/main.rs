@@ -52,7 +52,7 @@ commands:
   security-corpus check|report|import LIBXML2_SOURCE DATA_DIR LIBXSLT_SOURCE
   shared-pkix
   wasm-c14n
-  xades check|corpus|dss|binding|package ...
+  xades check|corpus|dss|binding|fixtures|package ...
   xslt-conformance [--cache-managed]";
 
 fn main() -> ExitCode {

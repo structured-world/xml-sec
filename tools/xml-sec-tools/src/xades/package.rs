@@ -7,12 +7,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Repository files distributed with the corpus.
-const SOURCES: [&str; 18] = [
+const SOURCES: [&str; 19] = [
     "LICENSE",
     "LICENSE-THIRD-PARTY",
     "README.md",
     "interop/.gitignore",
-    "scripts/generate-xades-fixtures.sh",
     ".github/workflows/ci.yml",
     "crates/xml-sec-xades/examples/interop_probe.rs",
     "tools/xml-sec-tools/Cargo.toml",
@@ -21,6 +20,8 @@ const SOURCES: [&str; 18] = [
     "tools/xml-sec-tools/src/xades/check.rs",
     "tools/xml-sec-tools/src/xades/corpus.rs",
     "tools/xml-sec-tools/src/xades/dss.rs",
+    "tools/xml-sec-tools/src/xades/fixtures.rs",
+    "tools/xml-sec-tools/src/xades/fixtures/tests.rs",
     "tools/xml-sec-tools/src/xades/package.rs",
     "tools/xml-sec-tools/src/xades/process.rs",
     "tools/xml-sec-tools/src/xades/process/tests.rs",

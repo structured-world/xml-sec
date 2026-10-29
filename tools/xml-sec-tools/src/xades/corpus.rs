@@ -140,29 +140,12 @@ fn template(corpus: &Corpus, fixtures: &Path, work: &Path) -> Result<String, Str
     if retained.exists() {
         return xml::read(&retained);
     }
-    let env = [
-        ("XADES_FIXTURE_WORK".to_owned(), work.display().to_string()),
-        (
-            "XADES_FIXTURE_OUTPUT".to_owned(),
-            fixtures.join("baseline").display().to_string(),
-        ),
-        (
-            "XMLSEC1_BIN".to_owned(),
-            corpus.xmlsec.to_string_lossy().into_owned(),
-        ),
-    ];
-    let script = corpus.root.join("scripts/generate-xades-fixtures.sh");
-    let log = corpus.package().join("generation/baseline");
-    let run = super::process::run(
-        &line(&[&"bash", &script]),
-        &log,
-        &corpus.root,
-        &env,
-        super::process::DEADLINE,
-    )?;
-    if !run.success() {
-        return Err("baseline generator failed; inspect generation/baseline.stderr".into());
-    }
+    super::fixtures::generate(&super::fixtures::Generator {
+        xmlsec: corpus.xmlsec.clone(),
+        work: work.to_owned(),
+        output: fixtures.join("baseline"),
+    })
+    .map_err(|error| format!("baseline generator failed: {error}"))?;
     for name in ["signer.key", "signer.pem", "intermediate.pem"] {
         std::fs::copy(work.join(name), fixtures.join(name))
             .map_err(|error| format!("copy {name}: {error}"))?;

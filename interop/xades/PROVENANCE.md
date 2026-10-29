@@ -5,7 +5,7 @@ They contain no invoices, real people, production keys, purchased signatures or 
 The included signer private key is deliberately public test material and grants no real trust.
 
 The initial chain and baseline variants were generated locally with the repository's
-`scripts/generate-xades-fixtures.sh`. Its only change is an optional output directory,
+fixture generator (`xades fixtures` of `xml-sec-tools`) with a separate output directory,
 so the existing checked-in fixtures remain untouched. The new variants are defined by
 `xades corpus --generate` of `xml-sec-tools`; independent libxmlsec1 computes every base signature.
 Adversarial mutations preserve or break selected boundaries intentionally. `cases.json`

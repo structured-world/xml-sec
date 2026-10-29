@@ -133,7 +133,7 @@ results directory; this also applies to the DSS runner's `--results` directory.
 `--summarize` explicitly reanalyzes existing DSS reports without rerunning the engine.
 `--generate` explicitly rebuilds synthetic variants, reusing retained
 test credentials when present. Starting with no `fixtures/` uses the existing
-`scripts/generate-xades-fixtures.sh` to create a new random test chain and B-B variants.
+`xades fixtures` generator to create a new random test chain and B-B variants.
 Random new credentials change the signed bytes and hashes: archive the new set as a new
 corpus, rather than comparing its signatures with this frozen run.
 
