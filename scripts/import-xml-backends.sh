@@ -54,8 +54,12 @@ fi
 printf '%s  %s\n' "$checksum" "$archive" | shasum -a 256 --check
 tar -xf "$archive" -C "$scratch"
 source="$scratch/$backend-$version"
+examples() {
+  cargo run --quiet --manifest-path "$root/Cargo.toml" -p xml-sec-tools -- \
+    kernel-examples "$backend" "$1" "${files[@]}"
+}
 if [[ "$mode" == --refresh-patch ]]; then
-  perl "$root/scripts/xml-kernel-examples.pl" "$backend" "$target" "${files[@]}"
+  examples "$target"
   rustfmt --edition 2024 "$target/documentation_tests.rs"
   : > "$scratch/delta.patch"
   for file in "${files[@]}"; do
@@ -74,7 +78,7 @@ fi
 if [[ -s "$delta" ]]; then
   patch --batch --forward --strip=3 --directory="$source/src" < "$delta"
 fi
-perl "$root/scripts/xml-kernel-examples.pl" "$backend" "$source/src" "${files[@]}"
+examples "$source/src"
 rustfmt --edition 2024 "$source/src/documentation_tests.rs"
 files+=(documentation_tests.rs)
 if [[ "$mode" == --verify ]]; then

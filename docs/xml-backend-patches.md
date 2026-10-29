@@ -30,10 +30,11 @@ canonicalization implementation. Original test assertions are retained using
 Rust's standard assertion macro.
 
 Original Rust documentation examples are generated as internal tests by
-`scripts/xml-kernel-examples.pl`, so they exercise the embedded kernel rather
-than an external crate with the same name. The import/verification command
-regenerates these tests. Compile-only examples remain compile-only; runnable
-examples retain their assertions and literal bytes. Their source documentation
+`cargo run -p xml-sec-tools -- kernel-examples`, so they exercise the embedded
+kernel rather than an external crate with the same name. The import/verification
+command regenerates these tests. Compile-only examples remain compile-only;
+runnable examples retain their assertions and literal bytes, and an example of
+a `cfg`-gated item carries the same `cfg`. Their source documentation
 is kept beside the implementation using `text,xml-sec-example` fences.
 
 The roxmltree kernel rejects prefixed namespace undeclaration, as required by
