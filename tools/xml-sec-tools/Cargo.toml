@@ -5,12 +5,21 @@ edition = "2024"
 publish = false
 
 [dependencies]
+base64 = "0.23"
+flate2 = "1"
 regex = "1"
 # Summaries keep the field order they are written in, and measured values
 # survive a read and rewrite unchanged.
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 sha2 = "0.11"
+tar = "0.4"
 tempfile = "3"
+# XML reports and fixtures are read with the product's own parser.
+xml-sec = { path = "../..", default-features = false, features = ["std", "xml-backend-roxmltree"] }
+
+[target.'cfg(unix)'.dependencies]
+# A timed-out command is stopped with its whole process group.
+libc = "0.2"
 
 [lints]
 workspace = true

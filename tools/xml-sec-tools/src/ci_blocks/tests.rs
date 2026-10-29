@@ -198,7 +198,7 @@ fn the_workflow_wires_every_block_on_stable_and_retains_required_aggregates() {
         assert!(job.contains("= \"success\""), "{name}");
     }
     let oracle = section(&workflow, "xslt-oracle");
-    assert!(oracle.contains("python3 scripts/check-xades-interop.py --output"));
+    assert!(oracle.contains("xml-sec-tools -- xades check --output"));
     assert!(oracle.contains("bash scripts/check-xslt-conformance.sh"));
     assert!(oracle.contains("name: xades-interop-results"));
     assert!(oracle.contains("name: xslt-performance"));

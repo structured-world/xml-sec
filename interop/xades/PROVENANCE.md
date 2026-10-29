@@ -7,7 +7,7 @@ The included signer private key is deliberately public test material and grants 
 The initial chain and baseline variants were generated locally with the repository's
 `scripts/generate-xades-fixtures.sh`. Its only change is an optional output directory,
 so the existing checked-in fixtures remain untouched. The new variants are defined by
-`scripts/xades-interop.py`; independent libxmlsec1 computes every base signature.
+`xades corpus --generate` of `xml-sec-tools`; independent libxmlsec1 computes every base signature.
 Adversarial mutations preserve or break selected boundaries intentionally. `cases.json`
 states expected XMLDSig validity, not expected application or XAdES acceptance.
 

@@ -17,6 +17,7 @@ mod shared_pkix;
 mod test_support;
 #[cfg(test)]
 mod workflow_contracts;
+mod xades;
 
 use repo::Failure;
 use std::process::ExitCode;
@@ -41,7 +42,8 @@ commands:
   pedantic-lints TOOLCHAIN...
   pkcs11-tests MODULE [--workspace] ARGS...
   security-corpus check|report|import LIBXML2_SOURCE DATA_DIR LIBXSLT_SOURCE
-  shared-pkix";
+  shared-pkix
+  xades check|corpus|dss|binding|package ...";
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -65,6 +67,7 @@ fn main() -> ExitCode {
         Some("pkcs11-tests") => pkcs11::run(args),
         Some("security-corpus") => security_corpus::run(args),
         Some("shared-pkix") => shared_pkix::run(args),
+        Some("xades") => xades::run(args),
         _ => Err(Failure {
             code: 2,
             message: USAGE.into(),
