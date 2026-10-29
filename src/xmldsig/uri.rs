@@ -13,9 +13,16 @@
 //! module never performs network or filesystem I/O.
 
 use crate::c14n::scratch::{Accounted, Bytes as _, Native, Scratch, Text as _};
-use std::cell::Cell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use alloc::{
+    borrow::{Cow, ToOwned},
+    collections::BTreeMap,
+    rc::Rc,
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::cell::Cell;
+
+use crate::collections::Map;
 
 use crate::xml::dom::{Document, Node, NodeId};
 
@@ -57,13 +64,13 @@ pub(crate) enum NormalizedFragment<'uri, B> {
     Owned(B),
 }
 
-impl<B: std::ops::Deref<Target = [u8]>> NormalizedFragment<'_, B> {
+impl<B: core::ops::Deref<Target = [u8]>> NormalizedFragment<'_, B> {
     pub(crate) fn view(&self, scratch: &impl Scratch) -> Result<&str, TransformError> {
         match self {
             Self::Borrowed(text) => Ok(text),
             Self::Owned(bytes) => {
                 scratch.charge(bytes.len())?;
-                std::str::from_utf8(bytes).map_err(|_| invalid_fragment())
+                core::str::from_utf8(bytes).map_err(|_| invalid_fragment())
             }
         }
     }
@@ -166,7 +173,7 @@ pub(crate) enum ExternalResourceMapError {
 }
 
 pub(crate) fn validate_external_resource_map(
-    resources: &HashMap<String, Vec<u8>>,
+    resources: &BTreeMap<String, Vec<u8>>,
     max_resource_bytes: usize,
     max_total_bytes: usize,
 ) -> Result<(), ExternalResourceMapError> {
@@ -204,14 +211,14 @@ pub(crate) fn validate_external_resource_map(
 /// rebound instead of silently resetting it for each parsed generation.
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) struct ExternalResourceContext<'a> {
-    resources: Option<&'a HashMap<String, Vec<u8>>>,
+    resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     budget: Rc<ExternalResourceBudget>,
 }
 
 #[cfg(feature = "xmldsig-sign")]
 impl<'a> ExternalResourceContext<'a> {
     pub(crate) fn new(
-        resources: Option<&'a HashMap<String, Vec<u8>>>,
+        resources: Option<&'a BTreeMap<String, Vec<u8>>>,
         max_resource_bytes: usize,
         max_total_bytes: usize,
     ) -> Self {
@@ -287,8 +294,7 @@ impl ExternalResourceBudget {
 
 /// Resolves same-document URI references against a parsed XML document.
 ///
-/// Builds a `HashMap<&str, Node>` index on construction for O(1) fragment
-/// lookups. Supports caller-provided ID attribute names (important for SAML
+/// Builds an ID index on construction for fragment lookups. Supports caller-provided ID attribute names (important for SAML
 /// which uses `ID` rather than the xml:id mechanism).
 ///
 /// # Example
@@ -313,17 +319,17 @@ pub struct UriReferenceResolver<'a> {
     resource_identity: Option<String>,
     id_registrations: Vec<crate::IdAttributeRegistration>,
     id_index: ResolverIdIndex<'a>,
-    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     external_resource_budget: Rc<ExternalResourceBudget>,
     same_document_id_semantics: SameDocumentIdSemantics,
 }
 
 enum ResolverIdIndex<'a> {
     Borrowed(XmlIdIndex<'a>),
-    Retained(HashMap<String, NodeId>),
+    Retained(Map<String, NodeId>),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum TraversalDocumentIdentity {
     Owned(crate::DocumentIdentity),
     External(String),
@@ -491,7 +497,7 @@ impl<'a> UriReferenceResolver<'a> {
         } else if let Some(view) = self.view {
             TraversalDocumentIdentity::Owned(view.identity())
         } else {
-            TraversalDocumentIdentity::Borrowed(std::ptr::from_ref(self.doc).addr())
+            TraversalDocumentIdentity::Borrowed(core::ptr::from_ref(self.doc).addr())
         }
     }
 
@@ -501,7 +507,7 @@ impl<'a> UriReferenceResolver<'a> {
     /// RFC 3986 resolved URI identities: paths have dot segments removed while
     /// query and fragment suffixes are retained.
     #[must_use]
-    pub fn with_external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+    pub fn with_external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
         self
     }
@@ -557,14 +563,9 @@ impl<'a> UriReferenceResolver<'a> {
     ) -> crate::operation::OperationResourceIdentity {
         use sha2::Digest;
 
-        let mut entries = self
-            .external_resources
-            .into_iter()
-            .flat_map(HashMap::iter)
-            .collect::<Vec<_>>();
-        entries.sort_unstable_by_key(|(uri, _)| *uri);
         let mut hasher = sha2::Sha256::new();
-        for (uri, bytes) in entries {
+        // The ordered map yields entries by URI, so the identity is stable.
+        for (uri, bytes) in self.external_resources.into_iter().flatten() {
             hasher.update(uri.len().to_be_bytes());
             hasher.update(uri.as_bytes());
             hasher.update(bytes.len().to_be_bytes());
@@ -983,10 +984,10 @@ impl<'a> UriReferenceResolver<'a> {
         fragment: &'uri str,
         budget: Option<&NodeSetMaterializationBudget>,
         semantics: SameDocumentIdSemantics,
-    ) -> Result<std::borrow::Cow<'uri, str>, TransformError> {
+    ) -> Result<Cow<'uri, str>, TransformError> {
         match Self::normalize_fragment_in(fragment, budget, semantics, &Native)? {
-            NormalizedFragment::Borrowed(text) => Ok(std::borrow::Cow::Borrowed(text)),
-            NormalizedFragment::Owned(bytes) => Ok(std::borrow::Cow::Owned(
+            NormalizedFragment::Borrowed(text) => Ok(Cow::Borrowed(text)),
+            NormalizedFragment::Owned(bytes) => Ok(Cow::Owned(
                 String::from_utf8(bytes).map_err(|_| invalid_fragment())?,
             )),
         }
@@ -1732,7 +1733,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([(
+        let resources = BTreeMap::from([(
             "https://example.test/data.bin".to_owned(),
             b"payload".to_vec(),
         )]);
@@ -1762,7 +1763,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([(
+        let resources = BTreeMap::from([(
             "https://example.test/data.bin".to_owned(),
             b"payload".to_vec(),
         )]);
@@ -1790,7 +1791,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([(
+        let resources = BTreeMap::from([(
             "https://example.test/data.bin".to_owned(),
             b"payload".to_vec(),
         )]);
@@ -1822,7 +1823,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([("data.bin".to_owned(), b"payload".to_vec())]);
+        let resources = BTreeMap::from([("data.bin".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
         let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
@@ -1851,7 +1852,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([("/data.bin".to_owned(), b"payload".to_vec())]);
+        let resources = BTreeMap::from([("/data.bin".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
         let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
@@ -1880,7 +1881,8 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([("//cdn.example/data.bin".to_owned(), b"payload".to_vec())]);
+        let resources =
+            BTreeMap::from([("//cdn.example/data.bin".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
         let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);
@@ -1909,7 +1911,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([(
+        let resources = BTreeMap::from([(
             "https://example.test/base/é?x".to_owned(),
             b"payload".to_vec(),
         )]);
@@ -1939,7 +1941,7 @@ mod tests {
             .descendants()
             .find(|node| node.has_tag_name("reference"))
             .unwrap();
-        let resources = HashMap::from([("urn:payload".to_owned(), b"payload".to_vec())]);
+        let resources = BTreeMap::from([("urn:payload".to_owned(), b"payload".to_vec())]);
         let budget = NodeSetMaterializationBudget::default();
         let xml_base_budget = XmlBaseResolutionBudget::default();
         let resolver = UriReferenceResolver::new(&doc).with_external_resources(&resources);

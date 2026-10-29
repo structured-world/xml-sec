@@ -1,6 +1,6 @@
 #![cfg(feature = "xmlenc")]
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use xml_sec::policy::{KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy};
 use xml_sec::provider::{
@@ -257,7 +257,7 @@ fn public_encryption_and_decryption_agree_without_exporting_secret() {
         )
         .provider(provider.clone());
     let mut denied = xml_sec::policy::EncryptionPolicy::default();
-    denied.key_establishment.agreement_algorithms = Some(HashSet::new());
+    denied.key_establishment.agreement_algorithms = Some(BTreeSet::new());
     assert!(matches!(
         builder
             .clone()
@@ -326,7 +326,7 @@ fn encryption_defers_derivation_to_final_operation_policy() {
         .provider(provider.clone());
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
     let mut denied = xml_sec::policy::EncryptionPolicy::default();
-    denied.key_establishment.derivation_algorithms = Some(HashSet::new());
+    denied.key_establishment.derivation_algorithms = Some(BTreeSet::new());
     assert!(matches!(
         builder.clone().policy(denied).encrypt_binary(b"payload"),
         Err(XmlEncError::Policy(_))
@@ -701,7 +701,7 @@ fn public_decrypt_uses_operation_policy_for_derived_content_keys() {
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
     let mut denied = policy;
-    denied.key_establishment.derivation_algorithms = Some(HashSet::new());
+    denied.key_establishment.derivation_algorithms = Some(BTreeSet::new());
     assert!(matches!(
         DecryptContext::new(&resolver)
             .provider(&provider)
@@ -828,7 +828,7 @@ fn sha3_concat_padding_crossing_is_reserved_before_provider_work() {
         };
         let provider = RecordingProvider::new();
         let mut policy = KeyEstablishmentPolicy {
-            digest_algorithms: Some(HashSet::from([digest])),
+            digest_algorithms: Some(BTreeSet::from([digest])),
             max_hash_blocks: 1,
             ..KeyEstablishmentPolicy::default()
         };
@@ -917,7 +917,7 @@ fn agreement_is_gated_by_kdf_permission_and_both_output_reservations() {
     let provider = RecordingProvider::new();
     let mut budget = xml_sec::xmlenc::KeyCandidateBudget::with_limit(20);
     let mut policy = xml_sec::policy::DecryptionPolicy::default();
-    policy.key_establishment.derivation_algorithms = Some(HashSet::new());
+    policy.key_establishment.derivation_algorithms = Some(BTreeSet::new());
     assert!(matches!(
         budget.agree_and_derive(&provider, &policy, &key, &agreement, &parameters()),
         Err(XmlEncError::Policy(_))
@@ -994,7 +994,7 @@ fn kdf_permission_gates_provider_work() {
     // Provider capability cannot override either the KDF or digest permission.
     let provider = RecordingProvider::new();
     let policy = KeyEstablishmentPolicy {
-        derivation_algorithms: Some(HashSet::new()),
+        derivation_algorithms: Some(BTreeSet::new()),
         ..Default::default()
     };
     let mut budget = KeyEstablishmentBudget::new(&policy).unwrap();
@@ -1005,7 +1005,7 @@ fn kdf_permission_gates_provider_work() {
     assert_eq!(provider.calls.load(Ordering::Relaxed), 0);
     assert_eq!(budget.hash_blocks(), 0);
     let policy = KeyEstablishmentPolicy {
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha512])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha512])),
         ..Default::default()
     };
     let mut budget = KeyEstablishmentBudget::new(&policy).unwrap();
@@ -1056,7 +1056,7 @@ fn x448_permission_and_secret_width_gate_agreement() {
     ));
     assert_eq!(private.calls.load(Ordering::Relaxed), 0);
     policy.key_establishment.agreement_algorithms =
-        Some(HashSet::from([KeyAgreementAlgorithm::X448]));
+        Some(BTreeSet::from([KeyAgreementAlgorithm::X448]));
     policy.key_establishment.max_owned_bytes = 71;
     assert!(matches!(
         budget.agree_and_derive(
@@ -1216,8 +1216,8 @@ fn provider_output_width_and_legacy_permissions_are_checked() {
             .is_err()
     );
     let policy = KeyEstablishmentPolicy {
-        derivation_algorithms: Some(HashSet::from([KeyDerivationAlgorithm::LegacyDh])),
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        derivation_algorithms: Some(BTreeSet::from([KeyDerivationAlgorithm::LegacyDh])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         ..Default::default()
     };
     assert!(

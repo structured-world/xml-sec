@@ -31,9 +31,18 @@ pub(crate) mod ns_exclusive;
 pub(crate) mod ns_inclusive;
 pub(crate) mod prefix;
 pub(crate) mod serialize;
+pub(crate) mod sink;
 pub(crate) mod xml_base;
 
-use std::collections::HashSet;
+use alloc::{
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+#[cfg(feature = "xmldsig")]
+use sink::ByteSink;
 
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId};
@@ -68,7 +77,7 @@ pub struct C14nAlgorithm {
     with_comments: bool,
     /// For Exclusive C14N: prefixes forced via `InclusiveNamespaces PrefixList`.
     /// `"#default"` is normalized to `""` (empty string) by `with_prefix_list()`.
-    inclusive_prefixes: HashSet<String>,
+    inclusive_prefixes: BTreeSet<String>,
 }
 
 impl C14nAlgorithm {
@@ -86,7 +95,7 @@ impl C14nAlgorithm {
 
     /// Prefixes forced via `InclusiveNamespaces PrefixList` (exclusive C14N).
     #[must_use]
-    pub fn inclusive_prefixes(&self) -> &HashSet<String> {
+    pub fn inclusive_prefixes(&self) -> &BTreeSet<String> {
         &self.inclusive_prefixes
     }
 
@@ -96,7 +105,7 @@ impl C14nAlgorithm {
         Self {
             mode,
             with_comments,
-            inclusive_prefixes: HashSet::new(),
+            inclusive_prefixes: BTreeSet::new(),
         }
     }
 
@@ -117,7 +126,7 @@ impl C14nAlgorithm {
         Some(Self {
             mode,
             with_comments,
-            inclusive_prefixes: HashSet::new(),
+            inclusive_prefixes: BTreeSet::new(),
         })
     }
 
@@ -197,9 +206,14 @@ pub enum C14nError {
         /// Maximum bytes admitted for this serialization, excluding any prefix.
         max_bytes: usize,
     },
-    /// I/O error.
+    /// The caller's writer failed.
+    #[cfg(feature = "std")]
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+    /// An internal byte consumer stopped accepting canonical output; the
+    /// operation reports the consumer's own failure instead.
+    #[error("canonical output consumer refused bytes")]
+    OutputRefused,
 }
 
 #[cfg(any(feature = "xmldsig", test))]
@@ -360,7 +374,7 @@ pub(crate) fn canonicalize_bounded_with_xml_base_budget_and_positions(
 /// Same bounded serializer for terminal streams and retained collecting output.
 /// The supplied initial offset preserves absolute positions for append callers.
 #[cfg(feature = "xmldsig")]
-pub(crate) fn canonicalize_visible_to_writer_bounded<W: std::io::Write + ?Sized>(
+pub(crate) fn canonicalize_visible_to_writer_bounded<W: ByteSink + ?Sized>(
     doc: &Document,
     visibility: Option<&dyn NodeVisibility>,
     algo: &C14nAlgorithm,
@@ -387,7 +401,7 @@ pub(crate) fn canonicalize_visible_to_writer_bounded<W: std::io::Write + ?Sized>
 #[cfg(feature = "xmldsig")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn canonicalize_visible_to_writer_accounted<
-    W: std::io::Write + ?Sized,
+    W: ByteSink + ?Sized,
     E: structured_asn1::memory::Work,
     D: DomStorage,
 >(
@@ -418,7 +432,7 @@ pub(crate) fn canonicalize_visible_to_writer_accounted<
 /// Terminal stream for any scratch and DOM storage; nothing is collected.
 #[cfg(feature = "xmldsig")]
 pub(crate) fn canonicalize_visible_to_writer_in<
-    W: std::io::Write + ?Sized,
+    W: ByteSink + ?Sized,
     S: scratch::Scratch,
     D: DomStorage,
 >(
@@ -457,30 +471,14 @@ pub(crate) fn canonicalize_buffer_in<S: scratch::Scratch, D: DomStorage>(
     xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
     scratch: &S,
 ) -> Result<(S::Bytes, Option<usize>), C14nError> {
-    struct Buffer<B> {
-        bytes: B,
-        failure: Option<C14nError>,
-    }
-    impl<B: scratch::Bytes> std::io::Write for Buffer<B> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.failure.is_some() {
-                return Err(std::io::ErrorKind::OutOfMemory.into());
-            }
-            if let Err(error) = self.bytes.append(bytes) {
-                self.failure = Some(error);
-                return Err(std::io::ErrorKind::OutOfMemory.into());
-            }
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+    struct Buffer<B>(B);
+    impl<B: scratch::Bytes> ByteSink for Buffer<B> {
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
+            self.0.append(bytes)
         }
     }
-    let mut buffer = Buffer {
-        bytes: scratch.bytes(),
-        failure: None,
-    };
-    let result = canonicalize_writer_with_scratch(
+    let mut buffer = Buffer(scratch.bytes());
+    let tracked_position = canonicalize_writer_with_scratch(
         doc,
         Some(visibility),
         algo,
@@ -491,20 +489,13 @@ pub(crate) fn canonicalize_buffer_in<S: scratch::Scratch, D: DomStorage>(
         scratch,
         prefix_list,
         tracked,
-    );
-    if let Some(error) = buffer.failure {
-        return Err(error);
-    }
-    Ok((buffer.bytes, result?))
+    )?;
+    Ok((buffer.0, tracked_position))
 }
 
 #[cfg(feature = "xmldsig")]
 #[allow(clippy::too_many_arguments)]
-fn canonicalize_writer_with_scratch<
-    W: std::io::Write + ?Sized,
-    S: scratch::Scratch,
-    D: DomStorage,
->(
+fn canonicalize_writer_with_scratch<W: ByteSink + ?Sized, S: scratch::Scratch, D: DomStorage>(
     doc: &Document<'_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
@@ -757,7 +748,7 @@ pub fn canonicalize_xml_with_backend(
         )));
     }
     let xml_str =
-        std::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
+        core::str::from_utf8(xml).map_err(|e| C14nError::Parse(format!("invalid UTF-8: {e}")))?;
     let document = crate::document::parse_borrowed_with_settings_and_budget(
         xml_str,
         crate::document::DocumentParseSettings::default().with_backend(backend),

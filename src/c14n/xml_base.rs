@@ -9,7 +9,9 @@
 //! This module provides a minimal RFC 3986 relative URI resolver — just
 //! enough for `xml:base` fixup. It is NOT a general-purpose URI library.
 
-use std::cell::Cell;
+#[cfg(any(feature = "xmldsig", test))]
+use alloc::string::String;
+use core::cell::Cell;
 
 use crate::xml::dom::Node;
 use crate::xml::dom::storage::Storage as DomStorage;

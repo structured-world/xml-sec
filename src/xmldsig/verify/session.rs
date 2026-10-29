@@ -10,6 +10,7 @@ use super::{
     XmlDocument, classify_uri, enforce_current_transform_allowed, enforce_transform_allowed,
     is_xml_whitespace_only, transform_chain_uses_implicit_c14n, with_verified_document,
 };
+use alloc::{collections::BTreeSet, string::String};
 use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, Work};
 
 mod detached;
@@ -825,7 +826,7 @@ struct ReplayTerminal<'a, W: Work, E, F> {
     work: &'a W,
     receiver: &'a mut F,
     timestamp: Option<(crate::c14n::C14nAlgorithm, Option<&'a str>)>,
-    error: std::marker::PhantomData<fn() -> E>,
+    error: core::marker::PhantomData<fn() -> E>,
 }
 
 impl<'a, W: Work, E, F: FnMut(&[u8]) -> Result<(), E>>
@@ -853,8 +854,8 @@ impl<'a, W: Work, E, F: FnMut(&[u8]) -> Result<(), E>>
             failure: None,
         };
         let result = if let Some(bytes) = data.binary() {
-            use std::io::Write;
-            output.write_all(bytes).map_err(crate::c14n::C14nError::Io)
+            use crate::c14n::sink::ByteSink as _;
+            output.write_bytes(bytes)
         } else {
             let nodes = data.nodes().expect("execution has nodes or bytes");
             let implicit = crate::c14n::C14nAlgorithm::from_uri(DEFAULT_IMPLICIT_C14N_URI)
@@ -925,32 +926,34 @@ impl<W: Work> Drop for AdmittedReplay<'_, W> {
         self.active.set(false);
     }
 }
-impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> std::io::Write for ReplayWriter<'_, W, E, F> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.failure.is_some() {
-            return Err(std::io::ErrorKind::Other.into());
+impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> ReplayWriter<'_, W, E, F> {
+    fn deliver(&mut self, bytes: &[u8]) -> Result<(), ReplayError<E>> {
+        // The receiver sees only nonempty chunks; empty output delivers none.
+        if bytes.is_empty() {
+            return Ok(());
         }
-        let result = (|| {
-            let units = u64::try_from(bytes.len())
-                .map_err(|_| ReplayError::Processing(MemoryError::WorkExceeded.into()))?;
-            self.work
-                .charge_work(units)
-                .map_err(|error| ReplayError::Processing(error.into()))?;
-            if self.canonicalizing {
-                super::super::transforms::charge_replay_output(self.budget, bytes.len())?;
-            }
-            (self.receiver)(bytes).map_err(ReplayError::Receiver)
-        })();
-        match result {
-            Ok(()) => Ok(bytes.len()),
-            Err(error) => {
-                self.failure = Some(error);
-                Err(std::io::ErrorKind::Other.into())
-            }
+        let units = u64::try_from(bytes.len())
+            .map_err(|_| ReplayError::Processing(MemoryError::WorkExceeded.into()))?;
+        self.work
+            .charge_work(units)
+            .map_err(|error| ReplayError::Processing(error.into()))?;
+        if self.canonicalizing {
+            super::super::transforms::charge_replay_output(self.budget, bytes.len())?;
         }
+        (self.receiver)(bytes).map_err(ReplayError::Receiver)
     }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+}
+
+// The canonical serializer stops at the refusal; `finish` reports the
+// retained typed failure instead of the serializer's error.
+impl<W: Work, E, F: FnMut(&[u8]) -> Result<(), E>> crate::c14n::sink::ByteSink
+    for ReplayWriter<'_, W, E, F>
+{
+    fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), crate::c14n::C14nError> {
+        self.deliver(bytes).map_err(|error| {
+            self.failure = Some(error);
+            crate::c14n::C14nError::OutputRefused
+        })
     }
 }
 
@@ -1041,7 +1044,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     fn validate_replay_transform_policy<E>(
         &self,
         node: Node<'_, '_>,
-    ) -> Result<Option<&std::collections::HashSet<String>>, ReplayError<E>> {
+    ) -> Result<Option<&BTreeSet<String>>, ReplayError<E>> {
         let processing = ReplayError::Processing;
         let allowed = self
             .session
@@ -1102,7 +1105,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
     fn replay_timestamp_method<E>(
         &self,
         method: NodeIdentity,
-        allowed: Option<&std::collections::HashSet<String>>,
+        allowed: Option<&BTreeSet<String>>,
     ) -> Result<(crate::c14n::C14nAlgorithm, Option<&str>), ReplayError<E>> {
         let processing = ReplayError::Processing;
         let method = self
@@ -1202,7 +1205,7 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
                 work: self.work,
                 receiver,
                 timestamp,
-                error: std::marker::PhantomData,
+                error: core::marker::PhantomData,
             },
         )?;
         Ok(ReplayOutcome::Complete)

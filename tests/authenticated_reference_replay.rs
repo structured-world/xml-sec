@@ -2,7 +2,7 @@
 //! mock providers. Payload validity is deliberately separate from instruction authentication.
 #![cfg(feature = "xmldsig-sign")]
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::xmldsig::{
     CatalogueCompleteness, CatalogueError, DsigError, DsigStatus, FailureReason, HmacSigningKey,
@@ -100,7 +100,7 @@ fn assert_binary_xml_storage_refused(bytes: Vec<u8>) {
     let uri = "https://example.test/parser-storage";
     let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms>"#;
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
-    let resources = HashMap::from([(uri.to_owned(), bytes)]);
+    let resources = BTreeMap::from([(uri.to_owned(), bytes)]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..Default::default()
@@ -247,7 +247,7 @@ fn current_query_admits_base64_capacity_before_receiver() {
     let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/></ds:Transforms>"#;
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
     let document = XmlDocument::parse(xml).unwrap();
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         uri.to_owned(),
         base64::engine::general_purpose::STANDARD
             .encode(vec![0x42; 65536])
@@ -298,7 +298,7 @@ fn current_query_binary_chain_releases_consumed_input_capacity() {
     let transform = r#"<ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#base64"/>"#;
     let transforms = format!("<ds:Transforms>{transform}{transform}</ds:Transforms>");
     let expected = vec![0x42; 65536];
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         uri.to_owned(),
         STANDARD.encode(STANDARD.encode(&expected)).into_bytes(),
     )]);
@@ -355,7 +355,7 @@ fn current_query_admits_external_uri_scratch_before_lookup_output() {
     let uri = format!("https://example.test/{}", "x".repeat(16384));
     let (xml, key) = signed_manifest(&uri, "http://www.w3.org/2001/04/xmlenc#sha256", "");
     let document = XmlDocument::parse(xml).unwrap();
-    let resources = HashMap::from([(uri, vec![0x42])]);
+    let resources = BTreeMap::from([(uri, vec![0x42])]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..Default::default()
@@ -405,7 +405,7 @@ fn current_query_base64_charges_local_and_aggregate_once() {
     let expected = vec![0x42; 768];
     let encoded = STANDARD.encode(&expected).into_bytes();
     let input_length = encoded.len();
-    let resources = HashMap::from([(uri.to_owned(), encoded)]);
+    let resources = BTreeMap::from([(uri.to_owned(), encoded)]);
     let secret = vec![0x61; 32];
     let signer = HmacSigningKey::new(secret.clone()).unwrap();
     let key = HmacVerificationKey::new(secret).unwrap();
@@ -1349,7 +1349,7 @@ fn final_octets_are_borrowed_and_not_timestamp_recanonicalized() {
     let uri = "https://example.test/binary";
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", "");
     for bytes in [vec![], vec![0xff, 0, 0x80, 1], vec![0xff; 16384]] {
-        let resources = HashMap::from([(uri.to_owned(), bytes)]);
+        let resources = BTreeMap::from([(uri.to_owned(), bytes)]);
         let expected = resources.get(uri).unwrap();
         let document = XmlDocument::parse(xml.clone()).unwrap();
         let mut policy = xml_sec::policy::VerificationPolicy::default();
@@ -1402,7 +1402,7 @@ fn external_enveloped_replay_refuses_a_foreign_document() {
     let key = HmacVerificationKey::new(vec![0x61; 32]).unwrap();
     let document =
         XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
-    let resources = HashMap::from([(uri.to_owned(), b"<payload/>".to_vec())]);
+    let resources = BTreeMap::from([(uri.to_owned(), b"<payload/>".to_vec())]);
     let context = VerifyContext::new()
         .key(&key)
         .allowed_uri_types(UriTypeSet::ALL)
@@ -1794,7 +1794,7 @@ fn external_xml_replay_uses_the_original_binary_to_xml_adapter() {
     let uri = "https://example.test/xml";
     let transforms = r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#WithComments"/></ds:Transforms>"#;
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         uri.to_owned(),
         b"<q:root xmlns:q='urn:payload' z='2' a='1'><!--keep--><q:child/></q:root>".to_vec(),
     )]);
@@ -1832,7 +1832,7 @@ fn external_xml_xpath_replay_keeps_namespace_axes_and_original_id_rules() {
         );
         let (xml, key) =
             signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", &transforms);
-        let resources = HashMap::from([(uri.to_owned(), payload.to_vec())]);
+        let resources = BTreeMap::from([(uri.to_owned(), payload.to_vec())]);
         let request = VerificationRequest {
             external_resources: Some(&resources),
             ..Default::default()
@@ -1889,7 +1889,7 @@ fn current_query_replays_opc_with_the_original_edition_after_producer_exhaustion
     let payload = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="drop" Type="urn:other" Target="discard"/><Relationship Id="keep" Type="urn:test" Target="part.xml"/></Relationships>"#;
     let expected = br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="keep" Target="part.xml" TargetMode="Internal" Type="urn:test"></Relationship></Relationships>"#;
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
-    let resources = HashMap::from([(uri.to_owned(), payload.to_vec())]);
+    let resources = BTreeMap::from([(uri.to_owned(), payload.to_vec())]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..Default::default()
@@ -1975,7 +1975,7 @@ fn current_query_replays_xslt_within_its_memory_account() {
         r#"</xsl:stylesheet></ds:Transform></ds:Transforms>"#
     );
     let (xml, key) = signed_manifest(uri, "http://www.w3.org/2001/04/xmlenc#sha256", transforms);
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         uri.to_owned(),
         b"<doc><item>b</item><item>a</item></doc>".to_vec(),
     )]);

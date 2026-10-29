@@ -46,12 +46,12 @@ pub struct RecoveredContentKey {
     bytes: zeroize::Zeroizing<Vec<u8>>,
     valid: subtle::Choice,
     implicit_rejection: bool,
-    opaque: Option<std::sync::Arc<dyn ContentDecryptionKey>>,
+    opaque: Option<Arc<dyn ContentDecryptionKey>>,
 }
 
 #[cfg(feature = "xmlenc")]
-impl std::fmt::Debug for RecoveredContentKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for RecoveredContentKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("RecoveredContentKey")
             .finish_non_exhaustive()
     }
@@ -92,7 +92,7 @@ impl RecoveredContentKey {
     }
 
     /// Retain a non-exportable content key until the content operation ends.
-    pub fn opaque(key: std::sync::Arc<dyn ContentDecryptionKey>) -> Self {
+    pub fn opaque(key: Arc<dyn ContentDecryptionKey>) -> Self {
         Self {
             bytes: zeroize::Zeroizing::new(Vec::new()),
             valid: subtle::Choice::from(1),
@@ -113,7 +113,7 @@ impl RecoveredContentKey {
         use subtle::ConstantTimeEq;
 
         match (&self.opaque, &other.opaque) {
-            (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
             // Width is public algorithm metadata; secret bytes and recovery
             // validity must not select an early-exit comparison path.
             (None, None) => bool::from(
@@ -236,7 +236,8 @@ pub use aws_lc::AwsLcRsaPrivateKey;
 pub use aws_lc::{AwsLcFipsProvider, AwsLcSigningKey};
 
 #[cfg(feature = "xmlenc")]
-use std::borrow::Cow;
+use alloc::borrow::Cow;
+use alloc::{borrow::ToOwned, boxed::Box, string::String, sync::Arc, vec::Vec};
 
 // Randomness serves signing and encryption only; verification never draws it.
 #[cfg(feature = "xmldsig-sign")]
@@ -470,7 +471,7 @@ pub struct KdfParameters<'a> {
 
 /// Provider-neutral X.509 certificate and CRL signature parameters.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum X509SignatureAlgorithm {
     /// DSA with the selected message digest.
@@ -687,13 +688,13 @@ pub enum ExternalProviderError {
 
 /// Caller-owned identity for external-provider handles, independent of engine name.
 #[derive(Clone, Default)]
-pub struct ProviderBinding(std::sync::Arc<()>);
+pub struct ProviderBinding(Arc<()>);
 
 impl ProviderBinding {
     /// Test identity without copying secret or public key material.
     #[must_use]
     pub fn matches(&self, other: &Self) -> bool {
-        std::sync::Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -998,10 +999,7 @@ pub trait CryptoProvider: Send + Sync {
     /// Returns `Unsupported` by default, or an invalid key encoding or import
     /// failure from an implementing provider.
     #[cfg(feature = "xmlenc")]
-    fn import_recovery_key(
-        &self,
-        _pkcs8: &[u8],
-    ) -> Result<std::sync::Arc<dyn KeyRecoveryKey>, ProviderError> {
+    fn import_recovery_key(&self, _pkcs8: &[u8]) -> Result<Arc<dyn KeyRecoveryKey>, ProviderError> {
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::KeyRecovery,
             algorithm: None,
@@ -1026,7 +1024,7 @@ pub trait CryptoProvider: Send + Sync {
         &self,
         algorithm: KeyEncapsulationAlgorithm,
         _spki: &[u8],
-    ) -> Result<std::sync::Arc<dyn KeyEncapsulationKey>, ProviderError> {
+    ) -> Result<Arc<dyn KeyEncapsulationKey>, ProviderError> {
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::Encapsulate,
             algorithm: Some(algorithm.uri().into()),
@@ -1044,7 +1042,7 @@ pub trait CryptoProvider: Send + Sync {
         &self,
         algorithm: KeyEncapsulationAlgorithm,
         _pkcs8: &[u8],
-    ) -> Result<std::sync::Arc<dyn KeyDecapsulationKey>, ProviderError> {
+    ) -> Result<Arc<dyn KeyDecapsulationKey>, ProviderError> {
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::Decapsulate,
             algorithm: Some(algorithm.uri().into()),
@@ -1867,10 +1865,10 @@ impl CryptoProvider for RustCryptoProvider {
         &self,
         algorithm: KeyEncapsulationAlgorithm,
         spki: &[u8],
-    ) -> Result<std::sync::Arc<dyn KeyEncapsulationKey>, ProviderError> {
+    ) -> Result<Arc<dyn KeyEncapsulationKey>, ProviderError> {
         self.require_capability(ProviderCapability::Encapsulate(algorithm))?;
         let key = RustCryptoMlKemPublicKey::from_spki_der_with_algorithm(spki, Some(algorithm))?;
-        Ok(std::sync::Arc::new(key))
+        Ok(Arc::new(key))
     }
 
     #[cfg(feature = "experimental-pq")]
@@ -1878,24 +1876,21 @@ impl CryptoProvider for RustCryptoProvider {
         &self,
         algorithm: KeyEncapsulationAlgorithm,
         pkcs8: &[u8],
-    ) -> Result<std::sync::Arc<dyn KeyDecapsulationKey>, ProviderError> {
+    ) -> Result<Arc<dyn KeyDecapsulationKey>, ProviderError> {
         self.require_capability(ProviderCapability::Decapsulate(algorithm))?;
         let key = RustCryptoMlKemPrivateKey::from_pkcs8_der_with_algorithm(pkcs8, Some(algorithm))?;
-        Ok(std::sync::Arc::new(key))
+        Ok(Arc::new(key))
     }
 
     #[cfg(feature = "xmlenc")]
-    fn import_recovery_key(
-        &self,
-        pkcs8: &[u8],
-    ) -> Result<std::sync::Arc<dyn KeyRecoveryKey>, ProviderError> {
+    fn import_recovery_key(&self, pkcs8: &[u8]) -> Result<Arc<dyn KeyRecoveryKey>, ProviderError> {
         use crate::rsa_encoding::RsaPrivateKeyEncoding as _;
         let key = rsa::RsaPrivateKey::from_pkcs8_der(pkcs8).map_err(|_| {
             ProviderError::InvalidInput(ProviderInputError::PrimitiveInitialization(
                 "RSA recovery key",
             ))
         })?;
-        Ok(std::sync::Arc::new(RustCryptoRsaPrivateKey::new(key)))
+        Ok(Arc::new(RustCryptoRsaPrivateKey::new(key)))
     }
 
     // Without `xmldsig-sign` the trait default reports signing unsupported.
@@ -2243,6 +2238,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
 
 #[cfg(feature = "xmldsig")]
 pub(crate) mod rustcrypto_x509 {
+    use alloc::borrow::ToOwned;
     use der::Decode as _;
     use rsa::{
         RsaPublicKey,

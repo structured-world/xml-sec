@@ -3,6 +3,7 @@
 use super::SignatureAlgorithm;
 #[cfg(feature = "xmldsig-sign")]
 use super::{SigningKey, SigningKeyError, SigningPublicKeyInfo};
+use alloc::borrow::ToOwned;
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
 use sha2::digest::Update;

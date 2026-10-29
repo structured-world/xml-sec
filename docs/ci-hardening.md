@@ -82,7 +82,8 @@ lint keeps standard-library use within it. The lint matrix in
 backend, all-feature, experimental, FIPS and XSLT workspace graphs, plus
 library-only minimal graphs for `xmldsig`, `xmldsig-sign`, `xmlenc` and `xslt` on
 the differential backend. The alloc-only job lints the separate XML-input crate
-without default features.
+without default features, and C14N and XMLDSig verification without `std` for
+`thumbv7em-none-eabihf` with each XML backend.
 
 The standalone legacy `raw-pointer-backend` is not selected by the product or by
 the safe workspace all-feature graph and is not claimed as pedantic-qualified.

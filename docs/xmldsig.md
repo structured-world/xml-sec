@@ -343,7 +343,7 @@ processed as during verification; the request's acceptance is recomputed after e
 ```rust
 # #[cfg(feature = "xmldsig-sign")]
 # fn main() -> Result<(), Box<dyn std::error::Error>> {
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::XmlDocument;
@@ -361,7 +361,7 @@ let mut signing = SigningPolicy::default();
 signing.uris.references = UriTypeSet::ALL;
 let signed = SignContext::new(&HmacSigningKey::new(secret.clone())?)
     .policy(signing)
-    .external_resources(&HashMap::from([(
+    .external_resources(&BTreeMap::from([(
         "https://example.test/report.pdf".to_owned(),
         payload.clone(),
     )]))
@@ -815,7 +815,7 @@ minimum salt length, and trailer field. Implicit external resource loading is no
 generation, selected provider, immutable policy, captured external resource map,
 authentication state and remaining operation budgets. Additional scoped storage,
 scalar inspection and terminal C14N scratch use the supplied current shared `Work`.
-This does not introduce alloc-only `XMLDSig` support.
+Sessions, like the rest of verification, are available without `std`.
 
 Select the exact successful Signature with `select_signature` when continuing
 under the producer's original Work. For an independently funded continuation, use
@@ -993,7 +993,7 @@ A `VerifiedSession` also answers operation-bound lookups for extension formats:
   certificate processing. `execution` lends the request's own execution, so a
   continuation can spend it instead of a separately supplied account.
 
-`X509TrustEvidence::validation_instant` returns the exact instant the path
+`X509TrustEvidence::verification_time` returns the exact instant the path
 processor used, and `X509TrustEvidence::certificate_identity_in` computes a
 certificate's path identity with the mechanism that recorded
 `certificate_fingerprints`. A consumer re-checking a validated path finds the

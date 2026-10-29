@@ -1,5 +1,7 @@
 //! Original `XPath` parameter text, borrowed unless XML text nodes require a join.
 
+use alloc::{borrow::ToOwned, string::String};
+
 use super::{TransformError, is_xpath_whitespace, transform_resource_limit};
 use crate::c14n::scratch::{Text, TextBuilder};
 use crate::xml::dom::Node;
@@ -8,11 +10,11 @@ pub(crate) enum Source<'a, T> {
     Borrowed(&'a str),
     Joined {
         text: T,
-        range: std::ops::Range<usize>,
+        range: core::ops::Range<usize>,
     },
 }
 
-impl<T: std::ops::Deref<Target = str>> AsRef<str> for Source<'_, T> {
+impl<T: core::ops::Deref<Target = str>> AsRef<str> for Source<'_, T> {
     fn as_ref(&self) -> &str {
         match self {
             Self::Borrowed(text) => text,

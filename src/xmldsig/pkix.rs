@@ -1,6 +1,6 @@
 //! Adapter-owned execution domain for the published ASN.1 and PKIX mechanisms.
 
-use std::sync::Arc;
+use alloc::{borrow::ToOwned, string::String, sync::Arc, vec::Vec};
 
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, OwnedVec, Work};
 use structured_asn1::{Encoding, Limits, Parser};
@@ -264,24 +264,6 @@ impl CertificateSession {
     }
 }
 
-pub(crate) fn verification_instant(
-    time: std::time::SystemTime,
-) -> Result<structured_pkix::temporal::Instant, X509ChainError> {
-    use std::time::UNIX_EPOCH;
-    let nanos = match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i128::try_from(duration.as_nanos())
-            .map_err(|_| X509ChainError::CertificateNotValid(0))?,
-        Err(error) => -i128::try_from(error.duration().as_nanos())
-            .map_err(|_| X509ChainError::CertificateNotValid(0))?,
-    };
-    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000))
-        .map_err(|_| X509ChainError::CertificateNotValid(0))?;
-    let fraction = u32::try_from(nanos.rem_euclid(1_000_000_000))
-        .map_err(|_| X509ChainError::CertificateNotValid(0))?;
-    structured_pkix::temporal::Instant::new(seconds, fraction)
-        .ok_or(X509ChainError::CertificateNotValid(0))
-}
-
 #[cfg(test)]
 pub(crate) fn test_utc_facts() -> structured_pkix::temporal::LeapTable<'static> {
     // Synthetic caller evidence for test labels; never used by a runtime default.
@@ -314,7 +296,7 @@ pub(crate) fn verify_crls<'a>(
         provider,
         allowed: options.certificate_signature_algorithms,
     };
-    let now = verification_instant(options.verification_time)?.into();
+    let now = options.verification_time.into();
     let mut issuer_key = WorkingKey::standing(anchor.tbs().public_key());
     // RFC 5280 §6.1.4: project effective parameters once from the validated
     // anchor toward its subjects. Original SPKI/TBS bytes are never rewritten.
@@ -630,7 +612,7 @@ pub(crate) fn validate_supplied_path<'a>(
     };
     let context = ValidationContext {
         execution: session.memory(),
-        interval: Interval::at_instant(verification_instant(options.verification_time)?),
+        interval: Interval::at_instant(options.verification_time),
         policy: Policy::default(),
         bounds: path_bounds(options.max_chain_depth),
         verifier: &verifier,
@@ -1136,13 +1118,13 @@ impl<W: Work> structured_pkix::path::Verify<W> for CertificatePathVerifier<'_, '
                     0,
                 ))
             })?;
-        let position = if std::ptr::eq(raw, self.anchor.tbs().public_key().as_bytes()) {
+        let position = if core::ptr::eq(raw, self.anchor.tbs().public_key().as_bytes()) {
             self.chain.len()
         } else {
             self.chain
                 .iter()
                 .position(|certificate| {
-                    std::ptr::eq(raw, certificate.tbs().public_key().as_bytes())
+                    core::ptr::eq(raw, certificate.tbs().public_key().as_bytes())
                 })
                 .ok_or_else(|| X509ChainError::InvalidDer {
                     kind: "issuer public key",
@@ -2398,7 +2380,9 @@ mod tests {
         let options = super::super::x509::X509ChainOptions {
             utc_facts: None,
             trusted_certs: &anchors,
-            verification_time: std::time::SystemTime::now(),
+            verification_time:
+                crate::policy::instant_from_system_time(std::time::SystemTime::now())
+                    .expect("representable test time"),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,

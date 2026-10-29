@@ -29,7 +29,7 @@ use sha2::{Sha224, Sha256, Sha384, Sha512};
 use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Range,
 };
 use zeroize::Zeroizing;
@@ -1658,7 +1658,7 @@ pub struct SignContext<'a> {
     key_info_writer: Option<&'a dyn KeyInfoWriter>,
     start_node_id: Option<&'a str>,
     id_attributes: &'a [crate::IdAttributeRegistration],
-    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     template_selection: SignatureTemplateSelection,
     policy: crate::policy::SigningPolicy,
     provider: &'a dyn crate::provider::CryptoProvider,
@@ -1768,7 +1768,7 @@ impl<'a> SignContext<'a> {
     /// by [`crate::policy::SigningPolicy::uris`]. Keys are normalized RFC 3986
     /// URI identities with dot segments removed and query/fragment retained.
     #[must_use]
-    pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+    pub fn external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
         self
     }

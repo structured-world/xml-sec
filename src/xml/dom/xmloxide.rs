@@ -1,6 +1,7 @@
 //! `xmloxide` parser adapter for the shared semantic arena.
 
-use std::ops::Range;
+use alloc::string::ToString;
+use core::ops::Range;
 
 use super::storage::names::NameStorage;
 use super::storage::{Native, Storage, Values};

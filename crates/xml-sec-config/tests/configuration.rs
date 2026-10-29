@@ -22,8 +22,23 @@ fn effective(config: &Configuration, name: &str) -> xml_sec_config::EffectivePol
         .expect("compiled policy")
 }
 
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+fn now() -> xml_sec::policy::Instant {
+    xml_sec::policy::instant_from_system_time(std::time::SystemTime::now()).unwrap()
+}
+
+/// `time` moved by `nanos`, carrying across whole seconds.
+fn shifted(time: xml_sec::policy::Instant, nanos: i128) -> xml_sec::policy::Instant {
+    let total = i128::from(time.seconds()) * NANOS_PER_SECOND + i128::from(time.nanos()) + nanos;
+    xml_sec::policy::Instant::new(
+        i64::try_from(total.div_euclid(NANOS_PER_SECOND)).unwrap(),
+        u32::try_from(total.rem_euclid(NANOS_PER_SECOND)).unwrap(),
+    )
+    .unwrap()
+}
+
 #[test]
-#[cfg(unix)]
 fn earliest_signed_verification_time_round_trips_effective_policy() {
     // Schema-admitted lower-bound instants must compile and survive effective
     // output, not fail only when the snapshot serializes their unsigned span.
@@ -484,8 +499,7 @@ fn effective_time_preserves_fractional_and_negative_unix_time() {
         ),
         "team",
     );
-    let expected = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)
-        + std::time::Duration::from_nanos(123_456_789);
+    let expected = xml_sec::policy::Instant::new(-1, 123_456_789).unwrap();
     assert_eq!(
         original
             .compiled()
@@ -514,17 +528,16 @@ fn effective_time_preserves_fractional_and_negative_unix_time() {
 fn validity_presence_diff_is_one_directional_change_per_operation() {
     // Binding a grant narrows every operation to its time window; removing it
     // widens permission. Audit metadata must not split this into false relaxations.
-    use std::time::{Duration, SystemTime};
     use xml_sec::policy::PolicyValidity;
     let configuration = config("");
     let ordinary = effective(&configuration, "team");
-    let now = SystemTime::now();
+    let now = now();
     let grant = PolicyValidity {
         authorization_id: "test-grant".into(),
         authority: "test-application".into(),
         reason: "bounded operation".into(),
-        not_before: now - Duration::from_secs(60),
-        expires_at: now + Duration::from_secs(3600),
+        not_before: shifted(now, -60 * NANOS_PER_SECOND),
+        expires_at: shifted(now, 3600 * NANOS_PER_SECOND),
     };
     let bounded = configuration
         .compile(
@@ -562,8 +575,8 @@ fn validity_presence_diff_is_one_directional_change_per_operation() {
                 target_evidence: true,
             },
             Some(PolicyValidity {
-                not_before: grant.not_before + Duration::from_nanos(1),
-                expires_at: grant.expires_at - Duration::from_nanos(1),
+                not_before: shifted(grant.not_before, 1),
+                expires_at: shifted(grant.expires_at, -1),
                 ..grant
             }),
         )
@@ -589,7 +602,6 @@ fn validity_presence_diff_is_one_directional_change_per_operation() {
 fn legacy_authority_must_come_from_caller_and_retains_exact_interval() {
     // A TOML audit record is not proof of authority. A supplied authenticated
     // grant is retained exactly, including fractional expiry, on round trip.
-    use std::time::{Duration, SystemTime};
     use xml_sec::policy::PolicyValidity;
     let config = Configuration::from_str(
         "schema_version=1\n[profiles.legacy]\nbase='LegacyVerify'",
@@ -605,13 +617,13 @@ fn legacy_authority_must_come_from_caller_and_retains_exact_interval() {
             .compile("legacy", default_provider(), &context, None)
             .is_err()
     );
-    let now = SystemTime::now();
+    let now = now();
     let grant = PolicyValidity {
         authorization_id: "audit-record".into(),
         authority: "trusted-application".into(),
         reason: "historical validation".into(),
-        not_before: now - Duration::from_secs(60),
-        expires_at: now + Duration::from_secs(3600),
+        not_before: shifted(now, -60 * NANOS_PER_SECOND),
+        expires_at: shifted(now, 3600 * NANOS_PER_SECOND),
     };
     let policy = config
         .compile("legacy", default_provider(), &context, Some(grant.clone()))

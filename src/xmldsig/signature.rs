@@ -22,6 +22,12 @@ use sha1::Sha1;
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
 use signature::Verifier;
 
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec::Vec,
+};
+
 use super::parse::SignatureAlgorithm;
 use super::pkix::{CertificateSession, SpkiAlgorithm};
 use crate::policy::EcdsaSignatureValueEncoding;
@@ -362,7 +368,7 @@ fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerifi
         return Err(SignatureVerificationError::InvalidKeyFormat { label: block.label });
     }
     // Public material needs no wiping; take the buffer instead of copying it.
-    Ok(std::mem::take(&mut *block.contents))
+    Ok(core::mem::take(&mut *block.contents))
 }
 
 /// One decoded PEM block of caller-supplied key or certificate text.
@@ -1140,7 +1146,7 @@ fn parse_der_length(input: &[u8]) -> Option<Result<(usize, &[u8]), ()>> {
     }
 
     let len_len = usize::from(len_byte & 0x7f);
-    if len_len == 0 || len_len > std::mem::size_of::<usize>() || rest.len() < len_len {
+    if len_len == 0 || len_len > core::mem::size_of::<usize>() || rest.len() < len_len {
         return Some(Err(()));
     }
 

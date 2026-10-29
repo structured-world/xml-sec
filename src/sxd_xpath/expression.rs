@@ -1,7 +1,10 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
+#[cfg(feature = "embedded")]
+use alloc::{borrow::ToOwned, string::ToString, vec};
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::fmt;
 use snafu::{ResultExt, Snafu};
-use std::fmt;
 use sxd_document_no_unsafe::{PrefixedName, QName};
 
 use crate::Value::{Boolean, Number};
@@ -450,7 +453,7 @@ fn call_function_in<'d, E: Expression, R: crate::runtime::Runtime>(
     };
     let bytes = arguments
         .len()
-        .checked_mul(std::mem::size_of::<Value<'_>>())
+        .checked_mul(core::mem::size_of::<Value<'_>>())
         .filter(|bytes| isize::try_from(*bytes).is_ok())
         .ok_or_else(|| crate::function::Error::Other {
             what: "XPath argument storage exceeds addressable memory".into(),
@@ -880,7 +883,7 @@ fn collect_node_numbers_in<R: crate::runtime::Runtime>(
     runtime: R,
 ) -> Result<R::List<f64>, Error> {
     use crate::runtime::List;
-    if nodes.size() > usize::MAX / std::mem::size_of::<f64>() {
+    if nodes.size() > usize::MAX / core::mem::size_of::<f64>() {
         return Err(Error::FunctionEvaluation {
             source: function::Error::Other {
                 what: "XPath numeric workspace size overflow".into(),
@@ -889,7 +892,7 @@ fn collect_node_numbers_in<R: crate::runtime::Runtime>(
     }
     if !R::ACCOUNTED {
         context
-            .reserve_string_allocation(nodes.size() * std::mem::size_of::<f64>())
+            .reserve_string_allocation(nodes.size() * core::mem::size_of::<f64>())
             .context(FunctionEvaluation)?;
     }
     let mut values = runtime.list();
@@ -975,7 +978,7 @@ impl<E: Expression> Predicate<E> {
             // strings. The root handle only initializes the vacated slot and
             // is never exposed to the expression or returned as a result.
             let vacant = crate::nodeset::Node::Root(nodes[index].document().root());
-            let node = std::mem::replace(&mut nodes[index], vacant);
+            let node = core::mem::replace(&mut nodes[index], vacant);
             let mut child = context.new_context_for(node);
             child.position = index + 1;
             child.size = size;
@@ -1078,7 +1081,7 @@ fn select_step<'d, E: Expression, R: crate::runtime::Runtime>(
         // Preserve axis order while moving candidates out of admitted slots.
         for index in 0..nodes.len() {
             let vacant = crate::nodeset::Node::Root(nodes[index].document().root());
-            let node = std::mem::replace(&mut nodes[index], vacant);
+            let node = core::mem::replace(&mut nodes[index], vacant);
             unique.insert(context, node).context(FunctionEvaluation)?;
         }
     }
@@ -1314,7 +1317,7 @@ impl<R: crate::runtime::Runtime> Expression for ArenaExpression<'_, '_, R> {
                 let mut nodes = self.runtime.set();
                 for index in 0..selected.len() {
                     let vacant = crate::nodeset::Node::Root(selected[index].document().root());
-                    let node = std::mem::replace(&mut selected[index], vacant);
+                    let node = core::mem::replace(&mut selected[index], vacant);
                     nodes.insert(context, node).context(FunctionEvaluation)?;
                 }
                 selected.truncate(0);
@@ -1793,10 +1796,9 @@ mod test {
         let mut insufficient = Context::without_core_functions();
         insufficient.set_variable("left", nodeset![left_value.clone()]);
         insufficient.set_variable("right", nodeset![right_value.clone()]);
-        // Each variable owns a copied one-node SwissTable before comparison starts.
-        let variable_storage = 2
-            * crate::nodeset::hashset_growth_bytes::<crate::nodeset::Node<'_>>(0)
-                .expect("one-node set storage is representable");
+        // Each variable owns a copied one-node set before comparison starts.
+        let variable_storage = 2 * crate::nodeset::set_slot_bytes::<crate::nodeset::Node<'_>>(0)
+            .expect("one-node set storage is representable");
         insufficient.set_string_allocation_limit(variable_storage + 3);
         let context_node = document.create_element("test");
         let evaluation = context::Evaluation::new(&insufficient, context_node.clone().into());

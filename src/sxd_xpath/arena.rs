@@ -1,6 +1,6 @@
 //! Original-source `XPath` nodes with current-execution construction.
 
-use std::cell::RefCell;
+use core::cell::RefCell;
 
 use structured_asn1::memory::{OwnedVec, Work};
 

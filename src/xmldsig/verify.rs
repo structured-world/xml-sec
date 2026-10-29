@@ -11,10 +11,19 @@
 //!   computation and comparison
 //! - [`verify_signature_with_pem_key`] for full pipeline validation (`SignedInfo` + `SignatureValue`)
 
+use crate::collections::{Map, Set};
 use crate::xml::dom::{Node, NodeId};
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    collections::{BTreeMap, BTreeSet},
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use base64::Engine;
-use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use core::cell::{Cell, RefCell};
 
 use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 use crate::document::{
@@ -459,7 +468,7 @@ pub struct VerifyContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     store_pre_digest: bool,
-    external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     signature_selection: SignatureSelection<'a>,
     id_attributes: &'a [crate::IdAttributeRegistration],
 }
@@ -595,7 +604,7 @@ impl<'a> VerifyContext<'a> {
     /// enabled through [`UriTypeSet`]. Map keys are RFC 3986 resolved URI
     /// identities: use normalized paths with dot segments removed and retain
     /// query or fragment suffixes.
-    pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+    pub fn external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
         self.external_resources = Some(resources);
         self
     }
@@ -674,7 +683,7 @@ impl<'a> VerifyContext<'a> {
         self
     }
 
-    fn allowed_transform_uris(&self) -> Option<&HashSet<String>> {
+    fn allowed_transform_uris(&self) -> Option<&BTreeSet<String>> {
         self.policy.transforms.allowed_algorithms.as_ref()
     }
 
@@ -803,7 +812,7 @@ pub struct VerificationRequest<'a> {
     /// Per-signature trusted keys. Duplicate/foreign/stale mappings fail closed.
     pub trusted_keys: &'a [CallerTrustedSignatureKey<'a>],
     /// Explicit external bytes; no implicit I/O or configuration discovery.
-    pub external_resources: Option<&'a HashMap<String, Vec<u8>>>,
+    pub external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     /// Required multi-signature outcome; zero counts are invalid requests.
     pub signatures: SignatureRequirement,
     /// Opaque caller correlation value, never read from XML or used as trust.
@@ -840,7 +849,7 @@ pub struct VerifyEvidence<V = Vec<SignatureEvidence>> {
     correlation: Option<[u8; 16]>,
 }
 
-impl<V: std::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
+impl<V: core::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
     /// Whether the explicit request requirements hold for this document.
     /// Foreign documents or any mutation after verification invalidate acceptance.
     ///
@@ -1256,8 +1265,8 @@ struct VerificationOperationBudgets<'a> {
     canonicalized: CanonicalizedDataBudget,
     xpath_parse: RefCell<XPathSignatureParseBudget>,
     key_info_materialization: RefCell<KeyInfoMaterializationState>,
-    external_resource_identities: RefCell<HashMap<String, OperationResourceIdentity>>,
-    resolved_reference_resources: RefCell<HashMap<NodeId, OperationResourceIdentity>>,
+    external_resource_identities: RefCell<Map<String, OperationResourceIdentity>>,
+    resolved_reference_resources: RefCell<Map<NodeId, OperationResourceIdentity>>,
     external_resource_set_identity: RefCell<Option<OperationResourceIdentity>>,
 }
 
@@ -1284,8 +1293,8 @@ impl<'a> VerificationOperationBudgets<'a> {
             ),
             xpath_parse: RefCell::new(xpath_parse),
             key_info_materialization: RefCell::new(KeyInfoMaterializationState::default()),
-            external_resource_identities: RefCell::new(HashMap::new()),
-            resolved_reference_resources: RefCell::new(HashMap::new()),
+            external_resource_identities: RefCell::new(Map::new()),
+            resolved_reference_resources: RefCell::new(Map::new()),
             external_resource_set_identity: RefCell::new(None),
         }
     }
@@ -1838,6 +1847,12 @@ pub struct VerifyResult {
     pub canonicalized_signed_info: Option<Vec<u8>>,
 }
 
+impl From<base64::DecodeError> for DsigError {
+    fn from(error: base64::DecodeError) -> Self {
+        Self::SignatureValueBase64(error)
+    }
+}
+
 /// Errors while running end-to-end `XMLDSig` verification.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1930,7 +1945,8 @@ pub enum DsigError {
 
     /// `SignatureValue` base64 decoding failed.
     #[error("invalid SignatureValue base64: {0}")]
-    SignatureValueBase64(#[from] base64::DecodeError),
+    // base64 implements `Error` only with its `std` feature.
+    SignatureValueBase64(#[cfg_attr(feature = "std", source)] base64::DecodeError),
 
     /// Cryptographic verification failed before validity decision.
     #[error("signature verification failed: {0}")]
@@ -2137,7 +2153,7 @@ fn count_signature_nodes(view: DocumentView<'_>, maximum: usize) -> Result<usize
     Ok(count)
 }
 
-trait SignatureBuffer: std::ops::Deref<Target = [SignatureEvidence]> {
+trait SignatureBuffer: core::ops::Deref<Target = [SignatureEvidence]> {
     fn push_signature(
         &mut self,
         evidence: SignatureEvidence,
@@ -2364,7 +2380,7 @@ fn validate_verification_request(
 
 /// Apply the request's cardinality and target requirements to the outcomes.
 /// A verified session calls this again after completing detached References.
-fn accept_verification_evidence<V: std::ops::Deref<Target = [SignatureEvidence]>>(
+fn accept_verification_evidence<V: core::ops::Deref<Target = [SignatureEvidence]>>(
     view: DocumentView<'_>,
     requirement: SignatureRequirement,
     expected_targets: &[NodeIdentity],
@@ -2439,7 +2455,9 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
                 captured.external_resources = Some(resources);
             }
             if capture_time {
-                captured.policy.key_trust.verification_time = Some(std::time::SystemTime::now());
+                // Without a host clock this stays `None`; key resolution then
+                // reports the missing verification time.
+                captured.policy.key_trust.verification_time = crate::policy::clock::host_now();
             }
             captured
         };
@@ -2533,7 +2551,7 @@ fn verify_signature_document_with_context_and_transforms(
     {
         captured_context = {
             let mut context = ctx.clone();
-            context.policy.key_trust.verification_time = Some(std::time::SystemTime::now());
+            context.policy.key_trust.verification_time = crate::policy::clock::host_now();
             context
         };
         &captured_context
@@ -2631,7 +2649,7 @@ fn canonicalize_verification_signed_info(
     >,
 ) -> Result<Vec<u8>, DsigError> {
     let doc = signed_info_node.document();
-    let signed_info_subtree: HashSet<_> = signed_info_node.descendants().map(Node::id).collect();
+    let signed_info_subtree: Set<_> = signed_info_node.descendants().map(Node::id).collect();
     let mut canonical_signed_info = Vec::new();
     let signed_info_limit = operation
         .budgets()
@@ -3479,7 +3497,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
         completion.key_info_reading,
         completion.key_info.take(),
         completion.key_info_origins.take(),
-        std::mem::take(&mut completion.key_info_unread),
+        core::mem::take(&mut completion.key_info_unread),
     )?;
     finish_authenticated_verification(
         operation,
@@ -3688,7 +3706,7 @@ struct RetrievalMaterializationBudgets<'a> {
 
 #[derive(Default)]
 struct KeyInfoMaterializationState {
-    active: HashSet<(super::uri::TraversalDocumentIdentity, String)>,
+    active: Set<(super::uri::TraversalDocumentIdentity, String)>,
     candidate_work: usize,
     collect_encapsulation: bool,
     encapsulation_template: bool,
@@ -3775,7 +3793,7 @@ trait KeyInfoReferencePolicy {
     fn key_info_reference_uris(&self) -> UriTypeSet;
     fn retrieval_method_uris(&self) -> UriTypeSet;
     fn key_info_reference_source_enabled(&self) -> bool;
-    fn allowed_transforms(&self) -> Option<&HashSet<String>>;
+    fn allowed_transforms(&self) -> Option<&BTreeSet<String>>;
 }
 
 impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
@@ -3813,7 +3831,7 @@ impl KeyInfoReferencePolicy for crate::policy::SigningPolicy {
         true
     }
 
-    fn allowed_transforms(&self) -> Option<&HashSet<String>> {
+    fn allowed_transforms(&self) -> Option<&BTreeSet<String>> {
         self.transforms.allowed_algorithms.as_ref()
     }
 }
@@ -3854,7 +3872,7 @@ impl KeyInfoReferencePolicy for crate::policy::VerificationPolicy {
             .contains(crate::policy::KeySourceKind::KeyInfoReference)
     }
 
-    fn allowed_transforms(&self) -> Option<&HashSet<String>> {
+    fn allowed_transforms(&self) -> Option<&BTreeSet<String>> {
         self.transforms.allowed_algorithms.as_ref()
     }
 }
@@ -4112,10 +4130,10 @@ fn materialize_key_info_visit<P: KeyInfoReferencePolicy>(
     // Origins, when tracked, stay index for index with the sources.
     let mut pending = origins
         .as_deref_mut()
-        .map(|origins| std::mem::take(origins).into_iter());
+        .map(|origins| core::mem::take(origins).into_iter());
     let mut materialized_origins = Vec::new();
     let mut outcome = RetrievalMaterialization::default();
-    for source in std::mem::take(&mut key_info.sources) {
+    for source in core::mem::take(&mut key_info.sources) {
         let origin = pending.as_mut().and_then(Iterator::next);
         let source_work = match &source {
             super::parse::KeyInfoSource::X509Data(info) => info.certificates.len().max(1),
@@ -4530,7 +4548,7 @@ fn visit_encapsulation<P: KeyInfoReferencePolicy>(
     }
     // Every document on the active stack remains alive for this traversal;
     // arena identity distinguishes equal node IDs in different documents.
-    let identity = (std::ptr::from_ref(node.document()) as usize, node.id());
+    let identity = (core::ptr::from_ref(node.document()) as usize, node.id());
     if state.path[..depth].contains(&Some(identity)) {
         if state.materialization.is_some() {
             return Err(DsigError::InvalidStructure {
@@ -5174,15 +5192,15 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     }
 
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
-    let mut seen = HashSet::new();
+    let mut seen = Set::new();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
     // Origins, when tracked, stay index for index with the sources.
     let mut pending = origins
         .as_deref_mut()
-        .map(|origins| std::mem::take(origins).into_iter());
+        .map(|origins| core::mem::take(origins).into_iter());
     let mut materialized_origins = Vec::new();
     let mut outcome = RetrievalMaterialization::default();
-    for source in std::mem::take(&mut key_info.sources) {
+    for source in core::mem::take(&mut key_info.sources) {
         let origin = pending.as_mut().and_then(Iterator::next);
         let super::parse::KeyInfoSource::RetrievalMethod {
             uri: resolved_uri,
@@ -5304,7 +5322,7 @@ fn materialize_retrieval_methods(
     key_info: &mut KeyInfo,
     resolver: &UriReferenceResolver<'_>,
     allowed_uri_types: UriTypeSet,
-    allowed_transforms: Option<&HashSet<String>>,
+    allowed_transforms: Option<&BTreeSet<String>>,
     provider: &dyn crate::provider::CryptoProvider,
 ) -> Result<RetrievalMaterialization, SignatureVerificationPipelineError> {
     let mut xpath_parse_budget = XPathSignatureParseBudget::default();
@@ -5506,7 +5524,7 @@ fn evaluate_manifest_reference<C: VerificationCapture>(
         )
     } else {
         match enforce_reference_policies(
-            std::slice::from_ref(reference),
+            core::slice::from_ref(reference),
             ctx.policy.uris.references,
             ctx.allowed_transform_uris(),
         ) {
@@ -5632,7 +5650,7 @@ fn process_authenticated_manifest_references<C: VerificationCapture>(
     core_validation: &[OperationNodeId],
 ) -> Result<(Vec<ReferenceResult>, Vec<OperationNodeId>), SignatureVerificationPipelineError> {
     let ctx = verification.context;
-    let mut processed_manifests = HashSet::new();
+    let mut processed_manifests = Set::new();
     let mut next_reference_index = 0usize;
     let mut frontier_index = 0usize;
     let mut completed_digests = Vec::new();
@@ -5724,7 +5742,7 @@ fn parse_manifest_references(
     >,
     view: DocumentView<'_>,
     state: &mut ManifestDiscoveryState<'_>,
-    allowed_transforms: Option<&HashSet<String>>,
+    allowed_transforms: Option<&BTreeSet<String>>,
 ) -> Result<ParsedManifestReferences, SignatureVerificationPipelineError> {
     let mut references = Vec::new();
     let mut invalid = Vec::new();
@@ -5858,7 +5876,7 @@ struct ParsedManifestReferences {
 }
 
 struct ManifestDiscoveryState<'a> {
-    processed: &'a mut HashSet<NodeId>,
+    processed: &'a mut Set<NodeId>,
     remaining_capacity: &'a mut usize,
     next_reference_index: &'a mut usize,
     xpath_parse: &'a mut XPathSignatureParseBudget,
@@ -5978,7 +5996,7 @@ fn require_verifying_key_candidate_capacity(
 fn enforce_reference_policies(
     references: &[Reference],
     allowed_uri_types: UriTypeSet,
-    allowed_transforms: Option<&HashSet<String>>,
+    allowed_transforms: Option<&BTreeSet<String>>,
 ) -> Result<(), SignatureVerificationPipelineError> {
     for reference in references {
         let uri = reference
@@ -6017,7 +6035,7 @@ fn enforce_reference_policies(
 }
 
 fn enforce_transform_allowed(
-    allowed_transforms: Option<&HashSet<String>>,
+    allowed_transforms: Option<&BTreeSet<String>>,
     algorithm: &str,
 ) -> Result<(), SignatureVerificationPipelineError> {
     if allowed_transforms.is_some_and(|allowed| !allowed.contains(algorithm)) {
@@ -6032,7 +6050,7 @@ fn enforce_transform_allowed(
 
 /// Query-funded form: the attacker-sized URI is copied into `work`'s storage.
 fn enforce_current_transform_allowed<W: structured_asn1::memory::Work>(
-    allowed_transforms: Option<&HashSet<String>>,
+    allowed_transforms: Option<&BTreeSet<String>>,
     algorithm: &str,
     work: &W,
 ) -> Result<(), SignatureVerificationPipelineError> {

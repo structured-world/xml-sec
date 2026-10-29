@@ -19,6 +19,8 @@
 //!
 //! No external entity loading is performed (immune to XXE).
 
+use alloc::string::String;
+
 use crate::xml::dom::storage::Values;
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{Native, Storage};
@@ -600,7 +602,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
         if remaining.len() < len {
             return None;
         }
-        std::str::from_utf8(&remaining[..len])
+        core::str::from_utf8(&remaining[..len])
             .ok()
             .and_then(|s| s.chars().next())
     }
@@ -939,7 +941,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
         self.skip_whitespace()?;
         self.storage.charge(self.pos - start)?;
         // Whitespace bytes are valid ASCII/UTF-8, so this conversion is safe.
-        Ok(std::str::from_utf8(&self.input[start..self.pos])
+        Ok(core::str::from_utf8(&self.input[start..self.pos])
             .expect("whitespace scanner consumes ASCII"))
     }
 
@@ -963,7 +965,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
         self.storage.charge(count)?;
         // The predicates used (ascii_digit, ascii_hexdigit) only match ASCII,
         // so the consumed range is always valid UTF-8.
-        Ok(std::str::from_utf8(&self.input[start..self.pos])
+        Ok(core::str::from_utf8(&self.input[start..self.pos])
             .expect("numeric scanners consume ASCII on UTF-8 boundaries"))
     }
 
@@ -1018,7 +1020,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
                 }
                 // Input is guaranteed valid UTF-8 and we only consumed ASCII bytes
                 self.storage.charge(len)?;
-                let name = std::str::from_utf8(&self.input[start..self.pos])
+                let name = core::str::from_utf8(&self.input[start..self.pos])
                     .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
                 return Ok(name);
             }
@@ -1060,7 +1062,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
         }
 
         self.storage.charge(len)?;
-        let name = std::str::from_utf8(&self.input[start..self.pos])
+        let name = core::str::from_utf8(&self.input[start..self.pos])
             .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
         Ok(name)
     }
@@ -1223,7 +1225,7 @@ impl<S: NameStorage> ParserInput<'_, S> {
             self.expect_byte(b';')?;
             let start = buf.len();
             self.storage.charge(self.pos - reference_start)?;
-            let reference = std::str::from_utf8(self.slice(reference_start, self.pos))
+            let reference = core::str::from_utf8(self.slice(reference_start, self.pos))
                 .expect("a parsed reference preserves UTF-8 boundaries");
             self.expand_entity_into(reference, buf, context)?;
             Ok(&buf[start..])
@@ -1244,7 +1246,7 @@ impl<S: NameStorage> ParserInput<'_, S> {
             while *position < bytes.len() && bytes[*position].is_ascii_hexdigit() {
                 *position += 1;
             }
-            let hex = std::str::from_utf8(&bytes[start..*position])
+            let hex = core::str::from_utf8(&bytes[start..*position])
                 .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
             u32::from_str_radix(hex, 16)
                 .map_err(|_| self.fatal("invalid hex character reference"))?
@@ -1253,7 +1255,7 @@ impl<S: NameStorage> ParserInput<'_, S> {
             while *position < bytes.len() && bytes[*position].is_ascii_digit() {
                 *position += 1;
             }
-            let dec = std::str::from_utf8(&bytes[start..*position])
+            let dec = core::str::from_utf8(&bytes[start..*position])
                 .map_err(|_| self.fatal("invalid UTF-8 in entity value"))?;
             dec.parse::<u32>()
                 .map_err(|_| self.fatal("invalid decimal character reference"))?
@@ -1454,7 +1456,7 @@ impl<S: NameStorage> ParserInput<'_, S> {
                         if i >= bytes.len() {
                             return Err(self.fatal("incomplete entity reference in entity value"));
                         }
-                        let name = std::str::from_utf8(&bytes[start..i])
+                        let name = core::str::from_utf8(&bytes[start..i])
                             .map_err(|_| self.fatal("invalid UTF-8 in entity name"))?;
                         i += 1; // skip ';'
 
@@ -1542,7 +1544,7 @@ impl<S: NameStorage> ParserInput<'_, S> {
                 self.storage.charge(safe_len)?;
                 self.storage.charge(safe_len)?;
                 self.storage.charge(safe_len)?;
-                let chunk = std::str::from_utf8(&self.input[start..start + safe_len])
+                let chunk = core::str::from_utf8(&self.input[start..start + safe_len])
                     .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
                 // Fast byte-level pre-check: only validate when bytes suggest
                 // possible invalid chars (0x7F or U+FFFE/U+FFFF sequences).
@@ -1610,7 +1612,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
             self.scan_bytes(self.input.len() - self.pos, 1, |bytes, i| bytes[i] == quote)?;
         self.advance_counting_lines(count)?;
         self.storage.charge(count)?;
-        let value = std::str::from_utf8(&self.input[start..self.pos])
+        let value = core::str::from_utf8(&self.input[start..self.pos])
             .map_err(|_| self.fatal("invalid UTF-8 in quoted value"))?;
         self.expect_byte(quote)?;
         Ok(value)
@@ -1619,7 +1621,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
     // -- Error helpers --
 
     /// Creates a fatal `ParseError` at the current location.
-    pub fn fatal(&self, message: impl std::fmt::Display) -> ParseError<S> {
+    pub fn fatal(&self, message: impl core::fmt::Display) -> ParseError<S> {
         let snapshot = || -> Result<_, crate::xml::dom::ParseError> {
             let message = S::freeze(self.storage.formatted(format_args!("{message}"))?);
             self.storage.charge(self.diagnostics.len())?;
@@ -1647,7 +1649,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
     pub fn push_diagnostic(
         &mut self,
         severity: ErrorSeverity,
-        message: impl std::fmt::Display,
+        message: impl core::fmt::Display,
     ) -> Result<(), ParseError<S>> {
         let message = S::freeze(self.storage.formatted(format_args!("{message}"))?);
         let diagnostic = ParseDiagnostic {
@@ -1802,7 +1804,7 @@ pub(crate) fn parse_comment_content<'a, S: NameStorage>(
                     // Validate XML chars using byte-level pre-check
                     let has_bad =
                         may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
-                    let chunk = std::str::from_utf8(input.slice(start, start + safe_len))
+                    let chunk = core::str::from_utf8(input.slice(start, start + safe_len))
                         .map_err(|_| input.fatal("invalid UTF-8 in comment"))?;
                     if has_bad && let Some(bad) = find_invalid_xml_char(chunk) {
                         if input.recover() {
@@ -1821,7 +1823,7 @@ pub(crate) fn parse_comment_content<'a, S: NameStorage>(
                 }
                 // Check if it's `-->` (end of comment) or just `--`
                 if input.looking_at(b"-->") {
-                    let content = std::str::from_utf8(input.slice(content_start, input.pos()))
+                    let content = core::str::from_utf8(input.slice(content_start, input.pos()))
                         .map_err(|_| input.fatal("invalid UTF-8 in comment"))?;
                     input.advance_counting_lines(3)?;
                     return Ok(content);
@@ -1862,7 +1864,7 @@ pub(crate) fn parse_cdata_content<'a, S: NameStorage>(
             input.storage.charge(safe_len)?;
             input.storage.charge(safe_len)?;
             let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + safe_len));
-            let content = std::str::from_utf8(input.slice(start, start + safe_len))
+            let content = core::str::from_utf8(input.slice(start, start + safe_len))
                 .map_err(|_| input.fatal("invalid UTF-8 in CDATA section"))?;
             if has_bad && let Some(bad) = find_invalid_xml_char(content) {
                 if input.recover() {
@@ -1915,7 +1917,7 @@ pub(crate) fn parse_pi_content<'a, S: NameStorage>(
                 input.storage.charge(data_len)?;
                 input.storage.charge(data_len)?;
                 let has_bad = may_contain_invalid_xml_chars(input.slice(start, start + data_len));
-                let data = std::str::from_utf8(input.slice(start, start + data_len))
+                let data = core::str::from_utf8(input.slice(start, start + data_len))
                     .map_err(|_| input.fatal("invalid UTF-8 in processing instruction"))?;
                 if has_bad && let Some(bad) = find_invalid_xml_char(data) {
                     if input.recover() {

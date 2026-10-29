@@ -4,9 +4,8 @@
 //! every template with a real root -> intermediate -> signer path, so `XMLDSig`
 //! verification succeeds and only the `XAdES` properties differ.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 
 use structured_asn1::digest::Resolution;
 use structured_asn1::memory::{Memory, MemoryAccount};
@@ -18,7 +17,7 @@ use structured_xades::properties::{ClaimedTimeFailure, Error as PropertyError};
 use structured_xades::xml::{Access, Xml};
 use xml_sec::XmlDocument;
 use xml_sec::document::NodeIdentity;
-use xml_sec::policy::VerificationPolicy;
+use xml_sec::policy::{Instant, VerificationPolicy};
 use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigError, KeyResolverConfig, UriTypeSet,
@@ -71,13 +70,12 @@ fn verify_in<R>(
 ) -> (Result<R, DsigError>, Memory) {
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
-    policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
+    policy.key_trust.verification_time = Instant::new(500_000 * 3600, 0);
     policy.uris.references = UriTypeSet::ALL;
     configure(&mut policy);
     let context = VerifyContext::new().policy(policy).key_resolver(resolver);
     let document = XmlDocument::parse(xml).expect("fixture parses");
-    let resources = HashMap::from([("detached.txt".to_owned(), DETACHED.to_vec())]);
+    let resources = BTreeMap::from([("detached.txt".to_owned(), DETACHED.to_vec())]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..VerificationRequest::default()
@@ -153,7 +151,7 @@ fn certificate_path_identities_ignore_the_reference_digest_policy() {
     let outcome = verified(
         include_str!("fixtures/sha384.xml"),
         &anchored(),
-        |policy| policy.digest_algorithms = Some(HashSet::from([DigestAlgorithm::Sha384])),
+        |policy| policy.digest_algorithms = Some(BTreeSet::from([DigestAlgorithm::Sha384])),
         |session| validate_basic(session, signature(session, 0), &[ROOT], facts),
     );
     assert!(matches!(outcome, Ok(Outcome::Assessed(MET))), "{outcome:?}");

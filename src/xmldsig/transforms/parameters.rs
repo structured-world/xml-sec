@@ -1,5 +1,7 @@
 //! Borrowed parameter views shared by template-owned and original instructions.
 
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+
 use super::TransformError;
 use super::{RelationshipSelector, Transform, XPathHereNodes, source::Source};
 use super::{
@@ -21,7 +23,7 @@ pub(crate) enum Diagnostic {
 }
 
 fn current_text<W: Work>(
-    arguments: std::fmt::Arguments<'_>,
+    arguments: core::fmt::Arguments<'_>,
     work: &W,
 ) -> Result<OwnedText, TransformError> {
     use crate::xml::dom::storage::Storage as _;
@@ -36,7 +38,7 @@ fn current_text<W: Work>(
 
 pub(crate) fn current_diagnostic<W: Work>(
     kind: Diagnostic,
-    arguments: std::fmt::Arguments<'_>,
+    arguments: core::fmt::Arguments<'_>,
     work: &W,
 ) -> TransformError {
     match current_text(arguments, work) {
@@ -171,15 +173,15 @@ pub(crate) trait ParseStorage<'a>: Scratch {
         bytes: usize,
         complexity: usize,
     ) -> Result<(), TransformError>;
-    fn diagnostic(&self, kind: Diagnostic, arguments: std::fmt::Arguments<'_>) -> TransformError;
+    fn diagnostic(&self, kind: Diagnostic, arguments: core::fmt::Arguments<'_>) -> TransformError;
     /// Structural diagnostic owned by this storage, as transform diagnostics are.
-    fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError;
+    fn structure(&self, arguments: core::fmt::Arguments<'_>) -> ParseError;
     /// Unsupported-algorithm diagnostic owned by this storage.
     fn unsupported_algorithm(&self, uri: &str) -> ParseError;
-    fn unsupported(&self, arguments: std::fmt::Arguments<'_>) -> TransformError {
+    fn unsupported(&self, arguments: core::fmt::Arguments<'_>) -> TransformError {
         self.diagnostic(Diagnostic::Unsupported, arguments)
     }
-    fn xpath_error(&self, arguments: std::fmt::Arguments<'_>) -> TransformError {
+    fn xpath_error(&self, arguments: core::fmt::Arguments<'_>) -> TransformError {
         self.diagnostic(Diagnostic::XPath, arguments)
     }
     fn expression(
@@ -217,8 +219,8 @@ impl<'a> ParseStorage<'a> for Native {
     type Selector = RelationshipSelector;
     type Instruction = Transform;
 
-    fn diagnostic(&self, kind: Diagnostic, arguments: std::fmt::Arguments<'_>) -> TransformError {
-        let message = std::fmt::format(arguments);
+    fn diagnostic(&self, kind: Diagnostic, arguments: core::fmt::Arguments<'_>) -> TransformError {
+        let message = alloc::fmt::format(arguments);
         match kind {
             Diagnostic::XPath => TransformError::XPath(message),
             Diagnostic::Unsupported => TransformError::UnsupportedTransform(message),
@@ -227,8 +229,8 @@ impl<'a> ParseStorage<'a> for Native {
         }
     }
 
-    fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError {
-        ParseError::InvalidStructure(std::fmt::format(arguments))
+    fn structure(&self, arguments: core::fmt::Arguments<'_>) -> ParseError {
+        ParseError::InvalidStructure(alloc::fmt::format(arguments))
     }
 
     fn unsupported_algorithm(&self, uri: &str) -> ParseError {
@@ -406,11 +408,11 @@ impl<'a, W: Work> ParseStorage<'a> for Accounted<'_, W> {
     type Selector = OriginalSelector<'a>;
     type Instruction = OriginalInstruction<'a>;
 
-    fn diagnostic(&self, kind: Diagnostic, arguments: std::fmt::Arguments<'_>) -> TransformError {
+    fn diagnostic(&self, kind: Diagnostic, arguments: core::fmt::Arguments<'_>) -> TransformError {
         current_diagnostic(kind, arguments, self.0)
     }
 
-    fn structure(&self, arguments: std::fmt::Arguments<'_>) -> ParseError {
+    fn structure(&self, arguments: core::fmt::Arguments<'_>) -> ParseError {
         current_text(arguments, self.0)
             .map_or_else(ParseError::Transform, ParseError::AccountedInvalidStructure)
     }

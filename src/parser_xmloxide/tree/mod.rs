@@ -22,7 +22,13 @@ pub use node::NodeKind;
 use crate::parser_xmloxide::error::{ParseDiagnostic, ParseError};
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{Native, Storage, Values};
-use std::num::NonZeroU32;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::num::NonZeroU32;
 
 /// A typed index into the document's node arena.
 ///
@@ -174,8 +180,8 @@ pub struct Document<S: NameStorage = Native> {
     storage: S,
 }
 
-impl<S: NameStorage> std::fmt::Debug for Document<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: NameStorage> core::fmt::Debug for Document<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Document")
             .field("nodes", &&self.nodes[..])
             .field("root", &self.root)
@@ -349,6 +355,7 @@ impl Document {
     ///
     /// let doc = Document::parse_file("document.xml").unwrap();
     /// ```
+    #[cfg(feature = "std")]
     pub fn parse_file<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ParseError> {
         use crate::parser_xmloxide::error::SourceLocation;
 
@@ -2174,6 +2181,7 @@ mod tests {
         assert_eq!(doc.text_content(children[1]), "A");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_parse_file_nonexistent() {
         let result = Document::parse_file("/nonexistent/path.xml");
@@ -2186,6 +2194,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_parse_file_valid() {
         use std::io::Write;

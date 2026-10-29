@@ -1,13 +1,9 @@
 //! End-to-end coverage for the upstream Merlin `XMLDSig` interoperability corpus.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use x509_parser::prelude::{FromDer, X509Certificate};
-use xml_sec::policy::{KeyTrustPolicy, XsltStylesheetSemantics};
+use xml_sec::policy::{Instant, KeyTrustPolicy, XsltStylesheetSemantics};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, DsigStatus, FailureReason, HmacSha1VerificationKey,
     KeyResolutionError, KeyResolverConfig, ParseError, SignatureAlgorithm, UriTypeSet,
@@ -16,13 +12,13 @@ use xml_sec::xmldsig::{
 
 const MERLIN: &str = "tests/fixtures/xmldsig/merlin-xmldsig-twenty-three";
 const DONOR_EXTERNAL: &str = "tests/fixtures/xmldsig/external-data";
-const VERIFY_2005: u64 = 1_104_580_800;
+const VERIFY_2005: i64 = 1_104_580_800;
 
 fn chain_policy(check_crls: bool) -> KeyTrustPolicy {
     KeyTrustPolicy {
         verify_x509_chains: true,
         check_crls,
-        verification_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005)),
+        verification_time: Instant::new(VERIFY_2005, 0),
         ..KeyTrustPolicy::default()
     }
 }
@@ -100,8 +96,8 @@ fn verification_key(name: &str, algorithm: SignatureAlgorithm) -> VerificationKe
     }
 }
 
-fn external_resources() -> HashMap<String, Vec<u8>> {
-    HashMap::from([
+fn external_resources() -> BTreeMap<String, Vec<u8>> {
+    BTreeMap::from([
         (
             "http://www.w3.org/TR/xml-stylesheet".into(),
             bytes(&format!("{DONOR_EXTERNAL}/xml-stylesheet-2005")),
@@ -295,8 +291,7 @@ fn verifies_the_complex_merlin_signature_with_upstream_expectations() {
         ..KeyResolverConfig::default()
     });
     let mut complex_policy = legacy_policy(SignatureAlgorithm::DsaSha1);
-    complex_policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_secs(VERIFY_2005));
+    complex_policy.key_trust.verification_time = Instant::new(VERIFY_2005, 0);
     // The donor compiles the #notaries stylesheet with libxslt.
     complex_policy.transforms.xslt_stylesheet_semantics = XsltStylesheetSemantics::Libxmlsec1;
     let verify = |policy| {
@@ -416,7 +411,7 @@ fn rejects_missing_or_tampered_external_resources() {
     // Detached references cannot trigger I/O and must fail on absent or altered caller bytes.
     let default = DefaultKeyResolver::default();
     let document = xml("signature-external-dsa");
-    let missing = HashMap::new();
+    let missing = BTreeMap::new();
     let absent = VerifyContext::new()
         .policy(legacy_policy(SignatureAlgorithm::DsaSha1))
         .key_resolver(&default)

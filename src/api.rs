@@ -19,8 +19,9 @@ use crate::xmldsig::{
     KeyResolver, VerificationRequest, VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
 };
 use crate::{IdAttributeRegistration, XmlBackend, XmlDocument, XmlSecError};
+use alloc::string::String;
 #[cfg(feature = "xmldsig-sign")]
-use std::collections::HashMap;
+use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
 
 /// The operation whose immutable policy governs document preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,7 +316,7 @@ impl<'a> Signer<'a> {
     }
     /// Borrow detached inputs; the compiled URI policy remains authoritative.
     #[must_use]
-    pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+    pub fn external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
         self.context = self.context.external_resources(resources);
         self
     }
@@ -440,7 +441,7 @@ pub struct Decryptor<'a> {
 impl<'a> Decryptor<'a> {
     /// Borrow external ciphertext inputs under the original URI/transform policy.
     #[must_use]
-    pub fn external_resources(mut self, resources: &'a HashMap<String, Vec<u8>>) -> Self {
+    pub fn external_resources(mut self, resources: &'a BTreeMap<String, Vec<u8>>) -> Self {
         self.context = self.context.external_resources(resources);
         self
     }

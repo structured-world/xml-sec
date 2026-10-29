@@ -32,7 +32,7 @@ fn detached_input_retains_its_entity_declaration_base() {
     // against the resource containing its declaration, not the Signature.
     let signature = Document::parse("<Signature/>").expect("signature document");
     let uri = "https://example.org/resources/input.xml";
-    let resources = std::collections::HashMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         uri.to_owned(),
         br#"<!DOCTYPE root [<!NOTATION image SYSTEM "image"><!ENTITY logo SYSTEM "images/logo.png" NDATA image>]><root/>"#.to_vec(),
     )]);

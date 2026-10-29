@@ -5,7 +5,11 @@
 //! bidirectional node map so the result can be projected back onto the
 //! original document without serializing and reparsing signed input.
 
-use std::cell::Cell;
+use alloc::{
+    format,
+    string::{String, ToString},
+};
+use core::cell::Cell;
 
 mod mirror;
 mod source;
@@ -88,8 +92,8 @@ pub(crate) trait XPathStorage: crate::c14n::scratch::Scratch {
     ) -> Self::Runtime<'q>;
     type Compiled<'s>: CompiledExpression;
     fn compile<'s>(&self, source: &'s str) -> Result<Self::Compiled<'s>, TransformError>;
-    fn diagnostic(&self, message: std::fmt::Arguments<'_>) -> TransformError;
-    fn formatted(&self, message: std::fmt::Arguments<'_>) -> Result<Self::Text, TransformError>;
+    fn diagnostic(&self, message: core::fmt::Arguments<'_>) -> TransformError;
+    fn formatted(&self, message: core::fmt::Arguments<'_>) -> Result<Self::Text, TransformError>;
     fn order_nodes<'d>(
         &self,
         nodes: &nodeset::Nodeset<'d>,
@@ -102,7 +106,7 @@ struct NamespaceResolver<'q, 'source, K: Keys> {
     bindings: &'q K::Bindings<'source>,
     execution: K::Execution,
     failure: &'q Cell<Option<structured_asn1::memory::MemoryError>>,
-    source: std::marker::PhantomData<&'source str>,
+    source: core::marker::PhantomData<&'source str>,
 }
 
 impl<'q, 'source, K: Keys> NamespaceResolver<'q, 'source, K> {
@@ -115,7 +119,7 @@ impl<'q, 'source, K: Keys> NamespaceResolver<'q, 'source, K> {
             bindings,
             execution,
             failure,
-            source: std::marker::PhantomData,
+            source: core::marker::PhantomData,
         }
     }
 }
@@ -168,12 +172,12 @@ impl XPathStorage for crate::c14n::scratch::Native {
             .map_err(|error| TransformError::XPath(error.to_string()))
     }
 
-    fn diagnostic(&self, message: std::fmt::Arguments<'_>) -> TransformError {
-        TransformError::XPath(std::fmt::format(message))
+    fn diagnostic(&self, message: core::fmt::Arguments<'_>) -> TransformError {
+        TransformError::XPath(alloc::fmt::format(message))
     }
 
-    fn formatted(&self, message: std::fmt::Arguments<'_>) -> Result<Self::Text, TransformError> {
-        Ok(std::fmt::format(message))
+    fn formatted(&self, message: core::fmt::Arguments<'_>) -> Result<Self::Text, TransformError> {
+        Ok(alloc::fmt::format(message))
     }
 }
 
@@ -239,11 +243,11 @@ impl<'w, W: structured_asn1::memory::Work> XPathStorage for crate::c14n::scratch
             })
     }
 
-    fn diagnostic(&self, message: std::fmt::Arguments<'_>) -> TransformError {
+    fn diagnostic(&self, message: core::fmt::Arguments<'_>) -> TransformError {
         super::transforms::current_diagnostic(super::transforms::Diagnostic::XPath, message, self.0)
     }
 
-    fn formatted(&self, message: std::fmt::Arguments<'_>) -> Result<Self::Text, TransformError> {
+    fn formatted(&self, message: core::fmt::Arguments<'_>) -> Result<Self::Text, TransformError> {
         use crate::xml::dom::storage::Storage as _;
         crate::xml::dom::storage::Accounted(self.0)
             .formatted(message)
@@ -389,7 +393,7 @@ impl XPathWorkBudget {
 
     fn map_evaluation_error(
         &self,
-        error: impl std::fmt::Display,
+        error: impl core::fmt::Display,
         shared_failure: &Cell<Option<structured_asn1::memory::MemoryError>>,
         scratch: &impl XPathStorage,
     ) -> TransformError {
@@ -1089,7 +1093,7 @@ struct Mirror<
     texts: K::Index<(usize, usize, usize), NodeId>,
     comments: K::Index<(usize, usize, usize), NodeId>,
     processing_instructions: K::Index<(usize, usize, usize), NodeId>,
-    lifetime: std::marker::PhantomData<dom::Document<'d>>,
+    lifetime: core::marker::PhantomData<dom::Document<'d>>,
     #[cfg(test)]
     target: dom::Document<'d>,
 }
@@ -1223,7 +1227,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
             texts: K::index(execution),
             comments: K::index(execution),
             processing_instructions: K::index(execution),
-            lifetime: std::marker::PhantomData,
+            lifetime: core::marker::PhantomData,
             #[cfg(test)]
             target,
         };
@@ -1393,7 +1397,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
     }
 
     fn owns_source(&self, source: &Document<'_, D>) -> bool {
-        std::ptr::eq(self.source, source)
+        core::ptr::eq(self.source, source)
     }
 
     fn lookup_node<'a>(
@@ -1528,7 +1532,7 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
         let mut kept = 0;
         for index in 0..nodes.len() {
             let vacant = nodeset::Node::Root(nodes[index].document().root());
-            let node = std::mem::replace(&mut nodes[index], vacant);
+            let node = core::mem::replace(&mut nodes[index], vacant);
             if self.input_contains(source, input, &node)? {
                 nodes[kept] = node;
                 kept += 1;
@@ -1618,7 +1622,7 @@ enum HereContext<L> {
     MissingParameterNode,
 }
 
-impl<L: std::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereFunction<'_, L, K> {
+impl<L: core::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereFunction<'_, L, K> {
     fn evaluate_borrowed<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -1659,13 +1663,13 @@ impl<L: std::ops::Deref<Target = [usize]>, K: Keys> function::Function for HereF
 /// SXD omits `XPath`'s DTD-aware `id()` function. `XMLDSig` commonly identifies
 /// elements through `Id`, `ID`, `id`, xml:id, or retained DTD ID type,
 /// matching this crate's semantic DOM without requiring a validating parser.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct Identifier<'a>(&'a str);
 
 struct NumberLexical(f64);
 
-impl std::fmt::Display for NumberLexical {
-    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for NumberLexical {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         sxd_xpath_no_unsafe::write_xpath_number(output, self.0)
     }
 }
@@ -1834,7 +1838,7 @@ impl<K: Keys, D: crate::xml::dom::storage::Storage> function::Function
             Value::Boolean(value) => Some(if *value { "true" } else { "false" }),
         };
         let mut requests = match scalar {
-            Some(text) => IdRequests::<K>::new(std::iter::once(text), self.execution),
+            Some(text) => IdRequests::<K>::new(core::iter::once(text), self.execution),
             None => IdRequests::<K>::new(values.iter().map(|text| &**text), self.execution),
         }
         .map_err(stop)?;
@@ -2043,9 +2047,9 @@ impl XPathDocumentRelation {
         left: &Document<'_, L>,
         right: &Document<'_, R>,
     ) -> Self {
-        if std::ptr::eq(
-            std::ptr::from_ref(left).cast::<()>(),
-            std::ptr::from_ref(right).cast::<()>(),
+        if core::ptr::eq(
+            core::ptr::from_ref(left).cast::<()>(),
+            core::ptr::from_ref(right).cast::<()>(),
         ) {
             Self::SameDocument
         } else {
@@ -3729,8 +3733,8 @@ mod tests {
         // Refusal must return the original typed cause without allocating a
         // diagnostic when the embedding resource domain is already exhausted.
         struct MustNotFormat;
-        impl std::fmt::Display for MustNotFormat {
-            fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        impl core::fmt::Display for MustNotFormat {
+            fn fmt(&self, _: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
                 panic!("a retained resource cause must not format secondary errors")
             }
         }

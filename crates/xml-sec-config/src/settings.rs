@@ -1,8 +1,5 @@
 use crate::{Change, Direction, Error, Profile};
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    time::{Duration, UNIX_EPOCH},
-};
+use std::collections::{BTreeMap, BTreeSet};
 use toml::{Table, Value};
 #[cfg(feature = "xmlenc")]
 use xml_sec::policy::{DecryptionPolicy, EncryptionPolicy};
@@ -13,12 +10,13 @@ use xml_sec::xmlenc::{
 use xml_sec::{
     policy::{
         CertificateSignatureAlgorithms, CompiledPolicies, DetachedDigestAttestation, DsaKeyPolicy,
-        EcdsaSignatureValueEncoding, ExtendedKeyPurpose, HmacPolicy, KemContentAuthentication,
-        KeyAgreementAlgorithm, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourceKind,
-        KeySourcePolicy, KeyTrustPolicy, ManifestProcessing, OpcRelationshipEdition, PolicySet,
-        PolicyValidity, ResourcePolicy, RsaKeyPolicy, RsaPssPermission, SameDocumentIdSemantics,
-        SignatureConstraints, SigningPolicy, TransformPolicy, UriPolicy, VerificationPolicy,
-        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
+        EcdsaSignatureValueEncoding, ExtendedKeyPurpose, HmacPolicy, Instant,
+        KemContentAuthentication, KeyAgreementAlgorithm, KeyDerivationAlgorithm,
+        KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
+        OpcRelationshipEdition, PolicySet, PolicyValidity, ResourcePolicy, RsaKeyPolicy,
+        RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
+        TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
+        XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -42,7 +40,7 @@ fn number(value: &Value, field: &str) -> Result<usize, Error> {
         .ok_or_else(|| invalid(field))
 }
 
-fn timestamp(value: &Value, field: &str) -> Result<std::time::SystemTime, Error> {
+fn timestamp(value: &Value, field: &str) -> Result<Instant, Error> {
     let (seconds, nanos) = if let Some(seconds) = value.as_integer() {
         (seconds, 0)
     } else {
@@ -62,37 +60,21 @@ fn timestamp(value: &Value, field: &str) -> Result<std::time::SystemTime, Error>
             .ok_or_else(|| invalid(field))?;
         (seconds, nanos)
     };
-    let base = match u64::try_from(seconds) {
-        Ok(seconds) => UNIX_EPOCH.checked_add(Duration::from_secs(seconds)),
-        Err(_) => UNIX_EPOCH.checked_sub(Duration::from_secs(seconds.unsigned_abs())),
-    };
-    base.and_then(|base| base.checked_add(Duration::from_nanos(nanos)))
-        .ok_or_else(|| invalid(field))
+    let nanos = u32::try_from(nanos).map_err(|_| invalid(field))?;
+    Instant::new(seconds, nanos).ok_or_else(|| invalid(field))
 }
 
-fn timestamp_value(time: std::time::SystemTime) -> Result<Value, Error> {
-    let (seconds, nanoseconds) = match time.duration_since(UNIX_EPOCH) {
-        Ok(d) => (
-            i64::try_from(d.as_secs()).map_err(|_| invalid("timestamp range"))?,
-            d.subsec_nanos(),
-        ),
-        Err(e) => {
-            let d = e.duration();
-            let secs = -i128::from(d.as_secs());
-            let (seconds, nanoseconds) = if d.subsec_nanos() == 0 {
-                (secs, 0)
-            } else {
-                (secs - 1, 1_000_000_000 - d.subsec_nanos())
-            };
-            (
-                i64::try_from(seconds).map_err(|_| invalid("timestamp range"))?,
-                nanoseconds,
-            )
-        }
-    };
+fn timestamp_value(time: Instant) -> Result<Value, Error> {
+    // Settings store POSIX seconds, which cannot name an inserted leap second.
+    if time.is_leap_second() {
+        return Err(invalid("timestamp range"));
+    }
     Ok(Value::Table(Table::from_iter([
-        ("seconds".into(), Value::Integer(seconds)),
-        ("nanoseconds".into(), Value::Integer(i64::from(nanoseconds))),
+        ("seconds".into(), Value::Integer(time.seconds())),
+        (
+            "nanoseconds".into(),
+            Value::Integer(i64::from(time.nanos())),
+        ),
     ])))
 }
 fn table<'a>(value: &'a Value, field: &str) -> Result<&'a Table, Error> {
@@ -106,12 +88,12 @@ fn strings<'a>(value: &'a Value, field: &str) -> Result<Vec<&'a str>, Error> {
         .map(|v| string(v, field))
         .collect()
 }
-fn selected<T: Eq + std::hash::Hash>(
+fn selected<T: Ord>(
     value: &Value,
     field: &str,
     parse: impl Fn(&Value) -> Result<T, Error>,
-) -> Result<HashSet<T>, Error> {
-    let mut output = HashSet::new();
+) -> Result<BTreeSet<T>, Error> {
+    let mut output = BTreeSet::new();
     for value in value.as_array().ok_or_else(|| invalid(field))? {
         if !output.insert(parse(value)?) {
             return Err(Error::Schema(format!("duplicate selection in {field}")));
@@ -119,11 +101,11 @@ fn selected<T: Eq + std::hash::Hash>(
     }
     Ok(output)
 }
-fn optional<T: Eq + std::hash::Hash>(
+fn optional<T: Ord>(
     value: &Value,
     field: &str,
     parse: impl Fn(&Value) -> Result<T, Error>,
-) -> Result<Option<HashSet<T>>, Error> {
+) -> Result<Option<BTreeSet<T>>, Error> {
     if value.as_str() == Some("default") {
         Ok(None)
     } else {
@@ -694,7 +676,7 @@ fn sorted<T>(values: impl IntoIterator<Item = T>, convert: impl Fn(T) -> Value) 
     values.sort_by_cached_key(ToString::to_string);
     Value::Array(values)
 }
-fn optional_value<T: Copy>(set: Option<&HashSet<T>>, convert: impl Fn(T) -> Value) -> Value {
+fn optional_value<T: Copy>(set: Option<&BTreeSet<T>>, convert: impl Fn(T) -> Value) -> Value {
     match set {
         None => text("default"),
         Some(set) => sorted(set.iter().copied(), convert),
@@ -1489,27 +1471,19 @@ mod tests {
                     ("seconds".into(), Value::Integer(seconds)),
                     ("nanoseconds".into(), Value::Integer(nanoseconds)),
                 ]));
-                // SystemTime's supported range is platform-dependent. Every
-                // instant admitted on this platform must round-trip exactly.
-                if let Ok(time) = timestamp(&value, "time") {
-                    assert_eq!(timestamp_value(time).unwrap(), value);
-                }
+                // Every i64 second is a representable instant on every platform.
+                let time = timestamp(&value, "time").unwrap();
+                assert_eq!(timestamp_value(time).unwrap(), value);
             }
         }
-        #[cfg(unix)]
-        assert!(timestamp(&Value::Integer(i64::MIN), "time").is_ok());
     }
 
     #[test]
     fn exact_timestamp_codec_handles_both_sides_of_epoch() {
         // Preserve the epoch's fractional predecessor, not a truncation toward
-        // zero, and reject out-of-range nanos before SystemTime construction.
-        for time in [
-            UNIX_EPOCH,
-            UNIX_EPOCH - Duration::from_nanos(1),
-            UNIX_EPOCH + Duration::from_nanos(1),
-            UNIX_EPOCH - Duration::from_secs(100),
-        ] {
+        // zero, and reject out-of-range nanos before instant construction.
+        for (seconds, nanos) in [(0, 0), (-1, 999_999_999), (0, 1), (-100, 0)] {
+            let time = Instant::new(seconds, nanos).unwrap();
             let value = timestamp_value(time).unwrap();
             assert_eq!(timestamp(&value, "time").unwrap(), time);
         }

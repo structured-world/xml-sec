@@ -5,8 +5,9 @@
 //! These types are consumed by URI dereference, the transform chain (P1-014,
 //! P1-015), and reference processing (P1-018).
 
-use std::cell::Cell;
-use std::ops::RangeInclusive;
+use alloc::{string::String, vec::Vec};
+use core::cell::Cell;
+use core::ops::RangeInclusive;
 
 use crate::xml::dom::{Document, Node};
 
@@ -45,8 +46,8 @@ pub enum TransformData<'a> {
     },
 }
 
-impl std::fmt::Debug for TransformData<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for TransformData<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NodeSet(_) => f.debug_tuple("NodeSet").field(&"...").finish(),
             Self::Binary(b) => f.debug_tuple("Binary").field(&b.len()).finish(),
@@ -471,7 +472,8 @@ pub enum TransformError {
 
     /// Base64 decoding failed during the standard `XMLDSig` Base64 transform.
     #[error("base64 transform decode error: {0}")]
-    Base64(#[source] base64::DecodeSliceError),
+    // base64 implements `Error` only with its `std` feature.
+    Base64(#[cfg_attr(feature = "std", source)] base64::DecodeSliceError),
 
     /// `XPath` parsing or evaluation failed.
     #[error("XPath transform error: {0}")]

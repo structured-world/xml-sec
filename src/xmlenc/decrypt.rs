@@ -697,7 +697,7 @@ pub struct DecryptContext<'a> {
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     id_attributes: &'a [crate::IdAttributeRegistration],
-    external_resources: Option<&'a std::collections::HashMap<String, Vec<u8>>>,
+    external_resources: Option<&'a std::collections::BTreeMap<String, Vec<u8>>>,
 }
 
 struct DecryptionPlanNodes {
@@ -891,7 +891,7 @@ impl<'a> DecryptContext<'a> {
     #[must_use]
     pub fn external_resources(
         mut self,
-        resources: &'a std::collections::HashMap<String, Vec<u8>>,
+        resources: &'a std::collections::BTreeMap<String, Vec<u8>>,
     ) -> Self {
         self.external_resources = Some(resources);
         self
@@ -5614,7 +5614,7 @@ mod tests {
             ..inline_data(DataEncryptionAlgorithm::Aes128Gcm, &[0_u8; 28])
         };
         let policy = crate::policy::DecryptionPolicy {
-            oaep_digests: Some(std::collections::HashSet::from([
+            oaep_digests: Some(std::collections::BTreeSet::from([
                 OaepDigestAlgorithm::Sha256,
             ])),
             ..crate::policy::DecryptionPolicy::default()

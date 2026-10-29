@@ -5,6 +5,7 @@ use super::{
     VerifiedSession, Work, XMLDSIG_NS,
 };
 use crate::xmldsig::uri::BareNameNode;
+use alloc::boxed::Box;
 
 /// Outcome of resolving a same-document bare-name URI (`#id`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

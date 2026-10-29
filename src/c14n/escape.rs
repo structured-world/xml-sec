@@ -1,11 +1,12 @@
 //! Text and attribute value escaping for canonical XML.
 
-use std::io::{self, Write};
+use super::C14nError;
+use super::sink::ByteSink;
 
 /// Escape text node content for canonical XML.
 ///
 /// Replaces: `&` → `&amp;`, `<` → `&lt;`, `>` → `&gt;`, `\r` → `&#xD;`
-pub(crate) fn escape_text(s: &str, output: &mut impl Write) -> io::Result<()> {
+pub(crate) fn escape_text(s: &str, output: &mut impl ByteSink) -> Result<(), C14nError> {
     escape_runs(s, output, |byte| match byte {
         b'&' => Some(b"&amp;"),
         b'<' => Some(b"&lt;"),
@@ -19,7 +20,7 @@ pub(crate) fn escape_text(s: &str, output: &mut impl Write) -> io::Result<()> {
 ///
 /// Replaces: `&` → `&amp;`, `<` → `&lt;`, `"` → `&quot;`,
 /// `\t` → `&#x9;`, `\n` → `&#xA;`, `\r` → `&#xD;`
-pub(crate) fn escape_attr(s: &str, output: &mut impl Write) -> io::Result<()> {
+pub(crate) fn escape_attr(s: &str, output: &mut impl ByteSink) -> Result<(), C14nError> {
     escape_runs(s, output, |byte| match byte {
         b'&' => Some(b"&amp;"),
         b'<' => Some(b"&lt;"),
@@ -34,7 +35,7 @@ pub(crate) fn escape_attr(s: &str, output: &mut impl Write) -> io::Result<()> {
 /// Escape only carriage returns in comment/PI content for canonical XML.
 ///
 /// C14N spec section 2.3: `\r` in comments and PIs → `&#xD;`
-pub(crate) fn escape_cr(s: &str, output: &mut impl Write) -> io::Result<()> {
+pub(crate) fn escape_cr(s: &str, output: &mut impl ByteSink) -> Result<(), C14nError> {
     escape_runs(s, output, |byte| {
         (byte == b'\r').then_some(b"&#xD;" as &'static [u8])
     })
@@ -42,22 +43,22 @@ pub(crate) fn escape_cr(s: &str, output: &mut impl Write) -> io::Result<()> {
 
 fn escape_runs(
     source: &str,
-    output: &mut impl Write,
+    output: &mut impl ByteSink,
     replacement: impl Fn(u8) -> Option<&'static [u8]>,
-) -> io::Result<()> {
+) -> Result<(), C14nError> {
     let bytes = source.as_bytes();
     let mut run_start = 0;
     for (index, byte) in bytes.iter().copied().enumerate() {
         if let Some(escaped) = replacement(byte) {
             if run_start < index {
-                output.write_all(&bytes[run_start..index])?;
+                output.write_bytes(&bytes[run_start..index])?;
             }
-            output.write_all(escaped)?;
+            output.write_bytes(escaped)?;
             run_start = index + 1;
         }
     }
     if run_start < bytes.len() {
-        output.write_all(&bytes[run_start..])?;
+        output.write_bytes(&bytes[run_start..])?;
     }
     Ok(())
 }
@@ -73,14 +74,10 @@ mod tests {
         writes: usize,
     }
 
-    impl Write for CountingWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+    impl ByteSink for CountingWriter {
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
             self.writes += 1;
-            self.bytes.extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
+            self.bytes.extend_from_slice(bytes);
             Ok(())
         }
     }

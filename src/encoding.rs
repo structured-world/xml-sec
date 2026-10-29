@@ -1,7 +1,7 @@
 //! XML byte-encoding detection shared by process and transform boundaries.
 
 use crate::xml_input as xml_sec_xml_input;
-use std::borrow::Cow;
+use alloc::borrow::Cow;
 
 /// Shared decoder errors, including unsupported encodings and decoded-size limits.
 /// This replaces the former XML-only error variants rather than collapsing new
@@ -80,7 +80,7 @@ impl<W: structured_asn1::memory::Work> crate::xml_input_shared::DecodeStorage
     fn replace(
         &self,
         text: Self::Text,
-        range: std::ops::Range<usize>,
+        range: core::ops::Range<usize>,
         replacement: &str,
     ) -> Result<Self::Text, DecodeError> {
         // The common grammar supplied character boundaries from this exact

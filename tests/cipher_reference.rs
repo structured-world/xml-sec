@@ -1,7 +1,7 @@
 #![cfg(feature = "xmlenc")]
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use xml_sec::policy::DecryptionPolicy;
 use xml_sec::xmldsig::UriTypeSet;
 use xml_sec::xmlenc::{
@@ -23,7 +23,7 @@ fn external_policy() -> DecryptionPolicy {
 fn cipher_reference_xslt_retains_the_detached_entity_base() {
     // XMLEnc's transform adapter must preserve the same resource identity as
     // XMLDSig, including NDATA identifiers relative to the containing DTD.
-    let resources = HashMap::from([(
+    let resources = BTreeMap::from([(
         "https://example.org/data/input.xml".to_owned(),
         br#"<!DOCTYPE root [<!NOTATION image SYSTEM "image"><!ENTITY logo SYSTEM "images/logo.png" NDATA image>]><root/>"#.to_vec(),
     )]);
@@ -67,7 +67,7 @@ fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
         &format!("<xenc:CipherValue>{encoded}</xenc:CipherValue>"),
         &reference,
     );
-    let resources = HashMap::from([("urn:source".into(), b"<source/>".to_vec())]);
+    let resources = BTreeMap::from([("urn:source".into(), b"<source/>".to_vec())]);
     for backend in xml_sec::XmlBackend::available() {
         let document = xml_sec::XmlDomDocument::parse_with_options_and_backend(
             &xml,
@@ -177,7 +177,7 @@ fn external_cipher_reference_decrypts_authenticated_content() {
         &format!("<xenc:CipherValue>{encoded}</xenc:CipherValue>"),
         "<xenc:CipherReference URI=\"urn:cipher\"/>",
     );
-    let resources = HashMap::from([("urn:cipher".into(), ciphertext.clone())]);
+    let resources = BTreeMap::from([("urn:cipher".into(), ciphertext.clone())]);
     let resolver = SymmetricKeyDecryptor::new(key);
     let context = DecryptContext::new(&resolver)
         .policy(external_policy())
@@ -194,7 +194,7 @@ fn external_cipher_reference_decrypts_authenticated_content() {
     ));
     let mut corrupted = ciphertext;
     *corrupted.last_mut().unwrap() ^= 1;
-    let resources = HashMap::from([("urn:cipher".into(), corrupted)]);
+    let resources = BTreeMap::from([("urn:cipher".into(), corrupted)]);
     assert!(
         DecryptContext::new(&resolver)
             .policy(external_policy())
@@ -229,7 +229,7 @@ fn referenced_wrapped_key_and_content_share_external_budget() {
             "<xenc:CipherReference URI=\"urn:data\"/>",
         );
     let total = key_bytes.len() + content_bytes.len();
-    let resources = HashMap::from([
+    let resources = BTreeMap::from([
         ("urn:key".into(), key_bytes),
         ("urn:data".into(), content_bytes),
     ]);
@@ -300,7 +300,7 @@ fn cipher_reference_syntax_and_transform_permission_are_not_implicit() {
     // An allowed external resource does not grant permission for an unknown or
     // disallowed transform, and missing URI is distinct from URI="".
     let resolver = SymmetricKeyDecryptor::new([0; 16]);
-    let resources = HashMap::from([("urn:data".into(), b"not ciphertext".to_vec())]);
+    let resources = BTreeMap::from([("urn:data".into(), b"not ciphertext".to_vec())]);
     for reference in [
         "<xenc:CipherReference/>",
         "<xenc:CipherReference URI='urn:data'><ds:Transforms/></xenc:CipherReference>",

@@ -101,11 +101,11 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     ) -> Result<KeyAssociation, DsigError> {
         work.charge_work(1)?;
         let capture = &self.operations[index].capture;
-        if !std::ptr::eq(
-            std::ptr::from_ref(receipt.seal),
-            std::ptr::from_ref(&capture.seal),
+        if !core::ptr::eq(
+            core::ptr::from_ref(receipt.seal),
+            core::ptr::from_ref(&capture.seal),
         ) || receipt.signature != self.evidence.signatures()[index].identity
-            || !std::ptr::eq(receipt.provider, self.context.provider)
+            || !core::ptr::eq(receipt.provider, self.context.provider)
         {
             return Err(DsigError::InvalidRequest {
                 reason: "key receipt belongs to another selected operation",

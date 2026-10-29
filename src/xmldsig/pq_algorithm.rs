@@ -1,7 +1,7 @@
 //! Explicit experimental XML method identifiers, not W3C-standardized algorithms.
 
 /// FIPS 204/205 parameter sets exposed by libxmlsec1's experimental XML methods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PqAlgorithm {
     /// ML-DSA-44.
     MlDsa44,

@@ -6,7 +6,6 @@
 //! and deliberately bypass document `KeyInfo` resolution.
 
 use std::path::Path;
-use std::time::{Duration, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -26,6 +25,11 @@ const PHAOS_RSA_CERTIFICATE: &[u8] =
     include_bytes!("fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-cert.der");
 const PHAOS_RSA_CA_CERTIFICATE: &[u8] =
     include_bytes!("fixtures/xmldsig/phaos-xmldsig-three/certs/rsa-ca-cert.der");
+
+/// A whole-hour instant after the Unix epoch.
+fn hours_after_epoch(hours: i64) -> xml_sec::policy::Instant {
+    xml_sec::policy::Instant::new(hours * 3600, 0).unwrap()
+}
 
 fn read_vector(name: &str) -> String {
     let path = Path::new(PHAOS_DIR).join(name);
@@ -220,7 +224,7 @@ fn phaos_certificate_chain_is_expired_at_a_modern_verification_time() {
     let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
     let options = X509ChainOptions {
         trusted_certs: &trusted,
-        verification_time: UNIX_EPOCH + Duration::from_hours(490_896),
+        verification_time: hours_after_epoch(490_896),
         utc_facts: None,
         max_chain_depth: 2,
         check_crls: false,
@@ -266,7 +270,16 @@ fn x509_path_enforces_configured_issuer_rsa_minimum() {
     let mut options = X509ChainOptions {
         utc_facts: None,
         trusted_certs: &trusted,
-        verification_time: std::time::SystemTime::now(),
+        verification_time: xml_sec::policy::Instant::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
+            0,
+        )
+        .unwrap(),
         max_chain_depth: 2,
         check_crls: false,
         allowed_extended_key_usages: None,
@@ -302,7 +315,7 @@ fn phaos_non_der_key_usage_cannot_establish_certificate_trust() {
     let trusted = vec![PHAOS_RSA_CA_CERTIFICATE.to_vec()];
     let options = X509ChainOptions {
         trusted_certs: &trusted,
-        verification_time: UNIX_EPOCH + Duration::from_hours(306_828),
+        verification_time: hours_after_epoch(306_828),
         utc_facts: None,
         max_chain_depth: 2,
         check_crls: false,

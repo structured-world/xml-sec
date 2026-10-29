@@ -159,7 +159,7 @@ fn pss_family_permission_preserves_independent_legacy_gate() {
     assert!(policy.check_signature_algorithm(method).is_err());
     policy.key_trust.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
     assert!(policy.check_signature_algorithm(method).is_ok());
-    policy.signature_algorithms = Some(std::collections::HashSet::default());
+    policy.signature_algorithms = Some(std::collections::BTreeSet::default());
     assert!(policy.check_signature_algorithm(method).is_ok());
     policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::ExactOnly;
     assert!(policy.check_signature_algorithm(method).is_err());
@@ -178,7 +178,7 @@ fn pss_family_permission_preserves_independent_legacy_gate() {
     ));
     let signing = xml_sec::policy::SigningPolicy {
         parameterized_rsa_pss: xml_sec::policy::RsaPssPermission::AllSupported,
-        signature_algorithms: Some(std::collections::HashSet::default()),
+        signature_algorithms: Some(std::collections::BTreeSet::default()),
         ..Default::default()
     };
     let signed = SignContext::new(&key)

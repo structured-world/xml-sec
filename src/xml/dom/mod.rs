@@ -17,7 +17,8 @@ mod tree;
 #[cfg(feature = "xml-backend-xmloxide")]
 mod xmloxide;
 
-use std::fmt;
+use alloc::string::String;
+use core::fmt;
 
 use self::preflight::LexicalPreflight;
 
@@ -373,7 +374,7 @@ impl fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
 trait XmlBackendImplementation {
     fn parse<'input>(

@@ -4,10 +4,13 @@
 //! document targets, tenant identity, and external resource bytes remain in
 //! operation request contexts and are deliberately not stored here.
 
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-use std::collections::HashSet;
-#[cfg(feature = "xmldsig")]
-use std::time::SystemTime;
+use alloc::{
+    borrow::ToOwned,
+    collections::BTreeSet,
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 #[cfg(feature = "xmldsig")]
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm, UriTypeSet, XPathHereSemantics};
@@ -15,6 +18,13 @@ use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm, UriTypeSet, XPathHereS
 use crate::xmlenc::{
     DataEncryptionAlgorithm, KeyTransportAlgorithm, KeyWrapAlgorithm, OaepDigestAlgorithm,
 };
+
+#[cfg(feature = "xmldsig")]
+pub(crate) mod clock;
+#[cfg(feature = "xmldsig")]
+pub use clock::Instant;
+#[cfg(all(feature = "xmldsig", any(feature = "std", test)))]
+pub use clock::instant_from_system_time;
 
 #[cfg(feature = "xmldsig")]
 mod key_establishment;
@@ -1126,7 +1136,7 @@ pub enum EcdsaSignatureValueEncoding {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TransformPolicy {
     /// Allowed transform and canonicalization URIs; `None` accepts every implemented algorithm.
-    pub allowed_algorithms: Option<HashSet<String>>,
+    pub allowed_algorithms: Option<BTreeSet<String>>,
     /// Node selected for the `XPath` `here()` extension function.
     pub xpath_here_semantics: XPathHereSemantics,
     /// Interpretation of bare same-document ID fragments.
@@ -1162,7 +1172,7 @@ impl Default for UriPolicy {
 
 /// An RFC 5280 extended-key-purpose identifier accepted for XML signing.
 #[cfg(feature = "xmldsig")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ExtendedKeyPurpose {
     /// TLS server authentication (`id-kp-serverAuth`).
@@ -1205,7 +1215,7 @@ pub struct KeyTrustPolicy {
     /// Maximum complete or partial signature-valid path states generated.
     pub max_x509_candidate_paths: usize,
     /// Legacy signature algorithms explicitly permitted for verification.
-    pub allowed_legacy_signature_algorithms: HashSet<SignatureAlgorithm>,
+    pub allowed_legacy_signature_algorithms: BTreeSet<SignatureAlgorithm>,
     /// Independent legacy-hash permission for parameterized RSA-PSS verification.
     pub parameterized_rsa_pss: RsaPssPermission,
     /// Certificate and CRL signature permissions, independent of XML signatures.
@@ -1222,12 +1232,13 @@ pub struct KeyTrustPolicy {
     /// An empty set accepts only paths whose certificates omit `ExtendedKeyUsage`
     /// or use `anyExtendedKeyUsage`; it does not treat TLS/code-signing purposes
     /// as a generic authorization for XML signatures.
-    pub allowed_extended_key_usages: HashSet<ExtendedKeyPurpose>,
+    pub allowed_extended_key_usages: BTreeSet<ExtendedKeyPurpose>,
     /// Authenticate and enforce embedded CRLs during path validation.
     /// Requires [`Self::verify_x509_chains`].
     pub check_crls: bool,
-    /// Verification time override; `None` selects the system clock.
-    pub verification_time: Option<SystemTime>,
+    /// Verification time override; `None` selects the host clock. Builds
+    /// without `std` have no clock and require this time.
+    pub verification_time: Option<Instant>,
 }
 
 #[cfg(feature = "xmldsig")]
@@ -1238,12 +1249,12 @@ impl Default for KeyTrustPolicy {
             verify_x509_chains: false,
             max_x509_chain_depth: crate::hard_limits::X509_CHAIN_DEPTH_CEILING,
             max_x509_candidate_paths: crate::hard_limits::X509_CANDIDATE_PATH_CEILING,
-            allowed_legacy_signature_algorithms: HashSet::new(),
+            allowed_legacy_signature_algorithms: BTreeSet::new(),
             parameterized_rsa_pss: RsaPssPermission::ExactOnly,
             certificate_signature_algorithms: None,
             rsa_keys: RsaKeyPolicy::default(),
             dsa_keys: DsaKeyPolicy::default(),
-            allowed_extended_key_usages: HashSet::new(),
+            allowed_extended_key_usages: BTreeSet::new(),
             check_crls: false,
             verification_time: None,
         }
@@ -1258,7 +1269,7 @@ pub enum CertificateSignatureAlgorithms {
     /// This is an explicit compatibility opt-in, not a provider fallback.
     AllSupported,
     /// Permit only exact algorithms, including every RSA-PSS parameter.
-    Allowlist(HashSet<crate::provider::X509SignatureAlgorithm>),
+    Allowlist(BTreeSet<crate::provider::X509SignatureAlgorithm>),
 }
 
 #[cfg(feature = "xmldsig")]
@@ -1367,9 +1378,9 @@ pub struct VerificationPolicy {
     /// Exact signature methods, supplemented by `parameterized_rsa_pss`.
     /// `None` accepts every implemented method subject to
     /// independent gates such as [`KeyTrustPolicy::allowed_legacy_signature_algorithms`].
-    pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
+    pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` accepts every implemented method.
-    pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    pub digest_algorithms: Option<BTreeSet<DigestAlgorithm>>,
     /// HMAC secret and output-length requirements.
     pub hmac: HmacPolicy,
     /// Required ECDSA `SignatureValue` wire representation.
@@ -1420,7 +1431,7 @@ impl VerificationPolicy {
     /// invalid resource, key-establishment, trust and HMAC configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
-            validity.validate_at(SystemTime::now())?;
+            validity.validate_at(clock::authorization_time(self.key_trust.verification_time)?)?;
         }
         if self.signature_constraints != SignatureConstraints::General
             && self.key_trust.mode == VerificationTrustMode::CryptographicOnly
@@ -1504,9 +1515,9 @@ pub struct SigningPolicy {
     pub parameterized_rsa_pss: RsaPssPermission,
     /// Exact signing methods, supplemented by `parameterized_rsa_pss`.
     /// `None` uses the implemented secure defaults.
-    pub signature_algorithms: Option<HashSet<SignatureAlgorithm>>,
+    pub signature_algorithms: Option<BTreeSet<SignatureAlgorithm>>,
     /// Allowed reference digest methods; `None` uses the implemented secure defaults.
-    pub digest_algorithms: Option<HashSet<DigestAlgorithm>>,
+    pub digest_algorithms: Option<BTreeSet<DigestAlgorithm>>,
     /// HMAC secret and output-length requirements.
     pub hmac: HmacPolicy,
     /// ECDSA `SignatureValue` wire representation emitted by signing.
@@ -1537,7 +1548,7 @@ impl SigningPolicy {
     /// key-establishment, RSA, DSA and HMAC configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
-            validity.validate_at(SystemTime::now())?;
+            validity.validate_at(clock::authorization_time(None)?)?;
         }
         self.resources.validate()?;
         self.key_establishment.validate()?;
@@ -1575,8 +1586,8 @@ impl SigningPolicy {
 }
 
 #[cfg(feature = "xmldsig")]
-fn check_signing_algorithm<T: Copy + Eq + std::hash::Hash>(
-    allowlist: Option<&HashSet<T>>,
+fn check_signing_algorithm<T: Copy + Ord>(
+    allowlist: Option<&BTreeSet<T>>,
     algorithm: T,
     default_allowed: bool,
     uri: &str,
@@ -1594,7 +1605,7 @@ fn check_signing_algorithm<T: Copy + Eq + std::hash::Hash>(
 /// Enforce the shared content-cipher permission contract before dispatch.
 #[cfg(feature = "xmlenc")]
 pub(crate) fn check_content_algorithm(
-    allowlist: Option<&HashSet<DataEncryptionAlgorithm>>,
+    allowlist: Option<&BTreeSet<DataEncryptionAlgorithm>>,
     algorithm: DataEncryptionAlgorithm,
     operation: &'static str,
 ) -> Result<(), PolicyViolation> {
@@ -1617,13 +1628,13 @@ pub struct EncryptionPolicy {
     /// Explicitly authorized lifetime; checked again at operation entry.
     pub validity: Option<PolicyValidity>,
     /// Allowed content-encryption algorithms.
-    pub data_algorithms: Option<HashSet<DataEncryptionAlgorithm>>,
+    pub data_algorithms: Option<BTreeSet<DataEncryptionAlgorithm>>,
     /// Allowed RSA key-transport algorithms.
-    pub key_transport_algorithms: Option<HashSet<KeyTransportAlgorithm>>,
+    pub key_transport_algorithms: Option<BTreeSet<KeyTransportAlgorithm>>,
     /// Allowed symmetric key-wrap algorithms.
-    pub key_wrap_algorithms: Option<HashSet<KeyWrapAlgorithm>>,
+    pub key_wrap_algorithms: Option<BTreeSet<KeyWrapAlgorithm>>,
     /// Allowed OAEP digest algorithms.
-    pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
+    pub oaep_digests: Option<BTreeSet<OaepDigestAlgorithm>>,
     /// RSA requirements enforced when producing OAEP key transport.
     pub rsa_keys: RsaKeyPolicy,
     /// Shared agreement/KDF permission and cumulative work requirements.
@@ -1643,7 +1654,7 @@ impl EncryptionPolicy {
     /// key-establishment and RSA configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
-            validity.validate_at(SystemTime::now())?;
+            validity.validate_at(clock::authorization_time(None)?)?;
         }
         self.resources.validate()?;
         self.key_establishment.validate()?;
@@ -1662,13 +1673,13 @@ pub struct DecryptionPolicy {
     /// Shared transform permissions and same-document reference semantics.
     pub transforms: TransformPolicy,
     /// Allowed content-decryption algorithms.
-    pub data_algorithms: Option<HashSet<DataEncryptionAlgorithm>>,
+    pub data_algorithms: Option<BTreeSet<DataEncryptionAlgorithm>>,
     /// Allowed RSA key-transport algorithms accepted on input.
-    pub key_transport_algorithms: Option<HashSet<KeyTransportAlgorithm>>,
+    pub key_transport_algorithms: Option<BTreeSet<KeyTransportAlgorithm>>,
     /// Allowed symmetric key-wrap algorithms accepted on input.
-    pub key_wrap_algorithms: Option<HashSet<KeyWrapAlgorithm>>,
+    pub key_wrap_algorithms: Option<BTreeSet<KeyWrapAlgorithm>>,
     /// Allowed OAEP digest algorithms accepted on input.
-    pub oaep_digests: Option<HashSet<OaepDigestAlgorithm>>,
+    pub oaep_digests: Option<BTreeSet<OaepDigestAlgorithm>>,
     /// RSA requirements enforced before OAEP recovery; defaults to 2048 bits.
     /// Legacy input requires an explicit caller-selected lower minimum.
     pub rsa_keys: RsaKeyPolicy,
@@ -1689,7 +1700,7 @@ impl DecryptionPolicy {
     /// key-establishment and RSA configuration.
     pub fn validate(&self) -> Result<(), PolicyViolation> {
         if let Some(validity) = &self.validity {
-            validity.validate_at(SystemTime::now())?;
+            validity.validate_at(clock::authorization_time(None)?)?;
         }
         self.resources.validate()?;
         self.key_establishment.validate()?;
@@ -1718,11 +1729,11 @@ mod tests {
                     .is_err()
             );
             let verification = VerificationPolicy {
-                digest_algorithms: Some(HashSet::from([algorithm])),
+                digest_algorithms: Some(BTreeSet::from([algorithm])),
                 ..VerificationPolicy::default()
             };
             let signing = SigningPolicy {
-                digest_algorithms: Some(HashSet::from([algorithm])),
+                digest_algorithms: Some(BTreeSet::from([algorithm])),
                 ..SigningPolicy::default()
             };
             assert!(verification.check_digest_algorithm(algorithm).is_ok());
@@ -1752,7 +1763,7 @@ mod tests {
             mgf_digest: DigestAlgorithm::Sha256,
             salt_len: 32,
         };
-        let allowed = CertificateSignatureAlgorithms::Allowlist(HashSet::from([exact]));
+        let allowed = CertificateSignatureAlgorithms::Allowlist(BTreeSet::from([exact]));
         assert!(
             KeyTrustPolicy::check_certificate_signature_algorithm(exact, Some(&allowed)).is_ok()
         );

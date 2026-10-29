@@ -54,8 +54,9 @@ be accepted even when every cryptographic signature is valid.
   not complete timestamp or long-term validation levels.
 - Optional provider names do not attest approved-service status. Protected key
   containers may still be decoded by RustCrypto before native import.
-- The root XMLDSig graph currently requires `std`. Independent XML-input
-  alloc-only/WASM qualification does not imply alloc-only XMLDSig.
+- XMLDSig verification builds without `std`, but signing, XMLEnc and native
+  providers still require it. Without `std` there is no clock: supply the
+  verification time for X.509 path validation explicitly.
 
 ## Qualification Checklist
 

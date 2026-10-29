@@ -2,8 +2,12 @@
 
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
+// `core` below names this module's core function library, not the crate.
+use ::core::ops::Index;
+use alloc::{borrow::Cow, string::String, vec::Vec};
+#[cfg(feature = "embedded")]
+use alloc::{borrow::ToOwned, boxed::Box, string::ToString};
 use snafu::Snafu;
-use std::ops::Index;
 
 use crate::Value;
 use crate::context;
@@ -113,7 +117,9 @@ impl Error {
 
 /// Provides common utility functions for dealing with function
 /// argument lists.
-pub trait ArgumentList<'d>: std::ops::Deref<Target = [Value<'d>]> + std::ops::DerefMut {
+pub trait ArgumentList<'d>:
+    ::core::ops::Deref<Target = [Value<'d>]> + ::core::ops::DerefMut
+{
     fn pop(&mut self) -> Option<Value<'d>>;
 }
 
@@ -125,20 +131,20 @@ impl<'d> ArgumentList<'d> for Vec<Value<'d>> {
 
 impl<'d> ArgumentList<'d> for &mut [Value<'d>] {
     fn pop(&mut self) -> Option<Value<'d>> {
-        let slots = std::mem::take(self);
+        let slots = ::core::mem::take(self);
         let (last, rest) = slots.split_last_mut()?;
         *self = rest;
         // Vacated slots remain initialized until the caller drops its buffer.
         // Moving a value neither clones it nor frees the admitted capacity.
-        Some(std::mem::replace(last, Value::Boolean(false)))
+        Some(::core::mem::replace(last, Value::Boolean(false)))
     }
 }
 
-pub struct Args<'d, A = Vec<Value<'d>>>(pub A, std::marker::PhantomData<&'d ()>);
+pub struct Args<'d, A = Vec<Value<'d>>>(pub A, ::core::marker::PhantomData<&'d ()>);
 
 impl<'d, A: ArgumentList<'d>> Args<'d, A> {
     pub fn new(values: A) -> Self {
-        Self(values, std::marker::PhantomData)
+        Self(values, ::core::marker::PhantomData)
     }
 
     /// Remove the last argument without coercion.
@@ -195,9 +201,9 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
     pub fn exactly(&self, expected: usize) -> Result<(), Error> {
         let actual = self.0.len();
         match actual.cmp(&expected) {
-            std::cmp::Ordering::Less => Err(Error::NotEnoughArguments { expected, actual }),
-            std::cmp::Ordering::Greater => Err(Error::TooManyArguments { expected, actual }),
-            std::cmp::Ordering::Equal => Ok(()),
+            ::core::cmp::Ordering::Less => Err(Error::NotEnoughArguments { expected, actual }),
+            ::core::cmp::Ordering::Greater => Err(Error::TooManyArguments { expected, actual }),
+            ::core::cmp::Ordering::Equal => Ok(()),
         }
     }
 
@@ -235,7 +241,7 @@ impl<'d, A: ArgumentList<'d>> Args<'d, A> {
                 context.reserve_string_allocation(value.len())?;
                 Ok(value.as_str().to_owned())
             }
-            Value::ResultTreeFragment(_, value) => match std::sync::Arc::try_unwrap(value) {
+            Value::ResultTreeFragment(_, value) => match alloc::sync::Arc::try_unwrap(value) {
                 Ok(value) => Ok(value),
                 Err(value) => {
                     context.charge_work(value.len())?;
@@ -322,8 +328,7 @@ pub(crate) fn append_metered_string(
 pub fn string_argument_view<'a>(
     value: &'a Value<'_>,
     context: &context::Evaluation<'_, '_>,
-) -> Result<std::borrow::Cow<'a, str>, Error> {
-    use std::borrow::Cow;
+) -> Result<Cow<'a, str>, Error> {
     match value {
         Value::String(text) => Ok(Cow::Borrowed(text)),
         #[cfg(feature = "embedded")]
@@ -340,14 +345,32 @@ pub fn string_argument_view<'a>(
     }
 }
 
+// IEEE 754 floor and ceiling; core has no float rounding without std.
+#[cfg(any(feature = "std", not(feature = "embedded")))]
+fn ieee_floor(x: f64) -> f64 {
+    x.floor()
+}
+#[cfg(any(feature = "std", not(feature = "embedded")))]
+fn ieee_ceil(x: f64) -> f64 {
+    x.ceil()
+}
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+fn ieee_floor(x: f64) -> f64 {
+    libm::floor(x)
+}
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+fn ieee_ceil(x: f64) -> f64 {
+    libm::ceil(x)
+}
+
 // XPath 1.0 4.4 preserves signed zero and infinities when already integral.
 // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-round
 fn round_ties_to_positive_infinity(x: f64) -> f64 {
-    let y = x.floor();
+    let y = ieee_floor(x);
     if super::same_xpath_number(x, y) {
         x
     } else {
-        let z = (2.0 * x - y).floor();
+        let z = ieee_floor(2.0 * x - y);
         // Should use copysign
         if x.is_sign_positive() ^ z.is_sign_positive() {
             -z

@@ -1,11 +1,11 @@
 //! Shared compilation and execution state for one XML Security operation.
 
+use alloc::{collections::BTreeSet, string::String, vec, vec::Vec};
+use core::cell::{Cell, Ref, RefCell};
 #[cfg(not(feature = "xmldsig-sign"))]
-use std::marker::PhantomData;
-use std::{
-    cell::{Cell, RefCell},
-    collections::{BTreeSet, HashSet},
-};
+use core::marker::PhantomData;
+
+use crate::collections::Set;
 
 #[cfg(feature = "xmldsig")]
 use crate::NodeIdentity;
@@ -111,7 +111,7 @@ struct OperationNode {
 }
 
 /// A dependency edge from `requires` to `dependent`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct OperationEdge {
     requires: OperationNodeId,
     dependent: OperationNodeId,
@@ -153,7 +153,7 @@ pub(crate) enum OperationPlanError {
 #[derive(Clone, Default)]
 pub(crate) struct OperationPlanBuilder {
     nodes: Vec<OperationNode>,
-    edges: HashSet<OperationEdge>,
+    edges: Set<OperationEdge>,
 }
 
 impl OperationPlanBuilder {
@@ -246,7 +246,7 @@ impl OperationPlanBuilder {
 #[derive(Debug)]
 pub(crate) struct CompiledOperationPlan {
     nodes: Vec<OperationNode>,
-    edges: HashSet<OperationEdge>,
+    edges: Set<OperationEdge>,
     #[cfg(test)]
     order: Vec<OperationNodeId>,
 }
@@ -317,9 +317,9 @@ pub(crate) struct OperationExecutionContext<P, B> {
     builder: Option<OperationPlanBuilder>,
     plan: RefCell<Option<CompiledOperationPlan>>,
     document: Option<(DocumentIdentity, Cell<u64>)>,
-    executed: RefCell<HashSet<OperationNodeId>>,
+    executed: RefCell<Set<OperationNodeId>>,
     #[cfg(feature = "xmldsig")]
-    authenticated_nodes: RefCell<HashSet<NodeIdentity>>,
+    authenticated_nodes: RefCell<Set<NodeIdentity>>,
     decisions: RefCell<Vec<OperationDecision>>,
     first_failure: RefCell<Option<OperationDecision>>,
 }
@@ -337,9 +337,9 @@ impl<P, B> OperationExecutionContext<P, B> {
             builder: Some(OperationPlanBuilder::default()),
             plan: RefCell::new(None),
             document: document.map(|(identity, generation)| (identity, Cell::new(generation))),
-            executed: RefCell::new(HashSet::new()),
+            executed: RefCell::new(Set::new()),
             #[cfg(feature = "xmldsig")]
-            authenticated_nodes: RefCell::new(HashSet::new()),
+            authenticated_nodes: RefCell::new(Set::new()),
             decisions: RefCell::new(Vec::new()),
             first_failure: RefCell::new(None),
         }
@@ -359,8 +359,8 @@ impl<P, B> OperationExecutionContext<P, B> {
         &mut self.budgets
     }
 
-    pub(crate) fn plan(&self) -> std::cell::Ref<'_, CompiledOperationPlan> {
-        std::cell::Ref::map(self.plan.borrow(), |plan| {
+    pub(crate) fn plan(&self) -> Ref<'_, CompiledOperationPlan> {
+        Ref::map(self.plan.borrow(), |plan| {
             plan.as_ref()
                 .expect("operation plan must be compiled before execution")
         })

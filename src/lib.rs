@@ -17,6 +17,9 @@
 //! - **`XMLEnc`**: XML Encryption (encrypt + decrypt)
 //! - **X.509** — Certificate-based key extraction
 //!
+//! Without the default `std` feature, C14N and `XMLDSig` verification build on
+//! `core` and `alloc` alone; the caller then supplies the verification time.
+//!
 //! ## Quick Start
 //!
 //! ```rust
@@ -34,12 +37,15 @@
 //! # }
 //! ```
 
+// The unit-test harness needs std; the library target stays `no_std` here.
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(unsafe_code)]
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
 extern crate alloc;
-#[cfg(feature = "xmldsig")]
+// The embedded XPath engine's XML parser only builds test documents.
+#[cfg(all(test, feature = "xmldsig"))]
 #[macro_use]
 extern crate peresil;
 
@@ -54,6 +60,7 @@ pub mod api;
 #[doc(hidden)]
 pub mod benchmark_support;
 pub mod c14n;
+mod collections;
 pub mod document;
 pub mod encoding;
 pub mod error;

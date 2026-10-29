@@ -11,6 +11,7 @@ use super::super::{
     SignatureVerificationPipelineError, Transform, VerifiedSession,
 };
 use crate::NodeIdentity;
+use alloc::{boxed::Box, vec::Vec};
 use base64::Engine as _;
 use structured_asn1::memory::{MemoryError, OwnedText, OwnedVec, Work};
 

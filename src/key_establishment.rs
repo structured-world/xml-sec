@@ -3,6 +3,8 @@
 //! Requests supply keys; the immutable policy supplies permission. Keep one
 //! usage value across every key source and retry, including failed attempts.
 
+use alloc::vec::Vec;
+
 use crate::policy::{KeyEstablishmentPolicy, PolicyViolation};
 use crate::provider::{
     CryptoProvider, EncapsulatedKey, KeyDecapsulationKey, KeyEncapsulationAlgorithm,

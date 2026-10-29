@@ -1,9 +1,8 @@
 use super::signers;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::XmlDocument;
-use xml_sec::policy::VerificationPolicy;
+use xml_sec::policy::{Instant, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, KeyResolverConfig, VerificationRequest, VerifyContext,
     with_verified_request,
@@ -18,8 +17,8 @@ fn chosen(xml: &str, counters: &[usize]) -> Vec<usize> {
     });
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
-    policy.key_trust.verification_time =
-        Some(SystemTime::UNIX_EPOCH + Duration::from_hours(500_000));
+    // 2027-01-15 UTC, inside the fixture certificates' validity.
+    policy.key_trust.verification_time = Instant::new(500_000 * 3600, 0);
     let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
     let document = XmlDocument::parse(xml).unwrap();
     let work = Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 30)));

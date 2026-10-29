@@ -3,7 +3,7 @@
 #![cfg(feature = "xmldsig-sign")]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::Path,
 };
@@ -45,7 +45,7 @@ fn compatibility_verification_policy() -> VerificationPolicy {
     };
     // This corpus establishes algorithm interoperability, not signer trust.
     policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
-    policy.key_trust.allowed_legacy_signature_algorithms = HashSet::from([
+    policy.key_trust.allowed_legacy_signature_algorithms = BTreeSet::from([
         SignatureAlgorithm::DsaSha1,
         SignatureAlgorithm::EcdsaSha1,
         SignatureAlgorithm::HmacSha1,
@@ -59,7 +59,7 @@ fn compatibility_verification_policy() -> VerificationPolicy {
 
 fn compatibility_signing_policy() -> SigningPolicy {
     SigningPolicy {
-        signature_algorithms: Some(HashSet::from([
+        signature_algorithms: Some(BTreeSet::from([
             SignatureAlgorithm::EcdsaSha1,
             SignatureAlgorithm::EcdsaSha224,
             SignatureAlgorithm::EcdsaSha256,
@@ -67,7 +67,7 @@ fn compatibility_signing_policy() -> SigningPolicy {
             SignatureAlgorithm::EcdsaSha512,
             SignatureAlgorithm::RsaSha256,
         ])),
-        digest_algorithms: Some(HashSet::from([
+        digest_algorithms: Some(BTreeSet::from([
             DigestAlgorithm::Sha1,
             DigestAlgorithm::Sha224,
             DigestAlgorithm::Sha256,
@@ -357,7 +357,7 @@ fn external_key_info_reference_uses_only_caller_owned_bytes() {
         .unwrap();
     let external_key_info = xml.as_bytes()[start..end].to_vec();
     let external_xml = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"key-info.xml\"", 1);
-    let resources = HashMap::from([("key-info.xml".to_owned(), external_key_info)]);
+    let resources = BTreeMap::from([("key-info.xml".to_owned(), external_key_info)]);
     let resolver = DefaultKeyResolver::default();
     let mut policy = compatibility_verification_policy();
     policy.uris.key_info_references = UriTypeSet::ALL;
@@ -400,7 +400,7 @@ fn external_key_info_documents_obey_the_xml_node_policy() {
     );
     let oversized_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"oversized.xml#outer\"", 1);
     let oversized_resources =
-        HashMap::from([("oversized.xml".to_owned(), oversized_nodes.into_bytes())]);
+        BTreeMap::from([("oversized.xml".to_owned(), oversized_nodes.into_bytes())]);
     let mut node_policy = compatibility_verification_policy();
     node_policy.uris.key_info_references = UriTypeSet::ALL;
     node_policy.resources.max_xml_nodes = 128;
@@ -434,7 +434,7 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
     );
     let fragment_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"key-info.xml#outer\"", 1);
     let fragment_resources =
-        HashMap::from([("key-info.xml".to_owned(), fragment_document.into_bytes())]);
+        BTreeMap::from([("key-info.xml".to_owned(), fragment_document.into_bytes())]);
     let resolver = DefaultKeyResolver::default();
     let mut policy = compatibility_verification_policy();
     policy.uris.key_info_references = UriTypeSet::ALL;
@@ -462,7 +462,7 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
     );
     let retrieval_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"retrieval.xml#outer\"", 1);
     let retrieval_resources =
-        HashMap::from([("retrieval.xml".to_owned(), retrieval_document.into_bytes())]);
+        BTreeMap::from([("retrieval.xml".to_owned(), retrieval_document.into_bytes())]);
     let result = VerifyContext::new()
         .key_resolver(&resolver)
         .external_resources(&retrieval_resources)
@@ -477,7 +477,7 @@ fn external_key_info_reference_rebinds_fragments_and_shares_resource_budget() {
     let outer = br#"<keys xmlns:dsig="http://www.w3.org/2000/09/xmldsig#" xmlns:dsig11="http://www.w3.org/2009/xmldsig11#"><dsig:KeyInfo Id="outer"><dsig11:KeyInfoReference URI="inner.xml"/></dsig:KeyInfo></keys>"#.to_vec();
     let inner = key_info.as_bytes().to_vec();
     let external_signature = xml.replacen("URI=\"#KeyInfoID\"", "URI=\"keys/outer.xml#outer\"", 1);
-    let external_resources = HashMap::from([
+    let external_resources = BTreeMap::from([
         ("keys/outer.xml".to_owned(), outer.clone()),
         ("keys/inner.xml".to_owned(), inner.clone()),
     ]);
@@ -519,14 +519,14 @@ fn hmac_donor_vectors_sign_and_verify_with_declared_output_lengths() {
     let signing_key = HmacSigningKey::new(secret.clone()).expect("HMAC signing key must parse");
     let verification_key = HmacVerificationKey::new(secret).expect("HMAC key must parse");
     let signing_policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([
+        signature_algorithms: Some(BTreeSet::from([
             SignatureAlgorithm::HmacSha1,
             SignatureAlgorithm::HmacSha224,
             SignatureAlgorithm::HmacSha256,
             SignatureAlgorithm::HmacSha384,
             SignatureAlgorithm::HmacSha512,
         ])),
-        digest_algorithms: Some(HashSet::from([
+        digest_algorithms: Some(BTreeSet::from([
             DigestAlgorithm::Sha1,
             DigestAlgorithm::Sha224,
             DigestAlgorithm::Sha256,
@@ -583,8 +583,8 @@ fn signing_policy_rejects_weak_hmac_output_before_key_dispatch() {
     );
     let key = HmacSigningKey::new([0x42; 16]).expect("fixed HMAC key must parse");
     let policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         ..SigningPolicy::default()
     };
     assert!(matches!(
@@ -719,7 +719,7 @@ fn complete_second_edition_verification_corpus_is_classified_and_executed() {
     policy.uris.references = UriTypeSet::ALL;
     let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
         .expect("Second Edition external XML fixture must be readable");
-    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let resources = BTreeMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
     for backend in XmlBackend::available() {
         let mut verified = 0;
         let mut rejected_xslt = 0;
@@ -813,7 +813,7 @@ fn second_edition_external_reference_detects_tampering() {
         .position(|window| window == marker)
         .expect("external fixture must contain the tamper marker");
     external_xml[offset + marker.len() - 2] = b'4';
-    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let resources = BTreeMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
 
     let result = VerifyContext::new()
         .key(&key)
@@ -841,12 +841,12 @@ fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
         .expect("Second Edition signing template must be readable");
     let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
         .expect("Second Edition external XML fixture must be readable");
-    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let resources = BTreeMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
     let key = HmacSigningKey::new(b"secret".to_vec())
         .expect("upstream Second Edition HMAC key must parse");
     let mut signing_policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         hmac: HmacPolicy {
             minimum_key_bits: 40,
             minimum_output_bits: 40,
@@ -931,12 +931,13 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
         .expect("Second Edition signing template must be readable");
     let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
         .expect("Second Edition external XML fixture must be readable");
-    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml.clone())]);
+    let resources =
+        BTreeMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml.clone())]);
     let key = HmacSigningKey::new(b"secret".to_vec())
         .expect("upstream Second Edition HMAC key must parse");
     let base_policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         hmac: HmacPolicy {
             minimum_key_bits: 40,
             minimum_output_bits: 40,
@@ -967,7 +968,7 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
     assert_eq!(document.as_xml(), template);
     assert_eq!(document.generation(), original_generation);
 
-    let empty_resources = HashMap::new();
+    let empty_resources = BTreeMap::new();
     let missing = SignContext::new(&key)
         .policy(allowed_policy.clone())
         .external_resources(&empty_resources)
@@ -994,7 +995,7 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
     ));
 
     let unused = vec![0_u8; external_xml.len() * 2];
-    let complete_map = HashMap::from([
+    let complete_map = BTreeMap::from([
         ("c14n11/xml-base-input.xml".to_owned(), external_xml.clone()),
         ("unused.bin".to_owned(), unused.clone()),
     ]);
@@ -1043,12 +1044,12 @@ fn detached_signing_resolves_reference_xml_base() {
     );
     let external_xml = fs::read(format!("{XMLDSIG2ED_DIR}/c14n11/xml-base-input.xml"))
         .expect("Second Edition external XML fixture must be readable");
-    let resources = HashMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
+    let resources = BTreeMap::from([("c14n11/xml-base-input.xml".to_owned(), external_xml)]);
     let key = HmacSigningKey::new(b"secret".to_vec())
         .expect("upstream Second Edition HMAC key must parse");
     let mut policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha1])),
-        digest_algorithms: Some(HashSet::from([DigestAlgorithm::Sha1])),
+        signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::HmacSha1])),
+        digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha1])),
         hmac: HmacPolicy {
             minimum_key_bits: 40,
             minimum_output_bits: 40,
@@ -1127,7 +1128,7 @@ fn dsa_sha1_rejects_a_key_with_a_256_bit_q() {
     )
     .expect("upstream encrypted DSA PKCS#8 key must parse");
     let policy = SigningPolicy {
-        signature_algorithms: Some(HashSet::from([SignatureAlgorithm::DsaSha1])),
+        signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::DsaSha1])),
         ..SigningPolicy::default()
     };
 

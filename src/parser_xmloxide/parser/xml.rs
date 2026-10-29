@@ -29,8 +29,8 @@ struct QualifiedName<'a> {
     local: &'a str,
 }
 
-impl std::fmt::Display for QualifiedName<'_> {
-    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for QualifiedName<'_> {
+    fn fmt(&self, output: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if let Some(prefix) = self.prefix {
             write!(output, "{prefix}:")?;
         }
@@ -280,7 +280,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                 .fatal("unexpected end of input in internal subset"));
         }
         let end = self.input.pos() - 1;
-        std::str::from_utf8(self.input.slice(start, end))
+        core::str::from_utf8(self.input.slice(start, end))
             .map_err(|_| self.input.fatal("invalid UTF-8 in internal subset"))
     }
 
@@ -651,7 +651,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         Ok(())
     }
 
-    fn namespace_error(&mut self, message: impl std::fmt::Display) -> Result<(), ParseError<S>> {
+    fn namespace_error(&mut self, message: impl core::fmt::Display) -> Result<(), ParseError<S>> {
         if self.options.recover {
             self.input.push_diagnostic(ErrorSeverity::Error, message)
         } else {
@@ -946,7 +946,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             let safe_len = self.input.scan_char_data()?;
             if safe_len > 0 {
                 let start = self.input.pos();
-                let chunk = std::str::from_utf8(self.input.slice(start, start + safe_len))
+                let chunk = core::str::from_utf8(self.input.slice(start, start + safe_len))
                     .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
                 // Fast byte-level pre-check for invalid XML chars (0x7F,
                 // U+FFFE, U+FFFF). Skips the expensive char-by-char
@@ -1006,7 +1006,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                     if !text.is_empty() {
                         let empty = self.storage.text("")?;
                         let text_id = self.doc.try_create_node(NodeKind::Text {
-                            content: std::mem::replace(&mut text, empty),
+                            content: core::mem::replace(&mut text, empty),
                         })?;
                         self.doc.append_child(parent, text_id);
                     }
@@ -1179,23 +1179,23 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         // enough to overflow the stack).
         sub.input.set_depth(self.input.depth());
         // Move shared state into the sub-parser (returned below).
-        std::mem::swap(&mut sub.input.entity_map, &mut self.input.entity_map);
+        core::mem::swap(&mut sub.input.entity_map, &mut self.input.entity_map);
         sub.input.has_pe_references = self.input.has_pe_references;
         sub.input.has_external_dtd = self.input.has_external_dtd;
         sub.input.entity_expansions = self.input.entity_expansions;
-        std::mem::swap(&mut sub.attr_types, &mut self.attr_types);
-        std::mem::swap(&mut sub.attr_defaults, &mut self.attr_defaults);
-        std::mem::swap(&mut sub.ns, &mut self.ns);
+        core::mem::swap(&mut sub.attr_types, &mut self.attr_types);
+        core::mem::swap(&mut sub.attr_defaults, &mut self.attr_defaults);
+        core::mem::swap(&mut sub.ns, &mut self.ns);
 
         let sub_root = sub.doc.root();
         let result = sub.parse_content_fragment(sub_root);
 
         // Restore shared state regardless of outcome.
-        std::mem::swap(&mut self.input.entity_map, &mut sub.input.entity_map);
+        core::mem::swap(&mut self.input.entity_map, &mut sub.input.entity_map);
         self.input.entity_expansions = sub.input.entity_expansions;
-        std::mem::swap(&mut self.attr_types, &mut sub.attr_types);
-        std::mem::swap(&mut self.attr_defaults, &mut sub.attr_defaults);
-        std::mem::swap(&mut self.ns, &mut sub.ns);
+        core::mem::swap(&mut self.attr_types, &mut sub.attr_types);
+        core::mem::swap(&mut self.attr_defaults, &mut sub.attr_defaults);
+        core::mem::swap(&mut self.ns, &mut sub.ns);
         self.expansion_size = sub.expansion_size;
         if !sub.input.diagnostics.is_empty() {
             for diagnostic in sub.input.diagnostics.drain_all()? {
@@ -1326,7 +1326,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
             self.storage.charge(raw_bytes.len())?;
             if raw_bytes.contains(&b'&') {
-                let raw_str = std::str::from_utf8(raw_bytes)
+                let raw_str = core::str::from_utf8(raw_bytes)
                     .map_err(|_| self.input.fatal("invalid UTF-8 in raw attribute value"))?;
                 // Only store raw_value if it differs from the expanded value
                 // (i.e., it contained entity references that got expanded) AND

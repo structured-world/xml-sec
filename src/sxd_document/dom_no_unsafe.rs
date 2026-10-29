@@ -1,4 +1,5 @@
-use std::{fmt, hash};
+use alloc::{string::String, vec::Vec};
+use core::{fmt, hash};
 
 use super::{QName, raw};
 use crate::string_pool::InternedString;
@@ -15,7 +16,7 @@ pub struct Document<'d> {
 }
 
 /// Process-local identity for one document arena.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentIdentity {
     value: usize,
 }
@@ -124,6 +125,20 @@ impl<'d> PartialEq for Document<'d> {
     }
 }
 
+impl Eq for Document<'_> {}
+
+impl PartialOrd for Document<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Document<'_> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        self.identity.cmp(&other.identity)
+    }
+}
+
 impl hash::Hash for Document<'_> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.identity.hash(state);
@@ -132,7 +147,7 @@ impl hash::Hash for Document<'_> {
 
 impl fmt::Debug for Document<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Document {{ {:?} }}", std::ptr::from_ref(self))
+        write!(f, "Document {{ {:?} }}", core::ptr::from_ref(self))
     }
 }
 
@@ -171,6 +186,21 @@ macro_rules! node(
         }
 
         impl<'d> Eq for $name<'d> {}
+
+        // Identity order, consistent with equality: document, then arena slot.
+        impl<'d> PartialOrd for $name<'d> {
+            fn partial_cmp(&self, other: &$name<'d>) -> Option<core::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+
+        impl<'d> Ord for $name<'d> {
+            fn cmp(&self, other: &$name<'d>) -> core::cmp::Ordering {
+                self.document
+                    .cmp(&other.document)
+                    .then_with(|| self.node.cmp(&other.node))
+            }
+        }
 
         impl<'d> hash::Hash for $name<'d> {
             fn hash<H>(&self, state: &mut H)

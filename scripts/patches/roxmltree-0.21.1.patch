@@ -1760,7 +1760,7 @@
              Error::InvalidElementNamePrefix(pos) => pos,
              Error::DuplicatedNamespace(_, pos) => pos,
              Error::UnknownNamespace(_, pos) => pos,
-@@ -186,137 +254,113 @@
+@@ -186,141 +254,112 @@
              Error::InvalidCharacterData(pos) => pos,
              Error::UnknownToken(pos) => pos,
              Error::UnexpectedEndOfStream => TextPos::new(1, 1),
@@ -1937,10 +1937,14 @@
              }
 +            Error::UnknownToken(pos) => write!(f, "unknown token at {pos}"),
 +            Error::UnexpectedEndOfStream => f.write_str("unexpected end of stream"),
-+        }
-+    }
-+}
-+
+         }
+     }
+ }
+ 
+-#[cfg(feature = "std")]
+-impl std::error::Error for Error {
+-    fn description(&self) -> &str {
+-        "an XML parsing error"
 +impl<E> From<crate::xml::dom::ParseError> for Error<E> {
 +    fn from(error: crate::xml::dom::ParseError) -> Self {
 +        match error {
@@ -1948,19 +1952,16 @@
 +            #[cfg(feature = "xmldsig")]
 +            crate::xml::dom::ParseError::SharedExecution(error) => Self::SharedExecution(error),
 +            _ => unreachable!("XML storage strategy returns only allocation/execution failures"),
-         }
++        }
      }
  }
  
- #[cfg(feature = "std")]
--impl std::error::Error for Error {
--    fn description(&self) -> &str {
-+impl<E: fmt::Display + fmt::Debug> std::error::Error for Error<E> {
-+    fn description(&self) -> &'static str {
-         "an XML parsing error"
-     }
- }
-@@ -342,7 +386,7 @@
++impl<E: fmt::Display + fmt::Debug> core::error::Error for Error<E> {}
++
+ /// Parsing options.
+ pub struct ParsingOptions<'input> {
+     /// Allow DTD parsing.
+@@ -342,7 +381,7 @@
      ///
      /// Useful when dealing with random input to limit memory usage.
      ///
@@ -1969,7 +1970,7 @@
      pub nodes_limit: u32,
  
      /// Function to resolve external entities
-@@ -394,14 +438,14 @@
+@@ -394,14 +433,14 @@
      }
  }
  
@@ -1988,7 +1989,7 @@
      eq_len: u8,
  }
  
-@@ -415,7 +459,7 @@
+@@ -415,7 +454,7 @@
      ///
      /// # Examples
      ///
@@ -1997,7 +1998,7 @@
      /// let doc = roxmltree::Document::parse("<e/>").unwrap();
      /// assert_eq!(doc.descendants().count(), 2); // root node + `e` element node
      /// ```
-@@ -431,14 +475,24 @@
+@@ -431,14 +470,24 @@
      ///
      /// # Examples
      ///
@@ -2024,7 +2025,7 @@
      }
  }
  
-@@ -455,7 +509,7 @@
+@@ -455,7 +504,7 @@
      prefix_pos: usize,
  }
  
@@ -2033,7 +2034,7 @@
      #[inline]
      fn new_null() -> Self {
          Self {
-@@ -506,7 +560,7 @@
+@@ -506,7 +555,7 @@
  
  impl LoopDetector {
      #[inline]
@@ -2042,7 +2043,7 @@
          if self.depth < 10 {
              self.depth += 1;
              Ok(())
-@@ -528,7 +582,7 @@
+@@ -528,7 +577,7 @@
      }
  
      #[inline]
@@ -2051,7 +2052,7 @@
          if self.depth == 0 {
              // Allow infinite amount of references at zero depth.
              Ok(())
-@@ -543,27 +597,34 @@
+@@ -543,27 +592,34 @@
      }
  }
  
@@ -2096,7 +2097,7 @@
          let _ = range;
  
          let new_child_id = NodeId::from(self.doc.nodes.len());
-@@ -575,22 +636,23 @@
+@@ -575,22 +631,23 @@
              next_subtree: None,
              last_child: None,
              kind,
@@ -2124,7 +2125,7 @@
          }
  
          Ok(new_child_id)
-@@ -598,60 +660,94 @@
+@@ -598,60 +655,94 @@
  
      fn append_text(
          &mut self,
@@ -2245,7 +2246,7 @@
      };
  
      // Add a root node.
-@@ -661,32 +757,48 @@
+@@ -661,32 +752,48 @@
          next_subtree: None,
          last_child: None,
          kind: NodeKind::Root,
@@ -2302,7 +2303,7 @@
      if !doc.root().children().any(|n| n.is_element()) {
          return Err(Error::NoRootNode);
      }
-@@ -695,34 +807,69 @@
+@@ -695,34 +802,69 @@
          return Err(Error::UnclosedRootNode);
      }
  
@@ -2381,7 +2382,7 @@
  
                  if prefix == XMLNS {
                      let pos = self.doc.text_pos_at(start + 1);
-@@ -740,7 +887,7 @@
+@@ -740,7 +882,7 @@
                  process_attribute(range, qname_len, eq_len, prefix, local, value, self)?;
              }
              tokenizer::Token::ElementEnd(end, range) => {
@@ -2390,7 +2391,7 @@
                  process_element(end, range, self)?;
              }
              tokenizer::Token::Text(text, range) => {
-@@ -753,29 +900,30 @@
+@@ -753,29 +895,30 @@
  
          Ok(())
      }
@@ -2432,7 +2433,7 @@
          // The xmlns namespace MUST NOT be declared as the default namespace.
          if value.as_str() == NS_XMLNS_URI {
              let pos = ctx.doc.text_pos_at(range.start);
-@@ -804,10 +952,10 @@
+@@ -804,10 +947,10 @@
          if ctx
              .doc
              .namespaces
@@ -2445,7 +2446,7 @@
          }
  
          // Xml namespace should not be added to the namespaces.
-@@ -829,7 +977,7 @@
+@@ -829,7 +972,7 @@
  
          ctx.doc.namespaces.push_ns(None, value)?;
      } else {
@@ -2454,7 +2455,7 @@
          let _ = (qname_len, eq_len);
  
          ctx.current_attributes.push(TempAttributeData {
-@@ -837,21 +985,21 @@
+@@ -837,21 +980,21 @@
              local,
              value,
              range,
@@ -2482,7 +2483,7 @@
      if ctx.tag_name.name.is_empty() {
          // May occur in XML like this:
          // <!DOCTYPE test [ <!ENTITY p '</p>'> ]>
-@@ -861,12 +1009,11 @@
+@@ -861,12 +1004,11 @@
              return Err(Error::UnexpectedEntityCloseTag(
                  ctx.doc.text_pos_at(token_range.start),
              ));
@@ -2497,7 +2498,7 @@
      ctx.namespace_start_idx = ctx.doc.namespaces.tree_order.len();
  
      let attributes = resolve_attributes(namespaces, ctx)?;
-@@ -890,29 +1037,32 @@
+@@ -890,29 +1032,32 @@
                  },
                  ctx.tag_name.pos..token_range.end,
              )?;
@@ -2542,7 +2543,7 @@
  
              if let Some(id) = parent_node.parent {
                  ctx.parent_id = id;
-@@ -946,21 +1096,21 @@
+@@ -946,21 +1091,21 @@
                  },
                  ctx.tag_name.pos..token_range.end,
              )?;
@@ -2568,7 +2569,7 @@
              }
  
              for i in parent_ns.to_urange() {
-@@ -970,17 +1120,20 @@
+@@ -970,17 +1115,20 @@
                          .namespaces
                          .get(self.doc.namespaces.tree_order[i])
                          .name,
@@ -2593,7 +2594,7 @@
      if ctx.current_attributes.is_empty() {
          return Ok(ShortRange::new(0, 0));
      }
-@@ -991,7 +1144,7 @@
+@@ -991,7 +1139,7 @@
  
      let start_idx = ctx.doc.attributes.len();
  
@@ -2602,7 +2603,7 @@
          let namespace_idx = if attr.prefix == NS_XML_PREFIX {
              // The prefix 'xml' is by definition bound to the namespace name
              // http://www.w3.org/XML/1998/namespace. This namespace is added
-@@ -1011,60 +1164,74 @@
+@@ -1011,60 +1159,74 @@
          };
  
          // Check for duplicated attributes.
@@ -2696,7 +2697,7 @@
                          is_as_is = true;
                      }
                  }
-@@ -1073,7 +1240,7 @@
+@@ -1073,7 +1235,7 @@
                  is_as_is = false;
  
                  if !text_buffer.is_empty() {
@@ -2705,7 +2706,7 @@
                  }
  
                  ctx.loop_detector.inc_references(&stream)?;
-@@ -1088,7 +1255,9 @@
+@@ -1088,7 +1250,9 @@
                  let mut stream = Stream::from_substr(text, fragment.range());
                  let prev_tag_name = ctx.tag_name;
                  ctx.tag_name = TagNameSpan::new_null();
@@ -2716,7 +2717,7 @@
                  ctx.tag_name = prev_tag_name;
                  text_buffer.clear();
  
-@@ -1098,7 +1267,7 @@
+@@ -1098,7 +1262,7 @@
      }
  
      if !text_buffer.is_empty() {
@@ -2725,7 +2726,7 @@
      }
  
      Ok(())
-@@ -1106,26 +1275,27 @@
+@@ -1106,26 +1270,27 @@
  
  // While the whole purpose of CDATA is to indicate to an XML library that this text
  // has to be stored as is, carriage return (`\r`) is still has to be replaced with `\n`.
@@ -2760,7 +2761,7 @@
  
          text = if rest.as_bytes().get(1) == Some(&b'\n') {
              &rest[2..]
-@@ -1136,9 +1306,9 @@
+@@ -1136,9 +1301,9 @@
          pos = memchr(b'\r', text.as_bytes());
      }
  
@@ -2772,7 +2773,7 @@
      Ok(())
  }
  
-@@ -1148,7 +1318,33 @@
+@@ -1148,7 +1313,33 @@
      Text(StrSpan<'a>),
  }
  
@@ -2807,7 +2808,7 @@
      debug_assert!(!stream.at_end());
  
      // Safe, because we already checked that stream is not at the end.
-@@ -1160,13 +1356,14 @@
+@@ -1160,13 +1351,14 @@
          let start = stream.pos();
          match stream.consume_reference() {
              Some(Reference::Char(ch)) => Ok(NextChunk::Char(ch)),
@@ -2827,7 +2828,7 @@
                  }),
              None => {
                  let pos = stream.gen_text_pos_from(start);
-@@ -1180,22 +1377,31 @@
+@@ -1180,22 +1372,31 @@
  }
  
  // https://www.w3.org/TR/REC-xml/#AVNormalize
@@ -2867,7 +2868,7 @@
      let mut stream = Stream::from_substr(ctx.doc.text, text.range());
      while !stream.at_end() {
          // Safe, because we already checked that the stream is not at the end.
-@@ -1203,7 +1409,7 @@
+@@ -1203,7 +1404,7 @@
  
          if c != b'&' {
              stream.advance(1);
@@ -2876,7 +2877,7 @@
              continue;
          }
  
-@@ -1221,26 +1427,26 @@
+@@ -1221,26 +1422,26 @@
                              ));
                          }
  
@@ -2914,7 +2915,7 @@
              None => {
                  let pos = stream.gen_text_pos_from(start);
                  return Err(Error::MalformedEntityReference(pos));
-@@ -1251,12 +1457,12 @@
+@@ -1251,12 +1452,12 @@
      Ok(())
  }
  
@@ -2930,7 +2931,7 @@
      // Prefix CAN be empty when the default namespace was defined.
      //
      // Example:
-@@ -1267,38 +1473,48 @@
+@@ -1267,38 +1468,48 @@
          Some(prefix)
      };
  
@@ -2995,7 +2996,7 @@
      }
  }
  
-@@ -1326,11 +1542,11 @@
+@@ -1326,11 +1537,11 @@
          if self.idx < 4 {
              let b = self.buf[self.idx as usize];
  
@@ -3010,7 +3011,7 @@
              }
          }
  
-@@ -1338,27 +1554,29 @@
+@@ -1338,27 +1549,29 @@
      }
  }
  
@@ -3051,7 +3052,7 @@
          }
  
          // \n, \r and \t should be converted into spaces.
-@@ -1367,27 +1585,28 @@
+@@ -1367,27 +1580,28 @@
              _ => current,
          };
  
@@ -3086,7 +3087,7 @@
      }
  
      #[inline]
-@@ -1401,8 +1620,8 @@
+@@ -1401,8 +1615,8 @@
      }
  
      #[inline]

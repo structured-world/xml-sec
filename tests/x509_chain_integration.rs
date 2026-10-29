@@ -1,10 +1,6 @@
 #![cfg(feature = "xmldsig")]
 
-use std::{
-    fs,
-    path::Path,
-    time::{Duration, UNIX_EPOCH},
-};
+use std::{fs, path::Path};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use der::{Decode as _, Encode as _, asn1::BitString};
@@ -15,12 +11,13 @@ use rcgen::{
     RevokedCertParams, SerialNumber, date_time_ymd,
 };
 use xml_sec::XmlDomDocument as Document;
+use xml_sec::policy::Instant;
 use xml_sec::xmldsig::{
     KeyInfoSource, X509ChainError, X509ChainOptions, X509DataInfo, parse_key_info,
     verify_x509_certificate_chain,
 };
 
-const VERIFICATION_TIME: u64 = 1_773_964_800; // 2026-03-20T00:00:00Z
+const VERIFICATION_TIME: i64 = 1_773_964_800; // 2026-03-20T00:00:00Z
 
 #[test]
 fn default_path_validation_preflights_every_evidence_source() {
@@ -237,7 +234,7 @@ fn options(trusted_certs: &[Vec<u8>], check_crls: bool) -> X509ChainOptions<'_> 
                 .expect("test UTC facts"),
         ),
         trusted_certs,
-        verification_time: UNIX_EPOCH + Duration::from_secs(VERIFICATION_TIME),
+        verification_time: Instant::new(VERIFICATION_TIME, 0).unwrap(),
         max_chain_depth: 3,
         check_crls,
         allowed_extended_key_usages: None,
@@ -710,7 +707,7 @@ fn rejects_expired_leaf_at_selected_verification_time() {
     let info = parsed_chain("rsa/rsa-expired-cert.pem", None);
     let anchors = [fixture("cacert.pem")];
     let mut expired_time = options(&anchors, false);
-    expired_time.verification_time = UNIX_EPOCH + Duration::from_hours(493_008);
+    expired_time.verification_time = Instant::new(493_008 * 3600, 0).unwrap();
 
     assert_eq!(
         verify_x509_certificate_chain(&info, &expired_time),
@@ -832,7 +829,7 @@ fn crl_time_qualification_requires_explicit_covered_utc_facts() {
         verify_x509_certificate_chain(&info, &inputs),
         Err(X509ChainError::MissingUtcFacts)
     );
-    let verification_second = i64::try_from(VERIFICATION_TIME).unwrap();
+    let verification_second = VERIFICATION_TIME;
     inputs.utc_facts = Some(
         structured_pkix::temporal::LeapTable::new(
             verification_second - 1,
@@ -854,10 +851,7 @@ fn crl_time_qualification_requires_explicit_covered_utc_facts() {
         Err(X509ChainError::Revoked(0))
     );
     let at_date = |year, month, day| {
-        UNIX_EPOCH
-            + Duration::from_secs(
-                u64::try_from(date_time_ymd(year, month, day).unix_timestamp()).unwrap(),
-            )
+        Instant::new(date_time_ymd(year, month, day).unix_timestamp(), 0).unwrap()
     };
     inputs.verification_time = at_date(2026, 3, 15);
     assert_eq!(verify_x509_certificate_chain(&info, &inputs), Ok(()));
@@ -866,7 +860,11 @@ fn crl_time_qualification_requires_explicit_covered_utc_facts() {
         verify_x509_certificate_chain(&info, &inputs),
         Err(X509ChainError::Revoked(0))
     );
-    inputs.verification_time += Duration::from_nanos(1);
+    inputs.verification_time = Instant::new(
+        inputs.verification_time.seconds(),
+        inputs.verification_time.nanos() + 1,
+    )
+    .unwrap();
     assert_eq!(
         verify_x509_certificate_chain(&info, &inputs),
         Err(X509ChainError::InvalidCrl(0))

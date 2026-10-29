@@ -5,11 +5,15 @@
 use crate::sxd_document as sxd_document_no_unsafe;
 use sxd_document_no_unsafe::QName;
 
-use std::cell::Cell;
+use alloc::{boxed::Box, string::String, vec::Vec};
+use core::cell::Cell;
+use core::iter;
+#[cfg(any(feature = "std", not(feature = "embedded")))]
 use std::collections::{HashMap, hash_map::RandomState};
+#[cfg(any(feature = "std", not(feature = "embedded")))]
 use std::hash::{BuildHasher, Hash, Hasher};
-use std::iter;
 
+use crate::collections::Map;
 use crate::function;
 use crate::nodeset::{Node, OrderedNodes};
 use crate::{OwnedQName, Value};
@@ -19,7 +23,7 @@ type Functions<'f> = QNameMap<Box<dyn function::Function + 'f>>;
 /// A mapping of names to `XPath` variables.
 type Variables<'d> = QNameMap<Value<'d>>;
 /// A mapping of namespace prefixes to namespace URIs.
-type Namespaces = HashMap<String, String>;
+type Namespaces = Map<String, String>;
 
 // A root resolver works for the input node's document lifetime; it must not
 // pin an otherwise empty context to one document or make that lifetime invariant.
@@ -45,11 +49,56 @@ fn view_function<'f>(
     None
 }
 
+/// Caller-registered functions and variables. Without std there is no hash
+/// seed; these few application-chosen names are then scanned in order.
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+struct QNameMap<V> {
+    entries: Vec<(OwnedQName, V)>,
+}
+
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+impl<V> Default for QNameMap<V> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+impl<V> QNameMap<V> {
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn insert(&mut self, name: OwnedQName, value: V) {
+        if let Some((_, previous)) = self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| candidate == &name)
+        {
+            *previous = value;
+        } else {
+            self.entries.push((name, value));
+        }
+    }
+
+    fn get(&self, name: QName<'_>) -> Option<&V> {
+        self.entries.iter().find_map(|(candidate, value)| {
+            (candidate.namespace_uri() == name.namespace_uri()
+                && candidate.local_part() == name.local_part())
+            .then_some(value)
+        })
+    }
+}
+
+#[cfg(any(feature = "std", not(feature = "embedded")))]
 struct QNameMap<V> {
     buckets: HashMap<u64, Vec<(OwnedQName, V)>>,
     names: RandomState,
 }
 
+#[cfg(any(feature = "std", not(feature = "embedded")))]
 impl<V> Default for QNameMap<V> {
     fn default() -> Self {
         Self {
@@ -59,6 +108,7 @@ impl<V> Default for QNameMap<V> {
     }
 }
 
+#[cfg(any(feature = "std", not(feature = "embedded")))]
 impl<V> QNameMap<V> {
     fn len(&self) -> usize {
         self.buckets.values().map(Vec::len).sum()
@@ -646,7 +696,7 @@ fn release_allocation(
 /// An iterator for the contexts of each node in a nodeset
 pub struct EvaluationNodesetIter<'c, 'd> {
     parent: Evaluation<'c, 'd>,
-    nodes: iter::Enumerate<::std::vec::IntoIter<Node<'d>>>,
+    nodes: iter::Enumerate<alloc::vec::IntoIter<Node<'d>>>,
     size: usize,
 }
 
@@ -692,7 +742,7 @@ mod tests {
         ];
         let mut context = super::ScopedContext::new();
         context.set_function_view(&functions);
-        assert!(context.functions.buckets.is_empty());
+        assert_eq!(context.functions.len(), 0);
         assert_eq!(context.function_count(), 26);
         let package = sxd_document_no_unsafe::Package::new();
         let root = package.as_document().root();
@@ -756,7 +806,7 @@ mod tests {
         // A fresh security query must not allocate an unaccounted registry of
         // immutable core functions before current-execution admission exists.
         let context = super::ScopedContext::new();
-        assert!(context.functions.buckets.is_empty());
+        assert_eq!(context.functions.len(), 0);
         assert_eq!(context.function_count(), 25);
         let package = sxd_document_no_unsafe::Package::new();
         let evaluation = super::Evaluation::new(&context, package.as_document().root().into());

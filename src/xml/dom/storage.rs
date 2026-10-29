@@ -1,6 +1,10 @@
 //! Storage vocabulary for the single semantic-tree construction kernel.
 
-use std::{
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
+use core::{
     fmt::Debug,
     ops::{Deref, DerefMut},
 };
@@ -16,8 +20,8 @@ pub(crate) mod names;
 pub trait Storage:
     Copy + Debug + crate::xml_input::lexical::storage::Storage<Label = Self::Text>
 {
-    type Text: AsRef<str> + Deref<Target = str> + Debug + std::fmt::Display;
-    type FrozenText: AsRef<str> + Deref<Target = str> + Debug + std::fmt::Display;
+    type Text: AsRef<str> + Deref<Target = str> + Debug + core::fmt::Display;
+    type FrozenText: AsRef<str> + Deref<Target = str> + Debug + core::fmt::Display;
     type Values<T>: Values<T>;
     type Declarations<'input>: super::preflight::Declarations<'input, Self>;
     type ParseFailure: From<ParseError>;
@@ -30,7 +34,7 @@ pub trait Storage:
     fn declarations<'input>(&self) -> Self::Declarations<'input>;
     fn text(&self, value: &str) -> Result<Self::Text, ParseError>;
     fn freeze(value: Self::Text) -> Self::FrozenText;
-    fn formatted(&self, arguments: std::fmt::Arguments<'_>) -> Result<Self::Text, ParseError> {
+    fn formatted(&self, arguments: core::fmt::Arguments<'_>) -> Result<Self::Text, ParseError> {
         let mut text = self.text("")?;
         self.format_into(&mut text, arguments)?;
         Ok(text)
@@ -38,23 +42,23 @@ pub trait Storage:
     fn format_into(
         &self,
         text: &mut Self::Text,
-        arguments: std::fmt::Arguments<'_>,
+        arguments: core::fmt::Arguments<'_>,
     ) -> Result<(), ParseError> {
         struct Writer<'a, S: Storage> {
             storage: S,
             text: &'a mut S::Text,
             failure: Option<ParseError>,
         }
-        impl<S: Storage> std::fmt::Write for Writer<'_, S> {
-            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        impl<S: Storage> core::fmt::Write for Writer<'_, S> {
+            fn write_str(&mut self, value: &str) -> core::fmt::Result {
                 if self.failure.is_some() {
-                    return Err(std::fmt::Error);
+                    return Err(core::fmt::Error);
                 }
                 match self.storage.append(self.text, value) {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         self.failure = Some(error);
-                        Err(std::fmt::Error)
+                        Err(core::fmt::Error)
                     }
                 }
             }
@@ -64,7 +68,7 @@ pub trait Storage:
             text,
             failure: None,
         };
-        let result = std::fmt::write(&mut writer, arguments);
+        let result = core::fmt::write(&mut writer, arguments);
         if let Some(error) = writer.failure {
             return Err(error);
         }
@@ -90,7 +94,7 @@ pub trait Values<T>: Deref<Target = [T]> + DerefMut + IntoIterator<Item = T> {
     fn drain_all(
         &mut self,
     ) -> Result<
-        impl DoubleEndedIterator<Item = T> + ExactSizeIterator + std::iter::FusedIterator + '_,
+        impl DoubleEndedIterator<Item = T> + ExactSizeIterator + core::iter::FusedIterator + '_,
         ParseError,
     >;
     fn extend_copy(&mut self, values: &[T]) -> Result<(), ParseError>
@@ -115,7 +119,7 @@ pub struct Native;
 
 impl crate::xml_input::lexical::storage::Storage for Native {
     type Label = String;
-    type Refusal = std::collections::TryReserveError;
+    type Refusal = alloc::collections::TryReserveError;
     type Attributes<'a> = Vec<crate::xml_input::lexical::Attribute<'a>>;
 
     fn attributes<'a>(&self) -> Self::Attributes<'a> {
@@ -136,7 +140,7 @@ impl<T> Values<T> for Vec<T> {
     fn drain_all(
         &mut self,
     ) -> Result<
-        impl DoubleEndedIterator<Item = T> + ExactSizeIterator + std::iter::FusedIterator + '_,
+        impl DoubleEndedIterator<Item = T> + ExactSizeIterator + core::iter::FusedIterator + '_,
         ParseError,
     > {
         Ok(self.drain(..))
@@ -168,7 +172,7 @@ impl Storage for Native {
     type Text = String;
     type FrozenText = String;
     type Values<T> = Vec<T>;
-    type Declarations<'input> = std::collections::HashMap<
+    type Declarations<'input> = crate::collections::Map<
         super::preflight::DtdAttributeName<'input>,
         super::preflight::DtdAttributeInfo,
     >;
@@ -185,7 +189,7 @@ impl Storage for Native {
     }
 
     fn declarations<'input>(&self) -> Self::Declarations<'input> {
-        std::collections::HashMap::new()
+        crate::collections::Map::new()
     }
     fn freeze(value: String) -> String {
         value
@@ -249,7 +253,7 @@ pub(crate) struct Accounted<'w, W: structured_asn1::memory::Work>(pub &'w W);
 impl<W: structured_asn1::memory::Work> Copy for Accounted<'_, W> {}
 #[cfg(feature = "xmldsig")]
 impl<W: structured_asn1::memory::Work> Debug for Accounted<'_, W> {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str("AccountedXmlStorage")
     }
 }
@@ -304,7 +308,7 @@ impl<W: structured_asn1::memory::Work> Storage for Accounted<'_, W> {
     fn normalize_id(&self, value: &mut Self::Text) -> Result<(), ParseError> {
         self.charge(value.len())?;
         let empty = self.text("")?;
-        let mut bytes = std::mem::replace(value, empty).into_bytes();
+        let mut bytes = core::mem::replace(value, empty).into_bytes();
         let mut output = 0;
         let mut previous_space = true;
         for index in 0..bytes.len() {
@@ -357,7 +361,7 @@ impl<T, W: structured_asn1::memory::Work> Values<T> for structured_asn1::memory:
     fn drain_all(
         &mut self,
     ) -> Result<
-        impl DoubleEndedIterator<Item = T> + ExactSizeIterator + std::iter::FusedIterator + '_,
+        impl DoubleEndedIterator<Item = T> + ExactSizeIterator + core::iter::FusedIterator + '_,
         ParseError,
     > {
         Ok(self.try_drain_all()?)

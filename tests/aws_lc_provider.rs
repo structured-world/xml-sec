@@ -227,7 +227,7 @@ fn inventory_imports_native_handles_without_bypassing_authorization() {
             .is_err()
     );
     let denied = SigningPolicy {
-        signature_algorithms: Some(std::collections::HashSet::new()),
+        signature_algorithms: Some(std::collections::BTreeSet::new()),
         ..SigningPolicy::default()
     };
     assert!(

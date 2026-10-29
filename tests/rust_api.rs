@@ -582,8 +582,8 @@ fn request_ids_template_selection_and_owned_input_reach_each_backend() {
 }
 
 fn external_policies() -> CompiledPolicies {
-    use std::time::{Duration, SystemTime};
-    use xml_sec::policy::PolicyValidity;
+    use std::time::SystemTime;
+    use xml_sec::policy::{Instant, PolicyValidity, instant_from_system_time};
     use xml_sec::xmldsig::UriTypeSet;
     let compiler = PolicyCompiler::new(PolicyProfile::Modern, &RustCryptoProvider, None).unwrap();
     let mut replacement = compiler.policies().clone();
@@ -593,7 +593,7 @@ fn external_policies() -> CompiledPolicies {
     {
         replacement.decryption.as_mut().unwrap().uris.references = UriTypeSet::ALL;
     }
-    let now = SystemTime::now();
+    let now = instant_from_system_time(SystemTime::now()).unwrap();
     compiler
         .authorize_replacement(
             replacement,
@@ -602,7 +602,7 @@ fn external_policies() -> CompiledPolicies {
                 authority: "test caller".into(),
                 reason: "caller-supplied detached bytes".into(),
                 not_before: now,
-                expires_at: now + Duration::from_secs(3600),
+                expires_at: Instant::new(now.seconds() + 3600, now.nanos()).unwrap(),
             },
         )
         .unwrap()
@@ -622,7 +622,7 @@ fn detached_signatures_use_only_request_supplied_external_bytes() {
     let sign_key = HmacSigningKey::new(vec![4; 32]).unwrap();
     let verify_key = HmacVerificationKey::new(vec![4; 32]).unwrap();
     let inputs =
-        std::collections::HashMap::from([("urn:test:input".into(), b"detached bytes".to_vec())]);
+        std::collections::BTreeMap::from([("urn:test:input".into(), b"detached bytes".to_vec())]);
     let builder = SignatureBuilder::new(
         C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
         SignatureAlgorithm::HmacSha256,
@@ -663,7 +663,7 @@ fn detached_signatures_use_only_request_supplied_external_bytes() {
         DsigStatus::Invalid(FailureReason::ReferenceUnavailable { ref_index: 0 })
     );
     let changed =
-        std::collections::HashMap::from([("urn:test:input".into(), b"changed bytes".to_vec())]);
+        std::collections::BTreeMap::from([("urn:test:input".into(), b"changed bytes".to_vec())]);
     assert!(
         !verifier
             .verify(
@@ -733,7 +733,7 @@ fn recovery_request_ids_and_external_ciphertext_are_not_implicit() {
     let ciphertext = base64::engine::general_purpose::STANDARD
         .decode(value)
         .unwrap();
-    let inputs = std::collections::HashMap::from([("urn:test:cipher".into(), ciphertext)]);
+    let inputs = std::collections::BTreeMap::from([("urn:test:cipher".into(), ciphertext)]);
     let detached = format!(
         "<x:EncryptedData xmlns:x='http://www.w3.org/2001/04/xmlenc#'><x:EncryptionMethod Algorithm='{}'/><x:CipherData><x:CipherReference URI='urn:test:cipher'/></x:CipherData></x:EncryptedData>",
         DataEncryptionAlgorithm::Aes128Gcm.uri()

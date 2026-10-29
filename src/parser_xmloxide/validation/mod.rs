@@ -16,7 +16,8 @@
 
 pub mod dtd;
 
-use std::fmt;
+use alloc::{string::String, vec::Vec};
+use core::fmt;
 
 /// Result of validating a document against a schema (DTD, `RelaxNG`, XSD, etc.).
 ///

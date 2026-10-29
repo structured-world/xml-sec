@@ -1,6 +1,6 @@
 //! Parser-independent retained XML tree consumed by XML Security algorithms.
 
-use std::{
+use core::{
     hash::{Hash, Hasher},
     ops::Range,
 };
@@ -105,8 +105,8 @@ pub(super) struct NamespaceData<S: Storage = Native> {
     pub(super) uri: S::Text,
 }
 
-impl<S: Storage> std::fmt::Debug for AttributeData<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for AttributeData<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("AttributeData")
             .field("name", &self.name)
             .field("namespace", &self.namespace)
@@ -128,8 +128,8 @@ impl<S: Storage> PartialEq for AttributeData<S> {
     }
 }
 impl<S: Storage> Eq for AttributeData<S> {}
-impl<S: Storage> std::fmt::Debug for NamespaceData<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for NamespaceData<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NamespaceData")
             .field("prefix", &self.prefix)
             .field("uri", &self.uri)
@@ -159,8 +159,8 @@ where
         }
     }
 }
-impl<S: Storage> std::fmt::Debug for NodeKind<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for NodeKind<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Root => f.write_str("Root"),
             Self::Text(value) => f.debug_tuple("Text").field(value).finish(),
@@ -231,8 +231,8 @@ impl<S: Storage> PartialEq for NodeKind<S> {
     }
 }
 impl<S: Storage> Eq for NodeKind<S> {}
-impl<S: Storage> std::fmt::Debug for NodeData<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for NodeData<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NodeData")
             .field("parent", &self.parent)
             .field("children", &&self.children[..])
@@ -451,8 +451,8 @@ pub struct Document<'input, S: Storage = Native> {
     xpath_nodes: u32,
 }
 
-impl<S: Storage> std::fmt::Debug for Document<'_, S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for Document<'_, S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Document")
             .field("input", &self.input)
             .field("nodes", &&self.nodes[..])
@@ -631,8 +631,8 @@ pub struct Node<'a, 'input, S: Storage = Native> {
     id: NodeId,
 }
 
-impl<S: Storage> std::fmt::Debug for Node<'_, '_, S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for Node<'_, '_, S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Node")
             .field("document", &self.document)
             .field("id", &self.id)
@@ -641,13 +641,13 @@ impl<S: Storage> std::fmt::Debug for Node<'_, '_, S> {
 }
 impl<S: Storage> PartialEq for Node<'_, '_, S> {
     fn eq(&self, other: &Self) -> bool {
-        std::ptr::eq(self.document, other.document) && self.id == other.id
+        core::ptr::eq(self.document, other.document) && self.id == other.id
     }
 }
 impl<S: Storage> Eq for Node<'_, '_, S> {}
 impl<S: Storage> Hash for Node<'_, '_, S> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        std::ptr::from_ref(self.document).hash(state);
+        core::ptr::from_ref(self.document).hash(state);
         self.id.hash(state);
     }
 }
@@ -1046,7 +1046,7 @@ impl<'a, S: Storage> Attribute<'a, S> {
 
 /// Iterator over element attributes.
 pub struct Attributes<'a, S: Storage = Native> {
-    values: std::slice::Iter<'a, AttributeData<S>>,
+    values: core::slice::Iter<'a, AttributeData<S>>,
 }
 impl<'a, S: Storage> Iterator for Attributes<'a, S> {
     type Item = Attribute<'a, S>;
@@ -1082,7 +1082,7 @@ impl<'a, S: Storage> Namespace<'a, S> {
 
 /// Iterator over in-scope namespace bindings.
 pub struct Namespaces<'a, S: Storage = Native> {
-    values: std::slice::Iter<'a, NamespaceData<S>>,
+    values: core::slice::Iter<'a, NamespaceData<S>>,
 }
 impl<'a, S: Storage> Iterator for Namespaces<'a, S> {
     type Item = Namespace<'a, S>;
@@ -1110,7 +1110,7 @@ pub struct PI<'a> {
 /// Iterator over direct child nodes.
 pub struct Children<'a, 'input, S: Storage = Native> {
     document: &'a Document<'input, S>,
-    ids: std::slice::Iter<'a, NodeId>,
+    ids: core::slice::Iter<'a, NodeId>,
 }
 impl<'a, 'input, S: Storage> Iterator for Children<'a, 'input, S> {
     type Item = Node<'a, 'input, S>;
@@ -1389,7 +1389,7 @@ mod tests {
 
     #[test]
     fn every_backend_enforces_the_same_active_namespace_ceiling() {
-        use std::fmt::Write as _;
+        use core::fmt::Write as _;
         // Backend selection must not change whether an adversarial namespace
         // stack is accepted. The 1024th binding is valid; the 1025th is not.
         let mut declarations = String::new();

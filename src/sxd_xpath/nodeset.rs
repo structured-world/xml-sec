@@ -2,16 +2,23 @@
 
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
-use std::borrow::ToOwned;
-use std::collections::HashSet;
-use std::collections::hash_set;
-use std::iter::{FromIterator, IntoIterator};
+#[cfg(feature = "embedded")]
+use alloc::string::ToString;
+use alloc::{
+    borrow::{Cow, ToOwned},
+    format,
+    string::String,
+    vec::Vec,
+};
+use core::iter::{FromIterator, IntoIterator};
+use core::mem::size_of;
 use sxd_document_no_unsafe::NsStr;
 use sxd_document_no_unsafe::QName;
 use sxd_document_no_unsafe::dom;
 
 #[path = "nodeset/storage.rs"]
 pub(crate) mod storage;
+use crate::collections::{Set, set};
 use storage::Storage;
 
 #[cfg(feature = "no-unsafe")]
@@ -67,7 +74,7 @@ macro_rules! conversion_trait(
 ///
 /// This differs from the DOM, which does not treat namespaces as a
 /// separate item.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Namespace<'d> {
     pub parent: dom::Element<'d>,
     pub prefix: NsStr<'d>,
@@ -142,10 +149,10 @@ pub(crate) fn visit_namespace_bindings_in<
     mut visit: impl FnMut(
         DeclarationText<'_, 'd>,
         DeclarationText<'_, 'd>,
-    ) -> Result<std::ops::ControlFlow<()>, E>,
+    ) -> Result<core::ops::ControlFlow<()>, E>,
 ) -> Result<(), E> {
     use crate::runtime::NamespaceSet;
-    use std::ops::ControlFlow;
+    use core::ops::ControlFlow;
     // XPath 1.0 §5.4 supplies xml independently of declarations. Emit it
     // before allocating shadow state; no ancestor can override this binding.
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#namespace-nodes
@@ -196,7 +203,7 @@ pub(crate) fn visit_namespace_bindings_in<
 }
 
 /// Any of the various types of nodes found in an XML document.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Node<'d> {
     Root(dom::Root<'d>),
     Element(dom::Element<'d>),
@@ -256,10 +263,10 @@ impl<'d> Node<'d> {
                         output = runtime.empty_text()?;
                         runtime.append_text(context, &mut output, prefix)?;
                         if preferred.is_none() || preferred == Some(prefix) {
-                            return Ok(std::ops::ControlFlow::Break(()));
+                            return Ok(core::ops::ControlFlow::Break(()));
                         }
                     }
-                    Ok::<_, crate::function::Error>(std::ops::ControlFlow::Continue(()))
+                    Ok::<_, crate::function::Error>(core::ops::ControlFlow::Continue(()))
                 })?;
             }
             if !output.is_empty() {
@@ -853,7 +860,7 @@ impl<'d> TextStack<'d> for Vec<(Node<'d>, usize)> {
 
 struct TextFrames<'s, 'd, S: TextStack<'d>> {
     stack: &'s mut S,
-    lifetime: std::marker::PhantomData<&'d ()>,
+    lifetime: core::marker::PhantomData<&'d ()>,
 }
 
 impl<'d, S: TextStack<'d>> Drop for TextFrames<'_, 'd, S> {
@@ -882,7 +889,7 @@ fn visit_descendant_text_using_stack<'d>(
 ) -> Result<(), crate::function::Error> {
     let frames = TextFrames {
         stack,
-        lifetime: std::marker::PhantomData,
+        lifetime: core::marker::PhantomData,
     };
     if work == StringValueWork::Extension {
         context.charge_extension_work(1)?;
@@ -1261,7 +1268,7 @@ fn order_path_in<'a, R: crate::runtime::Runtime>(
     let mut path = runtime.list();
     // Borrow the starting identity: safe-backend namespace handles own strings.
     // Ancestor identities are fixed-size element/root handles, not namespace copies.
-    let mut current = std::borrow::Cow::Borrowed(node);
+    let mut current = Cow::Borrowed(node);
     while let Some(parent) = current.parent() {
         if let Some(context) = context {
             context.charge_work(1)?;
@@ -1302,20 +1309,21 @@ fn order_path_in<'a, R: crate::runtime::Runtime>(
             path.reserve(1)?;
             path.push(step)?;
         }
-        current = std::borrow::Cow::Owned(parent);
+        current = Cow::Owned(parent);
     }
     path.reverse();
     Ok(path)
 }
 
-pub(crate) fn reserve_hashset_slot<T: Eq + std::hash::Hash>(
-    values: &mut HashSet<T>,
+#[cfg(any(feature = "std", not(feature = "embedded")))]
+pub(crate) fn reserve_hashset_slot<T: Eq + ::core::hash::Hash>(
+    values: &mut Set<T>,
     context: &crate::context::Evaluation<'_, '_>,
 ) -> Result<(), crate::function::Error> {
     if values.len() < values.capacity() {
         return Ok(());
     }
-    context.reserve_temporary_allocation(hashset_growth_bytes::<T>(values.len())?)?;
+    context.reserve_temporary_allocation(set_slot_bytes::<T>(values.len())?)?;
     values
         .try_reserve(1)
         .map_err(|_| crate::function::Error::Other {
@@ -1323,7 +1331,34 @@ pub(crate) fn reserve_hashset_slot<T: Eq + std::hash::Hash>(
         })
 }
 
-pub(crate) fn hashset_growth_bytes<T>(current_len: usize) -> Result<usize, crate::function::Error> {
+/// Charges one insertion into the ordered set used without std. A tree
+/// allocates nodes as it grows instead of reserving.
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+pub(crate) fn reserve_hashset_slot<T: Ord>(
+    values: &mut Set<T>,
+    context: &crate::context::Evaluation<'_, '_>,
+) -> Result<(), crate::function::Error> {
+    context.reserve_temporary_allocation(set_slot_bytes::<T>(values.len())?)?;
+    Ok(())
+}
+
+/// Bytes charged for the next insertion into the ordered set used without
+/// std: its share of an internal node at the minimum occupancy of five keys.
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+pub(crate) fn set_slot_bytes<T>(_current_len: usize) -> Result<usize, crate::function::Error> {
+    // std's B-tree: 11 keys and 12 edges per internal node, plus the parent link.
+    size_of::<T>()
+        .checked_mul(11)
+        .and_then(|keys| keys.checked_add(14 * size_of::<usize>()))
+        .map(|node| node.div_ceil(5))
+        .ok_or_else(|| crate::function::Error::Other {
+            what: "XPath set capacity overflow".into(),
+        })
+}
+
+/// Bytes charged for the next insertion into the hash set used with std.
+#[cfg(any(feature = "std", not(feature = "embedded")))]
+pub(crate) fn set_slot_bytes<T>(current_len: usize) -> Result<usize, crate::function::Error> {
     // std's SwissTable uses power-of-two buckets at at most 7/8 occupancy, plus
     // a control byte per bucket and a SIMD control group. Charge the whole new
     // allocation: the old table remains live during rehash, not just its delta.
@@ -1333,7 +1368,7 @@ pub(crate) fn hashset_growth_bytes<T>(current_len: usize) -> Result<usize, crate
         .and_then(|scaled| scaled.checked_add(6))
         .and_then(|scaled| (scaled / 7).checked_next_power_of_two())
         .map(|buckets| buckets.max(4))
-        .and_then(|buckets| buckets.checked_mul(std::mem::size_of::<T>().saturating_add(1)))
+        .and_then(|buckets| buckets.checked_mul(size_of::<T>().saturating_add(1)))
         .and_then(|bytes| bytes.checked_add(16))
         .ok_or_else(|| crate::function::Error::Other {
             what: "XPath set capacity overflow".into(),
@@ -1348,7 +1383,7 @@ fn reserve_metered_vec_slot<T>(
         return Ok(());
     }
     let additional = values.capacity().max(4);
-    context.reserve_temporary_allocation(additional.saturating_mul(std::mem::size_of::<T>()))?;
+    context.reserve_temporary_allocation(additional.saturating_mul(size_of::<T>()))?;
     values
         .try_reserve_exact(additional)
         .map_err(|_| crate::function::Error::Other {
@@ -1396,7 +1431,7 @@ impl<'d> FromIterator<Node<'d>> for Nodeset<'d> {
 }
 
 pub struct Iter<'a, 'd> {
-    iter: hash_set::Iter<'a, Node<'d>>,
+    iter: set::Iter<'a, Node<'d>>,
 }
 
 impl<'a, 'd: 'a> Iterator for Iter<'a, 'd> {
@@ -1407,7 +1442,7 @@ impl<'a, 'd: 'a> Iterator for Iter<'a, 'd> {
 }
 
 pub struct IntoIter<'d> {
-    iter: hash_set::IntoIter<Node<'d>>,
+    iter: set::IntoIter<Node<'d>>,
 }
 
 impl<'d> Iterator for IntoIter<'d> {
@@ -1807,7 +1842,7 @@ mod test {
             root.append_child(doc.create_element("empty"));
         }
         let mut context = crate::context::Context::new();
-        context.set_string_allocation_limit(4 * std::mem::size_of::<(Node<'_>, usize)>());
+        context.set_string_allocation_limit(4 * size_of::<(Node<'_>, usize)>());
         let evaluation = crate::context::Evaluation::new(&context, doc.root().into());
 
         assert_eq!(
@@ -1855,7 +1890,7 @@ mod test {
         let package = Package::new();
         let document = package.as_document();
         let mut context = crate::context::Context::new();
-        context.set_string_allocation_limit(std::mem::size_of::<Node<'_>>());
+        context.set_string_allocation_limit(size_of::<Node<'_>>());
         let evaluation = crate::context::Evaluation::new(&context, document.root().into());
         assert!(
             Nodeset::new()
@@ -1864,7 +1899,7 @@ mod test {
         );
 
         let mut context = crate::context::Context::new();
-        context.set_string_allocation_limit(std::mem::size_of::<Node<'_>>());
+        context.set_string_allocation_limit(size_of::<Node<'_>>());
         let evaluation = crate::context::Evaluation::new(&context, document.root().into());
         assert!(
             super::OrderedNodes::new()
@@ -1925,7 +1960,7 @@ mod test {
             } else {
                 let ordered = ordered.expect("funded document order");
                 assert_eq!(&ordered[..], &[parent.into(), first.into(), last.into()]);
-                assert!(work.used() >= ordered.len() * std::mem::size_of::<Node<'_>>());
+                assert!(work.used() >= ordered.len() * size_of::<Node<'_>>());
                 drop(ordered);
             }
             assert_eq!(work.used(), 0);
@@ -1947,7 +1982,7 @@ mod test {
         let nodes = nodeset![element];
         let context = crate::context::Context::new();
         let evaluation = crate::context::Evaluation::new(&context, document.root().into());
-        let bytes = std::mem::size_of::<Node<'_>>();
+        let bytes = size_of::<Node<'_>>();
         let work = Memory::new(Arc::new(MemoryAccount::new(bytes, 65536)));
         let failure = Cell::new(None);
         let ordered = nodes

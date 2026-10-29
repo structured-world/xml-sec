@@ -1,6 +1,6 @@
 //! Storage adapters for `XPath`'s original-to-mirror identity indexes.
 
-use std::collections::HashMap;
+use crate::collections::{Key, Map};
 use structured_asn1::memory::{HashWork, MemoryError, OwnedMap, Work};
 
 pub(crate) trait Index<K: HashWork, V, E: Copy> {
@@ -8,17 +8,17 @@ pub(crate) trait Index<K: HashWork, V, E: Copy> {
     fn insert(&mut self, key: K, value: V) -> Result<(), MemoryError>;
 }
 
-pub(crate) struct NativeIndex<K, V>(HashMap<K, V>);
+pub(crate) struct NativeIndex<K, V>(Map<K, V>);
 
 pub(crate) trait Bindings<'source, E: Copy> {
     fn resolve(&self, prefix: &str, execution: E) -> Result<Option<&'source str>, MemoryError>;
     fn bind(&mut self, prefix: &'source str, uri: &'source str) -> Result<(), MemoryError>;
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct Prefix<'source>(&'source str);
 
-impl std::borrow::Borrow<str> for Prefix<'_> {
+impl core::borrow::Borrow<str> for Prefix<'_> {
     fn borrow(&self) -> &str {
         self.0
     }
@@ -52,11 +52,11 @@ impl<'source, 'w, W: Work> Bindings<'source, &'w W> for OwnedMap<Prefix<'source>
 
 impl<K, V> NativeIndex<K, V> {
     pub(crate) fn new() -> Self {
-        Self(HashMap::new())
+        Self(Map::new())
     }
 }
 
-impl<K: HashWork, V> Index<K, V, ()> for NativeIndex<K, V> {
+impl<K: HashWork + Key, V> Index<K, V, ()> for NativeIndex<K, V> {
     fn lookup(&self, key: &K, (): ()) -> Result<Option<&V>, MemoryError> {
         Ok(self.0.get(key))
     }
@@ -75,7 +75,7 @@ impl<'w, K: HashWork, V, W: Work> Index<K, V, &'w W> for OwnedMap<K, V, W> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct NamespaceKey<'source> {
     pub(super) owner: (usize, usize, usize),
     pub(super) prefix: &'source str,

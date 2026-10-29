@@ -3275,7 +3275,7 @@ fn named_certificate_resolution_preserves_document_crl() {
         key_trust: crate::policy::KeyTrustPolicy {
             verify_x509_chains: true,
             check_crls: true,
-            verification_time: Some(std::time::SystemTime::now()),
+            verification_time: crate::policy::clock::host_now(),
             ..crate::policy::KeyTrustPolicy::default()
         },
         ..crate::policy::VerificationPolicy::default()
@@ -3397,9 +3397,7 @@ fn named_certificate_resolution_enforces_inventory_crl() {
             verify_x509_chains: true,
             check_crls: true,
             max_x509_chain_depth: 3,
-            verification_time: Some(
-                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(492_768),
-            ),
+            verification_time: crate::policy::Instant::new(492_768 * 3600, 0),
             ..crate::policy::KeyTrustPolicy::default()
         },
         ..crate::policy::VerificationPolicy::default()

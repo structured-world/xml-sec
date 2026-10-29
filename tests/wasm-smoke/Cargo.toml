@@ -10,4 +10,4 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-xml-sec = { path = "../..", default-features = false, features = ["c14n", "xml-backend-roxmltree"] }
+xml-sec = { path = "../..", default-features = false, features = ["c14n", "xmldsig", "xml-backend-roxmltree"] }

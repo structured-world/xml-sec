@@ -115,11 +115,23 @@ compile_error!("select either `no-unsafe` or `raw-pointer-backend`");
 // Cargo's all-feature verification enables both selectors. Safe precedence keeps that profile
 // free of raw pointers; selecting the legacy backend requires disabling default features.
 
+#[cfg(not(feature = "embedded"))]
+extern crate alloc;
+
+// The standalone crate always has std; embedded, the tables follow xml-sec's build.
+#[cfg(not(feature = "embedded"))]
+mod collections {
+    pub(crate) use std::collections::{HashMap as Map, HashSet as Set, hash_set as set};
+}
+
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{self, String, ToString},
+};
 use snafu::{ResultExt, Snafu};
-use std::borrow::ToOwned;
-use std::string;
 use sxd_document_no_unsafe::dom::Document;
 use sxd_document_no_unsafe::{PrefixedName, QName};
 
@@ -234,17 +246,17 @@ pub(crate) type LiteralValue = Value<'static>;
 
 struct FormattedLength(usize);
 
-impl std::fmt::Write for FormattedLength {
-    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+impl core::fmt::Write for FormattedLength {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
         self.0 = self.0.saturating_add(value.len());
         Ok(())
     }
 }
 
 pub(crate) fn write_xpath_number(
-    output: &mut impl std::fmt::Write,
+    output: &mut impl core::fmt::Write,
     number: f64,
-) -> std::fmt::Result {
+) -> core::fmt::Result {
     if number.is_infinite() {
         output.write_str(if number.signum() < 0.0 {
             "-Infinity"
@@ -273,7 +285,7 @@ pub enum Value<'d> {
     #[cfg(feature = "embedded")]
     AccountedString(structured_asn1::memory::OwnedText),
     /// An XSLT 1.0 result-tree fragment. It is truthy but is not navigable as a node-set.
-    ResultTreeFragment(u64, std::sync::Arc<string::String>),
+    ResultTreeFragment(u64, alloc::sync::Arc<string::String>),
     /// A collection of unique nodes
     Nodeset(nodeset::Nodeset<'d>),
 }
@@ -346,7 +358,7 @@ pub(crate) fn same_xpath_number(left: f64, right: f64) -> bool {
     // XPath 1.0 3.4 and 3.5 require IEEE equality, not a tolerance:
     // NaN is unequal to itself; the two signed zeros compare equal.
     // https://www.w3.org/TR/1999/REC-xpath-19991116/#booleans
-    left.partial_cmp(&right) == Some(std::cmp::Ordering::Equal)
+    left.partial_cmp(&right) == Some(core::cmp::Ordering::Equal)
 }
 
 pub(crate) fn node_to_num_with_context(
@@ -390,7 +402,7 @@ impl<'d> Value<'d> {
             Self::AccountedString(text) => Self::String(copy_string(text)?),
             Self::Nodeset(nodes) => Self::Nodeset(nodes.clone_with_context(context)?),
             Self::ResultTreeFragment(identity, text) => {
-                Self::ResultTreeFragment(*identity, std::sync::Arc::clone(text))
+                Self::ResultTreeFragment(*identity, alloc::sync::Arc::clone(text))
             }
         })
     }
@@ -480,7 +492,7 @@ impl<'d> Value<'d> {
         match *self {
             Self::Boolean(v) => v.to_string(),
             Self::Number(n) => {
-                let mut value = std::string::String::with_capacity(self.string_len());
+                let mut value = String::with_capacity(self.string_len());
                 write_xpath_number(&mut value, n).expect("String formatting cannot fail");
                 value
             }
@@ -500,7 +512,7 @@ impl<'d> Value<'d> {
         match self {
             Self::String(val) => val,
             Self::ResultTreeFragment(_, val) => {
-                std::sync::Arc::try_unwrap(val).unwrap_or_else(|value| value.as_ref().clone())
+                alloc::sync::Arc::try_unwrap(val).unwrap_or_else(|value| value.as_ref().clone())
             }
             other => other.string(),
         }
@@ -641,16 +653,16 @@ pub struct Factory {
 // live until that build returns; temporary vector replacements release their old capacity.
 pub(crate) struct ParseBudget {
     limit: usize,
-    used: std::cell::Cell<usize>,
-    failure: std::cell::Cell<Option<(usize, usize)>>,
+    used: core::cell::Cell<usize>,
+    failure: core::cell::Cell<Option<(usize, usize)>>,
 }
 
 impl ParseBudget {
     fn new(limit: usize) -> Self {
         Self {
             limit,
-            used: std::cell::Cell::new(0),
-            failure: std::cell::Cell::new(None),
+            used: core::cell::Cell::new(0),
+            failure: core::cell::Cell::new(None),
         }
     }
 
@@ -949,7 +961,7 @@ mod test {
         for text in [" 1.5 ", "not-a-number", "\u{a0}1"] {
             for value in [
                 Value::String(text.into()),
-                Value::ResultTreeFragment(1, std::sync::Arc::new(text.into())),
+                Value::ResultTreeFragment(1, alloc::sync::Arc::new(text.into())),
             ] {
                 for limit in [text.len() - 1, text.len()] {
                     let mut context = Context::without_core_functions();
@@ -1167,7 +1179,7 @@ mod test {
         // One large literal owns one payload and one AST node, regardless of its contents.
         let payload = " / * ".repeat(200_000);
         let source = format!("'{payload}'");
-        let required = payload.len() + std::mem::size_of::<expression::Literal>();
+        let required = payload.len() + core::mem::size_of::<expression::Literal>();
         let factory = Factory::new();
         assert!(Factory::build_bounded(&source, required).is_ok());
         let error = Factory::build_bounded(&source, required - 1).unwrap_err();
@@ -1205,7 +1217,7 @@ mod test {
         // Parentheses allocate no AST nodes and must not accumulate per-rule heap charges.
         let nested = format!("{}1{}", "(".repeat(32), ")".repeat(32));
         assert!(
-            Factory::build_bounded(&nested, std::mem::size_of::<expression::Literal>()).is_ok()
+            Factory::build_bounded(&nested, core::mem::size_of::<expression::Literal>()).is_ok()
         );
     }
 

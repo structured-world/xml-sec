@@ -2427,8 +2427,10 @@ mod tests {
             label: Vec::new(),
         };
         let policy = crate::policy::EncryptionPolicy {
-            key_transport_algorithms: Some(std::collections::HashSet::from([parameters.algorithm])),
-            oaep_digests: Some(std::collections::HashSet::from([parameters.digest])),
+            key_transport_algorithms: Some(std::collections::BTreeSet::from(
+                [parameters.algorithm],
+            )),
+            oaep_digests: Some(std::collections::BTreeSet::from([parameters.digest])),
             ..crate::policy::EncryptionPolicy::default()
         };
         let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)

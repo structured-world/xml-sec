@@ -315,7 +315,7 @@ fn public_executor_can_select_2012_policy() {
         .is_err()
     );
     policy.resources = xml_sec::policy::ResourcePolicy::default();
-    policy.transforms.allowed_algorithms = Some(std::collections::HashSet::default());
+    policy.transforms.allowed_algorithms = Some(std::collections::BTreeSet::default());
     assert!(
         xml_sec::xmldsig::execute_transforms_with_policy(
             document.root_element(),
@@ -616,7 +616,7 @@ fn cipher_reference_uses_typed_edition_and_selected_backend_for_encoded_input() 
     for backend in xml_sec::XmlBackend::available() {
         let document = Document::parse_with_backend(&xml, backend).unwrap();
         for bytes in [source.as_bytes().to_vec(), utf16.clone()] {
-            let resources = std::collections::HashMap::from([("part.rels".into(), bytes)]);
+            let resources = std::collections::BTreeMap::from([("part.rels".into(), bytes)]);
             for edition in [
                 OpcRelationshipEdition::Ecma2012,
                 OpcRelationshipEdition::Ecma2021,
@@ -670,7 +670,7 @@ fn authenticated_manifest_uses_the_same_relationship_contract() {
     let part = format!(
         "<Relationships xmlns=\"{REL}\"><Relationship Id=\"RID\" Type=\"urn:t\" Target=\"a\"/></Relationships>"
     );
-    let resources = std::collections::HashMap::from([("part.rels".into(), part.into_bytes())]);
+    let resources = std::collections::BTreeMap::from([("part.rels".into(), part.into_bytes())]);
     for edition in [
         OpcRelationshipEdition::Ecma2012,
         OpcRelationshipEdition::Ecma2021,
@@ -768,7 +768,7 @@ fn relationship_transform_processes_mce_selected_and_ignored_branches() {
 fn signed_external_part(
     edition: OpcRelationshipEdition,
     input: &str,
-) -> (String, std::collections::HashMap<String, Vec<u8>>) {
+) -> (String, std::collections::BTreeMap<String, Vec<u8>>) {
     let key = RsaSigningKey::from_pkcs8_pem(
         &std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem").unwrap(),
     )
@@ -778,7 +778,7 @@ fn signed_external_part(
     )
     .unwrap();
     let resources =
-        std::collections::HashMap::from([("_rels/.rels".to_owned(), input.as_bytes().to_vec())]);
+        std::collections::BTreeMap::from([("_rels/.rels".to_owned(), input.as_bytes().to_vec())]);
     let canonical = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
     let builder = SignatureBuilder::new(canonical.clone(), SignatureAlgorithm::RsaSha256)
         .add_reference(
@@ -986,7 +986,7 @@ fn upstream_office_relationship_fixture_signs_and_verifies() {
     .unwrap();
     let part = std::fs::read(format!("{root}relationship/xml-base-input.xml")).unwrap();
     let resources =
-        std::collections::HashMap::from([("relationship/xml-base-input.xml".to_owned(), part)]);
+        std::collections::BTreeMap::from([("relationship/xml-base-input.xml".to_owned(), part)]);
     let key = RsaSigningKey::from_pkcs8_pem(
         &std::fs::read_to_string("tests/fixtures/keys/rsa/rsa-2048-key.pem").unwrap(),
     )

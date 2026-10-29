@@ -3,9 +3,10 @@
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
 use crate::{Value, context, function};
-use std::{fmt, ops::DerefMut};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use core::{fmt, ops::DerefMut};
 
-pub(crate) trait List<T>: std::ops::Deref<Target = [T]> + DerefMut {
+pub(crate) trait List<T>: core::ops::Deref<Target = [T]> + DerefMut {
     fn reserve(&mut self, additional: usize) -> Result<(), function::Error>;
     fn push(&mut self, value: T) -> Result<(), function::Error>;
     fn capacity(&self) -> usize;
@@ -48,7 +49,7 @@ pub(crate) enum TextView<'a, T> {
     Owned(T),
 }
 
-impl<T: std::ops::Deref<Target = str>> std::ops::Deref for TextView<'_, T> {
+impl<T: core::ops::Deref<Target = str>> core::ops::Deref for TextView<'_, T> {
     type Target = str;
     fn deref(&self) -> &str {
         match self {
@@ -58,7 +59,7 @@ impl<T: std::ops::Deref<Target = str>> std::ops::Deref for TextView<'_, T> {
     }
 }
 
-impl NamespaceSet for std::collections::HashSet<String> {
+impl NamespaceSet for crate::collections::Set<String> {
     fn insert<'d>(
         &mut self,
         context: &context::Evaluation<'_, 'd>,
@@ -71,14 +72,14 @@ impl NamespaceSet for std::collections::HashSet<String> {
         }
         crate::nodeset::reserve_hashset_slot(self, context)?;
         context.reserve_temporary_allocation(prefix.len())?;
-        Ok(std::collections::HashSet::insert(self, prefix.to_owned()))
+        Ok(crate::collections::Set::insert(self, prefix.to_owned()))
     }
 }
 
 pub(crate) trait Runtime: Copy + fmt::Debug {
     const ACCOUNTED: bool;
     type List<T>: List<T>;
-    type Text: std::ops::Deref<Target = str>;
+    type Text: core::ops::Deref<Target = str>;
     type Namespaces: NamespaceSet;
     type Set<'d>: Set<'d>;
     fn set<'d>(self) -> Self::Set<'d>;
@@ -134,7 +135,7 @@ pub(crate) trait Runtime: Copy + fmt::Debug {
             Value::Number(value) => Value::Number(*value),
             Value::Nodeset(nodes) => Value::Nodeset(self.clone_nodes(context, nodes)?),
             Value::ResultTreeFragment(identity, text) => {
-                Value::ResultTreeFragment(*identity, std::sync::Arc::clone(text))
+                Value::ResultTreeFragment(*identity, alloc::sync::Arc::clone(text))
             }
             Value::String(text) => return self.literal(context, text),
             #[cfg(feature = "embedded")]
@@ -257,7 +258,7 @@ pub(crate) trait Runtime: Copy + fmt::Debug {
     ) -> Result<(), function::Error> {
         if !Self::ACCOUNTED {
             context.reserve_temporary_allocation(
-                additional.saturating_mul(std::mem::size_of::<T>()),
+                additional.saturating_mul(core::mem::size_of::<T>()),
             )?;
         }
         values.reserve(additional)
@@ -282,7 +283,7 @@ pub(crate) trait Runtime: Copy + fmt::Debug {
         if !Self::ACCOUNTED && values.len() == values.capacity() {
             let additional = values.capacity().max(4);
             context.reserve_temporary_allocation(
-                additional.saturating_mul(std::mem::size_of::<T>()),
+                additional.saturating_mul(core::mem::size_of::<T>()),
             )?;
             values.reserve(additional)?;
         }
@@ -369,7 +370,7 @@ impl Runtime for Native {
     const ACCOUNTED: bool = false;
     type List<T> = Vec<T>;
     type Text = String;
-    type Namespaces = std::collections::HashSet<String>;
+    type Namespaces = crate::collections::Set<String>;
     fn empty_text(self) -> Result<String, function::Error> {
         Ok(String::new())
     }
@@ -454,7 +455,7 @@ mod paid {
         DerefMut, List, NamespaceSet, Runtime, Set, Value, context, fmt, function,
         sxd_document_no_unsafe,
     };
-    use std::{cell::Cell, ops::Deref};
+    use core::{cell::Cell, ops::Deref};
     use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, SharedString, Work};
 
     #[derive(Clone)]
@@ -602,8 +603,9 @@ mod paid {
                     })
                     .map_err(|_| self.refuse(MemoryError::WorkExceeded)),
                 Storage::Native(nodes) => {
+                    use crate::collections::Table as _;
                     self.work
-                        .charge_work(nodes.capacity() as u64)
+                        .charge_work(nodes.entry_capacity() as u64)
                         .map_err(|cause| self.refuse(cause))?;
                     let mut result = self.set();
                     for node in nodes {
@@ -947,7 +949,7 @@ mod tests {
                 assert_eq!(prefix.as_str(), "xml");
                 assert_eq!(uri.as_str(), "http://www.w3.org/XML/1998/namespace");
                 visits += 1;
-                Ok::<_, function::Error>(std::ops::ControlFlow::Break(()))
+                Ok::<_, function::Error>(core::ops::ControlFlow::Break(()))
             },
         )
         .unwrap();

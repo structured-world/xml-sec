@@ -306,7 +306,7 @@ fn checked<'d, W: Work, Q: Work>(
     let verifier = session.certificate_path_verifier(&chain, anchor);
     let context = ValidationContext {
         execution: work,
-        interval: Interval::at_instant(evidence.validation_instant()?),
+        interval: Interval::at_instant(evidence.verification_time()),
         policy: Policy::default(),
         bounds: session.certificate_path_bounds(),
         verifier: &verifier,

@@ -296,7 +296,7 @@ impl EffectivePolicy {
     pub const fn compiled(&self) -> &CompiledPolicies {
         &self.compiled
     }
-    /// Stable field and set order, independent of TOML layout or `HashSet` order.
+    /// Stable field and set order, independent of TOML layout.
     ///
     /// # Errors
     /// Returns a TOML serialization failure.

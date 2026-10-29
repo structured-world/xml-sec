@@ -1,7 +1,7 @@
 //! xml-sec through its Rust API, configured as the competitors are for each workload.
 
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::process::ExitCode;
 use xml_sec::policy::{
     DecryptionPolicy, EncryptionPolicy, PolicyViolation, SigningPolicy, TransformPolicy,
@@ -216,9 +216,9 @@ fn encrypt(args: &Args, input: &str) -> Result<Outcome, String> {
     let recipient = RsaPublicKey::from_public_key_pem(&args.corpus_text("public.pem")?)
         .map_err(|error| error.to_string())?;
     let policy = EncryptionPolicy {
-        data_algorithms: Some(HashSet::from([DataEncryptionAlgorithm::Aes256Gcm])),
-        key_transport_algorithms: Some(HashSet::from([KeyTransportAlgorithm::RsaOaepMgf1p])),
-        oaep_digests: Some(HashSet::from([OaepDigestAlgorithm::Sha1])),
+        data_algorithms: Some(BTreeSet::from([DataEncryptionAlgorithm::Aes256Gcm])),
+        key_transport_algorithms: Some(BTreeSet::from([KeyTransportAlgorithm::RsaOaepMgf1p])),
+        oaep_digests: Some(BTreeSet::from([OaepDigestAlgorithm::Sha1])),
         ..EncryptionPolicy::default()
     };
     let builder = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes256Gcm)
@@ -274,9 +274,9 @@ fn decrypt(args: &Args, input: &str) -> Result<Outcome, String> {
         .map_err(|error| error.to_string())?;
     let resolver = PrivateKeyDecryptor::new(key);
     let policy = DecryptionPolicy {
-        data_algorithms: Some(HashSet::from([DataEncryptionAlgorithm::Aes256Gcm])),
-        key_transport_algorithms: Some(HashSet::from([KeyTransportAlgorithm::RsaOaepMgf1p])),
-        oaep_digests: Some(HashSet::from([OaepDigestAlgorithm::Sha1])),
+        data_algorithms: Some(BTreeSet::from([DataEncryptionAlgorithm::Aes256Gcm])),
+        key_transport_algorithms: Some(BTreeSet::from([KeyTransportAlgorithm::RsaOaepMgf1p])),
+        oaep_digests: Some(BTreeSet::from([OaepDigestAlgorithm::Sha1])),
         ..DecryptionPolicy::default()
     };
     let provider = RustCryptoProvider;

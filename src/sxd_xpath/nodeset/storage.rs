@@ -2,18 +2,18 @@
 
 #[cfg(feature = "embedded")]
 use super::Nodeset;
-use super::{HashSet, Node};
+use super::{Node, Set};
 
 #[derive(Debug)]
 pub(crate) enum Storage<'d> {
-    Native(HashSet<Node<'d>>),
+    Native(Set<Node<'d>>),
     #[cfg(feature = "embedded")]
     Current(structured_asn1::memory::OwnedMap<Node<'d>, ()>),
 }
 
 impl Default for Storage<'_> {
     fn default() -> Self {
-        Self::Native(HashSet::new())
+        Self::Native(Set::new())
     }
 }
 
@@ -34,7 +34,7 @@ impl<'d> Storage<'d> {
         clippy::mutable_key_type,
         reason = "node keys hash immutable arena/slot identity, not mutable DOM contents"
     )]
-    pub(super) fn native(&self) -> &HashSet<Node<'d>> {
+    pub(super) fn native(&self) -> &Set<Node<'d>> {
         match self {
             Self::Native(nodes) => nodes,
             #[cfg(feature = "embedded")]
@@ -46,7 +46,7 @@ impl<'d> Storage<'d> {
         clippy::mutable_key_type,
         reason = "node keys hash immutable arena/slot identity, not mutable DOM contents"
     )]
-    pub(super) fn native_mut(&mut self) -> &mut HashSet<Node<'d>> {
+    pub(super) fn native_mut(&mut self) -> &mut Set<Node<'d>> {
         match self {
             Self::Native(nodes) => nodes,
             #[cfg(feature = "embedded")]
@@ -58,7 +58,7 @@ impl<'d> Storage<'d> {
         clippy::mutable_key_type,
         reason = "moving the set preserves immutable node identities and namespace labels"
     )]
-    pub(super) fn into_native(self) -> HashSet<Node<'d>> {
+    pub(super) fn into_native(self) -> Set<Node<'d>> {
         match self {
             Self::Native(nodes) => nodes,
             #[cfg(feature = "embedded")]
@@ -93,7 +93,8 @@ impl<'d> Nodeset<'d> {
     ) -> Result<impl Iterator<Item = &'a Node<'d>> + 'a, structured_asn1::memory::MemoryError> {
         let (native, current) = match &self.nodes {
             Storage::Native(nodes) => {
-                work.charge_work(nodes.capacity() as u64)?;
+                use crate::collections::Table as _;
+                work.charge_work(nodes.entry_capacity() as u64)?;
                 (Some(nodes.iter()), None)
             }
             Storage::Current(nodes) => (None, Some(nodes.try_iter(work)?)),

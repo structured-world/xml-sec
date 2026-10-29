@@ -274,7 +274,7 @@ impl Core {
                 args.at_most(1)?;
                 if let Some(value) = values.first_mut() {
                     if value.string_text().is_some() {
-                        return Ok(std::mem::replace(value, Value::Boolean(false)));
+                        return Ok(::core::mem::replace(value, Value::Boolean(false)));
                     }
                     match runtime.value_text(context, value)? {
                         crate::runtime::TextView::Borrowed(text) => runtime.literal(context, text),
@@ -332,8 +332,8 @@ impl Core {
                 args.exactly(1)?;
                 let value = values[0].number_in(context, runtime)?;
                 Ok(Value::Number(match self {
-                    Self::Floor => value.floor(),
-                    Self::Ceiling => value.ceil(),
+                    Self::Floor => super::ieee_floor(value),
+                    Self::Ceiling => super::ieee_ceil(value),
                     _ => super::round_ties_to_positive_infinity(value),
                 }))
             }

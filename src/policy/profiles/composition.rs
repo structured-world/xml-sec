@@ -12,8 +12,7 @@ use crate::policy::{
     OaepDigestAlgorithm, check_content_algorithm,
 };
 use crate::xmldsig::UriTypeSet;
-use std::hash::Hash;
-use std::{collections::HashSet, time::SystemTime};
+use alloc::collections::BTreeSet;
 
 impl PolicySet {
     pub(super) fn intersect(&self, other: &Self) -> Result<Self, PolicyViolation> {
@@ -60,7 +59,7 @@ impl PolicySet {
                     validity.not_before = validity.not_before.max(inherited.not_before);
                     validity.expires_at = validity.expires_at.min(inherited.expires_at);
                 }
-                validity.validate_at(SystemTime::now())?;
+                validity.validate_now()?;
                 *field(policy) = Some(validity);
             }
             Ok(())
@@ -114,12 +113,12 @@ fn intersect_operation<T>(
 // None has field-specific default semantics. In particular it does NOT grant
 // every legacy/experimental method. Ask the existing enforcement core instead
 // of maintaining another algorithm permission table here.
-fn algorithms<T: Copy + Eq + Hash>(
-    a: Option<&HashSet<T>>,
-    b: Option<&HashSet<T>>,
+fn algorithms<T: Copy + Ord>(
+    a: Option<&BTreeSet<T>>,
+    b: Option<&BTreeSet<T>>,
     accepts_a: impl Fn(T) -> bool,
     accepts_b: impl Fn(T) -> bool,
-) -> Option<HashSet<T>> {
+) -> Option<BTreeSet<T>> {
     if a.is_none() && b.is_none() {
         return None;
     }
@@ -133,14 +132,14 @@ fn algorithms<T: Copy + Eq + Hash>(
     )
 }
 
-fn set<T: Clone + Eq + Hash>(a: &HashSet<T>, b: &HashSet<T>) -> HashSet<T> {
+fn set<T: Clone + Ord>(a: &BTreeSet<T>, b: &BTreeSet<T>) -> BTreeSet<T> {
     a.intersection(b).cloned().collect()
 }
 
-fn optional_set<T: Clone + Eq + Hash>(
-    a: Option<&HashSet<T>>,
-    b: Option<&HashSet<T>>,
-) -> Option<HashSet<T>> {
+fn optional_set<T: Clone + Ord>(
+    a: Option<&BTreeSet<T>>,
+    b: Option<&BTreeSet<T>>,
+) -> Option<BTreeSet<T>> {
     match (a, b) {
         (Some(a), Some(b)) => Some(set(a, b)),
         (Some(values), None) | (None, Some(values)) => Some(values.clone()),
@@ -187,7 +186,7 @@ fn validity(
             let mut result = a.clone();
             result.not_before = a.not_before.max(b.not_before);
             result.expires_at = a.expires_at.min(b.expires_at);
-            result.validate_at(SystemTime::now())?;
+            result.validate_now()?;
             Ok(Some(result))
         }
     }
@@ -206,7 +205,7 @@ fn family(a: RsaPssPermission, b: RsaPssPermission) -> RsaPssPermission {
 }
 
 fn effective_family<T>(
-    algorithms: Option<&HashSet<T>>,
+    algorithms: Option<&BTreeSet<T>>,
     explicit: RsaPssPermission,
     default: RsaPssPermission,
 ) -> RsaPssPermission {
@@ -646,7 +645,7 @@ fn decryption(
 
 #[cfg(feature = "xmlenc")]
 fn transport_allowed(
-    set: Option<&HashSet<KeyTransportAlgorithm>>,
+    set: Option<&BTreeSet<KeyTransportAlgorithm>>,
     value: KeyTransportAlgorithm,
 ) -> bool {
     set.map_or(!value.requires_explicit_permission(), |s| {
@@ -654,13 +653,13 @@ fn transport_allowed(
     })
 }
 #[cfg(feature = "xmlenc")]
-fn wrap_allowed(set: Option<&HashSet<KeyWrapAlgorithm>>, value: KeyWrapAlgorithm) -> bool {
+fn wrap_allowed(set: Option<&BTreeSet<KeyWrapAlgorithm>>, value: KeyWrapAlgorithm) -> bool {
     set.map_or(!value.requires_explicit_permission(), |s| {
         s.contains(&value)
     })
 }
 #[cfg(feature = "xmlenc")]
-fn oaep_allowed(set: Option<&HashSet<OaepDigestAlgorithm>>, value: OaepDigestAlgorithm) -> bool {
+fn oaep_allowed(set: Option<&BTreeSet<OaepDigestAlgorithm>>, value: OaepDigestAlgorithm) -> bool {
     set.map_or(!value.requires_explicit_permission(), |s| {
         s.contains(&value)
     })
@@ -676,7 +675,7 @@ mod tests {
         // None accepts arbitrary secure tuples; intersecting it with an
         // explicit family grant must not silently collapse to listed tuples.
         let layer = VerificationPolicy {
-            signature_algorithms: Some(HashSet::from([SignatureAlgorithm::HmacSha256])),
+            signature_algorithms: Some(BTreeSet::from([SignatureAlgorithm::HmacSha256])),
             parameterized_rsa_pss: RsaPssPermission::AllSupported,
             ..VerificationPolicy::default()
         };

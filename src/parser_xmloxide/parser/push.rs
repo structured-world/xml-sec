@@ -30,6 +30,8 @@
 //! assert_eq!(doc.node_name(root), Some("root"));
 //! ```
 
+use alloc::vec::Vec;
+
 use crate::parser_xmloxide::encoding::decode_to_utf8;
 use crate::parser_xmloxide::error::{ParseError, SourceLocation};
 use crate::parser_xmloxide::parser::ParseOptions;
@@ -254,8 +256,8 @@ impl Default for PushParser {
     }
 }
 
-impl std::fmt::Debug for PushParser {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for PushParser {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PushParser")
             .field("buffered_bytes", &self.buffer.len())
             .field("options", &self.options)

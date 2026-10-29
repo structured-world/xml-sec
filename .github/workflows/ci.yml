@@ -264,6 +264,8 @@ jobs:
       - run: test "${{ needs.test-matrix.result }}" = "success"
 
   alloc-only:
+    # The name is the required status check of the default branch; the job
+    # also covers C14N and XMLDSig verification without std.
     name: alloc-only XML input
     runs-on: ubuntu-latest
     steps:
@@ -283,10 +285,29 @@ jobs:
           cargo check -p xml-sec-xml-input --no-default-features
           --target thumbv7em-none-eabihf
       - run: bash scripts/check-shared-pkix.sh
+      - run: >-
+          cargo clippy -p xml-sec --lib --no-default-features
+          --features c14n,xml-backend-xmloxide
+          --target thumbv7em-none-eabihf -- -D warnings
+      - run: >-
+          cargo clippy -p xml-sec --lib --no-default-features
+          --features xmldsig,xml-backend-xmloxide
+          --target thumbv7em-none-eabihf -- -D warnings
+      - run: >-
+          cargo clippy -p xml-sec --lib --no-default-features
+          --features xmldsig,xml-backend-roxmltree
+          --target thumbv7em-none-eabihf -- -D warnings
+      - uses: taiki-e/install-action@nextest
+      - name: Target coverage on the build without std
+        run: |
+          for backend in xmloxide roxmltree; do
+            cargo nextest run -p xml-sec --no-default-features \
+              --features "xmldsig,xml-backend-$backend" --test alloc_only_verification
+          done
       - uses: actions/setup-node@v7
         with:
           node-version: "24"
-      - run: bash scripts/test-wasm-c14n.sh
+      - run: bash scripts/test-wasm.sh
 
   test-matrix:
     name: test block (${{ matrix.block }})

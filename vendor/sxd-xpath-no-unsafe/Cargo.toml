@@ -36,6 +36,9 @@ repository = "https://github.com/structured-world/xml-sec"
 
 [features]
 default = ["no-unsafe"]
+# The standalone crate always uses the host library. Declared because the
+# sources it shares with xml-sec select host-only code on xml-sec's `std`.
+std = []
 no-unsafe = ["sxd-document-no-unsafe/no-unsafe"]
 # Select with `--no-default-features`; an all-feature build intentionally retains the safe backend.
 raw-pointer-backend = ["sxd-document-no-unsafe/raw-pointer-backend"]
@@ -52,8 +55,10 @@ workspace = true
 name = "integration"
 path = "tests/integration.rs"
 
-[dependencies.peresil]
-version = "0.3.0"
+[dependencies.winnow]
+version = "1.0.4"
+default-features = false
+features = ["parser"]
 
 [dependencies.snafu]
 version = "0.9"

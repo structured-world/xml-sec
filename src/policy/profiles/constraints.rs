@@ -12,7 +12,7 @@ use crate::policy::{
 use crate::provider::{CryptoProvider, ProviderCapability};
 use crate::xml::dom::Node;
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
-use std::collections::HashSet;
+use alloc::collections::BTreeSet;
 
 impl PolicySet {
     pub(super) fn validate(
@@ -93,7 +93,7 @@ impl PolicySet {
 }
 
 fn signature_methods(
-    methods: Option<&HashSet<SignatureAlgorithm>>,
+    methods: Option<&BTreeSet<SignatureAlgorithm>>,
     hmac: HmacPolicy,
     provider: &dyn CryptoProvider,
     signing: bool,
@@ -134,7 +134,7 @@ fn signature_methods(
 }
 
 fn digest_methods(
-    methods: Option<&HashSet<DigestAlgorithm>>,
+    methods: Option<&BTreeSet<DigestAlgorithm>>,
     provider: &dyn CryptoProvider,
 ) -> Result<(), PolicyViolation> {
     if let Some(methods) = methods {
@@ -229,8 +229,8 @@ fn uri_contract(uris: UriPolicy, context: PolicyCompileContext) -> Result<(), Po
 
 #[cfg(feature = "xmlenc")]
 fn cipher_methods(
-    data: Option<&HashSet<DataEncryptionAlgorithm>>,
-    wraps: Option<&HashSet<KeyWrapAlgorithm>>,
+    data: Option<&BTreeSet<DataEncryptionAlgorithm>>,
+    wraps: Option<&BTreeSet<KeyWrapAlgorithm>>,
     provider: &dyn CryptoProvider,
     encrypt: bool,
 ) -> Result<(), PolicyViolation> {
@@ -316,8 +316,8 @@ impl SignatureConstraints {
 
 #[cfg(feature = "xmlenc")]
 fn transport_methods(
-    methods: Option<&HashSet<KeyTransportAlgorithm>>,
-    digests: Option<&HashSet<OaepDigestAlgorithm>>,
+    methods: Option<&BTreeSet<KeyTransportAlgorithm>>,
+    digests: Option<&BTreeSet<OaepDigestAlgorithm>>,
     provider: &dyn CryptoProvider,
     encrypt: bool,
 ) -> Result<(), PolicyViolation> {

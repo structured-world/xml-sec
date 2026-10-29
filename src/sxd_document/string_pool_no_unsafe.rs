@@ -1,7 +1,10 @@
-use std::borrow::Borrow;
-use std::str::FromStr;
-use std::{cell::RefCell, collections::HashSet, fmt, hash, ops::Deref, rc::Rc};
+use alloc::{borrow::ToOwned, rc::Rc, string::String};
+use core::borrow::Borrow;
+use core::str::FromStr;
+use core::{cell::RefCell, fmt, hash, ops::Deref};
 use structured_asn1::memory::{MemoryError, OwnedMap, SharedString, Work};
+
+use crate::collections::Set;
 
 #[cfg(not(feature = "embedded"))]
 pub type StorageText = Rc<str>;
@@ -103,7 +106,7 @@ impl InternedString {
 }
 
 impl FromStr for InternedString {
-    type Err = std::convert::Infallible;
+    type Err = core::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(InternedString::from_str(s))
@@ -125,6 +128,19 @@ impl<S: Deref<Target = str>> fmt::Display for InternedString<S> {
 impl<S: Deref<Target = str>> PartialEq for InternedString<S> {
     fn eq(&self, other: &Self) -> bool {
         *self.0 == *other.0
+    }
+}
+
+// Text order, consistent with the text equality above.
+impl<S: Deref<Target = str>> PartialOrd for InternedString<S> {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl<S: Deref<Target = str>> Ord for InternedString<S> {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        (*self.0).cmp(&*other.0)
     }
 }
 
@@ -207,10 +223,10 @@ fn intern<S: PoolStorage>(
 }
 
 #[derive(Default)]
-struct NativePool(HashSet<Rc<str>>);
+struct NativePool(Set<Rc<str>>);
 impl PoolStorage for NativePool {
     type Text = Rc<str>;
-    type Error = std::convert::Infallible;
+    type Error = core::convert::Infallible;
     fn find(&self, text: &str) -> Result<Option<Rc<str>>, Self::Error> {
         Ok(self.0.get(text).cloned())
     }

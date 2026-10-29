@@ -2,6 +2,7 @@ use crate::OwnedPrefixedName;
 use crate::node_test;
 #[cfg(feature = "embedded")]
 use crate::sxd_document as sxd_document_no_unsafe;
+use alloc::{borrow::ToOwned, string::String};
 use sxd_document_no_unsafe::PrefixedName;
 
 #[derive(Debug, Copy, Clone, PartialEq)]

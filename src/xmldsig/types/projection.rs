@@ -8,9 +8,10 @@
 use super::{NodeSetMaterializationBudget, TransformError, charge_resource_bytes};
 use crate::c14n::scratch::{List as _, Scratch as _};
 use crate::c14n::{C14nError, NodeVisibility};
+use crate::collections::Key;
 use crate::xml::dom::storage::{Native as NativeDom, Storage as DomStorage};
 use crate::xml::dom::{Document, Node, NodeId};
-use std::ops::Range;
+use core::ops::Range;
 use structured_asn1::memory::{HashWork, MemoryError, Work};
 
 /// Sets with at least `1 / DENSE_DIVISOR` of the document's `XPath` nodes use the
@@ -175,8 +176,8 @@ pub(crate) trait Keys {
     type Bindings<'source>: super::super::xpath::storage::Bindings<'source, Self::Execution>;
     fn bindings<'source>(execution: Self::Execution) -> Self::Bindings<'source>;
     fn scratch(execution: Self::Execution) -> Self::Scratch;
-    type Index<T: HashWork, V>: super::super::xpath::storage::Index<T, V, Self::Execution>;
-    fn index<T: HashWork, V>(execution: Self::Execution) -> Self::Index<T, V>;
+    type Index<T: HashWork + Key, V>: super::super::xpath::storage::Index<T, V, Self::Execution>;
+    fn index<T: HashWork + Key, V>(execution: Self::Execution) -> Self::Index<T, V>;
     type NamespaceIndex<'source>: super::super::xpath::storage::NamespaceIndex<'source, Self::Execution>;
     fn namespace_index<'source>(execution: Self::Execution) -> Self::NamespaceIndex<'source>;
     fn execution(&self) -> Self::Execution;
@@ -211,8 +212,8 @@ impl Keys for NativeKeys {
     fn namespace_index<'source>((): ()) -> Self::NamespaceIndex<'source> {
         super::super::xpath::storage::NativeIndex::new()
     }
-    type Index<T: HashWork, V> = super::super::xpath::storage::NativeIndex<T, V>;
-    fn index<T: HashWork, V>((): ()) -> Self::Index<T, V> {
+    type Index<T: HashWork + Key, V> = super::super::xpath::storage::NativeIndex<T, V>;
+    fn index<T: HashWork + Key, V>((): ()) -> Self::Index<T, V> {
         super::super::xpath::storage::NativeIndex::new()
     }
     fn execution(&self) {}
@@ -254,8 +255,8 @@ impl<'w, W: Work> Keys for PaidKeys<'w, W> {
     fn namespace_index<'source>(execution: &'w W) -> Self::NamespaceIndex<'source> {
         execution.map()
     }
-    type Index<T: HashWork, V> = structured_asn1::memory::OwnedMap<T, V, W>;
-    fn index<T: HashWork, V>(execution: &'w W) -> Self::Index<T, V> {
+    type Index<T: HashWork + Key, V> = structured_asn1::memory::OwnedMap<T, V, W>;
+    fn index<T: HashWork + Key, V>(execution: &'w W) -> Self::Index<T, V> {
         execution.map()
     }
     fn execution(&self) -> &'w W {
@@ -418,7 +419,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
     }
 
     fn owns(&self, node: Node<'_, '_, D>) -> bool {
-        std::ptr::eq(self.document, node.document())
+        core::ptr::eq(self.document, node.document())
     }
     fn available(&self) -> Result<(), C14nError> {
         match self.failure {
@@ -1001,7 +1002,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
     ) -> Result<(), TransformError> {
         self.available()?;
         other.available()?;
-        if !std::ptr::eq(self.document, other.document) {
+        if !core::ptr::eq(self.document, other.document) {
             return Ok(());
         }
         let execution = self.keys.execution();
@@ -1131,7 +1132,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
     }
 
     fn intersect_with(&mut self, other: &Self) -> Result<(), TransformError> {
-        if !std::ptr::eq(self.document, other.document) {
+        if !core::ptr::eq(self.document, other.document) {
             self.members = self.no_members();
             self.entries = 0;
             self.projected_string_bytes = 0;
@@ -1169,7 +1170,7 @@ impl<'a, K: Keys, D: DomStorage> Projection<'a, K, D> {
     pub(crate) fn subtract(&mut self, other: &Self) -> Result<(), C14nError> {
         self.available()?;
         other.available()?;
-        if !std::ptr::eq(self.document, other.document) {
+        if !core::ptr::eq(self.document, other.document) {
             return Ok(());
         }
         let execution = self.keys.execution();

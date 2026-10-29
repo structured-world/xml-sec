@@ -9,11 +9,11 @@ See [provider boundaries](crypto-providers.md) and [policy profiles](policy-prof
 | Selection | Compiled surface |
 | --- | --- |
 | Defaults | `std`, `c14n`, `xmldsig`, `xmldsig-sign`, `xmlenc`, `xml-backend-xmloxide` |
-| `c14n` plus one XML backend | Canonicalization without signature/encryption dependencies |
-| `xmldsig` plus one XML backend | Signature verification, policy and the public-key inventory; implies `std` |
-| `xmldsig-sign` plus one XML backend | Adds signing, signature templates, private-key import (PEM, PKCS#8, encrypted PKCS#8, PKCS#12) and the bundled randomness source; implies `xmldsig` |
+| `c14n` plus one XML backend | Canonicalization without signature/encryption dependencies; builds without `std` |
+| `xmldsig` plus one XML backend | Signature verification, policy and the public-key inventory; builds without `std` |
+| `xmldsig-sign` plus one XML backend | Adds signing, signature templates, private-key import (PEM, PKCS#8, encrypted PKCS#8, PKCS#12) and the bundled randomness source; implies `xmldsig` and `std` |
 | `xmlenc` plus one XML backend | Encryption and its shared signature/key-inventory graph; implies `xmldsig-sign` and `std` |
-| `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` |
+| `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` and `std` |
 | `experimental-pq` plus one XML backend | Experimental signature verification and key establishment; implies `xmldsig`, not `xmlenc`; PQ signing keys also need `xmldsig-sign` |
 | `xmldsig,legacy-algorithms` plus one XML backend | Optional compatibility algorithms, still denied by secure policy defaults |
 | `aws-lc-fips` plus one XML backend | Adds the official FIPS provider; implies `xmldsig` and `std`, not encryption |
@@ -39,9 +39,28 @@ qualified; it is not a fork or an additional provider.
 helpers remain available with an XML backend even without the `c14n` marker.
 `no-unsafe` and `embedded` are compatibility markers, not separate security modes.
 
-The root XMLDSig graph currently requires `std`. Disabling Cargo defaults is
-not proof of a `no_std` build. The independent `xml-sec-xml-input` package and
-shared PKIX dependencies retain their separately tested alloc-only contracts.
+### Builds without `std`
+
+Without the `std` feature the crate is `no_std` with `alloc`: C14N and XMLDSig
+verification build for targets such as `thumbv7em-none-eabihf` and
+`wasm32-unknown-unknown`. Host-only capabilities keep requiring `std`: signing
+and its randomness (`xmldsig-sign`), `xmlenc`, native providers and PKCS#11.
+
+Such a build differs from a `std` build only where the host is absent:
+
+- There is no clock. X.509 path validation and authorized policy exceptions
+  use `KeyTrustPolicy::verification_time`, which the caller must supply;
+  without it, chain verification reports `KeyResolutionError::SystemTime`.
+- There is no hash seed. Tables keyed by document content are ordered trees
+  instead of randomly seeded hash tables, so no document can force collisions.
+- Canonical output is written to a `Vec<u8>` or an internal byte consumer;
+  `C14nError::Io` exists only with `std`.
+- Detached payloads come only from the caller, as resident bytes or a
+  streamed session; nothing is fetched.
+
+On targets without 64-bit atomics `portable-atomic` provides the document
+identity counter, and `libm` supplies XPath `floor()` and `ceiling()`. The
+ECDSA curves' precomputed basepoint tables are compiled only with `std`.
 
 ### Verification-only builds
 
@@ -107,6 +126,8 @@ Passing the portable Windows core does not claim Windows native-provider or
 oracle qualification.
 
 The required aggregate test check includes the feature-contract jobs. The
-alloc-only XML-input, embedded target, shared PKIX and actual WASM C14N checks
-remain independent mandatory gates. This is a meaningful feature/provider
+alloc-only job is an independent mandatory gate: it lints XML input, C14N and
+XMLDSig verification for `thumbv7em-none-eabihf` with each XML backend, runs the
+target-coverage tests against the build without `std`, checks the shared PKIX
+packages, and executes C14N and a real XMLDSig verification in WASM. This is a meaningful feature/provider
 matrix, not a claim that every subset of all Cargo features has been tested.

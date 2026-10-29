@@ -3,9 +3,9 @@
 //! The builder receives children directly, never an already allocated native
 //! tree. Borrowed lexer payloads can therefore remain original-source slices.
 
-use std::cell::Cell;
-use std::iter::Peekable;
-use std::ops::{Deref, DerefMut};
+use core::cell::Cell;
+use core::iter::Peekable;
+use core::ops::{Deref, DerefMut};
 
 use crate::axis::{Axis, AxisLike, PrincipalNodeType};
 use crate::node_test::NameTest;
@@ -40,8 +40,8 @@ pub(crate) enum Fault<T> {
     Resource(structured_asn1::memory::MemoryError),
 }
 
-impl<T: std::fmt::Debug> std::fmt::Display for Fault<T> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<T: core::fmt::Debug> core::fmt::Display for Fault<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::NoXPath => f.write_str("XPath was empty"),
             Self::EmptyPredicate => f.write_str("empty predicate"),
@@ -63,7 +63,7 @@ impl<T: std::fmt::Debug> std::fmt::Display for Fault<T> {
 }
 
 pub(super) type Failure<B> = Fault<Token<<B as Builder>::Name, <B as Builder>::Text>>;
-type Result<B, T> = std::result::Result<T, Failure<B>>;
+type Result<B, T> = core::result::Result<T, Failure<B>>;
 type Optional<B> = Result<B, Option<<B as Builder>::Expression>>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -162,7 +162,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn next<I>(&self, source: &mut Source<I>) -> Result<B, Token<B::Name, B::Text>>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         self.builder.inspect()?;
         source
@@ -173,7 +173,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn is<I>(source: &mut Source<I>, token: &Token<B::Name, B::Text>) -> bool
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         matches!(source.peek(), Some(Ok(next)) if next == token)
     }
@@ -184,7 +184,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
         expected: &Token<B::Name, B::Text>,
     ) -> Result<B, ()>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         let token = self.next(source)?;
         if &token != expected {
@@ -195,7 +195,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn axis<I>(&self, source: &mut Source<I>) -> Result<B, Axis>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         if !matches!(source.peek(), Some(Ok(Token::Axis(_)))) {
             return Ok(Axis::Child);
@@ -222,7 +222,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn step<I>(&self, source: &mut Source<I>) -> Result<B, Option<B::Step>>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         self.builder.inspect()?;
         let axis = self.axis(source)?;
@@ -254,7 +254,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn predicate<I>(&self, source: &mut Source<I>) -> Result<B, B::Expression>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         self.consume(source, &Token::LeftBracket)?;
         let result = self
@@ -271,7 +271,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
         first: B::Step,
     ) -> Result<B, B::Expression>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         let mut depth = self
             .builder
@@ -290,7 +290,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn primary<I>(&self, source: &mut Source<I>) -> Optional<B>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         self.builder.inspect()?;
         let node = match source.peek() {
@@ -349,7 +349,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn path<I>(&self, source: &mut Source<I>) -> Optional<B>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         if Self::is(source, &Token::Slash) {
             self.consume(source, &Token::Slash)?;
@@ -384,7 +384,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn unary<I>(&self, source: &mut Source<I>) -> Optional<B>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         // XPath 1.0 §3.5: UnionExpr binds more tightly than unary minus.
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#numbers
@@ -401,7 +401,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn binary<I>(&self, source: &mut Source<I>, level: u8) -> Optional<B>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         self.builder.inspect()?;
         let Some(mut left) = self.child(source, level)? else {
@@ -438,7 +438,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     fn child<I>(&self, source: &mut Source<I>, level: u8) -> Optional<B>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         match level {
             5 => self.unary(source),
@@ -449,7 +449,7 @@ impl<'b, B: Builder> Grammar<'b, B> {
 
     pub fn parse<I>(&self, source: I) -> Result<B, B::Expression>
     where
-        I: Iterator<Item = std::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
+        I: Iterator<Item = core::result::Result<Token<B::Name, B::Text>, tokenizer::Error>>,
     {
         let mut source = source.peekable();
         let expression = self.binary(&mut source, 0)?;

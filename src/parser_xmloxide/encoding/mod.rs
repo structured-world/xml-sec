@@ -12,7 +12,11 @@
 //! 4. After initial decoding, inspect the XML declaration's `encoding=` attribute
 //!    to confirm or override the detected encoding.
 
-use std::fmt;
+use alloc::{
+    format,
+    string::{String, ToString},
+};
+use core::fmt;
 
 /// An error that occurs during encoding detection or transcoding.
 #[derive(Debug, Clone)]
@@ -36,7 +40,7 @@ impl fmt::Display for EncodingError {
     }
 }
 
-impl std::error::Error for EncodingError {}
+impl core::error::Error for EncodingError {}
 
 /// Detects the encoding of an XML byte stream by inspecting the Byte Order Mark.
 ///
@@ -172,7 +176,7 @@ pub fn decode_to_utf8(bytes: &[u8]) -> Result<String, EncodingError> {
     // Fast path: if the BOM says UTF-8 (or no BOM, which defaults to UTF-8),
     // try to validate directly without transcoding.
     if bom_encoding == "UTF-8" {
-        if let Ok(s) = std::str::from_utf8(content_bytes) {
+        if let Ok(s) = core::str::from_utf8(content_bytes) {
             // Valid UTF-8. Check for an encoding declaration that might
             // indicate a different encoding (unusual but permitted).
             if let Some(declared) = extract_xml_decl_encoding(s) {

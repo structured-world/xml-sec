@@ -77,8 +77,8 @@ pub enum NodeKind<S: Storage = Native> {
     },
 }
 
-impl<S: Storage> std::fmt::Debug for NodeKind<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl<S: Storage> core::fmt::Debug for NodeKind<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Document => f.write_str("Document"),
             Self::Element {

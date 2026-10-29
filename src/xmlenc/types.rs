@@ -26,7 +26,7 @@ pub enum EncryptedDataType {
 }
 
 /// Supported content-encryption algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DataEncryptionAlgorithm {
     /// Legacy three-key Triple DES CBC, available only with explicit policy permission.
     #[cfg(feature = "legacy-algorithms")]
@@ -398,7 +398,7 @@ impl KeyWrapAlgorithm {
 }
 
 /// Supported asymmetric session-key transport algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyTransportAlgorithm {
     /// Historical RSAES-PKCS1-v1_5 transport; explicit policy permission is required.
     #[cfg(feature = "legacy-algorithms")]
@@ -413,7 +413,7 @@ pub enum KeyTransportAlgorithm {
 }
 
 /// Supported symmetric key-wrap algorithms.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum KeyWrapAlgorithm {
     /// CBC encryption of key bytes. Unlike RFC 3394 this is not authenticated;
     /// permission must name this exact algorithm. Only CBC ciphers are valid.
@@ -438,7 +438,7 @@ pub enum KeyWrapAlgorithm {
 }
 
 /// Digest algorithms accepted by RSA-OAEP encryption.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum OaepDigestAlgorithm {
     /// MD5 compatibility digest; requires explicit legacy permission.
     #[cfg(feature = "legacy-algorithms")]

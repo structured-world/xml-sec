@@ -5,12 +5,23 @@
 //! generation atomically, so identities from an older generation cannot be
 //! confused with nodes in the new tree.
 
-use std::borrow::Cow;
+use alloc::{
+    borrow::{Cow, ToOwned},
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-use std::cell::Cell;
-use std::collections::{HashMap, HashSet, hash_map::Entry};
-use std::sync::atomic::{AtomicU64, Ordering};
+use core::cell::Cell;
+use core::ops::Range;
+#[cfg(target_has_atomic = "64")]
+use core::sync::atomic::AtomicU64;
+use core::sync::atomic::Ordering;
+// Targets without 64-bit atomics (ARMv7-M, for one) take a lock-based fallback.
+#[cfg(not(target_has_atomic = "64"))]
+use portable_atomic::AtomicU64;
 
+use crate::collections::{Entry, Map, Set, Table};
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{
     Native as NativeXmlStorage, Storage as XmlStorage, Values as XmlValues,
@@ -42,11 +53,11 @@ pub(crate) fn selected_parser_passes() -> usize {
 }
 
 /// Process-local provenance of one owned XML document.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentIdentity(u64);
 
 /// Identity of one tree node in one immutable document generation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeIdentity {
     document: DocumentIdentity,
     generation: u64,
@@ -313,7 +324,7 @@ fn charge_semantic_parser_work(
 }
 
 struct ContentReplacementEdit<'a> {
-    range: std::ops::Range<usize>,
+    range: Range<usize>,
     replacement: &'a str,
     self_closing: Option<SelfClosingContentEdit>,
 }
@@ -378,7 +389,7 @@ impl ContentReplacementEdit<'_> {
         }
     }
 
-    fn write_validation_output(&self, source: &str, output: &mut String) -> std::ops::Range<usize> {
+    fn write_validation_output(&self, source: &str, output: &mut String) -> Range<usize> {
         if let Some(expansion) = &self.self_closing {
             output.push_str(&source[self.range.start..self.range.start + expansion.prefix_end]);
             output.push('>');
@@ -399,9 +410,9 @@ impl ContentReplacementEdit<'_> {
 
 #[derive(Debug)]
 struct DocumentIndexes {
-    order: HashMap<NodeId, usize>,
-    default_ids: HashMap<String, Option<NodeId>>,
-    attributes_by_value: HashMap<(String, String), Vec<NodeId>>,
+    order: Map<NodeId, usize>,
+    default_ids: Map<String, Option<NodeId>>,
+    attributes_by_value: Map<(String, String), Vec<NodeId>>,
 }
 
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
@@ -1336,7 +1347,7 @@ impl XmlDocument {
         replacements: &'a [(NodeIdentity, String)],
         maximum_bytes: usize,
     ) -> Result<(Vec<ContentReplacementEdit<'a>>, usize), XmlDocumentError> {
-        let mut targets = HashSet::with_capacity(replacements.len());
+        let mut targets = Set::with_entry_capacity(replacements.len());
         if replacements
             .iter()
             .any(|(target, _)| !targets.insert(*target))
@@ -1720,7 +1731,7 @@ impl XmlDocument {
 
     fn replace_range(
         &mut self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         replacement: &str,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
@@ -1730,7 +1741,7 @@ impl XmlDocument {
 
     fn replace_range_with_settings(
         &mut self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         replacement: &str,
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
@@ -1758,7 +1769,7 @@ impl XmlDocument {
 
     fn replaced_range(
         &self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         replacement: &str,
         maximum_bytes: usize,
     ) -> Result<String, XmlDocumentError> {
@@ -1772,7 +1783,7 @@ impl XmlDocument {
 
     fn ensure_replacement_fits(
         &self,
-        range: &std::ops::Range<usize>,
+        range: &Range<usize>,
         replacement_len: usize,
         maximum_bytes: usize,
     ) -> Result<usize, XmlDocumentError> {
@@ -1844,12 +1855,12 @@ impl XmlDocument {
 
     fn parse_wrapped_range(
         &self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         replacement: &str,
         maximum: Option<usize>,
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
+    ) -> Result<(DocumentCell, Range<usize>), XmlDocumentError> {
         let wrapped = wrapped_fragment(replacement);
         let wrapper_range = range.start..(range.start + wrapped.len());
         self.parse_wrapped_edit(range, &wrapped, wrapper_range, maximum, settings, budget)
@@ -1857,13 +1868,13 @@ impl XmlDocument {
 
     fn parse_wrapped_edit(
         &self,
-        range: std::ops::Range<usize>,
+        range: Range<usize>,
         replacement: &str,
-        wrapper_range: std::ops::Range<usize>,
+        wrapper_range: Range<usize>,
         maximum: Option<usize>,
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(DocumentCell, std::ops::Range<usize>), XmlDocumentError> {
+    ) -> Result<(DocumentCell, Range<usize>), XmlDocumentError> {
         let projected = self
             .as_xml()
             .len()
@@ -1995,10 +2006,7 @@ impl<'a> DocumentView<'a> {
     }
 
     #[cfg(feature = "xmldsig")]
-    pub(crate) fn id_index(
-        self,
-        registrations: &[IdAttributeRegistration],
-    ) -> HashMap<String, NodeId> {
+    pub(crate) fn id_index(self, registrations: &[IdAttributeRegistration]) -> Map<String, NodeId> {
         // The same classification and ambiguity rules govern borrowed and
         // retained resolvers; retain only the final value-to-node mapping.
         crate::xml::XmlIdIndex::with_registrations(self.document(), registrations).into_node_ids()
@@ -2070,9 +2078,9 @@ impl<'a> DocumentView<'a> {
         for namespace in owner.namespaces() {
             let candidate = (namespace.name().unwrap_or_default(), namespace.uri());
             match candidate.cmp(&target) {
-                std::cmp::Ordering::Less => position += 1,
-                std::cmp::Ordering::Equal => found = true,
-                std::cmp::Ordering::Greater => {}
+                core::cmp::Ordering::Less => position += 1,
+                core::cmp::Ordering::Equal => found = true,
+                core::cmp::Ordering::Greater => {}
             }
         }
         if !found {
@@ -3208,7 +3216,7 @@ impl<'a> Iterator for GeneralReferences<'a> {
             let name = &self.value[start..end];
             if !name.starts_with(b"#")
                 && !matches!(name, b"amp" | b"apos" | b"gt" | b"lt" | b"quot")
-                && let Ok(name) = std::str::from_utf8(name)
+                && let Ok(name) = core::str::from_utf8(name)
             {
                 return Some(name);
             }
@@ -3821,8 +3829,8 @@ struct FoldedText {
 fn validate_replacement_slot(
     xml: &str,
     document: &Document<'_>,
-    slot: std::ops::Range<usize>,
-    parent: Option<std::ops::Range<usize>>,
+    slot: Range<usize>,
+    parent: Option<Range<usize>>,
     folded: FoldedText,
     shape: ReplacementShape,
 ) -> Result<(), XmlDocumentError> {
@@ -3970,7 +3978,7 @@ fn strip_validation_wrapper_namespace_binding(
 
 fn validation_wrapper<'a, 'input>(
     parsed: &'a ParsedDocument<'input>,
-    expected_range: std::ops::Range<usize>,
+    expected_range: Range<usize>,
 ) -> Result<Node<'a, 'input>, XmlDocumentError> {
     parsed
         .document
@@ -3987,12 +3995,12 @@ fn validation_wrapper<'a, 'input>(
 
 fn validate_wrappers(
     parsed: &ParsedDocument<'_>,
-    expected_ranges: &[std::ops::Range<usize>],
+    expected_ranges: &[Range<usize>],
 ) -> Result<(), XmlDocumentError> {
     let mut remaining = expected_ranges
         .iter()
         .map(|range| (range.start, range.end))
-        .collect::<HashSet<_>>();
+        .collect::<Set<_>>();
     for node in parsed
         .document
         .descendants()
@@ -4012,10 +4020,10 @@ fn validate_wrappers(
 
 impl DocumentIndexes {
     fn build(document: &Document<'_>) -> Self {
-        let mut order = HashMap::new();
-        let mut default_ids = HashMap::new();
-        let mut duplicate_ids = HashSet::new();
-        let mut attributes_by_value: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
+        let mut order = Map::new();
+        let mut default_ids = Map::new();
+        let mut duplicate_ids = Set::new();
+        let mut attributes_by_value: Map<(String, String), Vec<NodeId>> = Map::new();
 
         for (position, node) in document.descendants().enumerate() {
             order.insert(node.id(), position);
@@ -4052,9 +4060,7 @@ impl DocumentIndexes {
     }
 }
 
-fn element_content_range(
-    element: &str,
-) -> Result<(std::ops::Range<usize>, String, bool), XmlDocumentError> {
+fn element_content_range(element: &str) -> Result<(Range<usize>, String, bool), XmlDocumentError> {
     let start_end = element_opening_end(element)?;
     let start_tag = &element[..=start_end];
     let qualified_name = start_tag[1..]

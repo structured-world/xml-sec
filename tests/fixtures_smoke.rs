@@ -257,7 +257,8 @@ fn fixture_file_count_matches_expected() {
         // Five DSA inputs cover reciprocal 1024/2048/3072-bit signing.
         // All 17 upstream PSS cases include both signed XML and its template.
         // ML-KEM adds six key formats and two DSig inputs for each of three sets.
-        ("xmldsig", 391),
+        // Two alloc-only inputs cover detached and multi-signature documents.
+        ("xmldsig", 393),
         ("saml", 2),
         // Complete Merlin, Phaos and Aleksey snapshots, plus shared XDH keys.
         // Agreement recipes additionally need all 66 EC and 12 DHX key files.
