@@ -264,7 +264,9 @@ jobs:
       - run: test "${{ needs.test-matrix.result }}" = "success"
 
   alloc-only:
-    name: alloc-only XML input, C14N and XMLDSig verification
+    # The name is the required status check of the default branch; the job
+    # also covers C14N and XMLDSig verification without std.
+    name: alloc-only XML input
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
