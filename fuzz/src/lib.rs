@@ -620,7 +620,7 @@ pub fn policy_compilation(data: &[u8]) {
         .expect("modern profile");
     let mut impossible = compiler.policies().clone();
     let verification = impossible.verification.as_mut().expect("verification");
-    verification.signature_algorithms = Some(std::collections::HashSet::from([
+    verification.signature_algorithms = Some(std::collections::BTreeSet::from([
         xml_sec::xmldsig::SignatureAlgorithm::HmacSha256,
     ]));
     verification.hmac.minimum_output_bits = 257 + usize::from(data.first().copied().unwrap_or(0));

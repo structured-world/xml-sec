@@ -1759,12 +1759,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
-name = "peresil"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f658886ed52e196e850cfbbfddab9eaa7f6d90dd0929e264c31e5cec07e09e57"
-
-[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1884,6 +1878,12 @@ dependencies = [
  "cpufeatures 0.3.1",
  "universal-hash",
 ]
+
+[[package]]
+name = "portable-atomic"
+version = "1.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 
 [[package]]
 name = "potential_utf"
@@ -2453,9 +2453,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "structured-asn1"
-version = "0.16.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4acb06fde14a02e0719312370f78f6f83f41342b885f4f84970ed3ba8a158f98"
+checksum = "da210068ac087bcc3c1b388d880fa83fcb444d6fc4522eee62622d2afa42e589"
 dependencies = [
  "allocator-api2 0.2.21",
  "allocator-api2 0.4.0",
@@ -2465,9 +2465,9 @@ dependencies = [
 
 [[package]]
 name = "structured-cms"
-version = "0.16.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f65b07a7262ef9bde13f2b28726a52fe9ae40ccb9447c62a8ff93db55d1f8d07"
+checksum = "9e28a2cb271cfeea93f3baca671f22e0c1881b4cfefdf64672e8aa8daeff283d"
 dependencies = [
  "structured-asn1",
  "structured-pkix",
@@ -2487,9 +2487,9 @@ dependencies = [
 
 [[package]]
 name = "structured-pkix"
-version = "0.16.0"
+version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8502e052731bbe87f544d590189eb824acc7e8106d377cb268f0c2a8a85437c3"
+checksum = "d89f13beb9b98d77ddcd93136d762835526878a4930e87f8ac60d37ff40833fc"
 dependencies = [
  "structured-asn1",
  "structured-email-address",
@@ -2836,6 +2836,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "winnow"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
 name = "wnaf"
 version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2917,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "xml-sec"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",
@@ -2942,15 +2948,16 @@ dependencies = [
  "icu_collator",
  "icu_locale",
  "keccak 0.2.2",
+ "libm",
  "md-5 0.11.0",
  "p256 0.14.0",
  "p384 0.14.0",
  "p521 0.14.0",
  "pbkdf2 0.13.0",
- "peresil",
  "pkcs1 0.8.0-rc.5",
  "pkcs12",
  "pkcs8 0.11.0",
+ "portable-atomic",
  "primeorder 0.14.0",
  "roxmltree",
  "sad-rsa",
@@ -2968,6 +2975,7 @@ dependencies = [
  "time",
  "tinyvec",
  "url",
+ "winnow",
  "x25519-dalek 3.0.0",
  "x448",
  "xmlparser",

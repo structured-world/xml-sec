@@ -3,7 +3,7 @@
 #![cfg(feature = "xmlenc")]
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -1852,7 +1852,7 @@ fn verifies_merlin_signatures_after_authenticated_symmetric_key_unwrap() {
     // The application selects the KEK independently. Unwrapping a message's
     // key is not implicit signer authorization or certificate chain trust.
     let keys = read_merlin_aes_keys();
-    let resources = BTreeMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         "http://www.w3.org/TR/xml-stylesheet".to_owned(),
         std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
     )]);
@@ -1971,7 +1971,7 @@ fn validates_merlin_rsa_transported_hmac_keys_without_exporting_recovered_keys()
     policy.rsa_keys.minimum_modulus_bits = 1024;
     let context = DecryptContext::new(&resolver).policy(policy);
     let verification_key = HmacVerificationKey::new(secret.to_vec()).unwrap();
-    let resources = BTreeMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         "http://www.w3.org/TR/xml-stylesheet".to_owned(),
         std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
     )]);
@@ -2230,7 +2230,7 @@ fn verifies_merlin_dh_signatures(dh: &MerlinDh) {
         VerifyContext,
     };
     use xml_sec::xmlenc::{KeyEstablishmentBudget, KeyWrapAlgorithm as W};
-    let resources = BTreeMap::from([(
+    let resources = std::collections::BTreeMap::from([(
         "http://www.w3.org/TR/xml-stylesheet".to_owned(),
         std::fs::read("tests/fixtures/xmldsig/external-data/xml-stylesheet-2005").unwrap(),
     )]);
@@ -2310,7 +2310,7 @@ fn assert_documented_dh_hmac_departure(
     xml: &str,
     name: &str,
     verifier: &xml_sec::xmldsig::HmacVerificationKey,
-    resources: &BTreeMap<String, Vec<u8>>,
+    resources: &std::collections::BTreeMap<String, Vec<u8>>,
 ) {
     use xml_sec::xmldsig::{
         DsigStatus, FailureReason, SignatureAlgorithm, UriTypeSet, VerifyContext, VerifyingKey as _,
