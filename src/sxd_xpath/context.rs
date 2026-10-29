@@ -742,7 +742,7 @@ mod tests {
         ];
         let mut context = super::ScopedContext::new();
         context.set_function_view(&functions);
-        assert!(context.functions.buckets.is_empty());
+        assert_eq!(context.functions.len(), 0);
         assert_eq!(context.function_count(), 26);
         let package = sxd_document_no_unsafe::Package::new();
         let root = package.as_document().root();
@@ -806,7 +806,7 @@ mod tests {
         // A fresh security query must not allocate an unaccounted registry of
         // immutable core functions before current-execution admission exists.
         let context = super::ScopedContext::new();
-        assert!(context.functions.buckets.is_empty());
+        assert_eq!(context.functions.len(), 0);
         assert_eq!(context.function_count(), 25);
         let package = sxd_document_no_unsafe::Package::new();
         let evaluation = super::Evaluation::new(&context, package.as_document().root().into());

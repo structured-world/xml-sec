@@ -1323,7 +1323,7 @@ pub(crate) fn reserve_hashset_slot<T: Eq + ::core::hash::Hash>(
     if values.len() < values.capacity() {
         return Ok(());
     }
-    context.reserve_temporary_allocation(hashset_growth_bytes::<T>(values.len())?)?;
+    context.reserve_temporary_allocation(set_slot_bytes::<T>(values.len())?)?;
     values
         .try_reserve(1)
         .map_err(|_| crate::function::Error::Other {
@@ -1332,20 +1332,33 @@ pub(crate) fn reserve_hashset_slot<T: Eq + ::core::hash::Hash>(
 }
 
 /// Charges one insertion into the ordered set used without std. A tree
-/// allocates nodes as it grows instead of reserving, so each insertion pays
-/// its share of an internal node at the minimum occupancy of five keys.
+/// allocates nodes as it grows instead of reserving.
 #[cfg(all(feature = "embedded", not(feature = "std")))]
 pub(crate) fn reserve_hashset_slot<T: Ord>(
-    _values: &mut Set<T>,
+    values: &mut Set<T>,
     context: &crate::context::Evaluation<'_, '_>,
 ) -> Result<(), crate::function::Error> {
-    // std's B-tree: 11 keys and 12 edges per internal node, plus the parent link.
-    let node = 11 * size_of::<T>() + 14 * size_of::<usize>();
-    context.reserve_temporary_allocation(node.div_ceil(5))?;
+    context.reserve_temporary_allocation(set_slot_bytes::<T>(values.len())?)?;
     Ok(())
 }
 
-pub(crate) fn hashset_growth_bytes<T>(current_len: usize) -> Result<usize, crate::function::Error> {
+/// Bytes charged for the next insertion into the ordered set used without
+/// std: its share of an internal node at the minimum occupancy of five keys.
+#[cfg(all(feature = "embedded", not(feature = "std")))]
+pub(crate) fn set_slot_bytes<T>(_current_len: usize) -> Result<usize, crate::function::Error> {
+    // std's B-tree: 11 keys and 12 edges per internal node, plus the parent link.
+    size_of::<T>()
+        .checked_mul(11)
+        .and_then(|keys| keys.checked_add(14 * size_of::<usize>()))
+        .map(|node| node.div_ceil(5))
+        .ok_or_else(|| crate::function::Error::Other {
+            what: "XPath set capacity overflow".into(),
+        })
+}
+
+/// Bytes charged for the next insertion into the hash set used with std.
+#[cfg(any(feature = "std", not(feature = "embedded")))]
+pub(crate) fn set_slot_bytes<T>(current_len: usize) -> Result<usize, crate::function::Error> {
     // std's SwissTable uses power-of-two buckets at at most 7/8 occupancy, plus
     // a control byte per bucket and a SIMD control group. Charge the whole new
     // allocation: the old table remains live during rehash, not just its delta.

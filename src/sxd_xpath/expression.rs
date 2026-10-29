@@ -1796,10 +1796,9 @@ mod test {
         let mut insufficient = Context::without_core_functions();
         insufficient.set_variable("left", nodeset![left_value.clone()]);
         insufficient.set_variable("right", nodeset![right_value.clone()]);
-        // Each variable owns a copied one-node SwissTable before comparison starts.
-        let variable_storage = 2
-            * crate::nodeset::hashset_growth_bytes::<crate::nodeset::Node<'_>>(0)
-                .expect("one-node set storage is representable");
+        // Each variable owns a copied one-node set before comparison starts.
+        let variable_storage = 2 * crate::nodeset::set_slot_bytes::<crate::nodeset::Node<'_>>(0)
+            .expect("one-node set storage is representable");
         insufficient.set_string_allocation_limit(variable_storage + 3);
         let context_node = document.create_element("test");
         let evaluation = context::Evaluation::new(&insufficient, context_node.clone().into());

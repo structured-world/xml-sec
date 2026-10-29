@@ -186,6 +186,7 @@ fn tree_mod_rs_example_3() -> impl std::process::Termination {
 }
 
 // tree/mod.rs:353; original compile-only example.
+#[cfg(feature = "std")]
 #[test]
 fn tree_mod_rs_example_4() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;

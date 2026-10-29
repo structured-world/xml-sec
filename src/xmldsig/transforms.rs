@@ -4066,6 +4066,9 @@ mod tests {
             TransformData::Binary(b"SGVsbG8===".to_vec()),
         )
         .unwrap_err();
+        assert!(matches!(error, TransformError::Base64(_)));
+        // base64 implements `Error` only with `std`, so only then is it the source.
+        #[cfg(feature = "std")]
         assert!(
             std::error::Error::source(&error)
                 .and_then(|cause| cause.downcast_ref::<base64::DecodeSliceError>())

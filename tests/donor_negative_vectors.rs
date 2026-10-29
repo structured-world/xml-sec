@@ -270,8 +270,16 @@ fn x509_path_enforces_configured_issuer_rsa_minimum() {
     let mut options = X509ChainOptions {
         utc_facts: None,
         trusted_certs: &trusted,
-        verification_time: xml_sec::policy::instant_from_system_time(std::time::SystemTime::now())
-            .unwrap(),
+        verification_time: xml_sec::policy::Instant::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                .try_into()
+                .unwrap(),
+            0,
+        )
+        .unwrap(),
         max_chain_depth: 2,
         check_crls: false,
         allowed_extended_key_usages: None,

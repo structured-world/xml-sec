@@ -37,14 +37,13 @@
 //! # }
 //! ```
 
-#![cfg_attr(not(feature = "std"), no_std)]
+// The unit-test harness needs std; the library target stays `no_std` here.
+#![cfg_attr(not(any(feature = "std", test)), no_std)]
 #![deny(unsafe_code)]
 #![deny(clippy::unwrap_used)]
 #![warn(missing_docs)]
 
 extern crate alloc;
-#[cfg(all(test, not(feature = "std")))]
-extern crate std;
 // The embedded XPath engine's XML parser only builds test documents.
 #[cfg(all(test, feature = "xmldsig"))]
 #[macro_use]

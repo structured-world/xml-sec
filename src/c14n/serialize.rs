@@ -964,7 +964,6 @@ mod tests {
     use super::super::ns_inclusive::InclusiveNsRenderer;
     use super::*;
     use crate::xml::dom::NodeId;
-    use std::io::{self, Write};
 
     #[test]
     fn visibility_refusal_precedes_output_and_preserves_cause() {
@@ -1020,17 +1019,11 @@ mod tests {
             expected: &'a [u8],
             position: usize,
         }
-        impl Write for ExactSink<'_> {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                let count = bytes.len().min(2);
-                assert_eq!(
-                    &bytes[..count],
-                    &self.expected[self.position..self.position + count]
-                );
-                self.position += count;
-                Ok(count)
-            }
-            fn flush(&mut self) -> io::Result<()> {
+        impl ByteSink for ExactSink<'_> {
+            fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
+                let end = self.position + bytes.len();
+                assert_eq!(bytes, &self.expected[self.position..end]);
+                self.position = end;
                 Ok(())
             }
         }
@@ -1064,7 +1057,7 @@ mod tests {
         #[cfg(feature = "xmldsig")]
         {
             // Mode/PrefixList selection enters that same serializer. The sink
-            // compares golden bytes incrementally, including short writes.
+            // compares golden bytes incrementally.
             let document =
                 Document::parse("<r xmlns:p=\"urn:p\" xmlns:q=\"urn:q\"><p:c q:a=\"v\"/></r>")
                     .unwrap();
@@ -1118,12 +1111,9 @@ mod tests {
         // Exhausting output allowance must not allocate an error or invoke the
         // sink with a chunk that exceeds the remaining allowance.
         struct NeverWrite;
-        impl Write for NeverWrite {
-            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        impl ByteSink for NeverWrite {
+            fn write_bytes(&mut self, _: &[u8]) -> Result<(), C14nError> {
                 panic!("output was not admitted");
-            }
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
             }
         }
         let document = Document::parse("<root/>").unwrap();
@@ -1145,10 +1135,13 @@ mod tests {
         ));
     }
 
+    // `io::Write` destinations exist only with `std`.
+    #[cfg(feature = "std")]
     #[test]
     fn terminal_writer_stops_at_first_io_refusal() {
         // A downstream refusal stops traversal immediately; the serializer must
         // neither buffer the remaining output nor call the sink again.
+        use std::io::{self, Write};
         struct RefusingSink {
             calls: usize,
         }

@@ -8,7 +8,7 @@ use super::PolicyViolation;
 /// Converts a host clock reading to the label policy and path validation use.
 ///
 /// Returns `None` outside the range of whole `i64` seconds around the epoch.
-#[cfg(feature = "std")]
+#[cfg(any(feature = "std", test))]
 #[must_use]
 pub fn instant_from_system_time(time: std::time::SystemTime) -> Option<Instant> {
     let nanos = match time.duration_since(std::time::UNIX_EPOCH) {

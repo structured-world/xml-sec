@@ -23,7 +23,7 @@ use crate::xmlenc::{
 pub(crate) mod clock;
 #[cfg(feature = "xmldsig")]
 pub use clock::Instant;
-#[cfg(all(feature = "xmldsig", feature = "std"))]
+#[cfg(all(feature = "xmldsig", any(feature = "std", test)))]
 pub use clock::instant_from_system_time;
 
 #[cfg(feature = "xmldsig")]

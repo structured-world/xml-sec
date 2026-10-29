@@ -2181,6 +2181,7 @@ mod tests {
         assert_eq!(doc.text_content(children[1]), "A");
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_parse_file_nonexistent() {
         let result = Document::parse_file("/nonexistent/path.xml");
@@ -2193,6 +2194,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_parse_file_valid() {
         use std::io::Write;

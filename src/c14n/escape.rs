@@ -67,7 +67,6 @@ fn escape_runs(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use std::io::{self, Write};
 
     #[derive(Default)]
     struct CountingWriter {
@@ -75,14 +74,10 @@ mod tests {
         writes: usize,
     }
 
-    impl Write for CountingWriter {
-        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+    impl ByteSink for CountingWriter {
+        fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
             self.writes += 1;
-            self.bytes.extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
+            self.bytes.extend_from_slice(bytes);
             Ok(())
         }
     }

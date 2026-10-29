@@ -2380,7 +2380,9 @@ mod tests {
         let options = super::super::x509::X509ChainOptions {
             utc_facts: None,
             trusted_certs: &anchors,
-            verification_time: crate::policy::clock::host_now().expect("test host clock"),
+            verification_time:
+                crate::policy::instant_from_system_time(std::time::SystemTime::now())
+                    .expect("representable test time"),
             max_chain_depth: 2,
             check_crls: false,
             allowed_extended_key_usages: None,

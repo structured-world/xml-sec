@@ -3131,8 +3131,11 @@ mod tests {
     }
 
     fn chain_policy() -> crate::policy::KeyTrustPolicy {
+        // An explicit time keeps path tests independent of a host clock,
+        // which builds without `std` do not have.
         crate::policy::KeyTrustPolicy {
             verify_x509_chains: true,
+            verification_time: crate::policy::instant_from_system_time(std::time::SystemTime::now()),
             ..crate::policy::KeyTrustPolicy::default()
         }
     }
@@ -3374,8 +3377,7 @@ mod tests {
             trusted_certs: vec![root.der().to_vec()],
             ..KeyResolverConfig::default()
         });
-        let mut policy = crate::policy::VerificationPolicy::default();
-        policy.key_trust.verify_x509_chains = true;
+        let mut policy = verification_policy_with_trust(chain_policy());
 
         let Err(error) =
             resolver.resolve_with_policy(Some(&key_info), SignatureAlgorithm::EcdsaSha256, &policy)

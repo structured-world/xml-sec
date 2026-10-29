@@ -13,7 +13,7 @@ See [provider boundaries](crypto-providers.md) and [policy profiles](policy-prof
 | `xmldsig` plus one XML backend | Signature verification, policy and the public-key inventory; builds without `std` |
 | `xmldsig-sign` plus one XML backend | Adds signing, signature templates, private-key import (PEM, PKCS#8, encrypted PKCS#8, PKCS#12) and the bundled randomness source; implies `xmldsig` and `std` |
 | `xmlenc` plus one XML backend | Encryption and its shared signature/key-inventory graph; implies `xmldsig-sign` and `std` |
-| `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` |
+| `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` and `std` |
 | `experimental-pq` plus one XML backend | Experimental signature verification and key establishment; implies `xmldsig`, not `xmlenc`; PQ signing keys also need `xmldsig-sign` |
 | `xmldsig,legacy-algorithms` plus one XML backend | Optional compatibility algorithms, still denied by secure policy defaults |
 | `aws-lc-fips` plus one XML backend | Adds the official FIPS provider; implies `xmldsig` and `std`, not encryption |
