@@ -509,7 +509,7 @@ struct ParsedDocument<'input> {
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     peak_namespace_bindings: usize,
     /// Parser work charged to build this generation from its text.
-    #[cfg(feature = "xmldsig-sign")]
+    #[cfg(feature = "xmldsig")]
     parse_work: usize,
 }
 
@@ -980,7 +980,7 @@ impl XmlDocument {
     }
 
     /// Parser work charged to build the current generation from its text.
-    #[cfg(feature = "xmldsig-sign")]
+    #[cfg(feature = "xmldsig")]
     pub(crate) fn parse_work(&self) -> usize {
         self.with_view(|view| view.parsed.parse_work)
     }
@@ -2314,8 +2314,8 @@ fn build_semantic_cell(
 ) -> Result<DocumentCell, XmlDocumentError> {
     #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
     let _ = peak_namespace_bindings;
-    // Only signing reuses a handed-over parse and charges its work.
-    #[cfg(not(feature = "xmldsig-sign"))]
+    // Only XMLDSig entry points take over a caller's parse and charge its work.
+    #[cfg(not(feature = "xmldsig"))]
     let _ = parse_work;
     DocumentCell::try_new(xml, |source| {
         let (document, metrics) = parse_semantic_document(source, settings)?;
@@ -2328,7 +2328,7 @@ fn build_semantic_cell(
             max_depth: metrics.max_depth,
             #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             peak_namespace_bindings,
-            #[cfg(feature = "xmldsig-sign")]
+            #[cfg(feature = "xmldsig")]
             parse_work,
         })
     })

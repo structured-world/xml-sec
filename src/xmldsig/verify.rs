@@ -724,6 +724,23 @@ impl<'a> VerifyContext<'a> {
         verify_signature_document_with_context(document, self)
     }
 
+    /// Verify an input the caller parsed for this operation, for example to
+    /// read its key hints, instead of parsing the text again.
+    ///
+    /// The same pipeline as [`Self::verify`] on a document parsed under this
+    /// context's policy, for example with
+    /// [`XmlDocument::parse_with_policy_and_backend`]. The parser work spent on
+    /// the document is charged to this operation, exactly as `verify` charges
+    /// its own parse; [`Self::verify_document`] instead treats a retained
+    /// document's parse as a separate, earlier operation.
+    ///
+    /// # Errors
+    /// Returns document provenance/policy mismatch or XML, resource, resolution
+    /// and selected-provider processing failures.
+    pub fn verify_parsed(&self, document: &XmlDocument) -> Result<VerifyResult, DsigError> {
+        verify_signature_parsed_with_context(document, self)
+    }
+
     /// Verify every Signature in one retained document generation.
     ///
     /// All signatures share the operation's work and retention budgets. A
@@ -2132,6 +2149,28 @@ fn verify_signature_document_with_context(
         TransformExecutionBudget::from_resources(&ctx.policy.resources)
             .with_xml_backend(ctx.xml_backend),
     )
+}
+
+fn verify_signature_parsed_with_context(
+    document: &XmlDocument,
+    ctx: &VerifyContext<'_>,
+) -> Result<VerifyResult, SignatureVerificationPipelineError> {
+    document.validate_operation_policy(ctx.policy.xml, &ctx.policy.resources)?;
+    let budget = TransformExecutionBudget::from_resources(&ctx.policy.resources)
+        .with_xml_backend(ctx.xml_backend);
+    // max_xml_parse_work_bytes is cumulative over the whole operation, whose
+    // initial parse the caller ran on its behalf.
+    budget
+        .xml_parse_work()
+        .charge(document.parse_work())
+        .map_err(|error| {
+            map_document_parse_error(
+                error,
+                DocumentParseSettings::from_policy(ctx.policy.xml, &ctx.policy.resources)
+                    .with_backend(ctx.xml_backend),
+            )
+        })?;
+    verify_signature_document_with_context_and_transforms(document, ctx, budget)
 }
 
 fn count_signature_nodes(view: DocumentView<'_>, maximum: usize) -> Result<usize, DsigError> {

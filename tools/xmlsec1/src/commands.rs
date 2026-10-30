@@ -1976,7 +1976,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         VerificationKeySource::Certificates(resolver) => context.key_resolver(resolver),
     };
     let result = context
-        .verify_document(&document)
+        .verify_parsed(&document)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     write_verification_diagnostics(invocation, &result, stdout)?;
     if aggregate_verification_status(&result) != DsigStatus::Valid {

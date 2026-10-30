@@ -136,9 +136,11 @@ generation, including source validation in `sign_with_builder`, digest filling, 
 parsing, signature filling, and optional `KeyInfo` filling. An internal-DTD opt-in and XML node
 ceiling therefore cannot be lost between stages. `SignContext::sign_document` and
 `sign_document_with_builder` reuse an `XmlDocument`; string APIs are adapters over that boundary.
-A caller that parsed a template to inspect it (through `DocumentView::document`) hands that
-document to `sign_template_document`, which signs it in place and returns the XML without parsing
-it again; `VerifyContext::verify_document` is the verification counterpart.
+A caller that parsed an input to inspect it (through `DocumentView::document`) hands that
+document over instead of parsing it again: `sign_template_document` signs a template in place and
+returns the XML, and `VerifyContext::verify_parsed` verifies a signed input. Both charge the
+document's parser work to the operation, so `max_xml_parse_work_bytes` stays cumulative across
+the caller's parse and the operation, as with the string entry points.
 External callers that need non-default XML input rules construct that retained document with
 `XmlDocument::parse_with_policy(xml, &signing_or_verification_policy)`, so parsing and the later
 operation share one immutable policy snapshot rather than independent DTD or resource settings.

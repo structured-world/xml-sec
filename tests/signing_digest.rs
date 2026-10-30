@@ -1979,6 +1979,93 @@ fn a_handed_over_parsed_template_signs_like_its_text() {
 }
 
 #[test]
+fn a_handed_over_signed_input_charges_its_parse_to_verification() {
+    // A caller that parses the input to select keys hands that parse to the
+    // verification, which must stay within one cumulative parser allowance,
+    // exactly like verifying the text.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    // Canonical octets fed to a second canonicalization are parsed back, so
+    // verification itself spends parser work on this Reference.
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(exclusive_c14n()))
+                .transform(Transform::C14n(exclusive_c14n())),
+        );
+    let signed = SignContext::new(&private_key)
+        .sign_with_builder("<root><payload ID=\"payload\">x</payload></root>", &builder)
+        .expect("signing");
+    let key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: rsa_spki(&private_key),
+        certificate_der: None,
+        name: None,
+    };
+    let limited = |limit: usize| {
+        let mut policy = VerificationPolicy::default();
+        policy.resources.max_xml_parse_work_bytes = limit;
+        policy
+    };
+    let parses = |limit: usize| {
+        XmlDocument::parse_with_policy_and_backend(
+            signed.as_str(),
+            &limited(limit),
+            xml_sec::XmlBackend::default(),
+        )
+        .is_ok()
+    };
+    let verifies_text = |limit: usize| {
+        VerifyContext::new()
+            .key(&key)
+            .policy(limited(limit))
+            .verify(&signed)
+            .is_ok_and(|result| result.status == DsigStatus::Valid)
+    };
+    let smallest = |accepts: &dyn Fn(usize) -> bool| {
+        let (mut refused, mut accepted) = (0, 64 * signed.len());
+        assert!(accepts(accepted));
+        while accepted - refused > 1 {
+            let middle = refused + (accepted - refused) / 2;
+            if accepts(middle) {
+                accepted = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        accepted
+    };
+    let parse_only = smallest(&parses);
+    let whole = smallest(&verifies_text);
+    assert!(
+        whole > parse_only,
+        "verification must itself spend parser work: {whole} <= {parse_only}"
+    );
+    for (limit, expected) in [(whole - 1, false), (whole, true)] {
+        let policy = limited(limit);
+        let document = XmlDocument::parse_with_policy_and_backend(
+            signed.as_str(),
+            &policy,
+            xml_sec::XmlBackend::default(),
+        )
+        .expect("the input alone fits either allowance");
+        let outcome = VerifyContext::new()
+            .key(&key)
+            .policy(policy)
+            .verify_parsed(&document);
+        assert_eq!(
+            outcome
+                .as_ref()
+                .is_ok_and(|result| result.status == DsigStatus::Valid),
+            expected,
+            "limit {limit}: {outcome:?}"
+        );
+    }
+}
+
+#[test]
 fn a_handed_over_template_charges_its_parse_to_the_operation() {
     // Parser work is cumulative across the whole signing operation: handing
     // over the parsed template must not give the signing passes a fresh
