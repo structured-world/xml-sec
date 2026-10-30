@@ -508,7 +508,7 @@ struct ParsedDocument<'input> {
     max_depth: usize,
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     peak_namespace_bindings: usize,
-    /// Parser work charged to build this generation from its text.
+    /// Parser work charged to build this generation and every earlier one.
     #[cfg(feature = "xmldsig")]
     parse_work: usize,
 }
@@ -996,7 +996,7 @@ impl XmlDocument {
         Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
     }
 
-    /// Parser work charged to build the current generation from its text.
+    /// Parser work charged to build the current generation and every earlier one.
     #[cfg(feature = "xmldsig")]
     pub(crate) fn parse_work(&self) -> usize {
         self.with_view(|view| view.parsed.parse_work)
@@ -1710,6 +1710,18 @@ impl XmlDocument {
         let next_generation = self.generation.checked_add(1).ok_or_else(|| {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
         })?;
+        #[cfg(feature = "xmldsig")]
+        let mut next = next;
+        #[cfg(feature = "xmldsig")]
+        {
+            let prior_work = self.parse_work();
+            next.with_dependent_mut(|_, parsed| {
+                parsed.parse_work = parsed.parse_work.checked_add(prior_work).ok_or_else(|| {
+                    XmlDocumentError::InvalidReplacement("document parse work overflow".into())
+                })?;
+                Ok::<_, XmlDocumentError>(())
+            })?;
+        }
         self.cell = next;
         self.generation = next_generation;
         Ok(())

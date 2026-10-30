@@ -2078,6 +2078,116 @@ fn a_handed_over_signed_input_charges_its_parse_to_verification() {
     assert_eq!(smallest(&verifies_decoded), whole + signed.len());
 }
 
+/// Shrink the `padding` element of a parsed input through a public mutation.
+fn parse_and_drop_padding(xml: &str, policy: &impl xml_sec::XmlDocumentPolicy) -> XmlDocument {
+    let mut document = XmlDocument::parse_with_policy(xml, policy).expect("input must parse");
+    let padding = document.with_view(|view| view.node_for_id("padding", &[]).expect("padding"));
+    document
+        .replace_element(padding, "<padding/>")
+        .expect("shrinking mutation");
+    document
+}
+
+#[test]
+fn a_mutated_document_hands_over_the_parses_of_its_earlier_generations() {
+    // Shrinking a document must not drop the work already spent on it: the
+    // allowance below admits the mutated text on its own, but not that text
+    // on top of the original parse.
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let padded = format!(
+        "<root><padding ID=\"padding\">{}</padding><payload ID=\"payload\">x</payload></root>",
+        "x".repeat(16 * 1024)
+    );
+    let allowance = padded.len() * 8;
+    let builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
+        .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let signed = SignContext::new(&private_key)
+        .sign_with_builder(&padded, &builder)
+        .expect("signing");
+    let key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: rsa_spki(&private_key),
+        certificate_der: None,
+        name: None,
+    };
+    let verification = |limit: usize| {
+        let mut policy = VerificationPolicy::default();
+        policy.resources.max_xml_parse_work_bytes = limit;
+        policy
+    };
+    let exact = {
+        let (mut refused, mut accepted) = (0, allowance);
+        while accepted - refused > 1 {
+            let middle = refused + (accepted - refused) / 2;
+            let policy = verification(middle);
+            if XmlDocument::parse_with_policy(signed.as_str(), &policy).is_ok() {
+                accepted = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        accepted
+    };
+    let policy = verification(exact);
+    let document = parse_and_drop_padding(&signed, &policy);
+    assert!(
+        VerifyContext::new()
+            .key(&key)
+            .policy(verification(exact))
+            .verify(document.as_xml())
+            .is_ok_and(|result| result.status == DsigStatus::Valid),
+        "the mutated text alone fits the allowance"
+    );
+    assert!(
+        VerifyContext::new()
+            .key(&key)
+            .policy(policy)
+            .verify_parsed(&document)
+            .is_err(),
+        "the original parse already spent this allowance"
+    );
+
+    let template =
+        template_with_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
+    let xml = append_signature_to_root(&padded, &template).expect("append signature");
+    let signing = |limit: usize| SigningPolicy {
+        resources: xml_sec::policy::ResourcePolicy {
+            max_xml_parse_work_bytes: limit,
+            ..xml_sec::policy::ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let exact = {
+        let (mut refused, mut accepted) = (0, allowance);
+        while accepted - refused > 1 {
+            let middle = refused + (accepted - refused) / 2;
+            if XmlDocument::parse_with_policy(xml.as_str(), &signing(middle)).is_ok() {
+                accepted = middle;
+            } else {
+                refused = middle;
+            }
+        }
+        accepted
+    };
+    let document = parse_and_drop_padding(&xml, &signing(exact));
+    assert!(
+        SignContext::new(&private_key)
+            .policy(signing(exact))
+            .sign_template(document.as_xml())
+            .is_ok(),
+        "the mutated text alone fits the allowance"
+    );
+    assert!(
+        SignContext::new(&private_key)
+            .policy(signing(exact))
+            .sign_template_document(document)
+            .is_err(),
+        "the original parse already spent this allowance"
+    );
+}
+
 #[test]
 fn a_handed_over_template_charges_its_parse_to_the_operation() {
     // Parser work is cumulative across the whole signing operation: handing

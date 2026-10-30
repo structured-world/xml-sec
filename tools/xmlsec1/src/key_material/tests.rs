@@ -1020,3 +1020,19 @@ fn signature_discovery_obeys_the_verification_node_ceiling() {
         "invalid XML signature: nodes limit reached"
     );
 }
+
+#[test]
+fn a_syntax_error_keeps_the_backend_diagnostic() {
+    // The owned parse maps a syntax error to the backend's own text, which the
+    // CLI reports without the document layer's "XML parsing error" prefix.
+    let Err(error) = parse_operation_document(
+        "<root>".to_owned(),
+        &xml_sec::policy::VerificationPolicy::default(),
+        xml_sec::XmlBackend::default(),
+    ) else {
+        panic!("an unclosed element must not parse");
+    };
+    let text = error.to_string();
+    assert!(text.contains(" rejected XML: "), "{text}");
+    assert!(!text.contains("XML parsing error"), "{text}");
+}
