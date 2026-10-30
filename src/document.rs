@@ -294,10 +294,49 @@ impl XmlParseWorkBudget {
         }
     }
 
-    #[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
-    pub(crate) fn consumed(&self) -> usize {
-        self.maximum.saturating_sub(self.remaining.get())
+    /// A budget that only counts, for parses that run without an operation.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn unlimited() -> Self {
+        Self {
+            remaining: Cell::new(usize::MAX),
+            maximum: usize::MAX,
+        }
     }
+
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    pub(crate) fn consumed(&self) -> usize {
+        // `remaining` only decreases from `maximum`.
+        self.maximum - self.remaining.get()
+    }
+}
+
+/// Runs `work` against `budget`, or against a counting budget when there is
+/// none, and returns its result with the parser work it charged.
+#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+fn metered<T>(
+    budget: Option<&XmlParseWorkBudget>,
+    work: impl FnOnce(Option<&XmlParseWorkBudget>) -> Result<T, XmlDocumentError>,
+) -> Result<(T, usize), XmlDocumentError> {
+    let counting;
+    let meter = if let Some(budget) = budget {
+        budget
+    } else {
+        counting = XmlParseWorkBudget::unlimited();
+        &counting
+    };
+    let before = meter.consumed();
+    let value = work(Some(meter))?;
+    Ok((value, meter.consumed() - before))
+}
+
+/// Without an XML Security operation no parse is budgeted or reused, so
+/// there is nothing to count.
+#[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+fn metered<T>(
+    budget: Option<&XmlParseWorkBudget>,
+    work: impl FnOnce(Option<&XmlParseWorkBudget>) -> Result<T, XmlDocumentError>,
+) -> Result<(T, usize), XmlDocumentError> {
+    Ok((work(budget)?, 0))
 }
 
 fn charge_parse_work(
@@ -469,6 +508,10 @@ struct ParsedDocument<'input> {
     max_depth: usize,
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     peak_namespace_bindings: usize,
+    /// Parser work spent on this generation and every earlier one, including
+    /// the validation parses of the mutations between them.
+    #[cfg(feature = "xmldsig")]
+    parse_work: usize,
 }
 
 self_cell!(
@@ -681,8 +724,7 @@ impl XmlDocument {
     /// # Errors
     /// Returns encoding errors or the parsing/ceiling failures of [`Self::parse`].
     pub fn parse_bytes(bytes: &[u8]) -> Result<Self, XmlDocumentError> {
-        let settings = DocumentParseSettings::default();
-        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
+        Self::parse_encoded(bytes, DocumentParseSettings::default(), None)
     }
 
     /// Decode and parse XML bytes with an explicitly selected semantic backend.
@@ -694,7 +736,7 @@ impl XmlDocument {
         backend: XmlBackend,
     ) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default().with_backend(backend);
-        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
+        Self::parse_encoded(bytes, settings, None)
     }
 
     /// Parse and own XML with an explicitly selected compiled parser backend.
@@ -743,9 +785,8 @@ impl XmlDocument {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
-        Self::parse_with_settings_and_optional_budget(
-            xml,
+        Self::parse_encoded(
+            bytes,
             DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources),
             Some(&budget),
         )
@@ -786,13 +827,22 @@ impl XmlDocument {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
-        Self::parse_with_settings_and_optional_budget(
-            xml,
+        Self::parse_encoded(
+            bytes,
             DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
                 .with_backend(backend),
             Some(&budget),
         )
+    }
+
+    /// Decode and parse, recording the decoding pass as part of the parse's work.
+    fn parse_encoded(
+        bytes: &[u8],
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<Self, XmlDocumentError> {
+        let xml = decode_owned_xml(bytes, settings.max_bytes, budget)?;
+        Self::parse_recording_prior_work(xml, settings, budget, bytes.len())
     }
 
     pub(crate) fn parse_with_settings(
@@ -807,16 +857,40 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<Self, XmlDocumentError> {
+        Self::parse_recording_prior_work(xml, settings, budget, 0)
+    }
+
+    fn parse_recording_prior_work(
+        xml: String,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+        prior_work: usize,
+    ) -> Result<Self, XmlDocumentError> {
         if xml.len() > settings.max_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
                 maximum: settings.max_bytes,
                 actual: xml.len(),
             });
         }
-        let peak_namespace_bindings = preflight_document_limits(&xml, settings, budget)?;
-        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-        let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
-        let cell = build_cell_after_preflight(xml, settings, budget, peak_namespace_bindings)?;
+        let ((peak_namespace_bindings, requires_internal_dtd), preflight_work) =
+            metered(budget, |budget| {
+                let peak = preflight_document_limits(&xml, settings, budget)?;
+                #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+                let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
+                #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+                let requires_internal_dtd = ();
+                Ok((peak, requires_internal_dtd))
+            })?;
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let () = requires_internal_dtd;
+        let cell = build_cell_after_preflight(
+            xml,
+            settings,
+            budget,
+            peak_namespace_bindings,
+            // Both terms are bounded by the input and expansion ceilings.
+            prior_work + preflight_work,
+        )?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
@@ -921,6 +995,12 @@ impl XmlDocument {
         budget: &XmlParseWorkBudget,
     ) -> Result<Self, XmlDocumentError> {
         Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
+    }
+
+    /// Parser work spent on the current generation and every earlier one.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn parse_work(&self) -> usize {
+        recorded_work(&self.cell)
     }
 
     #[cfg(feature = "xmldsig-sign")]
@@ -1077,7 +1157,7 @@ impl XmlDocument {
             Ok((node.range(), node.parent_element().map(Node::range), folded))
         })?;
         let output = self.replaced_range(range.clone(), replacement, settings.max_bytes)?;
-        let next = build_cell(output, settings, budget).map_err(|error| match error {
+        let mut next = build_cell(output, settings, budget).map_err(|error| match error {
             XmlDocumentError::Parse(ParseError::NodesLimitReached) if budget.is_some() => {
                 XmlDocumentError::ProjectedNodeLimit {
                     maximum: settings.nodes_limit as usize,
@@ -1109,13 +1189,15 @@ impl XmlDocument {
                 .map(|()| true)
         })?;
         if !checked {
-            self.validate_in_wrapper(target, replacement, shape, settings, budget)?;
+            let validation_work =
+                self.validate_in_wrapper(target, replacement, shape, settings, budget)?;
+            record_work(&mut next, validation_work);
         }
         Ok(next)
     }
 
     /// Parse `replacement` inside a validation wrapper at the position of `target`,
-    /// then check its shape on the wrapper's children.
+    /// then check its shape on the wrapper's children. Returns the parse's work.
     fn validate_in_wrapper(
         &self,
         target: NodeIdentity,
@@ -1123,14 +1205,15 @@ impl XmlDocument {
         shape: ReplacementShape,
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<usize, XmlDocumentError> {
         let range =
             self.with_view(|view| Ok::<_, XmlDocumentError>(view.resolve_node(target)?.range()))?;
         let maximum = budget.map(|_| settings.nodes_limit as usize);
         let (parsed, wrapper_range) =
             self.parse_wrapped_range(range, replacement, maximum, settings, budget)?;
+        let work = recorded_work(&parsed);
         if shape == ReplacementShape::Fragment {
-            return Ok(());
+            return Ok(work);
         }
         parsed.with_dependent(|_, parsed| {
             let wrapper = validation_wrapper(parsed, wrapper_range.clone())?;
@@ -1146,7 +1229,7 @@ impl XmlDocument {
                     "element replacement must contain exactly one element".into(),
                 ));
             }
-            Ok(())
+            Ok(work)
         })
     }
 
@@ -1222,13 +1305,21 @@ impl XmlDocument {
         } else {
             replacement.to_owned()
         };
-        self.validate_content_in_element_context(target, replacement, maximum, settings, budget)?;
+        let validation_work = self.validate_content_in_element_context(
+            target,
+            replacement,
+            maximum,
+            settings,
+            budget,
+        )?;
         if let Some(maximum) = maximum {
             debug_assert_eq!(maximum, settings.nodes_limit as usize);
-            self.replace_range_with_settings(range, &serialized_replacement, settings, budget)
+            self.replace_range_with_settings(range, &serialized_replacement, settings, budget)?;
         } else {
-            self.replace_range(range, &serialized_replacement, budget)
+            self.replace_range(range, &serialized_replacement, budget)?;
         }
+        record_work(&mut self.cell, validation_work);
+        Ok(())
     }
 
     /// Replace the children of several non-overlapping elements atomically.
@@ -1330,16 +1421,20 @@ impl XmlDocument {
         let (edits, projected) =
             self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
 
-        if validate_fragments {
-            self.validate_content_edits(&edits, settings, policy_bounded, budget)?;
-        }
+        let validation_work = if validate_fragments {
+            self.validate_content_edits(&edits, settings, policy_bounded, budget)?
+        } else {
+            0
+        };
 
         let output = self.render_content_replacement_edits(&edits, projected);
         if policy_bounded {
-            self.replace_serialized_with_settings(output, settings, budget)
+            self.replace_serialized_with_settings(output, settings, budget)?;
         } else {
-            self.replace_serialized(output, budget)
+            self.replace_serialized(output, budget)?;
         }
+        record_work(&mut self.cell, validation_work);
+        Ok(())
     }
 
     fn prepare_content_replacement_edits<'a>(
@@ -1441,7 +1536,7 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         policy_bounded: bool,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<usize, XmlDocumentError> {
         let projected = edits.iter().try_fold(self.as_xml().len(), |length, edit| {
             length
                 .checked_sub(edit.range.len())
@@ -1494,7 +1589,8 @@ impl XmlDocument {
             }
             (_, error) => strip_validation_wrapper_namespace_binding(error, settings),
         })?;
-        parsed.with_dependent(|_, document| validate_wrappers(document, &wrapper_ranges))
+        parsed.with_dependent(|_, document| validate_wrappers(document, &wrapper_ranges))?;
+        Ok(recorded_work(&parsed))
     }
 
     /// Append a well-formed XML fragment as the last child of an element.
@@ -1590,15 +1686,19 @@ impl XmlDocument {
             ))
         })?;
         self.ensure_replacement_fits(&range, replacement.len(), settings.max_bytes)?;
-        if validate_context {
-            self.validate_content_in_element_context(target, child, maximum, settings, budget)?;
-        }
+        let validation_work = if validate_context {
+            self.validate_content_in_element_context(target, child, maximum, settings, budget)?
+        } else {
+            0
+        };
         if let Some(maximum) = maximum {
             debug_assert_eq!(maximum, settings.nodes_limit as usize);
-            self.replace_range_with_settings(range, &replacement, settings, budget)
+            self.replace_range_with_settings(range, &replacement, settings, budget)?;
         } else {
-            self.replace_range(range, &replacement, budget)
+            self.replace_range(range, &replacement, budget)?;
         }
+        record_work(&mut self.cell, validation_work);
+        Ok(())
     }
 
     pub(crate) fn replace_serialized(
@@ -1627,10 +1727,11 @@ impl XmlDocument {
         self.commit_cell(next)
     }
 
-    fn commit_cell(&mut self, next: DocumentCell) -> Result<(), XmlDocumentError> {
+    fn commit_cell(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
         let next_generation = self.generation.checked_add(1).ok_or_else(|| {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
         })?;
+        record_work(&mut next, recorded_work(&self.cell));
         self.cell = next;
         self.generation = next_generation;
         Ok(())
@@ -1805,6 +1906,7 @@ impl XmlDocument {
         Ok(projected)
     }
 
+    /// Parse `replacement` in its element's context; returns that parse's work.
     fn validate_content_in_element_context(
         &self,
         target: NodeIdentity,
@@ -1812,7 +1914,7 @@ impl XmlDocument {
         maximum: Option<usize>,
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
-    ) -> Result<(), XmlDocumentError> {
+    ) -> Result<usize, XmlDocumentError> {
         let (element_range, content_range, qualified_name, self_closing) =
             self.with_view(|view| {
                 let target = view.resolve_node(target)?;
@@ -1832,7 +1934,7 @@ impl XmlDocument {
         if !self_closing {
             return self
                 .parse_wrapped_range(content_range, replacement, maximum, settings, budget)
-                .map(|_| ());
+                .map(|(parsed, _)| recorded_work(&parsed));
         }
 
         let source = &self.as_xml()[element_range.clone()];
@@ -1850,7 +1952,7 @@ impl XmlDocument {
             settings,
             budget,
         )
-        .map(|_| ())
+        .map(|(parsed, _)| recorded_work(&parsed))
     }
 
     fn parse_wrapped_range(
@@ -2093,7 +2195,12 @@ impl<'a> DocumentView<'a> {
         })
     }
 
-    pub(crate) fn document(self) -> &'a Document<'a> {
+    /// The semantic tree of this generation, read-only.
+    ///
+    /// Callers that inspect a document before an operation read the same
+    /// tree the operation then uses, instead of parsing the text again.
+    #[must_use]
+    pub fn document(self) -> &'a Document<'a> {
         &self.parsed.document
     }
 
@@ -2202,32 +2309,76 @@ impl<'a> DocumentView<'a> {
     }
 }
 
+#[cfg(feature = "xmldsig")]
+fn recorded_work(cell: &DocumentCell) -> usize {
+    cell.borrow_dependent().parse_work
+}
+
+#[cfg(feature = "xmldsig")]
+fn record_work(cell: &mut DocumentCell, work: usize) {
+    // Saturation fails closed: a saturated total exceeds every operation allowance.
+    cell.with_dependent_mut(|_, parsed| {
+        parsed.parse_work = parsed.parse_work.saturating_add(work);
+    });
+}
+
+/// Only `XMLDSig` entry points take over a caller's parse and read its work back.
+#[cfg(not(feature = "xmldsig"))]
+const fn recorded_work(_cell: &DocumentCell) -> usize {
+    0
+}
+
+#[cfg(not(feature = "xmldsig"))]
+const fn record_work(_cell: &mut DocumentCell, _work: usize) {}
+
 fn build_cell(
     xml: String,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    let peak_namespace_bindings = preflight_document_limits(&xml, settings, budget)?;
-    build_cell_after_preflight(xml, settings, budget, peak_namespace_bindings)
+    let (peak_namespace_bindings, preflight_work) = metered(budget, |budget| {
+        preflight_document_limits(&xml, settings, budget)
+    })?;
+    build_cell_after_preflight(
+        xml,
+        settings,
+        budget,
+        peak_namespace_bindings,
+        preflight_work,
+    )
 }
 
+/// Builds a generation whose preflight already charged `preflight_work`.
 fn build_cell_after_preflight(
     xml: String,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
     peak_namespace_bindings: usize,
+    preflight_work: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    charge_semantic_parser_work(budget, xml.len())?;
-    build_semantic_cell(xml, settings, peak_namespace_bindings)
+    let ((), semantic_work) = metered(budget, |budget| {
+        charge_semantic_parser_work(budget, xml.len())
+    })?;
+    // Both terms are charges already admitted by one budget below usize::MAX.
+    build_semantic_cell(
+        xml,
+        settings,
+        peak_namespace_bindings,
+        preflight_work + semantic_work,
+    )
 }
 
 fn build_semantic_cell(
     xml: String,
     settings: DocumentParseSettings,
     peak_namespace_bindings: usize,
+    parse_work: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
     #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
     let _ = peak_namespace_bindings;
+    // Only XMLDSig entry points take over a caller's parse and charge its work.
+    #[cfg(not(feature = "xmldsig"))]
+    let _ = parse_work;
     DocumentCell::try_new(xml, |source| {
         let (document, metrics) = parse_semantic_document(source, settings)?;
         let indexes = DocumentIndexes::build(&document);
@@ -2239,6 +2390,8 @@ fn build_semantic_cell(
             max_depth: metrics.max_depth,
             #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             peak_namespace_bindings,
+            #[cfg(feature = "xmldsig")]
+            parse_work,
         })
     })
 }
@@ -3234,16 +3387,16 @@ fn charge_entity_expansion_work<S: NameStorage>(
     bytes: usize,
 ) -> Result<(), XmlDocumentError> {
     charge_parse_work(budget, bytes)?;
-    if budget.is_none() {
-        let actual = state.entity_expansion_work.saturating_add(bytes);
-        let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING;
-        if actual > maximum {
-            return Err(XmlDocumentError::Parse(
-                ParseError::EntityExpansionWorkLimitReached { maximum, actual },
-            ));
-        }
-        state.entity_expansion_work = actual;
+    // A policy budget is at most this ceiling and also pays for the input, so it
+    // refuses first; the ceiling bounds parses that only count their work.
+    let actual = state.entity_expansion_work.saturating_add(bytes);
+    let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING;
+    if actual > maximum {
+        return Err(XmlDocumentError::Parse(
+            ParseError::EntityExpansionWorkLimitReached { maximum, actual },
+        ));
     }
+    state.entity_expansion_work = actual;
     Ok(())
 }
 
@@ -4530,7 +4683,7 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        let retained = build_semantic_cell(xml.to_owned(), settings, 1)
+        let retained = build_semantic_cell(xml.to_owned(), settings, 1, 0)
             .expect("selected backend semantic projection must parse");
         retained.with_dependent(|_, parsed| {
             assert!(parsed.indexes.default_ids.contains_key("target"));
@@ -5173,11 +5326,11 @@ mod tests {
     fn selected_backend_enforces_exact_depth_boundary() {
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        build_semantic_cell(accepted, settings, 0).expect("exact depth must parse");
+        build_semantic_cell(accepted, settings, 0, 0).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            build_semantic_cell(rejected, settings, 0),
+            build_semantic_cell(rejected, settings, 0, 0),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,
@@ -5846,6 +5999,41 @@ mod tests {
 
         assert_eq!(document.as_xml(), before);
         assert_eq!(document.generation(), 0);
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn a_mutation_records_its_validation_parse() {
+        // A content mutation parses a wrapped validation candidate and then the
+        // committed document; a handed-over document owes both to the operation.
+        type Mutation = fn(&mut XmlDocument, NodeIdentity) -> Result<(), XmlDocumentError>;
+        let mutations: [Mutation; 3] = [
+            |document, target| document.replace_content(target, "a"),
+            |document, target| document.replace_contents(&[(target, "a".into())]),
+            |document, target| document.append_child(target, "a"),
+        ];
+        for mutate in mutations {
+            let mut document =
+                XmlDocument::parse("<root><first/></root>").expect("fixture must parse");
+            let target = document.with_view(|view| {
+                view.node_identity(
+                    view.document()
+                        .descendants()
+                        .find(|node| node.has_tag_name("first"))
+                        .expect("first target"),
+                )
+            });
+            let before = document.parse_work();
+            mutate(&mut document, target).expect("mutation");
+            let output = "<root><first>a</first></root>";
+            assert_eq!(document.as_xml(), output);
+            let validation =
+                output.len() + VALIDATION_WRAPPER_OPEN.len() + VALIDATION_WRAPPER_CLOSE.len();
+            assert_eq!(
+                document.parse_work(),
+                before + (validation + output.len()) * selected_parser_passes()
+            );
+        }
     }
 
     #[cfg(feature = "xmldsig")]

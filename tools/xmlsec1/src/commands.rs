@@ -938,8 +938,10 @@ fn sign_with_policy(
     let xml = read_input(invocation, policy.resources.max_xml_document_bytes)?;
     let start_node_id = option_text(invocation, "node-id")?;
     let id_attributes = id_attribute_registrations(invocation)?;
+    // One parse serves the template metadata and the signing operation.
+    let document = key_material::parse_operation_document(xml, &policy, xml_backend)?;
     let signature = key_material::signing_signature_metadata(
-        &xml,
+        &document,
         start_node_id,
         &id_attributes,
         &policy,
@@ -1013,7 +1015,7 @@ fn sign_with_policy(
         context = context.key_info_writer(writer);
     }
     let signed = context
-        .sign_template(&xml)
+        .sign_template_document(document)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     write_result_then_stdout_diagnostics(invocation, signed.as_bytes(), stdout, |stdout| {
         write_signing_diagnostics(invocation, signature.algorithm, stdout)
@@ -1900,8 +1902,10 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         has_key_store,
         ..
     } = key_options;
+    // One parse serves signature selection, key metadata and verification.
+    let document = key_material::parse_operation_document(xml, &policy, xml_backend)?;
     let signature = key_material::verification_signature_metadata(
-        &xml,
+        &document,
         start_node_id,
         &id_attributes,
         &policy,
@@ -1972,7 +1976,7 @@ fn verify(invocation: &Invocation, stdout: &mut dyn Write) -> Result<(), Command
         VerificationKeySource::Certificates(resolver) => context.key_resolver(resolver),
     };
     let result = context
-        .verify(&xml)
+        .verify_parsed(&document)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
     write_verification_diagnostics(invocation, &result, stdout)?;
     if aggregate_verification_status(&result) != DsigStatus::Valid {

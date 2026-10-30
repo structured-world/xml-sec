@@ -1808,14 +1808,40 @@ impl<'a> SignContext<'a> {
             self.document_parse_settings(),
             budgets.transforms.xml_parse_work(),
         )
-        .map_err(|error| match owned_document_policy_violation(error) {
-            Ok(error) => SigningError::Policy(error),
-            Err(XmlDocumentError::Parse(error)) => {
-                SigningError::Digest(SigningDigestError::XmlParse(error))
-            }
-            Err(error) => SigningError::Document(error),
-        })?;
+        .map_err(map_template_parse_error)?;
         self.validate_owned_document_input(&document)?;
+        self.sign_document_in_place::<SerializeText>(&mut document, &mut budgets)
+    }
+
+    /// Sign a parsed template the caller hands over, and return the signed XML.
+    ///
+    /// The same pipeline as [`Self::sign_template`] on a document parsed under
+    /// this context's policy, for example with
+    /// [`XmlDocument::parse_with_policy_and_backend`], so a caller that already
+    /// read the template's metadata does not parse it twice. The parser work
+    /// spent on the document is charged to the operation, exactly as
+    /// `sign_template` charges its own parse. The document is consumed: a
+    /// failure leaves nothing to roll back.
+    ///
+    /// # Errors
+    /// Returns document provenance, template, policy/resource, key-info,
+    /// reference, selected-provider signing or final mutation failures.
+    pub fn sign_template_document(
+        &self,
+        mut document: XmlDocument,
+    ) -> Result<String, SigningError> {
+        self.validate_owned_document_input(&document)?;
+        let mut budgets = SigningOperationBudgets::from_resources_with_backend(
+            &self.policy.resources,
+            self.xml_backend,
+        );
+        // max_xml_parse_work_bytes is cumulative over the whole operation,
+        // whose initial parse the caller ran on our behalf.
+        budgets
+            .transforms
+            .xml_parse_work()
+            .charge(document.parse_work())
+            .map_err(map_template_parse_error)?;
         self.sign_document_in_place::<SerializeText>(&mut document, &mut budgets)
     }
 
@@ -2611,6 +2637,17 @@ fn projected_signature_output_len(
             .ok_or(SigningKeyError::InvalidPublicKeyInfo.into());
     }
     Ok(raw_signature_len)
+}
+
+/// The error of a template's initial parse or of charging its parser work.
+fn map_template_parse_error(error: XmlDocumentError) -> SigningError {
+    match owned_document_policy_violation(error) {
+        Ok(error) => SigningError::Policy(error),
+        Err(XmlDocumentError::Parse(error)) => {
+            SigningError::Digest(SigningDigestError::XmlParse(error))
+        }
+        Err(error) => SigningError::Document(error),
+    }
 }
 
 fn map_owned_document_mutation_error(error: XmlDocumentError) -> SigningError {
