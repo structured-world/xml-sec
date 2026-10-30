@@ -356,10 +356,10 @@ pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates
-structured-asn1 = { version = "0.17.1", default-features = false, features = ["alloc"], optional = true }
-structured-pkix = { version = "0.17.1", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.18.0", default-features = false, features = ["alloc"], optional = true }
+structured-pkix = { version = "0.18.0", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 container framing; this crate keeps the password, KDF and cipher work.
-structured-cms = { version = "0.17.1", default-features = false, features = ["alloc"], optional = true }
+structured-cms = { version = "0.18.0", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
