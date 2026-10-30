@@ -723,8 +723,7 @@ impl XmlDocument {
     /// # Errors
     /// Returns encoding errors or the parsing/ceiling failures of [`Self::parse`].
     pub fn parse_bytes(bytes: &[u8]) -> Result<Self, XmlDocumentError> {
-        let settings = DocumentParseSettings::default();
-        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
+        Self::parse_encoded(bytes, DocumentParseSettings::default(), None)
     }
 
     /// Decode and parse XML bytes with an explicitly selected semantic backend.
@@ -736,7 +735,7 @@ impl XmlDocument {
         backend: XmlBackend,
     ) -> Result<Self, XmlDocumentError> {
         let settings = DocumentParseSettings::default().with_backend(backend);
-        Self::parse_with_settings(decode_owned_xml(bytes, settings.max_bytes, None)?, settings)
+        Self::parse_encoded(bytes, settings, None)
     }
 
     /// Parse and own XML with an explicitly selected compiled parser backend.
@@ -785,9 +784,8 @@ impl XmlDocument {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
-        Self::parse_with_settings_and_optional_budget(
-            xml,
+        Self::parse_encoded(
+            bytes,
             DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources),
             Some(&budget),
         )
@@ -828,13 +826,22 @@ impl XmlDocument {
         let resources = policy.resource_policy();
         resources.validate()?;
         let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = decode_owned_xml(bytes, resources.max_xml_document_bytes, Some(&budget))?;
-        Self::parse_with_settings_and_optional_budget(
-            xml,
+        Self::parse_encoded(
+            bytes,
             DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
                 .with_backend(backend),
             Some(&budget),
         )
+    }
+
+    /// Decode and parse, recording the decoding pass as part of the parse's work.
+    fn parse_encoded(
+        bytes: &[u8],
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<Self, XmlDocumentError> {
+        let xml = decode_owned_xml(bytes, settings.max_bytes, budget)?;
+        Self::parse_recording_prior_work(xml, settings, budget, bytes.len())
     }
 
     pub(crate) fn parse_with_settings(
@@ -848,6 +855,15 @@ impl XmlDocument {
         xml: String,
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
+    ) -> Result<Self, XmlDocumentError> {
+        Self::parse_recording_prior_work(xml, settings, budget, 0)
+    }
+
+    fn parse_recording_prior_work(
+        xml: String,
+        settings: DocumentParseSettings,
+        budget: Option<&XmlParseWorkBudget>,
+        prior_work: usize,
     ) -> Result<Self, XmlDocumentError> {
         if xml.len() > settings.max_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
@@ -871,7 +887,8 @@ impl XmlDocument {
             settings,
             budget,
             peak_namespace_bindings,
-            preflight_work,
+            // Both terms are bounded by the input and expansion ceilings.
+            prior_work + preflight_work,
         )?;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
@@ -3325,16 +3342,16 @@ fn charge_entity_expansion_work<S: NameStorage>(
     bytes: usize,
 ) -> Result<(), XmlDocumentError> {
     charge_parse_work(budget, bytes)?;
-    if budget.is_none() {
-        let actual = state.entity_expansion_work.saturating_add(bytes);
-        let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING;
-        if actual > maximum {
-            return Err(XmlDocumentError::Parse(
-                ParseError::EntityExpansionWorkLimitReached { maximum, actual },
-            ));
-        }
-        state.entity_expansion_work = actual;
+    // A policy budget is at most this ceiling and also pays for the input, so it
+    // refuses first; the ceiling bounds parses that only count their work.
+    let actual = state.entity_expansion_work.saturating_add(bytes);
+    let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING;
+    if actual > maximum {
+        return Err(XmlDocumentError::Parse(
+            ParseError::EntityExpansionWorkLimitReached { maximum, actual },
+        ));
     }
+    state.entity_expansion_work = actual;
     Ok(())
 }
 

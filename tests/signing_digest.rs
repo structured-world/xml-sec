@@ -2063,6 +2063,19 @@ fn a_handed_over_signed_input_charges_its_parse_to_verification() {
             "limit {limit}: {outcome:?}"
         );
     }
+    // Decoding encoded input is a charged pass of the same allowance, so a
+    // document parsed from bytes hands that pass over too.
+    let verifies_decoded = |limit: usize| {
+        let policy = limited(limit);
+        XmlDocument::parse_bytes_with_policy(signed.as_bytes(), &policy).is_ok_and(|document| {
+            VerifyContext::new()
+                .key(&key)
+                .policy(policy)
+                .verify_parsed(&document)
+                .is_ok_and(|result| result.status == DsigStatus::Valid)
+        })
+    };
+    assert_eq!(smallest(&verifies_decoded), whole + signed.len());
 }
 
 #[test]

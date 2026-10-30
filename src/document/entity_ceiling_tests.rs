@@ -83,3 +83,30 @@ fn declared_entity_references_still_reach_the_ceiling() {
         }
     }
 }
+
+#[test]
+fn a_parse_without_an_operation_still_reaches_the_expansion_work_ceiling() {
+    // A parse outside any operation has no parse-work budget, so the absolute
+    // expansion-work ceiling is its only bound on replacement text traversed. Recording
+    // the work a document cost must not lift that ceiling.
+    let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_WORK_BYTE_CEILING;
+    let replacement = "x".repeat(1024 * 1024);
+    let uses = maximum / replacement.len() + 1;
+    let references = "<a>&e;</a>".repeat(uses);
+    let xml = format!(r#"<!DOCTYPE r [<!ENTITY e "{replacement}">]><r>{references}</r>"#);
+    for backend in backends() {
+        let error = parse(xml.clone(), backend)
+            .err()
+            .unwrap_or_else(|| panic!("{backend:?}: the ceiling was not enforced"));
+        assert!(
+            matches!(
+                error,
+                XmlDocumentError::Parse(ParseError::EntityExpansionWorkLimitReached {
+                    maximum: reported,
+                    ..
+                }) if reported == maximum
+            ),
+            "{backend:?}: {error:?}"
+        );
+    }
+}
