@@ -1,6 +1,6 @@
-//! `wasm-smoke`: builds the WebAssembly consumer and executes its C14N and
-//! signature verification paths, so the check is a run of the compiled module
-//! rather than a successful compilation.
+//! `wasm-smoke`: builds the WebAssembly consumer and executes its C14N,
+//! signature verification and CMS timestamp paths, so the check is a run of
+//! the compiled module rather than a successful compilation.
 
 use crate::repo::{Failure, Run, Step, System, require, root};
 use std::path::Path;
@@ -10,7 +10,7 @@ mod tests;
 
 /// Each export, the failure it reports when it does not return 1, and the
 /// line printed when it does.
-const EXPORTS: [(&str, &str, &str); 2] = [
+const EXPORTS: [(&str, &str, &str); 3] = [
     (
         "xml_sec_wasm_smoke",
         "WASM canonicalization must produce exact expected bytes",
@@ -20,6 +20,11 @@ const EXPORTS: [(&str, &str, &str); 2] = [
         "xml_sec_wasm_verify",
         "WASM XMLDSig verification must accept the signed response and reject tampering",
         "WASM XMLDSig verification passed",
+    ),
+    (
+        "xml_sec_wasm_cms",
+        "WASM CMS timestamp check must accept the token and reject tampering",
+        "WASM CMS timestamp check passed",
     ),
 ];
 

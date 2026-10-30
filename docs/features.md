@@ -132,8 +132,8 @@ Passing the portable Windows core does not claim Windows native-provider or
 oracle qualification.
 
 The required aggregate test check includes the feature-contract jobs. The
-alloc-only job is an independent mandatory gate: it lints XML input, C14N and
-XMLDSig verification for `thumbv7em-none-eabihf` with each XML backend, runs the
+alloc-only job is an independent mandatory gate: it lints XML input, C14N,
+XMLDSig verification and the `cms` provider for `thumbv7em-none-eabihf`, runs the
 target-coverage tests against the build without `std`, checks the shared PKIX
-packages, and executes C14N and a real XMLDSig verification in WASM. This is a meaningful feature/provider
-matrix, not a claim that every subset of all Cargo features has been tested.
+packages, and executes C14N, a real XMLDSig verification and a real RFC 3161
+timestamp check in WASM. This is a meaningful feature/provider matrix, not a claim that every subset of all Cargo features has been tested.

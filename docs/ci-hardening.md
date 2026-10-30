@@ -149,8 +149,8 @@ with their original independent validators and separate evidence artifacts.
 Shared mechanisms are resolved as one registry version across ASN.1, PKIX, CMS,
 LTV and XAdES. The `shared-pkix` tool command rejects duplicate generations and
 path/git substitutes, then independently checks the PKIX and XAdES alloc graphs
-on bare-metal and WASM targets. Core XMLDSig still requires `std`; the shared
-dependency qualification is not a root alloc-only claim.
+on bare-metal and WASM targets. The root package's own alloc-only checks are
+separate; see [feature profiles](features.md).
 
 Custom resolvers and other consumers using the exposed shared memory or PKIX
 types must upgrade their direct shared dependencies together with xml-sec.

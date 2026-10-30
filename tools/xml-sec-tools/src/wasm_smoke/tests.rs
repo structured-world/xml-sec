@@ -25,25 +25,43 @@ fn module(exports: &[(&str, u8)]) -> Vec<u8> {
     bytes
 }
 
-const BOTH: [&str; 2] = ["xml_sec_wasm_smoke", "xml_sec_wasm_verify"];
+const ALL: [&str; 3] = [
+    "xml_sec_wasm_smoke",
+    "xml_sec_wasm_verify",
+    "xml_sec_wasm_cms",
+];
+
+/// A module where the export at `failing`, if any, reports failure.
+fn answering(failing: Option<usize>) -> Vec<u8> {
+    let exports = [0, 1, 2].map(|index| (ALL[index], u8::from(Some(index) != failing)));
+    module(&exports)
+}
 
 #[test]
-fn both_compiled_exports_must_report_success() {
+fn every_compiled_export_must_report_success() {
     // The check is each export's own answer, not that the module loaded.
-    assert!(check_module(&module(&[(BOTH[0], 1), (BOTH[1], 1)])).is_ok());
-    let error = check_module(&module(&[(BOTH[0], 0), (BOTH[1], 1)])).unwrap_err();
-    assert!(error.contains("canonicalization"), "{error}");
-    let error = check_module(&module(&[(BOTH[0], 1), (BOTH[1], 0)])).unwrap_err();
-    assert!(error.contains("XMLDSig verification"), "{error}");
+    assert!(check_module(&answering(None)).is_ok());
+    for (index, failure) in ["canonicalization", "XMLDSig verification", "CMS timestamp"]
+        .into_iter()
+        .enumerate()
+    {
+        let error = check_module(&answering(Some(index))).unwrap_err();
+        assert!(error.contains(failure), "{error}");
+    }
 }
 
 #[test]
 fn a_module_without_an_export_fails() {
     // A renamed or stripped export cannot pass as an executed check.
-    let error = check_module(&module(&[(BOTH[0], 1)])).unwrap_err();
-    assert!(error.contains("xml_sec_wasm_verify"), "{error}");
-    let error = check_module(&module(&[(BOTH[1], 1)])).unwrap_err();
-    assert!(error.contains("xml_sec_wasm_smoke"), "{error}");
+    for missing in ALL {
+        let exports: Vec<_> = ALL
+            .into_iter()
+            .filter(|&name| name != missing)
+            .map(|name| (name, 1))
+            .collect();
+        let error = check_module(&module(&exports)).unwrap_err();
+        assert!(error.contains(missing), "{error}");
+    }
     assert!(check_module(b"not wasm").is_err());
 }
 
