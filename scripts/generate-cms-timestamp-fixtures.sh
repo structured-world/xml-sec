@@ -87,3 +87,10 @@ authority ed25519 -algorithm ED25519
 resign ed25519 -md sha512
 authority rsa-pss -algorithm RSA -pkeyopt rsa_keygen_bits:2048
 resign rsa-pss -md sha256 -keyopt rsa_padding_mode:pss -keyopt rsa_pss_saltlen:32
+
+# Certificates read only for their own signature identifiers.
+authority ed448 -algorithm ED448
+openssl req -x509 -new -key rsa-pss.key -outform DER -out "$output/rsa-pss-signed.der" \
+  -sha256 -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 \
+  -not_before "$NOT_BEFORE" -not_after "$NOT_AFTER" \
+  -subj "/CN=xml-sec Test PSS signature" 2>/dev/null

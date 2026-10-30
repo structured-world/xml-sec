@@ -23,6 +23,7 @@ use structured_pkix::AlgorithmIdentifier;
 use structured_pkix::algorithm::digest::{Algorithm, AsnDigest};
 use structured_pkix::path::WorkingKey;
 
+use super::pkix::CertificateSession;
 use super::verify::SessionDigest;
 use super::{DigestAlgorithm, DsigError, X509ChainError};
 use crate::policy::{KeyTrustPolicy, PolicyViolation, VerificationPolicy};
@@ -32,10 +33,13 @@ use crate::provider::{CryptoProvider, ProviderCapability, X509SignatureAlgorithm
 const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
 
 /// The `structured-cms` provider of one verification operation.
-#[derive(Clone, Copy)]
+///
+/// One value serves one CMS processing session: its signer key checks share
+/// one [`ResourcePolicy::max_x509_work`](crate::policy::ResourcePolicy) account.
 pub struct CmsProvider<'p> {
     provider: &'p dyn CryptoProvider,
     policy: &'p VerificationPolicy,
+    certificates: CertificateSession,
 }
 
 impl core::fmt::Debug for CmsProvider<'_> {
@@ -47,10 +51,14 @@ impl core::fmt::Debug for CmsProvider<'_> {
 }
 
 impl<'p> CmsProvider<'p> {
-    /// Bind `provider` and `policy`; this performs no work.
+    /// Bind `provider` and `policy` and open the session's certificate account.
     #[must_use]
     pub fn new(provider: &'p dyn CryptoProvider, policy: &'p VerificationPolicy) -> Self {
-        Self { provider, policy }
+        Self {
+            provider,
+            policy,
+            certificates: CertificateSession::new(&policy.resources),
+        }
     }
 }
 
@@ -232,15 +240,30 @@ impl CmsProvider<'_> {
         else {
             return Ok(Resolution::Unsupported);
         };
-        // RFC 5753 §2.1.1: the hash named by an ECDSA signature algorithm
-        // MUST be the same as digestAlgorithm.
-        // https://www.rfc-editor.org/rfc/rfc5753#section-2.1.1
-        if let X509SignatureAlgorithm::Ecdsa(hash) = algorithm
-            && hash != digest
-        {
-            return Ok(Resolution::Malformed);
-        }
-        Ok(Resolution::Supported(algorithm))
+        // Raw verification never reads digestAlgorithm, so only this check
+        // binds it. RFC 5754 sets no such rule for PKCS #1 v1.5 or DSA.
+        let consistent = match algorithm {
+            // RFC 5753 §2.1.1: the hash named by an ECDSA signature algorithm
+            // MUST be the same as digestAlgorithm.
+            // https://www.rfc-editor.org/rfc/rfc5753#section-2.1.1
+            // RFC 4056 §3: signedAttrs and the RSASSA-PSS hashAlgorithm MUST
+            // use the same hash.
+            // https://www.rfc-editor.org/rfc/rfc4056#section-3
+            X509SignatureAlgorithm::Ecdsa(hash)
+            | X509SignatureAlgorithm::RsaPss { digest: hash, .. } => hash == digest,
+            // RFC 8419 §3.1 and §3.2: digestAlgorithm MUST be id-sha512 for
+            // Ed25519, and a SHAKE256 identifier for Ed448, which never
+            // resolves to a DigestAlgorithm.
+            // https://www.rfc-editor.org/rfc/rfc8419#section-3
+            X509SignatureAlgorithm::Ed25519 => digest == DigestAlgorithm::Sha512,
+            X509SignatureAlgorithm::Ed448 => false,
+            _ => true,
+        };
+        Ok(if consistent {
+            Resolution::Supported(algorithm)
+        } else {
+            Resolution::Malformed
+        })
     }
 }
 
@@ -276,14 +299,13 @@ impl<'a> SignatureProvider<'a> for CmsProvider<'_> {
             return Ok(Resolution::Unsupported);
         }
         // Key strength is checked before any signed byte is read.
-        let certificates = super::pkix::CertificateSession::new(&self.policy.resources);
         super::pkix::with_effective_spki(key, &parent.execution(), |spki| {
             super::x509::validate_issuer_spki_policy(
                 spki,
                 0,
                 self.policy.key_trust.rsa_keys,
                 self.policy.key_trust.dsa_keys,
-                &certificates,
+                &self.certificates,
             )
         })?;
         Ok(Resolution::Supported(SignatureMode::Raw(algorithm)))

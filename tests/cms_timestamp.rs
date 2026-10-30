@@ -418,6 +418,115 @@ fn an_algorithm_the_provider_lacks_is_unsupported_after_policy_permits_it() {
     ));
 }
 
+/// Resolve the signature identifier of certificate fixture `name` for a signer
+/// whose `digestAlgorithm` is `digest`.
+fn resolve_own_signature(
+    name: &str,
+    digest: DigestAlgorithm,
+) -> Result<Resolution<SignatureMode<X509SignatureAlgorithm>>, CmsProviderError> {
+    let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+    let parser = Parser::der(memory);
+    let policy = permissive();
+    let provider = RustCryptoProvider;
+    let cms = CmsProvider::new(&provider, &policy);
+    let parent = parser.read(&[], 0).expect("reader");
+    let bytes = fixture(&format!("{name}.der"));
+    let certificate = Certificate::read(&parser, &bytes, 0).expect("certificate");
+    cms.resolve_signature(
+        certificate.signature_algorithm(),
+        &digest,
+        WorkingKey::standing(certificate.tbs().public_key()),
+        Encoding::Der,
+        &parent,
+    )
+}
+
+#[test]
+fn ed25519_requires_a_sha512_signer_digest() {
+    // RFC 8419 3.1 and 3.2: the signature verifies over signedAttrs whatever
+    // digestAlgorithm says, so only this check refuses another digest.
+    assert!(matches!(
+        resolve_own_signature("ed25519", DigestAlgorithm::Sha256),
+        Ok(Resolution::Malformed)
+    ));
+    assert!(matches!(
+        resolve_own_signature("ed25519", DigestAlgorithm::Sha512),
+        Ok(Resolution::Supported(SignatureMode::Raw(
+            X509SignatureAlgorithm::Ed25519
+        )))
+    ));
+}
+
+#[test]
+fn ed448_refuses_every_digest_it_could_resolve() {
+    // RFC 8419 3.1 and 3.2 require SHAKE256, which is no digest identity here.
+    for digest in [DigestAlgorithm::Sha256, DigestAlgorithm::Sha512] {
+        assert!(matches!(
+            resolve_own_signature("ed448", digest),
+            Ok(Resolution::Malformed)
+        ));
+    }
+}
+
+#[test]
+fn rsa_pss_must_name_the_signer_digest() {
+    // RFC 4056 section 3: the hash of signedAttrs and hashAlgorithm of the
+    // RSASSA-PSS parameters MUST be the same.
+    assert!(matches!(
+        resolve_own_signature("rsa-pss-signed", DigestAlgorithm::Sha384),
+        Ok(Resolution::Malformed)
+    ));
+    assert!(matches!(
+        resolve_own_signature("rsa-pss-signed", DigestAlgorithm::Sha256),
+        Ok(Resolution::Supported(SignatureMode::Raw(
+            X509SignatureAlgorithm::RsaPss { .. }
+        )))
+    ));
+}
+
+#[test]
+fn one_provider_charges_every_signer_to_one_certificate_account() {
+    // max_x509_work is cumulative for a processing session: with the smallest
+    // allowance one signer's key check fits, a second one through the same
+    // provider is refused instead of receiving a fresh allowance.
+    let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+    let parser = Parser::der(memory);
+    let provider = RustCryptoProvider;
+    let parent = parser.read(&[], 0).expect("reader");
+    let bytes = fixture("rsa.der");
+    let certificate = Certificate::read(&parser, &bytes, 0).expect("certificate");
+    let key = certificate.tbs().public_key();
+    let smallest = (1..=4096)
+        .find(|&work| {
+            let mut policy = permissive();
+            policy.resources.max_x509_work = work;
+            CmsProvider::new(&provider, &policy)
+                .resolve_signature(
+                    certificate.signature_algorithm(),
+                    &DigestAlgorithm::Sha256,
+                    WorkingKey::standing(key),
+                    Encoding::Der,
+                    &parent,
+                )
+                .is_ok()
+        })
+        .expect("an allowance that fits one key check");
+    let mut policy = permissive();
+    policy.resources.max_x509_work = smallest;
+    let cms = CmsProvider::new(&provider, &policy);
+    let resolve = || {
+        cms.resolve_signature(
+            certificate.signature_algorithm(),
+            &DigestAlgorithm::Sha256,
+            WorkingKey::standing(key),
+            Encoding::Der,
+            &parent,
+        )
+    };
+    assert!(resolve().is_ok());
+    assert!(resolve().is_err());
+}
+
 #[test]
 fn ecdsa_must_name_the_signer_digest_and_rsa_encryption_takes_it() {
     // RFC 5753 §2.1.1: ecdsa-with-SHA256 under a SHA-384 digestAlgorithm is

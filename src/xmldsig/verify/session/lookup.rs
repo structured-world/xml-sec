@@ -177,7 +177,9 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     }
 
     /// CMS and RFC 3161 signature checks through this operation's provider,
-    /// digest and certificate-signature policy and RSA/DSA key policy.
+    /// digest and certificate-signature policy and RSA/DSA key policy. Each
+    /// call opens a new certificate account, as [`Self::certificate_parser`]
+    /// does, so one CMS processing session uses one provider.
     #[cfg(feature = "cms")]
     pub fn cms_provider(&self) -> crate::xmldsig::cms::CmsProvider<'_> {
         crate::xmldsig::cms::CmsProvider::new(self.context.provider, &self.context.policy)
