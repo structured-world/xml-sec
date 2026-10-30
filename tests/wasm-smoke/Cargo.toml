@@ -10,4 +10,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-xml-sec = { path = "../..", default-features = false, features = ["c14n", "xmldsig", "xml-backend-roxmltree"] }
+xml-sec = { path = "../..", default-features = false, features = ["c14n", "cms", "xml-backend-roxmltree"] }
+structured-asn1 = { version = "0.18.0", default-features = false, features = ["alloc"] }
+structured-cms = { version = "0.18.0", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.18.0", default-features = false, features = ["alloc"] }
