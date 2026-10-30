@@ -8,8 +8,9 @@ fn lines(actions: &[Action]) -> Vec<String> {
     actions
         .iter()
         .map(|action| {
-            let (Action::Run(step) | Action::VerifyOnlyGraph(step) | Action::MissingBackend(step)) =
-                action;
+            let (Action::Run(step)
+            | Action::VerifyOnlyGraph(step, _)
+            | Action::MissingBackend(step)) = action;
             step.args.join(" ")
         })
         .collect()
@@ -71,7 +72,7 @@ fn a_verification_only_graph_with_signing_or_import_crates_fails_before_lint() {
     // The verify-only feature exists to keep these crates out of the dependency
     // graph; one reappearing through any edge must fail qualification.
     let actions = plan("dsig-xmloxide", "lint", None).unwrap();
-    assert!(matches!(actions[0], Action::VerifyOnlyGraph(_)));
+    assert!(matches!(actions[0], Action::VerifyOnlyGraph(..)));
     for name in VERIFY_ONLY_FORBIDDEN {
         let mut runner = Recorded {
             output: format!("xml-sec v0.2.0\n{name} v1.0.0\n"),
@@ -89,7 +90,10 @@ fn a_verification_only_graph_with_signing_or_import_crates_fails_before_lint() {
     }
     // A crate whose name merely starts with a forbidden name is not a match.
     assert_eq!(
-        forbidden_crate("xml-sec v0.2.0\npkcs12-extra v1.0.0\n"),
+        forbidden_crate(
+            "xml-sec v0.2.0\npkcs12-extra v1.0.0\n",
+            &VERIFY_ONLY_FORBIDDEN
+        ),
         None
     );
     let mut prefixed = Recorded {
@@ -97,6 +101,44 @@ fn a_verification_only_graph_with_signing_or_import_crates_fails_before_lint() {
         ..Recorded::default()
     };
     execute(&actions, &mut prefixed).unwrap();
+}
+
+#[test]
+fn only_the_cms_profile_may_compile_the_cms_processor() {
+    // Plain XMLDSig verification stays free of CMS; the cms profile adds it
+    // but keeps every signing and import crate out of its graph.
+    let graph = "xml-sec v0.2.0\nstructured-cms v0.18.0\n";
+    let run = |profile: &str, output: &str| {
+        let actions = plan(profile, "lint", None).unwrap();
+        execute(
+            &actions,
+            &mut Recorded {
+                output: output.into(),
+                ..Recorded::default()
+            },
+        )
+    };
+    assert_eq!(
+        run("dsig-roxmltree", graph).unwrap_err().message,
+        "verification-only graph contains structured-cms"
+    );
+    run("cms-xmloxide", graph).unwrap();
+    assert_eq!(
+        run("cms-xmloxide", "xml-sec v0.2.0\npkcs12 v0.2.0\n")
+            .unwrap_err()
+            .message,
+        "verification-only graph contains pkcs12"
+    );
+}
+
+#[test]
+fn the_cms_profile_runs_its_real_token_tests_without_the_signing_facade_test() {
+    assert_eq!(
+        planned("cms-xmloxide", "test"),
+        [
+            "nextest run -p xml-sec --no-default-features --features cms,xml-backend-xmloxide --lib --test cms_timestamp"
+        ]
+    );
 }
 
 #[test]
@@ -161,6 +203,7 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
         ("c14n-roxmltree", "c14n,xml-backend-roxmltree"),
         ("dsig-xmloxide", "xmldsig,xml-backend-xmloxide"),
         ("dsig-roxmltree", "xmldsig,xml-backend-roxmltree"),
+        ("cms-xmloxide", "cms,xml-backend-xmloxide"),
         ("dsig-sign-xmloxide", "xmldsig-sign,xml-backend-xmloxide"),
         ("xmlenc-xmloxide", "xmlenc,xml-backend-xmloxide"),
         ("xmlenc-roxmltree", "xmlenc,xml-backend-roxmltree"),
@@ -177,7 +220,9 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
         ("pkcs11", "pkcs11,xml-backend-xmloxide"),
     ] {
         let mut expected = Vec::new();
-        if profile.starts_with("dsig-") && !profile.starts_with("dsig-sign") {
+        if profile.starts_with("cms-")
+            || profile.starts_with("dsig-") && !profile.starts_with("dsig-sign")
+        {
             expected.push(format!(
                 "tree -p xml-sec --no-default-features --features {features} -e normal --prefix none --format {{p}}"
             ));

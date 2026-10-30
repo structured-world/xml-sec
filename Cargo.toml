@@ -416,6 +416,7 @@ std = [
     "xmlparser/std",
     "structured-asn1?/std",
     "structured-pkix?/std",
+    "structured-cms?/std",
     "base64/std",
     "snafu?/std",
     "der?/std",
@@ -466,6 +467,8 @@ xmldsig = [            # XML Digital Signature verification and public-key inven
     "dep:tinyvec",
     "dep:zeroize",
 ]
+# CMS SignedData and RFC 3161 timestamp signatures through the selected provider.
+cms = ["xmldsig", "dep:structured-cms"]
 # Signing, signing randomness and private-key import (PEM/PKCS#8, encrypted
 # PKCS#8, PKCS#12) on top of verification.
 xmldsig-sign = [

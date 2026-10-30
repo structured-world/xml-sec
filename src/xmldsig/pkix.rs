@@ -789,7 +789,7 @@ fn materialize_effective_spki<W: Work>(
     Ok(output.expect("all parts completed"))
 }
 
-fn with_effective_spki<T, W: Work>(
+pub(crate) fn with_effective_spki<T, W: Work>(
     key: structured_pkix::path::WorkingKey<'_>,
     execution: &W,
     verify: impl FnOnce(&[u8]) -> Result<T, X509ChainError>,
@@ -934,7 +934,7 @@ impl ProviderVerifier<'_> {
 }
 
 /// Digests this crate implements, by their shared PKIX identity.
-fn digest_algorithm(
+pub(crate) fn digest_algorithm(
     value: structured_pkix::algorithm::digest::Algorithm,
 ) -> Option<super::DigestAlgorithm> {
     use structured_pkix::algorithm::digest::Algorithm as Hash;
@@ -956,43 +956,48 @@ fn signature_algorithm<W: Work>(
     identifier: structured_pkix::algorithm::AlgorithmIdentifier<'_>,
     execution: &W,
 ) -> Result<crate::provider::X509SignatureAlgorithm, X509ChainError> {
+    if let Some(algorithm) = known_signature_algorithm(identifier, execution)? {
+        return Ok(algorithm);
+    }
+    // Preserve branch-local discovery semantics for unknown identifiers.
+    // PKIX has already validated the OID's original encoding; its dotted
+    // text is rendered under the current operation's account.
+    let memory = execution.memory();
+    let resource = |reason| {
+        X509ChainError::Processing(structured_pkix::Error::resource(
+            reason,
+            "certificate.signature",
+            identifier.offset(),
+        ))
+    };
+    let text = identifier.algorithm().text(memory).map_err(resource)?;
+    Err(X509ChainError::UnsupportedSignatureAlgorithm {
+        oid: text.as_str(memory).map_err(resource)?.to_owned(),
+    })
+}
+
+/// The provider signature algorithm a PKIX identifier names, or `None` when
+/// this crate implements no such algorithm or parameter set.
+pub(crate) fn known_signature_algorithm<W: Work>(
+    identifier: structured_pkix::algorithm::AlgorithmIdentifier<'_>,
+    execution: &W,
+) -> Result<Option<crate::provider::X509SignatureAlgorithm>, X509ChainError> {
     use crate::provider::X509SignatureAlgorithm as Signature;
     use structured_asn1::digest::Resolution;
-    use structured_pkix::algorithm::{digest::Algorithm as Hash, signature::Algorithm};
-    let unsupported = || {
-        // Preserve branch-local discovery semantics for unknown identifiers.
-        // PKIX has already validated the OID's original encoding; its dotted
-        // text is rendered under the current operation's account.
-        let memory = execution.memory();
-        let resource = |reason| {
-            X509ChainError::Processing(structured_pkix::Error::resource(
-                reason,
-                "certificate.signature",
-                identifier.offset(),
-            ))
-        };
-        match identifier.algorithm().text(memory) {
-            Ok(text) => match text.as_str(memory) {
-                Ok(oid) => X509ChainError::UnsupportedSignatureAlgorithm {
-                    oid: oid.to_owned(),
-                },
-                Err(reason) => resource(reason),
-            },
-            Err(reason) => resource(reason),
-        }
-    };
-    let hash = |value: Hash| digest_algorithm(value).ok_or_else(unsupported);
+    use structured_pkix::algorithm::signature::Algorithm;
     // Shared PKIX owns ASN.1 signature syntax and parameters, retaining the
     // original reader/depth and both source and current Work. The XML adapter
     // maps only provider capability; it never encodes/reparses the identifier.
     structured_pkix::algorithm::signature::with_algorithm(identifier, execution, |value| {
         Ok(match value {
-            Some(Algorithm::RsaPkcs1v15(value)) => Signature::RsaPkcs1v15(hash(value)?),
-            Some(Algorithm::Dsa(value)) => Signature::Dsa(hash(value)?),
-            Some(Algorithm::Ecdsa(value)) => Signature::Ecdsa(hash(value)?),
-            Some(Algorithm::Ed25519) => Signature::Ed25519,
-            Some(Algorithm::Ed448) => Signature::Ed448,
-            Some(Algorithm::MlDsa(set)) => Signature::PostQuantum(match set {
+            Some(Algorithm::RsaPkcs1v15(value)) => {
+                digest_algorithm(value).map(Signature::RsaPkcs1v15)
+            }
+            Some(Algorithm::Dsa(value)) => digest_algorithm(value).map(Signature::Dsa),
+            Some(Algorithm::Ecdsa(value)) => digest_algorithm(value).map(Signature::Ecdsa),
+            Some(Algorithm::Ed25519) => Some(Signature::Ed25519),
+            Some(Algorithm::Ed448) => Some(Signature::Ed448),
+            Some(Algorithm::MlDsa(set)) => Some(Signature::PostQuantum(match set {
                 structured_pkix::algorithm::ml_dsa::ParameterSet::MlDsa44 => {
                     super::PqAlgorithm::MlDsa44
                 }
@@ -1002,24 +1007,32 @@ fn signature_algorithm<W: Work>(
                 structured_pkix::algorithm::ml_dsa::ParameterSet::MlDsa87 => {
                     super::PqAlgorithm::MlDsa87
                 }
-            }),
+            })),
             Some(Algorithm::RsaPss(parameters)) => {
-                let profile = match parameters
+                match parameters
                     .profile(execution)
                     .map_err(X509ChainError::Processing)?
                 {
-                    Resolution::Supported(profile) => profile,
-                    Resolution::Unsupported | Resolution::Malformed => return Err(unsupported()),
-                };
-                let salt_len = profile
-                    .salt()
-                    .as_u64()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or_else(unsupported)?;
-                Signature::RsaPss {
-                    digest: hash(profile.hash())?,
-                    mgf_digest: hash(profile.mask_hash())?,
-                    salt_len,
+                    Resolution::Supported(profile) => {
+                        match (
+                            digest_algorithm(profile.hash()),
+                            digest_algorithm(profile.mask_hash()),
+                            profile
+                                .salt()
+                                .as_u64()
+                                .and_then(|value| usize::try_from(value).ok()),
+                        ) {
+                            (Some(digest), Some(mgf_digest), Some(salt_len)) => {
+                                Some(Signature::RsaPss {
+                                    digest,
+                                    mgf_digest,
+                                    salt_len,
+                                })
+                            }
+                            _ => None,
+                        }
+                    }
+                    Resolution::Unsupported | Resolution::Malformed => None,
                 }
             }
             None => {
@@ -1031,31 +1044,28 @@ fn signature_algorithm<W: Work>(
                     [0x2b, 0x0e, 0x03, 0x02, 0x1d]
                         if parameters.is_none() || identifier.has_null_parameter() =>
                     {
-                        Signature::RsaPkcs1v15(super::DigestAlgorithm::Sha1)
+                        Some(Signature::RsaPkcs1v15(super::DigestAlgorithm::Sha1))
                     }
                     [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x03]
                         if parameters.is_none() =>
                     {
-                        Signature::Dsa(super::DigestAlgorithm::Sha384)
+                        Some(Signature::Dsa(super::DigestAlgorithm::Sha384))
                     }
                     [0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x04]
                         if parameters.is_none() =>
                     {
-                        Signature::Dsa(super::DigestAlgorithm::Sha512)
+                        Some(Signature::Dsa(super::DigestAlgorithm::Sha512))
                     }
-                    _ if parameters.is_none() => Signature::PostQuantum(
-                        super::PqAlgorithm::ALL
-                            .into_iter()
-                            .find(|value| {
-                                der::asn1::ObjectIdentifier::new_unwrap(value.oid()).as_bytes()
-                                    == oid
-                            })
-                            .ok_or_else(unsupported)?,
-                    ),
-                    _ => return Err(unsupported()),
+                    _ if parameters.is_none() => super::PqAlgorithm::ALL
+                        .into_iter()
+                        .find(|value| {
+                            der::asn1::ObjectIdentifier::new_unwrap(value.oid()).as_bytes() == oid
+                        })
+                        .map(Signature::PostQuantum),
+                    _ => None,
                 }
             }
-            _ => return Err(unsupported()),
+            _ => None,
         })
     })
     .map_err(X509ChainError::Processing)?

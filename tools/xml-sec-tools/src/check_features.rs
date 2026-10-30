@@ -9,8 +9,9 @@ mod tests;
 
 /// Crates a verification-only build must not compile: signing, private-key
 /// import, password derivation, an OS randomness source and a second
-/// certificate reader.
-pub(crate) const VERIFY_ONLY_FORBIDDEN: [&str; 8] = [
+/// certificate reader. The `cms` feature admits only `structured-cms`, the
+/// last entry.
+pub(crate) const VERIFY_ONLY_FORBIDDEN: [&str; 9] = [
     "pkcs12",
     "pkcs5",
     "pbkdf2",
@@ -19,7 +20,13 @@ pub(crate) const VERIFY_ONLY_FORBIDDEN: [&str; 8] = [
     "x509-cert",
     "x509-parser",
     "getrandom",
+    "structured-cms",
 ];
+
+const CMS_FORBIDDEN: &[&str] = VERIFY_ONLY_FORBIDDEN
+    .split_last()
+    .expect("the list is not empty")
+    .1;
 
 const BACKEND_DIAGNOSTIC: &str = "compile at least one XML backend";
 
@@ -52,8 +59,8 @@ impl Phase {
 pub(crate) enum Action {
     /// A process that must succeed.
     Run(Step),
-    /// A `cargo tree` listing that must name no verification-only refusal.
-    VerifyOnlyGraph(Step),
+    /// A `cargo tree` listing that must name none of the refused crates.
+    VerifyOnlyGraph(Step, &'static [&'static str]),
     /// A build that must fail with the missing-backend diagnostic.
     MissingBackend(Step),
 }
@@ -67,7 +74,7 @@ struct Profile {
     facade: bool,
 }
 
-const PROFILES: [Profile; 15] = [
+const PROFILES: [Profile; 16] = [
     profile("default", None, &["rust_api"], false),
     profile("dom-xmloxide", Some("xml-backend-xmloxide"), &[], false),
     profile("dom-roxmltree", Some("xml-backend-roxmltree"), &[], false),
@@ -93,6 +100,12 @@ const PROFILES: [Profile; 15] = [
         "dsig-roxmltree",
         Some("xmldsig,xml-backend-roxmltree"),
         &["verify_only_build"],
+        false,
+    ),
+    profile(
+        "cms-xmloxide",
+        Some("cms,xml-backend-xmloxide"),
+        &["cms_timestamp"],
         false,
     ),
     profile(
@@ -191,18 +204,22 @@ pub(crate) fn plan(
         );
     }
     let mut actions = Vec::new();
-    if selected.targets.contains(&"verify_only_build") && phase.includes(Phase::Lint) {
+    let forbidden: Option<&'static [&'static str]> = match selected.targets {
+        ["verify_only_build"] => Some(&VERIFY_ONLY_FORBIDDEN),
+        ["cms_timestamp"] => Some(CMS_FORBIDDEN),
+        _ => None,
+    };
+    if let Some(forbidden) = forbidden.filter(|_| phase.includes(Phase::Lint)) {
         let tree = [
             &["tree"][..],
             &args,
             &["-e", "normal", "--prefix", "none", "--format", "{p}"],
         ]
         .concat();
-        actions.push(Action::VerifyOnlyGraph(Step::new(
-            "dependency graph",
-            "cargo",
-            &tree,
-        )));
+        actions.push(Action::VerifyOnlyGraph(
+            Step::new("dependency graph", "cargo", &tree),
+            forbidden,
+        ));
     }
     if phase.includes(Phase::Lint) {
         let clippy = [
@@ -229,10 +246,10 @@ pub(crate) fn plan(
     Ok(actions)
 }
 
-/// The first crate of `graph` (one `name vVERSION` per line) a
-/// verification-only build must not contain.
-pub(crate) fn forbidden_crate(graph: &str) -> Option<&'static str> {
-    VERIFY_ONLY_FORBIDDEN.into_iter().find(|name| {
+/// The first crate of `forbidden` that `graph` (one `name vVERSION` per line)
+/// contains.
+pub(crate) fn forbidden_crate(graph: &str, forbidden: &[&'static str]) -> Option<&'static str> {
+    forbidden.iter().copied().find(|name| {
         graph.lines().any(|line| {
             line.strip_prefix(name)
                 .is_some_and(|rest| rest.starts_with(" v"))
@@ -245,10 +262,10 @@ pub(crate) fn execute(actions: &[Action], runner: &mut impl Run) -> Result<(), F
     for action in actions {
         match action {
             Action::Run(step) => require(runner.status(step)?)?,
-            Action::VerifyOnlyGraph(step) => {
+            Action::VerifyOnlyGraph(step, forbidden) => {
                 let (status, graph) = runner.stdout(step)?;
                 require(status)?;
-                if let Some(name) = forbidden_crate(&graph) {
+                if let Some(name) = forbidden_crate(&graph, forbidden) {
                     return Err(format!("verification-only graph contains {name}").into());
                 }
             }
