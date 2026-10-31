@@ -2,6 +2,22 @@
 
 use alloc::{string::String, vec, vec::Vec};
 
+/// Whether a byte is a RFC 4648 §4 alphabet character.
+const BASE64_ALPHABET: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut byte = 0_u8;
+    loop {
+        table[byte as usize] = matches!(
+            byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/'
+        );
+        if byte == u8::MAX {
+            break table;
+        }
+        byte += 1;
+    }
+};
+
 /// Borrow XML text and validate its exact decoded size without normalizing it
 /// into a second heap buffer. Callers reserve this size before calling decode.
 pub(crate) struct XmlBase64Payload<'a, 'input> {
@@ -42,30 +58,50 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
             text_len = text_len
                 .checked_add(text.len())
                 .ok_or("base64 size overflow")?;
-            for byte in text.bytes() {
+            let mut rest = text.as_bytes();
+            while let [byte, ..] = rest {
                 if matches!(byte, b' ' | b'\t' | b'\r' | b'\n') {
+                    rest = &rest[1..];
                     continue;
                 }
                 if normalized_len >= max_normalized {
                     return Err("maximum allowed base64 length");
                 }
-                if byte == b'=' {
+                let run = rest
+                    .iter()
+                    .position(|byte| !BASE64_ALPHABET[usize::from(*byte)])
+                    .unwrap_or(rest.len());
+                if run == 0 {
+                    if *byte != b'=' {
+                        return Err("invalid base64 character or XML whitespace");
+                    }
                     padding += 1;
                     if padding > 2 {
                         return Err("invalid base64 padding");
                     }
-                } else if padding != 0
-                    || !matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/')
-                {
+                    #[cfg(feature = "xmlenc")]
+                    {
+                        tail[normalized_len % 4] = b'=';
+                    }
+                    // Bounded by `max_normalized`, checked above.
+                    normalized_len += 1;
+                    rest = &rest[1..];
+                    continue;
+                }
+                if padding != 0 {
                     return Err("invalid base64 character or XML whitespace");
                 }
-                #[cfg(feature = "xmlenc")]
-                {
-                    tail[normalized_len % 4] = byte;
+                if run > max_normalized - normalized_len {
+                    return Err("maximum allowed base64 length");
                 }
-                normalized_len = normalized_len
-                    .checked_add(1)
-                    .ok_or("base64 size overflow")?;
+                // Only the final quartet is read back, so the run's last bytes
+                // land where a byte-at-a-time walk would leave them.
+                #[cfg(feature = "xmlenc")]
+                for (offset, byte) in rest[..run].iter().enumerate().skip(run.saturating_sub(4)) {
+                    tail[(normalized_len + offset) % 4] = *byte;
+                }
+                normalized_len += run;
+                rest = &rest[run..];
             }
         }
         if !normalized_len.is_multiple_of(4) {
@@ -109,8 +145,21 @@ impl<'a, 'input> XmlBase64Payload<'a, 'input> {
     pub(crate) fn normalized(&self) -> Result<String, &'static str> {
         self.validate()?;
         let mut value = String::with_capacity(self.normalized_len);
-        for byte in self.normalized_bytes() {
-            value.push(char::from(byte));
+        let texts = self
+            .node
+            .children()
+            .filter(crate::xml::dom::Node::is_text)
+            .filter_map(crate::xml::dom::Node::text);
+        for mut rest in texts {
+            // XML whitespace is ASCII, so these offsets are character boundaries.
+            while let Some(end) = rest
+                .bytes()
+                .position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+            {
+                value.push_str(&rest[..end]);
+                rest = &rest[end + 1..];
+            }
+            value.push_str(rest);
         }
         Ok(value)
     }
