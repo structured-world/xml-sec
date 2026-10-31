@@ -210,6 +210,17 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
                     inherited_range,
                     range_actionable,
                 } => {
+                    // The next sibling waits under this node's subtree, so the
+                    // stack grows with depth and not with an element's width.
+                    if let Some(next) = self.source.next_sibling(source) {
+                        stack.push(ProjectionFrame::Enter {
+                            source: next,
+                            parent,
+                            namespace_owner,
+                            inherited_range: inherited_range.clone(),
+                            range_actionable,
+                        })?;
+                    }
                     // Each node is entered once, so its payload moves out.
                     let kind = core::mem::replace(
                         &mut self.source.node_mut(source).kind,
@@ -460,18 +471,14 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
         inherited_range: Option<&Range<usize>>,
         range_actionable: bool,
     ) -> Result<(), ParseError> {
-        // Walk linked siblings backwards instead of allocating a second child
-        // vector merely to reverse iteration.
-        let mut child = self.source.last_child(source);
-        while let Some(current) = child {
+        if let Some(first) = self.source.first_child(source) {
             stack.push(ProjectionFrame::Enter {
-                source: current,
+                source: first,
                 parent,
                 namespace_owner,
                 inherited_range: inherited_range.cloned(),
                 range_actionable,
             })?;
-            child = self.source.prev_sibling(current);
         }
         Ok(())
     }

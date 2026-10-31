@@ -174,7 +174,8 @@ impl<'a> CanonicalOutputOptions<'a> {
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
 pub(crate) trait NsRenderer<S: Scratch = Native, D: DomStorage = NativeDom> {
     /// Compute namespace declarations to emit for this element.
-    /// Returns `(sorted_ns_decls, updated_rendered_map)`.
+    /// Returns `(sorted_ns_decls, updated_rendered_map)`, the map `None` when
+    /// children read `parent_rendered` unchanged.
     ///
     /// `parent_rendered` maps prefix → URI for what the nearest output ancestor
     /// already declared in the canonical form.
@@ -637,7 +638,7 @@ fn serialize_element<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
         with_comments,
         ns_renderer,
         config,
-        &rendered,
+        rendered.as_ref().unwrap_or(parent_rendered),
         output,
     )?;
     output.write_all(b"</")?;
@@ -653,7 +654,7 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
     output: &mut CanonicalOutput<'_, W, S>,
-) -> Result<S::Namespaces<'n>, C14nError> {
+) -> Result<Option<S::Namespaces<'n>>, C14nError> {
     let (ns_decls, rendered) =
         ns_renderer.render_namespaces(node, parent_rendered, visibility, output.scratch)?;
 

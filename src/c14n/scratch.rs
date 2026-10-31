@@ -21,7 +21,7 @@ pub(crate) enum NamespaceState<'a> {
 }
 
 impl<'a> NamespaceState<'a> {
-    fn binding(entry: Option<&'a str>) -> Self {
+    pub(crate) fn binding(entry: Option<&'a str>) -> Self {
         match entry {
             None => Self::Excluded,
             Some(uri) => Self::Bound(uri),
@@ -163,10 +163,23 @@ pub(crate) trait Scratch {
     fn text(&self, parts: &[&str]) -> Result<Self::Text, C14nError>;
 }
 
+/// An element's declarations, and the map its children read when it differs
+/// from the parent's. Most elements change nothing, so most copy nothing.
 pub(crate) type NamespaceRendering<'a, S> = (
     <S as Scratch>::Values<(&'a str, &'a str)>,
-    <S as Scratch>::Namespaces<'a>,
+    Option<<S as Scratch>::Namespaces<'a>>,
 );
+
+/// `rendered`, copied from `parent` before its first change.
+pub(crate) fn changed<'m, 'a, M: NamespaceMap<'a>>(
+    rendered: &'m mut Option<M>,
+    parent: &M,
+) -> Result<&'m mut M, C14nError> {
+    if rendered.is_none() {
+        *rendered = Some(parent.copy()?);
+    }
+    Ok(rendered.as_mut().expect("assigned above"))
+}
 
 pub(crate) struct Native;
 

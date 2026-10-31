@@ -11,7 +11,7 @@ use crate::xml::dom::storage::Storage as DomStorage;
 use super::C14nError;
 use super::NodeVisibility;
 use super::prefix::has_in_scope_default_namespace;
-use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
+use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch, changed};
 
 /// Collect, filter, and sort namespace declarations for a single element.
 ///
@@ -33,7 +33,7 @@ use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
 /// # Returns
 ///
 /// `(sorted_ns_decls, updated_rendered_map)` — the declarations to emit and
-/// the binding map to pass to child elements.
+/// the binding map for child elements, `None` when it is `parent_rendered`.
 pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
     node: Node<'a, '_, D>,
     parent_rendered: &S::Namespaces<'a>,
@@ -42,7 +42,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
     include_prefix: impl Fn(&str, &str) -> Result<bool, C14nError>,
     scratch: &S,
 ) -> Result<NamespaceRendering<'a, S>, C14nError> {
-    let mut rendered = parent_rendered.copy()?;
+    let mut rendered = None;
     let mut decls = scratch.values();
 
     for (ordinal, ns) in node.namespaces().enumerate() {
@@ -70,7 +70,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
                 {
                     decls.push(("", ""))?;
                 }
-                rendered.remove(prefix)?;
+                changed(&mut rendered, parent_rendered)?.remove(prefix)?;
             }
             continue;
         }
@@ -114,7 +114,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
 
     // Update the rendered map for child elements.
     for &(prefix, uri) in decls.iter() {
-        rendered.insert(prefix, false, Some(uri))?;
+        changed(&mut rendered, parent_rendered)?.insert(prefix, false, Some(uri))?;
     }
 
     Ok((decls, rendered))
@@ -156,6 +156,7 @@ mod tests {
                 .map(|(p, u)| (p.to_owned(), u.to_owned()))
                 .collect(),
             rendered
+                .unwrap_or(namespaces)
                 .into_pairs()
                 .map(|(p, u)| (p.to_owned(), u.to_owned()))
                 .collect(),
