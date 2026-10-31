@@ -11,7 +11,7 @@ use xmloxide::tree::{NodeId as XmloxNodeId, NodeKind as XmloxNodeKind};
 use super::{
     Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
     preflight::{PositionCursor, SourceKind},
-    tree::{AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder},
+    tree::{AttributeData, NamespaceData, NamespaceSet, NodeId, NodeKind, TreeBuilder},
 };
 
 pub(super) struct XmloxideBackend;
@@ -243,30 +243,11 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
             Some(range) => range.clone(),
             None => self.positions.take(SourceKind::Element)?,
         };
-        let inherited = namespace_owner
-            .and_then(|owner| self.target.namespaces(owner))
-            .unwrap_or_default();
-        let mut namespaces = storage.values(inherited.len())?;
-        for namespace in inherited {
-            storage.charge(1)?;
-            namespaces.push(NamespaceData {
-                prefix: storage.optional_text(namespace.prefix.as_deref())?,
-                uri: storage.text(namespace.uri.as_ref())?,
-            })?;
-        }
+        let namespaces = self.project_namespaces(attributes, namespace_owner)?;
         let mut semantic_attributes = storage.values(attributes.len())?;
         for attribute in &**attributes {
             storage.charge(1)?;
-            if attribute.prefix.as_deref() == Some("xmlns") {
-                set_namespace(
-                    &mut namespaces,
-                    Some(&attribute.name),
-                    &attribute.value,
-                    storage,
-                )?;
-            } else if attribute.prefix.is_none() && attribute.name.as_ref() == "xmlns" {
-                set_namespace(&mut namespaces, None, &attribute.value, storage)?;
-            } else {
+            if namespace_declaration(attribute).is_none() {
                 semantic_attributes.push(AttributeData {
                     name: storage.text(&attribute.name)?,
                     namespace: storage.optional_text(attribute.namespace.as_deref())?,
@@ -290,6 +271,38 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
             range,
             range_actionable,
         )
+    }
+
+    /// The element's in-scope set: its parent's, unless it declares bindings.
+    fn project_namespaces(
+        &mut self,
+        attributes: &[xmloxide::tree::Attribute<R>],
+        namespace_owner: Option<NodeId>,
+    ) -> Result<NamespaceSet, ParseError> {
+        let storage = self.target.storage();
+        let inherited = self.target.namespace_set_of(namespace_owner);
+        storage.charge(attributes.len())?;
+        if attributes
+            .iter()
+            .all(|attribute| namespace_declaration(attribute).is_none())
+        {
+            return Ok(inherited);
+        }
+        let inherited = self.target.namespace_bindings(inherited);
+        let mut namespaces = storage.values(inherited.len())?;
+        for namespace in inherited {
+            storage.charge(1)?;
+            namespaces.push(NamespaceData {
+                prefix: storage.optional_text(namespace.prefix.as_deref())?,
+                uri: storage.text(namespace.uri.as_ref())?,
+            })?;
+        }
+        for attribute in attributes {
+            if let Some(prefix) = namespace_declaration(attribute) {
+                set_namespace(&mut namespaces, prefix, &attribute.value, storage)?;
+            }
+        }
+        self.target.add_namespace_set(namespaces)
     }
 
     fn project_leaf(
@@ -401,6 +414,20 @@ impl<S: Storage, R: NameStorage> Projector<'_, '_, '_, S, R> {
             return Ok(());
         }
         Err(ParseError::NodesLimitReached)
+    }
+}
+
+/// The bound prefix when `attribute` declares a namespace: `Some(None)` is the
+/// default namespace.
+fn namespace_declaration<R: NameStorage>(
+    attribute: &xmloxide::tree::Attribute<R>,
+) -> Option<Option<&str>> {
+    if attribute.prefix.as_deref() == Some("xmlns") {
+        Some(Some(&attribute.name))
+    } else if attribute.prefix.is_none() && attribute.name.as_ref() == "xmlns" {
+        Some(None)
+    } else {
+        None
     }
 }
 

@@ -52,7 +52,9 @@ pub enum NodeType {
 
 pub(super) struct NodeData<S: Storage = Native> {
     pub(super) parent: Option<NodeId>,
-    pub(super) children: S::Values<NodeId>,
+    // Subtrees are contiguous in preorder, so children are reached through
+    // `subtree_end` and need no list of their own.
+    pub(super) child_count: u32,
     pub(super) kind: NodeKind<S>,
     pub(super) range: Range<usize>,
     pub(super) range_actionable: bool,
@@ -63,6 +65,20 @@ pub(super) struct NodeData<S: Storage = Native> {
     pub(super) xpath_start: u32,
 }
 
+/// One in-scope binding list in the document's table. An element without its
+/// own declarations shares its parent's list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NamespaceSet(u32);
+
+impl NamespaceSet {
+    /// No bindings; every document's first table entry.
+    pub(super) const EMPTY: Self = Self(0);
+
+    fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 pub(super) enum NodeKind<S: Storage = Native> {
     Root,
     Element {
@@ -70,7 +86,7 @@ pub(super) enum NodeKind<S: Storage = Native> {
         namespace: Option<S::Text>,
         prefix: Option<S::Text>,
         attributes: S::Values<AttributeData<S>>,
-        namespaces: S::Values<NamespaceData<S>>,
+        namespaces: NamespaceSet,
     },
     Text(S::Text),
     Comment(S::Text),
@@ -182,60 +198,16 @@ impl<S: Storage> core::fmt::Debug for NodeKind<S> {
                 .field("namespace", namespace)
                 .field("prefix", prefix)
                 .field("attributes", &&attributes[..])
-                .field("namespaces", &&namespaces[..])
+                .field("namespaces", namespaces)
                 .finish(),
         }
     }
 }
-impl<S: Storage> PartialEq for NodeKind<S> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Root, Self::Root) => true,
-            (Self::Text(a), Self::Text(b)) | (Self::Comment(a), Self::Comment(b)) => {
-                a.as_ref() == b.as_ref()
-            }
-            (
-                Self::PI {
-                    target: a,
-                    value: av,
-                },
-                Self::PI {
-                    target: b,
-                    value: bv,
-                },
-            ) => a.as_ref() == b.as_ref() && av.as_deref() == bv.as_deref(),
-            (
-                Self::Element {
-                    name: a,
-                    namespace: an,
-                    prefix: ap,
-                    attributes: aa,
-                    namespaces: ans,
-                },
-                Self::Element {
-                    name: b,
-                    namespace: bn,
-                    prefix: bp,
-                    attributes: ba,
-                    namespaces: bns,
-                },
-            ) => {
-                a.as_ref() == b.as_ref()
-                    && an.as_deref() == bn.as_deref()
-                    && ap.as_deref() == bp.as_deref()
-                    && aa[..] == ba[..]
-                    && ans[..] == bns[..]
-            }
-            _ => false,
-        }
-    }
-}
-impl<S: Storage> Eq for NodeKind<S> {}
 impl<S: Storage> core::fmt::Debug for NodeData<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("NodeData")
             .field("parent", &self.parent)
-            .field("children", &&self.children[..])
+            .field("child_count", &self.child_count)
             .field("kind", &self.kind)
             .field("range", &self.range)
             .field("range_actionable", &self.range_actionable)
@@ -248,6 +220,7 @@ impl<S: Storage> core::fmt::Debug for NodeData<S> {
 pub(super) struct TreeBuilder<'input, S: Storage = Native> {
     input: &'input str,
     nodes: S::Values<NodeData<S>>,
+    namespace_sets: S::Values<S::Values<NamespaceData<S>>>,
     storage: S,
 }
 
@@ -256,11 +229,38 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         self.storage
     }
     pub(super) fn new(input: &'input str, capacity: usize, storage: S) -> Result<Self, ParseError> {
+        let mut namespace_sets = storage.values(1)?;
+        namespace_sets.push(storage.values(0)?)?;
         Ok(Self {
             input,
             nodes: storage.values(capacity)?,
+            namespace_sets,
             storage,
         })
+    }
+
+    /// The set of `node`, or the empty one when it is not an element.
+    pub(super) fn namespace_set_of(&self, node: Option<NodeId>) -> NamespaceSet {
+        match node.map(|node| &self.nodes[node.index()].kind) {
+            Some(NodeKind::Element { namespaces, .. }) => *namespaces,
+            _ => NamespaceSet::EMPTY,
+        }
+    }
+
+    pub(super) fn namespace_bindings(&self, set: NamespaceSet) -> &[NamespaceData<S>] {
+        &self.namespace_sets[set.index()]
+    }
+
+    pub(super) fn add_namespace_set(
+        &mut self,
+        bindings: S::Values<NamespaceData<S>>,
+    ) -> Result<NamespaceSet, ParseError> {
+        let set = NamespaceSet(
+            u32::try_from(self.namespace_sets.len())
+                .expect("bounded XML node count must fit into u32"),
+        );
+        self.namespace_sets.push(bindings)?;
+        Ok(set)
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
@@ -285,7 +285,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         );
         self.nodes.push(NodeData {
             parent,
-            children: self.storage.values(0)?,
+            child_count: 0,
             kind,
             range,
             range_actionable,
@@ -294,7 +294,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             xpath_start: 0,
         })?;
         if let Some(parent) = parent {
-            self.nodes[parent.index()].children.push(id)?;
+            self.nodes[parent.index()].child_count += 1;
         }
         Ok(id)
     }
@@ -306,10 +306,11 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
 
     #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn has_text_tail(&self, parent: NodeId) -> bool {
-        self.nodes[parent.index()]
-            .children
-            .last()
-            .is_some_and(|last| matches!(self.nodes[last.index()].kind, NodeKind::Text(_)))
+        // In preorder a parent's text tail is the last node pushed: an element
+        // child, or anything below it, would have been pushed after it.
+        self.nodes.last().is_some_and(|last| {
+            last.parent == Some(parent) && matches!(last.kind, NodeKind::Text(_))
+        })
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
@@ -320,8 +321,8 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         range: Range<usize>,
         range_actionable: bool,
     ) -> Result<(), ParseError> {
-        if let Some(last) = self.nodes[parent.index()].children.last().copied()
-            && let node = &mut self.nodes[last.index()]
+        if let Some(node) = self.nodes.last_mut()
+            && node.parent == Some(parent)
             && let NodeKind::Text(existing) = &mut node.kind
         {
             self.storage.append(existing, value)?;
@@ -347,14 +348,6 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         self.nodes.len()
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn namespaces(&self, node: NodeId) -> Option<&[NamespaceData<S>]> {
-        match &self.nodes[node.index()].kind {
-            NodeKind::Element { namespaces, .. } => Some(namespaces),
-            _ => None,
-        }
-    }
-
     pub(super) fn finish<P: Storage>(
         mut self,
         preflight: &super::LexicalPreflight<'_, P>,
@@ -371,7 +364,9 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
                         attributes,
                         namespaces,
                         ..
-                    } => attributes.len().checked_add(namespaces.len()),
+                    } => attributes
+                        .len()
+                        .checked_add(self.namespace_sets[namespaces.index()].len()),
                     _ => Some(0),
                 };
                 xpath_nodes = axes
@@ -429,6 +424,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         Ok(Document {
             input: self.input,
             nodes: self.nodes,
+            namespace_sets: self.namespace_sets,
             #[cfg(feature = "xmldsig")]
             xpath_nodes,
         })
@@ -447,6 +443,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
 pub struct Document<'input, S: Storage = Native> {
     input: &'input str,
     nodes: S::Values<NodeData<S>>,
+    namespace_sets: S::Values<S::Values<NamespaceData<S>>>,
     #[cfg(feature = "xmldsig")]
     xpath_nodes: u32,
 }
@@ -564,6 +561,24 @@ impl<'input, S: Storage> Document<'input, S> {
         self.nodes
             .get(id.index())
             .map(|_| Node { document: self, id })
+    }
+
+    pub(super) fn namespace_bindings(&self, set: NamespaceSet) -> &[NamespaceData<S>] {
+        &self.namespace_sets[set.index()]
+    }
+
+    /// The child of `parent` whose subtree ends at `end`. That subtree's last
+    /// node is `end - 1`, so its ancestor chain reaches the child within the
+    /// document's depth.
+    fn last_child_before(&self, parent: NodeId, end: u32) -> Option<NodeId> {
+        let mut id = NodeId(end.checked_sub(1)?);
+        loop {
+            let up = self.nodes.get(id.index())?.parent?;
+            if up == parent {
+                return Some(id);
+            }
+            id = up;
+        }
     }
 
     /// Number of `XPath` nodes: tree nodes with their attribute and namespace nodes.
@@ -726,7 +741,10 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
     pub fn children(self) -> Children<'a, 'input, S> {
         Children {
             document: self.document,
-            ids: self.data().children.iter(),
+            parent: self.id,
+            front: self.id.0 + 1,
+            back: self.data().subtree_end,
+            remaining: self.data().child_count,
         }
     }
     /// Returns the first direct child node.
@@ -773,36 +791,20 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
     /// Returns the preceding sibling.
     #[must_use]
     pub fn prev_sibling(self) -> Option<Self> {
-        let parent = self.parent()?;
-        let position = parent
-            .data()
-            .children
-            .iter()
-            .position(|id| *id == self.id)?;
-        position
-            .checked_sub(1)
-            .and_then(|index| self.document.get_node(parent.data().children[index]))
+        let parent = self.data().parent?;
+        if self.id.0 == parent.0 + 1 {
+            return None;
+        }
+        // The node before this one ends the previous sibling's subtree.
+        self.document
+            .last_child_before(parent, self.id.0)
+            .and_then(|id| self.document.get_node(id))
     }
-    /// Returns the following sibling.
+    /// Returns the following sibling. The arena stores each subtree
+    /// contiguously in preorder, so the node after this subtree is the next
+    /// sibling exactly when it has the same parent.
     #[must_use]
     pub fn next_sibling(self) -> Option<Self> {
-        let parent = self.parent()?;
-        let position = parent
-            .data()
-            .children
-            .iter()
-            .position(|id| *id == self.id)?;
-        parent
-            .data()
-            .children
-            .get(position + 1)
-            .and_then(|id| self.document.get_node(*id))
-    }
-    /// Returns the following sibling in constant time. The arena stores each
-    /// subtree contiguously in preorder, so the node after this subtree is the
-    /// next sibling exactly when it has the same parent.
-    #[cfg(feature = "xmldsig")]
-    pub(crate) fn following_sibling(self) -> Option<Self> {
         let parent = self.data().parent?;
         let next = NodeId(self.data().subtree_end);
         let data = self.document.nodes.get(next.index())?;
@@ -892,7 +894,7 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
     #[must_use]
     pub fn namespaces(self) -> Namespaces<'a, S> {
         let values: &[NamespaceData<S>] = match &self.data().kind {
-            NodeKind::Element { namespaces, .. } => &namespaces[..],
+            NodeKind::Element { namespaces, .. } => self.document.namespace_bindings(*namespaces),
             _ => &[],
         };
         Namespaces {
@@ -1110,23 +1112,37 @@ pub struct PI<'a> {
 /// Iterator over direct child nodes.
 pub struct Children<'a, 'input, S: Storage = Native> {
     document: &'a Document<'input, S>,
-    ids: core::slice::Iter<'a, NodeId>,
+    parent: NodeId,
+    front: u32,
+    back: u32,
+    remaining: u32,
 }
 impl<'a, 'input, S: Storage> Iterator for Children<'a, 'input, S> {
     type Item = Node<'a, 'input, S>;
     fn next(&mut self) -> Option<Self::Item> {
-        self.ids.next().and_then(|id| self.document.get_node(*id))
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let node = self.document.get_node(NodeId(self.front))?;
+        self.front = node.data().subtree_end;
+        Some(node)
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.ids.size_hint()
+        let remaining = self.remaining as usize;
+        (remaining, Some(remaining))
     }
 }
 impl<S: Storage> ExactSizeIterator for Children<'_, '_, S> {}
 impl<S: Storage> DoubleEndedIterator for Children<'_, '_, S> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        self.ids
-            .next_back()
-            .and_then(|id| self.document.get_node(*id))
+        if self.remaining == 0 {
+            return None;
+        }
+        self.remaining -= 1;
+        let id = self.document.last_child_before(self.parent, self.back)?;
+        self.back = id.0;
+        self.document.get_node(id)
     }
 }
 
