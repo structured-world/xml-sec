@@ -28,6 +28,7 @@ a disabled operation. Encryption tables require an encryption-enabled build.
 | `ecdsa_signature_value_encoding` | verify, sign | `XmlDsig`, `XmlSecAsn1Der` |
 | `manifest_processing` | verify, sign | `Ignore`, `Process` |
 | `detached_digest_attestation` | verify | `Forbidden`, `Accepted` |
+| `timestamp_token_encoding` | verify | `Declared`, `Ber` |
 | `hmac` | verify, sign | `minimum_key_bits`, `minimum_output_bits` (nonnegative integers) |
 | `uris`, `transforms` | verify, sign, decrypt | Nested tables below |
 | `key_trust`, `key_sources` | verify | Nested tables below |

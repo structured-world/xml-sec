@@ -15,8 +15,8 @@ use xml_sec::{
         KeyEstablishmentPolicy, KeySourceKind, KeySourcePolicy, KeyTrustPolicy, ManifestProcessing,
         OpcRelationshipEdition, PolicySet, PolicyValidity, ResourcePolicy, RsaKeyPolicy,
         RsaPssPermission, SameDocumentIdSemantics, SignatureConstraints, SigningPolicy,
-        TransformPolicy, UriPolicy, VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
-        XsltStylesheetSemantics,
+        TimestampTokenEncoding, TransformPolicy, UriPolicy, VerificationPolicy,
+        VerificationTrustMode, XmlInputPolicy, XsltStylesheetSemantics,
     },
     provider::{KeyEncapsulationAlgorithm, X509SignatureAlgorithm},
     xmldsig::{
@@ -525,6 +525,14 @@ fn verification(p: &mut VerificationPolicy, t: &Table, syntax_only: bool) -> Res
                     key,
                     DetachedDigestAttestation::Forbidden,
                     DetachedDigestAttestation::Accepted
+                );
+            }
+            "timestamp_token_encoding" => {
+                p.timestamp_token_encoding = choice!(
+                    value,
+                    key,
+                    TimestampTokenEncoding::Declared,
+                    TimestampTokenEncoding::Ber
                 );
             }
             _ => signature_fields!(p, key, value),
@@ -1052,6 +1060,7 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
         transforms: _,
         manifest_processing: _,
         detached_digest_attestation: _,
+        timestamp_token_encoding: _,
         xml: _,
         resources: _,
     } = p;
@@ -1061,6 +1070,10 @@ fn verification_snapshot(p: &VerificationPolicy) -> Result<Value, Error> {
     t.insert(
         "detached_digest_attestation".into(),
         named(p.detached_digest_attestation),
+    );
+    t.insert(
+        "timestamp_token_encoding".into(),
+        named(p.timestamp_token_encoding),
     );
     Ok(Value::Table(t))
 }

@@ -237,6 +237,22 @@ impl Levels<'_> {
 
     /// As [`Self::ocsp`], signed by `responder`.
     fn ocsp_from(&self, responder: &str, subject: &str, by_key: bool) -> Result<Vec<u8>, String> {
+        self.ocsp_response(responder, subject, by_key, &[])
+    }
+
+    /// As [`Self::ocsp_from`], with no certificates: RFC 6960 §4.2.1 lets a
+    /// responder omit them.
+    fn ocsp_uncertified(&self, responder: &str, subject: &str) -> Result<Vec<u8>, String> {
+        self.ocsp_response(responder, subject, false, &["-resp_no_certs"])
+    }
+
+    fn ocsp_response(
+        &self,
+        responder: &str,
+        subject: &str,
+        by_key: bool,
+        options: &[&str],
+    ) -> Result<Vec<u8>, String> {
         let (signer, signer_key) = (format!("{responder}.pem"), format!("{responder}.key"));
         let certificate = format!("{subject}.pem");
         let serial = self.serial(subject)?;
@@ -279,6 +295,7 @@ impl Levels<'_> {
         if by_key {
             respond.push("-resp_key_id");
         }
+        respond.extend(options);
         self.openssl(&respond)?;
         self.read(&response)
     }
@@ -290,20 +307,28 @@ impl Levels<'_> {
 
     /// An RFC 3161 token over `input`, issued under this TSA configuration.
     fn token_under(&self, input: &[u8], config: &str) -> Result<String, String> {
+        self.token_requested(input, config, &["-cert"])
+    }
+
+    /// As [`Self::token`], without the signing certificate: RFC 3161 §2.4.1
+    /// includes it only when the request asks.
+    fn token_uncertified(&self, input: &[u8]) -> Result<String, String> {
+        self.token_requested(input, TSA_CONFIG, &[])
+    }
+
+    fn token_requested(
+        &self,
+        input: &[u8],
+        config: &str,
+        options: &[&str],
+    ) -> Result<String, String> {
         self.write("tsa.input", input)?;
         self.write("tsa.serial", "01\n")?;
         self.write("tsa.cnf", config)?;
-        self.openssl(&[
-            "ts",
-            "-query",
-            "-data",
-            "tsa.input",
-            "-sha256",
-            "-cert",
-            "-no_nonce",
-            "-out",
-            "tsa.tsq",
-        ])?;
+        let mut query = vec!["ts", "-query", "-data", "tsa.input", "-sha256"];
+        query.extend(options);
+        query.extend(["-no_nonce", "-out", "tsa.tsq"]);
+        self.openssl(&query)?;
         self.openssl(&[
             "ts",
             "-reply",
@@ -885,6 +910,34 @@ fn write_status_variants(
                 &certificate_values(generator, &["issuer", "root", "responder"])?,
                 &certificate_values(generator, &["issuer", "root"])?,
             ),
+    )?;
+    let uncertified = levels.ocsp_uncertified("outsider", "signer")?;
+    let uncertified_tsa = levels.ocsp_uncertified("outsider", "tsa")?;
+    variant(
+        "b-lt-uncertified-responder.xml",
+        material
+            .replace(&good, &revocation_values(&[root_crl], &[&uncertified]))
+            .replace(
+                &revocation_values(&[issuer_crl, root_crl], &[]),
+                &revocation_values(&[root_crl], &[&uncertified_tsa]),
+            )
+            .replace(
+                &certificate_values(generator, &["issuer", "root", "responder"])?,
+                &certificate_values(generator, &["issuer", "root"])?,
+            ),
+    )?;
+    let value = element(signed, "<ds:SignatureValue", "</ds:SignatureValue>")?;
+    let token = levels.token_uncertified(&canonical(generator, &value)?)?;
+    let stamp = format!(
+        r#"<xades:SignatureTimeStamp Id="ts">{}</xades:SignatureTimeStamp>"#,
+        stamped(&token)
+    );
+    let start = material
+        .find("<xades:CertificateValues>")
+        .ok_or("no values")?;
+    variant(
+        "b-lt-uncertified-token.xml",
+        format!("{stamp}{}", &material[start..]),
     )?;
     let revoked = levels.crl_revoking("issuer", "signer")?;
     variant(

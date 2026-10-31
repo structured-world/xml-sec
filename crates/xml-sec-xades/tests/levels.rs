@@ -17,20 +17,23 @@ use structured_pkix::crl::{CombinedEntry, EntryLookup};
 use structured_pkix::temporal::LeapTable;
 use structured_xades::baseline::Evidence;
 use xml_sec::XmlDocument;
-use xml_sec::policy::{Instant, ManifestProcessing, VerificationPolicy};
+use xml_sec::policy::{Instant, ManifestProcessing, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigError, KeyResolverConfig, UriTypeSet, VerificationRequest,
     VerifyContext, with_verified_request,
 };
 use xml_sec_xades::{
     AuthorityAccuracy, ConfiguredResponder, Inputs, Level, Outcome, RenewalFailure, Requirements,
-    StatusFailure, TimestampFailure, TokenProfile, ValidationError, validate,
+    StatusFailure, TimestampFailure, ValidationError, validate,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/levels/root.der");
 const ISSUER: &[u8] = include_bytes!("fixtures/levels/issuer.der");
 const OUTSIDER: &[u8] = include_bytes!("fixtures/levels/outsider.der");
 const B_LT_CONFIGURED: &str = include_str!("fixtures/levels/b-lt-configured-responder.xml");
+const B_LT_UNCERTIFIED_RESPONDER: &str =
+    include_str!("fixtures/levels/b-lt-uncertified-responder.xml");
+const B_LT_UNCERTIFIED_TOKEN: &str = include_str!("fixtures/levels/b-lt-uncertified-token.xml");
 const B_LT_CONFLICTING: &str = include_str!("fixtures/levels/b-lt-conflicting-status.xml");
 const B_LT_CONFLICTING_DELTA: &str = include_str!("fixtures/levels/b-lt-conflicting-delta.xml");
 const B_LT_TSA_DELTA: &str = include_str!("fixtures/levels/b-lt-tsa-delta.xml");
@@ -65,7 +68,7 @@ struct Given<'a> {
     responders: &'a [ConfiguredResponder<'a>],
     crls: &'a [&'a [u8]],
     responses: &'a [&'a [u8]],
-    /// [`TokenProfile::Etsi`] unless a case asks for the CMS reading.
+    /// [`TimestampTokenEncoding::Declared`] unless a case asks for the CMS reading.
     cms: bool,
 }
 
@@ -88,6 +91,9 @@ fn level_in<R>(
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
     policy.key_trust.verification_time = Instant::new(AT, 0);
+    if given.cms {
+        policy.timestamp_token_encoding = TimestampTokenEncoding::Ber;
+    }
     let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
     let document = XmlDocument::parse(xml).expect("fixture parses");
     let request = VerificationRequest::default();
@@ -97,11 +103,6 @@ fn level_in<R>(
         let signature = session.evidence().signatures()[0].identity();
         let inputs = Inputs {
             requirements,
-            token_profile: if given.cms {
-                TokenProfile::Cms
-            } else {
-                TokenProfile::Etsi
-            },
             anchors: given.anchors,
             certificates: given.certificates,
             utc: &utc,
@@ -463,7 +464,6 @@ fn renewal(xml: &str, detached: Option<&[u8]>) -> Result<Outcome<bool>, Validati
         let anchors: &[&[u8]] = &[ROOT];
         let inputs = Inputs {
             requirements: Requirements::Archival,
-            token_profile: TokenProfile::Etsi,
             anchors,
             certificates: &[],
             utc: &utc,
@@ -550,7 +550,6 @@ fn every_signature(xml: &str, requirements: Requirements) -> Vec<String> {
         let anchors: &[&[u8]] = &[ROOT];
         let inputs = Inputs {
             requirements,
-            token_profile: TokenProfile::Etsi,
             anchors,
             certificates: &[],
             utc: &utc,
@@ -747,6 +746,36 @@ fn a_responder_outside_the_issuer_counts_only_when_configured() {
         responder: OUTSIDER,
         issuer: ISSUER,
     }]);
+    assert!(matches!(result, Ok(Outcome::Assessed(true))), "{result:?}");
+}
+
+#[test]
+fn a_responder_certificate_omitted_from_its_response_comes_from_the_caller() {
+    // RFC 6960 §4.2.1: a response may carry no certificates, so the signer's key
+    // may be only in the responder configuration or among the anchors. These
+    // responses are the only status of the issuer's certificates: unauthenticated
+    // they leave no source. Authenticated, the level is assessed, and stays
+    // unmet because EN 319 132-1 §6.3 also wants the responder incorporated.
+    let responders = [ConfiguredResponder {
+        responder: OUTSIDER,
+        issuer: ISSUER,
+    }];
+    for anchors in [&[ROOT][..], &[ROOT, OUTSIDER]] {
+        let given = Given {
+            anchors,
+            responders: &responders,
+            ..Given::default()
+        };
+        let result = met(B_LT_UNCERTIFIED_RESPONDER, Requirements::LongTerm, &given);
+        assert!(matches!(result, Ok(Outcome::Assessed(false))), "{result:?}");
+    }
+}
+
+#[test]
+fn a_timestamp_signer_omitted_from_its_token_comes_from_the_document() {
+    // RFC 5652 §5.1 makes the certificate optional in the token. The TSA's own
+    // certificate is in the timestamp validation data, so nothing is missing.
+    let result = level(B_LT_UNCERTIFIED_TOKEN, Requirements::LongTerm, &[ROOT], &[]);
     assert!(matches!(result, Ok(Outcome::Assessed(true))), "{result:?}");
 }
 

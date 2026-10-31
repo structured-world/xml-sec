@@ -66,7 +66,7 @@ There is no Rust self-sign/self-verify evidence in this package.
 | Full XAdES/trust verdict from DSS | failed | All nine global outcomes are INDETERMINATE / CERTIFICATE_CHAIN_GENERAL_FAILURE; no revocation data was supplied |
 | B-T/B-LT/B-LTA over a test PKI (`crates/xml-sec-xades/tests/fixtures/levels`) | verified | OpenSSL issues every token, CRL and OCSP response; `xades levels` compares DSS's format and indication on each fixture, `validate` reaches the same levels, detached, parallel and countersigned structures included |
 | RFC 3161 token without stated accuracy | verified | Rejected unless `Inputs::accuracies` states the accuracy of its authority and signed policy (RFC 3161 §2.4.2); a token's own field comes first |
-| Signatures produced by DSS 6.5.1 | verified | `xades levels` reads them at the DSS tag at run time, outside the repository: `xades-lta-valid` meets B-T and copied tokens are rejected. Its last archive TSA has no status in the document, so B-LT and B-LTA stop at `NoSource` (EN 319 132-1 §6.3(x)). `xades-t-with-tsvd` carries an unsorted certificate SET OF: `TokenProfile::Etsi` refuses it because an unmarked token is DER (§5.1.3), `TokenProfile::Cms` reads it as RFC 5652 BER |
+| Signatures produced by DSS 6.5.1 | verified | `xades levels` reads them at the DSS tag at run time, outside the repository: `xades-lta-valid` meets B-T and copied tokens are rejected. Its last archive TSA has no status in the document, so B-LT and B-LTA stop at `NoSource` (EN 319 132-1 §6.3(x)). `xades-t-with-tsvd` carries an unsorted certificate SET OF: `TimestampTokenEncoding::Declared` refuses it because an unmarked token is DER (§5.1.3), `TimestampTokenEncoding::Ber` reads it as RFC 5652 BER |
 | OCSP responder outside the issuer | verified | Counts only as `Inputs::responders` configures it for that issuer (RFC 6960 §4.2.2.2) |
 | `RenewedDigestsV2` over a signed Manifest | verified | B-LTA with SHA-512 renewal of a SHA-256 Manifest reference; a wrong new digest or reference digest stops the level with `Outcome::Renewal` (EN 319 132-1 §5.5.3). No independent validator checked it |
 | Caller-supplied CRLs and OCSP responses | verified | They answer status but do not count as incorporated, so the level stays unmet |
@@ -240,7 +240,7 @@ certificate engine, C14N, transform or XAdES implementation. Existing work was i
 
 No duplicate backlog was created. Trust in this package means only the explicitly supplied
 synthetic root at the fixed test instant. No legal qualification follows from that path
-or from `all_root_requirements_met()`.
+or from `all_requirements_met()`.
 
 ## Intended collaboration
 

@@ -16,14 +16,12 @@ use structured_cms::timestamp::{Accuracy, PolicyAccuracy, Token};
 use structured_pkix::Certificate;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
-use xml_sec::policy::{Instant, VerificationPolicy};
+use xml_sec::policy::{Instant, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, KeyResolverConfig, VerificationRequest, VerifyContext,
     with_verified_request,
 };
-use xml_sec_xades::{
-    AuthorityAccuracy, ConfiguredResponder, Inputs, Requirements, TokenProfile, validate,
-};
+use xml_sec_xades::{AuthorityAccuracy, ConfiguredResponder, Inputs, Requirements, validate};
 
 /// Every base64 value between `open` and `close` in the source text.
 fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
@@ -109,9 +107,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     };
     let seconds = rest.first().map(|value| value.parse()).transpose()?;
-    let token_profile = match rest.get(1) {
-        Some(profile) if profile == "cms" => TokenProfile::Cms,
-        _ => TokenProfile::Etsi,
+    let timestamp_token_encoding = match rest.get(1) {
+        Some(profile) if profile == "cms" => TimestampTokenEncoding::Ber,
+        _ => TimestampTokenEncoding::Declared,
     };
     let requirements = match level.as_str() {
         "b" => Requirements::Basic,
@@ -146,6 +144,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut policy = VerificationPolicy::default();
     policy.key_trust.verify_x509_chains = true;
     policy.key_trust.verification_time = Instant::new(at.parse()?, 0);
+    policy.timestamp_token_encoding = timestamp_token_encoding;
     let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
     let document = XmlDocument::parse(text.as_str())?;
     let request = VerificationRequest::default();
@@ -179,7 +178,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("signature: {:?}", entry.result().as_ref().map(|r| r.status));
             let inputs = Inputs {
                 requirements,
-                token_profile,
                 anchors: &references,
                 certificates: &others,
                 utc: &utc,

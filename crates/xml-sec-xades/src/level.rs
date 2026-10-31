@@ -47,6 +47,7 @@ use structured_xades::timestamp::{
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::{Access, Xml};
 use xml_sec::document::{DocumentIdentity, NodeIdentity};
+use xml_sec::policy::TimestampTokenEncoding;
 use xml_sec::xmldsig::cms::CmsProvider;
 use xml_sec::xmldsig::{VerifiedSession, X509ChainError};
 
@@ -70,10 +71,6 @@ pub type Level<'a> = Assessment<'a, NoCredential, N, D, G>;
 pub struct Inputs<'a> {
     /// The structural level to establish.
     pub requirements: Requirements,
-    /// How timestamp tokens are read. [`TokenProfile::Cms`] takes RFC 5652 BER,
-    /// so a met level then asserts nothing about EN 319 132-1 §5.1.3;
-    /// [`TokenProfile::Etsi`] holds each token to its declared encoding.
-    pub token_profile: TokenProfile,
     /// DER certificates that end timestamp and revocation-authority paths.
     pub anchors: &'a [&'a [u8]],
     /// Further DER certificates a path may use, beyond the document's.
@@ -177,7 +174,10 @@ pub fn validate<W: Work, R>(
     let timing = (requirements != Requirements::Basic).then_some(Timing {
         utc: inputs.utc,
         accuracies: inputs.accuracies,
-        profile: inputs.token_profile,
+        profile: match session.timestamp_token_encoding() {
+            TimestampTokenEncoding::Declared => TokenProfile::Etsi,
+            TimestampTokenEncoding::Ber => TokenProfile::Cms,
+        },
     });
     with_stage(
         session,
@@ -266,7 +266,7 @@ fn timed<W: Work, R>(
 /// nothing: a path still has to end at a caller anchor.
 fn certificate_pool<'p, 't>(
     pools: &'p Pools<'p, 't>,
-    supplied: &'p [Certificate<'t>],
+    supplied: [&'p [Certificate<'t>]; 2],
     memory: &Memory,
 ) -> Result<OwnedVec<&'p Certificate<'t>>, Error> {
     let mut pool = memory.vector();
@@ -285,7 +285,7 @@ fn certificate_pool<'p, 't>(
             pool.try_push(certificate)?;
         }
     }
-    for certificate in supplied {
+    for certificate in supplied.into_iter().flatten() {
         pool.try_push(certificate)?;
     }
     Ok(pool.into_owned())
@@ -298,13 +298,19 @@ type TokenFailure = (N, TimestampFailure);
 fn token_signer<'p, 't>(
     pools: &'p Pools<'p, 't>,
     ordinal: usize,
-    supplied: &'p [Certificate<'t>],
+    [supplied, incorporated]: [&'p [Certificate<'t>]; 2],
     supplied_parent: &'p Reader<'t>,
 ) -> Result<Option<(&'p Certificate<'t>, &'p Reader<'t>)>, ValidationError> {
     let reading = &pools.tokens.readings()[ordinal];
     let named = reading.token().signer().sid();
     let carried = reading.token().message().certificates();
-    for (certificates, parent) in [(carried, reading.reader()), (supplied, supplied_parent)] {
+    // RFC 5652 §5.1: a token may omit the signer's certificate, which the
+    // document's own validation data then supplies.
+    for (certificates, parent) in [
+        (carried, reading.reader()),
+        (supplied, supplied_parent),
+        (incorporated, supplied_parent),
+    ] {
         for certificate in certificates {
             if matches!(
                 matches_certificate_in(named, certificate, parent)
@@ -318,6 +324,21 @@ fn token_signer<'p, 't>(
     Ok(None)
 }
 
+/// The document's certificates as DER. Each value was read in a session of its
+/// own, so a check that needs a shared parent reads these bytes again.
+fn incorporated_certificates<'p>(
+    pools: &Pools<'p, 'p>,
+    memory: &Memory,
+) -> Result<OwnedVec<&'p [u8]>, Error> {
+    let mut certificates = memory.vector();
+    for value in pools.view.values() {
+        if let Value::Certificate(certificate) = &value.value {
+            certificates.try_push(certificate.as_bytes())?;
+        }
+    }
+    Ok(certificates.into_owned())
+}
+
 /// No token extension is recognized, so a critical one refuses its token.
 fn unrecognized() -> impl FnMut(&TokenExtension<'_>, &Execution<'_>) -> Result<bool, Infallible> {
     |_, _| Ok(false)
@@ -328,7 +349,7 @@ fn token_actors<'p, 't, W: Work>(
     stage: &'p Stage<'_, '_, '_, '_, W>,
     inputs: &'p Inputs<'t>,
     pools: &'p Pools<'p, 't>,
-    supplied: &'p [Certificate<'t>],
+    supplied: [&'p [Certificate<'t>]; 2],
     supplied_parent: &'p Reader<'t>,
     cms: &CmsProvider<'_>,
 ) -> Result<Result<OwnedVec<TokenActor<'p, 't>>, TokenFailure>, ValidationError> {
@@ -470,11 +491,20 @@ fn frozen<W: Work, R>(
     let access = stage.access;
     let anchors = read_certificates(stage.parser, inputs.anchors)?;
     let supplied = read_certificates(stage.parser, inputs.certificates)?;
+    let mut configured = memory.vector();
+    configured
+        .try_reserve_exact(inputs.responders.len())
+        .map_err(Error::from)?;
+    for entry in inputs.responders {
+        configured.try_push(entry.responder).map_err(Error::from)?;
+    }
+    let configured = configured.into_owned();
+    let responders = read_certificates(stage.parser, &configured)?;
     let supplied_parent = stage
         .parser
         .read(&[], 0)
         .map_err(ValidationError::Operation)?;
-    let pool = certificate_pool(pools, &supplied, memory)?;
+    let pool = certificate_pool(pools, [&supplied, &responders], memory)?;
     let mut anchored = memory.vector();
     anchored
         .try_reserve_exact(anchors.len())
@@ -493,11 +523,13 @@ fn frozen<W: Work, R>(
     };
     let external = External::read(stage.parser, inputs, &supplied_parent)?;
     let cms = session.cms_provider();
+    let document_der = incorporated_certificates(pools, memory)?;
+    let incorporated = read_certificates(stage.parser, &document_der)?;
     let actors = token_fact!(token_actors(
         stage,
         inputs,
         pools,
-        &supplied,
+        [&supplied, &incorporated],
         &supplied_parent,
         &cms
     ));

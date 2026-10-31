@@ -48,7 +48,6 @@ pub use level::{
 };
 pub use path::CounterPathError;
 pub use status::{StatusError, StatusFailure};
-pub use structured_xades::timestamp::TokenProfile;
 pub use structured_xades::unsigned::Requirements;
 
 /// Original document identity and generation, as seen by the shared core.

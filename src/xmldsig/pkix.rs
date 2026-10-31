@@ -1394,6 +1394,65 @@ impl<W: Work> structured_pkix::path::Verify<W> for CertificatePathVerifier<'_, '
     }
 }
 
+/// CRL and OCSP signature checks. A responder's authority never lifts the
+/// operation's key-strength policy, which no certificate path reaches here: the
+/// signing certificate is a path's target, or has no path at all.
+pub struct RevocationVerifier<'p> {
+    signatures: ProviderVerifier<'p>,
+    rsa_keys: crate::policy::RsaKeyPolicy,
+    dsa_keys: crate::policy::DsaKeyPolicy,
+    /// Account that reads the signing key for the strength checks.
+    certificates: CertificateSession,
+}
+
+impl<'p> RevocationVerifier<'p> {
+    pub(crate) fn new(
+        provider: &'p dyn crate::provider::CryptoProvider,
+        trust: &'p crate::policy::KeyTrustPolicy,
+        certificates: CertificateSession,
+    ) -> Self {
+        Self {
+            signatures: ProviderVerifier {
+                provider,
+                allowed: trust.certificate_signature_algorithms.as_ref(),
+            },
+            rsa_keys: trust.rsa_keys,
+            dsa_keys: trust.dsa_keys,
+            certificates,
+        }
+    }
+}
+
+impl<W: Work> structured_pkix::path::Verify<W> for RevocationVerifier<'_> {
+    type Error = X509ChainError;
+
+    fn verify(
+        &self,
+        algorithm: &structured_pkix::algorithm::AlgorithmIdentifier<'_>,
+        key: structured_pkix::path::WorkingKey<'_>,
+        signed: &[u8],
+        signature: structured_pkix::signature::SignatureValue<'_>,
+        execution: &W,
+    ) -> Result<structured_pkix::path::Verified, Self::Error> {
+        self.signatures.verify_with_key_check(
+            algorithm,
+            key,
+            signed,
+            signature,
+            execution,
+            |effective| {
+                super::x509::validate_issuer_spki_policy(
+                    effective,
+                    0,
+                    self.rsa_keys,
+                    self.dsa_keys,
+                    &self.certificates,
+                )
+            },
+        )
+    }
+}
+
 /// Key family of a standalone `SubjectPublicKeyInfo` algorithm identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpkiAlgorithm {
@@ -2562,6 +2621,36 @@ mod tests {
             .expect("certificate sequence")
             .to_der()
             .expect("test encoding")
+    }
+
+    #[test]
+    fn a_revocation_signature_obeys_the_key_strength_policy() {
+        // A configured OCSP responder has no certificate path, so this check is
+        // the only one that reads its key: a weak key must not sign status.
+        let bytes = pem::parse(include_bytes!("../../tests/fixtures/keys/cacert.pem"))
+            .expect("CA certificate PEM")
+            .into_contents();
+        let session = CertificateSession::new(&ResourcePolicy::default());
+        let parsed = session.read(&bytes).expect("RSA certificate");
+        let mut trust = crate::policy::KeyTrustPolicy::default();
+        trust.rsa_keys.minimum_modulus_bits = 8192;
+        let verifier = RevocationVerifier::new(
+            crate::provider::default_provider(),
+            &trust,
+            CertificateSession::new(&ResourcePolicy::default()),
+        );
+        let result = structured_pkix::path::Verify::verify(
+            &verifier,
+            &parsed.tbs().signature(),
+            WorkingKey::standing(parsed.tbs().public_key()),
+            parsed.signed_bytes(),
+            parsed.signature_value(),
+            session.memory(),
+        );
+        assert!(
+            matches!(result, Err(X509ChainError::KeyPolicy { .. })),
+            "{result:?}"
+        );
     }
 
     #[test]

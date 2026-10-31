@@ -215,9 +215,12 @@ fn signed_responses<'x, W: Work>(
     let verifier = session.revocation_verifier();
     let mut signed = memory.vector();
     for response in responses {
+        // RFC 6960 §4.2.1: a response may carry no certificates, so its signer
+        // can be known only to the caller. Authorization stays per target.
         for candidate in response
             .certificates()
             .iter()
+            .chain(authorities.anchors.iter())
             .chain(authorities.pool.iter().copied())
         {
             let key = WorkingKey::standing(candidate.tbs().public_key());
