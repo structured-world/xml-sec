@@ -3,8 +3,8 @@ use crate::policy::{
     CertificateSignatureAlgorithms, DetachedDigestAttestation, DsaKeyPolicy, HmacPolicy,
     KemContentAuthentication, KeyDerivationAlgorithm, KeyEstablishmentPolicy, KeySourcePolicy,
     KeyTrustPolicy, ManifestProcessing, PolicyViolation, ResourcePolicy, RsaKeyPolicy,
-    RsaPssPermission, SigningPolicy, TransformPolicy, UriPolicy, VerificationPolicy,
-    VerificationTrustMode, XmlInputPolicy,
+    RsaPssPermission, SigningPolicy, TimestampTokenEncoding, TransformPolicy, UriPolicy,
+    VerificationPolicy, VerificationTrustMode, XmlInputPolicy,
 };
 #[cfg(feature = "xmlenc")]
 use crate::policy::{
@@ -503,10 +503,23 @@ fn verification(
             a.detached_digest_attestation,
             b.detached_digest_attestation,
         ),
+        timestamp_token_encoding: token_encoding(
+            a.timestamp_token_encoding,
+            b.timestamp_token_encoding,
+        ),
         xml: xml(a.xml, b.xml),
         resources: resources(&a.resources, &b.resources),
     })
 }
+/// BER is read only when both layers read it.
+fn token_encoding(a: TimestampTokenEncoding, b: TimestampTokenEncoding) -> TimestampTokenEncoding {
+    if a == TimestampTokenEncoding::Ber && b == TimestampTokenEncoding::Ber {
+        TimestampTokenEncoding::Ber
+    } else {
+        TimestampTokenEncoding::Declared
+    }
+}
+
 /// A caller-attested digest is accepted only when both layers accept it.
 fn attestation(
     a: DetachedDigestAttestation,

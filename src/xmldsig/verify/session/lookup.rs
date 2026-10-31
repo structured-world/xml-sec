@@ -208,6 +208,23 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         super::super::super::pkix::path_bounds(self.context.policy.key_trust.max_x509_chain_depth)
     }
 
+    /// How this operation's compiled policy reads timestamp tokens.
+    pub fn timestamp_token_encoding(&self) -> crate::policy::TimestampTokenEncoding {
+        self.context.policy.timestamp_token_encoding
+    }
+
+    /// CRL and OCSP signature checks through this operation's provider,
+    /// certificate-signature permissions and RSA/DSA key policy. Any key that
+    /// passes them is otherwise checked as supplied: the caller establishes
+    /// that key's authority.
+    pub fn revocation_verifier(&self) -> super::super::super::pkix::RevocationVerifier<'_> {
+        super::super::super::pkix::RevocationVerifier::new(
+            self.context.provider,
+            &self.context.policy.key_trust,
+            super::super::super::pkix::CertificateSession::new(&self.context.policy.resources),
+        )
+    }
+
     /// Certificate-path signature checks for `chain` and `anchor` through this
     /// operation's provider and certificate trust policy. Issuer key material
     /// is read on a fresh account bounded by this operation's X.509 resource

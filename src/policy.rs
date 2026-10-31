@@ -1362,6 +1362,18 @@ pub enum DetachedDigestAttestation {
     Accepted,
 }
 
+/// How the RFC 3161 tokens of a signature are read.
+#[cfg(feature = "xmldsig")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TimestampTokenEncoding {
+    /// Each token holds to its declared encoding, DER when it declares none
+    /// (EN 319 132-1 §5.1.3).
+    #[default]
+    Declared,
+    /// RFC 5652 BER. A level then asserts nothing about EN 319 132-1 §5.1.3.
+    Ber,
+}
+
 /// Immutable policy snapshot for `XMLDSig` verification.
 #[cfg(feature = "xmldsig")]
 #[derive(Debug, Clone, Default)]
@@ -1397,6 +1409,8 @@ pub struct VerificationPolicy {
     pub manifest_processing: ManifestProcessing,
     /// Whether a caller-attested digest may complete a detached Reference.
     pub detached_digest_attestation: DetachedDigestAttestation,
+    /// How the signature's timestamp tokens are read.
+    pub timestamp_token_encoding: TimestampTokenEncoding,
     /// XML parser rules.
     pub xml: XmlInputPolicy,
     /// Resource ceilings.

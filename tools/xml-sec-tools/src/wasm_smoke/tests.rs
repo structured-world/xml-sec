@@ -25,15 +25,16 @@ fn module(exports: &[(&str, u8)]) -> Vec<u8> {
     bytes
 }
 
-const ALL: [&str; 3] = [
+const ALL: [&str; 4] = [
     "xml_sec_wasm_smoke",
     "xml_sec_wasm_verify",
     "xml_sec_wasm_cms",
+    "xml_sec_wasm_xades",
 ];
 
 /// A module where the export at `failing`, if any, reports failure.
 fn answering(failing: Option<usize>) -> Vec<u8> {
-    let exports = [0, 1, 2].map(|index| (ALL[index], u8::from(Some(index) != failing)));
+    let exports = [0, 1, 2, 3].map(|index| (ALL[index], u8::from(Some(index) != failing)));
     module(&exports)
 }
 
@@ -41,9 +42,14 @@ fn answering(failing: Option<usize>) -> Vec<u8> {
 fn every_compiled_export_must_report_success() {
     // The check is each export's own answer, not that the module loaded.
     assert!(check_module(&answering(None)).is_ok());
-    for (index, failure) in ["canonicalization", "XMLDSig verification", "CMS timestamp"]
-        .into_iter()
-        .enumerate()
+    for (index, failure) in [
+        "canonicalization",
+        "XMLDSig verification",
+        "CMS timestamp",
+        "XAdES B-LTA",
+    ]
+    .into_iter()
+    .enumerate()
     {
         let error = check_module(&answering(Some(index))).unwrap_err();
         assert!(error.contains(failure), "{error}");

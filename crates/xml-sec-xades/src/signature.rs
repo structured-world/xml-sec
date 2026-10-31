@@ -14,6 +14,7 @@ use structured_xades::reference::{
     Boolean, Completeness, Descriptor, LexicalSource, ObjectLocation, Parent, ReferenceXml, Replay,
     ReplayOutcome, Resolution, VisitError,
 };
+use structured_xades::timestamp::TimestampXml;
 use structured_xades::xml::Name;
 use xml_sec::document::NodeIdentity;
 use xml_sec::provider;
@@ -327,6 +328,25 @@ impl<W: Work> ReferenceXml for Document<'_, '_, '_, '_, W> {
             .map_err(|error| match error {
                 CatalogueError::Processing(error) => error.into(),
                 CatalogueError::Visitor(error) => error,
+            })
+    }
+}
+
+impl<W: Work> TimestampXml for Document<'_, '_, '_, '_, W> {
+    fn canonicalize<Q: Work>(
+        &self,
+        snapshot: Snapshot,
+        node: NodeIdentity,
+        method: NodeIdentity,
+        receiver: &mut impl Receiver,
+        execution: &Q,
+    ) -> Result<(), Error> {
+        self.check(snapshot)?;
+        self.session
+            .canonicalize_element(node, method, execution, &mut |bytes| receiver.write(bytes))
+            .map_err(|error| match error {
+                ReplayError::Processing(error) => error.into(),
+                ReplayError::Receiver(_) => Error::ReceiverRefused,
             })
     }
 }

@@ -5,9 +5,9 @@ use core::cmp::Ordering;
 use crate::signature::{MD5, any_uri};
 use crate::{Document, Error, Snapshot};
 use structured_asn1::digest::{Digest, Resolution};
-use structured_asn1::memory::Work;
+use structured_asn1::memory::{OwnedVec, Work};
 use structured_asn1::{Parser, Reader};
-use structured_xades::binary::{BinaryXml, Decoded};
+use structured_xades::binary::{BinaryXml, Decoded, OwnedBinaryXml, OwnedDecoded};
 use structured_xades::certificate::DigestProvider;
 use structured_xades::hashes::HashClass;
 use structured_xades::xml::{Access, Name};
@@ -57,6 +57,40 @@ impl<W: Work> BinaryXml for Document<'_, '_, '_, '_, W> {
                 })
             },
         )?)
+    }
+}
+
+impl<W: Work> OwnedBinaryXml for Document<'_, '_, '_, '_, W> {
+    fn decode_owned<Q: Work>(
+        &self,
+        snapshot: Snapshot,
+        node: NodeIdentity,
+        execution: &Q,
+    ) -> Result<OwnedVec<u8>, Error> {
+        self.check(snapshot)?;
+        Ok(extension::base64_owned(
+            self.session.view(),
+            node,
+            execution,
+        )?)
+    }
+
+    fn decode_binary_owned(
+        &self,
+        snapshot: Snapshot,
+        node: NodeIdentity,
+        operation: &Reader<'_>,
+    ) -> Result<OwnedDecoded, Error> {
+        self.check(snapshot)?;
+        let bytes = extension::base64_owned(self.session.view(), node, &operation.execution())?;
+        // A fresh decoded source, as in `with_binary`: its producing session
+        // spends the operation's account.
+        Ok(OwnedDecoded {
+            parser: Parser::der(operation.memory().clone()),
+            bytes,
+            base: 0,
+            depth: 0,
+        })
     }
 }
 

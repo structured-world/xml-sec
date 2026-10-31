@@ -243,6 +243,27 @@ fn detached_payload_settings_compose_restrictively() {
 }
 
 #[test]
+fn a_profile_overlay_cannot_relax_the_timestamp_token_encoding() {
+    // RFC 5652 BER drops the EN 319 132-1 §5.1.3 assertion, so an overlay may
+    // not choose it over a base that holds tokens to their declared encoding.
+    use xml_sec::policy::TimestampTokenEncoding;
+    let relaxed = effective(
+        &config("[profiles.team.verification]\ntimestamp_token_encoding='Ber'"),
+        "team",
+    );
+    assert_eq!(
+        relaxed
+            .compiled()
+            .verification()
+            .unwrap()
+            .timestamp_token_encoding,
+        TimestampTokenEncoding::Declared
+    );
+    let output = relaxed.to_toml().unwrap();
+    assert!(output.contains("timestamp_token_encoding = \"Declared\""));
+}
+
+#[test]
 fn bounded_readers_and_paths_admit_bytes_before_parsing() {
     // The exact boundary passes, one extra byte fails without heap growth for
     // that byte, and caller-selected paths are the only files consulted.

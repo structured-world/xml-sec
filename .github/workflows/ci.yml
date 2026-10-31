@@ -285,6 +285,10 @@ jobs:
           cargo clippy -p xml-sec --lib --no-default-features
           --features cms,xml-backend-xmloxide
           --target thumbv7em-none-eabihf -- -D warnings
+      - run: >-
+          cargo clippy -p xml-sec-xades --lib --no-default-features
+          --features xml-backend-roxmltree
+          --target thumbv7em-none-eabihf -- -D warnings
       - uses: taiki-e/install-action@nextest
       - name: Target coverage on the build without std
         run: |

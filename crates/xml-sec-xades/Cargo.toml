@@ -8,16 +8,28 @@ publish = false
 description = "XAdES baseline validation of signatures verified by xml-sec"
 
 [dependencies]
-xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "c14n"] }
-structured-xades = { version = "0.18.0", default-features = false, features = ["std"] }
-structured-asn1 = { version = "0.18.0", default-features = false, features = ["std"] }
-structured-pkix = { version = "0.18.0", default-features = false, features = ["std"] }
-structured-cms = { version = "0.18.0", default-features = false, features = ["std"] }
-structured-ltv = { version = "0.18.0", default-features = false, features = ["std"] }
-thiserror = "2"
+xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c14n", "cms"] }
+structured-xades = { version = "0.20.0", default-features = false, features = ["alloc"] }
+structured-asn1 = { version = "0.20.0", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.20.0", default-features = false, features = ["alloc"] }
+structured-cms = { version = "0.20.0", default-features = false, features = ["alloc"] }
+structured-ltv = { version = "0.20.0", default-features = false, features = ["alloc"] }
+thiserror = { version = "2", default-features = false }
+
+[dev-dependencies]
+base64 = "0.22"
 
 [features]
-default = ["xml-backend-xmloxide"]
+default = ["std", "xml-backend-xmloxide"]
+std = [
+    "xml-sec/std",
+    "structured-xades/std",
+    "structured-asn1/std",
+    "structured-pkix/std",
+    "structured-cms/std",
+    "structured-ltv/std",
+    "thiserror/std",
+]
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
 

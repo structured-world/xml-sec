@@ -181,8 +181,9 @@ fn execute(corpus: &Corpus, output: &Path) -> Result<(), String> {
         &package.join("dss-investigation/strict-policy-expectations.json"),
         &binding.join("strict-policy-summary.json"),
     )?;
+    super::levels::execute(corpus, &output.join("levels"))?;
     println!(
-        "verified: live XMLDSig/XAdES, {count} independent octet vectors, DSS and strict-policy expectations"
+        "verified: live XMLDSig/XAdES, {count} independent octet vectors, DSS, strict-policy and baseline-level expectations"
     );
     Ok(())
 }

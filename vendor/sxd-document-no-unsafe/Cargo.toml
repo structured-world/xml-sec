@@ -31,5 +31,5 @@ workspace = true
 
 [dependencies]
 peresil = "0.3.0"
-structured-asn1 = { version = "0.18.0", default-features = false, features = ["alloc"] }
+structured-asn1 = { version = "0.20.0", default-features = false, features = ["alloc"] }
 typed-arena = "2.0"

@@ -5,7 +5,7 @@
 //! authenticates the node it reads.
 
 use crate::document::{DocumentView, NodeIdentity, XmlDocumentError};
-use structured_asn1::memory::{MemoryError, Work};
+use structured_asn1::memory::{MemoryError, OwnedVec, Work};
 
 /// Original tree read failure, independent of the content it would have read.
 #[derive(Debug, thiserror::Error)]
@@ -153,6 +153,28 @@ pub fn with_base64<W: Work, R>(
     work: &W,
     visitor: impl for<'a> FnOnce(&'a [u8]) -> R,
 ) -> Result<R, TreeError> {
+    Ok(visitor(&decode_base64(view, owner, work)?))
+}
+
+/// The same decoding into independently retained storage, charged to `work`
+/// for as long as the returned bytes live.
+///
+/// # Errors
+///
+/// The errors of [`with_base64`].
+pub fn base64_owned<W: Work>(
+    view: DocumentView<'_>,
+    owner: NodeIdentity,
+    work: &W,
+) -> Result<OwnedVec<u8>, TreeError> {
+    Ok(decode_base64(view, owner, work)?.into_owned())
+}
+
+fn decode_base64<W: Work>(
+    view: DocumentView<'_>,
+    owner: NodeIdentity,
+    work: &W,
+) -> Result<OwnedVec<u8, W>, TreeError> {
     // Zero-fill source for initialized decode storage, in bounded chunks.
     const ZEROS: [u8; 512] = [0; 512];
     charge(work, 1)?;
@@ -195,5 +217,5 @@ pub fn with_base64<W: Work, R>(
     payload
         .decode_into(&mut decoded)
         .map_err(TreeError::Base64)?;
-    Ok(visitor(&decoded))
+    Ok(decoded)
 }
