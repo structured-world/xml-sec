@@ -358,51 +358,21 @@ pub fn canonicalize(
     )
 }
 
-/// Canonicalize through the closure visibility API while enforcing both the
-/// output ceiling and the caller's operation-wide XML Base work budget.
-#[cfg(feature = "xmldsig-sign")]
-pub(crate) fn canonicalize_bounded_with_xml_base_budget(
-    doc: &Document,
-    node_set: Option<&dyn Fn(Node) -> bool>,
-    algo: &C14nAlgorithm,
-    max_output_bytes: usize,
-    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
-    output: &mut Vec<u8>,
-) -> Result<(), C14nError> {
-    let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
-    let initial_offset = output.len();
-    canonicalize_visible_to_writer_bounded(
-        doc,
-        visibility
-            .as_ref()
-            .map(|visibility| visibility as &dyn NodeVisibility),
-        algo,
-        max_output_bytes,
-        xml_base_resolution,
-        output,
-        initial_offset,
-    )?;
-    Ok(())
-}
-
-/// [`canonicalize_bounded_with_xml_base_budget`] that also reports where each
-/// tracked element's start tag begins in `output`.
+/// Bounded canonicalization that also reports where each tracked element's
+/// start tag begins in `output`.
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) fn canonicalize_bounded_with_xml_base_budget_and_positions(
     doc: &Document,
-    node_set: &dyn Fn(Node) -> bool,
+    visibility: &dyn NodeVisibility,
     algo: &C14nAlgorithm,
     tracked_elements: &[NodeId],
     max_output_bytes: usize,
     xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
     output: &mut Vec<u8>,
 ) -> Result<Vec<(NodeId, usize)>, C14nError> {
-    let visibility = ClosureVisibility {
-        predicate: node_set,
-    };
     canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
         doc,
-        Some(&visibility),
+        Some(visibility),
         algo,
         tracked_elements,
         max_output_bytes,
