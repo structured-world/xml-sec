@@ -440,7 +440,7 @@ fn newest_delta<'b, 'r, 'a>(
     session: &CertificateSession,
 ) -> Result<Option<(usize, structured_pkix::crl::BoundDelta<'b, 'r, 'a>)>, X509ChainError> {
     use structured_pkix::crl::DeltaBinding;
-    let mut newest: Option<(&AuthenticatedCrl<'r, 'a>, _)> = None;
+    let mut newest: Option<(usize, structured_pkix::crl::BoundDelta<'b, 'r, 'a>)> = None;
     for candidate in lists.iter().filter(|list| list.delta) {
         let binding = base
             .proof
@@ -451,70 +451,21 @@ fn newest_delta<'b, 'r, 'a>(
         };
         candidate.bound.set(true);
         // Numbers are compared only when a second bound delta exists.
-        let newer = match &newest {
+        // RFC 5280 §5.2.3: the larger CRL number is the newer list. Equal numbers
+        // keep the delta already selected.
+        // <https://www.rfc-editor.org/rfc/rfc5280#section-5.2.3>
+        let newer = match newest {
             None => true,
-            Some((current, _)) => crl_number_after(
-                crl_number(candidate, session)?,
-                crl_number(current, session)?,
-            ),
+            Some((_, current)) => pair
+                .compare_delta_number(current, session.memory())
+                .map_err(|error| session.error(error))?
+                .is_gt(),
         };
         if newer {
-            newest = Some((candidate, pair));
+            newest = Some((candidate.index, pair));
         }
     }
-    Ok(newest.map(|(list, pair)| (list.index, pair)))
-}
-
-/// Original `cRLNumber` content octets of a list `bind_delta` has validated.
-fn crl_number<'a>(
-    list: &AuthenticatedCrl<'_, 'a>,
-    session: &CertificateSession,
-) -> Result<&'a [u8], X509ChainError> {
-    let execution = session.memory();
-    let crl = list.proof.crl();
-    let number = crl
-        .tbs()
-        .extensions()
-        .get(structured_pkix::oid::CRL_NUMBER, execution)
-        .map_err(|error| session.error(error))?
-        .ok_or(X509ChainError::InvalidCrl(list.index))?;
-    let integer = number
-        .reader_scoped(execution)
-        .and_then(|mut reader| reader.read_integer())
-        .map_err(|error| {
-            session.error(structured_pkix::Error::new(
-                structured_pkix::ErrorCode::Encoding(error.code()),
-                "extensions.cRLNumber",
-                error.offset(),
-            ))
-        })?;
-    execution
-        .charge_work(integer.as_bytes().len() as u64 + 1)
-        .map_err(|reason| {
-            session.error(structured_pkix::Error::resource(
-                reason,
-                "extensions.cRLNumber",
-                number.span().start,
-            ))
-        })?;
-    Ok(integer.as_bytes())
-}
-
-/// RFC 5280 §5.2.3: CRL numbers increase monotonically, so the larger integer
-/// is the newer list. `bind_delta` admitted both as nonnegative minimal DER.
-/// <https://www.rfc-editor.org/rfc/rfc5280#section-5.2.3>
-fn crl_number_after(left: &[u8], right: &[u8]) -> bool {
-    fn magnitude(bytes: &[u8]) -> &[u8] {
-        match bytes {
-            [0, rest @ ..] => rest,
-            all => all,
-        }
-    }
-    let (left, right) = (magnitude(left), magnitude(right));
-    left.len()
-        .cmp(&right.len())
-        .then_with(|| left.cmp(right))
-        .is_gt()
+    Ok(newest)
 }
 
 /// How a CRL's authority key identifier relates to a candidate issuer.
