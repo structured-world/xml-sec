@@ -750,6 +750,22 @@ pub(crate) fn execute(corpus: &super::Corpus, results: &std::path::Path) -> Resu
     dss_signatures(corpus, results)
 }
 
+/// The signed payload: a short text, or `units` elements for a sized document.
+fn payload(units: usize) -> String {
+    if units == 0 {
+        return "Levels payload".to_owned();
+    }
+    let mut items = String::new();
+    for unit in 0..units {
+        std::fmt::Write::write_fmt(
+            &mut items,
+            format_args!(r#"<Item name="attribute-{unit}" kind="text">value-{unit}</Item>"#),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    items
+}
+
 /// Writes the level fixtures and their anchor into `levels/` of the output.
 pub(crate) fn generate(generator: &Generator) -> Result<(), String> {
     let directory = generator.output.join("levels");
@@ -765,13 +781,7 @@ pub(crate) fn generate(generator: &Generator) -> Result<(), String> {
     let digests = generator.digests()?;
     let typed = format!(r#"Type="{}""#, super::fixtures::SIGNED_PROPERTIES);
     let signature = baseline(&digests, &typed, RSA_SHA256_PROFILE);
-    let payload = if generator.units == 0 {
-        "Levels payload".to_owned()
-    } else {
-        (0..generator.units)
-            .map(|unit| format!(r#"<Item name="attribute-{unit}" kind="text">value-{unit}</Item>"#))
-            .collect()
-    };
+    let payload = payload(generator.units);
     let template = document(&payload, &signature, RSA_SHA256_PROFILE);
     write(&generator.work.join("levels.template.xml"), &template)?;
     let target = generator.work.join("levels.xml");
