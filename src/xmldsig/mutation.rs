@@ -515,14 +515,30 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
         target_signature,
         policy,
         budget,
-    )?;
+    )?
+    .xml;
     parse_mutation_xml_with_budget(&merged, policy, budget)?;
     Ok(merged)
 }
 
+/// The nodes under `wrapper`, and how deep they reach once inside `key_info`.
+fn key_info_source_extent(wrapper: Node<'_, '_>, key_info: Node<'_, '_>) -> (usize, usize) {
+    let wrapper_depth = wrapper.ancestors().count();
+    let source_depth = wrapper
+        .descendants()
+        .map(|node| node.ancestors().count() - wrapper_depth)
+        .max()
+        .unwrap_or(0);
+    (
+        wrapper.descendants().count() - 1,
+        source_depth + key_info.ancestors().count(),
+    )
+}
+
 /// Merge writer output into the target `<Signature>/<KeyInfo>` of `xml`, whose
-/// current parse is `document`. The result is not reparsed here: the caller
-/// commits it through a parse that validates the whole merged document.
+/// current parse is `document`. The result is not reparsed here: the writer's
+/// content is parsed in its namespace context, and the extent it reports lets
+/// the caller apply the document limits to the whole.
 pub(super) fn merge_key_info_source_in_document(
     document: &crate::xml::dom::Document<'_>,
     xml: &str,
@@ -530,7 +546,7 @@ pub(super) fn merge_key_info_source_in_document(
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
-) -> Result<String, XmlMutationError> {
+) -> Result<crate::document::SplicedElement, XmlMutationError> {
     let Some(signature) = signature_node(document, target_signature) else {
         return Err(XmlMutationError::ValueCountMismatch {
             element: "Signature",
@@ -556,6 +572,8 @@ pub(super) fn merge_key_info_source_in_document(
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
     let wrapped_source = wrap_key_info_children(key_info_source, key_info, policy)?;
     let source_document = parse_mutation_xml_with_budget(&wrapped_source, policy, budget)?;
+    let (added_nodes, depth) = key_info_source_extent(source_document.root_element(), key_info);
+    let original = key_info.range();
     let sources = source_document
         .root_element()
         .children()
@@ -633,7 +651,12 @@ pub(super) fn merge_key_info_source_in_document(
             budget,
         )?;
     }
-    Ok(output)
+    Ok(crate::document::SplicedElement {
+        xml: output,
+        original,
+        added_nodes,
+        depth,
+    })
 }
 
 fn merge_one_key_info_source_at_index_with_options(

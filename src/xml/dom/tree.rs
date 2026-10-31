@@ -498,7 +498,11 @@ impl<'input> Document<'input> {
         options: ParsingOptions,
         backend: XmlBackend,
     ) -> Result<Self, ParseError> {
-        let preflight = super::LexicalPreflight::scan(input, options.allow_dtd)?;
+        let preflight = if backend.records_positions(input) {
+            super::LexicalPreflight::unscanned(super::storage::Native)?
+        } else {
+            super::LexicalPreflight::scan(input, options.allow_dtd)?
+        };
         backend.parse(input, options, &preflight)
     }
 
@@ -510,7 +514,11 @@ impl<'input> Document<'input> {
         storage: super::storage::Accounted<'w, W>,
     ) -> Result<Document<'input, super::storage::Accounted<'w, W>>, super::AccountedParseError>
     {
-        let preflight = super::LexicalPreflight::scan_in(input, options.allow_dtd, storage)?;
+        let preflight = if backend.records_positions(input) {
+            super::LexicalPreflight::unscanned(storage)?
+        } else {
+            super::LexicalPreflight::scan_in(input, options.allow_dtd, storage)?
+        };
         backend.parse_in(input, options, &preflight, storage)
     }
 }
@@ -1331,6 +1339,7 @@ mod tests {
             raw(),
             super::ParsingOptions::default(),
             &preflight,
+            preflight.source_nodes(),
             super::super::storage::Accounted(&memory),
         )
         .expect("paid projection fits");
@@ -1345,6 +1354,7 @@ mod tests {
                 raw(),
                 super::ParsingOptions::default(),
                 &preflight,
+                preflight.source_nodes(),
                 super::super::storage::Accounted(&denied)
             ),
             Err(super::ParseError::SharedExecution(
@@ -1379,6 +1389,7 @@ mod tests {
                     allow_dtd: false,
                 },
                 &preflight,
+                preflight.source_nodes(),
                 Accounted(&memory),
             );
             assert!(matches!(result, Err(super::ParseError::NodesLimitReached)));

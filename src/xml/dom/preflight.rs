@@ -10,7 +10,7 @@ use super::ParseError;
 use super::storage::{Native, Storage, Values};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SourceKind {
+pub(crate) enum SourceKind {
     Element,
     Text,
     CData,
@@ -19,9 +19,46 @@ pub(super) enum SourceKind {
     Pi,
 }
 
-struct SourceNode {
+pub(crate) struct SourceNode {
     kind: SourceKind,
     range: Range<usize>,
+}
+
+/// The sidecar a parser fills while it walks a document that has no DOCTYPE,
+/// where no entity expansion separates its nodes from their source.
+#[cfg(feature = "xml-backend-xmloxide")]
+pub(crate) struct PositionRecorder<S: Storage> {
+    nodes: S::Values<SourceNode>,
+    open: S::Values<usize>,
+}
+
+#[cfg(feature = "xml-backend-xmloxide")]
+impl<S: Storage> PositionRecorder<S> {
+    pub(crate) fn new(storage: S) -> Result<Self, ParseError> {
+        Ok(Self {
+            nodes: storage.values(0)?,
+            open: storage.values(0)?,
+        })
+    }
+
+    pub(crate) fn start_element(&mut self, start: usize) -> Result<(), ParseError> {
+        enforce_depth(self.open.len() + 1)?;
+        self.open.push(self.nodes.len())?;
+        self.leaf(SourceKind::Element, start..start)
+    }
+
+    pub(crate) fn end_element(&mut self, end: usize) {
+        let index = self.open.pop().expect("every end follows its start");
+        self.nodes[index].range.end = end;
+    }
+
+    pub(crate) fn leaf(&mut self, kind: SourceKind, range: Range<usize>) -> Result<(), ParseError> {
+        push_source_position(&mut self.nodes, SourceNode { kind, range })
+    }
+
+    pub(crate) fn into_nodes(self) -> S::Values<SourceNode> {
+        self.nodes
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -128,6 +165,9 @@ pub(super) struct LexicalPreflight<'input, S: Storage = Native> {
     nodes: S::Values<SourceNode>,
     attributes: S::Declarations<'input>,
     storage: S,
+    /// The backend records the source positions itself.
+    #[cfg(feature = "xml-backend-xmloxide")]
+    unscanned: bool,
     #[cfg(feature = "xml-backend-roxmltree")]
     doctype: Option<Range<usize>>,
 }
@@ -139,6 +179,25 @@ impl<'input> LexicalPreflight<'input> {
 }
 
 impl<'input, S: Storage> LexicalPreflight<'input, S> {
+    /// The preflight of a document that declares nothing: no attribute
+    /// declarations exist, and the parser supplies the positions.
+    pub(super) fn unscanned(storage: S) -> Result<Self, ParseError> {
+        Ok(Self {
+            nodes: storage.values(0)?,
+            attributes: storage.declarations(),
+            storage,
+            #[cfg(feature = "xml-backend-xmloxide")]
+            unscanned: true,
+            #[cfg(feature = "xml-backend-roxmltree")]
+            doctype: None,
+        })
+    }
+
+    #[cfg(feature = "xml-backend-xmloxide")]
+    pub(super) fn is_unscanned(&self) -> bool {
+        self.unscanned
+    }
+
     pub(super) fn scan_in(
         input: &'input str,
         allow_dtd: bool,
@@ -243,6 +302,8 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
             nodes,
             attributes,
             storage,
+            #[cfg(feature = "xml-backend-xmloxide")]
+            unscanned: false,
             #[cfg(feature = "xml-backend-roxmltree")]
             doctype,
         })
@@ -308,11 +369,8 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
     }
 
     #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn positions(&self) -> PositionCursor<'_> {
-        PositionCursor {
-            positions: &self.nodes,
-            next: 0,
-        }
+    pub(super) fn source_nodes(&self) -> &[SourceNode] {
+        &self.nodes
     }
 }
 
@@ -444,7 +502,11 @@ pub(super) struct PositionCursor<'a> {
 }
 
 #[cfg(feature = "xml-backend-xmloxide")]
-impl PositionCursor<'_> {
+impl<'a> PositionCursor<'a> {
+    pub(super) fn new(positions: &'a [SourceNode]) -> Self {
+        Self { positions, next: 0 }
+    }
+
     pub(super) fn take(&mut self, expected: SourceKind) -> Result<Range<usize>, ParseError> {
         let Some(node) = self.positions.get(self.next) else {
             return Err(ParseError::SourceMapMismatch {
@@ -473,6 +535,9 @@ impl PositionCursor<'_> {
         }
     }
 }
+
+#[cfg(all(test, feature = "xml-backend-xmloxide"))]
+mod recorder_tests;
 
 #[cfg(all(test, feature = "xmldsig"))]
 mod accounted_tests {

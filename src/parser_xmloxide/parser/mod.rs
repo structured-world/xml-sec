@@ -242,3 +242,11 @@ pub fn parse_str_with_options(input: &str, options: &ParseOptions) -> Result<Doc
     let parser = xml::XmlParser::new(input, options)?;
     parser.parse()
 }
+
+/// Parses a document without a DOCTYPE, returning the source range of each node.
+pub(crate) fn parse_str_recording_positions(
+    input: &str,
+    options: &ParseOptions,
+) -> Result<(Document, alloc::vec::Vec<crate::xml::dom::SourceNode>), ParseError> {
+    xml::XmlParser::new(input, options)?.parse_recording_positions()
+}

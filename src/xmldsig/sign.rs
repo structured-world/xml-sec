@@ -65,7 +65,9 @@ use super::uri::{
     validate_signing_reference_uri,
 };
 use super::verify::parse_signature_children;
-use crate::document::{DocumentParseSettings, XmlDocument, XmlDocumentError, XmlParseWorkBudget};
+use crate::document::{
+    DocumentParseSettings, SplicedElement, XmlDocument, XmlDocumentError, XmlParseWorkBudget,
+};
 
 /// Result for one computed signing-template reference digest.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1858,14 +1860,13 @@ impl<'a> SignContext<'a> {
             &self.policy.resources,
             self.xml_backend,
         );
-        let mut staged = document
-            .staged_copy_with_budget(
-                self.document_parse_settings(),
-                budgets.transforms.xml_parse_work(),
-            )
-            .map_err(map_owned_document_mutation_error)?;
-        self.sign_document_in_place::<CommitDocument>(&mut staged, &mut budgets)?;
-        commit_signed_staged(document, staged, &self.policy)
+        budgets
+            .transforms
+            .xml_parse_work()
+            .admit(document.as_xml().len())?;
+        atomically(document, |document| {
+            self.sign_document_in_place::<CommitDocument>(document, &mut budgets)
+        })
     }
 
     fn sign_document_in_place<O: SignedOutput>(
@@ -2103,10 +2104,9 @@ impl<'a> SignContext<'a> {
         target_signature: usize,
         operation: &mut SigningExecution<'_>,
         key_info: OperationNodeId,
-        output: SigningKeyOutput,
+        encapsulated: Option<(crate::NodeIdentity, crate::provider::EncapsulatedKey)>,
         has_external_resources: bool,
     ) -> Result<OperationNodeId, SigningError> {
-        let (key_info_content, encapsulated) = output;
         operation.extend();
         let kem_mutation = if let Some((target, result)) = encapsulated {
             let mutation =
@@ -2156,60 +2156,105 @@ impl<'a> SignContext<'a> {
         } else {
             None
         };
-        let setup_gate = normalization.or(kem_mutation).unwrap_or(key_info);
-        self.populate_signing_key_info(
-            document,
-            target_signature,
-            operation,
-            setup_gate,
-            key_info_content,
-        )
+        Ok(normalization.or(kem_mutation).unwrap_or(key_info))
     }
 
+    /// The writer's `KeyInfo` spliced into a copy of the serialization. The
+    /// helper checks its namespace wrapper and every projected replacement
+    /// against policy before allocating that copy.
+    fn splice_signing_key_info(
+        &self,
+        document: &XmlDocument,
+        target_signature: usize,
+        key_info_content: &str,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<SplicedElement, SigningError> {
+        let spliced = document.with_view(|view| {
+            merge_key_info_source_in_document(
+                view.document(),
+                view.xml(),
+                key_info_content,
+                target_signature,
+                Some(&self.policy),
+                Some(budget),
+            )
+        })?;
+        self.policy
+            .resources
+            .validate_xml_document_len(spliced.xml.len())?;
+        Ok(spliced)
+    }
+
+    /// Analyze the `Reference` set and settle how the writer's `KeyInfo` joins
+    /// the document: in the final mutation when nothing signed reads it, or as
+    /// its own generation when something may.
+    fn plan_signing_key_info(
+        &self,
+        document: &mut XmlDocument,
+        operation: &mut SigningExecution<'_>,
+        (request, transform_options): (SigningReferenceRequest<'_, '_>, TransformOptions<'_>),
+        setup_gate: OperationNodeId,
+        key_info_content: Option<String>,
+    ) -> Result<(AnalyzedReferences, OperationNodeId, Option<SplicedElement>), SigningError> {
+        let target_signature = request.target_signature;
+        let analysis = analyze_signing_references(document, operation, request, transform_options);
+        match (key_info_content, analysis) {
+            (None, analysis) => Ok((analysis?, setup_gate, None)),
+            (Some(content), Ok(analyzed))
+                if digests_can_defer(document, &analyzed) && analyzed.1.key_info_unread =>
+            {
+                let budget = operation.budgets_mut().transforms.xml_parse_work();
+                let spliced =
+                    self.splice_signing_key_info(document, target_signature, &content, budget)?;
+                Ok((analyzed, setup_gate, Some(spliced)))
+            }
+            // A `Reference` may read what the writer adds, or name an ID only the
+            // writer provides, so a failed analysis is decided after the commit.
+            (Some(content), _) => {
+                let setup_gate = self.populate_signing_key_info(
+                    document,
+                    target_signature,
+                    operation,
+                    setup_gate,
+                    &content,
+                )?;
+                let analyzed =
+                    analyze_signing_references(document, operation, request, transform_options)?;
+                Ok((analyzed, setup_gate, None))
+            }
+        }
+    }
+
+    /// Commit `KeyInfo` as its own generation, for a `Reference` that reads it.
     fn populate_signing_key_info(
         &self,
         document: &mut XmlDocument,
         target_signature: usize,
         operation: &mut SigningExecution<'_>,
         setup_gate: OperationNodeId,
-        key_info_content: Option<String>,
+        key_info_content: &str,
     ) -> Result<OperationNodeId, SigningError> {
-        let setup_gate = if let Some(key_info_content) = key_info_content {
-            let mutation =
-                operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
-            operation.add_dependency(mutation, setup_gate)?;
-            operation.compile()?;
-            operation.run_document_transition(mutation, document, |document, budgets| {
-                // The mutation helper checks its namespace wrapper and every projected
-                // replacement against policy before allocating the committed candidate;
-                // the commit below parses and validates the merged document.
-                let populated = document.with_view(|view| {
-                    merge_key_info_source_in_document(
-                        view.document(),
-                        view.xml(),
-                        &key_info_content,
-                        target_signature,
-                        Some(&self.policy),
-                        Some(budgets.transforms.xml_parse_work()),
-                    )
-                })?;
-                self.policy
-                    .resources
-                    .validate_xml_document_len(populated.len())?;
-                document
-                    .replace_serialized_with_settings(
-                        populated,
-                        self.document_parse_settings(),
-                        Some(budgets.transforms.xml_parse_work()),
-                    )
-                    .map_err(map_owned_document_mutation_error)
-            })?;
-            operation.extend();
-            mutation
-        } else {
-            setup_gate
-        };
-        Ok(setup_gate)
+        let mutation =
+            operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+        operation.add_dependency(mutation, setup_gate)?;
+        operation.compile()?;
+        operation.run_document_transition(mutation, document, |document, budgets| {
+            let populated = self.splice_signing_key_info(
+                document,
+                target_signature,
+                key_info_content,
+                budgets.transforms.xml_parse_work(),
+            )?;
+            document
+                .replace_serialized_with_settings(
+                    populated.xml,
+                    self.document_parse_settings(),
+                    Some(budgets.transforms.xml_parse_work()),
+                )
+                .map_err(map_owned_document_mutation_error)
+        })?;
+        operation.extend();
+        Ok(mutation)
     }
 
     fn admit_signature_output(
@@ -2219,7 +2264,7 @@ impl<'a> SignContext<'a> {
         signing_key: &dyn SigningKey,
         algorithm: SignatureAlgorithm,
         hmac_output_length_bits: Option<usize>,
-        pending_digests: &[(crate::NodeIdentity, String)],
+        (pending_digests, key_info): (&[(crate::NodeIdentity, String)], Option<&SplicedElement>),
     ) -> Result<(usize, crate::NodeIdentity), SigningError> {
         let expected_signature_len = expected_signature_output_len(
             signing_key,
@@ -2259,9 +2304,26 @@ impl<'a> SignContext<'a> {
                 },
             )? - document.as_xml().len();
         }
+        if let Some(spliced) = key_info {
+            // `spliced` and the source share everything outside `KeyInfo`.
+            projected_document_len =
+                projected_document_len - document.as_xml().len() + spliced.xml.len();
+        }
         self.policy
             .resources
             .validate_xml_document_len(projected_document_len)?;
+        // Every ceiling of the final generation is decided here, once, before
+        // the private key is used.
+        document
+            .validate_commit_limits(
+                pending_digests
+                    .iter()
+                    .map(|(target, _)| *target)
+                    .chain([signature_value_node]),
+                key_info,
+                self.document_parse_settings(),
+            )
+            .map_err(map_owned_document_mutation_error)?;
         Ok((expected_signature_len, signature_value_node))
     }
 
@@ -2272,6 +2334,7 @@ impl<'a> SignContext<'a> {
         operation: &mut SigningExecution<'_>,
         (plan_nodes, pending_digests): (SigningPlanNodes, Vec<(crate::NodeIdentity, String)>),
         signing_key: &dyn SigningKey,
+        key_info: Option<&SplicedElement>,
     ) -> Result<O::Output, SigningError> {
         self.policy
             .resources
@@ -2298,7 +2361,7 @@ impl<'a> SignContext<'a> {
             signing_key,
             algorithm,
             hmac_output_length_bits,
-            &pending_digests,
+            (&pending_digests, key_info),
         )?;
         let signature_value = operation.run(plan_nodes.crypto, || {
             self.provider
@@ -2326,7 +2389,14 @@ impl<'a> SignContext<'a> {
         })?;
         let mut replacement = pending_digests;
         replacement.push((signature_value_node, signature_b64));
-        O::finish(self, operation, plan_nodes.mutation, document, &replacement)
+        O::finish(
+            self,
+            operation,
+            plan_nodes.mutation,
+            document,
+            &replacement,
+            key_info,
+        )
     }
 
     fn sign_template_at_index_with_budgets<O: SignedOutput>(
@@ -2386,29 +2456,38 @@ impl<'a> SignContext<'a> {
             target_signature,
             &mut operation,
             key_info,
-            (key_info_content, encapsulated),
+            encapsulated,
             external_resources.is_configured(),
         )?;
-        let (plan_nodes, pending_digests) =
-            fill_reference_digest_values_in_dependency_order_with_operation(
-                document,
-                transform_options,
-                self.provider,
-                &mut operation,
-                SigningReferenceRequest {
-                    target_signature,
-                    id_attributes: self.id_attributes,
-                    external_resources: &external_resources,
-                },
-                Some(setup_gate),
-                true,
-            )?;
+        let request = SigningReferenceRequest {
+            target_signature,
+            id_attributes: self.id_attributes,
+            external_resources: &external_resources,
+        };
+        let (analyzed, setup_gate, spliced_key_info) = self.plan_signing_key_info(
+            document,
+            &mut operation,
+            (request, transform_options),
+            setup_gate,
+            key_info_content,
+        )?;
+        let (plan_nodes, pending_digests) = fill_analyzed_reference_digest_values(
+            document,
+            transform_options,
+            self.provider,
+            &mut operation,
+            request,
+            Some(setup_gate),
+            true,
+            analyzed,
+        )?;
         self.finish_signing_template::<O>(
             document,
             target_signature,
             &mut operation,
             (plan_nodes, pending_digests),
             signing_key,
+            spliced_key_info.as_ref(),
         )
     }
 
@@ -2464,18 +2543,17 @@ impl<'a> SignContext<'a> {
             &self.policy.resources,
             self.xml_backend,
         );
-        let mut staged = document
-            .staged_copy_with_budget(
-                self.document_parse_settings(),
-                budgets.transforms.xml_parse_work(),
+        budgets
+            .transforms
+            .xml_parse_work()
+            .admit(document.as_xml().len())?;
+        atomically(document, |document| {
+            self.sign_document_with_builder_in_place::<CommitDocument>(
+                document,
+                builder,
+                &mut budgets,
             )
-            .map_err(map_owned_document_mutation_error)?;
-        self.sign_document_with_builder_in_place::<CommitDocument>(
-            &mut staged,
-            builder,
-            &mut budgets,
-        )?;
-        commit_signed_staged(document, staged, &self.policy)
+        })
     }
 
     fn sign_document_with_builder_in_place<O: SignedOutput>(
@@ -2565,6 +2643,7 @@ trait SignedOutput {
         mutation: OperationNodeId,
         document: &mut XmlDocument,
         replacement: &[(crate::NodeIdentity, String)],
+        key_info: Option<&SplicedElement>,
     ) -> Result<Self::Output, SigningError>;
 }
 
@@ -2580,15 +2659,27 @@ impl SignedOutput for CommitDocument {
         mutation: OperationNodeId,
         document: &mut XmlDocument,
         replacement: &[(crate::NodeIdentity, String)],
+        key_info: Option<&SplicedElement>,
     ) -> Result<(), SigningError> {
         operation.run_document_transition(mutation, document, |document, budgets| {
-            document
-                .replace_base64_contents_with_budget(
-                    replacement,
-                    context.document_parse_settings(),
-                    budgets.transforms.xml_parse_work(),
-                )
-                .map_err(map_owned_document_mutation_error)
+            let settings = context.document_parse_settings();
+            let parse_work = budgets.transforms.xml_parse_work();
+            match key_info {
+                Some(_) => {
+                    let signed = document.project_base64_commit(replacement, settings, key_info);
+                    signed.and_then(|signed| {
+                        document.replace_serialized_with_settings(
+                            signed,
+                            settings,
+                            Some(parse_work),
+                        )
+                    })
+                }
+                None => {
+                    document.replace_base64_contents_with_budget(replacement, settings, parse_work)
+                }
+            }
+            .map_err(map_owned_document_mutation_error)
         })?;
         context
             .policy
@@ -2610,10 +2701,11 @@ impl SignedOutput for SerializeText {
         mutation: OperationNodeId,
         document: &mut XmlDocument,
         replacement: &[(crate::NodeIdentity, String)],
+        key_info: Option<&SplicedElement>,
     ) -> Result<String, SigningError> {
         let signed = operation.run_document_projection(mutation, document, |document| {
             document
-                .project_base64_commit(replacement, context.document_parse_settings())
+                .project_base64_commit(replacement, context.document_parse_settings(), key_info)
                 .map_err(map_owned_document_mutation_error)
         })?;
         context
@@ -3124,6 +3216,8 @@ fn analyze_signing_reference_inputs(
             reference_limit,
         )?);
     }
+    // A transform here can read node content, not only keep or drop subtrees,
+    // so KeyInfo may shape its output even when it does not appear there.
     reference_dependency_levels(
         &analysis_doc,
         analysis_signature,
@@ -3132,6 +3226,10 @@ fn analyze_signing_reference_inputs(
         &budgets.transforms,
         request.uri_resolution(policy.transforms.same_document_id_semantics),
     )
+    .map(|plan| SigningDependencyPlan {
+        key_info_unread: false,
+        ..plan
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3275,6 +3373,7 @@ fn compute_deferred_reference_digests(
     })
 }
 
+#[cfg(test)]
 fn fill_reference_digest_values_in_dependency_order_with_operation(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
@@ -3287,6 +3386,31 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
     setup_gate: Option<OperationNodeId>,
     defer_digests: bool,
 ) -> Result<(SigningPlanNodes, Vec<(crate::NodeIdentity, String)>), SigningDigestError> {
+    let analyzed = analyze_signing_references(document, operation, request, transform_options)?;
+    fill_analyzed_reference_digest_values(
+        document,
+        transform_options,
+        provider,
+        operation,
+        request,
+        setup_gate,
+        defer_digests,
+        analyzed,
+    )
+}
+
+/// The Reference inputs of the current generation and what they depend on.
+type AnalyzedReferences = (SigningReferenceInputs, SigningDependencyPlan);
+
+fn analyze_signing_references(
+    document: &XmlDocument,
+    operation: &mut OperationExecutionContext<
+        crate::policy::SigningPolicy,
+        &mut SigningOperationBudgets,
+    >,
+    request: SigningReferenceRequest<'_, '_>,
+    transform_options: TransformOptions<'_>,
+) -> Result<AnalyzedReferences, SigningDigestError> {
     let policy = operation.policy().clone();
     let references =
         collect_signing_reference_inputs(document, &policy, operation.budgets_mut(), request)?;
@@ -3298,20 +3422,17 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
         transform_options,
         &references,
     )?;
-    let (node_levels, plan_nodes) =
-        compile_signing_operation_plan(operation, &dependency_plan, setup_gate)?;
-    let level_request = LevelDigestRequest {
-        transform_options,
-        provider,
-        target_signature: request.target_signature,
-        uri_resolution: request.uri_resolution(policy.transforms.same_document_id_semantics),
-    };
-    // When no Reference reads another's digest and every DigestValue is empty,
-    // all digests come from the current generation; SignedInfo canonicalization
-    // and the final commit receive them instead of an intermediate generation.
-    if defer_digests
-        && let [level] = dependency_plan.levels.as_slice()
-        && let [node_level] = node_levels.as_slice()
+    Ok((references, dependency_plan))
+}
+
+/// Whether every digest comes from the current generation: no `Reference` reads
+/// another's digest and every `DigestValue` is empty, so `SignedInfo`
+/// canonicalization and the final commit receive them with no generation between.
+fn digests_can_defer(
+    document: &XmlDocument,
+    (references, dependency_plan): &AnalyzedReferences,
+) -> bool {
+    dependency_plan.levels.len() == 1
         && document.with_view(|view| {
             references
                 .signed_info
@@ -3323,6 +3444,39 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
                         .is_some_and(|node| node.children().next().is_none())
                 })
         })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one part of the signing operation already in progress"
+)]
+fn fill_analyzed_reference_digest_values(
+    document: &mut XmlDocument,
+    transform_options: TransformOptions<'_>,
+    provider: &dyn crate::provider::CryptoProvider,
+    operation: &mut OperationExecutionContext<
+        crate::policy::SigningPolicy,
+        &mut SigningOperationBudgets,
+    >,
+    request: SigningReferenceRequest<'_, '_>,
+    setup_gate: Option<OperationNodeId>,
+    defer_digests: bool,
+    analyzed: AnalyzedReferences,
+) -> Result<(SigningPlanNodes, Vec<(crate::NodeIdentity, String)>), SigningDigestError> {
+    let can_defer = defer_digests && digests_can_defer(document, &analyzed);
+    let (references, dependency_plan) = analyzed;
+    let policy = operation.policy().clone();
+    let (node_levels, plan_nodes) =
+        compile_signing_operation_plan(operation, &dependency_plan, setup_gate)?;
+    let level_request = LevelDigestRequest {
+        transform_options,
+        provider,
+        target_signature: request.target_signature,
+        uri_resolution: request.uri_resolution(policy.transforms.same_document_id_semantics),
+    };
+    if can_defer
+        && let [level] = dependency_plan.levels.as_slice()
+        && let [node_level] = node_levels.as_slice()
     {
         let pending = compute_deferred_reference_digests(
             operation,
@@ -3392,6 +3546,48 @@ fn fill_reference_digest_values_in_dependency_order(
 struct SigningDependencyPlan {
     dependencies: Vec<HashSet<usize>>,
     levels: Vec<Vec<usize>>,
+    /// No `Reference` can observe the content of the target `KeyInfo`.
+    key_info_unread: bool,
+}
+
+/// Every node whose content signing changes or adds, with the index of what
+/// fills it: a `Reference`, `SignatureValue` at `references.len()`, and the
+/// target `KeyInfo` one past that.
+fn tracked_signing_nodes(
+    doc: &Document<'_>,
+    signature: Node<'_, '_>,
+    references: &[SigningReference],
+) -> Result<Vec<(usize, NodeId)>, SigningDigestError> {
+    let terminal_signature_value_index = references.len();
+    let signature_value = find_required_child(signature, "SignatureValue")?;
+    let mut tracked = references
+        .iter()
+        .enumerate()
+        .flat_map(|(index, reference)| {
+            std::iter::once((index, reference.digest_value_node_id)).chain(
+                doc.get_node(reference.digest_value_node_id)
+                    .into_iter()
+                    .flat_map(Node::children)
+                    .filter(Node::is_text)
+                    .map(move |node| (index, node.id())),
+            )
+        })
+        .collect::<Vec<_>>();
+    tracked.push((terminal_signature_value_index, signature_value.id()));
+    tracked.extend(
+        signature_value
+            .children()
+            .filter(Node::is_text)
+            .map(|node| (terminal_signature_value_index, node.id())),
+    );
+    tracked.extend(
+        signature
+            .children()
+            .filter(|node| node.has_tag_name((XMLDSIG_NS, "KeyInfo")))
+            .flat_map(Node::descendants)
+            .map(|node| (terminal_signature_value_index + 1, node.id())),
+    );
+    Ok(tracked)
 }
 
 fn reference_dependency_levels(
@@ -3408,28 +3604,9 @@ fn reference_dependency_levels(
         uri_resolution.same_document_id_semantics,
     );
     let terminal_signature_value_index = references.len();
-    let signature_value = find_required_child(signature, "SignatureValue")?;
-    let mut tracked_mutable_nodes = references
-        .iter()
-        .enumerate()
-        .flat_map(|(index, reference)| {
-            std::iter::once((index, reference.digest_value_node_id)).chain(
-                doc.get_node(reference.digest_value_node_id)
-                    .into_iter()
-                    .flat_map(Node::children)
-                    .filter(Node::is_text)
-                    .map(move |node| (index, node.id())),
-            )
-        })
-        .collect::<Vec<_>>();
-    tracked_mutable_nodes.push((terminal_signature_value_index, signature_value.id()));
-    tracked_mutable_nodes.extend(
-        signature_value
-            .children()
-            .filter(Node::is_text)
-            .map(|node| (terminal_signature_value_index, node.id())),
-    );
-    let analyses = references
+    let key_info_index = terminal_signature_value_index + 1;
+    let tracked_mutable_nodes = tracked_signing_nodes(doc, signature, references)?;
+    let mut analyses = references
         .iter()
         .map(|reference| {
             let origin = signing_reference_origin(doc, reference)?;
@@ -3457,6 +3634,11 @@ fn reference_dependency_levels(
         return Err(SigningDigestError::InvalidStructure(
             "Reference dependency cycle includes the mutable SignatureValue".into(),
         ));
+    }
+    // KeyInfo orders no digest; only whether a Reference covers it matters.
+    let mut key_info_unread = true;
+    for dependencies in &mut analyses {
+        key_info_unread &= !dependencies.remove(&key_info_index);
     }
     let mut remaining_dependencies = analyses.clone();
     let mut completed = vec![false; references.len()];
@@ -3493,6 +3675,7 @@ fn reference_dependency_levels(
     Ok(SigningDependencyPlan {
         dependencies: analyses,
         levels,
+        key_info_unread,
     })
 }
 
@@ -3610,23 +3793,32 @@ fn signing_document_root(view: crate::document::DocumentView<'_>) -> crate::Node
     view.root_element()
 }
 
-fn commit_signed_staged(
+/// Returns `document` to its starting generation unless signing finished,
+/// including when signing unwinds.
+struct AtomicSigning<'a> {
+    document: &'a mut XmlDocument,
+    succeeded: bool,
+}
+
+impl Drop for AtomicSigning<'_> {
+    fn drop(&mut self) {
+        self.document.finish_atomic_mutation(self.succeeded);
+    }
+}
+
+/// Run `sign` so that it commits one generation or none.
+fn atomically<T>(
     document: &mut XmlDocument,
-    staged: XmlDocument,
-    policy: &crate::policy::SigningPolicy,
-) -> Result<(), SigningError> {
-    let mut operation = OperationExecutionContext::new(
-        policy.clone(),
-        (),
-        Some((document.identity(), document.generation())),
-    );
-    let mutation = operation.add_node(OperationNodeKind::Mutation, OperationStage::Mutation, None);
-    operation.compile()?;
-    operation.run_document_transition(mutation, document, |document, ()| {
-        document
-            .commit_staged(staged)
-            .map_err(map_owned_document_mutation_error)
-    })
+    sign: impl FnOnce(&mut XmlDocument) -> Result<T, SigningError>,
+) -> Result<T, SigningError> {
+    document.begin_atomic_mutation();
+    let mut guard = AtomicSigning {
+        document,
+        succeeded: false,
+    };
+    let result = sign(guard.document);
+    guard.succeeded = result.is_ok();
+    result
 }
 
 fn validate_signing_references(

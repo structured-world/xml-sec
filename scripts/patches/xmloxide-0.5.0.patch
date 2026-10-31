@@ -88,7 +88,7 @@
          f.debug_struct("ParseOptions")
              .field("recover", &self.recover)
              .field("no_blanks", &self.no_blanks)
-@@ -238,6 +239,6 @@
+@@ -238,6 +239,14 @@
  /// Returns `ParseError` if the input is not well-formed XML and recovery
  /// mode is not enabled.
  pub fn parse_str_with_options(input: &str, options: &ParseOptions) -> Result<Document, ParseError> {
@@ -96,6 +96,14 @@
 +    let parser = xml::XmlParser::new(input, options)?;
      parser.parse()
  }
++
++/// Parses a document without a DOCTYPE, returning the source range of each node.
++pub(crate) fn parse_str_recording_positions(
++    input: &str,
++    options: &ParseOptions,
++) -> Result<(Document, alloc::vec::Vec<crate::xml::dom::SourceNode>), ParseError> {
++    xml::XmlParser::new(input, options)?.parse_recording_positions()
++}
 --- a/xmloxide/src/parser/input.rs
 +++ b/xmloxide/src/parser/input.rs
 @@ -19,10 +19,99 @@
@@ -4014,17 +4022,19 @@
      #[test]
 --- a/xmloxide/src/parser/xml.rs
 +++ b/xmloxide/src/parser/xml.rs
-@@ -3,19 +3,55 @@
+@@ -3,19 +3,56 @@
  //! Implements a hand-rolled recursive descent parser for XML 1.0 (Fifth Edition).
  //! See <https://www.w3.org/TR/xml/> for the specification.
  
 -use std::collections::HashMap;
-+use crate::xml::dom::storage::names::{NameStorage, Names};
-+use crate::xml::dom::storage::{Native, Storage, Values};
- 
+-
 -use crate::error::{ErrorSeverity, ParseError};
 -use crate::tree::{Attribute, Document, NodeId, NodeKind};
 -use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
++use crate::xml::dom::storage::names::{NameStorage, Names};
++use crate::xml::dom::storage::{Native, Storage, Values};
++use crate::xml::dom::{PositionRecorder, SourceKind, SourceNode};
++
 +use crate::parser_xmloxide::error::{ErrorSeverity, ParseDiagnostic};
 +use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
 +use crate::parser_xmloxide::validation::dtd::{
@@ -4079,9 +4089,14 @@
  
  /// Default maximum amplification factor for entity/attribute expansion.
  ///
-@@ -33,21 +69,22 @@
+@@ -32,56 +69,91 @@
+ /// resolver-provided external entities and stack safety.
  const MAX_ENTITY_DEPTH: u32 = 32;
  
++/// A parsed document with the source ranges of its nodes.
++pub(crate) type Located<S> = (Document<S>, <S as Storage>::Values<SourceNode>);
++type Finished<S> = (Document<S>, Option<PositionRecorder<S>>);
++
  /// The core XML parser.
 -pub(crate) struct XmlParser<'a> {
 +pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
@@ -4110,7 +4125,11 @@
      /// Total input size in bytes, used for amplification factor checking.
      input_size: usize,
      /// Running total of bytes added through default attribute expansion.
-@@ -57,31 +94,45 @@
+     expansion_size: usize,
+     /// Current nesting depth of general entity expansion (0 = document level).
+     entity_depth: u32,
++    /// Source ranges of the nodes, when the caller has no lexical sidecar.
++    positions: Option<PositionRecorder<S>>,
  }
  
  impl<'a> XmlParser<'a> {
@@ -4157,16 +4176,30 @@
              expansion_size: 0,
              entity_depth: 0,
 -        }
++            positions: None,
 +        })
      }
  
      /// Main parse entry point. Parses the entire document.
 -    pub fn parse(&mut self) -> Result<Document, ParseError> {
-+    pub fn parse(mut self) -> Result<Document<S>, ParseError<S>> {
++    pub fn parse(self) -> Result<Document<S>, ParseError<S>> {
++        self.parse_tree().map(|(document, _)| document)
++    }
++
++    /// Parses a document without a DOCTYPE and returns its nodes' source ranges,
++    /// in the order the projector visits them.
++    pub(crate) fn parse_recording_positions(mut self) -> Result<Located<S>, ParseError<S>> {
++        self.positions = Some(PositionRecorder::new(self.storage)?);
++        let (document, positions) = self.parse_tree()?;
++        let positions = positions.expect("recording was enabled above");
++        Ok((document, positions.into_nodes()))
++    }
++
++    fn parse_tree(mut self) -> Result<Finished<S>, ParseError<S>> {
          // Parse optional XML declaration — must be at the very start of the
          // document with no leading whitespace (XML 1.0 §2.8).
          if self.input.looking_at(b"<?xml ")
-@@ -91,12 +142,12 @@
+@@ -91,12 +163,12 @@
              self.parse_xml_declaration()?;
              // Skip whitespace immediately after the XML declaration — the
              // serializer always emits its own newline after the declaration.
@@ -4181,7 +4214,7 @@
              // But if the whitespace was hiding an XML declaration, that's an error
              if had_leading_ws
                  && (self.input.looking_at(b"<?xml ")
-@@ -128,7 +179,7 @@
+@@ -128,7 +200,7 @@
              self.parse_element(self.doc.root())?;
          } else if self.options.recover {
              self.input
@@ -4190,7 +4223,7 @@
          } else {
              return Err(self.input.fatal("missing root element"));
          }
-@@ -136,40 +187,42 @@
+@@ -136,40 +208,47 @@
          // Parse trailing content (comments, PIs after root element)
          self.parse_misc(self.doc.root())?;
  
@@ -4207,7 +4240,7 @@
 -        Ok(std::mem::take(&mut self.doc))
 +        // Parsing is complete and the parser is consumed. Moving the arena
 +        // avoids Document::default allocating a replacement tree on return.
-+        Ok(self.doc)
++        Ok((self.doc, self.positions))
      }
  
      // --- XML Declaration ---
@@ -4218,6 +4251,11 @@
          let decl = parse_xml_decl(&mut self.input)?;
 -        self.doc.version = Some(decl.version);
 -        self.doc.encoding = decl.encoding;
++        // XML 1.0 §2.8 allows a later 1.x only to a processor implementing that
++        // version's character model. This parser implements XML 1.0.
++        if decl.version != "1.0" {
++            return Err(self.input.fatal("unsupported XML version"));
++        }
 +        self.doc.version = Some(self.storage.text(decl.version)?);
 +        self.doc.encoding = self.storage.optional_text(decl.encoding)?;
          self.doc.standalone = decl.standalone;
@@ -4244,7 +4282,7 @@
                  self.doc.append_child(parent, ws_node);
              }
              if self.input.at_end() {
-@@ -189,8 +242,49 @@
+@@ -189,8 +268,49 @@
      // --- DOCTYPE Declaration ---
      // See XML 1.0 §2.8: [28] doctypedecl
  
@@ -4296,7 +4334,7 @@
          // Consume <!DOCTYPE (case-insensitive match already checked by caller)
          self.input.expect_str(b"<!DOCTYPE")?;
          self.input.skip_whitespace_required()?;
-@@ -198,7 +292,7 @@
+@@ -198,7 +318,7 @@
          // Read the root element name
          let name = self.input.parse_name()?;
  
@@ -4305,7 +4343,7 @@
  
          // Check for external ID: SYSTEM or PUBLIC
          let mut system_id = None;
-@@ -208,23 +302,17 @@
+@@ -208,23 +328,17 @@
              self.input.expect_str(b"SYSTEM")?;
              self.input.skip_whitespace_required()?;
              system_id = Some(self.input.parse_quoted_value()?);
@@ -4332,14 +4370,13 @@
          }
  
          // Flag whether there's an external DTD subset. Per XML 1.0 §4.1 WFC:
-@@ -237,142 +325,82 @@
+@@ -237,142 +351,82 @@
          // Parse optional internal subset: [ ... ]
          let mut internal_subset = None;
          if self.input.peek() == Some(b'[') {
 -            self.input.advance(1);
 -            let start = self.input.pos();
-+            let subset_text = self.scan_internal_subset()?;
- 
+-
 -            // Scan to matching ']', tracking depth for bracket chars inside
 -            // entity values. Quoted strings and comments are skipped to avoid
 -            // misinterpreting brackets or apostrophes in comments.
@@ -4378,7 +4415,8 @@
 -                    .input
 -                    .fatal("unexpected end of input in internal subset"));
 -            }
--
++            let subset_text = self.scan_internal_subset()?;
+ 
 -            // Extract the internal subset text (between '[' and ']').
 -            let end = self.input.pos() - 1; // exclude the closing ']'
 -            let subset_text = std::str::from_utf8(self.input.slice(start, end))
@@ -4516,7 +4554,7 @@
          self.doc.append_child(parent, doctype_id);
          Ok(())
      }
-@@ -380,535 +408,506 @@
+@@ -380,535 +434,515 @@
      // --- Elements ---
      // See XML 1.0 §3.1: [40] STag, [42] ETag, [44] EmptyElemTag
  
@@ -5130,6 +5168,9 @@
 +        parent: NodeId,
 +    ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
 +        self.input.increment_depth()?;
++        if let Some(positions) = &mut self.positions {
++            positions.start_element(self.input.pos())?;
++        }
 +        self.input.expect_byte(b'<')?;
 +        let name = self.input.parse_name()?;
 +        let mut attributes = self.storage.values(0)?;
@@ -5152,10 +5193,10 @@
 +            let had_ws = self.input.skip_whitespace()?;
 +            if self.input.peek() == Some(b'>') || self.input.looking_at(b"/>") {
 +                break;
-+            }
+             }
 +            if !had_ws {
 +                return Err(self.input.fatal("whitespace required between attributes"));
-             }
++            }
 +            let attr = self.parse_attribute()?;
 +            attributes.push(attr)?;
          }
@@ -5329,6 +5370,9 @@
          if self.input.looking_at(b"/>") {
 -            self.input.advance(2);
 +            self.input.advance(2)?;
++            if let Some(positions) = &mut self.positions {
++                positions.end_element(self.input.pos());
++            }
              if has_ns_decls {
 -                self.ns.pop_scope();
 +                self.ns.pop_scope()?;
@@ -5389,6 +5433,9 @@
 -        self.input.skip_whitespace();
 +        self.input.skip_whitespace()?;
          self.input.expect_byte(b'>')?;
++        if let Some(positions) = &mut self.positions {
++            positions.end_element(self.input.pos());
++        }
  
          // Pop the namespace scope when leaving this element (only if we pushed).
          if has_ns_decls {
@@ -5402,7 +5449,7 @@
      }
  
      /// Normalizes an attribute value based on its DTD-declared type.
-@@ -921,105 +920,58 @@
+@@ -921,105 +955,59 @@
          element_name: &str,
          attr_name: &str,
          value: &str,
@@ -5472,6 +5519,7 @@
 -    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError> {
 -        let mut text = String::new();
 +    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
++        let source_start = self.input.pos();
 +        let mut text = self.storage.text("")?;
  
          while !self.input.at_end() {
@@ -5530,7 +5578,7 @@
                      }
                  }
                  continue;
-@@ -1034,10 +986,10 @@
+@@ -1034,10 +1022,10 @@
                  if self.options.recover {
                      self.input.push_diagnostic(
                          ErrorSeverity::Error,
@@ -5545,7 +5593,7 @@
                      continue;
                  }
                  return Err(self.input.fatal("']]>' not allowed in character data"));
-@@ -1049,15 +1001,13 @@
+@@ -1049,15 +1037,13 @@
                  // node is created and the entity's replacement text is parsed
                  // as content, attached as children of the EntityRef node.
                  // Skip the peek for builtins at byte level to avoid String allocation.
@@ -5566,7 +5614,7 @@
                          self.doc.append_child(parent, text_id);
                      }
                      self.parse_entity_ref_in_content(parent)?;
-@@ -1066,16 +1016,20 @@
+@@ -1066,17 +1052,24 @@
                  self.input.parse_reference_into(&mut text)?;
              } else {
                  let ch = self.input.next_char()?;
@@ -5589,9 +5637,13 @@
 -            let text_id = self.doc.create_node(NodeKind::Text { content: text });
 +            let text_id = self.doc.try_create_node(NodeKind::Text { content: text })?;
              self.doc.append_child(parent, text_id);
++            if let Some(positions) = &mut self.positions {
++                positions.leaf(SourceKind::Text, source_start..self.input.pos())?;
++            }
          }
  
-@@ -1089,60 +1043,82 @@
+         Ok(())
+@@ -1089,60 +1082,82 @@
      /// replacement text (XML 1.0 §4.5: character references expanded at
      /// declaration time) as content, attaching the resulting nodes as
      /// children of the `EntityRef` node.
@@ -5718,7 +5770,7 @@
          self.doc.append_child(parent, ref_id);
  
          let Some(replacement) = replacement else {
-@@ -1160,18 +1136,16 @@
+@@ -1160,18 +1175,16 @@
                  .fatal("maximum entity amplification factor exceeded"));
          }
  
@@ -5746,7 +5798,7 @@
          Ok(())
      }
  
-@@ -1187,14 +1161,15 @@
+@@ -1187,14 +1200,15 @@
          entity_name: &str,
          replacement: &str,
          ref_id: NodeId,
@@ -5765,7 +5817,7 @@
          sub.entity_depth = self.entity_depth + 1;
          sub.input_size = self.input_size;
          sub.expansion_size = self.expansion_size;
-@@ -1204,51 +1179,50 @@
+@@ -1204,51 +1218,50 @@
          // enough to overflow the stack).
          sub.input.set_depth(self.input.depth());
          // Move shared state into the sub-parser (returned below).
@@ -5837,7 +5889,7 @@
          Ok(())
      }
  
-@@ -1258,7 +1232,7 @@
+@@ -1258,7 +1271,7 @@
      /// Unlike [`parse_content`](Self::parse_content), end of input is the
      /// normal termination and an end tag (`</`) is an error (it would close
      /// an element opened outside the entity — WFC violation).
@@ -5846,7 +5898,7 @@
          while !self.input.at_end() {
              if self.input.looking_at(b"</") {
                  return Err(self.input.fatal("unbalanced end tag"));
-@@ -1278,20 +1252,9 @@
+@@ -1278,20 +1291,9 @@
          Ok(())
      }
  
@@ -5868,7 +5920,7 @@
      #[inline]
      fn is_looking_at_builtin_entity_ref(&self) -> bool {
          let remaining = self.input.remaining();
-@@ -1306,58 +1269,29 @@
+@@ -1306,58 +1308,29 @@
              || after_amp.starts_with(b"quot;")
      }
  
@@ -5939,7 +5991,7 @@
                      }
                      i = j + 1;
                  } else {
-@@ -1367,17 +1301,17 @@
+@@ -1367,17 +1340,17 @@
                  i += 1;
              }
          }
@@ -5961,7 +6013,7 @@
  
          // Capture raw attribute value text (before entity expansion) so we
          // can preserve entity references during serialization.
-@@ -1390,13 +1324,20 @@
+@@ -1390,13 +1363,20 @@
          // contain no '&' (most attributes have no entity references).
          let raw_value = if raw_end > raw_start + 2 {
              let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
@@ -5984,7 +6036,7 @@
              } else {
                  None
              }
-@@ -1404,12 +1345,12 @@
+@@ -1404,12 +1384,12 @@
              None
          };
  
@@ -6000,40 +6052,49 @@
              namespace: None,
              raw_value,
          })
-@@ -1418,9 +1359,11 @@
+@@ -1418,51 +1398,51 @@
      // --- Comments ---
      // See XML 1.0 §2.5: [15] Comment
  
 -    fn parse_comment(&mut self, parent: NodeId) -> Result<(), ParseError> {
 +    fn parse_comment(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
++        let start = self.input.pos();
          let content = parse_comment_content(&mut self.input)?;
 -        let comment_id = self.doc.create_node(NodeKind::Comment { content });
 +        let comment_id = self.doc.try_create_node(NodeKind::Comment {
 +            content: self.storage.text(content)?,
 +        })?;
          self.doc.append_child(parent, comment_id);
++        if let Some(positions) = &mut self.positions {
++            positions.leaf(SourceKind::Comment, start..self.input.pos())?;
++        }
          Ok(())
      }
-@@ -1428,9 +1371,11 @@
+ 
      // --- CDATA Sections ---
      // See XML 1.0 §2.7: [18] CDSect
  
 -    fn parse_cdata(&mut self, parent: NodeId) -> Result<(), ParseError> {
 +    fn parse_cdata(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
++        let start = self.input.pos();
          let content = parse_cdata_content(&mut self.input)?;
 -        let cdata_id = self.doc.create_node(NodeKind::CData { content });
 +        let cdata_id = self.doc.try_create_node(NodeKind::CData {
 +            content: self.storage.text(content)?,
 +        })?;
          self.doc.append_child(parent, cdata_id);
++        if let Some(positions) = &mut self.positions {
++            positions.leaf(SourceKind::CData, start..self.input.pos())?;
++        }
          Ok(())
      }
-@@ -1438,43 +1383,27 @@
+ 
      // --- Processing Instructions ---
      // See XML 1.0 §2.6: [16] PI
  
 -    fn parse_processing_instruction(&mut self, parent: NodeId) -> Result<(), ParseError> {
 +    fn parse_processing_instruction(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
++        let start = self.input.pos();
          let (target, data) = parse_pi_content(&mut self.input)?;
 -        let pi_id = self
 -            .doc
@@ -6043,10 +6104,10 @@
 +            data: self.storage.optional_text(data)?,
 +        })?;
          self.doc.append_child(parent, pi_id);
-         Ok(())
-     }
- }
- 
+-        Ok(())
+-    }
+-}
+-
 -/// Normalizes line ends per XML 1.0 §2.11: `\r\n` and lone `\r` become `\n`.
 -fn normalize_line_ends(s: &str) -> String {
 -    let mut out = String::with_capacity(s.len());
@@ -6059,14 +6120,16 @@
 -            out.push('\n');
 -        } else {
 -            out.push(ch);
--        }
--    }
++        if let Some(positions) = &mut self.positions {
++            positions.leaf(SourceKind::Pi, start..self.input.pos())?;
+         }
++        Ok(())
+     }
 -    out
--}
--
+ }
+ 
  /// Strips an optional leading text declaration (`<?xml ...?>`) from external
- /// parsed entity text (XML 1.0 §4.3.1: `TextDecl`).
- fn strip_text_declaration(s: &str) -> &str {
+@@ -1471,10 +1451,10 @@
      let rest = s.strip_prefix("<?xml").filter(|r| {
          r.starts_with(' ') || r.starts_with('\t') || r.starts_with('\r') || r.starts_with('\n')
      });
@@ -6081,7 +6144,7 @@
      }
      s
  }
-@@ -1488,14 +1417,122 @@
+@@ -1488,14 +1468,122 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -6206,7 +6269,7 @@
      fn test_parse_empty_element() {
          let doc = parse("<root/>");
          let root = doc.root_element().unwrap();
-@@ -1660,7 +1697,7 @@
+@@ -1660,7 +1748,7 @@
      fn test_roundtrip_simple() {
          let input = "<root><child>text</child></root>";
          let doc = parse(input);
@@ -6215,7 +6278,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1668,7 +1705,7 @@
+@@ -1668,7 +1756,7 @@
      fn test_roundtrip_attributes() {
          let input = "<root attr=\"value\"><child id=\"1\"/></root>";
          let doc = parse(input);
@@ -6224,7 +6287,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1676,7 +1713,7 @@
+@@ -1676,7 +1764,7 @@
      fn test_roundtrip_entities() {
          let input = "<root>&amp; &lt; &gt;</root>";
          let doc = parse(input);
@@ -6233,7 +6296,7 @@
          // After parsing, entities are resolved to characters.
          // Serialization re-escapes them.
          assert_eq!(output, format!("{DECL}<root>&amp; &lt; &gt;</root>\n"));
-@@ -1686,7 +1723,7 @@
+@@ -1686,7 +1774,7 @@
      fn test_roundtrip_comment() {
          let input = "<root><!-- comment --></root>";
          let doc = parse(input);
@@ -6242,7 +6305,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1694,7 +1731,7 @@
+@@ -1694,7 +1782,7 @@
      fn test_roundtrip_cdata() {
          let input = "<root><![CDATA[data & stuff]]></root>";
          let doc = parse(input);
@@ -6251,7 +6314,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1702,7 +1739,7 @@
+@@ -1702,7 +1790,7 @@
      fn test_roundtrip_pi() {
          let input = "<?target data?><root/>";
          let doc = parse(input);
@@ -6260,7 +6323,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1710,7 +1747,7 @@
+@@ -1710,7 +1798,7 @@
      fn test_roundtrip_xml_declaration() {
          let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
          let doc = parse(input);
@@ -6269,7 +6332,7 @@
          assert_eq!(
              output,
              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root/>\n"
-@@ -1898,13 +1935,13 @@
+@@ -1898,13 +1986,13 @@
          // Simple DOCTYPE (no whitespace between DOCTYPE and root in input)
          let input = "<!DOCTYPE html><html/>";
          let doc = parse(input);
@@ -6285,7 +6348,7 @@
          assert_eq!(
              output,
              format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\"><root/>\n")
-@@ -1914,7 +1951,7 @@
+@@ -1914,7 +2002,7 @@
          let input = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
                        \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>";
          let doc = parse(input);
@@ -6294,7 +6357,7 @@
          assert_eq!(
              output,
              format!(
-@@ -2061,7 +2098,7 @@
+@@ -2061,7 +2149,7 @@
          let element = doc.first_child(entity_ref).unwrap();
          assert_eq!(doc.node_name(element), Some("b"));
          // Serialization re-emits the entity reference, preserving roundtrip.
@@ -6303,7 +6366,7 @@
          assert!(
              out.contains("<d>&e;</d>"),
              "unexpected serialization: {out}"
-@@ -2069,6 +2106,20 @@
+@@ -2069,6 +2157,20 @@
      }
  
      #[test]
@@ -6324,7 +6387,7 @@
      fn test_parse_entity_charref_markup() {
          // "&#60;b>hi&#60;/b>" expands to "<b>hi</b>" at declaration time
          // (§4.5) and must be parsed as markup at reference time.
-@@ -2086,7 +2137,7 @@
+@@ -2086,7 +2188,7 @@
          // inside the entity expansion.
          let input = "<!DOCTYPE d [<!ENTITY e \"<b>hi</b>\">]><d>&e;</d>";
          let doc = parse(input);
@@ -6333,7 +6396,7 @@
          let doc2 = parse(&out);
          let root2 = doc2.root_element().unwrap();
          assert_eq!(doc2.text_content(root2), "hi");
-@@ -2144,9 +2195,9 @@
+@@ -2144,9 +2246,9 @@
              panic!("expected depth-limited parse to fail");
          };
          assert!(
@@ -6345,7 +6408,7 @@
          );
      }
  
-@@ -2169,9 +2220,10 @@
+@@ -2169,9 +2271,10 @@
              panic!("expected amplification attack to be rejected");
          };
          assert!(

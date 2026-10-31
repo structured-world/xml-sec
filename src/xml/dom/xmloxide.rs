@@ -10,7 +10,7 @@ use xmloxide::tree::{NodeId as XmloxNodeId, NodeKind as XmloxNodeKind};
 
 use super::{
     Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
-    preflight::{PositionCursor, SourceKind},
+    preflight::{PositionCursor, SourceKind, SourceNode},
     tree::{AttributeData, NamespaceData, NamespaceSet, NodeId, NodeKind, TreeBuilder},
 };
 
@@ -25,23 +25,36 @@ impl XmloxideBackend {
         storage: super::storage::Accounted<'w, W>,
     ) -> Result<Document<'input, super::storage::Accounted<'w, W>>, super::AccountedParseError>
     {
-        let parsed = xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
-            .and_then(xmloxide::parser::XmlParser::parse)
-            .map_err(|error| match error {
-                xmloxide::error::ParseError::Resource(error) => {
-                    super::AccountedParseError::Semantic(error)
-                }
-                xmloxide::error::ParseError::Syntax {
-                    message,
-                    location,
-                    diagnostics,
-                } => super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
-                    message,
-                    location,
-                    diagnostics: diagnostics.into_owned(),
-                }),
-            })?;
-        Ok(project_in(input, parsed, options, preflight, storage)?)
+        let (parsed, recorded) =
+            xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
+                .and_then(|parser| {
+                    if preflight.is_unscanned() {
+                        let (parsed, positions) = parser.parse_recording_positions()?;
+                        Ok((parsed, Some(positions)))
+                    } else {
+                        Ok((parser.parse()?, None))
+                    }
+                })
+                .map_err(|error| match error {
+                    xmloxide::error::ParseError::Resource(error) => {
+                        super::AccountedParseError::Semantic(error)
+                    }
+                    xmloxide::error::ParseError::Syntax {
+                        message,
+                        location,
+                        diagnostics,
+                    } => {
+                        super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
+                            message,
+                            location,
+                            diagnostics: diagnostics.into_owned(),
+                        })
+                    }
+                })?;
+        let positions = recorded.as_deref().unwrap_or(preflight.source_nodes());
+        Ok(project_in(
+            input, parsed, options, preflight, positions, storage,
+        )?)
     }
 }
 
@@ -87,15 +100,21 @@ impl XmlBackendImplementation for XmloxideBackend {
         options: ParsingOptions,
         preflight: &LexicalPreflight,
     ) -> Result<Document<'input>, ParseError> {
-        let parsed = xmloxide::parser::parse_str_with_options(input, &backend_options()).map_err(
-            |error| match error {
-                xmloxide::error::ParseError::Resource(error) => error,
-                error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
-                    backend: "xmloxide",
-                    message: error.to_string(),
-                },
+        let failure = |error| match error {
+            xmloxide::error::ParseError::Resource(error) => error,
+            error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
+                backend: "xmloxide",
+                message: error.to_string(),
             },
-        )?;
+        };
+        if preflight.is_unscanned() {
+            let (parsed, positions) =
+                xmloxide::parser::parse_str_recording_positions(input, &backend_options())
+                    .map_err(failure)?;
+            return project_in(input, parsed, options, preflight, &positions, Native);
+        }
+        let parsed =
+            xmloxide::parser::parse_str_with_options(input, &backend_options()).map_err(failure)?;
         project(input, parsed, options, preflight)
     }
 }
@@ -106,7 +125,8 @@ pub(super) fn project<'input>(
     options: ParsingOptions,
     preflight: &LexicalPreflight,
 ) -> Result<Document<'input>, ParseError> {
-    project_in(input, parsed, options, preflight, Native)
+    let positions = preflight.source_nodes();
+    project_in(input, parsed, options, preflight, positions, Native)
 }
 
 pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
@@ -114,6 +134,7 @@ pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
     parsed: xmloxide::Document<R>,
     options: ParsingOptions,
     preflight: &LexicalPreflight<'_, P>,
+    positions: &[SourceNode],
     storage: S,
 ) -> Result<Document<'input, S>, ParseError> {
     if options.nodes_limit == 0 {
@@ -127,7 +148,7 @@ pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
             storage,
         )?,
         source: parsed,
-        positions: preflight.positions(),
+        positions: PositionCursor::new(positions),
         nodes_limit: options.nodes_limit,
     };
     let root = projector
