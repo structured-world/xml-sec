@@ -112,7 +112,7 @@ pub fn next_sibling<W: Work>(
         return Err(TreeError::NotChild);
     }
     Ok(node
-        .following_sibling()
+        .next_sibling()
         .map(|sibling| view.node_identity(sibling)))
 }
 

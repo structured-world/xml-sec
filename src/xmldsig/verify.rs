@@ -25,7 +25,6 @@ use alloc::{
 use base64::Engine;
 use core::cell::{Cell, RefCell};
 
-use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 use crate::document::{
     DocumentParseSettings, DocumentView, NodeIdentity, XmlDocument, XmlDocumentError,
 };
@@ -2688,20 +2687,22 @@ fn canonicalize_verification_signed_info(
     >,
 ) -> Result<Vec<u8>, DsigError> {
     let doc = signed_info_node.document();
-    let signed_info_subtree: Set<_> = signed_info_node.descendants().map(Node::id).collect();
     let mut canonical_signed_info = Vec::new();
     let signed_info_limit = operation
         .budgets()
         .canonicalized
         .remaining()
         .min(operation.budgets().transforms.remaining_c14n_output());
-    canonicalize_bounded_with_xml_base_budget(
+    crate::c14n::canonicalize_visible_to_writer_bounded(
         doc,
-        Some(&|node| signed_info_subtree.contains(&node.id())),
+        Some(&crate::c14n::SubtreeVisibility {
+            apex: signed_info_node,
+        }),
         method,
         signed_info_limit,
         operation.budgets().transforms.xml_base_resolution(),
         &mut canonical_signed_info,
+        0,
     )
     .map_err(|error| {
         if let Some(violation) = map_c14n_resource_policy_violation(

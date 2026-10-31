@@ -624,11 +624,17 @@ CRL checking is meaningful only inside authenticated X.509 path validation. A po
 CRLs without enabling certificate-chain validation is rejected during context construction rather
 than silently accepting a control the resolver cannot enforce.
 CRL structure is validated before authority-key applicability is selected: duplicate CRL or
-CRL-entry extension OIDs fail closed, and `deltaCRLIndicator` is rejected regardless of criticality.
+CRL-entry extension OIDs fail closed.
 Applicable CRLs must include the RFC 5280 `nextUpdate` field and the verification time must remain
 inside the bounded `thisUpdate` through `nextUpdate` validity window.
-The `removeFromCRL` reason is rejected in complete CRLs because it is meaningful only in a delta
-CRL. URI subject alternative names
+A delta CRL is evaluated together with the complete CRL it binds to under RFC 5280 section 5.2.4:
+same issuer, key and scope, a critical `deltaCRLIndicator`, and a complete CRL number from
+`BaseCRLNumber` up to but excluding the delta's own. The newest bound delta decides, and its
+validity window governs the pair, so a current delta keeps an expired complete CRL usable while an
+expired delta is refused even over a current one. An applicable delta bound to no supplied complete
+CRL fails closed.
+The `removeFromCRL` reason lifts an entry only from a delta CRL and is rejected in complete CRLs.
+URI subject alternative names
 likewise require one RFC 3986 authority, including syntactically valid userinfo, before their host
 can participate in `NameConstraints` matching.
 Critical `NameConstraints` also retain their DER structure during validation: the extension must

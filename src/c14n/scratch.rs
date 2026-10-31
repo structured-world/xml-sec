@@ -209,29 +209,73 @@ impl<T> List<T> for Vec<T> {
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct NativeNamespaces<'a>(Map<NamespaceKey<'a>, Option<&'a str>>);
+/// Bindings held without a heap table. Elements rarely see more prefixes, and
+/// each element builds and copies these maps.
+const INLINE_NAMESPACES: usize = 6;
+
+type NamespaceEntry<'a> = (NamespaceKey<'a>, Option<&'a str>);
+
+const EMPTY_NAMESPACE: NamespaceEntry<'static> = (
+    NamespaceKey {
+        prefix: "",
+        utilizer: false,
+    },
+    None,
+);
+
+/// Prefix bindings: a short inline list, then the keyed table, so a document
+/// declaring many prefixes keeps constant-time lookups.
+#[derive(Clone)]
+pub(crate) struct NativeNamespaces<'a> {
+    inline: [NamespaceEntry<'a>; INLINE_NAMESPACES],
+    used: usize,
+    table: Option<Map<NamespaceKey<'a>, Option<&'a str>>>,
+}
+
+impl Default for NativeNamespaces<'_> {
+    fn default() -> Self {
+        Self {
+            inline: [EMPTY_NAMESPACE; INLINE_NAMESPACES],
+            used: 0,
+            table: None,
+        }
+    }
+}
+
+impl NativeNamespaces<'_> {
+    fn position(&self, prefix: &str, utilizer: bool) -> Option<usize> {
+        self.inline[..self.used]
+            .iter()
+            .position(|(key, _)| key.utilizer == utilizer && key.prefix == prefix)
+    }
+}
 
 #[cfg(test)]
 impl<'a> NativeNamespaces<'a> {
     pub(super) fn into_pairs(self) -> impl Iterator<Item = (&'a str, &'a str)> {
-        self.0.into_iter().filter_map(|(key, value)| {
-            if key.utilizer {
-                None
-            } else {
-                value.map(|uri| (key.prefix, uri))
-            }
-        })
+        let inline = self.inline[..self.used].to_vec();
+        inline
+            .into_iter()
+            .chain(self.table.into_iter().flatten())
+            .filter_map(|(key, value)| {
+                if key.utilizer {
+                    None
+                } else {
+                    value.map(|uri| (key.prefix, uri))
+                }
+            })
     }
 }
 
 impl<'a> NamespaceMap<'a> for NativeNamespaces<'a> {
     fn get(&self, prefix: &str, utilizer: bool) -> Result<NamespaceState<'a>, C14nError> {
-        Ok(self
-            .0
-            .get(&NamespaceKey { prefix, utilizer })
-            .copied()
-            .map_or(NamespaceState::Absent, NamespaceState::binding))
+        let entry = match &self.table {
+            Some(table) => table.get(&NamespaceKey { prefix, utilizer }).copied(),
+            None => self
+                .position(prefix, utilizer)
+                .map(|index| self.inline[index].1),
+        };
+        Ok(entry.map_or(NamespaceState::Absent, NamespaceState::binding))
     }
     fn insert(
         &mut self,
@@ -239,14 +283,32 @@ impl<'a> NamespaceMap<'a> for NativeNamespaces<'a> {
         utilizer: bool,
         value: Option<&'a str>,
     ) -> Result<(), C14nError> {
-        self.0.insert(NamespaceKey { prefix, utilizer }, value);
+        let key = NamespaceKey { prefix, utilizer };
+        if let Some(table) = &mut self.table {
+            table.insert(key, value);
+        } else if let Some(index) = self.position(prefix, utilizer) {
+            self.inline[index].1 = value;
+        } else if self.used < INLINE_NAMESPACES {
+            self.inline[self.used] = (key, value);
+            self.used += 1;
+        } else {
+            let mut table: Map<_, _> = self.inline.iter().copied().collect();
+            table.insert(key, value);
+            self.table = Some(table);
+            self.used = 0;
+        }
         Ok(())
     }
     fn remove(&mut self, prefix: &'a str) -> Result<(), C14nError> {
-        self.0.remove(&NamespaceKey {
-            prefix,
-            utilizer: false,
-        });
+        if let Some(table) = &mut self.table {
+            table.remove(&NamespaceKey {
+                prefix,
+                utilizer: false,
+            });
+        } else if let Some(index) = self.position(prefix, false) {
+            self.used -= 1;
+            self.inline[index] = self.inline[self.used];
+        }
         Ok(())
     }
     fn copy(&self) -> Result<Self, C14nError> {

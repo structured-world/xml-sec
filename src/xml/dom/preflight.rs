@@ -161,10 +161,11 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                         &mut nodes,
                         SourceNode {
                             kind: SourceKind::Element,
-                            range: element.range.clone(),
+                            range: element.range,
                         },
                     )?;
                     elements.push(index)?;
+                    reader.recycle(element.attributes);
                 }
                 Event::Empty(element) => {
                     enforce_depth(elements.len() + 1)?;
@@ -175,6 +176,7 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                             range: element.range,
                         },
                     )?;
+                    reader.recycle(element.attributes);
                 }
                 Event::End { range, .. } => {
                     if let Some(index) = elements.pop() {
@@ -510,6 +512,26 @@ mod accounted_tests {
         }
         assert!(memory.used() > 0);
         drop(actual);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn recycling_a_tag_releases_its_accounted_capacity() {
+        use std::fmt::Write as _;
+        // A finished wide tag must not stay charged while later source
+        // positions allocate: a document at its limit would be refused.
+        let mut source = String::from("<r");
+        for index in 0..64 {
+            write!(source, " a{index}='v'").expect("scanner attribute");
+        }
+        source.push_str("/>");
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        let mut scanner = Scanner::with_storage(&source, Accounted(&memory));
+        let Some(Event::Empty(tag)) = scanner.next_event().expect("funded empty tag") else {
+            panic!("one empty tag");
+        };
+        assert!(memory.used() > 0);
+        scanner.recycle(tag.attributes);
         assert_eq!(memory.used(), 0);
     }
 

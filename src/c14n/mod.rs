@@ -230,6 +230,11 @@ pub(crate) fn is_output_limit_error(error: &C14nError) -> bool {
 pub(crate) trait NodeVisibility<D: DomStorage = NativeDom> {
     fn contains_node(&self, node: Node<'_, '_, D>) -> Result<bool, C14nError>;
 
+    /// The element whose whole subtree, and nothing else, this set selects.
+    fn apex(&self) -> Option<NodeId> {
+        None
+    }
+
     fn contains_attribute(
         &self,
         owner: Node<'_, '_, D>,
@@ -290,6 +295,41 @@ impl NodeVisibility for ClosureVisibility<'_> {
     }
 }
 
+/// One element's whole subtree, with every attribute and namespace node on it.
+#[cfg(feature = "xmldsig")]
+pub(crate) struct SubtreeVisibility<'a, 'input> {
+    pub(crate) apex: Node<'a, 'input>,
+}
+
+#[cfg(feature = "xmldsig")]
+impl NodeVisibility for SubtreeVisibility<'_, '_> {
+    fn contains_node(&self, node: Node<'_, '_>) -> Result<bool, C14nError> {
+        Ok(self.apex.subtree_contains_id(node.id()))
+    }
+
+    fn apex(&self) -> Option<NodeId> {
+        Some(self.apex.id())
+    }
+
+    fn contains_attribute(
+        &self,
+        owner: Node<'_, '_>,
+        _namespace: Option<&str>,
+        _local_name: &str,
+    ) -> Result<bool, C14nError> {
+        self.contains_node(owner)
+    }
+
+    fn contains_namespace(
+        &self,
+        owner: Node<'_, '_>,
+        _prefix: &str,
+        _uri: &str,
+    ) -> Result<bool, C14nError> {
+        self.contains_node(owner)
+    }
+}
+
 /// Canonicalize an XML document or document subset.
 ///
 /// - `doc`: parsed backend-neutral semantic document (read-only DOM).
@@ -318,51 +358,21 @@ pub fn canonicalize(
     )
 }
 
-/// Canonicalize through the closure visibility API while enforcing both the
-/// output ceiling and the caller's operation-wide XML Base work budget.
-#[cfg(feature = "xmldsig")]
-pub(crate) fn canonicalize_bounded_with_xml_base_budget(
-    doc: &Document,
-    node_set: Option<&dyn Fn(Node) -> bool>,
-    algo: &C14nAlgorithm,
-    max_output_bytes: usize,
-    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
-    output: &mut Vec<u8>,
-) -> Result<(), C14nError> {
-    let visibility = node_set.map(|predicate| ClosureVisibility { predicate });
-    let initial_offset = output.len();
-    canonicalize_visible_to_writer_bounded(
-        doc,
-        visibility
-            .as_ref()
-            .map(|visibility| visibility as &dyn NodeVisibility),
-        algo,
-        max_output_bytes,
-        xml_base_resolution,
-        output,
-        initial_offset,
-    )?;
-    Ok(())
-}
-
-/// [`canonicalize_bounded_with_xml_base_budget`] that also reports where each
-/// tracked element's start tag begins in `output`.
+/// Bounded canonicalization that also reports where each tracked element's
+/// start tag begins in `output`.
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) fn canonicalize_bounded_with_xml_base_budget_and_positions(
     doc: &Document,
-    node_set: &dyn Fn(Node) -> bool,
+    visibility: &dyn NodeVisibility,
     algo: &C14nAlgorithm,
     tracked_elements: &[NodeId],
     max_output_bytes: usize,
     xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
     output: &mut Vec<u8>,
 ) -> Result<Vec<(NodeId, usize)>, C14nError> {
-    let visibility = ClosureVisibility {
-        predicate: node_set,
-    };
     canonicalize_with_visibility_and_positions_bounded_with_xml_base_budget(
         doc,
-        Some(&visibility),
+        Some(visibility),
         algo,
         tracked_elements,
         max_output_bytes,
@@ -777,6 +787,76 @@ pub fn canonicalize_document(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "xmldsig")]
+    fn subtree_bytes(
+        document: &Document,
+        apex: Node<'_, '_>,
+        algorithm: &C14nAlgorithm,
+    ) -> Vec<u8> {
+        let mut output = Vec::new();
+        canonicalize_visible_to_writer_bounded(
+            document,
+            Some(&SubtreeVisibility { apex }),
+            algorithm,
+            usize::MAX,
+            &xml_base::XmlBaseResolutionBudget::default(),
+            &mut output,
+            0,
+        )
+        .expect("subtree canonicalization");
+        output
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn walking_from_the_apex_matches_filtering_the_whole_document() {
+        // SignedInfo starts at its own element. Ancestors still supply in-scope
+        // namespaces and inherited xml:* attributes, in every mode.
+        let xml = r#"<r xmlns="urn:d" xmlns:p="urn:p" xmlns:q="urn:q" xml:lang="en" xml:base="http://a/b/"><!--c-->text<p:s xml:space="preserve" q:a="1" b="2"><p:i xml:base="c/">t</p:i><!--in--><?pi x?></p:s><p:after/></r>"#;
+        let document = Document::parse(xml).expect("parse");
+        let apex = document.root_element().first_element_child().expect("apex");
+        let subtree: Vec<_> = apex.descendants().map(Node::id).collect();
+        for mode in [
+            C14nMode::Inclusive1_0,
+            C14nMode::Inclusive1_1,
+            C14nMode::Exclusive1_0,
+        ] {
+            for comments in [false, true] {
+                let algorithm = C14nAlgorithm::new(mode, comments);
+                let mut filtered = Vec::new();
+                canonicalize(
+                    &document,
+                    Some(&|node| subtree.contains(&node.id())),
+                    &algorithm,
+                    &mut filtered,
+                )
+                .expect("filtered canonicalization");
+                assert_eq!(subtree_bytes(&document, apex, &algorithm), filtered);
+            }
+        }
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn relative_namespace_outside_the_apex_still_fails() {
+        // Canonical XML 1.0 §2.3 refuses the document, not just the subset, so
+        // starting at the apex must not skip a binding declared elsewhere.
+        let document = Document::parse("<r><a/><b xmlns:p='relative'><c/></b></r>").expect("parse");
+        let apex = document.root_element().first_element_child().expect("apex");
+        let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+        let mut output = Vec::new();
+        let result = canonicalize_visible_to_writer_bounded(
+            &document,
+            Some(&SubtreeVisibility { apex }),
+            &algorithm,
+            usize::MAX,
+            &xml_base::XmlBaseResolutionBudget::default(),
+            &mut output,
+            0,
+        );
+        assert!(matches!(result, Err(C14nError::RelativeNamespace)));
+    }
 
     #[test]
     fn from_uri_roundtrip() {

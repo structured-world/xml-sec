@@ -34,7 +34,6 @@ use std::{
 };
 use zeroize::Zeroizing;
 
-use crate::c14n::canonicalize_bounded_with_xml_base_budget;
 use crate::operation::{
     OperationExecutionContext, OperationNodeId, OperationNodeKind, OperationPlanError,
     OperationStage,
@@ -3890,24 +3889,23 @@ fn canonicalize_signed_info(
             }
             .into());
         }
-        let signed_info_subtree: HashSet<_> = signed_info_node
-            .descendants()
-            .map(|node: Node<'_, '_>| node.id())
-            .collect();
         let mut canonical_signed_info = Vec::new();
         let canonicalized = if pending_digests.is_empty() {
-            canonicalize_bounded_with_xml_base_budget(
+            crate::c14n::canonicalize_visible_to_writer_bounded(
                 doc,
-                Some(&|node| signed_info_subtree.contains(&node.id())),
+                Some(&crate::c14n::SubtreeVisibility {
+                    apex: signed_info_node,
+                }),
                 &signed_info.c14n_method,
                 budgets.transforms.remaining_c14n_output(),
                 budgets.transforms.xml_base_resolution(),
                 &mut canonical_signed_info,
+                0,
             )
         } else {
             canonicalize_with_pending_digests(
                 doc,
-                &signed_info_subtree,
+                signed_info_node,
                 &signed_info.c14n_method,
                 budgets,
                 &pending_digests,
@@ -3945,7 +3943,7 @@ const SECOND_EDITION_GENERATION_C14N_URI: &str = "http://www.w3.org/2006/12/xml-
 /// <https://www.w3.org/TR/2001/REC-xml-c14n-20010315#ProcessingModel>
 fn canonicalize_with_pending_digests(
     document: &Document<'_>,
-    signed_info_subtree: &HashSet<NodeId>,
+    signed_info: Node<'_, '_>,
     algorithm: &crate::c14n::C14nAlgorithm,
     budgets: &SigningOperationBudgets,
     pending_digests: &[(NodeId, &str)],
@@ -3954,7 +3952,7 @@ fn canonicalize_with_pending_digests(
     let digests = pending_digests
         .iter()
         .copied()
-        .filter(|(node, _)| signed_info_subtree.contains(node))
+        .filter(|(node, _)| signed_info.subtree_contains_id(*node))
         .collect::<HashMap<_, _>>();
     let tracked = digests.keys().copied().collect::<Vec<_>>();
     let inserted = digests.values().map(|digest| digest.len()).sum::<usize>();
@@ -3968,7 +3966,7 @@ fn canonicalize_with_pending_digests(
     let mut unfilled = Vec::new();
     let mut positions = crate::c14n::canonicalize_bounded_with_xml_base_budget_and_positions(
         document,
-        &|node| signed_info_subtree.contains(&node.id()),
+        &crate::c14n::SubtreeVisibility { apex: signed_info },
         algorithm,
         &tracked,
         allowance,

@@ -86,13 +86,14 @@ fn large_reference_sign(bencher: divan::Bencher, units: usize) {
 #[divan::bench(args = specs().filter(|spec| spec.backend != xml_sec::XmlBackend::Differential))]
 fn projection(bencher: divan::Bencher, spec: Spec) {
     let fixture = Fixture::new(spec);
-    let projection = xml_sec::benchmark_support::Projection::new(&fixture.unsigned, spec.backend)
-        .expect("prepared backend");
     bencher
         .counter(divan::counter::BytesCount::new(fixture.unsigned.len()))
-        .bench_local(|| {
-            std::hint::black_box(projection.project().expect("project"));
-        });
+        // Projection consumes its backend DOM, so each sample prepares a new one.
+        .with_inputs(|| {
+            xml_sec::benchmark_support::Projection::new(&fixture.unsigned, spec.backend)
+                .expect("prepared backend")
+        })
+        .bench_local_values(|projection| projection.project().expect("project"));
 }
 
 /// Signed-document shape for node-set measurements: `elements` siblings with

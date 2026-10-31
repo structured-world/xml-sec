@@ -6,7 +6,9 @@ use alloc::string::ToString;
 
 use super::{
     Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
-    tree::{AttributeData, NamespaceData, NodeId, NodeKind, TreeBuilder, range_contains},
+    tree::{
+        AttributeData, NamespaceData, NamespaceSet, NodeId, NodeKind, TreeBuilder, range_contains,
+    },
 };
 
 pub(super) struct RoxmltreeBackend;
@@ -159,14 +161,7 @@ fn project_document<R: Storage, S: Storage, P: Storage>(
                                 xml_id_error: None,
                             })?;
                         }
-                        let mut namespaces = storage.values(source.namespaces().len())?;
-                        for namespace in source.namespaces() {
-                            storage.charge(1)?;
-                            namespaces.push(NamespaceData {
-                                prefix: storage.optional_text(namespace.name())?,
-                                uri: storage.text(namespace.uri())?,
-                            })?;
-                        }
+                        let namespaces = project_namespaces(target, source, parent)?;
                         NodeKind::Element {
                             name: storage.text(source.tag_name().name())?,
                             namespace: storage.optional_text(
@@ -211,6 +206,39 @@ fn project_document<R: Storage, S: Storage, P: Storage>(
         }
     }
     Ok(())
+}
+
+/// The element's in-scope set, sharing its parent's when the bindings agree.
+fn project_namespaces<R: Storage, S: Storage>(
+    target: &mut TreeBuilder<'_, S>,
+    source: backend::Node<'_, '_, R>,
+    parent: Option<NodeId>,
+) -> Result<NamespaceSet, ParseError> {
+    let storage = target.storage();
+    let inherited = target.namespace_set_of(parent);
+    let bindings = target.namespace_bindings(inherited);
+    let mut same = bindings.len() == source.namespaces().len();
+    if same {
+        for (binding, namespace) in bindings.iter().zip(source.namespaces()) {
+            storage.charge(binding.uri.len().saturating_add(1))?;
+            if binding.prefix.as_deref() != namespace.name() || &*binding.uri != namespace.uri() {
+                same = false;
+                break;
+            }
+        }
+    }
+    if same {
+        return Ok(inherited);
+    }
+    let mut namespaces = storage.values(source.namespaces().len())?;
+    for namespace in source.namespaces() {
+        storage.charge(1)?;
+        namespaces.push(NamespaceData {
+            prefix: storage.optional_text(namespace.name())?,
+            uri: storage.text(namespace.uri())?,
+        })?;
+    }
+    target.add_namespace_set(namespaces)
 }
 
 fn element_prefix<'input, R: Storage, S: Storage>(

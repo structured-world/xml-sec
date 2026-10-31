@@ -65,6 +65,48 @@ fn native_namespaces_keep_absent_excluded_and_empty_uri_distinct() {
     check_namespace_states(Native.namespaces());
 }
 
+#[test]
+fn native_namespaces_keep_every_state_across_the_inline_boundary() {
+    // The same contract holds with free inline slots, exactly full and spilled,
+    // and no earlier binding is lost when the bindings move to the table.
+    const PREFIXES: [&str; 8] = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    for filled in 0..=PREFIXES.len() {
+        let mut namespaces = Native.namespaces();
+        for prefix in &PREFIXES[..filled] {
+            namespaces
+                .insert(prefix, false, Some(prefix))
+                .expect("fill binding");
+        }
+        for prefix in &PREFIXES[..filled] {
+            assert_eq!(
+                namespaces.get(prefix, false).expect("filled binding"),
+                NamespaceState::Bound(prefix),
+                "{filled} bindings"
+            );
+        }
+        check_namespace_states(namespaces.clone());
+        // A repeated insert replaces, so it must not consume another slot.
+        for _ in 0..PREFIXES.len() {
+            namespaces
+                .insert("repeat", false, Some("urn:repeat"))
+                .expect("repeat binding");
+        }
+        if let Some(first) = PREFIXES[..filled].first() {
+            namespaces.remove(first).expect("remove first binding");
+            assert_eq!(
+                namespaces.get(first, false).expect("removed binding"),
+                NamespaceState::Absent
+            );
+        }
+        if let Some(last) = PREFIXES[..filled].last().filter(|_| filled > 1) {
+            assert_eq!(
+                namespaces.get(last, false).expect("last binding survives"),
+                NamespaceState::Bound(last)
+            );
+        }
+    }
+}
+
 #[cfg(feature = "xmldsig")]
 #[test]
 fn accounted_namespaces_share_states_and_release_retained_capacity() {

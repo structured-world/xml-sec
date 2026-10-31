@@ -5,12 +5,16 @@
 //! so ordered trees take their place.
 
 use alloc::collections::TryReserveError;
+#[cfg(all(not(feature = "std"), any(feature = "xmldsig", test)))]
+pub(crate) use alloc::collections::btree_map::Entry;
 #[cfg(not(feature = "std"))]
-pub(crate) use alloc::collections::{BTreeMap as Map, BTreeSet as Set, btree_map::Entry};
+pub(crate) use alloc::collections::{BTreeMap as Map, BTreeSet as Set};
 #[cfg(all(not(feature = "std"), feature = "xmldsig"))]
 pub(crate) use alloc::collections::{btree_map as map, btree_set as set};
+#[cfg(all(feature = "std", any(feature = "xmldsig", test)))]
+pub(crate) use std::collections::hash_map::Entry;
 #[cfg(feature = "std")]
-pub(crate) use std::collections::{HashMap as Map, HashSet as Set, hash_map::Entry};
+pub(crate) use std::collections::{HashMap as Map, HashSet as Set};
 #[cfg(all(feature = "std", feature = "xmldsig"))]
 pub(crate) use std::collections::{hash_map as map, hash_set as set};
 

@@ -25,10 +25,15 @@ fn percentile(sorted: &[u128], percent: usize) -> u128 {
 fn measure(
     fixture: &Fixture,
     operation: &str,
-    projection: Option<&xml_sec::benchmark_support::Projection<'_>>,
+    backend: XmlBackend,
     policy: &xml_sec::policy::VerificationPolicy,
 ) -> (u128, usize) {
     // Per-sample preparation is excluded, just as Divan's with_inputs excludes it.
+    // Projection consumes its backend DOM, so each sample prepares a new one.
+    let projection = (operation == "projection").then(|| {
+        xml_sec::benchmark_support::Projection::new(&fixture.unsigned, backend)
+            .expect("prepared projection")
+    });
     let mut plan = match operation {
         "plan_compile" | "plan_execute" => Some(xml_sec::benchmark_support::Plan::new(
             fixture.spec.units.min(64),
@@ -332,14 +337,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     } = parse_request(&args)?;
     let (units, backend) = (spec.units, spec.backend);
     let fixture = Fixture::new(spec);
-    let projection = if operation == "projection" {
-        Some(xml_sec::benchmark_support::Projection::new(
-            &fixture.unsigned,
-            backend,
-        )?)
-    } else {
-        None
-    };
     let policy = xml_sec::policy::VerificationPolicy {
         signature_algorithms: Some(
             [xml_sec::xmldsig::SignatureAlgorithm::RsaSha256]
@@ -349,12 +346,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     for _ in 0..8 {
-        std::hint::black_box(measure(&fixture, operation, projection.as_ref(), &policy));
+        std::hint::black_box(measure(&fixture, operation, backend, &policy));
     }
     let mut timings = Vec::with_capacity(samples);
     let mut output_bytes = 0;
     for _ in 0..samples {
-        let (elapsed, bytes) = measure(&fixture, operation, projection.as_ref(), &policy);
+        let (elapsed, bytes) = measure(&fixture, operation, backend, &policy);
         output_bytes = bytes;
         timings.push(elapsed);
     }

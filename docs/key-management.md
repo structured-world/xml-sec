@@ -125,7 +125,8 @@ table from the host, network or a built-in default. Missing facts return
 `CrlTimeUncertain`, never non-revocation. Cached complete CRLs permit the exact
 `nextUpdate` boundary, but even one nanosecond later fails freshness. Revocation
 dates are checked against the same lossless operation time. Unsupported critical
-demands, entry conflicts and unpaired delta CRLs cannot authorize a key.
+demands, entry conflicts and delta CRLs without their complete CRL cannot
+authorize a key; a bound complete-plus-delta pair is evaluated as one source.
 Applicable partial lists must collectively cover all revocation reasons;
 otherwise `IncompleteCrlCoverage` is returned. This checks supplied evidence,
 not an implicit online revocation fetch or a requirement to supply a CRL for

@@ -201,7 +201,31 @@
  
  // -------------------------------------------------------------------------
  // Security defaults
-@@ -177,26 +266,6 @@
+@@ -93,9 +182,22 @@
+ ///
+ /// Covers the ASCII subset of XML 1.0 §2.3 `[4a]`: `[A-Za-z0-9_:.-]`.
+ fn is_ascii_name_char(b: u8) -> bool {
+-    b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'-' || b == b'.'
++    ASCII_NAME_CHARS[b as usize]
+ }
+ 
++/// The table behind [`is_ascii_name_char`]: names are the most scanned bytes in
++/// a document, and a lookup replaces a chain of range checks per byte.
++const ASCII_NAME_CHARS: [bool; 256] = {
++    let mut table = [false; 256];
++    let mut value = 0_u8;
++    while value < 0x80 {
++        table[value as usize] =
++            value.is_ascii_alphanumeric() || matches!(value, b'_' | b':' | b'-' | b'.');
++        value += 1;
++    }
++    table
++};
++
+ /// Matches one of the five XML builtin entity references at the byte level.
+ ///
+ /// Given bytes starting after `&`, returns `(replacement_char, bytes_to_skip)`
+@@ -177,26 +279,6 @@
      }
  }
  
@@ -228,7 +252,7 @@
  /// Validates that a name is a legal `QName` per Namespaces in XML 1.0 §4.
  ///
  /// A `QName` has at most one colon, and neither prefix nor local part may be
-@@ -228,22 +297,6 @@
+@@ -228,22 +310,6 @@
      )
  }
  
@@ -251,7 +275,7 @@
  // -------------------------------------------------------------------------
  // Position checkpointing (for backtracking)
  // -------------------------------------------------------------------------
-@@ -266,22 +319,19 @@
+@@ -266,22 +332,19 @@
  // ParserInput
  // -------------------------------------------------------------------------
  
@@ -281,7 +305,7 @@
      /// The input bytes (must be valid UTF-8).
      input: &'a [u8],
  
-@@ -313,16 +363,11 @@
+@@ -313,16 +376,11 @@
      recover: bool,
  
      /// Accumulated diagnostics (warnings and recoverable errors).
@@ -300,7 +324,7 @@
  
      /// Whether the DTD internal subset contained parameter entity references.
      /// Per XML 1.0 §4.1 WFC: Entity Declared, undeclared entity references
-@@ -336,10 +381,6 @@
+@@ -336,10 +394,6 @@
      /// external DTD subset that was not read.
      pub(crate) has_external_dtd: bool,
  
@@ -311,7 +335,7 @@
      /// Optional callback for resolving external entities.
      entity_resolver: Option<EntityResolver>,
  }
-@@ -347,7 +388,28 @@
+@@ -347,7 +401,28 @@
  impl<'a> ParserInput<'a> {
      /// Creates a new `ParserInput` from a UTF-8 string with default limits.
      pub fn new(input: &'a str) -> Self {
@@ -341,7 +365,7 @@
              input: input.as_bytes(),
              pos: 0,
              line: 1,
-@@ -358,19 +420,12 @@
+@@ -358,19 +433,12 @@
              entity_expansions: 0,
              max_entity_expansions: DEFAULT_MAX_ENTITY_EXPANSIONS,
              recover: false,
@@ -364,7 +388,7 @@
      }
  
      /// Sets the maximum nesting depth.
-@@ -398,13 +453,32 @@
+@@ -398,13 +466,32 @@
          self.recover
      }
  
@@ -399,7 +423,7 @@
                  "maximum nesting depth exceeded ({})",
                  self.max_depth
              )));
-@@ -458,7 +532,7 @@
+@@ -458,7 +545,7 @@
      /// Returns a slice of the raw input bytes from `start` to `end`.
      #[allow(dead_code)]
      #[inline]
@@ -408,7 +432,7 @@
          &self.input[start..end]
      }
  
-@@ -528,7 +602,7 @@
+@@ -528,7 +615,7 @@
          if remaining.len() < len {
              return None;
          }
@@ -417,7 +441,7 @@
              .ok()
              .and_then(|s| s.chars().next())
      }
-@@ -537,9 +611,10 @@
+@@ -537,9 +624,10 @@
  
      /// Advances the position by `count` bytes, updating line/column.
      #[inline]
@@ -429,7 +453,7 @@
              if self.pos < self.input.len() {
                  if self.input[self.pos] == b'\n' {
                      self.line += 1;
-@@ -549,15 +624,16 @@
+@@ -549,15 +637,16 @@
                  }
                  self.pos += 1;
              }
@@ -449,7 +473,7 @@
          if ch == '\n' {
              self.line += 1;
              self.column = 1;
-@@ -565,23 +641,25 @@
+@@ -565,23 +654,25 @@
              self.column += 1;
          }
          self.pos += len;
@@ -478,7 +502,7 @@
          if self.pos >= self.input.len() {
              return Err(self.fatal("unexpected end of input"));
          }
-@@ -608,11 +686,11 @@
+@@ -608,11 +699,11 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -493,7 +517,7 @@
                          );
                      }
                  }
-@@ -623,16 +701,16 @@
+@@ -623,16 +714,16 @@
          let ch = self
              .peek_char()
              .ok_or_else(|| self.fatal("unexpected end of input"))?;
@@ -514,7 +538,7 @@
              }
          }
          Ok(ch)
-@@ -640,31 +718,46 @@
+@@ -640,31 +731,46 @@
  
      // -- Bulk scanning --
  
@@ -575,7 +599,7 @@
      }
  
      /// Scans forward to find the next attribute value delimiter: the given
-@@ -672,22 +765,16 @@
+@@ -672,22 +778,16 @@
      /// Returns the number of safe bytes before the delimiter.
      /// Avoids the 256-byte lookup table of `scan_until_any`.
      #[inline]
@@ -603,7 +627,7 @@
      }
  
      /// Scans forward to find the next occurrence of any of the given marker
-@@ -696,63 +783,72 @@
+@@ -696,63 +796,72 @@
      /// Uses a 256-byte lookup table for O(1) per-byte matching instead of
      /// linear `contains()` on the marker slice.
      #[allow(dead_code)]
@@ -703,7 +727,7 @@
          let end = self.pos + count;
          let slice = &self.input[self.pos..end];
          // Fast path: if no newlines in the slice, just bump column
-@@ -766,22 +862,21 @@
+@@ -766,22 +875,21 @@
                  }
              }
          } else {
@@ -731,7 +755,7 @@
                  "expected '{}', found '{}'",
                  expected as char, b as char
              )));
-@@ -791,12 +886,13 @@
+@@ -791,12 +899,13 @@
  
      /// Consumes bytes and asserts they match the `expected` sequence.
      #[inline]
@@ -747,7 +771,7 @@
          } else {
              // Fall back to per-byte for precise error reporting
              for &b in expected {
-@@ -828,51 +924,30 @@
+@@ -828,51 +937,30 @@
  
      /// Skips whitespace characters. Returns `true` if any were consumed.
      #[inline]
@@ -812,7 +836,7 @@
              return Err(self.fatal("whitespace required"));
          }
          Ok(())
-@@ -880,23 +955,18 @@
+@@ -880,23 +968,18 @@
  
      // -- Take while --
  
@@ -845,7 +869,7 @@
      }
  
      // -- Name parsing (XML 1.0 §2.3) --
-@@ -910,7 +980,16 @@
+@@ -910,7 +993,16 @@
      /// Uses an ASCII fast path that scans name characters as bytes,
      /// avoiding per-character UTF-8 decoding for the common case.
      #[inline]
@@ -863,7 +887,7 @@
          let start = self.pos;
          if self.pos >= self.input.len() {
              return Err(self.fatal("expected name, found end of input"));
-@@ -919,26 +998,31 @@
+@@ -919,26 +1011,35 @@
          let first = self.input[self.pos];
  
          // ASCII fast path: most XML names are pure ASCII
@@ -882,7 +906,11 @@
 +            let count = self.scan_bytes(self.input.len() - self.pos, 1, |bytes, i| {
 +                !is_ascii_name_char(bytes[i])
 +            })?;
-+            self.advance_counting_lines(count)?;
++            // Name characters exclude newlines, so no second scan looks for one.
++            self.storage.charge(count * 2)?;
++            self.pos += count;
++            self.column +=
++                u32::try_from(count).expect("XML source windows fit the admitted byte ceiling");
              // Check if we stopped at a non-ASCII byte (need slow path)
              if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
                  let len = self.pos - start;
@@ -903,7 +931,7 @@
              }
              // Fall through: hit a non-ASCII continuation byte, continue
              // with the char-by-char path below.
-@@ -948,16 +1032,22 @@
+@@ -948,16 +1049,22 @@
              let ch = self
                  .peek_char()
                  .ok_or_else(|| self.fatal("expected name"))?;
@@ -931,7 +959,7 @@
              } else {
                  break;
              }
-@@ -965,90 +1055,32 @@
+@@ -965,90 +1072,32 @@
  
          let len = self.pos - start;
          if len > self.max_name_length {
@@ -1033,7 +1061,7 @@
      }
  
      /// Parses a name and checks whether it matches the given prefix + local
-@@ -1060,111 +1092,46 @@
+@@ -1060,111 +1109,46 @@
          &mut self,
          prefix: Option<&str>,
          local: &str,
@@ -1165,7 +1193,7 @@
      /// Parses an entity or character reference (`&...;`).
      ///
      /// Handles the five built-in XML entities (`amp`, `lt`, `gt`, `apos`,
-@@ -1175,8 +1142,8 @@
+@@ -1175,8 +1159,8 @@
      /// Increments the entity expansion counter and returns an error if the
      /// limit is exceeded.
      #[cfg(test)]
@@ -1176,7 +1204,7 @@
          self.parse_reference_into(&mut buf)?;
          Ok(buf)
      }
-@@ -1190,34 +1157,47 @@
+@@ -1190,34 +1174,47 @@
      ///
      /// Returns the resolved text as a `&str` slice of `buf` (the portion
      /// that was appended), which callers can use for validation.
@@ -1234,7 +1262,7 @@
                  if dec.is_empty() {
                      return Err(self.fatal("empty decimal character reference"));
                  }
-@@ -1226,68 +1206,191 @@
+@@ -1226,68 +1223,191 @@
              };
              self.expect_byte(b';')?;
  
@@ -1475,7 +1503,7 @@
          }
      }
  
-@@ -1295,196 +1398,128 @@
+@@ -1295,196 +1415,128 @@
      ///
      /// Per XML 1.0 §4.4, when an entity's replacement text is included,
      /// character references and entity references within it are resolved.
@@ -1620,11 +1648,23 @@
 -                        "amp" => {
 -                            result.push('&');
 -                            continue;
+-                        }
+-                        "lt" => {
+-                            result.push('<');
+-                            continue;
+-                        }
+-                        "gt" => {
+-                            result.push('>');
+-                            continue;
+-                        }
+-                        "apos" => {
+-                            result.push('\'');
+-                            continue;
 +                        if i >= bytes.len() {
 +                            return Err(self.fatal("incomplete entity reference in entity value"));
                          }
--                        "lt" => {
--                            result.push('<');
+-                        "quot" => {
+-                            result.push('"');
 +                        let name = core::str::from_utf8(&bytes[start..i])
 +                            .map_err(|_| self.fatal("invalid UTF-8 in entity name"))?;
 +                        i += 1; // skip ';'
@@ -1635,18 +1675,6 @@
 +                        if self.append_builtin_replacement(name, result)? {
                              continue;
                          }
--                        "gt" => {
--                            result.push('>');
--                            continue;
--                        }
--                        "apos" => {
--                            result.push('\'');
--                            continue;
--                        }
--                        "quot" => {
--                            result.push('"');
--                            continue;
--                        }
 -                        _ => {}
 -                    }
  
@@ -1774,7 +1802,7 @@
      // -- Attribute value parsing (XML 1.0 §3.3.3) --
  
      /// Parses a quoted attribute value with entity resolution and
-@@ -1493,19 +1528,23 @@
+@@ -1493,19 +1545,23 @@
      /// Uses bulk scanning to find the next `&`, `<`, or quote character,
      /// then extracts safe chunks with a single `push_str()` instead of
      /// processing character by character.
@@ -1802,7 +1830,7 @@
                      .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
                  // Fast byte-level pre-check: only validate when bytes suggest
                  // possible invalid chars (0x7F or U+FFFE/U+FFFF sequences).
-@@ -1516,30 +1555,18 @@
+@@ -1516,30 +1572,18 @@
                      if self.recover {
                          self.push_diagnostic(
                              ErrorSeverity::Error,
@@ -1840,7 +1868,7 @@
              }
  
              if self.at_end() {
-@@ -1548,57 +1575,45 @@
+@@ -1548,57 +1592,45 @@
  
              let b = self.input[self.pos];
              if b == quote {
@@ -1913,7 +1941,7 @@
          self.expect_byte(quote)?;
          Ok(value)
      }
-@@ -1606,21 +1621,44 @@
+@@ -1606,21 +1638,44 @@
      // -- Error helpers --
  
      /// Creates a fatal `ParseError` at the current location.
@@ -1966,7 +1994,7 @@
      }
  }
  
-@@ -1630,100 +1668,111 @@
+@@ -1630,100 +1685,111 @@
  
  /// Manages namespace scope for XML parsers.
  ///
@@ -2136,7 +2164,7 @@
      }
  }
  
-@@ -1736,54 +1785,56 @@
+@@ -1736,54 +1802,56 @@
  /// The opening `<!--` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.5 production `[15]`.
@@ -2221,7 +2249,7 @@
                  } else {
                      return Err(input.fatal("'--' not allowed inside comments"));
                  }
-@@ -1793,8 +1844,6 @@
+@@ -1793,8 +1861,6 @@
              }
          }
      }
@@ -2230,7 +2258,7 @@
  }
  
  /// Parses a CDATA section (`<![CDATA[ ... ]]>`), returning the content text.
-@@ -1802,32 +1851,34 @@
+@@ -1802,32 +1868,34 @@
  /// The opening `<![CDATA[` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.7 production `[18]`.
@@ -2283,7 +2311,7 @@
              Ok(content)
          }
          None => Err(input.fatal("unexpected end of input in CDATA section")),
-@@ -1840,9 +1891,9 @@
+@@ -1840,9 +1908,9 @@
  /// The opening `<?` must not have been consumed yet.
  ///
  /// See XML 1.0 §2.6 production `[16]`.
@@ -2296,7 +2324,7 @@
      input.expect_str(b"<?")?;
      let target = input.parse_name()?;
  
-@@ -1852,39 +1903,35 @@
+@@ -1852,39 +1920,35 @@
      }
  
      // Namespaces in XML 1.0 §3: PI targets must be NCNames (no colons).
@@ -2355,7 +2383,7 @@
              }
              None => {
                  return Err(input.fatal("unexpected end of input in processing instruction"));
-@@ -1900,11 +1947,11 @@
+@@ -1900,11 +1964,11 @@
  
  /// Parsed XML declaration data.
  #[derive(Debug, Clone)]
@@ -2370,7 +2398,7 @@
      /// Optional standalone declaration.
      pub standalone: Option<bool>,
  }
-@@ -1916,37 +1963,41 @@
+@@ -1916,37 +1980,41 @@
  /// verified by the caller via `looking_at`).
  ///
  /// See XML 1.0 §2.8 production `[23]`.
@@ -2422,7 +2450,7 @@
          }
  
          Some(enc)
-@@ -1958,17 +2009,17 @@
+@@ -1958,17 +2026,17 @@
      // If encoding was present, we need fresh whitespace before standalone.
      // If encoding was absent, the whitespace consumed when looking for
      // encoding already separates version from standalone.
@@ -2444,7 +2472,7 @@
              "yes" => Some(true),
              "no" => Some(false),
              _ => return Err(input.fatal("standalone must be 'yes' or 'no'")),
-@@ -1977,7 +2028,7 @@
+@@ -1977,7 +2045,7 @@
          None
      };
  
@@ -2453,7 +2481,7 @@
      input.expect_str(b"?>")?;
  
      Ok(XmlDeclaration {
-@@ -2024,9 +2075,9 @@
+@@ -2024,9 +2092,9 @@
          let mut input = ParserInput::new("abc");
          assert_eq!(input.peek(), Some(b'a'));
          assert_eq!(input.peek_at(1), Some(b'b'));
@@ -2465,7 +2493,7 @@
          assert!(input.at_end());
      }
  
-@@ -2035,9 +2086,9 @@
+@@ -2035,9 +2103,9 @@
          let mut input = ParserInput::new("ab\ncd");
          assert_eq!(input.location().line, 1);
          assert_eq!(input.location().column, 1);
@@ -2477,7 +2505,7 @@
          assert_eq!(input.location().line, 2);
          assert_eq!(input.location().column, 1);
      }
-@@ -2058,13 +2109,29 @@
+@@ -2058,13 +2126,29 @@
      }
  
      #[test]
@@ -2508,7 +2536,7 @@
      }
  
      #[test]
-@@ -2112,9 +2179,25 @@
+@@ -2112,9 +2196,25 @@
          assert_eq!(input.diagnostics.len(), 1);
      }
  
@@ -2535,7 +2563,7 @@
          input.set_max_entity_expansions(2);
          assert!(input.parse_reference().is_ok());
          assert!(input.parse_reference().is_ok());
-@@ -2145,6 +2228,14 @@
+@@ -2145,6 +2245,14 @@
      }
  
      #[test]
@@ -2550,7 +2578,7 @@
      fn test_parse_quoted_value() {
          let mut input = ParserInput::new("'hello'");
          let value = input.parse_quoted_value().unwrap();
-@@ -2154,7 +2245,7 @@
+@@ -2154,7 +2262,7 @@
      #[test]
      fn test_skip_whitespace() {
          let mut input = ParserInput::new("  \t\n  abc");
@@ -2559,7 +2587,7 @@
          assert_eq!(input.peek(), Some(b'a'));
      }
  
-@@ -2168,12 +2259,211 @@
+@@ -2168,12 +2276,211 @@
      #[test]
      fn test_take_while() {
          let mut input = ParserInput::new("12345abc");
@@ -2772,7 +2800,7 @@
      fn test_split_name() {
          assert_eq!(split_name("foo:bar"), (Some("foo"), "bar"));
          assert_eq!(split_name("bar"), (None, "bar"));
-@@ -2182,37 +2472,94 @@
+@@ -2182,37 +2489,94 @@
  
      #[test]
      fn test_namespace_resolver() {
@@ -2890,7 +2918,7 @@
      }
  
      #[test]
-@@ -2234,7 +2581,7 @@
+@@ -2234,7 +2598,7 @@
          let mut input = ParserInput::new("<?target data?>");
          let (target, data) = parse_pi_content(&mut input).unwrap();
          assert_eq!(target, "target");
@@ -2899,7 +2927,7 @@
      }
  
      #[test]
-@@ -2250,7 +2597,7 @@
+@@ -2250,7 +2614,7 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"UTF-8\"?>");
          let decl = parse_xml_decl(&mut input).unwrap();
          assert_eq!(decl.version, "1.0");
@@ -2908,7 +2936,7 @@
          assert_eq!(decl.standalone, None);
      }
  
-@@ -2301,7 +2648,10 @@
+@@ -2301,7 +2665,10 @@
          input.set_max_depth(1);
          assert!(input.increment_depth().is_ok()); // depth = 1
          let err = input.increment_depth().unwrap_err();
@@ -2920,7 +2948,7 @@
      }
  
      #[test]
-@@ -2310,7 +2660,10 @@
+@@ -2310,7 +2677,10 @@
          let mut input = ParserInput::new("");
          input.set_max_depth(0);
          let err = input.increment_depth().unwrap_err();
@@ -2932,7 +2960,7 @@
      }
  
      #[test]
-@@ -2345,64 +2698,75 @@
+@@ -2345,64 +2715,75 @@
      #[test]
      fn test_entity_expansion_limit_exact_boundary() {
          // max_entity_expansions = 3 means exactly 3 are allowed
@@ -3031,7 +3059,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY greet "Hello">
  ]>
-@@ -2414,7 +2778,7 @@
+@@ -2414,7 +2795,7 @@
  
      #[test]
      fn test_entity_expansion_nested_dtd_entities() {
@@ -3040,7 +3068,7 @@
          // Entity "b" references entity "a". The nested reference is parsed
          // as content (XML 1.0 §4.4), so the entity expansion is visible
          // through text_content.
-@@ -2430,7 +2794,7 @@
+@@ -2430,7 +2811,7 @@
  
      #[test]
      fn test_entity_expansion_limit_nested_dtd_entities_in_attributes() {
@@ -3049,7 +3077,7 @@
          // In attribute values, entity references ARE fully expanded through
          // parse_reference_into + expand_entity_text. Each expansion counts
          // against the limit. Chain: c -> 3*b -> 9*a = 13 total expansions.
-@@ -2443,17 +2807,19 @@
+@@ -2443,17 +2824,19 @@
          let opts = ParseOptions::default().max_entity_expansions(5);
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -3074,7 +3102,7 @@
          // Classic billion laughs pattern in an attribute value where
          // entities ARE fully expanded. Each entity references the
          // previous one multiple times, causing exponential expansion.
-@@ -2470,15 +2836,15 @@
+@@ -2470,15 +2853,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3093,7 +3121,7 @@
          // When entity replacement text contains '<', the parser must expand
          // it (to validate the markup), which triggers entity expansion
          // counting. This tests the billion laughs pattern for text content
-@@ -2494,9 +2860,9 @@
+@@ -2494,9 +2877,9 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3105,7 +3133,7 @@
          );
      }
  
-@@ -2504,7 +2870,7 @@
+@@ -2504,7 +2887,7 @@
  
      #[test]
      fn test_xxe_external_entity_rejected_by_default() {
@@ -3114,7 +3142,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/passwd">
  ]>
-@@ -2513,15 +2879,15 @@
+@@ -2513,15 +2896,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3133,7 +3161,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe PUBLIC "-//Evil//EN" "http://evil.com/payload">
  ]>
-@@ -2530,15 +2896,15 @@
+@@ -2530,15 +2913,15 @@
          assert!(result.is_err());
          let err = result.unwrap_err();
          assert!(
@@ -3152,7 +3180,7 @@
          let xml = r#"<!DOCTYPE r [
  <!ENTITY xxe SYSTEM "file:///etc/shadow">
  ]>
-@@ -2549,7 +2915,7 @@
+@@ -2549,7 +2932,7 @@
  
      #[test]
      fn test_xxe_multiple_external_entities_all_rejected() {
@@ -3161,7 +3189,7 @@
          // Even if one entity is internal, the external one should fail
          let xml = r#"<!DOCTYPE r [
  <!ENTITY safe "ok">
-@@ -2568,9 +2934,9 @@
+@@ -2568,9 +2951,9 @@
          let mut input = ParserInput::new("&#0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3173,7 +3201,7 @@
          );
      }
  
-@@ -2579,9 +2945,9 @@
+@@ -2579,9 +2962,9 @@
          let mut input = ParserInput::new("&#x0;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3185,7 +3213,7 @@
          );
      }
  
-@@ -2619,17 +2985,17 @@
+@@ -2619,17 +3002,17 @@
          let mut input = ParserInput::new("&#xD800;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3207,7 +3235,7 @@
          );
      }
  
-@@ -2639,17 +3005,17 @@
+@@ -2639,17 +3022,17 @@
          let mut input = ParserInput::new("&#xFFFE;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3229,7 +3257,7 @@
          );
      }
  
-@@ -2668,9 +3034,9 @@
+@@ -2668,9 +3051,9 @@
          let mut input = ParserInput::new("&#x110000;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3241,7 +3269,7 @@
          );
      }
  
-@@ -2680,9 +3046,10 @@
+@@ -2680,9 +3063,10 @@
          let mut input = ParserInput::new("&#99999999999;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3254,7 +3282,7 @@
          );
      }
  
-@@ -2692,9 +3059,10 @@
+@@ -2692,9 +3076,10 @@
          let mut input = ParserInput::new("&#xFFFFFFFFFF;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3267,7 +3295,7 @@
          );
      }
  
-@@ -2703,9 +3071,10 @@
+@@ -2703,9 +3088,10 @@
          let mut input = ParserInput::new("&#;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3280,7 +3308,7 @@
          );
      }
  
-@@ -2714,9 +3083,10 @@
+@@ -2714,9 +3100,10 @@
          let mut input = ParserInput::new("&#x;");
          let err = input.parse_reference().unwrap_err();
          assert!(
@@ -3293,7 +3321,7 @@
          );
      }
  
-@@ -2760,7 +3130,7 @@
+@@ -2760,7 +3147,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name();
          assert!(result.is_err());
@@ -3302,7 +3330,7 @@
      }
  
      #[test]
-@@ -2806,7 +3176,7 @@
+@@ -2806,7 +3193,7 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq("something");
          assert!(result.is_err());
@@ -3311,7 +3339,7 @@
      }
  
      #[test]
-@@ -2817,7 +3187,59 @@
+@@ -2817,7 +3204,59 @@
          input.set_max_name_length(50);
          let result = input.parse_name_eq_parts(None, "something");
          assert!(result.is_err());
@@ -3372,7 +3400,7 @@
      }
  
      // -- Comment boundary edge cases --
-@@ -2829,7 +3251,10 @@
+@@ -2829,7 +3268,10 @@
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
          assert!(
@@ -3384,7 +3412,7 @@
              "double dash inside comment should be rejected"
          );
      }
-@@ -2848,10 +3273,12 @@
+@@ -2848,10 +3290,12 @@
          let mut input = ParserInput::new("<!-- no end");
          let result = parse_comment_content(&mut input);
          assert!(result.is_err());
@@ -3401,7 +3429,7 @@
      }
  
      #[test]
-@@ -2893,10 +3320,12 @@
+@@ -2893,10 +3337,12 @@
          let mut input = ParserInput::new("<![CDATA[no end");
          let result = parse_cdata_content(&mut input);
          assert!(result.is_err());
@@ -3418,7 +3446,7 @@
      }
  
      #[test]
-@@ -2937,10 +3366,12 @@
+@@ -2937,10 +3383,12 @@
          let mut input = ParserInput::new("<?xml data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3435,7 +3463,7 @@
      }
  
      #[test]
-@@ -2959,10 +3390,12 @@
+@@ -2959,10 +3407,12 @@
          let mut input = ParserInput::new("<?ns:target data?>");
          let result = parse_pi_content(&mut input);
          assert!(result.is_err());
@@ -3452,7 +3480,7 @@
      }
  
      #[test]
-@@ -2988,10 +3421,12 @@
+@@ -2988,10 +3438,12 @@
          let mut input = ParserInput::new("\"abc<def\"");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3469,7 +3497,7 @@
      }
  
      #[test]
-@@ -2999,10 +3434,12 @@
+@@ -2999,10 +3451,12 @@
          let mut input = ParserInput::new("\"no closing quote");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3486,7 +3514,7 @@
      }
  
      #[test]
-@@ -3010,10 +3447,12 @@
+@@ -3010,10 +3464,12 @@
          let mut input = ParserInput::new("unquoted");
          let result = input.parse_attribute_value();
          assert!(result.is_err());
@@ -3503,7 +3531,7 @@
      }
  
      #[test]
-@@ -3024,22 +3463,19 @@
+@@ -3024,22 +3480,19 @@
      }
  
      #[test]
@@ -3535,7 +3563,7 @@
      }
  
      // -- Invalid XML character detection --
-@@ -3076,10 +3512,12 @@
+@@ -3076,10 +3529,12 @@
          let mut input = ParserInput::new(input_bytes);
          let result = input.next_char();
          assert!(result.is_err());
@@ -3552,7 +3580,7 @@
      }
  
      #[test]
-@@ -3101,138 +3539,150 @@
+@@ -3101,138 +3556,150 @@
      fn test_scan_char_data_cdata_end_marker() {
          // `]]>` in character data is not allowed — the scanner should stop before it
          let input = ParserInput::new("text]]>more");
@@ -3759,7 +3787,7 @@
      }
  
      // -- QName validation edge cases --
-@@ -3265,34 +3715,46 @@
+@@ -3265,34 +3732,46 @@
          assert!(result.unwrap().contains("empty prefix or local part"));
      }
  
@@ -3816,7 +3844,7 @@
      }
  
      // -- XML declaration edge cases --
-@@ -3302,10 +3764,12 @@
+@@ -3302,10 +3781,12 @@
          let mut input = ParserInput::new("<?xml version=\"2.0\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3833,7 +3861,7 @@
      }
  
      #[test]
-@@ -3313,10 +3777,12 @@
+@@ -3313,10 +3794,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"123bad\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3850,7 +3878,7 @@
      }
  
      #[test]
-@@ -3324,10 +3790,12 @@
+@@ -3324,10 +3807,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" standalone=\"maybe\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3867,7 +3895,7 @@
      }
  
      #[test]
-@@ -3342,10 +3810,10 @@
+@@ -3342,10 +3827,10 @@
      #[test]
      fn test_save_restore_position() {
          let mut input = ParserInput::new("abcdef");
@@ -3880,7 +3908,7 @@
          assert_eq!(input.peek(), Some(b'f'));
          input.restore_position(saved);
          assert_eq!(input.peek(), Some(b'd'));
-@@ -3357,7 +3825,7 @@
+@@ -3357,7 +3842,7 @@
  
      #[test]
      fn test_depth_limit_via_parse_str_with_options() {
@@ -3889,7 +3917,7 @@
          // 3 levels with limit 3 should succeed
          let xml = "<a><b><c/></b></a>";
          let opts = ParseOptions::default().max_depth(3);
-@@ -3367,7 +3835,7 @@
+@@ -3367,7 +3852,7 @@
          let xml = "<a><b><c><d/></c></b></a>";
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -3898,7 +3926,7 @@
      }
  
      // -- Builtin entity matching edge cases --
-@@ -3403,12 +3871,24 @@
+@@ -3403,12 +3888,24 @@
      fn test_expand_entity_text_counts_against_limit() {
          // Set up a ParserInput with entity_map containing nested references
          let mut input = ParserInput::new("");
@@ -3929,7 +3957,7 @@
          input.set_max_entity_expansions(2);
  
          // Expanding "b" should expand &a; twice, hitting the limit
-@@ -3465,6 +3945,54 @@
+@@ -3465,6 +3962,54 @@
          assert_eq!(result, "<![CDATA[&amp; not expanded]]>");
      }
  

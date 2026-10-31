@@ -141,7 +141,7 @@ impl<L: Storage> Document<'_, L> {
             ))?));
         }
         for (index, (left, right)) in self.nodes.iter().zip(other.nodes.iter()).enumerate() {
-            if let Some(field) = difference(left, right, doctype, storage)? {
+            if let Some(field) = difference(self, other, left, right, doctype, storage)? {
                 let reason = if field == "source range" {
                     storage.formatted(format_args!(
                         "retained semantic node {index} differs in source range ({}..{} versus {}..{})",
@@ -180,6 +180,8 @@ fn optional_equal<S: Storage>(
 }
 
 fn difference<L: Storage, R: Storage, S: ComparisonStorage>(
+    left_document: &Document<'_, L>,
+    right_document: &Document<'_, R>,
     left: &NodeData<L>,
     right: &NodeData<R>,
     doctype: Option<&Range<usize>>,
@@ -189,14 +191,16 @@ fn difference<L: Storage, R: Storage, S: ComparisonStorage>(
     if left.parent != right.parent {
         return Ok(Some("parent identity"));
     }
-    if left.children.len() != right.children.len() {
+    // With every node's parent compared, the child count catches a difference
+    // in child identities here and keeps its diagnostic.
+    if left.child_count != right.child_count {
         return Ok(Some("child identities"));
     }
-    storage.charge(left.children.len())?;
-    if left.children[..] != right.children[..] {
-        return Ok(Some("child identities"));
-    }
-    if let Some(field) = kind_difference(&left.kind, &right.kind, storage)? {
+    if let Some(field) = kind_difference(
+        (left_document, &left.kind),
+        (right_document, &right.kind),
+        storage,
+    )? {
         return Ok(Some(field));
     }
     if !source_ranges_equivalent(&left.range, &right.range, doctype) {
@@ -214,8 +218,8 @@ fn difference<L: Storage, R: Storage, S: ComparisonStorage>(
 }
 
 fn kind_difference<L: Storage, R: Storage, S: ComparisonStorage>(
-    left: &NodeKind<L>,
-    right: &NodeKind<R>,
+    (left_document, left): (&Document<'_, L>, &NodeKind<L>),
+    (right_document, right): (&Document<'_, R>, &NodeKind<R>),
     storage: S,
 ) -> Result<Option<&'static str>, ParseError> {
     match (left, right) {
@@ -284,7 +288,11 @@ fn kind_difference<L: Storage, R: Storage, S: ComparisonStorage>(
             if !attributes_equal(la, ra, storage)? {
                 return Ok(Some("attribute axis"));
             }
-            if !namespaces_equal(lx, rx, storage)? {
+            if !namespaces_equal(
+                left_document.namespace_bindings(*lx),
+                right_document.namespace_bindings(*rx),
+                storage,
+            )? {
                 return Ok(Some("namespace axis"));
             }
             Ok(None)

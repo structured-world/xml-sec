@@ -1,12 +1,14 @@
 //! Builders for deterministic `XMLDSig` signature templates.
 
 use crate::xml_input as xml_sec_xml_input;
-use std::{collections::HashSet, io::Write};
+use std::io::Write;
 
 use base64::Engine;
 use xml_sec_xml_input::lexical::Writer;
 
-use crate::c14n::{C14nAlgorithm, C14nMode, canonicalize_bounded_with_xml_base_budget};
+use crate::c14n::{
+    C14nAlgorithm, C14nMode, SubtreeVisibility, canonicalize_visible_to_writer_bounded,
+};
 use crate::policy::{PolicyViolation, SigningPolicy};
 use crate::xml::{is_xml_1_0_character, is_xml_ncname};
 
@@ -459,18 +461,15 @@ impl SignatureBuilder {
             .children()
             .find(|node| node.has_tag_name((XMLDSIG_NS, "SignedInfo")))
             .ok_or(SignatureBuilderError::MissingGeneratedSignedInfo)?;
-        let signed_info_subtree: HashSet<_> = signed_info
-            .descendants()
-            .map(crate::xml::dom::Node::id)
-            .collect();
         let mut canonical_signed_info = Vec::new();
-        canonicalize_bounded_with_xml_base_budget(
+        canonicalize_visible_to_writer_bounded(
             &document,
-            Some(&|node| signed_info_subtree.contains(&node.id())),
+            Some(&SubtreeVisibility { apex: signed_info }),
             &self.c14n_method,
             budget.remaining_c14n_output(),
             budget.xml_base_resolution(),
             &mut canonical_signed_info,
+            0,
         )
         .map_err(|error| {
             map_c14n_resource_policy_violation(

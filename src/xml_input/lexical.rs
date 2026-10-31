@@ -216,6 +216,7 @@ pub struct Scanner<'a, S: Storage = Native> {
     pending_text: Option<PendingText<'a>>,
     pending_start: Option<PendingStart<'a, S>>,
     dtd_start: Option<(usize, &'a str)>,
+    spare_attributes: Option<S::Attributes<'a>>,
     storage: S,
     admitted: bool,
 }
@@ -309,9 +310,15 @@ impl<'a, S: Storage> Scanner<'a, S> {
             pending_text: None,
             pending_start: None,
             dtd_start: None,
+            spare_attributes: None,
             storage,
             admitted: false,
         }
+    }
+
+    /// Return a finished tag's attribute buffer for the next start tag.
+    pub fn recycle(&mut self, attributes: S::Attributes<'a>) {
+        self.spare_attributes = attributes.into_reusable();
     }
 
     /// Return the next event, or `None` at end of input.
@@ -461,7 +468,10 @@ impl<'a, S: Storage> Scanner<'a, S> {
                         prefix: prefix.as_str(),
                         local: local.as_str(),
                     },
-                    attributes: self.storage.attributes(),
+                    attributes: self
+                        .spare_attributes
+                        .take()
+                        .unwrap_or_else(|| self.storage.attributes()),
                     start: span.range().start,
                 });
                 Ok(None)
@@ -576,16 +586,28 @@ fn validate_qualified_lexeme<L, R>(source: &str) -> Result<(), Error<L, R>> {
         .strip_prefix("</")
         .or_else(|| source.strip_prefix('<'))
         .unwrap_or(source);
-    let name = source
-        .split(|character: char| {
-            character.is_ascii_whitespace() || matches!(character, '=' | '/' | '>')
-        })
-        .next()
-        .unwrap_or_default();
-    let mut parts = name.split(':');
-    let first = parts.next().unwrap_or_default();
-    let second = parts.next();
-    if first.is_empty() || second.is_some_and(str::is_empty) || parts.next().is_some() {
+    // Every delimiter is ASCII and UTF-8 continuation bytes never are, so bytes
+    // decide this without decoding characters.
+    let mut colon = None;
+    let mut length = source.len();
+    for (index, &byte) in source.as_bytes().iter().enumerate() {
+        match byte {
+            b':' if colon.is_some() => {
+                return Err(Error::Static("invalid qualified XML name"));
+            }
+            b':' => colon = Some(index),
+            b'=' | b'/' | b'>' => {
+                length = index;
+                break;
+            }
+            byte if byte.is_ascii_whitespace() => {
+                length = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if length == 0 || colon.is_some_and(|colon| colon == 0 || colon + 1 == length) {
         return Err(Error::Static("invalid qualified XML name"));
     }
     Ok(())

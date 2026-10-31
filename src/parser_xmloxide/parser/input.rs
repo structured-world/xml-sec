@@ -182,8 +182,21 @@ fn is_ascii_name_start(b: u8) -> bool {
 ///
 /// Covers the ASCII subset of XML 1.0 §2.3 `[4a]`: `[A-Za-z0-9_:.-]`.
 fn is_ascii_name_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b':' || b == b'-' || b == b'.'
+    ASCII_NAME_CHARS[b as usize]
 }
+
+/// The table behind [`is_ascii_name_char`]: names are the most scanned bytes in
+/// a document, and a lookup replaces a chain of range checks per byte.
+const ASCII_NAME_CHARS: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut value = 0_u8;
+    while value < 0x80 {
+        table[value as usize] =
+            value.is_ascii_alphanumeric() || matches!(value, b'_' | b':' | b'-' | b'.');
+        value += 1;
+    }
+    table
+};
 
 /// Matches one of the five XML builtin entity references at the byte level.
 ///
@@ -1008,7 +1021,11 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
             let count = self.scan_bytes(self.input.len() - self.pos, 1, |bytes, i| {
                 !is_ascii_name_char(bytes[i])
             })?;
-            self.advance_counting_lines(count)?;
+            // Name characters exclude newlines, so no second scan looks for one.
+            self.storage.charge(count * 2)?;
+            self.pos += count;
+            self.column +=
+                u32::try_from(count).expect("XML source windows fit the admitted byte ceiling");
             // Check if we stopped at a non-ASCII byte (need slow path)
             if self.pos >= self.input.len() || self.input[self.pos] < 0x80 {
                 let len = self.pos - start;

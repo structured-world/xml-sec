@@ -121,10 +121,6 @@ impl IdAttributeRegistration {
             && self.matches_node(node)
     }
 
-    pub(crate) fn attribute_local_name(&self) -> &str {
-        &self.attribute_local_name
-    }
-
     pub(crate) fn matches_node<S: dom::storage::Storage>(&self, node: Node<'_, '_, S>) -> bool {
         match &self.element_scope {
             IdAttributeElementScope::AnyElement => true,
