@@ -21,8 +21,9 @@ impl<'a> Projection<'a> {
         )?))
     }
 
-    /// Build the real normalized arena, retaining it until the caller drops it.
-    pub fn project(&self) -> Result<crate::xml::dom::Document<'a>, crate::xml::dom::ParseError> {
+    /// Build the real normalized arena from the prepared tree, which it
+    /// consumes, retaining the arena until the caller drops it.
+    pub fn project(self) -> Result<crate::xml::dom::Document<'a>, crate::xml::dom::ParseError> {
         self.0.project()
     }
 }

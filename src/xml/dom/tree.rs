@@ -317,7 +317,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
     pub(super) fn append_text(
         &mut self,
         parent: NodeId,
-        value: &str,
+        value: S::Text,
         range: Range<usize>,
         range_actionable: bool,
     ) -> Result<(), ParseError> {
@@ -325,7 +325,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             && node.parent == Some(parent)
             && let NodeKind::Text(existing) = &mut node.kind
         {
-            self.storage.append(existing, value)?;
+            self.storage.append(existing, &value)?;
             // One semantic text node can fold several adjacent lexical tokens
             // (plain text, CDATA, and references). Its source range must cover
             // every token so mutation never splices only a semantic prefix.
@@ -334,12 +334,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             node.range_actionable &= range_actionable;
             return Ok(());
         }
-        self.push_with_actionability(
-            Some(parent),
-            NodeKind::Text(self.storage.text(value)?),
-            range,
-            range_actionable,
-        )?;
+        self.push_with_actionability(Some(parent), NodeKind::Text(value), range, range_actionable)?;
         Ok(())
     }
 
@@ -1311,15 +1306,17 @@ mod tests {
         let xml = "<r xmlns:p='urn:p' xml:id=' a  b ' p:x='value'>left<![CDATA[middle]]>right</r>";
         let preflight =
             super::super::LexicalPreflight::scan(xml, false).expect("fixed XML preflight");
-        let raw = crate::parser_xmloxide::parser::parse_str_with_options(
-            xml,
-            &super::super::xmloxide::backend_options(),
-        )
-        .expect("fixed backend XML");
+        let raw = || {
+            crate::parser_xmloxide::parser::parse_str_with_options(
+                xml,
+                &super::super::xmloxide::backend_options(),
+            )
+            .expect("fixed backend XML")
+        };
         let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
         let document = super::super::xmloxide::project_in(
             xml,
-            &raw,
+            raw(),
             super::ParsingOptions::default(),
             &preflight,
             super::super::storage::Accounted(&memory),
@@ -1333,7 +1330,7 @@ mod tests {
         assert!(matches!(
             super::super::xmloxide::project_in(
                 xml,
-                &raw,
+                raw(),
                 super::ParsingOptions::default(),
                 &preflight,
                 super::super::storage::Accounted(&denied)
@@ -1355,16 +1352,16 @@ mod tests {
         let source = format!("<r a='{}'/>", "x".repeat(65536));
         let preflight =
             super::super::LexicalPreflight::scan(&source, false).expect("native lexical baseline");
-        let raw = crate::parser_xmloxide::parser::parse_str_with_options(
-            &source,
-            &super::super::xmloxide::backend_options(),
-        )
-        .expect("native raw XML baseline");
         for (limit, capacity) in [(0, 0), (1, 4096)] {
+            let raw = crate::parser_xmloxide::parser::parse_str_with_options(
+                &source,
+                &super::super::xmloxide::backend_options(),
+            )
+            .expect("native raw XML baseline");
             let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(capacity, 1 << 24)));
             let result = super::super::xmloxide::project_in(
                 &source,
-                &raw,
+                raw,
                 super::ParsingOptions {
                     nodes_limit: limit,
                     allow_dtd: false,

@@ -45,10 +45,10 @@ impl<'a> Projection<'a> {
         })
     }
 
-    pub(crate) fn project(&self) -> Result<Document<'a>, ParseError> {
-        match &self.parsed {
+    pub(crate) fn project(self) -> Result<Document<'a>, ParseError> {
+        match self.parsed {
             Parsed::Roxmltree(parsed) => {
-                super::roxmltree::project(self.input, parsed, &self.preflight)
+                super::roxmltree::project(self.input, &parsed, &self.preflight)
             }
             Parsed::Xmloxide(parsed) => super::xmloxide::project(
                 self.input,
