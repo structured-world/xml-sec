@@ -21,7 +21,9 @@ use core::sync::atomic::Ordering;
 #[cfg(not(target_has_atomic = "64"))]
 use portable_atomic::AtomicU64;
 
-use crate::collections::{Entry, Map, Set, Table};
+#[cfg(feature = "xmldsig")]
+use crate::collections::Map;
+use crate::collections::{Set, Table};
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{
     Native as NativeXmlStorage, Storage as XmlStorage, Values as XmlValues,
@@ -447,12 +449,6 @@ impl ContentReplacementEdit<'_> {
     }
 }
 
-#[derive(Debug)]
-struct DocumentIndexes {
-    default_ids: Map<String, Option<NodeId>>,
-    attributes_by_value: Map<(String, String), Vec<NodeId>>,
-}
-
 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
 mod policy_sealed {
     pub trait Sealed {}
@@ -501,7 +497,6 @@ impl_document_policy!(crate::policy::DecryptionPolicy);
 
 struct ParsedDocument<'input> {
     document: Document<'input>,
-    indexes: DocumentIndexes,
     node_count: usize,
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     max_depth: usize,
@@ -2076,31 +2071,23 @@ impl<'a> DocumentView<'a> {
         value: &str,
         registrations: &[IdAttributeRegistration],
     ) -> Option<NodeIdentity> {
-        let mut matched = match self.parsed.indexes.default_ids.get(value) {
-            Some(Some(node)) => Some(*node),
-            Some(None) => return None,
-            None => None,
-        };
-        for registration in registrations {
-            let key = (
-                registration.attribute_local_name().to_owned(),
-                value.to_owned(),
-            );
-            if let Some(nodes) = self.parsed.indexes.attributes_by_value.get(&key) {
-                for node_id in nodes {
-                    let recognized = self.parsed.document.get_node(*node_id).is_some_and(|node| {
-                        node.attributes().any(|attribute| {
-                            attribute.value() == value && registration.matches(node, attribute)
-                        })
-                    });
-                    if !recognized {
-                        continue;
-                    }
-                    if matched.is_some_and(|previous| previous != *node_id) {
-                        return None;
-                    }
-                    matched = Some(*node_id);
+        // One walk per query: operations resolve through their own ID index, so
+        // parsing does not pay to copy every attribute for this rare lookup.
+        let mut matched = None;
+        for node in self.parsed.document.descendants() {
+            if !node.is_element() {
+                continue;
+            }
+            for attribute in node.attributes() {
+                if attribute.value() != value
+                    || !crate::xml::is_id_attribute(node, attribute, registrations)
+                {
+                    continue;
                 }
+                if matched.is_some_and(|previous| previous != node.id()) {
+                    return None;
+                }
+                matched = Some(node.id());
             }
         }
         matched.map(|node| self.node_identity_by_id(node))
@@ -2377,10 +2364,15 @@ fn build_semantic_cell(
     let _ = parse_work;
     DocumentCell::try_new(xml, |source| {
         let (document, metrics) = parse_semantic_document(source, settings)?;
-        let indexes = DocumentIndexes::build(&document);
+        debug_assert!(
+            document
+                .descendants()
+                .enumerate()
+                .all(|(position, node)| node.id().get_usize() == position),
+            "document order must equal the preorder arena index"
+        );
         Ok::<_, XmlDocumentError>(ParsedDocument {
             document,
-            indexes,
             node_count: metrics.node_count,
             #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             max_depth: metrics.max_depth,
@@ -4167,50 +4159,6 @@ fn validate_wrappers(
     }
 }
 
-impl DocumentIndexes {
-    fn build(document: &Document<'_>) -> Self {
-        let mut default_ids = Map::new();
-        let mut duplicate_ids = Set::new();
-        let mut attributes_by_value: Map<(String, String), Vec<NodeId>> = Map::new();
-
-        for (position, node) in document.descendants().enumerate() {
-            debug_assert_eq!(
-                node.id().get_usize(),
-                position,
-                "document order must equal the preorder arena index"
-            );
-            if !node.is_element() {
-                continue;
-            }
-            for attribute in node.attributes() {
-                attributes_by_value
-                    .entry((attribute.name().to_owned(), attribute.value().to_owned()))
-                    .or_default()
-                    .push(node.id());
-                if !crate::xml::is_id_attribute(node, attribute, &[])
-                    || duplicate_ids.contains(attribute.value())
-                {
-                    continue;
-                }
-                match default_ids.entry(attribute.value().to_owned()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(Some(node.id()));
-                    }
-                    Entry::Occupied(mut entry) if entry.get() != &Some(node.id()) => {
-                        entry.insert(None);
-                        duplicate_ids.insert(attribute.value().to_owned());
-                    }
-                    Entry::Occupied(_) => {}
-                }
-            }
-        }
-        Self {
-            default_ids,
-            attributes_by_value,
-        }
-    }
-}
-
 fn element_content_range(element: &str) -> Result<(Range<usize>, String, bool), XmlDocumentError> {
     let start_end = element_opening_end(element)?;
     let start_tag = &element[..=start_end];
@@ -4684,16 +4632,13 @@ mod tests {
         let retained = build_semantic_cell(xml.to_owned(), settings, 1, 0)
             .expect("selected backend semantic projection must parse");
         retained.with_dependent(|_, parsed| {
-            assert!(parsed.indexes.default_ids.contains_key("target"));
-            assert_eq!(
-                parsed
-                    .document
-                    .root_element()
-                    .first_element_child()
-                    .expect("fixture must contain the indexed child element")
-                    .text(),
-                Some("value")
-            );
+            let item = parsed
+                .document
+                .root_element()
+                .first_element_child()
+                .expect("fixture must contain the identified child element");
+            assert_eq!(item.attribute("ID"), Some("target"));
+            assert_eq!(item.text(), Some("value"));
         });
     }
 
