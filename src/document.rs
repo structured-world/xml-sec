@@ -3063,13 +3063,18 @@ fn scan_preflight_event<S: NameStorage>(
             1,
         ));
     }
-    let end = remaining.find(['<', '&']).unwrap_or(remaining.len());
-    let text = &remaining[..end];
+    let bytes = remaining.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|byte| matches!(byte, b'<' | b'&'))
+        .unwrap_or(remaining.len());
     Ok((
         PreflightEvent::CharacterData {
-            xml_whitespace: text
-                .chars()
-                .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
+            // Only text outside the document element is judged by this.
+            xml_whitespace: state.depth == 0
+                && bytes[..end]
+                    .iter()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
         },
         end,
     ))
@@ -3086,13 +3091,23 @@ fn scan_preflight_opening<S: NameStorage>(
         return Ok((PreflightEvent::Done, remaining.len()));
     };
     let opening = &remaining[..=end];
-    let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
-    let attribute_source =
-        element_attribute_reference_source(opening, element_name, &attributes, dtd)?;
+    // Attributes matter here for their namespace declarations and DTD defaults.
+    // A tag with neither has nothing to split, however many attributes it has.
+    let (attribute_source, namespace_declarations) =
+        if dtd.attribute_defaults.len() == 0 && !opening.contains("xmlns") {
+            (
+                element_attribute_reference_source(opening, "", &[], dtd)?,
+                storage.values(0)?,
+            )
+        } else {
+            let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
+            (
+                element_attribute_reference_source(opening, element_name, &attributes, dtd)?,
+                namespace_declarations(element_name, &attributes, dtd, state, budget)?,
+            )
+        };
     // The frame later revisits this attribute/reference window.
     storage.charge(attribute_source.len())?;
-    let namespace_declarations =
-        namespace_declarations(element_name, &attributes, dtd, state, budget)?;
     let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
         PreflightEvent::Empty {
             attribute_source,

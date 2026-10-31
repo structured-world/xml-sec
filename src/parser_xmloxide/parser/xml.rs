@@ -982,8 +982,10 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             let safe_len = self.input.scan_char_data()?;
             if safe_len > 0 {
                 let start = self.input.pos();
-                let chunk = core::str::from_utf8(self.input.slice(start, start + safe_len))
-                    .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                let chunk = self
+                    .input
+                    .text(start, start + safe_len)
+                    .ok_or_else(|| self.input.fatal("invalid UTF-8 in character data"))?;
                 // Fast byte-level pre-check for invalid XML chars (0x7F,
                 // U+FFFE, U+FFFF). Skips the expensive char-by-char
                 // validation for the 99.9% of chunks that are clean.
