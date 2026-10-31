@@ -339,8 +339,13 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
             })?;
         }
         for attribute in attributes {
-            if let Some(prefix) = namespace_declaration(attribute) {
-                set_namespace(&mut namespaces, prefix, &attribute.value, storage)?;
+            if let Some(declared) = namespace_declaration(attribute) {
+                set_namespace(
+                    &mut namespaces,
+                    declared.prefix(),
+                    &attribute.value,
+                    storage,
+                )?;
             }
         }
         self.target.add_namespace_set(namespaces)
@@ -466,15 +471,29 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
     }
 }
 
-/// The bound prefix when `attribute` declares a namespace: `Some(None)` is the
-/// default namespace.
+/// What a namespace declaration attribute binds.
+#[derive(Clone, Copy)]
+enum Declared<'a> {
+    Default,
+    Prefix(&'a str),
+}
+
+impl<'a> Declared<'a> {
+    fn prefix(self) -> Option<&'a str> {
+        match self {
+            Self::Default => None,
+            Self::Prefix(prefix) => Some(prefix),
+        }
+    }
+}
+
 fn namespace_declaration<R: NameStorage>(
     attribute: &xmloxide::tree::Attribute<R>,
-) -> Option<Option<&str>> {
+) -> Option<Declared<'_>> {
     if attribute.prefix.as_deref() == Some("xmlns") {
-        Some(Some(&attribute.name))
+        Some(Declared::Prefix(&attribute.name))
     } else if attribute.prefix.is_none() && attribute.name.as_ref() == "xmlns" {
-        Some(None)
+        Some(Declared::Default)
     } else {
         None
     }

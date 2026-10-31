@@ -562,6 +562,13 @@ impl<'input, S: Storage> Document<'input, S> {
         &self.namespace_sets[set.index()]
     }
 
+    /// Every namespace URI any element has in scope, repeats included.
+    pub(crate) fn namespace_uris(&self) -> impl Iterator<Item = &str> {
+        self.namespace_sets
+            .iter()
+            .flat_map(|set| set.iter().map(|namespace| namespace.uri.as_ref()))
+    }
+
     /// The child of `parent` whose subtree ends at `end`. That subtree's last
     /// node is `end - 1`, so its ancestor chain reaches the child within the
     /// document's depth.
@@ -764,6 +771,11 @@ impl<'a, 'input, S: Storage> Node<'a, 'input, S> {
             document: self.document,
             ids: self.id.0..self.data().subtree_end,
         }
+    }
+    /// Whether `other` is this node or one of its descendants.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn subtree_contains_id(self, other: NodeId) -> bool {
+        (self.id.0..self.data().subtree_end).contains(&other.0)
     }
     /// Document-order `XPath` index of this tree node.
     #[cfg(feature = "xmldsig")]

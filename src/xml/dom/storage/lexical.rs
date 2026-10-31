@@ -47,6 +47,9 @@ impl<'a, W: Work> AttributeBuffer<'a, Accounted<'_, W>> for OwnedVec<Attribute<'
     fn push(&mut self, attribute: Attribute<'a>) -> Result<(), MemoryError> {
         self.try_push(attribute)
     }
+    fn clear(&mut self) {
+        OwnedVec::clear(self);
+    }
     fn sort(
         &mut self,
         compare: impl FnMut(&Attribute<'a>, &Attribute<'a>) -> Result<Ordering, MemoryError>,

@@ -161,10 +161,11 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                         &mut nodes,
                         SourceNode {
                             kind: SourceKind::Element,
-                            range: element.range.clone(),
+                            range: element.range,
                         },
                     )?;
                     elements.push(index)?;
+                    reader.recycle(element.attributes);
                 }
                 Event::Empty(element) => {
                     enforce_depth(elements.len() + 1)?;
@@ -175,6 +176,7 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                             range: element.range,
                         },
                     )?;
+                    reader.recycle(element.attributes);
                 }
                 Event::End { range, .. } => {
                     if let Some(index) = elements.pop() {

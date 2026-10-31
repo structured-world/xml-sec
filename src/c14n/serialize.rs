@@ -361,6 +361,16 @@ pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomSto
     initial_offset: usize,
     scratch: &S,
 ) -> Result<(Option<usize>, TrackedPositions), C14nError> {
+    // Canonical XML 1.0 §2.3 requires operation failure on documents containing
+    // relative namespace URIs, including outside the selected subset. Elements
+    // share binding lists, so each list is checked once for the whole document.
+    // https://www.w3.org/TR/2001/REC-xml-c14n-20010315#DataModel
+    for uri in doc.namespace_uris() {
+        scratch.charge(uri.len().saturating_mul(2).saturating_add(1))?;
+        if !uri.is_empty() && !super::xml_base::has_scheme(uri) {
+            return Err(C14nError::RelativeNamespace);
+        }
+    }
     let root = doc.root();
     let max_len = match options.max_output_bytes {
         Some(limit) => initial_offset
@@ -380,15 +390,32 @@ pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomSto
         xml_base_resolution: options.xml_base_resolution,
         scratch,
     };
-    serialize_children(
-        root,
-        visibility,
-        with_comments,
-        ns_renderer,
-        config,
-        &scratch.namespaces(),
-        &mut output,
-    )?;
+    let top = scratch.namespaces();
+    // No node outside a whole subtree can contribute, so the walk starts there.
+    if let Some(apex) = visibility
+        .and_then(NodeVisibility::apex)
+        .and_then(|apex| doc.get_node(apex))
+    {
+        serialize_element(
+            apex,
+            visibility,
+            with_comments,
+            ns_renderer,
+            config,
+            &top,
+            &mut output,
+        )?;
+    } else {
+        serialize_children(
+            root,
+            visibility,
+            with_comments,
+            ns_renderer,
+            config,
+            &top,
+            &mut output,
+        )?;
+    }
     Ok((output.tracked_position, output.tracked_positions))
 }
 
@@ -414,19 +441,6 @@ fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
 
         match child.node_type() {
             NodeType::Element => {
-                // Canonical XML 1.0 §2.3 requires operation failure on
-                // documents containing relative namespace URIs. Apply before
-                // visibility filtering, including Exclusive C14N subsets.
-                // https://www.w3.org/TR/2001/REC-xml-c14n-20010315#DataModel
-                for namespace in child.namespaces() {
-                    let uri = namespace.uri();
-                    output
-                        .scratch
-                        .charge(uri.len().saturating_mul(2).saturating_add(1))?;
-                    if !uri.is_empty() && !super::xml_base::has_scheme(uri) {
-                        return Err(C14nError::RelativeNamespace);
-                    }
-                }
                 if in_set {
                     serialize_element(
                         child,
