@@ -34,7 +34,15 @@ const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
 type TrackedPositions = Vec<(NodeId, usize)>;
 
-struct CanonicalOutput<'a, W: ByteSink + ?Sized, S: Scratch = Native> {
+/// One attribute of a start tag: namespace URI, local name, prefix and value.
+type StartTagAttribute<'n, S> = (
+    &'n str,
+    &'n str,
+    &'n str,
+    AttributeValue<'n, <S as Scratch>::Text>,
+);
+
+struct CanonicalOutput<'a, 'n, W: ByteSink + ?Sized, S: Scratch = Native> {
     writer: &'a mut W,
     position: usize,
     max_len: usize,
@@ -46,6 +54,9 @@ struct CanonicalOutput<'a, W: ByteSink + ?Sized, S: Scratch = Native> {
     tracked_positions: Vec<(NodeId, usize)>,
     xml_base_resolution: &'a XmlBaseResolutionBudget,
     scratch: &'a S,
+    /// Start-tag working space, empty between tags. One start tag finishes
+    /// before the next begins, so one capacity serves the whole walk.
+    attributes: S::Values<StartTagAttribute<'n, S>>,
 }
 
 enum AttributeValue<'a, T: Text> {
@@ -61,13 +72,13 @@ impl<T: Text> AttributeValue<'_, T> {
     }
 }
 
-impl<W: ByteSink + ?Sized, S: Scratch> ByteSink for CanonicalOutput<'_, W, S> {
+impl<W: ByteSink + ?Sized, S: Scratch> ByteSink for CanonicalOutput<'_, '_, W, S> {
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
         self.write_all(bytes)
     }
 }
 
-impl<W: ByteSink + ?Sized, S: Scratch> CanonicalOutput<'_, W, S> {
+impl<W: ByteSink + ?Sized, S: Scratch> CanonicalOutput<'_, '_, W, S> {
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
         debug_assert!(self.position <= self.max_len);
         if bytes.len() > self.max_len - self.position {
@@ -390,6 +401,7 @@ pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomSto
         tracked_positions: Vec::new(),
         xml_base_resolution: options.xml_base_resolution,
         scratch,
+        attributes: scratch.values(),
     };
     let top = scratch.namespaces();
     // No node outside a whole subtree can contribute, so the walk starts there.
@@ -428,7 +440,7 @@ fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S>,
 ) -> Result<(), C14nError> {
     let is_doc_root = parent.node_type() == NodeType::Root;
 
@@ -538,7 +550,7 @@ fn serialize_selected_axes_of_omitted_element<
     visibility: Option<&dyn NodeVisibility<D>>,
     ns_renderer: &dyn NsRenderer<S, D>,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S>,
 ) -> Result<(), C14nError> {
     let Some(visibility) = visibility else {
         return Ok(());
@@ -622,7 +634,7 @@ fn serialize_element<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S>,
 ) -> Result<(), C14nError> {
     let rendered = serialize_start_tag(
         node,
@@ -653,7 +665,7 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S>,
 ) -> Result<Option<S::Namespaces<'n>>, C14nError> {
     let (ns_decls, rendered) =
         ns_renderer.render_namespaces(node, parent_rendered, visibility, output.scratch)?;
@@ -703,7 +715,7 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
 
     // Build unified list: (ns_uri, local_name, prefix, value)
     // Using Cow to avoid allocations when no fixup is needed.
-    let mut all_attrs = output.scratch.values();
+    let mut all_attrs = core::mem::replace(&mut output.attributes, output.scratch.values());
     for (ordinal, attr) in node.attributes().enumerate() {
         output.scratch.charge(attr.name().len().saturating_add(1))?;
         if let Some(set) = visibility
@@ -744,7 +756,7 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
         let resolved_value = if config.fixup_xml_base && name == "base" {
             // C14N 1.1: inherited xml:base uses the resolved effective value
             match effective_parent_base.as_ref() {
-                Some(base) => AttributeValue::Borrowed(base.view()?),
+                Some(base) => AttributeValue::Owned(output.scratch.text(&[base.view()?])?),
                 None => AttributeValue::Borrowed(value),
             }
         } else {
@@ -779,6 +791,8 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     // Always use <tag></tag> form, never self-closing.
     output.write_all(b">")?;
 
+    while all_attrs.pop().is_some() {}
+    output.attributes = all_attrs;
     Ok(rendered)
 }
 
@@ -786,7 +800,7 @@ fn effective_parent_base<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     node: Node<'_, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     config: C14nConfig,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S>,
 ) -> Result<Option<S::Text>, C14nError> {
     let parent_not_in_set = if let Some(set) = visibility {
         match node.parent().filter(Node::is_element) {
@@ -830,7 +844,7 @@ pub(super) fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
 fn write_doc_level_prefix<W: ByteSink + ?Sized, S: Scratch>(
     is_doc_root: bool,
     follows_document_element: bool,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S>,
 ) -> Result<(), C14nError> {
     if is_doc_root && follows_document_element {
         output.write_all(b"\n")?;
@@ -842,7 +856,7 @@ fn write_doc_level_prefix<W: ByteSink + ?Sized, S: Scratch>(
 fn write_doc_level_suffix<W: ByteSink + ?Sized, S: Scratch>(
     is_doc_root: bool,
     follows_document_element: bool,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S>,
 ) -> Result<(), C14nError> {
     if is_doc_root && !follows_document_element {
         output.write_all(b"\n")?;
@@ -962,7 +976,7 @@ fn collect_inherited_xml_attrs<'a, S: Scratch, D: DomStorage>(
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
 fn write_qualified_name<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     node: Node<'_, '_, D>,
-    output: &mut CanonicalOutput<'_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S>,
 ) -> Result<(), C14nError> {
     let prefix = element_prefix(node);
     if !prefix.is_empty() {
