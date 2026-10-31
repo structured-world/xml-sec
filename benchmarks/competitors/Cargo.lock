@@ -2453,9 +2453,9 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "structured-asn1"
-version = "0.18.2"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1929d0c152f8c4f46777f01757d38df8dc0a8fd05dcf8ca5c1bc33ffe102d609"
+checksum = "2327671666df0e22a40a20971a6eba300aeae791e363d71b074444e4c7f796d2"
 dependencies = [
  "allocator-api2 0.2.21",
  "allocator-api2 0.4.0",
@@ -2465,9 +2465,9 @@ dependencies = [
 
 [[package]]
 name = "structured-cms"
-version = "0.18.2"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3c74074e07917756c831081389c342c7176c0399be4cbe966c0d5f23092c1a96"
+checksum = "50f70a73d6891647a06c05534cc7436961c343c324499cea5b2eb090ce72354f"
 dependencies = [
  "structured-asn1",
  "structured-pkix",
@@ -2487,9 +2487,9 @@ dependencies = [
 
 [[package]]
 name = "structured-pkix"
-version = "0.18.2"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9e67176be19f5f1244c8c30021294c845a304b6189a8cf34b294a18b46a1b95"
+checksum = "710a622e9d42ac36ff5d79030b141660d133fcbdcffc1bebf0f7d4c67c499efb"
 dependencies = [
  "structured-asn1",
  "structured-email-address",

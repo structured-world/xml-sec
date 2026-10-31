@@ -1065,7 +1065,7 @@ pub(crate) fn effective_target_spki(
 
 /// Certificate signatures use the same selected engine and permissions as CRLs.
 #[derive(Clone, Copy)]
-pub(crate) struct ProviderVerifier<'a> {
+pub struct ProviderVerifier<'a> {
     pub(crate) provider: &'a dyn crate::provider::CryptoProvider,
     pub(crate) allowed: Option<&'a crate::policy::CertificateSignatureAlgorithms>,
 }

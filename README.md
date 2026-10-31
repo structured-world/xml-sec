@@ -12,10 +12,6 @@ Pure Rust XML Security for **XMLDSig**, **XML Encryption**, **C14N**, **SAML 2.0
 **No C dependencies in the default build. No CMake. No system XML or crypto packages.
 Just `cargo add xml-sec`.**
 
-> [!WARNING]
-> Early-stage pre-release. The API is unstable, XMLDSig/XMLEnc coverage is still incomplete,
-> and this crate should not yet be used in production.
-
 ## Why xml-sec?
 
 - **End-to-end XML security**: sign, verify, encrypt, and decrypt through public Rust APIs.
@@ -27,7 +23,7 @@ Just `cargo add xml-sec`.**
   Direct KEM-to-CBC additionally requires caller-owned external authentication; GCM is the safe default path.
 - **SAML-ready primitives**: enveloped signatures, encrypted assertions, X.509 keys, XPath,
   canonicalization, same-document XPointer references, DTD/`xml:id` IDs, and namespace-scoped ID registration.
-- **Pure Rust deployment**: RustCrypto, `x509-parser`, and selectable Rust XML backends replace
+- **Pure Rust deployment**: RustCrypto, shared structured PKIX/CMS primitives, and selectable Rust XML backends replace
   the libxml2/OpenSSL-style native dependency stack.
 - **Optional AWS-LC FIPS provider**: select a native cryptographic engine explicitly through
   the same provider contracts, without silent fallback to RustCrypto.
@@ -69,13 +65,13 @@ declarations.
 Verification only, with no private-key import, password derivation or randomness source:
 
 ```toml
-xml-sec = { version = "0.2", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
+xml-sec = { version = "0.4", default-features = false, features = ["xmldsig", "c14n", "xml-backend-xmloxide"] }
 ```
 
 Verification and signing:
 
 ```toml
-xml-sec = { version = "0.2", default-features = false, features = ["xmldsig-sign", "c14n", "xml-backend-xmloxide"] }
+xml-sec = { version = "0.4", default-features = false, features = ["xmldsig-sign", "c14n", "xml-backend-xmloxide"] }
 ```
 
 See [feature and provider qualification](docs/features.md) for supported combinations,
@@ -95,7 +91,9 @@ a published dependency. C source and binary ABI compatibility are not delivered.
 | Optional XSLT transform | `xslt`: the XMLDSig XSLT transform on the safe-Rust XSLT 1.0 engine, without external resources and within operation-wide XSLT limits |
 | XML encryption | AES-CBC/GCM, RSA-OAEP, AES Key Wrap, opt-in Camellia-CBC/Key Wrap and experimental ChaCha20/Poly1305 profiles, ECDH/X25519/X448/DH, bounded KDFs, referenced ciphertext, nested recipients, and Element/Content replacement |
 | Optional compatibility algorithms | `legacy-algorithms`: MD5/RIPEMD-160 signatures and digests, AES-192, TripleDES-CBC/CMS wrap, and RSA-1.5 transport; library policy denies these by default |
-| X.509 | Certificate key extraction, chain validation, CRLs, required key authorization by default, and typed trust evidence |
+| XAdES | `xml-sec-xades`, an in-repository workspace crate: B-B, B-T, B-LT and B-LTA validation of verified signatures, including detached, parallel and countersigned ones, over the document's own timestamps and validation material; caller-supplied anchors, TSA policy accuracy, OCSP responders and status; nothing fetched |
+| CMS | `cms`: the selected provider behind RFC 3161 timestamp and CMS signature checks |
+| X.509 | Certificate key extraction, chain validation, complete and delta CRLs, required key authorization by default, and typed trust evidence |
 | Key management | Caller-owned named inventory, usage-restricted keys, xmlsec `keys.xml`, encrypted PKCS#8, and bounded RustCrypto-backed PKCS#12 import |
 | SAML 2.0 | Signed assertions and encrypted-assertion workflows covered by integration tests |
 | XML input | Strict bounded byte decoding, entity/depth/node limits, stable node identities, and generation-safe mutation |
@@ -178,7 +176,7 @@ Use `xml-backend-roxmltree` for a thin alternative build, or compile `xml-backen
 `Xmloxide`, `Roxmltree`, or fail-closed `Differential` parsing per operation:
 
 ```toml
-xml-sec = { version = "0.2", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
+xml-sec = { version = "0.4", default-features = false, features = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"] }
 ```
 
 ```rust
@@ -201,17 +199,6 @@ Raw-byte APIs select XML encoding from the BOM, byte signature, declaration, or 
 metadata. UTF-8 remains borrowed when possible; other supported encodings are strictly transcoded
 under the same materialization ceiling. Conflicting declarations, malformed byte sequences,
 ambiguous BOM-less UTF-16/UTF-32, and unsupported EBCDIC variants fail explicitly.
-
-**API migration for this pre-release change:** `encoding::decode_xml_octets` now requires a
-maximum decoded-byte count as its second argument. `encoding::XmlEncodingError` is now the
-shared, non-exhaustive `xml_sec::encoding::XmlEncodingError`; update matches to handle the new error
-variants and include a fallback arm. Code constructing `ResourcePolicy` with every field must
-also set `max_xml_namespace_bindings` and the `max_xslt_*` limits (or start from
-`ResourcePolicy::default()` and override selected fields); matches on `xmldsig::Transform`
-need a fallback arm. These changes keep decoding and namespace-scope allocation under explicit
-resource limits. For trusted resolver-provided encoding metadata, use
-`xml_input::decode_xml_bounded(bytes, Some(encoding), maximum_decoded_bytes)`; the unbounded
-decoder remains internal.
 
 ## Native xmlsec1 CLI
 
@@ -249,7 +236,9 @@ surface and operation behavior with source and test evidence.
 The [local XAdES interoperability corpus](interop/xades/README.md) compares exact Reference
 and SignedInfo bytes with native libxmlsec1 and checks independent EU DSS profile expectations.
 Its synthetic fixtures and reproducible commands distinguish transform/XMLDSig interoperability,
-XAdES property binding, expected-object coverage, and trust-validation limits.
+XAdES property binding, expected-object coverage, and trust-validation limits. Baseline levels
+are compared with EU DSS conclusions on fixtures issued by OpenSSL, libxml2 and xmlsec1, and
+checked on signatures DSS itself produced.
 
 ## Safe-Rust XSLT
 
@@ -262,8 +251,8 @@ request host-clock compatibility.
 Resolver authorization also gates cached documents and retained stylesheet dependencies, with
 typed expiry/revocation failures that cannot be hidden by resource fallback.
 
-The engine remains an in-repository workspace crate rather than a separately published package;
-`xml-sec` is the only crate published to crates.io. Its optional `xslt` feature compiles the same
+The engine remains an in-repository workspace crate rather than a separately published package,
+as does `xml-sec-xades`; `xml-sec` is the only crate published to crates.io. Its optional `xslt` feature compiles the same
 engine sources and executes the XMLDSig XSLT transform with them; see
 [XML Digital Signatures](docs/xmldsig.md#xslt-transform). The shared strict byte-decoding and
 lexical source is compiled into `xml-sec` and reused by the internal XSLT workspace crate.
@@ -278,6 +267,8 @@ lexical source is compiled into `xml-sec` and reused by the internal XSLT worksp
 | [XMLDSig 1.0/1.1](https://www.w3.org/TR/xmldsig-core1/) | Core sign/verify pipelines; complete Merlin, Phaos 3, XMLDSig 1.1, and Second Edition corpora classified and executed |
 | [XML Encryption](https://www.w3.org/TR/xmlenc-core1/) | Core AES-CBC/GCM, RSA-OAEP, and AES-KW pipelines implemented; broader conformance work continues |
 | [XSLT 1.0](https://www.w3.org/TR/xslt-10/) | Safe-Rust engine implemented; the XMLDSig XSLT transform executes with the optional `xslt` feature |
+| [ETSI EN 319 132-1](https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf) (XAdES) | Baseline levels B-B to B-LTA validated through `xml-sec-xades`; signature creation is not provided |
+| [RFC 3161](https://www.rfc-editor.org/rfc/rfc3161) | Timestamp tokens checked inside XAdES validation; no client or TSA |
 
 The project tracks stable Rust and supports Rust 1.92 or newer. Detailed contracts and limitations
 live in the [XMLDSig guide](docs/xmldsig.md), [XML Encryption guide](docs/xmlenc.md), and

@@ -133,6 +133,7 @@ fn check(
             utc: &utc,
             reference: Some(Instant::new(1_800_000_000, 0).expect("instant")),
             window: None,
+            policy_accuracy: None,
         };
         match token.check(&cms, &parent, &context, &mut [covered], |_, _| {
             Ok::<_, ()>(false)

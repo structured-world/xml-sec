@@ -299,11 +299,7 @@ snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], o
 
 # Crypto
 cryptoki = { version = "0.12.1", optional = true }
-# Keep the published consumer graph on bindgen 0.72: the newer sys release's
-# bindgen 0.73 can resolve incompatible syn/prettyplease major versions.
-# The sys dependency only constrains resolution; provider calls use aws-lc-rs.
-aws-lc-rs = { version = "=1.18.2", default-features = false, features = ["fips"], optional = true }
-aws-lc-fips-sys = { version = "=0.14.3", default-features = false, optional = true }
+aws-lc-rs = { version = "1.19", default-features = false, features = ["fips"], optional = true }
 rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
 sha1 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
 sha2 = { version = "0.11", features = ["oid", "zeroize"], optional = true }
@@ -356,10 +352,10 @@ pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
 # X.509 certificates
-structured-asn1 = { version = "0.18.2", default-features = false, features = ["alloc"], optional = true }
-structured-pkix = { version = "0.18.2", default-features = false, features = ["alloc"], optional = true }
+structured-asn1 = { version = "0.20.0", default-features = false, features = ["alloc"], optional = true }
+structured-pkix = { version = "0.20.0", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 container framing; this crate keeps the password, KDF and cipher work.
-structured-cms = { version = "0.18.2", default-features = false, features = ["alloc"], optional = true }
+structured-cms = { version = "0.20.0", default-features = false, features = ["alloc"], optional = true }
 tinyvec = { version = "1.13", optional = true }
 # `pem` is RFC 7468 decoding of caller key and certificate text.
 der = { version = "0.8", default-features = false, features = ["alloc", "pem"], optional = true }
@@ -427,7 +423,7 @@ std = [
     "p384?/precomputed-tables",
     "p521?/precomputed-tables",
 ]
-aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs", "dep:aws-lc-fips-sys"]
+aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = []
 xml-backend-roxmltree = ["dep:memchr"]

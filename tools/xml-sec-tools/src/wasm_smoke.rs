@@ -10,7 +10,7 @@ mod tests;
 
 /// Each export, the failure it reports when it does not return 1, and the
 /// line printed when it does.
-const EXPORTS: [(&str, &str, &str); 3] = [
+const EXPORTS: [(&str, &str, &str); 4] = [
     (
         "xml_sec_wasm_smoke",
         "WASM canonicalization must produce exact expected bytes",
@@ -25,6 +25,11 @@ const EXPORTS: [(&str, &str, &str); 3] = [
         "xml_sec_wasm_cms",
         "WASM CMS timestamp check must accept the token and reject tampering",
         "WASM CMS timestamp check passed",
+    ),
+    (
+        "xml_sec_wasm_xades",
+        "WASM XAdES B-LTA must accept the signature and refuse a changed archive token",
+        "WASM XAdES B-LTA passed",
     ),
 ];
 

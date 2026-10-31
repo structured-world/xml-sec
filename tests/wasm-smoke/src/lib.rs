@@ -10,11 +10,16 @@ use structured_cms::timestamp::{CheckContext, ImprintAgreement, Token, TokenSign
 use structured_pkix::Certificate;
 use structured_pkix::path::WorkingKey;
 use structured_pkix::temporal::{Instant, LeapTable};
+use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_xml};
 use xml_sec::policy::{CertificateSignatureAlgorithms, VerificationPolicy};
 use xml_sec::provider::RustCryptoProvider;
 use xml_sec::xmldsig::cms::CmsProvider;
-use xml_sec::xmldsig::{DsigStatus, FailureReason, verify_signature_with_pem_key};
+use xml_sec::xmldsig::{
+    DefaultKeyResolver, DsigStatus, FailureReason, KeyResolverConfig, VerificationRequest,
+    VerifyContext, verify_signature_with_pem_key, with_verified_request,
+};
+use xml_sec_xades::{Inputs, Outcome, Requirements, TokenProfile, validate};
 
 /// A donor SAML 2.0 response signed by its identity provider.
 const SIGNED_RESPONSE: &str = include_str!("../../fixtures/saml/response_signed_by_idp_ecdsa.xml");
@@ -23,6 +28,11 @@ const SIGNER_KEY: &str = include_str!("../../fixtures/keys/ec/saml-idp-ecdsa-pub
 const TOKEN: &[u8] = include_bytes!("../../fixtures/cms/timestamp/ed25519.tst");
 const TOKEN_CERTIFICATE: &[u8] = include_bytes!("../../fixtures/cms/timestamp/ed25519.der");
 const TOKEN_PAYLOAD: &[u8] = include_bytes!("../../fixtures/cms/timestamp/payload.txt");
+/// A B-LTA signature whose tokens and status OpenSSL produced.
+const LEVELS_ARCHIVAL: &str =
+    include_str!("../../../crates/xml-sec-xades/tests/fixtures/levels/b-lta.xml");
+const LEVELS_ROOT: &[u8] =
+    include_bytes!("../../../crates/xml-sec-xades/tests/fixtures/levels/root.der");
 
 /// Called in the compiled WASM module, not a native substitute.
 #[unsafe(no_mangle)]
@@ -52,6 +62,68 @@ pub extern "C" fn xml_sec_wasm_verify() -> u32 {
     u32::from(valid && rejected)
 }
 
+/// Whether the archival level of `xml`'s first signature is met, in this module.
+fn archival_level(xml: &str) -> Option<bool> {
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![LEVELS_ROOT.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+    let mut policy = VerificationPolicy::default();
+    policy.key_trust.verify_x509_chains = true;
+    policy.key_trust.verification_time = Some(Instant::new(1_800_000_000, 0)?);
+    let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
+    let document = XmlDocument::parse(xml).ok()?;
+    let request = VerificationRequest::default();
+    let account = Memory::new(Arc::new(MemoryAccount::new(1 << 25, 1 << 31)));
+    let utc = LeapTable::new(0, 2_000_000_000, &[]).ok()?;
+    let anchors: &[&[u8]] = &[LEVELS_ROOT];
+    with_verified_request(&document, &context, &request, &account, |session| {
+        let inputs = Inputs {
+            requirements: Requirements::Archival,
+            token_profile: TokenProfile::Etsi,
+            anchors,
+            certificates: &[],
+            utc: &utc,
+            accuracies: &[],
+            responders: &[],
+            crls: &[],
+            responses: &[],
+        };
+        let signature = session.evidence().signatures()[0].identity();
+        Ok(validate(&session, signature, &inputs, |level| {
+            level.all_requirements_met()
+        }))
+    })
+    .ok()?
+    .ok()
+    .and_then(|outcome| match outcome {
+        Outcome::Assessed(met) => Some(met),
+        _ => None,
+    })
+}
+
+/// B-LTA validation in the compiled WASM module: real tokens, CRLs and OCSP
+/// meet the level, and a changed archive token does not.
+#[unsafe(no_mangle)]
+pub extern "C" fn xml_sec_wasm_xades() -> u32 {
+    let open = "<xades:EncapsulatedTimeStamp>";
+    let Some((start, _)) = LEVELS_ARCHIVAL.rmatch_indices(open).next() else {
+        return 0;
+    };
+    let at = start + open.len() + 400;
+    let replacement = if &LEVELS_ARCHIVAL[at..=at] == "A" {
+        "B"
+    } else {
+        "A"
+    };
+    let tampered = format!(
+        "{}{replacement}{}",
+        &LEVELS_ARCHIVAL[..at],
+        &LEVELS_ARCHIVAL[at + 1..]
+    );
+    u32::from(archival_level(LEVELS_ARCHIVAL) == Some(true) && archival_level(&tampered).is_none())
+}
+
 /// The signature answer for `token`, if its check completed with a matching
 /// imprint and, for a valid signature, retained evidence.
 fn check_token(token: &[u8]) -> Option<SignatureAnswer> {
@@ -76,6 +148,7 @@ fn check_token(token: &[u8]) -> Option<SignatureAnswer> {
         utc: &utc,
         reference: Some(Instant::new(1_800_000_000, 0)?),
         window: None,
+        policy_accuracy: None,
     };
     let checked = token
         .check(&cms, &parent, &context, &mut [TOKEN_PAYLOAD], |_, _| {

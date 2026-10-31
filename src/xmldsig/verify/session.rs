@@ -15,6 +15,7 @@ use structured_asn1::memory::{MemoryError, OwnedMap, OwnedText, OwnedVec, Work};
 
 mod detached;
 pub use detached::*;
+mod element;
 mod hash_uses;
 pub use hash_uses::*;
 mod key_info;
@@ -1100,35 +1101,6 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
         Ok(allowed)
     }
 
-    /// The timestamp's canonicalization method, after its URI passes the
-    /// operation's transform permission.
-    fn replay_timestamp_method<E>(
-        &self,
-        method: NodeIdentity,
-        allowed: Option<&BTreeSet<String>>,
-    ) -> Result<(crate::c14n::C14nAlgorithm, Option<&str>), ReplayError<E>> {
-        let processing = ReplayError::Processing;
-        let method = self
-            .session
-            .view
-            .resolve_node(method)
-            .map_err(|error| processing(error.into()))?;
-        let uri = method.attribute("Algorithm").ok_or_else(|| {
-            processing(DsigError::InvalidStructure {
-                reason: "timestamp method has no Algorithm",
-            })
-        })?;
-        self.work
-            .charge_work(uri.len() as u64)
-            .map_err(|error| processing(error.into()))?;
-        enforce_current_transform_allowed(allowed, uri, self.work).map_err(processing)?;
-        super::super::parse::parse_replay_canonicalization_method(
-            method,
-            &crate::c14n::scratch::Accounted(self.work),
-        )
-        .map_err(replay_parse_failure)
-    }
-
     fn replay_instruction<E>(
         &self,
         descriptor: &AuthenticatedReference<'_>,
@@ -1170,7 +1142,9 @@ impl<W: Work, Q: Work> SelectedSignature<'_, '_, '_, '_, W, Q> {
         }
         let timestamp = match mode {
             ReplayMode::ReferenceOutput => None,
-            ReplayMode::Timestamp(method) => Some(self.replay_timestamp_method(method, allowed)?),
+            ReplayMode::Timestamp(method) => {
+                Some(self.session.timestamp_method(method, allowed, self.work)?)
+            }
         };
         let budget = &self.session.budgets.transforms;
         let Some(data) = self.session.resolver.replay_input_from_with_budget(

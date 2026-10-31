@@ -15,7 +15,7 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 mod tests;
 
-const SIGNED_PROPERTIES: &str = "http://uri.etsi.org/01903#SignedProperties";
+pub(crate) const SIGNED_PROPERTIES: &str = "http://uri.etsi.org/01903#SignedProperties";
 const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 const SHA384: &str = "http://www.w3.org/2001/04/xmldsig-more#sha384";
 const MD5: &str = "http://www.w3.org/2001/04/xmldsig-more#md5";
@@ -61,6 +61,8 @@ pub(crate) struct Signature<'a> {
     pub(crate) target: &'a str,
     pub(crate) reference_type: &'a str,
     pub(crate) objects: String,
+    /// `DataObjectFormat` properties of further signed data objects.
+    pub(crate) formats: String,
     pub(crate) x509: &'a str,
     pub(crate) unsigned: String,
 }
@@ -80,6 +82,7 @@ impl Signature<'_> {
             target,
             reference_type,
             objects,
+            formats,
             x509,
             unsigned,
         } = self;
@@ -116,7 +119,7 @@ impl Signature<'_> {
         <xades:SignedDataObjectProperties>
           <xades:DataObjectFormat ObjectReference="#{id}-data">
             <xades:MimeType>{mime}</xades:MimeType>
-          </xades:DataObjectFormat>
+          </xades:DataObjectFormat>{formats}
         </xades:SignedDataObjectProperties>
       </xades:SignedProperties>
       {unsigned}
@@ -224,6 +227,8 @@ pub(crate) struct Generator {
     pub(crate) xmlsec: OsString,
     pub(crate) work: PathBuf,
     pub(crate) output: PathBuf,
+    /// Repeated payload elements of the level fixtures, for size measurements.
+    pub(crate) units: usize,
 }
 
 /// Fails unless `command` succeeds; its diagnostics stay on stderr.
@@ -239,7 +244,7 @@ fn succeed(mut command: Command, what: &str) -> Result<(), String> {
 }
 
 impl Generator {
-    fn openssl(&self, args: &[&str]) -> Result<(), String> {
+    pub(crate) fn openssl(&self, args: &[&str]) -> Result<(), String> {
         let mut command = Command::new("openssl");
         command
             .args(args)
@@ -314,7 +319,7 @@ impl Generator {
     }
 
     /// The DER encoding of `name.pem`.
-    fn der(&self, name: &str) -> Result<Vec<u8>, String> {
+    pub(crate) fn der(&self, name: &str) -> Result<Vec<u8>, String> {
         let output = Command::new("openssl")
             .args(["x509", "-in", &format!("{name}.pem"), "-outform", "DER"])
             .current_dir(&self.work)
@@ -346,7 +351,7 @@ impl Generator {
         Ok(output.stdout)
     }
 
-    fn digests(&self) -> Result<Digests, String> {
+    pub(crate) fn digests(&self) -> Result<Digests, String> {
         use sha2::Digest as _;
         let signer = self.der("signer")?;
         Ok(Digests {
@@ -358,7 +363,13 @@ impl Generator {
     }
 
     /// Signs the node with ID `node` of `input` into `result` with xmlsec1.
-    fn sign(&self, input: &str, result: &Path, node: &str, key: &str) -> Result<(), String> {
+    pub(crate) fn sign(
+        &self,
+        input: &str,
+        result: &Path,
+        node: &str,
+        key: &str,
+    ) -> Result<(), String> {
         let mut command = Command::new(&self.xmlsec);
         command
             .args(["--sign", "--lax-key-search", "--privkey-pem", key])
@@ -403,6 +414,7 @@ pub(crate) fn baseline<'a>(
         target: "#sig",
         reference_type,
         objects: String::new(),
+        formats: String::new(),
         x509: "<ds:X509Certificate/>",
         unsigned: String::new(),
     }
@@ -644,11 +656,24 @@ pub(crate) fn generate(generator: &Generator) -> Result<(), String> {
 }
 
 pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage = "usage: xades fixtures [--output DIR] [--work DIR]";
+    let usage = "usage: xades fixtures [--levels] [--units N] [--output DIR] [--work DIR]";
     let mut output = corpus.root.join("crates/xml-sec-xades/tests/fixtures");
     let mut work = None;
+    let mut levels = false;
+    let mut units = 0;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
+        if arg == "--levels" {
+            levels = true;
+            continue;
+        }
+        if arg == "--units" {
+            units = args
+                .next()
+                .and_then(|value| value.parse().ok())
+                .ok_or(usage)?;
+            continue;
+        }
         let value = super::absolute(args.next().ok_or(usage)?)?;
         match arg.as_str() {
             "--output" => output = value,
@@ -659,9 +684,14 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
     // Without --work the keys and templates are removed with the scratch directory.
     let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
     let work = work.unwrap_or_else(|| scratch.path().to_owned());
-    Ok(generate(&Generator {
+    let generator = Generator {
         xmlsec: corpus.xmlsec.clone(),
         work,
         output,
-    })?)
+        units,
+    };
+    if levels {
+        return Ok(super::levels::generate(&generator)?);
+    }
+    Ok(generate(&generator)?)
 }

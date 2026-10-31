@@ -5,27 +5,51 @@
 //! catalogue, scalar kernels, hash-use and selected-key receipts that the
 //! `XMLDSig` verification produced. No second XML representation is built and
 //! no signature is verified again. [`validate_basic`] runs the B-B checks of
-//! ETSI EN 319 132-1 for one selected signature.
+//! ETSI EN 319 132-1 for one selected signature, and [`validate`] any level up
+//! to B-LTA over the document's own timestamps and validation material.
 //!
-//! Certificate paths are the paths xml-sec already validated: the adapter
-//! selects the exact certificates recorded in each signature's X.509 trust
-//! evidence and re-checks them through the shared path processor with the
-//! operation's provider and certificate policy.
+//! Signer paths are the paths xml-sec already validated: the adapter selects
+//! the exact certificates recorded in each signature's X.509 trust evidence and
+//! re-checks them through the shared path processor with the operation's
+//! provider and certificate policy. Timestamp and revocation-authority paths
+//! end only at the caller's [`Inputs::anchors`].
+//!
+//! A level states what the document structurally carries. Its reports keep
+//! every status, including a revoked or stale one, so usability, chronology and
+//! trust stay the caller's reading of those facts. Nothing is fetched and no
+//! clock is read: statuses are evaluated at the operation's verification time.
+
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
 
 use structured_asn1::memory::{MemoryError, Work};
 use xml_sec::document::{DocumentIdentity, NodeIdentity};
 use xml_sec::xmldsig::extension::{ScalarError, TreeError};
 use xml_sec::xmldsig::{DsigError, VerifiedSession, X509ChainError};
 
+mod accuracy;
 mod basic;
 mod binary;
+mod level;
 mod path;
 mod signature;
+mod status;
 mod xml;
 
-pub use basic::{CounterError, Outcome, PathFailure, Report, ValidationError, validate_basic};
+pub use accuracy::AuthorityAccuracy;
+pub use basic::{
+    CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,
+    validate_basic,
+};
 pub use binary::DigestIdentity;
+pub use level::{
+    ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure, validate,
+};
 pub use path::CounterPathError;
+pub use status::{StatusError, StatusFailure};
+pub use structured_xades::timestamp::TokenProfile;
+pub use structured_xades::unsigned::Requirements;
 
 /// Original document identity and generation, as seen by the shared core.
 pub type Snapshot = structured_xades::xml::Snapshot<DocumentIdentity, u64>;

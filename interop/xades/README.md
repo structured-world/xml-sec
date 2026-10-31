@@ -64,7 +64,13 @@ There is no Rust self-sign/self-verify evidence in this package.
 | DSS signing-certificate digest check in ISC | failed | A matching root digest is counted despite no reference to the selected signer; see the focused investigation |
 | DSS missing Type classification | verified | DSS reports XAdES-BES rather than Baseline-B; Rust refuses SignedProperties binding |
 | Full XAdES/trust verdict from DSS | failed | All nine global outcomes are INDETERMINATE / CERTIFICATE_CHAIN_GENERAL_FAILURE; no revocation data was supplied |
-| B-T/B-LT/B-LTA, TSA/OCSP/CRL, EU Trusted Lists, legal qualification | not run or blocked | Outside this corpus; no such evidence or trust service inputs |
+| B-T/B-LT/B-LTA over a test PKI (`crates/xml-sec-xades/tests/fixtures/levels`) | verified | OpenSSL issues every token, CRL and OCSP response; `xades levels` compares DSS's format and indication on each fixture, `validate` reaches the same levels, detached, parallel and countersigned structures included |
+| RFC 3161 token without stated accuracy | verified | Rejected unless `Inputs::accuracies` states the accuracy of its authority and signed policy (RFC 3161 §2.4.2); a token's own field comes first |
+| Signatures produced by DSS 6.5.1 | verified | `xades levels` reads them at the DSS tag at run time, outside the repository: `xades-lta-valid` meets B-T and copied tokens are rejected. Its last archive TSA has no status in the document, so B-LT and B-LTA stop at `NoSource` (EN 319 132-1 §6.3(x)). `xades-t-with-tsvd` carries an unsorted certificate SET OF: `TokenProfile::Etsi` refuses it because an unmarked token is DER (§5.1.3), `TokenProfile::Cms` reads it as RFC 5652 BER |
+| OCSP responder outside the issuer | verified | Counts only as `Inputs::responders` configures it for that issuer (RFC 6960 §4.2.2.2) |
+| `RenewedDigestsV2` over a signed Manifest | verified | B-LTA with SHA-512 renewal of a SHA-256 Manifest reference; a wrong new digest or reference digest stops the level with `Outcome::Renewal` (EN 319 132-1 §5.5.3). No independent validator checked it |
+| Caller-supplied CRLs and OCSP responses | verified | They answer status but do not count as incorporated, so the level stays unmet |
+| EU Trusted Lists, legal qualification | not run or blocked | Outside this corpus; no such trust service inputs |
 | AL/SignedXml pipeline or direct Rust invocation from AL/SaaS | not run or blocked | No Business Central environment; no deployment assumption |
 
 Only the 100 independent libxmlsec1 `expected-reference-N.bin` and
@@ -98,7 +104,8 @@ XMLSEC1_BIN=/path/to/native/xmlsec1 cargo run -p xml-sec-tools -- xades check --
 
 This is the same entry point used by the required `XAdES interoperability corpus` CI job.
 It runs harness regressions, every retained signed fixture, both explicit here modes,
-authenticated replay, all independent octet vectors and default/strict DSS expectations.
+authenticated replay, all independent octet vectors, default/strict DSS expectations and
+DSS's verdict on the baseline-level fixtures.
 No part may skip on a missing oracle. The existing aggregate `test` job requires its success.
 CI publishes actual octets, hashes, first-difference diagnostics and full DSS reports as
 `xades-interop-results` run artifacts. It never updates fixtures or expectations.
@@ -161,9 +168,9 @@ cargo check -p xml-sec-xml-input --no-default-features --target thumbv7em-none-e
 cargo clean
 ```
 
-Core XMLDSig and the current XAdES adapter require std; passing XML-input alloc checks
-does not establish alloc-only XMLDSig/XAdES support. No production dependency or policy
-surface was changed. Probe memory/work ceilings are test execution accounts.
+The XAdES adapter builds without std; CI lints it on a bare-metal target and
+`wasm-smoke` executes B-LTA validation in the compiled module. Probe memory/work
+ceilings are test execution accounts.
 Generated `.tar.gz` bundles remain local artifacts; Git contains
 the reviewable sources, selected fixtures, independent expected bytes, expected conclusions and provenance.
 The full workspace CLI suite requires native libxmlsec1 1.3.13 and the pinned
@@ -232,8 +239,8 @@ certificate engine, C14N, transform or XAdES implementation. Existing work was i
   existing boundaries; this corpus does not close them.
 
 No duplicate backlog was created. Trust in this package means only the explicitly supplied
-synthetic root at the fixed test instant. No revocation, reliable signing time or legal
-qualification follows from that path or from `all_root_requirements_met()`.
+synthetic root at the fixed test instant. No legal qualification follows from that path
+or from `all_root_requirements_met()`.
 
 ## Intended collaboration
 

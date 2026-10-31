@@ -30,12 +30,6 @@ RustCrypto is bundled with the signature graph, not a separate Cargo feature
 named `rustcrypto`. Compiling an optional provider does not remove RustCrypto
 key/container codecs and does not make the whole build FIPS approved. There is
 no ordinary AWS-LC adapter and no missing-operation fallback between providers.
-The optional provider temporarily pins official `aws-lc-rs =1.18.2` and
-`aws-lc-fips-sys =0.14.3`: the newer sys release's bindgen dependency can resolve
-incompatible `syn`/`prettyplease` major versions. The direct optional sys
-dependency constrains published consumer resolution only; no sys API is used.
-This also defers newer AWS build/linking changes until a compatible update is
-qualified; it is not a fork or an additional provider.
 `legacy-algorithms` alone does not enable XMLDSig or XMLEnc. Canonicalization
 helpers remain available with an XML backend even without the `c14n` marker.
 `no-unsafe` and `embedded` are compatibility markers, not separate security modes.

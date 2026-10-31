@@ -2,10 +2,15 @@
 
 use crate::Error;
 use structured_asn1::Parser;
-use structured_asn1::memory::{HashWork, MemoryError, OwnedVec, Work};
+use structured_asn1::memory::{HashWork, Memory, MemoryError, OwnedVec, Work};
 use structured_ltv::pki::{CheckedPath, PathOutcome};
-use structured_pkix::Certificate;
-use structured_pkix::path::{Anchor, BuildError, Interval, Policy, Truncation, ValidationContext};
+use structured_pkix::path::{
+    Anchor, Bounds, BuildError, Context as PathContext, Interval, Policy, Truncation,
+    ValidationContext, Verified, Verify as PathVerify, WorkingKey,
+};
+use structured_pkix::signature::SignatureValue;
+use structured_pkix::temporal::Instant;
+use structured_pkix::{AlgorithmIdentifier, Certificate};
 use xml_sec::document::NodeIdentity;
 use xml_sec::xmldsig::extension::{self, NodeView};
 use xml_sec::xmldsig::{KeyTrustEvidence, VerifiedSession, X509ChainError, X509TrustEvidence};
@@ -114,6 +119,33 @@ pub(crate) fn key_info_certificates<W: Work, Q: Work>(
         }
     }
     Ok(decoded.into_owned())
+}
+
+/// The instant verification validated `signature`'s path at, if it did.
+pub(crate) fn verification_time(
+    signers: &[(NodeIdentity, &X509TrustEvidence)],
+    signature: NodeIdentity,
+) -> Option<Instant> {
+    signers
+        .iter()
+        .find(|(identity, _)| *identity == signature)
+        .map(|(_, evidence)| evidence.verification_time())
+}
+
+/// The decoded `KeyInfo` certificates followed by each of the caller's lists.
+pub(crate) fn candidates<'c, Q: Work>(
+    decoded: &'c [OwnedVec<u8>],
+    [first, second]: [&[&'c [u8]]; 2],
+    work: &Q,
+) -> Result<OwnedVec<&'c [u8], Q>, Error> {
+    let mut candidates = work.vector();
+    candidates.try_reserve_exact(decoded.len() + first.len() + second.len())?;
+    for bytes in decoded {
+        candidates.try_push(&bytes[..])?;
+    }
+    candidates.try_extend_from_slice(first)?;
+    candidates.try_extend_from_slice(second)?;
+    Ok(candidates)
 }
 
 fn children<W: Work, Q: Work>(
@@ -270,12 +302,16 @@ impl<'d> Paths<'d> {
 pub(crate) fn check<'d, W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     selection: &'d Selection<'d>,
+    (root, span): (NodeIdentity, Option<Interval>),
     work: &Q,
 ) -> Result<Paths<'d>, Error> {
     let mut entries = work.vector();
     for (signature, evidence, path) in &selection.signers {
+        let interval = span
+            .filter(|_| *signature == root)
+            .unwrap_or_else(|| Interval::at_instant(evidence.verification_time()));
         let outcome = match path {
-            Ok(path) => checked(session, &selection.certificates, evidence, path, work)?,
+            Ok(path) => checked(session, &selection.certificates, interval, path, work)?,
             Err(failure) => Err(*failure),
         };
         entries.try_push((*signature, outcome))?;
@@ -288,7 +324,7 @@ pub(crate) fn check<'d, W: Work, Q: Work>(
 fn checked<'d, W: Work, Q: Work>(
     session: &VerifiedSession<'_, '_, '_, W>,
     certificates: &'d [Certificate<'d>],
-    evidence: &X509TrustEvidence,
+    interval: Interval,
     path: &[usize],
     work: &Q,
 ) -> Result<Result<CheckedPath<'d>, PathFailure>, Error> {
@@ -302,18 +338,29 @@ fn checked<'d, W: Work, Q: Work>(
     for position in members {
         chain.try_push(&certificates[*position])?;
     }
-    let anchor = &certificates[*anchor];
-    let verifier = session.certificate_path_verifier(&chain, anchor);
+    check_chain(session, &chain, &certificates[*anchor], interval, work)
+}
+
+/// One leaf-first chain through the shared processor over `interval`, with the
+/// operation's provider, certificate policy and path bounds.
+pub(crate) fn check_chain<'d, W: Work, Q: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    chain: &[&'d Certificate<'d>],
+    anchor: &'d Certificate<'d>,
+    interval: Interval,
+    work: &Q,
+) -> Result<Result<CheckedPath<'d>, PathFailure>, Error> {
+    let verifier = session.certificate_path_verifier(chain, anchor);
     let context = ValidationContext {
         execution: work,
-        interval: Interval::at_instant(evidence.verification_time()),
+        interval,
         policy: Policy::default(),
         bounds: session.certificate_path_bounds(),
         verifier: &verifier,
         watch: &(),
         recognizer: &(),
     };
-    match structured_ltv::pki::check_path(&chain, Anchor::from_certificate(anchor), &context) {
+    match structured_ltv::pki::check_path(chain, Anchor::from_certificate(anchor), &context) {
         Ok(PathOutcome::Accepted(path)) => Ok(Ok(path)),
         Ok(PathOutcome::Rejected(_)) => Ok(Err(PathFailure::Rejected)),
         Ok(PathOutcome::Incomplete(reason)) => Ok(Err(PathFailure::Incomplete(reason))),
@@ -321,4 +368,80 @@ fn checked<'d, W: Work, Q: Work>(
         Err(BuildError::Verification(error)) => Err(error.into()),
         Err(BuildError::Recognition(never)) => match never {},
     }
+}
+
+/// Discovery answers which issuers name each other; it proves nothing.
+/// [`check_chain`] authenticates every edge of a candidate once, so a forged
+/// issuer can only cost its own path's rejection.
+struct Unverified;
+
+impl PathVerify for Unverified {
+    type Error = core::convert::Infallible;
+
+    fn verify(
+        &self,
+        _algorithm: &AlgorithmIdentifier<'_>,
+        _key: WorkingKey<'_>,
+        _signed: &[u8],
+        _signature: SignatureValue<'_>,
+        _execution: &Memory,
+    ) -> Result<Verified, Self::Error> {
+        Ok(Verified::Yes)
+    }
+}
+
+/// The caller's trust anchors, the certificates every issuer may come from
+/// and the account path work spends.
+pub(crate) struct Authorities<'d> {
+    pub(crate) anchors: &'d [Certificate<'d>],
+    /// `anchors` in the form path building takes, built once per validation.
+    pub(crate) anchored: &'d [Anchor<'d>],
+    pub(crate) pool: &'d [&'d Certificate<'d>],
+    pub(crate) responders: &'d [crate::level::ConfiguredResponder<'d>],
+    pub(crate) memory: &'d Memory,
+}
+
+/// The first candidate path from `target` to a caller anchor that the shared
+/// processor accepts over `interval`.
+pub(crate) fn discover<'d, W: Work>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    authorities: &Authorities<'d>,
+    target: &'d Certificate<'d>,
+    interval: Interval,
+) -> Result<Result<CheckedPath<'d>, PathFailure>, Error> {
+    let memory = authorities.memory;
+    let bounds = session.certificate_path_bounds();
+    let context = PathContext {
+        execution: memory,
+        anchors: authorities.anchored,
+        interval,
+        bounds: Bounds {
+            depth: bounds.depth,
+            work: bounds.work,
+            policies: bounds.policies,
+            ..Bounds::default()
+        },
+        policy: Policy::default(),
+        verifier: &Unverified,
+        watch: &(),
+        recognizer: &(),
+    };
+    let found = match structured_pkix::path::build(target, authorities.pool, &context) {
+        Ok(found) => found,
+        Err(BuildError::Processing(error)) => return Err(X509ChainError::Processing(error).into()),
+        Err(BuildError::Verification(never) | BuildError::Recognition(never)) => match never {},
+    };
+    let mut failure = found
+        .truncated()
+        .map_or(PathFailure::NotValidated, PathFailure::Incomplete);
+    for candidate in found.paths() {
+        let Some(anchor) = candidate.anchor().certificate() else {
+            continue;
+        };
+        match check_chain(session, candidate.certificates(), anchor, interval, memory)? {
+            Ok(path) => return Ok(Ok(path)),
+            Err(reason) => failure = reason,
+        }
+    }
+    Ok(Err(failure))
 }

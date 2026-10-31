@@ -144,6 +144,7 @@ fn template(corpus: &Corpus, fixtures: &Path, work: &Path) -> Result<String, Str
         xmlsec: corpus.xmlsec.clone(),
         work: work.to_owned(),
         output: fixtures.join("baseline"),
+        units: 0,
     })
     .map_err(|error| format!("baseline generator failed: {error}"))?;
     for name in ["signer.key", "signer.pem", "intermediate.pem"] {

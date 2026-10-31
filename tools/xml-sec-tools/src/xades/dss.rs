@@ -190,11 +190,8 @@ fn bootstrap(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         .map_err(|error| format!("unpack Maven: {error}"))
 }
 
-/// Builds the probe and validates every case with DSS.
-pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
-    if logs.exists() {
-        return Err("results already exist; select a fresh --results directory".into());
-    }
+/// Builds the probes against DSS, bootstrapping the pinned Maven once.
+pub(crate) fn build(corpus: &Corpus, logs: &Path) -> Result<(), String> {
     let tools = tools(corpus);
     std::fs::create_dir_all(&tools).map_err(|error| error.to_string())?;
     std::fs::create_dir_all(logs).map_err(|error| error.to_string())?;
@@ -228,6 +225,16 @@ pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
         &format!("-DoutputFile={}", logs.join("dependencies.json").display()),
     ]));
     corpus.require(&maven, &logs.join("dependencies"))?;
+    Ok(())
+}
+
+/// Builds the probe and validates every case with DSS.
+pub(crate) fn execute(corpus: &Corpus, logs: &Path) -> Result<(), String> {
+    if logs.exists() {
+        return Err("results already exist; select a fresh --results directory".into());
+    }
+    build(corpus, logs)?;
+    let package = corpus.package();
     let cases: Value = serde_json::from_str(&xml::read(&package.join("cases.json"))?)
         .map_err(|error| error.to_string())?;
     let classpath = classpath(corpus)?;

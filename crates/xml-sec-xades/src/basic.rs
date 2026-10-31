@@ -1,18 +1,38 @@
 //! The `XAdES` B-B pipeline for one verified signature.
 
+use crate::accuracy::{self, AuthorityAccuracy, Stated};
+use crate::level::{RenewalFailure, TimestampFailure, signature_span};
 use crate::path::{self, CounterPathError};
+use crate::status::{StatusError, StatusFailure};
 use crate::{Document, Error};
+use alloc::{boxed::Box, string::String};
+use core::convert::Infallible;
 use structured_asn1::memory::Work;
-use structured_xades::baseline::{self, Basic, BasicInput};
-use structured_xades::certificate::{self, KeyAssociation};
+use structured_asn1::{Parser, Reader};
+use structured_cms::content_source::ContentError;
+use structured_cms::timestamp::InfoError;
+use structured_ltv::baseline::{ArchiveCensusError, TimeError};
+use structured_ltv::material::IndexError;
+use structured_ltv::pki::{ParticipantClosureError, ParticipantError, TimestampBindingError};
+use structured_ltv::timestamp::{ObligationError, TemporalError};
+use structured_pkix::temporal::{Instant, LeapTable};
+use structured_xades::baseline::{self, Basic, BasicInput, LevelError};
+use structured_xades::certificate::{self, CheckedPathCertificate, KeyAssociation};
 use structured_xades::counter::{self, WalkError};
+use structured_xades::credential;
 use structured_xades::hashes::{self, HashError, ParticipantBinding, ParticipantProblem};
-use structured_xades::pki::{self, CounterSelectionError};
-use structured_xades::prepare;
+use structured_xades::material::PipelineError;
+use structured_xades::pki::{self, CounterPaths, CounterSelectionError};
+use structured_xades::prepare::{self, Prepared};
+use structured_xades::renewed;
+use structured_xades::timestamp::{
+    self, CarriedError, CounterTimestampError, RequirementError, TokenPipelineError, TokenProfile,
+};
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::{Access, Xml};
 use xml_sec::document::{DocumentIdentity, NodeIdentity};
 use xml_sec::xmldsig::VerifiedSession;
+use xml_sec::xmldsig::cms::CmsProviderError;
 
 pub use crate::path::PathFailure;
 
@@ -44,6 +64,27 @@ pub enum Outcome<R> {
     /// An original actor used MD5 or an unsupported or unprocessed hash
     /// (EN 319 132-1 §6.2.1).
     Hashes(ParticipantProblem<NodeIdentity>),
+    /// A timestamp token has no usable evidence for this request.
+    Timestamp {
+        /// Original timestamp property.
+        property: NodeIdentity,
+        /// Why the token proves nothing here.
+        failure: TimestampFailure,
+    },
+    /// A signed credential has no selected format handler.
+    Credential {
+        /// Original credential payload.
+        node: NodeIdentity,
+    },
+    /// A path member has no usable status input.
+    Status(StatusFailure),
+    /// A `RenewedDigestsV2` property does not confirm its detached object.
+    Renewal {
+        /// Original renewal property.
+        property: NodeIdentity,
+        /// Why it does not.
+        failure: RenewalFailure,
+    },
 }
 
 /// Countersignature traversal failure with the original selection cause.
@@ -81,7 +122,75 @@ pub enum ValidationError {
     /// The ASN.1 operation for binary values could not start.
     #[error("ASN.1 operation could not start: {0:?}")]
     Operation(structured_asn1::Error),
+    /// The stage reports do not describe the requested level.
+    #[error("baseline level assembly failed: {0:?}")]
+    Level(LevelError),
+    /// A countersignature's timestamp properties could not be read.
+    #[error("countersignature timestamps failed: {0:?}")]
+    Stamps(Box<CounterTimestampError<Error, NodeIdentity>>),
+    /// Original timestamp tokens could not be decoded.
+    #[error("timestamp tokens failed: {0:?}")]
+    Tokens(Box<TokenPipelineError<Error, Infallible, NodeIdentity, DocumentIdentity, u64>>),
+    /// Original validation material could not be decoded.
+    #[error("validation material failed: {0:?}")]
+    Material(Box<PipelineError<Error, Infallible, NodeIdentity, DocumentIdentity, u64>>),
+    /// A signature timestamp's generation time could not be read.
+    #[error("timestamp information failed: {0:?}")]
+    TokenInfo(Box<ContentError<InfoError<Infallible>>>),
+    /// A token's signer could not be compared with a certificate.
+    #[error("timestamp signer comparison failed: {0:?}")]
+    Token(structured_cms::directory::Error),
+    /// A timestamp check could not complete.
+    #[error("timestamp check failed: {0:?}")]
+    Timestamp(Box<TimestampCheckError>),
+    /// A token's generation interval could not be established.
+    #[error("timestamp generation interval failed: {0:?}")]
+    Time(TemporalError),
+    /// A token could not be bound to its checked path.
+    #[error("timestamp path binding failed: {0:?}")]
+    TimestampBinding(TimestampBindingError),
+    /// The document's timestamp obligations could not be derived.
+    #[error("timestamp requirements failed: {0:?}")]
+    Requirements(Box<RequirementError<Error, NodeIdentity>>),
+    /// The timestamp obligations could not be associated with their paths.
+    #[error("timestamp obligation failed: {0:?}")]
+    Obligation(ObligationError<NodeIdentity>),
+    /// The B-T association could not complete.
+    #[error("timestamp association failed: {0:?}")]
+    Timing(TimeError<NodeIdentity>),
+    /// A signed credential could not be processed.
+    #[error("credential processing failed: {0:?}")]
+    Credentials(Box<credential::Error<Error, Infallible, NodeIdentity>>),
+    /// The participant census could not be derived or linked.
+    #[error("participant census failed: {0:?}")]
+    Participants(ParticipantError<NodeIdentity>),
+    /// Material carried in a timestamp token could not be decoded.
+    #[error("carried token material failed: {0:?}")]
+    Carried(Box<CarriedError<NodeIdentity, DocumentIdentity, u64>>),
+    /// The artifact index could not be built.
+    #[error("artifact index failed: {0:?}")]
+    Index(IndexError<NodeIdentity>),
+    /// A path's status inputs could not be processed.
+    #[error("status processing failed: {0}")]
+    Status(Box<StatusError>),
+    /// The reachable status authorities could not be closed.
+    #[error("authority closure failed: {0:?}")]
+    Closure(ParticipantClosureError<NodeIdentity>),
+    /// Material presence or placement could not be assessed. The cause borrows
+    /// certificates of this scope, so its diagnostic is what remains of it.
+    #[error("validation material assessment failed: {0}")]
+    Placement(String),
+    /// The archive census could not be completed.
+    #[error("archive census failed: {0:?}")]
+    Archives(ArchiveCensusError<NodeIdentity>),
+    /// A `RenewedDigestsV2` property could not be processed.
+    #[error("renewed digest processing failed: {0:?}")]
+    Renewal(Box<renewed::CheckError<Error, Error, NodeIdentity, DocumentIdentity, u64>>),
 }
+
+/// A timestamp check that could not complete, with its original cause.
+pub type TimestampCheckError =
+    timestamp::CheckError<Error, NodeIdentity, DocumentIdentity, u64, CmsProviderError, Infallible>;
 
 /// Validate the B-B level (ETSI EN 319 132-1 §6.3) of `signature`.
 ///
@@ -109,12 +218,81 @@ pub fn validate_basic<W: Work, R>(
     certificates: &[&[u8]],
     visitor: impl for<'a> FnOnce(&Report<'a>) -> R,
 ) -> Result<Outcome<R>, ValidationError> {
+    with_stage(
+        session,
+        signature,
+        Requirements::Basic,
+        [certificates, &[]],
+        None,
+        |_, report| Ok(Outcome::Assessed(visitor(report))),
+    )
+}
+
+/// The inputs a higher level continues from, all of one verified signature.
+pub(crate) struct Stage<'a, 'view, 'scope, 'inputs, W: Work> {
+    pub(crate) session: &'a VerifiedSession<'view, 'scope, 'inputs, W>,
+    pub(crate) document: &'a Document<'a, 'view, 'scope, 'inputs, W>,
+    pub(crate) access: &'a Access<'a, Document<'a, 'view, 'scope, 'inputs, W>, W>,
+    pub(crate) prepared: &'a Prepared<Document<'a, 'view, 'scope, 'inputs, W>>,
+    pub(crate) counters: &'a CounterPaths<'a, 'a, NodeIdentity, DocumentIdentity, u64>,
+    pub(crate) certificate: &'a CheckedPathCertificate<'a, 'a, NodeIdentity, DocumentIdentity, u64>,
+    pub(crate) parser: &'a Parser,
+    pub(crate) operation: &'a Reader<'a>,
+    pub(crate) signer_time: Instant,
+    pub(crate) stated: &'a [Stated<'a>],
+    pub(crate) token_profile: TokenProfile,
+}
+
+/// What a level above B-B reads timestamp tokens with.
+#[derive(Clone, Copy)]
+pub(crate) struct Timing<'t> {
+    pub(crate) utc: &'t LeapTable<'t>,
+    pub(crate) accuracies: &'t [AuthorityAccuracy<'t>],
+    pub(crate) profile: TokenProfile,
+}
+
+/// The completed negative fact of a countersignature binding, or its refusal.
+fn counter_fact<R>(error: CounterError) -> Result<Outcome<R>, ValidationError> {
+    match error {
+        WalkError::Visitor(CounterSelectionError::Selection {
+            signature,
+            cause: CounterPathError::Missing(failure),
+        }) => Ok(Outcome::Path { signature, failure }),
+        WalkError::Visitor(CounterSelectionError::Differs { signature }) => {
+            Ok(Outcome::CounterKey {
+                signature,
+                association: KeyAssociation::Differs,
+            })
+        }
+        WalkError::Visitor(CounterSelectionError::Unproven { signature }) => {
+            Ok(Outcome::CounterKey {
+                signature,
+                association: KeyAssociation::Unproven,
+            })
+        }
+        error => Err(ValidationError::Counters(Box::new(error))),
+    }
+}
+
+/// Run the B-B pipeline for the requested structural level, then `then` over
+/// its assembled report. A completed negative fact stops before `then`.
+pub(crate) fn with_stage<W: Work, R>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: NodeIdentity,
+    requirements: Requirements,
+    certificates: [&[&[u8]]; 2],
+    timing: Option<Timing<'_>>,
+    then: impl for<'a> FnOnce(
+        &Stage<'a, '_, '_, '_, W>,
+        &Report<'a>,
+    ) -> Result<Outcome<R>, ValidationError>,
+) -> Result<Outcome<R>, ValidationError> {
     let work = session.execution();
     path::require_member(session, signature, work)?;
 
     let document = Document::new(session);
     let access = Access::new(&document, document.snapshot(), work);
-    let prepared = prepare::prepare(&access, signature, Requirements::Basic, None)
+    let prepared = prepare::prepare(&access, signature, requirements, None)
         .map_err(|error| ValidationError::Prepare(Box::new(error)))?;
     let fields = prepare::check_fields(&prepared, &access)
         .map_err(|error| ValidationError::Fields(Box::new(error)))?;
@@ -129,18 +307,20 @@ pub fn validate_basic<W: Work, R>(
     let x509 = parser.memory();
     let signers = path::signers(session, signature, &incorporated, x509)?;
     let decoded = path::key_info_certificates(session, &signers, x509)?;
-    let mut candidates = x509.vector();
-    candidates
-        .try_reserve_exact(decoded.len() + certificates.len())
-        .map_err(Error::from)?;
-    for bytes in &decoded {
-        candidates.try_push(&bytes[..]).map_err(Error::from)?;
-    }
-    for bytes in certificates {
-        candidates.try_push(*bytes).map_err(Error::from)?;
-    }
+    let candidates = path::candidates(&decoded, certificates, x509)?;
     let selection = path::select(&signers, &candidates, &parser, x509)?;
-    let paths = path::check(session, &selection, x509)?;
+    let operation = parser.read(&[], 0).map_err(ValidationError::Operation)?;
+    let verified_at = path::verification_time(&signers, signature);
+    let stated = accuracy::read(&parser, timing.map_or(&[], |timing| timing.accuracies))?;
+    let span = signature_span(
+        &document,
+        &prepared,
+        &operation,
+        &stated,
+        timing,
+        verified_at,
+    )?;
+    let paths = path::check(session, &selection, (signature, span), x509)?;
     let root = match paths.get(signature, x509) {
         Ok(root) => root,
         Err(CounterPathError::Missing(failure)) => {
@@ -149,29 +329,12 @@ pub fn validate_basic<W: Work, R>(
         Err(CounterPathError::Resource(cause)) => return Err(Error::from(cause).into()),
     };
 
-    let counters = match pki::bind_counters(prepared.bound(), &access, |binding, work| {
+    let bound = pki::bind_counters(prepared.bound(), &access, |binding, work| {
         paths.get(binding.original().child(), work)
-    }) {
+    });
+    let counters = match bound {
         Ok(counters) => counters,
-        Err(WalkError::Visitor(CounterSelectionError::Selection {
-            signature,
-            cause: CounterPathError::Missing(failure),
-        })) => {
-            return Ok(Outcome::Path { signature, failure });
-        }
-        Err(WalkError::Visitor(CounterSelectionError::Differs { signature })) => {
-            return Ok(Outcome::CounterKey {
-                signature,
-                association: KeyAssociation::Differs,
-            });
-        }
-        Err(WalkError::Visitor(CounterSelectionError::Unproven { signature })) => {
-            return Ok(Outcome::CounterKey {
-                signature,
-                association: KeyAssociation::Unproven,
-            });
-        }
-        Err(error) => return Err(ValidationError::Counters(Box::new(error))),
+        Err(error) => return counter_fact(error),
     };
     let hashes = match hashes::check_participants(&prepared, &counters, &access)
         .map_err(|error| ValidationError::Hashes(Box::new(error)))?
@@ -188,7 +351,6 @@ pub fn validate_basic<W: Work, R>(
         work,
     )
     .map_err(|error| ValidationError::Certificate(Box::new(error)))?;
-    let operation = parser.read(&[], 0).map_err(ValidationError::Operation)?;
     let report = baseline::basic(
         BasicInput {
             fields: &fields,
@@ -200,5 +362,21 @@ pub fn validate_basic<W: Work, R>(
         &operation,
     )
     .map_err(|error| ValidationError::Basic(Box::new(error)))?;
-    Ok(Outcome::Assessed(visitor(&report)))
+    then(
+        &Stage {
+            session,
+            document: &document,
+            access: &access,
+            prepared: &prepared,
+            counters: &counters,
+            certificate: &certificate,
+            parser: &parser,
+            operation: &operation,
+            signer_time: verified_at.expect("a checked root path has its trust evidence"),
+            stated: &stated,
+            // B-B reads no token, so this choice is never consulted there.
+            token_profile: timing.map_or(TokenProfile::Etsi, |timing| timing.profile),
+        },
+        &report,
+    )
 }
