@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/structured-world/xml-sec/compare/v0.3.0...v0.4.0) - 2026-10-31
+
+### Added
+
+- *(x509)* evaluate delta CRLs and cut verify overhead ([#350](https://github.com/structured-world/xml-sec/pull/350))
+- *(cms)* add CMS signature provider ([#343](https://github.com/structured-world/xml-sec/pull/343))
+- [**breaking**] build XMLDSig verification without std ([#331](https://github.com/structured-world/xml-sec/pull/331))
+- *(xmldsig)* expose KeyInfo candidates of verified signatures ([#329](https://github.com/structured-world/xml-sec/pull/329))
+- *(xmldsig)* [**breaking**] stream detached payloads into sessions ([#328](https://github.com/structured-world/xml-sec/pull/328))
+- *(xmldsig)* [**breaking**] verify the signature before references ([#326](https://github.com/structured-world/xml-sec/pull/326))
+
+### Fixed
+
+- *(interop)* stop pinning the XAdES corpus to a commit ([#337](https://github.com/structured-world/xml-sec/pull/337))
+
+### Performance
+
+- *(cli)* parse sign and verify input once ([#339](https://github.com/structured-world/xml-sec/pull/339))
+
 ## [0.3.0](https://github.com/structured-world/xml-sec/compare/v0.2.0...v0.3.0) - 2026-10-27
 
 ### Added
