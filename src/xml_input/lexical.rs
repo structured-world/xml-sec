@@ -317,9 +317,8 @@ impl<'a, S: Storage> Scanner<'a, S> {
     }
 
     /// Return a finished tag's attribute buffer for the next start tag.
-    pub fn recycle(&mut self, mut attributes: S::Attributes<'a>) {
-        attributes.clear();
-        self.spare_attributes = Some(attributes);
+    pub fn recycle(&mut self, attributes: S::Attributes<'a>) {
+        self.spare_attributes = attributes.into_reusable();
     }
 
     /// Return the next event, or `None` at end of input.

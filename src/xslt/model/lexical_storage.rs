@@ -100,8 +100,8 @@ impl Drop for Attributes<'_, '_> {
 }
 
 impl<'a, 's> AttributeBuffer<'a, Storage<'s>> for Attributes<'a, 's> {
-    fn clear(&mut self) {
-        self.values.clear();
+    fn into_reusable(self) -> Option<Self> {
+        None
     }
     fn push(&mut self, attribute: Attribute<'a>) -> Result<()> {
         if self.values.len() == self.values.capacity() {

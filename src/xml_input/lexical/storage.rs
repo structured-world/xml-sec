@@ -29,8 +29,11 @@ pub trait Storage: Copy {
 pub trait AttributeBuffer<'a, S: Storage>: Deref<Target = [Attribute<'a>]> + DerefMut {
     /// Append one borrowed attribute, admitting actual growth first.
     fn push(&mut self, attribute: Attribute<'a>) -> Result<(), S::Refusal>;
-    /// Forget the attributes, keeping the capacity.
-    fn clear(&mut self);
+    /// Empty the buffer for the next tag, or release it when its capacity
+    /// would stay charged against an operation's memory budget.
+    fn into_reusable(self) -> Option<Self>
+    where
+        Self: Sized;
     /// In-place ordering without a second allocation.
     fn sort(
         &mut self,
@@ -74,8 +77,10 @@ impl<'a, S: Storage<Refusal = TryReserveError>> AttributeBuffer<'a, S> for Vec<A
         Vec::push(self, attribute);
         Ok(())
     }
-    fn clear(&mut self) {
-        Vec::clear(self);
+    fn into_reusable(mut self) -> Option<Self> {
+        // No budget can refuse later work here, and capacity is bounded by the input.
+        Vec::clear(&mut self);
+        Some(self)
     }
     fn sort(
         &mut self,
