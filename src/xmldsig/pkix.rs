@@ -440,8 +440,7 @@ fn newest_delta<'b, 'r, 'a>(
     session: &CertificateSession,
 ) -> Result<Option<(usize, structured_pkix::crl::BoundDelta<'b, 'r, 'a>)>, X509ChainError> {
     use structured_pkix::crl::DeltaBinding;
-    let mut newest = None;
-    let mut newest_number = &[][..];
+    let mut newest: Option<(&AuthenticatedCrl<'r, 'a>, _)> = None;
     for candidate in lists.iter().filter(|list| list.delta) {
         let binding = base
             .proof
@@ -451,13 +450,19 @@ fn newest_delta<'b, 'r, 'a>(
             continue;
         };
         candidate.bound.set(true);
-        let number = crl_number(candidate, session)?;
-        if newest.is_none() || crl_number_after(number, newest_number) {
-            newest = Some((candidate.index, pair));
-            newest_number = number;
+        // Numbers are compared only when a second bound delta exists.
+        let newer = match &newest {
+            None => true,
+            Some((current, _)) => crl_number_after(
+                crl_number(candidate, session)?,
+                crl_number(current, session)?,
+            ),
+        };
+        if newer {
+            newest = Some((candidate, pair));
         }
     }
-    Ok(newest)
+    Ok(newest.map(|(list, pair)| (list.index, pair)))
 }
 
 /// Original `cRLNumber` content octets of a list `bind_delta` has validated.
@@ -672,8 +677,11 @@ fn delta_reasons<'a>(
     };
     validate_delta_window(&facts, delta, evaluation.index)?;
     validate_delta_entry(&facts, delta, utc, evaluation, session)?;
-    // The pair shares the base's scope; its facts expose reasons only through
-    // absence, which a not yet effective entry does not establish.
+    if let Some(absence) = facts.absence() {
+        return Ok(Some(absence.reasons()));
+    }
+    // The facts expose reasons only through absence, which a not yet effective
+    // entry does not establish; the pair shares the base's scope.
     match pair
         .base()
         .scope(target, execution)
