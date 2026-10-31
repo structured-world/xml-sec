@@ -19,7 +19,7 @@ use xml_sec::xmldsig::{
     DefaultKeyResolver, DsigStatus, FailureReason, KeyResolverConfig, VerificationRequest,
     VerifyContext, verify_signature_with_pem_key, with_verified_request,
 };
-use xml_sec_xades::{Inputs, Outcome, Requirements, TokenProfile, validate};
+use xml_sec_xades::{Inputs, Outcome, Requirements, validate};
 
 /// A donor SAML 2.0 response signed by its identity provider.
 const SIGNED_RESPONSE: &str = include_str!("../../fixtures/saml/response_signed_by_idp_ecdsa.xml");
@@ -80,7 +80,6 @@ fn archival_level(xml: &str) -> Option<bool> {
     with_verified_request(&document, &context, &request, &account, |session| {
         let inputs = Inputs {
             requirements: Requirements::Archival,
-            token_profile: TokenProfile::Etsi,
             anchors,
             certificates: &[],
             utc: &utc,

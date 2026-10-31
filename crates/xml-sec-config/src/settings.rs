@@ -1360,7 +1360,8 @@ fn direction(field: &str, old: Option<&Value>, new: Option<&Value>) -> Direction
                 | "Process"
                 | "RequireAuthenticatedCipher"
                 | "ExactOnly"
-                | "Forbidden",
+                | "Forbidden"
+                | "Declared",
             ),
         )
         | (Some("AllSupported"), Some("SecureSupported")) => Restrictive,
@@ -1576,6 +1577,23 @@ mod tests {
         );
         assert_eq!(
             direction(field, Some(&classical), Some(&default)),
+            Direction::Relaxing
+        );
+    }
+
+    #[test]
+    fn holding_timestamp_tokens_to_their_declared_encoding_is_restrictive() {
+        // Composition treats `Declared` as the stricter reading; a rollout
+        // report must not call the same change a relaxation.
+        let field = "verification.timestamp_token_encoding";
+        let declared = Value::String("Declared".into());
+        let ber = Value::String("Ber".into());
+        assert_eq!(
+            direction(field, Some(&ber), Some(&declared)),
+            Direction::Restrictive
+        );
+        assert_eq!(
+            direction(field, Some(&declared), Some(&ber)),
             Direction::Relaxing
         );
     }

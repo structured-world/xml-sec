@@ -1,5 +1,7 @@
 use super::signers;
-use std::sync::Arc;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use xml_sec::XmlDocument;
 use xml_sec::policy::{Instant, VerificationPolicy};
