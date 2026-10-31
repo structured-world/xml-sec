@@ -1,6 +1,7 @@
 //! Adapter-owned execution domain for the published ASN.1 and PKIX mechanisms.
 
 use alloc::{borrow::ToOwned, string::String, sync::Arc, vec::Vec};
+use core::cell::Cell;
 
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError, OwnedVec, Work};
 use structured_asn1::{Encoding, Limits, Parser};
@@ -280,8 +281,6 @@ pub(crate) fn verify_crls<'a>(
     provider: &dyn crate::provider::CryptoProvider,
     session: &'a CertificateSession,
 ) -> Result<(), X509ChainError> {
-    use structured_pkix::crl::{Authentication, AuthenticationFailure};
-    use structured_pkix::error::CallbackError;
     use structured_pkix::path::WorkingKey;
 
     if embedded.is_empty() && additional.is_empty() {
@@ -305,54 +304,19 @@ pub(crate) fn verify_crls<'a>(
         let issuer = &path[position + 1];
         let target = &path[position];
         let mut reasons = structured_pkix::crl::Reasons::NONE;
-        for (index, crl) in crls.iter().enumerate() {
-            if !crl
-                .tbs()
-                .issuer()
-                .matches(issuer.tbs().subject(), execution)
-                .map_err(|error| session.error(error))?
-            {
-                continue;
-            }
-            let identified = match crl_key_identifier_match(crl, issuer, session)? {
-                KeyIdentifierMatch::Mismatch => continue,
-                KeyIdentifierMatch::Identified => true,
-                KeyIdentifierMatch::Unidentified => false,
+        let lists = authenticated_crls(&crls, issuer, issuer_key, position, &verifier, session)?;
+        for list in lists.iter().filter(|list| !list.delta) {
+            let evaluation = CrlEvaluation {
+                utc: options.utc_facts.as_ref(),
+                now,
+                index: list.index,
+                position,
             };
-            let proof = crl
-                .authenticate(issuer, issuer_key, &verifier, execution)
-                .map_err(|error| match error {
-                    CallbackError::Processing(error) => session.error(error),
-                    CallbackError::Callback(error) => error,
-                })?;
-            let proof = match proof {
-                Authentication::Authenticated(proof) => proof,
-                Authentication::Rejected(AuthenticationFailure::KeyUsage) => {
-                    return Err(X509ChainError::InvalidKeyUsage {
-                        position: position + 1,
-                        required: "cRLSign",
-                    });
-                }
-                Authentication::Rejected(AuthenticationFailure::Signature) if !identified => {
-                    continue;
-                }
-                Authentication::Rejected(_) | Authentication::Unsupported => {
-                    return Err(X509ChainError::InvalidCrl(index));
-                }
+            let covered = match newest_delta(list, &lists, session)? {
+                Some((delta, pair)) => delta_reasons(pair, target, delta, evaluation, session)?,
+                None => crl_reasons(&list.proof, target, evaluation, session)?,
             };
-            let Some(covered) = crl_reasons(
-                &proof,
-                crl,
-                target,
-                CrlEvaluation {
-                    utc: options.utc_facts.as_ref(),
-                    now,
-                    index,
-                    position,
-                },
-                session,
-            )?
-            else {
+            let Some(covered) = covered else {
                 continue;
             };
             // RFC 5280 §6.3.3(d),(l): partial-list absence cannot establish
@@ -360,6 +324,17 @@ pub(crate) fn verify_crls<'a>(
             // target and operation time by construction; no new evidence pool.
             // https://www.rfc-editor.org/rfc/rfc5280#section-6.3.3
             reasons = reasons.union(covered);
+        }
+        for list in lists.iter().filter(|list| list.delta && !list.bound.get()) {
+            // A delta alone lists changes, not status (RFC 5280 §5.2.4), and it
+            // may carry a revocation, so an applicable unbound one fails closed.
+            let scope = list
+                .proof
+                .scope(target, execution)
+                .map_err(|error| session.error(error))?;
+            if matches!(scope, structured_pkix::crl::ScopeOutcome::Applicable(_)) {
+                return Err(X509ChainError::InvalidCrl(list.index));
+            }
         }
         // The existing policy validates supplied applicable lists, rather than
         // requiring callers to provide a list for every path certificate.
@@ -371,6 +346,170 @@ pub(crate) fn verify_crls<'a>(
             .map_err(|error| session.error(error))?;
     }
     Ok(())
+}
+
+/// One supplied list authenticated by the selected issuer key.
+struct AuthenticatedCrl<'r, 'a> {
+    /// Original embedded/inventory source index.
+    index: usize,
+    proof: structured_pkix::crl::Authenticated<'r, 'a>,
+    delta: bool,
+    /// A delta bound to some complete list of this issuer.
+    bound: Cell<bool>,
+}
+
+/// The supplied lists of `issuer` that its key authenticates. A same-name list
+/// of another key is skipped; a list naming this key must verify.
+fn authenticated_crls<'r, 'a>(
+    crls: &'r [structured_pkix::crl::CertificateList<'a>],
+    issuer: &'r Certificate<'a>,
+    issuer_key: structured_pkix::path::WorkingKey<'a>,
+    position: usize,
+    verifier: &ProviderVerifier<'_>,
+    session: &'r CertificateSession,
+) -> Result<OwnedVec<AuthenticatedCrl<'r, 'a>>, X509ChainError> {
+    use structured_pkix::crl::{Authentication, AuthenticationFailure};
+    use structured_pkix::error::CallbackError;
+    let execution = session.memory();
+    let mut lists = execution.vector();
+    for (index, crl) in crls.iter().enumerate() {
+        if !crl
+            .tbs()
+            .issuer()
+            .matches(issuer.tbs().subject(), execution)
+            .map_err(|error| session.error(error))?
+        {
+            continue;
+        }
+        let identified = match crl_key_identifier_match(crl, issuer, session)? {
+            KeyIdentifierMatch::Mismatch => continue,
+            KeyIdentifierMatch::Identified => true,
+            KeyIdentifierMatch::Unidentified => false,
+        };
+        let proof = crl
+            .authenticate(issuer, issuer_key, verifier, execution)
+            .map_err(|error| match error {
+                CallbackError::Processing(error) => session.error(error),
+                CallbackError::Callback(error) => error,
+            })?;
+        let proof = match proof {
+            Authentication::Authenticated(proof) => proof,
+            Authentication::Rejected(AuthenticationFailure::KeyUsage) => {
+                return Err(X509ChainError::InvalidKeyUsage {
+                    position: position + 1,
+                    required: "cRLSign",
+                });
+            }
+            Authentication::Rejected(AuthenticationFailure::Signature) if !identified => {
+                continue;
+            }
+            Authentication::Rejected(_) | Authentication::Unsupported => {
+                return Err(X509ChainError::InvalidCrl(index));
+            }
+        };
+        validate_crl_serials(crl, session)?;
+        let delta = crl
+            .tbs()
+            .extensions()
+            .get(structured_pkix::oid::DELTA_CRL_INDICATOR, execution)
+            .map_err(|error| session.error(error))?
+            .is_some();
+        lists
+            .try_push(AuthenticatedCrl {
+                index,
+                proof,
+                delta,
+                bound: Cell::new(false),
+            })
+            .map_err(|reason| {
+                session.error(structured_pkix::Error::resource(
+                    reason,
+                    "certificateList.pool",
+                    crl.span().start,
+                ))
+            })?;
+    }
+    Ok(lists.into_owned())
+}
+
+/// The newest delta bound to `base`, with its source index. Deltas accumulate
+/// from their base, so an older one is superseded and takes no part.
+fn newest_delta<'b, 'r, 'a>(
+    base: &'b AuthenticatedCrl<'r, 'a>,
+    lists: &'b [AuthenticatedCrl<'r, 'a>],
+    session: &CertificateSession,
+) -> Result<Option<(usize, structured_pkix::crl::BoundDelta<'b, 'r, 'a>)>, X509ChainError> {
+    use structured_pkix::crl::DeltaBinding;
+    let mut newest = None;
+    let mut newest_number = &[][..];
+    for candidate in lists.iter().filter(|list| list.delta) {
+        let binding = base
+            .proof
+            .bind_delta(&candidate.proof, session.memory())
+            .map_err(|error| session.error(error))?;
+        let DeltaBinding::Bound(pair) = binding else {
+            continue;
+        };
+        candidate.bound.set(true);
+        let number = crl_number(candidate, session)?;
+        if newest.is_none() || crl_number_after(number, newest_number) {
+            newest = Some((candidate.index, pair));
+            newest_number = number;
+        }
+    }
+    Ok(newest)
+}
+
+/// Original `cRLNumber` content octets of a list `bind_delta` has validated.
+fn crl_number<'a>(
+    list: &AuthenticatedCrl<'_, 'a>,
+    session: &CertificateSession,
+) -> Result<&'a [u8], X509ChainError> {
+    let execution = session.memory();
+    let crl = list.proof.crl();
+    let number = crl
+        .tbs()
+        .extensions()
+        .get(structured_pkix::oid::CRL_NUMBER, execution)
+        .map_err(|error| session.error(error))?
+        .ok_or(X509ChainError::InvalidCrl(list.index))?;
+    let integer = number
+        .reader_scoped(execution)
+        .and_then(|mut reader| reader.read_integer())
+        .map_err(|error| {
+            session.error(structured_pkix::Error::new(
+                structured_pkix::ErrorCode::Encoding(error.code()),
+                "extensions.cRLNumber",
+                error.offset(),
+            ))
+        })?;
+    execution
+        .charge_work(integer.as_bytes().len() as u64 + 1)
+        .map_err(|reason| {
+            session.error(structured_pkix::Error::resource(
+                reason,
+                "extensions.cRLNumber",
+                number.span().start,
+            ))
+        })?;
+    Ok(integer.as_bytes())
+}
+
+/// RFC 5280 §5.2.3: CRL numbers increase monotonically, so the larger integer
+/// is the newer list. `bind_delta` admitted both as nonnegative minimal DER.
+/// <https://www.rfc-editor.org/rfc/rfc5280#section-5.2.3>
+fn crl_number_after(left: &[u8], right: &[u8]) -> bool {
+    fn magnitude(bytes: &[u8]) -> &[u8] {
+        match bytes {
+            [0, rest @ ..] => rest,
+            all => all,
+        }
+    }
+    let (left, right) = (magnitude(left), magnitude(right));
+    left.len()
+        .cmp(&right.len())
+        .then_with(|| left.cmp(right))
+        .is_gt()
 }
 
 /// How a CRL's authority key identifier relates to a candidate issuer.
@@ -431,29 +570,39 @@ struct CrlEvaluation<'u> {
     position: usize,
 }
 
-/// Reason coverage an authenticated CRL contributes for `target`, or `None`
-/// when it does not apply. Revocation and unusable lists are errors.
+/// The caller's UTC history, a fact and no implicit clock/table default: `None`
+/// when the list does not apply anyway, so that absence costs nothing.
+fn required_utc<'u, 'a>(
+    proof: &structured_pkix::crl::Authenticated<'_, 'a>,
+    target: &'a Certificate<'a>,
+    evaluation: CrlEvaluation<'u>,
+    session: &CertificateSession,
+) -> Result<Option<&'u structured_pkix::temporal::LeapTable<'u>>, X509ChainError> {
+    use structured_pkix::crl::ScopeOutcome;
+    if evaluation.utc.is_some() {
+        return Ok(evaluation.utc);
+    }
+    match proof
+        .scope(target, session.memory())
+        .map_err(|error| session.error(error))?
+    {
+        ScopeOutcome::NotApplicable(_) => Ok(None),
+        ScopeOutcome::Applicable(_) => Err(X509ChainError::MissingUtcFacts),
+    }
+}
+
+/// Reason coverage an authenticated complete CRL contributes for `target`, or
+/// `None` when it does not apply. Revocation and unusable lists are errors.
 fn crl_reasons<'a>(
     proof: &structured_pkix::crl::Authenticated<'_, 'a>,
-    crl: &structured_pkix::crl::CertificateList<'_>,
     target: &'a Certificate<'a>,
     evaluation: CrlEvaluation<'_>,
     session: &CertificateSession,
 ) -> Result<Option<structured_pkix::crl::Reasons>, X509ChainError> {
-    use structured_pkix::crl::{CompleteEvidence, Evaluation, ScopeOutcome, SourceOrigin};
+    use structured_pkix::crl::{CompleteEvidence, Evaluation, SourceOrigin};
     let execution = session.memory();
-    validate_crl_serials(crl, session)?;
-    // UTC history is a caller fact, not an implicit clock/table default.
-    let Some(utc) = evaluation.utc else {
-        if matches!(
-            proof
-                .scope(target, execution)
-                .map_err(|error| session.error(error))?,
-            ScopeOutcome::NotApplicable(_)
-        ) {
-            return Ok(None);
-        }
-        return Err(X509ChainError::MissingUtcFacts);
+    let Some(utc) = required_utc(proof, target, evaluation, session)? else {
+        return Ok(None);
     };
     let evidence = proof
         .evaluate(
@@ -485,10 +634,141 @@ fn crl_reasons<'a>(
         session.error(structured_pkix::Error::resource(
             reason,
             "certificateList.reasons",
-            crl.span().start,
+            proof.crl().span().start,
         ))
     })?;
     Ok(Some(facts.reasons()))
+}
+
+/// Reason coverage a bound complete-plus-delta pair contributes for `target`,
+/// or `None` when it does not apply. `evaluation.index` names the complete list
+/// and `delta` the updating one.
+fn delta_reasons<'a>(
+    pair: structured_pkix::crl::BoundDelta<'_, '_, 'a>,
+    target: &'a Certificate<'a>,
+    delta: usize,
+    evaluation: CrlEvaluation<'_>,
+    session: &CertificateSession,
+) -> Result<Option<structured_pkix::crl::Reasons>, X509ChainError> {
+    use structured_pkix::crl::{DeltaEvidence, Evaluation, ScopeOutcome, SourceOrigin};
+    let execution = session.memory();
+    let Some(utc) = required_utc(pair.base(), target, evaluation, session)? else {
+        return Ok(None);
+    };
+    let evidence = pair
+        .evaluate(
+            target,
+            &Evaluation {
+                now: evaluation.now,
+                utc,
+                execution,
+                origin: SourceOrigin::Cached,
+            },
+        )
+        .map_err(|error| session.error(error))?;
+    let facts = match evidence {
+        DeltaEvidence::Facts(facts) => facts,
+        DeltaEvidence::NotApplicable(_) => return Ok(None),
+    };
+    validate_delta_window(&facts, delta, evaluation.index)?;
+    validate_delta_entry(&facts, delta, utc, evaluation, session)?;
+    // The pair shares the base's scope; its facts expose reasons only through
+    // absence, which a not yet effective entry does not establish.
+    match pair
+        .base()
+        .scope(target, execution)
+        .map_err(|error| session.error(error))?
+    {
+        ScopeOutcome::Applicable(reasons) => Ok(Some(reasons)),
+        ScopeOutcome::NotApplicable(_) => Ok(None),
+    }
+}
+
+/// RFC 5280 §5.2.4: the delta's window governs the combined list. An expired
+/// complete list stays usable under it, one not yet valid does not.
+/// <https://www.rfc-editor.org/rfc/rfc5280#section-5.2.4>
+fn validate_delta_window(
+    facts: &structured_pkix::crl::DeltaFacts<'_, '_, '_>,
+    delta: usize,
+    base: usize,
+) -> Result<(), X509ChainError> {
+    use structured_pkix::crl::Freshness;
+    match facts.delta_freshness() {
+        Freshness::Current | Freshness::AtNextUpdate => (),
+        Freshness::Uncertain(reason) => {
+            return Err(X509ChainError::CrlTimeUncertain {
+                index: delta,
+                reason,
+            });
+        }
+        _ => return Err(X509ChainError::InvalidCrl(delta)),
+    }
+    match facts.base_freshness() {
+        Freshness::Uncertain(reason) => Err(X509ChainError::CrlTimeUncertain {
+            index: base,
+            reason,
+        }),
+        Freshness::NotYetCurrent | Freshness::InvalidUpdateOrder => {
+            Err(X509ChainError::InvalidCrl(base))
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_delta_entry(
+    facts: &structured_pkix::crl::DeltaFacts<'_, '_, '_>,
+    delta: usize,
+    utc: &structured_pkix::temporal::LeapTable<'_>,
+    evaluation: CrlEvaluation<'_>,
+    session: &CertificateSession,
+) -> Result<(), X509ChainError> {
+    use structured_pkix::crl::{CombinedEntry, EntryOrigin};
+    let source = |origin| match origin {
+        EntryOrigin::Complete => evaluation.index,
+        EntryOrigin::Delta => delta,
+    };
+    match *facts.entry() {
+        CombinedEntry::Absent | CombinedEntry::Removed { .. } => Ok(()),
+        CombinedEntry::Revoked { origin, entry, .. } => revocation_in_effect(
+            entry,
+            source(origin),
+            RevocationCheck {
+                now: evaluation.now,
+                utc,
+                position: evaluation.position,
+            },
+            session,
+        ),
+        CombinedEntry::Conflict { origin, .. } | CombinedEntry::Unsupported { origin, .. } => {
+            Err(X509ChainError::InvalidCrl(source(origin)))
+        }
+    }
+}
+
+/// The instant and path member a found revocation entry is checked against.
+#[derive(Clone, Copy)]
+struct RevocationCheck<'u> {
+    now: structured_pkix::temporal::Reading,
+    utc: &'u structured_pkix::temporal::LeapTable<'u>,
+    position: usize,
+}
+
+/// An entry revokes from its date on; a later date is not yet in effect.
+fn revocation_in_effect(
+    entry: &structured_pkix::crl::RevokedCertificate<'_>,
+    index: usize,
+    check: RevocationCheck<'_>,
+    session: &CertificateSession,
+) -> Result<(), X509ChainError> {
+    use structured_pkix::time::Relation;
+    match entry
+        .time_relation(check.now, check.utc, session.memory())
+        .map_err(|error| session.error(error))?
+    {
+        Relation::Before | Relation::At => Err(X509ChainError::Revoked(check.position)),
+        Relation::After => Ok(()),
+        Relation::Uncertain(reason) => Err(X509ChainError::CrlTimeUncertain { index, reason }),
+    }
 }
 
 fn read_crl_pool<'a>(
@@ -525,7 +805,6 @@ fn validate_complete_crl(
     position: usize,
 ) -> Result<(), X509ChainError> {
     use structured_pkix::crl::{EntryLookup, Freshness};
-    use structured_pkix::time::Relation;
     match facts.freshness() {
         Freshness::Current | Freshness::AtNextUpdate => (),
         Freshness::Uncertain(reason) => {
@@ -536,16 +815,12 @@ fn validate_complete_crl(
     match facts.entry() {
         EntryLookup::Absent => (),
         EntryLookup::Found(entry) => {
-            match entry
-                .time_relation(now, utc, session.memory())
-                .map_err(|error| session.error(error))?
-            {
-                Relation::Before | Relation::At => return Err(X509ChainError::Revoked(position)),
-                Relation::After => (),
-                Relation::Uncertain(reason) => {
-                    return Err(X509ChainError::CrlTimeUncertain { index, reason });
-                }
-            }
+            revocation_in_effect(
+                entry,
+                index,
+                RevocationCheck { now, utc, position },
+                session,
+            )?;
         }
         EntryLookup::Conflict { .. } | EntryLookup::Unsupported { .. } => {
             return Err(X509ChainError::InvalidCrl(index));
