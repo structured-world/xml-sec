@@ -30,7 +30,7 @@ include = [
     "!/tests/capability_ledger.rs",
     "!/tests/donor_negative_vectors.rs",
     "!/tests/opc_relationship_transform.rs",
-    "!/tests/xmlsec1_interop.rs",
+    "!/tests/xmlsec1_donor_interop.rs",
     "/compatibility/**",
     "/scripts/**",
 ]
@@ -225,6 +225,11 @@ opt-level = 2
 [[test]]
 name = "xmlsec1_interop"
 path = "tests/xmlsec1_interop.rs"
+required-features = ["xmldsig-sign", "c14n"]
+
+[[test]]
+name = "xmlsec1_donor_interop"
+path = "tests/xmlsec1_donor_interop.rs"
 required-features = ["xmldsig-sign", "c14n"]
 
 [[test]]
