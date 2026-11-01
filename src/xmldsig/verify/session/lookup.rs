@@ -36,14 +36,17 @@ pub struct SessionDigest<'p> {
 }
 
 impl<'p> SessionDigest<'p> {
-    /// Start `algorithm` on `provider` once `policy` permits it.
-    pub(crate) fn begin(
+    /// Start `algorithm` on `provider` once `policy` permits it, admitting the
+    /// state's creation and storage in `work`. The state keeps its charge.
+    pub(crate) fn begin<Q: Work>(
         provider: &'p dyn crate::provider::CryptoProvider,
         policy: &crate::policy::VerificationPolicy,
         algorithm: DigestAlgorithm,
+        work: &Q,
     ) -> Result<Self, DsigError> {
         policy.check_digest_algorithm(algorithm)?;
-        let state = super::super::super::digest::begin_digest(provider, algorithm)
+        work.charge_work(1)?;
+        let state = super::super::super::digest::begin_digest(provider, algorithm, work.memory())
             .map_err(DsigError::from)?;
         Ok(Self { algorithm, state })
     }
@@ -64,14 +67,13 @@ impl<'p> SessionDigest<'p> {
         self.state.update(data).map_err(DsigError::from)
     }
 
-    /// Write the digest into an exactly sized caller buffer. Admit finalization
-    /// work and the provider's temporary output before invoking it; the caller
-    /// can keep an inline output without another heap allocation.
+    /// Write the digest into an exactly sized caller buffer, admitting
+    /// finalization work first. The output is inline, so nothing is allocated.
     ///
     /// # Errors
-    /// Returns an error for the wrong output width, refused work or temporary
-    /// capacity, provider finalization failure, or an invalid provider output size.
-    pub fn finish<Q: Work>(self, output: &mut [u8], work: &Q) -> Result<(), DsigError> {
+    /// Returns an error for the wrong output width, refused work, provider
+    /// finalization failure, or an invalid provider output size.
+    pub fn finish<Q: Work>(mut self, output: &mut [u8], work: &Q) -> Result<(), DsigError> {
         let width = self.algorithm.output_len();
         if output.len() != width {
             return Err(DsigError::InvalidRequest {
@@ -79,11 +81,24 @@ impl<'p> SessionDigest<'p> {
             });
         }
         work.charge_work(width as u64)?;
-        let _temporary = work.memory().reserve(width)?;
-        let digest = super::super::super::digest::finish_digest(self.algorithm, self.state)
+        let digest = super::super::super::digest::finish_digest(self.algorithm, &mut *self.state)
             .map_err(DsigError::from)?;
         output.copy_from_slice(&digest);
         Ok(())
+    }
+
+    /// Finish into an inline output of this digest's width.
+    ///
+    /// # Errors
+    /// Returns refused work, provider finalization failure, or an invalid
+    /// provider output size.
+    pub fn finish_output<Q: Work>(
+        mut self,
+        work: &Q,
+    ) -> Result<crate::xmldsig::DigestOutput, DsigError> {
+        work.charge_work(self.algorithm.output_len() as u64)?;
+        super::super::super::digest::finish_digest(self.algorithm, &mut *self.state)
+            .map_err(DsigError::from)
     }
 }
 
@@ -167,13 +182,18 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
     }
 
     /// Start an incremental digest with the selected provider under the
-    /// compiled digest policy.
+    /// compiled digest policy, its state charged to `work` for its whole life.
     ///
     /// # Errors
     /// Returns an error for a digest denied by policy, an unavailable provider
-    /// capability, or failure to create the provider's incremental state.
-    pub fn begin_digest(&self, algorithm: DigestAlgorithm) -> Result<SessionDigest<'_>, DsigError> {
-        SessionDigest::begin(self.context.provider, &self.context.policy, algorithm)
+    /// capability, a resource refusal, or failure to create the provider's
+    /// incremental state.
+    pub fn begin_digest<Q: Work>(
+        &self,
+        algorithm: DigestAlgorithm,
+        work: &Q,
+    ) -> Result<SessionDigest<'_>, DsigError> {
+        SessionDigest::begin(self.context.provider, &self.context.policy, algorithm, work)
     }
 
     /// CMS and RFC 3161 signature checks through this operation's provider,
@@ -254,19 +274,22 @@ mod digest_admission_tests {
         fn update(&mut self, _: &[u8]) -> Result<(), crate::provider::ProviderError> {
             Ok(())
         }
-        fn finalize(self: Box<Self>) -> Result<Vec<u8>, crate::provider::ProviderError> {
+        fn finalize(
+            &mut self,
+            _: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+        ) -> Result<usize, crate::provider::ProviderError> {
             self.0.set(true);
-            Ok(vec![0; 32])
+            Ok(32)
         }
     }
 
     #[test]
     fn digest_refusals_never_enter_provider_finalize() {
-        // Wrong output shape and both admission axes fail before the backend,
-        // and a temporary output reservation is released on every path.
-        for (capacity, work, width) in [(31, 100, 32), (32, 31, 32), (32, 100, 31), (32, 100, 32)] {
+        // Wrong output shape and spent work fail before the backend. The output
+        // is inline, so no storage is needed and an empty account suffices.
+        for (work, width) in [(31, 32), (100, 31), (100, 32)] {
             let memory = structured_asn1::memory::Memory::new(std::sync::Arc::new(
-                structured_asn1::memory::MemoryAccount::new(capacity, work),
+                structured_asn1::memory::MemoryAccount::new(0, work),
             ));
             let called = Cell::new(false);
             let state = SessionDigest {
@@ -275,10 +298,112 @@ mod digest_admission_tests {
             };
             let mut output = [0; 32];
             let result = state.finish(&mut output[..width], &memory);
-            let admitted = capacity == 32 && work == 100 && width == 32;
+            let admitted = work == 100 && width == 32;
             assert_eq!(result.is_ok(), admitted, "{result:?}");
             assert_eq!(called.get(), admitted);
             assert_eq!(memory.used(), 0);
         }
+    }
+
+    fn account(capacity: usize, work: usize) -> structured_asn1::memory::Memory {
+        structured_asn1::memory::Memory::new(std::sync::Arc::new(
+            structured_asn1::memory::MemoryAccount::new(capacity, work),
+        ))
+    }
+
+    fn begin(
+        memory: &structured_asn1::memory::Memory,
+    ) -> Result<SessionDigest<'static>, DsigError> {
+        SessionDigest::begin(
+            crate::provider::default_provider(),
+            &crate::policy::VerificationPolicy::default(),
+            DigestAlgorithm::Sha256,
+            memory,
+        )
+    }
+
+    #[test]
+    fn a_state_that_does_not_fit_is_refused_before_it_exists() {
+        // A resource cause, not an unsupported capability or a mismatch.
+        for (capacity, work, expected) in [
+            (0, 100, MemoryError::LimitExceeded),
+            (1 << 20, 0, MemoryError::WorkExceeded),
+        ] {
+            let memory = account(capacity, work);
+            let failure = begin(&memory).err().expect("the account refuses");
+            let resource = match failure {
+                DsigError::Provider(crate::provider::ProviderError::Resource(cause))
+                | DsigError::SharedExecution(cause) => cause,
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(resource, expected);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn a_state_keeps_its_charge_until_it_is_gone() {
+        // On success and on drop alike, and its whole block, not its output width.
+        let memory = account(1 << 20, 1 << 20);
+        let state = begin(&memory).expect("admitted");
+        let held = memory.used();
+        assert!(held > 32, "{held}");
+        let mut output = [0; 32];
+        state.finish(&mut output, &memory).expect("finished");
+        assert_eq!(memory.used(), 0);
+        drop(begin(&memory).expect("admitted"));
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[test]
+    fn exactly_the_state_size_is_enough() {
+        let measured = account(1 << 20, 1 << 20);
+        let state = begin(&measured).expect("admitted");
+        let exact = measured.used();
+        drop(state);
+        begin(&account(exact, 100)).expect("the block fits exactly");
+        assert!(begin(&account(exact - 1, 100)).is_err());
+    }
+
+    #[test]
+    fn chunk_boundaries_do_not_change_the_digest() {
+        let memory = account(1 << 20, 1 << 20);
+        let message = b"the same bytes in any number of updates";
+        let mut whole = begin(&memory).expect("admitted");
+        whole.update(message, &memory).expect("absorbed");
+        let whole = whole.finish_output(&memory).expect("finished");
+        for split in 0..=message.len() {
+            let mut parts = begin(&memory).expect("admitted");
+            let (left, right) = message.split_at(split);
+            parts.update(left, &memory).expect("absorbed");
+            parts.update(right, &memory).expect("absorbed");
+            let parts = parts.finish_output(&memory).expect("finished");
+            assert_eq!(&*parts, &*whole);
+        }
+        let one_shot = crate::xmldsig::compute_digest_with_provider(
+            crate::provider::default_provider(),
+            DigestAlgorithm::Sha256,
+            message,
+            &memory,
+        )
+        .expect("digested");
+        assert_eq!(&*one_shot, &*whole);
+    }
+
+    #[test]
+    fn the_one_shot_refuses_like_the_stream() {
+        let memory = account(0, 100);
+        assert_eq!(
+            crate::xmldsig::compute_digest_with_provider(
+                crate::provider::default_provider(),
+                DigestAlgorithm::Sha256,
+                b"",
+                &memory,
+            )
+            .err(),
+            Some(crate::provider::ProviderError::Resource(
+                MemoryError::LimitExceeded
+            ))
+        );
     }
 }

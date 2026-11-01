@@ -89,8 +89,9 @@ impl CryptoProvider for RecordingProvider {
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn xml_sec::provider::DigestState + '_>, ProviderError> {
-        RUST_CRYPTO_PROVIDER.begin_digest(algorithm)
+        RUST_CRYPTO_PROVIDER.begin_digest(algorithm, memory)
     }
     fn sign(
         &self,

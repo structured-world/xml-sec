@@ -154,6 +154,8 @@ pub(crate) struct TransformExecutionBudget {
     xml_parse_settings: DocumentParseSettings,
     state: TransformChainState,
     opc_workspace: relationship::WorkspaceBudget,
+    /// Holds the one live digest state of each Reference this budget runs.
+    digest_memory: structured_asn1::memory::Memory,
     #[cfg(feature = "xslt")]
     xslt: Rc<xslt::Allowance>,
 }
@@ -370,6 +372,7 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
+            digest_memory: super::digest::digest_memory(),
             #[cfg(feature = "xslt")]
             xslt: Rc::default(),
         }
@@ -392,6 +395,7 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::default(),
+            digest_memory: super::digest::digest_memory(),
             #[cfg(feature = "xslt")]
             xslt: Rc::default(),
         }
@@ -411,6 +415,7 @@ impl TransformExecutionBudget {
             ),
             xml_parse_settings: DocumentParseSettings::default(),
             state: TransformChainState::default(),
+            digest_memory: super::digest::digest_memory(),
             #[cfg(feature = "xslt")]
             xslt: Rc::default(),
         }
@@ -450,6 +455,7 @@ impl TransformExecutionBudget {
             xml_parse_settings: DocumentParseSettings::for_transform_output(resources),
             state: TransformChainState::default(),
             opc_workspace: relationship::WorkspaceBudget::new(resources.max_opc_workspace_bytes),
+            digest_memory: super::digest::digest_memory(),
             #[cfg(feature = "xslt")]
             xslt: Rc::new(xslt::Allowance::new(resources)),
         }
@@ -1866,7 +1872,7 @@ impl TransformTerminal<Native> for DiscardTerminal {
 
 /// Digest of one Reference's final transform output.
 pub(crate) struct ReferenceDigest {
-    pub(crate) digest: Vec<u8>,
+    pub(crate) digest: super::DigestOutput,
     /// The hashed bytes, kept only when the caller asked for them.
     pub(crate) pre_digest: Option<Vec<u8>>,
 }
@@ -1949,11 +1955,11 @@ impl<'p> DigestWriter<'p> {
     fn finish(
         mut self,
         algorithm: super::DigestAlgorithm,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), crate::provider::ProviderError> {
+    ) -> Result<(super::DigestOutput, Option<Vec<u8>>), crate::provider::ProviderError> {
         if self.pending > 0 {
             self.state.update(&self.block[..self.pending])?;
         }
-        let digest = super::digest::finish_digest(algorithm, self.state)?;
+        let digest = super::digest::finish_digest(algorithm, &mut *self.state)?;
         Ok((digest, self.retained))
     }
 }
@@ -1988,7 +1994,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             retain_pre_digest,
         } = self.0;
         let mut sink = DigestWriter::new(
-            super::digest::begin_digest(provider, algorithm)
+            super::digest::begin_digest(provider, algorithm, &budget.digest_memory)
                 .map_err(ReferenceDigestError::Provider)?,
             retain_pre_digest,
         );
@@ -2042,7 +2048,7 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
             retain_pre_digest,
         } = self.0;
         let mut sink = DigestWriter::new(
-            super::digest::begin_digest(provider, algorithm)
+            super::digest::begin_digest(provider, algorithm, &budget.digest_memory)
                 .map_err(ReferenceDigestError::Provider)?,
             retain_pre_digest,
         );

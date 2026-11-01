@@ -2,23 +2,28 @@
 
 #![cfg(feature = "xmldsig-sign")]
 
+#[path = "support/refusing_state.rs"]
+mod refusing_state;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
+use refusing_state::RefusingStateProvider;
 use sha2::{Digest, Sha256};
-use structured_asn1::memory::{Memory, MemoryAccount};
+use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{
     DetachedDigestAttestation, ManifestProcessing, PolicyViolation, SigningPolicy,
     VerificationPolicy,
 };
+use xml_sec::provider::ProviderError;
 use xml_sec::xmldsig::{
     DetachedChain, DetachedCompletion, DigestAlgorithm, DsigError, DsigStatus, ExternalPayload,
-    FailureReason, HmacSigningKey, HmacVerificationKey, ReferenceBuilder, ReferenceResult,
-    SignContext, SignatureAlgorithm, SignatureBuilder, Transform, UriTypeSet, VerificationRequest,
-    VerifiedSession, VerifyContext, with_verified_request,
+    FailureReason, HmacSigningKey, HmacVerificationKey, ReferenceBuilder, ReferenceProcessingError,
+    ReferenceResult, SignContext, SignatureAlgorithm, SignatureBuilder, Transform, UriTypeSet,
+    VerificationRequest, VerifiedSession, VerifyContext, with_verified_request,
 };
 
 const SECRET: [u8; 32] = [0x5a; 32];
@@ -747,12 +752,9 @@ fn invalid_payload_requests_are_rejected_before_any_byte() {
     });
 }
 
-#[test]
-fn completing_core_validation_processes_the_authenticated_manifest() {
-    // While a SignedInfo Reference is unavailable, core validation has failed
-    // and Manifests are unparsed. Completing it processes them as verification
-    // would (XMLDSig 1.1 §3.2), instead of leaving an empty Manifest list.
-    let payload = b"detached part";
+/// A signature whose `SignedInfo` covers `payload` by a detached Reference and
+/// an authenticated Manifest.
+fn manifest_document(payload: &[u8]) -> XmlDocument {
     let digest = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(payload));
     let template = format!(
         r##"<root xml:base="https://example.test/data/"><item Id="item">manifest target</item><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="part.bin"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#item"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
@@ -768,7 +770,114 @@ fn completing_core_validation_processes_the_authenticated_manifest() {
         .external_resources(&resources)
         .sign_template(&template)
         .unwrap();
-    let document = XmlDocument::parse(xml).unwrap();
+    XmlDocument::parse(xml).unwrap()
+}
+
+#[test]
+fn a_manifest_digest_refusal_ends_the_detached_completion() {
+    // One state serves the #manifest Reference and one the payload, so the
+    // Manifest's own digest is refused during completion. A spent ceiling must
+    // reach the caller as well as the evidence, not read as a finished payload.
+    let payload = b"detached part";
+    let document = manifest_document(payload);
+    let mut policy = verification_policy();
+    policy.manifest_processing = ManifestProcessing::Process;
+    let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
+    let provider = RefusingStateProvider::after(2);
+    let context = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .provider(&provider);
+    let work = work();
+    let error = with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &work,
+        |mut session| {
+            let reference = pending_references(&session, DetachedCompletion::Complete)[0];
+            let outcome = stream(
+                &mut session,
+                &[reference],
+                payload,
+                4,
+                DetachedCompletion::Complete,
+            );
+            assert!(session.evidence().signatures()[0].result().is_err());
+            outcome
+        },
+    )
+    .expect_err("the Manifest digest cannot start");
+    assert!(
+        matches!(
+            error,
+            DsigError::Reference(ReferenceProcessingError::Provider(ProviderError::Resource(
+                MemoryError::OutOfMemory
+            )))
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn finalization_is_admitted_before_the_provider_runs() {
+    // Updates can spend the allowance to the last unit; finishing then must
+    // stop at the admission, with the backend never entered.
+    let payload = b"detached part";
+    let document = signed(
+        &[Detached {
+            uri: "part.bin",
+            base64: false,
+            digest: DigestAlgorithm::Sha256,
+            payload,
+        }],
+        false,
+    );
+    let run = |allowance: usize| {
+        let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
+        let provider = RefusingStateProvider::after(usize::MAX);
+        let context = VerifyContext::new()
+            .policy(verification_policy())
+            .key(&key)
+            .provider(&provider);
+        let work = Memory::new(Arc::new(MemoryAccount::new(1 << 22, allowance)));
+        let before_finish = std::cell::Cell::new((0, 0));
+        let result = with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &work,
+            |mut session| {
+                let reference = pending_references(&session, DetachedCompletion::Complete)[0];
+                let mut stream =
+                    session.detached_payload(&[reference], DetachedCompletion::Complete)?;
+                stream.update(payload)?;
+                before_finish.set((work.work_used(), provider.finalized()));
+                stream.finish()
+            },
+        );
+        (result, before_finish.get(), provider.finalized())
+    };
+    let (result, (spent, _), _) = run(1 << 28);
+    result.expect("the account is ample");
+    let (result, (_, finalized_before), finalized_after) = run(spent);
+    assert!(
+        matches!(
+            result,
+            Err(DsigError::SharedExecution(MemoryError::WorkExceeded))
+        ),
+        "{result:?}"
+    );
+    assert_eq!(finalized_after, finalized_before);
+}
+
+#[test]
+fn completing_core_validation_processes_the_authenticated_manifest() {
+    // While a SignedInfo Reference is unavailable, core validation has failed
+    // and Manifests are unparsed. Completing it processes them as verification
+    // would (XMLDSig 1.1 §3.2), instead of leaving an empty Manifest list.
+    let payload = b"detached part";
+    let document = manifest_document(payload);
     let mut policy = verification_policy();
     policy.manifest_processing = ManifestProcessing::Process;
     let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();

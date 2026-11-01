@@ -449,15 +449,27 @@ pub fn provider_operations(data: &[u8]) {
             if !provider.supports(ProviderCapability::Digest(algorithm)) {
                 continue;
             }
-            let mut one = provider.begin_digest(algorithm).expect("advertised digest");
+            let memory = structured_asn1::memory::Memory::new(std::sync::Arc::new(
+                structured_asn1::memory::MemoryAccount::new(1 << 20, 1 << 20),
+            ));
+            let finish = |state: &mut dyn xml_sec::provider::DigestState| {
+                let mut output = [0; xml_sec::xmldsig::MAX_DIGEST_OUTPUT];
+                let written = state.finalize(&mut output).expect("finalize");
+                output[..written].to_vec()
+            };
+            let mut one = provider
+                .begin_digest(algorithm, &memory)
+                .expect("advertised digest");
             one.update(data).expect("digest input");
-            let one = one.finalize().expect("finalize");
-            let mut chunks = provider.begin_digest(algorithm).expect("advertised digest");
+            let one = finish(&mut *one);
+            let mut chunks = provider
+                .begin_digest(algorithm, &memory)
+                .expect("advertised digest");
             let split = data.len() / 2;
             chunks.update(&data[..split]).expect("first chunk");
             chunks.update(&[]).expect("empty chunk");
             chunks.update(&data[split..]).expect("last chunk");
-            assert_eq!(one, chunks.finalize().expect("finalize"), "digest chunking");
+            assert_eq!(one, finish(&mut *chunks), "digest chunking");
             if let Some(expected) = &expected {
                 assert_eq!(&one, expected, "provider digest disagreement");
             }

@@ -196,8 +196,12 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             states.push(StreamState {
                 algorithm: target.algorithm,
                 chain: target.chain,
-                state: super::super::super::digest::begin_digest(provider, target.algorithm)
-                    .map_err(|error| DsigError::Reference(error.into()))?,
+                state: super::super::super::digest::begin_digest(
+                    provider,
+                    target.algorithm,
+                    self.work.memory(),
+                )
+                .map_err(|error| DsigError::Reference(error.into()))?,
             });
         }
         let base64 = targets
@@ -500,7 +504,7 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             self.stop_detached();
         }
         for signature in affected {
-            self.revalidate(signature);
+            self.revalidate(signature)?;
         }
         super::super::accept_verification_evidence(
             self.view,
@@ -534,10 +538,11 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
 
     /// Recompute one Signature's core status. When its last `SignedInfo`
     /// Reference passes, core validation succeeds (`XMLDSig` 1.1 §3.2) and the
-    /// authenticated Manifests are processed exactly as in verification.
-    fn revalidate(&mut self, signature: usize) {
+    /// authenticated Manifests are processed exactly as in verification. A
+    /// failure stays in the evidence; a spent ceiling also reaches the caller.
+    fn revalidate(&mut self, signature: usize) -> Result<(), DsigError> {
         let Ok(result) = &self.evidence.signatures[signature].result else {
-            return;
+            return Ok(());
         };
         let was_valid = result.status == DsigStatus::Valid;
         // NotProcessed is never an overall status: the first actual failure is.
@@ -555,10 +560,10 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             if let Ok(result) = &mut self.evidence.signatures[signature].result {
                 result.status = first_failure.unwrap_or(result.status);
             }
-            return;
+            return Ok(());
         }
         if was_valid {
-            return;
+            return Ok(());
         }
         let manifests = self.process_manifests(signature, reference_count);
         let entry = &mut self.evidence.signatures[signature];
@@ -568,8 +573,13 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
                     result.status = DsigStatus::Valid;
                     result.manifest_references = manifest_references;
                 }
+                Ok(())
             }
-            Err(error) => entry.result = Err(error),
+            Err(error) => {
+                let refusal = resource_refusal(&error);
+                entry.result = Err(error);
+                refusal.map_or(Ok(()), Err)
+            }
         }
     }
 
@@ -619,6 +629,23 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             remaining,
             core_validation,
         )
+    }
+}
+
+/// A copy of `error` when it is a spent ceiling. Those end the operation; other
+/// failures belong to their Signature, whose evidence records them.
+fn resource_refusal(error: &DsigError) -> Option<DsigError> {
+    match error {
+        DsigError::SharedExecution(cause) => Some(DsigError::SharedExecution(*cause)),
+        DsigError::Reference(super::ReferenceProcessingError::SharedExecution(cause)) => Some(
+            DsigError::Reference(super::ReferenceProcessingError::SharedExecution(*cause)),
+        ),
+        DsigError::Reference(super::ReferenceProcessingError::Provider(
+            provider @ crate::provider::ProviderError::Resource(_),
+        )) => Some(DsigError::Reference(
+            super::ReferenceProcessingError::Provider(provider.clone()),
+        )),
+        _ => None,
     }
 }
 
@@ -791,11 +818,14 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
             None => false,
         };
         let mut digests = Vec::with_capacity(states.len());
-        for state in states {
+        for mut state in states {
+            session
+                .work
+                .charge_work(state.algorithm.output_len() as u64)?;
             digests.push((
                 state.algorithm,
                 state.chain,
-                super::super::super::digest::finish_digest(state.algorithm, state.state)
+                super::super::super::digest::finish_digest(state.algorithm, &mut *state.state)
                     .map_err(provider_error)?,
             ));
         }
@@ -807,7 +837,7 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
                 .find(|(algorithm, chain, _)| {
                     *algorithm == DigestAlgorithm::Sha256 && *chain == DetachedChain::Octets
                 })
-                .and_then(|(_, _, digest)| <[u8; 32]>::try_from(digest.as_slice()).ok())
+                .and_then(|(_, _, digest)| <[u8; 32]>::try_from(&**digest).ok())
                 .ok_or(DsigError::InvalidRequest {
                     reason: "raw SHA-256 digest is missing for the payload fingerprint",
                 })?,
@@ -822,7 +852,7 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
                     .find(|(algorithm, chain, _)| {
                         *algorithm == target.algorithm && *chain == target.chain
                     })
-                    .map(|(_, _, digest)| digest.as_slice())
+                    .map(|(_, _, digest)| &**digest)
             };
             let status = digest_status(&target, digest);
             results.push((target, status));

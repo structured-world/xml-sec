@@ -86,6 +86,7 @@ impl CryptoProvider for ProfileTestProvider {
     fn begin_digest(
         &self,
         _: xml_sec::xmldsig::DigestAlgorithm,
+        _: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn xml_sec::provider::DigestState + '_>, xml_sec::provider::ProviderError>
     {
         panic!("compile must not execute crypto")

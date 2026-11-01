@@ -10,6 +10,7 @@ use cryptoki::{
     types::AuthPin,
 };
 use std::sync::Arc;
+use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::provider::pkcs11::{Pkcs11AesKey, Pkcs11Provider, Pkcs11RsaKey, cryptoki};
 use xml_sec::provider::{
     ContentDecryptionKey, CryptoProvider, ExternalProviderError, KeyAgreementParameters,
@@ -102,19 +103,45 @@ fn assert_login_and_digests(provider: &Pkcs11Provider, pin: &AuthPin) {
             continue;
         }
         digested += 1;
-        let expected = RustCryptoProvider.digest(algorithm, &data).unwrap();
-        let mut state = provider.begin_digest(algorithm).unwrap();
+        let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
+        let expected = RustCryptoProvider
+            .digest(algorithm, &data, &memory)
+            .unwrap();
+        let mut state = provider.begin_digest(algorithm, &memory).unwrap();
         for part in data.chunks(7) {
             state.update(part).unwrap();
         }
-        assert_eq!(state.finalize().unwrap(), expected, "{algorithm:?}");
-        let mut abandoned = provider.begin_digest(algorithm).unwrap();
+        let mut output = [0; xml_sec::xmldsig::MAX_DIGEST_OUTPUT];
+        let written = state.finalize(&mut output).unwrap();
+        assert_eq!(&output[..written], &*expected, "{algorithm:?}");
+        drop(state);
+        let mut abandoned = provider.begin_digest(algorithm, &memory).unwrap();
         abandoned.update(&data).unwrap();
         drop(abandoned);
         assert_eq!(
-            provider.digest(algorithm, &data).unwrap(),
-            expected,
+            &*provider.digest(algorithm, &data, &memory).unwrap(),
+            &*expected,
             "{algorithm:?}"
+        );
+        // The token's state is charged like a software one, and refused alike.
+        assert_eq!(memory.used(), 0);
+        // The result crosses a buffer cryptoki allocates, so a ceiling that
+        // only fits the state refuses finalization, and drop ends the operation.
+        let state = provider.begin_digest(algorithm, &memory).unwrap();
+        let state_size = memory.used();
+        drop(state);
+        let exact = Memory::new(Arc::new(MemoryAccount::new(state_size, 1 << 20)));
+        let mut state = provider.begin_digest(algorithm, &exact).unwrap();
+        assert_eq!(
+            state.finalize(&mut output).err(),
+            Some(ProviderError::Resource(MemoryError::LimitExceeded))
+        );
+        drop(state);
+        assert_eq!(exact.used(), 0);
+        let empty = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
+        assert_eq!(
+            provider.begin_digest(algorithm, &empty).err(),
+            Some(ProviderError::Resource(MemoryError::LimitExceeded))
         );
     }
     assert!(digested > 0, "the test token advertises no digest");
@@ -332,10 +359,13 @@ fn assert_token_signatures(
             )
             .unwrap()
     );
+    let memory = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
     assert_eq!(
-        provider.digest(DigestAlgorithm::Sha256, MESSAGE).unwrap(),
-        RustCryptoProvider
-            .digest(DigestAlgorithm::Sha256, MESSAGE)
+        &*provider
+            .digest(DigestAlgorithm::Sha256, MESSAGE, &memory)
+            .unwrap(),
+        &*RustCryptoProvider
+            .digest(DigestAlgorithm::Sha256, MESSAGE, &memory)
             .unwrap()
     );
     // A same-name provider on another session must not execute this handle.

@@ -677,6 +677,10 @@ pub enum ProviderError {
     /// Operating-system randomness was unavailable.
     #[error("operating-system random number generation failed: {0}")]
     Random(String),
+    /// The operation's account or the allocator refused storage. This is a
+    /// spent ceiling, never a finding about the document.
+    #[error("provider resource refusal: {0}")]
+    Resource(structured_asn1::memory::MemoryError),
 }
 
 /// Operational failure classes for an explicitly selected external provider.
@@ -921,11 +925,69 @@ pub trait DigestState {
     /// Returns the selected provider's digest-update failure.
     fn update(&mut self, data: &[u8]) -> Result<(), ProviderError>;
 
-    /// Return the digest of all absorbed bytes.
+    /// Write the digest of all absorbed bytes to the start of `output` and
+    /// return its length. The owner finalizes once, then drops the state.
     ///
     /// # Errors
     /// Returns the selected provider's digest-finalization failure.
-    fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError>;
+    fn finalize(
+        &mut self,
+        output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+    ) -> Result<usize, ProviderError>;
+}
+
+/// A digest state with the charge for the block that holds it.
+#[cfg(feature = "xmldsig")]
+struct Charged<T> {
+    state: T,
+    // Inside the block it pays for, so it releases just before the block does:
+    // the one moment the account is lower than the allocator, and nothing runs in it.
+    _charge: structured_asn1::memory::MemoryReservation,
+}
+
+// One element, because a fallibly allocated `Box<[T; 1]>` is the only `Box` that
+// stable Rust offers without `unsafe`.
+#[cfg(feature = "xmldsig")]
+impl<T: DigestState> DigestState for [Charged<T>; 1] {
+    fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
+        self[0].state.update(data)
+    }
+
+    fn finalize(
+        &mut self,
+        output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+    ) -> Result<usize, ProviderError> {
+        self[0].state.finalize(output)
+    }
+}
+
+/// Move `state` to the heap under `memory`: its complete block is admitted
+/// first, the allocation can fail, and the charge lasts as long as the state.
+///
+/// # Errors
+/// Returns [`ProviderError::Resource`] when the account or the allocator refuses.
+#[cfg(feature = "xmldsig")]
+pub fn charged_digest_state<'s, T: DigestState + 's>(
+    state: T,
+    memory: &structured_asn1::memory::Memory,
+) -> Result<Box<dyn DigestState + 's>, ProviderError> {
+    use structured_asn1::memory::MemoryError;
+    let charge = memory
+        .reserve(core::mem::size_of::<Charged<T>>())
+        .map_err(ProviderError::Resource)?;
+    let mut block = Vec::new();
+    block
+        .try_reserve_exact(1)
+        .map_err(|_| ProviderError::Resource(MemoryError::OutOfMemory))?;
+    block.push(Charged {
+        state,
+        _charge: charge,
+    });
+    let block: Box<[Charged<T>; 1]> = match block.into_boxed_slice().try_into() {
+        Ok(block) => block,
+        Err(_) => unreachable!("the slice holds the one pushed element"),
+    };
+    Ok(block)
 }
 
 /// Provider operations used by the XML Security pipelines.
@@ -1108,25 +1170,34 @@ pub trait CryptoProvider: Send + Sync {
     }
 
     /// Start an incremental message digest; streamed input never needs to be
-    /// collected in memory first.
+    /// collected in memory first. Storage for the state is admitted in `memory`
+    /// before it exists, as [`charged_digest_state`] does.
     ///
     /// # Errors
-    /// Returns an unsupported digest or the selected provider's state-creation failure.
+    /// Returns an unsupported digest, a resource refusal, or the selected
+    /// provider's state-creation failure.
     #[cfg(feature = "xmldsig")]
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn DigestState + '_>, ProviderError>;
 
-    /// Compute the message digest of one contiguous input.
+    /// Compute the message digest of one contiguous input over the same
+    /// execution as streamed input.
     ///
     /// # Errors
     /// Propagates state creation, update and finalization failures unchanged.
     #[cfg(feature = "xmldsig")]
-    fn digest(&self, algorithm: DigestAlgorithm, data: &[u8]) -> Result<Vec<u8>, ProviderError> {
-        let mut state = self.begin_digest(algorithm)?;
+    fn digest(
+        &self,
+        algorithm: DigestAlgorithm,
+        data: &[u8],
+        memory: &structured_asn1::memory::Memory,
+    ) -> Result<crate::xmldsig::DigestOutput, ProviderError> {
+        let mut state = self.begin_digest(algorithm, memory)?;
         state.update(data)?;
-        state.finalize()
+        crate::xmldsig::finish_digest(algorithm, &mut *state)
     }
 
     /// Sign bytes with an opaque key handle.
@@ -1523,10 +1594,17 @@ macro_rules! rust_crypto_digest {
                 Ok(())
             }
 
-            fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
+            fn finalize(
+                &mut self,
+                output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+            ) -> Result<usize, ProviderError> {
                 use sha2::Digest as _;
-                Ok(match *self {
-                    $($(#[$attr])* Self::$variant(hasher) => hasher.finalize().to_vec(),)+
+                Ok(match self {
+                    $($(#[$attr])* Self::$variant(hasher) => {
+                        let digest = hasher.finalize_reset();
+                        output[..digest.len()].copy_from_slice(&digest);
+                        digest.len()
+                    })+
                 })
             }
         }
@@ -2074,12 +2152,13 @@ impl CryptoProvider for RustCryptoProvider {
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
         #[cfg(feature = "dstu4145")]
         if crate::xmldsig::dstu4145::is_ukrainian_digest(algorithm) {
-            return crate::xmldsig::dstu4145::begin_digest(algorithm);
+            return crate::xmldsig::dstu4145::begin_digest(algorithm, memory);
         }
-        Ok(Box::new(RustCryptoDigest::new(algorithm)))
+        charged_digest_state(RustCryptoDigest::new(algorithm), memory)
     }
 
     #[cfg(feature = "xmldsig")]
@@ -3332,8 +3411,8 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                RUST_CRYPTO_PROVIDER
-                    .digest(algorithm, b"abc")
+                &*RUST_CRYPTO_PROVIDER
+                    .digest(algorithm, b"abc", &crate::xmldsig::digest::digest_memory())
                     .expect("compiled digest must be supported"),
                 expected
             );
@@ -3352,10 +3431,11 @@ mod tests {
         fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
             self.0.update(data)
         }
-        fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
-            let mut digest = self.0.finalize()?;
-            digest.push(0);
-            Ok(digest)
+        fn finalize(
+            &mut self,
+            output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+        ) -> Result<usize, ProviderError> {
+            Ok(self.0.finalize(output)? + 1)
         }
     }
 
@@ -3393,6 +3473,7 @@ mod tests {
         fn begin_digest(
             &self,
             algorithm: DigestAlgorithm,
+            memory: &structured_asn1::memory::Memory,
         ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
             if self.reject_digest == Some(algorithm) {
                 return Err(ProviderError::Unsupported {
@@ -3400,7 +3481,7 @@ mod tests {
                     algorithm: Some(algorithm.uri().to_owned()),
                 });
             }
-            let state = RUST_CRYPTO_PROVIDER.begin_digest(algorithm)?;
+            let state = RUST_CRYPTO_PROVIDER.begin_digest(algorithm, memory)?;
             Ok(if self.extra_digest_byte {
                 Box::new(ExtraByteDigest(state))
             } else {

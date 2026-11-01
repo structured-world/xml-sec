@@ -194,50 +194,96 @@ impl DigestAlgorithm {
 /// or returns an output width inconsistent with the selected algorithm.
 #[must_use]
 pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
-    compute_digest_with_provider(crate::provider::default_provider(), algorithm, data)
-        .expect("default provider advertises every XMLDSig digest")
+    compute_digest_with_provider(
+        crate::provider::default_provider(),
+        algorithm,
+        data,
+        &digest_memory(),
+    )
+    .expect("default provider advertises every XMLDSig digest")
+    .to_vec()
 }
 
-/// Compute a digest with an explicitly selected provider.
+/// An account for digests without an operation account of their own. It has
+/// no ceiling because one state lives per call or per Reference, whose number
+/// policy bounds; an allocator refusal still comes back typed.
+pub(crate) fn digest_memory() -> structured_asn1::memory::Memory {
+    structured_asn1::memory::Memory::new(alloc::sync::Arc::new(
+        structured_asn1::memory::MemoryAccount::new(usize::MAX, usize::MAX),
+    ))
+}
+
+/// Compute a digest with an explicitly selected provider, under `memory`.
 ///
 /// # Errors
-/// Returns the provider's capability, update, or finalization error, or an error
-/// if the finalized digest has the wrong width for the selected algorithm.
+/// Returns the provider's capability, update, or finalization error, a resource
+/// refusal, or an error if the finalized digest has the wrong width for the
+/// selected algorithm.
 pub fn compute_digest_with_provider(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DigestAlgorithm,
     data: &[u8],
-) -> Result<Vec<u8>, crate::provider::ProviderError> {
-    let mut state = begin_digest(provider, algorithm)?;
+    memory: &structured_asn1::memory::Memory,
+) -> Result<DigestOutput, crate::provider::ProviderError> {
+    let mut state = begin_digest(provider, algorithm, memory)?;
     state.update(data)?;
-    finish_digest(algorithm, state)
+    finish_digest(algorithm, &mut *state)
 }
 
 /// Start an incremental digest after checking the advertised capability.
 pub(crate) fn begin_digest<'p>(
     provider: &'p dyn crate::provider::CryptoProvider,
     algorithm: DigestAlgorithm,
+    memory: &structured_asn1::memory::Memory,
 ) -> Result<Box<dyn crate::provider::DigestState + 'p>, crate::provider::ProviderError> {
     provider.require_capability(crate::provider::ProviderCapability::Digest(algorithm))?;
-    provider.begin_digest(algorithm)
+    provider.begin_digest(algorithm, memory)
+}
+
+/// The longest digest any `XMLDSig` algorithm produces, in bytes.
+pub const MAX_DIGEST_OUTPUT: usize = 64;
+
+/// A finished digest, held inline.
+#[derive(Debug, Clone, Copy)]
+pub struct DigestOutput {
+    bytes: [u8; MAX_DIGEST_OUTPUT],
+    len: usize,
+}
+
+impl core::ops::Deref for DigestOutput {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl AsRef<[u8]> for DigestOutput {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
 }
 
 /// Finish an incremental digest. The facade, not an interchangeable provider,
 /// owns the output width of each `XMLDSig` algorithm.
+///
+/// # Errors
+/// Returns the provider's finalization failure or a wrong output width.
 pub(crate) fn finish_digest(
     algorithm: DigestAlgorithm,
-    state: Box<dyn crate::provider::DigestState + '_>,
-) -> Result<Vec<u8>, crate::provider::ProviderError> {
-    let digest = state.finalize()?;
+    state: &mut (dyn crate::provider::DigestState + '_),
+) -> Result<DigestOutput, crate::provider::ProviderError> {
+    let mut bytes = [0; MAX_DIGEST_OUTPUT];
+    let len = state.finalize(&mut bytes)?;
     let expected = algorithm.output_len();
-    if digest.len() != expected {
+    if len != expected {
         return Err(crate::provider::ProviderError::InvalidOutputSize {
             operation: crate::provider::ProviderOperation::Digest,
             expected,
-            actual: digest.len(),
+            actual: len,
         });
     }
-    Ok(digest)
+    Ok(DigestOutput { bytes, len })
 }
 
 /// Constant-time comparison of two byte slices.
@@ -268,8 +314,12 @@ mod tests {
         fn update(&mut self, _: &[u8]) -> Result<(), crate::provider::ProviderError> {
             Ok(())
         }
-        fn finalize(self: Box<Self>) -> Result<Vec<u8>, crate::provider::ProviderError> {
-            Ok(self.0)
+        fn finalize(
+            &mut self,
+            output: &mut [u8; super::MAX_DIGEST_OUTPUT],
+        ) -> Result<usize, crate::provider::ProviderError> {
+            output[..self.0.len()].copy_from_slice(&self.0);
+            Ok(self.0.len())
         }
     }
 
@@ -302,6 +352,7 @@ mod tests {
         fn begin_digest(
             &self,
             _algorithm: DigestAlgorithm,
+            _memory: &structured_asn1::memory::Memory,
         ) -> Result<Box<dyn crate::provider::DigestState + '_>, crate::provider::ProviderError>
         {
             if let Some(output) = &self.output {
@@ -398,7 +449,8 @@ mod tests {
             compute_digest_with_provider(
                 &RejectingDigestProvider { output: None },
                 DigestAlgorithm::Sha256,
-                b"x"
+                b"x",
+                &digest_memory(),
             ),
             Err(crate::provider::ProviderError::Unsupported { .. })
         ));
@@ -416,6 +468,7 @@ mod tests {
                     },
                     DigestAlgorithm::Sha256,
                     b"x",
+                    &digest_memory(),
                 ),
                 Err(crate::provider::ProviderError::InvalidOutputSize {
                     operation: crate::provider::ProviderOperation::Digest,
@@ -426,14 +479,16 @@ mod tests {
         }
 
         assert_eq!(
-            compute_digest_with_provider(
+            &*compute_digest_with_provider(
                 &RejectingDigestProvider {
                     output: Some(vec![7_u8; 32]),
                 },
                 DigestAlgorithm::Sha256,
                 b"x",
-            ),
-            Ok(vec![7_u8; 32]),
+                &digest_memory(),
+            )
+            .expect("the width is right"),
+            &[7_u8; 32],
         );
     }
 

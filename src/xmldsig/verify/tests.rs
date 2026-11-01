@@ -32,6 +32,35 @@ fn make_reference(
 }
 
 #[test]
+fn a_spent_execution_is_never_a_manifest_finding() {
+    // A refused admission says nothing about the Reference, whichever account
+    // it came from; a Reference's own failure stays a per-Reference finding.
+    use structured_asn1::memory::MemoryError;
+    assert!(matches!(
+        manifest_reference_failure_reason(
+            ReferenceProcessingError::SharedExecution(MemoryError::WorkExceeded),
+            0
+        ),
+        Err(ReferenceProcessingError::SharedExecution(
+            MemoryError::WorkExceeded
+        ))
+    ));
+    assert!(matches!(
+        manifest_reference_failure_reason(
+            ReferenceProcessingError::Provider(crate::provider::ProviderError::Resource(
+                MemoryError::OutOfMemory
+            )),
+            0
+        ),
+        Err(ReferenceProcessingError::Provider(_))
+    ));
+    assert_eq!(
+        manifest_reference_failure_reason(ReferenceProcessingError::MissingUri, 3).ok(),
+        Some(FailureReason::ReferenceProcessingFailure { ref_index: 3 })
+    );
+}
+
+#[test]
 fn operation_borrows_caller_utc_facts_without_policy_rebinding()
 -> Result<(), Box<dyn std::error::Error>> {
     // Synthetic caller facts test transport, not real-world UTC history.

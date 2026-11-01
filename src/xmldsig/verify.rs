@@ -5440,18 +5440,27 @@ fn add_retrieval_binary_usage(
 fn manifest_reference_failure_reason(
     error: ReferenceProcessingError,
     ref_index: usize,
-) -> FailureReason {
+) -> Result<FailureReason, ReferenceProcessingError> {
+    // A spent ceiling says nothing about this Reference and would refuse every
+    // later one too, so it ends the operation instead of becoming a finding.
+    if matches!(
+        error,
+        ReferenceProcessingError::SharedExecution(_)
+            | ReferenceProcessingError::Provider(crate::provider::ProviderError::Resource(_))
+    ) {
+        return Err(error);
+    }
     // Same Unavailable outcome as a SignedInfo Reference without caller bytes.
     if matches!(
         error,
         ReferenceProcessingError::UriDereference(TransformError::ExternalResourceUnavailable(_))
     ) {
-        return FailureReason::ReferenceUnavailable { ref_index };
+        return Ok(FailureReason::ReferenceUnavailable { ref_index });
     }
-    match error.into_policy_violation() {
+    Ok(match error.into_policy_violation() {
         Ok(_) => FailureReason::ReferencePolicyViolation { ref_index },
         Err(_) => FailureReason::ReferenceProcessingFailure { ref_index },
-    }
+    })
 }
 
 struct CompiledManifestReference {
@@ -5551,7 +5560,7 @@ fn evaluate_manifest_reference<C: VerificationCapture>(
     signature_node: Node<'_, '_>,
     ctx: &VerifyContext<'_>,
     reference_node: Option<Node<'_, '_>>,
-) -> ReferenceResult {
+) -> Result<ReferenceResult, SignatureVerificationPipelineError> {
     if execution.transform_budget.remaining_c14n_output() == 0
         || super::transforms::validate_relationship_chain(
             &reference.transforms,
@@ -5564,18 +5573,18 @@ fn evaluate_manifest_reference<C: VerificationCapture>(
             .check_digest_algorithm(reference.digest_method)
             .is_err()
     {
-        manifest_reference_invalid_result(
+        Ok(manifest_reference_invalid_result(
             reference,
             index,
             FailureReason::ReferencePolicyViolation { ref_index: index },
-        )
+        ))
     } else {
         match enforce_reference_policies(
             core::slice::from_ref(reference),
             ctx.policy.uris.references,
             ctx.allowed_transform_uris(),
         ) {
-            Ok(()) => process_reference_with_options(
+            Ok(()) => match process_reference_with_options(
                 reference,
                 resolver,
                 signature_node,
@@ -5583,26 +5592,26 @@ fn evaluate_manifest_reference<C: VerificationCapture>(
                 index,
                 reference_node,
                 execution,
-            )
-            .unwrap_or_else(|error| {
-                manifest_reference_invalid_result(
+            ) {
+                Ok(result) => Ok(result),
+                Err(error) => Ok(manifest_reference_invalid_result(
                     reference,
                     index,
-                    manifest_reference_failure_reason(error, index),
-                )
-            }),
+                    manifest_reference_failure_reason(error, index)?,
+                )),
+            },
             Err(SignatureVerificationPipelineError::Policy(_)) => {
-                manifest_reference_invalid_result(
+                Ok(manifest_reference_invalid_result(
                     reference,
                     index,
                     FailureReason::ReferencePolicyViolation { ref_index: index },
-                )
+                ))
             }
-            Err(_) => manifest_reference_invalid_result(
+            Err(_) => Ok(manifest_reference_invalid_result(
                 reference,
                 index,
                 FailureReason::ReferenceProcessingFailure { ref_index: index },
-            ),
+            )),
         }
     }
 }
@@ -5657,7 +5666,7 @@ fn execute_manifest_reference<C: VerificationCapture>(
                     signature_node,
                     ctx,
                     resolver.node_for_node_id(compiled.reference_node_id),
-                );
+                )?;
                 bind_reference_evidence(
                     &mut result,
                     reference,

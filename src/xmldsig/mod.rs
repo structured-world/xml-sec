@@ -92,7 +92,11 @@ mod xpath;
 
 #[cfg(feature = "xmldsig-sign")]
 pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
-pub use digest::{DigestAlgorithm, compute_digest, compute_digest_with_provider, constant_time_eq};
+pub(crate) use digest::finish_digest;
+pub use digest::{
+    DigestAlgorithm, DigestOutput, MAX_DIGEST_OUTPUT, compute_digest, compute_digest_with_provider,
+    constant_time_eq,
+};
 pub use keys::{
     DefaultKeyResolver, HmacSha1VerificationKey, HmacVerificationKey, InspectedKeyCandidateBudget,
     KeyResolutionError, KeyResolverConfig, VerificationKey,
