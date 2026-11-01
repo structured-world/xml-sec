@@ -490,6 +490,94 @@ fn external_evidence_identifies_resolved_bytes_not_the_lexical_uri() {
     assert_eq!(reference.target_identity, None);
 }
 
+/// Sign `signed` as `urn:payload` with `transforms`, then verify against `verified`.
+fn external_reference_fingerprint(
+    signed: &[u8],
+    verified: &[u8],
+    digest: DigestAlgorithm,
+    transforms: &[xml_sec::xmldsig::Transform],
+) -> (DsigStatus, Option<[u8; 32]>) {
+    use xml_sec::policy::{SigningPolicy, VerificationPolicy};
+    use xml_sec::xmldsig::UriTypeSet;
+    let secret = vec![0x31; 32];
+    let signing_key = HmacSigningKey::new(secret.clone()).unwrap();
+    let key = HmacVerificationKey::new(secret).unwrap();
+    let mut item = ReferenceBuilder::new(digest).uri("urn:payload");
+    for transform in transforms {
+        item = item.transform(transform.clone());
+    }
+    let mut signing_policy = SigningPolicy::default();
+    signing_policy.uris.references = UriTypeSet::ALL;
+    let builder = SignatureBuilder::new(
+        C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        SignatureAlgorithm::HmacSha256,
+    )
+    .add_reference(item);
+    let resources = BTreeMap::from([("urn:payload".to_owned(), signed.to_vec())]);
+    let xml = SignContext::new(&signing_key)
+        .policy(signing_policy)
+        .external_resources(&resources)
+        .sign_with_builder("<root/>", &builder)
+        .unwrap();
+    let document = XmlDocument::parse(xml).unwrap();
+    let mut policy = VerificationPolicy::default();
+    policy.uris.references = UriTypeSet::ALL;
+    let resources = BTreeMap::from([("urn:payload".to_owned(), verified.to_vec())]);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..VerificationRequest::default()
+    };
+    let evidence = VerifyContext::new()
+        .policy(policy)
+        .key(&key)
+        .verify_request(&document, &request)
+        .unwrap();
+    let reference = &evidence.signatures()[0]
+        .result()
+        .as_ref()
+        .unwrap()
+        .signed_info_references[0];
+    (reference.status, reference.external_resource_fingerprint)
+}
+
+#[test]
+fn external_fingerprint_is_of_the_verified_bytes_never_the_signed_digest() {
+    // A failed Reference carries a DigestValue of other bytes, so that value
+    // must not stand in for the fingerprint of the bytes actually supplied.
+    use sha2::{Digest, Sha256};
+    let (status, fingerprint) =
+        external_reference_fingerprint(b"signed", b"tampered", DigestAlgorithm::Sha256, &[]);
+    assert!(matches!(status, DsigStatus::Invalid(_)));
+    assert_eq!(fingerprint, Some(Sha256::digest(b"tampered").into()));
+}
+
+#[test]
+fn external_fingerprint_is_sha256_whatever_the_reference_digests() {
+    // The digest of another algorithm, or of transformed output, is not the
+    // SHA-256 identity of the resolved bytes.
+    use sha2::{Digest, Sha256};
+    use xml_sec::xmldsig::Transform;
+    let expected: [u8; 32] = Sha256::digest(b"QUJD").into();
+    for (digest, transforms) in [
+        (DigestAlgorithm::Sha384, Vec::new()),
+        (DigestAlgorithm::Sha256, vec![Transform::Base64Decode]),
+    ] {
+        let (status, fingerprint) =
+            external_reference_fingerprint(b"QUJD", b"QUJD", digest, &transforms);
+        assert_eq!(status, DsigStatus::Valid);
+        assert_eq!(fingerprint, Some(expected));
+    }
+}
+
+#[test]
+fn external_fingerprint_of_a_valid_sha256_reference_is_its_digest() {
+    use sha2::{Digest, Sha256};
+    let (status, fingerprint) =
+        external_reference_fingerprint(b"bytes", b"bytes", DigestAlgorithm::Sha256, &[]);
+    assert_eq!(status, DsigStatus::Valid);
+    assert_eq!(fingerprint, Some(Sha256::digest(b"bytes").into()));
+}
+
 #[test]
 fn mathematical_embedded_key_success_is_not_authorized_coverage() {
     // XMLDSig core validation and application trust are distinct. The exact

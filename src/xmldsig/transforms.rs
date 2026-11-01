@@ -52,6 +52,7 @@ use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sha2::{Digest as _, Sha256};
 
+use super::base64_stream::is_rfc2045_base64_byte;
 use super::parse::XMLDSIG_NS;
 use super::types::projection::{Keys, NativeKeys, PaidKeys, Projection};
 use super::types::{
@@ -1192,10 +1193,6 @@ fn append_normalized_base64<S: Scratch>(
     Ok(())
 }
 
-fn is_rfc2045_base64_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
-}
-
 fn decode_base64_transform<S: Scratch>(
     normalized: &[u8],
     budget: &Base64WorkBudget,
@@ -1228,26 +1225,38 @@ fn base64_projection<S: Scratch, K: super::types::projection::Keys, D: DomStorag
     scratch: &S,
 ) -> Result<S::Bytes, TransformError> {
     let mut normalized = scratch.bytes();
+    for_each_base64_input(binary, nodes, scratch, |encoded| {
+        append_normalized_base64(encoded, &mut normalized, &budget.base64, scratch)
+    })?;
+    decode_base64_transform(&normalized, &budget.base64, scratch)
+}
+
+/// Visit the Base64 input in order: octets, or the selected text nodes in
+/// document order (`XMLDSig` 1.1 section 6.6.2).
+/// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Base-64>
+fn for_each_base64_input<S: Scratch, K: super::types::projection::Keys, D: DomStorage, E>(
+    binary: Option<&[u8]>,
+    nodes: Option<&Projection<'_, K, D>>,
+    scratch: &S,
+    mut visit: impl FnMut(&[u8]) -> Result<(), E>,
+) -> Result<(), E>
+where
+    E: From<TransformError>,
+{
     match (binary, nodes) {
-        (Some(bytes), _) => {
-            append_normalized_base64(bytes, &mut normalized, &budget.base64, scratch)?;
-        }
+        (Some(bytes), _) => visit(bytes),
         (None, Some(nodes)) => {
             for node in nodes.document().descendants() {
-                scratch.charge(1)?;
-                if nodes.contains_tree(node)? && node.is_text() {
-                    append_normalized_base64(
-                        node.text().unwrap_or_default().as_bytes(),
-                        &mut normalized,
-                        &budget.base64,
-                        scratch,
-                    )?;
+                scratch.charge(1).map_err(TransformError::from)?;
+                let selected = nodes.contains_tree(node).map_err(TransformError::from)?;
+                if selected && node.is_text() {
+                    visit(node.text().unwrap_or_default().as_bytes())?;
                 }
             }
+            Ok(())
         }
         (None, None) => unreachable!("execution data has either nodes or bytes"),
     }
-    decode_base64_transform(&normalized, &budget.base64, scratch)
 }
 
 /// Execute a chain of transforms for a single `<Reference>`.
@@ -1772,6 +1781,23 @@ pub(crate) trait TransformTerminal<S: TransformScratch> {
         explicit: Option<(&C14nAlgorithm, Option<&str>)>,
         budget: &TransformExecutionBudget,
     ) -> Result<Self::Output, Self::Error>;
+
+    /// Finish a chain whose last transform is Base64, by default on its
+    /// materialized output.
+    fn finish_base64<D: DomStorage>(
+        self,
+        data: ExecutionData<'_, S, D>,
+        budget: &TransformExecutionBudget,
+        scratch: &S,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        Self: Sized,
+    {
+        let bytes = base64_projection(data.binary(), data.nodes(), budget, scratch)?;
+        // The consumed input must not stay pinned while the terminal runs.
+        drop(data);
+        self.finish(ExecutionData::<S, D>::Accounted(bytes), None, budget)
+    }
 }
 
 struct CollectTerminal;
@@ -1822,6 +1848,17 @@ impl TransformTerminal<Native> for DiscardTerminal {
         _: ExecutionData<'_, Native, D>,
         _: Option<(&C14nAlgorithm, Option<&str>)>,
         _: &TransformExecutionBudget,
+    ) -> Result<(), TransformError> {
+        Ok(())
+    }
+
+    // The digest pass decodes and charges the payload once; decoding here
+    // would spend the operation's allowance on output nobody reads.
+    fn finish_base64<D: DomStorage>(
+        self,
+        _: ExecutionData<'_, Native, D>,
+        _: &TransformExecutionBudget,
+        _: &Native,
     ) -> Result<(), TransformError> {
         Ok(())
     }
@@ -1984,6 +2021,44 @@ impl TransformTerminal<Native> for DigestTerminal<'_> {
                 .c14n
                 .charge(sink.written)
                 .map_err(TransformError::from)?;
+        }
+        let (digest, pre_digest) = sink
+            .finish(algorithm)
+            .map_err(ReferenceDigestError::Provider)?;
+        Ok(ReferenceDigest { digest, pre_digest })
+    }
+
+    // The input allowance is charged for all input before a decoding failure
+    // is reported, as the resident transform does.
+    fn finish_base64<D: DomStorage>(
+        self,
+        data: ExecutionData<'_, Native, D>,
+        budget: &TransformExecutionBudget,
+        scratch: &Native,
+    ) -> Result<ReferenceDigest, ReferenceDigestError> {
+        let DigestRequest {
+            provider,
+            algorithm,
+            retain_pre_digest,
+        } = self.0;
+        let mut sink = DigestWriter::new(
+            super::digest::begin_digest(provider, algorithm)
+                .map_err(ReferenceDigestError::Provider)?,
+            retain_pre_digest,
+        );
+        let mut absorb = |decoded: &[u8]| -> Result<(), ReferenceDigestError> {
+            budget.base64.charge_output(decoded.len())?;
+            sink.absorb(decoded).map_err(ReferenceDigestError::Provider)
+        };
+        let mut stream = super::base64_stream::Base64Stream::new();
+        for_each_base64_input(data.binary(), data.nodes(), scratch, |encoded| {
+            budget.base64.charge_input(encoded.len())?;
+            stream.feed(encoded, &mut absorb)
+        })?;
+        if let Some(failure) = stream.finish(&mut absorb)? {
+            return Err(
+                TransformError::Base64(base64::DecodeSliceError::DecodeError(failure)).into(),
+            );
         }
         let (digest, pre_digest) = sink
             .finish(algorithm)
@@ -2499,6 +2574,40 @@ fn apply_chain_step<'e, 'd, S: TransformScratch, D: DomStorage, I: Instruction>(
     Ok(ChainStep::untracked(enveloped_signature, data))
 }
 
+fn chain_output<T>(
+    output: T,
+    #[cfg_attr(not(feature = "xmldsig-sign"), expect(unused_variables))] tracking: &mut Option<
+        DependencyTracking,
+    >,
+) -> TransformChainOutput<T> {
+    TransformChainOutput {
+        output,
+        #[cfg(feature = "xmldsig-sign")]
+        dependencies: dependency_indexes(tracking.take()),
+    }
+}
+
+/// Binary input not produced by tracked canonicalization is a different
+/// document. Keep the source signature for `XPath` `here()` semantics, but do
+/// not apply its identity to Enveloped.
+fn remap_enveloped_signature<'e, D: DomStorage, O: DomStorage>(
+    document: &'e Document<'_, D>,
+    provenance: SignatureProvenance,
+    enveloped_signature: Option<Node<'_, '_, O>>,
+) -> Result<Option<Node<'e, 'e, D>>, TransformError> {
+    let SignatureProvenance::Canonical(Some(position)) = provenance else {
+        return Ok(None);
+    };
+    document
+        .descendants()
+        .find(|node| node.is_element() && node.range().start == position)
+        .filter(|node| {
+            enveloped_signature.is_some_and(|source| node.tag_name() == source.tag_name())
+        })
+        .map(Some)
+        .ok_or(TransformError::CrossDocumentSignatureNode)
+}
+
 // Terminal strategy is monomorphized: collecting callers retain their existing
 // position/remapping path, while streaming consumers may intercept final C14N.
 fn execute_transform_chain<
@@ -2532,11 +2641,7 @@ where
             retain_visible_dependencies(nodes, tracking)?;
         }
         let output = finalize.finish(data, None, context.budget)?;
-        return Ok(TransformChainOutput {
-            output,
-            #[cfg(feature = "xmldsig-sign")]
-            dependencies: dependency_indexes(dependency_tracking),
-        });
+        return Ok(chain_output(output, &mut dependency_tracking));
     };
 
     let binary = if transform_requires_node_set(transform) {
@@ -2571,22 +2676,7 @@ where
         if let Some(tracking) = &mut dependency_tracking {
             tracking.remap_reparsed(&document);
         }
-        // Binary input not produced by tracked canonicalization is a different
-        // document. Keep source_signature for XPath here() semantics, but do not
-        // apply its identity to Enveloped.
-        let remapped = match provenance {
-            SignatureProvenance::Canonical(Some(position)) => Some(
-                document
-                    .descendants()
-                    .find(|node| node.is_element() && node.range().start == position)
-                    .filter(|node| {
-                        enveloped_signature
-                            .is_some_and(|source| node.tag_name() == source.tag_name())
-                    })
-                    .ok_or(TransformError::CrossDocumentSignatureNode)?,
-            ),
-            SignatureProvenance::Canonical(None) | SignatureProvenance::Untracked => None,
-        };
+        let remapped = remap_enveloped_signature(&document, provenance, enveloped_signature)?;
         return execute_transform_chain::<STREAM_FINAL_C14N, _, _, _, _, _, _>(
             source_signature,
             ChainStep::untracked(remapped, ExecutionData::Nodes(nodes)),
@@ -2606,12 +2696,21 @@ where
         }
         if STREAM_FINAL_C14N && remaining.is_empty() {
             let output = finalize.finish(data, Some((algo, prefixes)), context.budget)?;
-            return Ok(TransformChainOutput {
-                output,
-                #[cfg(feature = "xmldsig-sign")]
-                dependencies: dependency_indexes(dependency_tracking),
-            });
+            return Ok(chain_output(output, &mut dependency_tracking));
         }
+    }
+    if STREAM_FINAL_C14N
+        && remaining.is_empty()
+        && matches!(transform.view(), InstructionView::Base64)
+    {
+        if let Some(tracking) = &mut dependency_tracking {
+            if let Some(nodes) = data.nodes() {
+                retain_visible_dependencies(nodes, tracking)?;
+            }
+            tracking.discard_provenance();
+        }
+        let output = finalize.finish_base64(data, context.budget, context.scratch)?;
+        return Ok(chain_output(output, &mut dependency_tracking));
     }
     // The step consumes its input, so a decoded or canonicalized predecessor is
     // never pinned in this frame while the rest of the chain runs.

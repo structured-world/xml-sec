@@ -7,6 +7,7 @@ mod cryptographic;
 
 use base64::Engine;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::policy::{PolicyViolation, SigningPolicy};
 use xml_sec::xmldsig::{
     BASE64_TRANSFORM_URI, DefaultKeyResolver, DigestAlgorithm, DsigStatus, FailureReason,
     ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder,
@@ -332,4 +333,64 @@ fn decoded_xml_rejects_here_from_the_signature_document() {
         message.contains("same XML document"),
         "error must state the normative cross-document here() requirement: {message}"
     );
+}
+
+fn sign_with_base64_limits(xml: &str, input: usize, output: usize) -> Result<String, SigningError> {
+    let (key, key_info) = signing_material();
+    let mut policy = SigningPolicy::default();
+    policy.resources.max_base64_transform_input_bytes = input;
+    policy.resources.max_base64_transform_output_bytes = output;
+    SignContext::new(&key)
+        .policy(policy)
+        .key_info_writer(&key_info)
+        .sign_with_builder(xml, &base64_signature_builder())
+}
+
+#[test]
+fn signing_charges_a_final_base64_transform_once() {
+    // A payload exactly at both limits signs: dependency analysis must not
+    // spend the same allowance before the digest pass reads the payload.
+    let encoded = "QUJD".repeat(64);
+    let xml = format!(r#"<root><Encoded ID="payload">{encoded}</Encoded></root>"#);
+    let signed = sign_with_base64_limits(&xml, encoded.len(), encoded.len() / 4 * 3)
+        .expect("a payload within both Base64 limits must sign");
+    assert!(signed.contains("DigestValue"));
+}
+
+#[test]
+fn signing_refuses_a_final_base64_transform_one_byte_over_each_limit() {
+    let encoded = "QUJD".repeat(64);
+    let xml = format!(r#"<root><Encoded ID="payload">{encoded}</Encoded></root>"#);
+    let decoded = encoded.len() / 4 * 3;
+    for (input, output, resource) in [
+        (encoded.len() - 1, decoded, "Base64 transform input bytes"),
+        (encoded.len(), decoded - 1, "Base64 transform output bytes"),
+    ] {
+        let error = sign_with_base64_limits(&xml, input, output)
+            .expect_err("a payload over a Base64 limit must be refused");
+        let SigningError::Policy(PolicyViolation::ResourceLimit {
+            resource: refused, ..
+        }) = error
+        else {
+            panic!("expected a Base64 resource refusal: {error:?}");
+        };
+        assert_eq!(refused, resource);
+    }
+}
+
+#[test]
+fn malformed_final_base64_is_refused_across_a_decoding_block() {
+    // The invalid quantum lies past the first streamed block, so a decoder
+    // that validates only the head of the payload would accept it.
+    let padded = format!("{}QQ==QUJD", "QUJD".repeat(4096));
+    let xml = format!(r#"<root><Encoded ID="payload">{padded}</Encoded></root>"#);
+    let (key, key_info) = signing_material();
+    let error = SignContext::new(&key)
+        .key_info_writer(&key_info)
+        .sign_with_builder(&xml, &base64_signature_builder())
+        .expect_err("data after padding must fail closed");
+    assert!(matches!(
+        error,
+        SigningError::Digest(SigningDigestError::Transform(TransformError::Base64(_)))
+    ));
 }

@@ -274,8 +274,8 @@ fn stage_regression_and_repeat_execution_are_rejected() {
 #[cfg(feature = "xmldsig")]
 #[test]
 fn resource_identity_is_checked_before_the_action_runs() {
-    let expected = OperationResourceIdentity::external("urn:test", b"expected");
-    let observed = OperationResourceIdentity::external("urn:test", b"changed");
+    let expected = OperationResourceIdentity::Generated("urn:test", 0);
+    let observed = OperationResourceIdentity::Generated("urn:test", 1);
     let mut context = OperationExecutionContext::new((), (), None);
     let node = context.add_node(
         OperationNodeKind::Digest { index: 0 },
@@ -300,7 +300,7 @@ fn resource_identity_is_checked_before_the_action_runs() {
 fn resource_bound_node_requires_an_observed_identity() {
     // A caller cannot accidentally bypass provenance validation by using the
     // generic execution entry point for a resource-bound operation node.
-    let expected = OperationResourceIdentity::external("urn:test", b"expected");
+    let expected = OperationResourceIdentity::Generated("urn:test", 0);
     let mut context = OperationExecutionContext::new((), (), None);
     let node = context.add_node(
         OperationNodeKind::Digest { index: 0 },

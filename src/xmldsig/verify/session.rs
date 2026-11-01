@@ -624,8 +624,14 @@ impl<'scope, 'inputs, W: Work, Q: Work> SelectedSignature<'_, '_, 'scope, 'input
                     .borrow()
                     .get(&node.id())
                 {
-                    Some(OperationResourceIdentity::External { fingerprint, .. }) => {
-                        ReferenceLocation::Detached(Some(*fingerprint))
+                    Some(OperationResourceIdentity::BorrowedExternal { uri, .. }) => {
+                        ReferenceLocation::Detached(
+                            self.session.budgets.external_resource_fingerprint(
+                                uri,
+                                &self.session.resolver,
+                                None,
+                            ),
+                        )
                     }
                     Some(OperationResourceIdentity::MissingExternal) => {
                         ReferenceLocation::Detached(None)

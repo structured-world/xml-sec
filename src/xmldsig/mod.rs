@@ -56,6 +56,7 @@
 //! ```
 #![doc = include_str!("../../docs/xmldsig.md")]
 
+mod base64_stream;
 #[cfg(feature = "xmldsig-sign")]
 pub mod builder;
 #[cfg(feature = "cms")]

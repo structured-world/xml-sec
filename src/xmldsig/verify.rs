@@ -1224,6 +1224,28 @@ fn reference_origin_node<'a, 'input>(
     }
 }
 
+fn bind_external_evidence(
+    result: &mut ReferenceResult,
+    reference: &Reference,
+    observed: &OperationResourceIdentity,
+    budgets: &VerificationOperationBudgets<'_>,
+    resolver: &UriReferenceResolver<'_>,
+) {
+    let OperationResourceIdentity::BorrowedExternal { uri, .. } = observed else {
+        return;
+    };
+    // Without transforms a valid SHA-256 DigestValue was just compared against
+    // the digest of exactly these bytes, so it is their fingerprint.
+    let digested = (result.status == DsigStatus::Valid
+        && reference.transforms.is_empty()
+        && reference.digest_method == DigestAlgorithm::Sha256)
+        .then(|| <[u8; 32]>::try_from(reference.digest_value.as_slice()).ok())
+        .flatten();
+    result.external_resource_fingerprint =
+        budgets.external_resource_fingerprint(uri, resolver, digested);
+    result.external_payload = Some(ExternalPayload::Resident);
+}
+
 fn bind_reference_evidence(
     result: &mut ReferenceResult,
     reference: &Reference,
@@ -1232,10 +1254,6 @@ fn bind_reference_evidence(
     observed: &OperationResourceIdentity,
 ) {
     result.reference_identity = origin.map(|node| view.node_identity(node));
-    if let OperationResourceIdentity::External { fingerprint, .. } = observed {
-        result.external_resource_fingerprint = Some(*fingerprint);
-        result.external_payload = Some(ExternalPayload::Resident);
-    }
     if let OperationResourceIdentity::DocumentNode(target) = observed {
         result.target_identity = Some(*target);
         // A later node-set transform can reparse C14N output, so arbitrary
@@ -1281,9 +1299,8 @@ struct VerificationOperationBudgets<'a> {
     canonicalized: CanonicalizedDataBudget,
     xpath_parse: RefCell<XPathSignatureParseBudget>,
     key_info_materialization: RefCell<KeyInfoMaterializationState>,
-    external_resource_identities: RefCell<Map<String, OperationResourceIdentity>>,
+    external_resource_fingerprints: RefCell<Map<String, [u8; 32]>>,
     resolved_reference_resources: RefCell<Map<NodeId, OperationResourceIdentity>>,
-    external_resource_set_identity: RefCell<Option<OperationResourceIdentity>>,
 }
 
 impl<'a> VerificationOperationBudgets<'a> {
@@ -1309,22 +1326,27 @@ impl<'a> VerificationOperationBudgets<'a> {
             ),
             xpath_parse: RefCell::new(xpath_parse),
             key_info_materialization: RefCell::new(KeyInfoMaterializationState::default()),
-            external_resource_identities: RefCell::new(Map::new()),
+            external_resource_fingerprints: RefCell::new(Map::new()),
             resolved_reference_resources: RefCell::new(Map::new()),
-            external_resource_set_identity: RefCell::new(None),
         }
     }
 
-    fn external_resource_set_identity(
+    /// One resolver borrows the same immutable map for the entire request, so
+    /// each URI is hashed at most once, and not at all when `digested` is given.
+    fn external_resource_fingerprint(
         &self,
+        uri: &str,
         resolver: &UriReferenceResolver<'_>,
-    ) -> OperationResourceIdentity {
-        // One resolver borrows the same immutable map for the entire request.
-        // Hash/sort it once, not once per graph node or Signature.
-        let mut cached = self.external_resource_set_identity.borrow_mut();
-        cached
-            .get_or_insert_with(|| resolver.external_resource_set_identity())
-            .clone()
+        digested: Option<[u8; 32]>,
+    ) -> Option<[u8; 32]> {
+        if let Some(fingerprint) = self.external_resource_fingerprints.borrow().get(uri) {
+            return Some(*fingerprint);
+        }
+        let fingerprint = digested.or_else(|| resolver.external_resource_fingerprint(uri))?;
+        self.external_resource_fingerprints
+            .borrow_mut()
+            .insert(uri.to_owned(), fingerprint);
+        Some(fingerprint)
     }
 
     fn resource_identity_for_reference(
@@ -1376,22 +1398,9 @@ impl<'a> VerificationOperationBudgets<'a> {
         } else {
             uri
         };
-        if let Some(identity) = self.external_resource_identities.borrow().get(uri).cloned() {
-            if let Some(origin) = origin {
-                self.resolved_reference_resources
-                    .borrow_mut()
-                    .insert(origin.id(), identity.clone());
-            }
-            return identity;
-        }
         let identity = resolver
             .external_resource_identity(uri)
             .unwrap_or(OperationResourceIdentity::MissingExternal);
-        if matches!(identity, OperationResourceIdentity::External { .. }) {
-            self.external_resource_identities
-                .borrow_mut()
-                .insert(uri.to_owned(), identity.clone());
-        }
         if let Some(origin) = origin {
             self.resolved_reference_resources
                 .borrow_mut()
@@ -1432,7 +1441,7 @@ fn compile_verification_operation_plan(
             view.node_identity(signature_node),
         )),
     );
-    let key_materialization_resource = operation.budgets().external_resource_set_identity(resolver);
+    let key_materialization_resource = resolver.external_resource_set_identity();
     let key_materialization = operation.add_node(
         OperationNodeKind::Key { index: 0 },
         OperationStage::Resolve,
@@ -2794,13 +2803,10 @@ fn process_signed_info_references<C: VerificationCapture>(
         .zip(signed_info_references)
         .enumerate()
     {
-        let observed = operation.budgets().resource_identity_for_reference(
-            reference,
-            index,
-            resolver,
-            view,
-            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
-        );
+        let origin = reference_origin_node(signature_node, ReferenceSet::SignedInfo, index);
+        let observed = operation
+            .budgets()
+            .resource_identity_for_reference(reference, index, resolver, view, origin);
         let mut result = operation.run_with_resource(node, &observed, || {
             let budgets = operation.budgets();
             let execution = ReferenceExecutionContext {
@@ -2817,7 +2823,7 @@ fn process_signed_info_references<C: VerificationCapture>(
                 signature_node,
                 ReferenceSet::SignedInfo,
                 index,
-                reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
+                origin,
                 &execution,
             )
             .or_else(|error| {
@@ -2831,12 +2837,13 @@ fn process_signed_info_references<C: VerificationCapture>(
             })
             .map_err(SignatureVerificationPipelineError::from)
         })?;
-        bind_reference_evidence(
+        bind_reference_evidence(&mut result, reference, view, origin, &observed);
+        bind_external_evidence(
             &mut result,
             reference,
-            view,
-            reference_origin_node(signature_node, ReferenceSet::SignedInfo, index),
             &observed,
+            operation.budgets(),
+            resolver,
         );
         let accepted = result.status == DsigStatus::Valid;
         operation.set_outcome(
@@ -3589,7 +3596,7 @@ fn verify_signature_node<'a, C: VerificationCapture>(
             .validate_document_view(view)
             .map_err(map_verification_plan_error)
     })?;
-    let observed_key_resources = operation.budgets().external_resource_set_identity(resolver);
+    let observed_key_resources = resolver.external_resource_set_identity();
     let retrieval_materialization = operation.run_with_resource(
         plan_nodes.key_materialization,
         &observed_key_resources,
@@ -5658,6 +5665,7 @@ fn execute_manifest_reference<C: VerificationCapture>(
                     resolver.node_for_node_id(compiled.reference_node_id),
                     &observed,
                 );
+                bind_external_evidence(&mut result, reference, &observed, budgets, resolver);
                 if result.status == DsigStatus::Valid
                     && reference
                         .transforms
