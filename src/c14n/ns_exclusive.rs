@@ -12,7 +12,7 @@ use super::C14nError;
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
 use super::prefix::{attribute_prefix, element_prefix};
-use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch};
+use super::scratch::{List, NamespaceMap, NamespaceRendering, NamespaceState, Scratch, changed};
 use super::serialize::NsRenderer;
 
 /// Exclusive C14N namespace renderer.
@@ -123,7 +123,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
                         && declarations.iter().any(|(declared, _)| *declared == prefix))
                 );
                 let nearest_utilizer_omitted_namespace =
-                    parent_rendered.get(prefix, true)? == super::scratch::NamespaceState::Excluded;
+                    parent_rendered.get(prefix, true)? == NamespaceState::Excluded;
                 let uses_exclusive_rendering = utilized.get(prefix, false)?.is_present()
                     && !self.inclusive_prefixes.contains(prefix);
 
@@ -143,7 +143,11 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
                 // nearest output ancestor that visibly utilized its prefix,
                 // not merely with the physically effective output binding.
                 if uses_exclusive_rendering {
-                    rendered.insert(prefix, true, selected_here.then_some(uri))?;
+                    let value = selected_here.then_some(uri);
+                    let current = rendered.as_ref().unwrap_or(parent_rendered);
+                    if current.get(prefix, true)? != NamespaceState::binding(value) {
+                        changed(&mut rendered, parent_rendered)?.insert(prefix, true, value)?;
+                    }
                 }
             }
         }

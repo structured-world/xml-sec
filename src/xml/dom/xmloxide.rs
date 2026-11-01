@@ -10,7 +10,7 @@ use xmloxide::tree::{NodeId as XmloxNodeId, NodeKind as XmloxNodeKind};
 
 use super::{
     Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
-    preflight::{PositionCursor, SourceKind},
+    preflight::{PositionCursor, SourceKind, SourceNode},
     tree::{AttributeData, NamespaceData, NamespaceSet, NodeId, NodeKind, TreeBuilder},
 };
 
@@ -25,23 +25,36 @@ impl XmloxideBackend {
         storage: super::storage::Accounted<'w, W>,
     ) -> Result<Document<'input, super::storage::Accounted<'w, W>>, super::AccountedParseError>
     {
-        let parsed = xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
-            .and_then(xmloxide::parser::XmlParser::parse)
-            .map_err(|error| match error {
-                xmloxide::error::ParseError::Resource(error) => {
-                    super::AccountedParseError::Semantic(error)
-                }
-                xmloxide::error::ParseError::Syntax {
-                    message,
-                    location,
-                    diagnostics,
-                } => super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
-                    message,
-                    location,
-                    diagnostics: diagnostics.into_owned(),
-                }),
-            })?;
-        Ok(project_in(input, parsed, options, preflight, storage)?)
+        let (parsed, recorded) =
+            xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
+                .and_then(|parser| {
+                    if preflight.is_unscanned() {
+                        let (parsed, positions) = parser.parse_recording_positions()?;
+                        Ok((parsed, Some(positions)))
+                    } else {
+                        Ok((parser.parse()?, None))
+                    }
+                })
+                .map_err(|error| match error {
+                    xmloxide::error::ParseError::Resource(error) => {
+                        super::AccountedParseError::Semantic(error)
+                    }
+                    xmloxide::error::ParseError::Syntax {
+                        message,
+                        location,
+                        diagnostics,
+                    } => {
+                        super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
+                            message,
+                            location,
+                            diagnostics: diagnostics.into_owned(),
+                        })
+                    }
+                })?;
+        let positions = recorded.as_deref().unwrap_or(preflight.source_nodes());
+        Ok(project_in(
+            input, parsed, options, preflight, positions, storage,
+        )?)
     }
 }
 
@@ -87,15 +100,21 @@ impl XmlBackendImplementation for XmloxideBackend {
         options: ParsingOptions,
         preflight: &LexicalPreflight,
     ) -> Result<Document<'input>, ParseError> {
-        let parsed = xmloxide::parser::parse_str_with_options(input, &backend_options()).map_err(
-            |error| match error {
-                xmloxide::error::ParseError::Resource(error) => error,
-                error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
-                    backend: "xmloxide",
-                    message: error.to_string(),
-                },
+        let failure = |error| match error {
+            xmloxide::error::ParseError::Resource(error) => error,
+            error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
+                backend: "xmloxide",
+                message: error.to_string(),
             },
-        )?;
+        };
+        if preflight.is_unscanned() {
+            let (parsed, positions) =
+                xmloxide::parser::parse_str_recording_positions(input, &backend_options())
+                    .map_err(failure)?;
+            return project_in(input, parsed, options, preflight, &positions, Native);
+        }
+        let parsed =
+            xmloxide::parser::parse_str_with_options(input, &backend_options()).map_err(failure)?;
         project(input, parsed, options, preflight)
     }
 }
@@ -106,7 +125,8 @@ pub(super) fn project<'input>(
     options: ParsingOptions,
     preflight: &LexicalPreflight,
 ) -> Result<Document<'input>, ParseError> {
-    project_in(input, parsed, options, preflight, Native)
+    let positions = preflight.source_nodes();
+    project_in(input, parsed, options, preflight, positions, Native)
 }
 
 pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
@@ -114,6 +134,7 @@ pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
     parsed: xmloxide::Document<R>,
     options: ParsingOptions,
     preflight: &LexicalPreflight<'_, P>,
+    positions: &[SourceNode],
     storage: S,
 ) -> Result<Document<'input, S>, ParseError> {
     if options.nodes_limit == 0 {
@@ -127,7 +148,7 @@ pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
             storage,
         )?,
         source: parsed,
-        positions: preflight.positions(),
+        positions: PositionCursor::new(positions),
         nodes_limit: options.nodes_limit,
     };
     let root = projector
@@ -189,6 +210,17 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
                     inherited_range,
                     range_actionable,
                 } => {
+                    // The next sibling waits under this node's subtree, so the
+                    // stack grows with depth and not with an element's width.
+                    if let Some(next) = self.source.next_sibling(source) {
+                        stack.push(ProjectionFrame::Enter {
+                            source: next,
+                            parent,
+                            namespace_owner,
+                            inherited_range: inherited_range.clone(),
+                            range_actionable,
+                        })?;
+                    }
                     // Each node is entered once, so its payload moves out.
                     let kind = core::mem::replace(
                         &mut self.source.node_mut(source).kind,
@@ -439,18 +471,14 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
         inherited_range: Option<&Range<usize>>,
         range_actionable: bool,
     ) -> Result<(), ParseError> {
-        // Walk linked siblings backwards instead of allocating a second child
-        // vector merely to reverse iteration.
-        let mut child = self.source.last_child(source);
-        while let Some(current) = child {
+        if let Some(first) = self.source.first_child(source) {
             stack.push(ProjectionFrame::Enter {
-                source: current,
+                source: first,
                 parent,
                 namespace_owner,
                 inherited_range: inherited_range.cloned(),
                 range_actionable,
             })?;
-            child = self.source.prev_sibling(current);
         }
         Ok(())
     }

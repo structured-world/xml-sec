@@ -272,6 +272,20 @@ impl XmlParseWorkBudget {
         Ok(())
     }
 
+    /// Refuse work the remaining allowance cannot hold, charging nothing: the
+    /// parse that follows charges it, once, for the bytes it really reads.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) fn admit(&self, bytes: usize) -> Result<(), crate::policy::PolicyViolation> {
+        if bytes > self.remaining.get() {
+            return Err(crate::policy::PolicyViolation::ResourceLimit {
+                resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
+                maximum: self.maximum,
+                actual: self.consumed().saturating_add(bytes),
+            });
+        }
+        Ok(())
+    }
+
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub(crate) fn charge(&self, bytes: usize) -> Result<(), XmlDocumentError> {
         self.charge_policy(bytes).map_err(Into::into)
@@ -675,6 +689,74 @@ pub struct XmlDocument {
     requires_internal_dtd: bool,
     settings: DocumentParseSettings,
     cell: DocumentCell,
+    #[cfg(feature = "xmldsig-sign")]
+    atomic: AtomicMutation,
+}
+
+/// The generation an all-or-nothing mutation started from, kept from its first
+/// commit on, so that no copy of the document is parsed in advance.
+#[cfg(feature = "xmldsig-sign")]
+enum AtomicMutation {
+    /// No atomic mutation is running.
+    Idle,
+    /// One is running and has not committed yet.
+    Started,
+    /// One is running; this is the cell and generation to return to.
+    Replaced(DocumentCell, u64),
+}
+
+/// The serialization with source ranges already replaced in text.
+#[cfg(feature = "xmldsig-sign")]
+pub(crate) struct SplicedElement {
+    /// The whole document with the new content.
+    pub(crate) xml: String,
+    /// Each replaced source range with its new length, in document order.
+    pub(crate) spans: Vec<(core::ops::Range<usize>, usize)>,
+    /// Upper bound of the nodes the splice added.
+    pub(crate) added_nodes: usize,
+    /// The deepest level the new content reaches.
+    pub(crate) depth: usize,
+    /// The content adds no ID and no namespace scope the parsed fragment did not
+    /// have, so it may join the final mutation unparsed.
+    pub(crate) inert: bool,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl SplicedElement {
+    /// `xml` with `original` of a source of `source_len` bytes replaced; the
+    /// source around that range is unchanged.
+    pub(crate) fn replacing(
+        source_len: usize,
+        original: core::ops::Range<usize>,
+        xml: String,
+        (added_nodes, depth, inert): (usize, usize, bool),
+    ) -> Self {
+        let replaced = original.len() + xml.len() - source_len;
+        Self {
+            xml,
+            spans: alloc::vec![(original, replaced)],
+            added_nodes,
+            depth,
+            inert,
+        }
+    }
+}
+
+fn render_content_replacement_edits(
+    source: &str,
+    edits: &[ContentReplacementEdit<'_>],
+    projected: usize,
+) -> String {
+    let mut output = String::with_capacity(projected);
+    let mut cursor = 0;
+    for edit in edits {
+        output.push_str(&source[cursor..edit.range.start]);
+        edit.write_output(source, &mut output);
+        cursor = edit.range.end;
+    }
+    output.push_str(&source[cursor..]);
+    debug_assert_eq!(output.len(), projected);
+    output
 }
 
 #[cfg(feature = "xmlenc")]
@@ -893,6 +975,8 @@ impl XmlDocument {
             requires_internal_dtd,
             settings,
             cell,
+            #[cfg(feature = "xmldsig-sign")]
+            atomic: AtomicMutation::Idle,
         })
     }
 
@@ -982,27 +1066,32 @@ impl XmlDocument {
         self.cell.into_owner()
     }
 
+    /// Make the following commits one all-or-nothing mutation.
     #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn staged_copy_with_budget(
-        &self,
-        settings: DocumentParseSettings,
-        budget: &XmlParseWorkBudget,
-    ) -> Result<Self, XmlDocumentError> {
-        Self::parse_with_settings_and_budget(self.as_xml().to_owned(), settings, budget)
+    pub(crate) fn begin_atomic_mutation(&mut self) {
+        self.atomic = AtomicMutation::Started;
+    }
+
+    /// End the mutation: success leaves one new generation, failure leaves the
+    /// starting serialization and generation exactly as they were.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) fn finish_atomic_mutation(&mut self, succeeded: bool) {
+        match core::mem::replace(&mut self.atomic, AtomicMutation::Idle) {
+            AtomicMutation::Replaced(_, generation) if succeeded => {
+                self.generation = generation + 1;
+            }
+            AtomicMutation::Replaced(cell, generation) => {
+                self.cell = cell;
+                self.generation = generation;
+            }
+            AtomicMutation::Idle | AtomicMutation::Started => {}
+        }
     }
 
     /// Parser work spent on the current generation and every earlier one.
     #[cfg(feature = "xmldsig")]
     pub(crate) fn parse_work(&self) -> usize {
         recorded_work(&self.cell)
-    }
-
-    #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn commit_staged(&mut self, staged: Self) -> Result<(), XmlDocumentError> {
-        // Signing mutates and validates every staged generation under the active
-        // policy. Moving that retained cell preserves atomicity without parsing
-        // the complete signed document once more merely to commit it.
-        self.commit_cell(staged.cell)
     }
 
     /// Borrow the retained parsed view without reparsing.
@@ -1365,40 +1454,93 @@ impl XmlDocument {
         validate_base64_replacements(replacements)?;
         let (edits, projected) =
             self.prepare_content_replacement_edits(replacements, maximum_bytes)?;
-        Ok(self.render_content_replacement_edits(&edits, projected))
+        Ok(render_content_replacement_edits(
+            self.as_xml(),
+            &edits,
+            projected,
+        ))
     }
 
-    /// Serialize the generation that committing these base64 replacements under
-    /// `settings` would produce, without parsing it. Base64 character data cannot
-    /// change element structure, so the commit parse would only recheck the
-    /// projected size and node count, which are checked here instead.
+    /// Apply the node and depth ceilings of the final generation before anything
+    /// is computed for it. Each of `targets` receives one text node. With a
+    /// splice the node count is an upper bound: a reused placeholder counts as
+    /// added.
     #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn project_base64_commit(
+    pub(crate) fn validate_commit_limits(
         &self,
-        replacements: &[(NodeIdentity, String)],
+        targets: impl Iterator<Item = NodeIdentity>,
+        spliced: Option<&SplicedElement>,
         settings: DocumentParseSettings,
-    ) -> Result<String, XmlDocumentError> {
-        validate_base64_replacements(replacements)?;
-        let (edits, projected) =
-            self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
+    ) -> Result<(), XmlDocumentError> {
+        let (added_nodes, depth) =
+            spliced.map_or((0, 0), |spliced| (spliced.added_nodes, spliced.depth));
+        if depth > settings.depth_limit {
+            return Err(XmlDocumentError::DocumentTooDeep {
+                maximum: settings.depth_limit,
+                actual: depth,
+            });
+        }
         let projected_nodes = self.with_view(|view| {
-            replacements
-                .iter()
-                .try_fold(view.node_count(), |count, (target, replacement)| {
-                    // The content becomes exactly one text node, or none when empty. The
-                    // target's descendants (itself included) are part of `count`.
-                    let replaced = view.resolve_mutation_node(*target)?.descendants().count() - 1;
-                    Ok::<_, XmlDocumentError>(
-                        count - replaced + usize::from(!replacement.is_empty()),
-                    )
-                })
+            let mut count = view.node_count() + added_nodes;
+            for target in targets {
+                // The target's descendants (itself included) are part of `count`.
+                count -= view.resolve_mutation_node(target)?.descendants().count() - 1;
+                count += 1;
+            }
+            Ok::<_, XmlDocumentError>(count)
         })?;
         if projected_nodes > settings.nodes_limit as usize {
             return Err(XmlDocumentError::ProjectedNodeLimit {
                 maximum: settings.nodes_limit as usize,
             });
         }
-        Ok(self.render_content_replacement_edits(&edits, projected))
+        Ok(())
+    }
+
+    /// Serialize the generation that committing these base64 replacements under
+    /// `settings` would produce, without parsing it. Base64 character data cannot
+    /// change element structure, and `validate_commit_limits` has already applied
+    /// what the commit parse would recheck.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) fn project_base64_commit(
+        &self,
+        replacements: &[(NodeIdentity, String)],
+        settings: DocumentParseSettings,
+        spliced: Option<&SplicedElement>,
+    ) -> Result<String, XmlDocumentError> {
+        validate_base64_replacements(replacements)?;
+        let (mut edits, mut projected) =
+            self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
+        let mut source = self.as_xml();
+        if let Some(spliced) = spliced {
+            source = &spliced.xml;
+            // Everything after a span moved with it; nothing inside one is
+            // replaced, as no DigestValue or SignatureValue lives there.
+            for edit in &mut edits {
+                let (mut grown, mut shrunk) = (0, 0);
+                for (span, length) in &spliced.spans {
+                    if edit.range.start >= span.end {
+                        grown += *length;
+                        shrunk += span.len();
+                    } else if edit.range.end > span.start {
+                        return Err(XmlDocumentError::InvalidReplacement(
+                            "replacement target lies inside a spliced range".into(),
+                        ));
+                    }
+                }
+                // Every counted span lies before the edit, so this stays in range.
+                edit.range = edit.range.start + grown - shrunk..edit.range.end + grown - shrunk;
+            }
+            // Replacements may have shortened the document: add before subtracting.
+            projected = projected + spliced.xml.len() - self.as_xml().len();
+            if projected > settings.max_bytes {
+                return Err(XmlDocumentError::DocumentTooLarge {
+                    maximum: settings.max_bytes,
+                    actual: projected,
+                });
+            }
+        }
+        Ok(render_content_replacement_edits(source, &edits, projected))
     }
 
     fn replace_contents_inner(
@@ -1421,7 +1563,7 @@ impl XmlDocument {
             0
         };
 
-        let output = self.render_content_replacement_edits(&edits, projected);
+        let output = render_content_replacement_edits(self.as_xml(), &edits, projected);
         if policy_bounded {
             self.replace_serialized_with_settings(output, settings, budget)?;
         } else {
@@ -1505,23 +1647,6 @@ impl XmlDocument {
             });
         }
         Ok((edits, projected))
-    }
-
-    fn render_content_replacement_edits(
-        &self,
-        edits: &[ContentReplacementEdit<'_>],
-        projected: usize,
-    ) -> String {
-        let mut output = String::with_capacity(projected);
-        let mut cursor = 0;
-        for edit in edits {
-            output.push_str(&self.as_xml()[cursor..edit.range.start]);
-            edit.write_output(self.as_xml(), &mut output);
-            cursor = edit.range.end;
-        }
-        output.push_str(&self.as_xml()[cursor..]);
-        debug_assert_eq!(output.len(), projected);
-        output
     }
 
     fn validate_content_edits(
@@ -1726,7 +1851,13 @@ impl XmlDocument {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
         })?;
         record_work(&mut next, recorded_work(&self.cell));
-        self.cell = next;
+        let previous = core::mem::replace(&mut self.cell, next);
+        #[cfg(feature = "xmldsig-sign")]
+        if matches!(self.atomic, AtomicMutation::Started) {
+            self.atomic = AtomicMutation::Replaced(previous, self.generation);
+        }
+        #[cfg(not(feature = "xmldsig-sign"))]
+        drop(previous);
         self.generation = next_generation;
         Ok(())
     }
@@ -2957,13 +3088,18 @@ fn scan_preflight_event<S: NameStorage>(
             1,
         ));
     }
-    let end = remaining.find(['<', '&']).unwrap_or(remaining.len());
-    let text = &remaining[..end];
+    let bytes = remaining.as_bytes();
+    let end = bytes
+        .iter()
+        .position(|byte| matches!(byte, b'<' | b'&'))
+        .unwrap_or(remaining.len());
     Ok((
         PreflightEvent::CharacterData {
-            xml_whitespace: text
-                .chars()
-                .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n')),
+            // Only text outside the document element is judged by this.
+            xml_whitespace: state.depth == 0
+                && bytes[..end]
+                    .iter()
+                    .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
         },
         end,
     ))
@@ -2980,13 +3116,23 @@ fn scan_preflight_opening<S: NameStorage>(
         return Ok((PreflightEvent::Done, remaining.len()));
     };
     let opening = &remaining[..=end];
-    let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
-    let attribute_source =
-        element_attribute_reference_source(opening, element_name, &attributes, dtd)?;
+    // Attributes matter here for their namespace declarations and DTD defaults.
+    // A tag with neither has nothing to split, however many attributes it has.
+    let (attribute_source, namespace_declarations) =
+        if dtd.attribute_defaults.len() == 0 && !opening.contains("xmlns") {
+            (
+                element_attribute_reference_source(opening, "", &[], dtd)?,
+                storage.values(0)?,
+            )
+        } else {
+            let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
+            (
+                element_attribute_reference_source(opening, element_name, &attributes, dtd)?,
+                namespace_declarations(element_name, &attributes, dtd, state, budget)?,
+            )
+        };
     // The frame later revisits this attribute/reference window.
     storage.charge(attribute_source.len())?;
-    let namespace_declarations =
-        namespace_declarations(element_name, &attributes, dtd, state, budget)?;
     let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
         PreflightEvent::Empty {
             attribute_source,

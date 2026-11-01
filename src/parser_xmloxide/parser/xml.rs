@@ -5,6 +5,7 @@
 
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{Native, Storage, Values};
+use crate::xml::dom::{PositionRecorder, SourceKind, SourceNode};
 
 use crate::parser_xmloxide::error::{ErrorSeverity, ParseDiagnostic};
 use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
@@ -68,6 +69,10 @@ const DEFAULT_MAX_AMPLIFICATION: usize = 5;
 /// resolver-provided external entities and stack safety.
 const MAX_ENTITY_DEPTH: u32 = 32;
 
+/// A parsed document with the source ranges of its nodes.
+pub(crate) type Located<S> = (Document<S>, <S as Storage>::Values<SourceNode>);
+type Finished<S> = (Document<S>, Option<PositionRecorder<S>>);
+
 /// The core XML parser.
 pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
     /// Shared low-level input state (position, peek, advance, name parsing, etc.).
@@ -91,6 +96,8 @@ pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
     expansion_size: usize,
     /// Current nesting depth of general entity expansion (0 = document level).
     entity_depth: u32,
+    /// Source ranges of the nodes, when the caller has no lexical sidecar.
+    positions: Option<PositionRecorder<S>>,
 }
 
 impl<'a> XmlParser<'a> {
@@ -128,11 +135,25 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             input_size: input.len(),
             expansion_size: 0,
             entity_depth: 0,
+            positions: None,
         })
     }
 
     /// Main parse entry point. Parses the entire document.
-    pub fn parse(mut self) -> Result<Document<S>, ParseError<S>> {
+    pub fn parse(self) -> Result<Document<S>, ParseError<S>> {
+        self.parse_tree().map(|(document, _)| document)
+    }
+
+    /// Parses a document without a DOCTYPE and returns its nodes' source ranges,
+    /// in the order the projector visits them.
+    pub(crate) fn parse_recording_positions(mut self) -> Result<Located<S>, ParseError<S>> {
+        self.positions = Some(PositionRecorder::new(self.storage)?);
+        let (document, positions) = self.parse_tree()?;
+        let positions = positions.expect("recording was enabled above");
+        Ok((document, positions.into_nodes()))
+    }
+
+    fn parse_tree(mut self) -> Result<Finished<S>, ParseError<S>> {
         // Parse optional XML declaration — must be at the very start of the
         // document with no leading whitespace (XML 1.0 §2.8).
         if self.input.looking_at(b"<?xml ")
@@ -197,7 +218,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
 
         // Parsing is complete and the parser is consumed. Moving the arena
         // avoids Document::default allocating a replacement tree on return.
-        Ok(self.doc)
+        Ok((self.doc, self.positions))
     }
 
     // --- XML Declaration ---
@@ -205,6 +226,11 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
 
     fn parse_xml_declaration(&mut self) -> Result<(), ParseError<S>> {
         let decl = parse_xml_decl(&mut self.input)?;
+        // XML 1.0 §2.8 allows a later 1.x only to a processor implementing that
+        // version's character model. This parser implements XML 1.0.
+        if decl.version != "1.0" {
+            return Err(self.input.fatal("unsupported XML version"));
+        }
         self.doc.version = Some(self.storage.text(decl.version)?);
         self.doc.encoding = self.storage.optional_text(decl.encoding)?;
         self.doc.standalone = decl.standalone;
@@ -756,6 +782,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         parent: NodeId,
     ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
         self.input.increment_depth()?;
+        if let Some(positions) = &mut self.positions {
+            positions.start_element(self.input.pos())?;
+        }
         self.input.expect_byte(b'<')?;
         let name = self.input.parse_name()?;
         let mut attributes = self.storage.values(0)?;
@@ -854,6 +883,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {
             self.input.advance(2)?;
+            if let Some(positions) = &mut self.positions {
+                positions.end_element(self.input.pos());
+            }
             if has_ns_decls {
                 self.ns.pop_scope()?;
             }
@@ -900,6 +932,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         }
         self.input.skip_whitespace()?;
         self.input.expect_byte(b'>')?;
+        if let Some(positions) = &mut self.positions {
+            positions.end_element(self.input.pos());
+        }
 
         // Pop the namespace scope when leaving this element (only if we pushed).
         if has_ns_decls {
@@ -938,6 +973,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // See XML 1.0 §2.4: [14] CharData
 
     fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+        let source_start = self.input.pos();
         let mut text = self.storage.text("")?;
 
         while !self.input.at_end() {
@@ -946,8 +982,10 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             let safe_len = self.input.scan_char_data()?;
             if safe_len > 0 {
                 let start = self.input.pos();
-                let chunk = core::str::from_utf8(self.input.slice(start, start + safe_len))
-                    .map_err(|_| self.input.fatal("invalid UTF-8 in character data"))?;
+                let chunk = self
+                    .input
+                    .text(start, start + safe_len)
+                    .ok_or_else(|| self.input.fatal("invalid UTF-8 in character data"))?;
                 // Fast byte-level pre-check for invalid XML chars (0x7F,
                 // U+FFFE, U+FFFF). Skips the expensive char-by-char
                 // validation for the 99.9% of chunks that are clean.
@@ -1031,6 +1069,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             }
             let text_id = self.doc.try_create_node(NodeKind::Text { content: text })?;
             self.doc.append_child(parent, text_id);
+            if let Some(positions) = &mut self.positions {
+                positions.leaf(SourceKind::Text, source_start..self.input.pos())?;
+            }
         }
 
         Ok(())
@@ -1360,11 +1401,15 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // See XML 1.0 §2.5: [15] Comment
 
     fn parse_comment(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+        let start = self.input.pos();
         let content = parse_comment_content(&mut self.input)?;
         let comment_id = self.doc.try_create_node(NodeKind::Comment {
             content: self.storage.text(content)?,
         })?;
         self.doc.append_child(parent, comment_id);
+        if let Some(positions) = &mut self.positions {
+            positions.leaf(SourceKind::Comment, start..self.input.pos())?;
+        }
         Ok(())
     }
 
@@ -1372,11 +1417,15 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // See XML 1.0 §2.7: [18] CDSect
 
     fn parse_cdata(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+        let start = self.input.pos();
         let content = parse_cdata_content(&mut self.input)?;
         let cdata_id = self.doc.try_create_node(NodeKind::CData {
             content: self.storage.text(content)?,
         })?;
         self.doc.append_child(parent, cdata_id);
+        if let Some(positions) = &mut self.positions {
+            positions.leaf(SourceKind::CData, start..self.input.pos())?;
+        }
         Ok(())
     }
 
@@ -1384,12 +1433,16 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // See XML 1.0 §2.6: [16] PI
 
     fn parse_processing_instruction(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+        let start = self.input.pos();
         let (target, data) = parse_pi_content(&mut self.input)?;
         let pi_id = self.doc.try_create_node(NodeKind::ProcessingInstruction {
             target: self.storage.text(target)?,
             data: self.storage.optional_text(data)?,
         })?;
         self.doc.append_child(parent, pi_id);
+        if let Some(positions) = &mut self.positions {
+            positions.leaf(SourceKind::Pi, start..self.input.pos())?;
+        }
         Ok(())
     }
 }

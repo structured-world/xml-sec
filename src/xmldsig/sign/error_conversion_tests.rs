@@ -411,14 +411,13 @@ fn owned_signing_commits_the_validated_stage_without_reparsing() {
     let xml = r##"<root><payload Id="payload">content</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></root>"##;
     let policy = crate::policy::SigningPolicy::default();
     let context = SignContext::new(&FixedRsaSigningKey).policy(policy.clone());
-    let source = XmlDocument::parse(xml).expect("fixture must parse");
     let mut measured = SigningOperationBudgets::from_resources(&policy.resources);
-    let mut staged = source
-        .staged_copy_with_budget(
-            DocumentParseSettings::from_policy(policy.xml, &policy.resources),
-            measured.transforms.xml_parse_work(),
-        )
-        .expect("staging must parse");
+    let mut staged = XmlDocument::parse_with_settings_and_budget(
+        xml.to_owned(),
+        DocumentParseSettings::from_policy(policy.xml, &policy.resources),
+        measured.transforms.xml_parse_work(),
+    )
+    .expect("staging must parse");
     context
         .sign_document_in_place::<CommitDocument>(&mut staged, &mut measured)
         .expect("staged signing must succeed");
@@ -435,6 +434,68 @@ fn owned_signing_commits_the_validated_stage_without_reparsing() {
     assert_eq!(document.generation(), 1);
     assert!(!document.as_xml().contains("<ds:DigestValue/>"));
     assert!(!document.as_xml().contains("<ds:SignatureValue/>"));
+}
+
+#[test]
+fn a_key_info_writer_adds_no_document_parse() {
+    // Nothing signed reads KeyInfo here, so the writer's output joins the final
+    // generation: its own fragment is parsed, the document only at the commit.
+    struct NameWriter;
+
+    impl KeyInfoWriter for NameWriter {
+        fn write_key_info(&self, _: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+            Ok(format!(r#"<KeyName xmlns="{XMLDSIG_NS}">signer</KeyName>"#))
+        }
+    }
+
+    let padding = "x".repeat(16 * 1024);
+    let exclusive = "http://www.w3.org/2001/10/xml-exc-c14n#";
+    let xml = format!(
+        concat!(
+            r#"<root><payload Id="payload">{padding}</payload>"#,
+            r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+            r#"<ds:CanonicalizationMethod Algorithm="{exclusive}"/>"#,
+            r#"<ds:SignatureMethod "#,
+            r#"Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>"#,
+            r##"<ds:Reference URI="#payload"><ds:Transforms>"##,
+            r#"<ds:Transform Algorithm="{exclusive}"/></ds:Transforms>"#,
+            r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+            r#"<ds:DigestValue/></ds:Reference></ds:SignedInfo>"#,
+            r#"<ds:SignatureValue/><ds:KeyInfo/></ds:Signature></root>"#,
+        ),
+        padding = padding,
+        exclusive = exclusive,
+    );
+    let policy = crate::policy::SigningPolicy::default();
+    let context = SignContext::new(&FixedRsaSigningKey)
+        .policy(policy.clone())
+        .key_info_writer(&NameWriter);
+    let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
+    let mut measured = SigningOperationBudgets::from_resources(&policy.resources);
+    context
+        .sign_document_in_place::<CommitDocument>(&mut document, &mut measured)
+        .expect("signing must succeed");
+    assert!(document.as_xml().contains("signer</KeyName>"));
+    let once = XmlParseWorkBudget::from_resources(&policy.resources);
+    XmlDocument::parse_with_settings_and_budget(
+        document.as_xml().to_owned(),
+        DocumentParseSettings::from_policy(policy.xml, &policy.resources),
+        &once,
+    )
+    .expect("the signed generation must parse");
+    let work = measured.transforms.xml_parse_work().consumed();
+    assert!(
+        work < once.consumed() * 3 / 2,
+        "{work} against {}",
+        once.consumed()
+    );
+
+    let text = SignContext::new(&FixedRsaSigningKey)
+        .policy(policy)
+        .key_info_writer(&NameWriter)
+        .sign_template(&xml)
+        .expect("text signing must succeed");
+    assert_eq!(text, document.as_xml());
 }
 
 #[test]
@@ -512,7 +573,11 @@ fn dtd_capable_staged_copy_charges_both_parser_passes() {
     parsing_policy.resources.max_xml_parse_work_bytes = xml.len();
     let budget = XmlParseWorkBudget::from_resources(&parsing_policy.resources);
     assert!(matches!(
-        document.staged_copy_with_budget(DocumentParseSettings::default(), &budget),
+        XmlDocument::parse_with_settings_and_budget(
+            document.as_xml().to_owned(),
+            DocumentParseSettings::default(),
+            &budget,
+        ),
         Err(XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
             resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
             maximum,

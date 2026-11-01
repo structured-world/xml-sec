@@ -348,6 +348,9 @@ pub(crate) struct ParserInput<'a, S: NameStorage = Native> {
     /// The input bytes (must be valid UTF-8).
     input: &'a [u8],
 
+    /// The same input as text, whose slices need no second UTF-8 validation.
+    text: &'a str,
+
     /// Current byte offset in `input`.
     pos: usize,
 
@@ -424,6 +427,7 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
         Ok(Self {
             storage,
             input: input.as_bytes(),
+            text: input,
             pos: 0,
             line: 1,
             column: 1,
@@ -540,6 +544,12 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
     #[inline]
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    /// The input from `start` to `end`, unless that splits a character.
+    #[inline]
+    pub fn text(&self, start: usize, end: usize) -> Option<&'a str> {
+        self.text.get(start..end)
     }
 
     /// Returns a slice of the raw input bytes from `start` to `end`.
@@ -1037,9 +1047,9 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
                 }
                 // Input is guaranteed valid UTF-8 and we only consumed ASCII bytes
                 self.storage.charge(len)?;
-                let name = core::str::from_utf8(&self.input[start..self.pos])
-                    .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
-                return Ok(name);
+                return self
+                    .text(start, self.pos)
+                    .ok_or_else(|| self.fatal("invalid UTF-8 in name"));
             }
             // Fall through: hit a non-ASCII continuation byte, continue
             // with the char-by-char path below.
@@ -1079,9 +1089,8 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
         }
 
         self.storage.charge(len)?;
-        let name = core::str::from_utf8(&self.input[start..self.pos])
-            .map_err(|_| self.fatal("invalid UTF-8 in name"))?;
-        Ok(name)
+        self.text(start, self.pos)
+            .ok_or_else(|| self.fatal("invalid UTF-8 in name"))
     }
 
     /// Parses a name from the input and checks whether it matches `expected`.
@@ -1561,8 +1570,9 @@ impl<S: NameStorage> ParserInput<'_, S> {
                 self.storage.charge(safe_len)?;
                 self.storage.charge(safe_len)?;
                 self.storage.charge(safe_len)?;
-                let chunk = core::str::from_utf8(&self.input[start..start + safe_len])
-                    .map_err(|_| self.fatal("invalid UTF-8 in attribute value"))?;
+                let chunk = self
+                    .text(start, start + safe_len)
+                    .ok_or_else(|| self.fatal("invalid UTF-8 in attribute value"))?;
                 // Fast byte-level pre-check: only validate when bytes suggest
                 // possible invalid chars (0x7F or U+FFFE/U+FFFF sequences).
                 if let Some(bad) = may_contain_invalid_xml_chars(chunk.as_bytes())
@@ -1690,9 +1700,16 @@ impl<'a, S: NameStorage> ParserInput<'a, S> {
 pub(crate) struct NamespaceResolver<S: NameStorage = Native> {
     stack: S::Values<S::Values<NamespaceUndo<S>>>,
     default_ns: Option<S::Text>,
+    /// Bindings while they are few, compared without hashing. Beyond
+    /// [`SHORT_PREFIXES`] they all move to `prefixed_ns` for constant-time lookups.
+    short_prefixes: S::Values<(S::Text, S::Text)>,
     prefixed_ns: S::Names<S::Text, S::Text>,
+    spilled: bool,
     storage: S,
 }
+
+/// Documents rarely bind more prefixes at once than this.
+const SHORT_PREFIXES: usize = 8;
 
 enum NamespaceUndo<S: Storage> {
     Default(Option<S::Text>),
@@ -1714,7 +1731,9 @@ impl<S: NameStorage> NamespaceResolver<S> {
         let mut resolver = Self {
             stack: storage.values(0)?,
             default_ns: None,
+            short_prefixes: storage.values(0)?,
             prefixed_ns: storage.names(),
+            spilled: false,
             storage,
         };
         resolver.push_scope()?;
@@ -1738,13 +1757,59 @@ impl<S: NameStorage> NamespaceResolver<S> {
                     }
                     NamespaceUndo::Prefix(prefix, previous) => {
                         if let Some(uri) = previous {
-                            self.prefixed_ns.insert(prefix, uri)?;
+                            self.store_prefix(prefix, uri)?;
                         } else {
-                            self.prefixed_ns.remove(prefix.as_ref(), self.storage)?;
+                            self.remove_prefix(prefix.as_ref())?;
                         }
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// The position of `prefix` among the short bindings.
+    fn short_position(&self, prefix: &str) -> Result<Option<usize>, crate::xml::dom::ParseError> {
+        for (index, (key, _)) in self.short_prefixes.iter().enumerate() {
+            self.storage.charge(1 + prefix.len().min(key.len()))?;
+            if key.as_ref() == prefix {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn store_prefix(
+        &mut self,
+        prefix: S::Text,
+        uri: S::Text,
+    ) -> Result<Option<S::Text>, crate::xml::dom::ParseError> {
+        if self.spilled {
+            return self.prefixed_ns.insert(prefix, uri);
+        }
+        if let Some(index) = self.short_position(prefix.as_ref())? {
+            return Ok(Some(core::mem::replace(
+                &mut self.short_prefixes[index].1,
+                uri,
+            )));
+        }
+        self.short_prefixes.push((prefix, uri))?;
+        if self.short_prefixes.len() > SHORT_PREFIXES {
+            while let Some((key, value)) = self.short_prefixes.pop() {
+                self.prefixed_ns.insert(key, value)?;
+            }
+            self.spilled = true;
+        }
+        Ok(None)
+    }
+
+    fn remove_prefix(&mut self, prefix: &str) -> Result<(), crate::xml::dom::ParseError> {
+        if self.spilled {
+            self.prefixed_ns.remove(prefix, self.storage)?;
+        } else if let Some(index) = self.short_position(prefix)? {
+            let last = self.short_prefixes.len() - 1;
+            self.short_prefixes.swap(index, last);
+            self.short_prefixes.pop();
         }
         Ok(())
     }
@@ -1764,7 +1829,7 @@ impl<S: NameStorage> NamespaceResolver<S> {
                 // The cache owns its key; the undo frame needs only that key,
                 // while the previous (possibly large) URI moves without a copy.
                 let key = self.storage.text(prefix.as_ref())?;
-                let previous = self.prefixed_ns.insert(prefix, uri)?;
+                let previous = self.store_prefix(prefix, uri)?;
                 NamespaceUndo::Prefix(key, previous)
             }
         };
@@ -1782,14 +1847,16 @@ impl<S: NameStorage> NamespaceResolver<S> {
         prefix: Option<&str>,
     ) -> Result<Option<&str>, crate::xml::dom::ParseError> {
         self.storage.charge(1)?;
-        Ok(match prefix {
-            None => self.default_ns.as_deref().filter(|s| !s.is_empty()),
-            Some(pfx) => self
-                .prefixed_ns
-                .get(pfx, self.storage)?
-                .map(AsRef::as_ref)
-                .filter(|s| !s.is_empty()),
-        })
+        let Some(prefix) = prefix else {
+            return Ok(self.default_ns.as_deref().filter(|s| !s.is_empty()));
+        };
+        let uri = if self.spilled {
+            self.prefixed_ns.get(prefix, self.storage)?
+        } else {
+            self.short_position(prefix)?
+                .map(|index| &self.short_prefixes[index].1)
+        };
+        Ok(uri.map(AsRef::as_ref).filter(|s| !s.is_empty()))
     }
 }
 

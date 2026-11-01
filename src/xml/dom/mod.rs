@@ -21,6 +21,8 @@ use alloc::string::String;
 use core::fmt;
 
 use self::preflight::LexicalPreflight;
+#[cfg(feature = "xml-backend-xmloxide")]
+pub(crate) use self::preflight::{PositionRecorder, SourceKind, SourceNode};
 
 pub use tree::{
     Ancestors, Attribute, Attributes, Children, Descendants, Document, ExpandedName, Namespace,
@@ -89,6 +91,15 @@ impl XmlBackend {
         [Self::Xmloxide, Self::Roxmltree, Self::Differential]
             .into_iter()
             .filter(|backend| backend.is_available())
+    }
+
+    /// Whether this parse needs no lexical scan: xmloxide knows every source
+    /// range, and only a DOCTYPE, whose keyword is case-sensitive (XML 1.0
+    /// production 28), brings declarations and entity expansion.
+    fn records_positions(self, input: &str) -> bool {
+        cfg!(feature = "xml-backend-xmloxide")
+            && self == Self::Xmloxide
+            && !input.contains("<!DOCTYPE")
     }
 
     fn parse<'input>(
