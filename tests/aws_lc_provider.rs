@@ -116,8 +116,8 @@ fn native_primitives_match_published_known_answers() {
     assert!(AwsLcFipsProvider.fips_module_version().is_some());
     // SHA-256("abc") anchors differential testing to a fixed known answer.
     assert_eq!(
-        AwsLcFipsProvider
-            .digest(DigestAlgorithm::Sha256, b"abc")
+        *AwsLcFipsProvider
+            .digest(DigestAlgorithm::Sha256, b"abc", &memory())
             .unwrap(),
         hex_literal::hex!("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     );
@@ -263,8 +263,10 @@ fn aws_digests_match_rustcrypto() {
     ] {
         assert!(aws.supports(ProviderCapability::Digest(algorithm)));
         assert_eq!(
-            aws.digest(algorithm, b"abc").unwrap(),
-            RustCryptoProvider.digest(algorithm, b"abc").unwrap()
+            &*aws.digest(algorithm, b"abc", &memory()).unwrap(),
+            &*RustCryptoProvider
+                .digest(algorithm, b"abc", &memory())
+                .unwrap()
         );
     }
 }
@@ -336,7 +338,17 @@ fn unsupported_digest_never_falls_back() {
     // An absent AWS mechanism cannot silently run in the other engine.
     let algorithm = DigestAlgorithm::Sha3_224;
     assert!(!AwsLcFipsProvider.supports(ProviderCapability::Digest(algorithm)));
-    assert!(AwsLcFipsProvider.digest(algorithm, b"abc").is_err());
+    assert!(
+        AwsLcFipsProvider
+            .digest(algorithm, b"abc", &memory())
+            .is_err()
+    );
+}
+
+fn memory() -> structured_asn1::memory::Memory {
+    structured_asn1::memory::Memory::new(std::sync::Arc::new(
+        structured_asn1::memory::MemoryAccount::new(1 << 20, 1 << 20),
+    ))
 }
 
 #[test]

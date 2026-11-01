@@ -3537,13 +3537,13 @@ fn source_digest_matches(
         .memory()
         .charge_work(source.len() as u64 + expected.len() as u64)
         .map_err(resource)?;
-    let _output = session
-        .memory()
-        .reserve(algorithm.output_len())
-        .map_err(resource)?;
-    // Built-in providers return the fixed-width digest; opaque custom-provider
-    // internals remain that provider's admitted-work responsibility.
-    let actual = compute_digest_with_provider(provider, algorithm, source)?;
+    // Opaque custom-provider internals remain that provider's admitted-work
+    // responsibility; the state and the inline output are admitted here.
+    let actual = compute_digest_with_provider(provider, algorithm, source, session.memory())
+        .map_err(|error| match error {
+            crate::provider::ProviderError::Resource(reason) => resource(reason),
+            error => error.into(),
+        })?;
     Ok(constant_time_eq(&actual, expected))
 }
 
@@ -5509,8 +5509,10 @@ BA== </Modulus>
             crate::provider::default_provider(),
             DigestAlgorithm::Sha256,
             &certificate,
+            &crate::xmldsig::digest::digest_memory(),
         )
-        .unwrap();
+        .unwrap()
+        .to_vec();
         let matching = X509DataInfo {
             subject_names: vec![parsed.subject_dn.clone()],
             issuer_serials: vec![(

@@ -807,6 +807,7 @@ impl KeyInfoWriter for X509DigestKeyInfoWriter {
             provider,
             self.digest_algorithm,
             &self.certificate_der,
+            &super::digest::digest_memory(),
         )?;
         let start = "<ds:X509Data xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><dsig11:X509Digest xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\" Algorithm=\"";
         let end = "</dsig11:X509Digest></ds:X509Data>";
@@ -1186,8 +1187,12 @@ impl SigningKey for DsaSigningKey {
         if algorithm.dsa_component_len() != Some(component_len) {
             return Err(SigningKeyError::InvalidPublicKeyInfo);
         }
-        let digest =
-            super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
+        let digest = super::compute_digest_with_provider(
+            provider,
+            digest_algorithm,
+            canonical_signed_info,
+            &super::digest::digest_memory(),
+        )?;
         let mut rng = crate::provider::ProviderRng(provider);
         let signature: dsa::Signature = self
             .key
@@ -1262,8 +1267,12 @@ where
     S: SignatureEncoding,
 {
     let digest_algorithm = ecdsa_digest_algorithm(algorithm)?;
-    let prehash =
-        super::compute_digest_with_provider(provider, digest_algorithm, canonical_signed_info)?;
+    let prehash = super::compute_digest_with_provider(
+        provider,
+        digest_algorithm,
+        canonical_signed_info,
+        &super::digest::digest_memory(),
+    )?;
     let signature = key
         .sign_prehash(&prehash)
         .map_err(|_| SigningKeyError::SigningFailed)?;

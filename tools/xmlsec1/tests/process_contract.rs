@@ -7125,9 +7125,8 @@ fn rsa_encryption_matches_selector_only_x509data_to_configured_certificate() {
             _ => None,
         })
         .unwrap();
-    let digest = default_provider()
-        .digest(DigestAlgorithm::Sha256, &certificate_pem.contents)
-        .unwrap();
+    let digest =
+        xml_sec::xmldsig::compute_digest(DigestAlgorithm::Sha256, &certificate_pem.contents);
     fs::write(&plaintext, b"selector recipient identity").unwrap();
     let selectors = [
         (

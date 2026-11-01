@@ -108,8 +108,9 @@ impl CryptoProvider for ExternalProvider {
     fn begin_digest(
         &self,
         algorithm: xml_sec::xmldsig::DigestAlgorithm,
+        memory: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn xml_sec::provider::DigestState + '_>, ProviderError> {
-        xml_sec::provider::default_provider().begin_digest(algorithm)
+        xml_sec::provider::default_provider().begin_digest(algorithm, memory)
     }
 
     fn sign(

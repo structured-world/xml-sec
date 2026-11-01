@@ -23,6 +23,7 @@ use structured_pkix::AlgorithmIdentifier;
 use structured_pkix::algorithm::digest::{Algorithm, AsnDigest};
 use structured_pkix::path::WorkingKey;
 
+pub use super::DigestOutput;
 use super::pkix::CertificateSession;
 use super::verify::SessionDigest;
 use super::{DigestAlgorithm, DsigError, X509ChainError};
@@ -110,19 +111,6 @@ impl From<DsigError> for CmsProviderError {
     }
 }
 
-/// A finished digest, held inline.
-#[derive(Debug, Clone, Copy)]
-pub struct DigestOutput {
-    bytes: [u8; 64],
-    len: usize,
-}
-
-impl AsRef<[u8]> for DigestOutput {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
 impl<'a> Digest<'a> for CmsProvider<'_> {
     type Identity = DigestAlgorithm;
     type State = SessionDigest<'a>;
@@ -148,11 +136,11 @@ impl<'a> Digest<'a> for CmsProvider<'_> {
         identity: &DigestAlgorithm,
         execution: &Q,
     ) -> Result<Resolution<SessionDigest<'a>>, CmsProviderError> {
-        execution.charge_work(1)?;
         Ok(Resolution::Supported(SessionDigest::begin(
             self.provider,
             self.policy,
             *identity,
+            execution,
         )?))
     }
 
@@ -170,12 +158,7 @@ impl<'a> Digest<'a> for CmsProvider<'_> {
         state: SessionDigest<'a>,
         execution: &Q,
     ) -> Result<DigestOutput, CmsProviderError> {
-        let mut output = DigestOutput {
-            bytes: [0; 64],
-            len: state.output_len(),
-        };
-        state.finish(&mut output.bytes[..output.len], execution)?;
-        Ok(output)
+        Ok(state.finish_output(execution)?)
     }
 
     fn matches<Q: Work>(

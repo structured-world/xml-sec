@@ -10,6 +10,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4.13"
+structured-asn1 = { version = "0.20", default-features = false, features = ["alloc", "std"] }
 xml-sec = { path = "..", default-features = false, features = ["xmlenc", "xslt", "xml-backends-all"] }
 xml-sec-config = { path = "../crates/xml-sec-config" }
 xml-sec-xslt = { path = "../crates/xml-sec-xslt" }

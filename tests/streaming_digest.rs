@@ -1,15 +1,17 @@
 #![cfg(feature = "xmldsig-sign")]
 //! Incremental digests at the provider boundary and in Reference processing.
 
+use std::sync::Arc;
+use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::provider::{
     CryptoProvider, DigestState, ExternalProviderError, KdfParameters, ProviderCapability,
     ProviderError, RustCryptoProvider,
 };
 use xml_sec::xmldsig::{
-    DigestAlgorithm, DsigError, ReferenceBuilder, ReferenceProcessingError, RsaSigningKey,
-    SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError, SigningError,
-    SigningKey, VerificationKey, VerifyContext,
+    DigestAlgorithm, DsigError, MAX_DIGEST_OUTPUT, ReferenceBuilder, ReferenceProcessingError,
+    RsaSigningKey, SignContext, SignatureAlgorithm, SignatureBuilder, SigningDigestError,
+    SigningError, SigningKey, VerificationKey, VerifyContext,
 };
 
 fn providers() -> Vec<&'static dyn CryptoProvider> {
@@ -27,13 +29,19 @@ fn streamed(
     chunk: usize,
 ) -> Vec<u8> {
     let mut state = provider
-        .begin_digest(algorithm)
+        .begin_digest(algorithm, &memory())
         .expect("advertised digest starts");
     for part in data.chunks(chunk) {
         state.update(part).expect("digest absorbs input");
         state.update(&[]).expect("an empty update is a no-op");
     }
-    state.finalize().expect("digest finishes")
+    let mut output = [0; MAX_DIGEST_OUTPUT];
+    let written = state.finalize(&mut output).expect("digest finishes");
+    output[..written].to_vec()
+}
+
+fn memory() -> Memory {
+    Memory::new(Arc::new(MemoryAccount::new(1 << 20, 1 << 20)))
 }
 
 #[test]
@@ -47,13 +55,13 @@ fn streamed_digests_equal_one_shot_digests_for_every_algorithm_and_chunking() {
                 continue;
             }
             let whole = provider
-                .digest(algorithm, &data)
+                .digest(algorithm, &data, &memory())
                 .expect("advertised digest");
             assert_eq!(whole.len(), algorithm.output_len(), "{algorithm:?}");
             for chunk in [1, 7, 64, 1_000, data.len()] {
                 assert_eq!(
                     streamed(provider, algorithm, &data, chunk),
-                    whole,
+                    &*whole,
                     "{} {algorithm:?} in {chunk}-byte chunks",
                     provider.name()
                 );
@@ -68,6 +76,228 @@ fn streamed_digests_equal_one_shot_digests_for_every_algorithm_and_chunking() {
             0x22, 0x23, 0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61,
             0xf2, 0x00, 0x15, 0xad,
         ]
+    );
+}
+
+#[test]
+fn every_provider_charges_its_state_and_releases_it() {
+    // State creation is refused, not panicked on, and a live state is paid for
+    // until it is dropped, whatever the backend.
+    for provider in providers() {
+        let empty = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
+        assert_eq!(
+            provider.begin_digest(DigestAlgorithm::Sha256, &empty).err(),
+            Some(ProviderError::Resource(MemoryError::LimitExceeded)),
+            "{}",
+            provider.name()
+        );
+        assert_eq!(
+            provider
+                .digest(DigestAlgorithm::Sha256, b"abc", &empty)
+                .err(),
+            Some(ProviderError::Resource(MemoryError::LimitExceeded))
+        );
+        let account = memory();
+        let state = provider
+            .begin_digest(DigestAlgorithm::Sha256, &account)
+            .expect("admitted");
+        assert!(account.used() > 0);
+        drop(state);
+        assert_eq!(account.used(), 0);
+    }
+}
+
+/// Refuses to create a state after `allowed` of them, as a spent account or the
+/// allocator does.
+struct RefusingStateProvider {
+    delegate: FailingDigestProvider,
+    allowed: std::sync::atomic::AtomicUsize,
+}
+
+impl RefusingStateProvider {
+    fn after(allowed: usize) -> Self {
+        Self {
+            delegate: FailingDigestProvider::refusing_after(usize::MAX),
+            allowed: std::sync::atomic::AtomicUsize::new(allowed),
+        }
+    }
+}
+
+impl CryptoProvider for RefusingStateProvider {
+    fn name(&self) -> &'static str {
+        "refusing-state"
+    }
+    fn supports(&self, capability: ProviderCapability<'_>) -> bool {
+        self.delegate.supports(capability)
+    }
+    fn fill_random(&self, output: &mut [u8]) -> Result<(), ProviderError> {
+        self.delegate.fill_random(output)
+    }
+    fn derive_key(
+        &self,
+        parameters: &KdfParameters<'_>,
+        secret: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.derive_key(parameters, secret)
+    }
+    fn begin_digest(
+        &self,
+        algorithm: DigestAlgorithm,
+        memory: &Memory,
+    ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let remaining = self
+            .allowed
+            .load(Relaxed)
+            .checked_sub(1)
+            .ok_or(ProviderError::Resource(MemoryError::OutOfMemory))?;
+        self.allowed.store(remaining, Relaxed);
+        RustCryptoProvider.begin_digest(algorithm, memory)
+    }
+    fn sign(
+        &self,
+        key: &dyn SigningKey,
+        algorithm: SignatureAlgorithm,
+        data: &[u8],
+    ) -> Result<Vec<u8>, xml_sec::xmldsig::SigningKeyError> {
+        self.delegate.sign(key, algorithm, data)
+    }
+    fn verify(
+        &self,
+        key: &dyn xml_sec::xmldsig::VerifyingKey,
+        algorithm: SignatureAlgorithm,
+        data: &[u8],
+        signature: &[u8],
+    ) -> Result<bool, DsigError> {
+        self.delegate.verify(key, algorithm, data, signature)
+    }
+    #[cfg(feature = "xmlenc")]
+    fn encrypt_data(
+        &self,
+        algorithm: xml_sec::xmlenc::DataEncryptionAlgorithm,
+        key: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.encrypt_data(algorithm, key, plaintext)
+    }
+    #[cfg(feature = "xmlenc")]
+    fn decrypt_data(
+        &self,
+        algorithm: xml_sec::xmlenc::DataEncryptionAlgorithm,
+        key: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.decrypt_data(algorithm, key, ciphertext)
+    }
+    #[cfg(feature = "xmlenc")]
+    fn wrap_key(
+        &self,
+        algorithm: xml_sec::xmlenc::KeyWrapAlgorithm,
+        kek: &[u8],
+        key: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.wrap_key(algorithm, kek, key)
+    }
+    #[cfg(feature = "xmlenc")]
+    fn unwrap_key(
+        &self,
+        algorithm: xml_sec::xmlenc::KeyWrapAlgorithm,
+        kek: &[u8],
+        wrapped: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.unwrap_key(algorithm, kek, wrapped)
+    }
+    #[cfg(feature = "xmlenc")]
+    fn transport_key(
+        &self,
+        key: &dyn xml_sec::provider::KeyTransportKey,
+        parameters: &xml_sec::xmlenc::RsaOaepParameters,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.transport_key(key, parameters, plaintext)
+    }
+    #[cfg(feature = "xmlenc")]
+    fn recover_key(
+        &self,
+        key: &dyn xml_sec::provider::KeyRecoveryKey,
+        parameters: &xml_sec::xmlenc::RsaOaepParameters,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, ProviderError> {
+        self.delegate.recover_key(key, parameters, ciphertext)
+    }
+}
+
+#[test]
+fn a_storage_refusal_stays_typed_and_terminal() {
+    // Not unsupported, not a digest mismatch, not a per-Reference finding with
+    // more work after it: the operation ends with the resource cause.
+    let key = signing_key();
+    let signed = SignContext::new(&key)
+        .sign_template(&template())
+        .expect("signing with the default provider");
+    let provider = RefusingStateProvider::after(0);
+    let error = VerifyContext::new()
+        .key(&verification_key(&key))
+        .provider(&provider)
+        .verify(&signed)
+        .expect_err("verification cannot pass without a digest");
+    assert!(
+        matches!(
+            error,
+            DsigError::Reference(ReferenceProcessingError::Provider(ProviderError::Resource(
+                MemoryError::OutOfMemory
+            )))
+        ),
+        "{error:?}"
+    );
+    let error = SignContext::new(&key)
+        .provider(&provider)
+        .sign_template(&template())
+        .expect_err("signing cannot pass without a digest");
+    assert!(
+        matches!(
+            error,
+            SigningError::Digest(SigningDigestError::Provider(ProviderError::Resource(
+                MemoryError::OutOfMemory
+            )))
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn a_storage_refusal_in_a_manifest_reference_ends_the_operation() {
+    // SignedInfo passes; the Manifest Reference then cannot start its digest. A
+    // spent ceiling must not read as an invalid Reference with more work after it.
+    let template = r##"<root><payload Id="payload">manifest payload</payload><ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/><ds:Reference URI="#manifest"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:Object><ds:Manifest Id="manifest"><ds:Reference URI="#payload"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>stale</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##;
+    let key = signing_key();
+    let signed = SignContext::new(&key)
+        .policy(xml_sec::policy::SigningPolicy {
+            manifest_processing: xml_sec::policy::ManifestProcessing::Process,
+            ..xml_sec::policy::SigningPolicy::default()
+        })
+        .sign_template(template)
+        .expect("signing with the default provider");
+    let public = verification_key(&key);
+    let verify = |provider: &RefusingStateProvider| {
+        VerifyContext::new()
+            .key(&public)
+            .provider(provider)
+            .process_manifests(true)
+            .verify(&signed)
+    };
+    let admitted = verify(&RefusingStateProvider::after(2)).expect("both digests fit");
+    assert_eq!(admitted.manifest_references.len(), 1);
+    let error =
+        verify(&RefusingStateProvider::after(1)).expect_err("the Manifest digest cannot start");
+    assert!(
+        matches!(
+            error,
+            DsigError::Reference(ReferenceProcessingError::Provider(ProviderError::Resource(
+                MemoryError::OutOfMemory
+            )))
+        ),
+        "{error:?}"
     );
 }
 
@@ -88,8 +318,8 @@ impl DigestState for FailingDigest<'_> {
         self.remaining = remaining;
         self.inner.update(data)
     }
-    fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
-        self.inner.finalize()
+    fn finalize(&mut self, output: &mut [u8; MAX_DIGEST_OUTPUT]) -> Result<usize, ProviderError> {
+        self.inner.finalize(output)
     }
 }
 
@@ -127,11 +357,12 @@ impl CryptoProvider for FailingDigestProvider {
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &Memory,
     ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
         Ok(Box::new(FailingDigest {
             remaining: self.updates,
             calls: &self.calls,
-            inner: xml_sec::provider::default_provider().begin_digest(algorithm)?,
+            inner: xml_sec::provider::default_provider().begin_digest(algorithm, memory)?,
         }))
     }
     fn sign(

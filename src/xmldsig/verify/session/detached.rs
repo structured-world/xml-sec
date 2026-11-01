@@ -196,8 +196,12 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
             states.push(StreamState {
                 algorithm: target.algorithm,
                 chain: target.chain,
-                state: super::super::super::digest::begin_digest(provider, target.algorithm)
-                    .map_err(|error| DsigError::Reference(error.into()))?,
+                state: super::super::super::digest::begin_digest(
+                    provider,
+                    target.algorithm,
+                    self.work.memory(),
+                )
+                .map_err(|error| DsigError::Reference(error.into()))?,
             });
         }
         let base64 = targets
@@ -791,11 +795,11 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
             None => false,
         };
         let mut digests = Vec::with_capacity(states.len());
-        for state in states {
+        for mut state in states {
             digests.push((
                 state.algorithm,
                 state.chain,
-                super::super::super::digest::finish_digest(state.algorithm, state.state)
+                super::super::super::digest::finish_digest(state.algorithm, &mut *state.state)
                     .map_err(provider_error)?,
             ));
         }
@@ -807,7 +811,7 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
                 .find(|(algorithm, chain, _)| {
                     *algorithm == DigestAlgorithm::Sha256 && *chain == DetachedChain::Octets
                 })
-                .and_then(|(_, _, digest)| <[u8; 32]>::try_from(digest.as_slice()).ok())
+                .and_then(|(_, _, digest)| <[u8; 32]>::try_from(&**digest).ok())
                 .ok_or(DsigError::InvalidRequest {
                     reason: "raw SHA-256 digest is missing for the payload fingerprint",
                 })?,
@@ -822,7 +826,7 @@ impl<W: Work> DetachedPayload<'_, '_, '_, '_, W> {
                     .find(|(algorithm, chain, _)| {
                         *algorithm == target.algorithm && *chain == target.chain
                     })
-                    .map(|(_, _, digest)| digest.as_slice())
+                    .map(|(_, _, digest)| &**digest)
             };
             let status = digest_status(&target, digest);
             results.push((target, status));

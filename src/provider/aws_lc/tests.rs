@@ -32,7 +32,7 @@ fn optional_legacy_capabilities_fail_without_another_engine() {
     for digest in [DigestAlgorithm::Md5, DigestAlgorithm::Ripemd160] {
         assert!(!AwsLcFipsProvider.supports(ProviderCapability::Digest(digest)));
         assert!(matches!(
-            AwsLcFipsProvider.digest(digest, b"test"),
+            AwsLcFipsProvider.digest(digest, b"test", &crate::xmldsig::digest::digest_memory()),
             Err(ProviderError::Unsupported { .. })
         ));
     }

@@ -331,6 +331,7 @@ mod tests {
         fn begin_digest(
             &self,
             _: crate::xmldsig::DigestAlgorithm,
+            _: &structured_asn1::memory::Memory,
         ) -> Result<Box<dyn crate::provider::DigestState + '_>, ProviderError> {
             unreachable!("no digest after failed entropy")
         }
