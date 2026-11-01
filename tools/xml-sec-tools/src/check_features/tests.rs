@@ -216,6 +216,7 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
             "experimental",
             "experimental-pq,xmldsig-sign,xml-backend-xmloxide",
         ),
+        ("dstu4145", "dstu4145,xml-backend-xmloxide"),
         ("fips-dsig", "aws-lc-fips,xmldsig-sign,xml-backend-xmloxide"),
         ("pkcs11", "pkcs11,xml-backend-xmloxide"),
     ] {

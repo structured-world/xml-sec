@@ -236,6 +236,14 @@ pub enum SignatureAlgorithm {
     Ed448Ph,
     /// Experimental post-quantum method; compile capability does not grant permission.
     PostQuantum(super::PqAlgorithm),
+    /// DSTU 4145 over GOST 34.311; the key selects curve and byte order.
+    /// Verification only, and operation policy must explicitly permit it.
+    #[cfg(feature = "dstu4145")]
+    Dstu4145Gost34311,
+    /// DSTU 4145 over DSTU 7564-256; the key selects curve and byte order.
+    /// Verification only, and operation policy must explicitly permit it.
+    #[cfg(feature = "dstu4145")]
+    Dstu4145Dstu7564_256,
 }
 
 impl SignatureAlgorithm {
@@ -282,7 +290,7 @@ impl SignatureAlgorithm {
             5
         } else {
             0
-        }] = [
+        } + if cfg!(feature = "dstu4145") { 2 } else { 0 }] = [
         #[cfg(feature = "legacy-algorithms")]
         Self::RsaMd5,
         #[cfg(feature = "legacy-algorithms")]
@@ -338,6 +346,10 @@ impl SignatureAlgorithm {
         Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_192s),
         Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_256f),
         Self::PostQuantum(super::PqAlgorithm::SlhDsaSha2_256s),
+        #[cfg(feature = "dstu4145")]
+        Self::Dstu4145Gost34311,
+        #[cfg(feature = "dstu4145")]
+        Self::Dstu4145Dstu7564_256,
     ];
 
     /// Digest selected by an ECDSA method, independently of its key's curve.
@@ -478,6 +490,17 @@ impl SignatureAlgorithm {
             "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed25519ph" => Some(Self::Ed25519Ph),
             "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448" => Some(Self::Ed448),
             "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448ph" => Some(Self::Ed448Ph),
+            // No registry assigns these. They are the identifiers of the test
+            // signatures the Central Certification Authority of Ukraine publishes:
+            // https://czo.gov.ua/testexamples
+            #[cfg(feature = "dstu4145")]
+            "http://www.w3.org/2001/04/xmldsig-more#dstu4145-gost34311" => {
+                Some(Self::Dstu4145Gost34311)
+            }
+            #[cfg(feature = "dstu4145")]
+            "http://www.w3.org/2001/04/xmldsig-more#dstu4145-dstu7564-256" => {
+                Some(Self::Dstu4145Dstu7564_256)
+            }
             _ => super::PqAlgorithm::ALL
                 .into_iter()
                 .find(|algorithm| algorithm.uri() == uri)
@@ -536,6 +559,12 @@ impl SignatureAlgorithm {
             Self::Ed448 => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448",
             Self::Ed448Ph => "http://www.w3.org/2021/04/xmldsig-more#eddsa-ed448ph",
             Self::PostQuantum(algorithm) => algorithm.uri(),
+            #[cfg(feature = "dstu4145")]
+            Self::Dstu4145Gost34311 => "http://www.w3.org/2001/04/xmldsig-more#dstu4145-gost34311",
+            #[cfg(feature = "dstu4145")]
+            Self::Dstu4145Dstu7564_256 => {
+                "http://www.w3.org/2001/04/xmldsig-more#dstu4145-dstu7564-256"
+            }
         }
     }
 
@@ -561,7 +590,20 @@ impl SignatureAlgorithm {
             | Self::HmacMd5
             | Self::HmacRipemd160
             | Self::EcdsaRipemd160 => true,
+            #[cfg(feature = "dstu4145")]
+            Self::Dstu4145Gost34311 | Self::Dstu4145Dstu7564_256 => true,
             _ => false,
+        }
+    }
+
+    /// Digest selected by a DSTU 4145 method, independently of its key's curve.
+    #[cfg(feature = "dstu4145")]
+    #[must_use]
+    pub(crate) const fn dstu4145_digest(self) -> Option<DigestAlgorithm> {
+        match self {
+            Self::Dstu4145Gost34311 => Some(DigestAlgorithm::Gost34311),
+            Self::Dstu4145Dstu7564_256 => Some(DigestAlgorithm::Dstu7564_256),
+            _ => None,
         }
     }
 

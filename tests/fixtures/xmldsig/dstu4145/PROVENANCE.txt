@@ -1,0 +1,15 @@
+Test signatures published unchanged by the Central Certification Authority of
+Ukraine at https://czo.gov.ua/testexamples, under /download/test_sign/XAdES/:
+
+dstu-enveloped-bb.xml     DSTU/enveloped/XAdES-B-B/test.xml
+kupyna-enveloped-bb.xml   DSTU-7564/enveloped/XAdES-B-B/test.xml
+dstu-detached-lta.xml     DSTU/detached/XAdES-B-LTA/sign.xml
+
+and under /download/test_sign/CAdES/:
+
+gost-detached-bes.p7s     DSTU/detached/CAdES-BES/test.txt.p7s
+kupyna-detached-bes.p7s   DSTU-7564/detached/CAdES-BES/test.txt.p7s
+cades-content.bin         DSTU-7564/detached/CAdES-BES/test.txt
+
+They carry test certificates only. The certificates expired in 2026, so path
+validation runs at a fixed moment inside their validity.

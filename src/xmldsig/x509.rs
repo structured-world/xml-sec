@@ -1341,6 +1341,10 @@ fn x509_signature_algorithm(
             require_null_or_absent_signature_parameters(identifier)?;
         }
         X509SignatureAlgorithm::RsaPss { .. } => {}
+        #[cfg(feature = "dstu4145")]
+        X509SignatureAlgorithm::Dstu4145 { .. } => {
+            require_absent_signature_parameters(identifier)?;
+        }
     }
     Ok(algorithm)
 }

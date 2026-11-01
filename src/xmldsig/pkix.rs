@@ -1149,6 +1149,29 @@ impl ProviderVerifier<'_> {
             // https://www.rfc-editor.org/rfc/rfc5280.html#section-6.1.4
             return Ok(structured_pkix::path::Verified::Unsupported);
         }
+        // X.509 keeps the DSTU 4145 value in an OCTET STRING inside the BIT
+        // STRING; CMS carries the same octets directly in SignerInfo.
+        #[cfg(feature = "dstu4145")]
+        let signature = if matches!(
+            algorithm,
+            crate::provider::X509SignatureAlgorithm::Dstu4145 { .. }
+        ) {
+            use structured_asn1::{Tag, universal};
+            let mut reader = original_signature
+                .reader_in(execution)
+                .map_err(X509ChainError::Processing)?;
+            match reader.next_element() {
+                Ok(Some(element))
+                    if element.tag() == Tag::primitive(universal::OCTET_STRING)
+                        && reader.is_empty() =>
+                {
+                    element.contents()
+                }
+                _ => return Ok(structured_pkix::path::Verified::No),
+            }
+        } else {
+            signature
+        };
         let verify = |spki: &[u8]| {
             check(spki)?;
             self.provider
@@ -1182,6 +1205,10 @@ pub(crate) fn digest_algorithm(
         Hash::Sha3_256 => super::DigestAlgorithm::Sha3_256,
         Hash::Sha3_384 => super::DigestAlgorithm::Sha3_384,
         Hash::Sha3_512 => super::DigestAlgorithm::Sha3_512,
+        #[cfg(feature = "dstu4145")]
+        Hash::Gost34311 => super::DigestAlgorithm::Gost34311,
+        #[cfg(feature = "dstu4145")]
+        Hash::Kupyna256 => super::DigestAlgorithm::Dstu7564_256,
         _ => return None,
     })
 }
@@ -1231,6 +1258,19 @@ pub(crate) fn known_signature_algorithm<W: Work>(
             Some(Algorithm::Ecdsa(value)) => digest_algorithm(value).map(Signature::Ecdsa),
             Some(Algorithm::Ed25519) => Some(Signature::Ed25519),
             Some(Algorithm::Ed448) => Some(Signature::Ed448),
+            #[cfg(feature = "dstu4145")]
+            Some(Algorithm::Dstu4145(profile)) => {
+                use structured_pkix::algorithm::{digest::Algorithm as Hash, dstu4145::ByteOrder};
+                let digest = match profile.digest() {
+                    Hash::Gost34311 => Some(super::DigestAlgorithm::Gost34311),
+                    Hash::Kupyna256 => Some(super::DigestAlgorithm::Dstu7564_256),
+                    _ => None,
+                };
+                digest.map(|digest| Signature::Dstu4145 {
+                    digest,
+                    big_endian: profile.byte_order() == ByteOrder::BigEndian,
+                })
+            }
             Some(Algorithm::MlDsa(set)) => Some(Signature::PostQuantum(match set {
                 structured_pkix::algorithm::ml_dsa::ParameterSet::MlDsa44 => {
                     super::PqAlgorithm::MlDsa44

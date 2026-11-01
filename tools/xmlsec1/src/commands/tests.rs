@@ -592,6 +592,10 @@ fn compatibility_signing_policy_includes_every_implemented_algorithm() {
     assert_eq!(
         policy.signature_algorithms,
         Some(BTreeSet::from([
+            #[cfg(feature = "dstu4145")]
+            SignatureAlgorithm::Dstu4145Gost34311,
+            #[cfg(feature = "dstu4145")]
+            SignatureAlgorithm::Dstu4145Dstu7564_256,
             #[cfg(feature = "legacy-algorithms")]
             SignatureAlgorithm::RsaMd5,
             #[cfg(feature = "legacy-algorithms")]
@@ -652,6 +656,10 @@ fn compatibility_signing_policy_includes_every_implemented_algorithm() {
     assert_eq!(
         policy.digest_algorithms,
         Some(BTreeSet::from([
+            #[cfg(feature = "dstu4145")]
+            DigestAlgorithm::Gost34311,
+            #[cfg(feature = "dstu4145")]
+            DigestAlgorithm::Dstu7564_256,
             #[cfg(feature = "legacy-algorithms")]
             DigestAlgorithm::Md5,
             #[cfg(feature = "legacy-algorithms")]

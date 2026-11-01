@@ -257,6 +257,10 @@ impl CmsProvider<'_> {
             // https://www.rfc-editor.org/rfc/rfc8419#section-3
             X509SignatureAlgorithm::Ed25519 => digest == DigestAlgorithm::Sha512,
             X509SignatureAlgorithm::Ed448 => false,
+            // The identifier names the hash that the signature covers, so
+            // digestAlgorithm can only repeat it, as for ECDSA.
+            #[cfg(feature = "dstu4145")]
+            X509SignatureAlgorithm::Dstu4145 { digest: hash, .. } => hash == digest,
             _ => true,
         };
         Ok(if consistent {

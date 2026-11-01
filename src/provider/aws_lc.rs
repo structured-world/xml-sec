@@ -52,6 +52,8 @@ fn digest_algorithm(algorithm: DigestAlgorithm) -> Option<&'static digest::Algor
         DigestAlgorithm::Sha3_384 => &digest::SHA3_384,
         DigestAlgorithm::Sha3_512 => &digest::SHA3_512,
         DigestAlgorithm::Sha3_224 => return None,
+        #[cfg(feature = "dstu4145")]
+        DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256 => return None,
     })
 }
 

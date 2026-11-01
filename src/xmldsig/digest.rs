@@ -39,15 +39,24 @@ pub enum DigestAlgorithm {
     Sha3_384,
     /// SHA3-512 (512-bit).
     Sha3_512,
+    /// GOST 34.311-95 with the Ukrainian substitution table number one, the
+    /// only one its URI can name; operation policy must explicitly permit it.
+    #[cfg(feature = "dstu4145")]
+    Gost34311,
+    /// DSTU 7564 (Kupyna) with 256-bit output; operation policy must explicitly
+    /// permit it.
+    #[cfg(feature = "dstu4145")]
+    Dstu7564_256,
 }
 
 impl DigestAlgorithm {
     /// Every compiled digest capability; this registry grants no policy permission.
-    pub const ALL: [Self; 9 + if cfg!(feature = "legacy-algorithms") {
-        2
-    } else {
-        0
-    }] = [
+    pub const ALL: [Self;
+        9 + if cfg!(feature = "legacy-algorithms") {
+            2
+        } else {
+            0
+        } + if cfg!(feature = "dstu4145") { 2 } else { 0 }] = [
         #[cfg(feature = "legacy-algorithms")]
         Self::Md5,
         #[cfg(feature = "legacy-algorithms")]
@@ -61,6 +70,10 @@ impl DigestAlgorithm {
         Self::Sha3_256,
         Self::Sha3_384,
         Self::Sha3_512,
+        #[cfg(feature = "dstu4145")]
+        Self::Gost34311,
+        #[cfg(feature = "dstu4145")]
+        Self::Dstu7564_256,
     ];
     /// Parse a digest algorithm from its XML namespace URI.
     ///
@@ -97,6 +110,13 @@ impl DigestAlgorithm {
             "http://www.w3.org/2007/05/xmldsig-more#sha3-256" => Some(Self::Sha3_256),
             "http://www.w3.org/2007/05/xmldsig-more#sha3-384" => Some(Self::Sha3_384),
             "http://www.w3.org/2007/05/xmldsig-more#sha3-512" => Some(Self::Sha3_512),
+            // No registry assigns these. They are the identifiers of the test
+            // signatures the Central Certification Authority of Ukraine publishes:
+            // https://czo.gov.ua/testexamples
+            #[cfg(feature = "dstu4145")]
+            "http://www.w3.org/2001/04/xmlenc#gost34311" => Some(Self::Gost34311),
+            #[cfg(feature = "dstu4145")]
+            "http://www.w3.org/2001/04/xmlenc#dstu7564-256" => Some(Self::Dstu7564_256),
             _ => None,
         }
     }
@@ -118,6 +138,10 @@ impl DigestAlgorithm {
             Self::Sha3_256 => "http://www.w3.org/2007/05/xmldsig-more#sha3-256",
             Self::Sha3_384 => "http://www.w3.org/2007/05/xmldsig-more#sha3-384",
             Self::Sha3_512 => "http://www.w3.org/2007/05/xmldsig-more#sha3-512",
+            #[cfg(feature = "dstu4145")]
+            Self::Gost34311 => "http://www.w3.org/2001/04/xmlenc#gost34311",
+            #[cfg(feature = "dstu4145")]
+            Self::Dstu7564_256 => "http://www.w3.org/2001/04/xmlenc#dstu7564-256",
         }
     }
 
@@ -136,6 +160,8 @@ impl DigestAlgorithm {
         match self {
             #[cfg(feature = "legacy-algorithms")]
             Self::Md5 | Self::Ripemd160 => true,
+            #[cfg(feature = "dstu4145")]
+            Self::Gost34311 | Self::Dstu7564_256 => true,
             _ => false,
         }
     }
@@ -153,6 +179,8 @@ impl DigestAlgorithm {
             Self::Sha256 | Self::Sha3_256 => 32,
             Self::Sha384 | Self::Sha3_384 => 48,
             Self::Sha512 | Self::Sha3_512 => 64,
+            #[cfg(feature = "dstu4145")]
+            Self::Gost34311 | Self::Dstu7564_256 => 32,
         }
     }
 }

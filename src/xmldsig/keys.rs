@@ -298,6 +298,10 @@ impl VerificationKey {
                     session,
                 )
             }
+            #[cfg(feature = "dstu4145")]
+            SignatureAlgorithm::Dstu4145Gost34311 | SignatureAlgorithm::Dstu4145Dstu7564_256 => {
+                super::dstu4145::validate_public_key(&self.public_key_bytes, session)
+            }
             SignatureAlgorithm::RsaSha1
             | SignatureAlgorithm::RsaSha224
             | SignatureAlgorithm::RsaSha256
@@ -373,7 +377,12 @@ impl VerificationKey {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
         let key = &self.public_key_bytes;
-        let result = if algorithm.eddsa_signature_len().is_some()
+        #[cfg(feature = "dstu4145")]
+        let dstu4145 = algorithm.dstu4145_digest().is_some();
+        #[cfg(not(feature = "dstu4145"))]
+        let dstu4145 = false;
+        let result = if dstu4145
+            || algorithm.eddsa_signature_len().is_some()
             || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
         {
             super::modern::verify_with_context(
@@ -2240,6 +2249,11 @@ fn validate_spki_algorithm(
         || matches!(algorithm, SignatureAlgorithm::PostQuantum(_))
     {
         return super::modern::validate_public_key(algorithm, public_key_bytes, session)
+            .map_err(spki_check_error);
+    }
+    #[cfg(feature = "dstu4145")]
+    if algorithm.dstu4145_digest().is_some() {
+        return super::dstu4145::validate_public_key(public_key_bytes, session)
             .map_err(spki_check_error);
     }
     let family = session

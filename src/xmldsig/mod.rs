@@ -62,6 +62,8 @@ pub mod builder;
 #[cfg(feature = "cms")]
 pub mod cms;
 pub mod digest;
+#[cfg(feature = "dstu4145")]
+pub(crate) mod dstu4145;
 pub mod extension;
 pub mod keys;
 pub(crate) mod modern;

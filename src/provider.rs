@@ -495,6 +495,14 @@ pub enum X509SignatureAlgorithm {
     Ed448,
     /// Pure ML-DSA or SLH-DSA with the PKIX-mandated empty context.
     PostQuantum(crate::xmldsig::PqAlgorithm),
+    /// DSTU 4145 with the selected digest; SPKI selects the curve.
+    #[cfg(feature = "dstu4145")]
+    Dstu4145 {
+        /// Message digest applied to the signed certificate data.
+        digest: DigestAlgorithm,
+        /// Whether the signature octets follow the big-endian profile.
+        big_endian: bool,
+    },
 }
 
 #[cfg(feature = "xmldsig")]
@@ -507,6 +515,12 @@ impl X509SignatureAlgorithm {
             Self::Dsa(DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160)
             | Self::RsaPkcs1v15(DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160)
             | Self::Ecdsa(DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160) => return None,
+            #[cfg(feature = "dstu4145")]
+            Self::Dsa(DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256)
+            | Self::RsaPkcs1v15(DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256)
+            | Self::Ecdsa(DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256) => {
+                return None;
+            }
             Self::Dsa(DigestAlgorithm::Sha1) => "1.2.840.10040.4.3",
             Self::Dsa(DigestAlgorithm::Sha224) => "2.16.840.1.101.3.4.3.1",
             Self::Dsa(DigestAlgorithm::Sha256) => "2.16.840.1.101.3.4.3.2",
@@ -538,6 +552,9 @@ impl X509SignatureAlgorithm {
             Self::Ed25519 => "1.3.101.112",
             Self::Ed448 => "1.3.101.113",
             Self::PostQuantum(algorithm) => algorithm.oid(),
+            // The identifier also carries the field basis, which only SPKI fixes.
+            #[cfg(feature = "dstu4145")]
+            Self::Dstu4145 { .. } => return None,
         })
     }
 }
@@ -1489,6 +1506,10 @@ macro_rules! rust_crypto_digest {
                 use sha2::Digest as _;
                 match algorithm {
                     $($(#[$attr])* DigestAlgorithm::$variant => Self::$variant(<$hasher>::new()),)+
+                    #[cfg(feature = "dstu4145")]
+                    DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256 => {
+                        unreachable!("begin_digest sends these to the DSTU 4145 module")
+                    }
                 }
             }
         }
@@ -2054,6 +2075,10 @@ impl CryptoProvider for RustCryptoProvider {
         &self,
         algorithm: DigestAlgorithm,
     ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
+        #[cfg(feature = "dstu4145")]
+        if crate::xmldsig::dstu4145::is_ukrainian_digest(algorithm) {
+            return crate::xmldsig::dstu4145::begin_digest(algorithm);
+        }
         Ok(Box::new(RustCryptoDigest::new(algorithm)))
     }
 
@@ -2120,6 +2145,19 @@ impl CryptoProvider for RustCryptoProvider {
         signature: &[u8],
         issuer_spki_der: &[u8],
     ) -> Result<bool, ProviderError> {
+        // A refused key or framing is a non-matching signature.
+        #[cfg(feature = "dstu4145")]
+        if let X509SignatureAlgorithm::Dstu4145 { digest, big_endian } = algorithm {
+            return Ok(crate::xmldsig::dstu4145::verify_identified(
+                digest,
+                big_endian,
+                issuer_spki_der,
+                signed_data,
+                signature,
+                &crate::xmldsig::pkix::CertificateSession::standalone(),
+            )
+            .unwrap_or(false));
+        }
         rustcrypto_x509::verify_signature(algorithm, signed_data, signature, issuer_spki_der)
     }
 
@@ -2224,6 +2262,8 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
             rustcrypto_x509::xml_signature_algorithm(algorithm).is_some()
         }
         X509SignatureAlgorithm::PostQuantum(_) => cfg!(feature = "experimental-pq"),
+        #[cfg(feature = "dstu4145")]
+        X509SignatureAlgorithm::Dstu4145 { .. } => true,
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
         } => {
@@ -2470,6 +2510,8 @@ pub(crate) mod rustcrypto_x509 {
             X509SignatureAlgorithm::Ecdsa(digest) => match digest {
                 #[cfg(feature = "legacy-algorithms")]
                 DigestAlgorithm::Md5 | DigestAlgorithm::Ripemd160 => None,
+                #[cfg(feature = "dstu4145")]
+                DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256 => None,
                 DigestAlgorithm::Sha1 => Some(SignatureAlgorithm::EcdsaSha1),
                 DigestAlgorithm::Sha224 => Some(SignatureAlgorithm::EcdsaSha224),
                 DigestAlgorithm::Sha256 => Some(SignatureAlgorithm::EcdsaSha256),
