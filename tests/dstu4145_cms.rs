@@ -162,8 +162,8 @@ fn a_signature_method_naming_another_digest_is_malformed() {
     // digestAlgorithm stays Kupyna while signatureAlgorithm becomes the shorter
     // GOST 34.311 method at the same place: the published offsets of this
     // sample, one octet less in each of the five enclosing lengths.
-    let mut sample = KUPYNA_CADES.to_vec();
     const METHOD: usize = 3440;
+    let mut sample = KUPYNA_CADES.to_vec();
     assert_eq!(sample[METHOD..METHOD + 4], [0x30, 0x0e, 0x06, 0x0c]);
     sample.splice(
         METHOD..METHOD + 16,
