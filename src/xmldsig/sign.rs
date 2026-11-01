@@ -2106,7 +2106,7 @@ impl<'a> SignContext<'a> {
         key_info: OperationNodeId,
         encapsulated: Option<(crate::NodeIdentity, crate::provider::EncapsulatedKey)>,
         has_external_resources: bool,
-    ) -> Result<OperationNodeId, SigningError> {
+    ) -> Result<(OperationNodeId, Vec<GeneratedC14n>), SigningError> {
         operation.extend();
         let kem_mutation = if let Some((target, result)) = encapsulated {
             let mutation =
@@ -2131,32 +2131,40 @@ impl<'a> SignContext<'a> {
         // Validate reference inputs and build the normalization candidate only after
         // independent key output has passed its own byte boundary. The execution pass
         // revalidates the resulting document defensively after controlled mutations.
-        let c14n_candidate = materialize_second_edition_c14n11_candidate(
+        let generated = second_edition_c14n11_edits(
             document,
             target_signature,
             &self.policy,
             has_external_resources,
         )?;
-        let normalization = if let Some(candidate) = c14n_candidate {
-            let mutation =
-                operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
-            operation.add_dependency(mutation, kem_mutation.unwrap_or(key_info))?;
-            operation.compile()?;
-            operation.run_document_transition(mutation, document, |document, budgets| {
-                document
-                    .replace_serialized_with_settings(
-                        candidate,
-                        self.document_parse_settings(),
-                        Some(budgets.transforms.xml_parse_work()),
-                    )
-                    .map_err(map_owned_document_mutation_error)
-            })?;
-            operation.extend();
-            Some(mutation)
-        } else {
-            None
-        };
-        Ok(normalization.or(kem_mutation).unwrap_or(key_info))
+        Ok((kem_mutation.unwrap_or(key_info), generated))
+    }
+
+    /// Commit generated canonicalization as its own generation, for a `Reference`
+    /// that reads it or a form the final mutation cannot stand in for.
+    fn commit_generated_c14n(
+        &self,
+        document: &mut XmlDocument,
+        operation: &mut SigningExecution<'_>,
+        setup_gate: OperationNodeId,
+        generated: Vec<GeneratedC14n>,
+    ) -> Result<OperationNodeId, SigningError> {
+        let candidate = c14n11_candidate(document, generated);
+        let mutation =
+            operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+        operation.add_dependency(mutation, setup_gate)?;
+        operation.compile()?;
+        operation.run_document_transition(mutation, document, |document, budgets| {
+            document
+                .replace_serialized_with_settings(
+                    candidate,
+                    self.document_parse_settings(),
+                    Some(budgets.transforms.xml_parse_work()),
+                )
+                .map_err(map_owned_document_mutation_error)
+        })?;
+        operation.extend();
+        Ok(mutation)
     }
 
     /// The writer's `KeyInfo` spliced into a copy of the serialization. The
@@ -2185,44 +2193,77 @@ impl<'a> SignContext<'a> {
         Ok(spliced)
     }
 
-    /// Analyze the `Reference` set and settle how the writer's `KeyInfo` joins
-    /// the document: in the final mutation when nothing signed reads it, or as
-    /// its own generation when something may.
-    fn plan_signing_key_info(
+    /// Analyze the `Reference` set and settle how generated canonicalization and
+    /// the writer's `KeyInfo` join the document: in the final mutation when
+    /// nothing signed reads them, or as their own generations when something may.
+    fn plan_signing_splice(
         &self,
         document: &mut XmlDocument,
         operation: &mut SigningExecution<'_>,
         (request, transform_options): (SigningReferenceRequest<'_, '_>, TransformOptions<'_>),
-        setup_gate: OperationNodeId,
+        mut setup_gate: OperationNodeId,
         key_info_content: Option<String>,
-    ) -> Result<(AnalyzedReferences, OperationNodeId, Option<SplicedElement>), SigningError> {
+        mut generated: Vec<GeneratedC14n>,
+    ) -> Result<PlannedReferences, SigningError> {
         let target_signature = request.target_signature;
-        let analysis = analyze_signing_references(document, operation, request, transform_options);
-        match (key_info_content, analysis) {
-            (None, analysis) => Ok((analysis?, setup_gate, None)),
-            (Some(content), Ok(analyzed))
-                if digests_can_defer(document, &analyzed) && analyzed.1.key_info_unread =>
-            {
-                let budget = operation.budgets_mut().transforms.xml_parse_work();
-                let spliced =
-                    self.splice_signing_key_info(document, target_signature, &content, budget)?;
-                Ok((analyzed, setup_gate, Some(spliced)))
-            }
-            // A `Reference` may read what the writer adds, or name an ID only the
-            // writer provides, so a failed analysis is decided after the commit.
-            (Some(content), _) => {
-                let setup_gate = self.populate_signing_key_info(
-                    document,
-                    target_signature,
-                    operation,
-                    setup_gate,
-                    &content,
-                )?;
-                let analyzed =
-                    analyze_signing_references(document, operation, request, transform_options)?;
-                Ok((analyzed, setup_gate, None))
-            }
+        // A DTD's attribute default would reach the new element when it is
+        // parsed (XML 1.0 §3.3.2), which no text inserted here can stand in for.
+        if !generated.is_empty()
+            && (document.as_xml().contains("<!DOCTYPE")
+                || !generated.iter().all(|edit| edit.canonical_in_place))
+        {
+            setup_gate = self.commit_generated_c14n(
+                document,
+                operation,
+                setup_gate,
+                core::mem::take(&mut generated),
+            )?;
         }
+        if key_info_content.is_none() && generated.is_empty() {
+            let analyzed =
+                analyze_signing_references(document, operation, request, transform_options)?;
+            return Ok((analyzed, setup_gate, None));
+        }
+        let references = generated
+            .iter()
+            .map(|edit| edit.digest_value)
+            .collect::<Vec<_>>();
+        let deferred = SigningReferenceRequest {
+            generated: &references,
+            ..request
+        };
+        match analyze_signing_references(document, operation, deferred, transform_options) {
+            Ok(analyzed) if digests_can_defer(document, &analyzed) && analyzed.1.splice_unread => {
+                let budget = operation.budgets_mut().transforms.xml_parse_work();
+                let key_info = key_info_content
+                    .map(|content| {
+                        self.splice_signing_key_info(document, target_signature, &content, budget)
+                    })
+                    .transpose()?;
+                let splice = DeferredSplice::new(document.as_xml(), key_info, generated);
+                self.policy
+                    .resources
+                    .validate_xml_document_len(splice.spliced.xml.len())?;
+                return Ok((analyzed, setup_gate, Some(splice)));
+            }
+            // A `Reference` may read what these add, or name an ID only the
+            // writer provides, so a failed analysis is decided after the commit.
+            _ => {}
+        }
+        if !generated.is_empty() {
+            setup_gate = self.commit_generated_c14n(document, operation, setup_gate, generated)?;
+        }
+        if let Some(content) = key_info_content {
+            setup_gate = self.populate_signing_key_info(
+                document,
+                target_signature,
+                operation,
+                setup_gate,
+                &content,
+            )?;
+        }
+        let analyzed = analyze_signing_references(document, operation, request, transform_options)?;
+        Ok((analyzed, setup_gate, None))
     }
 
     /// Commit `KeyInfo` as its own generation, for a `Reference` that reads it.
@@ -2334,8 +2375,10 @@ impl<'a> SignContext<'a> {
         operation: &mut SigningExecution<'_>,
         (plan_nodes, pending_digests): (SigningPlanNodes, Vec<(crate::NodeIdentity, String)>),
         signing_key: &dyn SigningKey,
-        key_info: Option<&SplicedElement>,
+        splice: Option<&DeferredSplice>,
     ) -> Result<O::Output, SigningError> {
+        let key_info = splice.map(|splice| &splice.spliced);
+        let insertions = splice.map_or(&[][..], |splice| splice.insertions.as_slice());
         self.policy
             .resources
             .validate_xml_document_len(document.as_xml().len())?;
@@ -2347,6 +2390,7 @@ impl<'a> SignContext<'a> {
                     budgets,
                     target_signature,
                     &pending_digests,
+                    insertions,
                 )?;
                 budgets
                     .transforms
@@ -2451,7 +2495,7 @@ impl<'a> SignContext<'a> {
                 .into());
             }
         };
-        let setup_gate = self.apply_signing_setup(
+        let (setup_gate, generated) = self.apply_signing_setup(
             document,
             target_signature,
             &mut operation,
@@ -2463,13 +2507,15 @@ impl<'a> SignContext<'a> {
             target_signature,
             id_attributes: self.id_attributes,
             external_resources: &external_resources,
+            generated: &[],
         };
-        let (analyzed, setup_gate, spliced_key_info) = self.plan_signing_key_info(
+        let (analyzed, setup_gate, splice) = self.plan_signing_splice(
             document,
             &mut operation,
             (request, transform_options),
             setup_gate,
             key_info_content,
+            generated,
         )?;
         let (plan_nodes, pending_digests) = fill_analyzed_reference_digest_values(
             document,
@@ -2487,7 +2533,7 @@ impl<'a> SignContext<'a> {
             &mut operation,
             (plan_nodes, pending_digests),
             signing_key,
-            spliced_key_info.as_ref(),
+            splice.as_ref(),
         )
     }
 
@@ -2847,7 +2893,96 @@ struct SigningReferenceRequest<'a, 'resources> {
     target_signature: usize,
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: &'a ExternalResourceContext<'resources>,
+    /// `DigestValue` nodes of the `Reference`s whose generated canonicalization
+    /// is not in the document yet; their chains end with it regardless.
+    generated: &'a [NodeId],
 }
+
+/// The Second Edition transform one `Reference` gains.
+struct GeneratedC14n {
+    digest_value: NodeId,
+    digest_method: NodeId,
+    /// Whether it joins existing `Transforms`, instead of bringing the element.
+    appends: bool,
+    /// Whether nothing lies between the `Transforms` end tag and `DigestMethod`
+    /// that a search for that end tag in canonical output could stop on.
+    canonical_in_place: bool,
+    in_signed_info: bool,
+    /// The depth the new content reaches.
+    depth: usize,
+    edit: SourceEdit,
+    /// The canonical form of the new content.
+    canonical: String,
+}
+
+/// Canonical text `SignedInfo` gains for a generated transform.
+struct CanonicalInsertion {
+    digest_method: NodeId,
+    appends: bool,
+    text: String,
+}
+
+/// What joins the document in the final mutation instead of a generation of
+/// its own, because nothing signed reads it.
+struct DeferredSplice {
+    spliced: SplicedElement,
+    insertions: Vec<CanonicalInsertion>,
+}
+
+impl DeferredSplice {
+    fn new(source: &str, key_info: Option<SplicedElement>, generated: Vec<GeneratedC14n>) -> Self {
+        let (mut added_nodes, mut depth) = key_info
+            .as_ref()
+            .map_or((0, 0), |spliced| (spliced.added_nodes, spliced.depth));
+        let mut insertions = Vec::with_capacity(generated.len());
+        let mut parts = Vec::with_capacity(generated.len() + 1);
+        for edit in generated {
+            added_nodes += if edit.appends { 1 } else { 2 };
+            depth = depth.max(edit.depth);
+            if edit.in_signed_info {
+                insertions.push(CanonicalInsertion {
+                    digest_method: edit.digest_method,
+                    appends: edit.appends,
+                    text: edit.canonical,
+                });
+            }
+            parts.push((edit.edit.range, edit.edit.replacement));
+        }
+        if let Some(spliced) = key_info {
+            // Everything before its single span is the source's.
+            for (range, length) in spliced.spans {
+                let replacement = spliced.xml[range.start..range.start + length].to_owned();
+                parts.push((range, replacement));
+            }
+        }
+        parts.sort_unstable_by_key(|(range, _)| range.start);
+        let mut xml = String::with_capacity(
+            source.len() + parts.iter().map(|(_, text)| text.len()).sum::<usize>(),
+        );
+        let mut cursor = 0;
+        let mut spans = Vec::with_capacity(parts.len());
+        for (range, replacement) in parts {
+            xml.push_str(&source[cursor..range.start]);
+            xml.push_str(&replacement);
+            cursor = range.end;
+            spans.push((range, replacement.len()));
+        }
+        xml.push_str(&source[cursor..]);
+        Self {
+            spliced: SplicedElement {
+                xml,
+                spans,
+                added_nodes,
+                depth,
+            },
+            insertions,
+        }
+    }
+}
+
+/// The analyzed `Reference`s, the gate digests follow, and what the final
+/// mutation still has to add.
+type PlannedReferences = (AnalyzedReferences, OperationNodeId, Option<DeferredSplice>);
 
 impl<'a, 'resources> SigningReferenceRequest<'a, 'resources> {
     fn uri_resolution(
@@ -3072,15 +3207,16 @@ fn collect_signing_reference_inputs(
                 SigningSignatureTarget::Index(request.target_signature),
             )?;
             let signed_info = find_required_child(signature, "SignedInfo")?;
-            let signed_info_references =
+            let mut signed_info_references =
                 parse_signing_references_with_budget(signed_info, &mut budgets.xpath_parse)?;
+            append_generated_c14n(&mut signed_info_references, request.generated);
             validate_signing_references(
                 &signed_info_references,
                 signed_info_references.len(),
                 Some(policy),
                 request.external_resources.is_configured(),
             )?;
-            let manifest_references = if process_manifests {
+            let mut manifest_references = if process_manifests {
                 parse_signing_manifest_references(
                     signature,
                     &mut budgets.xpath_parse,
@@ -3090,6 +3226,7 @@ fn collect_signing_reference_inputs(
             } else {
                 Vec::new()
             };
+            append_generated_c14n(&mut manifest_references, request.generated);
             Ok::<_, SigningDigestError>((signed_info_references, manifest_references))
         })?
     };
@@ -3111,6 +3248,18 @@ fn collect_signing_reference_inputs(
     })
 }
 
+/// End the chain of each listed `Reference` with the transform it will gain.
+fn append_generated_c14n(references: &mut [SigningReference], generated: &[NodeId]) {
+    for reference in references {
+        if generated.contains(&reference.digest_value_node_id) {
+            let algorithm =
+                crate::c14n::C14nAlgorithm::from_uri(SECOND_EDITION_GENERATION_C14N_URI)
+                    .expect("Canonical XML 1.1 is an implemented canonicalization");
+            reference.transforms.push(Transform::C14n(algorithm));
+        }
+    }
+}
+
 fn analyze_signing_reference_inputs(
     document: &XmlDocument,
     policy: &crate::policy::SigningPolicy,
@@ -3119,11 +3268,7 @@ fn analyze_signing_reference_inputs(
     transform_options: TransformOptions<'_>,
     references: &SigningReferenceInputs,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
-    let signed_info_references = &references.signed_info;
-    let manifest_references = &references.manifests;
-    let reference_limit = references.maximum;
-    let process_manifests = references.process_manifests;
-    let all_references = signed_info_references.iter().chain(manifest_references);
+    let all_references = references.signed_info.iter().chain(&references.manifests);
     if all_references.clone().all(|reference| {
         reference.transforms.iter().all(|transform| {
             matches!(
@@ -3156,6 +3301,7 @@ fn analyze_signing_reference_inputs(
                 view.document(),
                 signature,
                 &analysis_references,
+                request.generated,
                 transform_options,
                 &budgets.transforms,
                 request.uri_resolution(policy.transforms.same_document_id_semantics),
@@ -3166,6 +3312,37 @@ fn analyze_signing_reference_inputs(
             return Ok(plan);
         }
     }
+    // Without the current tree a generated transform has to be committed anyway,
+    // so the caller is told before this parses a document it would discard.
+    if !request.generated.is_empty() {
+        return Err(SigningDigestError::InvalidStructure(
+            "generated canonicalization needs its own generation".into(),
+        ));
+    }
+    analyze_signing_placeholder_generation(
+        document,
+        policy,
+        budgets,
+        request,
+        transform_options,
+        references,
+    )
+}
+
+/// Analyze the `Reference` set on a parse of the document with placeholder text
+/// in every value the operation fills.
+fn analyze_signing_placeholder_generation(
+    document: &XmlDocument,
+    policy: &crate::policy::SigningPolicy,
+    budgets: &mut SigningOperationBudgets,
+    request: SigningReferenceRequest<'_, '_>,
+    transform_options: TransformOptions<'_>,
+    references: &SigningReferenceInputs,
+) -> Result<SigningDependencyPlan, SigningDigestError> {
+    let signed_info_references = &references.signed_info;
+    let manifest_references = &references.manifests;
+    let reference_limit = references.maximum;
+    let process_manifests = references.process_manifests;
     let placeholder = "AA==";
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
@@ -3222,12 +3399,13 @@ fn analyze_signing_reference_inputs(
         &analysis_doc,
         analysis_signature,
         &analysis_references,
+        &[],
         transform_options,
         &budgets.transforms,
         request.uri_resolution(policy.transforms.same_document_id_semantics),
     )
     .map(|plan| SigningDependencyPlan {
-        key_info_unread: false,
+        splice_unread: false,
         ..plan
     })
 }
@@ -3536,6 +3714,7 @@ fn fill_reference_digest_values_in_dependency_order(
             target_signature,
             id_attributes,
             external_resources: &external_resources,
+            generated: &[],
         },
         None,
         false,
@@ -3546,17 +3725,19 @@ fn fill_reference_digest_values_in_dependency_order(
 struct SigningDependencyPlan {
     dependencies: Vec<HashSet<usize>>,
     levels: Vec<Vec<usize>>,
-    /// No `Reference` can observe the content of the target `KeyInfo`.
-    key_info_unread: bool,
+    /// No `Reference` can observe the target `KeyInfo` or a `Reference` that
+    /// gains a generated transform.
+    splice_unread: bool,
 }
 
 /// Every node whose content signing changes or adds, with the index of what
-/// fills it: a `Reference`, `SignatureValue` at `references.len()`, and the
-/// target `KeyInfo` one past that.
+/// fills it: a `Reference`, `SignatureValue` at `references.len()`, and one past
+/// that the target `KeyInfo` and every `Reference` in `generated`.
 fn tracked_signing_nodes(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: &[SigningReference],
+    generated: &[NodeId],
 ) -> Result<Vec<(usize, NodeId)>, SigningDigestError> {
     let terminal_signature_value_index = references.len();
     let signature_value = find_required_child(signature, "SignatureValue")?;
@@ -3587,6 +3768,14 @@ fn tracked_signing_nodes(
             .flat_map(Node::descendants)
             .map(|node| (terminal_signature_value_index + 1, node.id())),
     );
+    tracked.extend(
+        generated
+            .iter()
+            .filter_map(|digest_value| doc.get_node(*digest_value))
+            .filter_map(Node::parent)
+            .flat_map(Node::descendants)
+            .map(|node| (terminal_signature_value_index + 1, node.id())),
+    );
     Ok(tracked)
 }
 
@@ -3594,6 +3783,7 @@ fn reference_dependency_levels(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
     references: &[SigningReference],
+    generated: &[NodeId],
     transform_options: TransformOptions<'_>,
     execution_budget: &TransformExecutionBudget,
     uri_resolution: SigningUriResolution<'_, '_>,
@@ -3605,7 +3795,7 @@ fn reference_dependency_levels(
     );
     let terminal_signature_value_index = references.len();
     let key_info_index = terminal_signature_value_index + 1;
-    let tracked_mutable_nodes = tracked_signing_nodes(doc, signature, references)?;
+    let tracked_mutable_nodes = tracked_signing_nodes(doc, signature, references, generated)?;
     let mut analyses = references
         .iter()
         .map(|reference| {
@@ -3635,10 +3825,10 @@ fn reference_dependency_levels(
             "Reference dependency cycle includes the mutable SignatureValue".into(),
         ));
     }
-    // KeyInfo orders no digest; only whether a Reference covers it matters.
-    let mut key_info_unread = true;
+    // Spliced content orders no digest; only whether a Reference covers it matters.
+    let mut splice_unread = true;
     for dependencies in &mut analyses {
-        key_info_unread &= !dependencies.remove(&key_info_index);
+        splice_unread &= !dependencies.remove(&key_info_index);
     }
     let mut remaining_dependencies = analyses.clone();
     let mut completed = vec![false; references.len()];
@@ -3675,7 +3865,7 @@ fn reference_dependency_levels(
     Ok(SigningDependencyPlan {
         dependencies: analyses,
         levels,
-        key_info_unread,
+        splice_unread,
     })
 }
 
@@ -4038,6 +4228,7 @@ fn canonicalize_signed_info(
     budgets: &mut SigningOperationBudgets,
     target_signature: usize,
     pending_digests: &[(crate::NodeIdentity, String)],
+    insertions: &[CanonicalInsertion],
 ) -> Result<
     (
         SignatureAlgorithm,
@@ -4082,7 +4273,7 @@ fn canonicalize_signed_info(
             .into());
         }
         let mut canonical_signed_info = Vec::new();
-        let canonicalized = if pending_digests.is_empty() {
+        let canonicalized = if pending_digests.is_empty() && insertions.is_empty() {
             crate::c14n::canonicalize_visible_to_writer_bounded(
                 doc,
                 Some(&crate::c14n::SubtreeVisibility {
@@ -4101,6 +4292,7 @@ fn canonicalize_signed_info(
                 &signed_info.c14n_method,
                 budgets,
                 &pending_digests,
+                insertions,
                 &mut canonical_signed_info,
             )
         };
@@ -4132,6 +4324,12 @@ const SECOND_EDITION_GENERATION_C14N_URI: &str = "http://www.w3.org/2006/12/xml-
 /// element's start is that end tag. Base64 text needs no escaping (C14N 1.0
 /// section 5.2), so inserting it there yields the canonical form of the filled
 /// element. Digests outside `SignedInfo` are not part of its output.
+///
+/// A generated transform lies before the `DigestMethod` of its `Reference` or at
+/// the end of its `Transforms`, whose end tag is then the last one before that
+/// `DigestMethod`. It takes the prefix of an element already in scope there, so
+/// neither mode renders a namespace on it (Exclusive C14N section 3), and its
+/// `Algorithm` URI needs no escaping.
 /// <https://www.w3.org/TR/2001/REC-xml-c14n-20010315#ProcessingModel>
 fn canonicalize_with_pending_digests(
     document: &Document<'_>,
@@ -4139,6 +4337,7 @@ fn canonicalize_with_pending_digests(
     algorithm: &crate::c14n::C14nAlgorithm,
     budgets: &SigningOperationBudgets,
     pending_digests: &[(NodeId, &str)],
+    insertions: &[CanonicalInsertion],
     output: &mut Vec<u8>,
 ) -> Result<(), crate::c14n::C14nError> {
     let digests = pending_digests
@@ -4146,8 +4345,16 @@ fn canonicalize_with_pending_digests(
         .copied()
         .filter(|(node, _)| signed_info.subtree_contains_id(*node))
         .collect::<HashMap<_, _>>();
-    let tracked = digests.keys().copied().collect::<Vec<_>>();
-    let inserted = digests.values().map(|digest| digest.len()).sum::<usize>();
+    let tracked = digests
+        .keys()
+        .copied()
+        .chain(insertions.iter().map(|insertion| insertion.digest_method))
+        .collect::<Vec<_>>();
+    let inserted = digests.values().map(|digest| digest.len()).sum::<usize>()
+        + insertions
+            .iter()
+            .map(|insertion| insertion.text.len())
+            .sum::<usize>();
     let remaining = budgets.transforms.remaining_c14n_output();
     // Output that cannot hold the inserted digests exceeds the limit in either form.
     let Some(allowance) = remaining.checked_sub(inserted) else {
@@ -4170,18 +4377,38 @@ fn canonicalize_with_pending_digests(
         tracked.len(),
         "every SignedInfo element is visible to its own canonicalization"
     );
-    positions.sort_unstable_by_key(|(_, position)| *position);
+    let mut splices = Vec::with_capacity(positions.len());
+    for (node, start) in positions.drain(..) {
+        if let Some(digest) = digests.get(&node) {
+            let end_tag = unfilled[start..]
+                .windows(2)
+                .position(|bytes| bytes == b"</")
+                .map(|offset| start + offset)
+                .expect("a canonical element is closed by an end tag");
+            splices.push((end_tag, digest.as_bytes()));
+            continue;
+        }
+        let insertion = insertions
+            .iter()
+            .find(|insertion| insertion.digest_method == node)
+            .expect("every other tracked node is a generated transform's");
+        let at = if insertion.appends {
+            unfilled[..start]
+                .windows(2)
+                .rposition(|bytes| bytes == b"</")
+                .expect("Transforms closes before its DigestMethod")
+        } else {
+            start
+        };
+        splices.push((at, insertion.text.as_bytes()));
+    }
+    splices.sort_unstable_by_key(|(offset, _)| *offset);
     output.reserve(unfilled.len() + inserted);
     let mut cursor = 0;
-    for (node, start) in positions {
-        let end_tag = unfilled[start..]
-            .windows(2)
-            .position(|bytes| bytes == b"</")
-            .map(|offset| start + offset)
-            .expect("a canonical element is closed by an end tag");
-        output.extend_from_slice(&unfilled[cursor..end_tag]);
-        output.extend_from_slice(digests[&node].as_bytes());
-        cursor = end_tag;
+    for (offset, text) in splices {
+        output.extend_from_slice(&unfilled[cursor..offset]);
+        output.extend_from_slice(text);
+        cursor = offset;
     }
     output.extend_from_slice(&unfilled[cursor..]);
     Ok(())
@@ -4274,11 +4501,38 @@ fn materialize_second_edition_c14n11_candidate(
     policy: &crate::policy::SigningPolicy,
     has_external_resources: bool,
 ) -> Result<Option<String>, SigningDigestError> {
+    let generated =
+        second_edition_c14n11_edits(document, target_signature, policy, has_external_resources)?;
+    Ok((!generated.is_empty()).then(|| c14n11_candidate(document, generated)))
+}
+
+/// The serialization with every generated transform in place.
+fn c14n11_candidate(document: &XmlDocument, generated: Vec<GeneratedC14n>) -> String {
+    let mut candidate = document.as_xml().to_owned();
+    let mut edits = generated
+        .into_iter()
+        .map(|generated| generated.edit)
+        .collect::<Vec<_>>();
+    edits.sort_unstable_by_key(|edit| core::cmp::Reverse(edit.range.start));
+    for edit in edits {
+        candidate.replace_range(edit.range, &edit.replacement);
+    }
+    candidate
+}
+
+/// The Second Edition transform each `Reference` still needs, as source edits.
+fn second_edition_c14n11_edits(
+    document: &XmlDocument,
+    target_signature: usize,
+    policy: &crate::policy::SigningPolicy,
+    has_external_resources: bool,
+) -> Result<Vec<GeneratedC14n>, SigningDigestError> {
     let edits = document.with_view(|view| {
         let signature = find_signing_signature_node(
             view.document(),
             SigningSignatureTarget::Index(target_signature),
         )?;
+        let signed_info = find_required_child(signature, "SignedInfo")?;
         let reference_nodes = generation_reference_nodes(signature, policy)?;
 
         let mut edits = Vec::new();
@@ -4340,36 +4594,69 @@ fn materialize_second_edition_c14n11_candidate(
             }
 
             let edit = c14n11_edit_for_reference(view.xml(), reference_node, &structure)?;
-            edits.push(edit);
+            edits.push(generated_c14n(
+                signed_info,
+                reference_node,
+                &structure,
+                edit,
+            ));
         }
         Ok::<_, SigningDigestError>(edits)
     })?;
     if edits.is_empty() {
-        return Ok(None);
+        return Ok(edits);
     }
 
-    let projected_len = edits
-        .iter()
-        .try_fold(document.as_xml().len(), |total, edit| {
+    let projected_len = edits.iter().map(|generated| &generated.edit).try_fold(
+        document.as_xml().len(),
+        |total, edit| {
             total
                 .checked_sub(edit.range.len())
                 .and_then(|value| value.checked_add(edit.replacement.len()))
                 .ok_or_else(|| {
                     SigningDigestError::InvalidStructure("document length overflow".into())
                 })
-        })?;
+        },
+    )?;
     policy
         .resources
         .validate_xml_document_len(projected_len)
         .map_err(SigningDigestError::Policy)?;
+    Ok(edits)
+}
 
-    let mut candidate = document.as_xml().to_owned();
-    let mut edits = edits;
-    edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.range.start));
-    for edit in edits {
-        candidate.replace_range(edit.range, &edit.replacement);
+/// How `edit` joins `reference`, and its canonical form.
+fn generated_c14n(
+    signed_info: Node<'_, '_>,
+    reference: Node<'_, '_>,
+    structure: &SigningReferenceStructure<'_>,
+    edit: SourceEdit,
+) -> GeneratedC14n {
+    let owner = structure.transforms_node.unwrap_or(reference);
+    let qualifier = xml_qualifier(owner.prefix().unwrap_or_default());
+    let transform = format!(
+        "<{qualifier}Transform Algorithm=\"{SECOND_EDITION_GENERATION_C14N_URI}\"></{qualifier}Transform>"
+    );
+    let appends = structure.transforms_node.is_some();
+    let canonical_in_place = structure.transforms_node.is_none_or(|transforms| {
+        core::iter::successors(transforms.next_sibling(), |node| node.next_sibling())
+            .take_while(|node| node.id() != structure.digest_method_node.id())
+            .all(|node| node.is_text())
+    });
+    GeneratedC14n {
+        digest_value: structure.digest_value_node.id(),
+        digest_method: structure.digest_method_node.id(),
+        appends,
+        canonical_in_place,
+        in_signed_info: signed_info.subtree_contains_id(reference.id()),
+        depth: reference.ancestors().count() + 2,
+        edit,
+        canonical: if appends {
+            transform
+        } else {
+            format!("<{qualifier}Transforms>{transform}</{qualifier}Transforms>")
+        },
     }
-    Ok(Some(candidate))
 }
 
 fn c14n11_edit_for_transforms(
@@ -4464,6 +4751,9 @@ mod generation_output_tests;
 
 #[cfg(test)]
 mod deferred_commit_tests;
+
+#[cfg(test)]
+mod generated_c14n_tests;
 
 fn xml_qualifier(prefix: &str) -> String {
     if prefix.is_empty() {

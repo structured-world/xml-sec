@@ -651,12 +651,12 @@ pub(super) fn merge_key_info_source_in_document(
             budget,
         )?;
     }
-    Ok(crate::document::SplicedElement {
-        xml: output,
+    Ok(crate::document::SplicedElement::replacing(
+        xml.len(),
         original,
-        added_nodes,
-        depth,
-    })
+        output,
+        (added_nodes, depth),
+    ))
 }
 
 fn merge_one_key_info_source_at_index_with_options(

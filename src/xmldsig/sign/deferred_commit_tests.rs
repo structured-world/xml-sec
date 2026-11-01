@@ -144,7 +144,7 @@ fn independent_canonical_signed_info(
 ) -> Vec<u8> {
     let document = XmlDocument::parse(signed).expect("signed output must parse");
     let mut budgets = SigningOperationBudgets::from_resources(&policy.resources);
-    canonicalize_signed_info(&document, policy, &mut budgets, 0, &[])
+    canonicalize_signed_info(&document, policy, &mut budgets, 0, &[], &[])
         .expect("signed output SignedInfo must canonicalize")
         .2
 }

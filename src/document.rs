@@ -705,17 +705,37 @@ enum AtomicMutation {
     Replaced(DocumentCell, u64),
 }
 
-/// The serialization with one element's source already replaced in text.
+/// The serialization with source ranges already replaced in text.
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) struct SplicedElement {
-    /// The whole document with the new element.
+    /// The whole document with the new content.
     pub(crate) xml: String,
-    /// Where the element lay in the source this was spliced from.
-    pub(crate) original: core::ops::Range<usize>,
+    /// Each replaced source range with its new length, in document order.
+    pub(crate) spans: Vec<(core::ops::Range<usize>, usize)>,
     /// Upper bound of the nodes the splice added.
     pub(crate) added_nodes: usize,
     /// The deepest level the new content reaches.
     pub(crate) depth: usize,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl SplicedElement {
+    /// `xml` with `original` of a source of `source_len` bytes replaced; the
+    /// source around that range is unchanged.
+    pub(crate) fn replacing(
+        source_len: usize,
+        original: core::ops::Range<usize>,
+        xml: String,
+        (added_nodes, depth): (usize, usize),
+    ) -> Self {
+        let replaced = original.len() + xml.len() - source_len;
+        Self {
+            xml,
+            spans: alloc::vec![(original, replaced)],
+            added_nodes,
+            depth,
+        }
+    }
 }
 
 fn render_content_replacement_edits(
@@ -1490,22 +1510,22 @@ impl XmlDocument {
         let mut source = self.as_xml();
         if let Some(spliced) = spliced {
             source = &spliced.xml;
-            // Everything after the element moved with it; nothing inside it is
-            // replaced, as no Reference digest or SignatureValue lives there.
-            let shift = spliced.xml.len().abs_diff(self.as_xml().len());
-            let grew = spliced.xml.len() >= self.as_xml().len();
+            // Everything after a span moved with it; nothing inside one is
+            // replaced, as no DigestValue or SignatureValue lives there.
             for edit in &mut edits {
-                if edit.range.start >= spliced.original.end {
-                    edit.range = if grew {
-                        edit.range.start + shift..edit.range.end + shift
-                    } else {
-                        edit.range.start - shift..edit.range.end - shift
-                    };
-                } else if edit.range.end > spliced.original.start {
-                    return Err(XmlDocumentError::InvalidReplacement(
-                        "replacement target lies inside the spliced element".into(),
-                    ));
+                let (mut grown, mut shrunk) = (0, 0);
+                for (span, length) in &spliced.spans {
+                    if edit.range.start >= span.end {
+                        grown += *length;
+                        shrunk += span.len();
+                    } else if edit.range.end > span.start {
+                        return Err(XmlDocumentError::InvalidReplacement(
+                            "replacement target lies inside a spliced range".into(),
+                        ));
+                    }
                 }
+                // Every counted span lies before the edit, so this stays in range.
+                edit.range = edit.range.start + grown - shrunk..edit.range.end + grown - shrunk;
             }
             projected = projected - self.as_xml().len() + spliced.xml.len();
             if projected > settings.max_bytes {
