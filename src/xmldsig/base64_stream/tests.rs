@@ -1,4 +1,5 @@
 use super::{Base64Stream, is_rfc2045_base64_byte};
+use alloc::{format, string::String, vec::Vec};
 use base64::Engine as _;
 
 /// The decoded bytes and error of one streamed input.

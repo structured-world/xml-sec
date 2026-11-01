@@ -91,10 +91,8 @@ pub(crate) enum OperationResourceIdentity {
     },
     #[cfg(feature = "xmldsig")]
     DocumentNode(NodeIdentity),
-    External {
-        uri: String,
-        fingerprint: [u8; 32],
-    },
+    #[cfg(feature = "xmlenc")]
+    External { uri: String, fingerprint: [u8; 32] },
     #[cfg(feature = "xmldsig")]
     // Absence has no bytes to cache. The originating graph Reference retains
     // provenance; cloning absence must not clone an unaccounted URI string.
@@ -104,6 +102,7 @@ pub(crate) enum OperationResourceIdentity {
 }
 
 impl OperationResourceIdentity {
+    #[cfg(feature = "xmlenc")]
     pub(crate) fn external(uri: impl Into<String>, bytes: &[u8]) -> Self {
         use sha2::Digest;
 

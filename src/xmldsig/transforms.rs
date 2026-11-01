@@ -2576,14 +2576,14 @@ fn apply_chain_step<'e, 'd, S: TransformScratch, D: DomStorage, I: Instruction>(
 
 fn chain_output<T>(
     output: T,
-    #[cfg_attr(not(feature = "xmldsig-sign"), expect(unused_variables))] tracking: Option<
+    #[cfg_attr(not(feature = "xmldsig-sign"), expect(unused_variables))] tracking: &mut Option<
         DependencyTracking,
     >,
 ) -> TransformChainOutput<T> {
     TransformChainOutput {
         output,
         #[cfg(feature = "xmldsig-sign")]
-        dependencies: dependency_indexes(tracking),
+        dependencies: dependency_indexes(tracking.take()),
     }
 }
 
@@ -2641,7 +2641,7 @@ where
             retain_visible_dependencies(nodes, tracking)?;
         }
         let output = finalize.finish(data, None, context.budget)?;
-        return Ok(chain_output(output, dependency_tracking));
+        return Ok(chain_output(output, &mut dependency_tracking));
     };
 
     let binary = if transform_requires_node_set(transform) {
@@ -2696,7 +2696,7 @@ where
         }
         if STREAM_FINAL_C14N && remaining.is_empty() {
             let output = finalize.finish(data, Some((algo, prefixes)), context.budget)?;
-            return Ok(chain_output(output, dependency_tracking));
+            return Ok(chain_output(output, &mut dependency_tracking));
         }
     }
     if STREAM_FINAL_C14N
@@ -2710,7 +2710,7 @@ where
             tracking.discard_provenance();
         }
         let output = finalize.finish_base64(data, context.budget, context.scratch)?;
-        return Ok(chain_output(output, dependency_tracking));
+        return Ok(chain_output(output, &mut dependency_tracking));
     }
     // The step consumes its input, so a decoded or canonicalized predecessor is
     // never pinned in this frame while the rest of the chain runs.
