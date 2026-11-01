@@ -17,6 +17,7 @@ See [provider boundaries](crypto-providers.md) and [policy profiles](policy-prof
 | `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` and `std` |
 | `experimental-pq` plus one XML backend | Experimental signature verification and key establishment; implies `xmldsig`, not `xmlenc`; PQ signing keys also need `xmldsig-sign` |
 | `xmldsig,legacy-algorithms` plus one XML backend | Optional compatibility algorithms, still denied by secure policy defaults |
+| `dstu4145` plus one XML backend | Verifies DSTU 4145 signatures with GOST 34.311 and DSTU 7564-256 digests, in XML and in X.509 chains; implies `xmldsig`; denied unless policy names the methods; no signing |
 | `aws-lc-fips` plus one XML backend | Adds the official FIPS provider; implies `xmldsig` and `std`, not encryption |
 | `pkcs11` plus one XML backend | Adds explicit external-key operations; implies `xmlenc` and `std` |
 | `--all-features` | All available providers and mechanisms coexist; runtime selection is still explicit |

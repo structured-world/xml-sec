@@ -280,6 +280,12 @@ pub(crate) fn verify_with_context(
         }
     }
     match algorithm {
+        #[cfg(feature = "dstu4145")]
+        SignatureAlgorithm::Dstu4145Gost34311 | SignatureAlgorithm::Dstu4145Dstu7564_256
+            if context.as_bytes().is_empty() =>
+        {
+            super::dstu4145::verify(algorithm, der, message, signature, session)
+        }
         SignatureAlgorithm::Ed25519
         | SignatureAlgorithm::Ed25519Ctx
         | SignatureAlgorithm::Ed25519Ph => {

@@ -82,6 +82,11 @@ pub(crate) fn signature_value_matches_algorithm_with_encoding(
         | SignatureAlgorithm::Ed25519Ctx
         | SignatureAlgorithm::Ed25519Ph => signature_value.len() == 64,
         SignatureAlgorithm::Ed448 | SignatureAlgorithm::Ed448Ph => signature_value.len() == 114,
+        // Two equal components of at most 64 octets; the key fixes their minimum.
+        #[cfg(feature = "dstu4145")]
+        SignatureAlgorithm::Dstu4145Gost34311 | SignatureAlgorithm::Dstu4145Dstu7564_256 => {
+            (2..=128).contains(&signature_value.len()) && signature_value.len().is_multiple_of(2)
+        }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => algorithm
             .dsa_component_len()
             .is_some_and(|component_len| signature_value.len() == component_len * 2),
@@ -195,6 +200,15 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
                 uri: algorithm.uri().to_owned(),
             });
         }
+    }
+    #[cfg(feature = "dstu4145")]
+    if algorithm.dstu4145_digest().is_some() {
+        super::dstu4145::validate_public_key(public_key_spki_der, session)?;
+        return Ok(signature_value_matches_algorithm_with_encoding(
+            algorithm,
+            signature_value,
+            encoding,
+        ));
     }
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
         let modulus =

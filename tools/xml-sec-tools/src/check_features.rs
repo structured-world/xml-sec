@@ -74,7 +74,7 @@ struct Profile {
     facade: bool,
 }
 
-const PROFILES: [Profile; 16] = [
+const PROFILES: [Profile; 17] = [
     profile("default", None, &["rust_api"], false),
     profile("dom-xmloxide", Some("xml-backend-xmloxide"), &[], false),
     profile("dom-roxmltree", Some("xml-backend-roxmltree"), &[], false),
@@ -138,6 +138,12 @@ const PROFILES: [Profile; 16] = [
         Some("experimental-pq,xmldsig-sign,xml-backend-xmloxide"),
         &[],
         true,
+    ),
+    profile(
+        "dstu4145",
+        Some("dstu4145,xml-backend-xmloxide"),
+        &["dstu4145_interop"],
+        false,
     ),
     profile(
         "fips-dsig",

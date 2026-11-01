@@ -1286,10 +1286,12 @@ impl KeyTrustPolicy {
             Some(CertificateSignatureAlgorithms::Allowlist(allowed)) => {
                 allowed.contains(&algorithm)
             }
-            None => !matches!(
-                algorithm,
-                crate::provider::X509SignatureAlgorithm::PostQuantum(_)
-            ),
+            None => match algorithm {
+                crate::provider::X509SignatureAlgorithm::PostQuantum(_) => false,
+                #[cfg(feature = "dstu4145")]
+                crate::provider::X509SignatureAlgorithm::Dstu4145 { .. } => false,
+                _ => true,
+            },
         };
         if !permitted {
             return Err(PolicyViolation::Algorithm {

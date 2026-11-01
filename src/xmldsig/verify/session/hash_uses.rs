@@ -81,6 +81,10 @@ fn message_hash(algorithm: SignatureAlgorithm) -> HashUseAlgorithm<'static> {
     if let Some(digest) = algorithm.ecdsa_digest() {
         return HashUseAlgorithm::Digest(digest);
     }
+    #[cfg(feature = "dstu4145")]
+    if let Some(digest) = algorithm.dstu4145_digest() {
+        return HashUseAlgorithm::Digest(digest);
+    }
     let digest = match algorithm {
         S::RsaSha1 | S::DsaSha1 | S::HmacSha1 => D::Sha1,
         S::RsaSha224 | S::HmacSha224 => D::Sha224,

@@ -308,6 +308,9 @@ winnow ={ version = "1.0.4", default-features = false, features = ["parser"], op
 snafu = { version = "0.9", default-features = false, features = ["rust_1_81"], optional = true }
 
 # Crypto
+structured-dstu4145 = { version = "0.20.1", default-features = false, features = ["alloc"], optional = true }
+# Holds the prepared GOST substitution tables that digest states borrow.
+once_cell = { version = "1", default-features = false, features = ["alloc", "race"], optional = true }
 cryptoki = { version = "0.12.1", optional = true }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["fips"], optional = true }
 rsa = { package = "sad-rsa", version = "0.10.2", default-features = false, features = ["sha1", "sha2", "hazmat"], optional = true }
@@ -522,6 +525,8 @@ c14n = []              # XML Canonicalization (inclusive + exclusive)
 xslt = ["xmldsig", "std", "dep:icu_collator", "dep:icu_locale", "dep:roxmltree", "dep:time", "dep:url"]
 # Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
 experimental-pq = ["xmldsig", "der/derive", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
+# DSTU 4145 verification with GOST 34.311 and DSTU 7564; build capability is not policy permission.
+dstu4145 = ["xmldsig", "dep:structured-dstu4145", "dep:once_cell"]
 no-unsafe = []
 embedded = []
 

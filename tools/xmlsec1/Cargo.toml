@@ -70,6 +70,7 @@ xml-backends-all = ["xml-sec/xml-backends-all", "xml-sec-config/xml-backends-all
 xml-backend-differential = ["xml-sec/xml-backend-differential", "xml-sec-config/xml-backend-differential"]
 legacy-algorithms = ["xml-sec/legacy-algorithms"]
 experimental-pq = ["xmldsig", "xml-sec/experimental-pq"]
+dstu4145 = ["xmldsig", "xml-sec/dstu4145"]
 xslt = ["xmldsig", "xml-sec/xslt"]
 aws-lc-fips = ["std", "xmldsig", "xml-sec/aws-lc-fips"]
 pkcs11 = ["std", "xmlenc", "xml-sec/pkcs11"]

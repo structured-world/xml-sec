@@ -772,6 +772,18 @@ operation policy. PKCS#8 and SPKI use RFC 9881/RFC 9909 encodings. ML-DSA import
 seed-only, expanded-only, and consistent seed-plus-expanded keys; expanded imports are checked
 before signing. See [the maintained `RustCrypto` patch](ml-dsa-patch.md) for provenance,
 validation, and reproduction. These key primitives are dispatched through `CryptoProvider`.
+
+The optional `dstu4145` feature verifies DSTU 4145 signatures with the GOST 34.311 and
+DSTU 7564-256 digests, in XML, in X.509 paths and in CMS `SignedData`. No registry assigns XML
+identifiers to them, so the library follows the ones in the test signatures published by the
+Central Certification Authority of Ukraine; the 384 and 512-bit DSTU 7564 methods have no
+published example and stay unknown. These URIs have no parameter for a substitution table, so
+GOST 34.311 means table number one and a key stating another is refused. Custom curves need
+primality evidence that a certificate does not carry, so only named domains and explicit copies
+of them are accepted. The feature grants no permission: digests, signature methods and, for
+certificates and CMS, `certificate_signature_algorithms` must each be allowed by policy. These
+methods only verify.
+
 `HMACOutputLength` uses XML Schema integer syntax (including XML whitespace and
 an optional leading plus), not Unicode whitespace. `XMLDSig` 1.1 requires at least 80 bits and
 half the hash width; the default policy tightens that floor to at least 128 bits. Arbitrary

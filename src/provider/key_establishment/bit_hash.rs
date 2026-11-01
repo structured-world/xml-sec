@@ -96,6 +96,11 @@ pub(super) fn hash(
             total_bits,
             algorithm.output_len(),
         ),
+        // The KDF names its digest in the document; these have no bit framing.
+        #[cfg(feature = "dstu4145")]
+        DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256 => Err(
+            ProviderError::InvalidInput(ProviderInputError::ConcatKdfParameters),
+        ),
     }
 }
 

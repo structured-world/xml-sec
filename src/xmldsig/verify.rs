@@ -6399,6 +6399,25 @@ fn signature_value_limits(
     (encoded, resources.max_xml_document_bytes)
 }
 
+/// Verify a method whose key the PEM block's SPKI carries for `modern::verify`.
+fn verify_modern_pem(
+    algorithm: SignatureAlgorithm,
+    public_key_pem: &str,
+    signed_data: &[u8],
+    signature_value: &[u8],
+) -> Result<bool, SignatureVerificationPipelineError> {
+    let pem = super::signature::PemBlock::decode(public_key_pem)
+        .filter(|pem| pem.label == "PUBLIC KEY")
+        .ok_or(SignatureVerificationError::InvalidKeyPem)?;
+    Ok(super::modern::verify(
+        algorithm,
+        &pem.contents,
+        signed_data,
+        signature_value,
+        &super::pkix::CertificateSession::standalone(),
+    )?)
+}
+
 fn verify_with_algorithm(
     algorithm: SignatureAlgorithm,
     public_key_pem: &str,
@@ -6430,16 +6449,11 @@ fn verify_with_algorithm(
         | SignatureAlgorithm::Ed448
         | SignatureAlgorithm::Ed448Ph
         | SignatureAlgorithm::PostQuantum(_) => {
-            let pem = super::signature::PemBlock::decode(public_key_pem)
-                .filter(|pem| pem.label == "PUBLIC KEY")
-                .ok_or(SignatureVerificationError::InvalidKeyPem)?;
-            Ok(super::modern::verify(
-                algorithm,
-                &pem.contents,
-                signed_data,
-                signature_value,
-                &super::pkix::CertificateSession::standalone(),
-            )?)
+            verify_modern_pem(algorithm, public_key_pem, signed_data, signature_value)
+        }
+        #[cfg(feature = "dstu4145")]
+        SignatureAlgorithm::Dstu4145Gost34311 | SignatureAlgorithm::Dstu4145Dstu7564_256 => {
+            verify_modern_pem(algorithm, public_key_pem, signed_data, signature_value)
         }
         SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256 => {
             let pem = super::signature::PemBlock::decode(public_key_pem)

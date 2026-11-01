@@ -258,7 +258,9 @@ fn fixture_file_count_matches_expected() {
         // All 17 upstream PSS cases include both signed XML and its template.
         // ML-KEM adds six key formats and two DSig inputs for each of three sets.
         // Two alloc-only inputs cover detached and multi-signature documents.
-        ("xmldsig", 393),
+        // Five published DSTU 4145 signatures add one signed original and
+        // their provenance note.
+        ("xmldsig", 400),
         ("saml", 2),
         // Complete Merlin, Phaos and Aleksey snapshots, plus shared XDH keys.
         // Agreement recipes additionally need all 66 EC and 12 DHX key files.

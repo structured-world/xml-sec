@@ -47,6 +47,12 @@ fn hash(algorithm: DigestAlgorithm, parts: &[&[u8]], output: &mut [u8; 64]) {
         DigestAlgorithm::Md5 => compute!(md5::Md5),
         #[cfg(feature = "legacy-algorithms")]
         DigestAlgorithm::Ripemd160 => compute!(ripemd::Ripemd160),
+        // Parameterized PSS names its hashes in the document.
+        #[cfg(feature = "dstu4145")]
+        DigestAlgorithm::Gost34311 | DigestAlgorithm::Dstu7564_256 => {
+            let result = crate::xmldsig::dstu4145::digest_parts(algorithm, parts);
+            output[..result.len()].copy_from_slice(&result);
+        }
     }
 }
 
