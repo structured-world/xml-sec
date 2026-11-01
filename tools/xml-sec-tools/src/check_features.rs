@@ -139,7 +139,12 @@ const PROFILES: [Profile; 17] = [
         &[],
         true,
     ),
-    profile("dstu4145", Some("dstu4145,xml-backend-xmloxide"), &[], true),
+    profile(
+        "dstu4145",
+        Some("dstu4145,xml-backend-xmloxide"),
+        &["dstu4145_interop"],
+        false,
+    ),
     profile(
         "fips-dsig",
         Some("aws-lc-fips,xmldsig-sign,xml-backend-xmloxide"),

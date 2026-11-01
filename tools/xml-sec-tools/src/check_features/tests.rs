@@ -236,6 +236,19 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
 }
 
 #[test]
+fn the_dstu_profile_runs_its_interoperability_tests_and_no_signing_facade() {
+    // The feature only verifies, so the signing facade has no place here, and
+    // the library tests alone would leave the published signatures unread.
+    let features = "dstu4145,xml-backend-xmloxide";
+    assert_eq!(
+        planned("dstu4145", "test"),
+        [format!(
+            "nextest run -p xml-sec --no-default-features --features {features} --lib --test dstu4145_interop"
+        )]
+    );
+}
+
+#[test]
 fn token_tests_execute_the_real_disposable_store_harness() {
     // The runner must not turn a missing native module into an ignored test;
     // with explicit setup its Cargo arguments retain the isolated core graph.

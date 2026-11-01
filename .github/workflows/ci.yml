@@ -147,7 +147,7 @@ jobs:
         env:
           PKCS11_MODULE: /usr/lib/softhsm/libsofthsm2.so
         run: |
-          for profile in dom-xmloxide dom-roxmltree c14n-xmloxide c14n-roxmltree dsig-xmloxide dsig-roxmltree cms-xmloxide dsig-sign-xmloxide xmlenc-xmloxide xmlenc-roxmltree xslt legacy experimental fips-dsig pkcs11 no-backend; do
+          for profile in dom-xmloxide dom-roxmltree c14n-xmloxide c14n-roxmltree dsig-xmloxide dsig-roxmltree cms-xmloxide dsig-sign-xmloxide xmlenc-xmloxide xmlenc-roxmltree xslt legacy experimental dstu4145 fips-dsig pkcs11 no-backend; do
             echo "::group::$profile"
             cargo run --quiet -p xml-sec-tools -- check-features "$profile"
             echo '::endgroup::'
