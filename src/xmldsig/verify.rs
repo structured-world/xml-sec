@@ -569,7 +569,8 @@ impl<'a> VerifyContext<'a> {
     /// `VerifyResult::manifest_references` in addition to `VerifyResult::status`
     /// when interpreting `verify()` results.
     /// Structural/parse errors in Manifest content abort `verify()` and are
-    /// returned as `Err(...)`.
+    /// returned as `Err(...)`, as does a spent operation resource limit, which
+    /// says nothing about the Reference that reached it.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
         self.policy.manifest_processing = if enabled {
             crate::policy::ManifestProcessing::Process
@@ -5447,6 +5448,15 @@ fn manifest_reference_failure_reason(
         error,
         ReferenceProcessingError::SharedExecution(_)
             | ReferenceProcessingError::Provider(crate::provider::ProviderError::Resource(_))
+            | ReferenceProcessingError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. }
+            )
+            | ReferenceProcessingError::UriDereference(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. }
+            ))
+            | ReferenceProcessingError::Transform(TransformError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. }
+            ))
     ) {
         return Err(error);
     }
@@ -5561,12 +5571,11 @@ fn evaluate_manifest_reference<C: VerificationCapture>(
     ctx: &VerifyContext<'_>,
     reference_node: Option<Node<'_, '_>>,
 ) -> Result<ReferenceResult, SignatureVerificationPipelineError> {
-    if execution.transform_budget.remaining_c14n_output() == 0
-        || super::transforms::validate_relationship_chain(
-            &reference.transforms,
-            ctx.policy.transforms.opc_relationship_edition,
-        )
-        .is_err()
+    if super::transforms::validate_relationship_chain(
+        &reference.transforms,
+        ctx.policy.transforms.opc_relationship_edition,
+    )
+    .is_err()
         || reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
         || ctx
             .policy

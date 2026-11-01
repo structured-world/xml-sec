@@ -509,7 +509,8 @@ fn verification_policy_shares_canonicalization_budget_with_signed_info() {
 #[test]
 fn manifest_processing_stops_after_c14n_budget_exhaustion() {
     // A failed bounded render consumes the remaining operation allowance.
-    // Later Manifest references, including cheap binary ones, must not run.
+    // Later Manifest references, including cheap binary ones, must not run:
+    // the operation ends with the typed limit and returns no results.
     let digest = base64::engine::general_purpose::STANDARD.encode([0_u8; 32]);
     let xml = format!(
         r##"<root xmlns:ds="{XMLDSIG_NS}"><payload Id="payload">too large</payload><ds:Signature><ds:Object Id="signed-object"><ds:Manifest><ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference><ds:Reference URI="urn:small"><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>{digest}</ds:DigestValue></ds:Reference></ds:Manifest></ds:Object></ds:Signature></root>"##
@@ -520,7 +521,7 @@ fn manifest_processing_stops_after_c14n_budget_exhaustion() {
         .allowed_uri_types(UriTypeSet::ALL)
         .external_resources(&resources);
     let document = XmlDocument::parse(xml).expect("test signature must parse");
-    let results = document
+    let error = document
         .with_view(|view| {
             let signature = view
                 .document()
@@ -564,15 +565,21 @@ fn manifest_processing_stops_after_c14n_budget_exhaustion() {
             )
             .map(|(results, _)| results)
         })
-        .expect("resource exhaustion is reported per Manifest reference");
+        .expect_err("resource exhaustion ends the operation");
 
-    assert_eq!(results.len(), 2);
-    assert!(results.iter().all(|result| {
+    assert!(
         matches!(
-            result.status,
-            DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { .. })
-        )
-    }));
+            &error,
+            SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit {
+                    resource: crate::policy::resource_name::CANONICALIZED_BYTES,
+                    maximum: 8,
+                    ..
+                }
+            )
+        ),
+        "unexpected error: {error:?}"
+    );
 }
 
 #[test]
@@ -2431,6 +2438,67 @@ fn verify_context_applies_transform_count_policy_to_manifest_references() {
         result.manifest_references[0].status,
         DsigStatus::Invalid(FailureReason::ReferencePolicyViolation { ref_index: 0 })
     ));
+}
+
+#[test]
+fn a_spent_canonicalization_budget_is_never_a_manifest_finding() {
+    // The budget is shared by the whole operation, so running out says nothing
+    // about a Manifest Reference. Sweeping every ceiling reaches both the
+    // Reference that overruns it and the next one, which finds it spent.
+    let xml = signature_with_manifest_xml_with_manifest_mutation(true, |xml| {
+        let start = xml.find("<ds:Manifest").expect("fixture has a Manifest");
+        let reference_start = start
+            + xml[start..]
+                .find("<ds:Reference")
+                .expect("fixture has a Manifest Reference");
+        let reference_end = reference_start
+            + xml[reference_start..]
+                .find("</ds:Reference>")
+                .expect("fixture closes the Reference")
+            + "</ds:Reference>".len();
+        let reference = xml[reference_start..reference_end].to_owned();
+        xml.replacen("</ds:Manifest>", &format!("{reference}</ds:Manifest>"), 1)
+    });
+    let mut refused = 0_usize;
+    let mut completed = 0_usize;
+    for ceiling in 1..=2048 {
+        let policy = crate::policy::VerificationPolicy {
+            manifest_processing: crate::policy::ManifestProcessing::Process,
+            resources: crate::policy::ResourcePolicy {
+                max_canonicalized_bytes: ceiling,
+                ..crate::policy::ResourcePolicy::default()
+            },
+            ..crate::policy::VerificationPolicy::default()
+        };
+        match VerifyContext::new()
+            .key(&AcceptingKey)
+            .policy(policy)
+            .verify(&xml)
+        {
+            Ok(result) => {
+                assert!(matches!(result.status, DsigStatus::Valid), "{ceiling}");
+                assert_eq!(result.manifest_references.len(), 2, "{ceiling}");
+                assert!(
+                    result
+                        .manifest_references
+                        .iter()
+                        .all(|reference| matches!(reference.status, DsigStatus::Valid)),
+                    "ceiling {ceiling} reported a spent budget as a finding: {:?}",
+                    result
+                        .manifest_references
+                        .iter()
+                        .map(|reference| &reference.status)
+                        .collect::<Vec<_>>()
+                );
+                completed += 1;
+            }
+            Err(SignatureVerificationPipelineError::Policy(
+                crate::policy::PolicyViolation::ResourceLimit { .. },
+            )) => refused += 1,
+            Err(error) => panic!("ceiling {ceiling}: {error:?}"),
+        }
+    }
+    assert!(refused > 0 && completed > 0, "{refused} {completed}");
 }
 
 #[test]
