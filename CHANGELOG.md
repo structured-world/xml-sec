@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1](https://github.com/structured-world/xml-sec/compare/v0.4.0...v0.4.1) - 2026-11-01
+
+### Added
+
+- *(xmldsig)* verify DSTU 4145 signatures ([#360](https://github.com/structured-world/xml-sec/pull/360))
+
+### Fixed
+
+- *(pq)* clear SHAKE state on drop ([#361](https://github.com/structured-world/xml-sec/pull/361))
+
+### Performance
+
+- *(xmldsig)* stream final Base64, hash externals once ([#357](https://github.com/structured-world/xml-sec/pull/357))
+
 ## [0.4.0](https://github.com/structured-world/xml-sec/compare/v0.3.0...v0.4.0) - 2026-11-01
 
 ### Added
