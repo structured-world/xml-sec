@@ -193,6 +193,8 @@ fn unpacked_package_is_the_single_directory_named_for_the_crate() {
     std::fs::write(package.join("xml-sec-1.2.3.crate"), "").unwrap();
     assert!(unpacked_package(root.path()).is_err());
     std::fs::create_dir(package.join("xml-sec-1.2.3")).unwrap();
+    // `cargo package` keeps its own scratch registry beside the unpacked crate.
+    std::fs::create_dir(package.join("tmp-registry")).unwrap();
     assert_eq!(
         unpacked_package(root.path()).unwrap(),
         package.join("xml-sec-1.2.3")

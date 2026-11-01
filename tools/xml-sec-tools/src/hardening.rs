@@ -271,7 +271,10 @@ pub(crate) fn unpacked_package(target: &Path) -> Result<PathBuf, String> {
         let path = entry
             .map_err(|error| format!("read {}: {error}", root.display()))?
             .path();
-        if path.is_dir() {
+        let named = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("xml-sec-"));
+        if named && path.is_dir() {
             found.push(path);
         }
     }
