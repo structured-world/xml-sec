@@ -60,8 +60,8 @@ PKCS11_MODULE=/path/to/libsofthsm2.so \
 
 The phase packages `xml-sec` with all features and runs every test target from
 the unpacked archive, with the xmlsec1 oracle and a disposable token. A test that
-reads a file of a sibling package cannot pass there, so it stays out of the
-package through `include` in the root manifest and runs in the workspace.
+reads a sibling package or the donor checkout cannot pass there, so it stays out
+of the package through `include` in the root manifest and runs in the workspace.
 
 ## Pedantic Lint
 

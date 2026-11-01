@@ -25,11 +25,12 @@ include = [
     "/benchmarks/dashboard/**",
     "/benchmarks/Dockerfile",
     "/tests/**",
-    # These read files of sibling packages, which Cargo never packages; they run
-    # in the workspace.
+    # These read sibling packages, which Cargo never packages, or the donor
+    # checkout; they run in the workspace.
     "!/tests/capability_ledger.rs",
     "!/tests/donor_negative_vectors.rs",
     "!/tests/opc_relationship_transform.rs",
+    "!/tests/xmlsec1_interop.rs",
     "/compatibility/**",
     "/scripts/**",
 ]
