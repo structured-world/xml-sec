@@ -2181,7 +2181,7 @@ impl<'a> SignContext<'a> {
             merge_key_info_source_in_document(
                 view.document(),
                 view.xml(),
-                key_info_content,
+                (key_info_content, self.id_attributes),
                 target_signature,
                 Some(&self.policy),
                 Some(budget),
@@ -2206,11 +2206,13 @@ impl<'a> SignContext<'a> {
         mut generated: Vec<GeneratedC14n>,
     ) -> Result<PlannedReferences, SigningError> {
         let target_signature = request.target_signature;
-        // A DTD's attribute default would reach the new element when it is
-        // parsed (XML 1.0 §3.3.2), which no text inserted here can stand in for.
+        // A DTD's attribute default would reach the new elements when they are
+        // parsed (XML 1.0 §3.3.2), and its ATTLIST could type a new ID, neither
+        // of which text inserted here can stand in for.
+        let doctype = (key_info_content.is_some() || !generated.is_empty())
+            && document.as_xml().contains("<!DOCTYPE");
         if !generated.is_empty()
-            && (document.as_xml().contains("<!DOCTYPE")
-                || !generated.iter().all(|edit| edit.canonical_in_place))
+            && (doctype || !generated.iter().all(|edit| edit.canonical_in_place))
         {
             setup_gate = self.commit_generated_c14n(
                 document,
@@ -2230,25 +2232,30 @@ impl<'a> SignContext<'a> {
             .collect::<Vec<_>>();
         let deferred = SigningReferenceRequest {
             generated: &references,
+            speculative: true,
             ..request
         };
-        match analyze_signing_references(document, operation, deferred, transform_options) {
-            Ok(analyzed) if digests_can_defer(document, &analyzed) && analyzed.1.splice_unread => {
-                let budget = operation.budgets_mut().transforms.xml_parse_work();
-                let key_info = key_info_content
-                    .map(|content| {
-                        self.splice_signing_key_info(document, target_signature, &content, budget)
-                    })
-                    .transpose()?;
+        // A `Reference` may read what these add, or name an ID only the writer
+        // provides, so a failed analysis is decided after the commit.
+        let analysis = (!doctype)
+            .then(|| analyze_signing_references(document, operation, deferred, transform_options))
+            .and_then(Result::ok)
+            .filter(|analyzed| digests_can_defer(document, analyzed) && analyzed.1.splice_unread);
+        if let Some(analyzed) = analysis {
+            let budget = operation.budgets_mut().transforms.xml_parse_work();
+            let key_info = key_info_content
+                .as_deref()
+                .map(|content| {
+                    self.splice_signing_key_info(document, target_signature, content, budget)
+                })
+                .transpose()?;
+            if key_info.as_ref().is_none_or(|spliced| spliced.inert) {
                 let splice = DeferredSplice::new(document.as_xml(), key_info, generated);
                 self.policy
                     .resources
                     .validate_xml_document_len(splice.spliced.xml.len())?;
                 return Ok((analyzed, setup_gate, Some(splice)));
             }
-            // A `Reference` may read what these add, or name an ID only the
-            // writer provides, so a failed analysis is decided after the commit.
-            _ => {}
         }
         if !generated.is_empty() {
             setup_gate = self.commit_generated_c14n(document, operation, setup_gate, generated)?;
@@ -2346,9 +2353,11 @@ impl<'a> SignContext<'a> {
             )? - document.as_xml().len();
         }
         if let Some(spliced) = key_info {
-            // `spliced` and the source share everything outside `KeyInfo`.
+            // `spliced` and the source share everything outside its spans. The
+            // replacements above may have shortened the document, so this adds
+            // before it subtracts.
             projected_document_len =
-                projected_document_len - document.as_xml().len() + spliced.xml.len();
+                projected_document_len + spliced.xml.len() - document.as_xml().len();
         }
         self.policy
             .resources
@@ -2508,6 +2517,7 @@ impl<'a> SignContext<'a> {
             id_attributes: self.id_attributes,
             external_resources: &external_resources,
             generated: &[],
+            speculative: false,
         };
         let (analyzed, setup_gate, splice) = self.plan_signing_splice(
             document,
@@ -2896,6 +2906,8 @@ struct SigningReferenceRequest<'a, 'resources> {
     /// `DigestValue` nodes of the `Reference`s whose generated canonicalization
     /// is not in the document yet; their chains end with it regardless.
     generated: &'a [NodeId],
+    /// The analysis only asks whether a splice can wait for the final mutation.
+    speculative: bool,
 }
 
 /// The Second Edition transform one `Reference` gains.
@@ -2974,6 +2986,7 @@ impl DeferredSplice {
                 spans,
                 added_nodes,
                 depth,
+                inert: true,
             },
             insertions,
         }
@@ -3312,11 +3325,11 @@ fn analyze_signing_reference_inputs(
             return Ok(plan);
         }
     }
-    // Without the current tree a generated transform has to be committed anyway,
-    // so the caller is told before this parses a document it would discard.
-    if !request.generated.is_empty() {
+    // Without the current tree a splice has to be committed anyway, so the caller
+    // is told before this parses a document it would discard.
+    if request.speculative {
         return Err(SigningDigestError::InvalidStructure(
-            "generated canonicalization needs its own generation".into(),
+            "a splice over placeholder analysis needs its own generation".into(),
         ));
     }
     analyze_signing_placeholder_generation(
@@ -3715,6 +3728,7 @@ fn fill_reference_digest_values_in_dependency_order(
             id_attributes,
             external_resources: &external_resources,
             generated: &[],
+            speculative: false,
         },
         None,
         false,
@@ -4649,7 +4663,8 @@ fn generated_c14n(
         appends,
         canonical_in_place,
         in_signed_info: signed_info.subtree_contains_id(reference.id()),
-        depth: reference.ancestors().count() + 2,
+        // Depth counts elements alone, as the parser's document metrics do.
+        depth: reference.ancestors().filter(Node::is_element).count() + 2,
         edit,
         canonical: if appends {
             transform

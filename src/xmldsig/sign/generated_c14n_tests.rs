@@ -262,6 +262,167 @@ fn a_chain_read_through_a_placeholder_parses_no_more_for_generation() {
     assert!(consumed <= once.consumed() * 3, "{consumed}");
 }
 
+const OPEN_DS: &str = "xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"";
+const EXCLUSIVE: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
+
+/// A writer returning fixed `KeyInfo` content.
+struct FixedWriter(&'static str);
+
+impl KeyInfoWriter for FixedWriter {
+    fn write_key_info(&self, _: &dyn SigningKey) -> Result<String, KeyInfoWriteError> {
+        Ok(self.0.to_owned())
+    }
+}
+
+fn with_key_info(reference: &str, key_info: &str) -> String {
+    template(EXCLUSIVE, OPEN_DS, "ds:", reference).replace(
+        "<ds:SignatureValue/>",
+        &format!("<ds:SignatureValue/>{key_info}"),
+    )
+}
+
+fn explicit_transforms() -> String {
+    format!("<ds:Transforms><ds:Transform Algorithm=\"{EXCLUSIVE}\"/></ds:Transforms>")
+}
+
+#[test]
+fn a_shrinking_signature_value_keeps_the_projected_length_in_range() {
+    // Stale SignatureValue content longer than the new value makes the value
+    // replacements shorten the document before the splice grows it again.
+    let policy = crate::policy::SigningPolicy::default();
+    let stale = format!(
+        "<ds:SignatureValue>{}</ds:SignatureValue>",
+        " ".repeat(1024)
+    );
+    let build = |transforms: &str| {
+        template(
+            EXCLUSIVE,
+            OPEN_DS,
+            "ds:",
+            &reference("ds:", "#payload", transforms),
+        )
+        .replace("<ds:SignatureValue/>", &stale)
+    };
+    let last = format!("<ds:Transforms><ds:Transform Algorithm=\"{C14N11}\"/></ds:Transforms>");
+    assert_eq!(signed(&build(""), &policy), signed(&build(&last), &policy));
+}
+
+#[test]
+fn a_generated_transform_is_held_to_the_depth_the_parser_counts() {
+    // root/Signature/SignedInfo/Reference/Transforms/Transform has depth 6.
+    let xml = template(EXCLUSIVE, OPEN_DS, "ds:", &reference("ds:", "#payload", ""));
+    let sign = |max_xml_depth: usize| {
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_depth = max_xml_depth;
+        SignContext::new(&RecordingKey::default())
+            .policy(policy)
+            .sign_template(&xml)
+    };
+    sign(6).expect("depth 6 is within the limit");
+    assert!(sign(5).is_err());
+}
+
+#[test]
+fn a_spliced_key_info_is_held_to_the_depth_the_parser_counts() {
+    // Elements alone count: root/Signature/KeyInfo/a/b/c/d is 7, whatever text
+    // sits in the deepest one.
+    let xml = with_key_info(
+        &reference("ds:", "#payload", &explicit_transforms()),
+        "<ds:KeyInfo/>",
+    );
+    let writer = FixedWriter("<a xmlns=\"urn:a\"><b><c><d>text</d></c></b></a>");
+    let sign = |max_xml_depth: usize| {
+        let mut policy = crate::policy::SigningPolicy::default();
+        policy.resources.max_xml_depth = max_xml_depth;
+        SignContext::new(&RecordingKey::default())
+            .policy(policy)
+            .key_info_writer(&writer)
+            .sign_template(&xml)
+    };
+    sign(7).expect("depth 7 is within the limit");
+    assert!(sign(6).is_err());
+}
+
+#[test]
+fn a_merged_placeholder_is_held_to_the_namespace_limit() {
+    // The fragment and the document each pass; only the merged element, with
+    // the placeholder's binding and the writer's, can exceed the limit. The text
+    // path does not parse its result, so it must decide as the commit does.
+    let xml = with_key_info(
+        &reference("ds:", "#payload", &explicit_transforms()),
+        "<ds:KeyInfo><ds:KeyName xmlns:q=\"urn:q\"/></ds:KeyInfo>",
+    );
+    let writer = FixedWriter(
+        "<ds:KeyName xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\" \
+         xmlns:p=\"urn:p\">signer</ds:KeyName>",
+    );
+    let verdicts = (1..8)
+        .map(|max_xml_namespace_bindings| {
+            let mut policy = crate::policy::SigningPolicy::default();
+            policy.resources.max_xml_namespace_bindings = max_xml_namespace_bindings;
+            let key = RecordingKey::default();
+            let context = SignContext::new(&key)
+                .policy(policy)
+                .key_info_writer(&writer);
+            let text = context.sign_template(&xml).is_ok();
+            let mut document = XmlDocument::parse(xml.as_str()).expect("fixture parses");
+            (text, context.sign_document(&mut document).is_ok())
+        })
+        .collect::<Vec<_>>();
+    assert!(verdicts.contains(&(false, false)));
+    assert!(verdicts.contains(&(true, true)));
+    assert!(
+        verdicts.iter().all(|(text, document)| text == document),
+        "{verdicts:?}"
+    );
+}
+
+#[test]
+fn an_id_from_the_writer_is_seen_by_reference_resolution() {
+    // The new ID makes `#payload` ambiguous in the signed document, so a
+    // signature over the original target could never verify.
+    let xml = with_key_info(
+        &reference("ds:", "#payload", &explicit_transforms()),
+        "<ds:KeyInfo/>",
+    );
+    let writer = FixedWriter("<meta xmlns=\"urn:meta\" Id=\"payload\"/>");
+    let result = SignContext::new(&RecordingKey::default())
+        .key_info_writer(&writer)
+        .sign_template(&xml);
+    assert!(result.is_err(), "{result:?}");
+}
+
+#[test]
+fn a_writer_with_a_placeholder_analysis_parses_no_more_for_deferral() {
+    // XPath analysis rules deferral out, which must be known before the
+    // placeholder document is parsed: KeyInfo, analysis and the signed generation.
+    let policy = crate::policy::SigningPolicy::default();
+    let xpath = "<ds:Transforms><ds:Transform \
+        Algorithm=\"http://www.w3.org/TR/1999/REC-xpath-19991116\">\
+        <ds:XPath>true()</ds:XPath></ds:Transform>";
+    let transforms = format!("{xpath}<ds:Transform Algorithm=\"{EXCLUSIVE}\"/></ds:Transforms>");
+    let xml = with_key_info(&reference("ds:", "#payload", &transforms), "<ds:KeyInfo/>")
+        .replace("content", &"x".repeat(16 * 1024));
+    let writer = FixedWriter("<ds:KeyName>signer</ds:KeyName>");
+    let key = RecordingKey::default();
+    let mut document = XmlDocument::parse(xml.as_str()).expect("fixture parses");
+    let mut measured = SigningOperationBudgets::from_resources(&policy.resources);
+    SignContext::new(&key)
+        .policy(policy.clone())
+        .key_info_writer(&writer)
+        .sign_document_in_place::<CommitDocument>(&mut document, &mut measured)
+        .expect("signing succeeds");
+    let once = XmlParseWorkBudget::from_resources(&policy.resources);
+    XmlDocument::parse_with_settings_and_budget(
+        document.as_xml().to_owned(),
+        DocumentParseSettings::from_policy(policy.xml, &policy.resources),
+        &once,
+    )
+    .expect("the signed generation parses");
+    let consumed = measured.transforms.xml_parse_work().consumed();
+    assert!(consumed < once.consumed() * 7 / 2, "{consumed}");
+}
+
 #[test]
 fn a_generated_canonicalization_adds_no_document_parse() {
     // The document is parsed for the signed generation alone. A DOCTYPE keeps

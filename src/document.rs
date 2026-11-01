@@ -716,6 +716,9 @@ pub(crate) struct SplicedElement {
     pub(crate) added_nodes: usize,
     /// The deepest level the new content reaches.
     pub(crate) depth: usize,
+    /// The content adds no ID and no namespace scope the parsed fragment did not
+    /// have, so it may join the final mutation unparsed.
+    pub(crate) inert: bool,
 }
 
 #[cfg(feature = "xmldsig-sign")]
@@ -726,7 +729,7 @@ impl SplicedElement {
         source_len: usize,
         original: core::ops::Range<usize>,
         xml: String,
-        (added_nodes, depth): (usize, usize),
+        (added_nodes, depth, inert): (usize, usize, bool),
     ) -> Self {
         let replaced = original.len() + xml.len() - source_len;
         Self {
@@ -734,6 +737,7 @@ impl SplicedElement {
             spans: alloc::vec![(original, replaced)],
             added_nodes,
             depth,
+            inert,
         }
     }
 }
@@ -1527,7 +1531,8 @@ impl XmlDocument {
                 // Every counted span lies before the edit, so this stays in range.
                 edit.range = edit.range.start + grown - shrunk..edit.range.end + grown - shrunk;
             }
-            projected = projected - self.as_xml().len() + spliced.xml.len();
+            // Replacements may have shortened the document: add before subtracting.
+            projected = projected + spliced.xml.len() - self.as_xml().len();
             if projected > settings.max_bytes {
                 return Err(XmlDocumentError::DocumentTooLarge {
                     maximum: settings.max_bytes,

@@ -511,7 +511,7 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
     let merged = merge_key_info_source_in_document(
         &document,
         xml,
-        key_info_source,
+        (key_info_source, &[]),
         target_signature,
         policy,
         budget,
@@ -522,16 +522,35 @@ pub(super) fn merge_key_info_source_at_index_with_budget(
 }
 
 /// The nodes under `wrapper`, and how deep they reach once inside `key_info`.
-fn key_info_source_extent(wrapper: Node<'_, '_>, key_info: Node<'_, '_>) -> (usize, usize) {
-    let wrapper_depth = wrapper.ancestors().count();
-    let source_depth = wrapper
-        .descendants()
-        .map(|node| node.ancestors().count() - wrapper_depth)
+fn key_info_source_extent(
+    wrapper: Node<'_, '_>,
+    key_info: Node<'_, '_>,
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> (usize, usize, bool) {
+    // Depth counts elements alone, as the parser's document metrics do.
+    let element_depth = |node: Node<'_, '_>| node.ancestors().filter(Node::is_element).count();
+    let wrapper_depth = element_depth(wrapper);
+    let elements = || wrapper.descendants().filter(Node::is_element);
+    let source_depth = elements()
+        .map(|node| element_depth(node) - wrapper_depth)
         .max()
         .unwrap_or(0);
+    // The wrapper declares exactly the scope of `KeyInfo`, so the fragment's
+    // parse bounded every element's bindings unless the source merges into a
+    // child with a scope of its own. An ID can change what a `Reference` resolves.
+    let scope = key_info.namespaces().count();
+    let inert = key_info
+        .descendants()
+        .filter(Node::is_element)
+        .all(|node| node.namespaces().count() == scope)
+        && !elements().any(|node| {
+            node.attributes()
+                .any(|attribute| crate::xml::is_id_attribute(node, attribute, id_attributes))
+        });
     (
         wrapper.descendants().count() - 1,
-        source_depth + key_info.ancestors().count(),
+        source_depth + element_depth(key_info),
+        inert,
     )
 }
 
@@ -542,7 +561,7 @@ fn key_info_source_extent(wrapper: Node<'_, '_>, key_info: Node<'_, '_>) -> (usi
 pub(super) fn merge_key_info_source_in_document(
     document: &crate::xml::dom::Document<'_>,
     xml: &str,
-    key_info_source: &str,
+    (key_info_source, id_attributes): (&str, &[crate::IdAttributeRegistration]),
     target_signature: usize,
     policy: Option<&crate::policy::SigningPolicy>,
     budget: Option<&XmlParseWorkBudget>,
@@ -572,8 +591,7 @@ pub(super) fn merge_key_info_source_in_document(
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
     let wrapped_source = wrap_key_info_children(key_info_source, key_info, policy)?;
     let source_document = parse_mutation_xml_with_budget(&wrapped_source, policy, budget)?;
-    let (added_nodes, depth) = key_info_source_extent(source_document.root_element(), key_info);
-    let original = key_info.range();
+    let extent = key_info_source_extent(source_document.root_element(), key_info, id_attributes);
     let sources = source_document
         .root_element()
         .children()
@@ -651,11 +669,12 @@ pub(super) fn merge_key_info_source_in_document(
             budget,
         )?;
     }
+    let range = key_info.range();
     Ok(crate::document::SplicedElement::replacing(
         xml.len(),
-        original,
+        range,
         output,
-        (added_nodes, depth),
+        extent,
     ))
 }
 
