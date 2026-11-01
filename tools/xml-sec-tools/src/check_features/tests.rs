@@ -1,6 +1,10 @@
-use super::{Action, VERIFY_ONLY_FORBIDDEN, execute, forbidden_crate, plan};
+use super::{
+    Action, VERIFY_ONLY_FORBIDDEN, consumer_manifest, execute, forbidden_crate, missing_feature,
+    plan,
+};
 use crate::repo::{Failure, Run, Step};
 use std::os::unix::process::ExitStatusExt as _;
+use std::path::Path;
 use std::process::ExitStatus;
 
 /// The planned command lines, as the original runner's Cargo log recorded them.
@@ -10,7 +14,8 @@ fn lines(actions: &[Action]) -> Vec<String> {
         .map(|action| {
             let (Action::Run(step)
             | Action::VerifyOnlyGraph(step, _)
-            | Action::MissingBackend(step)) = action;
+            | Action::MissingBackend(step)
+            | Action::ConsumerFeatures(step, _)) = action;
             step.args.join(" ")
         })
         .collect()
@@ -228,11 +233,74 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
                 "tree -p xml-sec --no-default-features --features {features} -e normal --prefix none --format {{p}}"
             ));
         }
+        if profile == "experimental" {
+            expected.push("metadata --format-version 1".to_owned());
+        }
         expected.push(format!(
             "clippy -p xml-sec --no-default-features --features {features} --all-targets -- -D warnings"
         ));
         assert_eq!(planned(profile, "lint"), expected, "{profile}");
     }
+}
+
+/// `cargo metadata` output naming `shake` with `features`.
+fn shake_metadata(features: &str) -> String {
+    format!(
+        r#"{{"packages":[{{"name":"shake","id":"id#shake"}},{{"name":"other","id":"id#other"}}],
+        "resolve":{{"nodes":[{{"id":"id#shake","features":[{features}]}},
+        {{"id":"id#other","features":["zeroize"]}}]}}}}"#
+    )
+}
+
+#[test]
+fn a_consumer_without_shake_state_clearing_fails_qualification() {
+    // Another crate's feature of the same name must not pass for shake's; this
+    // is the graph a downstream crate resolved before the manifest asked for it.
+    let actions = plan("experimental", "lint", None).unwrap();
+    assert!(matches!(actions[0], Action::ConsumerFeatures(..)));
+    let mut runner = Recorded {
+        output: shake_metadata(""),
+        ..Recorded::default()
+    };
+    assert_eq!(
+        execute(&actions, &mut runner).unwrap_err(),
+        Failure {
+            code: 1,
+            message: "a downstream consumer does not enable shake/zeroize".to_owned(),
+        }
+    );
+    assert_eq!(runner.calls, 1);
+}
+
+#[test]
+fn a_consumer_graph_without_the_package_is_no_proof() {
+    // A renamed or dropped dependency must fail the check, not satisfy it.
+    assert_eq!(
+        missing_feature(
+            r#"{"packages":[],"resolve":{"nodes":[]}}"#,
+            &[("shake", "zeroize")]
+        ),
+        Ok(Some(("shake", "zeroize")))
+    );
+    assert!(missing_feature("not json", &[("shake", "zeroize")]).is_err());
+}
+
+#[test]
+fn a_consumer_with_shake_state_clearing_passes() {
+    assert_eq!(
+        missing_feature(&shake_metadata(r#""zeroize""#), &[("shake", "zeroize")]),
+        Ok(None)
+    );
+}
+
+#[test]
+fn the_consumer_stands_outside_the_workspace() {
+    // Its own empty workspace table is what stops feature unification, and
+    // default features stay off as they do for a minimal downstream crate.
+    let manifest = consumer_manifest(Path::new("/repository"));
+    assert!(manifest.contains("\n[workspace]\n"));
+    assert!(manifest.contains("path = '/repository', default-features = false"));
+    assert!(!manifest.contains("dev-dependencies"));
 }
 
 #[test]

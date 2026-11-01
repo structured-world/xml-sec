@@ -5,6 +5,7 @@ use super::{
     KeyEncapsulationKey, ProviderError, Zeroizing,
 };
 use crate::provider::{ProviderCapability, ProviderInputError};
+use alloc::vec::Vec;
 use der::{
     AnyRef, Decode, Encode, Reader, Tag, TagMode, TagNumber, Tagged,
     asn1::{BitStringRef, ContextSpecific, OctetStringRef},
@@ -546,6 +547,22 @@ mod tests {
         KeyEncapsulationAlgorithm::MlKem1024,
     ];
 
+    #[cfg(not(feature = "xmldsig-sign"))]
+    #[test]
+    fn encapsulation_without_a_randomness_source_is_unsupported() {
+        // FIPS 203 section 7.2 needs fresh m, and a build without the bundled
+        // source has none: refusing is the only answer that is not a weak key.
+        // https://doi.org/10.6028/NIST.FIPS.203
+        let key = RustCryptoMlKemPrivateKey::from_seed(ALGORITHMS[0], &[42; 64])
+            .expect("seed")
+            .public_key();
+        assert!(matches!(
+            RustCryptoProvider.encapsulate_key(&key),
+            Err(ProviderError::Unsupported { .. })
+        ));
+    }
+
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn all_parameter_sets_roundtrip_every_private_encoding() {
         // RFC 9935 section 6 permits every CHOICE branch, not just the preferred seed.
@@ -616,6 +633,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "xmldsig-sign")]
     #[test]
     fn valid_size_invalid_ciphertext_is_implicitly_rejected() {
         // FIPS 203 section 7.3 returns a deterministic fallback secret, never an oracle bit.

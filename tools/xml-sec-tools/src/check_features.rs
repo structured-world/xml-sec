@@ -2,7 +2,9 @@
 //! feature profile of the core package alone. Workspace feature unification
 //! could otherwise hide a broken gate.
 
-use crate::repo::{Failure, Run, Step, System, TOOL, require};
+use crate::repo::{Failure, Run, Step, System, TOOL, require, root};
+use serde_json::Value;
+use std::path::Path;
 
 #[cfg(test)]
 mod tests;
@@ -29,6 +31,9 @@ const CMS_FORBIDDEN: &[&str] = VERIFY_ONLY_FORBIDDEN
     .1;
 
 const BACKEND_DIAGNOSTIC: &str = "compile at least one XML backend";
+
+/// What the embedded post-quantum code relies on from its dependencies.
+const EXPERIMENTAL_CONSUMER: [(&str, &str); 1] = [("shake", "zeroize")];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Phase {
@@ -63,6 +68,9 @@ pub(crate) enum Action {
     VerifyOnlyGraph(Step, &'static [&'static str]),
     /// A build that must fail with the missing-backend diagnostic.
     MissingBackend(Step),
+    /// `cargo metadata` of a throwaway consumer, whose graph must enable each
+    /// `(package, feature)` pair without asking for it.
+    ConsumerFeatures(Step, &'static [(&'static str, &'static str)]),
 }
 
 struct Profile {
@@ -136,7 +144,7 @@ const PROFILES: [Profile; 17] = [
     profile(
         "experimental",
         Some("experimental-pq,xmldsig-sign,xml-backend-xmloxide"),
-        &[],
+        &["shake_state_clearing"],
         true,
     ),
     profile(
@@ -227,6 +235,16 @@ pub(crate) fn plan(
             forbidden,
         ));
     }
+    if phase.includes(Phase::Lint) && profile == "experimental" {
+        actions.push(Action::ConsumerFeatures(
+            Step::new(
+                "consumer graph",
+                "cargo",
+                &["metadata", "--format-version", "1"],
+            ),
+            &EXPERIMENTAL_CONSUMER,
+        ));
+    }
     if phase.includes(Phase::Lint) {
         let clippy = [
             &["clippy"][..],
@@ -263,6 +281,50 @@ pub(crate) fn forbidden_crate(graph: &str, forbidden: &[&'static str]) -> Option
     })
 }
 
+/// A manifest outside the workspace that depends on `root` like a downstream
+/// crate: no dev-dependency or workspace member can unify features into it.
+fn consumer_manifest(root: &Path) -> String {
+    format!(
+        "[package]\nname = \"feature-consumer\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n\
+         [lib]\npath = \"lib.rs\"\n\n[workspace]\n\n[dependencies]\n\
+         xml-sec = {{ path = '{}', default-features = false, \
+         features = [\"experimental-pq\", \"xml-backend-roxmltree\"] }}\n",
+        root.display()
+    )
+}
+
+/// The first `(package, feature)` of `required` that `metadata`, the output of
+/// `cargo metadata`, leaves off. A package missing from the graph counts: an
+/// absent crate must not pass as a clean one.
+fn missing_feature(
+    metadata: &str,
+    required: &[(&'static str, &'static str)],
+) -> Result<Option<(&'static str, &'static str)>, String> {
+    let metadata: Value =
+        serde_json::from_str(metadata).map_err(|error| format!("parse cargo metadata: {error}"))?;
+    let list = |value: Option<&Value>| value.and_then(Value::as_array).cloned().unwrap_or_default();
+    let packages = list(metadata.get("packages"));
+    let nodes = list(metadata.pointer("/resolve/nodes"));
+    Ok(required.iter().copied().find(|(package, feature)| {
+        let mut identities = packages
+            .iter()
+            .filter(|candidate| candidate.get("name").and_then(Value::as_str) == Some(package))
+            .filter_map(|candidate| candidate.get("id"))
+            .peekable();
+        identities.peek().is_none()
+            || identities.any(|identity| {
+                !nodes
+                    .iter()
+                    .filter(|node| node.get("id") == Some(identity))
+                    .any(|node| {
+                        list(node.get("features"))
+                            .iter()
+                            .any(|name| name.as_str() == Some(feature))
+                    })
+            })
+    }))
+}
+
 /// Executes `actions` in order; the first failure stops qualification.
 pub(crate) fn execute(actions: &[Action], runner: &mut impl Run) -> Result<(), Failure> {
     for action in actions {
@@ -273,6 +335,24 @@ pub(crate) fn execute(actions: &[Action], runner: &mut impl Run) -> Result<(), F
                 require(status)?;
                 if let Some(name) = forbidden_crate(&graph, forbidden) {
                     return Err(format!("verification-only graph contains {name}").into());
+                }
+            }
+            Action::ConsumerFeatures(step, required) => {
+                let consumer = tempfile::tempdir().map_err(|error| error.to_string())?;
+                let write = |name: &str, text: String| {
+                    std::fs::write(consumer.path().join(name), text)
+                        .map_err(|error| error.to_string())
+                };
+                write("Cargo.toml", consumer_manifest(&root()))?;
+                write("lib.rs", String::new())?;
+                let (status, metadata) =
+                    runner.stdout(&step.clone().in_directory(consumer.path()))?;
+                require(status)?;
+                if let Some((package, feature)) = missing_feature(&metadata, required)? {
+                    return Err(format!(
+                        "a downstream consumer does not enable {package}/{feature}"
+                    )
+                    .into());
                 }
             }
             Action::MissingBackend(step) => {
