@@ -16,7 +16,9 @@ use structured_cms::verify::{self, ContentAgreement};
 use structured_pkix::path::WorkingKey;
 use structured_pkix::temporal::{Instant, LeapTable};
 use xml_sec::policy::{CertificateSignatureAlgorithms, VerificationPolicy};
-use xml_sec::provider::RustCryptoProvider;
+use xml_sec::provider::{
+    CryptoProvider, ProviderCapability, ProviderError, RustCryptoProvider, X509SignatureAlgorithm,
+};
 use xml_sec::xmldsig::DigestAlgorithm;
 use xml_sec::xmldsig::cms::CmsProvider;
 
@@ -177,6 +179,26 @@ fn a_signature_method_naming_another_digest_is_malformed() {
         sample[header + 2..header + 4].copy_from_slice(&length.to_be_bytes());
     }
     assert_eq!(detached(&sample, CONTENT), Detached::Malformed);
+}
+
+#[test]
+fn a_foreign_digest_is_unsupported_not_a_panic() {
+    // The variant is public, so a caller can pair it with any digest. The key
+    // is valid (the signer's SPKI in the published sample) so that the refusal
+    // comes from the pairing and nothing earlier hides it.
+    let algorithm = X509SignatureAlgorithm::Dstu4145 {
+        digest: DigestAlgorithm::Sha256,
+        big_endian: false,
+    };
+    let provider = RustCryptoProvider;
+    assert!(!provider.supports(ProviderCapability::VerifyCertificate(algorithm)));
+    let error = provider
+        .verify_x509_signature(algorithm, b"signed", &[0; 64], &KUPYNA_CADES[513..691])
+        .expect_err("no such method exists");
+    assert!(
+        matches!(error, ProviderError::Unsupported { .. }),
+        "{error:?}"
+    );
 }
 
 #[test]

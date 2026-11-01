@@ -146,7 +146,9 @@ fn prepared(
 }
 
 /// Verify `signature`, the bare signature octets, for an ASN.1 carrier: there
-/// the identifier, not the key, states the byte order.
+/// the identifier, not the key, states the byte order. `digest` must satisfy
+/// [`is_ukrainian_digest`]: the public identifier can pair the method with any
+/// digest, so the provider refuses the others before calling this.
 pub(crate) fn verify_identified(
     digest: DigestAlgorithm,
     big_endian: bool,

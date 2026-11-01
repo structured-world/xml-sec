@@ -2147,7 +2147,9 @@ impl CryptoProvider for RustCryptoProvider {
     ) -> Result<bool, ProviderError> {
         // A refused key or framing is a non-matching signature.
         #[cfg(feature = "dstu4145")]
-        if let X509SignatureAlgorithm::Dstu4145 { digest, big_endian } = algorithm {
+        if let X509SignatureAlgorithm::Dstu4145 { digest, big_endian } = algorithm
+            && crate::xmldsig::dstu4145::is_ukrainian_digest(digest)
+        {
             return Ok(crate::xmldsig::dstu4145::verify_identified(
                 digest,
                 big_endian,
@@ -2263,7 +2265,9 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
         }
         X509SignatureAlgorithm::PostQuantum(_) => cfg!(feature = "experimental-pq"),
         #[cfg(feature = "dstu4145")]
-        X509SignatureAlgorithm::Dstu4145 { .. } => true,
+        X509SignatureAlgorithm::Dstu4145 { digest, .. } => {
+            crate::xmldsig::dstu4145::is_ukrainian_digest(digest)
+        }
         X509SignatureAlgorithm::RsaPss {
             digest, mgf_digest, ..
         } => {
