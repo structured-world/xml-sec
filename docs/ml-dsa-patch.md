@@ -28,6 +28,11 @@ Expanded-only keys are exported as expanded keys, never a fabricated seed.
 Secret staging buffers are zeroized. All public signing and verification still
 pass through `CryptoProvider`.
 
+`experimental-pq` enables `shake/zeroize`, so the `Shake` and `ShakeReader` values
+clear their own state and cursor when dropped. This is dependency-owned clearing of
+those values only: it does not reach compiler-generated copies or other temporaries,
+and it is no claim of complete secret erasure.
+
 Namespace, feature and Rust 1.92 lint adaptations let the same algorithm live as a private
 module. They do not change cryptographic behavior. Inspect the generated delta
 in `scripts/patches/ml-dsa-0.1.1.patch` when updating the donor.

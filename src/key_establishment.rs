@@ -313,7 +313,11 @@ mod tests {
             "failed-random"
         }
         fn supports(&self, capability: ProviderCapability<'_>) -> bool {
-            RustCryptoProvider.supports(capability)
+            // Its own source, which fails, exists in every build.
+            matches!(
+                capability,
+                ProviderCapability::Random | ProviderCapability::Encapsulate(_)
+            ) || RustCryptoProvider.supports(capability)
         }
         fn fill_random(&self, _: &mut [u8]) -> Result<(), ProviderError> {
             Err(ProviderError::Random("test entropy failure".into()))
@@ -431,7 +435,7 @@ mod tests {
         ));
         assert_eq!(usage.encapsulation_operations, 1);
         assert!(matches!(
-            usage.encapsulate(&policy, &RustCryptoProvider, &key),
+            usage.encapsulate(&policy, &FailedRandom, &key),
             Err(KeyEstablishmentError::Policy(
                 PolicyViolation::ResourceLimit { .. }
             ))
