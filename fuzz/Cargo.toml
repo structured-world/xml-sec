@@ -1,6 +1,7 @@
 [package]
 name = "xml-sec-fuzz"
 version = "0.0.0"
+license = "Apache-2.0 AND MIT"
 publish = false
 edition = "2024"
 

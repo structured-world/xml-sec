@@ -1,4 +1,4 @@
-use super::{Action, Coverage, Runner, execute, parse_env, plan, remapped_flags};
+use super::{Action, Coverage, Runner, execute, parse_env, plan, remapped_flags, unpacked_package};
 use crate::repo::{Failure, Run, Step, require};
 use serde_json::{Value, json};
 use std::os::unix::process::ExitStatusExt as _;
@@ -77,6 +77,10 @@ impl Runner for Recorder {
         self.calls.push(format!("write {}", path.display()));
         Ok(())
     }
+
+    fn unpacked(&mut self, target: &Path) -> Result<PathBuf, String> {
+        Ok(target.join("package/xml-sec-1.2.3"))
+    }
 }
 
 fn index(calls: &[String], prefix: &str) -> usize {
@@ -96,8 +100,8 @@ fn the_runner_preserves_every_source_and_delegates_the_85_percent_gate_to_llvm()
     execute(&actions, Some(&coverage), &mut recorder).unwrap();
     let calls = &recorder.calls;
     for expected in [
-        "cargo deny --all-features check --config deny.toml advisories sources",
-        "cargo deny --manifest-path fuzz/Cargo.toml",
+        "cargo deny --all-features check --config deny.toml advisories sources licenses",
+        "cargo deny --manifest-path fuzz/Cargo.toml --all-features check --config deny.toml advisories sources licenses",
         "cargo clippy --workspace --lib --all-features -- -D warnings -D unsafe_code",
         "tokens /test/module --workspace --all-features",
         "cargo llvm-cov report --package * --fail-under-lines 85",
@@ -141,6 +145,60 @@ fn the_runner_preserves_every_source_and_delegates_the_85_percent_gate_to_llvm()
             .starts_with(&format!("{encoded}\x1f"))
     );
     assert!(remapped_flags(Some(""), Some("-A b"), Path::new("/repo")).starts_with("-A\x1fb\x1f"));
+}
+
+#[test]
+fn the_package_phase_tests_the_archive_rather_than_the_workspace() {
+    // Workspace tests cannot notice a target that needs a file outside the
+    // archive, so the tests must run from the unpacked package.
+    let inputs = coverage("");
+    let actions = plan("package", Some(&inputs)).unwrap();
+    let mut recorder = Recorder::default();
+    execute(&actions, Some(&inputs), &mut recorder).unwrap();
+    assert_eq!(
+        recorder.calls,
+        [
+            "cargo package -p xml-sec --all-features --target-dir /evidence",
+            "tokens /test/module --workspace --manifest-path /evidence/package/xml-sec-1.2.3/Cargo.toml --all-features --target-dir /evidence",
+        ]
+    );
+}
+
+#[test]
+fn the_package_phase_refuses_a_missing_directory_and_stops_on_failure() {
+    // A failed package must not fall through to tests of an older unpacked copy.
+    assert!(plan("package", None).is_err());
+    let inputs = coverage("");
+    let actions = plan("package", Some(&inputs)).unwrap();
+    let mut recorder = Recorder {
+        fail: Some("cargo package"),
+        ..Recorder::default()
+    };
+    assert_eq!(
+        execute(&actions, Some(&inputs), &mut recorder)
+            .unwrap_err()
+            .code,
+        37
+    );
+    assert_eq!(recorder.calls.len(), 1);
+}
+
+#[test]
+fn unpacked_package_is_the_single_directory_named_for_the_crate() {
+    // The compressed archive beside the directory shares its name prefix.
+    let root = tempfile::tempdir().unwrap();
+    assert!(unpacked_package(root.path()).is_err());
+    let package = root.path().join("package");
+    std::fs::create_dir(&package).unwrap();
+    std::fs::write(package.join("xml-sec-1.2.3.crate"), "").unwrap();
+    assert!(unpacked_package(root.path()).is_err());
+    std::fs::create_dir(package.join("xml-sec-1.2.3")).unwrap();
+    assert_eq!(
+        unpacked_package(root.path()).unwrap(),
+        package.join("xml-sec-1.2.3")
+    );
+    std::fs::create_dir(package.join("xml-sec-1.2.2")).unwrap();
+    assert!(unpacked_package(root.path()).is_err());
 }
 
 #[test]

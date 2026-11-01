@@ -25,7 +25,11 @@ include = [
     "/benchmarks/dashboard/**",
     "/benchmarks/Dockerfile",
     "/tests/**",
-    "/tools/xmlsec1/**",
+    # These read files of sibling packages, which Cargo never packages; they run
+    # in the workspace.
+    "!/tests/capability_ledger.rs",
+    "!/tests/donor_negative_vectors.rs",
+    "!/tests/opc_relationship_transform.rs",
     "/compatibility/**",
     "/scripts/**",
 ]
