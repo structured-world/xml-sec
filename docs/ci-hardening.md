@@ -42,13 +42,26 @@ cargo nextest run -p xml-sec-tools
 cargo-deny 0.19.0 checks both the production and fuzz graphs, including optional
 features and development dependencies. Vulnerable, unsound and notice advisories
 fail under the tool's policy; yanked crates and unapproved git/registry sources
-are refused. There is no blanket ignore list. Refresh an ignored local lockfile
-when it retains a yanked dependency; do not weaken the gate to accept that lock.
+are refused. Every crate must satisfy the licence allow-list in `deny.toml`.
+There is no blanket ignore list. Refresh an ignored local lockfile when it
+retains a yanked dependency; do not weaken the gate to accept that lock.
 
 The native safety gate lints all workspace library targets with unsafe-code
 refusal. Test/benchmark diagnostic allocator probes are not product library
 permission to use unsafe. Native dependencies retain their separate upstream
 safety and FIPS/module boundaries; this check is not an audit of external code.
+
+## Packaged Crate
+
+```sh
+PKCS11_MODULE=/path/to/libsofthsm2.so \
+  cargo run -p xml-sec-tools -- hardening package /new/directory/outside/the/repository
+```
+
+The phase packages `xml-sec` with all features and runs every test target from
+the unpacked archive, with the xmlsec1 oracle and a disposable token. A test that
+reads a sibling package or the donor checkout cannot pass there, so it stays out
+of the package through `include` in the root manifest and runs in the workspace.
 
 ## Pedantic Lint
 

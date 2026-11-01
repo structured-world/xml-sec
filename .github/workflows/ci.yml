@@ -100,6 +100,8 @@ jobs:
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Execute every workspace target and enforce canonical coverage
         run: cargo run --quiet -p xml-sec-tools -- hardening coverage "$RUNNER_TEMP/coverage"
+      - name: Build the packaged crate and run every test from its archive
+        run: cargo run --quiet -p xml-sec-tools -- hardening package "$RUNNER_TEMP/package"
       - uses: actions/upload-artifact@v7
         if: always()
         with:

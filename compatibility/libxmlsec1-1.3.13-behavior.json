@@ -11,7 +11,7 @@
     "asn1-signatures": {
       "positive": [
         {
-          "file": "tests/xmlsec1_interop.rs",
+          "file": "tests/xmlsec1_donor_interop.rs",
           "test": "asn1_ecdsa_compatibility_matches_pinned_xmlsec1",
           "description": "Pinned donor and native verification accept the upstream DER fixture only in explicit compatibility mode."
         },
@@ -28,7 +28,7 @@
       ],
       "negative": [
         {
-          "file": "tests/xmlsec1_interop.rs",
+          "file": "tests/xmlsec1_donor_interop.rs",
           "test": "asn1_ecdsa_compatibility_matches_pinned_xmlsec1",
           "description": "Pinned donor and native standards defaults both reject the upstream DER fixture."
         },

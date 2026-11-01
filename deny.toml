@@ -2,6 +2,20 @@
 yanked = "deny"
 ignore = []
 
+[licenses]
+# One list serves the production and fuzz graphs, which use different licences.
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "NCSA",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Zlib",
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

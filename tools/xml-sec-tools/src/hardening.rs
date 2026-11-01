@@ -1,6 +1,7 @@
-//! `hardening [all|dependencies|safety|coverage] [EVIDENCE_DIR]`: dependency
-//! policy, native safety and canonical line coverage. Coverage evidence is
-//! kept outside build output.
+//! `hardening [all|dependencies|safety|coverage|package] [DIR]`: dependency
+//! policy, native safety, canonical line coverage and the packaged crate's own
+//! tests. `DIR` receives the evidence or the package build and lies outside the
+//! repository, because a package unpacked inside it would join its workspace.
 
 use crate::repo::{Failure, Run, Step, System, require};
 use serde_json::Value;
@@ -30,6 +31,8 @@ pub(crate) enum Action {
     ShowEnv(Step),
     /// The token-backed workspace tests under the instrumented build.
     TokenTests(Vec<String>),
+    /// Every test of the unpacked package, token-backed ones included.
+    PackagedTests,
     /// Validates the JSON coverage report.
     CheckReport,
     /// A process whose stdout becomes the named evidence file.
@@ -74,6 +77,24 @@ pub(crate) fn plan(phase: &str, coverage: Option<&Coverage>) -> Result<Vec<Actio
         "dependencies" => (true, false, false),
         "safety" => (false, true, false),
         "coverage" => (false, false, true),
+        "package" => {
+            let inputs = coverage.ok_or("pass a package build directory and PKCS11_MODULE")?;
+            let target = inputs.evidence.display().to_string();
+            return Ok(vec![
+                Action::Run(cargo(
+                    "package",
+                    &[
+                        "package",
+                        "-p",
+                        "xml-sec",
+                        "--all-features",
+                        "--target-dir",
+                        &target,
+                    ],
+                )),
+                Action::PackagedTests,
+            ]);
+        }
         _ => {
             return Err(Failure {
                 code: 2,
@@ -93,6 +114,7 @@ pub(crate) fn plan(phase: &str, coverage: Option<&Coverage>) -> Result<Vec<Actio
                 "deny.toml",
                 "advisories",
                 "sources",
+                "licenses",
             ],
         )));
         actions.push(Action::Run(cargo(
@@ -107,6 +129,7 @@ pub(crate) fn plan(phase: &str, coverage: Option<&Coverage>) -> Result<Vec<Actio
                 "deny.toml",
                 "advisories",
                 "sources",
+                "licenses",
             ],
         )));
     }
@@ -234,6 +257,35 @@ pub(crate) trait Runner: Run {
     fn create_dir(&mut self, path: &Path) -> Result<(), String>;
     fn check_report(&mut self, path: &Path) -> Result<Value, String>;
     fn write(&mut self, path: &Path, text: &str) -> Result<(), String>;
+    fn unpacked(&mut self, target: &Path) -> Result<PathBuf, String>;
+}
+
+/// The directory `cargo package` unpacked under `target`; the name holds the
+/// version, and a second match means a stale build rather than this package.
+pub(crate) fn unpacked_package(target: &Path) -> Result<PathBuf, String> {
+    let root = target.join("package");
+    let entries =
+        std::fs::read_dir(&root).map_err(|error| format!("read {}: {error}", root.display()))?;
+    let mut found = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("read {}: {error}", root.display()))?
+            .path();
+        let named = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("xml-sec-"));
+        if named && path.is_dir() {
+            found.push(path);
+        }
+    }
+    match found.as_slice() {
+        [package] => Ok(package.clone()),
+        _ => Err(format!(
+            "expected one unpacked package in {}, found {}",
+            root.display(),
+            found.len()
+        )),
+    }
 }
 
 impl Runner for System {
@@ -256,6 +308,10 @@ impl Runner for System {
 
     fn write(&mut self, path: &Path, text: &str) -> Result<(), String> {
         std::fs::write(path, text).map_err(|error| format!("write {}: {error}", path.display()))
+    }
+
+    fn unpacked(&mut self, target: &Path) -> Result<PathBuf, String> {
+        unpacked_package(target)
     }
 }
 
@@ -288,6 +344,19 @@ pub(crate) fn execute(
                 env.extend(parse_env(&listing)?);
             }
             Action::TokenTests(args) => runner.token_tests(&measured()?.module, args, &env)?,
+            Action::PackagedTests => {
+                let inputs = measured()?;
+                let manifest = runner.unpacked(&inputs.evidence)?.join("Cargo.toml");
+                let args = [
+                    "--workspace".into(),
+                    "--manifest-path".into(),
+                    manifest.display().to_string(),
+                    "--all-features".into(),
+                    "--target-dir".into(),
+                    inputs.evidence.display().to_string(),
+                ];
+                runner.token_tests(&inputs.module, &args, &env)?;
+            }
             Action::CheckReport => {
                 let summary = runner.check_report(&measured()?.evidence.join("coverage.json"))?;
                 println!("{summary}");
