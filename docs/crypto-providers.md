@@ -142,7 +142,8 @@ reported as an unsupported algorithm or a digest mismatch. Sessions, CMS, XAdES 
 detached payloads charge the caller's execution; plain signing and verification,
 which hold one state per Reference, use an account of their own without a ceiling.
 A PKCS#11 result passes through a buffer that `cryptoki` allocates itself: its width
-is admitted first, but that one allocation cannot report a refusal.
+is admitted with the state, before the token operation starts, but that one
+allocation cannot report a refusal.
 
 XMLDSig Reference processing streams the final transform output into this state
 for both signing and verification: a final node set is canonicalized straight

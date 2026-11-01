@@ -285,9 +285,10 @@ const fn output_capacity() -> usize {
 struct Pkcs11Digest<'a> {
     session: MutexGuard<'a, Session>,
     active: bool,
-    /// Pays for the result buffer, which only cryptoki can allocate.
-    memory: structured_asn1::memory::Memory,
-    width: usize,
+    /// Pays for the result buffer that only cryptoki can allocate. `digest_final`
+    /// runs on every way out of an operation, including `Drop`, so it is
+    /// admitted before the operation starts and held until the state is gone.
+    _result_buffer: structured_asn1::memory::MemoryReservation,
 }
 
 impl super::DigestState for Pkcs11Digest<'_> {
@@ -306,12 +307,7 @@ impl super::DigestState for Pkcs11Digest<'_> {
         output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
     ) -> Result<usize, ProviderError> {
         // The module's reply reaches us through cryptoki's own buffer; it has
-        // no call that writes to caller storage, so the width is admitted here.
-        // A refusal leaves the operation active for Drop to end.
-        let _temporary = self
-            .memory
-            .reserve(self.width)
-            .map_err(ProviderError::Resource)?;
+        // no call that writes to caller storage.
         self.active = false;
         let digest = self
             .session
@@ -844,6 +840,9 @@ impl CryptoProvider for Pkcs11Provider {
         self.require_capability(ProviderCapability::Digest(algorithm))?;
         let mechanism = digest_mechanism(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Digest(algorithm)))?;
+        let result_buffer = memory
+            .reserve(algorithm.output_len())
+            .map_err(ProviderError::Resource)?;
         let session = self.0.session()?;
         session
             .digest_init(&mechanism)
@@ -852,8 +851,7 @@ impl CryptoProvider for Pkcs11Provider {
             Pkcs11Digest {
                 session,
                 active: true,
-                memory: memory.clone(),
-                width: algorithm.output_len(),
+                _result_buffer: result_buffer,
             },
             memory,
         )

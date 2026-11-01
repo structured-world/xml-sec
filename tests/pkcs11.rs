@@ -125,19 +125,41 @@ fn assert_login_and_digests(provider: &Pkcs11Provider, pin: &AuthPin) {
         );
         // The token's state is charged like a software one, and refused alike.
         assert_eq!(memory.used(), 0);
-        // The result crosses a buffer cryptoki allocates, so a ceiling that
-        // only fits the state refuses finalization, and drop ends the operation.
+        // The result crosses a buffer cryptoki allocates on every way out of an
+        // operation, finalization and abandonment alike, so an admitted state
+        // has already paid for it and finishing needs nothing more.
         let state = provider.begin_digest(algorithm, &memory).unwrap();
-        let state_size = memory.used();
+        let admitted = memory.used();
         drop(state);
-        let exact = Memory::new(Arc::new(MemoryAccount::new(state_size, 1 << 20)));
+        let exact = Memory::new(Arc::new(MemoryAccount::new(admitted, 1 << 20)));
         let mut state = provider.begin_digest(algorithm, &exact).unwrap();
-        assert_eq!(
-            state.finalize(&mut output).err(),
-            Some(ProviderError::Resource(MemoryError::LimitExceeded))
-        );
+        assert_eq!(exact.used(), admitted);
+        state.update(&data).unwrap();
+        let written = state.finalize(&mut output).unwrap();
+        assert_eq!(&output[..written], &*expected, "{algorithm:?}");
         drop(state);
         assert_eq!(exact.used(), 0);
+        let short = Memory::new(Arc::new(MemoryAccount::new(admitted - 1, 1 << 20)));
+        assert_eq!(
+            provider.begin_digest(algorithm, &short).err(),
+            Some(ProviderError::Resource(MemoryError::LimitExceeded))
+        );
+        // A refusal after the operation started must still leave the session
+        // ready: the state's block does not fit, the result buffer does.
+        let width_only = Memory::new(Arc::new(MemoryAccount::new(
+            algorithm.output_len(),
+            1 << 20,
+        )));
+        assert_eq!(
+            provider.begin_digest(algorithm, &width_only).err(),
+            Some(ProviderError::Resource(MemoryError::LimitExceeded))
+        );
+        assert_eq!(width_only.used(), 0);
+        assert_eq!(
+            &*provider.digest(algorithm, &data, &memory).unwrap(),
+            &*expected,
+            "{algorithm:?}"
+        );
         let empty = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
         assert_eq!(
             provider.begin_digest(algorithm, &empty).err(),
