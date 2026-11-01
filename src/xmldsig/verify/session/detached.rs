@@ -637,6 +637,10 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
 fn resource_refusal(error: &DsigError) -> Option<DsigError> {
     match error {
         DsigError::SharedExecution(cause) => Some(DsigError::SharedExecution(*cause)),
+        DsigError::Policy(
+            violation @ (crate::policy::PolicyViolation::ResourceLimit { .. }
+            | crate::policy::PolicyViolation::ResourceLimitExceeded { .. }),
+        ) => Some(DsigError::Policy(violation.clone())),
         DsigError::Reference(super::ReferenceProcessingError::SharedExecution(cause)) => Some(
             DsigError::Reference(super::ReferenceProcessingError::SharedExecution(*cause)),
         ),

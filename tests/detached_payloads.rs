@@ -820,6 +820,51 @@ fn a_manifest_digest_refusal_ends_the_detached_completion() {
 }
 
 #[test]
+fn a_manifest_policy_limit_ends_the_detached_completion() {
+    // The Manifest is processed only once the payload completes core validation,
+    // so a low enough ceiling is spent there. Sweeping every ceiling reaches it:
+    // the limit must reach the caller as well as the evidence.
+    let payload = b"detached part";
+    let document = manifest_document(payload);
+    let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
+    let mut refused = 0_usize;
+    for ceiling in 1..=4096 {
+        let mut policy = verification_policy();
+        policy.manifest_processing = ManifestProcessing::Process;
+        policy.resources.max_canonicalized_bytes = ceiling;
+        let context = VerifyContext::new().policy(policy).key(&key);
+        let work = work();
+        let outcome = with_verified_request(
+            &document,
+            &context,
+            &VerificationRequest::default(),
+            &work,
+            |mut session| {
+                let Some(&reference) =
+                    pending_references(&session, DetachedCompletion::Complete).first()
+                else {
+                    return Ok(());
+                };
+                let outcome = stream(
+                    &mut session,
+                    &[reference],
+                    payload,
+                    4,
+                    DetachedCompletion::Complete,
+                );
+                let in_evidence = session.evidence().signatures()[0].result().is_err();
+                assert_eq!(outcome.is_err(), in_evidence, "ceiling {ceiling}");
+                outcome
+            },
+        );
+        if let Err(DsigError::Policy(PolicyViolation::ResourceLimit { .. })) = outcome {
+            refused += 1;
+        }
+    }
+    assert!(refused > 0);
+}
+
+#[test]
 fn finalization_is_admitted_before_the_provider_runs() {
     // Updates can spend the allowance to the last unit; finishing then must
     // stop at the admission, with the backend never entered.
