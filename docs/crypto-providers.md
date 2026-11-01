@@ -129,9 +129,21 @@ Without it, that selection is an explicit unavailable-provider error.
 
 Every provider implements `CryptoProvider::begin_digest`, which returns a
 provider-owned `DigestState`: input is absorbed in order across any number of
-`update` calls, and `finalize` consumes the state. The one-shot `digest` is a
-provided method built on it, so an engine implements hashing once. Custom
-providers implement `begin_digest`; it replaces the former required `digest`.
+`update` calls, and `finalize` writes the digest to an inline buffer, once. The
+one-shot `digest` is a provided method built on it, so an engine implements hashing
+once. Custom providers implement `begin_digest`; it replaces the former required
+`digest`.
+
+`begin_digest` receives the operation's `Memory`. A provider puts its state on the
+heap with `charged_digest_state`, which admits the whole block first, keeps the
+charge as long as the state and turns an allocator refusal into an error. A refusal
+is `ProviderError::Resource`: it ends the operation with that cause and is never
+reported as an unsupported algorithm or a digest mismatch. Sessions, CMS, XAdES and
+detached payloads charge the caller's execution; plain signing and verification,
+which hold one state per Reference, use an account of their own without a ceiling.
+A PKCS#11 result passes through a buffer that `cryptoki` allocates itself: its width
+is admitted with the state, before the token operation starts, but that one
+allocation cannot report a refusal.
 
 XMLDSig Reference processing streams the final transform output into this state
 for both signing and verification: a final node set is canonicalized straight

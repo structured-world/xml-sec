@@ -29,15 +29,26 @@ fn hash(algorithm: DigestAlgorithm) -> Option<Hash<'static>> {
     }
 }
 
-struct UkrainianDigest(State<'static>);
+// `State::finalize` consumes the state, which `finalize` receives by reference.
+struct UkrainianDigest(Option<State<'static>>);
 
 impl DigestState for UkrainianDigest {
     fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
-        self.0.update(data).map_err(|_| digest_refusal())
+        self.0
+            .as_mut()
+            .ok_or_else(digest_refusal)?
+            .update(data)
+            .map_err(|_| digest_refusal())
     }
 
-    fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
-        Ok(self.0.finalize().as_ref().to_vec())
+    fn finalize(
+        &mut self,
+        output: &mut [u8; super::MAX_DIGEST_OUTPUT],
+    ) -> Result<usize, ProviderError> {
+        let digest = self.0.take().ok_or_else(digest_refusal)?.finalize();
+        let digest = digest.as_ref();
+        output[..digest.len()].copy_from_slice(digest);
+        Ok(digest.len())
     }
 }
 
@@ -70,10 +81,11 @@ pub(crate) const fn is_ukrainian_digest(algorithm: DigestAlgorithm) -> bool {
 /// Start the incremental digest of a Ukrainian `algorithm`.
 pub(crate) fn begin_digest(
     algorithm: DigestAlgorithm,
+    memory: &structured_asn1::memory::Memory,
 ) -> Result<Box<dyn DigestState>, ProviderError> {
     let identity = hash(algorithm).ok_or_else(digest_refusal)?;
     let state = State::new(identity).map_err(|_| digest_refusal())?;
-    Ok(Box::new(UkrainianDigest(state)))
+    crate::provider::charged_digest_state(UkrainianDigest(Some(state)), memory)
 }
 
 /// The numeric domain written in `curve`, for the crate's own validation.

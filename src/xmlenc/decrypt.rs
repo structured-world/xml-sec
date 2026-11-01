@@ -3982,9 +3982,10 @@ mod tests {
         fn begin_digest(
             &self,
             algorithm: crate::xmldsig::DigestAlgorithm,
+            memory: &structured_asn1::memory::Memory,
         ) -> Result<Box<dyn crate::provider::DigestState + '_>, crate::provider::ProviderError>
         {
-            crate::provider::default_provider().begin_digest(algorithm)
+            crate::provider::default_provider().begin_digest(algorithm, memory)
         }
 
         #[cfg(feature = "xmldsig")]

@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::policy::{PolicyViolation, SameDocumentIdSemantics, VerificationPolicy};
+use xml_sec::provider::ProviderError;
 use xml_sec::{XmlDocument, xmldsig::*};
 
 const SHA1: &str = "http://www.w3.org/2000/09/xmldsig#sha1";
@@ -182,7 +183,7 @@ fn digests_use_the_selected_provider_and_policy() {
     // FIPS 180-4 Appendix B.1 known answer for SHA-256("abc"), absorbed in two
     // chunks; each chunk is charged before the provider sees it.
     with_session(|session, work| {
-        let mut digest = session.begin_digest(DigestAlgorithm::Sha256).unwrap();
+        let mut digest = session.begin_digest(DigestAlgorithm::Sha256, work).unwrap();
         digest.update(b"a", work).unwrap();
         digest.update(b"bc", work).unwrap();
         let before_finish = work.work_used();
@@ -201,15 +202,28 @@ fn digests_use_the_selected_provider_and_policy() {
             "digest finalization and output must be admitted by the current query"
         );
         assert!(matches!(
-            session.begin_digest(DigestAlgorithm::Sha1),
+            session.begin_digest(DigestAlgorithm::Sha1, work),
             Err(DsigError::Policy(PolicyViolation::Algorithm { .. }))
         ));
         let starved = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 2)));
-        let mut digest = session.begin_digest(DigestAlgorithm::Sha256).unwrap();
+        let mut digest = session.begin_digest(DigestAlgorithm::Sha256, work).unwrap();
         assert!(matches!(
             digest.update(b"abc", &starved),
             Err(DsigError::SharedExecution(MemoryError::WorkExceeded))
         ));
         assert_eq!(starved.used(), 0);
+        // State creation answers to the same execution, with the same cause.
+        let empty = Memory::new(Arc::new(MemoryAccount::new(0, 16)));
+        assert!(matches!(
+            session.begin_digest(DigestAlgorithm::Sha256, &empty),
+            Err(DsigError::Provider(ProviderError::Resource(
+                MemoryError::LimitExceeded
+            )))
+        ));
+        let spent = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 0)));
+        assert!(matches!(
+            session.begin_digest(DigestAlgorithm::Sha256, &spent),
+            Err(DsigError::SharedExecution(MemoryError::WorkExceeded))
+        ));
     });
 }

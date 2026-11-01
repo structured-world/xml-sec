@@ -3537,14 +3537,25 @@ fn source_digest_matches(
         .memory()
         .charge_work(source.len() as u64 + expected.len() as u64)
         .map_err(resource)?;
-    let _output = session
-        .memory()
-        .reserve(algorithm.output_len())
-        .map_err(resource)?;
-    // Built-in providers return the fixed-width digest; opaque custom-provider
-    // internals remain that provider's admitted-work responsibility.
-    let actual = compute_digest_with_provider(provider, algorithm, source)?;
+    // Opaque custom-provider internals remain that provider's admitted-work
+    // responsibility; the state and the inline output are admitted here.
+    let actual = compute_digest_with_provider(provider, algorithm, source, session.memory())
+        .map_err(|error| selector_digest_error(error, resource))?;
     Ok(constant_time_eq(&actual, expected))
+}
+
+/// The certificate account's own ceilings read as this session's limits.
+fn selector_digest_error(
+    error: crate::provider::ProviderError,
+    limit: impl FnOnce(structured_asn1::memory::MemoryError) -> ParseError,
+) -> ParseError {
+    use structured_asn1::memory::MemoryError;
+    match error {
+        crate::provider::ProviderError::Resource(
+            reason @ (MemoryError::LimitExceeded | MemoryError::WorkExceeded),
+        ) => limit(reason),
+        error => error.into(),
+    }
 }
 
 fn ensure_x509_data_entry_budget(info: &X509DataInfo) -> Result<(), ParseError> {
@@ -5139,6 +5150,27 @@ BA== </Modulus>
     }
 
     #[test]
+    fn a_selector_digest_keeps_an_allocator_refusal_apart_from_a_limit() {
+        // Only a configured ceiling is a policy limit; running out of memory
+        // is the provider's cause and must stay recognisable as such.
+        use crate::provider::ProviderError;
+        use structured_asn1::memory::MemoryError;
+        let limit = |_| ParseError::InvalidStructure("limit".into());
+        for reason in [MemoryError::LimitExceeded, MemoryError::WorkExceeded] {
+            assert!(matches!(
+                selector_digest_error(ProviderError::Resource(reason), limit),
+                ParseError::InvalidStructure(_)
+            ));
+        }
+        for reason in [MemoryError::OutOfMemory, MemoryError::CapacityOverflow] {
+            assert!(matches!(
+                selector_digest_error(ProviderError::Resource(reason), limit),
+                ParseError::Provider(ProviderError::Resource(actual)) if actual == reason
+            ));
+        }
+    }
+
+    #[test]
     fn certificate_selectors_ignore_rewritten_display_metadata() {
         // Serial/SKI discovery must consult the source certificate, not a
         // stale or edited projection supplied alongside its unchanged DER.
@@ -5509,8 +5541,10 @@ BA== </Modulus>
             crate::provider::default_provider(),
             DigestAlgorithm::Sha256,
             &certificate,
+            &crate::xmldsig::digest::digest_memory(),
         )
-        .unwrap();
+        .unwrap()
+        .to_vec();
         let matching = X509DataInfo {
             subject_names: vec![parsed.subject_dn.clone()],
             issuer_serials: vec![(

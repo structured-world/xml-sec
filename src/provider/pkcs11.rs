@@ -277,10 +277,18 @@ fn oaep_error(error: Error, capability: ProviderCapability<'_>) -> ProviderError
     }
 }
 
+const fn output_capacity() -> usize {
+    crate::xmldsig::MAX_DIGEST_OUTPUT
+}
+
 /// A multi-part digest holding the serialized session from init to final.
 struct Pkcs11Digest<'a> {
     session: MutexGuard<'a, Session>,
     active: bool,
+    /// Pays for the result buffer that only cryptoki can allocate. `digest_final`
+    /// runs on every way out of an operation, including `Drop`, so it is
+    /// admitted before the operation starts and held until the state is gone.
+    _result_buffer: structured_asn1::memory::MemoryReservation,
 }
 
 impl super::DigestState for Pkcs11Digest<'_> {
@@ -294,11 +302,26 @@ impl super::DigestState for Pkcs11Digest<'_> {
         })
     }
 
-    fn finalize(mut self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
+    fn finalize(
+        &mut self,
+        output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+    ) -> Result<usize, ProviderError> {
+        // The module's reply reaches us through cryptoki's own buffer; it has
+        // no call that writes to caller storage.
         self.active = false;
-        self.session
+        let digest = self
+            .session
             .digest_final()
-            .map_err(|error| map_error(&error))
+            .map_err(|error| map_error(&error))?;
+        output
+            .get_mut(..digest.len())
+            .ok_or(ProviderError::InvalidOutputSize {
+                operation: ProviderOperation::Digest,
+                expected: output_capacity(),
+                actual: digest.len(),
+            })?
+            .copy_from_slice(&digest);
+        Ok(digest.len())
     }
 }
 
@@ -812,18 +835,26 @@ impl CryptoProvider for Pkcs11Provider {
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn super::DigestState + '_>, ProviderError> {
         self.require_capability(ProviderCapability::Digest(algorithm))?;
         let mechanism = digest_mechanism(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Digest(algorithm)))?;
+        let result_buffer = memory
+            .reserve(algorithm.output_len())
+            .map_err(ProviderError::Resource)?;
         let session = self.0.session()?;
         session
             .digest_init(&mechanism)
             .map_err(|error| map_error(&error))?;
-        Ok(Box::new(Pkcs11Digest {
-            session,
-            active: true,
-        }))
+        super::charged_digest_state(
+            Pkcs11Digest {
+                session,
+                active: true,
+                _result_buffer: result_buffer,
+            },
+            memory,
+        )
     }
     fn sign(
         &self,

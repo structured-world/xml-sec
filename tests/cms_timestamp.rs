@@ -5,8 +5,9 @@
 
 use std::sync::Arc;
 
+use structured_asn1::digest::{Digest, Resolution};
 use structured_asn1::memory::{Memory, MemoryAccount};
-use structured_asn1::{Encoding, Parser, digest::Resolution};
+use structured_asn1::{Encoding, Parser};
 use structured_cms::content_source::ContentError;
 use structured_cms::digest::DigestError;
 use structured_cms::ess::BindingError;
@@ -192,6 +193,33 @@ fn every_independent_authority_token_verifies_through_the_selected_provider() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn a_digest_the_execution_cannot_hold_is_refused_with_its_cause() {
+    // The CMS digest callback admits the state in the caller's execution; a
+    // small ceiling is a resource refusal, never Unsupported or a mismatch.
+    let policy = VerificationPolicy::default();
+    let provider = RustCryptoProvider;
+    let cms = CmsProvider::new(&provider, &policy);
+    let empty = Memory::new(Arc::new(MemoryAccount::new(0, 1 << 20)));
+    let refusal = match Digest::start(&cms, &DigestAlgorithm::Sha256, &empty) {
+        Err(CmsProviderError::Digest(refusal)) => refusal,
+        Err(other) => panic!("{other:?}"),
+        Ok(_) => panic!("an empty account cannot hold a state"),
+    };
+    assert!(
+        matches!(
+            refusal,
+            xml_sec::xmldsig::DsigError::Provider(xml_sec::provider::ProviderError::Resource(
+                structured_asn1::memory::MemoryError::LimitExceeded
+            ))
+        ),
+        "{refusal:?}"
+    );
+    let spent = Memory::new(Arc::new(MemoryAccount::new(1 << 20, 0)));
+    assert!(Digest::start(&cms, &DigestAlgorithm::Sha256, &spent).is_err());
+    assert_eq!(spent.used(), 0);
 }
 
 #[test]
@@ -391,8 +419,9 @@ impl CryptoProvider for WithoutEd25519 {
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &Memory,
     ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
-        RustCryptoProvider.begin_digest(algorithm)
+        RustCryptoProvider.begin_digest(algorithm, memory)
     }
 }
 

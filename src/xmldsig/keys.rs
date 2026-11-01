@@ -2749,8 +2749,11 @@ mod tests {
                 );
             }
             let signed = der::asn1::Any::new(der::Tag::Sequence, body)?.to_der()?;
-            let digest = crate::provider::default_provider()
-                .digest(super::super::DigestAlgorithm::Sha1, &signed)?;
+            let digest = crate::provider::default_provider().digest(
+                super::super::DigestAlgorithm::Sha1,
+                &signed,
+                &super::super::digest::digest_memory(),
+            )?;
             // Test-certificate generation only; production dispatch stays in CryptoProvider.
             let signature: dsa::Signature = key.sign_prehash_with_rng(
                 &mut ChaCha20Rng::from_seed([u8::from(root); 32]),
@@ -3011,6 +3014,7 @@ mod tests {
         fn begin_digest(
             &self,
             algorithm: super::super::DigestAlgorithm,
+            memory: &structured_asn1::memory::Memory,
         ) -> Result<Box<dyn crate::provider::DigestState + '_>, crate::provider::ProviderError>
         {
             if algorithm == super::super::DigestAlgorithm::Sha512
@@ -3021,7 +3025,7 @@ mod tests {
                     algorithm: Some(algorithm.uri().to_owned()),
                 });
             }
-            crate::provider::default_provider().begin_digest(algorithm)
+            crate::provider::default_provider().begin_digest(algorithm, memory)
         }
 
         fn sign(
@@ -4991,7 +4995,11 @@ mod tests {
             .der()
             .to_vec();
         let digest = crate::provider::default_provider()
-            .digest(super::super::DigestAlgorithm::Sha256, &unrelated)
+            .digest(
+                super::super::DigestAlgorithm::Sha256,
+                &unrelated,
+                &super::super::digest::digest_memory(),
+            )
             .expect("SHA-256 selector digest must be available");
         let key_info_xml = format!(
             "<KeyInfo xmlns=\"http://www.w3.org/2000/09/xmldsig#\" xmlns:dsig11=\"http://www.w3.org/2009/xmldsig11#\"><X509Data><X509SubjectName>CN=Test Key rsa-2048,O=XML Security Library (http://www.aleksey.com/xmlsec),ST=California,C=US</X509SubjectName><dsig11:X509Digest Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\">{}</dsig11:X509Digest></X509Data></KeyInfo>",

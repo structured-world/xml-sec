@@ -558,13 +558,14 @@ Manifest references obey the same per-reference transform-count ceiling and tran
 `<SignedInfo>` references; a violation is recorded in that Manifest reference's independent status.
 They also share `ResourcePolicy::max_references` with `<SignedInfo>`: every parsed Manifest
 reference consumes that operation-wide budget, including entries whose transforms are unsupported
-and retained only as independent failure results.
+and retained only as independent failure results. Exhausting an operation-wide resource limit while
+processing a Manifest reference ends `verify()` with an error instead of a per-reference status.
 
 Malformed `XMLDSig` structure, unsupported algorithms in core signature processing, disallowed URIs
 in `<SignedInfo>` references, and inconsistent `KeyInfo` metadata are processing errors rather
-than validity statuses. Manifest policy violations and unsupported transforms remain independent
-per-reference statuses as described above. Treat both `Invalid(reason)` and an API error as a
-rejected document; never continue an authentication flow after either outcome.
+than validity statuses. Other Manifest policy violations and unsupported transforms remain
+independent per-reference statuses as described above. Treat both `Invalid(reason)` and an API
+error as a rejected document; never continue an authentication flow after either outcome.
 
 External references are disabled by default. Verification and signing callers must both allow
 their URI class with `UriTypeSet` and provide every payload through

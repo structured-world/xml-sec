@@ -49,7 +49,11 @@ impl CryptoProvider for RefusingProvider {
     fn derive_key(&self, _: &KdfParameters<'_>, _: &[u8]) -> Result<Vec<u8>, ProviderError> {
         Err(refusal())
     }
-    fn begin_digest(&self, _: DigestAlgorithm) -> Result<Box<dyn DigestState + '_>, ProviderError> {
+    fn begin_digest(
+        &self,
+        _: DigestAlgorithm,
+        _: &structured_asn1::memory::Memory,
+    ) -> Result<Box<dyn DigestState + '_>, ProviderError> {
         Err(refusal())
     }
     fn sign(

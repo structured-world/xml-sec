@@ -57,16 +57,26 @@ fn digest_algorithm(algorithm: DigestAlgorithm) -> Option<&'static digest::Algor
     })
 }
 
-struct AwsLcDigest(digest::Context);
+// `finish` consumes the context, which `finalize` receives by reference.
+struct AwsLcDigest(Option<digest::Context>);
 
 impl super::DigestState for AwsLcDigest {
     fn update(&mut self, data: &[u8]) -> Result<(), ProviderError> {
-        self.0.update(data);
+        self.0
+            .as_mut()
+            .expect("the owner finalizes last")
+            .update(data);
         Ok(())
     }
 
-    fn finalize(self: Box<Self>) -> Result<Vec<u8>, ProviderError> {
-        Ok(self.0.finish().as_ref().to_vec())
+    fn finalize(
+        &mut self,
+        output: &mut [u8; crate::xmldsig::MAX_DIGEST_OUTPUT],
+    ) -> Result<usize, ProviderError> {
+        let digest = self.0.take().expect("the owner finalizes once").finish();
+        let digest = digest.as_ref();
+        output[..digest.len()].copy_from_slice(digest);
+        Ok(digest.len())
     }
 }
 
@@ -201,10 +211,11 @@ impl CryptoProvider for AwsLcFipsProvider {
     fn begin_digest(
         &self,
         algorithm: DigestAlgorithm,
+        memory: &structured_asn1::memory::Memory,
     ) -> Result<Box<dyn super::DigestState + '_>, ProviderError> {
         let native = digest_algorithm(algorithm)
             .ok_or_else(|| unsupported(ProviderCapability::Digest(algorithm)))?;
-        Ok(Box::new(AwsLcDigest(digest::Context::new(native))))
+        super::charged_digest_state(AwsLcDigest(Some(digest::Context::new(native))), memory)
     }
 
     fn sign(

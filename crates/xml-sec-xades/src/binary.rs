@@ -12,6 +12,7 @@ use structured_xades::certificate::DigestProvider;
 use structured_xades::hashes::HashClass;
 use structured_xades::xml::{Access, Name};
 use xml_sec::document::NodeIdentity;
+pub use xml_sec::xmldsig::DigestOutput;
 use xml_sec::xmldsig::extension;
 use xml_sec::xmldsig::{DigestAlgorithm, DigestMethodResolution, SessionDigest, constant_time_eq};
 
@@ -104,19 +105,6 @@ pub enum DigestIdentity {
     Digest(DigestAlgorithm),
 }
 
-/// A finished certificate digest, held inline.
-#[derive(Debug, Clone, Copy)]
-pub struct DigestOutput {
-    bytes: [u8; 64],
-    len: usize,
-}
-
-impl AsRef<[u8]> for DigestOutput {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes[..self.len]
-    }
-}
-
 impl DigestIdentity {
     /// Total order key: equal keys name the same digest, so outputs can be shared.
     fn order_key(self) -> (u8, &'static str) {
@@ -159,9 +147,8 @@ impl<'a, W: Work> Digest<'a> for Document<'_, '_, '_, '_, W> {
         let DigestIdentity::Digest(algorithm) = identity else {
             return Err(Error::ProhibitedDigest);
         };
-        execution.charge_work(1)?;
         Ok(Resolution::Supported(
-            self.session.begin_digest(*algorithm)?,
+            self.session.begin_digest(*algorithm, execution)?,
         ))
     }
 
@@ -179,12 +166,7 @@ impl<'a, W: Work> Digest<'a> for Document<'_, '_, '_, '_, W> {
         state: SessionDigest<'a>,
         execution: &Q,
     ) -> Result<DigestOutput, Error> {
-        let mut output = DigestOutput {
-            bytes: [0; 64],
-            len: state.output_len(),
-        };
-        state.finish(&mut output.bytes[..output.len], execution)?;
-        Ok(output)
+        Ok(state.finish_output(execution)?)
     }
 
     fn matches<Q: Work>(
