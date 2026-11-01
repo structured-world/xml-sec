@@ -5184,14 +5184,19 @@ fn missing_external_identity_does_not_retain_uri_cache_copies() {
     document.with_view(|view| {
         let resolver = UriReferenceResolver::new(view.document());
         let _ = budgets.resource_identity_for_reference(&reference, 0, &resolver, view, None);
-        assert!(budgets.external_resource_identities.borrow().is_empty());
+        assert_eq!(
+            budgets.external_resource_fingerprint(&uri, &resolver, None),
+            None
+        );
+        assert!(budgets.external_resource_fingerprints.borrow().is_empty());
     });
 }
 
 #[test]
 fn operation_memoizes_repeated_external_resource_identity() {
     // The external resource map is immutably borrowed for the operation,
-    // so one content fingerprint safely identifies every repeated URI.
+    // so one content fingerprint safely identifies every repeated URI, and
+    // planning an identity does not read the bytes at all.
     let document = XmlDocument::parse("<root/>").expect("fixture must parse");
     let resources = BTreeMap::from([("urn:repeated".to_owned(), vec![b'x'; 8 * 1_024])]);
     let reference = make_reference(
@@ -5213,7 +5218,17 @@ fn operation_memoizes_repeated_external_resource_identity() {
         let second = budgets.resource_identity_for_reference(&reference, 1, &resolver, view, None);
 
         assert_eq!(first, second);
-        assert_eq!(budgets.external_resource_identities.borrow().len(), 1);
+        assert!(budgets.external_resource_fingerprints.borrow().is_empty());
+
+        let fingerprint = budgets
+            .external_resource_fingerprint("urn:repeated", &resolver, None)
+            .unwrap();
+        assert_eq!(
+            budgets.external_resource_fingerprint("urn:repeated", &resolver, Some([0; 32])),
+            Some(fingerprint),
+            "the first fingerprint of a URI stands for the operation"
+        );
+        assert_eq!(budgets.external_resource_fingerprints.borrow().len(), 1);
     });
 }
 

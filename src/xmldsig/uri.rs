@@ -555,26 +555,33 @@ impl<'a> UriReferenceResolver<'a> {
     ) -> Option<crate::operation::OperationResourceIdentity> {
         self.external_resources
             .and_then(|resources| resources.get(uri))
-            .map(|bytes| crate::operation::OperationResourceIdentity::external(uri, bytes))
+            .map(
+                |bytes| crate::operation::OperationResourceIdentity::BorrowedExternal {
+                    uri: uri.to_owned(),
+                    address: bytes.as_ptr().addr(),
+                    length: bytes.len(),
+                },
+            )
+    }
+
+    /// SHA-256 identity of the bytes mapped to `uri`.
+    pub(crate) fn external_resource_fingerprint(&self, uri: &str) -> Option<[u8; 32]> {
+        use sha2::Digest as _;
+
+        self.external_resources
+            .and_then(|resources| resources.get(uri))
+            .map(|bytes| sha2::Sha256::digest(bytes).into())
     }
 
     pub(crate) fn external_resource_set_identity(
         &self,
     ) -> crate::operation::OperationResourceIdentity {
-        use sha2::Digest;
-
-        let mut hasher = sha2::Sha256::new();
-        // The ordered map yields entries by URI, so the identity is stable.
-        for (uri, bytes) in self.external_resources.into_iter().flatten() {
-            hasher.update(uri.len().to_be_bytes());
-            hasher.update(uri.as_bytes());
-            hasher.update(bytes.len().to_be_bytes());
-            hasher.update(bytes);
-        }
-        crate::operation::OperationResourceIdentity::External {
-            uri: "caller-owned-external-resource-set".to_owned(),
-            fingerprint: hasher.finalize().into(),
-        }
+        // The map stays immutably borrowed for the whole operation, so its
+        // address identifies its bytes without reading them.
+        crate::operation::OperationResourceIdentity::BorrowedResourceSet(
+            self.external_resources
+                .map_or(0, |resources| core::ptr::from_ref(resources).addr()),
+        )
     }
 
     /// Dereference a URI string to a [`TransformData`].

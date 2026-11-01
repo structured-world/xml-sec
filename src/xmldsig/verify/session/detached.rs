@@ -11,8 +11,8 @@ use super::super::{
     SignatureVerificationPipelineError, Transform, VerifiedSession,
 };
 use crate::NodeIdentity;
+use crate::xmldsig::base64_stream::Base64Stream;
 use alloc::{boxed::Box, vec::Vec};
-use base64::Engine as _;
 use structured_asn1::memory::{MemoryError, OwnedText, OwnedVec, Work};
 
 /// How detached completion treats a failed Reference.
@@ -104,129 +104,6 @@ struct StreamState<'p> {
     algorithm: DigestAlgorithm,
     chain: DetachedChain,
     state: Box<dyn crate::provider::DigestState + 'p>,
-}
-
-/// RFC 2045 alphabet bytes are decoded in blocks of whole quanta; the same
-/// `STANDARD` engine as the resident Base64 transform enforces padding.
-const BASE64_BLOCK: usize = 4096;
-
-struct Base64Stream {
-    block: [u8; BASE64_BLOCK],
-    filled: usize,
-    /// Alphabet bytes accepted so far: the offset the resident decoder reports
-    /// within its filtered input.
-    offset: usize,
-    padded: bool,
-    failure: Option<base64::DecodeError>,
-}
-
-impl Base64Stream {
-    fn new() -> Self {
-        Self {
-            block: [0; BASE64_BLOCK],
-            filled: 0,
-            offset: 0,
-            padded: false,
-            failure: None,
-        }
-    }
-
-    /// Whether decoding still runs; a decoding error ends it.
-    fn active(&self) -> bool {
-        self.failure.is_none()
-    }
-
-    /// Decode `chunk` and hand each decoded block to `sink`. A decoding error
-    /// is kept and stops this stream only; octet digests continue.
-    fn feed(
-        &mut self,
-        chunk: &[u8],
-        sink: &mut impl FnMut(&[u8]) -> Result<(), DsigError>,
-    ) -> Result<(), DsigError> {
-        if self.failure.is_some() {
-            return Ok(());
-        }
-        for &byte in chunk {
-            // RFC 2045 §6.8: bytes outside the alphabet are ignored, exactly as
-            // the resident transform filters them before decoding.
-            if !(byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')) {
-                continue;
-            }
-            if self.padded {
-                // Padding ends the encoded data; anything after it is the
-                // invalid byte the resident decoder reports.
-                self.failure = Some(base64::DecodeError::InvalidByte(self.offset, byte));
-                return Ok(());
-            }
-            self.block[self.filled] = byte;
-            self.filled += 1;
-            // Bounded by the policy's streamed byte limit, which fits usize.
-            self.offset += 1;
-            if self.filled == BASE64_BLOCK {
-                self.flush(sink)?;
-                if self.failure.is_some() {
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn flush(
-        &mut self,
-        sink: &mut impl FnMut(&[u8]) -> Result<(), DsigError>,
-    ) -> Result<(), DsigError> {
-        let mut decoded = [0_u8; BASE64_BLOCK / 4 * 3];
-        let encoded = &self.block[..self.filled];
-        // The block holds the last `filled` accepted bytes.
-        let base = self.offset - encoded.len();
-        self.padded = encoded.last() == Some(&b'=');
-        self.filled = 0;
-        match base64::engine::general_purpose::STANDARD.decode_slice(encoded, &mut decoded) {
-            Ok(written) => sink(&decoded[..written]),
-            Err(error) => {
-                self.failure = Some(match error {
-                    base64::DecodeSliceError::DecodeError(base64::DecodeError::InvalidByte(
-                        index,
-                        byte,
-                    )) => base64::DecodeError::InvalidByte(base + index, byte),
-                    base64::DecodeSliceError::DecodeError(
-                        base64::DecodeError::InvalidLastSymbol {
-                            offset,
-                            symbol,
-                            symbol_value,
-                        },
-                    ) => base64::DecodeError::InvalidLastSymbol {
-                        offset: base + offset,
-                        symbol,
-                        symbol_value,
-                    },
-                    base64::DecodeSliceError::DecodeError(base64::DecodeError::InvalidLength(
-                        length,
-                    )) => base64::DecodeError::InvalidLength(base + length),
-                    base64::DecodeSliceError::DecodeError(error) => error,
-                    // The output block holds every quantum of a full input
-                    // block, so its size cannot be the failure.
-                    base64::DecodeSliceError::OutputSliceTooSmall => {
-                        base64::DecodeError::InvalidLength(encoded.len())
-                    }
-                });
-                Ok(())
-            }
-        }
-    }
-
-    /// Decode the final partial block; an incomplete quantum is the padding
-    /// error the resident `STANDARD` decoder reports for the whole input.
-    fn finish(
-        mut self,
-        sink: &mut impl FnMut(&[u8]) -> Result<(), DsigError>,
-    ) -> Result<Option<base64::DecodeError>, DsigError> {
-        if self.failure.is_none() && self.filled > 0 {
-            self.flush(sink)?;
-        }
-        Ok(self.failure)
-    }
 }
 
 /// A detached payload being streamed into one session. Feed every chunk once

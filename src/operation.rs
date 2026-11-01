@@ -78,6 +78,17 @@ pub(crate) enum OperationResourceIdentity {
         document: usize,
         node: crate::NodeId,
     },
+    /// Caller's immutable resource map, valid only while its operation borrows
+    /// it. Never used as a cross-operation or persistent cache identity.
+    #[cfg(feature = "xmldsig")]
+    BorrowedResourceSet(usize),
+    /// One entry of that map, identified without reading its bytes.
+    #[cfg(feature = "xmldsig")]
+    BorrowedExternal {
+        uri: String,
+        address: usize,
+        length: usize,
+    },
     #[cfg(feature = "xmldsig")]
     DocumentNode(NodeIdentity),
     External {
