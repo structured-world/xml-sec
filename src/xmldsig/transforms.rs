@@ -2288,16 +2288,18 @@ impl DependencyTracking {
                 Some(node) => nodes.contains_tree(node).map_err(TransformError::from)?,
                 None => false,
             };
-            if remains_visible {
-                active_nodes.push(tracked);
-            } else if preserve_excluded_as_opaque {
+            if preserve_excluded_as_opaque {
                 // SXD exposes output membership but not which source
                 // values a predicate coerced. Structural selection does
                 // not depend on mutable DigestValue text, but a value
-                // scan may control another node's inclusion, so absence
-                // is not proof of independence in that case.
+                // scan may control another node's inclusion, so neither
+                // absence nor a later Enveloped removal proves
+                // independence: the read stays a dependency either way.
                 self.opaque_dependencies.insert(tracked.index);
-            } else {
+            }
+            if remains_visible {
+                active_nodes.push(tracked);
+            } else if !preserve_excluded_as_opaque {
                 self.dormant_indexes.insert(tracked.index);
             }
         }

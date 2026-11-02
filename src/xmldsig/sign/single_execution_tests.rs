@@ -328,30 +328,35 @@ fn a_writer_key_info_that_drops_a_referenced_id_is_refused() {
 }
 
 #[test]
-fn a_known_dependency_still_lets_later_node_set_steps_drop_the_signature() {
-    // A value-reading XPath excludes KeyInfo, leaving a dependency that lost
-    // its provenance; the Enveloped step after it still removes the
-    // Reference's own DigestValue and SignatureValue. Stopping the chain at the
-    // first known dependency would keep them and report a false cycle.
-    let xpath = transform(
-        XPATH,
-        "<ds:XPath>not(ancestor-or-self::ds:KeyInfo) and string-length(string(.)) &gt;= 0</ds:XPath>",
-    );
-    let xml = template(
-        &reference(
+fn a_value_read_by_xpath_stays_a_dependency_after_enveloped_removes_it() {
+    // The XPath selects nodes by the length of the Reference's own
+    // DigestValue, which it can still see; Enveloped removes that value from
+    // the output afterwards. The selection was made on the empty placeholder
+    // and a verifier makes it on the filled value, so the Reference depends on
+    // its own DigestValue: signing must refuse, not digest the placeholder
+    // selection. A `string(.)` test reads it too, through the string value of
+    // every ancestor.
+    for predicate in [
+        "string-length(string(//ds:DigestValue)) &lt; 10",
+        "not(ancestor-or-self::ds:KeyInfo) and string-length(string(.)) &gt;= 0",
+    ] {
+        let xpath = transform(XPATH, &format!("<ds:XPath>{predicate}</ds:XPath>"));
+        let xml = template(
+            &reference(
+                "",
+                &[xpath, transform(ENVELOPED, ""), transform(EXCLUSIVE, "")].concat(),
+            ),
             "",
-            &[xpath, transform(ENVELOPED, ""), transform(EXCLUSIVE, "")].concat(),
-        ),
-        "",
-    )
-    .replace(
-        "<ds:SignatureValue/>",
-        "<ds:SignatureValue/><ds:KeyInfo><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
-    );
-    let policy = crate::policy::SigningPolicy::default();
-    let signed = SignContext::new(&FixedKey)
-        .policy(policy.clone())
-        .sign_template(&xml)
-        .expect("Enveloped removes the signature's own values from the dependencies");
-    assert_digests_match_final_document(&signed, &policy);
+        )
+        .replace(
+            "<ds:SignatureValue/>",
+            "<ds:SignatureValue/><ds:KeyInfo><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
+        );
+        let result = SignContext::new(&FixedKey).sign_template(&xml);
+        let refusal = format!("{result:?}");
+        assert!(
+            result.is_err() && refusal.contains("dependency cycle"),
+            "{predicate}: {refusal}"
+        );
+    }
 }
