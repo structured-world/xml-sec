@@ -2218,11 +2218,45 @@ impl Evaluator {
         result
     }
 
+    /// Evaluate with the context node's path paid for in owned memory: the path
+    /// is held for the whole evaluation and released with it.
     #[expect(
         clippy::too_many_arguments,
         reason = "the XPath engine requires every component of its dynamic context"
     )]
     fn evaluate_core(
+        &self,
+        expression: &Expression,
+        node: &SourceNode,
+        position: usize,
+        size: usize,
+        variables: &dyn VariableBindings,
+        meter: &mut Meter,
+        custom_calls: Option<&CustomCallSession>,
+    ) -> Result<XPathValue> {
+        let path_bytes = self
+            .maps
+            .path_bytes(&self.source, node)
+            .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
+        meter.charge(BudgetKind::OwnedBytes, path_bytes)?;
+        let result = self.evaluate_with_context_path(
+            expression,
+            node,
+            position,
+            size,
+            variables,
+            meter,
+            custom_calls,
+        );
+        meter.release_owned_bytes(path_bytes);
+        result
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the XPath engine requires every component of its dynamic context"
+    )]
+    fn evaluate_with_context_path(
         &self,
         expression: &Expression,
         node: &SourceNode,
@@ -4098,7 +4132,7 @@ fn project_logical_root<'d>(
                             element.register_prefix("", &namespace.uri);
                         }
                     }
-                    for attribute in attributes {
+                    for (index, attribute) in attributes.iter().enumerate() {
                         let projected = element.set_attribute_value(
                             QName::with_namespace_uri(
                                 attribute.name.namespace.as_deref(),
@@ -4107,6 +4141,12 @@ fn project_logical_root<'d>(
                             &attribute.value,
                         );
                         projected.set_preferred_prefix(attribute.prefix.as_deref());
+                        ProjectedSlots::record(
+                            &mut slots.attributes,
+                            projected.identity_key(),
+                            (id, index),
+                            meter,
+                        )?;
                     }
                     parent.append_child(element);
                     ProjectedSlots::record(&mut slots.elements, element.identity_key(), id, meter)?;
@@ -6218,19 +6258,24 @@ fn decode_resource_metered_inner(
 
 /// The semantic node behind each SXD arena slot, per arena. Projection fills
 /// these, so a node the evaluator returns maps back without walking its siblings.
+/// Every evaluator node lives in the one projection document (result fragments
+/// and loaded documents are imported into the semantic document and projected
+/// there), so the arena slot alone identifies it.
 #[derive(Default)]
 struct ProjectedSlots {
     elements: Vec<Option<NodeId>>,
     texts: Vec<Option<NodeId>>,
     comments: Vec<Option<NodeId>>,
     instructions: Vec<Option<NodeId>>,
+    /// The owner and attribute index behind each attribute slot.
+    attributes: Vec<Option<(NodeId, usize)>>,
 }
 
 impl ProjectedSlots {
-    fn record(
-        slots: &mut Vec<Option<NodeId>>,
+    fn record<T>(
+        slots: &mut Vec<Option<T>>,
         key: (usize, usize, usize),
-        id: NodeId,
+        id: T,
         meter: &mut Meter,
     ) -> Result<()> {
         let (_, _, slot) = key;
@@ -6361,16 +6406,51 @@ impl NodeMaps {
         })
     }
 
-    fn ordinary_path(&self, source: &Document, id: NodeId) -> Option<Vec<usize>> {
+    /// Entries of the ordinary path of a placed node: the container index and
+    /// one position per level.
+    fn path_len(&self, source: &Document, id: NodeId) -> Option<usize> {
         self.rank(id)?;
-        let mut path = vec![0];
+        let mut len = 1;
         let mut current = Some(id);
         while let Some(node) = current {
-            path.push(*self.positions.get(node.0)?);
+            len += 1;
             current = source.node(node)?.parent;
         }
-        path[1..].reverse();
+        Some(len)
+    }
+
+    fn ordinary_path(&self, source: &Document, id: NodeId) -> Option<Vec<usize>> {
+        let len = self.path_len(source, id)?;
+        // Allocated at its exact length, which `path_bytes` admits beforehand.
+        let mut path = vec![0; len];
+        let mut current = Some(id);
+        for slot in path[1..].iter_mut().rev() {
+            let node = current?;
+            *slot = *self.positions.get(node.0)?;
+            current = source.node(node)?.parent;
+        }
         Some(path)
+    }
+
+    /// Heap bytes [`Self::path`] allocates for `node`, known before it does.
+    fn path_bytes(&self, source: &Document, node: &SourceNode) -> Option<usize> {
+        let words = self
+            .path_len(source, source_node_owner(node))?
+            .checked_mul(std::mem::size_of::<usize>())?;
+        let owner = &source.node(source_node_owner(node))?.kind;
+        let strings = match (node, owner) {
+            (SourceNode::Node(_), _) => 0,
+            (SourceNode::Attribute { index, .. }, NodeKind::Element { attributes, .. }) => {
+                let name = &attributes.get(*index)?.name;
+                name.namespace.as_ref().map_or(0, String::len) + name.local.len()
+            }
+            (SourceNode::Namespace { index, .. }, NodeKind::Element { namespaces, .. }) => {
+                let namespace = namespaces.get(*index)?;
+                namespace.prefix.as_ref().map_or(0, String::len) + namespace.uri.len()
+            }
+            _ => return None,
+        };
+        words.checked_add(strings)
     }
 
     fn path(&self, source: &Document, node: &SourceNode) -> Option<NodePath> {
@@ -6420,11 +6500,16 @@ impl NodeMaps {
     }
 
     /// The semantic node an evaluator result came from.
-    fn source_of_sxd(&self, source: &Document, node: &nodeset::Node<'_>) -> Option<SourceNode> {
+    fn source_of_sxd(
+        &self,
+        source: &Document,
+        node: &nodeset::Node<'_>,
+        meter: &mut Meter,
+    ) -> Result<Option<SourceNode>> {
         let projected = |slots: &[Option<NodeId>], (_, _, slot): (usize, usize, usize)| {
             slots.get(slot).copied().flatten().map(SourceNode::Node)
         };
-        match node {
+        Ok(match node {
             nodeset::Node::Root(_) => None,
             nodeset::Node::Element(node) => projected(&self.slots.elements, node.identity_key()),
             nodeset::Node::Text(node) => projected(&self.slots.texts, node.identity_key()),
@@ -6433,16 +6518,30 @@ impl NodeMaps {
                 projected(&self.slots.instructions, node.identity_key())
             }
             nodeset::Node::Attribute(attribute) => {
-                let owner = self.slots.element(&attribute.parent()?)?;
-                let name = attribute.name();
-                let name = name.get();
-                attribute_of(source, owner, name.namespace_uri(), name.local_part())
+                let (_, _, slot) = attribute.identity_key();
+                self.slots
+                    .attributes
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .map(|(owner, index)| SourceNode::Attribute { owner, index })
             }
             nodeset::Node::Namespace(namespace) => {
-                let owner = self.slots.element(&namespace.parent)?;
+                let Some(owner) = self.slots.element(&namespace.parent) else {
+                    return Ok(None);
+                };
+                // A namespace node has no arena slot: the owner's declarations
+                // are searched, and that search is admitted before it runs.
+                if let NodeKind::Element { namespaces, .. } = &source
+                    .node(owner)
+                    .ok_or_else(|| Error::Dynamic(format!("stale semantic node {owner:?}")))?
+                    .kind
+                {
+                    meter.charge(BudgetKind::XPathOperations, namespaces.len())?;
+                }
                 namespace_of(source, owner, namespace.prefix(), namespace.uri())
             }
-        }
+        })
     }
 
     fn to_sxd<'d>(
@@ -6491,7 +6590,7 @@ impl NodeMaps {
                 let mut projected = projected_node_storage(nodes.size(), meter)?;
                 for node in nodes {
                     meter.charge(BudgetKind::XPathOperations, 1)?;
-                    if let Some(node) = self.source_of_sxd(source, &node) {
+                    if let Some(node) = self.source_of_sxd(source, &node, meter)? {
                         projected.push(node);
                     }
                 }
@@ -6512,9 +6611,22 @@ fn attribute_of(
         return None;
     };
     let index = attributes.iter().position(|attribute| {
+        #[cfg(test)]
+        ATTRIBUTE_SCANS.with(|count| count.set(count.get() + 1));
         attribute.name.namespace.as_deref() == namespace && attribute.name.local == local
     })?;
     Some(SourceNode::Attribute { owner, index })
+}
+
+#[cfg(test)]
+thread_local! {
+    static ATTRIBUTE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Attribute comparisons made by name lookups on this thread since the last call.
+#[cfg(test)]
+fn take_attribute_scans() -> usize {
+    ATTRIBUTE_SCANS.with(|count| count.replace(0))
 }
 
 fn namespace_of(source: &Document, owner: NodeId, prefix: &str, uri: &str) -> Option<SourceNode> {
