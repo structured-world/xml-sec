@@ -554,6 +554,52 @@ fn key_info_source_extent(
     )
 }
 
+/// The template `KeyInfo` content the writer's output replaces, and whether any
+/// of it carries an ID. Writer-provided identity is authoritative within its own
+/// group: generated key material replaces stale material, while `KeyName` is
+/// replaced only by a generated `KeyName`; extension elements remain.
+fn stale_key_info_ranges(
+    key_info: Node<'_, '_>,
+    (generated_key_material, generated_key_name, generated_x509_data): (bool, bool, bool),
+    id_attributes: &[crate::IdAttributeRegistration],
+) -> Result<(Vec<Range<usize>>, bool), XmlMutationError> {
+    let mut stale_ranges = Vec::new();
+    let mut removes_id = false;
+    let mut remove = |removed: Node<'_, '_>| {
+        removes_id |= removed
+            .descendants()
+            .filter(Node::is_element)
+            .any(|element| {
+                element
+                    .attributes()
+                    .any(|attribute| crate::xml::is_id_attribute(element, attribute, id_attributes))
+            });
+        actionable_node_range(removed)
+    };
+    for node in key_info.children().filter(Node::is_element) {
+        let (namespace, name) = (node.tag_name().namespace(), node.tag_name().name());
+        let replaces_key_material =
+            generated_key_material && is_cryptographic_key_info_source(namespace, name);
+        let replaces_key_name = generated_key_name && is_dsig_key_name(namespace, name);
+        if !(replaces_key_material || replaces_key_name)
+            || !has_cryptographic_identity_content(node)
+        {
+            continue;
+        }
+        if generated_x509_data && is_dsig_x509_data(namespace, name) {
+            for child in node
+                .children()
+                .filter(|child| child.is_element() && is_x509_identity_child(*child))
+            {
+                stale_ranges.push(remove(child)?);
+            }
+        } else {
+            stale_ranges.push(remove(node)?);
+        }
+    }
+    Ok((stale_ranges, removes_id))
+}
+
 /// Merge writer output into the target `<Signature>/<KeyInfo>` of `xml`, whose
 /// current parse is `document`. The result is not reparsed here: the writer's
 /// content is parsed in its namespace context, and the extent it reports lets
@@ -591,7 +637,8 @@ pub(super) fn merge_key_info_source_in_document(
     // inherited prefixes have exactly the semantics they will have in KeyInfo.
     let wrapped_source = wrap_key_info_children(key_info_source, key_info, policy)?;
     let source_document = parse_mutation_xml_with_budget(&wrapped_source, policy, budget)?;
-    let extent = key_info_source_extent(source_document.root_element(), key_info, id_attributes);
+    let mut extent =
+        key_info_source_extent(source_document.root_element(), key_info, id_attributes);
     let sources = source_document
         .root_element()
         .children()
@@ -621,36 +668,18 @@ pub(super) fn merge_key_info_source_in_document(
         .any(|(namespace, name)| is_dsig_x509_data(*namespace, name));
     let mut output = xml.to_owned();
     if !generated_key_material_sources.is_empty() || generated_key_name {
-        // Writer-provided identity is authoritative within its own group.
-        // Generated key material replaces stale material, while KeyName is
-        // replaced only by a generated KeyName; extension elements remain.
-        let mut stale_ranges = Vec::new();
-        for node in key_info.children().filter(Node::is_element) {
-            let replaces_key_material = !generated_key_material_sources.is_empty()
-                && is_cryptographic_key_info_source(
-                    node.tag_name().namespace(),
-                    node.tag_name().name(),
-                );
-            let replaces_key_name = generated_key_name
-                && is_dsig_key_name(node.tag_name().namespace(), node.tag_name().name());
-            if !(replaces_key_material || replaces_key_name)
-                || !has_cryptographic_identity_content(node)
-            {
-                continue;
-            }
-            if generated_x509_data
-                && is_dsig_x509_data(node.tag_name().namespace(), node.tag_name().name())
-            {
-                for child in node
-                    .children()
-                    .filter(|child| child.is_element() && is_x509_identity_child(*child))
-                {
-                    stale_ranges.push(actionable_node_range(child)?);
-                }
-            } else {
-                stale_ranges.push(actionable_node_range(node)?);
-            }
-        }
+        let (mut stale_ranges, removes_id) = stale_key_info_ranges(
+            key_info,
+            (
+                !generated_key_material_sources.is_empty(),
+                generated_key_name,
+                generated_x509_data,
+            ),
+            id_attributes,
+        )?;
+        // Removing an ID changes what a Reference resolves to as much as
+        // adding one, so a splice that drops one is not inert either.
+        extent.2 &= !removes_id;
         order_disjoint_ranges_for_splicing(&mut stale_ranges, output.len())?;
         for range in stale_ranges {
             output.replace_range(range, "");
