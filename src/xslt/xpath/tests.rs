@@ -113,10 +113,10 @@ fn generated_id_result_crosses_the_allocation_gate_before_formatting() {
             source: &source,
             maps: &maps,
         },
-        assigned: Rc::new(RefCell::new(GeneratedIdCache {
+        assigned: &RefCell::new(GeneratedIdCache {
             assigned,
             owned_bytes: 0,
-        })),
+        }),
     };
     let mut nodes = nodeset::Nodeset::new();
     nodes.add(root);
@@ -414,7 +414,7 @@ fn string_consumers_gate_nodeset_work_before_allocation() {
             one_qname_argument(
                 &evaluation,
                 &[SxdValue::Nodeset(nodes)],
-                &[],
+                &NamespaceBindings::default(),
                 "system-property",
             )
             .map(|_| SxdValue::Boolean(true))
@@ -451,12 +451,12 @@ fn key_name_coercion_rejects_work_before_lookup() {
             source: &source,
             maps: &maps,
         },
-        index: Rc::new(RefCell::new(HashMap::new())),
-        namespaces: Arc::new(Vec::new()),
-        declarations: Arc::from([]),
-        name_indices: Arc::from([]),
-        ready: Rc::new(RefCell::new(HashSet::new())),
-        pending: Rc::new(RefCell::new(None)),
+        index: &RefCell::new(HashMap::new()),
+        namespaces: &NamespaceBindings::default(),
+        declarations: &[],
+        name_indices: &[],
+        ready: &RefCell::new(HashSet::new()),
+        pending: &RefCell::new(None),
     };
     assert!(
         key.evaluate(
@@ -517,10 +517,10 @@ fn request_base_uri_is_rejected_before_clone_when_budget_is_exhausted() {
         },
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
-        roots: Rc::new(RefCell::new(HashMap::new())),
-        pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
-        node_base_uris: Rc::new(RefCell::new(HashMap::new())),
-        static_base_uri: Some(Arc::from("memory:principal.xsl")),
+        roots: &RefCell::new(HashMap::new()),
+        pending: &RefCell::new(PendingDocumentRequests::default()),
+        node_base_uris: &RefCell::new(HashMap::new()),
+        static_base_uri: Some("memory:principal.xsl"),
         static_document: StylesheetDocumentId::PRINCIPAL,
     };
 
@@ -1406,19 +1406,18 @@ impl Resolver for StaticResolver {
 }
 
 #[test]
-fn xpath_adapter_workspace_includes_namespace_copies() {
+fn xpath_adapter_workspace_borrows_namespace_bindings() {
+    // The evaluation context resolves prefixes through the expression's own
+    // bindings, so adding bindings adds no buffer an evaluation must admit.
     let plain = Expression::generated("/source", Vec::new());
     let namespaced = Expression::generated(
         "/source",
         vec![("prefix".into(), "urn:namespace:retained".into())],
     );
 
-    assert!(
-        xpath_adapter_workspace_upper_bound(&namespaced)
-            >= xpath_adapter_workspace_upper_bound(&plain)
-                + hash_table_entry_bytes::<(String, String)>()
-                + "prefix".len()
-                + "urn:namespace:retained".len()
+    assert_eq!(
+        xpath_adapter_workspace_upper_bound(&namespaced),
+        xpath_adapter_workspace_upper_bound(&plain)
     );
 }
 
@@ -1621,16 +1620,16 @@ fn variable_overlay_borrows_existing_payloads() {
 
 #[test]
 fn function_available_shares_the_stylesheet_catalog() {
-    let catalog = Arc::new(HashSet::from([ExpandedName::new(
-        Some("urn:extension"),
-        "function",
-    )]));
+    let catalog = HashSet::from([ExpandedName::new(Some("urn:extension"), "function")]);
     let function = FunctionAvailable {
-        namespaces: Arc::new(vec![]),
-        stylesheet_functions: Arc::clone(&catalog),
+        namespaces: &NamespaceBindings::default(),
+        stylesheet_functions: &catalog,
     };
 
-    assert!(Arc::ptr_eq(&function.stylesheet_functions, &catalog));
+    assert!(std::ptr::eq(
+        function.stylesheet_functions,
+        &raw const catalog
+    ));
 }
 
 #[test]
@@ -1645,15 +1644,15 @@ fn outer_context_functions_accept_xpath_whitespace() {
 
 #[test]
 fn prepared_expressions_admit_only_the_bindings_evaluation_copies() {
-    // Compiled text carries its engine form, so its evaluation workspace is exactly the
-    // namespace bindings copied into the scoped context. Text created during execution is
-    // still prepared per evaluation and must keep admitting those buffers first.
+    // Compiled text carries its engine form and its context borrows the namespace
+    // bindings, so its evaluation builds no buffers first. Text created during execution
+    // is still prepared per evaluation and must keep admitting those buffers first.
     let source = "count(../item) + position()";
     let namespaces: Vec<(String, String)> =
         vec![("prefix".into(), "urn:namespace:retained".into())];
     let deferred = Expression::generated(source, namespaces.clone());
     let mut compiled = deferred.clone();
-    compiled.prepared = Some(PreparedXPath::new(source, &namespaces));
+    compiled.prepared = Some(PreparedXPath::new(source, &namespaces, 0));
     let rewrite = compiled
         .prepared
         .as_ref()
@@ -1674,13 +1673,7 @@ fn prepared_expressions_admit_only_the_bindings_evaluation_copies() {
             .text(source),
         "both paths must evaluate the same engine text"
     );
-    assert_eq!(
-        xpath_adapter_workspace_upper_bound(&compiled),
-        xpath_namespace_binding_bytes(&compiled)
-            + hash_table_entry_bytes::<(String, String)>()
-            + prefix.len()
-            + namespace.len()
-    );
+    assert_eq!(xpath_adapter_workspace_upper_bound(&compiled), 0);
     assert!(
         xpath_adapter_workspace_upper_bound(&deferred)
             > xpath_adapter_workspace_upper_bound(&compiled)
@@ -1691,10 +1684,10 @@ fn prepared_expressions_admit_only_the_bindings_evaluation_copies() {
 fn plain_expressions_retain_no_engine_form() {
     // Text the engine evaluates unchanged must not cost a heap form per compiled expression,
     // while a rewritten form is retained and charged at its exact size.
-    let plain = PreparedXPath::new("root/item", &[]);
+    let plain = PreparedXPath::new("root/item", &[], 0);
     assert!(plain.rewrite.is_none());
     assert_eq!(plain.retained_bytes(), 0);
-    let current = PreparedXPath::new("current()/item", &[]);
+    let current = PreparedXPath::new("current()/item", &[], 1);
     assert!(xpath_uses_current(&Expression {
         prepared: Some(current.clone()),
         ..Expression::generated("current()/item", Vec::new())
@@ -1703,7 +1696,7 @@ fn plain_expressions_retain_no_engine_form() {
         current.retained_bytes(),
         std::mem::size_of::<XPathRewrite>()
     );
-    let spaced = PreparedXPath::new("count \r( * )", &[]);
+    let spaced = PreparedXPath::new("count \r( * )", &[], 2);
     let text = spaced
         .rewrite
         .as_deref()
@@ -1906,7 +1899,7 @@ fn id_result_nodes_cross_the_xpath_allocation_gate() {
             source: &source,
             maps: &maps,
         },
-        nodes_by_document: Rc::new(RefCell::new(index)),
+        nodes_by_document: &RefCell::new(index),
     };
     let mut context = Context::new();
     context.set_string_allocation_limit(0);
@@ -1930,7 +1923,7 @@ fn id_string_tokenization_obeys_work_budget() {
             source: &source,
             maps: &maps,
         },
-        nodes_by_document: Rc::new(RefCell::new(vec![HashMap::new()])),
+        nodes_by_document: &RefCell::new(vec![HashMap::new()]),
     };
     let mut context = Context::new();
     context.set_evaluation_work_limit(8);
@@ -1979,7 +1972,7 @@ fn runtime_node_paths_obey_work_budget() {
             source: &source,
             maps: &maps,
         },
-        nodes_by_document: Rc::new(RefCell::new(Vec::new())),
+        nodes_by_document: &RefCell::new(Vec::new()),
     };
     let mut context = Context::new();
     context.set_evaluation_work_limit(0);
@@ -2128,15 +2121,15 @@ fn restored_function_results_obey_evaluation_budgets() {
                 source: &source,
                 maps: &maps,
             },
-            name,
-            session: Rc::new(RefCell::new(CustomCallState {
+            name: &name,
+            session: &RefCell::new(CustomCallState {
                 completed: vec![CompletedCustomCall {
                     call: Rc::new(call),
                     result,
                     fragment: None,
                 }],
                 ..CustomCallState::default()
-            })),
+            }),
         };
         let mut context = Context::new();
         context.set_string_allocation_limit(1024);
@@ -2291,12 +2284,12 @@ fn key_and_document_nodeset_arguments_obey_the_allocation_budget() {
 
     let key = KeyFunction {
         paths,
-        index: Rc::new(RefCell::new(HashMap::new())),
-        namespaces: Arc::new(Vec::new()),
-        declarations: Arc::from([]),
-        name_indices: Arc::from([]),
-        ready: Rc::new(RefCell::new(HashSet::new())),
-        pending: Rc::new(RefCell::new(None)),
+        index: &RefCell::new(HashMap::new()),
+        namespaces: &NamespaceBindings::default(),
+        declarations: &[],
+        name_indices: &[],
+        ready: &RefCell::new(HashSet::new()),
+        pending: &RefCell::new(None),
     };
     assert!(matches!(
         key.evaluate(
@@ -2310,9 +2303,9 @@ fn key_and_document_nodeset_arguments_obey_the_allocation_budget() {
         paths,
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
-        roots: Rc::new(RefCell::new(HashMap::new())),
-        pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
-        node_base_uris: Rc::new(RefCell::new(HashMap::new())),
+        roots: &RefCell::new(HashMap::new()),
+        pending: &RefCell::new(PendingDocumentRequests::default()),
+        node_base_uris: &RefCell::new(HashMap::new()),
         static_base_uri: None,
         static_document: StylesheetDocumentId::PRINCIPAL,
     };
@@ -2340,9 +2333,9 @@ fn document_scalar_uri_obeys_the_xpath_work_budget() {
         },
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
-        roots: Rc::new(RefCell::new(HashMap::new())),
-        pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
-        node_base_uris: Rc::new(RefCell::new(HashMap::new())),
+        roots: &RefCell::new(HashMap::new()),
+        pending: &RefCell::new(PendingDocumentRequests::default()),
+        node_base_uris: &RefCell::new(HashMap::new()),
         static_base_uri: None,
         static_document: StylesheetDocumentId::PRINCIPAL,
     };
@@ -2368,12 +2361,12 @@ fn key_lookup_borrows_scalar_payload() {
             source: &source,
             maps: &maps,
         },
-        index: Rc::new(RefCell::new(HashMap::new())),
-        namespaces: Arc::new(Vec::new()),
-        declarations: Arc::from([]),
-        name_indices: Arc::from([]),
-        ready: Rc::new(RefCell::new(HashSet::new())),
-        pending: Rc::new(RefCell::new(None)),
+        index: &RefCell::new(HashMap::new()),
+        namespaces: &NamespaceBindings::default(),
+        declarations: &[],
+        name_indices: &[],
+        ready: &RefCell::new(HashSet::new()),
+        pending: &RefCell::new(None),
     };
     let result = key
         .evaluate(
@@ -2958,7 +2951,7 @@ fn id_nodeset_arguments_stream_through_the_allocation_gate() {
             source: &source,
             maps: &maps,
         },
-        nodes_by_document: Rc::new(RefCell::new(vec![indexed])),
+        nodes_by_document: &RefCell::new(vec![indexed]),
     };
     let mut nodes = nodeset::Nodeset::new();
     nodes.add(package_node(&package, &[0, 0, 0, 1]));
@@ -2988,10 +2981,10 @@ fn unparsed_entity_uri_uses_the_dynamic_context_document() {
             source: &source,
             maps: &maps,
         },
-        documents: Rc::new(RefCell::new(vec![
+        documents: &RefCell::new(vec![
             HashMap::from([("logo".into(), "principal.png".into())]),
             HashMap::from([("logo".into(), "external.png".into())]),
-        ])),
+        ]),
     };
 
     assert_eq!(
@@ -3015,10 +3008,7 @@ fn unparsed_entity_uri_reserves_the_returned_uri() {
             source: &source,
             maps: &maps,
         },
-        documents: Rc::new(RefCell::new(vec![HashMap::from([(
-            "logo".into(),
-            uri.clone(),
-        )])])),
+        documents: &RefCell::new(vec![HashMap::from([("logo".into(), uri.clone())])]),
     };
     let mut context = Context::new();
     context.set_string_allocation_limit(uri.len() - 1);
@@ -3047,12 +3037,12 @@ fn document_function_reserves_explicit_base_selection_before_cloning() {
         },
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
-        roots: Rc::new(RefCell::new(HashMap::new())),
-        pending: Rc::new(RefCell::new(PendingDocumentRequests::default())),
-        node_base_uris: Rc::new(RefCell::new(HashMap::from([(
+        roots: &RefCell::new(HashMap::new()),
+        pending: &RefCell::new(PendingDocumentRequests::default()),
+        node_base_uris: &RefCell::new(HashMap::from([(
             path.ordinary().to_vec(),
             Some(base_uri.clone()),
-        )]))),
+        )])),
         static_base_uri: None,
         static_document: StylesheetDocumentId::PRINCIPAL,
     };
@@ -3331,8 +3321,8 @@ fn format_number_obeys_picture_work_budget() {
     let evaluation =
         sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
     let function = FormatNumberFunction {
-        formats: Arc::from([]),
-        namespaces: Arc::new(Vec::new()),
+        formats: &[],
+        namespaces: &NamespaceBindings::default(),
     };
     let error = function
         .evaluate(
@@ -3352,9 +3342,10 @@ fn format_number_special_values_obey_allocation_budget() {
         let mut format = default_decimal_format();
         format.nan = "N".repeat(16_384);
         format.infinity = "I".repeat(16_384);
+        let formats = [format];
         let function = FormatNumberFunction {
-            formats: Arc::from([format]),
-            namespaces: Arc::new(Vec::new()),
+            formats: &formats,
+            namespaces: &NamespaceBindings::default(),
         };
         let mut context = Context::new();
         context.set_string_allocation_limit(4096);
@@ -3494,8 +3485,8 @@ fn format_number_reserves_dynamic_pattern_workspace_before_rendering() {
     let evaluation =
         sxd_xpath_no_unsafe::context::Evaluation::new(&context, document.root().into());
     let function = FormatNumberFunction {
-        formats: Arc::from([]),
-        namespaces: Arc::new(Vec::new()),
+        formats: &[],
+        namespaces: &NamespaceBindings::default(),
     };
 
     let error = function
@@ -3514,8 +3505,8 @@ fn format_number_reserves_each_string_conversion_before_materializing_it() {
     let package = Package::new();
     let document = package.as_document();
     let function = FormatNumberFunction {
-        formats: Arc::from([]),
-        namespaces: Arc::new(Vec::new()),
+        formats: &[],
+        namespaces: &NamespaceBindings::default(),
     };
 
     for args in [
@@ -3762,9 +3753,9 @@ fn evaluator_namespaces_charge_the_declarations_they_search() {
 
 #[test]
 fn the_context_path_is_paid_for_while_an_expression_evaluates() {
-    // The evaluator keeps the context node's path for the whole evaluation, so
-    // a context 100 levels deeper needs at least 100 more path words of owned
-    // memory before the same expression succeeds.
+    // An expression calling current() keeps the context node's path for the
+    // whole evaluation, so a context 100 levels deeper needs at least 100
+    // more path words of owned memory before it succeeds.
     let depth = 128;
     let source_xml = format!("{}{}", "<e>".repeat(depth), "</e>".repeat(depth));
     let source = Document::parse(&source_xml, None).expect("source parses");
@@ -3794,9 +3785,9 @@ fn the_context_path_is_paid_for_while_an_expression_evaluates() {
         }
         SourceNode::Node(node)
     };
-    let expression = Expression::generated("count(.)", Vec::new());
     let variables = HashMap::<ExpandedName, Value>::new();
-    let least_owned_bytes = |node: &SourceNode| {
+    let least_owned_bytes = |source: &str, node: &SourceNode| {
+        let expression = Expression::generated(source, Vec::new());
         let (mut low, mut high) = (0, 1 << 20);
         while low < high {
             let middle = low + (high - low) / 2;
@@ -3812,10 +3803,68 @@ fn the_context_path_is_paid_for_while_an_expression_evaluates() {
         }
         low
     };
-    let shallow = least_owned_bytes(&at_depth(10));
-    let deep = least_owned_bytes(&at_depth(110));
-    assert!(
-        deep >= shallow + 100 * std::mem::size_of::<usize>(),
-        "{deep} < {shallow} + 100 words"
+    let (shallow, deep) = (at_depth(10), at_depth(110));
+    let current = (
+        least_owned_bytes("count(current())", &shallow),
+        least_owned_bytes("count(current())", &deep),
     );
+    assert!(
+        current.1 >= current.0 + 100 * std::mem::size_of::<usize>(),
+        "{current:?}: current() keeps a path 100 words longer"
+    );
+    // Without current() the evaluator reaches the context node through its
+    // projected slot and builds no path, so depth costs no memory.
+    assert_eq!(
+        least_owned_bytes("count(.)", &shallow),
+        least_owned_bytes("count(.)", &deep)
+    );
+}
+
+#[test]
+fn compiled_expressions_find_their_engine_form_by_slot() {
+    // Two compiled expressions with one text share one engine form, and each
+    // slot leads to it; text made during execution finds the same form by
+    // its text. Every evaluation still produces the same value.
+    let source = Document::parse("<root><a/><a/></root>", None).expect("source parses");
+    let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+    let mut setup = Meter::new(owned_byte_budget(usize::MAX), 0).expect("setup meter");
+    let options = EvaluatorSourceOptions {
+        process_xinclude: false,
+        whitespace: Arc::from([]),
+        clock: None,
+    };
+    let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut setup, &options)
+        .expect("source prepares");
+    let evaluator = Evaluator::new(
+        prepared,
+        &stylesheet,
+        None,
+        &[],
+        Arc::new(crate::NoResolver),
+        &mut setup,
+        options,
+    )
+    .expect("evaluator initializes");
+    let compiled = |slot| {
+        let mut expression = Expression::generated("count(root/a)", Vec::new());
+        expression.prepared = Some(PreparedXPath::new("count(root/a)", &[], slot));
+        expression
+    };
+    let node = SourceNode::Node(evaluator.source.logical_roots()[0]);
+    let variables = HashMap::<ExpandedName, Value>::new();
+    let mut meter = Meter::new(owned_byte_budget(usize::MAX), 0).expect("meter");
+    for expression in [
+        compiled(3),
+        compiled(1),
+        compiled(3),
+        Expression::generated("count(root/a)", Vec::new()),
+    ] {
+        let value = evaluator
+            .evaluate_core(&expression, &node, 1, 1, &variables, &mut meter, None)
+            .expect("expression evaluates");
+        assert!(matches!(value, XPathValue::Number(count) if count.to_bits() == 2.0_f64.to_bits()));
+    }
+    let cache = evaluator.expressions.borrow();
+    assert_eq!(cache.forms.len(), 1);
+    assert_eq!(cache.by_slot, [None, Some(0), None, Some(0)]);
 }

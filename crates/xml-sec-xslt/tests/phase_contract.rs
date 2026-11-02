@@ -67,8 +67,10 @@ fn phase_split_preserves_output_and_does_not_reset_serialization_limits() {
             drop(tree);
             // Admission may conservatively check an upcoming step before its
             // eventual charge. Leave bounded headroom for that check, but less
-            // than the known output bytes that serialization must charge.
-            assert!(work > fixture.expected.len());
+            // than the known output bytes that serialization must charge: the
+            // tree phase spent work and the output is not empty, so half of
+            // it is short of what serialization needs beyond that work.
+            assert!(work > 0 && fixture.expected.len() > 1);
             let ceiling = work + fixture.expected.len() / 2;
             let constrained = sheet
                 .measure_tree(

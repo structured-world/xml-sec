@@ -1097,10 +1097,48 @@ pub(crate) struct Variable {
     pub content: InstructionSequence,
     pub base_uri: Option<String>,
 }
+/// The in-scope namespace bindings of an expression, indexed by prefix once
+/// so that evaluating it resolves each prefix by binary search rather than
+/// by rebuilding a hash table per evaluation. A stylesheet chooses how many
+/// bindings there are, so a lookup must not scan them all.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NamespaceBindings {
+    pairs: Vec<(String, String)>,
+    /// Indexes into `pairs` ordered by prefix; equal prefixes keep their
+    /// declaration order, so the last of them is the binding in force.
+    by_prefix: Box<[usize]>,
+}
+
+impl NamespaceBindings {
+    pub(crate) fn new(pairs: Vec<(String, String)>) -> Self {
+        let mut by_prefix: Box<[usize]> = (0..pairs.len()).collect();
+        by_prefix.sort_by(|&left, &right| pairs[left].0.cmp(&pairs[right].0));
+        Self { pairs, by_prefix }
+    }
+
+    /// The URI bound to `prefix`; a later binding replaces an earlier one.
+    pub(crate) fn lookup(&self, prefix: &str) -> Option<&str> {
+        let end = self
+            .by_prefix
+            .partition_point(|&index| self.pairs[index].0.as_str() <= prefix);
+        let index = *self.by_prefix.get(end.checked_sub(1)?)?;
+        let (bound, uri) = &self.pairs[index];
+        (bound == prefix).then_some(uri.as_str())
+    }
+}
+
+impl std::ops::Deref for NamespaceBindings {
+    type Target = [(String, String)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.pairs
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Expression {
     pub source: String,
-    pub namespaces: Arc<Vec<(String, String)>>,
+    pub namespaces: Arc<NamespaceBindings>,
     /// Expanded references let execution initialize only globals on the reached `XPath` path.
     pub variable_references: Arc<[ExpandedName]>,
     /// Static base of the stylesheet module that owns this expression.
@@ -1314,7 +1352,7 @@ impl Expression {
         Self::new_with_namespaces(
             source,
             node,
-            Arc::new(namespaces(node)),
+            Arc::new(NamespaceBindings::new(namespaces(node))),
             static_base_uri,
             stylesheet_document,
             max_depth,
@@ -1325,7 +1363,7 @@ impl Expression {
     fn new_with_namespaces(
         source: &str,
         node: roxmltree::Node<'_, '_>,
-        namespaces: Arc<Vec<(String, String)>>,
+        namespaces: Arc<NamespaceBindings>,
         static_base_uri: Option<&str>,
         stylesheet_document: StylesheetDocumentId,
         max_depth: usize,
@@ -1345,7 +1383,7 @@ impl Expression {
 
     fn new_with_namespaces_and_base(
         source: &str,
-        namespaces: Arc<Vec<(String, String)>>,
+        namespaces: Arc<NamespaceBindings>,
         static_base_uri: Option<Arc<str>>,
         stylesheet_document: StylesheetDocumentId,
         max_depth: usize,
@@ -1367,7 +1405,9 @@ impl Expression {
         // Stylesheet text sizes the preparation buffers, so they are admitted before they
         // exist. They are gone once the form is built; only the form stays retained.
         workspace.reserve(xpath_preparation_bytes(source, &namespaces))?;
-        let prepared = PreparedXPath::new(source, &namespaces);
+        let slot = workspace.xpath_slots.get();
+        workspace.xpath_slots.set(slot + 1);
+        let prepared = PreparedXPath::new(source, &namespaces, slot);
         workspace.retain(prepared.retained_bytes())?;
         Ok(Self {
             source: source.to_owned(),
@@ -1391,7 +1431,7 @@ impl Expression {
     pub(crate) fn generated(source: impl Into<String>, namespaces: Vec<(String, String)>) -> Self {
         Self::from_parts(
             source.into(),
-            Arc::new(namespaces),
+            Arc::new(NamespaceBindings::new(namespaces)),
             None,
             StylesheetDocumentId::PRINCIPAL,
         )
@@ -1399,7 +1439,7 @@ impl Expression {
 
     fn from_parts(
         source: String,
-        namespaces: Arc<Vec<(String, String)>>,
+        namespaces: Arc<NamespaceBindings>,
         static_base_uri: Option<Arc<str>>,
         stylesheet_document: StylesheetDocumentId,
     ) -> Self {
@@ -2155,6 +2195,7 @@ struct CompileState {
     stylesheet_bytes: usize,
     owned_bytes: usize,
     xpath_owned_bytes: Cell<usize>,
+    xpath_slots: Cell<usize>,
     parse_work: ParseWork,
     precedence: usize,
     order: usize,
@@ -2165,6 +2206,7 @@ impl CompileState {
             limit: self.budget.owned_bytes,
             occupied: self.owned_bytes,
             retained: &self.xpath_owned_bytes,
+            xpath_slots: &self.xpath_slots,
         }
     }
     fn new(mut budget: CompileBudget, stylesheet_bytes: usize) -> Self {
@@ -2194,6 +2236,7 @@ impl CompileState {
             stylesheet_bytes,
             owned_bytes: 0,
             xpath_owned_bytes: Cell::new(0),
+            xpath_slots: Cell::new(0),
             parse_work: ParseWork::new(budget.parse_work_bytes),
             precedence: 0,
             order: 0,
@@ -2986,6 +3029,8 @@ struct CompileWorkspace<'a> {
     limit: usize,
     occupied: usize,
     retained: &'a Cell<usize>,
+    /// Slots already given to prepared expressions of this stylesheet.
+    xpath_slots: &'a Cell<usize>,
 }
 
 impl CompileWorkspace<'_> {
@@ -3217,7 +3262,7 @@ struct CompileContext<'a> {
     prefix_lists: UnboundPrefixLists,
 }
 
-type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<Vec<(String, String)>>)>>>;
+type NamespaceSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Weak<NamespaceBindings>)>>>;
 type BaseUriSnapshot = Rc<RefCell<Option<(roxmltree::NodeId, Option<Arc<str>>)>>>;
 #[derive(Debug)]
 struct LocalBindingIndex<'a> {
@@ -3409,7 +3454,7 @@ impl<'a> CompileContext<'a> {
         } else {
             self.workspace
                 .retain(namespace_copy_bytes(node, true, self.workspace)?)?;
-            let namespaces = Arc::new(namespaces(node));
+            let namespaces = Arc::new(NamespaceBindings::new(namespaces(node)));
             *snapshot = Some((node.id(), Arc::downgrade(&namespaces)));
             namespaces
         };
@@ -5147,11 +5192,18 @@ fn namespace_copy_bytes(
     shared: bool,
     workspace: CompileWorkspace<'_>,
 ) -> Result<usize> {
+    // Shared bindings also keep one prefix-index slot per binding.
+    let binding = std::mem::size_of::<(String, String)>()
+        + if shared {
+            std::mem::size_of::<usize>()
+        } else {
+            0
+        };
     let mut bytes = 0usize;
     for namespace in node.namespaces() {
         if let Some(prefix) = namespace.name() {
             bytes = bytes
-                .checked_add(std::mem::size_of::<(String, String)>())
+                .checked_add(binding)
                 .and_then(|bytes| bytes.checked_add(prefix.len()))
                 .and_then(|bytes| bytes.checked_add(namespace.uri().len()))
                 .ok_or_else(|| workspace.overflow())?;
@@ -5159,7 +5211,7 @@ fn namespace_copy_bytes(
     }
     if shared {
         bytes = bytes
-            .checked_add(std::mem::size_of::<Vec<(String, String)>>())
+            .checked_add(std::mem::size_of::<NamespaceBindings>())
             .and_then(|bytes| bytes.checked_add(2 * std::mem::size_of::<usize>()))
             .ok_or_else(|| workspace.overflow())?;
     }
