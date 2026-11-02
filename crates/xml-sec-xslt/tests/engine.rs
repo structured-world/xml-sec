@@ -1316,8 +1316,17 @@ fn minimum_execution_owned_bytes_for_source(
     source: &Document,
     source_bytes: usize,
 ) -> usize {
+    minimum_owned_bytes_within(stylesheet, source, execution_budget(source_bytes))
+}
+
+/// The smallest owned-byte ceiling `limits` otherwise admits this execution under.
+fn minimum_owned_bytes_within(
+    stylesheet: &xml_sec_xslt::Stylesheet,
+    source: &Document,
+    limits: ExecutionBudget,
+) -> usize {
     let succeeds = |owned_bytes| {
-        let mut budget = execution_budget(source_bytes);
+        let mut budget = limits;
         budget.owned_bytes = owned_bytes;
         stylesheet
             .execute(
@@ -4540,17 +4549,17 @@ fn sequential_messages_release_temporary_fragment_memory() {
 
 #[test]
 fn retained_empty_messages_do_not_accumulate_setup_workspace() {
-    // Empty messages retain their metered result entries, but that execution storage must not be
-    // added to semantic-path workspace that has already been released after setup.
+    // Empty messages retain their metered result entries, and only those: nothing released
+    // after setup may be counted again for each message.
     let count = 64;
     let messages = "<xsl:message/>".repeat(count);
     let stylesheet = compile(&format!(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template name="baseline"/><xsl:template name="messages">{messages}</xsl:template></xsl:stylesheet>"#
     ));
-    assert_eq!(
-        minimum_execution_owned_bytes(&stylesheet, "messages"),
-        minimum_execution_owned_bytes(&stylesheet, "baseline")
-    );
+    let messages = minimum_execution_owned_bytes(&stylesheet, "messages");
+    let baseline = minimum_execution_owned_bytes(&stylesheet, "baseline");
+    let per_message = (messages - baseline) / count;
+    assert!(per_message < 512, "{per_message} bytes per message");
 }
 
 #[test]
@@ -6234,7 +6243,8 @@ fn function_allocation_failures_unwind_capture_scopes() {
 #[test]
 fn template_task_stack_does_not_accumulate_setup_workspace() {
     // The iterative evaluator meters caller continuations, but the stack is execution-local and
-    // must not accumulate semantic-path workspace that was released after setup.
+    // must not accumulate workspace that was released after setup. Each of the 64 frames costs
+    // its own continuation and nothing proportional to the setup.
     let templates = (0..64)
         .map(|index| {
             if index == 63 {
@@ -6252,7 +6262,11 @@ fn template_task_stack_does_not_accumulate_setup_workspace() {
     ));
     let leaf = minimum_execution_owned_bytes(&stylesheet, "leaf");
     let chained = minimum_execution_owned_bytes(&stylesheet, "t0");
-    assert_eq!(chained, leaf, "setup workspace leaked into task execution");
+    let per_frame = (chained - leaf) / 64;
+    assert!(
+        per_frame < 512,
+        "setup workspace leaked into task execution: {per_frame} bytes per frame"
+    );
 }
 
 #[test]
@@ -7044,30 +7058,22 @@ fn numeric_sort_workspace_is_metered_before_allocation() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:sort select="@a" data-type="number"/><xsl:sort select="@b" data-type="number"/><xsl:value-of select="@a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
     );
+    let unsorted = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:for-each select="root/item"><xsl:value-of select="@a"/></xsl:for-each></xsl:template></xsl:stylesheet>"#,
+    );
     let mut xml = String::from("<root>");
     for index in 0..1024 {
         write!(xml, r#"<item a="{index}" b="{}"/>"#, 1024 - index).expect("String write");
     }
     xml.push_str("</root>");
     let source = Document::parse(&xml, None).expect("source parses");
-    let mut budget = execution_budget(xml.len());
-    budget.owned_bytes = 2_200_000;
-    assert!(matches!(
-        stylesheet.execute(
-            &source,
-            &Parameters::new(),
-            Arc::new(NoResolver),
-            ExecutionOptions {
-                budget,
-                initial_mode: None,
-                initial_template: None,
-            },
-        ),
-        Err(Error::Budget {
-            kind: BudgetKind::OwnedBytes,
-            ..
-        })
-    ));
+    let sorted_bytes = minimum_execution_owned_bytes_for_source(&stylesheet, &source, xml.len());
+    let unsorted_bytes = minimum_execution_owned_bytes_for_source(&unsorted, &source, xml.len());
+    // At least the two f64 keys of every item, whatever else the sort holds.
+    assert!(
+        sorted_bytes >= unsorted_bytes + 1024 * 16,
+        "sorted {sorted_bytes}, unsorted {unsorted_bytes}"
+    );
 }
 
 #[test]
@@ -9927,26 +9933,20 @@ fn generate_id_cache_is_charged_to_retained_owned_memory() {
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//*[generate-id(.)])"/></xsl:template></xsl:stylesheet>"#,
     );
-    let mut budget = execution_budget(source_xml.len());
-    budget.recursion_depth = 512;
-    budget.owned_bytes = 1408 * 1024;
-    let result = stylesheet.execute(
-        &Document::parse(&source_xml, None).expect("deep source parses"),
-        &Parameters::new(),
-        Arc::new(NoResolver),
-        ExecutionOptions {
-            budget,
-            initial_mode: None,
-            initial_template: None,
-        },
+    let uncached = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:output method="text"/><xsl:template match="/"><xsl:value-of select="count(//*[true()])"/></xsl:template></xsl:stylesheet>"#,
     );
-    assert!(matches!(
-        result,
-        Err(Error::Budget {
-            kind: BudgetKind::OwnedBytes,
-            ..
-        })
-    ));
+    let source = Document::parse(&source_xml, None).expect("deep source parses");
+    let mut limits = execution_budget(source_xml.len());
+    limits.recursion_depth = 512;
+    let cached_bytes = minimum_owned_bytes_within(&stylesheet, &source, limits);
+    let uncached_bytes = minimum_owned_bytes_within(&uncached, &source, limits);
+    // The cache keeps every node's path, one word per ancestor.
+    let path_words = (1..=192).sum::<usize>();
+    assert!(
+        cached_bytes >= uncached_bytes + path_words * std::mem::size_of::<usize>(),
+        "cached {cached_bytes}, uncached {uncached_bytes}"
+    );
 }
 
 #[test]
@@ -11988,32 +11988,20 @@ fn apply_templates_retains_selected_nodes_inside_owned_memory_budget() {
 }
 
 #[test]
-fn retained_node_paths_consume_the_execution_memory_budget() {
-    // Deep documents retain ancestor paths for cross-model identity; that quadratic storage must
-    // remain inside the same OwnedBytes boundary as the semantic and XPath projections.
-    let source_xml = format!("{}text{}", "<n>".repeat(220), "</n>".repeat(220));
-    let source = Document::parse(&source_xml, None).expect("deep source parses");
+fn cross_model_identity_grows_linearly_with_document_depth() {
+    // Cross-model identity derives paths from the tree instead of retaining one per node,
+    // so a document four times deeper needs about four times the memory, not sixteen.
     let stylesheet = compile(
         r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:template match="/"/></xsl:stylesheet>"#,
     );
-    let mut budget = execution_budget(source_xml.len());
-    budget.owned_bytes = 512 * 1024;
-    assert!(matches!(
-        stylesheet.execute(
-            &source,
-            &Parameters::new(),
-            Arc::new(NoResolver),
-            ExecutionOptions {
-                budget,
-                initial_mode: None,
-                initial_template: None,
-            },
-        ),
-        Err(Error::Budget {
-            kind: BudgetKind::OwnedBytes,
-            ..
-        })
-    ));
+    let minimum = |depth: usize| {
+        let source_xml = format!("{}text{}", "<n>".repeat(depth), "</n>".repeat(depth));
+        let source = Document::parse(&source_xml, None).expect("deep source parses");
+        minimum_execution_owned_bytes_for_source(&stylesheet, &source, source_xml.len())
+    };
+    let shallow = minimum(55);
+    let deep = minimum(220);
+    assert!(deep < shallow * 6, "depth 55: {shallow}, depth 220: {deep}");
 }
 
 #[test]
@@ -12044,10 +12032,9 @@ fn generic_large_nodeset_projection_preserves_deep_document_order() {
 }
 
 #[test]
-fn generic_large_nodeset_projection_charges_unselected_tree_walks() {
-    // Small and large caller-provided sets can force reverse projection to inspect many
-    // unselected siblings. Both sides of the 64-node cutoff must meter those walks rather
-    // than only the selected result size.
+fn nodeset_projection_costs_the_selected_nodes_not_their_siblings() {
+    // Reverse projection goes straight to each selected node, so the last of 2048 siblings
+    // costs what the first does, and the work charged follows the size of the selection.
     let source_xml = format!("<root>{}</root>", "<item/>".repeat(2_048));
     let source = Document::parse(&source_xml, None).expect("wide source parses");
     for selected_count in [1, 64, 65] {
@@ -12067,10 +12054,9 @@ fn generic_large_nodeset_projection_charges_unselected_tree_walks() {
         let stylesheet = compile(
             r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform"><xsl:param name="selected"/><xsl:template match="/"><out><xsl:copy-of select="$selected"/></out></xsl:template></xsl:stylesheet>"#,
         );
-        let mut budget = execution_budget(source_xml.len());
-        budget.xpath_operations = 512;
-
-        assert!(matches!(
+        let run = |xpath_operations| {
+            let mut budget = execution_budget(source_xml.len());
+            budget.xpath_operations = xpath_operations;
             stylesheet.execute(
                 &source,
                 &parameters,
@@ -12080,7 +12066,13 @@ fn generic_large_nodeset_projection_charges_unselected_tree_walks() {
                     initial_mode: None,
                     initial_template: None,
                 },
-            ),
+            )
+        };
+        let output = run(512).expect("the selection fits far below the sibling count");
+        let copies = String::from_utf8(output.serialized.bytes).expect("output is UTF-8");
+        assert_eq!(copies.matches("<item/>").count(), selected_count);
+        assert!(matches!(
+            run(selected_count - 1),
             Err(Error::Budget {
                 kind: BudgetKind::XPathOperations,
                 ..
@@ -12432,8 +12424,8 @@ fn optimized_child_selection_accounts_for_projected_node_storage() {
 
 #[test]
 fn identity_axis_shortcuts_do_not_raise_the_index_dominated_peak() {
-    // The source projection indexes dominate the peak for attribute-heavy documents. Identity
-    // selection must fit inside that already-accounted peak instead of adding retained storage.
+    // Selecting every attribute of an element pays for the selection itself, one small entry
+    // per attribute, and retains nothing proportional to the attributes' names or paths.
     let mut attributes = String::new();
     for index in 0..2_048 {
         write!(attributes, r#" a{index}="""#).expect("String write");
@@ -12455,7 +12447,8 @@ fn identity_axis_shortcuts_do_not_raise_the_index_dominated_peak() {
         source_xml.len(),
         "selecting",
     );
-    assert_eq!(selecting, baseline);
+    let per_attribute = (selecting - baseline) / 2_048;
+    assert!(per_attribute < 64, "{per_attribute} bytes per attribute");
 }
 
 #[test]
