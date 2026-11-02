@@ -31,8 +31,13 @@ type RootResolver = for<'node> fn(Node<'node>) -> Node<'node>;
 
 #[cfg(feature = "embedded")]
 type FunctionView<'f> = &'f [(QName<'f>, &'f dyn function::Function)];
-#[cfg(feature = "embedded")]
-pub(crate) trait NamespaceLookup {
+/// Embedding-owned namespace bindings an evaluation resolves prefixes
+/// through, in place of the context's own map.
+pub trait NamespaceLookup {
+    /// The namespace URI bound to `prefix`, if any.
+    ///
+    /// # Errors
+    /// Returns the embedding's refusal, which ends the evaluation.
     fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error>;
 }
 
@@ -216,7 +221,6 @@ pub struct ScopedContext<'f, 'd> {
     core_functions: bool,
     #[cfg(feature = "embedded")]
     function_view: FunctionView<'f>,
-    #[cfg(feature = "embedded")]
     namespace_lookup: Option<&'f dyn NamespaceLookup>,
     variables: Variables<'d>,
     namespaces: Namespaces,
@@ -258,7 +262,6 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
             core_functions: false,
             #[cfg(feature = "embedded")]
             function_view: &[],
-            #[cfg(feature = "embedded")]
             namespace_lookup: None,
             variables: Variables::default(),
             namespaces: Namespaces::default(),
@@ -397,10 +400,11 @@ impl<'f, 'd> ScopedContext<'f, 'd> {
         self.function_view = functions;
     }
 
-    /// Resolves original namespace bindings through embedding-owned storage.
-    /// It replaces this context's namespace map without allocating another one.
-    #[cfg(feature = "embedded")]
-    pub(crate) fn set_namespace_lookup(&mut self, lookup: &'f dyn NamespaceLookup) {
+    /// Resolves prefixes through embedding-owned bindings, which then replace
+    /// every namespace registered with [`Self::set_namespace`]. Bindings
+    /// shared by many evaluations are prepared once instead of being copied
+    /// into each context.
+    pub fn set_namespace_lookup(&mut self, lookup: &'f dyn NamespaceLookup) {
         self.namespace_lookup = Some(lookup);
     }
 
@@ -462,7 +466,6 @@ pub struct Evaluation<'c, 'd> {
     core_functions: bool,
     #[cfg(feature = "embedded")]
     function_view: FunctionView<'c>,
-    #[cfg(feature = "embedded")]
     namespace_lookup: Option<&'c dyn NamespaceLookup>,
     variables: &'c Variables<'d>,
     namespaces: &'c Namespaces,
@@ -485,7 +488,6 @@ impl<'c, 'd> Evaluation<'c, 'd> {
             core_functions: context.core_functions,
             #[cfg(feature = "embedded")]
             function_view: context.function_view,
-            #[cfg(feature = "embedded")]
             namespace_lookup: context.namespace_lookup,
             variables: &context.variables,
             namespaces: &context.namespaces,
@@ -541,7 +543,6 @@ impl<'c, 'd> Evaluation<'c, 'd> {
     /// # Errors
     /// Returns an embedding namespace resolver's refusal unchanged.
     pub fn namespace_for(&self, prefix: &str) -> Result<Option<&str>, function::Error> {
-        #[cfg(feature = "embedded")]
         if let Some(lookup) = self.namespace_lookup {
             return lookup.namespace_for(prefix);
         }

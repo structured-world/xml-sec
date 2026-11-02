@@ -76,6 +76,7 @@ fn xpath_diagnostics_reserve_the_exact_formatted_length() {
             limit,
             occupied: 0,
             retained: &retained,
+            xpath_slots: &Cell::new(0),
         };
         let error = validate_xpath_prefixes(source, &[], workspace)
             .expect_err("unbound prefix produces a static or budget error");
@@ -103,6 +104,7 @@ fn xpath_parser_diagnostic_accounts_for_owned_token_and_escaping() {
         limit: required - 1,
         occupied: 0,
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     assert!(matches!(workspace.parser_error(&error, source, false),
         Error::Budget { actual, .. } if actual == required));
@@ -126,6 +128,7 @@ fn xpath_namespace_copies_and_reference_conversion_are_charged() {
         limit: 16_384,
         occupied: 0,
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     let namespaces = namespaces(node);
     let copy_bytes = namespaces.capacity() * std::mem::size_of::<(String, String)>()
@@ -157,6 +160,7 @@ fn xpath_namespace_copies_and_reference_conversion_are_charged() {
             limit,
             occupied: 0,
             retained: &retained,
+            xpath_slots: &Cell::new(0),
         };
         let result = referenced_variables_bounded("$p:a + $p:a + $p:b", &names, workspace);
         if limit == peak {
@@ -206,6 +210,7 @@ fn xpath_source_credit_is_limited_to_its_borrowed_attribute_slice() {
         limit: 4096,
         occupied: source.len(),
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     assert_eq!(workspace.pending_source(source, node).occupied, 0);
     assert_eq!(workspace.pending_source(&source[1..8], node).occupied, 2);
@@ -228,6 +233,7 @@ fn xpath_prefix_scan_preserves_unicode_axes_and_literals() {
         limit: 4096,
         occupied: 0,
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     let namespaces = vec![("\u{3c0}".into(), "urn:test".into())];
     for source in [
@@ -302,6 +308,7 @@ fn xpath_compile_workspace_precedes_validation_and_is_released() {
         limit: 128,
         occupied: 128,
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     assert!(matches!(
         workspace.parse_xpath("'payload'", "'payload'", false),
@@ -315,6 +322,7 @@ fn xpath_compile_workspace_precedes_validation_and_is_released() {
         limit: 4096,
         occupied: 128,
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     for _ in 0..100 {
         workspace
@@ -444,10 +452,10 @@ fn expression_preparation_is_admitted_before_its_buffers_exist() {
     // Stylesheet text decides how large the engine-form buffers grow: a long in-scope prefix
     // makes the private context prefix just as long, and every outer position() repeats it.
     // Compilation must admit that workspace before preparing, not only the retained result.
-    let namespaces = Arc::new(vec![
+    let namespaces = Arc::new(NamespaceBindings::new(vec![
         ("__xml_sec_ctx".to_owned(), "urn:collision".to_owned()),
         (format!("p{}", "x".repeat(512)), "urn:long".to_owned()),
-    ]);
+    ]));
     let source = vec!["position()"; 64].join("+");
     let compile = |limit| {
         let retained = Cell::new(0usize);
@@ -455,6 +463,7 @@ fn expression_preparation_is_admitted_before_its_buffers_exist() {
             limit,
             occupied: 0,
             retained: &retained,
+            xpath_slots: &Cell::new(0),
         };
         Expression::new_with_namespaces_and_base(
             &source,
@@ -497,6 +506,7 @@ fn local_binding_index_reserves_and_releases_compile_workspace() {
         limit: usize::MAX,
         occupied: 0,
         retained: &retained,
+        xpath_slots: &Cell::new(0),
     };
     let document = roxmltree::Document::parse(
         r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><xsl:template match="/"><xsl:variable name="value"/></xsl:template></xsl:stylesheet>"#,
@@ -529,6 +539,7 @@ fn local_binding_index_reserves_and_releases_compile_workspace() {
         limit: 0,
         occupied: 0,
         retained: &constrained_retained,
+        xpath_slots: &Cell::new(0),
     };
     let context = CompileContext::new(
         false,
@@ -1035,6 +1046,7 @@ fn expressions_on_one_node_share_their_namespace_snapshot() {
     let document = roxmltree::Document::parse(source).expect("stylesheet fragment parses");
     let root = document.root_element();
     let retained = Cell::new(0);
+    let xpath_slots = Cell::new(0);
     let context = CompileContext::new(
         false,
         0,
@@ -1045,6 +1057,7 @@ fn expressions_on_one_node_share_their_namespace_snapshot() {
             limit: 16_384,
             occupied: 0,
             retained: &retained,
+            xpath_slots: &xpath_slots,
         },
         UnboundPrefixLists::Reject,
     )
@@ -1212,4 +1225,28 @@ fn semantic_projection_reserves_the_second_parser_workspace() {
             ..
         })
     ));
+}
+
+#[test]
+fn namespace_bindings_resolve_the_binding_in_force() {
+    // A later binding of a prefix replaces an earlier one, as registering
+    // them in order did; prefixes that sort next to each other stay distinct,
+    // and an unbound or empty lookup finds nothing.
+    let pair = |prefix: &str, uri: &str| (prefix.to_owned(), uri.to_owned());
+    let bindings = NamespaceBindings::new(vec![
+        pair("b", "urn:b"),
+        pair("a", "urn:first"),
+        pair("ab", "urn:ab"),
+        pair("a", "urn:last"),
+        pair("", "urn:empty-prefix"),
+    ]);
+    assert_eq!(bindings.lookup("a"), Some("urn:last"));
+    assert_eq!(bindings.lookup("ab"), Some("urn:ab"));
+    assert_eq!(bindings.lookup("b"), Some("urn:b"));
+    assert_eq!(bindings.lookup(""), Some("urn:empty-prefix"));
+    assert_eq!(bindings.lookup("aa"), None);
+    assert_eq!(bindings.lookup("c"), None);
+    assert_eq!(NamespaceBindings::default().lookup("a"), None);
+    // The bindings themselves keep their declaration order for other readers.
+    assert_eq!(bindings[1], pair("a", "urn:first"));
 }

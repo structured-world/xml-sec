@@ -22,8 +22,8 @@ use super::budget::{
     reserve_temporary_vec_slot, retained_hash_storage,
 };
 use super::compiler::{
-    DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, Pattern,
-    StylesheetDocumentId, normalize_xpath_for_sxd, normalized_xpath_len,
+    DecimalFormat, Expression, KeyDeclaration, ModuleDocument, NameTest, NamespaceBindings,
+    Pattern, StylesheetDocumentId, normalize_xpath_for_sxd, normalized_xpath_len,
 };
 use super::expression::innermost_namespaced_call;
 use super::lexical::{
@@ -677,8 +677,8 @@ impl CustomCallSession {
 
 struct DeferredStylesheetFunction<'a> {
     paths: ProjectedPaths<'a>,
-    name: ExpandedName,
-    session: Rc<RefCell<CustomCallState>>,
+    name: &'a ExpandedName,
+    session: &'a RefCell<CustomCallState>,
 }
 
 impl function::Function for DeferredStylesheetFunction<'_> {
@@ -687,7 +687,7 @@ impl function::Function for DeferredStylesheetFunction<'_> {
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         arguments: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        context.reserve_string_allocation(deferred_call_size(&self.name, &arguments))?;
+        context.reserve_string_allocation(deferred_call_size(self.name, &arguments))?;
         let call = DeferredCustomCall {
             name: self.name.clone(),
             node: self.paths.path(&context.node, context)?,
@@ -867,12 +867,23 @@ fn seed_evaluator_documents(
     })
 }
 
+/// Engine forms of the expressions one execution evaluated. Equal engine texts
+/// share one form; a compiled expression's slot leads to its form without
+/// hashing the text again.
+#[derive(Default)]
+struct XPathCache {
+    forms: Vec<XPath>,
+    by_text: HashMap<String, usize>,
+    /// The form of each compiled expression's slot, once it was evaluated.
+    by_slot: Vec<Option<usize>>,
+}
+
 pub(crate) struct Evaluator {
     pub(crate) source: Document,
     package: Package,
     maps: NodeMaps,
     node_base_uris: Rc<RefCell<HashMap<Vec<usize>, Option<String>>>>,
-    expressions: RefCell<HashMap<String, XPath>>,
+    expressions: RefCell<XPathCache>,
     pattern_matches: HashMap<PatternCacheKey, HashSet<SourceNode>>,
     pattern_match_index_bytes: usize,
     generated_ids: Rc<RefCell<GeneratedIdCache>>,
@@ -1017,7 +1028,7 @@ impl Evaluator {
             package,
             maps,
             node_base_uris,
-            expressions: RefCell::new(HashMap::new()),
+            expressions: RefCell::new(XPathCache::default()),
             pattern_matches: HashMap::new(),
             pattern_match_index_bytes: 0,
             generated_ids: Rc::new(RefCell::new(GeneratedIdCache::default())),
@@ -2259,10 +2270,15 @@ impl Evaluator {
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
-        let path_bytes = self
-            .maps
-            .path_bytes(&self.source, node)
-            .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
+        // Only `current()` reads the context node's path; other expressions
+        // reach the context node through its projected slot.
+        let path_bytes = if xpath_uses_current(expression) {
+            self.maps
+                .path_bytes(&self.source, node)
+                .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?
+        } else {
+            0
+        };
         meter.charge(BudgetKind::OwnedBytes, path_bytes)?;
         let result = self.evaluate_with_context_path(
             expression,
@@ -2291,8 +2307,8 @@ impl Evaluator {
         meter: &mut Meter,
         custom_calls: Option<&CustomCallSession>,
     ) -> Result<XPathValue> {
-        let (context_node, context_path) = self.xpath_context_node(node, meter)?;
         let uses_current = xpath_uses_current(expression);
+        let (context_node, context_path) = self.xpath_context_node(node, uses_current, meter)?;
         // XPath 1.0 section 3.2 requires '(' in every FunctionCall. Synthesized axis
         // predicates use only the core functions already supplied by ScopedContext::new().
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#section-Function-Calls
@@ -2303,8 +2319,6 @@ impl Evaluator {
                 .is_some()
                 .then_some(self.stylesheet_functions.as_ref()),
             bind_functions,
-            uses_current,
-            &context_path,
             meter,
         )?;
         let rewrite = evaluation_rewrite(expression, uses_current);
@@ -2314,7 +2328,7 @@ impl Evaluator {
                 rewrite.text(&expression.source)
             });
         let context_namespace = rewrite.as_deref().and_then(XPathRewrite::context_namespace);
-        self.cache_xpath(expression, rewritten, adapter_workspace, meter)?;
+        let form = self.cache_xpath(expression, rewritten, adapter_workspace, meter)?;
         // Context construction owns QName indexes, registered function objects, namespace
         // strings, and variable slots. Their complete representation bound is included in the
         // adapter preflight above, before any of these allocations can occur. Runtime QName
@@ -2324,8 +2338,13 @@ impl Evaluator {
         // are set below; this also holds all of it within the execution's work ceiling.
         let admission = XPathAdmission::new(meter.work_remaining());
         let admit_work = |units| admission.admit(units);
+        let namespaces = EvaluationNamespaces {
+            bindings: &expression.namespaces,
+            context: context_namespace,
+        };
         let mut context = sxd_xpath_no_unsafe::context::ScopedContext::new();
         context.set_work_admission(&admit_work);
+        context.set_namespace_lookup(&namespaces);
         // XPath 1.0 section 2.2 confines `following` and `preceding` to the same document as the
         // context node. Each projected logical document therefore supplies its wrapper as the
         // evaluator root instead of exposing sibling source/module projections.
@@ -2337,16 +2356,12 @@ impl Evaluator {
         let (extension_operations, extension_operations_limit) = limits.extensions;
         bind_xpath_namespaces(
             &mut context,
-            expression,
             context_namespace,
             position,
             size,
-            uses_current,
-            &context_path,
+            context_path,
         );
         if bind_functions {
-            // XPath function objects must own their static namespace context. Share one
-            // materialization across all functions registered for this evaluation.
             self.bind_xpath_functions(&mut context, expression);
             self.bind_document_functions(
                 &mut context,
@@ -2383,7 +2398,7 @@ impl Evaluator {
         self.execute_cached_xpath(
             &context,
             CompiledXPathInput {
-                source: rewritten,
+                form,
                 context_node,
                 operations: (xpath_operations, xpath_operations_limit),
                 extensions: (extension_operations, extension_operations_limit),
@@ -2406,16 +2421,14 @@ impl Evaluator {
     fn execute_cached_xpath<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::ScopedContext<'_, 'd>,
-        input: CompiledXPathInput<'_, 'd>,
+        input: CompiledXPathInput<'d>,
         projection: &XPathProjection<'_>,
         admission: &XPathAdmission,
         document_access_error: &RefCell<Option<Error>>,
         meter: &mut Meter,
     ) -> Result<XPathValue> {
         let expressions = self.expressions.borrow();
-        let xpath = expressions
-            .get(input.source)
-            .expect("compiled XPath was inserted into the execution cache");
+        let xpath = &expressions.forms[input.form];
         let generated_id_bytes_before = self.generated_ids.borrow().owned_bytes;
         let evaluation = xpath.evaluate(context, input.context_node);
         settle_xpath_work(
@@ -2435,17 +2448,24 @@ impl Evaluator {
         self.project_xpath_result(context, evaluation, projection, meter)
     }
 
+    /// The evaluator node of `node`, and its path when `current()` needs one.
     fn xpath_context_node(
         &self,
         node: &SourceNode,
+        uses_current: bool,
         meter: &mut Meter,
-    ) -> Result<(nodeset::Node<'_>, NodePath)> {
+    ) -> Result<(nodeset::Node<'_>, Option<NodePath>)> {
         let document = self.package.as_document();
-        let context_path = self
-            .maps
-            .path(&self.source, node)
-            .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
-        meter.charge(BudgetKind::XPathOperations, context_path.ordinary().len())?;
+        let context_path = if uses_current {
+            let path = self
+                .maps
+                .path(&self.source, node)
+                .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
+            meter.charge(BudgetKind::XPathOperations, path.ordinary().len())?;
+            Some(path)
+        } else {
+            None
+        };
         let context_node = self
             .maps
             .to_sxd(&self.source, document, node)
@@ -2453,14 +2473,27 @@ impl Evaluator {
         Ok((context_node, context_path))
     }
 
+    /// The index of `expression`'s engine form, built on first use. A
+    /// compiled expression finds it through its slot; only its first
+    /// evaluation, and evaluations of text made during execution, hash the
+    /// engine text.
     fn cache_xpath(
         &self,
         expression: &Expression,
         rewritten: &str,
         adapter_workspace: usize,
         meter: &mut Meter,
-    ) -> Result<()> {
-        if !self.expressions.borrow().contains_key(rewritten) {
+    ) -> Result<usize> {
+        let slot = expression.prepared.as_ref().map(PreparedXPath::slot);
+        if let Some(slot) = slot
+            && let Some(&Some(form)) = self.expressions.borrow().by_slot.get(slot)
+        {
+            return Ok(form);
+        }
+        let known = self.expressions.borrow().by_text.get(rewritten).copied();
+        let form = if let Some(form) = known {
+            form
+        } else {
             // One input byte can produce at most one parser token. This conservative
             // node-sized allowance bounds the retained AST and cache key before insertion.
             let retained_bytes = rewritten
@@ -2478,11 +2511,21 @@ impl Evaluator {
                     expression.source
                 ))
             })?;
-            self.expressions
-                .borrow_mut()
-                .insert(rewritten.to_owned(), xpath);
+            let mut cache = self.expressions.borrow_mut();
+            let form = cache.forms.len();
+            cache.forms.push(xpath);
+            cache.by_text.insert(rewritten.to_owned(), form);
+            form
+        };
+        if let Some(slot) = slot {
+            let mut cache = self.expressions.borrow_mut();
+            while cache.by_slot.len() <= slot {
+                reserve_retained_vec_slot(&mut cache.by_slot, meter)?;
+                cache.by_slot.push(None);
+            }
+            cache.by_slot[slot] = Some(form);
         }
-        Ok(())
+        Ok(form)
     }
 
     /// The projection this evaluation's functions read node paths from.
@@ -2496,63 +2539,55 @@ impl Evaluator {
     fn bind_xpath_functions<'function>(
         &'function self,
         context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'function, '_>,
-        expression: &Expression,
+        expression: &'function Expression,
     ) {
+        // Every function borrows the evaluator's state and the expression's
+        // bindings for this one evaluation: nothing is copied or counted.
         let paths = self.projected_paths();
-        let function_namespaces = Arc::clone(&expression.namespaces);
+        let namespaces: &NamespaceBindings = &expression.namespaces;
         context.set_function(
             "key",
             KeyFunction {
                 paths,
-                index: Rc::clone(&self.key_index),
-                namespaces: Arc::clone(&function_namespaces),
-                declarations: Arc::clone(&self.key_declarations),
-                name_indices: Arc::clone(&self.key_name_indices),
-                ready: Rc::clone(&self.ready_key_indexes),
-                pending: Rc::clone(&self.pending_dynamic_key_request),
+                index: &self.key_index,
+                namespaces,
+                declarations: &self.key_declarations,
+                name_indices: &self.key_name_indices,
+                ready: &self.ready_key_indexes,
+                pending: &self.pending_dynamic_key_request,
             },
         );
         context.set_function(
             "format-number",
             FormatNumberFunction {
-                formats: Arc::clone(&self.decimal_formats),
-                namespaces: Arc::clone(&function_namespaces),
+                formats: &self.decimal_formats,
+                namespaces,
             },
         );
         context.set_function(
             "generate-id",
             GenerateId {
                 paths,
-                assigned: self.generated_ids.clone(),
+                assigned: &self.generated_ids,
             },
         );
         context.set_function(
             "id",
             IdFunction {
                 paths,
-                nodes_by_document: Rc::clone(&self.id_index),
+                nodes_by_document: &self.id_index,
             },
         );
         context.set_function("name", NodeNameFunction::Qualified);
         context.set_function("local-name", NodeNameFunction::Local);
         context.set_function("namespace-uri", NodeNameFunction::NamespaceUri);
-        context.set_function(
-            "system-property",
-            SystemProperty {
-                namespaces: Arc::clone(&function_namespaces),
-            },
-        );
-        context.set_function(
-            "element-available",
-            ElementAvailable {
-                namespaces: Arc::clone(&function_namespaces),
-            },
-        );
+        context.set_function("system-property", SystemProperty { namespaces });
+        context.set_function("element-available", ElementAvailable { namespaces });
         context.set_function(
             "unparsed-entity-uri",
             UnparsedEntityUriFunction {
                 paths,
-                documents: Rc::clone(&self.unparsed_entity_index),
+                documents: &self.unparsed_entity_index,
             },
         );
         context.set_function("lang", LangFunction);
@@ -2560,8 +2595,8 @@ impl Evaluator {
         context.set_function(
             "function-available",
             FunctionAvailable {
-                namespaces: function_namespaces,
-                stylesheet_functions: Arc::clone(&self.stylesheet_functions),
+                namespaces,
+                stylesheet_functions: &self.stylesheet_functions,
             },
         );
     }
@@ -2569,9 +2604,9 @@ impl Evaluator {
     fn bind_document_functions<'function>(
         &'function self,
         context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'function, '_>,
-        expression: &Expression,
+        expression: &'function Expression,
         document_access_error: &'function RefCell<Option<Error>>,
-        custom_calls: Option<&CustomCallSession>,
+        custom_calls: Option<&'function CustomCallSession>,
     ) {
         context.set_function(
             "document",
@@ -2579,11 +2614,11 @@ impl Evaluator {
                 paths: self.projected_paths(),
                 resolver: self.resolver.as_ref(),
                 access_error: document_access_error,
-                static_base_uri: expression.static_base_uri.clone(),
+                static_base_uri: expression.static_base_uri.as_deref(),
                 static_document: expression.stylesheet_document,
-                roots: Rc::clone(&self.document_roots),
-                pending: Rc::clone(&self.pending_document_requests),
-                node_base_uris: Rc::clone(&self.node_base_uris),
+                roots: &self.document_roots,
+                pending: &self.pending_document_requests,
+                node_base_uris: &self.node_base_uris,
             },
         );
         if let Some(custom_calls) = custom_calls {
@@ -2596,8 +2631,8 @@ impl Evaluator {
                     qname,
                     DeferredStylesheetFunction {
                         paths: self.projected_paths(),
-                        name: name.clone(),
-                        session: Rc::clone(&custom_calls.state),
+                        name,
+                        session: &custom_calls.state,
                     },
                 );
             }
@@ -3822,49 +3857,17 @@ impl Evaluator {
     }
 }
 
+/// Buffers an evaluation of `expression` builds before its context exists.
+/// The context borrows the expression's namespace bindings instead of
+/// copying them, so a compiled expression, which carries its engine text,
+/// builds none.
 fn xpath_adapter_workspace_upper_bound(expression: &Expression) -> usize {
-    let Some(prepared) = &expression.prepared else {
-        return xpath_preparation_workspace_upper_bound(expression);
-    };
-    // A compiled expression carries its engine text, so evaluation only copies its
-    // namespace bindings, including the private context binding, into the scoped context.
-    xpath_namespace_binding_bytes(expression).saturating_add(
-        prepared
-            .rewrite
-            .as_deref()
-            .and_then(XPathRewrite::context_namespace)
-            .map_or(0, |(prefix, namespace)| {
-                hash_table_entry_bytes::<(String, String)>()
-                    .saturating_add(prefix.len())
-                    .saturating_add(namespace.len())
-            }),
-    )
-}
-
-/// Namespace bindings every evaluation copies into its scoped context.
-fn xpath_namespace_binding_bytes(expression: &Expression) -> usize {
-    expression
-        .namespaces
-        .iter()
-        .fold(0usize, |bytes, (prefix, uri)| {
-            bytes
-                .saturating_add(hash_table_entry_bytes::<(String, String)>())
-                .saturating_add(prefix.len())
-                .saturating_add(uri.len())
-        })
-        .saturating_add(hash_table_entry_bytes::<(String, String)>())
-        .saturating_add("xml".len())
-        .saturating_add("http://www.w3.org/XML/1998/namespace".len())
-}
-
-/// Workspace of text created during execution, which is prepared per evaluation and
-/// then bound into the scoped context.
-fn xpath_preparation_workspace_upper_bound(expression: &Expression) -> usize {
+    if expression.prepared.is_some() {
+        return 0;
+    }
+    // Text created during execution is prepared per evaluation.
     let workspace = xpath_preparation_workspace(&expression.source, &expression.namespaces);
-    workspace
-        .buffers
-        .saturating_add(xpath_namespace_binding_bytes(expression))
-        .saturating_add(workspace.context_binding)
+    workspace.buffers.saturating_add(workspace.context_binding)
 }
 
 /// Upper bound of the buffers `PreparedXPath::new` allocates for this text, admitted
@@ -3965,8 +3968,9 @@ fn xpath_context_workspace_upper_bound(
     } else {
         0
     };
+    // Namespace bindings are borrowed from the compiled expression, not
+    // copied into the context, so they add nothing here.
     let variable_slots = expression.variable_references.len().saturating_add(2);
-    let namespace_slots = expression.namespaces.len().saturating_add(2);
     let dynamic_name_bytes = expression
         .variable_references
         .iter()
@@ -3975,12 +3979,6 @@ fn xpath_context_workspace_upper_bound(
             bytes
                 .saturating_add(name.namespace.as_deref().map_or(0, str::len))
                 .saturating_add(name.local.len())
-        });
-    let namespace_bytes = expression
-        .namespaces
-        .iter()
-        .fold(0usize, |bytes, (prefix, uri)| {
-            bytes.saturating_add(prefix.len()).saturating_add(uri.len())
         });
     function_slots
         .saturating_mul(
@@ -3996,16 +3994,12 @@ fn xpath_context_workspace_upper_bound(
                     .saturating_mul(2),
             ),
         )
-        .saturating_add(
-            namespace_slots.saturating_mul(hash_table_entry_bytes::<(String, String)>()),
-        )
         .saturating_add(if bind_functions {
             FIXED_FUNCTION_NAME_BYTES
         } else {
             0
         })
         .saturating_add(dynamic_name_bytes)
-        .saturating_add(namespace_bytes)
 }
 
 fn hash_table_entry_bytes<T>() -> usize {
@@ -6738,13 +6732,33 @@ impl NodeMaps {
             }
             SxdValue::Nodeset(nodes) => {
                 let mut projected = projected_node_storage(nodes.size(), meter)?;
+                // Steps add nodes in document order unless they cross axes or
+                // documents; a result already in order is not sorted again.
+                let mut previous = None;
+                let mut ordered = true;
                 for node in nodes {
                     meter.charge(BudgetKind::XPathOperations, 1)?;
                     if let Some(node) = self.source_of_sxd(source, &node, meter)? {
+                        if ordered {
+                            let order = self.order(source, &node);
+                            ordered = previous <= order;
+                            previous = order;
+                        }
                         projected.push(node);
                     }
                 }
-                projected.sort_by_key(|node| self.order(source, node));
+                if !ordered {
+                    // The evaluator's set yields nodes in hash order. Each
+                    // node's key is computed once rather than per comparison;
+                    // the key table is transient and admitted before it exists.
+                    meter.check_additional(
+                        BudgetKind::OwnedBytes,
+                        projected
+                            .len()
+                            .saturating_mul(std::mem::size_of::<(Option<NodeOrder>, usize)>()),
+                    )?;
+                    projected.sort_by_cached_key(|node| self.order(source, node));
+                }
                 XPathValue::NodeSet(projected)
             }
         })
@@ -7031,8 +7045,9 @@ enum ExtensionCallKind {
     SaxonLineNumber,
 }
 
-struct CompiledXPathInput<'source, 'document> {
-    source: &'source str,
+struct CompiledXPathInput<'document> {
+    /// The engine form's index in the execution's cache.
+    form: usize,
     context_node: nodeset::Node<'document>,
     operations: (usize, usize),
     extensions: (usize, usize),
@@ -7160,50 +7175,56 @@ fn admit_xpath_workspace(
     expression: &Expression,
     stylesheet_functions: Option<&HashSet<ExpandedName>>,
     bind_functions: bool,
-    uses_current: bool,
-    context_path: &NodePath,
     meter: &mut Meter,
 ) -> Result<(usize, usize)> {
     let context_workspace =
         xpath_context_workspace_upper_bound(expression, stylesheet_functions, bind_functions);
-    let adapter_workspace = xpath_adapter_workspace_upper_bound(expression)
-        .saturating_add(context_workspace)
-        .saturating_add(if uses_current {
-            context_path.owned_bytes()
-        } else {
-            0
-        });
+    let adapter_workspace =
+        xpath_adapter_workspace_upper_bound(expression).saturating_add(context_workspace);
     meter.check_additional(BudgetKind::OwnedBytes, adapter_workspace)?;
     Ok((context_workspace, adapter_workspace))
 }
 
+/// Prefix resolution of one evaluation: the private binding for the outer
+/// `position()` and `last()`, then the implicit `xml` binding, then the
+/// expression's in-scope bindings, prepared once when it was compiled.
+struct EvaluationNamespaces<'a> {
+    bindings: &'a NamespaceBindings,
+    context: Option<(&'a str, &'a str)>,
+}
+
+impl sxd_xpath_no_unsafe::context::NamespaceLookup for EvaluationNamespaces<'_> {
+    fn namespace_for(&self, prefix: &str) -> std::result::Result<Option<&str>, function::Error> {
+        if let Some((bound, namespace)) = self.context
+            && bound == prefix
+        {
+            return Ok(Some(namespace));
+        }
+        // Namespaces in XML 1.0 section 3 binds `xml` in every scope.
+        // https://www.w3.org/TR/xml-names/#ns-decl
+        if prefix == "xml" {
+            return Ok(Some("http://www.w3.org/XML/1998/namespace"));
+        }
+        Ok(self.bindings.lookup(prefix))
+    }
+}
+
 fn bind_xpath_namespaces(
     context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'_, '_>,
-    expression: &Expression,
     context_namespace: Option<(&str, &str)>,
     position: usize,
     size: usize,
-    uses_current: bool,
-    context_path: &NodePath,
+    current_path: Option<NodePath>,
 ) {
-    for (prefix, uri) in expression.namespaces.iter() {
-        context.set_namespace(prefix, uri);
-    }
-    context.set_namespace("xml", "http://www.w3.org/XML/1998/namespace");
-    if let Some((prefix, namespace)) = context_namespace {
-        context.set_namespace(prefix, namespace);
+    if let Some((_, namespace)) = context_namespace {
         context.set_variable((namespace, "position"), super::number::size(position));
         context.set_variable((namespace, "last"), super::number::size(size));
     }
-    if uses_current {
-        // Reuse projected identity instead of rescanning siblings for every evaluation.
-        // Its retained clone belongs to the preflighted adapter workspace above.
-        context.set_function(
-            "current",
-            CurrentNode {
-                path: context_path.clone(),
-            },
-        );
+    if let Some(path) = current_path {
+        // The path was built from the projection's positions for this
+        // evaluation, its bytes charged before it existed, and moves into the
+        // function rather than being copied.
+        context.set_function("current", CurrentNode { path });
     }
 }
 
@@ -7269,11 +7290,14 @@ fn prepare_extension_expression(
             .source
             .len()
             .saturating_add(
+                // Each binding and its prefix-index slot.
                 expression
                     .namespaces
                     .len()
                     .saturating_add(1)
-                    .saturating_mul(std::mem::size_of::<(String, String)>()),
+                    .saturating_mul(
+                        std::mem::size_of::<(String, String)>() + std::mem::size_of::<usize>(),
+                    ),
             )
             .saturating_add(expression.namespaces.iter().fold(
                 0usize,
@@ -7285,7 +7309,7 @@ fn prepare_extension_expression(
             ))
             .saturating_add(extension_prefix_bytes)
             .saturating_add(extension_namespace_bytes)
-            .saturating_add(std::mem::size_of::<Vec<(String, String)>>())
+            .saturating_add(std::mem::size_of::<NamespaceBindings>())
             .saturating_add(2 * std::mem::size_of::<usize>());
     meter.charge(BudgetKind::OwnedBytes, rewrite_bytes)?;
     *reserved_owned_bytes = reserved_owned_bytes.saturating_add(rewrite_bytes);
@@ -7302,7 +7326,7 @@ fn prepare_extension_expression(
     ));
     let prepared_expression = Expression {
         source: String::new(),
-        namespaces: Arc::new(namespaces),
+        namespaces: Arc::new(NamespaceBindings::new(namespaces)),
         variable_references: Arc::clone(&expression.variable_references),
         static_base_uri: expression.static_base_uri.clone(),
         stylesheet_document: expression.stylesheet_document,
@@ -7696,6 +7720,9 @@ pub(crate) struct PreparedXPath {
     /// Out of line and absent for the common expression that evaluates its own text
     /// without extra bindings, so every compiled expression grows by one pointer only.
     rewrite: Option<Box<XPathRewrite>>,
+    /// Unique within the stylesheet: an evaluation finds this expression's
+    /// engine form by index once the first one has looked it up by text.
+    slot: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -7776,7 +7803,7 @@ fn evaluation_rewrite(
 }
 
 impl PreparedXPath {
-    pub(crate) fn new(source: &str, namespaces: &[(String, String)]) -> Self {
+    pub(crate) fn new(source: &str, namespaces: &[(String, String)], slot: usize) -> Self {
         let uses_current = super::expression::has_unprefixed_function_call(source, "current");
         let rewrite = XPathRewrite::new(source, namespaces, uses_current);
         Self {
@@ -7784,6 +7811,7 @@ impl PreparedXPath {
                 || rewrite.context_namespace.is_some()
                 || rewrite.uses_current)
                 .then(|| Box::new(rewrite)),
+            slot,
         }
     }
 
@@ -7791,6 +7819,10 @@ impl PreparedXPath {
         self.rewrite
             .as_ref()
             .is_some_and(|rewrite| rewrite.uses_current)
+    }
+
+    fn slot(&self) -> usize {
+        self.slot
     }
 
     /// Heap bytes owned beyond the expression's own text.
@@ -7971,7 +8003,7 @@ struct GeneratedNodeIdentity {
 
 struct GenerateId<'a> {
     paths: ProjectedPaths<'a>,
-    assigned: Rc<RefCell<GeneratedIdCache>>,
+    assigned: &'a RefCell<GeneratedIdCache>,
 }
 impl function::Function for GenerateId<'_> {
     fn evaluate<'d>(
@@ -7994,7 +8026,7 @@ impl function::Function for GenerateId<'_> {
         };
         let id = assign_generated_id(
             context,
-            &self.assigned,
+            self.assigned,
             GeneratedNodeIdentity {
                 document: node.document().identity(),
                 path: self.paths.path(&node, context)?,
@@ -8290,7 +8322,7 @@ type IdIndex = Vec<HashMap<String, NodePath>>;
 
 struct IdFunction<'a> {
     paths: ProjectedPaths<'a>,
-    nodes_by_document: Rc<RefCell<IdIndex>>,
+    nodes_by_document: &'a RefCell<IdIndex>,
 }
 
 impl function::Function for IdFunction<'_> {
@@ -8508,7 +8540,7 @@ fn unparsed_entity_table_bytes(capacity: usize) -> usize {
 
 struct UnparsedEntityUriFunction<'a> {
     paths: ProjectedPaths<'a>,
-    documents: Rc<RefCell<Vec<HashMap<String, String>>>>,
+    documents: &'a RefCell<Vec<HashMap<String, String>>>,
 }
 
 impl function::Function for UnparsedEntityUriFunction<'_> {
@@ -8543,10 +8575,10 @@ struct DocumentFunction<'a, R: Resolver + ?Sized> {
     paths: ProjectedPaths<'a>,
     resolver: &'a R,
     access_error: &'a RefCell<Option<Error>>,
-    roots: Rc<RefCell<HashMap<DocumentRequest, CachedDocumentRoots>>>,
-    pending: Rc<RefCell<PendingDocumentRequests>>,
-    node_base_uris: Rc<RefCell<HashMap<Vec<usize>, Option<String>>>>,
-    static_base_uri: Option<Arc<str>>,
+    roots: &'a RefCell<HashMap<DocumentRequest, CachedDocumentRoots>>,
+    pending: &'a RefCell<PendingDocumentRequests>,
+    node_base_uris: &'a RefCell<HashMap<Vec<usize>, Option<String>>>,
+    static_base_uri: Option<&'a str>,
     static_document: StylesheetDocumentId,
 }
 
@@ -9583,7 +9615,7 @@ impl<R: Resolver + ?Sized> function::Function for DocumentFunction<'_, R> {
                         logical_document.map(EmptyDocumentId::Logical),
                     ),
                     DocumentBaseSelection::Omitted => (
-                        clone_metered_optional_string(context, self.static_base_uri.as_deref())?,
+                        clone_metered_optional_string(context, self.static_base_uri)?,
                         Some(EmptyDocumentId::Stylesheet(self.static_document)),
                     ),
                 };
@@ -9656,16 +9688,16 @@ impl<R: Resolver + ?Sized> DocumentFunction<'_, R> {
     }
 }
 
-struct SystemProperty {
-    namespaces: Arc<Vec<(String, String)>>,
+struct SystemProperty<'a> {
+    namespaces: &'a NamespaceBindings,
 }
-impl function::Function for SystemProperty {
+impl function::Function for SystemProperty<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        let name = one_qname_argument(context, &args, &self.namespaces, "system-property")?;
+        let name = one_qname_argument(context, &args, self.namespaces, "system-property")?;
         if name.namespace.as_deref() == Some(super::compiler::XSLT_NS) && name.local == "version" {
             // XSLT 1.0 section 12.4 defines xsl:version as the number 1.0.
             return Ok(SxdValue::Number(1.0));
@@ -9683,16 +9715,16 @@ impl function::Function for SystemProperty {
     }
 }
 
-struct ElementAvailable {
-    namespaces: Arc<Vec<(String, String)>>,
+struct ElementAvailable<'a> {
+    namespaces: &'a NamespaceBindings,
 }
-impl function::Function for ElementAvailable {
+impl function::Function for ElementAvailable<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        let name = one_qname_argument(context, &args, &self.namespaces, "element-available")?;
+        let name = one_qname_argument(context, &args, self.namespaces, "element-available")?;
         let available = (name.namespace.as_deref() == Some(super::compiler::XSLT_NS)
             && matches!(
                 name.local.as_str(),
@@ -9883,17 +9915,17 @@ fn xpath_test_matches_root(node_test: &str) -> bool {
     trim_xml_whitespace(arguments).is_empty()
 }
 
-struct FunctionAvailable {
-    namespaces: Arc<Vec<(String, String)>>,
-    stylesheet_functions: Arc<HashSet<ExpandedName>>,
+struct FunctionAvailable<'a> {
+    namespaces: &'a NamespaceBindings,
+    stylesheet_functions: &'a HashSet<ExpandedName>,
 }
-impl function::Function for FunctionAvailable {
+impl function::Function for FunctionAvailable<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
         args: Vec<SxdValue<'d>>,
     ) -> std::result::Result<SxdValue<'d>, function::Error> {
-        let name = one_qname_argument(context, &args, &self.namespaces, "function-available")?;
+        let name = one_qname_argument(context, &args, self.namespaces, "function-available")?;
         let available = if name.namespace.is_some() {
             self.stylesheet_functions.contains(&name) || is_builtin_extension_function(&name)
         } else {
@@ -9980,7 +10012,7 @@ fn is_builtin_extension_function(name: &ExpandedName) -> bool {
 fn one_qname_argument(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     args: &[SxdValue<'_>],
-    namespaces: &[(String, String)],
+    namespaces: &NamespaceBindings,
     function: &str,
 ) -> std::result::Result<ExpandedName, function::Error> {
     if args.len() != 1 {
@@ -9994,15 +10026,15 @@ fn one_qname_argument(
 fn qname_argument(
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
     value: &SxdValue<'_>,
-    namespaces: &[(String, String)],
+    namespaces: &NamespaceBindings,
 ) -> std::result::Result<ExpandedName, function::Error> {
     let lexical = function::string_argument_view(value, context)?;
     context.charge_work(lexical.len())?;
     let retained_bytes = lexical.len().saturating_add(
         lexical
             .split_once(':')
-            .and_then(|(prefix, _)| namespaces.iter().find(|(candidate, _)| candidate == prefix))
-            .map_or(0, |(_, namespace)| namespace.len()),
+            .and_then(|(prefix, _)| namespaces.lookup(prefix))
+            .map_or(0, str::len),
     );
     context.reserve_string_allocation(retained_bytes)?;
     resolve_lexical_name(&lexical, namespaces)
@@ -10060,12 +10092,12 @@ type KeyIndex = HashMap<(usize, usize), HashMap<String, Vec<NodePath>>>;
 
 struct KeyFunction<'a> {
     paths: ProjectedPaths<'a>,
-    index: Rc<RefCell<KeyIndex>>,
-    namespaces: Arc<Vec<(String, String)>>,
-    declarations: Arc<[KeyDeclaration]>,
-    name_indices: Arc<[usize]>,
-    ready: Rc<RefCell<HashSet<(usize, usize)>>>,
-    pending: Rc<RefCell<Option<(usize, usize)>>>,
+    index: &'a RefCell<KeyIndex>,
+    namespaces: &'a NamespaceBindings,
+    declarations: &'a [KeyDeclaration],
+    name_indices: &'a [usize],
+    ready: &'a RefCell<HashSet<(usize, usize)>>,
+    pending: &'a RefCell<Option<(usize, usize)>>,
 }
 impl function::Function for KeyFunction<'_> {
     fn evaluate<'d>(
@@ -10078,7 +10110,7 @@ impl function::Function for KeyFunction<'_> {
                 what: "key() requires exactly two arguments".into(),
             });
         }
-        let name = qname_argument(context, &args[0], &self.namespaces)?;
+        let name = qname_argument(context, &args[0], self.namespaces)?;
         let document_index = self
             .paths
             .document_index(&context.node, context)?
@@ -10126,11 +10158,11 @@ impl function::Function for KeyFunction<'_> {
     }
 }
 
-struct FormatNumberFunction {
-    formats: Arc<[DecimalFormat]>,
-    namespaces: Arc<Vec<(String, String)>>,
+struct FormatNumberFunction<'a> {
+    formats: &'a [DecimalFormat],
+    namespaces: &'a NamespaceBindings,
 }
-impl function::Function for FormatNumberFunction {
+impl function::Function for FormatNumberFunction<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -10145,7 +10177,7 @@ impl function::Function for FormatNumberFunction {
         let mut args = function::Args::new(args);
         let name = if has_name {
             let lexical = args.pop_string(context)?;
-            Some(resolve_lexical_name(&lexical, &self.namespaces)?)
+            Some(resolve_lexical_name(&lexical, self.namespaces)?)
         } else {
             None
         };
@@ -10189,7 +10221,7 @@ fn decimal_render_workspace_bytes(pattern: &str) -> usize {
 
 fn resolve_lexical_name(
     lexical: &str,
-    namespaces: &[(String, String)],
+    namespaces: &NamespaceBindings,
 ) -> std::result::Result<ExpandedName, function::Error> {
     if let Some((prefix, local)) = lexical.split_once(':') {
         if !is_ncname(prefix) || !is_ncname(local) || local.contains(':') {
@@ -10198,9 +10230,8 @@ fn resolve_lexical_name(
             });
         }
         let namespace = namespaces
-            .iter()
-            .find(|(candidate, _)| candidate == prefix)
-            .map(|(_, uri)| uri.clone())
+            .lookup(prefix)
+            .map(str::to_owned)
             .ok_or_else(|| function::Error::Other {
                 what: format!("unbound QName prefix {prefix}"),
             })?;
