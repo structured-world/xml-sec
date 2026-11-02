@@ -2665,7 +2665,9 @@ fn known_dependent<S: TransformScratch, D: DomStorage, I: Instruction, F: Transf
                 .canonical_positions
                 .as_ref()
                 .is_some_and(|positions| !positions.is_empty()));
-    if !reads_tracked && tracking.opaque_dependencies.is_empty() {
+    // A node-set step still runs: Enveloped or a filter can drop tracked nodes
+    // the dependencies would otherwise keep, such as the Signature's own values.
+    if !reads_content || (!reads_tracked && tracking.opaque_dependencies.is_empty()) {
         return Ok(None);
     }
     tracking.discard_provenance();

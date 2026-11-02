@@ -326,3 +326,32 @@ fn a_writer_key_info_that_drops_a_referenced_id_is_refused() {
         assert!(result.is_err(), "{references}: {result:?}");
     }
 }
+
+#[test]
+fn a_known_dependency_still_lets_later_node_set_steps_drop_the_signature() {
+    // A value-reading XPath excludes KeyInfo, leaving a dependency that lost
+    // its provenance; the Enveloped step after it still removes the
+    // Reference's own DigestValue and SignatureValue. Stopping the chain at the
+    // first known dependency would keep them and report a false cycle.
+    let xpath = transform(
+        XPATH,
+        "<ds:XPath>not(ancestor-or-self::ds:KeyInfo) and string-length(string(.)) &gt;= 0</ds:XPath>",
+    );
+    let xml = template(
+        &reference(
+            "",
+            &[xpath, transform(ENVELOPED, ""), transform(EXCLUSIVE, "")].concat(),
+        ),
+        "",
+    )
+    .replace(
+        "<ds:SignatureValue/>",
+        "<ds:SignatureValue/><ds:KeyInfo><ds:KeyName>key</ds:KeyName></ds:KeyInfo>",
+    );
+    let policy = crate::policy::SigningPolicy::default();
+    let signed = SignContext::new(&FixedKey)
+        .policy(policy.clone())
+        .sign_template(&xml)
+        .expect("Enveloped removes the signature's own values from the dependencies");
+    assert_digests_match_final_document(&signed, &policy);
+}
