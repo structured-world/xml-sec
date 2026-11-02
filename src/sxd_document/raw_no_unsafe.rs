@@ -101,6 +101,11 @@ impl<T> Index<T> {
         self.idx
     }
 
+    /// The handle of arena slot `idx`; the caller checks it is in bounds.
+    pub(super) fn from_identity_index(idx: usize) -> Self {
+        Self::new(idx)
+    }
+
     fn new(idx: usize) -> Self {
         Index {
             idx,

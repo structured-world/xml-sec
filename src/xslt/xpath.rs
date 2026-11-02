@@ -1112,9 +1112,9 @@ impl Evaluator {
         meter: &mut Meter,
     ) -> Result<()> {
         debug_assert_eq!(value_reservation, value.capacity());
-        let Some(sxd) =
-            self.maps
-                .to_sxd(&self.source, self.package.as_document().root().into(), node)
+        let Some(sxd) = self
+            .maps
+            .to_sxd(&self.source, self.package.as_document(), node)
         else {
             meter.release_owned_bytes(value_reservation);
             return Ok(());
@@ -1271,12 +1271,14 @@ impl Evaluator {
         };
         pending
             .map(|pending| {
-                let node = NodeMaps::source_of_path(&self.source, &pending.node)
+                let node = NodeMaps::source_of_path(&self.source, &pending.node, meter)?
                     .ok_or_else(|| Error::Dynamic("stylesheet function context is stale".into()))?;
                 let arguments = pending
                     .arguments
                     .iter()
-                    .map(|argument| self.project_deferred_value(argument, session, variables))
+                    .map(|argument| {
+                        self.project_deferred_value(argument, session, variables, meter)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 Ok(CustomFunctionCall {
                     name: pending.name.clone(),
@@ -1350,6 +1352,7 @@ impl Evaluator {
         value: &DeferredXPathValue,
         session: &CustomCallSession,
         variables: &dyn VariableBindings,
+        meter: &mut Meter,
     ) -> Result<Value> {
         Ok(match value {
             DeferredXPathValue::Boolean(value) => Value::Boolean(*value),
@@ -1359,7 +1362,7 @@ impl Evaluator {
                 paths
                     .iter()
                     .map(|path| {
-                        NodeMaps::source_of_path(&self.source, path).ok_or_else(|| {
+                        NodeMaps::source_of_path(&self.source, path, meter)?.ok_or_else(|| {
                             Error::Dynamic("stylesheet function argument node is stale".into())
                         })
                     })
@@ -2421,7 +2424,9 @@ impl Evaluator {
             .path(&self.source, node)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
         meter.charge(BudgetKind::XPathOperations, context_path.ordinary().len())?;
-        let context_node = NodeMaps::resolve(document.root().into(), &context_path)
+        let context_node = self
+            .maps
+            .to_sxd(&self.source, document, node)
             .ok_or_else(|| Error::Dynamic("XPath context node is stale".into()))?;
         Ok((context_node, context_path))
     }
@@ -2632,10 +2637,7 @@ impl Evaluator {
                 Value::NodeSet(nodes) => {
                     let mut set = nodeset::Nodeset::new();
                     for reference in nodes {
-                        if let Some(node) =
-                            self.maps
-                                .to_sxd(&self.source, document.root().into(), reference)
-                        {
+                        if let Some(node) = self.maps.to_sxd(&self.source, document, reference) {
                             if !set.contains(node.clone()) {
                                 let reservation = context
                                     .reserve_temporary_allocation(std::mem::size_of_val(&node));
@@ -4076,6 +4078,61 @@ fn project_semantic_document(
     Ok(package)
 }
 
+/// Project one element with its namespace bindings and attributes, recording
+/// the arena slots of the element and of each attribute.
+fn project_element<'d>(
+    document: SxdDocument<'d>,
+    kind: &NodeKind,
+    id: NodeId,
+    slots: &mut ProjectedSlots,
+    meter: &mut Meter,
+) -> Result<SxdElement<'d>> {
+    let NodeKind::Element {
+        name,
+        prefix,
+        attributes,
+        namespaces,
+    } = kind
+    else {
+        return Err(Error::Dynamic(format!(
+            "semantic node {id:?} is not an element"
+        )));
+    };
+    let element = document.create_element(QName::with_namespace_uri(
+        name.namespace.as_deref(),
+        &name.local,
+    ));
+    element.set_preferred_prefix(prefix.as_deref());
+    for namespace in namespaces.iter() {
+        if let Some(prefix) = &namespace.prefix {
+            element.register_prefix(prefix, &namespace.uri);
+        } else {
+            element.set_default_namespace_uri(Some(&namespace.uri));
+            element.register_prefix("", &namespace.uri);
+        }
+    }
+    for (index, attribute) in attributes.iter().enumerate() {
+        let projected = element.set_attribute_value(
+            QName::with_namespace_uri(attribute.name.namespace.as_deref(), &attribute.name.local),
+            &attribute.value,
+        );
+        projected.set_preferred_prefix(attribute.prefix.as_deref());
+        ProjectedSlots::record(
+            &mut slots.attributes,
+            projected.identity_key(),
+            (id, index),
+            meter,
+        )?;
+    }
+    slots.record_node(
+        |slots| &mut slots.elements,
+        element.identity_key(),
+        id,
+        meter,
+    )?;
+    Ok(element)
+}
+
 fn project_logical_root<'d>(
     source: &Document,
     logical_root: NodeId,
@@ -4086,8 +4143,8 @@ fn project_logical_root<'d>(
 ) -> Result<()> {
     let wrapper = document.create_element(QName::new(DOCUMENT_ELEMENT));
     documents.append_child(wrapper);
-    ProjectedSlots::record(
-        &mut slots.elements,
+    slots.record_node(
+        |slots| &mut slots.elements,
         wrapper.identity_key(),
         logical_root,
         meter,
@@ -4113,43 +4170,9 @@ fn project_logical_root<'d>(
                         pending.push((*child, parent));
                     }
                 }
-                NodeKind::Element {
-                    name,
-                    prefix,
-                    attributes,
-                    namespaces,
-                } => {
-                    let element = document.create_element(QName::with_namespace_uri(
-                        name.namespace.as_deref(),
-                        &name.local,
-                    ));
-                    element.set_preferred_prefix(prefix.as_deref());
-                    for namespace in namespaces.iter() {
-                        if let Some(prefix) = &namespace.prefix {
-                            element.register_prefix(prefix, &namespace.uri);
-                        } else {
-                            element.set_default_namespace_uri(Some(&namespace.uri));
-                            element.register_prefix("", &namespace.uri);
-                        }
-                    }
-                    for (index, attribute) in attributes.iter().enumerate() {
-                        let projected = element.set_attribute_value(
-                            QName::with_namespace_uri(
-                                attribute.name.namespace.as_deref(),
-                                &attribute.name.local,
-                            ),
-                            &attribute.value,
-                        );
-                        projected.set_preferred_prefix(attribute.prefix.as_deref());
-                        ProjectedSlots::record(
-                            &mut slots.attributes,
-                            projected.identity_key(),
-                            (id, index),
-                            meter,
-                        )?;
-                    }
+                NodeKind::Element { .. } => {
+                    let element = project_element(document, &node.kind, id, slots, meter)?;
                     parent.append_child(element);
-                    ProjectedSlots::record(&mut slots.elements, element.identity_key(), id, meter)?;
                     for child in node.children.iter().rev() {
                         reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
                         pending.push((*child, element));
@@ -4158,19 +4181,24 @@ fn project_logical_root<'d>(
                 NodeKind::Text { value, .. } => {
                     let text = document.create_text(value);
                     parent.append_child(text);
-                    ProjectedSlots::record(&mut slots.texts, text.identity_key(), id, meter)?;
+                    slots.record_node(|slots| &mut slots.texts, text.identity_key(), id, meter)?;
                 }
                 NodeKind::Comment(value) => {
                     let comment = document.create_comment(value);
                     parent.append_child(comment);
-                    ProjectedSlots::record(&mut slots.comments, comment.identity_key(), id, meter)?;
+                    slots.record_node(
+                        |slots| &mut slots.comments,
+                        comment.identity_key(),
+                        id,
+                        meter,
+                    )?;
                 }
                 NodeKind::ProcessingInstruction { target, value } => {
                     let instruction =
                         document.create_processing_instruction(target, value.as_deref());
                     parent.append_child(instruction);
-                    ProjectedSlots::record(
-                        &mut slots.instructions,
+                    slots.record_node(
+                        |slots| &mut slots.instructions,
                         instruction.identity_key(),
                         id,
                         meter,
@@ -6269,9 +6297,30 @@ struct ProjectedSlots {
     instructions: Vec<Option<NodeId>>,
     /// The owner and attribute index behind each attribute slot.
     attributes: Vec<Option<(NodeId, usize)>>,
+    /// The inverse: the arena slot of each projected semantic node, by node id;
+    /// the node's kind names the arena.
+    sxd: Vec<Option<usize>>,
 }
 
 impl ProjectedSlots {
+    /// Record that semantic node `id` projected to slot `key` of `arena`, in
+    /// both directions.
+    fn record_node(
+        &mut self,
+        arena: fn(&mut Self) -> &mut Vec<Option<NodeId>>,
+        key: (usize, usize, usize),
+        id: NodeId,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        Self::record(arena(self), key, id, meter)?;
+        while self.sxd.len() <= id.0 {
+            reserve_retained_vec_slot(&mut self.sxd, meter)?;
+            self.sxd.push(None);
+        }
+        self.sxd[id.0] = Some(key.2);
+        Ok(())
+    }
+
     fn record<T>(
         slots: &mut Vec<Option<T>>,
         key: (usize, usize, usize),
@@ -6481,22 +6530,50 @@ impl NodeMaps {
     }
 
     /// The semantic node at `path`, the inverse of [`Self::path`].
-    fn source_of_path(source: &Document, path: &NodePath) -> Option<SourceNode> {
+    fn source_of_path(
+        source: &Document,
+        path: &NodePath,
+        meter: &mut Meter,
+    ) -> Result<Option<SourceNode>> {
         let ordinary = path.ordinary();
-        let (&[0, document], children) = ordinary.split_first_chunk::<2>()? else {
-            return None;
+        let Some((&[0, document], children)) = ordinary.split_first_chunk::<2>() else {
+            return Ok(None);
         };
-        let mut id = *source.logical_roots().get(document)?;
+        meter.charge(BudgetKind::XPathOperations, children.len())?;
+        let Some(mut id) = source.logical_roots().get(document).copied() else {
+            return Ok(None);
+        };
         for index in children {
-            id = *source.node(id)?.children.get(*index)?;
+            let Some(child) = source.node(id).and_then(|node| node.children.get(*index)) else {
+                return Ok(None);
+            };
+            id = *child;
         }
-        match path {
+        // A path names an attribute or namespace node rather than indexing it,
+        // so the owner's declarations are searched; the search is admitted first.
+        if let (
+            NodePath::Attribute { .. } | NodePath::Namespace { .. },
+            Some(NodeKind::Element {
+                attributes,
+                namespaces,
+                ..
+            }),
+        ) = (path, source.node(id).map(|node| &node.kind))
+        {
+            let declarations = if matches!(path, NodePath::Attribute { .. }) {
+                attributes.len()
+            } else {
+                namespaces.len()
+            };
+            meter.charge(BudgetKind::XPathOperations, declarations)?;
+        }
+        Ok(match path {
             NodePath::Ordinary(_) => Some(SourceNode::Node(id)),
             NodePath::Attribute {
                 namespace, local, ..
             } => attribute_of(source, id, namespace.as_deref(), local),
             NodePath::Namespace { prefix, uri, .. } => namespace_of(source, id, prefix, uri),
-        }
+        })
     }
 
     /// The semantic node an evaluator result came from.
@@ -6544,27 +6621,52 @@ impl NodeMaps {
         })
     }
 
+    /// The evaluator node of a semantic node, read from the arena slot its
+    /// projection recorded rather than found by a walk or a name search.
     fn to_sxd<'d>(
         &self,
         source: &Document,
-        root: nodeset::Node<'d>,
+        document: SxdDocument<'d>,
         node: &SourceNode,
     ) -> Option<nodeset::Node<'d>> {
-        Self::resolve(root, &self.path(source, node)?)
-    }
-    fn resolve<'d>(root: nodeset::Node<'d>, path: &NodePath) -> Option<nodeset::Node<'d>> {
-        let mut node = root;
-        for index in path.ordinary() {
-            node = node.child_at(*index)?;
+        let owner = source_node_owner(node);
+        let slot = self.slots.sxd.get(owner.0).copied().flatten()?;
+        let kind = &source.node(owner)?.kind;
+        let projected: nodeset::Node<'d> = match kind {
+            NodeKind::Root | NodeKind::Element { .. } => document.element_at_slot(slot)?.into(),
+            NodeKind::Text { .. } => document.text_at_slot(slot)?.into(),
+            NodeKind::Comment(_) => document.comment_at_slot(slot)?.into(),
+            NodeKind::ProcessingInstruction { .. } => {
+                document.processing_instruction_at_slot(slot)?.into()
+            }
+        };
+        match (node, kind) {
+            (SourceNode::Node(_), _) => Some(projected),
+            (SourceNode::Attribute { index, .. }, NodeKind::Element { attributes, .. }) => {
+                // Projection sets the attributes in source order and their names
+                // are distinct, so the evaluator keeps each at its source index.
+                let expected = &attributes.get(*index)?.name;
+                let attribute = projected.element()?.attribute_at(*index)?;
+                let name = attribute.name();
+                let name = name.get();
+                (name.local_part() == expected.local
+                    && name.namespace_uri() == expected.namespace.as_deref())
+                .then_some(nodeset::Node::Attribute(attribute))
+            }
+            (SourceNode::Namespace { index, .. }, NodeKind::Element { namespaces, .. }) => {
+                let namespace = namespaces
+                    .get(*index)
+                    .filter(|namespace| xpath_namespace_is_visible(namespace))?;
+                resolve_namespace_node(
+                    &projected,
+                    namespace.prefix.as_deref().unwrap_or_default(),
+                    &namespace.uri,
+                )
+            }
+            _ => None,
         }
-        match path {
-            NodePath::Ordinary(_) => Some(node),
-            NodePath::Attribute {
-                namespace, local, ..
-            } => resolve_attribute_node(&node, namespace.as_deref(), local),
-            NodePath::Namespace { prefix, uri, .. } => resolve_namespace_node(&node, prefix, uri),
-        }
     }
+
     fn project_value(
         &self,
         source: &Document,
@@ -10106,23 +10208,6 @@ fn resolve_node_path<'d>(
             })))
         }
     }
-}
-
-fn resolve_attribute_node<'d>(
-    node: &nodeset::Node<'d>,
-    namespace: Option<&str>,
-    local: &str,
-) -> Option<nodeset::Node<'d>> {
-    let element = node.element()?;
-    for index in 0..element.attributes_len() {
-        let attribute = element.attribute_at(index)?;
-        let name = attribute.name();
-        let name = name.get();
-        if name.local_part() == local && name.namespace_uri() == namespace {
-            return Some(nodeset::Node::Attribute(attribute));
-        }
-    }
-    None
 }
 
 fn resolve_namespace_node<'d>(

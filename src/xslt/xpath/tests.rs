@@ -661,10 +661,14 @@ fn node_paths_and_evaluator_nodes_map_back_to_their_semantic_node() {
     for reference in &references {
         let path = maps.path(&source, reference).expect("the node has a path");
         assert_eq!(
-            NodeMaps::source_of_path(&source, &path).as_ref(),
+            NodeMaps::source_of_path(&source, &path, &mut meter)
+                .expect("mapping fits the budget")
+                .as_ref(),
             Some(reference)
         );
-        let projected = NodeMaps::resolve(root.clone(), &path).expect("the path resolves");
+        let projected = maps
+            .to_sxd(&source, package.as_document(), reference)
+            .expect("the node projects");
         assert_eq!(
             maps.source_of_sxd(&source, &projected, &mut meter)
                 .expect("mapping fits the budget")
@@ -684,18 +688,13 @@ fn node_paths_and_evaluator_nodes_map_back_to_their_semantic_node() {
             .expect("mapping fits the budget"),
         None
     );
-    assert_eq!(
-        NodeMaps::source_of_path(&source, &NodePath::Ordinary(vec![0])),
-        None
-    );
-    assert_eq!(
-        NodeMaps::source_of_path(&source, &NodePath::Ordinary(vec![0, 9])),
-        None
-    );
-    assert_eq!(
-        NodeMaps::source_of_path(&source, &NodePath::Ordinary(vec![1, 0])),
-        None
-    );
+    for stale in [vec![0], vec![0, 9], vec![1, 0]] {
+        assert_eq!(
+            NodeMaps::source_of_path(&source, &NodePath::Ordinary(stale), &mut meter)
+                .expect("mapping fits the budget"),
+            None
+        );
+    }
     let mut ordered = references.clone();
     ordered.sort_by_key(|node| maps.order(&source, node));
     let position = |wanted: &SourceNode| ordered.iter().position(|node| node == wanted);
@@ -3494,7 +3493,6 @@ fn evaluator_attributes_map_back_without_scanning_their_siblings() {
     });
     let source = Document::parse(&format!("<e{attributes}/>"), None).expect("source parses");
     let (package, maps, mut meter) = projected_maps(&source);
-    let root: nodeset::Node<'_> = package.as_document().root().into();
     let owner = source
         .node(source.logical_roots()[0])
         .expect("root")
@@ -3503,7 +3501,7 @@ fn evaluator_attributes_map_back_without_scanning_their_siblings() {
     for index in 0..512 {
         let reference = SourceNode::Attribute { owner, index };
         let projected = maps
-            .to_sxd(&source, root.clone(), &reference)
+            .to_sxd(&source, package.as_document(), &reference)
             .expect("the attribute projects");
         assert_eq!(
             maps.source_of_sxd(&source, &projected, &mut meter)
@@ -3512,6 +3510,76 @@ fn evaluator_attributes_map_back_without_scanning_their_siblings() {
         );
     }
     assert_eq!(take_attribute_scans(), 0);
+}
+
+#[test]
+fn semantic_attributes_reach_the_evaluator_without_a_search() {
+    // Binding a node-set of N attributes to a variable, keying them or
+    // evaluating in their context locates each one in the evaluator tree; a
+    // search through the owner's attributes per node would cost N^2.
+    let attributes = (0..512).fold(String::new(), |mut attributes, index| {
+        std::fmt::Write::write_fmt(&mut attributes, format_args!(" a{index}='{index}'"))
+            .expect("writing to a String cannot fail");
+        attributes
+    });
+    let source = Document::parse(&format!("<e{attributes}/>"), None).expect("source parses");
+    let (package, maps, mut meter) = projected_maps(&source);
+    let document = package.as_document();
+    let owner = source
+        .node(source.logical_roots()[0])
+        .expect("root")
+        .children[0];
+    take_attribute_scans();
+    for index in 0..512 {
+        let reference = SourceNode::Attribute { owner, index };
+        let projected = maps
+            .to_sxd(&source, document, &reference)
+            .expect("the attribute projects");
+        let nodeset::Node::Attribute(attribute) = &projected else {
+            panic!("an attribute projects to an attribute");
+        };
+        assert_eq!(attribute.name().get().local_part(), format!("a{index}"));
+        assert_eq!(
+            maps.source_of_sxd(&source, &projected, &mut meter)
+                .expect("mapping fits the budget"),
+            Some(reference)
+        );
+    }
+    assert_eq!(take_attribute_scans(), 0);
+}
+
+#[test]
+fn path_lookups_charge_the_attributes_they_search() {
+    // A stylesheet function receiving `/*/@*` replays each argument from its
+    // node path, which names the attribute: finding it searches the owner's
+    // attributes, and every comparison is XPath work the meter pays.
+    let attributes = (0..256).fold(String::new(), |mut attributes, index| {
+        std::fmt::Write::write_fmt(&mut attributes, format_args!(" a{index}='{index}'"))
+            .expect("writing to a String cannot fail");
+        attributes
+    });
+    let source = Document::parse(&format!("<e{attributes}/>"), None).expect("source parses");
+    let (_package, maps, mut meter) = projected_maps(&source);
+    let owner = source
+        .node(source.logical_roots()[0])
+        .expect("root")
+        .children[0];
+    let (before, _) = meter.usage(BudgetKind::XPathOperations).expect("usage");
+    take_attribute_scans();
+    for index in 0..256 {
+        let reference = SourceNode::Attribute { owner, index };
+        let path = maps
+            .path(&source, &reference)
+            .expect("the attribute has a path");
+        assert_eq!(
+            NodeMaps::source_of_path(&source, &path, &mut meter).expect("lookup fits the budget"),
+            Some(reference)
+        );
+    }
+    let scanned = take_attribute_scans();
+    let (after, _) = meter.usage(BudgetKind::XPathOperations).expect("usage");
+    assert!(scanned >= 256 * 257 / 2);
+    assert!(after - before >= scanned, "{} < {scanned}", after - before);
 }
 
 #[test]
@@ -3528,7 +3596,6 @@ fn evaluator_namespaces_charge_the_declarations_they_search() {
     });
     let source = Document::parse(&format!("<e{declarations}/>"), None).expect("source parses");
     let (package, maps, mut meter) = projected_maps(&source);
-    let root: nodeset::Node<'_> = package.as_document().root().into();
     let owner = source
         .node(source.logical_roots()[0])
         .expect("root")
@@ -3540,7 +3607,7 @@ fn evaluator_namespaces_charge_the_declarations_they_search() {
     let mut searched = 0;
     for index in 0..namespaces.len() {
         let reference = SourceNode::Namespace { owner, index };
-        let Some(projected) = maps.to_sxd(&source, root.clone(), &reference) else {
+        let Some(projected) = maps.to_sxd(&source, package.as_document(), &reference) else {
             continue;
         };
         assert_eq!(
