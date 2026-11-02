@@ -13,9 +13,26 @@ inputs:
   save:
     description: Whether this job owns writes to the shared cache
     default: 'false'
+  mold:
+    description: >-
+      Link with mold on Linux. A job that also builds for a target other than
+      the host turns it off: RUSTFLAGS reach every target, and rustc accepts
+      -C linker-features only on x86_64-unknown-linux-gnu.
+    default: 'true'
 runs:
   using: composite
   steps:
+    # mold links with fewer threads and less random I/O than the self-contained
+    # rust-lld; it exists for Linux only. RUSTFLAGS is set before the cache step
+    # so the restored artifacts match the flags they were built with.
+    - name: Link with mold
+      if: runner.os == 'Linux' && inputs.mold == 'true'
+      shell: bash
+      run: |
+        sudo apt-get update -q
+        sudo apt-get install -y --no-install-recommends mold
+        mold --version
+        echo "RUSTFLAGS=${RUSTFLAGS:+$RUSTFLAGS }-C linker-features=-lld -C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
     - uses: ./.github/actions/runner-image
       id: image
     - uses: ./.github/actions/clean-build-output

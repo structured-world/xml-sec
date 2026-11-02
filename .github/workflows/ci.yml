@@ -266,6 +266,7 @@ jobs:
         with:
           domain: alloc-targets
           save: 'true'
+          mold: 'false'
       - run: cargo clippy -p xml-sec-xml-input --lib --no-default-features -- -D warnings
       - run: >-
           cargo check -p xml-sec-xml-input --no-default-features
