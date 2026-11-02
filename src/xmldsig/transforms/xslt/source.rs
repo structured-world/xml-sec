@@ -345,8 +345,12 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
         };
         if length == capacity {
             let additional = capacity.max(4);
-            self.admit(additional * core::mem::size_of::<T>())?;
+            // Growth moves the list: the old allocation, which the tape
+            // already holds, lives until the whole replacement has its copy.
+            self.admit((capacity + additional) * core::mem::size_of::<T>())?;
             list(&mut self.tape).reserve_exact(additional)?;
+            // An allocator may grant more than requested; what it granted is held.
+            self.admit(0)?;
         }
         list(&mut self.tape).push(value)
     }

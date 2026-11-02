@@ -288,6 +288,28 @@ fn the_built_source_obeys_each_xml_input_limit_as_its_parse_does() {
 }
 
 #[test]
+fn tape_growth_admits_the_old_and_the_new_allocation_together() {
+    // Growing a full list moves it: the old allocation is live until the
+    // replacement holds its copy, so the peak is both. Four events fit a
+    // limit of ten; growing to eight needs twelve at the peak and is refused.
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
+    let counters = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let event = core::mem::size_of::<super::Event<'_>>();
+    let mut recorder = super::Recorder::new(&Native, &counters, settings(&budget), 10 * event);
+    for _ in 0..4 {
+        recorder
+            .push(|tape| &mut tape.events, super::Event::End)
+            .expect("four events fit");
+    }
+    assert!(
+        recorder
+            .push(|tape| &mut tape.events, super::Event::End)
+            .is_err()
+    );
+    assert_eq!(recorder.exceeded, Some(12 * event));
+}
+
+#[test]
 fn the_tape_is_refused_before_it_grows_past_its_limit() {
     // One text node of escaped characters records one event each. Its tape
     // must be refused before it grows past the workspace, not after the
