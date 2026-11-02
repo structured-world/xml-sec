@@ -974,41 +974,32 @@ fn apply_xslt_transform<'d, S: TransformScratch, D: DomStorage>(
     input: &ExecutionData<'d, S, D>,
     context: &TransformExecutionContext<'_, S>,
 ) -> Result<ExecutionData<'d, S, D>, TransformError> {
-    let budget = context.budget;
-    let collected;
     // A slice does not imply borrowed storage: earlier transforms can
     // own its allocation, which remains live throughout this XSLT step.
-    let (bytes, input_storage): (&[u8], usize) = match input {
-        ExecutionData::NativeBinary(bytes) => (bytes, bytes.capacity()),
-        ExecutionData::Accounted(bytes) => (bytes, bytes.capacity()),
-        ExecutionData::BorrowedBinary(bytes) | ExecutionData::Resource { bytes, .. } => (bytes, 0),
-        ExecutionData::Nodes(nodes) => {
-            // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
-            // node-set input with inclusive C14N 1.0 first.
-            // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
-            let bytes = xslt::canonicalize_input(
-                *stylesheet,
-                nodes.document(),
-                nodes,
-                budget,
-                context.scratch,
-            )?;
-            let capacity = bytes.capacity();
-            collected = bytes;
-            (&collected, capacity)
-        }
+    let octets = |bytes, storage, base_uri| xslt::Input::Octets {
+        bytes,
+        storage,
+        base_uri,
+    };
+    let input = match input {
+        ExecutionData::NativeBinary(bytes) => octets(bytes, bytes.capacity(), None),
+        ExecutionData::Accounted(bytes) => octets(bytes, bytes.capacity(), None),
+        ExecutionData::BorrowedBinary(bytes) => octets(bytes, 0, None),
+        ExecutionData::Resource { bytes, uri } => octets(bytes, 0, Some(*uri)),
+        // XMLDSig 1.1 section 6.6.5 consumes octets; section 4.4.3.2 converts a
+        // node-set input with inclusive C14N 1.0 first.
+        // https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-XSLT
+        ExecutionData::Nodes(nodes) => xslt::Input::Nodes {
+            document: nodes.document(),
+            visibility: nodes,
+        },
     };
     xslt::execute(
         *stylesheet,
-        bytes,
-        input_storage,
-        match input {
-            ExecutionData::Resource { uri, .. } => Some(*uri),
-            _ => None,
-        },
+        input,
         context.options.xslt_stylesheet_semantics,
         context.options.internal_dtd_allowed(),
-        budget,
+        context.budget,
         context.xml_parse,
         context.scratch,
     )
