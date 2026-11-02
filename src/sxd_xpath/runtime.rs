@@ -394,7 +394,7 @@ impl Runtime for Native {
         node.visit_string_value_with_context(context, visit)
     }
     fn namespaces(self) -> Self::Namespaces {
-        Self::Namespaces::new()
+        Self::Namespaces::default()
     }
     fn list<T>(self) -> Vec<T> {
         Vec::new()

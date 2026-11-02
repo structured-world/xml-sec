@@ -13,7 +13,7 @@ pub(crate) enum Storage<'d> {
 
 impl Default for Storage<'_> {
     fn default() -> Self {
-        Self::Native(Set::new())
+        Self::Native(Set::default())
     }
 }
 

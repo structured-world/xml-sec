@@ -1172,7 +1172,7 @@ impl KeyInventory {
                 resources.max_external_resource_total_bytes,
             ));
         }
-        let mut names = Set::new();
+        let mut names = Set::default();
         for name in other
             .symmetric_keys
             .iter()
@@ -2668,7 +2668,7 @@ impl KeyInventory {
             used: live_material + bytes.len(),
             maximum: resources.max_external_resource_total_bytes,
         };
-        let mut names = Set::new();
+        let mut names = Set::default();
         let mut store = Self::default();
         let mut entry_count = 0_usize;
         // One account for every public key read while loading this store.

@@ -189,7 +189,7 @@ impl Storage for Native {
     }
 
     fn declarations<'input>(&self) -> Self::Declarations<'input> {
-        crate::collections::Map::new()
+        crate::collections::Map::default()
     }
     fn freeze(value: String) -> String {
         value

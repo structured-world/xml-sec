@@ -364,8 +364,8 @@ ripemd = { version = "0.2.0", default-features = false, features = ["oid", "zero
 pkcs12 = { version = "=0.2.0-pre.0", default-features = false, features = ["kdf"], optional = true }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"], optional = true }
 
-# X.509 certificates
-structured-asn1 = { version = "0.20.0", default-features = false, features = ["alloc"], optional = true }
+# X.509 certificates, and the seeded hashing of every table keyed by document content
+structured-asn1 = { version = "0.20.2", default-features = false, features = ["alloc"] }
 structured-pkix = { version = "0.20.0", default-features = false, features = ["alloc"], optional = true }
 # PKCS#12 container framing; this crate keeps the password, KDF and cipher work.
 structured-cms = { version = "0.20.0", default-features = false, features = ["alloc"], optional = true }
@@ -423,7 +423,7 @@ default = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmlo
 std = [
     "thiserror/std",
     "xmlparser/std",
-    "structured-asn1?/std",
+    "structured-asn1/std",
     "structured-pkix?/std",
     "structured-cms?/std",
     "base64/std",
@@ -471,7 +471,6 @@ xmldsig = [            # XML Digital Signature verification and public-key inven
     "dep:signature",
     "dep:snafu",
     "dep:subtle",
-    "dep:structured-asn1",
     "dep:structured-pkix",
     "dep:tinyvec",
     "dep:zeroize",

@@ -2453,12 +2453,13 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "structured-asn1"
-version = "0.20.0"
+version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2327671666df0e22a40a20971a6eba300aeae791e363d71b074444e4c7f796d2"
+checksum = "23852bb67534243c15bc4f14aa5b859c0fa75d5d25806df4d908380445b62a24"
 dependencies = [
  "allocator-api2 0.2.21",
  "allocator-api2 0.4.0",
+ "foldhash",
  "hashbrown",
  "miniz_oxide",
 ]
@@ -2923,7 +2924,7 @@ dependencies = [
 
 [[package]]
 name = "xml-sec"
-version = "0.3.0"
+version = "0.4.1"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm",

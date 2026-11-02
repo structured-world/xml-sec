@@ -13,10 +13,25 @@ pub(crate) use alloc::collections::{BTreeMap as Map, BTreeSet as Set};
 pub(crate) use alloc::collections::{btree_map as map, btree_set as set};
 #[cfg(all(feature = "std", any(feature = "xmldsig", test)))]
 pub(crate) use std::collections::hash_map::Entry;
-#[cfg(feature = "std")]
-pub(crate) use std::collections::{HashMap as Map, HashSet as Set};
 #[cfg(all(feature = "std", feature = "xmldsig"))]
 pub(crate) use std::collections::{hash_map as map, hash_set as set};
+
+/// Builds the hasher of one content-keyed table.
+///
+/// A document controls the strings these tables hash and chooses which arena
+/// identities they hold. Each table gets its own random seed: integer words,
+/// which most keys are (a document identity and a slot), take a seeded integer
+/// mix, and strings and every word after one take the keyed `SipHash`, so a
+/// document can predict where neither lands.
+#[cfg(feature = "std")]
+pub(crate) type SeededState = structured_asn1::hash::RandomState;
+
+/// A hash table keyed by document content.
+#[cfg(feature = "std")]
+pub(crate) type Map<K, V> = std::collections::HashMap<K, V, SeededState>;
+/// A hash set keyed by document content.
+#[cfg(feature = "std")]
+pub(crate) type Set<T> = std::collections::HashSet<T, SeededState>;
 
 /// What [`Map`] and [`Set`] require of their keys in this build.
 #[cfg(feature = "std")]
@@ -47,7 +62,7 @@ pub(crate) trait Table: Sized {
 #[cfg(feature = "std")]
 impl<K: Key, V> Table for Map<K, V> {
     fn with_entry_capacity(capacity: usize) -> Self {
-        Self::with_capacity(capacity)
+        Self::with_capacity_and_hasher(capacity, SeededState::default())
     }
 
     fn try_reserve_entries(&mut self, additional: usize) -> Result<(), TryReserveError> {
@@ -63,7 +78,7 @@ impl<K: Key, V> Table for Map<K, V> {
 #[cfg(feature = "std")]
 impl<T: Key> Table for Set<T> {
     fn with_entry_capacity(capacity: usize) -> Self {
-        Self::with_capacity(capacity)
+        Self::with_capacity_and_hasher(capacity, SeededState::default())
     }
 
     fn try_reserve_entries(&mut self, additional: usize) -> Result<(), TryReserveError> {
@@ -107,3 +122,6 @@ impl<T: Key> Table for Set<T> {
         self.len()
     }
 }
+
+#[cfg(all(test, feature = "std"))]
+mod tests;

@@ -33,7 +33,7 @@ where
     pub fn insert(&mut self, key: K, val: V) -> Option<V> {
         self.map = match self.map.take() {
             Some(m) => Some(m),
-            None => Some(Map::new()),
+            None => Some(Map::default()),
         };
 
         self.map.as_mut().and_then(|m| m.insert(key, val))

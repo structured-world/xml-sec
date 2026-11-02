@@ -2288,16 +2288,18 @@ impl DependencyTracking {
                 Some(node) => nodes.contains_tree(node).map_err(TransformError::from)?,
                 None => false,
             };
-            if remains_visible {
-                active_nodes.push(tracked);
-            } else if preserve_excluded_as_opaque {
+            if preserve_excluded_as_opaque {
                 // SXD exposes output membership but not which source
                 // values a predicate coerced. Structural selection does
                 // not depend on mutable DigestValue text, but a value
-                // scan may control another node's inclusion, so absence
-                // is not proof of independence in that case.
+                // scan may control another node's inclusion, so neither
+                // absence nor a later Enveloped removal proves
+                // independence: the read stays a dependency either way.
                 self.opaque_dependencies.insert(tracked.index);
-            } else {
+            }
+            if remains_visible {
+                active_nodes.push(tracked);
+            } else if !preserve_excluded_as_opaque {
                 self.dormant_indexes.insert(tracked.index);
             }
         }
@@ -2452,8 +2454,8 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
     let mut active_nodes = Vec::with_capacity(tracked_nodes.len());
-    let mut opaque_dependencies = Set::new();
-    let mut dormant_indexes = Set::new();
+    let mut opaque_dependencies = Set::default();
+    let mut dormant_indexes = Set::default();
     for (index, node_id) in tracked_nodes {
         if let Some(node) = signature_node.document().get_node(node_id) {
             let belongs_to_input = match &initial_data {
@@ -2665,7 +2667,9 @@ fn known_dependent<S: TransformScratch, D: DomStorage, I: Instruction, F: Transf
                 .canonical_positions
                 .as_ref()
                 .is_some_and(|positions| !positions.is_empty()));
-    if !reads_tracked && tracking.opaque_dependencies.is_empty() {
+    // A node-set step still runs: Enveloped or a filter can drop tracked nodes
+    // the dependencies would otherwise keep, such as the Signature's own values.
+    if !reads_content || (!reads_tracked && tracking.opaque_dependencies.is_empty()) {
         return Ok(None);
     }
     tracking.discard_provenance();
@@ -2891,7 +2895,7 @@ fn map_transform_xml_decode_error(error: crate::encoding::XmlEncodingError) -> T
 #[cfg(feature = "xmldsig-sign")]
 fn dependency_indexes(tracking: Option<DependencyTracking>) -> Set<usize> {
     let Some(tracking) = tracking else {
-        return Set::new();
+        return Set::default();
     };
     tracking
         .active_nodes
@@ -5260,7 +5264,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(output.dependencies, Set::from([7]));
+        assert_eq!(output.dependencies, Set::from_iter([7]));
     }
 
     #[cfg(feature = "xmldsig-sign")]

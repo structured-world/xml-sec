@@ -164,8 +164,8 @@ impl<'a> XmlIdIndex<'a> {
         document: &'a Document<'a>,
         registrations: &[IdAttributeRegistration],
     ) -> Self {
-        let mut nodes = Map::new();
-        let mut duplicates = Set::new();
+        let mut nodes = Map::default();
+        let mut duplicates = Set::default();
         for node in document.descendants().filter(Node::is_element) {
             // ID registration is local-name based: qualified profile attributes
             // such as wsu:Id and xml:id participate alongside unqualified Id.
