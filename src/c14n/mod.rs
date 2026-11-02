@@ -404,6 +404,7 @@ pub(crate) fn canonicalize_visible_to_writer_bounded<W: ByteSink + ?Sized>(
         &scratch::Native,
         None,
         None,
+        &mut (),
     )
     .map(|_| ())
 }
@@ -435,6 +436,7 @@ pub(crate) fn canonicalize_visible_to_writer_accounted<
         &scratch::Accounted(work),
         prefix_list,
         None,
+        &mut (),
     )
     .map(|_| ())
 }
@@ -465,6 +467,42 @@ pub(crate) fn canonicalize_visible_to_writer_in<
         scratch,
         prefix_list,
         None,
+        &mut (),
+    )
+    .map(|_| ())
+}
+
+/// [`canonicalize_visible_to_writer_in`] reporting the structure of the
+/// canonical form to `observer` as its octets reach `output`.
+#[cfg(feature = "xslt")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn canonicalize_visible_observed_in<
+    W: ByteSink + ?Sized,
+    S: scratch::Scratch,
+    D: DomStorage,
+    O: serialize::CanonicalObserver,
+>(
+    doc: &Document<'_, D>,
+    visibility: &dyn NodeVisibility<D>,
+    algo: &C14nAlgorithm,
+    max_output_bytes: usize,
+    xml_base_resolution: &xml_base::XmlBaseResolutionBudget,
+    output: &mut W,
+    scratch: &S,
+    observer: &mut O,
+) -> Result<(), C14nError> {
+    canonicalize_writer_with_scratch(
+        doc,
+        Some(visibility),
+        algo,
+        max_output_bytes,
+        xml_base_resolution,
+        output,
+        0,
+        scratch,
+        None,
+        None,
+        observer,
     )
     .map(|_| ())
 }
@@ -499,13 +537,19 @@ pub(crate) fn canonicalize_buffer_in<S: scratch::Scratch, D: DomStorage>(
         scratch,
         prefix_list,
         tracked,
+        &mut (),
     )?;
     Ok((buffer.0, tracked_position))
 }
 
 #[cfg(feature = "xmldsig")]
 #[allow(clippy::too_many_arguments)]
-fn canonicalize_writer_with_scratch<W: ByteSink + ?Sized, S: scratch::Scratch, D: DomStorage>(
+fn canonicalize_writer_with_scratch<
+    W: ByteSink + ?Sized,
+    S: scratch::Scratch,
+    D: DomStorage,
+    O: serialize::CanonicalObserver,
+>(
     doc: &Document<'_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
@@ -516,6 +560,7 @@ fn canonicalize_writer_with_scratch<W: ByteSink + ?Sized, S: scratch::Scratch, D
     scratch: &S,
     prefix_list: Option<&str>,
     tracked: Option<NodeId>,
+    observer: &mut O,
 ) -> Result<Option<usize>, C14nError> {
     let inclusive = InclusiveNsRenderer;
     let exclusive = match prefix_list {
@@ -536,6 +581,7 @@ fn canonicalize_writer_with_scratch<W: ByteSink + ?Sized, S: scratch::Scratch, D
         output,
         initial_offset,
         scratch,
+        observer,
     )?;
     Ok(position)
 }

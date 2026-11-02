@@ -54,7 +54,8 @@ pub use compiler::{Compiler, Stylesheet, UnboundPrefixLists};
 pub use environment::{Clock, ExecutionEnvironment, FixedClock, SystemClock};
 pub use error::{Error, ErrorKind, Result};
 pub use model::{
-    Attribute, Document, ExpandedName, Namespace, Node, NodeId, NodeKind, NodeReference,
+    Attribute, Document, DocumentBuilder, ExpandedName, Namespace, Node, NodeId, NodeKind,
+    NodeReference,
 };
 pub use resolver::{
     AccessDenialReason, NoResolver, ResolvePurpose, ResolveRequest, ResolvedResource, Resolver,
