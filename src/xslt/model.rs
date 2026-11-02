@@ -3258,13 +3258,16 @@ fn push_semantic_element<'v>(
     }
     let mut raw_attributes = Vec::new();
     for (bound, name, value) in attributes {
-        let mut lexical = String::new();
+        // Admit the name and value copies before either allocates, each at
+        // its exact size, so no growth outruns the admission.
+        let lexical_bytes = name.len() + bound.map_or(0, |bound| bound.len() + 1);
+        meter.charge_owned(lexical_bytes + value.len())?;
+        let mut lexical = String::with_capacity(lexical_bytes);
         if let Some(bound) = bound {
             lexical.push_str(bound);
             lexical.push(':');
         }
         lexical.push_str(name);
-        meter.charge_owned(lexical.len() + value.len())?;
         if raw_attributes.len() == raw_attributes.capacity() {
             let additional = raw_attributes.capacity().max(4);
             reserve_charged(&mut raw_attributes, additional, meter)?;
