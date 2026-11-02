@@ -289,6 +289,8 @@ and a separate writable output/build directory; select it through `CARGO_TARGET_
 and `XMLSEC1_PREFIX`. Resolve `Cargo.lock` before mounting source read-only
 (`cargo generate-lockfile`). The competitor checkout must be clean and match the pinned
 revision. Container results describe that container's architecture, not the host.
-Both Rust binaries are built with the same stable compiler, recorded in `build.json`.
+Both Rust binaries are built with the same stable compiler, recorded in `build.json`,
+and linked by mold through the image's per-target `CARGO_TARGET_*_RUSTFLAGS`; a
+`RUSTFLAGS` passed into the container replaces them.
 Keep build artifacts on a Linux-native volume when running Docker on macOS; only
 source and exported reports need bind mounts.
