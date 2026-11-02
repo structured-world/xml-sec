@@ -1799,6 +1799,12 @@ pub(crate) trait TransformTerminal<S: TransformScratch> {
     /// chain are empty.
     fn settle(&mut self, _independent: bool) {}
 
+    /// The output of a tracked chain already known to depend on a tracked
+    /// node, if this terminal needs nothing more from the chain then.
+    fn dependent_output(&self) -> Option<Self::Output> {
+        None
+    }
+
     fn finish<D: DomStorage>(
         self,
         data: ExecutionData<'_, S, D>,
@@ -1874,6 +1880,11 @@ impl TransformTerminal<Native> for AnalysisTerminal<'_> {
         if !independent {
             self.0 = None;
         }
+    }
+
+    // A dependent output is discarded, so the chain stops where that is known.
+    fn dependent_output(&self) -> Option<Self::Output> {
+        Some(None)
     }
 
     fn finish<D: DomStorage>(
@@ -2626,6 +2637,41 @@ fn apply_chain_step<'e, 'd, S: TransformScratch, D: DomStorage, I: Instruction>(
     Ok(ChainStep::untracked(enveloped_signature, data))
 }
 
+/// The terminal's output for a chain that already depends on a tracked node
+/// before `transform` runs, when the terminal needs nothing more then.
+///
+/// An octet-consuming step reads the content of all of its input, so a tracked
+/// node already there makes the chain dependent whatever the step produces, as
+/// does a dependency that lost its provenance. A dependent output is discarded,
+/// so the step need not run on a value not yet filled, where it could fail
+/// although the digest pass after the fill succeeds.
+fn known_dependent<S: TransformScratch, D: DomStorage, I: Instruction, F: TransformTerminal<S>>(
+    transform: &I,
+    data: &ExecutionData<'_, S, D>,
+    tracking: &mut Option<DependencyTracking>,
+    finalize: &F,
+) -> Result<Option<F::Output>, TransformError> {
+    let (Some(tracking), Some(output)) = (tracking.as_mut(), finalize.dependent_output()) else {
+        return Ok(None);
+    };
+    let reads_content = !transform_requires_node_set(transform);
+    if reads_content && let Some(nodes) = data.nodes() {
+        retain_visible_dependencies(nodes, tracking)?;
+        tracking.dormant_indexes.clear();
+    }
+    let reads_tracked = reads_content
+        && (!tracking.active_nodes.is_empty()
+            || tracking
+                .canonical_positions
+                .as_ref()
+                .is_some_and(|positions| !positions.is_empty()));
+    if !reads_tracked && tracking.opaque_dependencies.is_empty() {
+        return Ok(None);
+    }
+    tracking.discard_provenance();
+    Ok(Some(output))
+}
+
 /// Whether a chain's settled dependencies are empty; an untracked chain has none.
 fn settled_independent(tracking: Option<&DependencyTracking>) -> bool {
     tracking.is_none_or(|tracking| {
@@ -2772,6 +2818,9 @@ where
         }
         finalize.settle(settled_independent(dependency_tracking.as_ref()));
         let output = finalize.finish_base64(data, context.budget, context.scratch)?;
+        return Ok(chain_output(output, &mut dependency_tracking));
+    }
+    if let Some(output) = known_dependent(transform, &data, &mut dependency_tracking, &finalize)? {
         return Ok(chain_output(output, &mut dependency_tracking));
     }
     // The step consumes its input, so a decoded or canonicalized predecessor is

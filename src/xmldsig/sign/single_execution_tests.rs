@@ -7,6 +7,9 @@ const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
 const SHA256: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
 const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
 const BASE64: &str = "http://www.w3.org/2000/09/xmldsig#base64";
+const ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
+#[cfg(feature = "xslt")]
+const XSLT: &str = "http://www.w3.org/TR/1999/REC-xslt-19991116";
 
 struct FixedKey;
 
@@ -270,4 +273,56 @@ fn a_reference_with_a_value_reading_xpath_after_octets_executes_again() {
     let (signed, chains) = sign_counting(&xml, policy.clone());
     assert_eq!(chains, 2);
     assert_digests_match_final_document(&signed, &policy);
+}
+
+#[cfg(feature = "xslt")]
+#[test]
+fn a_stylesheet_over_an_unfilled_value_runs_once_the_value_is_filled() {
+    // A SignedInfo Reference transforms a Manifest whose DigestValue is filled
+    // first, with a stylesheet that refuses an empty one. Its input already
+    // holds that value, so analysis knows the dependency without running the
+    // stylesheet; the digest pass runs it after the value is filled.
+    let stylesheet = r#"<xsl:stylesheet xmlns:xsl="http://www.w3.org/1999/XSL/Transform" version="1.0"><xsl:template match="/"><xsl:if test="not(string(//*[local-name()='DigestValue']))"><xsl:message terminate="yes">unfilled</xsl:message></xsl:if><out><xsl:value-of select="//*[local-name()='DigestValue']"/></out></xsl:template></xsl:stylesheet>"#;
+    let manifest = format!(
+        r#"<ds:Object><ds:Manifest Id="manifest">{}</ds:Manifest></ds:Object>"#,
+        reference("#payload", &transform(EXCLUSIVE, "")),
+    );
+    let xml = template(
+        &reference("#manifest", &transform(XSLT, stylesheet)),
+        &manifest,
+    );
+    let policy = crate::policy::SigningPolicy {
+        manifest_processing: crate::policy::ManifestProcessing::Process,
+        ..crate::policy::SigningPolicy::default()
+    };
+    let signed = SignContext::new(&FixedKey)
+        .policy(policy.clone())
+        .sign_template(&xml)
+        .expect("the stylesheet runs on the filled Manifest value");
+    assert_digests_match_final_document(&signed, &policy);
+}
+
+#[test]
+fn a_writer_key_info_that_drops_a_referenced_id_is_refused() {
+    // The writer's KeyName replaces the template's, which carries the ID a
+    // Reference names. The signed document no longer holds that target, so
+    // signing fails instead of keeping a digest taken before the splice,
+    // whether the splice is committed (another Reference reads KeyInfo) or
+    // deferred to the final mutation.
+    let dropped = reference(
+        "#old",
+        &[transform(ENVELOPED, ""), transform(EXCLUSIVE, "")].concat(),
+    );
+    let writer =
+        Writer("<ds:KeyName xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">signer</ds:KeyName>");
+    for references in [[dropped.clone(), reference("#ki", "")].concat(), dropped] {
+        let xml = template(&references, "").replace(
+            "<ds:SignatureValue/>",
+            r#"<ds:SignatureValue/><ds:KeyInfo Id="ki"><ds:KeyName Id="old">template</ds:KeyName></ds:KeyInfo>"#,
+        );
+        let result = SignContext::new(&FixedKey)
+            .key_info_writer(&writer)
+            .sign_template(&xml);
+        assert!(result.is_err(), "{references}: {result:?}");
+    }
 }
