@@ -310,6 +310,34 @@ fn tape_growth_admits_the_old_and_the_new_allocation_together() {
 }
 
 #[test]
+fn a_document_over_both_limits_is_refused_for_its_size_first() {
+    // The document's size precedes the tape's workspace, as the octets'
+    // size precedes their decoding: a full tape stops the recording, not the
+    // walk that measures the canonical form.
+    let xml = format!("<r>{}</r>", "&amp;".repeat(100_000));
+    let document = Dom::parse(&xml).expect("source parses");
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy {
+        max_xml_document_bytes: 1000,
+        ..ResourcePolicy::default()
+    });
+    let refused = super::record(
+        (&document, &Everything),
+        settings(&budget),
+        &budget,
+        &Native,
+        (64 * 1024, 0),
+    );
+    match refused {
+        Err(TransformError::Policy(PolicyViolation::ResourceLimit {
+            resource: resource_name::XML_DOCUMENT,
+            actual,
+            ..
+        })) => assert_eq!(actual, "<r></r>".len() + 100_000 * "&amp;".len()),
+        other => panic!("expected a document-size refusal: {:?}", other.err()),
+    }
+}
+
+#[test]
 fn the_tape_is_refused_before_it_grows_past_its_limit() {
     // One text node of escaped characters records one event each. Its tape
     // must be refused before it grows past the workspace, not after the

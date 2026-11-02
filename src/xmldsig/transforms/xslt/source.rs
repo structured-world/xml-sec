@@ -8,9 +8,9 @@
 //! borrowed from the document. The octets are only counted, and the XML input
 //! policy limits of that parse apply to the same counts. After the stylesheet
 //! is compiled the tape is replayed into the engine's builder, which applies
-//! the parse's own budgets. Refusals keep the parse's precedence:
-//! canonicalization, the document size, the first structural limit, the
-//! stylesheet, then the engine.
+//! the parse's own budgets. Refusals keep the precedence of octet input:
+//! canonicalization, the document size, the tape's workspace (where decoding
+//! would stand), the first structural limit, the stylesheet, then the engine.
 
 use core::ops::Range;
 use std::cell::Cell;
@@ -178,11 +178,8 @@ pub(super) fn record<'n, S: TransformScratch, D: DomStorage>(
         budget.xml_base_resolution(),
         &mut CanonicalCount(&counters),
         scratch,
-        &mut recorder,
+        &mut Settled(&mut recorder),
     );
-    if let Some(needed) = recorder.exceeded {
-        return Err(budget.xslt.workspace_error(held.saturating_add(needed)));
-    }
     walked.map_err(|error| super::super::map_c14n_limit_error(error, &budget.c14n))?;
     let written = counters.0.get();
     budget.c14n.charge(written)?;
@@ -196,6 +193,11 @@ pub(super) fn record<'n, S: TransformScratch, D: DomStorage>(
             },
             settings,
         ));
+    }
+    // A tape over the workspace is refused after the size, as decoding octets
+    // into the workspace follows their size check.
+    if let Some(needed) = recorder.exceeded {
+        return Err(budget.xslt.workspace_error(held.saturating_add(needed)));
     }
     if let Some(error) = recorder.refusal {
         return Err(error);
@@ -313,24 +315,28 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
         }
     }
 
-    /// Whether a construct still matters: nothing does after a refusal or of
-    /// a document already larger than a parse would read.
+    /// Whether a construct still matters: nothing does after a refusal, once
+    /// the tape is full, or of a document already larger than a parse would
+    /// read.
     fn observing(&self) -> bool {
-        self.refusal.is_none() && self.written.get() <= self.settings.max_bytes
+        self.refusal.is_none()
+            && self.exceeded.is_none()
+            && self.written.get() <= self.settings.max_bytes
     }
 
     fn line(&self) -> usize {
         self.line_breaks.get() + 1
     }
 
-    /// Admit `bytes` more tape, or stop the walk.
+    /// Admit `bytes` more tape, or end the recording.
     fn admit(&mut self, bytes: usize) -> Result<(), C14nError> {
         // Each term is the size of live or requested storage, far below the
         // address space.
         let needed = self.tape.held_bytes() + bytes;
         if needed > self.limit {
             self.exceeded = Some(needed);
-            // The refusal is reported as the workspace's once the walk ends.
+            // Unwinds the construct being recorded; `Settled` ends it there
+            // and the walk goes on, measuring the document unrecorded.
             return Err(C14nError::OutputRefused);
         }
         Ok(())
@@ -640,5 +646,64 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
             }
         }
         Ok(())
+    }
+}
+
+/// A [`Recorder`] whose full tape ends the recording but not the canonical
+/// walk, which still measures the document and may still fail.
+struct Settled<'r, 'n, 'c, S: Scratch>(&'r mut Recorder<'n, 'c, S>);
+
+impl<S: Scratch> Settled<'_, '_, '_, S> {
+    fn settle(&self, recorded: Result<(), C14nError>) -> Result<(), C14nError> {
+        match recorded {
+            Err(C14nError::OutputRefused) if self.0.exceeded.is_some() => Ok(()),
+            recorded => recorded,
+        }
+    }
+}
+
+impl<'n, S: Scratch> CanonicalObserver<'n> for Settled<'_, 'n, '_, S> {
+    fn start_tag<'v>(
+        &mut self,
+        prefix: &'n str,
+        local: &'n str,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
+    ) -> Result<(), C14nError> {
+        let recorded = self.0.start_tag(prefix, local, namespaces, attributes);
+        self.settle(recorded)
+    }
+
+    fn end_tag(&mut self) -> Result<(), C14nError> {
+        let recorded = self.0.end_tag();
+        self.settle(recorded)
+    }
+
+    fn text(&mut self, text: &'n str) -> Result<(), C14nError> {
+        let recorded = self.0.text(text);
+        self.settle(recorded)
+    }
+
+    fn comment(&mut self, text: &'n str) -> Result<(), C14nError> {
+        let recorded = self.0.comment(text);
+        self.settle(recorded)
+    }
+
+    fn processing_instruction(
+        &mut self,
+        target: &'n str,
+        value: Option<&'n str>,
+    ) -> Result<(), C14nError> {
+        let recorded = self.0.processing_instruction(target, value);
+        self.settle(recorded)
+    }
+
+    fn omitted_axes(
+        &mut self,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
+    ) -> Result<(), C14nError> {
+        let recorded = self.0.omitted_axes(namespaces, attributes);
+        self.settle(recorded)
     }
 }
