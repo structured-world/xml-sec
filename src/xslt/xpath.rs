@@ -1178,19 +1178,18 @@ impl Evaluator {
     /// The retained path of a key entry, its bytes charged before it exists.
     fn key_entry_path(&self, node: &SourceNode, meter: &mut Meter) -> Result<(NodePath, usize)> {
         let stale = || Error::Dynamic("key node has no document path".into());
-        let bytes = self.maps.path_bytes(&self.source, node).ok_or_else(stale)?;
-        let words = self
+        let len = self
             .maps
             .path_len(&self.source, source_node_owner(node))
             .ok_or_else(stale)?;
-        meter.charge(BudgetKind::XPathOperations, words)?;
+        let bytes = NodeMaps::path_bytes_of(&self.source, node, len).ok_or_else(stale)?;
+        meter.charge(BudgetKind::XPathOperations, len)?;
         meter.charge(BudgetKind::OwnedBytes, bytes)?;
-        match self.maps.path(&self.source, node) {
-            Some(path) => Ok((path, bytes)),
-            None => {
-                meter.release_owned_bytes(bytes);
-                Err(stale())
-            }
+        if let Some(path) = self.maps.path_of(&self.source, node, len) {
+            Ok((path, bytes))
+        } else {
+            meter.release_owned_bytes(bytes);
+            Err(stale())
         }
     }
 
@@ -6506,12 +6505,13 @@ impl NodeMaps {
         Some(len)
     }
 
-    fn ordinary_path(&self, source: &Document, id: NodeId) -> Option<Vec<usize>> {
-        let len = self.path_len(source, id)?;
-        // Allocated at its exact length, which `path_bytes` admits beforehand.
+    /// The ordinary path of `id`, whose [`Self::path_len`] the caller already
+    /// read to admit its allocation.
+    fn ordinary_path(&self, source: &Document, id: NodeId, len: usize) -> Option<Vec<usize>> {
+        // Allocated at its exact length, which the caller admits beforehand.
         let mut path = vec![0; len];
         let mut current = Some(id);
-        for slot in path[1..].iter_mut().rev() {
+        for slot in path.get_mut(1..)?.iter_mut().rev() {
             let node = current?;
             *slot = *self.positions.get(node.0)?;
             current = source.node(node)?.parent;
@@ -6521,9 +6521,13 @@ impl NodeMaps {
 
     /// Heap bytes [`Self::path`] allocates for `node`, known before it does.
     fn path_bytes(&self, source: &Document, node: &SourceNode) -> Option<usize> {
-        let words = self
-            .path_len(source, source_node_owner(node))?
-            .checked_mul(std::mem::size_of::<usize>())?;
+        let len = self.path_len(source, source_node_owner(node))?;
+        Self::path_bytes_of(source, node, len)
+    }
+
+    /// [`Self::path_bytes`] for an owner whose path length is already known.
+    fn path_bytes_of(source: &Document, node: &SourceNode, len: usize) -> Option<usize> {
+        let words = len.checked_mul(std::mem::size_of::<usize>())?;
         let owner = &source.node(source_node_owner(node))?.kind;
         let strings = match (node, owner) {
             (SourceNode::Node(_), _) => 0,
@@ -6541,7 +6545,13 @@ impl NodeMaps {
     }
 
     fn path(&self, source: &Document, node: &SourceNode) -> Option<NodePath> {
-        let path = self.ordinary_path(source, source_node_owner(node))?;
+        let len = self.path_len(source, source_node_owner(node))?;
+        self.path_of(source, node, len)
+    }
+
+    /// [`Self::path`] for an owner whose path length is already known.
+    fn path_of(&self, source: &Document, node: &SourceNode, len: usize) -> Option<NodePath> {
+        let path = self.ordinary_path(source, source_node_owner(node), len)?;
         let owner = &source.node(source_node_owner(node))?.kind;
         Some(match (node, owner) {
             (SourceNode::Node(_), _) => NodePath::Ordinary(path),
@@ -6741,7 +6751,7 @@ impl NodeMaps {
     }
 }
 
-/// The projection an XPath evaluation runs over, lent to the functions that
+/// The projection an `XPath` evaluation runs over, lent to the functions that
 /// name evaluator nodes by path for the duration of that evaluation.
 #[derive(Clone, Copy)]
 struct ProjectedPaths<'a> {
@@ -6821,7 +6831,7 @@ impl ProjectedPaths<'_> {
             PathOwner::Documents => vec![0],
             PathOwner::Projected(id) => self
                 .maps
-                .ordinary_path(self.source, id)
+                .ordinary_path(self.source, id, words)
                 .ok_or_else(outside_projection)?,
         };
         Ok(match node {
@@ -6939,15 +6949,14 @@ fn extend_node_base_uri_entries(
         if !is_logical_root && base_uri == inherited {
             continue;
         }
-        let key = maps
-            .ordinary_path(source, id)
-            .ok_or_else(|| Error::Dynamic(format!("stale semantic node {id:?}")))?;
+        let stale = || Error::Dynamic(format!("stale semantic node {id:?}"));
+        let len = maps.path_len(source, id).ok_or_else(stale)?;
         meter.charge(
             BudgetKind::OwnedBytes,
-            key.len()
-                .saturating_mul(std::mem::size_of::<usize>())
+            len.saturating_mul(std::mem::size_of::<usize>())
                 .saturating_add(base_uri.map_or(0, str::len)),
         )?;
+        let key = maps.ordinary_path(source, id, len).ok_or_else(stale)?;
         reserve_retained_hash_map_slot(index, meter, index_bytes)?;
         index.insert(key, base_uri.map(str::to_owned));
     }
