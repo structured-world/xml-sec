@@ -15480,3 +15480,47 @@ fn imported_stylesheet_document_roots_preserve_module_order() {
         .expect("each module resolves its own document root");
     assert_eq!(result.serialized.bytes, b"first|second");
 }
+
+#[test]
+fn node_identity_functions_cost_linear_work_in_a_wide_document() {
+    // generate-id(), key() and the key index name each child of one wide
+    // parent by its path. Finding a child's position by scanning the siblings
+    // before it would make doubling the children quadruple the XPath work;
+    // reading the projected position keeps it proportional.
+    let stylesheet = compile(
+        r#"<xsl:stylesheet version="1.0" xmlns:xsl="http://www.w3.org/1999/XSL/Transform">
+             <xsl:output method="text"/>
+             <xsl:key name="k" match="c" use="@n"/>
+             <xsl:template match="/"><xsl:for-each select="r/c"><xsl:value-of select="generate-id(.)"/><xsl:value-of select="count(key('k', @n))"/></xsl:for-each></xsl:template>
+           </xsl:stylesheet>"#,
+    );
+    let work = |children: usize| {
+        let xml = format!(
+            "<r>{}</r>",
+            (0..children).fold(String::new(), |mut xml, index| {
+                write!(xml, "<c n='{index}'/>").expect("writing to a String cannot fail");
+                xml
+            })
+        );
+        let source = Document::parse(&xml, None).expect("source parses");
+        let reported = stylesheet.execute_reported(
+            &source,
+            &Parameters::new(),
+            ExecutionEnvironment::new(Arc::new(NoResolver)),
+            ExecutionOptions {
+                budget: ExecutionBudget {
+                    template_applications: 1_000_000,
+                    key_entries: 1_000_000,
+                    result_nodes: 1_000_000,
+                    ..execution_budget(xml.len())
+                },
+                initial_mode: None,
+                initial_template: None,
+            },
+        );
+        reported.outcome.expect("transform succeeds");
+        reported.usage.xpath_operations
+    };
+    let (narrow, wide) = (work(1024), work(2048));
+    assert!(wide < narrow * 3, "{narrow} -> {wide}");
+}
