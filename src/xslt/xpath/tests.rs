@@ -546,7 +546,8 @@ fn auxiliary_document_indexes_charge_empty_document_slots() {
     .expect("meter initializes");
     let before = meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0;
     let mut ids = Vec::new();
-    let maps = NodeMaps::new(&source, &mut meter).expect("node maps build");
+    let maps =
+        NodeMaps::new(&source, ProjectedSlots::default(), &mut meter).expect("node maps build");
     extend_id_index(&source, &maps, 0, &mut ids, &mut meter).expect("empty ID index builds");
     let mut entities = Vec::new();
     append_unparsed_entity_document(&source, source.root(), &mut entities, &mut meter)
@@ -564,11 +565,10 @@ fn auxiliary_document_indexes_charge_empty_document_slots() {
 }
 
 #[test]
-fn node_maps_release_semantic_path_workspace_after_projection() {
-    // Semantic paths are only construction workspace. Once the permanent indexes own their
-    // path payloads, the workspace reservation must be released rather than retained for the
-    // rest of the transformation. Hash-table backing storage already includes each inline
-    // `NodePath`; only its heap payload needs a separate charge.
+fn node_maps_retain_only_their_dense_tables() {
+    // The traversal stack is construction workspace, released with the build. What
+    // stays charged for the rest of the transformation is one word per table per
+    // node: stored paths would make the retained size grow with the document's depth.
     let source = Document::parse("<root><first><nested/></first><second/></root>", None)
         .expect("source parses");
     let mut meter = Meter::new(
@@ -593,25 +593,120 @@ fn node_maps_release_semantic_path_workspace_after_projection() {
     .expect("meter initializes");
     let before = meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0;
 
-    let maps = NodeMaps::new(&source, &mut meter).expect("node maps build");
+    let maps =
+        NodeMaps::new(&source, ProjectedSlots::default(), &mut meter).expect("node maps build");
 
-    let expected_retained = maps
-        .forward
-        .values()
-        .fold(0usize, |total, path| {
-            total.saturating_add(
-                path.owned_bytes()
-                    .saturating_sub(std::mem::size_of::<NodePath>())
-                    .saturating_mul(2),
-            )
-        })
-        .saturating_add(maps.forward_index_bytes)
-        .saturating_add(maps.reverse_index_bytes)
-        .saturating_add(maps.order_index_bytes);
+    let expected_retained = (maps.ranks.capacity() + maps.positions.capacity())
+        .saturating_mul(std::mem::size_of::<usize>());
     assert_eq!(
         meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0,
         before.saturating_add(expected_retained)
     );
+}
+
+#[test]
+fn node_paths_and_evaluator_nodes_map_back_to_their_semantic_node() {
+    // Paths, arena slots and document order all derive from the tree now, so
+    // every kind of node must survive the round trip, in every logical root.
+    let mut source = Document::parse(
+        "<a xmlns:p='urn:p' p:x='1' y='2'>text<!--c--><?pi d?><b z='3'/></a>",
+        None,
+    )
+    .expect("source parses");
+    let imported = Document::parse("<c q='4'/>", None).expect("import parses");
+    source.import(&imported);
+    let mut meter = Meter::new(
+        ExecutionBudget {
+            source_bytes: usize::MAX,
+            external_documents: 0,
+            recursion_depth: 8,
+            xpath_evaluations: 0,
+            xpath_operations: usize::MAX,
+            extension_operations: 0,
+            pattern_evaluations: 0,
+            template_applications: 0,
+            sort_comparisons: 0,
+            key_entries: 0,
+            result_nodes: 0,
+            serialized_bytes: 0,
+            messages: 0,
+            owned_bytes: usize::MAX,
+        },
+        0,
+    )
+    .expect("meter initializes");
+    let mut slots = ProjectedSlots::default();
+    let package =
+        project_semantic_document(&source, &mut slots, &mut meter).expect("source projects");
+    let maps = NodeMaps::new(&source, slots, &mut meter).expect("node maps build");
+    let root: nodeset::Node<'_> = package.as_document().root().into();
+    let mut references = Vec::new();
+    for (id, node) in source.nodes() {
+        references.push(SourceNode::Node(id));
+        if let NodeKind::Element {
+            attributes,
+            namespaces,
+            ..
+        } = &node.kind
+        {
+            for index in 0..attributes.len() {
+                references.push(SourceNode::Attribute { owner: id, index });
+            }
+            for index in 0..namespaces.len() {
+                references.push(SourceNode::Namespace { owner: id, index });
+            }
+        }
+    }
+    assert!(references.len() > 12);
+    for reference in &references {
+        let path = maps.path(&source, reference).expect("the node has a path");
+        assert_eq!(
+            NodeMaps::source_of_path(&source, &path, &mut meter)
+                .expect("mapping fits the budget")
+                .as_ref(),
+            Some(reference)
+        );
+        let projected = maps
+            .to_sxd(&source, package.as_document(), reference)
+            .expect("the node projects");
+        assert_eq!(
+            maps.source_of_sxd(&source, &projected, &mut meter)
+                .expect("mapping fits the budget")
+                .as_ref(),
+            Some(reference)
+        );
+    }
+    // The projection's own document root and container stand for no semantic node.
+    assert_eq!(
+        maps.source_of_sxd(&source, &root, &mut meter)
+            .expect("mapping fits the budget"),
+        None
+    );
+    let container = root.child_at(0).expect("projection container exists");
+    assert_eq!(
+        maps.source_of_sxd(&source, &container, &mut meter)
+            .expect("mapping fits the budget"),
+        None
+    );
+    for stale in [vec![0], vec![0, 9], vec![1, 0]] {
+        assert_eq!(
+            NodeMaps::source_of_path(&source, &NodePath::Ordinary(stale), &mut meter)
+                .expect("mapping fits the budget"),
+            None
+        );
+    }
+    let mut ordered = references.clone();
+    ordered.sort_by_key(|node| maps.order(&source, node));
+    let position = |wanted: &SourceNode| ordered.iter().position(|node| node == wanted);
+    let element = source.logical_roots()[0];
+    let first_child = source.node(element).expect("root").children[0];
+    let attribute = SourceNode::Attribute {
+        owner: first_child,
+        index: 0,
+    };
+    let text = SourceNode::Node(source.node(first_child).expect("element").children[0]);
+    assert!(position(&SourceNode::Node(first_child)) < position(&attribute));
+    assert!(position(&attribute) < position(&text));
 }
 
 #[test]
@@ -637,24 +732,14 @@ fn node_base_uri_index_charges_hash_backing_storage() {
         source.source_bytes(),
     )
     .expect("meter initializes");
-    let element = source
-        .nodes()
-        .find_map(|(id, node)| matches!(node.kind, NodeKind::Element { .. }).then_some(id))
-        .expect("document element exists");
-    let path = NodePath::Ordinary(vec![0, 0, 0]);
-    let node = SourceNode::Node(element);
+    let maps =
+        NodeMaps::new(&source, ProjectedSlots::default(), &mut meter).expect("node maps build");
     let mut index = HashMap::new();
     let mut index_bytes = 0;
     let before = meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0;
 
-    extend_node_base_uri_entries(
-        &source,
-        std::iter::once((&path, &node)),
-        &mut index,
-        &mut index_bytes,
-        &mut meter,
-    )
-    .expect("base URI index builds");
+    extend_node_base_uri_entries(&source, &maps, 0, &mut index, &mut index_bytes, &mut meter)
+        .expect("base URI index builds");
 
     let charged = meter.usage(BudgetKind::OwnedBytes).expect("valid kind").0 - before;
     assert_eq!(
@@ -1014,7 +1099,7 @@ fn xpointer_accepts_adjacent_pointer_parts() {
 #[test]
 fn small_nodeset_projection_checks_its_vector_capacity() {
     // XPath does not define resource ceilings. The engine's OwnedBytes contract must reject
-    // the second projection vector before allocation even on the <=64-node fast path.
+    // the second projection vector before allocation.
     let source_xml = format!("<root>{}</root>", "<item/>".repeat(32));
     let source = Document::parse(&source_xml, None).expect("source parses");
     let unlimited = || ExecutionBudget {
@@ -1034,9 +1119,10 @@ fn small_nodeset_projection_checks_its_vector_capacity() {
         owned_bytes: usize::MAX,
     };
     let mut setup_meter = Meter::new(unlimited(), 0).expect("setup meter initializes");
-    let package = project_semantic_document(&source, &mut setup_meter)
+    let mut slots = ProjectedSlots::default();
+    let package = project_semantic_document(&source, &mut slots, &mut setup_meter)
         .expect("source projects into the XPath DOM");
-    let maps = NodeMaps::new(&source, &mut setup_meter).expect("node maps build");
+    let maps = NodeMaps::new(&source, slots, &mut setup_meter).expect("node maps build");
     let document = package.as_document();
     let source_root = document.root().children()[0]
         .element()
@@ -1057,12 +1143,7 @@ fn small_nodeset_projection_checks_its_vector_capacity() {
     let mut meter = Meter::new(limits, 0).expect("empty source fits");
 
     assert!(matches!(
-        maps.project_value(
-            &source,
-            &document.root().into(),
-            SxdValue::Nodeset(selected),
-            &mut meter,
-        ),
+        maps.project_value(&source, SxdValue::Nodeset(selected), &mut meter),
         Err(Error::Budget {
             kind: BudgetKind::OwnedBytes,
             ..
@@ -3388,4 +3469,219 @@ fn uri_functions_reserve_xpath_coercions_before_empty_results() {
             .expect_err("URI coercion must cross the allocation gate");
         assert!(error.to_string().contains("allocation budget"));
     }
+}
+
+/// The projection of `source`, its node maps and the meter that paid for them.
+fn projected_maps(source: &Document) -> (sxd_document_no_unsafe::Package, NodeMaps, Meter) {
+    let mut meter = Meter::new(owned_byte_budget(usize::MAX), 0).expect("meter initializes");
+    let mut slots = ProjectedSlots::default();
+    let package =
+        project_semantic_document(source, &mut slots, &mut meter).expect("source projects");
+    let maps = NodeMaps::new(source, slots, &mut meter).expect("node maps build");
+    (package, maps, meter)
+}
+
+#[test]
+fn evaluator_attributes_map_back_without_scanning_their_siblings() {
+    // `@*` on an element with N attributes maps every selected attribute back
+    // to the semantic tree. A name search through the owner's attributes per
+    // result would cost N^2 comparisons for N units of metered XPath work.
+    let attributes = (0..512).fold(String::new(), |mut attributes, index| {
+        std::fmt::Write::write_fmt(&mut attributes, format_args!(" a{index}='{index}'"))
+            .expect("writing to a String cannot fail");
+        attributes
+    });
+    let source = Document::parse(&format!("<e{attributes}/>"), None).expect("source parses");
+    let (package, maps, mut meter) = projected_maps(&source);
+    let owner = source
+        .node(source.logical_roots()[0])
+        .expect("root")
+        .children[0];
+    take_attribute_scans();
+    for index in 0..512 {
+        let reference = SourceNode::Attribute { owner, index };
+        let projected = maps
+            .to_sxd(&source, package.as_document(), &reference)
+            .expect("the attribute projects");
+        assert_eq!(
+            maps.source_of_sxd(&source, &projected, &mut meter)
+                .expect("mapping fits the budget"),
+            Some(reference)
+        );
+    }
+    assert_eq!(take_attribute_scans(), 0);
+}
+
+#[test]
+fn semantic_attributes_reach_the_evaluator_without_a_search() {
+    // Binding a node-set of N attributes to a variable, keying them or
+    // evaluating in their context locates each one in the evaluator tree; a
+    // search through the owner's attributes per node would cost N^2.
+    let attributes = (0..512).fold(String::new(), |mut attributes, index| {
+        std::fmt::Write::write_fmt(&mut attributes, format_args!(" a{index}='{index}'"))
+            .expect("writing to a String cannot fail");
+        attributes
+    });
+    let source = Document::parse(&format!("<e{attributes}/>"), None).expect("source parses");
+    let (package, maps, mut meter) = projected_maps(&source);
+    let document = package.as_document();
+    let owner = source
+        .node(source.logical_roots()[0])
+        .expect("root")
+        .children[0];
+    take_attribute_scans();
+    for index in 0..512 {
+        let reference = SourceNode::Attribute { owner, index };
+        let projected = maps
+            .to_sxd(&source, document, &reference)
+            .expect("the attribute projects");
+        let nodeset::Node::Attribute(attribute) = &projected else {
+            panic!("an attribute projects to an attribute");
+        };
+        assert_eq!(attribute.name().get().local_part(), format!("a{index}"));
+        assert_eq!(
+            maps.source_of_sxd(&source, &projected, &mut meter)
+                .expect("mapping fits the budget"),
+            Some(reference)
+        );
+    }
+    assert_eq!(take_attribute_scans(), 0);
+}
+
+#[test]
+fn path_lookups_charge_the_attributes_they_search() {
+    // A stylesheet function receiving `/*/@*` replays each argument from its
+    // node path, which names the attribute: finding it searches the owner's
+    // attributes, and every comparison is XPath work the meter pays.
+    let attributes = (0..256).fold(String::new(), |mut attributes, index| {
+        std::fmt::Write::write_fmt(&mut attributes, format_args!(" a{index}='{index}'"))
+            .expect("writing to a String cannot fail");
+        attributes
+    });
+    let source = Document::parse(&format!("<e{attributes}/>"), None).expect("source parses");
+    let (_package, maps, mut meter) = projected_maps(&source);
+    let owner = source
+        .node(source.logical_roots()[0])
+        .expect("root")
+        .children[0];
+    let (before, _) = meter.usage(BudgetKind::XPathOperations).expect("usage");
+    take_attribute_scans();
+    for index in 0..256 {
+        let reference = SourceNode::Attribute { owner, index };
+        let path = maps
+            .path(&source, &reference)
+            .expect("the attribute has a path");
+        assert_eq!(
+            NodeMaps::source_of_path(&source, &path, &mut meter).expect("lookup fits the budget"),
+            Some(reference)
+        );
+    }
+    let scanned = take_attribute_scans();
+    let (after, _) = meter.usage(BudgetKind::XPathOperations).expect("usage");
+    assert!(scanned >= 256 * 257 / 2);
+    assert!(after - before >= scanned, "{} < {scanned}", after - before);
+}
+
+#[test]
+fn evaluator_namespaces_charge_the_declarations_they_search() {
+    // A namespace node has no arena slot, so mapping it back searches the
+    // owner's declarations; every comparison is XPath work the meter pays.
+    let declarations = (0..64).fold(String::new(), |mut declarations, index| {
+        std::fmt::Write::write_fmt(
+            &mut declarations,
+            format_args!(" xmlns:p{index}='urn:{index}'"),
+        )
+        .expect("writing to a String cannot fail");
+        declarations
+    });
+    let source = Document::parse(&format!("<e{declarations}/>"), None).expect("source parses");
+    let (package, maps, mut meter) = projected_maps(&source);
+    let owner = source
+        .node(source.logical_roots()[0])
+        .expect("root")
+        .children[0];
+    let NodeKind::Element { namespaces, .. } = &source.node(owner).expect("owner").kind else {
+        panic!("the owner is an element");
+    };
+    let (before, _) = meter.usage(BudgetKind::XPathOperations).expect("usage");
+    let mut searched = 0;
+    for index in 0..namespaces.len() {
+        let reference = SourceNode::Namespace { owner, index };
+        let Some(projected) = maps.to_sxd(&source, package.as_document(), &reference) else {
+            continue;
+        };
+        assert_eq!(
+            maps.source_of_sxd(&source, &projected, &mut meter)
+                .expect("mapping fits the budget"),
+            Some(reference)
+        );
+        searched += index + 1;
+    }
+    let (after, _) = meter.usage(BudgetKind::XPathOperations).expect("usage");
+    assert!(searched >= 64 * 65 / 2);
+    assert!(
+        after - before >= searched,
+        "{} < {searched}",
+        after - before
+    );
+}
+
+#[test]
+fn the_context_path_is_paid_for_while_an_expression_evaluates() {
+    // The evaluator keeps the context node's path for the whole evaluation, so
+    // a context 100 levels deeper needs at least 100 more path words of owned
+    // memory before the same expression succeeds.
+    let depth = 128;
+    let source_xml = format!("{}{}", "<e>".repeat(depth), "</e>".repeat(depth));
+    let source = Document::parse(&source_xml, None).expect("source parses");
+    let stylesheet = Document::parse("<stylesheet/>", None).expect("stylesheet parses");
+    let mut setup = Meter::new(owned_byte_budget(usize::MAX), 0).expect("setup meter");
+    let options = EvaluatorSourceOptions {
+        process_xinclude: false,
+        whitespace: Arc::from([]),
+        clock: None,
+    };
+    let prepared = prepare_evaluator_source(&source, &crate::NoResolver, &mut setup, &options)
+        .expect("source prepares");
+    let evaluator = Evaluator::new(
+        prepared,
+        &stylesheet,
+        None,
+        &[],
+        Arc::new(crate::NoResolver),
+        &mut setup,
+        options,
+    )
+    .expect("evaluator initializes");
+    let at_depth = |levels: usize| {
+        let mut node = evaluator.source.logical_roots()[0];
+        for _ in 0..levels {
+            node = evaluator.source.node(node).expect("node").children[0];
+        }
+        SourceNode::Node(node)
+    };
+    let expression = Expression::generated("count(.)", Vec::new());
+    let variables = HashMap::<ExpandedName, Value>::new();
+    let least_owned_bytes = |node: &SourceNode| {
+        let (mut low, mut high) = (0, 1 << 20);
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let mut meter = Meter::new(owned_byte_budget(middle), 0).expect("meter");
+            if evaluator
+                .evaluate_core(&expression, node, 1, 1, &variables, &mut meter, None)
+                .is_ok()
+            {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        low
+    };
+    let shallow = least_owned_bytes(&at_depth(10));
+    let deep = least_owned_bytes(&at_depth(110));
+    assert!(
+        deep >= shallow + 100 * std::mem::size_of::<usize>(),
+        "{deep} < {shallow} + 100 words"
+    );
 }

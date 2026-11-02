@@ -24,7 +24,8 @@ use super::lexical::{
 use super::serializer::{serialize, serialize_fragment};
 use super::xpath::{
     CustomCallSession, EXSLT_COMMON_NS, Evaluator, EvaluatorSourceOptions, PreparedEvaluatorSource,
-    SourceNode, XPathValue, parse_xpath_number, prepare_evaluator_source, xpath_number,
+    SourceNode, XPathValue, parse_xpath_number, prepare_evaluator_source,
+    prepare_owned_evaluator_source, xpath_number,
 };
 use super::{
     Attribute, BudgetKind, Document, Error, ExecutionBudget, ExecutionEnvironment, ExecutionUsage,
@@ -204,7 +205,39 @@ impl Stylesheet {
         environment: ExecutionEnvironment<R>,
         options: impl std::borrow::Borrow<ExecutionOptions>,
     ) -> Reported<TransformResult, ExecutionUsage> {
-        let options = options.borrow();
+        self.run_reported(
+            Cow::Borrowed(source),
+            parameters,
+            environment,
+            options.borrow(),
+        )
+    }
+
+    /// [`Self::execute_reported`] for a caller that has no further use for `source`:
+    /// the execution takes the document instead of paying for its own copy.
+    #[must_use]
+    pub fn execute_owned_reported<R: Resolver + 'static>(
+        &self,
+        source: Document,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: impl std::borrow::Borrow<ExecutionOptions>,
+    ) -> Reported<TransformResult, ExecutionUsage> {
+        self.run_reported(
+            Cow::Owned(source),
+            parameters,
+            environment,
+            options.borrow(),
+        )
+    }
+
+    fn run_reported<R: Resolver + 'static>(
+        &self,
+        source: Cow<'_, Document>,
+        parameters: &Parameters,
+        environment: ExecutionEnvironment<R>,
+        options: &ExecutionOptions,
+    ) -> Reported<TransformResult, ExecutionUsage> {
         let Reported { outcome, usage } =
             self.start_execution(source, parameters, environment, options);
         let mut state = match outcome {
@@ -231,7 +264,7 @@ impl Stylesheet {
 
     fn start_execution<R: Resolver + 'static>(
         &self,
-        source: &Document,
+        source: Cow<'_, Document>,
         parameters: &Parameters,
         environment: ExecutionEnvironment<R>,
         options: &ExecutionOptions,
@@ -280,7 +313,7 @@ impl Stylesheet {
 
     fn prepare_execution<'s, R: Resolver + 'static>(
         &'s self,
-        source: &Document,
+        source: Cow<'_, Document>,
         parameters: &Parameters,
         environment: &ExecutionEnvironment<R>,
         meter: &mut Meter,
@@ -305,7 +338,7 @@ impl Stylesheet {
                 .get(name)
                 .is_some_and(|global| global.is_parameter)
             {
-                validate_parameter_value(value, source)?;
+                validate_parameter_value(value, &source)?;
             }
         }
         let source_options = EvaluatorSourceOptions {
@@ -313,12 +346,15 @@ impl Stylesheet {
             whitespace: Arc::clone(&self.whitespace),
             clock: environment.clock.as_ref().map(Arc::clone),
         };
-        let mut prepared = prepare_evaluator_source(
-            source,
-            environment.resolver.as_ref(),
-            meter,
-            &source_options,
-        )?;
+        let resolver = environment.resolver.as_ref();
+        let mut prepared = match source {
+            Cow::Borrowed(source) => {
+                prepare_evaluator_source(source, resolver, meter, &source_options)
+            }
+            Cow::Owned(source) => {
+                prepare_owned_evaluator_source(source, resolver, meter, &source_options)
+            }
+        }?;
         let prepared_parameters = PreparedParameters {
             effective_globals,
             source_remap: SourceParameterRemap {
@@ -388,7 +424,7 @@ impl Stylesheet {
     ) -> Result<MeasuredTree<'_>> {
         let options = options.borrow();
         let mut state = self
-            .start_execution(source, parameters, environment, options)
+            .start_execution(Cow::Borrowed(source), parameters, environment, options)
             .outcome?;
         state.run_tree(options)?;
         Ok(MeasuredTree {

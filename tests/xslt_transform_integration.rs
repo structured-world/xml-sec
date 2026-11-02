@@ -1,5 +1,6 @@
 //! `XMLDSig` XSLT transform through the public signing and verification API.
 
+use std::fmt::Write as _;
 use std::fs;
 
 #[path = "support/cryptographic.rs"]
@@ -262,6 +263,32 @@ fn node_set_input_is_canonicalized_and_terminal_output_is_digested() {
     assert_eq!(
         verified_pre_digest(&signed),
         [b"<?xml version=\"1.0\"?>\n<values><v>a</v><v>b</v></values>\n".to_vec()]
+    );
+}
+
+#[test]
+fn a_document_of_16384_items_signs_and_verifies_under_the_default_policy() {
+    // Workspace and work stay linear in the source with a small constant: per-node
+    // path tables and a sibling scan per selected node refused this document.
+    let mut items = String::new();
+    let mut values = String::new();
+    for index in 0..16_384 {
+        write!(items, r#"<Item n="{index}">value</Item>"#).expect("writing to a String");
+        write!(values, r#"<v n="{index}">value</v>"#).expect("writing to a String");
+    }
+    let document = format!(r#"<Catalog><List ID="list">{items}</List></Catalog>"#);
+    let reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
+        .uri("#list")
+        .transform(Transform::Xslt(stylesheet(concat!(
+            r#"<xsl:output method="xml" omit-xml-declaration="yes"/>"#,
+            r#"<xsl:template match="/"><out><xsl:for-each select="//Item">"#,
+            r#"<v n="{@n}"><xsl:value-of select="."/></v>"#,
+            r#"</xsl:for-each></out></xsl:template>"#
+        ))));
+    let signed = sign(&document, &builder(reference)).expect("the document must sign");
+    assert_eq!(
+        verified_pre_digest(&signed),
+        [format!("<out>{values}</out>\n").into_bytes()]
     );
 }
 

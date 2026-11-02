@@ -32,6 +32,19 @@ macro_rules! wrapper(
     )
 );
 
+// The node in an arena slot, the inverse of the slot an `identity_key` reports.
+macro_rules! at_slot(
+    ($name:ident, $arena:ident, $wrap:ident, $node:ident) => (
+        #[doc = concat!("The ", stringify!($node), " in arena `slot`, if the arena holds one there.")]
+        #[doc(hidden)]
+        #[must_use]
+        pub fn $name(self, slot: usize) -> Option<$node<'d>> {
+            (slot < self.storage.$arena.borrow().len())
+                .then(|| self.$wrap(raw::Index::from_identity_index(slot)))
+        }
+    )
+);
+
 impl<'d> Document<'d> {
     wrapper!(wrap_root, Root, raw::Root);
     wrapper!(wrap_element, Element, raw::Element);
@@ -117,6 +130,16 @@ impl<'d> Document<'d> {
     ) -> ProcessingInstruction<'d> {
         self.wrap_pi(self.storage.create_processing_instruction(target, value))
     }
+
+    at_slot!(element_at_slot, elements, wrap_element, Element);
+    at_slot!(text_at_slot, texts, wrap_text, Text);
+    at_slot!(comment_at_slot, comments, wrap_comment, Comment);
+    at_slot!(
+        processing_instruction_at_slot,
+        processing_instructions,
+        wrap_pi,
+        ProcessingInstruction
+    );
 }
 
 impl<'d> PartialEq for Document<'d> {

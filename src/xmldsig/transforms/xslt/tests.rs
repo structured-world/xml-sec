@@ -288,8 +288,22 @@ fn implicit_c14n_input_stays_in_the_xslt_workspace() {
     let scratch = crate::c14n::scratch::Accounted(&memory);
     let nodes = crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
         .expect("accounted conversion projection");
-    let budget = budget(admitted);
     let parameter = super::XsltParameter::Stylesheet(&sheet);
+    // The least workspace the conversion itself runs in, if the engine's minimum is not enough.
+    let (mut refused, mut converts) = (admitted - 1, 1 << 22);
+    while converts - refused > 1 {
+        let middle = refused + (converts - refused) / 2;
+        let attempt = budget(middle);
+        if super::canonicalize_input(parameter, &document, &nodes.projection, &attempt, &scratch)
+            .is_ok()
+        {
+            converts = middle;
+        } else {
+            refused = middle;
+        }
+    }
+    assert!(converts < admitted + xml.len());
+    let budget = budget(converts);
     let collected =
         super::canonicalize_input(parameter, &document, &nodes.projection, &budget, &scratch)
             .expect("conversion alone fits");
@@ -1222,8 +1236,8 @@ fn the_parsed_input_is_charged_to_the_workspace_once() {
     let allowance = super::Allowance::new(&ResourcePolicy::default());
     let executes = |owned: usize| {
         compiled
-            .execute_with_environment(
-                &tree,
+            .execute_owned_reported(
+                tree.clone(),
                 &Parameters::new(),
                 ExecutionEnvironment::new(std::sync::Arc::new(NoResolver)),
                 ExecutionOptions {
@@ -1232,6 +1246,7 @@ fn the_parsed_input_is_charged_to_the_workspace_once() {
                     initial_template: None,
                 },
             )
+            .outcome
             .is_ok()
     };
     // The least owned-byte budget the engine runs this execution in.

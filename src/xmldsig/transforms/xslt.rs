@@ -1693,8 +1693,8 @@ fn run_stylesheet<S: TransformScratch>(
                 0,
             )
         })?;
-    let reported = compiled.execute_reported(
-        &source,
+    let reported = compiled.execute_owned_reported(
+        source,
         &Parameters::new(),
         // The query's remainder bounds the work of every kind together, so the engine
         // stops where the query would refuse it rather than after the policy allows.
@@ -1705,7 +1705,6 @@ fn run_stylesheet<S: TransformScratch>(
             initial_template: None,
         },
     );
-    drop(source);
     drop(compiled);
     // A failed execution spends its work too, and later references and signatures
     // of the operation draw on the same allowance. The error reports the totals
