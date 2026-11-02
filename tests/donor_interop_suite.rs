@@ -980,8 +980,16 @@ fn detached_signing_enforces_policy_request_and_shared_budget_atomically() {
         ))) if uri == "c14n11/xml-base-input.xml"
     ));
 
+    // Signing dereferences the resource once, so an aggregate allowance of
+    // exactly its size admits it and one byte less refuses it.
     allowed_policy.resources.max_external_resource_bytes = external_xml.len();
     allowed_policy.resources.max_external_resource_total_bytes = external_xml.len();
+    SignContext::new(&key)
+        .policy(allowed_policy.clone())
+        .external_resources(&resources)
+        .sign_template(&template)
+        .expect("one dereference must fit an allowance of the resource size");
+    allowed_policy.resources.max_external_resource_total_bytes = external_xml.len() - 1;
     let exhausted = SignContext::new(&key)
         .policy(allowed_policy)
         .external_resources(&resources)

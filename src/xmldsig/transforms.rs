@@ -593,6 +593,14 @@ impl XPathDocumentIdentity {
 #[cfg(test)]
 thread_local! {
     static XPATH_DOCUMENT_IDENTITY_COMPUTATIONS: Cell<usize> = const { Cell::new(0) };
+    static TRANSFORM_CHAINS_STARTED: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Transform chains started on this thread since the last call; tests count
+/// how often signing executes Reference transforms.
+#[cfg(all(test, feature = "xmldsig-sign"))]
+pub(crate) fn take_transform_chains_started() -> usize {
+    TRANSFORM_CHAINS_STARTED.with(|count| count.replace(0))
 }
 
 #[derive(Default)]
@@ -608,6 +616,8 @@ struct CachedXPathDocumentIdentity {
 
 impl TransformChainState {
     fn begin_chain(&self) {
+        #[cfg(test)]
+        TRANSFORM_CHAINS_STARTED.with(|count| count.set(count.get() + 1));
         // Document pointer identity is valid only while one transform chain
         // keeps that parsed document alive. Never carry it into a later chain,
         // where allocator address reuse could alias unrelated XML.
@@ -1516,6 +1526,9 @@ pub(crate) fn enveloped_signature_for_reference<'a, E, I: Instruction>(
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) struct TransformDependencyOutput {
     pub(crate) dependencies: Set<usize>,
+    /// The output's digest, present when the execution proved the output
+    /// independent of every tracked field, so a later execution would repeat it.
+    pub(crate) digest: Option<super::DigestOutput>,
 }
 
 struct TransformChainOutput<T> {
@@ -1781,6 +1794,11 @@ impl<'a, S: TransformScratch, D: DomStorage> ExecutionData<'a, S, D> {
 pub(crate) trait TransformTerminal<S: TransformScratch> {
     type Output;
     type Error: From<TransformError>;
+
+    /// Told, before finishing, whether the settled dependencies of a tracked
+    /// chain are empty.
+    fn settle(&mut self, _independent: bool) {}
+
     fn finish<D: DomStorage>(
         self,
         data: ExecutionData<'_, S, D>,
@@ -1842,31 +1860,50 @@ impl TransformTerminal<Native> for CollectTerminal {
 }
 
 /// Dependency analysis reads which tracked nodes stay visible, which the chain
-/// settles before its terminal; the final output itself is never needed.
+/// settles before its terminal. An output independent of them is final, so it
+/// is digested here instead of by a second execution; any other output is
+/// discarded without decoding or charging it, as the digest pass will.
 #[cfg(feature = "xmldsig-sign")]
-struct DiscardTerminal;
+struct AnalysisTerminal<'p>(Option<DigestRequest<'p>>);
 #[cfg(feature = "xmldsig-sign")]
-impl TransformTerminal<Native> for DiscardTerminal {
-    type Output = ();
-    type Error = TransformError;
-    fn finish<D: DomStorage>(
-        self,
-        _: ExecutionData<'_, Native, D>,
-        _: Option<(&C14nAlgorithm, Option<&str>)>,
-        _: &TransformExecutionBudget,
-    ) -> Result<(), TransformError> {
-        Ok(())
+impl TransformTerminal<Native> for AnalysisTerminal<'_> {
+    type Output = Option<super::DigestOutput>;
+    type Error = ReferenceDigestError;
+
+    fn settle(&mut self, independent: bool) {
+        if !independent {
+            self.0 = None;
+        }
     }
 
-    // The digest pass decodes and charges the payload once; decoding here
-    // would spend the operation's allowance on output nobody reads.
+    fn finish<D: DomStorage>(
+        self,
+        data: ExecutionData<'_, Native, D>,
+        explicit: Option<(&C14nAlgorithm, Option<&str>)>,
+        budget: &TransformExecutionBudget,
+    ) -> Result<Self::Output, ReferenceDigestError> {
+        self.0
+            .map(|request| {
+                DigestTerminal(request)
+                    .finish(data, explicit, budget)
+                    .map(|digest| digest.digest)
+            })
+            .transpose()
+    }
+
     fn finish_base64<D: DomStorage>(
         self,
-        _: ExecutionData<'_, Native, D>,
-        _: &TransformExecutionBudget,
-        _: &Native,
-    ) -> Result<(), TransformError> {
-        Ok(())
+        data: ExecutionData<'_, Native, D>,
+        budget: &TransformExecutionBudget,
+        scratch: &Native,
+    ) -> Result<Self::Output, ReferenceDigestError> {
+        self.0
+            .map(|request| {
+                DigestTerminal(request)
+                    .finish_base64(data, budget, scratch)
+                    .map(|digest| digest.digest)
+            })
+            .transpose()
     }
 }
 
@@ -2385,6 +2422,11 @@ fn canonicalize_tracked<S: TransformScratch, K: super::types::projection::Keys, 
 /// Dependency analysis deliberately shares this executor with digest
 /// computation so binary-to-node-set adaptation and later `XPath` filters cannot
 /// drift into a second, incomplete transform model.
+///
+/// With `digest`, an output proven independent of every tracked node is
+/// digested. A chain with an `XPath` step that may read character data is
+/// never proven so: after octets drop provenance, a value it reads outside
+/// its input is no longer tracked.
 #[cfg(feature = "xmldsig-sign")]
 pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     signature_node: Node<'a, 'a>,
@@ -2393,7 +2435,8 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
     options: TransformOptions<'_>,
     budget: &TransformExecutionBudget,
     tracked_nodes: Vec<(usize, NodeId)>,
-) -> Result<TransformDependencyOutput, TransformError> {
+    digest: Option<DigestRequest<'_>>,
+) -> Result<TransformDependencyOutput, ReferenceDigestError> {
     ensure_transform_count(transforms.len())?;
     relationship::validate_edition(transforms, options.opc_relationship_edition)?;
     budget.state.begin_chain();
@@ -2440,10 +2483,13 @@ pub(crate) fn execute_transforms_with_dependency_nodes<'a>(
             canonical_positions: None,
         }),
         &context,
-        DiscardTerminal,
+        AnalysisTerminal(
+            digest.filter(|_| !transforms.iter().any(transform_may_read_mutable_data)),
+        ),
     )?;
     Ok(TransformDependencyOutput {
         dependencies: output.dependencies,
+        digest: output.output,
     })
 }
 
@@ -2580,6 +2626,13 @@ fn apply_chain_step<'e, 'd, S: TransformScratch, D: DomStorage, I: Instruction>(
     Ok(ChainStep::untracked(enveloped_signature, data))
 }
 
+/// Whether a chain's settled dependencies are empty; an untracked chain has none.
+fn settled_independent(tracking: Option<&DependencyTracking>) -> bool {
+    tracking.is_none_or(|tracking| {
+        tracking.active_nodes.is_empty() && tracking.opaque_dependencies.is_empty()
+    })
+}
+
 fn chain_output<T>(
     output: T,
     #[cfg_attr(not(feature = "xmldsig-sign"), expect(unused_variables))] tracking: &mut Option<
@@ -2631,7 +2684,7 @@ fn execute_transform_chain<
     transforms: &[I],
     mut dependency_tracking: Option<DependencyTracking>,
     context: &TransformExecutionContext<'_, S>,
-    finalize: F,
+    mut finalize: F,
 ) -> Result<TransformChainOutput<T>, E>
 where
     E: From<TransformError>,
@@ -2646,6 +2699,7 @@ where
         if let (Some(nodes), Some(tracking)) = (data.nodes(), &mut dependency_tracking) {
             retain_visible_dependencies(nodes, tracking)?;
         }
+        finalize.settle(settled_independent(dependency_tracking.as_ref()));
         let output = finalize.finish(data, None, context.budget)?;
         return Ok(chain_output(output, &mut dependency_tracking));
     };
@@ -2701,6 +2755,7 @@ where
             tracking.dormant_indexes.clear();
         }
         if STREAM_FINAL_C14N && remaining.is_empty() {
+            finalize.settle(settled_independent(dependency_tracking.as_ref()));
             let output = finalize.finish(data, Some((algo, prefixes)), context.budget)?;
             return Ok(chain_output(output, &mut dependency_tracking));
         }
@@ -2715,6 +2770,7 @@ where
             }
             tracking.discard_provenance();
         }
+        finalize.settle(settled_independent(dependency_tracking.as_ref()));
         let output = finalize.finish_base64(data, context.budget, context.scratch)?;
         return Ok(chain_output(output, &mut dependency_tracking));
     }
@@ -5151,6 +5207,7 @@ mod tests {
             TransformOptions::default(),
             &TransformExecutionBudget::default(),
             vec![(7, digest_text.id())],
+            None,
         )
         .unwrap();
 
@@ -5190,6 +5247,7 @@ mod tests {
             TransformOptions::default(),
             &TransformExecutionBudget::default(),
             vec![(11, digest_text.id())],
+            None,
         )
         .unwrap();
 

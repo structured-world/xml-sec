@@ -2248,23 +2248,32 @@ impl<'a> SignContext<'a> {
         // provides, so a failed analysis is decided after the commit.
         let analysis = (!doctype)
             .then(|| analyze_signing_references(document, operation, deferred, transform_options))
-            .and_then(Result::ok)
-            .filter(|analyzed| digests_can_defer(document, analyzed) && analyzed.1.splice_unread);
+            .and_then(Result::ok);
+        // This analysis succeeds only on the current tree, whose transforms keep
+        // or drop whole subtrees. Generated canonicalization changes only the
+        // tracked Reference it joins and adds no ID, so the dependencies and the
+        // digests this analysis proved final hold after that commit and no chain
+        // is executed again. The writer's KeyInfo can bring an ID that changes
+        // what a URI resolves to, so after it everything is analyzed again.
+        let mut speculative_plan = None;
         if let Some(analyzed) = analysis {
-            let budget = operation.budgets_mut().transforms.xml_parse_work();
-            let key_info = key_info_content
-                .as_deref()
-                .map(|content| {
-                    self.splice_signing_key_info(document, target_signature, content, budget)
-                })
-                .transpose()?;
-            if key_info.as_ref().is_none_or(|spliced| spliced.inert) {
-                let splice = DeferredSplice::new(document.as_xml(), key_info, generated);
-                self.policy
-                    .resources
-                    .validate_xml_document_len(splice.spliced.xml.len())?;
-                return Ok((analyzed, setup_gate, Some(splice)));
+            if digests_can_defer(document, &analyzed) && analyzed.1.splice_unread {
+                let budget = operation.budgets_mut().transforms.xml_parse_work();
+                let key_info = key_info_content
+                    .as_deref()
+                    .map(|content| {
+                        self.splice_signing_key_info(document, target_signature, content, budget)
+                    })
+                    .transpose()?;
+                if key_info.as_ref().is_none_or(|spliced| spliced.inert) {
+                    let splice = DeferredSplice::new(document.as_xml(), key_info, generated);
+                    self.policy
+                        .resources
+                        .validate_xml_document_len(splice.spliced.xml.len())?;
+                    return Ok((analyzed, setup_gate, Some(splice)));
+                }
             }
+            speculative_plan = key_info_content.is_none().then_some(analyzed.1);
         }
         if !generated.is_empty() {
             setup_gate = self.commit_generated_c14n(document, operation, setup_gate, generated)?;
@@ -2277,6 +2286,18 @@ impl<'a> SignContext<'a> {
                 setup_gate,
                 &content,
             )?;
+        }
+        if let Some(plan) = speculative_plan {
+            let policy = operation.policy().clone();
+            let references = collect_signing_reference_inputs(
+                document,
+                &policy,
+                operation.budgets_mut(),
+                request,
+            )?;
+            if references.signed_info.len() + references.manifests.len() == plan.digests.len() {
+                return Ok(((references, plan), setup_gate, None));
+            }
         }
         let analyzed = analyze_signing_references(document, operation, request, transform_options)?;
         Ok((analyzed, setup_gate, None))
@@ -2527,6 +2548,7 @@ impl<'a> SignContext<'a> {
             external_resources: &external_resources,
             generated: &[],
             speculative: false,
+            provider: self.provider,
         };
         let (analyzed, setup_gate, splice) = self.plan_signing_splice(
             document,
@@ -2539,7 +2561,6 @@ impl<'a> SignContext<'a> {
         let (plan_nodes, pending_digests) = fill_analyzed_reference_digest_values(
             document,
             transform_options,
-            self.provider,
             &mut operation,
             request,
             Some(setup_gate),
@@ -2917,6 +2938,7 @@ struct SigningReferenceRequest<'a, 'resources> {
     generated: &'a [NodeId],
     /// The analysis only asks whether a splice can wait for the final mutation.
     speculative: bool,
+    provider: &'a dyn crate::provider::CryptoProvider,
 }
 
 /// The Second Edition transform one `Reference` gains.
@@ -3140,7 +3162,10 @@ fn compute_prepared_reference_digest_values_with_options(
     compute_signing_reference_digests(
         &doc,
         signature,
-        references,
+        references
+            .into_iter()
+            .map(|reference| (reference, None))
+            .collect(),
         transform_options,
         provider,
         execution_budget,
@@ -3326,7 +3351,10 @@ fn analyze_signing_reference_inputs(
                 request.generated,
                 transform_options,
                 &budgets.transforms,
-                request.uri_resolution(policy.transforms.same_document_id_semantics),
+                (
+                    request.uri_resolution(policy.transforms.same_document_id_semantics),
+                    request.provider,
+                ),
             )
             .map(Some)
         })?;
@@ -3424,7 +3452,10 @@ fn analyze_signing_placeholder_generation(
         &[],
         transform_options,
         &budgets.transforms,
-        request.uri_resolution(policy.transforms.same_document_id_semantics),
+        (
+            request.uri_resolution(policy.transforms.same_document_id_semantics),
+            request.provider,
+        ),
     )
     .map(|plan| SigningDependencyPlan {
         splice_unread: false,
@@ -3440,12 +3471,24 @@ struct LevelDigestRequest<'a, 'resources> {
     uri_resolution: SigningUriResolution<'a, 'resources>,
 }
 
+/// The digest dependency analysis proved final for the `Reference` at `index`.
+fn analyzed_digest(
+    analyzed: &[Option<String>],
+    index: usize,
+) -> Result<Option<String>, SigningDigestError> {
+    analyzed.get(index).cloned().ok_or_else(|| {
+        SigningDigestError::InvalidStructure(
+            "compiled signing Reference index is unavailable".into(),
+        )
+    })
+}
+
 /// Reparse the References of a committed intermediate generation and compute
 /// the digests of one dependency level against it.
 fn reparsed_level_digests(
     view: crate::document::DocumentView<'_>,
     budgets: &mut SigningOperationBudgets,
-    level: &[usize],
+    (level, analyzed): (&[usize], &[Option<String>]),
     references: &SigningReferenceInputs,
     request: LevelDigestRequest<'_, '_>,
 ) -> Result<Vec<(crate::NodeIdentity, String)>, SigningDigestError> {
@@ -3490,7 +3533,7 @@ fn reparsed_level_digests(
             )
         })?;
         destinations.push(view.node_identity_by_id(reference.digest_value_node_id));
-        level_references.push(reference.clone());
+        level_references.push((reference.clone(), analyzed_digest(analyzed, *index)?));
     }
     let computed = compute_signing_reference_digests(
         current_doc,
@@ -3519,7 +3562,7 @@ fn compute_deferred_reference_digests(
     operation: &mut SigningExecution<'_>,
     node_level: &[OperationNodeId],
     document: &XmlDocument,
-    level: &[usize],
+    (level, analyzed): (&[usize], &[Option<String>]),
     references: &SigningReferenceInputs,
     request: LevelDigestRequest<'_, '_>,
 ) -> Result<Vec<(crate::NodeIdentity, String)>, SigningDigestError> {
@@ -3544,11 +3587,12 @@ fn compute_deferred_reference_digests(
                                 "compiled signing Reference index is unavailable".into(),
                             )
                         })
+                        .and_then(|reference| Ok((reference, analyzed_digest(analyzed, *index)?)))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let destinations = level_references
                 .iter()
-                .map(|reference| view.node_identity_by_id(reference.digest_value_node_id))
+                .map(|(reference, _)| view.node_identity_by_id(reference.digest_value_node_id))
                 .collect::<Vec<_>>();
             let computed = compute_signing_reference_digests(
                 current_doc,
@@ -3577,7 +3621,6 @@ fn compute_deferred_reference_digests(
 fn fill_reference_digest_values_in_dependency_order_with_operation(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
-    provider: &dyn crate::provider::CryptoProvider,
     operation: &mut OperationExecutionContext<
         crate::policy::SigningPolicy,
         &mut SigningOperationBudgets,
@@ -3590,7 +3633,6 @@ fn fill_reference_digest_values_in_dependency_order_with_operation(
     fill_analyzed_reference_digest_values(
         document,
         transform_options,
-        provider,
         operation,
         request,
         setup_gate,
@@ -3646,14 +3688,9 @@ fn digests_can_defer(
         })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each argument is one part of the signing operation already in progress"
-)]
 fn fill_analyzed_reference_digest_values(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
-    provider: &dyn crate::provider::CryptoProvider,
     operation: &mut OperationExecutionContext<
         crate::policy::SigningPolicy,
         &mut SigningOperationBudgets,
@@ -3670,7 +3707,7 @@ fn fill_analyzed_reference_digest_values(
         compile_signing_operation_plan(operation, &dependency_plan, setup_gate)?;
     let level_request = LevelDigestRequest {
         transform_options,
-        provider,
+        provider: request.provider,
         target_signature: request.target_signature,
         uri_resolution: request.uri_resolution(policy.transforms.same_document_id_semantics),
     };
@@ -3682,19 +3719,26 @@ fn fill_analyzed_reference_digest_values(
             operation,
             node_level,
             document,
-            level,
+            (level, &dependency_plan.digests),
             &references,
             level_request,
         )?;
         return Ok((plan_nodes, pending));
     }
+    let analyzed = dependency_plan.digests;
     for (level, node_level) in dependency_plan.levels.into_iter().zip(node_levels) {
         operation.run_document_transition_batch_with_budgets(
             &node_level,
             document,
             |document, budgets| {
                 let replacements = document.with_view(|view| {
-                    reparsed_level_digests(view, budgets, &level, &references, level_request)
+                    reparsed_level_digests(
+                        view,
+                        budgets,
+                        (&level, &analyzed),
+                        &references,
+                        level_request,
+                    )
                 })?;
                 document
                     .replace_base64_contents_with_budget(
@@ -3730,7 +3774,6 @@ fn fill_reference_digest_values_in_dependency_order(
     fill_reference_digest_values_in_dependency_order_with_operation(
         document,
         transform_options,
-        provider,
         &mut operation,
         SigningReferenceRequest {
             target_signature,
@@ -3738,6 +3781,7 @@ fn fill_reference_digest_values_in_dependency_order(
             external_resources: &external_resources,
             generated: &[],
             speculative: false,
+            provider,
         },
         None,
         false,
@@ -3751,6 +3795,9 @@ struct SigningDependencyPlan {
     /// No `Reference` can observe the target `KeyInfo` or a `Reference` that
     /// gains a generated transform.
     splice_unread: bool,
+    /// Per `Reference`, the digest its analysis proved final: its output reads
+    /// no value signing fills, so the digest pass would compute the same bytes.
+    digests: Vec<Option<String>>,
 }
 
 /// Every node whose content signing changes or adds, with the index of what
@@ -3809,7 +3856,10 @@ fn reference_dependency_levels(
     generated: &[NodeId],
     transform_options: TransformOptions<'_>,
     execution_budget: &TransformExecutionBudget,
-    uri_resolution: SigningUriResolution<'_, '_>,
+    (uri_resolution, provider): (
+        SigningUriResolution<'_, '_>,
+        &dyn crate::provider::CryptoProvider,
+    ),
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
     let resolver = uri_resolution.external_resources.bind(
         doc,
@@ -3819,6 +3869,7 @@ fn reference_dependency_levels(
     let terminal_signature_value_index = references.len();
     let key_info_index = terminal_signature_value_index + 1;
     let tracked_mutable_nodes = tracked_signing_nodes(doc, signature, references, generated)?;
+    let mut digests = Vec::with_capacity(references.len());
     let mut analyses = references
         .iter()
         .map(|reference| {
@@ -3836,7 +3887,18 @@ fn reference_dependency_levels(
                 transform_options,
                 execution_budget,
                 tracked_mutable_nodes.clone(),
-            )?;
+                Some(super::transforms::DigestRequest {
+                    provider,
+                    algorithm: reference.digest_method,
+                    retain_pre_digest: false,
+                }),
+            )
+            .map_err(map_reference_digest_error)?;
+            digests.push(
+                output
+                    .digest
+                    .map(|digest| base64::engine::general_purpose::STANDARD.encode(digest)),
+            );
             Ok(output.dependencies)
         })
         .collect::<Result<Vec<_>, SigningDigestError>>()?;
@@ -3889,7 +3951,17 @@ fn reference_dependency_levels(
         dependencies: analyses,
         levels,
         splice_unread,
+        digests,
     })
+}
+
+fn map_reference_digest_error(
+    error: super::transforms::ReferenceDigestError,
+) -> SigningDigestError {
+    match error {
+        super::transforms::ReferenceDigestError::Transform(error) => error.into(),
+        super::transforms::ReferenceDigestError::Provider(error) => error.into(),
+    }
 }
 
 fn signing_reference_origin<'doc, 'input>(
@@ -4131,10 +4203,12 @@ struct SigningUriResolution<'a, 'resources> {
     external_resources: &'a ExternalResourceContext<'resources>,
 }
 
+/// Digest each `Reference`, taking the value its dependency analysis already
+/// proved final where there is one.
 fn compute_signing_reference_digests(
     doc: &Document<'_>,
     signature: Node<'_, '_>,
-    references: Vec<SigningReference>,
+    references: Vec<(SigningReference, Option<String>)>,
     transform_options: TransformOptions<'_>,
     provider: &dyn crate::provider::CryptoProvider,
     execution_budget: &TransformExecutionBudget,
@@ -4148,7 +4222,15 @@ fn compute_signing_reference_digests(
     references
         .into_iter()
         .enumerate()
-        .map(|(index, reference)| {
+        .map(|(index, (reference, analyzed))| {
+            if let Some(digest_value) = analyzed {
+                return Ok(ComputedReferenceDigest {
+                    index,
+                    uri: reference.uri,
+                    digest_method: reference.digest_method,
+                    digest_value,
+                });
+            }
             let origin = signing_reference_origin(doc, &reference)?;
             let initial_data = resolver.dereference_from_with_budget(
                 &reference.uri,
@@ -4170,12 +4252,7 @@ fn compute_signing_reference_digests(
                     retain_pre_digest: false,
                 },
             )
-            .map_err(|error| -> SigningDigestError {
-                match error {
-                    super::transforms::ReferenceDigestError::Transform(error) => error.into(),
-                    super::transforms::ReferenceDigestError::Provider(error) => error.into(),
-                }
-            })?
+            .map_err(map_reference_digest_error)?
             .digest;
             let digest_value = base64::engine::general_purpose::STANDARD.encode(digest);
             Ok(ComputedReferenceDigest {
@@ -4778,6 +4855,9 @@ mod deferred_commit_tests;
 
 #[cfg(test)]
 mod generated_c14n_tests;
+
+#[cfg(test)]
+mod single_execution_tests;
 
 fn xml_qualifier(prefix: &str) -> String {
     if prefix.is_empty() {
