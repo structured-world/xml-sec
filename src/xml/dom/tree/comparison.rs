@@ -30,7 +30,7 @@ pub(crate) trait Counts<'a, S: Storage> {
 impl ComparisonStorage for Native {
     type Counts<'a> = Map<NamespaceKey<'a>, usize>;
     fn counts<'a>(&self, capacity: usize) -> Result<Self::Counts<'a>, ParseError> {
-        let mut counts = Map::new();
+        let mut counts = Map::default();
         counts
             .try_reserve_entries(capacity)
             .map_err(|_| ParseError::AllocationFailed)?;

@@ -2684,7 +2684,7 @@ fn manifest_reference_limit_counts_unsupported_entries() {
             Some((view.identity(), view.generation())),
         );
         operation.authenticate(view.node_identity(object));
-        let mut processed = Set::new();
+        let mut processed = Set::default();
         let mut remaining = MAX_REFERENCES_PER_SIGNATURE;
         let mut next_index = 0;
         let mut xpath_parse = XPathSignatureParseBudget::default();
@@ -2727,7 +2727,7 @@ fn unsigned_manifest_discovery_cannot_bypass_the_filter_work_budget() {
             &budgets,
             Some((view.identity(), view.generation())),
         );
-        let mut processed = Set::new();
+        let mut processed = Set::default();
         let mut remaining = 1;
         let mut index = 0;
         let mut xpath = XPathSignatureParseBudget::default();
@@ -2774,7 +2774,7 @@ fn unsigned_manifest_remains_eligible_after_trust_expands() {
             Some((view.identity(), view.generation())),
         );
         operation.authenticate(view.node_identity(outer));
-        let mut processed = Set::new();
+        let mut processed = Set::default();
         let mut remaining = 2;
         let mut next_index = 0;
         let mut xpath_budget = XPathSignatureParseBudget::default();

@@ -347,9 +347,9 @@ impl<P, B> OperationExecutionContext<P, B> {
             builder: Some(OperationPlanBuilder::default()),
             plan: RefCell::new(None),
             document: document.map(|(identity, generation)| (identity, Cell::new(generation))),
-            executed: RefCell::new(Set::new()),
+            executed: RefCell::new(Set::default()),
             #[cfg(feature = "xmldsig")]
-            authenticated_nodes: RefCell::new(Set::new()),
+            authenticated_nodes: RefCell::new(Set::default()),
             decisions: RefCell::new(Vec::new()),
             first_failure: RefCell::new(None),
         }

@@ -10587,6 +10587,15 @@
  /// use xmloxide::Document;
  /// use xmloxide::validation::dtd::{parse_dtd, validate};
  ///
+@@ -2262,7 +2553,7 @@
+ pub fn validate(doc: &mut Document, dtd: &Dtd) -> ValidationResult {
+     let mut errors = Vec::new();
+     let mut warnings = Vec::new();
+-    let mut id_values: HashSet<String> = HashSet::new();
++    let mut id_values: HashSet<String> = HashSet::default();
+     let mut idref_values: Vec<String> = Vec::new();
+ 
+     // Check root element name against DOCTYPE
 @@ -2311,21 +2602,19 @@
          }
      });

@@ -1327,8 +1327,8 @@ impl<'a> VerificationOperationBudgets<'a> {
             ),
             xpath_parse: RefCell::new(xpath_parse),
             key_info_materialization: RefCell::new(KeyInfoMaterializationState::default()),
-            external_resource_fingerprints: RefCell::new(Map::new()),
-            resolved_reference_resources: RefCell::new(Map::new()),
+            external_resource_fingerprints: RefCell::new(Map::default()),
+            resolved_reference_resources: RefCell::new(Map::default()),
         }
     }
 
@@ -5240,7 +5240,7 @@ fn materialize_retrieval_methods_with_budgets<P: KeyInfoReferencePolicy>(
     }
 
     let mut total_binary_len = existing_x509_binary_len(key_info)?;
-    let mut seen = Set::new();
+    let mut seen = Set::default();
     let mut materialized = Vec::with_capacity(key_info.sources.len());
     // Origins, when tracked, stay index for index with the sources.
     let mut pending = origins
@@ -5716,7 +5716,7 @@ fn process_authenticated_manifest_references<C: VerificationCapture>(
     core_validation: &[OperationNodeId],
 ) -> Result<(Vec<ReferenceResult>, Vec<OperationNodeId>), SignatureVerificationPipelineError> {
     let ctx = verification.context;
-    let mut processed_manifests = Set::new();
+    let mut processed_manifests = Set::default();
     let mut next_reference_index = 0usize;
     let mut frontier_index = 0usize;
     let mut completed_digests = Vec::new();

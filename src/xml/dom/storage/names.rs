@@ -75,7 +75,7 @@ impl<T: AsRef<str>> structured_asn1::memory::HashWork for Name<T> {
 impl NameStorage for Native {
     type Names<K: AsRef<str>, V> = Map<Name<K>, V>;
     fn names<K: AsRef<str>, V>(&self) -> Self::Names<K, V> {
-        Map::new()
+        Map::default()
     }
 }
 

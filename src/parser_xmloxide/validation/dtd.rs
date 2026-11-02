@@ -2553,7 +2553,7 @@ fn is_name_char(c: char) -> bool {
 pub fn validate(doc: &mut Document, dtd: &Dtd) -> ValidationResult {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
-    let mut id_values: HashSet<String> = HashSet::new();
+    let mut id_values: HashSet<String> = HashSet::default();
     let mut idref_values: Vec<String> = Vec::new();
 
     // Check root element name against DOCTYPE

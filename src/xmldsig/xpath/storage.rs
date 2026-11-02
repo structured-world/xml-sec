@@ -52,7 +52,7 @@ impl<'source, 'w, W: Work> Bindings<'source, &'w W> for OwnedMap<Prefix<'source>
 
 impl<K, V> NativeIndex<K, V> {
     pub(crate) fn new() -> Self {
-        Self(Map::new())
+        Self(Map::default())
     }
 }
 

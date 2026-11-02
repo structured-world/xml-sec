@@ -29,7 +29,7 @@ use sha2::{Sha224, Sha256, Sha384, Sha512};
 use signature::hazmat::{PrehashSigner, RandomizedPrehashSigner};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     ops::Range,
 };
 use zeroize::Zeroizing;
@@ -3831,7 +3831,7 @@ fn fill_reference_digest_values_in_dependency_order(
 }
 
 struct SigningDependencyPlan {
-    dependencies: Vec<HashSet<usize>>,
+    dependencies: Vec<crate::collections::Set<usize>>,
     levels: Vec<Vec<usize>>,
     /// No `Reference` can observe the target `KeyInfo` or a `Reference` that
     /// gains a generated transform.
