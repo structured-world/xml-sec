@@ -9,6 +9,17 @@ use std::fmt::Write as _;
 
 const XSL: &str = "http://www.w3.org/1999/XSL/Transform";
 
+type Native = crate::xml::dom::storage::Native;
+
+/// Octet input in storage the transform does not hold.
+const fn octets(bytes: &[u8]) -> super::Input<'_, '_, Native> {
+    super::Input::Octets {
+        bytes,
+        storage: 0,
+        base_uri: None,
+    }
+}
+
 /// Work done outside any query: an owned transform is serialized once, when it is built.
 fn unmetered() -> impl FnMut(usize) -> Result<(), TransformError> {
     |_| Ok(())
@@ -240,10 +251,12 @@ fn parsed_source_round_trips_inherited_namespaces() {
 }
 
 #[test]
-fn implicit_c14n_input_stays_in_the_xslt_workspace() {
+fn implicit_c14n_input_holds_no_octets_in_the_xslt_workspace() {
     use structured_asn1::memory::{Memory, MemoryAccount};
-    // Node-set conversion retains an extra canonicalized buffer while the
-    // identical octet input is borrowed. That buffer must reduce engine space.
+    // The engine receives a node-set's canonical structure, not its octets, so
+    // the node-set runs in exactly the workspace its borrowed canonical octets
+    // need: no conversion buffer takes engine space, and the source tree is
+    // charged the same either way.
     let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
     let xml = format!("<root>{}</root>", "x".repeat(64 * 1024));
     let budget = |bytes| {
@@ -263,16 +276,20 @@ fn implicit_c14n_input_stays_in_the_xslt_workspace() {
         }
     }
     let document = Document::parse(&xml).expect("source document parses");
-    let result = execute_transforms_with_options_and_budget(
-        document.root_element(),
-        TransformData::NodeSet(
-            crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
-                .expect("source projection"),
-        ),
-        &[Transform::Xslt(sheet.clone())],
-        TransformOptions::default(),
-        &budget(admitted),
-    );
+    let node_set = |workspace| {
+        execute_transforms_with_options_and_budget(
+            document.root_element(),
+            TransformData::NodeSet(
+                crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
+                    .expect("source projection"),
+            ),
+            &[Transform::Xslt(sheet.clone())],
+            TransformOptions::default(),
+            &budget(workspace),
+        )
+    };
+    node_set(admitted).expect("the node-set fits the least octet workspace");
+    let result = node_set(refused);
     assert!(
         matches!(
             result,
@@ -281,53 +298,79 @@ fn implicit_c14n_input_stays_in_the_xslt_workspace() {
                 ..
             }))
         ),
-        "conversion buffer must not fit beside the minimum octet workspace: {result:?}"
+        "the node-set must not fit where its octets do not: {result:?}"
     );
 
     let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 28)));
     let scratch = crate::c14n::scratch::Accounted(&memory);
     let nodes = crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
         .expect("accounted conversion projection");
-    let parameter = super::XsltParameter::Stylesheet(&sheet);
-    // The least workspace the conversion itself runs in, if the engine's minimum is not enough.
-    let (mut refused, mut converts) = (admitted - 1, 1 << 22);
-    while converts - refused > 1 {
-        let middle = refused + (converts - refused) / 2;
-        let attempt = budget(middle);
-        if super::canonicalize_input(parameter, &document, &nodes.projection, &attempt, &scratch)
-            .is_ok()
-        {
-            converts = middle;
-        } else {
-            refused = middle;
-        }
+    for workspace in [refused, admitted] {
+        let budget = budget(workspace);
+        let result = super::execute::<_, Native, Native>(
+            super::XsltParameter::Stylesheet(&sheet),
+            super::Input::Nodes {
+                document: &document,
+                visibility: &nodes.projection,
+            },
+            crate::policy::XsltStylesheetSemantics::Specification,
+            false,
+            &budget,
+            budget.xml_parse_work(),
+            &scratch,
+        );
+        assert_eq!(
+            result.as_ref().err().map(ToString::to_string),
+            (workspace == refused).then(|| {
+                TransformError::from(PolicyViolation::ResourceLimit {
+                    resource: resource_name::XSLT_WORKSPACE_BYTES,
+                    maximum: refused,
+                    actual: admitted,
+                })
+                .to_string()
+            })
+        );
+        drop(result);
+        assert_eq!(memory.used(), 0, "the query releases all its allocations");
     }
-    assert!(converts < admitted + xml.len());
-    let budget = budget(converts);
-    let collected =
-        super::canonicalize_input(parameter, &document, &nodes.projection, &budget, &scratch)
-            .expect("conversion alone fits");
-    assert!(memory.used() >= collected.capacity());
-    let result = super::execute::<_, crate::xml::dom::storage::Native>(
-        parameter,
-        &collected,
-        collected.capacity(),
-        None,
+}
+
+#[test]
+fn a_node_set_converts_in_a_query_account_below_the_workspace() {
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    // A query whose memory is below the XSLT workspace gives the engine's lease
+    // all of it. The node-set's conversion still needs query storage for its
+    // own canonicalization, so it must take that before the lease does, as
+    // octet input decodes before it.
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let xml = r#"<root a="1"/>"#;
+    let memory = 1 << 20;
+    assert!(memory < ResourcePolicy::default().max_xslt_workspace_bytes);
+    query_run(&sheet, xml.as_bytes(), 1 << 24, memory)
+        .outcome
+        .expect("the octets run in this account");
+    let document = Document::parse(xml).expect("source document parses");
+    let nodes = crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
+        .expect("source projection");
+    let account = Memory::new(std::sync::Arc::new(MemoryAccount::new(memory, 1 << 26)));
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
+    let result = super::execute::<_, Native, Native>(
+        super::XsltParameter::Stylesheet(&sheet),
+        super::Input::Nodes {
+            document: &document,
+            visibility: &nodes.projection,
+        },
         crate::policy::XsltStylesheetSemantics::Specification,
         false,
         &budget,
         budget.xml_parse_work(),
-        &scratch,
+        &crate::c14n::scratch::Accounted(&account),
     );
-    assert!(matches!(
-        result,
-        Err(TransformError::Policy(PolicyViolation::ResourceLimit {
-            resource: resource_name::XSLT_WORKSPACE_BYTES,
-            ..
-        }))
-    ));
-    drop(collected);
-    assert_eq!(memory.used(), 0, "refusal releases all query allocations");
+    let expected = run(&budget, &sheet, xml.as_bytes()).expect("native octet run");
+    match result.expect("the node-set runs in the same account") {
+        super::ExecutionData::Accounted(bytes) => assert_eq!(&*bytes, &expected),
+        _ => panic!("accounted output expected"),
+    }
 }
 
 #[test]
@@ -386,11 +429,9 @@ fn replay_output_copy_obeys_xslt_workspace_peak() {
         .expect("the engine itself fits below the copy peak");
         let budget = TransformExecutionBudget::from_resources(&resources);
         let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 26, 1 << 28)));
-        let result = super::execute::<_, crate::xml::dom::storage::Native>(
+        let result = super::execute::<_, Native, Native>(
             super::XsltParameter::Stylesheet(&sheet),
-            b"<doc/>",
-            0,
-            None,
+            octets(b"<doc/>"),
             crate::policy::XsltStylesheetSemantics::Specification,
             false,
             &budget,
@@ -476,11 +517,9 @@ fn in_place_stylesheet_preserves_document_siblings() {
         crate::policy::XsltStylesheetSemantics::Libxmlsec1,
     ] {
         let budget = TransformExecutionBudget::default();
-        let result = super::execute::<_, crate::xml::dom::storage::Native>(
+        let result = super::execute::<_, Native, Native>(
             super::XsltParameter::Transform(document.root_element()),
-            b"<doc/>",
-            0,
-            None,
+            octets(b"<doc/>"),
             semantics,
             false,
             &budget,
@@ -864,11 +903,9 @@ fn query_run_with(
         .expect("leave the remainder");
     let before = work.work_used();
     let scratch = crate::c14n::scratch::Accounted(&work);
-    let outcome = super::execute::<_, crate::xml::dom::storage::Native>(
+    let outcome = super::execute::<_, Native, Native>(
         parameter,
-        input,
-        0,
-        None,
+        octets(input),
         crate::policy::XsltStylesheetSemantics::Specification,
         false,
         &budget,
@@ -1065,11 +1102,9 @@ fn entity_preflight_stops_at_the_current_query_remainder() {
         "x".repeat(2000),
         "&e;".repeat(100)
     );
-    let result = super::execute::<_, crate::xml::dom::storage::Native>(
+    let result = super::execute::<_, Native, Native>(
         super::XsltParameter::Stylesheet(&sheet),
-        input.as_bytes(),
-        0,
-        None,
+        octets(input.as_bytes()),
         crate::policy::XsltStylesheetSemantics::Specification,
         true,
         &budget,
@@ -1127,11 +1162,9 @@ fn inherited_xml_space_preserves_stylesheet_whitespace() {
         .expect("the Transform element");
     let output = |semantics| {
         let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
-        match super::execute::<_, crate::xml::dom::storage::Native>(
+        match super::execute::<_, Native, Native>(
             super::XsltParameter::Transform(transform),
-            b"<doc/>",
-            0,
-            None,
+            octets(b"<doc/>"),
             semantics,
             false,
             &budget,

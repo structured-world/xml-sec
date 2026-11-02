@@ -616,14 +616,16 @@ impl Document {
         )
     }
 
-    /// Parse within `budget`, charging each pass over the text to `work` first.
-    pub(crate) fn parse_iterative_bounded(
-        xml: &str,
+    /// The empty document and meter a bounded parse or build of text of
+    /// `source_bytes` bytes starts from, after the checks and charges that
+    /// precede reading the text, and the owned bytes the empty document holds.
+    fn bounded_start<'w>(
         base_uri: Option<&str>,
         budget: ParseBudget,
+        source_bytes: usize,
         work: &mut ParseWork,
-    ) -> Result<Self> {
-        ensure(BudgetKind::SourceBytes, budget.source_bytes, xml.len())?;
+    ) -> Result<(Self, StreamParseMeter<'w>, usize)> {
+        ensure(BudgetKind::SourceBytes, budget.source_bytes, source_bytes)?;
         ensure(BudgetKind::SourceNodes, budget.source_nodes, 1)?;
         let initial_owned = std::mem::size_of::<Node>()
             .checked_add(std::mem::size_of::<NodeId>())
@@ -636,8 +638,8 @@ impl Document {
         ensure(BudgetKind::OwnedBytes, budget.owned_bytes, initial_owned)?;
         work.charge(base_uri.map_or(0, str::len))?;
         let mut document = Self::empty(base_uri.map(str::to_owned));
-        document.source_bytes = xml.len();
-        let mut meter = StreamParseMeter {
+        document.source_bytes = source_bytes;
+        let meter = StreamParseMeter {
             budget,
             nodes: 1,
             entity_references: 0,
@@ -645,6 +647,78 @@ impl Document {
             namespace_scope_bytes: 0,
             owned_bytes: initial_owned,
         };
+        Ok((document, meter, initial_owned))
+    }
+
+    /// Build the document another reader has read from text of `source_bytes`
+    /// bytes at `base_uri`, describing its constructs to `construct`, within
+    /// `budget`; also reports the parser work admitted.
+    ///
+    /// The checks and charges are those of [`Self::parse_with_budget_reported`]
+    /// for that text, which has no document type declaration, in the same
+    /// order; see [`DocumentBuilder`].
+    #[must_use]
+    pub fn build_with_budget_reported(
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+        source_bytes: usize,
+        construct: impl FnOnce(&mut DocumentBuilder<'_, '_>) -> Result<()>,
+    ) -> Reported<Self, ParseUsage> {
+        let mut work = ParseWork::new(budget.parse_work_bytes);
+        let outcome = Self::build_bounded(base_uri, budget, source_bytes, &mut work, construct);
+        Reported {
+            outcome,
+            usage: work.usage(),
+        }
+    }
+
+    fn build_bounded(
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+        source_bytes: usize,
+        work: &mut ParseWork,
+        construct: impl FnOnce(&mut DocumentBuilder<'_, '_>) -> Result<()>,
+    ) -> Result<Self> {
+        let (mut document, mut meter, _) =
+            Self::bounded_start(base_uri, budget, source_bytes, work)?;
+        meter.entity_expansion.parse_work = Some(work);
+        meter.entity_expansion.workspace = budget.owned_bytes;
+        // The one parser pass over text without a document type declaration.
+        meter.entity_expansion.charge_parse_work(source_bytes)?;
+        let declarations = InternalEntityDeclarations::default();
+        let mut elements = Vec::new();
+        reserve_charged(&mut elements, 1, &mut meter)?;
+        elements.push(StreamElementFrame {
+            node: document.root,
+            lexical_name: None,
+        });
+        let mut builder = DocumentBuilder(StreamDocumentBuilder {
+            document: &mut document,
+            elements: &mut elements,
+            declarations: &declarations,
+            meter: &mut meter,
+            phase: DocumentPhase::Start,
+            saw_doctype: false,
+        });
+        construct(&mut builder)?;
+        builder.0.finish()?;
+        let stack_bytes = elements.capacity() * std::mem::size_of::<StreamElementFrame>();
+        drop(elements);
+        meter.release_owned(stack_bytes);
+        document.register_xml_ids(Some(&mut meter))?;
+        document.retained_bytes = meter.retained_bytes();
+        Ok(document)
+    }
+
+    /// Parse within `budget`, charging each pass over the text to `work` first.
+    pub(crate) fn parse_iterative_bounded(
+        xml: &str,
+        base_uri: Option<&str>,
+        budget: ParseBudget,
+        work: &mut ParseWork,
+    ) -> Result<Self> {
+        let (mut document, mut meter, initial_owned) =
+            Self::bounded_start(base_uri, budget, xml.len(), work)?;
         // Entity declarations and their expansion each take a pass over the
         // document only when an internal subset can declare entities.
         let subset = doctype_span(xml)?.is_some_and(|doctype| doctype.internal_subset.is_some());
@@ -2003,6 +2077,8 @@ fn append_normalized_xml_line_endings(output: &mut String, mut value: &str) {
 #[derive(Clone, Copy)]
 enum ParsedText<'a> {
     Source(&'a str),
+    /// Source text held as consecutive pieces, read as their concatenation.
+    Pieces(&'a [&'a str]),
     Reference(char),
 }
 
@@ -2010,9 +2086,22 @@ impl ParsedText<'_> {
     fn maximum_bytes(self) -> usize {
         match self {
             Self::Source(text) => text.len(),
+            // The pieces are slices of live text, so their total fits the address space.
+            Self::Pieces(pieces) => pieces.iter().map(|piece| piece.len()).sum(),
             Self::Reference(character) => character.len_utf8(),
         }
     }
+
+    /// Whether the text is empty or only XML whitespace.
+    fn is_blank(self) -> bool {
+        let blank = |text: &str| text.trim_matches([' ', '\t', '\r', '\n']).is_empty();
+        match self {
+            Self::Source(text) => blank(text),
+            Self::Pieces(pieces) => pieces.iter().all(|piece| blank(piece)),
+            Self::Reference(_) => false,
+        }
+    }
+
     fn append(self, output: &mut String, meter: &mut StreamParseMeter) -> Result<()> {
         // A source pass and its copy are admitted before either runs.
         meter
@@ -2020,10 +2109,40 @@ impl ParsedText<'_> {
             .charge_parse_work(2 * self.maximum_bytes())?;
         match self {
             Self::Source(text) => append_normalized_xml_line_endings(output, text),
+            Self::Pieces(pieces) => {
+                // A CR ending one piece and the LF starting the next are one
+                // line end of the concatenation.
+                let mut after_cr = false;
+                for piece in pieces.iter().filter(|piece| !piece.is_empty()) {
+                    let piece = if after_cr {
+                        piece.strip_prefix('\n').unwrap_or(piece)
+                    } else {
+                        piece
+                    };
+                    after_cr = piece.ends_with('\r');
+                    append_normalized_xml_line_endings(output, piece);
+                }
+            }
             Self::Reference(character) => output.push(character),
         }
         Ok(())
     }
+}
+
+/// Whether the concatenation of `pieces` contains `pattern`, of at most three bytes.
+fn pieces_contain(pieces: &[&str], pattern: &[u8]) -> bool {
+    debug_assert!((1..=3).contains(&pattern.len()));
+    let mut window = [0u8; 3];
+    let mut seen = 0usize;
+    for byte in pieces.iter().flat_map(|piece| piece.bytes()) {
+        window.rotate_left(1);
+        window[2] = byte;
+        seen += 1;
+        if seen >= pattern.len() && window[3 - pattern.len()..] == *pattern {
+            return true;
+        }
+    }
+    false
 }
 
 fn reserve_parsed_string(
@@ -2302,18 +2421,17 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
     }
 
     fn text(&mut self, text: &str, source_line: usize) -> Result<()> {
-        if self.elements.len() == 1 && !text.trim_matches([' ', '\t', '\r', '\n']).is_empty() {
+        self.text_run(ParsedText::Source(text), source_line)
+    }
+
+    fn text_run(&mut self, text: ParsedText<'_>, source_line: usize) -> Result<()> {
+        if self.elements.len() == 1 && !text.is_blank() {
             return Err(Error::Xml(
                 "non-whitespace text outside the document element".into(),
             ));
         }
-        if self.elements.len() > 1 && !text.is_empty() {
-            let id = push_parsed_text(
-                self.document,
-                self.elements,
-                ParsedText::Source(text),
-                self.meter,
-            )?;
+        if self.elements.len() > 1 && text.maximum_bytes() > 0 {
+            let id = push_parsed_text(self.document, self.elements, text, self.meter)?;
             self.document.nodes[id.0]
                 .source_line
                 .get_or_insert(source_line);
@@ -2344,6 +2462,10 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
     }
 
     fn comment(&mut self, text: &str, source_line: usize) -> Result<()> {
+        self.comment_value(ParsedText::Source(text), source_line)
+    }
+
+    fn comment_value(&mut self, text: ParsedText<'_>, source_line: usize) -> Result<()> {
         if self.phase == DocumentPhase::Start {
             self.phase = DocumentPhase::Prolog;
         }
@@ -2353,7 +2475,7 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
             .expect("document frame remains present")
             .node;
         self.meter.reserve_node()?;
-        let value = copy_parsed_text(ParsedText::Source(text), self.meter)?;
+        let value = copy_parsed_text(text, self.meter)?;
         let inherited_base = copy_base_uri(self.document, parent, self.meter)?;
         let id = push_metered(
             self.document,
@@ -2373,6 +2495,15 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
         content: Option<&str>,
         source_line: usize,
     ) -> Result<()> {
+        self.instruction(target, content.map(ParsedText::Source), source_line)
+    }
+
+    fn instruction(
+        &mut self,
+        target: &str,
+        content: Option<ParsedText<'_>>,
+        source_line: usize,
+    ) -> Result<()> {
         if self.phase == DocumentPhase::Start {
             self.phase = DocumentPhase::Prolog;
         }
@@ -2384,7 +2515,7 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
         self.meter.reserve_node()?;
         let target = copy_parsed_literal(target, self.meter)?;
         let value = content
-            .map(|text| copy_parsed_text(ParsedText::Source(text), self.meter))
+            .map(|text| copy_parsed_text(text, self.meter))
             .transpose()?;
         let inherited_base = copy_base_uri(self.document, parent, self.meter)?;
         let id = push_metered(
@@ -2401,10 +2532,7 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
 
     fn reference(&mut self, reference: &str, source_line: usize) -> Result<()> {
         if self.elements.len() == 1 {
-            return Err(Error::Xml(
-                "character and entity references are not allowed outside the document element"
-                    .into(),
-            ));
+            return Err(outside_reference());
         }
         let value = match reference {
             "amp" => '&',
@@ -2420,6 +2548,14 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
                 return Err(Error::Xml(format!("unresolved entity reference &{name};")));
             }
         };
+        self.character(value, source_line)
+    }
+
+    /// The character a reference stands for.
+    fn character(&mut self, value: char, source_line: usize) -> Result<()> {
+        if self.elements.len() == 1 {
+            return Err(outside_reference());
+        }
         let id = push_parsed_text(
             self.document,
             self.elements,
@@ -2460,13 +2596,183 @@ impl<'input> StreamDocumentBuilder<'_, 'input, '_> {
     }
 
     fn finish(&self) -> Result<()> {
-        if self.elements.len() != 1 {
-            return Err(Error::Xml("unclosed element".into()));
+        finished(self.elements.len(), self.phase)
+    }
+}
+
+fn outside_reference() -> Error {
+    Error::Xml(
+        "character and entity references are not allowed outside the document element".into(),
+    )
+}
+
+/// Refuse a document that ends with `open` element frames, the document's
+/// own included, in `phase`.
+fn finished(open: usize, phase: DocumentPhase) -> Result<()> {
+    if open != 1 {
+        return Err(Error::Xml("unclosed element".into()));
+    }
+    if phase != DocumentPhase::Epilog {
+        return Err(Error::Xml("document element is missing".into()));
+    }
+    Ok(())
+}
+
+/// Builds a source [`Document`] from markup another reader has already read,
+/// such as the canonical form of an XML node-set, so its text is not parsed
+/// again.
+///
+/// Obtained from [`Document::build_with_budget_reported`], which applies the
+/// checks and charges a parse makes before reading text of the stated size.
+/// Each call then describes the next construct of that text in document
+/// order, with the line it starts on: character data as each maximal run a
+/// parse reads between references (given as consecutive pieces), each
+/// reference as the character it stands for. The tree, the limits of the
+/// [`ParseBudget`] and the refusals are those a parse of the text gives.
+///
+/// # Examples
+///
+/// ```
+/// # #[cfg(not(feature = "embedded"))]
+/// # {
+/// use xml_sec_xslt::{Document, ParseBudget};
+///
+/// let budget = ParseBudget::new(1024, 16, 8, 0, 0, 64 * 1024);
+/// let text = r#"<doc a="1">x &amp; y</doc>"#;
+/// let built = Document::build_with_budget_reported(None, budget, text.len(), |builder| {
+///     builder.start_element((None, "doc"), [], [(None, "a", "1")], 1)?;
+///     builder.text(&["x "], 1)?;
+///     builder.character_reference('&', 1)?;
+///     builder.text(&[" ", "y"], 1)?;
+///     builder.end_element()
+/// })
+/// .outcome
+/// .expect("well-formed markup");
+///
+/// let parsed = Document::parse_with_budget(text, None, budget).expect("well-formed text");
+/// assert_eq!(built, parsed);
+/// # }
+/// ```
+pub struct DocumentBuilder<'b, 'w>(StreamDocumentBuilder<'b, 'static, 'w>);
+
+impl DocumentBuilder<'_, '_> {
+    /// A start tag: the element's prefix and local name, the namespace
+    /// declarations it makes as `(prefix, uri)` and its attributes as
+    /// `(prefix, local name, value)`, values as a parse normalizes them.
+    ///
+    /// # Errors
+    /// Returns XML or budget failures a parse of the tag would return.
+    pub fn start_element<'v>(
+        &mut self,
+        name: (Option<&str>, &str),
+        declarations: impl IntoIterator<Item = (Option<&'v str>, &'v str)>,
+        attributes: impl IntoIterator<Item = (Option<&'v str>, &'v str, &'v str)>,
+        line: usize,
+    ) -> Result<()> {
+        let builder = &mut self.0;
+        if builder.elements.len() == 1 {
+            if builder.phase == DocumentPhase::Epilog {
+                return Err(Error::Xml("multiple document elements".into()));
+            }
+            builder.phase = DocumentPhase::Content;
         }
-        if self.phase != DocumentPhase::Epilog {
-            return Err(Error::Xml("document element is missing".into()));
+        let id = push_semantic_element(
+            builder.document,
+            builder.elements,
+            name,
+            declarations,
+            attributes,
+            builder.meter,
+        )?;
+        builder.document.nodes[id.0].source_line = Some(line);
+        Ok(())
+    }
+
+    /// The end tag of the innermost open element.
+    ///
+    /// # Errors
+    /// Returns an XML failure when no element is open.
+    pub fn end_element(&mut self) -> Result<()> {
+        let builder = &mut self.0;
+        if builder.elements.len() == 1 {
+            return Err(Error::Xml("unmatched closing element".into()));
+        }
+        builder.elements.pop();
+        if builder.elements.len() == 1 {
+            builder.phase = DocumentPhase::Epilog;
         }
         Ok(())
+    }
+
+    /// A maximal run of character data between references, as the
+    /// concatenation of `pieces`.
+    ///
+    /// # Errors
+    /// Returns XML or budget failures a parse of the run would return.
+    pub fn text(&mut self, pieces: &[&str], line: usize) -> Result<()> {
+        // XML 1.0 section 2.4: character data must not contain `]]>`, which
+        // a parse's tokenizer refuses before it reads the run.
+        // https://www.w3.org/TR/xml/#syntax
+        if pieces_contain(pieces, b"]]>") {
+            return Err(Error::Xml("`]]>` is not allowed in character data".into()));
+        }
+        self.0.text_run(ParsedText::Pieces(pieces), line)
+    }
+
+    /// A character or predefined entity reference standing for `character`.
+    ///
+    /// # Errors
+    /// Returns XML or budget failures a parse of the reference would return.
+    pub fn character_reference(&mut self, character: char, line: usize) -> Result<()> {
+        self.0.character(character, line)
+    }
+
+    /// A comment whose value, as a parse reads it between its delimiters, is
+    /// the concatenation of `pieces`.
+    ///
+    /// # Errors
+    /// Returns budget failures a parse of the comment would return.
+    pub fn comment(&mut self, pieces: &[&str], line: usize) -> Result<()> {
+        // XML 1.0 section 2.5: a comment holds no `--` and does not end in `-`.
+        // https://www.w3.org/TR/xml/#sec-comments
+        let ends_in_hyphen = pieces
+            .iter()
+            .rev()
+            .find(|piece| !piece.is_empty())
+            .is_some_and(|piece| piece.ends_with('-'));
+        if ends_in_hyphen || pieces_contain(pieces, b"--") {
+            return Err(Error::Xml("`--` is not allowed in a comment".into()));
+        }
+        self.0.comment_value(ParsedText::Pieces(pieces), line)
+    }
+
+    /// A processing instruction whose value is the concatenation of `pieces`.
+    ///
+    /// # Errors
+    /// Returns budget failures a parse of the instruction would return.
+    pub fn processing_instruction(
+        &mut self,
+        target: &str,
+        pieces: Option<&[&str]>,
+        line: usize,
+    ) -> Result<()> {
+        // XML 1.0 section 2.6: the value holds no `?>`, and the target is a
+        // name, colon-free under Namespaces 1.0 section 7; a parse reads
+        // `<?xml` as the XML declaration, refused past the document's start.
+        // https://www.w3.org/TR/xml/#sec-pi
+        // https://www.w3.org/TR/xml-names/#Conformance
+        if !super::lexical::is_ncname(target) || target == "xml" {
+            return Err(Error::Xml(format!(
+                "invalid processing instruction target {target}"
+            )));
+        }
+        if pieces.is_some_and(|pieces| pieces_contain(pieces, b"?>")) {
+            return Err(Error::Xml(
+                "`?>` is not allowed in a processing instruction".into(),
+            ));
+        }
+        self.0
+            .instruction(target, pieces.map(ParsedText::Pieces), line)
     }
 }
 
@@ -2759,9 +3065,70 @@ fn push_stream_element<
         stage.source_attributes(start, declared_attributes, declarations, meter)?;
         stage.default_attributes(start, declared_attributes, declarations, meter)?;
     }
+    project_staged_element(
+        document,
+        elements,
+        StagedElement {
+            parent,
+            namespaces,
+            namespace_index,
+            raw_attributes,
+            staging_start,
+        },
+        &lexical_name,
+        (
+            start.name.prefix().map(str::to_owned),
+            start.name.local().to_owned(),
+        ),
+        if empty {
+            ElementFrame::Closed
+        } else {
+            ElementFrame::Open(Some(start.name))
+        },
+        meter,
+    )
+}
+
+/// Whether a projected element stays open for its content.
+#[derive(Clone, Copy)]
+enum ElementFrame<'a> {
+    /// An empty-element tag, which has no content.
+    Closed,
+    /// A start tag, with the lexical name its end tag must repeat when the
+    /// end tag is read rather than reported.
+    Open(Option<xml_sec_xml_input::lexical::Name<'a>>),
+}
+
+/// An element start whose namespace declarations are in scope and whose
+/// attributes are staged, before either entry projects it.
+struct StagedElement {
+    parent: NodeId,
+    namespaces: Arc<Vec<Namespace>>,
+    namespace_index: HashMap<String, usize>,
+    raw_attributes: Vec<(String, String, InternalAttributeType)>,
+    /// Owned bytes before staging began; projection settles the difference.
+    staging_start: usize,
+}
+
+/// Project a staged element under its parent and open its frame as `frame`
+/// says.
+fn project_staged_element<'a>(
+    document: &mut Document,
+    elements: &mut Vec<StreamElementFrame<'a>>,
+    staged: StagedElement,
+    lexical_name: &str,
+    (prefix, local): (Option<String>, String),
+    frame: ElementFrame<'a>,
+    meter: &mut StreamParseMeter,
+) -> Result<NodeId> {
+    let StagedElement {
+        parent,
+        namespaces,
+        namespace_index,
+        raw_attributes,
+        staging_start,
+    } = staged;
     meter.charge_owned(lexical_name.len())?;
-    let prefix = start.name.prefix().map(str::to_owned);
-    let local = start.name.local().to_owned();
     if let Some(position) = namespace_index.get(prefix.as_deref().unwrap_or_default()) {
         meter.charge_owned(namespaces[*position].uri.len())?;
     }
@@ -2771,7 +3138,6 @@ fn push_stream_element<
             "undeclared namespace prefix in element {lexical_name}"
         )));
     }
-    drop(lexical_name);
     let StreamProjectedAttributes {
         attributes,
         first_id_attribute,
@@ -2816,14 +3182,118 @@ fn push_stream_element<
         meter,
     )?;
     meter.release_owned(id_bytes);
-    if !empty {
+    if let ElementFrame::Open(lexical_name) = frame {
         elements.push(StreamElementFrame {
             node: projected,
-            lexical_name: Some(start.name),
+            lexical_name,
         });
     }
     Ok(projected)
 }
+
+/// The semantic counterpart of [`push_stream_element`]: an element whose
+/// names are split and whose namespace declarations and attribute values
+/// are already as a parse of its start tag yields them.
+fn push_semantic_element<'v>(
+    document: &mut Document,
+    elements: &mut Vec<StreamElementFrame<'static>>,
+    (prefix, local): (Option<&str>, &str),
+    declarations: impl IntoIterator<Item = (Option<&'v str>, &'v str)>,
+    attributes: impl IntoIterator<Item = (Option<&'v str>, &'v str, &'v str)>,
+    meter: &mut StreamParseMeter,
+) -> Result<NodeId> {
+    // Namespaces 1.0 section 4: an element name is a QName, whose parts are
+    // NCNames, as a parse of the start tag requires.
+    // https://www.w3.org/TR/xml-names/#ns-qualnames
+    if !super::lexical::is_ncname(local)
+        || prefix.is_some_and(|prefix| !super::lexical::is_ncname(prefix))
+    {
+        return Err(Error::Xml(format!(
+            "invalid XML QName {}{local}",
+            prefix
+                .map(|prefix| format!("{prefix}:"))
+                .unwrap_or_default()
+        )));
+    }
+    meter.element_depth(elements.len())?;
+    meter.reserve_node()?;
+    if elements.len() == elements.capacity() {
+        let additional = elements.capacity().max(4);
+        reserve_charged(elements, additional, meter)?;
+    }
+    let staging_start = meter.owned_bytes;
+    let parent = elements
+        .last()
+        .map(|frame| frame.node)
+        .expect("document frame remains present");
+    let mut namespaces = match document.node(parent).map(|node| &node.kind) {
+        Some(NodeKind::Element { namespaces, .. }) => Arc::clone(namespaces),
+        _ => Arc::new(vec![Namespace {
+            prefix: Some("xml".into()),
+            uri: "http://www.w3.org/XML/1998/namespace".into(),
+        }]),
+    };
+    let (mut namespace_index, mut namespace_index_bytes) =
+        admit_namespace_index(&namespaces, meter)?;
+    let qualified_bytes = local.len() + prefix.map_or(0, |prefix| prefix.len() + 1);
+    meter.charge_owned(qualified_bytes)?;
+    for (bound, uri) in declarations {
+        if bound.is_some_and(|bound| !super::lexical::is_ncname(bound)) {
+            return Err(Error::Xml(format!(
+                "invalid namespace prefix {}",
+                bound.unwrap_or_default()
+            )));
+        }
+        meter.charge_owned(uri.len())?;
+        validate_namespace_binding(bound, uri)?;
+        set_namespace_bounded(
+            &mut namespaces,
+            &mut namespace_index,
+            bound.map(str::to_owned),
+            uri.to_owned(),
+            meter.budget.namespace_scope_bytes,
+            &mut namespace_index_bytes,
+            &mut meter.namespace_scope_bytes,
+        )?;
+    }
+    let mut raw_attributes = Vec::new();
+    for (bound, name, value) in attributes {
+        let mut lexical = String::new();
+        if let Some(bound) = bound {
+            lexical.push_str(bound);
+            lexical.push(':');
+        }
+        lexical.push_str(name);
+        meter.charge_owned(lexical.len() + value.len())?;
+        if raw_attributes.len() == raw_attributes.capacity() {
+            let additional = raw_attributes.capacity().max(4);
+            reserve_charged(&mut raw_attributes, additional, meter)?;
+        }
+        raw_attributes.push((lexical, value.to_owned(), InternalAttributeType::Cdata));
+    }
+    let mut lexical_name = String::with_capacity(qualified_bytes);
+    if let Some(prefix) = prefix {
+        lexical_name.push_str(prefix);
+        lexical_name.push(':');
+    }
+    lexical_name.push_str(local);
+    project_staged_element(
+        document,
+        elements,
+        StagedElement {
+            parent,
+            namespaces,
+            namespace_index,
+            raw_attributes,
+            staging_start,
+        },
+        &lexical_name,
+        (prefix.map(str::to_owned), local.to_owned()),
+        ElementFrame::Open(None),
+        meter,
+    )
+}
+
 fn admit_namespace_index(
     namespaces: &[Namespace],
     meter: &mut StreamParseMeter<'_>,
@@ -5461,6 +5931,9 @@ fn lexical_attribute_prefix(xml: &str, offset: usize, local: &str) -> Option<Str
 
 #[cfg(all(test, not(feature = "embedded")))]
 mod parser_boundary_tests;
+
+#[cfg(all(test, not(feature = "embedded")))]
+mod builder_tests;
 
 #[cfg(test)]
 mod expansion_workspace_tests {
