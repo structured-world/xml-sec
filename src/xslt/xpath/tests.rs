@@ -98,17 +98,21 @@ fn xinclude_line_normalization_replaces_accounted_storage() {
 fn generated_id_result_crosses_the_allocation_gate_before_formatting() {
     // The cached identity itself requires no new storage here, leaving only the rendered
     // generate-id() result to exercise the XPath result-allocation gate.
-    let package = Package::new();
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
     let document = package.as_document();
     let root = document.root();
-    let path = typed_path_to(&nodeset::Node::Root(root));
     let identity = GeneratedNodeIdentity {
         document: document.identity(),
-        path,
+        path: NodePath::Ordinary(Vec::new()),
     };
     let mut assigned = HashMap::new();
     assigned.insert(identity, 1);
     let function = GenerateId {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         assigned: Rc::new(RefCell::new(GeneratedIdCache {
             assigned,
             owned_bytes: 0,
@@ -432,7 +436,8 @@ fn string_consumers_gate_nodeset_work_before_allocation() {
 #[test]
 fn key_name_coercion_rejects_work_before_lookup() {
     // key() must share QName coercion with availability/property queries, before index work.
-    let package = sxd_document_no_unsafe::parser::parse("<root>payload</root>").expect("test XML");
+    let source = Document::parse("<root>payload</root>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
     let document = package.as_document();
     let mut context = Context::new();
     context.set_evaluation_work_limit(0);
@@ -442,6 +447,10 @@ fn key_name_coercion_rejects_work_before_lookup() {
     let mut nodes = nodeset::Nodeset::new();
     nodes.add(document.root());
     let key = KeyFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         index: Rc::new(RefCell::new(HashMap::new())),
         namespaces: Arc::new(Vec::new()),
         declarations: Arc::from([]),
@@ -495,14 +504,17 @@ fn live_result_tree_fragment_handles_do_not_alias() {
 
 #[test]
 fn request_base_uri_is_rejected_before_clone_when_budget_is_exhausted() {
-    let package = Package::new();
-    let document = package.as_document();
-    let root = document.create_element("root");
-    document.root().append_child(root);
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let root = package_node(&package, &[0, 0, 0]);
     let mut context = Context::new();
     context.set_string_allocation_limit(0);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root);
     let function = DocumentFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
         roots: Rc::new(RefCell::new(HashMap::new())),
@@ -1882,25 +1894,23 @@ fn lang_ancestor_search_obeys_work_budget() {
 fn id_result_nodes_cross_the_xpath_allocation_gate() {
     // A wide id() result is temporary XPath-owned storage even when its caller consumes only
     // the first node. Every unique result insertion must therefore consume the shared gate.
-    let package = Package::new();
-    let document = package.as_document();
-    let documents = document.create_element("documents");
-    let logical_document = document.create_element("document");
-    let target = document.create_element("target");
-    document.root().append_child(documents);
-    documents.append_child(logical_document);
-    logical_document.append_child(target);
+    let source = Document::parse("<target/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let logical_document = package_node(&package, &[0, 0]);
     let index = vec![HashMap::from([(
         "target".into(),
         NodePath::Ordinary(vec![0, 0, 0]),
     )])];
     let function = IdFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         nodes_by_document: Rc::new(RefCell::new(index)),
     };
     let mut context = Context::new();
     context.set_string_allocation_limit(0);
-    let evaluation =
-        sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document);
 
     let error = function
         .evaluate(&evaluation, vec![SxdValue::String("target".into())])
@@ -1912,19 +1922,19 @@ fn id_result_nodes_cross_the_xpath_allocation_gate() {
 fn id_string_tokenization_obeys_work_budget() {
     // Existing String values avoid coercion, but splitting and hashing their ID tokens is
     // still attacker-controlled XPath work even when every lookup misses.
-    let package = Package::new();
-    let document = package.as_document();
-    let documents = document.create_element("documents");
-    let logical_document = document.create_element("document");
-    document.root().append_child(documents);
-    documents.append_child(logical_document);
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let logical_document = package_node(&package, &[0, 0]);
     let function = IdFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         nodes_by_document: Rc::new(RefCell::new(vec![HashMap::new()])),
     };
     let mut context = Context::new();
     context.set_evaluation_work_limit(8);
-    let evaluation =
-        sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document);
 
     let error = function
         .evaluate(&evaluation, vec![SxdValue::String("x ".repeat(128))])
@@ -1957,21 +1967,23 @@ fn scalar_math_extension_obeys_extension_work_budget() {
 fn runtime_node_paths_obey_work_budget() {
     // id() needs document identity even for an empty lookup; finding it must not scan
     // arbitrarily many preceding siblings outside the evaluation work allowance.
-    let package = Package::new();
-    let document = package.as_document();
-    let root = document.create_element("root");
-    document.root().append_child(root);
-    for _ in 0..128 {
-        root.append_child(document.create_element("sibling"));
-    }
-    let target = document.create_element("target");
-    root.append_child(target);
+    let source = Document::parse(
+        &format!("<root>{}<target/></root>", "<sibling/>".repeat(128)),
+        None,
+    )
+    .expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let target = package_node(&package, &[0, 0, 0, 128]);
     let function = IdFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         nodes_by_document: Rc::new(RefCell::new(Vec::new())),
     };
     let mut context = Context::new();
     context.set_evaluation_work_limit(0);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, target.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, target);
     assert!(
         function
             .evaluate(&evaluation, vec![SxdValue::String(String::new())])
@@ -1980,13 +1992,113 @@ fn runtime_node_paths_obey_work_budget() {
 }
 
 #[test]
+fn a_node_path_costs_its_depth_not_its_preceding_siblings() {
+    // The last of 4096 children names its path and its document with work
+    // proportional to its depth. A scan of the preceding siblings would
+    // spend 4096 units on each and exceed this allowance.
+    let source = Document::parse(
+        &format!("<root>{}<target a='1'/></root>", "<sibling/>".repeat(4096)),
+        None,
+    )
+    .expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let paths = ProjectedPaths {
+        source: &source,
+        maps: &maps,
+    };
+    let target = package_element(&package, &[0, 0, 0, 4096]);
+    let attribute = nodeset::Node::Attribute(target.attribute("a").expect("attribute"));
+    let mut context = Context::new();
+    context.set_evaluation_work_limit(16);
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, target.into());
+    assert_eq!(
+        paths.path(&target.into(), &evaluation).expect("depth fits"),
+        NodePath::Ordinary(vec![0, 0, 0, 4096])
+    );
+    assert_eq!(
+        paths.path(&attribute, &evaluation).expect("depth fits"),
+        NodePath::Attribute {
+            parent: vec![0, 0, 0, 4096],
+            namespace: None,
+            local: "a".into(),
+        }
+    );
+    assert_eq!(
+        paths
+            .document_index(&target.into(), &evaluation)
+            .expect("depth fits"),
+        Some(0)
+    );
+}
+
+#[test]
+fn projected_paths_match_the_tree_for_every_node_kind() {
+    // Every evaluator node's path, read from the projection's positions,
+    // names that same node when followed from the package root: elements,
+    // text, comments, instructions, attributes, declared and implicit
+    // namespaces, the documents container, the package root, and nodes of a
+    // second logical document.
+    let mut source = Document::parse(
+        "<a xmlns:p='urn:p'><!--c--><b p:x='1'>t<?pi v?></b>u<c/></a>",
+        None,
+    )
+    .expect("source parses");
+    source.import(&Document::parse("<second><leaf/></second>", None).expect("second parses"));
+    let (package, maps, _) = projected_maps(&source);
+    let paths = ProjectedPaths {
+        source: &source,
+        maps: &maps,
+    };
+    let context = Context::new();
+    let root: nodeset::Node<'_> = package.as_document().root().into();
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root.clone());
+    let mut pending = vec![root];
+    let mut checked = 0;
+    while let Some(node) = pending.pop() {
+        let mut nodes = vec![node.clone()];
+        if let Some(element) = node.element() {
+            nodes.extend((0..element.attributes_len()).map(|index| {
+                nodeset::Node::Attribute(element.attribute_at(index).expect("in range"))
+            }));
+            for (prefix, uri) in [
+                ("p", "urn:p"),
+                ("xml", "http://www.w3.org/XML/1998/namespace"),
+            ] {
+                nodes.extend(resolve_namespace_node(&node, prefix, uri));
+            }
+        }
+        for node in nodes {
+            let path = paths.path(&node, &evaluation).expect("unlimited path");
+            assert_eq!(
+                resolve_node_path(&evaluation, &path).expect("unlimited resolution"),
+                Some(node),
+                "{path:?}"
+            );
+            checked += 1;
+        }
+        pending.extend((0..).map_while(|index| node.child_at(index)));
+    }
+    assert!(checked > 20, "{checked}");
+    let leaf = package_node(&package, &[0, 1, 0, 0]);
+    assert_eq!(
+        paths.document_index(&leaf, &evaluation).expect("unlimited"),
+        Some(1)
+    );
+    assert_eq!(
+        paths
+            .document_index(&package.as_document().root().into(), &evaluation)
+            .expect("unlimited"),
+        None
+    );
+}
+
+#[test]
 fn restored_function_results_obey_evaluation_budgets() {
     // Owned strings/node projections require replay storage; immutable RTF projections
     // must instead preserve shared ownership without copying their retained payload.
-    let package = Package::new();
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
     let document = package.as_document();
-    let root = document.create_element("root");
-    document.root().append_child(root);
     let results = [
         DeferredXPathValue::String("x".repeat(4096)),
         DeferredXPathValue::ResultTreeFragment {
@@ -2012,6 +2124,10 @@ fn restored_function_results_obey_evaluation_budgets() {
             arguments: vec![],
         };
         let function = DeferredStylesheetFunction {
+            paths: ProjectedPaths {
+                source: &source,
+                maps: &maps,
+            },
             name,
             session: Rc::new(RefCell::new(CustomCallState {
                 completed: vec![CompletedCustomCall {
@@ -2048,32 +2164,37 @@ fn restored_function_results_obey_evaluation_budgets() {
 fn restored_nodes_preserve_identity_and_enforce_both_budgets() {
     // Replay must retain ordinary, attribute and namespace identities without
     // enumerating the entire namespace axis; stale paths remain errors.
-    let package = Package::new();
+    let source = Document::parse(
+        "<root xmlns='urn:default' xmlns:p='urn:p' id='value'/>",
+        None,
+    )
+    .expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
     let document = package.as_document();
-    let root = document.create_element("root");
-    document.root().append_child(root);
-    root.set_attribute_value("id", "value");
-    root.register_prefix("p", "urn:p");
-    root.set_default_namespace_uri(Some("urn:default"));
+    let projected = ProjectedPaths {
+        source: &source,
+        maps: &maps,
+    };
+    let root = vec![0, 0, 0];
     let paths = vec![
-        NodePath::Ordinary(vec![0]),
+        NodePath::Ordinary(root.clone()),
         NodePath::Attribute {
-            parent: vec![0],
+            parent: root.clone(),
             namespace: None,
             local: "id".into(),
         },
         NodePath::Namespace {
-            parent: vec![0],
+            parent: root.clone(),
             prefix: "p".into(),
             uri: "urn:p".into(),
         },
         NodePath::Namespace {
-            parent: vec![0],
+            parent: root.clone(),
             prefix: String::new(),
             uri: "urn:default".into(),
         },
         NodePath::Namespace {
-            parent: vec![0],
+            parent: root,
             prefix: "xml".into(),
             uri: "http://www.w3.org/XML/1998/namespace".into(),
         },
@@ -2100,7 +2221,12 @@ fn restored_nodes_preserve_identity_and_enforce_both_budgets() {
                 };
                 assert_eq!(nodes.size(), 1);
                 assert_eq!(
-                    typed_path_to(&nodes.iter().next().expect("one restored node")),
+                    projected
+                        .path(
+                            &nodes.iter().next().expect("one restored node"),
+                            &evaluation
+                        )
+                        .expect("unlimited path"),
                     path
                 );
             }
@@ -2146,24 +2272,25 @@ fn exslt_set_result_nodes_cross_the_xpath_allocation_gate() {
 fn key_and_document_nodeset_arguments_obey_the_allocation_budget() {
     // XSLT node-set arguments can contain many large string-values. key() and document()
     // must not retain an unmetered batch before performing their lookups.
-    let package = Package::new();
-    let document = package.as_document();
-    let documents = document.create_element("documents");
-    let logical = document.create_element("logical");
-    document.root().append_child(documents);
-    documents.append_child(logical);
+    let item = format!("<item>{}</item>", "x".repeat(1_024));
+    let source = Document::parse(&format!("<items>{}</items>", item.repeat(8)), None)
+        .expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let paths = ProjectedPaths {
+        source: &source,
+        maps: &maps,
+    };
+    let logical = package_node(&package, &[0, 0]);
     let mut nodes = nodeset::Nodeset::new();
-    for _ in 0..8 {
-        let item = document.create_element("item");
-        item.append_child(document.create_text(&"x".repeat(1_024)));
-        logical.append_child(item);
-        nodes.add(item);
+    for index in 0..8 {
+        nodes.add(package_node(&package, &[0, 0, 0, index]));
     }
     let mut xpath_context = Context::new();
     xpath_context.set_string_allocation_limit(128);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&xpath_context, logical.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&xpath_context, logical);
 
     let key = KeyFunction {
+        paths,
         index: Rc::new(RefCell::new(HashMap::new())),
         namespaces: Arc::new(Vec::new()),
         declarations: Arc::from([]),
@@ -2180,6 +2307,7 @@ fn key_and_document_nodeset_arguments_obey_the_allocation_budget() {
     ));
 
     let document_function = DocumentFunction {
+        paths,
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
         roots: Rc::new(RefCell::new(HashMap::new())),
@@ -2199,14 +2327,17 @@ fn key_and_document_nodeset_arguments_obey_the_allocation_budget() {
 fn document_scalar_uri_obeys_the_xpath_work_budget() {
     // An existing scalar avoids string coercion allocation, but URI materialization and the
     // document-cache probe must still charge the caller-controlled URI bytes.
-    let package = Package::new();
-    let document = package.as_document();
-    let logical = document.create_element("logical");
-    document.root().append_child(logical);
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let logical = package_node(&package, &[0, 0]);
     let mut context = Context::new();
     context.set_evaluation_work_limit(0);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical);
     let document_function = DocumentFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
         roots: Rc::new(RefCell::new(HashMap::new())),
@@ -2226,16 +2357,17 @@ fn document_scalar_uri_obeys_the_xpath_work_budget() {
 fn key_lookup_borrows_scalar_payload() {
     // An already-owned scalar argument needs no payload copy for a hash lookup.
     // Keep enough room for the context path/QName, but not for another large string.
-    let package = Package::new();
-    let document = package.as_document();
-    let documents = document.create_element("documents");
-    let logical = document.create_element("logical");
-    document.root().append_child(documents);
-    documents.append_child(logical);
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let logical = package_node(&package, &[0, 0]);
     let mut context = Context::new();
     context.set_string_allocation_limit(512);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical.into());
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical);
     let key = KeyFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         index: Rc::new(RefCell::new(HashMap::new())),
         namespaces: Arc::new(Vec::new()),
         declarations: Arc::from([]),
@@ -2816,34 +2948,23 @@ fn set_distinct_charges_descendant_string_traversal_as_extension_work() {
 fn id_nodeset_arguments_stream_through_the_allocation_gate() {
     // id() needs every node's string-value but does not retain those values. It must meter
     // each temporary while avoiding simultaneous retention in an unbounded Vec<String>.
-    let package = Package::new();
-    let document = package.as_document();
-    let container = document.create_element("container");
-    let logical_document = document.create_element("document");
-    let target = document.create_element("target");
-    let argument = document.create_element("ids");
-    argument.append_child(document.create_text("target"));
-    logical_document.append_child(target);
-    logical_document.append_child(argument);
-    container.append_child(logical_document);
-    document.root().append_child(container);
-
+    let source = Document::parse("<r><target/><ids>target</ids></r>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let logical_document = package_node(&package, &[0, 0]);
     let mut indexed = HashMap::new();
-    indexed.insert(
-        "target".into(),
-        typed_path_to(&nodeset::Node::Element(target)),
-    );
+    indexed.insert("target".into(), NodePath::Ordinary(vec![0, 0, 0, 0]));
     let function = IdFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         nodes_by_document: Rc::new(RefCell::new(vec![indexed])),
     };
     let mut nodes = nodeset::Nodeset::new();
-    nodes.add(argument);
+    nodes.add(package_node(&package, &[0, 0, 0, 1]));
     let mut context = Context::new();
     context.set_string_allocation_limit("target".len() - 1);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
-        &context,
-        nodeset::Node::Element(logical_document),
-    );
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document);
 
     let error = function
         .evaluate(&evaluation, vec![SxdValue::Nodeset(nodes)])
@@ -2856,22 +2977,17 @@ fn unparsed_entity_uri_uses_the_dynamic_context_document() {
     // XSLT 1.0 section 12.4 resolves the entity in the document containing the context node,
     // not in the principal document captured when the expression was compiled.
     // https://www.w3.org/TR/1999/REC-xslt-19991116#misc-func
-    let package = Package::new();
-    let document = package.as_document();
-    let documents = document.create_element("documents");
-    document.root().append_child(documents);
-    let first = document.create_element("document");
-    let second = document.create_element("document");
-    documents.append_child(first);
-    documents.append_child(second);
-    let context_node = document.create_element("external");
-    second.append_child(context_node);
+    let mut source = Document::parse("<principal/>", None).expect("source parses");
+    source.import(&Document::parse("<external/>", None).expect("second parses"));
+    let (package, maps, _) = projected_maps(&source);
+    let context_node = package_node(&package, &[0, 1, 0]);
     let context = Context::new();
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
-        &context,
-        nodeset::Node::Element(context_node),
-    );
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, context_node);
     let function = UnparsedEntityUriFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         documents: Rc::new(RefCell::new(vec![
             HashMap::from([("logo".into(), "principal.png".into())]),
             HashMap::from([("logo".into(), "external.png".into())]),
@@ -2890,14 +3006,15 @@ fn unparsed_entity_uri_uses_the_dynamic_context_document() {
 fn unparsed_entity_uri_reserves_the_returned_uri() {
     // The retained entity index owns one URI copy. Returning the XPath string creates a
     // second allocation, which must cross the operation allocation gate first.
-    let package = Package::new();
-    let document = package.as_document();
-    let documents = document.create_element("documents");
-    let logical_document = document.create_element("document");
-    document.root().append_child(documents);
-    documents.append_child(logical_document);
+    let source = Document::parse("<root/>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let logical_document = package_node(&package, &[0, 0]);
     let uri = "memory:entity/".repeat(32);
     let function = UnparsedEntityUriFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         documents: Rc::new(RefCell::new(vec![HashMap::from([(
             "logo".into(),
             uri.clone(),
@@ -2905,10 +3022,7 @@ fn unparsed_entity_uri_reserves_the_returned_uri() {
     };
     let mut context = Context::new();
     context.set_string_allocation_limit(uri.len() - 1);
-    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(
-        &context,
-        nodeset::Node::Element(logical_document),
-    );
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, logical_document);
 
     let error = function
         .evaluate(&evaluation, vec![SxdValue::String("logo".into())])
@@ -2920,15 +3034,17 @@ fn unparsed_entity_uri_reserves_the_returned_uri() {
 fn document_function_reserves_explicit_base_selection_before_cloning() {
     // The second argument's effective base is retained for the complete document() call.
     // Reserve that first clone independently of each request constructed later.
-    let package = Package::new();
-    let document = package.as_document();
-    let root = document.create_element("root");
-    let base = document.create_element("base");
-    root.append_child(base);
-    document.root().append_child(root);
-    let path = typed_path_to(&nodeset::Node::Element(base));
+    let source = Document::parse("<root><base/></root>", None).expect("source parses");
+    let (package, maps, _) = projected_maps(&source);
+    let root = package_node(&package, &[0, 0, 0]);
+    let base = package_node(&package, &[0, 0, 0, 0]);
+    let path = NodePath::Ordinary(vec![0, 0, 0, 0]);
     let base_uri = "memory:base/".repeat(32);
     let function = DocumentFunction {
+        paths: ProjectedPaths {
+            source: &source,
+            maps: &maps,
+        },
         resolver: &crate::NoResolver,
         access_error: &RefCell::new(None),
         roots: Rc::new(RefCell::new(HashMap::new())),
@@ -2944,8 +3060,7 @@ fn document_function_reserves_explicit_base_selection_before_cloning() {
     nodes.add(base);
     let mut context = Context::new();
     context.set_string_allocation_limit(base_uri.len() - 1);
-    let evaluation =
-        sxd_xpath_no_unsafe::context::Evaluation::new(&context, nodeset::Node::Element(root));
+    let evaluation = sxd_xpath_no_unsafe::context::Evaluation::new(&context, root);
 
     let error = function
         .evaluate(
@@ -3479,6 +3594,25 @@ fn projected_maps(source: &Document) -> (sxd_document_no_unsafe::Package, NodeMa
         project_semantic_document(source, &mut slots, &mut meter).expect("source projects");
     let maps = NodeMaps::new(source, slots, &mut meter).expect("node maps build");
     (package, maps, meter)
+}
+
+/// The evaluator node at `path` of a projected package: `[0]` is the
+/// documents container and `[0, d]` the wrapper of logical document `d`.
+fn package_node<'d>(
+    package: &'d sxd_document_no_unsafe::Package,
+    path: &[usize],
+) -> nodeset::Node<'d> {
+    follow_path(package.as_document().root().into(), path).expect("fixture path exists")
+}
+
+/// The element at `path` of a projected package.
+fn package_element<'d>(
+    package: &'d sxd_document_no_unsafe::Package,
+    path: &[usize],
+) -> sxd_document_no_unsafe::dom::Element<'d> {
+    package_node(package, path)
+        .element()
+        .expect("fixture path names an element")
 }
 
 #[test]

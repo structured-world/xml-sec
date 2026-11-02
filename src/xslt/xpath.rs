@@ -675,12 +675,13 @@ impl CustomCallSession {
     }
 }
 
-struct DeferredStylesheetFunction {
+struct DeferredStylesheetFunction<'a> {
+    paths: ProjectedPaths<'a>,
     name: ExpandedName,
     session: Rc<RefCell<CustomCallState>>,
 }
 
-impl function::Function for DeferredStylesheetFunction {
+impl function::Function for DeferredStylesheetFunction<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -689,12 +690,12 @@ impl function::Function for DeferredStylesheetFunction {
         context.reserve_string_allocation(deferred_call_size(&self.name, &arguments))?;
         let call = DeferredCustomCall {
             name: self.name.clone(),
-            node: typed_path_to_with_context(&context.node, context)?,
+            node: self.paths.path(&context.node, context)?,
             position: context.position,
             size: context.size,
             arguments: arguments
                 .into_iter()
-                .map(|value| defer_sxd_value(value, context))
+                .map(|value| defer_sxd_value(value, self.paths, context))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         };
         let mut state = self.session.borrow_mut();
@@ -741,6 +742,7 @@ fn deferred_sxd_value_size(value: &SxdValue<'_>) -> usize {
 
 fn defer_sxd_value(
     value: SxdValue<'_>,
+    paths: ProjectedPaths<'_>,
     context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
 ) -> std::result::Result<DeferredXPathValue, function::Error> {
     Ok(match value {
@@ -756,7 +758,7 @@ fn defer_sxd_value(
             nodes
                 .document_order_with_context(context)?
                 .iter()
-                .map(|node| typed_path_to_with_context(node, context))
+                .map(|node| paths.path(node, context))
                 .collect::<std::result::Result<Vec<_>, _>>()?,
         ),
     })
@@ -1112,13 +1114,15 @@ impl Evaluator {
         meter: &mut Meter,
     ) -> Result<()> {
         debug_assert_eq!(value_reservation, value.capacity());
-        let Some(sxd) = self
+        // A node the evaluator cannot see is never a key result.
+        if self
             .maps
             .to_sxd(&self.source, self.package.as_document(), node)
-        else {
+            .is_none()
+        {
             meter.release_owned_bytes(value_reservation);
             return Ok(());
-        };
+        }
         let document_index = self
             .source
             .logical_root_for(node)
@@ -1136,7 +1140,7 @@ impl Evaluator {
                 return Err(error);
             }
         };
-        let (path, path_reservation) = match typed_path_to_metered(&sxd, meter) {
+        let (path, path_reservation) = match self.key_entry_path(node, meter) {
             Ok(path) => path,
             Err(error) => {
                 meter.release_owned_bytes(value_reservation);
@@ -1169,6 +1173,24 @@ impl Evaluator {
             meter.release_owned_bytes(value_reservation.saturating_add(path_reservation));
         }
         result
+    }
+
+    /// The retained path of a key entry, its bytes charged before it exists.
+    fn key_entry_path(&self, node: &SourceNode, meter: &mut Meter) -> Result<(NodePath, usize)> {
+        let stale = || Error::Dynamic("key node has no document path".into());
+        let len = self
+            .maps
+            .path_len(&self.source, source_node_owner(node))
+            .ok_or_else(stale)?;
+        let bytes = NodeMaps::path_bytes_of(&self.source, node, len).ok_or_else(stale)?;
+        meter.charge(BudgetKind::XPathOperations, len)?;
+        meter.charge(BudgetKind::OwnedBytes, bytes)?;
+        if let Some(path) = self.maps.path_of(&self.source, node, len) {
+            Ok((path, bytes))
+        } else {
+            meter.release_owned_bytes(bytes);
+            Err(stale())
+        }
     }
 
     #[expect(
@@ -2463,15 +2485,25 @@ impl Evaluator {
         Ok(())
     }
 
-    fn bind_xpath_functions(
-        &self,
-        context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'_, '_>,
+    /// The projection this evaluation's functions read node paths from.
+    fn projected_paths(&self) -> ProjectedPaths<'_> {
+        ProjectedPaths {
+            source: &self.source,
+            maps: &self.maps,
+        }
+    }
+
+    fn bind_xpath_functions<'function>(
+        &'function self,
+        context: &mut sxd_xpath_no_unsafe::context::ScopedContext<'function, '_>,
         expression: &Expression,
     ) {
+        let paths = self.projected_paths();
         let function_namespaces = Arc::clone(&expression.namespaces);
         context.set_function(
             "key",
             KeyFunction {
+                paths,
                 index: Rc::clone(&self.key_index),
                 namespaces: Arc::clone(&function_namespaces),
                 declarations: Arc::clone(&self.key_declarations),
@@ -2490,12 +2522,14 @@ impl Evaluator {
         context.set_function(
             "generate-id",
             GenerateId {
+                paths,
                 assigned: self.generated_ids.clone(),
             },
         );
         context.set_function(
             "id",
             IdFunction {
+                paths,
                 nodes_by_document: Rc::clone(&self.id_index),
             },
         );
@@ -2517,6 +2551,7 @@ impl Evaluator {
         context.set_function(
             "unparsed-entity-uri",
             UnparsedEntityUriFunction {
+                paths,
                 documents: Rc::clone(&self.unparsed_entity_index),
             },
         );
@@ -2541,6 +2576,7 @@ impl Evaluator {
         context.set_function(
             "document",
             DocumentFunction {
+                paths: self.projected_paths(),
                 resolver: self.resolver.as_ref(),
                 access_error: document_access_error,
                 static_base_uri: expression.static_base_uri.clone(),
@@ -2559,6 +2595,7 @@ impl Evaluator {
                 context.set_function(
                     qname,
                     DeferredStylesheetFunction {
+                        paths: self.projected_paths(),
                         name: name.clone(),
                         session: Rc::clone(&custom_calls.state),
                     },
@@ -6468,12 +6505,13 @@ impl NodeMaps {
         Some(len)
     }
 
-    fn ordinary_path(&self, source: &Document, id: NodeId) -> Option<Vec<usize>> {
-        let len = self.path_len(source, id)?;
-        // Allocated at its exact length, which `path_bytes` admits beforehand.
+    /// The ordinary path of `id`, whose [`Self::path_len`] the caller already
+    /// read to admit its allocation.
+    fn ordinary_path(&self, source: &Document, id: NodeId, len: usize) -> Option<Vec<usize>> {
+        // Allocated at its exact length, which the caller admits beforehand.
         let mut path = vec![0; len];
         let mut current = Some(id);
-        for slot in path[1..].iter_mut().rev() {
+        for slot in path.get_mut(1..)?.iter_mut().rev() {
             let node = current?;
             *slot = *self.positions.get(node.0)?;
             current = source.node(node)?.parent;
@@ -6483,9 +6521,13 @@ impl NodeMaps {
 
     /// Heap bytes [`Self::path`] allocates for `node`, known before it does.
     fn path_bytes(&self, source: &Document, node: &SourceNode) -> Option<usize> {
-        let words = self
-            .path_len(source, source_node_owner(node))?
-            .checked_mul(std::mem::size_of::<usize>())?;
+        let len = self.path_len(source, source_node_owner(node))?;
+        Self::path_bytes_of(source, node, len)
+    }
+
+    /// [`Self::path_bytes`] for an owner whose path length is already known.
+    fn path_bytes_of(source: &Document, node: &SourceNode, len: usize) -> Option<usize> {
+        let words = len.checked_mul(std::mem::size_of::<usize>())?;
         let owner = &source.node(source_node_owner(node))?.kind;
         let strings = match (node, owner) {
             (SourceNode::Node(_), _) => 0,
@@ -6503,7 +6545,13 @@ impl NodeMaps {
     }
 
     fn path(&self, source: &Document, node: &SourceNode) -> Option<NodePath> {
-        let path = self.ordinary_path(source, source_node_owner(node))?;
+        let len = self.path_len(source, source_node_owner(node))?;
+        self.path_of(source, node, len)
+    }
+
+    /// [`Self::path`] for an owner whose path length is already known.
+    fn path_of(&self, source: &Document, node: &SourceNode, len: usize) -> Option<NodePath> {
+        let path = self.ordinary_path(source, source_node_owner(node), len)?;
         let owner = &source.node(source_node_owner(node))?.kind;
         Some(match (node, owner) {
             (SourceNode::Node(_), _) => NodePath::Ordinary(path),
@@ -6703,6 +6751,142 @@ impl NodeMaps {
     }
 }
 
+/// The projection an `XPath` evaluation runs over, lent to the functions that
+/// name evaluator nodes by path for the duration of that evaluation.
+#[derive(Clone, Copy)]
+struct ProjectedPaths<'a> {
+    source: &'a Document,
+    maps: &'a NodeMaps,
+}
+
+/// Where an evaluator node's path starts in the projected package.
+enum PathOwner {
+    /// The package root, whose path is empty.
+    Root,
+    /// The container of the logical documents, the root's only child.
+    Documents,
+    Projected(NodeId),
+}
+
+impl ProjectedPaths<'_> {
+    fn owner(&self, node: &nodeset::Node<'_>) -> Option<PathOwner> {
+        let slots = &self.maps.slots;
+        let projected = |table: &[Option<NodeId>], (_, _, slot): (usize, usize, usize)| {
+            table.get(slot).copied().flatten().map(PathOwner::Projected)
+        };
+        match node {
+            nodeset::Node::Root(_) => Some(PathOwner::Root),
+            nodeset::Node::Element(element) => slots
+                .element(element)
+                .map(PathOwner::Projected)
+                .or_else(|| {
+                    matches!(node.parent(), Some(nodeset::Node::Root(_)))
+                        .then_some(PathOwner::Documents)
+                }),
+            nodeset::Node::Text(text) => projected(&slots.texts, text.identity_key()),
+            nodeset::Node::Comment(comment) => projected(&slots.comments, comment.identity_key()),
+            nodeset::Node::ProcessingInstruction(instruction) => {
+                projected(&slots.instructions, instruction.identity_key())
+            }
+            nodeset::Node::Attribute(attribute) => {
+                self.owner(&nodeset::Node::Element(attribute.parent()?))
+            }
+            nodeset::Node::Namespace(namespace) => {
+                self.owner(&nodeset::Node::Element(namespace.parent))
+            }
+        }
+    }
+
+    /// The path of `node`, read from the per-node positions the projection
+    /// recorded: one charged step per level, never a scan of siblings.
+    /// Attribute and namespace leaves take their names from the evaluator
+    /// node, which also exposes the implicit `xml` binding.
+    fn path(
+        &self,
+        node: &nodeset::Node<'_>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    ) -> std::result::Result<NodePath, function::Error> {
+        let owner = self.owner(node).ok_or_else(outside_projection)?;
+        let words = match owner {
+            PathOwner::Root => 0,
+            PathOwner::Documents => 1,
+            PathOwner::Projected(id) => self
+                .maps
+                .path_len(self.source, id)
+                .ok_or_else(outside_projection)?,
+        };
+        context.charge_work(words.max(1))?;
+        let leaf = match node {
+            nodeset::Node::Attribute(attribute) => {
+                let name = attribute.name();
+                let name = name.get();
+                name.namespace_uri().map_or(0, str::len) + name.local_part().len()
+            }
+            nodeset::Node::Namespace(namespace) => namespace.prefix().len() + namespace.uri().len(),
+            _ => 0,
+        };
+        context.reserve_temporary_allocation(words * std::mem::size_of::<usize>() + leaf)?;
+        let parent = match owner {
+            PathOwner::Root => Vec::new(),
+            PathOwner::Documents => vec![0],
+            PathOwner::Projected(id) => self
+                .maps
+                .ordinary_path(self.source, id, words)
+                .ok_or_else(outside_projection)?,
+        };
+        Ok(match node {
+            nodeset::Node::Attribute(attribute) => {
+                let name = attribute.name();
+                let name = name.get();
+                NodePath::Attribute {
+                    parent,
+                    namespace: name.namespace_uri().map(str::to_owned),
+                    local: name.local_part().to_owned(),
+                }
+            }
+            nodeset::Node::Namespace(namespace) => NodePath::Namespace {
+                parent,
+                prefix: namespace.prefix().to_owned(),
+                uri: namespace.uri().to_owned(),
+            },
+            _ => NodePath::Ordinary(parent),
+        })
+    }
+
+    /// The logical document holding `node`, the second entry of its path,
+    /// found by walking to its logical root without building the path. The
+    /// package root and the documents container belong to none.
+    fn document_index(
+        &self,
+        node: &nodeset::Node<'_>,
+        context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
+    ) -> std::result::Result<Option<usize>, function::Error> {
+        let mut id = match self.owner(node).ok_or_else(outside_projection)? {
+            PathOwner::Root | PathOwner::Documents => return Ok(None),
+            PathOwner::Projected(id) => id,
+        };
+        loop {
+            context.charge_work(1)?;
+            match self.source.node(id).ok_or_else(outside_projection)?.parent {
+                Some(parent) => id = parent,
+                None => break,
+            }
+        }
+        Ok(self
+            .maps
+            .positions
+            .get(id.0)
+            .copied()
+            .filter(|position| *position != UNPLACED))
+    }
+}
+
+fn outside_projection() -> function::Error {
+    function::Error::Other {
+        what: "node is outside the projected documents".into(),
+    }
+}
+
 fn attribute_of(
     source: &Document,
     owner: NodeId,
@@ -6765,15 +6949,14 @@ fn extend_node_base_uri_entries(
         if !is_logical_root && base_uri == inherited {
             continue;
         }
-        let key = maps
-            .ordinary_path(source, id)
-            .ok_or_else(|| Error::Dynamic(format!("stale semantic node {id:?}")))?;
+        let stale = || Error::Dynamic(format!("stale semantic node {id:?}"));
+        let len = maps.path_len(source, id).ok_or_else(stale)?;
         meter.charge(
             BudgetKind::OwnedBytes,
-            key.len()
-                .saturating_mul(std::mem::size_of::<usize>())
+            len.saturating_mul(std::mem::size_of::<usize>())
                 .saturating_add(base_uri.map_or(0, str::len)),
         )?;
+        let key = maps.ordinary_path(source, id, len).ok_or_else(stale)?;
         reserve_retained_hash_map_slot(index, meter, index_bytes)?;
         index.insert(key, base_uri.map(str::to_owned));
     }
@@ -7786,10 +7969,11 @@ struct GeneratedNodeIdentity {
     path: NodePath,
 }
 
-struct GenerateId {
+struct GenerateId<'a> {
+    paths: ProjectedPaths<'a>,
     assigned: Rc<RefCell<GeneratedIdCache>>,
 }
-impl function::Function for GenerateId {
+impl function::Function for GenerateId<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -7813,7 +7997,7 @@ impl function::Function for GenerateId {
             &self.assigned,
             GeneratedNodeIdentity {
                 document: node.document().identity(),
-                path: typed_path_to_with_context(&node, context)?,
+                path: self.paths.path(&node, context)?,
             },
         )?;
         let digits = id.checked_ilog10().unwrap_or(0) as usize + 1;
@@ -8104,11 +8288,12 @@ fn language_tag_matches(language: &str, requested: &str) -> bool {
 
 type IdIndex = Vec<HashMap<String, NodePath>>;
 
-struct IdFunction {
+struct IdFunction<'a> {
+    paths: ProjectedPaths<'a>,
     nodes_by_document: Rc<RefCell<IdIndex>>,
 }
 
-impl function::Function for IdFunction {
+impl function::Function for IdFunction<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -8122,13 +8307,9 @@ impl function::Function for IdFunction {
         // XPath 1.0 section 4.1 binds id() to the document containing the dynamic context node.
         // Every projected logical document occupies root/containers/document[index].
         // https://www.w3.org/TR/1999/REC-xpath-19991116/#function-id
-        let context_path = typed_path_to_with_context(&context.node, context)?;
+        let document_index = self.paths.document_index(&context.node, context)?;
         let nodes_by_document = self.nodes_by_document.borrow();
-        let Some(nodes) = context_path
-            .ordinary()
-            .get(1)
-            .and_then(|index| nodes_by_document.get(*index))
-        else {
+        let Some(nodes) = document_index.and_then(|index| nodes_by_document.get(index)) else {
             return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
         };
         let mut result = nodeset::Nodeset::new();
@@ -8325,11 +8506,12 @@ fn unparsed_entity_table_bytes(capacity: usize) -> usize {
         .saturating_mul(2)
 }
 
-struct UnparsedEntityUriFunction {
+struct UnparsedEntityUriFunction<'a> {
+    paths: ProjectedPaths<'a>,
     documents: Rc<RefCell<Vec<HashMap<String, String>>>>,
 }
 
-impl function::Function for UnparsedEntityUriFunction {
+impl function::Function for UnparsedEntityUriFunction<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -8340,10 +8522,9 @@ impl function::Function for UnparsedEntityUriFunction {
                 what: "unparsed-entity-uri() requires one argument".into(),
             });
         }
-        let document_index = typed_path_to_with_context(&context.node, context)?
-            .ordinary()
-            .get(1)
-            .copied()
+        let document_index = self
+            .paths
+            .document_index(&context.node, context)?
             .ok_or_else(|| function::Error::Other {
                 what: "unparsed-entity-uri() context has no logical document".into(),
             })?;
@@ -8359,6 +8540,7 @@ impl function::Function for UnparsedEntityUriFunction {
 }
 
 struct DocumentFunction<'a, R: Resolver + ?Sized> {
+    paths: ProjectedPaths<'a>,
     resolver: &'a R,
     access_error: &'a RefCell<Option<Error>>,
     roots: Rc<RefCell<HashMap<DocumentRequest, CachedDocumentRoots>>>,
@@ -9338,7 +9520,7 @@ impl<R: Resolver + ?Sized> function::Function for DocumentFunction<'_, R> {
             else {
                 return Ok(SxdValue::Nodeset(nodeset::Nodeset::new()));
             };
-            let path = typed_path_to_with_context(&node, context)?;
+            let path = self.paths.path(&node, context)?;
             let base_uris = self.node_base_uris.borrow();
             DocumentBaseSelection::Explicit {
                 base_uri: clone_metered_optional_string(
@@ -9356,7 +9538,7 @@ impl<R: Resolver + ?Sized> function::Function for DocumentFunction<'_, R> {
         match &args[0] {
             SxdValue::Nodeset(nodes) => {
                 for node in nodes {
-                    let path = typed_path_to_with_context(&node, context)?;
+                    let path = self.paths.path(&node, context)?;
                     let (base_uri, logical_document) = match &base_selection {
                         DocumentBaseSelection::Explicit {
                             base_uri,
@@ -9872,113 +10054,12 @@ impl NodePath {
     }
 }
 
-#[cfg(test)]
-fn typed_path_to(node: &nodeset::Node<'_>) -> NodePath {
-    build_node_path(node, &mut |_, _| Ok::<_, std::convert::Infallible>(()))
-        .expect("unlimited fixture path")
-}
-
-fn typed_path_to_metered(node: &nodeset::Node<'_>, meter: &mut Meter) -> Result<(NodePath, usize)> {
-    let mut reserved = 0usize;
-    let result = build_node_path(node, &mut |kind, amount| {
-        meter.charge(kind, amount)?;
-        if kind == BudgetKind::OwnedBytes {
-            reserved += amount;
-        }
-        Ok(())
-    });
-    match result {
-        Ok(path) => Ok((path, reserved)),
-        Err(error) => {
-            meter.release_owned_bytes(reserved);
-            Err(error)
-        }
-    }
-}
-
-fn typed_path_to_with_context(
-    node: &nodeset::Node<'_>,
-    context: &sxd_xpath_no_unsafe::context::Evaluation<'_, '_>,
-) -> std::result::Result<NodePath, function::Error> {
-    build_node_path(node, &mut |kind, amount| match kind {
-        BudgetKind::OwnedBytes => context.reserve_temporary_allocation(amount),
-        _ => context.charge_work(amount),
-    })
-}
-
-// Both runtime budget domains gate the same builder. Count depth without allocation, reserve
-// exactly one path buffer, then use indexed children rather than materializing sibling vectors.
-fn build_node_path<E>(
-    node: &nodeset::Node<'_>,
-    charge: &mut impl FnMut(BudgetKind, usize) -> std::result::Result<(), E>,
-) -> std::result::Result<NodePath, E> {
-    let owner = match node {
-        nodeset::Node::Attribute(attribute) => attribute.parent().map(nodeset::Node::Element),
-        nodeset::Node::Namespace(namespace) => Some(nodeset::Node::Element(namespace.parent)),
-        node => Some(node.clone()),
-    };
-    let mut depth = 0;
-    let mut current = owner.clone();
-    while let Some(node) = current {
-        charge(BudgetKind::XPathOperations, 1)?;
-        current = node.parent();
-        if current.is_some() {
-            depth += 1;
-        }
-    }
-    charge(BudgetKind::OwnedBytes, depth * std::mem::size_of::<usize>())?;
-    let mut path = Vec::with_capacity(depth);
-    let mut current = owner;
-    while let Some(node) = current {
-        let Some(parent) = node.parent() else {
-            break;
-        };
-        let mut index = 0;
-        loop {
-            charge(BudgetKind::XPathOperations, 1)?;
-            if parent.child_at(index).as_ref() == Some(&node) {
-                break;
-            }
-            index += 1;
-        }
-        path.push(index);
-        current = Some(parent);
-    }
-    path.reverse();
-    Ok(match node {
-        nodeset::Node::Attribute(attribute) => {
-            let name = attribute.name();
-            let name = name.get();
-            charge(
-                BudgetKind::OwnedBytes,
-                name.namespace_uri().map_or(0, str::len) + name.local_part().len(),
-            )?;
-            NodePath::Attribute {
-                parent: path,
-                namespace: name.namespace_uri().map(str::to_owned),
-                local: name.local_part().to_owned(),
-            }
-        }
-        nodeset::Node::Namespace(namespace) => {
-            charge(
-                BudgetKind::OwnedBytes,
-                namespace.prefix().len() + namespace.uri().len(),
-            )?;
-            NodePath::Namespace {
-                parent: path,
-                prefix: namespace.prefix().to_owned(),
-                uri: namespace.uri().to_owned(),
-            }
-        }
-        _ => NodePath::Ordinary(path),
-    })
-}
-
 // Compiled key slots already identify expanded names. Grouping by slot/document lets
 // lookups borrow scalar values instead of cloning a QName/string tuple per candidate.
 type KeyIndex = HashMap<(usize, usize), HashMap<String, Vec<NodePath>>>;
 
-struct KeyFunction {
+struct KeyFunction<'a> {
+    paths: ProjectedPaths<'a>,
     index: Rc<RefCell<KeyIndex>>,
     namespaces: Arc<Vec<(String, String)>>,
     declarations: Arc<[KeyDeclaration]>,
@@ -9986,7 +10067,7 @@ struct KeyFunction {
     ready: Rc<RefCell<HashSet<(usize, usize)>>>,
     pending: Rc<RefCell<Option<(usize, usize)>>>,
 }
-impl function::Function for KeyFunction {
+impl function::Function for KeyFunction<'_> {
     fn evaluate<'d>(
         &self,
         context: &sxd_xpath_no_unsafe::context::Evaluation<'_, 'd>,
@@ -9998,10 +10079,9 @@ impl function::Function for KeyFunction {
             });
         }
         let name = qname_argument(context, &args[0], &self.namespaces)?;
-        let document_index = typed_path_to_with_context(&context.node, context)?
-            .ordinary()
-            .get(1)
-            .copied()
+        let document_index = self
+            .paths
+            .document_index(&context.node, context)?
             .ok_or_else(|| function::Error::Other {
                 what: "key() context has no logical document".into(),
             })?;
