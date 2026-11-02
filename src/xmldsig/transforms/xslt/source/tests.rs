@@ -137,16 +137,24 @@ fn reparsed(
     .map_err(|error| error.to_string())
 }
 
-/// The engine's document built from `visibility`'s canonical structure.
+/// The engine's document built from the tape of `visibility`'s canonical
+/// constructs.
 fn built(
     document: &Dom<'_>,
     visibility: &dyn NodeVisibility,
     resources: &ResourcePolicy,
 ) -> Result<Document, String> {
     let budget = TransformExecutionBudget::from_resources(resources);
-    super::build(
+    let tape = super::record(
         (document, visibility),
         settings(&budget),
+        &budget,
+        &Native,
+        (budget.xslt.max_workspace, 0),
+    )
+    .map_err(|error| error.to_string())?;
+    super::build(
+        &tape,
         budget.xslt.max_workspace,
         &budget,
         budget.xml_parse_work(),

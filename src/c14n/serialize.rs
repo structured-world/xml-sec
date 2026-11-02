@@ -48,52 +48,71 @@ type StartTagAttribute<'n, S> = (
 ///
 /// Text, comments, processing instructions and the axes of an omitted
 /// element are reported before their octets; tags after theirs, which hold
-/// no line break.
-pub(crate) trait CanonicalObserver {
+/// no line break. Names and values borrow the document for `'n`, so an
+/// observer may keep them instead of copying.
+pub(crate) trait CanonicalObserver<'n> {
     /// A start tag: its namespace declarations and attributes in canonical
     /// order, as `(prefix, uri)` and `(prefix, local name, value)`, unescaped.
     fn start_tag<'v>(
         &mut self,
-        prefix: &str,
-        local: &str,
-        namespaces: &[(&'v str, &'v str)],
-        attributes: impl Iterator<Item = Result<(&'v str, &'v str, &'v str), C14nError>>,
+        prefix: &'n str,
+        local: &'n str,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
     ) -> Result<(), C14nError>;
 
     /// The end tag of the innermost open start tag.
     fn end_tag(&mut self) -> Result<(), C14nError>;
 
     /// Character data of a visible text node, unescaped.
-    fn text(&mut self, text: &str) -> Result<(), C14nError>;
+    fn text(&mut self, text: &'n str) -> Result<(), C14nError>;
 
     /// A comment's value as the DOM holds it.
-    fn comment(&mut self, text: &str) -> Result<(), C14nError>;
+    fn comment(&mut self, text: &'n str) -> Result<(), C14nError>;
 
     /// A processing instruction's target and value as the DOM holds them.
     fn processing_instruction(
         &mut self,
-        target: &str,
-        value: Option<&str>,
+        target: &'n str,
+        value: Option<&'n str>,
     ) -> Result<(), C14nError>;
 
     /// Namespace declarations and attributes an omitted element keeps in the
     /// node-set; their octets are character data of the enclosing content.
-    fn omitted_axes<'v>(
+    fn omitted_axes(
         &mut self,
-        namespaces: &[(&'v str, &'v str)],
-        attributes: impl Iterator<Item = (&'v str, &'v str, &'v str)>,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
     ) -> Result<(), C14nError>;
 }
 
+/// An attribute value as canonicalization renders it: the document's own, or
+/// one it computed, which lives only for the call.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(feature = "xslt"),
+    expect(
+        dead_code,
+        reason = "only the XSLT source builder reads observed values"
+    )
+)]
+pub(crate) enum ObservedValue<'n, 'v> {
+    Document(&'n str),
+    Computed(&'v str),
+}
+
+/// An attribute of a start tag: its prefix, local name and value.
+pub(crate) type ObservedAttribute<'n, 'v> = (&'n str, &'n str, ObservedValue<'n, 'v>);
+
 /// Canonical output nothing observes.
-impl CanonicalObserver for () {
+impl<'n> CanonicalObserver<'n> for () {
     #[inline]
     fn start_tag<'v>(
         &mut self,
-        _: &str,
-        _: &str,
-        _: &[(&'v str, &'v str)],
-        _: impl Iterator<Item = Result<(&'v str, &'v str, &'v str), C14nError>>,
+        _: &'n str,
+        _: &'n str,
+        _: &[(&'n str, &'n str)],
+        _: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
     ) -> Result<(), C14nError> {
         Ok(())
     }
@@ -119,10 +138,10 @@ impl CanonicalObserver for () {
     }
 
     #[inline]
-    fn omitted_axes<'v>(
+    fn omitted_axes(
         &mut self,
-        _: &[(&'v str, &'v str)],
-        _: impl Iterator<Item = (&'v str, &'v str, &'v str)>,
+        _: &[(&'n str, &'n str)],
+        _: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
     ) -> Result<(), C14nError> {
         Ok(())
     }
@@ -150,12 +169,19 @@ enum AttributeValue<'a, T: Text> {
     Borrowed(&'a str),
     Owned(T),
 }
-impl<T: Text> AttributeValue<'_, T> {
+impl<'a, T: Text> AttributeValue<'a, T> {
     fn view(&self) -> Result<&str, C14nError> {
         match self {
             Self::Borrowed(text) => Ok(text),
             Self::Owned(text) => text.view(),
         }
+    }
+
+    fn observed(&self) -> Result<ObservedValue<'a, '_>, C14nError> {
+        Ok(match self {
+            Self::Borrowed(text) => ObservedValue::Document(text),
+            Self::Owned(text) => ObservedValue::Computed(text.view()?),
+        })
     }
 }
 
@@ -451,12 +477,13 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn serialize_with_scratch<
+    'n,
     W: ByteSink + ?Sized,
     S: Scratch,
     D: DomStorage,
-    O: CanonicalObserver,
+    O: CanonicalObserver<'n>,
 >(
-    doc: &Document<'_, D>,
+    doc: &'n Document<'_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer<S, D>,
@@ -528,7 +555,13 @@ pub(super) fn serialize_with_scratch<
 }
 
 /// Serialize children of a node in document order.
-fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage, O: CanonicalObserver>(
+fn serialize_children<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
     parent: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
@@ -645,7 +678,7 @@ fn serialize_selected_axes_of_omitted_element<
     W: ByteSink + ?Sized,
     S: Scratch,
     D: DomStorage,
-    O: CanonicalObserver,
+    O: CanonicalObserver<'n>,
 >(
     owner: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
@@ -732,7 +765,13 @@ fn serialize_selected_axes_of_omitted_element<
 }
 
 /// Serialize a single element node (start tag + children + end tag).
-fn serialize_element<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage, O: CanonicalObserver>(
+fn serialize_element<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
     node: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
@@ -769,7 +808,7 @@ fn serialize_start_tag<
     W: ByteSink + ?Sized,
     S: Scratch,
     D: DomStorage,
-    O: CanonicalObserver,
+    O: CanonicalObserver<'n>,
 >(
     node: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
@@ -899,7 +938,7 @@ fn serialize_start_tag<
         &ns_decls,
         all_attrs
             .iter()
-            .map(|(_, local_name, prefix, value)| Ok((*prefix, *local_name, value.view()?))),
+            .map(|(_, local_name, prefix, value)| Ok((*prefix, *local_name, value.observed()?))),
     )?;
 
     while all_attrs.pop().is_some() {}

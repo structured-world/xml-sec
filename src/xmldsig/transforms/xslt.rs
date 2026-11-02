@@ -1487,7 +1487,7 @@ pub(super) enum Input<'i, 'n, D: DomStorage> {
         base_uri: Option<&'i str>,
     },
     /// A node-set, which `XMLDSig` 1.1 section 4.4.3.2 converts with inclusive
-    /// C14N 1.0; the engine receives the structure of that canonical form
+    /// C14N 1.0; the engine receives the constructs of that canonical form
     /// rather than parsing its octets.
     Nodes {
         document: &'i crate::xml::dom::Document<'n, D>,
@@ -1495,7 +1495,7 @@ pub(super) enum Input<'i, 'n, D: DomStorage> {
     },
 }
 
-impl<'i, 'n, D: DomStorage> Input<'i, 'n, D> {
+impl<'i, D: DomStorage> Input<'i, '_, D> {
     /// Bytes of storage the input holds through the transform.
     const fn storage(self) -> usize {
         match self {
@@ -1504,15 +1504,17 @@ impl<'i, 'n, D: DomStorage> Input<'i, 'n, D> {
         }
     }
 
-    /// Decode octets into the query's account and apply the XML input policy
-    /// the engine's parser does not; returns the source and the workspace
-    /// bytes a decoded copy holds.
+    /// Bring the input into the query's storage and apply the XML input
+    /// policy the engine's parser does not: decode octets, or record a
+    /// node-set's canonical constructs. Returns the source and the workspace
+    /// bytes it holds.
     fn prepare<S: TransformScratch>(
         self,
         settings: DocumentParseSettings,
         storage: &WorkspaceDecoder<'_, S>,
+        budget: &TransformExecutionBudget,
         xml_parse: &XmlParseWorkBudget,
-    ) -> Result<(Source<'i, 'n, DecodedInput<'i, S>, D>, usize), TransformError> {
+    ) -> Result<(PreparedInput<'i, S>, usize), TransformError> {
         Ok(match self {
             Self::Octets {
                 bytes, base_uri, ..
@@ -1523,28 +1525,33 @@ impl<'i, 'n, D: DomStorage> Input<'i, 'n, D> {
             Self::Nodes {
                 document,
                 visibility,
-            } => (Source::Nodes((document, visibility)), 0),
+            } => {
+                let tape = source::record(
+                    (document, visibility),
+                    settings,
+                    budget,
+                    storage.scratch,
+                    (storage.limit, storage.held),
+                )?;
+                let held = tape.held_bytes();
+                (Source::Nodes(tape), held)
+            }
         })
     }
 }
 
-/// [`Input`] ready for the engine: decoded text, or the node-set to build from.
-enum Source<'i, 'n, T, D: DomStorage> {
-    Text {
-        xml: T,
-        base_uri: Option<&'i str>,
-    },
-    Nodes(
-        (
-            &'i crate::xml::dom::Document<'n, D>,
-            &'i dyn crate::c14n::NodeVisibility<D>,
-        ),
-    ),
+/// [`Input`] ready for the engine: decoded text, or a node-set's tape.
+enum Source<'i, T, P> {
+    Text { xml: T, base_uri: Option<&'i str> },
+    Nodes(P),
 }
 
-impl<T: AsRef<str>, D: DomStorage> Source<'_, '_, T, D> {
+/// [`Source`] in the storage of the query's scratch `S`.
+type PreparedInput<'i, S> = Source<'i, DecodedInput<'i, S>, source::Tape<'i, S>>;
+
+impl<T: AsRef<str>, S: TransformScratch> Source<'_, T, source::Tape<'_, S>> {
     /// The engine's source document within `workspace` owned bytes.
-    fn document<S: TransformScratch>(
+    fn document(
         self,
         settings: DocumentParseSettings,
         workspace: usize,
@@ -1562,9 +1569,7 @@ impl<T: AsRef<str>, D: DomStorage> Source<'_, '_, T, D> {
                 xml_parse,
                 scratch,
             ),
-            Self::Nodes(nodes) => {
-                source::build(nodes, settings, workspace, budget, xml_parse, scratch)
-            }
+            Self::Nodes(tape) => source::build(&tape, workspace, budget, xml_parse, scratch),
         }
     }
 }
@@ -1603,7 +1608,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage, N: DomStorage>(
         limit: available,
         held: carried,
     };
-    let (source, decoded) = input.prepare(settings, &storage, xml_parse)?;
+    let (source, decoded) = input.prepare(settings, &storage, budget, xml_parse)?;
 
     // Copies a parsed stylesheet carries stay in the workspace until the transform ends.
     let available = allowance

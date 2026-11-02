@@ -336,6 +336,44 @@ fn implicit_c14n_input_holds_no_octets_in_the_xslt_workspace() {
 }
 
 #[test]
+fn a_node_set_converts_in_a_query_account_below_the_workspace() {
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    // A query whose memory is below the XSLT workspace gives the engine's lease
+    // all of it. The node-set's conversion still needs query storage for its
+    // own canonicalization, so it must take that before the lease does, as
+    // octet input decodes before it.
+    let sheet = stylesheet(r#"<xsl:template match="/"><out/></xsl:template>"#);
+    let xml = r#"<root a="1"/>"#;
+    let memory = 1 << 20;
+    assert!(memory < ResourcePolicy::default().max_xslt_workspace_bytes);
+    query_run(&sheet, xml.as_bytes(), 1 << 24, memory)
+        .outcome
+        .expect("the octets run in this account");
+    let document = Document::parse(xml).expect("source document parses");
+    let nodes = crate::xmldsig::types::NodeSet::entire_document_with_comments(&document)
+        .expect("source projection");
+    let account = Memory::new(std::sync::Arc::new(MemoryAccount::new(memory, 1 << 26)));
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
+    let result = super::execute::<_, Native, Native>(
+        super::XsltParameter::Stylesheet(&sheet),
+        super::Input::Nodes {
+            document: &document,
+            visibility: &nodes.projection,
+        },
+        crate::policy::XsltStylesheetSemantics::Specification,
+        false,
+        &budget,
+        budget.xml_parse_work(),
+        &crate::c14n::scratch::Accounted(&account),
+    );
+    let expected = run(&budget, &sheet, xml.as_bytes()).expect("native octet run");
+    match result.expect("the node-set runs in the same account") {
+        super::ExecutionData::Accounted(bytes) => assert_eq!(&*bytes, &expected),
+        _ => panic!("accounted output expected"),
+    }
+}
+
+#[test]
 fn conversion_buffer_admits_old_and_new_capacity_before_growth() {
     // Both storage strategies must refuse before replacing a live block, not
     // after a serializer has already exceeded the XSLT workspace.

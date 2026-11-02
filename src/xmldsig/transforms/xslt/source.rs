@@ -1,22 +1,25 @@
 //! The engine's source document for a node-set input, built from the
-//! structure of its implicit inclusive C14N 1.0 form as that form is
-//! produced, instead of from parsing its octets.
+//! structure of its implicit inclusive C14N 1.0 form instead of from parsing
+//! its octets.
 //!
-//! The tree and the refusals are those of parsing the octets: the
-//! canonical serializer reports each construct in document order while its
-//! octets are only counted, the XML input policy limits of the parse are
-//! applied to the same counts, and character data reaches the engine in the
-//! runs and references a parse of the canonical escaping reports. Refusals
-//! keep the parse's precedence: canonicalization, then the document size,
-//! then the first structural limit, then the engine.
+//! The canonical walk runs where octet input is decoded, before the engine's
+//! workspace lease, and records the constructs a parse of its octets would
+//! read on a tape in the query's storage; names, values and text stay
+//! borrowed from the document. The octets are only counted, and the XML input
+//! policy limits of that parse apply to the same counts. After the stylesheet
+//! is compiled the tape is replayed into the engine's builder, which applies
+//! the parse's own budgets. Refusals keep the parse's precedence:
+//! canonicalization, the document size, the first structural limit, the
+//! stylesheet, then the engine.
 
+use core::ops::Range;
 use std::cell::Cell;
 
 use super::super::{TransformError, TransformExecutionBudget, TransformScratch};
-use crate::c14n::serialize::CanonicalObserver;
+use crate::c14n::scratch::{List as _, NamespaceMap as _, Scratch};
+use crate::c14n::serialize::{CanonicalObserver, ObservedAttribute, ObservedValue};
 use crate::c14n::sink::ByteSink;
 use crate::c14n::{C14nError, NodeVisibility};
-use crate::collections::{Set, Table as _};
 use crate::document::{DocumentParseSettings, XmlDocumentError, XmlParseWorkBudget};
 use crate::xml::dom::ParseError;
 use crate::xml::dom::storage::Storage as DomStorage;
@@ -25,37 +28,148 @@ use crate::xslt::{Document, DocumentBuilder, Error, ParseBudget};
 #[cfg(test)]
 mod tests;
 
-/// Build the engine's source document for the node-set `visibility` selects
-/// in `document` within `workspace` owned bytes, applying the XML input
-/// policy `settings` as a parse of its canonical octets would.
-pub(super) fn build<S: TransformScratch, D: DomStorage>(
-    (document, visibility): (&crate::xml::dom::Document<'_, D>, &dyn NodeVisibility<D>),
+/// One construct of the canonical form as a parse of its octets reads it.
+enum Event<'n> {
+    Start {
+        prefix: &'n str,
+        local: &'n str,
+        namespaces: Range<usize>,
+        attributes: Range<usize>,
+        line: usize,
+    },
+    End,
+    /// A maximal run of character data between references.
+    Text {
+        pieces: Range<usize>,
+        line: usize,
+    },
+    Reference {
+        character: char,
+        line: usize,
+    },
+    Comment {
+        pieces: Range<usize>,
+        line: usize,
+    },
+    Instruction {
+        target: &'n str,
+        value: Option<Range<usize>>,
+        line: usize,
+    },
+}
+
+/// An attribute value: the document's, or one canonicalization computed.
+enum Value<'n> {
+    Document(&'n str),
+    Computed(usize),
+}
+
+/// The constructs of a node-set's canonical form, held in query storage.
+pub(super) struct Tape<'n, S: Scratch> {
+    events: S::Values<Event<'n>>,
+    pieces: S::Values<&'n str>,
+    namespaces: S::Values<(&'n str, &'n str)>,
+    attributes: S::Values<(&'n str, &'n str, Value<'n>)>,
+    computed: S::Values<S::Text>,
+    computed_bytes: usize,
+    /// The length of the canonical octets.
+    source_bytes: usize,
+}
+
+impl<'n, S: Scratch> Tape<'n, S> {
+    fn new(scratch: &S) -> Self {
+        Self {
+            events: scratch.values(),
+            pieces: scratch.values(),
+            namespaces: scratch.values(),
+            attributes: scratch.values(),
+            computed: scratch.values(),
+            computed_bytes: 0,
+            source_bytes: 0,
+        }
+    }
+
+    /// Bytes the tape holds.
+    pub(super) fn held_bytes(&self) -> usize {
+        fn bytes<T>(capacity: usize) -> usize {
+            capacity * core::mem::size_of::<T>()
+        }
+        // Each list's storage was allocated, so the sum fits the address space.
+        bytes::<Event<'n>>(self.events.capacity())
+            + bytes::<&str>(self.pieces.capacity())
+            + bytes::<(&str, &str)>(self.namespaces.capacity())
+            + bytes::<(&str, &str, Value<'n>)>(self.attributes.capacity())
+            + bytes::<S::Text>(self.computed.capacity())
+            + self.computed_bytes
+    }
+
+    fn value(&self, value: &Value<'n>) -> &str {
+        match value {
+            Value::Document(text) => text,
+            Value::Computed(index) => &self.computed[*index],
+        }
+    }
+
+    /// Describe the recorded constructs to `builder`.
+    fn replay(&self, builder: &mut DocumentBuilder<'_, '_>) -> Result<(), Error> {
+        let name = |prefix: &'n str| (!prefix.is_empty()).then_some(prefix);
+        for event in self.events.iter() {
+            match event {
+                Event::Start {
+                    prefix,
+                    local,
+                    namespaces,
+                    attributes,
+                    line,
+                } => builder.start_element(
+                    (name(prefix), local),
+                    self.namespaces[namespaces.clone()]
+                        .iter()
+                        .map(|&(prefix, uri)| (name(prefix), uri)),
+                    self.attributes[attributes.clone()]
+                        .iter()
+                        .map(|(prefix, local, value)| (name(prefix), *local, self.value(value))),
+                    *line,
+                )?,
+                Event::End => builder.end_element()?,
+                Event::Text { pieces, line } => {
+                    builder.text(&self.pieces[pieces.clone()], *line)?;
+                }
+                Event::Reference { character, line } => {
+                    builder.character_reference(*character, *line)?;
+                }
+                Event::Comment { pieces, line } => {
+                    builder.comment(&self.pieces[pieces.clone()], *line)?;
+                }
+                Event::Instruction {
+                    target,
+                    value,
+                    line,
+                } => builder.processing_instruction(
+                    target,
+                    value.clone().map(|value| &self.pieces[value]),
+                    *line,
+                )?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Canonicalize the node-set `visibility` selects in `document` onto a tape,
+/// applying the XML input policy `settings` as a parse of its canonical
+/// octets would; the tape may hold at most `limit` bytes beside `held` ones.
+pub(super) fn record<'n, S: TransformScratch, D: DomStorage>(
+    (document, visibility): (&'n crate::xml::dom::Document<'_, D>, &dyn NodeVisibility<D>),
     settings: DocumentParseSettings,
-    workspace: usize,
     budget: &TransformExecutionBudget,
-    xml_parse: &XmlParseWorkBudget,
     scratch: &S,
-) -> Result<Result<Document, Error>, TransformError> {
-    let allowance = &budget.xslt;
-    let mut builder = DocumentBuilder::new(
-        None,
-        // Canonical form has no document type declaration, so it can neither
-        // reference nor expand an entity.
-        ParseBudget::new(
-            allowance.max_document_bytes,
-            allowance.max_nodes,
-            allowance.max_depth,
-            0,
-            0,
-            workspace,
-        )
-        .with_owned_bytes(workspace)
-        .with_parse_work_bytes(super::parse_work_limit(xml_parse, scratch)),
-    );
+    (limit, held): (usize, usize),
+) -> Result<Tape<'n, S>, TransformError> {
     let counters = (Cell::new(0), Cell::new(0));
     let algorithm = crate::c14n::C14nAlgorithm::from_uri(super::super::DEFAULT_IMPLICIT_C14N_URI)
         .expect("constant C14N URI");
-    let mut reader = SourceReader::new(&mut builder, &counters, settings);
+    let mut recorder = Recorder::new(scratch, &counters, settings);
     let walked = crate::c14n::canonicalize_visible_observed_in(
         document,
         visibility,
@@ -64,10 +178,15 @@ pub(super) fn build<S: TransformScratch, D: DomStorage>(
         budget.xml_base_resolution(),
         &mut CanonicalCount(&counters),
         scratch,
-        &mut reader,
+        &mut Bounded {
+            recorder: &mut recorder,
+            limit,
+        },
     );
-    reader.flush();
-    let refusal = reader.refusal;
+    let tape_bytes = recorder.tape.held_bytes();
+    if tape_bytes > limit {
+        return Err(budget.xslt.workspace_error(held.saturating_add(tape_bytes)));
+    }
     walked.map_err(|error| super::super::map_c14n_limit_error(error, &budget.c14n))?;
     let written = counters.0.get();
     budget.c14n.charge(written)?;
@@ -82,10 +201,44 @@ pub(super) fn build<S: TransformScratch, D: DomStorage>(
             settings,
         ));
     }
-    if let Some(error) = refusal {
+    if let Some(error) = recorder.refusal {
         return Err(error);
     }
-    super::charge_parse_work(builder.finish(written), xml_parse, scratch)
+    recorder.tape.source_bytes = written;
+    Ok(recorder.tape)
+}
+
+/// Build the engine's source document from `tape` within `workspace` owned
+/// bytes.
+pub(super) fn build<S: TransformScratch>(
+    tape: &Tape<'_, S>,
+    workspace: usize,
+    budget: &TransformExecutionBudget,
+    xml_parse: &XmlParseWorkBudget,
+    scratch: &S,
+) -> Result<Result<Document, Error>, TransformError> {
+    let allowance = &budget.xslt;
+    super::charge_parse_work(
+        Document::build_with_budget_reported(
+            None,
+            // Canonical form has no document type declaration, so it can
+            // neither reference nor expand an entity.
+            ParseBudget::new(
+                allowance.max_document_bytes,
+                allowance.max_nodes,
+                allowance.max_depth,
+                0,
+                0,
+                workspace,
+            )
+            .with_owned_bytes(workspace)
+            .with_parse_work_bytes(super::parse_work_limit(xml_parse, scratch)),
+            tape.source_bytes,
+            |builder| tape.replay(builder),
+        ),
+        xml_parse,
+        scratch,
+    )
 }
 
 /// The canonical octets' length and line breaks, counted as they are
@@ -103,84 +256,65 @@ impl ByteSink for CanonicalCount<'_> {
     }
 }
 
-/// Feeds the canonical structure to the engine and applies the XML input
-/// policy's structural limits the way the parse's preflight counts them.
+/// Records the canonical structure and applies the XML input policy's
+/// structural limits the way the parse's preflight counts them.
 ///
-/// Neither a refusal nor an engine failure stops the canonical walk, which
-/// must reach its end for the document's size and for a later
-/// canonicalization failure, both of which take precedence.
-struct SourceReader<'b, 'c> {
-    builder: &'b mut DocumentBuilder,
+/// A refusal does not stop the canonical walk, which must reach its end for
+/// the document's size and for a later canonicalization failure, both of
+/// which take precedence.
+struct Recorder<'n, 'c, S: Scratch> {
+    tape: Tape<'n, S>,
+    scratch: &'c S,
     written: &'c Cell<usize>,
     line_breaks: &'c Cell<usize>,
     settings: DocumentParseSettings,
     /// The first structural limit the canonical form exceeds; once set,
-    /// nothing more is observed.
+    /// nothing more is recorded.
     refusal: Option<TransformError>,
-    /// Unescaped character data not yet passed on: a parse reports each
-    /// maximal run between references and markup as one text event, and the
-    /// engine's text storage grows by the runs it receives.
-    pending: String,
-    /// The line `pending` starts on.
-    pending_line: usize,
     /// Semantic nodes so far, the document root included.
     nodes: u32,
     depth: usize,
     in_character_data: bool,
-    /// Prefixes bound at the current element; the default prefix is empty.
-    bindings: Set<String>,
-    /// Each open element's binding changes: a prefix and whether it was
-    /// already bound before the element.
-    scopes: Vec<Vec<(String, bool)>>,
+    /// Prefixes bound at the current element, the default prefix as empty.
+    bindings: S::Namespaces<'n>,
+    bound: usize,
+    /// Each open element's binding changes, as a prefix and whether it was
+    /// bound before the element, and where each element's changes start.
+    changes: S::Values<(&'n str, bool)>,
+    scopes: S::Values<usize>,
 }
 
-impl<'b, 'c> SourceReader<'b, 'c> {
+impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
     fn new(
-        builder: &'b mut DocumentBuilder,
+        scratch: &'c S,
         (written, line_breaks): &'c (Cell<usize>, Cell<usize>),
         settings: DocumentParseSettings,
     ) -> Self {
         Self {
-            builder,
+            tape: Tape::new(scratch),
+            scratch,
             written,
             line_breaks,
             settings,
             refusal: None,
-            pending: String::new(),
-            pending_line: 1,
             nodes: 1,
             depth: 0,
             in_character_data: false,
-            bindings: Set::with_entry_capacity(0),
-            scopes: Vec::new(),
+            bindings: scratch.namespaces(),
+            bound: 0,
+            changes: scratch.values(),
+            scopes: scratch.values(),
         }
     }
 
-    /// Whether a construct still matters: nothing does after a refusal, of a
-    /// document already larger than a parse would read, or for the engine
-    /// once it refused.
+    /// Whether a construct still matters: nothing does after a refusal or of
+    /// a document already larger than a parse would read.
     fn observing(&self) -> bool {
         self.refusal.is_none() && self.written.get() <= self.settings.max_bytes
     }
 
     fn line(&self) -> usize {
         self.line_breaks.get() + 1
-    }
-
-    /// Pass on the pending run of character data.
-    fn flush(&mut self) {
-        if !self.pending.is_empty() {
-            self.builder.text(&self.pending, self.pending_line);
-            self.pending.clear();
-        }
-    }
-
-    /// Unescaped character data starting on `line`.
-    fn literal(&mut self, text: &str, line: usize) {
-        if self.pending.is_empty() {
-            self.pending_line = line;
-        }
-        self.pending.push_str(text);
     }
 
     fn refuse(&mut self, error: XmlDocumentError) {
@@ -209,62 +343,103 @@ impl<'b, 'c> SourceReader<'b, 'c> {
         }
     }
 
-    /// Pass `text` on as a parse of its escaping reports it: runs of
-    /// unescaped characters and one reference per escaped character.
-    fn escaped_text(&mut self, text: &str, escaped: fn(char) -> bool) {
+    /// Unescaped character data: it extends the run the last event records,
+    /// or starts one.
+    fn literal(&mut self, piece: &'n str, line: usize) -> Result<(), C14nError> {
+        if piece.is_empty() {
+            return Ok(());
+        }
+        let end = self.tape.pieces.len();
+        match self.tape.events.last_mut() {
+            Some(Event::Text { pieces, .. }) if pieces.end == end => pieces.end += 1,
+            _ => self.tape.events.push(Event::Text {
+                pieces: end..end + 1,
+                line,
+            })?,
+        }
+        self.tape.pieces.push(piece)
+    }
+
+    /// `text` as a parse of its escaping reads it: runs of unescaped
+    /// characters and one reference per escaped character.
+    fn escaped_text(&mut self, text: &'n str, escaped: fn(char) -> bool) -> Result<(), C14nError> {
         let line = self.line();
         let mut run = 0;
         for (index, character) in text.char_indices() {
             if escaped(character) {
-                self.literal(&text[run..index], line);
-                self.flush();
-                self.builder.character_reference(character, line);
+                self.literal(&text[run..index], line)?;
+                self.tape
+                    .events
+                    .push(Event::Reference { character, line })?;
                 run = index + character.len_utf8();
             }
         }
-        self.literal(&text[run..], line);
+        self.literal(&text[run..], line)
     }
 
-    /// Markup ends the pending run of character data.
-    fn markup(&mut self) {
-        self.flush();
-        self.in_character_data = false;
+    /// A comment or instruction value as pieces a parse reads: canonical form
+    /// writes a carriage return as `&#xD;`, which those constructs keep.
+    fn value_pieces(&mut self, value: &'n str) -> Result<Range<usize>, C14nError> {
+        let start = self.tape.pieces.len();
+        let mut rest = value;
+        while let Some(index) = rest.find('\r') {
+            self.tape.pieces.push(&rest[..index])?;
+            self.tape.pieces.push("&#xD;")?;
+            rest = &rest[index + 1..];
+        }
+        self.tape.pieces.push(rest)?;
+        Ok(start..self.tape.pieces.len())
     }
 
-    fn bind(&mut self, prefix: &str, uri: &str, changes: &mut Vec<(String, bool)>) {
-        // An empty default namespace name undeclares the default namespace.
-        let was_bound = if prefix.is_empty() && uri.is_empty() {
-            self.bindings.remove(prefix)
-        } else if self.bindings.contains(prefix) {
-            true
-        } else {
-            self.bindings.insert(prefix.to_owned());
-            false
-        };
-        changes.push((prefix.to_owned(), was_bound));
+    /// Apply an element's namespace declarations to the bound prefixes.
+    fn bind(&mut self, namespaces: &[(&'n str, &'n str)]) -> Result<(), C14nError> {
+        self.scopes.push(self.changes.len())?;
+        for &(prefix, uri) in namespaces {
+            let was_bound = self.bindings.get(prefix, false)?.is_present();
+            // An empty default namespace name undeclares the default namespace.
+            if prefix.is_empty() && uri.is_empty() {
+                if was_bound {
+                    self.bindings.remove(prefix)?;
+                    self.bound -= 1;
+                }
+            } else if !was_bound {
+                self.bindings.insert(prefix, false, Some(uri))?;
+                self.bound += 1;
+            }
+            self.changes.push((prefix, was_bound))?;
+        }
+        Ok(())
     }
 
-    fn unbind(&mut self, changes: Vec<(String, bool)>) {
-        for (prefix, was_bound) in changes.into_iter().rev() {
-            if was_bound {
-                self.bindings.insert(prefix);
-            } else {
-                self.bindings.remove(&prefix);
+    /// Restore the bound prefixes the innermost element changed.
+    fn unbind(&mut self) -> Result<(), C14nError> {
+        let start = self
+            .scopes
+            .pop()
+            .expect("an end tag closes an open element");
+        while self.changes.len() > start {
+            let (prefix, was_bound) = self.changes.pop().expect("changes above the scope start");
+            let is_bound = self.bindings.get(prefix, false)?.is_present();
+            if was_bound && !is_bound {
+                self.bindings.insert(prefix, false, Some(""))?;
+                self.bound += 1;
+            } else if !was_bound && is_bound {
+                self.bindings.remove(prefix)?;
+                self.bound -= 1;
             }
         }
+        Ok(())
     }
 
     /// An omitted element's selected axis written as character data:
     /// ` name="value"`, its value escaped.
-    fn axis_text(&mut self, name: std::fmt::Arguments<'_>, value: &str) {
+    fn axis(&mut self, name: &[&'n str], value: &'n str) -> Result<(), C14nError> {
         let line = self.line();
-        let start = self.pending.len();
-        std::fmt::Write::write_fmt(&mut self.pending, name).expect("writing to a String");
-        if start == 0 {
-            self.pending_line = line;
+        for piece in name {
+            self.literal(piece, line)?;
         }
-        self.escaped_text(value, attribute_escape);
-        self.literal("\"", line);
+        self.escaped_text(value, attribute_escape)?;
+        self.literal("\"", line)
     }
 }
 
@@ -278,39 +453,24 @@ fn attribute_escape(character: char) -> bool {
     matches!(character, '&' | '<' | '"' | '\t' | '\n' | '\r')
 }
 
-/// A comment or instruction value as a parse reads it: canonical form
-/// writes a carriage return as `&#xD;`, which those constructs keep literal.
-fn literal_carriage_returns(value: &str) -> std::borrow::Cow<'_, str> {
-    if value.contains('\r') {
-        std::borrow::Cow::Owned(value.replace('\r', "&#xD;"))
-    } else {
-        std::borrow::Cow::Borrowed(value)
-    }
-}
-
-impl CanonicalObserver for SourceReader<'_, '_> {
+impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
     fn start_tag<'v>(
         &mut self,
-        prefix: &str,
-        local: &str,
-        namespaces: &[(&'v str, &'v str)],
-        attributes: impl Iterator<Item = Result<(&'v str, &'v str, &'v str), C14nError>>,
+        prefix: &'n str,
+        local: &'n str,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
     ) -> Result<(), C14nError> {
         if !self.observing() {
             return Ok(());
         }
-        self.markup();
-        let mut changes = Vec::with_capacity(namespaces.len());
-        for &(bound, uri) in namespaces {
-            self.bind(bound, uri, &mut changes);
-        }
-        self.scopes.push(changes);
-        let bound = self.bindings.len();
-        if bound > self.settings.namespace_bindings_limit {
+        self.in_character_data = false;
+        self.bind(namespaces)?;
+        if self.bound > self.settings.namespace_bindings_limit {
             self.refuse(XmlDocumentError::Parse(
                 ParseError::NamespaceBindingLimitReached {
                     maximum: self.settings.namespace_bindings_limit,
-                    actual: bound,
+                    actual: self.bound,
                 },
             ));
             return Ok(());
@@ -322,40 +482,47 @@ impl CanonicalObserver for SourceReader<'_, '_> {
                 maximum: self.settings.depth_limit,
                 actual: self.depth,
             });
-        }
-        if self.builder.is_refused() {
             return Ok(());
         }
-        let attributes = attributes.collect::<Result<Vec<_>, _>>()?;
-        self.builder.start_element(
-            ((!prefix.is_empty()).then_some(prefix), local),
-            namespaces
-                .iter()
-                .map(|&(bound, uri)| ((!bound.is_empty()).then_some(bound), uri)),
-            attributes
-                .iter()
-                .map(|&(bound, name, value)| ((!bound.is_empty()).then_some(bound), name, value)),
-            self.line(),
-        );
-        Ok(())
+        let first_namespace = self.tape.namespaces.len();
+        for &declaration in namespaces {
+            self.tape.namespaces.push(declaration)?;
+        }
+        let first_attribute = self.tape.attributes.len();
+        for attribute in attributes {
+            let (prefix, local, value) = attribute?;
+            let value = match value {
+                ObservedValue::Document(text) => Value::Document(text),
+                ObservedValue::Computed(text) => {
+                    let copy = self.scratch.text(&[text])?;
+                    self.tape.computed_bytes += copy.len();
+                    self.tape.computed.push(copy)?;
+                    Value::Computed(self.tape.computed.len() - 1)
+                }
+            };
+            self.tape.attributes.push((prefix, local, value))?;
+        }
+        let line = self.line();
+        self.tape.events.push(Event::Start {
+            prefix,
+            local,
+            namespaces: first_namespace..self.tape.namespaces.len(),
+            attributes: first_attribute..self.tape.attributes.len(),
+            line,
+        })
     }
 
     fn end_tag(&mut self) -> Result<(), C14nError> {
         if !self.observing() {
             return Ok(());
         }
-        self.markup();
+        self.in_character_data = false;
         self.depth -= 1;
-        let changes = self
-            .scopes
-            .pop()
-            .expect("an end tag closes an open element");
-        self.unbind(changes);
-        self.builder.end_element();
-        Ok(())
+        self.unbind()?;
+        self.tape.events.push(Event::End)
     }
 
-    fn text(&mut self, text: &str) -> Result<(), C14nError> {
+    fn text(&mut self, text: &'n str) -> Result<(), C14nError> {
         if text.is_empty() || !self.observing() {
             return Ok(());
         }
@@ -365,42 +532,43 @@ impl CanonicalObserver for SourceReader<'_, '_> {
             .chars()
             .all(|character| matches!(character, ' ' | '\t' | '\n'));
         self.character_data(whitespace);
-        self.escaped_text(text, text_escape);
-        Ok(())
+        self.escaped_text(text, text_escape)
     }
 
-    fn comment(&mut self, text: &str) -> Result<(), C14nError> {
+    fn comment(&mut self, text: &'n str) -> Result<(), C14nError> {
         if !self.observing() {
             return Ok(());
         }
-        self.markup();
+        self.in_character_data = false;
         self.node();
         let line = self.line();
-        self.builder.comment(&literal_carriage_returns(text), line);
-        Ok(())
+        let pieces = self.value_pieces(text)?;
+        self.tape.events.push(Event::Comment { pieces, line })
     }
 
     fn processing_instruction(
         &mut self,
-        target: &str,
-        value: Option<&str>,
+        target: &'n str,
+        value: Option<&'n str>,
     ) -> Result<(), C14nError> {
         if !self.observing() {
             return Ok(());
         }
-        self.markup();
+        self.in_character_data = false;
         self.node();
         let line = self.line();
-        let value = value.map(literal_carriage_returns);
-        self.builder
-            .processing_instruction(target, value.as_deref(), line);
-        Ok(())
+        let value = value.map(|value| self.value_pieces(value)).transpose()?;
+        self.tape.events.push(Event::Instruction {
+            target,
+            value,
+            line,
+        })
     }
 
-    fn omitted_axes<'v>(
+    fn omitted_axes(
         &mut self,
-        namespaces: &[(&'v str, &'v str)],
-        attributes: impl Iterator<Item = (&'v str, &'v str, &'v str)>,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
     ) -> Result<(), C14nError> {
         if !self.observing() {
             return Ok(());
@@ -412,18 +580,84 @@ impl CanonicalObserver for SourceReader<'_, '_> {
         }
         for &(prefix, uri) in namespaces {
             if prefix.is_empty() {
-                self.axis_text(format_args!(" xmlns=\""), uri);
+                self.axis(&[" xmlns=\""], uri)?;
             } else {
-                self.axis_text(format_args!(" xmlns:{prefix}=\""), uri);
+                self.axis(&[" xmlns:", prefix, "=\""], uri)?;
             }
         }
         for (prefix, local, value) in attributes {
             if prefix.is_empty() {
-                self.axis_text(format_args!(" {local}=\""), value);
+                self.axis(&[" ", local, "=\""], value)?;
             } else {
-                self.axis_text(format_args!(" {prefix}:{local}=\""), value);
+                self.axis(&[" ", prefix, ":", local, "=\""], value)?;
             }
         }
         Ok(())
+    }
+}
+
+/// A [`Recorder`] whose tape may not grow past `limit` bytes; the walk stops
+/// at the first construct that takes it there.
+struct Bounded<'r, 'n, 'c, S: Scratch> {
+    recorder: &'r mut Recorder<'n, 'c, S>,
+    limit: usize,
+}
+
+impl<S: Scratch> Bounded<'_, '_, '_, S> {
+    fn admit(&self, recorded: Result<(), C14nError>) -> Result<(), C14nError> {
+        recorded?;
+        if self.recorder.tape.held_bytes() > self.limit {
+            // The refusal is reported from the tape's size once the walk ends.
+            return Err(C14nError::Io(std::io::ErrorKind::OutOfMemory.into()));
+        }
+        Ok(())
+    }
+}
+
+impl<'n, S: Scratch> CanonicalObserver<'n> for Bounded<'_, 'n, '_, S> {
+    fn start_tag<'v>(
+        &mut self,
+        prefix: &'n str,
+        local: &'n str,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
+    ) -> Result<(), C14nError> {
+        let recorded = self
+            .recorder
+            .start_tag(prefix, local, namespaces, attributes);
+        self.admit(recorded)
+    }
+
+    fn end_tag(&mut self) -> Result<(), C14nError> {
+        let recorded = self.recorder.end_tag();
+        self.admit(recorded)
+    }
+
+    fn text(&mut self, text: &'n str) -> Result<(), C14nError> {
+        let recorded = self.recorder.text(text);
+        self.admit(recorded)
+    }
+
+    fn comment(&mut self, text: &'n str) -> Result<(), C14nError> {
+        let recorded = self.recorder.comment(text);
+        self.admit(recorded)
+    }
+
+    fn processing_instruction(
+        &mut self,
+        target: &'n str,
+        value: Option<&'n str>,
+    ) -> Result<(), C14nError> {
+        let recorded = self.recorder.processing_instruction(target, value);
+        self.admit(recorded)
+    }
+
+    fn omitted_axes(
+        &mut self,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
+    ) -> Result<(), C14nError> {
+        let recorded = self.recorder.omitted_axes(namespaces, attributes);
+        self.admit(recorded)
     }
 }

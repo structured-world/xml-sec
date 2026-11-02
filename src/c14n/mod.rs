@@ -477,12 +477,13 @@ pub(crate) fn canonicalize_visible_to_writer_in<
 #[cfg(feature = "xslt")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn canonicalize_visible_observed_in<
+    'n,
     W: ByteSink + ?Sized,
     S: scratch::Scratch,
     D: DomStorage,
-    O: serialize::CanonicalObserver,
+    O: serialize::CanonicalObserver<'n>,
 >(
-    doc: &Document<'_, D>,
+    doc: &'n Document<'_, D>,
     visibility: &dyn NodeVisibility<D>,
     algo: &C14nAlgorithm,
     max_output_bytes: usize,
@@ -545,12 +546,13 @@ pub(crate) fn canonicalize_buffer_in<S: scratch::Scratch, D: DomStorage>(
 #[cfg(feature = "xmldsig")]
 #[allow(clippy::too_many_arguments)]
 fn canonicalize_writer_with_scratch<
+    'n,
     W: ByteSink + ?Sized,
     S: scratch::Scratch,
     D: DomStorage,
-    O: serialize::CanonicalObserver,
+    O: serialize::CanonicalObserver<'n>,
 >(
-    doc: &Document<'_, D>,
+    doc: &'n Document<'_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     algo: &C14nAlgorithm,
     max_output_bytes: usize,
