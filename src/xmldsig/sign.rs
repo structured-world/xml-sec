@@ -2244,39 +2244,49 @@ impl<'a> SignContext<'a> {
             speculative: true,
             ..request
         };
-        // A `Reference` may read what these add, or name an ID only the writer
-        // provides, so a failed analysis is decided after the commit.
-        let analysis = (!doctype)
+        // Every path below joins the writer's KeyInfo to this document unless a
+        // commit comes first, so it is spliced once here and reused.
+        let mut key_info = match key_info_content.as_deref() {
+            Some(content) if !doctype => {
+                let budget = operation.budgets_mut().transforms.xml_parse_work();
+                Some(self.splice_signing_key_info(document, target_signature, content, budget)?)
+            }
+            _ => None,
+        };
+        // A KeyInfo that is not inert can change what a URI resolves to, so it
+        // is committed and everything analyzed after it; analyzing before it
+        // would spend the operation's allowances on a discarded result. A
+        // `Reference` may also read what these add, so a failed analysis is
+        // decided after the commit, unless it spent a limit: the analysis after
+        // the commit would only meet that limit again.
+        let analysis = match (!doctype && key_info.as_ref().is_none_or(|spliced| spliced.inert))
             .then(|| analyze_signing_references(document, operation, deferred, transform_options))
-            .and_then(Result::ok);
-        // This analysis succeeds only on the current tree, whose transforms keep
-        // or drop whole subtrees. Generated canonicalization changes only the
-        // tracked Reference it joins and adds no ID, so the dependencies and the
-        // digests this analysis proved final hold after that commit and no chain
-        // is executed again. The writer's KeyInfo can bring an ID that changes
-        // what a URI resolves to, so after it everything is analyzed again.
+        {
+            Some(Ok(analyzed)) => Some(analyzed),
+            Some(Err(error)) if spends_operation_limit(&error) => return Err(error.into()),
+            Some(Err(_)) | None => None,
+        };
+        // This analysis succeeds only on the current tree, whose transforms
+        // depend on whole subtrees of their input. Generated canonicalization
+        // changes only the tracked Reference it joins, and an inert KeyInfo only
+        // tracked nodes, neither adding an ID or a namespace scope, so the
+        // dependencies and the digests this analysis proved final hold after
+        // those commits and no chain is executed again.
         let mut speculative_plan = None;
         if let Some(analyzed) = analysis {
             if digests_can_defer(document, &analyzed) && analyzed.1.splice_unread {
-                let budget = operation.budgets_mut().transforms.xml_parse_work();
-                let key_info = key_info_content
-                    .as_deref()
-                    .map(|content| {
-                        self.splice_signing_key_info(document, target_signature, content, budget)
-                    })
-                    .transpose()?;
-                if key_info.as_ref().is_none_or(|spliced| spliced.inert) {
-                    let splice = DeferredSplice::new(document.as_xml(), key_info, generated);
-                    self.policy
-                        .resources
-                        .validate_xml_document_len(splice.spliced.xml.len())?;
-                    return Ok((analyzed, setup_gate, Some(splice)));
-                }
+                let splice = DeferredSplice::new(document.as_xml(), key_info, generated);
+                self.policy
+                    .resources
+                    .validate_xml_document_len(splice.spliced.xml.len())?;
+                return Ok((analyzed, setup_gate, Some(splice)));
             }
-            speculative_plan = key_info_content.is_none().then_some(analyzed.1);
+            speculative_plan = Some(analyzed.1);
         }
         if !generated.is_empty() {
             setup_gate = self.commit_generated_c14n(document, operation, setup_gate, generated)?;
+            // The splice was made against the generation this commit replaced.
+            key_info = None;
         }
         if let Some(content) = key_info_content {
             setup_gate = self.populate_signing_key_info(
@@ -2284,7 +2294,7 @@ impl<'a> SignContext<'a> {
                 target_signature,
                 operation,
                 setup_gate,
-                &content,
+                (&content, key_info),
             )?;
         }
         if let Some(plan) = speculative_plan {
@@ -2303,26 +2313,30 @@ impl<'a> SignContext<'a> {
         Ok((analyzed, setup_gate, None))
     }
 
-    /// Commit `KeyInfo` as its own generation, for a `Reference` that reads it.
+    /// Commit `KeyInfo` as its own generation, for a `Reference` that reads it,
+    /// from `spliced` when that was made against the current generation.
     fn populate_signing_key_info(
         &self,
         document: &mut XmlDocument,
         target_signature: usize,
         operation: &mut SigningExecution<'_>,
         setup_gate: OperationNodeId,
-        key_info_content: &str,
+        (key_info_content, spliced): (&str, Option<SplicedElement>),
     ) -> Result<OperationNodeId, SigningError> {
         let mutation =
             operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
         operation.add_dependency(mutation, setup_gate)?;
         operation.compile()?;
         operation.run_document_transition(mutation, document, |document, budgets| {
-            let populated = self.splice_signing_key_info(
-                document,
-                target_signature,
-                key_info_content,
-                budgets.transforms.xml_parse_work(),
-            )?;
+            let populated = match spliced {
+                Some(spliced) => spliced,
+                None => self.splice_signing_key_info(
+                    document,
+                    target_signature,
+                    key_info_content,
+                    budgets.transforms.xml_parse_work(),
+                )?,
+            };
             document
                 .replace_serialized_with_settings(
                     populated.xml,
@@ -3307,6 +3321,23 @@ fn append_generated_c14n(references: &mut [SigningReference], generated: &[NodeI
     }
 }
 
+/// Whether a transform's input selection and output depend only on whole
+/// subtrees of its input. Base64 decodes the text of the nodes it is given
+/// (`XMLDSig` 1.1 §6.6.2) and XSLT reads only its input octets and its own
+/// stylesheet, with no resolver; `XPath` filters can test any node or value.
+/// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Base-64>
+fn selects_whole_subtrees(transform: &Transform) -> bool {
+    match transform {
+        Transform::Enveloped
+        | Transform::XpathExcludeAllSignatures
+        | Transform::C14n(_)
+        | Transform::Base64Decode => true,
+        #[cfg(feature = "xslt")]
+        Transform::Xslt(_) => true,
+        _ => false,
+    }
+}
+
 fn analyze_signing_reference_inputs(
     document: &XmlDocument,
     policy: &crate::policy::SigningPolicy,
@@ -3316,15 +3347,12 @@ fn analyze_signing_reference_inputs(
     references: &SigningReferenceInputs,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
     let all_references = references.signed_info.iter().chain(&references.manifests);
-    if all_references.clone().all(|reference| {
-        reference.transforms.iter().all(|transform| {
-            matches!(
-                transform,
-                Transform::Enveloped | Transform::XpathExcludeAllSignatures | Transform::C14n(_)
-            )
-        })
-    }) {
-        // These transforms keep or remove whole subtrees, so a DigestValue or
+    if all_references
+        .clone()
+        .all(|reference| reference.transforms.iter().all(selects_whole_subtrees))
+    {
+        // These transforms keep or remove whole subtrees, or read only the
+        // octets or text of the nodes they are given, so a DigestValue or
         // SignatureValue element is covered exactly when its future text is:
         // the current tree decides every dependency without placeholder text.
         // That holds only while filling a value removes nothing but text; a
@@ -3379,6 +3407,17 @@ fn analyze_signing_reference_inputs(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static PLACEHOLDER_ANALYSES: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Placeholder-generation analyses on this thread since the last call.
+#[cfg(test)]
+fn take_placeholder_analyses() -> usize {
+    PLACEHOLDER_ANALYSES.with(|count| count.replace(0))
+}
+
 /// Analyze the `Reference` set on a parse of the document with placeholder text
 /// in every value the operation fills.
 fn analyze_signing_placeholder_generation(
@@ -3389,6 +3428,8 @@ fn analyze_signing_placeholder_generation(
     transform_options: TransformOptions<'_>,
     references: &SigningReferenceInputs,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
+    #[cfg(test)]
+    PLACEHOLDER_ANALYSES.with(|count| count.set(count.get() + 1));
     let signed_info_references = &references.signed_info;
     let manifest_references = &references.manifests;
     let reference_limit = references.maximum;
@@ -3953,6 +3994,20 @@ fn reference_dependency_levels(
         splice_unread,
         digests,
     })
+}
+
+/// Whether a failure is a refused resource or work limit of the operation.
+fn spends_operation_limit(error: &SigningDigestError) -> bool {
+    use crate::policy::PolicyViolation::{ResourceLimit, ResourceLimitExceeded};
+    matches!(
+        error,
+        SigningDigestError::Policy(ResourceLimit { .. } | ResourceLimitExceeded { .. })
+            | SigningDigestError::Transform(
+                TransformError::Policy(ResourceLimit { .. } | ResourceLimitExceeded { .. })
+                    | TransformError::C14n(crate::c14n::C14nError::SharedExecution(_))
+            )
+            | SigningDigestError::Provider(crate::provider::ProviderError::Resource(_))
+    )
 }
 
 fn map_reference_digest_error(
