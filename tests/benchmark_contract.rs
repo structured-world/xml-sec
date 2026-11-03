@@ -16,7 +16,9 @@ fn all_workloads_are_correct_on_every_backend() {
             assert!(fixture.input_bytes(operation) > 0);
             assert!(fixture.run(operation) > 0);
         }
-        if spec.backend != XmlBackend::Differential {
+        // Only roxmltree has a separate projection to measure: xmloxide
+        // builds the semantic tree as it parses.
+        if spec.backend == XmlBackend::Roxmltree {
             let projection =
                 xml_sec::benchmark_support::Projection::new(&fixture.unsigned, spec.backend)
                     .expect("prepare");

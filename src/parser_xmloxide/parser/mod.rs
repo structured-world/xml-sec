@@ -13,7 +13,7 @@
 pub(crate) mod input;
 pub mod push;
 mod xml;
-pub(crate) use xml::XmlParser;
+pub(crate) use xml::{Span, Tree, XmlParser};
 
 pub use push::PushParser;
 
@@ -21,6 +21,7 @@ use alloc::{string::String, sync::Arc};
 
 use crate::parser_xmloxide::error::ParseError;
 use crate::parser_xmloxide::tree::Document;
+use crate::xml::dom::storage::Native;
 
 use input::{
     DEFAULT_MAX_ATTRIBUTE_LENGTH, DEFAULT_MAX_ATTRIBUTES, DEFAULT_MAX_DEPTH,
@@ -243,20 +244,26 @@ pub fn parse_str_with_options(input: &str, options: &ParseOptions) -> Result<Doc
     parser.parse()
 }
 
-/// Parses a document without a DOCTYPE, returning the source range of each node.
-pub(crate) fn parse_str_recording_positions(
+/// Parses an XML string into `tree`.
+///
+/// # Errors
+///
+/// Returns `ParseError` if the input is not well-formed XML.
+pub(crate) fn parse_str_into<T: Tree<Native>>(
     input: &str,
     options: &ParseOptions,
-) -> Result<(Document, alloc::vec::Vec<crate::xml::dom::SourceNode>), ParseError> {
-    xml::XmlParser::new(input, options)?.parse_recording_positions()
+    tree: T,
+) -> Result<T, ParseError> {
+    xml::XmlParser::with_native_tree(input, options, tree)?.parse()
 }
 
-/// Parses a document without a DOCTYPE as [`parse_str_recording_positions`]
-/// does, enforcing `limits` as it reads.
-pub(crate) fn parse_str_enforcing_limits(
+/// Parses a document without a DOCTYPE into `tree`, enforcing `limits` as it
+/// reads.
+pub(crate) fn parse_str_enforcing_limits<T: Tree<Native>>(
     input: &str,
     options: &ParseOptions,
     limits: crate::xml::dom::ParseLimits,
-) -> Result<xml::Limited<crate::xml::dom::storage::Native>, ParseError> {
-    xml::XmlParser::new(input, options)?.parse_enforcing_limits(limits)
+    tree: T,
+) -> Result<xml::Limited<T, Native>, ParseError> {
+    xml::XmlParser::with_native_tree(input, options, tree)?.parse_enforcing_limits(limits)
 }

@@ -24,8 +24,6 @@ use core::fmt;
 pub(crate) use self::limits::{LimitCounter, LimitRefusal, ParseLimits};
 use self::preflight::LexicalPreflight;
 pub(crate) use self::preflight::ScanObserver;
-#[cfg(feature = "xml-backend-xmloxide")]
-pub(crate) use self::preflight::{PositionRecorder, SourceKind, SourceNode};
 
 pub use tree::{
     Ancestors, Attribute, Attributes, Children, Descendants, Document, ExpandedName, Namespace,

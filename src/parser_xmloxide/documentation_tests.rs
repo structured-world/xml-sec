@@ -12,7 +12,7 @@ fn lib_rs_example_1() -> impl std::process::Termination {
     assert_eq!(doc.node_name(root), Some("root"));
 }
 
-// parser/mod.rs:61; original runnable example.
+// parser/mod.rs:62; original runnable example.
 #[test]
 fn parser_mod_rs_example_1() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -197,7 +197,7 @@ fn tree_mod_rs_example_4() -> impl std::process::Termination {
     };
 }
 
-// tree/mod.rs:890; original runnable example.
+// tree/mod.rs:840; original runnable example.
 #[test]
 fn tree_mod_rs_example_5() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;
@@ -210,7 +210,7 @@ fn tree_mod_rs_example_5() -> impl std::process::Termination {
     doc.append_child(root, cloned);
 }
 
-// tree/mod.rs:923; original runnable example.
+// tree/mod.rs:873; original runnable example.
 #[test]
 fn tree_mod_rs_example_6() -> impl std::process::Termination {
     use crate::parser_xmloxide as xmloxide;

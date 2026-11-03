@@ -304,6 +304,21 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             u32::try_from(self.nodes.len()).expect("bounded XML node count must fit into u32");
     }
 
+    /// Ends the source range of `node`, pushed before its end was read.
+    #[cfg(feature = "xml-backend-xmloxide")]
+    pub(super) fn end_range(&mut self, node: NodeId, end: usize) {
+        self.nodes[node.index()].range.end = end;
+    }
+
+    /// The prefix and local name of `element`.
+    #[cfg(feature = "xml-backend-xmloxide")]
+    pub(super) fn element_name(&self, element: NodeId) -> (Option<&str>, &str) {
+        match &self.nodes[element.index()].kind {
+            NodeKind::Element { name, prefix, .. } => (prefix.as_deref(), name.as_ref()),
+            _ => unreachable!("only an element is open"),
+        }
+    }
+
     #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn has_text_tail(&self, parent: NodeId) -> bool {
         // In preorder a parent's text tail is the last node pushed: an element
@@ -500,7 +515,8 @@ impl<'input> Document<'input> {
         backend: XmlBackend,
         observer: &mut O,
     ) -> Result<Self, ParseError> {
-        let preflight = super::LexicalPreflight::scan_observed(input, options.allow_dtd, observer)?;
+        let preflight =
+            super::LexicalPreflight::scan_observed(input, options.allow_dtd, backend, observer)?;
         backend.parse(input, options, &preflight)
     }
 
@@ -517,8 +533,13 @@ impl<'input> Document<'input> {
     where
         O: super::ScanObserver<'input>,
     {
-        let preflight =
-            super::LexicalPreflight::scan_observed_in(input, options.allow_dtd, storage, observer)?;
+        let preflight = super::LexicalPreflight::scan_observed_in(
+            input,
+            options.allow_dtd,
+            backend,
+            storage,
+            observer,
+        )?;
         backend.parse_in(input, options, &preflight, storage)
     }
 
@@ -1346,80 +1367,78 @@ mod tests {
 
     #[cfg(all(feature = "xmldsig", feature = "xml-backend-xmloxide"))]
     #[test]
-    fn xmloxide_projection_uses_the_actual_scoped_tree_storage() {
+    fn xmloxide_tree_uses_the_actual_scoped_tree_storage() {
         // The same tree kernel must retain paid coalescing, normalized xml:id,
-        // namespace axes and attributes with the alternate selected backend.
+        // namespace axes and attributes with the alternate selected backend,
+        // which builds the tree as it parses, in the storage it parses with.
+        use super::super::storage::Accounted;
         use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
         let xml = "<r xmlns:p='urn:p' xml:id=' a  b ' p:x='value'>left<![CDATA[middle]]>right</r>";
-        let preflight =
-            super::super::LexicalPreflight::scan(xml, false).expect("fixed XML preflight");
-        let raw = || {
-            crate::parser_xmloxide::parser::parse_str_with_options(
-                xml,
-                &super::super::xmloxide::backend_options(),
-            )
-            .expect("fixed backend XML")
-        };
         let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
-        let document = super::super::xmloxide::project_in(
+        let preflight = super::super::LexicalPreflight::scan_in(xml, false, Accounted(&memory))
+            .expect("fixed XML preflight");
+        let document = super::super::xmloxide::XmloxideBackend::parse_in(
             xml,
-            raw(),
             super::ParsingOptions::default(),
             &preflight,
-            preflight.source_nodes(),
-            super::super::storage::Accounted(&memory),
+            Accounted(&memory),
         )
-        .expect("paid projection fits");
+        .expect("paid parse fits");
         assert_scoped_projection(&document);
-        assert!(memory.used() > 0);
-        drop(document);
-        assert_eq!(memory.used(), 0);
+        let preflight_only = {
+            drop(document);
+            memory.used()
+        };
+        assert!(preflight_only > 0);
         let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 20)));
         assert!(matches!(
-            super::super::xmloxide::project_in(
+            super::super::xmloxide::XmloxideBackend::parse_in(
                 xml,
-                raw(),
                 super::ParsingOptions::default(),
                 &preflight,
-                preflight.source_nodes(),
-                super::super::storage::Accounted(&denied)
+                Accounted(&denied)
             ),
-            Err(super::ParseError::SharedExecution(
-                MemoryError::LimitExceeded
+            Err(super::super::AccountedParseError::Semantic(
+                super::ParseError::SharedExecution(MemoryError::LimitExceeded)
             ))
         ));
         assert_eq!(denied.used(), 0);
+        drop(preflight);
+        assert_eq!(memory.used(), 0);
     }
 
     #[cfg(all(feature = "xmldsig", feature = "xml-backend-xmloxide"))]
     #[test]
-    fn projection_node_admission_precedes_arena_and_payload_growth() {
-        // A disallowed semantic node must not allocate its attributes or text
-        // first, nor reserve a larger arena based on the source backend count.
+    fn node_admission_precedes_arena_growth() {
+        // A disallowed semantic node is refused before the arena grows, and
+        // the arena is never reserved past the nodes the limit admits: a
+        // refused parse of a large document leaves nothing in the account.
         use super::super::storage::Accounted;
         use structured_asn1::memory::{Memory, MemoryAccount};
         let source = format!("<r a='{}'/>", "x".repeat(65536));
-        let preflight =
-            super::super::LexicalPreflight::scan(&source, false).expect("native lexical baseline");
-        for (limit, capacity) in [(0, 0), (1, 4096)] {
-            let raw = crate::parser_xmloxide::parser::parse_str_with_options(
+        let funded = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        for limit in [0, 1] {
+            // The parser's own copy of the attribute fits; an arena reserved
+            // for the source's size, about one node per 30 bytes, does not.
+            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(256 << 10, 1 << 24)));
+            let preflight =
+                super::super::LexicalPreflight::scan_in(&source, false, Accounted(&funded))
+                    .expect("funded lexical baseline");
+            let result = super::super::xmloxide::XmloxideBackend::parse_in(
                 &source,
-                &super::super::xmloxide::backend_options(),
-            )
-            .expect("native raw XML baseline");
-            let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(capacity, 1 << 24)));
-            let result = super::super::xmloxide::project_in(
-                &source,
-                raw,
                 super::ParsingOptions {
                     nodes_limit: limit,
                     allow_dtd: false,
                 },
                 &preflight,
-                preflight.source_nodes(),
                 Accounted(&memory),
             );
-            assert!(matches!(result, Err(super::ParseError::NodesLimitReached)));
+            assert!(matches!(
+                result,
+                Err(super::super::AccountedParseError::Semantic(
+                    super::ParseError::NodesLimitReached
+                ))
+            ));
             assert_eq!(memory.used(), 0);
         }
     }
