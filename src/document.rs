@@ -2852,18 +2852,19 @@ impl<S: NameStorage> LimitRun<'_, S> {
             }
         }
         if has_defaults && let Some(defaults) = dtd.attribute_defaults.get(element, storage)? {
-            for (index, default) in defaults.iter().enumerate() {
-                storage.charge(default.value.len())?;
-                // An attribute the tag gives, or an earlier default supplies,
-                // takes no value from this default.
+            // An attribute the tag gives, or an earlier default supplies, takes
+            // no value from a default; the storage meters this index.
+            let mut present = storage.names();
+            for (name, _) in pairs {
+                present.insert(name, ())?;
+            }
+            for default in &**defaults {
                 let name = default.attribute_name.as_ref();
-                if pairs.clone().any(|(given, _)| given == name)
-                    || defaults[..index]
-                        .iter()
-                        .any(|earlier| earlier.attribute_name.as_ref() == name)
-                {
+                if present.get(name, storage)?.is_some() {
                     continue;
                 }
+                present.insert(name, ())?;
+                storage.charge(default.value.len())?;
                 for name in general_references(default.value.as_bytes()) {
                     self.expand(dtd, name, FragmentContext::Attribute)?;
                 }

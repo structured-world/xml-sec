@@ -18,6 +18,11 @@ const DOCUMENTS: &[&str] = &[
         r#"<!--c--><?p d?><r a="&v;" b='&amp;'>&v;<![CDATA[x]]>&w;</r>"#
     ),
     concat!(
+        r#"<!DOCTYPE r [<!ENTITY v "<x/>"><!ENTITY w "w">"#,
+        r#"<!ATTLIST e a CDATA '&w;' a CDATA '&v;&v;' b CDATA '&w;' c CDATA '&w;&w;'>]>"#,
+        r#"<r><e/><e b="given"/><e a="&w;" c=""/></r>"#
+    ),
+    concat!(
         "<?xml version=\"1.0\"?>\n<!-- c -->\n",
         r#"<r xmlns:a="urn:a">a&amp;b<e/><f xmlns="">g</f></r>"#,
         "\n<!--z-->"
@@ -111,6 +116,32 @@ fn the_scan_refuses_each_limit_where_the_limit_pass_does() {
             refusals >= 20 && acceptances >= 20,
             "{backend:?}: {refusals} refusals, {acceptances} acceptances"
         );
+    }
+}
+
+#[test]
+fn the_scan_charges_the_entity_work_the_limit_pass_charges() {
+    // References expand in content, in given attribute values, and in the
+    // defaults of attributes a tag omits: the first declared default of each,
+    // never one the tag gives. Beyond the parse allowance (twice the source
+    // against the separate pass's once), both charge the same expansion work.
+    for backend in XmlBackend::available().filter(|backend| *backend != XmlBackend::Differential) {
+        for &xml in DOCUMENTS {
+            #[cfg(feature = "xml-backend-xmloxide")]
+            if backend.records_positions(xml) {
+                continue;
+            }
+            let case = settings(backend, u32::MAX, 64, 64);
+            let separate = XmlParseWorkBudget::with_limit(usize::MAX);
+            preflight_document_limits(xml, case, Some(&separate)).expect("the pass accepts");
+            let scanned = XmlParseWorkBudget::with_limit(usize::MAX);
+            build_cell(xml.to_owned(), case, Some(&scanned)).expect("the parse accepts");
+            assert_eq!(
+                scanned.consumed() - 2 * xml.len(),
+                separate.consumed() - xml.len(),
+                "{xml}: {backend:?}"
+            );
+        }
     }
 }
 
