@@ -404,6 +404,14 @@ impl<'d> Element<'d> {
             .element_register_prefix(self.node, prefix, namespace_uri);
     }
 
+    /// Room for `attributes` more attributes and `children` more children,
+    /// so a builder that knows their counts adds them without regrowth.
+    pub fn reserve(&self, attributes: usize, children: usize) {
+        self.document
+            .storage
+            .element_reserve(self.node, attributes, children);
+    }
+
     #[must_use]
     pub fn namespace_uri_for_prefix(&self, prefix: &str) -> Option<InternedString> {
         raw::Connections::element_namespace_uri_for_prefix(self.document.storage, self.node, prefix)
@@ -1019,6 +1027,10 @@ impl<'d> From<ChildOfRoot<'d>> for ChildOfElement<'d> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "dom_no_unsafe/namespace_tests.rs"]
+mod namespace_tests;
 
 #[cfg(test)]
 mod test {

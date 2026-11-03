@@ -407,6 +407,27 @@ impl Storage {
         Self::default()
     }
 
+    /// Storage whose node arenas hold `requirements` in their first chunk.
+    pub fn with_requirements(requirements: &crate::StorageRequirements) -> Storage {
+        Storage {
+            strings: StringPool::new(),
+            roots: Arena::with_capacity(requirements.roots),
+            elements: Arena::with_capacity(requirements.elements),
+            attributes: Arena::with_capacity(requirements.attributes),
+            texts: Arena::with_capacity(requirements.texts),
+            comments: Arena::with_capacity(requirements.comments),
+            processing_instructions: Arena::with_capacity(requirements.processing_instructions),
+        }
+    }
+
+    /// Room on `element` for `attributes` more attributes and `children`
+    /// more children.
+    pub fn element_reserve(&self, element: *mut Element, attributes: usize, children: usize) {
+        let element_r = unsafe { &mut *element };
+        element_r.attributes.reserve_exact(attributes);
+        element_r.children.reserve_exact(children);
+    }
+
     fn intern(&self, s: &str) -> InternedString {
         let interned = self.strings.intern(s);
         InternedString::from_str(interned)
@@ -1019,18 +1040,28 @@ impl Connections {
         namespace_uri: &str,
         preferred_prefix: Option<&str>,
     ) -> Option<&str> {
+        // Namespaces 1.0 section 6.1: a prefix a nearer element binds hides
+        // the same prefix on every ancestor.
+        // https://www.w3.org/TR/xml-names/#scoping
+        let mut rebound = Vec::new();
         for element_r in self.element_parents(element) {
             let prefixes: Vec<_> = element_r
                 .prefix_to_namespace
                 .iter()
                 .filter_map(|(&prefix, ns_uri)| {
-                    if ns_uri == namespace_uri {
+                    if ns_uri == namespace_uri && !rebound.contains(&prefix) {
                         Some(prefix)
                     } else {
                         None
                     }
                 })
                 .collect();
+            rebound.extend(
+                element_r
+                    .prefix_to_namespace
+                    .iter()
+                    .map(|(&prefix, _)| prefix),
+            );
 
             if let Some(preferred_prefix) = preferred_prefix
                 && let Some(prefix) = prefixes.iter().find(|&prefix| prefix == preferred_prefix)

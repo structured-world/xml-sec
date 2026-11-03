@@ -324,6 +324,14 @@ impl<'d> Element<'d> {
             .element_register_prefix(self.node, prefix, namespace_uri);
     }
 
+    /// Room for `attributes` more attributes and `children` more children,
+    /// so a builder that knows their counts adds them without regrowth.
+    pub fn reserve(&self, attributes: usize, children: usize) {
+        self.document
+            .storage
+            .element_reserve(self.node, attributes, children);
+    }
+
     /// Recursively resolve the prefix to a namespace URI.
     pub fn namespace_uri_for_prefix(&self, prefix: &str) -> Option<&'d str> {
         self.document

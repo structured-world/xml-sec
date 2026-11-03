@@ -305,8 +305,39 @@ impl Storage {
         Self::default()
     }
 
+    /// Storage whose node arenas hold `requirements` without growing.
+    pub fn with_requirements(requirements: &crate::StorageRequirements) -> Storage {
+        Storage {
+            strings: StringPool::new(),
+            roots: RefCell::new(Values::with_capacity(requirements.roots)),
+            elements: RefCell::new(Values::with_capacity(requirements.elements)),
+            attributes: RefCell::new(Values::with_capacity(requirements.attributes)),
+            texts: RefCell::new(Values::with_capacity(requirements.texts)),
+            comments: RefCell::new(Values::with_capacity(requirements.comments)),
+            processing_instructions: RefCell::new(Values::with_capacity(
+                requirements.processing_instructions,
+            )),
+        }
+    }
+
+    /// Room on `element` for `attributes` more attributes and `children`
+    /// more children.
+    pub fn element_reserve(&self, element: Index<Element>, attributes: usize, children: usize) {
+        let mut elements = self.elements.borrow_mut();
+        let element = &mut elements[element.idx];
+        element.attributes.reserve_exact(attributes);
+        element.children.reserve_exact(children);
+    }
+
     fn intern(&self, s: &str) -> InternedString {
         self.strings.intern(s)
+    }
+
+    /// A value held by its node alone. Names repeat across a document and are
+    /// interned; attribute values and character data are mostly unique, so
+    /// hashing them into the pool buys no sharing. Equality is by content.
+    fn value(s: &str) -> InternedString {
+        InternedString::from_str(s)
     }
 
     fn intern_qname(&self, q: QName<'_>) -> InternedQName {
@@ -349,7 +380,7 @@ impl Storage {
         N: Into<QName<'n>>,
     {
         let name = self.intern_qname(name.into());
-        let value = self.intern(value);
+        let value = Self::value(value);
         let mut attributes = self.attributes.borrow_mut();
         let idx = attributes.len();
         attributes.push(Attribute {
@@ -362,7 +393,7 @@ impl Storage {
     }
 
     pub fn create_text(&self, text: &str) -> Index<Text> {
-        let text = self.intern(text);
+        let text = Self::value(text);
         let mut texts = self.texts.borrow_mut();
         let idx = texts.len();
         texts.push(Text { text, parent: None });
@@ -370,7 +401,7 @@ impl Storage {
     }
 
     pub fn create_comment(&self, text: &str) -> Index<Comment> {
-        let text = self.intern(text);
+        let text = Self::value(text);
         let mut comments = self.comments.borrow_mut();
         let idx = comments.len();
         comments.push(Comment { text, parent: None });
@@ -383,7 +414,7 @@ impl Storage {
         value: Option<&str>,
     ) -> Index<ProcessingInstruction> {
         let target = self.intern(target);
-        let value = value.map(|v| self.intern(v));
+        let value = value.map(Self::value);
         let mut pis = self.processing_instructions.borrow_mut();
         let idx = pis.len();
         pis.push(ProcessingInstruction {
@@ -439,12 +470,12 @@ impl Storage {
     }
 
     pub fn text_set_text(&self, text: Index<Text>, new_text: &str) {
-        let new_text = self.intern(new_text);
+        let new_text = Self::value(new_text);
         self.texts.borrow_mut()[text.idx].text = new_text;
     }
 
     pub fn comment_set_text(&self, comment: Index<Comment>, new_text: &str) {
-        let new_text = self.intern(new_text);
+        let new_text = Self::value(new_text);
         self.comments.borrow_mut()[comment.idx].text = new_text;
     }
 
@@ -462,7 +493,7 @@ impl Storage {
         pi: Index<ProcessingInstruction>,
         new_value: Option<&str>,
     ) {
-        let new_value = new_value.map(|v| self.intern(v));
+        let new_value = new_value.map(Self::value);
         self.processing_instructions.borrow_mut()[pi.idx].value = new_value;
     }
 
@@ -1008,6 +1039,10 @@ impl Connections {
         namespace_uri: &str,
         preferred_prefix: Option<&str>,
     ) -> Option<InternedString> {
+        // Namespaces 1.0 section 6.1: a prefix a nearer element binds hides
+        // the same prefix on every ancestor.
+        // https://www.w3.org/TR/xml-names/#scoping
+        let mut rebound: Vec<InternedString> = Vec::new();
         let mut current = Some(element);
         while let Some(elem_idx) = current {
             let elements = storage.elements.borrow();
@@ -1017,13 +1052,18 @@ impl Connections {
                 .prefix_to_namespace
                 .iter()
                 .filter_map(|(prefix, ns_uri)| {
-                    if &**ns_uri == namespace_uri {
+                    if &**ns_uri == namespace_uri && !rebound.contains(prefix) {
                         Some(prefix.clone())
                     } else {
                         None
                     }
                 })
                 .collect();
+            rebound.extend(
+                elem.prefix_to_namespace
+                    .iter()
+                    .map(|(prefix, _)| prefix.clone()),
+            );
 
             if let Some(preferred) = preferred_prefix
                 && let Some(p) = prefixes.iter().find(|p| &***p == preferred)
