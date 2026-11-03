@@ -288,6 +288,29 @@ fn the_built_source_obeys_each_xml_input_limit_as_its_parse_does() {
 }
 
 #[test]
+fn an_element_over_two_limits_is_refused_for_the_one_a_parse_reports() {
+    // One element can pass both the node and the depth limit; the refusal is
+    // the one the preflight of the canonical octets reports first.
+    let document = Dom::parse("<a><b><c><d/></c></b></a>").expect("source parses");
+    for nodes in 0..6 {
+        for depth in 0..5 {
+            let resources = ResourcePolicy {
+                max_xml_nodes: nodes,
+                max_xml_depth: depth,
+                ..ResourcePolicy::default()
+            };
+            // `same` compares the refusals of both paths.
+            let _built = same(
+                &document,
+                &Everything,
+                &resources,
+                &format!("nodes {nodes}, depth {depth}"),
+            );
+        }
+    }
+}
+
+#[test]
 fn tape_growth_admits_the_old_and_the_new_allocation_together() {
     // Growing a full list moves it: the old allocation is live until the
     // replacement holds its copy, so the peak is both. Four events fit a

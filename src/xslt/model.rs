@@ -2130,6 +2130,30 @@ impl ParsedText<'_> {
 }
 
 /// Whether the concatenation of `pieces` contains `pattern`, of at most three bytes.
+/// Refuse `pieces` holding a character outside XML 1.0 production [2]: a C0
+/// control other than tab, line feed and carriage return, or U+FFFE or
+/// U+FFFF; `str` holds no surrogates, and each piece is whole UTF-8.
+/// <https://www.w3.org/TR/xml/#NT-Char>
+fn refuse_non_xml_characters(pieces: &[&str]) -> Result<()> {
+    for piece in pieces {
+        let bytes = piece.as_bytes();
+        for (index, &byte) in bytes.iter().enumerate() {
+            let excluded = match byte {
+                0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => true,
+                // U+FFFE and U+FFFF encode as EF BF BE and EF BF BF.
+                0xEF => matches!(bytes.get(index + 1..index + 3), Some([0xBF, 0xBE | 0xBF])),
+                _ => false,
+            };
+            if excluded {
+                return Err(Error::Xml(
+                    "character data holds a non-XML character".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn pieces_contain(pieces: &[&str], pattern: &[u8]) -> bool {
     debug_assert!((1..=3).contains(&pattern.len()));
     let mut window = [0u8; 3];
@@ -2716,6 +2740,7 @@ impl DocumentBuilder<'_, '_> {
         if pieces_contain(pieces, b"]]>") {
             return Err(Error::Xml("`]]>` is not allowed in character data".into()));
         }
+        refuse_non_xml_characters(pieces)?;
         self.0.text_run(ParsedText::Pieces(pieces), line)
     }
 
@@ -2751,6 +2776,7 @@ impl DocumentBuilder<'_, '_> {
         if ends_in_hyphen || pieces_contain(pieces, b"--") {
             return Err(Error::Xml("`--` is not allowed in a comment".into()));
         }
+        refuse_non_xml_characters(pieces)?;
         self.0.comment_value(ParsedText::Pieces(pieces), line)
     }
 
@@ -2779,6 +2805,7 @@ impl DocumentBuilder<'_, '_> {
                 "`?>` is not allowed in a processing instruction".into(),
             ));
         }
+        refuse_non_xml_characters(pieces.unwrap_or_default())?;
         self.0
             .instruction(target, pieces.map(ParsedText::Pieces), line)
     }
@@ -3252,7 +3279,11 @@ fn push_semantic_element<'v>(
                 bound.unwrap_or_default()
             )));
         }
-        meter.charge_owned(uri.len())?;
+        refuse_non_xml_characters(&[uri])?;
+        // Admit the declaration's name, as a parse does for the attribute it
+        // reads, and its URI, before the prefix and URI are copied.
+        let name_bytes = bound.map_or("xmlns".len(), |bound| "xmlns:".len() + bound.len());
+        meter.charge_owned(name_bytes + uri.len())?;
         validate_namespace_binding(bound, uri)?;
         set_namespace_bounded(
             &mut namespaces,
@@ -3275,6 +3306,7 @@ fn push_semantic_element<'v>(
                 bound.map_or_else(|| name.to_owned(), |bound| format!("{bound}:{name}"))
             )));
         }
+        refuse_non_xml_characters(&[value])?;
         // Admit the name and value copies before either allocates, each at
         // its exact size, so no growth outruns the admission.
         let lexical_bytes = name.len() + bound.map_or(0, |bound| bound.len() + 1);

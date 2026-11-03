@@ -560,6 +560,11 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
             return Ok(());
         }
         self.node();
+        // The preflight reports the node limit first when one element
+        // passes both.
+        if self.refusal.is_some() {
+            return Ok(());
+        }
         self.depth += 1;
         if self.depth > self.settings.depth_limit {
             self.refuse(XmlDocumentError::DocumentTooDeep {

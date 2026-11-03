@@ -111,6 +111,47 @@ fn references_and_attributes_no_parse_reads_are_refused_when_built() {
         let (built, _) = built_and_parsed("<r/>", attribute(bound, name));
         assert!(built.is_err(), "{bound:?} {name} is built: {built:?}");
     }
+    // XML 1.0 section 2.2, production [2]: literal text, comments,
+    // instruction values and attribute values hold only Char as well.
+    // https://www.w3.org/TR/xml/#NT-Char
+    let cases: [(&str, Box<Construct>); 4] = [
+        (
+            "<r>a\0b</r>",
+            Box::new(|builder: &mut DocumentBuilder<'_, '_>| {
+                builder.start_element((None, "r"), [], [], 1)?;
+                builder.text(&["a", "\0b"], 1)?;
+                builder.end_element()
+            }),
+        ),
+        (
+            "<r><!--\u{1}--></r>",
+            Box::new(|builder: &mut DocumentBuilder<'_, '_>| {
+                builder.start_element((None, "r"), [], [], 1)?;
+                builder.comment(&["\u{1}"], 1)?;
+                builder.end_element()
+            }),
+        ),
+        (
+            "<r><?t \u{FFFF}?></r>",
+            Box::new(|builder: &mut DocumentBuilder<'_, '_>| {
+                builder.start_element((None, "r"), [], [], 1)?;
+                builder.processing_instruction("t", Some(&["\u{FFFF}"]), 1)?;
+                builder.end_element()
+            }),
+        ),
+        (
+            "<r a=\"\u{FFFE}\"/>",
+            Box::new(|builder: &mut DocumentBuilder<'_, '_>| {
+                builder.start_element((None, "r"), [], [(None, "a", "\u{FFFE}")], 1)?;
+                builder.end_element()
+            }),
+        ),
+    ];
+    for (text, construct) in cases {
+        let (built, parsed) = built_and_parsed(text, construct);
+        assert!(parsed.is_err(), "{text:?} parses");
+        assert!(built.is_err(), "{text:?} is built: {built:?}");
+    }
     // Their valid neighbours are accepted by both.
     let (built, parsed) = built_and_parsed(r#"<r xml:lang="urn:a">&#xFFFD;</r>"#, |builder| {
         builder.start_element((None, "r"), [], [(Some("xml"), "lang", "urn:a")], 1)?;
