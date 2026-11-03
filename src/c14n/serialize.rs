@@ -42,8 +42,114 @@ type StartTagAttribute<'n, S> = (
     AttributeValue<'n, <S as Scratch>::Text>,
 );
 
-struct CanonicalOutput<'a, 'n, W: ByteSink + ?Sized, S: Scratch = Native> {
+/// Receives the structure of the canonical form while its octets are
+/// written, for a consumer that needs what parsing those octets yields
+/// rather than the octets themselves.
+///
+/// Text, comments, processing instructions and the axes of an omitted
+/// element are reported before their octets; tags after theirs, which hold
+/// no line break. Names and values borrow the document for `'n`, so an
+/// observer may keep them instead of copying.
+pub(crate) trait CanonicalObserver<'n> {
+    /// A start tag: its namespace declarations and attributes in canonical
+    /// order, as `(prefix, uri)` and `(prefix, local name, value)`, unescaped.
+    fn start_tag<'v>(
+        &mut self,
+        prefix: &'n str,
+        local: &'n str,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
+    ) -> Result<(), C14nError>;
+
+    /// The end tag of the innermost open start tag.
+    fn end_tag(&mut self) -> Result<(), C14nError>;
+
+    /// Character data of a visible text node, unescaped.
+    fn text(&mut self, text: &'n str) -> Result<(), C14nError>;
+
+    /// A comment's value as the DOM holds it.
+    fn comment(&mut self, text: &'n str) -> Result<(), C14nError>;
+
+    /// A processing instruction's target and value as the DOM holds them.
+    fn processing_instruction(
+        &mut self,
+        target: &'n str,
+        value: Option<&'n str>,
+    ) -> Result<(), C14nError>;
+
+    /// Namespace declarations and attributes an omitted element keeps in the
+    /// node-set; their octets are character data of the enclosing content.
+    fn omitted_axes(
+        &mut self,
+        namespaces: &[(&'n str, &'n str)],
+        attributes: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
+    ) -> Result<(), C14nError>;
+}
+
+/// An attribute value as canonicalization renders it: the document's own, or
+/// one it computed, which lives only for the call.
+#[derive(Clone, Copy)]
+#[cfg_attr(
+    not(feature = "xslt"),
+    expect(
+        dead_code,
+        reason = "only the XSLT source builder reads observed values"
+    )
+)]
+pub(crate) enum ObservedValue<'n, 'v> {
+    Document(&'n str),
+    Computed(&'v str),
+}
+
+/// An attribute of a start tag: its prefix, local name and value.
+pub(crate) type ObservedAttribute<'n, 'v> = (&'n str, &'n str, ObservedValue<'n, 'v>);
+
+/// Canonical output nothing observes.
+impl<'n> CanonicalObserver<'n> for () {
+    #[inline]
+    fn start_tag<'v>(
+        &mut self,
+        _: &'n str,
+        _: &'n str,
+        _: &[(&'n str, &'n str)],
+        _: impl Iterator<Item = Result<ObservedAttribute<'n, 'v>, C14nError>>,
+    ) -> Result<(), C14nError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn end_tag(&mut self) -> Result<(), C14nError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn text(&mut self, _: &str) -> Result<(), C14nError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn comment(&mut self, _: &str) -> Result<(), C14nError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn processing_instruction(&mut self, _: &str, _: Option<&str>) -> Result<(), C14nError> {
+        Ok(())
+    }
+
+    #[inline]
+    fn omitted_axes(
+        &mut self,
+        _: &[(&'n str, &'n str)],
+        _: impl Iterator<Item = (&'n str, &'n str, &'n str)>,
+    ) -> Result<(), C14nError> {
+        Ok(())
+    }
+}
+
+struct CanonicalOutput<'a, 'n, W: ByteSink + ?Sized, S: Scratch = Native, O = ()> {
     writer: &'a mut W,
+    observer: &'a mut O,
     position: usize,
     max_len: usize,
     /// The caller's limit, reported when `max_len` is reached.
@@ -63,22 +169,29 @@ enum AttributeValue<'a, T: Text> {
     Borrowed(&'a str),
     Owned(T),
 }
-impl<T: Text> AttributeValue<'_, T> {
+impl<'a, T: Text> AttributeValue<'a, T> {
     fn view(&self) -> Result<&str, C14nError> {
         match self {
             Self::Borrowed(text) => Ok(text),
             Self::Owned(text) => text.view(),
         }
     }
+
+    fn observed(&self) -> Result<ObservedValue<'a, '_>, C14nError> {
+        Ok(match self {
+            Self::Borrowed(text) => ObservedValue::Document(text),
+            Self::Owned(text) => ObservedValue::Computed(text.view()?),
+        })
+    }
 }
 
-impl<W: ByteSink + ?Sized, S: Scratch> ByteSink for CanonicalOutput<'_, '_, W, S> {
+impl<W: ByteSink + ?Sized, S: Scratch, O> ByteSink for CanonicalOutput<'_, '_, W, S, O> {
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
         self.write_all(bytes)
     }
 }
 
-impl<W: ByteSink + ?Sized, S: Scratch> CanonicalOutput<'_, '_, W, S> {
+impl<W: ByteSink + ?Sized, S: Scratch, O> CanonicalOutput<'_, '_, W, S, O> {
     fn write_all(&mut self, bytes: &[u8]) -> Result<(), C14nError> {
         debug_assert!(self.position <= self.max_len);
         if bytes.len() > self.max_len - self.position {
@@ -358,12 +471,19 @@ pub(crate) fn serialize_canonical_visible_with_positions_bounded_impl<
         output,
         initial_offset,
         &Native,
+        &mut (),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
-    doc: &Document<'_, D>,
+pub(super) fn serialize_with_scratch<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
+    doc: &'n Document<'_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer<S, D>,
@@ -372,6 +492,7 @@ pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomSto
     output: &mut W,
     initial_offset: usize,
     scratch: &S,
+    observer: &mut O,
 ) -> Result<(Option<usize>, TrackedPositions), C14nError> {
     // Canonical XML 1.0 §2.3 requires operation failure on documents containing
     // relative namespace URIs, including outside the selected subset. Elements
@@ -392,6 +513,7 @@ pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomSto
     };
     let mut output = CanonicalOutput {
         writer: output,
+        observer,
         position: initial_offset,
         max_len,
         max_output_bytes: options.max_output_bytes.unwrap_or(usize::MAX),
@@ -433,14 +555,20 @@ pub(super) fn serialize_with_scratch<W: ByteSink + ?Sized, S: Scratch, D: DomSto
 }
 
 /// Serialize children of a node in document order.
-fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_children<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
     parent: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, 'n, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S, O>,
 ) -> Result<(), C14nError> {
     let is_doc_root = parent.node_type() == NodeType::Root;
 
@@ -496,6 +624,7 @@ fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
                     if !is_doc_root && let Some(text) = child.text() {
                         output.scratch.charge(text.len())?;
                         output.track(child);
+                        output.observer.text(text)?;
                         escape_text(text, output)?;
                     }
                 }
@@ -505,6 +634,7 @@ fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
                     let follows_document_element =
                         is_doc_root && has_preceding_element_sibling(&child);
                     write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
+                    output.observer.comment(child.text().unwrap_or_default())?;
                     output.write_all(b"<!--")?;
                     if let Some(text) = child.text() {
                         output.scratch.charge(text.len())?;
@@ -520,6 +650,9 @@ fn serialize_children<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
                     let follows_document_element =
                         is_doc_root && has_preceding_element_sibling(&child);
                     write_doc_level_prefix(is_doc_root, follows_document_element, output)?;
+                    output
+                        .observer
+                        .processing_instruction(pi.target, pi.value)?;
                     output.write_all(b"<?")?;
                     output.write_all(pi.target.as_bytes())?;
                     if let Some(value) = pi.value {
@@ -545,12 +678,13 @@ fn serialize_selected_axes_of_omitted_element<
     W: ByteSink + ?Sized,
     S: Scratch,
     D: DomStorage,
+    O: CanonicalObserver<'n>,
 >(
     owner: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     ns_renderer: &dyn NsRenderer<S, D>,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, 'n, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S, O>,
 ) -> Result<(), C14nError> {
     let Some(visibility) = visibility else {
         return Ok(());
@@ -578,15 +712,7 @@ fn serialize_selected_axes_of_omitted_element<
         Ok(left.0.cmp(right.0))
     })?;
     for &(prefix, uri) in namespaces.iter() {
-        if prefix.is_empty() {
-            output.write_all(b" xmlns=\"")?;
-        } else {
-            output.write_all(b" xmlns:")?;
-            output.write_all(prefix.as_bytes())?;
-            output.write_all(b"=\"")?;
-        }
-        escape_attr(uri, output)?;
-        output.write_all(b"\"")?;
+        write_namespace_declaration(prefix, uri, output)?;
     }
 
     let mut attributes = output.scratch.values();
@@ -610,6 +736,18 @@ fn serialize_selected_axes_of_omitted_element<
         Ok((left.namespace().unwrap_or(""), left.name())
             .cmp(&(right.namespace().unwrap_or(""), right.name())))
     })?;
+    // The declarations already written hold no line break, so the axes are
+    // reported here, once both lists are known.
+    output.observer.omitted_axes(
+        &namespaces,
+        attributes.iter().map(|attribute| {
+            (
+                attribute_prefix(owner, *attribute),
+                attribute.name(),
+                attribute.value(),
+            )
+        }),
+    )?;
     for attribute in attributes.iter() {
         output.write_all(b" ")?;
         let prefix = attribute_prefix(owner, *attribute);
@@ -627,14 +765,20 @@ fn serialize_selected_axes_of_omitted_element<
 }
 
 /// Serialize a single element node (start tag + children + end tag).
-fn serialize_element<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_element<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
     node: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     with_comments: bool,
     ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, 'n, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S, O>,
 ) -> Result<(), C14nError> {
     let rendered = serialize_start_tag(
         node,
@@ -656,16 +800,22 @@ fn serialize_element<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
     output.write_all(b"</")?;
     write_qualified_name(node, output)?;
     output.write_all(b">")?;
-    Ok(())
+    output.observer.end_tag()
 }
 
-fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
+fn serialize_start_tag<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
     node: Node<'n, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     ns_renderer: &dyn NsRenderer<S, D>,
     config: C14nConfig,
     parent_rendered: &S::Namespaces<'n>,
-    output: &mut CanonicalOutput<'_, 'n, W, S>,
+    output: &mut CanonicalOutput<'_, 'n, W, S, O>,
 ) -> Result<Option<S::Namespaces<'n>>, C14nError> {
     let (ns_decls, rendered) =
         ns_renderer.render_namespaces(node, parent_rendered, visibility, output.scratch)?;
@@ -677,16 +827,8 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
 
     // Namespace declarations (already sorted by prefix).
     for &(prefix, uri) in ns_decls.iter() {
-        if prefix.is_empty() {
-            output.write_all(b" xmlns=\"")?;
-        } else {
-            output.write_all(b" xmlns:")?;
-            output.write_all(prefix.as_bytes())?;
-            output.write_all(b"=\"")?;
-        }
         output.scratch.charge(uri.len())?;
-        escape_attr(uri, output)?;
-        output.write_all(b"\"")?;
+        write_namespace_declaration(prefix, uri, output)?;
     }
 
     // Regular attributes, sorted by (namespace-uri, local-name).
@@ -790,17 +932,42 @@ fn serialize_start_tag<'n, W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
 
     // Always use <tag></tag> form, never self-closing.
     output.write_all(b">")?;
+    output.observer.start_tag(
+        element_prefix(node),
+        node.tag_name().name(),
+        &ns_decls,
+        all_attrs
+            .iter()
+            .map(|(_, local_name, prefix, value)| Ok((*prefix, *local_name, value.observed()?))),
+    )?;
 
     while all_attrs.pop().is_some() {}
     output.attributes = all_attrs;
     Ok(rendered)
 }
 
-fn effective_parent_base<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
+/// ` xmlns="uri"` for the default prefix, ` xmlns:prefix="uri"` otherwise.
+fn write_namespace_declaration<W: ByteSink + ?Sized, S: Scratch, O>(
+    prefix: &str,
+    uri: &str,
+    output: &mut CanonicalOutput<'_, '_, W, S, O>,
+) -> Result<(), C14nError> {
+    if prefix.is_empty() {
+        output.write_all(b" xmlns=\"")?;
+    } else {
+        output.write_all(b" xmlns:")?;
+        output.write_all(prefix.as_bytes())?;
+        output.write_all(b"=\"")?;
+    }
+    escape_attr(uri, output)?;
+    output.write_all(b"\"")
+}
+
+fn effective_parent_base<W: ByteSink + ?Sized, S: Scratch, D: DomStorage, O>(
     node: Node<'_, '_, D>,
     visibility: Option<&dyn NodeVisibility<D>>,
     config: C14nConfig,
-    output: &mut CanonicalOutput<'_, '_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S, O>,
 ) -> Result<Option<S::Text>, C14nError> {
     let parent_not_in_set = if let Some(set) = visibility {
         match node.parent().filter(Node::is_element) {
@@ -841,10 +1008,10 @@ pub(super) fn map_xml_base_error(error: XmlBaseResolutionError) -> C14nError {
 }
 
 /// Emit the separator preceding a document-level comment or PI.
-fn write_doc_level_prefix<W: ByteSink + ?Sized, S: Scratch>(
+fn write_doc_level_prefix<W: ByteSink + ?Sized, S: Scratch, O>(
     is_doc_root: bool,
     follows_document_element: bool,
-    output: &mut CanonicalOutput<'_, '_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S, O>,
 ) -> Result<(), C14nError> {
     if is_doc_root && follows_document_element {
         output.write_all(b"\n")?;
@@ -853,10 +1020,10 @@ fn write_doc_level_prefix<W: ByteSink + ?Sized, S: Scratch>(
 }
 
 /// Emit the separator following a document-level comment or PI.
-fn write_doc_level_suffix<W: ByteSink + ?Sized, S: Scratch>(
+fn write_doc_level_suffix<W: ByteSink + ?Sized, S: Scratch, O>(
     is_doc_root: bool,
     follows_document_element: bool,
-    output: &mut CanonicalOutput<'_, '_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S, O>,
 ) -> Result<(), C14nError> {
     if is_doc_root && !follows_document_element {
         output.write_all(b"\n")?;
@@ -974,9 +1141,9 @@ fn collect_inherited_xml_attrs<'a, S: Scratch, D: DomStorage>(
 ///
 /// Extracts the lexical prefix from the source XML via byte-range positions,
 /// avoiding ambiguity when multiple prefixes bind the same namespace URI.
-fn write_qualified_name<W: ByteSink + ?Sized, S: Scratch, D: DomStorage>(
+fn write_qualified_name<W: ByteSink + ?Sized, S: Scratch, D: DomStorage, O>(
     node: Node<'_, '_, D>,
-    output: &mut CanonicalOutput<'_, '_, W, S>,
+    output: &mut CanonicalOutput<'_, '_, W, S, O>,
 ) -> Result<(), C14nError> {
     let prefix = element_prefix(node);
     if !prefix.is_empty() {

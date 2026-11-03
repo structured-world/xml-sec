@@ -17,6 +17,7 @@ use crate::xslt::{
     UnboundPrefixLists,
 };
 
+mod source;
 #[cfg(test)]
 mod tests;
 
@@ -404,72 +405,6 @@ impl<B: crate::c14n::scratch::Bytes> Markup for QueryMarkup<B> {
     fn push_str(&mut self, text: &str) -> Result<(), Unavailable> {
         self.append(text.as_bytes())
     }
-}
-
-/// The implicit conversion belongs to this XSLT step, including replacement
-/// blocks during growth. Keep its capacity live through engine execution.
-pub(super) fn canonicalize_input<S: TransformScratch, D: DomStorage>(
-    parameter: XsltParameter<'_>,
-    document: &crate::xml::dom::Document<'_, D>,
-    visibility: &dyn crate::c14n::NodeVisibility<D>,
-    budget: &TransformExecutionBudget,
-    scratch: &S,
-) -> Result<S::Bytes, TransformError> {
-    struct Output<B: crate::c14n::scratch::Bytes> {
-        buffer: QueryMarkup<B>,
-        failure: Option<Unavailable>,
-    }
-    impl<B: crate::c14n::scratch::Bytes> std::io::Write for Output<B> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.failure.is_none() {
-                if let Err(error) = self.buffer.append(bytes) {
-                    self.failure = Some(error);
-                } else {
-                    return Ok(bytes.len());
-                }
-            }
-            Err(std::io::ErrorKind::OutOfMemory.into())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    let carried = parameter.carried_bytes();
-    let limit = budget
-        .xslt
-        .max_workspace
-        .checked_sub(carried)
-        .ok_or_else(|| budget.xslt.workspace_error(carried))?;
-    let mut output = Output {
-        buffer: QueryMarkup {
-            bytes: scratch.bytes(),
-            limit,
-        },
-        failure: None,
-    };
-    let algorithm = crate::c14n::C14nAlgorithm::from_uri(super::DEFAULT_IMPLICIT_C14N_URI)
-        .expect("constant C14N URI");
-    let result = crate::c14n::canonicalize_visible_to_writer_in(
-        document,
-        visibility,
-        (&algorithm, None),
-        budget.c14n.remaining(),
-        budget.xml_base_resolution(),
-        &mut output,
-        scratch,
-    );
-    if let Some(error) = output.failure {
-        return Err(match error {
-            Unavailable::Exceeds(needed) => {
-                budget.xslt.workspace_error(carried.saturating_add(needed))
-            }
-            Unavailable::Refused(error) => error,
-            Unavailable::Missing => unreachable!("byte append cannot lack a stylesheet"),
-        });
-    }
-    result.map_err(|error| super::map_c14n_limit_error(error, &budget.c14n))?;
-    budget.c14n.charge(output.buffer.bytes.len())?;
-    Ok(output.buffer.bytes)
 }
 
 enum QueryStylesheet<'a, B: crate::c14n::scratch::Bytes> {
@@ -1365,8 +1300,7 @@ fn charge_parse_work<T, S: TransformScratch>(
 ) -> Result<Result<T, Error>, TransformError> {
     // The engine was offered the smaller remainder, so what it admitted fits both.
     let used = reported.usage.parse_work_bytes;
-    xml_parse.charge_policy(used)?;
-    scratch.charge(used)?;
+    debit_parse_work(used, xml_parse, scratch)?;
     match reported.outcome {
         Err(Error::Budget {
             kind: BudgetKind::ParseWorkBytes,
@@ -1388,6 +1322,17 @@ fn charge_parse_work<T, S: TransformScratch>(
         }
         outcome => Ok(outcome),
     }
+}
+
+/// Debit `used` bytes of admitted parser work from the operation and the query.
+fn debit_parse_work<S: TransformScratch>(
+    used: usize,
+    xml_parse: &XmlParseWorkBudget,
+    scratch: &S,
+) -> Result<(), TransformError> {
+    xml_parse.charge_policy(used)?;
+    scratch.charge(used)?;
+    Ok(())
 }
 
 /// Why no stylesheet document could be assembled, with `held` workspace bytes
@@ -1531,17 +1476,113 @@ fn decode_input<'i, S: TransformScratch>(
     Ok((xml, held))
 }
 
-/// Apply the stylesheet of `parameter` to the octets `input` and return the serialized result.
+/// What the transform reads.
+#[derive(Clone, Copy)]
+pub(super) enum Input<'i, 'n, D: DomStorage> {
+    /// Octets in storage of `storage` bytes that live through the transform,
+    /// read from the resource at `base_uri`.
+    Octets {
+        bytes: &'i [u8],
+        storage: usize,
+        base_uri: Option<&'i str>,
+    },
+    /// A node-set, which `XMLDSig` 1.1 section 4.4.3.2 converts with inclusive
+    /// C14N 1.0; the engine receives the constructs of that canonical form
+    /// rather than parsing its octets.
+    Nodes {
+        document: &'i crate::xml::dom::Document<'n, D>,
+        visibility: &'i dyn crate::c14n::NodeVisibility<D>,
+    },
+}
+
+impl<'i, D: DomStorage> Input<'i, '_, D> {
+    /// Bytes of storage the input holds through the transform.
+    const fn storage(self) -> usize {
+        match self {
+            Self::Octets { storage, .. } => storage,
+            Self::Nodes { .. } => 0,
+        }
+    }
+
+    /// Bring the input into the query's storage and apply the XML input
+    /// policy the engine's parser does not: decode octets, or record a
+    /// node-set's canonical constructs. Returns the source and the workspace
+    /// bytes it holds.
+    fn prepare<S: TransformScratch>(
+        self,
+        settings: DocumentParseSettings,
+        storage: &WorkspaceDecoder<'_, S>,
+        budget: &TransformExecutionBudget,
+        xml_parse: &XmlParseWorkBudget,
+    ) -> Result<(PreparedInput<'i, S>, usize), TransformError> {
+        Ok(match self {
+            Self::Octets {
+                bytes, base_uri, ..
+            } => {
+                let (xml, decoded) = decode_input(bytes, settings, storage, xml_parse)?;
+                (Source::Text { xml, base_uri }, decoded)
+            }
+            Self::Nodes {
+                document,
+                visibility,
+            } => {
+                let tape = source::record(
+                    (document, visibility),
+                    settings,
+                    budget,
+                    storage.scratch,
+                    (storage.limit, storage.held),
+                )?;
+                let held = tape.held_bytes();
+                (Source::Nodes(tape), held)
+            }
+        })
+    }
+}
+
+/// [`Input`] ready for the engine: decoded text, or a node-set's tape.
+enum Source<'i, T, P> {
+    Text { xml: T, base_uri: Option<&'i str> },
+    Nodes(P),
+}
+
+/// [`Source`] in the storage of the query's scratch `S`.
+type PreparedInput<'i, S> = Source<'i, DecodedInput<'i, S>, source::Tape<'i, S>>;
+
+impl<T: AsRef<str>, S: TransformScratch> Source<'_, T, source::Tape<'_, S>> {
+    /// The engine's source document within `workspace` owned bytes.
+    fn document(
+        self,
+        settings: DocumentParseSettings,
+        workspace: usize,
+        budget: &TransformExecutionBudget,
+        xml_parse: &XmlParseWorkBudget,
+        scratch: &S,
+    ) -> Result<Result<Document, Error>, TransformError> {
+        match self {
+            Self::Text { xml, base_uri } => parse_source(
+                xml.as_ref(),
+                base_uri,
+                settings.allow_dtd,
+                workspace,
+                &budget.xslt,
+                xml_parse,
+                scratch,
+            ),
+            Self::Nodes(tape) => source::build(&tape, workspace, budget, xml_parse, scratch),
+        }
+    }
+}
+
+/// Apply the stylesheet of `parameter` to `input` and return the serialized result.
 ///
-/// The input is decoded first, into the query's own account; compilation, the
-/// parsed input and execution then share one workspace from what remains: each
-/// stage receives what the earlier ones still hold subtracted from it.
+/// Octets are decoded first, into the query's own account; compilation, the
+/// source document and execution then share one workspace from what remains:
+/// each stage receives what the earlier ones still hold subtracted from it.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
+pub(super) fn execute<'d, S: TransformScratch, D: DomStorage, N: DomStorage>(
     parameter: XsltParameter<'_>,
-    input: &[u8],
-    input_storage: usize,
-    input_base_uri: Option<&str>,
+    input: Input<'_, '_, N>,
     semantics: XsltStylesheetSemantics,
     allow_dtd: bool,
     budget: &TransformExecutionBudget,
@@ -1549,6 +1590,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     scratch: &S,
 ) -> Result<ExecutionData<'d, S, D>, TransformError> {
     let allowance = &budget.xslt;
+    let input_storage = input.storage();
     let carried = parameter
         .carried_bytes()
         .checked_add(input_storage)
@@ -1566,7 +1608,7 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
         limit: available,
         held: carried,
     };
-    let (xml, decoded) = decode_input(input, settings, &storage, xml_parse)?;
+    let (source, decoded) = input.prepare(settings, &storage, budget, xml_parse)?;
 
     // Copies a parsed stylesheet carries stay in the workspace until the transform ends.
     let available = allowance
@@ -1633,17 +1675,9 @@ pub(super) fn execute<'d, S: TransformScratch, D: DomStorage>(
     let source_workspace = workspace
         .checked_sub(held)
         .ok_or_else(|| fail(exhausted(held), Phase::Input, 0))?;
-    let source = parse_source(
-        xml.as_ref(),
-        input_base_uri,
-        allow_dtd,
-        source_workspace,
-        allowance,
-        xml_parse,
-        scratch,
-    )?
-    .map_err(|error| fail(error, Phase::Input, held))?;
-    drop(xml);
+    let source = source
+        .document(settings, source_workspace, budget, xml_parse, scratch)?
+        .map_err(|error| fail(error, Phase::Input, held))?;
     let (input_reservation, reclaimed_input) = if decoded == 0 {
         (None, 0)
     } else {
