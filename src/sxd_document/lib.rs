@@ -499,6 +499,18 @@ impl Package {
         Self::default()
     }
 
+    /// A package whose node arenas hold `requirements` without growing.
+    #[must_use]
+    pub fn with_requirements(requirements: &StorageRequirements) -> Package {
+        let s = raw::Storage::with_requirements(requirements);
+        let root = s.create_root();
+        Package {
+            identity: next_package_identity(),
+            storage: s,
+            connections: raw::Connections::new(root),
+        }
+    }
+
     #[cfg(feature = "embedded")]
     pub(crate) fn try_current(
         work: &impl structured_asn1::memory::Work,

@@ -16,6 +16,21 @@ impl<T> Values<T> {
         Self::Native(Vec::new())
     }
 
+    /// An arena with room for `capacity` values, so a caller that knows the
+    /// count fills it without moving it.
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::Native(Vec::with_capacity(capacity))
+    }
+
+    /// Room for `additional` more values.
+    pub(crate) fn reserve_exact(&mut self, additional: usize) {
+        match self {
+            Self::Native(values) => values.reserve_exact(additional),
+            #[cfg(feature = "embedded")]
+            Self::Current(_) => unreachable!("current arena growth requires its execution"),
+        }
+    }
+
     #[cfg(feature = "embedded")]
     pub(crate) fn current() -> Self {
         Self::Current(None)

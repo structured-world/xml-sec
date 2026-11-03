@@ -29,7 +29,7 @@ use super::expression::innermost_namespaced_call;
 use super::lexical::{
     ValidatedXPointerFragment, is_ncname, is_ncname_char, is_xml_whitespace, trim_xml_whitespace,
 };
-use super::model::parser_workspace_bytes;
+use super::model::{Namespace, parser_workspace_bytes};
 use super::resolver::decode_resource;
 use super::runtime::{apply_source_whitespace_rules, expanded_name_owned_bytes};
 use super::{
@@ -4097,8 +4097,14 @@ fn project_semantic_document(
     slots: &mut ProjectedSlots,
     meter: &mut Meter,
 ) -> Result<Package> {
-    meter.charge(BudgetKind::OwnedBytes, semantic_projection_size(source))?;
-    let package = Package::new();
+    let requirements = semantic_projection_requirements(source);
+    meter.charge(
+        BudgetKind::OwnedBytes,
+        sxd_document_no_unsafe::estimated_storage_bytes(requirements),
+    )?;
+    // The node arenas hold the counted nodes from the start; the estimate
+    // charged above rounds each arena up past its exact count.
+    let package = Package::with_requirements(&requirements);
     let document = package.as_document();
     let documents = document.create_element(QName::new(DOCUMENTS_ELEMENT));
     document.root().append_child(documents);
@@ -4109,11 +4115,45 @@ fn project_semantic_document(
     Ok(package)
 }
 
-/// Project one element with its namespace bindings and attributes, recording
-/// the arena slots of the element and of each attribute.
+/// The bindings of `namespaces`, an element's in-scope list, that its
+/// parent's list `inherited` does not already hold.
+///
+/// Every reader of projected bindings walks the ancestors with shadowing,
+/// so an element needs only its changes. A child's list starts as its
+/// parent's, shared until the child declares something, with rebound
+/// prefixes in place and new ones after them; a list that does not line up
+/// with its parent's is projected whole.
+fn changed_bindings<'n>(
+    namespaces: &'n Arc<Vec<Namespace>>,
+    inherited: Option<&Arc<Vec<Namespace>>>,
+) -> impl Iterator<Item = &'n Namespace> {
+    let parent = inherited.filter(|parent| {
+        Arc::ptr_eq(parent, namespaces)
+            || (parent.len() <= namespaces.len()
+                && parent
+                    .iter()
+                    .zip(namespaces.iter())
+                    .all(|(parent, own)| parent.prefix == own.prefix))
+    });
+    let unchanged = parent.is_some_and(|parent| Arc::ptr_eq(parent, namespaces));
+    namespaces
+        .iter()
+        .enumerate()
+        .filter(move |(index, own)| {
+            !unchanged
+                && parent
+                    .and_then(|parent| parent.get(*index))
+                    .is_none_or(|parent| parent.uri != own.uri)
+        })
+        .map(|(_, own)| own)
+}
+
+/// Project one element with the namespace bindings it changes and its
+/// attributes, recording the arena slots of the element and of each
+/// attribute.
 fn project_element<'d>(
     document: SxdDocument<'d>,
-    kind: &NodeKind,
+    (node, inherited): (&Node, Option<&Arc<Vec<Namespace>>>),
     id: NodeId,
     slots: &mut ProjectedSlots,
     meter: &mut Meter,
@@ -4123,7 +4163,7 @@ fn project_element<'d>(
         prefix,
         attributes,
         namespaces,
-    } = kind
+    } = &node.kind
     else {
         return Err(Error::Dynamic(format!(
             "semantic node {id:?} is not an element"
@@ -4133,8 +4173,10 @@ fn project_element<'d>(
         name.namespace.as_deref(),
         &name.local,
     ));
+    // The projection's charge counts every attribute and child edge.
+    element.reserve(attributes.len(), node.children.len());
     element.set_preferred_prefix(prefix.as_deref());
-    for namespace in namespaces.iter() {
+    for namespace in changed_bindings(namespaces, inherited) {
         if let Some(prefix) = &namespace.prefix {
             element.register_prefix(prefix, &namespace.uri);
         } else {
@@ -4183,14 +4225,16 @@ fn project_logical_root<'d>(
     let root = source
         .node(logical_root)
         .ok_or_else(|| Error::Dynamic("missing logical document root".into()))?;
+    // Each pending node carries its projected parent and the in-scope
+    // bindings of its source parent element, if it has one.
     let mut pending = Vec::new();
     let mut pending_reservation = 0usize;
     let projected = (|| {
         for child in root.children.iter().rev() {
             reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
-            pending.push((*child, wrapper));
+            pending.push((*child, wrapper, None));
         }
-        while let Some((id, parent)) = pending.pop() {
+        while let Some((id, parent, inherited)) = pending.pop() {
             let node = source
                 .node(id)
                 .ok_or_else(|| Error::Dynamic(format!("stale semantic node {id:?}")))?;
@@ -4198,15 +4242,15 @@ fn project_logical_root<'d>(
                 NodeKind::Root => {
                     for child in node.children.iter().rev() {
                         reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
-                        pending.push((*child, parent));
+                        pending.push((*child, parent, inherited));
                     }
                 }
-                NodeKind::Element { .. } => {
-                    let element = project_element(document, &node.kind, id, slots, meter)?;
+                NodeKind::Element { namespaces, .. } => {
+                    let element = project_element(document, (node, inherited), id, slots, meter)?;
                     parent.append_child(element);
                     for child in node.children.iter().rev() {
                         reserve_temporary_vec_slot(&mut pending, meter, &mut pending_reservation)?;
-                        pending.push((*child, element));
+                        pending.push((*child, element, Some(namespaces)));
                     }
                 }
                 NodeKind::Text { value, .. } => {
@@ -4245,6 +4289,11 @@ fn project_logical_root<'d>(
 }
 
 fn semantic_projection_size(source: &Document) -> usize {
+    sxd_document_no_unsafe::estimated_storage_bytes(semantic_projection_requirements(source))
+}
+
+/// The nodes, edges and strings projecting `source` stores.
+fn semantic_projection_requirements(source: &Document) -> StorageRequirements {
     let mut requirements = StorageRequirements {
         roots: 1,
         elements: 1usize.saturating_add(source.logical_roots().len()),
@@ -4329,7 +4378,7 @@ fn semantic_projection_size(source: &Document) -> usize {
             }
         }
     }
-    sxd_document_no_unsafe::estimated_storage_bytes(requirements)
+    requirements
 }
 
 fn split_pattern_branches(source: &str) -> Vec<&str> {
@@ -10783,3 +10832,6 @@ impl function::Function for CurrentNode {
 
 #[cfg(all(test, not(feature = "embedded")))]
 mod tests;
+
+#[cfg(all(test, not(feature = "embedded")))]
+mod namespace_projection_tests;
