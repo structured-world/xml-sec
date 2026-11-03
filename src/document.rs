@@ -4498,6 +4498,8 @@ mod entity_ceiling_tests;
 #[cfg(test)]
 mod replacement_tests;
 
+// `xmlenc` enables `xmldsig` through `xmldsig-sign`, so every build of this
+// module has the verification policy its tests use.
 #[cfg(all(
     test,
     feature = "xml-backend-xmloxide",
