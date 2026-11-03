@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/structured-world/xml-sec/compare/v0.4.1...v0.5.0) - 2026-11-03
+
+### Added
+
+- *(provider)* [**breaking**] admit digest state and type its refusals ([#364](https://github.com/structured-world/xml-sec/pull/364))
+
+### Performance
+
+- *(xslt)* build node-set input without a second parse ([#378](https://github.com/structured-world/xml-sec/pull/378))
+- *(xslt)* evaluate XPath without rebuilding its context per call ([#374](https://github.com/structured-world/xml-sec/pull/374))
+- *(xslt)* node paths without a sibling scan inside XPath functions ([#372](https://github.com/structured-world/xml-sec/pull/372))
+- hash arena identities without SipHash in content tables ([#370](https://github.com/structured-world/xml-sec/pull/370))
+- *(xmldsig)* execute each signed Reference's transforms once ([#369](https://github.com/structured-world/xml-sec/pull/369))
+- *(xslt)* run a 16384-item transform within default limits ([#366](https://github.com/structured-world/xml-sec/pull/366))
+
 ## [0.4.1](https://github.com/structured-world/xml-sec/compare/v0.4.0...v0.4.1) - 2026-11-01
 
 ### Added
