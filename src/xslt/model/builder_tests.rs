@@ -70,6 +70,13 @@ fn constructs_a_parse_refuses_are_refused_when_built() {
     // No text parses to an instruction value holding `?>`, which ends it.
     let (built, _) = built_and_parsed("<r><?t a?></r>", instruction("t", "a?>b"));
     assert!(built.is_err(), "{built:?}");
+    // A forbidden sequence split across pieces is the concatenation's.
+    let (built, parsed) = built_and_parsed("<r>a]]>b</r>", |builder| {
+        builder.start_element((None, "r"), [], [], 1)?;
+        builder.text(&["a]", "]", ">b"], 1)?;
+        builder.end_element()
+    });
+    assert!(parsed.is_err() && built.is_err(), "{built:?}");
     // Their valid neighbours are accepted by both.
     let (built, parsed) = built_and_parsed("<r><!--a-b--><?xml-t v?></r>", |builder| {
         builder.start_element((None, "r"), [], [], 1)?;

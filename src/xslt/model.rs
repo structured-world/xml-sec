@@ -2129,44 +2129,60 @@ impl ParsedText<'_> {
     }
 }
 
-/// Whether the concatenation of `pieces` contains `pattern`, of at most three bytes.
-/// Refuse `pieces` holding a character outside XML 1.0 production [2]: a C0
+/// A byte sequence a construct may not contain, at most three bytes long, and
+/// the refusal it earns.
+type Forbidden = (&'static [u8], &'static str);
+
+/// Refuse `pieces`, read as their concatenation, when they contain the
+/// `forbidden` sequence or a character outside XML 1.0 production [2]: a C0
 /// control other than tab, line feed and carriage return, or U+FFFE or
-/// U+FFFF; `str` holds no surrogates, and each piece is whole UTF-8.
+/// U+FFFF. `str` holds no surrogates, and each piece is whole UTF-8.
 /// <https://www.w3.org/TR/xml/#NT-Char>
-fn refuse_non_xml_characters(pieces: &[&str]) -> Result<()> {
+fn refuse_in_pieces(pieces: &[&str], forbidden: Option<Forbidden>) -> Result<()> {
+    let non_xml = || Error::Xml("character data holds a non-XML character".into());
+    // A byte no text holds stands in when no sequence is forbidden.
+    let last = forbidden.map_or(0xFF, |(sequence, _)| sequence[sequence.len() - 1]);
+    // One branch-free pass the compiler vectorizes. Excluded controls refuse
+    // outright; a lead byte EF or the sequence's last byte is rare in
+    // character data and only sends the pieces to the exact pass below.
+    let (mut control, mut suspect) = (0u8, 0u8);
+    for piece in pieces {
+        for &byte in piece.as_bytes() {
+            control |= u8::from(byte < 0x20)
+                & u8::from(byte != b'\t')
+                & u8::from(byte != b'\n')
+                & u8::from(byte != b'\r');
+            suspect |= u8::from(byte == 0xEF) | u8::from(byte == last);
+        }
+    }
+    if control != 0 {
+        return Err(non_xml());
+    }
+    if suspect == 0 {
+        return Ok(());
+    }
+    let mut window = [0u8; 3];
+    let mut seen = 0usize;
     for piece in pieces {
         let bytes = piece.as_bytes();
         for (index, &byte) in bytes.iter().enumerate() {
-            let excluded = match byte {
-                0x00..=0x08 | 0x0B | 0x0C | 0x0E..=0x1F => true,
-                // U+FFFE and U+FFFF encode as EF BF BE and EF BF BF.
-                0xEF => matches!(bytes.get(index + 1..index + 3), Some([0xBF, 0xBE | 0xBF])),
-                _ => false,
-            };
-            if excluded {
-                return Err(Error::Xml(
-                    "character data holds a non-XML character".into(),
-                ));
+            // U+FFFE and U+FFFF encode as EF BF BE and EF BF BF.
+            if byte == 0xEF && matches!(bytes.get(index + 1..index + 3), Some([0xBF, 0xBE | 0xBF]))
+            {
+                return Err(non_xml());
+            }
+            // The sequence may span pieces, so the window carries across them.
+            window = [window[1], window[2], byte];
+            seen += 1;
+            if let Some((sequence, refusal)) = forbidden
+                && seen >= sequence.len()
+                && window[3 - sequence.len()..] == *sequence
+            {
+                return Err(Error::Xml(refusal.into()));
             }
         }
     }
     Ok(())
-}
-
-fn pieces_contain(pieces: &[&str], pattern: &[u8]) -> bool {
-    debug_assert!((1..=3).contains(&pattern.len()));
-    let mut window = [0u8; 3];
-    let mut seen = 0usize;
-    for byte in pieces.iter().flat_map(|piece| piece.bytes()) {
-        window.rotate_left(1);
-        window[2] = byte;
-        seen += 1;
-        if seen >= pattern.len() && window[3 - pattern.len()..] == *pattern {
-            return true;
-        }
-    }
-    false
 }
 
 fn reserve_parsed_string(
@@ -2737,10 +2753,10 @@ impl DocumentBuilder<'_, '_> {
         // XML 1.0 section 2.4: character data must not contain `]]>`, which
         // a parse's tokenizer refuses before it reads the run.
         // https://www.w3.org/TR/xml/#syntax
-        if pieces_contain(pieces, b"]]>") {
-            return Err(Error::Xml("`]]>` is not allowed in character data".into()));
-        }
-        refuse_non_xml_characters(pieces)?;
+        refuse_in_pieces(
+            pieces,
+            Some((b"]]>", "`]]>` is not allowed in character data")),
+        )?;
         self.0.text_run(ParsedText::Pieces(pieces), line)
     }
 
@@ -2766,6 +2782,7 @@ impl DocumentBuilder<'_, '_> {
     /// # Errors
     /// Returns budget failures a parse of the comment would return.
     pub fn comment(&mut self, pieces: &[&str], line: usize) -> Result<()> {
+        const HYPHENS: &str = "`--` is not allowed in a comment";
         // XML 1.0 section 2.5: a comment holds no `--` and does not end in `-`.
         // https://www.w3.org/TR/xml/#sec-comments
         let ends_in_hyphen = pieces
@@ -2773,10 +2790,10 @@ impl DocumentBuilder<'_, '_> {
             .rev()
             .find(|piece| !piece.is_empty())
             .is_some_and(|piece| piece.ends_with('-'));
-        if ends_in_hyphen || pieces_contain(pieces, b"--") {
-            return Err(Error::Xml("`--` is not allowed in a comment".into()));
+        if ends_in_hyphen {
+            return Err(Error::Xml(HYPHENS.into()));
         }
-        refuse_non_xml_characters(pieces)?;
+        refuse_in_pieces(pieces, Some((b"--", HYPHENS)))?;
         self.0.comment_value(ParsedText::Pieces(pieces), line)
     }
 
@@ -2800,12 +2817,12 @@ impl DocumentBuilder<'_, '_> {
                 "invalid processing instruction target {target}"
             )));
         }
-        if pieces.is_some_and(|pieces| pieces_contain(pieces, b"?>")) {
-            return Err(Error::Xml(
-                "`?>` is not allowed in a processing instruction".into(),
-            ));
+        if let Some(pieces) = pieces {
+            refuse_in_pieces(
+                pieces,
+                Some((b"?>", "`?>` is not allowed in a processing instruction")),
+            )?;
         }
-        refuse_non_xml_characters(pieces.unwrap_or_default())?;
         self.0
             .instruction(target, pieces.map(ParsedText::Pieces), line)
     }
@@ -3110,7 +3127,7 @@ fn push_stream_element<
             raw_attributes,
             staging_start,
         },
-        &lexical_name,
+        lexical_name,
         (start.name.prefix(), start.name.local()),
         if empty {
             ElementFrame::Closed
@@ -3148,7 +3165,7 @@ fn project_staged_element<'a>(
     document: &mut Document,
     elements: &mut Vec<StreamElementFrame<'a>>,
     staged: StagedElement,
-    lexical_name: &str,
+    lexical_name: Cow<'_, str>,
     (prefix, local): (Option<&str>, &str),
     frame: ElementFrame<'a>,
     meter: &mut StreamParseMeter,
@@ -3189,6 +3206,9 @@ fn project_staged_element<'a>(
     } else {
         inherited_base
     };
+    // The staging charge covers the lexical name, so it is freed before that
+    // charge settles below.
+    drop(lexical_name);
     drop(namespace_index);
     // Keep the admitted payload live while growing the node arena and parent's
     // child vector. Only dropped staging is released, never the moved strings.
@@ -3279,7 +3299,7 @@ fn push_semantic_element<'v>(
                 bound.unwrap_or_default()
             )));
         }
-        refuse_non_xml_characters(&[uri])?;
+        refuse_in_pieces(&[uri], None)?;
         // Admit the declaration's name, as a parse does for the attribute it
         // reads, and its URI, before the prefix and URI are copied.
         let name_bytes = bound.map_or("xmlns".len(), |bound| "xmlns:".len() + bound.len());
@@ -3306,7 +3326,7 @@ fn push_semantic_element<'v>(
                 bound.map_or_else(|| name.to_owned(), |bound| format!("{bound}:{name}"))
             )));
         }
-        refuse_non_xml_characters(&[value])?;
+        refuse_in_pieces(&[value], None)?;
         // Admit the name and value copies before either allocates, each at
         // its exact size, so no growth outruns the admission.
         let lexical_bytes = name.len() + bound.map_or(0, |bound| bound.len() + 1);
@@ -3323,12 +3343,14 @@ fn push_semantic_element<'v>(
         }
         raw_attributes.push((lexical, value.to_owned(), InternalAttributeType::Cdata));
     }
-    let mut lexical_name = String::with_capacity(qualified_bytes);
-    if let Some(prefix) = prefix {
-        lexical_name.push_str(prefix);
-        lexical_name.push(':');
-    }
-    lexical_name.push_str(local);
+    // Only a prefixed name needs a copy to join its parts, as a parse reads it.
+    let lexical_name = prefix.map_or(Cow::Borrowed(local), |prefix| {
+        let mut joined = String::with_capacity(qualified_bytes);
+        joined.push_str(prefix);
+        joined.push(':');
+        joined.push_str(local);
+        Cow::Owned(joined)
+    });
     project_staged_element(
         document,
         elements,
@@ -3339,7 +3361,7 @@ fn push_semantic_element<'v>(
             raw_attributes,
             staging_start,
         },
-        &lexical_name,
+        lexical_name,
         (prefix, local),
         ElementFrame::Open(None),
         meter,
