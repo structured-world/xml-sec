@@ -18,6 +18,7 @@ use super::{
 pub(super) struct XmloxideBackend;
 
 /// The parser's failure in storage `S`.
+#[cfg(feature = "xmldsig")]
 type XmloxideError<S> = xmloxide::error::ParseError<
     <S as Storage>::FrozenText,
     <S as Storage>::Values<xmloxide::error::ParseDiagnostic<<S as Storage>::FrozenText>>,

@@ -28,7 +28,9 @@ use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{
     Native as NativeXmlStorage, Storage as XmlStorage, Values as XmlValues,
 };
-use crate::xml::dom::{Document, Node, NodeId, ParseError, ParsingOptions, XmlBackend};
+use crate::xml::dom::{
+    Document, LimitCounter, Node, NodeId, ParseError, ParsingOptions, ScanObserver, XmlBackend,
+};
 use crate::xml_input as xml_sec_xml_input;
 use self_cell::self_cell;
 
@@ -51,7 +53,7 @@ const VALIDATION_WRAPPER_NODE_OVERHEAD: u32 = 3;
 
 #[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
 pub(crate) fn selected_parser_passes() -> usize {
-    3
+    2
 }
 
 /// Process-local provenance of one owned XML document.
@@ -942,32 +944,13 @@ impl XmlDocument {
         budget: Option<&XmlParseWorkBudget>,
         prior_work: usize,
     ) -> Result<Self, XmlDocumentError> {
-        if xml.len() > settings.max_bytes {
-            return Err(XmlDocumentError::DocumentTooLarge {
-                maximum: settings.max_bytes,
-                actual: xml.len(),
-            });
-        }
-        let ((peak_namespace_bindings, requires_internal_dtd), preflight_work) =
-            metered(budget, |budget| {
-                let peak =
-                    limit_pass_unless_parser_enforces(&xml, settings, budget, NativeXmlStorage)?;
-                #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-                let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
-                #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-                let requires_internal_dtd = ();
-                Ok((peak, requires_internal_dtd))
-            })?;
+        // Parse provenance records what the source actually requires, not merely
+        // whether its creator used a permissive policy: a later strict operation
+        // accepts ordinary XML and rejects a document that declares a DTD.
+        let (cell, requires_internal_dtd) =
+            build_cell_recording(xml, settings, budget, prior_work)?;
         #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-        let () = requires_internal_dtd;
-        let cell = build_cell_after_preflight(
-            xml,
-            settings,
-            budget,
-            peak_namespace_bindings,
-            // Both terms are bounded by the input and expansion ceilings.
-            prior_work + preflight_work,
-        )?;
+        let _ = requires_internal_dtd;
         let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
         Ok(Self {
             identity,
@@ -2451,51 +2434,39 @@ fn build_cell(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    let (peak_namespace_bindings, preflight_work) = metered(budget, |budget| {
-        limit_pass_unless_parser_enforces(&xml, settings, budget, NativeXmlStorage)
-    })?;
-    build_cell_after_preflight(
-        xml,
-        settings,
-        budget,
-        peak_namespace_bindings,
-        preflight_work,
-    )
+    build_cell_recording(xml, settings, budget, 0).map(|(cell, _)| cell)
 }
 
-/// Builds a generation whose limit pass, if one ran, already charged
-/// `preflight_work` and found `peak_namespace_bindings`.
-fn build_cell_after_preflight(
+/// Builds a generation that records `prior_work` beside the work of its own
+/// parse, and returns whether its source declares a document type.
+fn build_cell_recording(
     xml: String,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
-    peak_namespace_bindings: Option<usize>,
-    preflight_work: usize,
-) -> Result<DocumentCell, XmlDocumentError> {
-    let ((), semantic_work) = metered(budget, |budget| {
-        charge_semantic_parser_work(budget, xml.len())
+    prior_work: usize,
+) -> Result<(DocumentCell, bool), XmlDocumentError> {
+    check_document_size(&xml, settings)?;
+    let ((mut cell, doctype), work) = metered(budget, |budget| {
+        charge_semantic_parser_work(budget, xml.len())?;
+        build_semantic_cell(xml, settings, budget)
     })?;
     // Both terms are charges already admitted by one budget below usize::MAX.
-    build_semantic_cell(
-        xml,
-        settings,
-        peak_namespace_bindings,
-        preflight_work + semantic_work,
-    )
+    record_work(&mut cell, prior_work + work);
+    Ok((cell, doctype))
 }
 
+/// Builds a generation, with no parse work recorded yet, and returns whether
+/// its source declares a document type.
 fn build_semantic_cell(
     xml: String,
     settings: DocumentParseSettings,
-    preflight_peak: Option<usize>,
-    parse_work: usize,
-) -> Result<DocumentCell, XmlDocumentError> {
-    // Only XMLDSig entry points take over a caller's parse and charge its work.
-    #[cfg(not(feature = "xmldsig"))]
-    let _ = parse_work;
-    DocumentCell::try_new(xml, |source| {
-        let (document, metrics, peak_namespace_bindings) =
-            parse_semantic_document(source, settings, preflight_peak)?;
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<(DocumentCell, bool), XmlDocumentError> {
+    let mut declares_doctype = false;
+    let cell = DocumentCell::try_new(xml, |source| {
+        let (document, metrics, peak_namespace_bindings, doctype) =
+            parse_semantic_document(source, settings, budget)?;
+        declares_doctype = doctype;
         #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
         let _ = peak_namespace_bindings;
         debug_assert!(
@@ -2513,9 +2484,10 @@ fn build_semantic_cell(
             #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
             peak_namespace_bindings,
             #[cfg(feature = "xmldsig")]
-            parse_work,
+            parse_work: 0,
         })
-    })
+    })?;
+    Ok((cell, declares_doctype))
 }
 
 pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
@@ -2523,10 +2495,9 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<Document<'a>, XmlDocumentError> {
-    let preflight_peak =
-        limit_pass_unless_parser_enforces(xml, settings, budget, NativeXmlStorage)?;
+    check_document_size(xml, settings)?;
     charge_semantic_parser_work(budget, xml.len())?;
-    let (document, _, _) = parse_semantic_document(xml, settings, preflight_peak)?;
+    let (document, ..) = parse_semantic_document(xml, settings, budget)?;
     Ok(document)
 }
 
@@ -2537,54 +2508,70 @@ pub(crate) fn parse_borrowed_in<'input, 'w, W: structured_asn1::memory::Work>(
     budget: Option<&XmlParseWorkBudget>,
     storage: crate::xml::dom::storage::Accounted<'w, W>,
 ) -> Result<Document<'input, crate::xml::dom::storage::Accounted<'w, W>>, XmlDocumentError> {
-    let preflight_peak = limit_pass_unless_parser_enforces(xml, settings, budget, storage)?;
+    check_document_size(xml, settings)?;
     charge_semantic_parser_work(budget, xml.len())?;
-    let options = ParsingOptions {
-        allow_dtd: settings.allow_dtd,
-        nodes_limit: settings.nodes_limit,
-    };
-    let document = match preflight_peak {
-        Some(_) => {
-            Document::parse_after_limit_preflight_in(xml, options, settings.backend, storage)?
-        }
-        #[cfg(feature = "xml-backend-xmloxide")]
-        None => {
+    let options = parsing_options(settings);
+    #[cfg(feature = "xml-backend-xmloxide")]
+    if settings.backend.records_positions(xml) {
+        let (document, _) =
             Document::parse_enforcing_limits_in(xml, options, parse_limits(settings), storage)
                 .map_err(|refused| match refused {
                     crate::xml::dom::Refused::Limit(refusal) => limit_refusal(refusal),
                     crate::xml::dom::Refused::Parse(error) => error.into(),
-                })?
-                .0
-        }
-        #[cfg(not(feature = "xml-backend-xmloxide"))]
-        None => unreachable!("only xmloxide enforces limits while it parses"),
-    };
+                })?;
+        validate_document_metrics_in(&document, settings.depth_limit, storage)?;
+        return Ok(document);
+    }
+    let mut pass = LimitPass::new(settings, budget, storage)?;
+    let document = Document::parse_observed_in(xml, options, settings.backend, storage, &mut pass)
+        .map_err(|error| pass.refusal_or(error.into()))?;
     validate_document_metrics_in(&document, settings.depth_limit, storage)?;
     Ok(document)
 }
 
+/// Parses `xml` under `settings`, its limits checked by the parser as it
+/// reads or by the lexical pass that records the source positions, and
+/// returns the document's peak namespace bindings and whether it declares a
+/// document type.
+fn parse_checked<'a>(
+    xml: &'a str,
+    settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<(Document<'a>, usize, bool), XmlDocumentError> {
+    let options = parsing_options(settings);
+    #[cfg(feature = "xml-backend-xmloxide")]
+    if settings.backend.records_positions(xml) {
+        let (document, peak) =
+            Document::parse_enforcing_limits(xml, options, parse_limits(settings)).map_err(
+                |refused| match refused {
+                    crate::xml::dom::Refused::Limit(refusal) => limit_refusal(refusal),
+                    crate::xml::dom::Refused::Parse(error) => XmlDocumentError::Parse(error),
+                },
+            )?;
+        return Ok((document, peak, false));
+    }
+    let mut pass = LimitPass::new(settings, budget, NativeXmlStorage)?;
+    let document = Document::parse_observed_with_backend(xml, options, settings.backend, &mut pass)
+        .map_err(|error| pass.refusal_or(XmlDocumentError::Parse(error)))?;
+    Ok((document, pass.peak_namespace_bindings(), pass.doctype))
+}
+
+fn parsing_options(settings: DocumentParseSettings) -> ParsingOptions {
+    ParsingOptions {
+        allow_dtd: settings.allow_dtd,
+        nodes_limit: settings.nodes_limit,
+    }
+}
+
+/// The limit pass by itself, the reference the parses that check the limits
+/// as they read are tested against.
+#[cfg(test)]
 fn preflight_document_limits(
     xml: &str,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlDocumentError> {
     preflight_document_limits_in(xml, settings, budget, NativeXmlStorage)
-}
-
-/// The limit pass before the parser, returning the peak namespace bindings,
-/// or `None` for a document whose parser enforces the limits as it reads it,
-/// which leaves only the size check before the parse.
-fn limit_pass_unless_parser_enforces<S: NameStorage>(
-    xml: &str,
-    settings: DocumentParseSettings,
-    budget: Option<&XmlParseWorkBudget>,
-    storage: S,
-) -> Result<Option<usize>, XmlDocumentError> {
-    if settings.backend.records_positions(xml) {
-        check_document_size(xml, settings)?;
-        return Ok(None);
-    }
-    preflight_document_limits_in(xml, settings, budget, storage).map(Some)
 }
 
 fn check_document_size(xml: &str, settings: DocumentParseSettings) -> Result<(), XmlDocumentError> {
@@ -2598,7 +2585,6 @@ fn check_document_size(xml: &str, settings: DocumentParseSettings) -> Result<(),
 }
 
 /// The limits a parser enforces as it reads a document under `settings`.
-#[cfg(feature = "xml-backend-xmloxide")]
 fn parse_limits(settings: DocumentParseSettings) -> crate::xml::dom::ParseLimits {
     crate::xml::dom::ParseLimits {
         nodes: settings.nodes_limit,
@@ -2608,7 +2594,6 @@ fn parse_limits(settings: DocumentParseSettings) -> crate::xml::dom::ParseLimits
 }
 
 /// The refusal for the limit a parse stopped at, as the limit pass reports it.
-#[cfg(feature = "xml-backend-xmloxide")]
 fn limit_refusal(refusal: crate::xml::dom::LimitRefusal) -> XmlDocumentError {
     use crate::xml::dom::LimitRefusal;
     match refusal {
@@ -2634,63 +2619,418 @@ pub(crate) fn preflight_xml_limits<S: NameStorage>(
     preflight_document_limits_in(xml, settings, Some(budget), storage).map(drop)
 }
 
+#[cfg(any(feature = "xslt", test))]
 fn preflight_document_limits_in<S: NameStorage>(
     xml: &str,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
     storage: S,
 ) -> Result<usize, XmlDocumentError> {
-    // This bounded lexical pass precedes any DOM construction wherever the
-    // parser does not enforce the limits itself.
+    // This bounded lexical pass precedes a parser that neither enforces the
+    // limits nor reads the source positions the strict pass records.
     check_document_size(xml, settings)?;
     charge_parse_work(budget, xml.len())?;
-    let mut dtd = InternalDtd::new(storage);
-    let mut expansion_stack = storage.names();
-    let mut state = DocumentPreflightState::new(storage)?;
-    preflight_xml_fragment(
-        xml,
-        settings,
-        &mut dtd,
-        &mut expansion_stack,
-        &mut state,
-        budget,
-        true,
-    )?;
-    Ok(state.peak_namespace_bindings)
+    let mut pass = LimitPass::new(settings, budget, storage)?;
+    pass.document(xml)?;
+    Ok(pass.peak_namespace_bindings())
 }
 
+/// The node, nesting and namespace-binding limits checked in a lexical pass
+/// before the parser, through the internal entities the document expands.
+///
+/// It runs over the whole document by itself ([`Self::document`]), or as the
+/// [`ScanObserver`] of the strict scan that records the source positions, so
+/// that one pass serves both.
+struct LimitPass<'b, S: NameStorage = NativeXmlStorage> {
+    dtd: InternalDtd<S>,
+    run: LimitRun<'b, S>,
+    /// The refusal behind the stop signal a strict scan returned.
+    refusal: Option<XmlDocumentError>,
+    /// The scan read a document type declaration.
+    doctype: bool,
+}
+
+/// The counts of a [`LimitPass`], apart from the declarations they read.
+struct LimitRun<'b, S: NameStorage> {
+    settings: DocumentParseSettings,
+    budget: Option<&'b XmlParseWorkBudget>,
+    counter: LimitCounter<S>,
+    expansion_stack: S::Names<S::Text, ()>,
+    state: DocumentPreflightState<S>,
+}
+
+/// Entity expansion counts, which the absolute ceilings bound.
 struct DocumentPreflightState<S: NameStorage = NativeXmlStorage> {
-    depth: usize,
-    nodes: u32,
-    in_character_data: bool,
     entity_expansions: u32,
     entity_expansion_work: usize,
-    active_namespace_bindings: S::Names<S::Text, ()>,
-    peak_namespace_bindings: usize,
-    namespace_scopes: S::Values<S::Values<(S::Text, bool)>>,
     storage: S,
 }
 
 impl<S: NameStorage> DocumentPreflightState<S> {
-    fn new(storage: S) -> Result<Self, ParseError> {
-        Ok(Self {
-            depth: 0,
-            nodes: 0,
-            in_character_data: false,
+    fn new(storage: S) -> Self {
+        Self {
             entity_expansions: 0,
             entity_expansion_work: 0,
-            active_namespace_bindings: storage.names(),
-            peak_namespace_bindings: 0,
-            namespace_scopes: storage.values(0)?,
             storage,
-        })
+        }
     }
 }
 
-impl Default for DocumentPreflightState {
-    fn default() -> Self {
-        Self::new(NativeXmlStorage).expect("empty XML preflight does not allocate")
+impl<'b, S: NameStorage> LimitPass<'b, S> {
+    fn new(
+        settings: DocumentParseSettings,
+        budget: Option<&'b XmlParseWorkBudget>,
+        storage: S,
+    ) -> Result<Self, ParseError> {
+        Ok(Self {
+            dtd: InternalDtd::new(storage),
+            run: LimitRun {
+                settings,
+                budget,
+                counter: LimitCounter::new(parse_limits(settings), storage)?,
+                expansion_stack: storage.names(),
+                state: DocumentPreflightState::new(storage),
+            },
+            refusal: None,
+            doctype: false,
+        })
     }
+
+    fn peak_namespace_bindings(&self) -> usize {
+        self.run.counter.peak_namespace_bindings()
+    }
+
+    /// The refusal a strict scan stopped at, in place of `signal`, the error
+    /// the scan returned.
+    fn refusal_or(&mut self, signal: XmlDocumentError) -> XmlDocumentError {
+        self.refusal.take().unwrap_or(signal)
+    }
+
+    /// The pass over a whole document, by itself.
+    #[cfg(any(feature = "xslt", test))]
+    fn document(&mut self, xml: &str) -> Result<(), XmlDocumentError> {
+        let storage = self.run.state.storage;
+        // Disjoint lexical event windows make these source-sized passes linear;
+        // dictionary probes, expansion revisits and copies are admitted separately.
+        storage.charge(xml.len())?;
+        storage.charge(xml.len())?;
+        storage.charge(xml.len())?;
+        let mut fragments: S::Values<FragmentFrame<'_, S>> = storage.values(1)?;
+        fragments.push(FragmentFrame::new(
+            FragmentSource::Document(xml),
+            FragmentContext::Content,
+            true,
+            storage,
+        )?)?;
+        while let Some(doctype) = self.run.drain(&self.dtd, &mut fragments)? {
+            storage.charge(doctype.len())?;
+            storage.charge(doctype.len())?;
+            storage.charge(doctype.len())?;
+            collect_internal_dtd(&doctype, &mut self.dtd, |_, _, _| Ok(()))?;
+        }
+        Ok(())
+    }
+
+    /// Stop a strict scan at `result`'s refusal, which the caller takes back
+    /// with [`Self::refusal_or`].
+    fn stop(&mut self, result: Result<(), XmlDocumentError>) -> Result<(), ParseError> {
+        match result {
+            Ok(()) => Ok(()),
+            Err(XmlDocumentError::Parse(error)) => Err(error),
+            Err(error) => {
+                let signal = dom_parse_error(&error);
+                self.refusal = Some(error);
+                Err(signal)
+            }
+        }
+    }
+}
+
+impl<'input, S: NameStorage> ScanObserver<'input> for LimitPass<'_, S> {
+    fn doctype<F>(&mut self, doctype: &'input str, attribute: F) -> Result<(), ParseError>
+    where
+        F: FnMut(&'input str, &'input str, DtdAttributeType) -> Result<(), ParseError>,
+    {
+        self.doctype = true;
+        let result = collect_internal_dtd(doctype, &mut self.dtd, attribute);
+        self.stop(result)
+    }
+
+    fn start_element(
+        &mut self,
+        tag: &'input str,
+        tag_start: usize,
+        attributes: &[xml_sec_xml_input::lexical::Attribute<'input>],
+        empty: bool,
+    ) -> Result<(), ParseError> {
+        let result = self
+            .run
+            .start_tag(&self.dtd, tag, tag_start, attributes, empty);
+        self.stop(result)
+    }
+
+    fn end_element(&mut self) -> Result<(), ParseError> {
+        let result = self.run.counter.end_element();
+        let result = limit_checked(&self.run.counter, result);
+        self.stop(result)
+    }
+
+    fn character_data(&mut self) -> Result<(), ParseError> {
+        let result = self.run.counter.character_data();
+        let result = limit_checked(&self.run.counter, result);
+        self.stop(result)
+    }
+
+    fn entity_reference(&mut self, name: &'input str) -> Result<(), ParseError> {
+        let result = self.run.expand(&self.dtd, name, FragmentContext::Content);
+        self.stop(result)
+    }
+
+    fn node(&mut self) -> Result<(), ParseError> {
+        let result = self.run.counter.node();
+        let result = limit_checked(&self.run.counter, result);
+        self.stop(result)
+    }
+
+    fn markup(&mut self) {
+        self.run.counter.markup();
+    }
+}
+
+impl<S: NameStorage> LimitRun<'_, S> {
+    /// Count an element with the namespace declarations it makes.
+    fn open(
+        &mut self,
+        declarations: &[NamespaceDeclaration<S>],
+        empty: bool,
+    ) -> Result<(), XmlDocumentError> {
+        let result = self.counter.start_element(
+            declarations
+                .iter()
+                .map(|declaration| (declaration.prefix.as_ref(), declaration.is_undeclaration)),
+            empty,
+        );
+        limit_checked(&self.counter, result)
+    }
+
+    /// A start tag the strict scan read: `tag` is its source, which starts at
+    /// `tag_start` in the document, and `attributes` its attributes.
+    fn start_tag(
+        &mut self,
+        dtd: &InternalDtd<S>,
+        tag: &str,
+        tag_start: usize,
+        attributes: &[xml_sec_xml_input::lexical::Attribute<'_>],
+        empty: bool,
+    ) -> Result<(), XmlDocumentError> {
+        let storage = self.state.storage;
+        storage.charge(tag.len())?;
+        let pairs = attributes.iter().map(|attribute| {
+            // The scanner's ranges lie inside the tag it read.
+            let start = attribute.range.start - tag_start;
+            (
+                &tag[start..start + qualified_len(attribute.name)],
+                attribute.value,
+            )
+        });
+        let has_defaults = dtd.attribute_defaults.len() != 0;
+        let element = if has_defaults { element_name(tag) } else { "" };
+        let declarations = if has_defaults
+            || attributes
+                .iter()
+                .any(|attribute| is_namespace_declaration(attribute.name))
+        {
+            namespace_declarations(element, pairs.clone(), dtd, &mut self.state, self.budget)?
+        } else {
+            storage.values(0)?
+        };
+        self.open(&declarations, empty)?;
+        // Attribute values expand their references once the element counts.
+        for (_, value) in pairs.clone() {
+            for name in general_references(value.as_bytes()) {
+                self.expand(dtd, name, FragmentContext::Attribute)?;
+            }
+        }
+        if has_defaults && let Some(defaults) = dtd.attribute_defaults.get(element, storage)? {
+            for (index, default) in defaults.iter().enumerate() {
+                storage.charge(default.value.len())?;
+                // An attribute the tag gives, or an earlier default supplies,
+                // takes no value from this default.
+                let name = default.attribute_name.as_ref();
+                if pairs.clone().any(|(given, _)| given == name)
+                    || defaults[..index]
+                        .iter()
+                        .any(|earlier| earlier.attribute_name.as_ref() == name)
+                {
+                    continue;
+                }
+                for name in general_references(default.value.as_bytes()) {
+                    self.expand(dtd, name, FragmentContext::Attribute)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Expand the general entity `name` referenced in `context`.
+    fn expand(
+        &mut self,
+        dtd: &InternalDtd<S>,
+        name: &str,
+        context: FragmentContext,
+    ) -> Result<(), XmlDocumentError> {
+        let storage = self.state.storage;
+        let mut fragments: S::Values<FragmentFrame<'_, S>> = storage.values(1)?;
+        enter_preflight_entity(
+            storage.text(name)?,
+            context,
+            dtd,
+            &mut self.expansion_stack,
+            &mut fragments,
+            &mut self.state,
+            self.budget,
+        )?;
+        let doctype = self.drain(dtd, &mut fragments)?;
+        debug_assert!(doctype.is_none(), "entity frames collect no DOCTYPE");
+        Ok(())
+    }
+
+    /// Read `fragments` to their end, or to a document type declaration to
+    /// collect, which is returned with the frames left to read after it.
+    fn drain(
+        &mut self,
+        dtd: &InternalDtd<S>,
+        fragments: &mut S::Values<FragmentFrame<'_, S>>,
+    ) -> Result<Option<S::Text>, XmlDocumentError> {
+        let storage = self.state.storage;
+        // Syntax diagnostics and exact parser precedence belong to the selected
+        // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
+        while !fragments.is_empty() {
+            storage.charge(1)?;
+            let (event, collect_doctype, context) = {
+                let frame = fragments.last_mut().expect("fragment stack is not empty");
+                frame.next_event(dtd, &mut self.state, self.budget, self.counter.depth())?
+            };
+
+            match event {
+                PreflightEvent::DocType(doctype) => {
+                    self.counter.markup();
+                    if collect_doctype
+                        && self.settings.allow_dtd
+                        && let Some(doctype) = doctype
+                    {
+                        return Ok(Some(doctype));
+                    }
+                }
+                PreflightEvent::GeneralRef {
+                    name,
+                    is_character_reference,
+                } => {
+                    let Some(name) = name else {
+                        continue;
+                    };
+                    if is_character_reference {
+                        if context == FragmentContext::Content {
+                            let result = self.counter.character_data();
+                            limit_checked(&self.counter, result)?;
+                        }
+                        continue;
+                    }
+                    enter_preflight_entity(
+                        name,
+                        context,
+                        dtd,
+                        &mut self.expansion_stack,
+                        fragments,
+                        &mut self.state,
+                        self.budget,
+                    )?;
+                }
+                PreflightEvent::Done => {
+                    let frame = fragments.pop().expect("fragment stack is not empty");
+                    match frame.source {
+                        FragmentSource::Entity(name, _) => {
+                            self.expansion_stack.remove(&name, storage)?;
+                        }
+                        #[cfg(any(feature = "xslt", test))]
+                        FragmentSource::Document(_) => {}
+                    }
+                }
+                PreflightEvent::CharacterData { xml_whitespace } => {
+                    if context == FragmentContext::Attribute {
+                        continue;
+                    }
+                    let result = if self.counter.depth() == 0 && xml_whitespace {
+                        self.counter.markup();
+                        Ok(())
+                    } else {
+                        self.counter.character_data()
+                    };
+                    limit_checked(&self.counter, result)?;
+                }
+                PreflightEvent::Node => {
+                    let result = self.counter.node();
+                    limit_checked(&self.counter, result)?;
+                }
+                PreflightEvent::Markup => self.counter.markup(),
+                PreflightEvent::Start {
+                    attribute_source,
+                    namespace_declarations,
+                    empty,
+                } => {
+                    if context == FragmentContext::Attribute {
+                        continue;
+                    }
+                    let frame = fragments
+                        .last_mut()
+                        .expect("active element frame remains registered");
+                    frame.pending_attribute_source = attribute_source;
+                    frame.pending_attribute_offset = 0;
+                    self.open(&namespace_declarations, empty)?;
+                }
+                PreflightEvent::End => {
+                    if context == FragmentContext::Attribute {
+                        continue;
+                    }
+                    let result = self.counter.end_element();
+                    limit_checked(&self.counter, result)?;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+/// `result` of a limit count, with the refusal `counter` stopped at, if any,
+/// in place of its stop signal.
+fn limit_checked<S: NameStorage>(
+    counter: &LimitCounter<S>,
+    result: Result<(), ParseError>,
+) -> Result<(), XmlDocumentError> {
+    result.map_err(|error| counter.refusal().map_or(error.into(), limit_refusal))
+}
+
+/// The length of `name` as written, prefix and colon included.
+fn qualified_len(name: xml_sec_xml_input::lexical::Name<'_>) -> usize {
+    name.prefix().map_or(0, |prefix| prefix.len() + 1) + name.local().len()
+}
+
+/// Whether the attribute `name` declares a namespace.
+fn is_namespace_declaration(name: xml_sec_xml_input::lexical::Name<'_>) -> bool {
+    match name.prefix() {
+        Some(prefix) => prefix == "xmlns",
+        None => name.local() == "xmlns",
+    }
+}
+
+/// The element name of the start tag `tag`.
+fn element_name(tag: &str) -> &str {
+    let name = &tag[1..];
+    let end = name
+        .bytes()
+        .position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'/' | b'>'))
+        .unwrap_or(name.len());
+    &name[..end]
 }
 
 struct InternalDtd<S: NameStorage = NativeXmlStorage> {
@@ -2735,13 +3075,11 @@ enum PreflightEvent<S: NameStorage = NativeXmlStorage> {
     CharacterData {
         xml_whitespace: bool,
     },
+    /// A start tag, or with `empty` an empty-element tag.
     Start {
         attribute_source: S::Values<u8>,
         namespace_declarations: S::Values<NamespaceDeclaration<S>>,
-    },
-    Empty {
-        attribute_source: S::Values<u8>,
-        namespace_declarations: S::Values<NamespaceDeclaration<S>>,
+        empty: bool,
     },
     End,
     Node,
@@ -2749,13 +3087,17 @@ enum PreflightEvent<S: NameStorage = NativeXmlStorage> {
     Done,
 }
 
-enum FragmentSource<S: NameStorage> {
-    Document,
-    Entity(S::Text),
+enum FragmentSource<'a, S: NameStorage> {
+    /// The document itself, read only by the pass that runs by itself.
+    #[cfg(any(feature = "xslt", test))]
+    Document(&'a str),
+    /// The replacement text of the named internal entity; the marker keeps
+    /// the document's lifetime where no document frame is compiled.
+    Entity(S::Text, core::marker::PhantomData<&'a str>),
 }
 
-struct FragmentFrame<S: NameStorage> {
-    source: FragmentSource<S>,
+struct FragmentFrame<'a, S: NameStorage> {
+    source: FragmentSource<'a, S>,
     offset: usize,
     collect_doctype: bool,
     context: FragmentContext,
@@ -2763,13 +3105,30 @@ struct FragmentFrame<S: NameStorage> {
     pending_attribute_offset: usize,
 }
 
-impl<S: NameStorage> FragmentFrame<S> {
+impl<'a, S: NameStorage> FragmentFrame<'a, S> {
+    fn new(
+        source: FragmentSource<'a, S>,
+        context: FragmentContext,
+        collect_doctype: bool,
+        storage: S,
+    ) -> Result<Self, ParseError> {
+        Ok(Self {
+            source,
+            offset: 0,
+            collect_doctype,
+            context,
+            pending_attribute_source: storage.values(0)?,
+            pending_attribute_offset: 0,
+        })
+    }
+
+    /// The next event of this fragment, read with `depth` elements open.
     fn next_event(
         &mut self,
-        xml: &str,
         dtd: &InternalDtd<S>,
         state: &mut DocumentPreflightState<S>,
         budget: Option<&XmlParseWorkBudget>,
+        depth: usize,
     ) -> Result<(PreflightEvent<S>, bool, FragmentContext), XmlDocumentError> {
         let storage = state.storage;
         let mut pending =
@@ -2793,15 +3152,22 @@ impl<S: NameStorage> FragmentFrame<S> {
         self.pending_attribute_source.clear();
         self.pending_attribute_offset = 0;
         let source = match &self.source {
-            FragmentSource::Document => xml,
-            FragmentSource::Entity(name) => dtd
+            #[cfg(any(feature = "xslt", test))]
+            FragmentSource::Document(xml) => xml,
+            FragmentSource::Entity(name, _) => dtd
                 .entities
                 .get(name, storage)?
                 .expect("active entity replacement remains registered")
                 .as_ref(),
         };
-        let (event, consumed) =
-            scan_preflight_event(&source[self.offset..], self.context, dtd, state, budget)?;
+        let (event, consumed) = scan_preflight_event(
+            &source[self.offset..],
+            self.context,
+            dtd,
+            state,
+            budget,
+            depth,
+        )?;
         self.offset = self.offset.saturating_add(consumed);
         Ok((event, self.collect_doctype, self.context))
     }
@@ -2812,7 +3178,7 @@ fn enter_preflight_entity<S: NameStorage>(
     context: FragmentContext,
     dtd: &InternalDtd<S>,
     expansion_stack: &mut S::Names<S::Text, ()>,
-    fragments: &mut S::Values<FragmentFrame<S>>,
+    fragments: &mut S::Values<FragmentFrame<'_, S>>,
     state: &mut DocumentPreflightState<S>,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<(), XmlDocumentError> {
@@ -2834,207 +3200,15 @@ fn enter_preflight_entity<S: NameStorage>(
             storage.charge(replacement.len())?;
             storage.charge(replacement.len())?;
             storage.charge(replacement.len())?;
-            fragments.push(FragmentFrame {
-                source: FragmentSource::Entity(name),
-                offset: 0,
-                collect_doctype: false,
+            fragments.push(FragmentFrame::new(
+                FragmentSource::Entity(name, core::marker::PhantomData),
                 context,
-                pending_attribute_source: storage.values(0)?,
-                pending_attribute_offset: 0,
-            })?;
+                false,
+                storage,
+            )?)?;
         } else {
             expansion_stack.remove(&name, storage)?;
         }
-    }
-    Ok(())
-}
-
-fn preflight_xml_fragment<S: NameStorage>(
-    xml: &str,
-    settings: DocumentParseSettings,
-    dtd: &mut InternalDtd<S>,
-    expansion_stack: &mut S::Names<S::Text, ()>,
-    state: &mut DocumentPreflightState<S>,
-    budget: Option<&XmlParseWorkBudget>,
-    collect_doctype: bool,
-) -> Result<(), XmlDocumentError> {
-    if state.nodes == 0 {
-        // roxmltree exposes its document root as the first semantic node.
-        state.nodes = 1;
-    }
-    let storage = state.storage;
-    // Disjoint lexical event windows make these source-sized passes linear;
-    // dictionary probes, expansion revisits and copies are admitted separately.
-    storage.charge(xml.len())?;
-    storage.charge(xml.len())?;
-    storage.charge(xml.len())?;
-    let mut fragments: S::Values<FragmentFrame<S>> = storage.values(1)?;
-    fragments.push(FragmentFrame {
-        source: FragmentSource::Document,
-        offset: 0,
-        collect_doctype,
-        context: FragmentContext::Content,
-        pending_attribute_source: storage.values(0)?,
-        pending_attribute_offset: 0,
-    })?;
-    // Syntax diagnostics and exact parser precedence belong to the selected
-    // DOM pipeline; this pass stops at malformed syntax after bounding its prefix.
-    while !fragments.is_empty() {
-        storage.charge(1)?;
-        let (event, collect_doctype, context) = {
-            let frame = fragments.last_mut().expect("fragment stack is not empty");
-            frame.next_event(xml, dtd, state, budget)?
-        };
-
-        match event {
-            PreflightEvent::DocType(doctype) => {
-                if collect_doctype
-                    && settings.allow_dtd
-                    && let Some(doctype) = doctype
-                {
-                    collect_internal_dtd(&doctype, dtd)?;
-                }
-                state.in_character_data = false;
-                continue;
-            }
-            PreflightEvent::GeneralRef {
-                name,
-                is_character_reference,
-            } => {
-                let Some(name) = name else {
-                    continue;
-                };
-                if is_character_reference {
-                    if context == FragmentContext::Content {
-                        observe_preflight_node(state, settings, true)?;
-                    }
-                    continue;
-                }
-                enter_preflight_entity(
-                    name,
-                    context,
-                    dtd,
-                    expansion_stack,
-                    &mut fragments,
-                    state,
-                    budget,
-                )?;
-                continue;
-            }
-            PreflightEvent::Done => {
-                let frame = fragments.pop().expect("fragment stack is not empty");
-                if let FragmentSource::Entity(name) = frame.source {
-                    expansion_stack.remove(&name, storage)?;
-                }
-                continue;
-            }
-            PreflightEvent::CharacterData { xml_whitespace } => {
-                if context == FragmentContext::Attribute {
-                    continue;
-                }
-                if state.depth == 0 && xml_whitespace {
-                    state.in_character_data = false;
-                    continue;
-                }
-                let starts_semantic_node = !state.in_character_data;
-                state.in_character_data = true;
-                if starts_semantic_node {
-                    observe_preflight_node(state, settings, false)?;
-                }
-                continue;
-            }
-            PreflightEvent::Node => {
-                state.in_character_data = false;
-                observe_preflight_node(state, settings, false)?;
-                continue;
-            }
-            PreflightEvent::Markup => {
-                state.in_character_data = false;
-                continue;
-            }
-            PreflightEvent::Start { .. } | PreflightEvent::Empty { .. } | PreflightEvent::End => {}
-        }
-
-        if context == FragmentContext::Attribute {
-            continue;
-        }
-        state.in_character_data = false;
-        observe_preflight_markup(event, settings, &mut fragments, state)?;
-    }
-    Ok(())
-}
-
-fn observe_preflight_markup<S: NameStorage>(
-    event: PreflightEvent<S>,
-    settings: DocumentParseSettings,
-    fragments: &mut S::Values<FragmentFrame<S>>,
-    state: &mut DocumentPreflightState<S>,
-) -> Result<(), XmlDocumentError> {
-    let storage = state.storage;
-    match event {
-        PreflightEvent::Start {
-            attribute_source,
-            namespace_declarations,
-        } => {
-            let frame = fragments
-                .last_mut()
-                .expect("active element frame remains registered");
-            frame.pending_attribute_source = attribute_source;
-            frame.pending_attribute_offset = 0;
-            let changes = apply_preflight_namespace_declarations(
-                state,
-                namespace_declarations,
-                settings.namespace_bindings_limit,
-            )?;
-            state.namespace_scopes.push(changes)?;
-            observe_preflight_node(state, settings, false)?;
-            state.depth = state.depth.saturating_add(1);
-            if state.depth > settings.depth_limit {
-                return Err(XmlDocumentError::DocumentTooDeep {
-                    maximum: settings.depth_limit,
-                    actual: state.depth,
-                });
-            }
-        }
-        PreflightEvent::Empty {
-            attribute_source,
-            namespace_declarations,
-        } => {
-            let frame = fragments
-                .last_mut()
-                .expect("active element frame remains registered");
-            frame.pending_attribute_source = attribute_source;
-            frame.pending_attribute_offset = 0;
-            let changes = apply_preflight_namespace_declarations(
-                state,
-                namespace_declarations,
-                settings.namespace_bindings_limit,
-            )?;
-            observe_preflight_node(state, settings, false)?;
-            let actual = state.depth.saturating_add(1);
-            if actual > settings.depth_limit {
-                return Err(XmlDocumentError::DocumentTooDeep {
-                    maximum: settings.depth_limit,
-                    actual,
-                });
-            }
-            restore_preflight_namespace_bindings(
-                &mut state.active_namespace_bindings,
-                changes,
-                storage,
-            )?;
-        }
-        PreflightEvent::End => {
-            state.depth = state.depth.saturating_sub(1);
-            if let Some(changes) = state.namespace_scopes.pop() {
-                restore_preflight_namespace_bindings(
-                    &mut state.active_namespace_bindings,
-                    changes,
-                    storage,
-                )?;
-            }
-        }
-        _ => unreachable!("non-structural events continue above"),
     }
     Ok(())
 }
@@ -3066,6 +3240,7 @@ fn scan_preflight_event<S: NameStorage>(
     dtd: &InternalDtd<S>,
     state: &mut DocumentPreflightState<S>,
     budget: Option<&XmlParseWorkBudget>,
+    depth: usize,
 ) -> Result<(PreflightEvent<S>, usize), XmlDocumentError> {
     let storage = state.storage;
     if remaining.is_empty() {
@@ -3157,7 +3332,7 @@ fn scan_preflight_event<S: NameStorage>(
     Ok((
         PreflightEvent::CharacterData {
             // Only text outside the document element is judged by this.
-            xml_whitespace: state.depth == 0
+            xml_whitespace: depth == 0
                 && bytes[..end]
                     .iter()
                     .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')),
@@ -3179,31 +3354,26 @@ fn scan_preflight_opening<S: NameStorage>(
     let opening = &remaining[..=end];
     // Attributes matter here for their namespace declarations and DTD defaults.
     // A tag with neither has nothing to split, however many attributes it has.
-    let (attribute_source, namespace_declarations) =
-        if dtd.attribute_defaults.len() == 0 && !opening.contains("xmlns") {
-            (
-                element_attribute_reference_source(opening, "", &[], dtd)?,
-                storage.values(0)?,
-            )
-        } else {
-            let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
-            (
-                element_attribute_reference_source(opening, element_name, &attributes, dtd)?,
-                namespace_declarations(element_name, &attributes, dtd, state, budget)?,
-            )
-        };
+    let (attribute_source, namespace_declarations) = if dtd.attribute_defaults.len() == 0
+        && !opening.contains("xmlns")
+    {
+        (
+            element_attribute_reference_source(opening, "", &[], dtd)?,
+            storage.values(0)?,
+        )
+    } else {
+        let (element_name, attributes) = opening_tag_attributes(opening, storage)?;
+        (
+            element_attribute_reference_source(opening, element_name, &attributes, dtd)?,
+            namespace_declarations(element_name, attributes.iter().copied(), dtd, state, budget)?,
+        )
+    };
     // The frame later revisits this attribute/reference window.
     storage.charge(attribute_source.len())?;
-    let event = if opening[..opening.len() - 1].trim_end().ends_with('/') {
-        PreflightEvent::Empty {
-            attribute_source,
-            namespace_declarations,
-        }
-    } else {
-        PreflightEvent::Start {
-            attribute_source,
-            namespace_declarations,
-        }
+    let event = PreflightEvent::Start {
+        attribute_source,
+        namespace_declarations,
+        empty: opening[..opening.len() - 1].trim_end().ends_with('/'),
     };
     Ok((event, end + 1))
 }
@@ -3251,16 +3421,19 @@ struct NamespaceDeclaration<S: NameStorage = NativeXmlStorage> {
     is_undeclaration: bool,
 }
 
-fn namespace_declarations<S: NameStorage>(
+/// The namespace declarations an element named `element_name` makes, with
+/// its `attributes` as name and raw value, and the defaults `dtd` gives it.
+fn namespace_declarations<'a, S: NameStorage>(
     element_name: &str,
-    attributes: &[(&str, &str)],
+    attributes: impl Iterator<Item = (&'a str, &'a str)> + Clone,
     dtd: &InternalDtd<S>,
     state: &mut DocumentPreflightState<S>,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<S::Values<NamespaceDeclaration<S>>, XmlDocumentError> {
     let storage = state.storage;
     let mut declarations = storage.values(0)?;
-    for &(name, value) in attributes {
+    let given = attributes.clone();
+    for (name, value) in attributes {
         storage.charge(name.len())?;
         let prefix = if name == "xmlns" {
             ""
@@ -3278,7 +3451,7 @@ fn namespace_declarations<S: NameStorage>(
     if let Some(defaults) = dtd.attribute_defaults.get(element_name, storage)? {
         for default in &**defaults {
             let mut present = false;
-            for &(name, _) in attributes {
+            for (name, _) in given.clone() {
                 storage.charge(
                     name.len()
                         .min(default.attribute_name.len())
@@ -3366,62 +3539,6 @@ fn namespace_value_expands_to_empty<'a, S: NameStorage>(
         pending.push(replacement.as_ref())?;
     }
     Ok(true)
-}
-
-fn apply_preflight_namespace_declarations<S: NameStorage>(
-    state: &mut DocumentPreflightState<S>,
-    declarations: S::Values<NamespaceDeclaration<S>>,
-    maximum: usize,
-) -> Result<S::Values<(S::Text, bool)>, XmlDocumentError> {
-    let storage = state.storage;
-    let mut changes = storage.values(declarations.len())?;
-    for declaration in declarations {
-        storage.charge(1)?;
-        let was_active = if declaration.is_undeclaration {
-            state
-                .active_namespace_bindings
-                .remove(&declaration.prefix, storage)?
-                .is_some()
-        } else if state
-            .active_namespace_bindings
-            .get(&declaration.prefix, storage)?
-            .is_some()
-        {
-            true
-        } else {
-            state
-                .active_namespace_bindings
-                .insert(storage.text(&declaration.prefix)?, ())?;
-            false
-        };
-        changes.push((declaration.prefix, was_active))?;
-    }
-    let actual = state.active_namespace_bindings.len();
-    state.peak_namespace_bindings = state.peak_namespace_bindings.max(actual);
-    if actual > maximum {
-        return Err(XmlDocumentError::Parse(
-            ParseError::NamespaceBindingLimitReached { maximum, actual },
-        ));
-    }
-    Ok(changes)
-}
-
-fn restore_preflight_namespace_bindings<S: NameStorage>(
-    active: &mut S::Names<S::Text, ()>,
-    mut changes: S::Values<(S::Text, bool)>,
-    storage: S,
-) -> Result<(), XmlDocumentError> {
-    while let Some((prefix, was_active)) = changes.pop() {
-        storage.charge(1)?;
-        if was_active {
-            if active.get(&prefix, storage)?.is_none() {
-                active.insert(prefix, ())?;
-            }
-        } else {
-            active.remove(&prefix, storage)?;
-        }
-    }
-    Ok(())
 }
 
 fn element_attribute_reference_source<S: NameStorage>(
@@ -3595,56 +3712,51 @@ fn charge_entity_expansion_work<S: NameStorage>(
     Ok(())
 }
 
-pub(crate) fn preflight_dom_limits(
+/// Parses `xml` for the DOM API, under `options` and the absolute ceilings,
+/// with the limits checked in one lexical pass or by the parser itself.
+pub(crate) fn parse_dom_checked(
     xml: &str,
     options: ParsingOptions,
-) -> Result<ParsingOptions, ParseError> {
-    let effective = ParsingOptions {
+    backend: XmlBackend,
+) -> Result<Document<'_>, ParseError> {
+    let options = ParsingOptions {
         allow_dtd: options.allow_dtd,
         nodes_limit: options
             .nodes_limit
             .min(crate::hard_limits::XML_DOCUMENT_NODE_CEILING),
     };
     let settings = DocumentParseSettings {
-        backend: XmlBackend::default(),
-        allow_dtd: effective.allow_dtd,
-        nodes_limit: effective.nodes_limit,
+        backend,
+        allow_dtd: options.allow_dtd,
+        nodes_limit: options.nodes_limit,
         depth_limit: crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING,
         namespace_bindings_limit: crate::hard_limits::XML_NAMESPACE_BINDING_CEILING,
         max_bytes: crate::hard_limits::XML_DOCUMENT_BYTE_CEILING,
     };
-    match preflight_document_limits(xml, settings, None) {
-        Ok(_) => Ok(effective),
-        Err(XmlDocumentError::Parse(error)) => Err(error),
-        Err(XmlDocumentError::DocumentTooDeep { maximum, actual }) => {
-            Err(ParseError::DepthLimitReached { maximum, actual })
-        }
-        Err(XmlDocumentError::DocumentTooLarge { maximum, actual }) => {
-            Err(ParseError::ByteLimitReached { maximum, actual })
-        }
-        Err(error) => Err(ParseError::Backend {
-            backend: "xml-limit-preflight",
-            message: error.to_string(),
-        }),
-    }
+    check_document_size(xml, settings)
+        .and_then(|()| parse_checked(xml, settings, None))
+        .map(|(document, ..)| document)
+        .map_err(|error| match error {
+            XmlDocumentError::Parse(error) => error,
+            error => dom_parse_error(&error),
+        })
 }
 
-fn observe_preflight_node<S: NameStorage>(
-    state: &mut DocumentPreflightState<S>,
-    settings: DocumentParseSettings,
-    character_data: bool,
-) -> Result<(), XmlDocumentError> {
-    if character_data {
-        if state.in_character_data {
-            return Ok(());
+/// The DOM API's error for a refusal of the document layer.
+fn dom_parse_error(error: &XmlDocumentError) -> ParseError {
+    match error {
+        XmlDocumentError::Parse(error) => error.clone(),
+        &XmlDocumentError::DocumentTooDeep { maximum, actual } => {
+            ParseError::DepthLimitReached { maximum, actual }
         }
-        state.in_character_data = true;
+        &XmlDocumentError::DocumentTooLarge { maximum, actual } => {
+            ParseError::ByteLimitReached { maximum, actual }
+        }
+        error => ParseError::Backend {
+            backend: "xml-limit-preflight",
+            message: error.to_string(),
+        },
     }
-    state.nodes = state.nodes.saturating_add(1);
-    if state.nodes > settings.nodes_limit {
-        return Err(XmlDocumentError::Parse(ParseError::NodesLimitReached));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3654,14 +3766,15 @@ pub(crate) enum DtdAttributeType {
     Tokenized,
 }
 
-fn collect_internal_dtd<S: NameStorage>(
-    doctype: &str,
+/// Collect the internal entities and attribute defaults the document type
+/// declaration `doctype` declares, and hand each attribute declaration to
+/// `declare`. The caller admits the work of reading `doctype`.
+fn collect_internal_dtd<'a, S: NameStorage>(
+    doctype: &'a str,
     dtd: &mut InternalDtd<S>,
+    mut declare: impl FnMut(&'a str, &'a str, DtdAttributeType) -> Result<(), ParseError>,
 ) -> Result<(), XmlDocumentError> {
     let storage = dtd.storage;
-    storage.charge(doctype.len())?;
-    storage.charge(doctype.len())?;
-    storage.charge(doctype.len())?;
     let mut failure = None;
     visit_internal_dtd(doctype, |declaration| {
         if failure.is_some() {
@@ -3679,11 +3792,12 @@ fn collect_internal_dtd<S: NameStorage>(
                 }
             } else if let Some(declaration) = dtd_declaration_body(declaration, "ATTLIST") {
                 let mut attribute_failure = None;
-                visit_attribute_declarations(declaration, |element, attribute, _, value| {
+                visit_attribute_declarations(declaration, |element, attribute, kind, value| {
                     if attribute_failure.is_some() {
                         return;
                     }
                     let result = (|| -> Result<(), ParseError> {
+                        declare(element, attribute, kind)?;
                         if let Some(value) = value {
                             let default = InternalAttributeDefault {
                                 attribute_name: storage.text(attribute)?,
@@ -3724,6 +3838,7 @@ fn collect_internal_dtd<S: NameStorage>(
 
 /// Visit actual internal-subset attribute declarations, not declaration-like
 /// strings inside comments, PIs, or quoted entity replacement text.
+#[cfg(any(feature = "benchmark-internals", test))]
 pub(crate) fn visit_dtd_attributes<'a>(
     doctype: &'a str,
     mut visitor: impl FnMut(&'a str, &'a str, DtdAttributeType),
@@ -4009,36 +4124,19 @@ fn find_unquoted_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     None
 }
 
-/// Parses `source` after the limit pass that found `preflight_peak` namespace
-/// bindings, or, for `None`, with a parser that enforces the limits as it
-/// reads; returns the document's peak namespace bindings either way.
-fn parse_semantic_document(
-    source: &str,
+/// A semantic document with its metrics, peak namespace bindings, and
+/// whether its source declares a document type.
+type SemanticParse<'a> = (Document<'a>, DocumentMetrics, usize, bool);
+
+/// Parses `source` (see [`parse_checked`]) and measures it.
+fn parse_semantic_document<'a>(
+    source: &'a str,
     settings: DocumentParseSettings,
-    preflight_peak: Option<usize>,
-) -> Result<(Document<'_>, DocumentMetrics, usize), XmlDocumentError> {
-    let options = ParsingOptions {
-        allow_dtd: settings.allow_dtd,
-        nodes_limit: settings.nodes_limit,
-    };
-    let (document, peak) = match preflight_peak {
-        Some(peak) => (
-            Document::parse_after_limit_preflight_with_backend(source, options, settings.backend)
-                .map_err(XmlDocumentError::Parse)?,
-            peak,
-        ),
-        #[cfg(feature = "xml-backend-xmloxide")]
-        None => Document::parse_enforcing_limits(source, options, parse_limits(settings)).map_err(
-            |refused| match refused {
-                crate::xml::dom::Refused::Limit(refusal) => limit_refusal(refusal),
-                crate::xml::dom::Refused::Parse(error) => XmlDocumentError::Parse(error),
-            },
-        )?,
-        #[cfg(not(feature = "xml-backend-xmloxide"))]
-        None => unreachable!("only xmloxide enforces limits while it parses"),
-    };
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<SemanticParse<'a>, XmlDocumentError> {
+    let (document, peak, doctype) = parse_checked(source, settings, budget)?;
     let metrics = validate_document_metrics(&document, settings.depth_limit)?;
-    Ok((document, metrics, peak))
+    Ok((document, metrics, peak, doctype))
 }
 
 fn validate_document_metrics(
@@ -4138,30 +4236,6 @@ fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, X
             Err(observed) => current = observed,
         }
     }
-}
-
-#[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-fn document_requires_internal_dtd(
-    xml: &str,
-    settings: DocumentParseSettings,
-    budget: Option<&XmlParseWorkBudget>,
-) -> Result<bool, XmlDocumentError> {
-    // Parse provenance records what the source actually requires, not merely
-    // whether its creator used a permissive policy. This lets a later strict
-    // operation accept ordinary XML while rejecting DTD-dependent documents.
-    if !settings.allow_dtd {
-        return Ok(false);
-    }
-    charge_semantic_parser_work(budget, xml.len())?;
-    Ok(Document::parse_after_limit_preflight_with_backend(
-        xml,
-        ParsingOptions {
-            allow_dtd: false,
-            nodes_limit: settings.nodes_limit,
-        },
-        settings.backend,
-    )
-    .is_err())
 }
 
 /// What a node replacement must leave in its parent.
@@ -4423,8 +4497,15 @@ mod entity_ceiling_tests;
 #[cfg(test)]
 mod replacement_tests;
 
-#[cfg(all(test, feature = "xml-backend-xmloxide"))]
+#[cfg(all(
+    test,
+    feature = "xml-backend-xmloxide",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
 mod parser_limit_tests;
+
+#[cfg(all(test, any(feature = "xmldsig", feature = "xmlenc")))]
+mod scan_limit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4823,15 +4904,13 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn byte_decoding_and_parsing_share_one_work_allowance() {
-        // UTF-16 decoding consumes its source bytes; the limit pass, where
-        // the parser does not enforce the limits as it reads, and the two
-        // parser/projection passes then consume normalized UTF-8 bytes.
+        // UTF-16 decoding consumes its source bytes; the parse allowance,
+        // the lexical pass and the parser, then consumes the UTF-8 bytes.
         let xml = "<r/>";
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
+        let required = bytes.len() + selected_parser_passes() * xml.len();
         for backend in XmlBackend::available() {
-            let passes = if backend.records_positions(xml) { 2 } else { 3 };
-            let required = bytes.len() + passes * xml.len();
             let mut policy = crate::policy::VerificationPolicy::default();
             policy.resources.max_xml_parse_work_bytes = required - 1;
             assert!(matches!(
@@ -4856,7 +4935,7 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        let retained = build_semantic_cell(xml.to_owned(), settings, Some(1), 0)
+        let (retained, _) = build_semantic_cell(xml.to_owned(), settings, None)
             .expect("selected backend semantic projection must parse");
         retained.with_dependent(|_, parsed| {
             let item = parsed
@@ -4884,11 +4963,12 @@ mod tests {
     #[test]
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn node_preflight_rejects_wide_input_before_any_dom_pass() {
-        // The allowance covers only the streaming preflight. Reaching either
-        // DOM would exhaust parser work before it could report the node bound.
+        // The allowance covers exactly one parse: the lexical pass and the
+        // parser reading the source once each. A second parse, or work past
+        // the node bound, would exhaust it before the node refusal.
         let xml = "<root><first/><second/></root>";
         let resources = crate::policy::ResourcePolicy {
-            max_xml_parse_work_bytes: xml.len(),
+            max_xml_parse_work_bytes: 2 * xml.len(),
             ..crate::policy::ResourcePolicy::default()
         };
         let budget = XmlParseWorkBudget::from_resources(&resources);
@@ -4911,7 +4991,7 @@ mod tests {
         for value in [
             "&amp;", "&#38;", "&#x26;", "&lt;", "&gt;", "&quot;", "&apos;",
         ] {
-            let mut state = DocumentPreflightState::default();
+            let mut state = DocumentPreflightState::new(NativeXmlStorage);
             let budget = XmlParseWorkBudget::with_limit(0);
             assert!(
                 !namespace_value_expands_to_empty(value, &dtd, &mut state, Some(&budget))
@@ -5275,25 +5355,26 @@ mod tests {
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn entity_preflight_charges_nested_replacement_work() {
         // Repeated nested references must exhaust parser work during the
-        // streaming pass, before either DOM parser receives the document.
+        // lexical pass, before either DOM parser builds the document. The
+        // parse allowance, the pass and the parser each reading the source
+        // once, is charged first.
         let xml = r#"<!DOCTYPE root [
             <!ENTITY a "0123456789">
             <!ENTITY b "&a;&a;&a;&a;">
         ]><root>&b;</root>"#;
         let first_replacement = "&a;&a;&a;&a;".len();
         let nested_replacement = "0123456789".len();
-        let maximum = xml.len() + first_replacement + nested_replacement - 1;
-        let budget = XmlParseWorkBudget::with_limit(maximum);
+        let required = 2 * xml.len() + first_replacement + nested_replacement;
+        let budget = XmlParseWorkBudget::with_limit(required - 1);
         let settings = DocumentParseSettings::new_with_depth(true, 32, 4, xml.len());
 
         assert!(matches!(
             build_cell(xml.to_owned(), settings, Some(&budget)),
             Err(XmlDocumentError::Policy(crate::policy::PolicyViolation::ResourceLimit {
                 resource: crate::policy::resource_name::XML_PARSE_WORK_BYTES,
-                maximum: observed_maximum,
+                maximum,
                 actual,
-            })) if observed_maximum == maximum
-                && actual == xml.len() + first_replacement + nested_replacement
+            })) if maximum == required - 1 && actual == required
         ));
     }
 
@@ -5467,11 +5548,12 @@ mod tests {
     #[test]
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     fn owned_parse_preflights_depth_before_dtd_provenance() {
-        // Enabling internal DTD syntax must not move the provenance probe ahead
-        // of the allocation-free depth boundary for an ordinary document.
+        // Enabling internal DTD syntax adds no parse of its own: whether the
+        // source declares a DTD comes from the one parse, whose allowance
+        // (the lexical pass and the parser) is all the depth refusal needs.
         let xml = "<root><child><leaf/></child></root>";
         let settings = DocumentParseSettings::new_with_depth(true, 16, 2, xml.len());
-        let budget = XmlParseWorkBudget::with_limit(xml.len());
+        let budget = XmlParseWorkBudget::with_limit(2 * xml.len());
 
         assert!(matches!(
             XmlDocument::parse_with_settings_and_optional_budget(
@@ -5496,11 +5578,11 @@ mod tests {
     fn selected_backend_enforces_exact_depth_boundary() {
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        build_semantic_cell(accepted, settings, Some(0), 0).expect("exact depth must parse");
+        build_semantic_cell(accepted, settings, None).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            build_semantic_cell(rejected, settings, Some(0), 0),
+            build_semantic_cell(rejected, settings, None),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,
@@ -6130,11 +6212,7 @@ mod tests {
         .into_iter()
         .filter(|backend| backend.is_available())
         {
-            // The limit pass, where the parser does not enforce the limits
-            // as it reads, and the parse and its projection each charge the
-            // source length.
-            let passes = if backend.records_positions(xml) { 2 } else { 3 };
-            let expected = xml.len() * passes;
+            let expected = xml.len() * selected_parser_passes();
             let budget = XmlParseWorkBudget::with_limit(expected);
             parse_borrowed_with_settings_and_budget(
                 xml,

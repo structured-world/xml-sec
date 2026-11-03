@@ -74,6 +74,11 @@ impl<S: NameStorage> LimitCounter<S> {
         self.peak_namespace_bindings
     }
 
+    /// The elements open now.
+    pub(crate) fn depth(&self) -> usize {
+        self.depth
+    }
+
     /// Record `refusal` and return the error that stops the parser.
     fn refuse(&mut self, refusal: LimitRefusal) -> ParseError {
         self.refusal = Some(refusal);
@@ -167,12 +172,15 @@ impl<S: NameStorage> LimitCounter<S> {
         }
     }
 
-    /// The end tag of the innermost open element.
+    /// The end tag of the innermost open element. A lexical pass, which does
+    /// not check well-formedness, may report an end tag nothing opened; the
+    /// parser that follows refuses that document.
     pub(crate) fn end_element(&mut self) -> Result<(), ParseError> {
         self.in_character_data = false;
-        debug_assert!(self.depth > 0, "an end tag follows its start tag");
-        // The parser reports an end tag only for an element it opened.
-        self.depth -= 1;
+        let Some(depth) = self.depth.checked_sub(1) else {
+            return Ok(());
+        };
+        self.depth = depth;
         match self.scopes.pop() {
             Some(changes) => self.restore(changes),
             None => Ok(()),

@@ -8,7 +8,6 @@
 pub(crate) mod benchmark;
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 mod differential;
-#[cfg(feature = "xml-backend-xmloxide")]
 mod limits;
 mod preflight;
 #[cfg(feature = "xml-backend-roxmltree")]
@@ -22,9 +21,9 @@ mod xmloxide;
 use alloc::string::String;
 use core::fmt;
 
-#[cfg(feature = "xml-backend-xmloxide")]
 pub(crate) use self::limits::{LimitCounter, LimitRefusal, ParseLimits};
 use self::preflight::LexicalPreflight;
+pub(crate) use self::preflight::ScanObserver;
 #[cfg(feature = "xml-backend-xmloxide")]
 pub(crate) use self::preflight::{PositionRecorder, SourceKind, SourceNode};
 
@@ -110,10 +109,9 @@ impl XmlBackend {
     /// range and enforces the policy limits as it reads, and only a DOCTYPE,
     /// whose keyword is case-sensitive (XML 1.0 production 28), brings
     /// declarations and entity expansion, which a scan must bound first.
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(crate) fn records_positions(self, input: &str) -> bool {
-        cfg!(feature = "xml-backend-xmloxide")
-            && self == Self::Xmloxide
-            && !input.contains("<!DOCTYPE")
+        self == Self::Xmloxide && !input.contains("<!DOCTYPE")
     }
 
     fn parse<'input>(
