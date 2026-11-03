@@ -1342,45 +1342,7 @@
 +        }
 +    }
 +}
- 
--            let expanded = match name.as_str() {
--                "amp" | "lt" | "gt" | "apos" | "quot" => {
--                    unreachable!("builtin entity should be caught by fast path")
--                }
--                _ => {
--                    if let Some(info) = self.entity_external.get(&name).cloned() {
--                        if let Some(ref resolver) = self.entity_resolver.clone() {
--                            let request = ExternalEntityRequest {
--                                name: &name,
--                                system_id: &info.system_id,
--                                public_id: info.public_id.as_deref(),
--                            };
--                            if let Some(resolved) = resolver(request) {
--                                self.expand_entity_text(&resolved)?
--                            } else {
--                                return Err(self.fatal(format!(
--                                    "reference to external entity '{name}' is not supported"
--                                )));
--                            }
--                        } else {
--                            return Err(self.fatal(format!(
--                                "reference to external entity '{name}' is not supported"
--                            )));
--                        }
--                    } else if let Some(value) = self.entity_map.get(&name).cloned() {
--                        if !self.validated_entities.contains(&name) {
--                            self.validated_entities.insert(name.clone());
--                            self.validate_entity_content(&name, &value)?;
--                        }
--                        self.expand_entity_text(&value)?
--                    } else if self.recover || self.has_pe_references || self.has_external_dtd {
--                        self.push_diagnostic(
--                            ErrorSeverity::Warning,
--                            format!("unknown entity reference: &{name};"),
--                        );
--                        String::new()
--                    } else {
--                        return Err(self.fatal(format!("unknown entity reference: &{name};")));
++
 +impl<S: NameStorage> ParserInput<'_, S> {
 +    fn replacement_character(
 +        &self,
@@ -1491,7 +1453,10 @@
 +        }
 +        Ok(())
 +    }
-+
+ 
+-            let expanded = match name.as_str() {
+-                "amp" | "lt" | "gt" | "apos" | "quot" => {
+-                    unreachable!("builtin entity should be caught by fast path")
 +    fn declared_replacement<'value>(
 +        &self,
 +        name: &str,
@@ -1508,7 +1473,41 @@
 +                // https://www.w3.org/TR/2008/REC-xml-20081126/#CleanAttrVals
 +                if context == ReferenceContext::Attribute {
 +                    return Err(self.fatal("external entity reference in attribute value"));
-+                }
+                 }
+-                _ => {
+-                    if let Some(info) = self.entity_external.get(&name).cloned() {
+-                        if let Some(ref resolver) = self.entity_resolver.clone() {
+-                            let request = ExternalEntityRequest {
+-                                name: &name,
+-                                system_id: &info.system_id,
+-                                public_id: info.public_id.as_deref(),
+-                            };
+-                            if let Some(resolved) = resolver(request) {
+-                                self.expand_entity_text(&resolved)?
+-                            } else {
+-                                return Err(self.fatal(format!(
+-                                    "reference to external entity '{name}' is not supported"
+-                                )));
+-                            }
+-                        } else {
+-                            return Err(self.fatal(format!(
+-                                "reference to external entity '{name}' is not supported"
+-                            )));
+-                        }
+-                    } else if let Some(value) = self.entity_map.get(&name).cloned() {
+-                        if !self.validated_entities.contains(&name) {
+-                            self.validated_entities.insert(name.clone());
+-                            self.validate_entity_content(&name, &value)?;
+-                        }
+-                        self.expand_entity_text(&value)?
+-                    } else if self.recover || self.has_pe_references || self.has_external_dtd {
+-                        self.push_diagnostic(
+-                            ErrorSeverity::Warning,
+-                            format!("unknown entity reference: &{name};"),
+-                        );
+-                        String::new()
+-                    } else {
+-                        return Err(self.fatal(format!("unknown entity reference: &{name};")));
 +                if let Some(resolver) = &self.entity_resolver {
 +                    let request = ExternalEntityRequest {
 +                        name,
@@ -3687,7 +3686,7 @@
      }
  
      #[test]
-@@ -3101,138 +3623,150 @@
+@@ -3101,138 +3623,204 @@
      fn test_scan_char_data_cdata_end_marker() {
          // `]]>` in character data is not allowed — the scanner should stop before it
          let input = ParserInput::new("text]]>more");
@@ -3891,10 +3890,64 @@
          }
 -        assert_eq!(ns.resolve(Some("p")), None);
 +        assert_eq!(ns.resolve(Some("p")).unwrap(), None);
++    }
++
++    /// Binds more prefixes than the short list holds, one per scope, then
++    /// unwinds them: every binding resolves while in scope and is gone after,
++    /// on both sides of the move to the keyed table.
++    fn bindings_cross_the_short_list<S: NameStorage>(storage: S) {
++        let prefixes = SHORT_PREFIXES + 4;
++        let text = |value: String| storage.text(&value).unwrap();
++        let mut ns = NamespaceResolver::with_storage(storage).unwrap();
++        for bound in 0..prefixes {
++            ns.push_scope().unwrap();
++            ns.bind(
++                Some(text(format!("p{bound}"))),
++                text(format!("urn:{bound}")),
++            )
++            .unwrap();
++            for earlier in 0..=bound {
++                let expected = format!("urn:{earlier}");
++                let prefix = format!("p{earlier}");
++                assert_eq!(ns.resolve(Some(&prefix)).unwrap(), Some(&*expected));
++            }
++        }
++        // Rebinding past the move restores the outer binding on pop.
++        ns.push_scope().unwrap();
++        ns.bind(Some(text("p0".into())), text("urn:inner".into()))
++            .unwrap();
++        assert_eq!(ns.resolve(Some("p0")).unwrap(), Some("urn:inner"));
++        ns.pop_scope().unwrap();
++        assert_eq!(ns.resolve(Some("p0")).unwrap(), Some("urn:0"));
++        for open in (0..prefixes).rev() {
++            ns.pop_scope().unwrap();
++            let prefix = format!("p{open}");
++            assert_eq!(ns.resolve(Some(&prefix)).unwrap(), None);
++            for earlier in 0..open {
++                let expected = format!("urn:{earlier}");
++                let prefix = format!("p{earlier}");
++                assert_eq!(ns.resolve(Some(&prefix)).unwrap(), Some(&*expected));
++            }
++        }
++        assert_eq!(ns.resolve(Some("xml")).unwrap(), Some(XML_NAMESPACE));
++    }
++
++    #[test]
++    fn bindings_cross_the_short_list_in_native_storage() {
++        bindings_cross_the_short_list(Native);
++    }
++
++    #[cfg(feature = "xmldsig")]
++    #[test]
++    fn bindings_cross_the_short_list_in_accounted_storage() {
++        use structured_asn1::memory::{Memory, MemoryAccount};
++        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
++        bindings_cross_the_short_list(crate::xml::dom::storage::Accounted(&memory));
++        assert_eq!(memory.used(), 0);
      }
  
      // -- QName validation edge cases --
-@@ -3265,34 +3799,46 @@
+@@ -3265,34 +3853,46 @@
          assert!(result.unwrap().contains("empty prefix or local part"));
      }
  
@@ -3951,7 +4004,7 @@
      }
  
      // -- XML declaration edge cases --
-@@ -3302,10 +3848,12 @@
+@@ -3302,10 +3902,12 @@
          let mut input = ParserInput::new("<?xml version=\"2.0\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3968,7 +4021,7 @@
      }
  
      #[test]
-@@ -3313,10 +3861,12 @@
+@@ -3313,10 +3915,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" encoding=\"123bad\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -3985,7 +4038,7 @@
      }
  
      #[test]
-@@ -3324,10 +3874,12 @@
+@@ -3324,10 +3928,12 @@
          let mut input = ParserInput::new("<?xml version=\"1.0\" standalone=\"maybe\"?>");
          let result = parse_xml_decl(&mut input);
          assert!(result.is_err());
@@ -4002,7 +4055,7 @@
      }
  
      #[test]
-@@ -3342,10 +3894,10 @@
+@@ -3342,10 +3948,10 @@
      #[test]
      fn test_save_restore_position() {
          let mut input = ParserInput::new("abcdef");
@@ -4015,7 +4068,7 @@
          assert_eq!(input.peek(), Some(b'f'));
          input.restore_position(saved);
          assert_eq!(input.peek(), Some(b'd'));
-@@ -3357,7 +3909,7 @@
+@@ -3357,7 +3963,7 @@
  
      #[test]
      fn test_depth_limit_via_parse_str_with_options() {
@@ -4024,7 +4077,7 @@
          // 3 levels with limit 3 should succeed
          let xml = "<a><b><c/></b></a>";
          let opts = ParseOptions::default().max_depth(3);
-@@ -3367,7 +3919,7 @@
+@@ -3367,7 +3973,7 @@
          let xml = "<a><b><c><d/></c></b></a>";
          let result = parse_str_with_options(xml, &opts);
          assert!(result.is_err());
@@ -4033,7 +4086,7 @@
      }
  
      // -- Builtin entity matching edge cases --
-@@ -3403,12 +3955,24 @@
+@@ -3403,12 +4009,24 @@
      fn test_expand_entity_text_counts_against_limit() {
          // Set up a ParserInput with entity_map containing nested references
          let mut input = ParserInput::new("");
@@ -4064,7 +4117,7 @@
          input.set_max_entity_expansions(2);
  
          // Expanding "b" should expand &a; twice, hitting the limit
-@@ -3465,6 +4029,54 @@
+@@ -3465,6 +4083,54 @@
          assert_eq!(result, "<![CDATA[&amp; not expanded]]>");
      }
  
