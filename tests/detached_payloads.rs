@@ -867,7 +867,9 @@ fn a_manifest_policy_limit_ends_the_detached_completion() {
 #[test]
 fn finalization_is_admitted_before_the_provider_runs() {
     // Updates can spend the allowance to the last unit; finishing then must
-    // stop at the admission, with the backend never entered.
+    // stop at the admission, with the backend never entered. The remainder
+    // is spent in place: lookups in randomly seeded tables compare a varying
+    // number of candidates, so a second run cannot replay the first's total.
     let payload = b"detached part";
     let document = signed(
         &[Detached {
@@ -878,34 +880,31 @@ fn finalization_is_admitted_before_the_provider_runs() {
         }],
         false,
     );
-    let run = |allowance: usize| {
-        let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
-        let provider = RefusingStateProvider::after(usize::MAX);
-        let context = VerifyContext::new()
-            .policy(verification_policy())
-            .key(&key)
-            .provider(&provider);
-        let work = Memory::new(Arc::new(MemoryAccount::new(1 << 22, allowance)));
-        let before_finish = std::cell::Cell::new((0, 0));
-        let result = with_verified_request(
-            &document,
-            &context,
-            &VerificationRequest::default(),
-            &work,
-            |mut session| {
-                let reference = pending_references(&session, DetachedCompletion::Complete)[0];
-                let mut stream =
-                    session.detached_payload(&[reference], DetachedCompletion::Complete)?;
-                stream.update(payload)?;
-                before_finish.set((work.work_used(), provider.finalized()));
-                stream.finish()
-            },
-        );
-        (result, before_finish.get(), provider.finalized())
-    };
-    let (result, (spent, _), _) = run(1 << 28);
-    result.expect("the account is ample");
-    let (result, (_, finalized_before), finalized_after) = run(spent);
+    let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
+    let provider = RefusingStateProvider::after(usize::MAX);
+    let context = VerifyContext::new()
+        .policy(verification_policy())
+        .key(&key)
+        .provider(&provider);
+    let allowance = 1 << 28;
+    let work = Memory::new(Arc::new(MemoryAccount::new(1 << 22, allowance)));
+    let finalized_before = std::cell::Cell::new(0);
+    let result = with_verified_request(
+        &document,
+        &context,
+        &VerificationRequest::default(),
+        &work,
+        |mut session| {
+            let reference = pending_references(&session, DetachedCompletion::Complete)[0];
+            let mut stream =
+                session.detached_payload(&[reference], DetachedCompletion::Complete)?;
+            stream.update(payload)?;
+            work.charge_work(u64::try_from(allowance - work.work_used()).unwrap())
+                .unwrap();
+            finalized_before.set(provider.finalized());
+            stream.finish()
+        },
+    );
     assert!(
         matches!(
             result,
@@ -913,7 +912,7 @@ fn finalization_is_admitted_before_the_provider_runs() {
         ),
         "{result:?}"
     );
-    assert_eq!(finalized_after, finalized_before);
+    assert_eq!(provider.finalized(), finalized_before.get());
 }
 
 #[test]
