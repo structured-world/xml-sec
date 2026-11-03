@@ -950,7 +950,8 @@ impl XmlDocument {
         }
         let ((peak_namespace_bindings, requires_internal_dtd), preflight_work) =
             metered(budget, |budget| {
-                let peak = preflight_document_limits(&xml, settings, budget)?;
+                let peak =
+                    limit_pass_unless_parser_enforces(&xml, settings, budget, NativeXmlStorage)?;
                 #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
                 let requires_internal_dtd = document_requires_internal_dtd(&xml, settings, budget)?;
                 #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
@@ -2451,7 +2452,7 @@ fn build_cell(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
     let (peak_namespace_bindings, preflight_work) = metered(budget, |budget| {
-        preflight_document_limits(&xml, settings, budget)
+        limit_pass_unless_parser_enforces(&xml, settings, budget, NativeXmlStorage)
     })?;
     build_cell_after_preflight(
         xml,
@@ -2462,12 +2463,13 @@ fn build_cell(
     )
 }
 
-/// Builds a generation whose preflight already charged `preflight_work`.
+/// Builds a generation whose limit pass, if one ran, already charged
+/// `preflight_work` and found `peak_namespace_bindings`.
 fn build_cell_after_preflight(
     xml: String,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
-    peak_namespace_bindings: usize,
+    peak_namespace_bindings: Option<usize>,
     preflight_work: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
     let ((), semantic_work) = metered(budget, |budget| {
@@ -2485,16 +2487,17 @@ fn build_cell_after_preflight(
 fn build_semantic_cell(
     xml: String,
     settings: DocumentParseSettings,
-    peak_namespace_bindings: usize,
+    preflight_peak: Option<usize>,
     parse_work: usize,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-    let _ = peak_namespace_bindings;
     // Only XMLDSig entry points take over a caller's parse and charge its work.
     #[cfg(not(feature = "xmldsig"))]
     let _ = parse_work;
     DocumentCell::try_new(xml, |source| {
-        let (document, metrics) = parse_semantic_document(source, settings)?;
+        let (document, metrics, peak_namespace_bindings) =
+            parse_semantic_document(source, settings, preflight_peak)?;
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let _ = peak_namespace_bindings;
         debug_assert!(
             document
                 .descendants()
@@ -2520,9 +2523,10 @@ pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<Document<'a>, XmlDocumentError> {
-    preflight_document_limits(xml, settings, budget)?;
+    let preflight_peak =
+        limit_pass_unless_parser_enforces(xml, settings, budget, NativeXmlStorage)?;
     charge_semantic_parser_work(budget, xml.len())?;
-    let (document, _) = parse_semantic_document(xml, settings)?;
+    let (document, _, _) = parse_semantic_document(xml, settings, preflight_peak)?;
     Ok(document)
 }
 
@@ -2533,17 +2537,28 @@ pub(crate) fn parse_borrowed_in<'input, 'w, W: structured_asn1::memory::Work>(
     budget: Option<&XmlParseWorkBudget>,
     storage: crate::xml::dom::storage::Accounted<'w, W>,
 ) -> Result<Document<'input, crate::xml::dom::storage::Accounted<'w, W>>, XmlDocumentError> {
-    preflight_document_limits_in(xml, settings, budget, storage)?;
+    let preflight_peak = limit_pass_unless_parser_enforces(xml, settings, budget, storage)?;
     charge_semantic_parser_work(budget, xml.len())?;
-    let document = Document::parse_after_limit_preflight_in(
-        xml,
-        ParsingOptions {
-            allow_dtd: settings.allow_dtd,
-            nodes_limit: settings.nodes_limit,
-        },
-        settings.backend,
-        storage,
-    )?;
+    let options = ParsingOptions {
+        allow_dtd: settings.allow_dtd,
+        nodes_limit: settings.nodes_limit,
+    };
+    let document = match preflight_peak {
+        Some(_) => {
+            Document::parse_after_limit_preflight_in(xml, options, settings.backend, storage)?
+        }
+        #[cfg(feature = "xml-backend-xmloxide")]
+        None => {
+            Document::parse_enforcing_limits_in(xml, options, parse_limits(settings), storage)
+                .map_err(|refused| match refused {
+                    crate::xml::dom::Refused::Limit(refusal) => limit_refusal(refusal),
+                    crate::xml::dom::Refused::Parse(error) => error.into(),
+                })?
+                .0
+        }
+        #[cfg(not(feature = "xml-backend-xmloxide"))]
+        None => unreachable!("only xmloxide enforces limits while it parses"),
+    };
     validate_document_metrics_in(&document, settings.depth_limit, storage)?;
     Ok(document)
 }
@@ -2554,6 +2569,57 @@ fn preflight_document_limits(
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<usize, XmlDocumentError> {
     preflight_document_limits_in(xml, settings, budget, NativeXmlStorage)
+}
+
+/// The limit pass before the parser, returning the peak namespace bindings,
+/// or `None` for a document whose parser enforces the limits as it reads it,
+/// which leaves only the size check before the parse.
+fn limit_pass_unless_parser_enforces<S: NameStorage>(
+    xml: &str,
+    settings: DocumentParseSettings,
+    budget: Option<&XmlParseWorkBudget>,
+    storage: S,
+) -> Result<Option<usize>, XmlDocumentError> {
+    if settings.backend.records_positions(xml) {
+        check_document_size(xml, settings)?;
+        return Ok(None);
+    }
+    preflight_document_limits_in(xml, settings, budget, storage).map(Some)
+}
+
+fn check_document_size(xml: &str, settings: DocumentParseSettings) -> Result<(), XmlDocumentError> {
+    if xml.len() > settings.max_bytes {
+        return Err(XmlDocumentError::DocumentTooLarge {
+            maximum: settings.max_bytes,
+            actual: xml.len(),
+        });
+    }
+    Ok(())
+}
+
+/// The limits a parser enforces as it reads a document under `settings`.
+#[cfg(feature = "xml-backend-xmloxide")]
+fn parse_limits(settings: DocumentParseSettings) -> crate::xml::dom::ParseLimits {
+    crate::xml::dom::ParseLimits {
+        nodes: settings.nodes_limit,
+        depth: settings.depth_limit,
+        namespace_bindings: settings.namespace_bindings_limit,
+    }
+}
+
+/// The refusal for the limit a parse stopped at, as the limit pass reports it.
+#[cfg(feature = "xml-backend-xmloxide")]
+fn limit_refusal(refusal: crate::xml::dom::LimitRefusal) -> XmlDocumentError {
+    use crate::xml::dom::LimitRefusal;
+    match refusal {
+        LimitRefusal::Nodes => XmlDocumentError::Parse(ParseError::NodesLimitReached),
+        LimitRefusal::Depth { maximum, actual } => {
+            XmlDocumentError::DocumentTooDeep { maximum, actual }
+        }
+        LimitRefusal::NamespaceBindings { maximum, actual } => {
+            XmlDocumentError::Parse(ParseError::NamespaceBindingLimitReached { maximum, actual })
+        }
+    }
 }
 
 /// Enforce every policy limit on `xml` in one charged lexical pass, for a
@@ -2574,14 +2640,9 @@ fn preflight_document_limits_in<S: NameStorage>(
     budget: Option<&XmlParseWorkBudget>,
     storage: S,
 ) -> Result<usize, XmlDocumentError> {
-    // This bounded lexical pass is the first parser stage for every entry
-    // point, before either backend is allowed to construct a DOM.
-    if xml.len() > settings.max_bytes {
-        return Err(XmlDocumentError::DocumentTooLarge {
-            maximum: settings.max_bytes,
-            actual: xml.len(),
-        });
-    }
+    // This bounded lexical pass precedes any DOM construction wherever the
+    // parser does not enforce the limits itself.
+    check_document_size(xml, settings)?;
     charge_parse_work(budget, xml.len())?;
     let mut dtd = InternalDtd::new(storage);
     let mut expansion_stack = storage.names();
@@ -3948,21 +4009,36 @@ fn find_unquoted_byte(bytes: &[u8], needle: u8, start: usize) -> Option<usize> {
     None
 }
 
+/// Parses `source` after the limit pass that found `preflight_peak` namespace
+/// bindings, or, for `None`, with a parser that enforces the limits as it
+/// reads; returns the document's peak namespace bindings either way.
 fn parse_semantic_document(
     source: &str,
     settings: DocumentParseSettings,
-) -> Result<(Document<'_>, DocumentMetrics), XmlDocumentError> {
-    let document = Document::parse_after_limit_preflight_with_backend(
-        source,
-        ParsingOptions {
-            allow_dtd: settings.allow_dtd,
-            nodes_limit: settings.nodes_limit,
-        },
-        settings.backend,
-    )
-    .map_err(XmlDocumentError::Parse)?;
+    preflight_peak: Option<usize>,
+) -> Result<(Document<'_>, DocumentMetrics, usize), XmlDocumentError> {
+    let options = ParsingOptions {
+        allow_dtd: settings.allow_dtd,
+        nodes_limit: settings.nodes_limit,
+    };
+    let (document, peak) = match preflight_peak {
+        Some(peak) => (
+            Document::parse_after_limit_preflight_with_backend(source, options, settings.backend)
+                .map_err(XmlDocumentError::Parse)?,
+            peak,
+        ),
+        #[cfg(feature = "xml-backend-xmloxide")]
+        None => Document::parse_enforcing_limits(source, options, parse_limits(settings)).map_err(
+            |refused| match refused {
+                crate::xml::dom::Refused::Limit(refusal) => limit_refusal(refusal),
+                crate::xml::dom::Refused::Parse(error) => XmlDocumentError::Parse(error),
+            },
+        )?,
+        #[cfg(not(feature = "xml-backend-xmloxide"))]
+        None => unreachable!("only xmloxide enforces limits while it parses"),
+    };
     let metrics = validate_document_metrics(&document, settings.depth_limit)?;
-    Ok((document, metrics))
+    Ok((document, metrics, peak))
 }
 
 fn validate_document_metrics(
@@ -4346,6 +4422,9 @@ mod entity_ceiling_tests;
 
 #[cfg(test)]
 mod replacement_tests;
+
+#[cfg(all(test, feature = "xml-backend-xmloxide"))]
+mod parser_limit_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4744,13 +4823,15 @@ mod tests {
     #[cfg(feature = "xmldsig")]
     #[test]
     fn byte_decoding_and_parsing_share_one_work_allowance() {
-        // UTF-16 decoding consumes its source bytes; preflight and the two
+        // UTF-16 decoding consumes its source bytes; the limit pass, where
+        // the parser does not enforce the limits as it reads, and the two
         // parser/projection passes then consume normalized UTF-8 bytes.
         let xml = "<r/>";
         let mut bytes = vec![0xff, 0xfe];
         bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
-        let required = bytes.len() + 3 * xml.len();
         for backend in XmlBackend::available() {
+            let passes = if backend.records_positions(xml) { 2 } else { 3 };
+            let required = bytes.len() + passes * xml.len();
             let mut policy = crate::policy::VerificationPolicy::default();
             policy.resources.max_xml_parse_work_bytes = required - 1;
             assert!(matches!(
@@ -4775,7 +4856,7 @@ mod tests {
         let settings = DocumentParseSettings::default();
         let xml =
             r#"<root xmlns:p="urn:test"><p:item ID="target"><![CDATA[value]]></p:item></root>"#;
-        let retained = build_semantic_cell(xml.to_owned(), settings, 1, 0)
+        let retained = build_semantic_cell(xml.to_owned(), settings, Some(1), 0)
             .expect("selected backend semantic projection must parse");
         retained.with_dependent(|_, parsed| {
             let item = parsed
@@ -5415,11 +5496,11 @@ mod tests {
     fn selected_backend_enforces_exact_depth_boundary() {
         let settings = DocumentParseSettings::new_with_depth(false, 128, 2, 4_096);
         let accepted = nested_document(2);
-        build_semantic_cell(accepted, settings, 0, 0).expect("exact depth must parse");
+        build_semantic_cell(accepted, settings, Some(0), 0).expect("exact depth must parse");
 
         let rejected = nested_document(3);
         assert!(matches!(
-            build_semantic_cell(rejected, settings, 0, 0),
+            build_semantic_cell(rejected, settings, Some(0), 0),
             Err(XmlDocumentError::DocumentTooDeep {
                 maximum: 2,
                 actual: 3,
@@ -6049,7 +6130,11 @@ mod tests {
         .into_iter()
         .filter(|backend| backend.is_available())
         {
-            let expected = xml.len() * 3;
+            // The limit pass, where the parser does not enforce the limits
+            // as it reads, and the parse and its projection each charge the
+            // source length.
+            let passes = if backend.records_positions(xml) { 2 } else { 3 };
+            let expected = xml.len() * passes;
             let budget = XmlParseWorkBudget::with_limit(expected);
             parse_borrowed_with_settings_and_budget(
                 xml,

@@ -8,6 +8,8 @@
 pub(crate) mod benchmark;
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 mod differential;
+#[cfg(feature = "xml-backend-xmloxide")]
+mod limits;
 mod preflight;
 #[cfg(feature = "xml-backend-roxmltree")]
 mod roxmltree;
@@ -20,6 +22,8 @@ mod xmloxide;
 use alloc::string::String;
 use core::fmt;
 
+#[cfg(feature = "xml-backend-xmloxide")]
+pub(crate) use self::limits::{LimitCounter, LimitRefusal, ParseLimits};
 use self::preflight::LexicalPreflight;
 #[cfg(feature = "xml-backend-xmloxide")]
 pub(crate) use self::preflight::{PositionRecorder, SourceKind, SourceNode};
@@ -36,6 +40,15 @@ pub struct ParsingOptions {
     pub allow_dtd: bool,
     /// Maximum retained semantic node count.
     pub nodes_limit: u32,
+}
+
+/// Why a parse that enforced its policy limits produced no document.
+#[cfg(feature = "xml-backend-xmloxide")]
+pub(crate) enum Refused<E> {
+    /// The document passes one of its limits.
+    Limit(LimitRefusal),
+    /// The parse failed otherwise.
+    Parse(E),
 }
 
 impl Default for ParsingOptions {
@@ -94,9 +107,10 @@ impl XmlBackend {
     }
 
     /// Whether this parse needs no lexical scan: xmloxide knows every source
-    /// range, and only a DOCTYPE, whose keyword is case-sensitive (XML 1.0
-    /// production 28), brings declarations and entity expansion.
-    fn records_positions(self, input: &str) -> bool {
+    /// range and enforces the policy limits as it reads, and only a DOCTYPE,
+    /// whose keyword is case-sensitive (XML 1.0 production 28), brings
+    /// declarations and entity expansion, which a scan must bound first.
+    pub(crate) fn records_positions(self, input: &str) -> bool {
         cfg!(feature = "xml-backend-xmloxide")
             && self == Self::Xmloxide
             && !input.contains("<!DOCTYPE")

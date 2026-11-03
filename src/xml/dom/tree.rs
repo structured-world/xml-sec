@@ -506,6 +506,33 @@ impl<'input> Document<'input> {
         backend.parse(input, options, &preflight)
     }
 
+    /// Parses an input whose policy limits the backend enforces as it reads
+    /// (see [`XmlBackend::records_positions`]), returning the document with
+    /// the most namespace bindings it had in scope at once.
+    #[cfg(feature = "xml-backend-xmloxide")]
+    pub(crate) fn parse_enforcing_limits(
+        input: &'input str,
+        options: ParsingOptions,
+        limits: super::ParseLimits,
+    ) -> Result<(Self, usize), super::Refused<ParseError>> {
+        super::xmloxide::XmloxideBackend::parse_enforcing_limits(input, options, limits)
+    }
+
+    /// [`parse_enforcing_limits`](Self::parse_enforcing_limits) in the
+    /// current query's storage.
+    #[cfg(all(feature = "xmldsig", feature = "xml-backend-xmloxide"))]
+    pub(crate) fn parse_enforcing_limits_in<'w, W: structured_asn1::memory::Work>(
+        input: &'input str,
+        options: ParsingOptions,
+        limits: super::ParseLimits,
+        storage: super::storage::Accounted<'w, W>,
+    ) -> Result<
+        (Document<'input, super::storage::Accounted<'w, W>>, usize),
+        super::Refused<super::AccountedParseError>,
+    > {
+        super::xmloxide::XmloxideBackend::parse_enforcing_limits_in(input, options, limits, storage)
+    }
+
     #[cfg(feature = "xmldsig")]
     pub(crate) fn parse_after_limit_preflight_in<'w, W: structured_asn1::memory::Work>(
         input: &'input str,

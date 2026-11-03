@@ -5,7 +5,7 @@
 
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{Native, Storage, Values};
-use crate::xml::dom::{PositionRecorder, SourceKind, SourceNode};
+use crate::xml::dom::{LimitCounter, ParseLimits, PositionRecorder, SourceKind, SourceNode};
 
 use crate::parser_xmloxide::error::{ErrorSeverity, ParseDiagnostic};
 use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
@@ -72,6 +72,11 @@ const MAX_ENTITY_DEPTH: u32 = 32;
 /// A parsed document with the source ranges of its nodes.
 pub(crate) type Located<S> = (Document<S>, <S as Storage>::Values<SourceNode>);
 type Finished<S> = (Document<S>, Option<PositionRecorder<S>>);
+/// A parse, with the limit counter that outlives a failed parse.
+type Counted<S> = (Result<Finished<S>, ParseError<S>>, Option<LimitCounter<S>>);
+/// A parse that enforced its limits, with the counter that names a limit it
+/// stopped at.
+pub(crate) type Limited<S> = (Result<Located<S>, ParseError<S>>, LimitCounter<S>);
 
 /// The core XML parser.
 pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
@@ -98,6 +103,8 @@ pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
     entity_depth: u32,
     /// Source ranges of the nodes, when the caller has no lexical sidecar.
     positions: Option<PositionRecorder<S>>,
+    /// The policy limits, when no pass before the parser enforced them.
+    limits: Option<LimitCounter<S>>,
 }
 
 impl<'a> XmlParser<'a> {
@@ -136,24 +143,72 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             expansion_size: 0,
             entity_depth: 0,
             positions: None,
+            limits: None,
         })
     }
 
     /// Main parse entry point. Parses the entire document.
     pub fn parse(self) -> Result<Document<S>, ParseError<S>> {
-        self.parse_tree().map(|(document, _)| document)
+        self.parse_tree().0.map(|(document, _)| document)
     }
 
     /// Parses a document without a DOCTYPE and returns its nodes' source ranges,
     /// in the order the projector visits them.
     pub(crate) fn parse_recording_positions(mut self) -> Result<Located<S>, ParseError<S>> {
         self.positions = Some(PositionRecorder::new(self.storage)?);
-        let (document, positions) = self.parse_tree()?;
+        let (document, positions) = self.parse_tree().0?;
         let positions = positions.expect("recording was enabled above");
         Ok((document, positions.into_nodes()))
     }
 
-    fn parse_tree(mut self) -> Result<Finished<S>, ParseError<S>> {
+    /// Parses a document without a DOCTYPE as
+    /// [`parse_recording_positions`](Self::parse_recording_positions) does,
+    /// refusing it at the first of `limits` it passes before allocating the
+    /// node that passes it.
+    ///
+    /// # Errors
+    /// Returns a resource refusal when the counter cannot be set up; the
+    /// parse's own outcome is the first member of the result.
+    pub(crate) fn parse_enforcing_limits(
+        mut self,
+        limits: ParseLimits,
+    ) -> Result<Limited<S>, ParseError<S>> {
+        self.positions = Some(PositionRecorder::new(self.storage)?);
+        self.limits = Some(LimitCounter::new(limits, self.storage)?);
+        let (parsed, counter) = self.parse_tree();
+        let located = parsed.map(|(document, positions)| {
+            let positions = positions.expect("recording was enabled above");
+            (document, positions.into_nodes())
+        });
+        Ok((located, counter.expect("limits were enabled above")))
+    }
+
+    /// Report a construct to the limit counter, if the parse enforces limits.
+    fn limit(
+        &mut self,
+        report: impl FnOnce(&mut LimitCounter<S>) -> Result<(), crate::xml::dom::ParseError>,
+    ) -> Result<(), ParseError<S>> {
+        if let Some(limits) = &mut self.limits {
+            report(limits)?;
+        }
+        Ok(())
+    }
+
+    /// The parse, and the limit counter, which outlives a failed parse.
+    fn parse_tree(mut self) -> Counted<S> {
+        let parsed = self.parse_document();
+        let limits = self.limits.take();
+        let finished = parsed.map(|()| {
+            // Sync diagnostics from input to document before returning.
+            self.doc.diagnostics = self.input.diagnostics;
+            // Parsing is complete and the parser is consumed. Moving the arena
+            // avoids Document::default allocating a replacement tree on return.
+            (self.doc, self.positions)
+        });
+        (finished, limits)
+    }
+
+    fn parse_document(&mut self) -> Result<(), ParseError<S>> {
         // Parse optional XML declaration — must be at the very start of the
         // document with no leading whitespace (XML 1.0 §2.8).
         if self.input.looking_at(b"<?xml ")
@@ -212,13 +267,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         if !self.input.at_end() && !self.options.recover {
             return Err(self.input.fatal("content after document element"));
         }
-
-        // Sync diagnostics from input to document before returning.
-        self.doc.diagnostics = self.input.diagnostics;
-
-        // Parsing is complete and the parser is consumed. Moving the arena
-        // avoids Document::default allocating a replacement tree on return.
-        Ok((self.doc, self.positions))
+        Ok(())
     }
 
     // --- XML Declaration ---
@@ -246,6 +295,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             // regardless of how many blank lines appear in the source.
             let ws = self.input.consume_whitespace()?;
             if !ws.is_empty() {
+                if let Some(limits) = &mut self.limits {
+                    limits.markup();
+                }
                 let ws_node = self.doc.try_create_node(NodeKind::Text {
                     content: self.storage.text("\n")?,
                 })?;
@@ -781,10 +833,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         &mut self,
         parent: NodeId,
     ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
-        self.input.increment_depth()?;
-        if let Some(positions) = &mut self.positions {
-            positions.start_element(self.input.pos())?;
-        }
+        let start = self.input.pos();
         self.input.expect_byte(b'<')?;
         let name = self.input.parse_name()?;
         let mut attributes = self.storage.values(0)?;
@@ -800,6 +849,29 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             }
             let attr = self.parse_attribute()?;
             attributes.push(attr)?;
+        }
+
+        // The tag is read; it is refused for a limit before it is checked
+        // or allocated, as a pass before the parser refused it.
+        let empty = self.input.looking_at(b"/>");
+        self.limit(|limits| {
+            limits.start_element(
+                attributes.iter().filter_map(|attribute| {
+                    let prefix = match attribute.prefix.as_deref() {
+                        Some("xmlns") => attribute.name.as_ref(),
+                        None if attribute.name.as_ref() == "xmlns" => "",
+                        _ => return None,
+                    };
+                    Some((prefix, attribute.value.is_empty()))
+                }),
+                empty,
+            )
+        })?;
+        // The absolute nesting ceilings follow the policy's own depth limit,
+        // which may equal them and is the refusal a document reports.
+        self.input.increment_depth()?;
+        if let Some(positions) = &mut self.positions {
+            positions.start_element(start)?;
         }
 
         self.check_attribute_spellings(&attributes)?;
@@ -935,6 +1007,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         if let Some(positions) = &mut self.positions {
             positions.end_element(self.input.pos());
         }
+        self.limit(LimitCounter::end_element)?;
 
         // Pop the namespace scope when leaving this element (only if we pushed).
         if has_ns_decls {
@@ -973,6 +1046,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // See XML 1.0 §2.4: [14] CharData
 
     fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+        self.limit(LimitCounter::character_data)?;
         let source_start = self.input.pos();
         let mut text = self.storage.text("")?;
 
@@ -1403,6 +1477,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     fn parse_comment(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
         let start = self.input.pos();
         let content = parse_comment_content(&mut self.input)?;
+        self.limit(LimitCounter::node)?;
         let comment_id = self.doc.try_create_node(NodeKind::Comment {
             content: self.storage.text(content)?,
         })?;
@@ -1419,6 +1494,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     fn parse_cdata(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
         let start = self.input.pos();
         let content = parse_cdata_content(&mut self.input)?;
+        self.limit(LimitCounter::character_data)?;
         let cdata_id = self.doc.try_create_node(NodeKind::CData {
             content: self.storage.text(content)?,
         })?;
@@ -1435,6 +1511,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     fn parse_processing_instruction(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
         let start = self.input.pos();
         let (target, data) = parse_pi_content(&mut self.input)?;
+        self.limit(LimitCounter::node)?;
         let pi_id = self.doc.try_create_node(NodeKind::ProcessingInstruction {
             target: self.storage.text(target)?,
             data: self.storage.optional_text(data)?,
