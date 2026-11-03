@@ -2462,7 +2462,7 @@ mod tests {
         // switch to the build default when its containing XML is revalidated.
         let backend = crate::XmlBackend::Roxmltree;
         let document = Document::parse_with_backend(DATA, backend).expect("test XML must parse");
-        let expected_work = DATA.len() * 3;
+        let expected_work = DATA.len() * crate::document::selected_parser_passes();
         let resources = crate::policy::ResourcePolicy {
             max_xml_parse_work_bytes: expected_work,
             ..crate::policy::ResourcePolicy::default()

@@ -88,7 +88,7 @@
          f.debug_struct("ParseOptions")
              .field("recover", &self.recover)
              .field("no_blanks", &self.no_blanks)
-@@ -238,6 +239,14 @@
+@@ -238,6 +239,24 @@
  /// Returns `ParseError` if the input is not well-formed XML and recovery
  /// mode is not enabled.
  pub fn parse_str_with_options(input: &str, options: &ParseOptions) -> Result<Document, ParseError> {
@@ -103,6 +103,16 @@
 +    options: &ParseOptions,
 +) -> Result<(Document, alloc::vec::Vec<crate::xml::dom::SourceNode>), ParseError> {
 +    xml::XmlParser::new(input, options)?.parse_recording_positions()
++}
++
++/// Parses a document without a DOCTYPE as [`parse_str_recording_positions`]
++/// does, enforcing `limits` as it reads.
++pub(crate) fn parse_str_enforcing_limits(
++    input: &str,
++    options: &ParseOptions,
++    limits: crate::xml::dom::ParseLimits,
++) -> Result<xml::Limited<crate::xml::dom::storage::Native>, ParseError> {
++    xml::XmlParser::new(input, options)?.parse_enforcing_limits(limits)
 +}
 --- a/xmloxide/src/parser/input.rs
 +++ b/xmloxide/src/parser/input.rs
@@ -4115,7 +4125,7 @@
 -use crate::validation::dtd::{parse_dtd, serialize_dtd, AttributeDecl, AttributeType, EntityKind};
 +use crate::xml::dom::storage::names::{NameStorage, Names};
 +use crate::xml::dom::storage::{Native, Storage, Values};
-+use crate::xml::dom::{PositionRecorder, SourceKind, SourceNode};
++use crate::xml::dom::{LimitCounter, ParseLimits, PositionRecorder, SourceKind, SourceNode};
 +
 +use crate::parser_xmloxide::error::{ErrorSeverity, ParseDiagnostic};
 +use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
@@ -4171,13 +4181,18 @@
  
  /// Default maximum amplification factor for entity/attribute expansion.
  ///
-@@ -32,56 +69,91 @@
+@@ -32,56 +69,146 @@
  /// resolver-provided external entities and stack safety.
  const MAX_ENTITY_DEPTH: u32 = 32;
  
 +/// A parsed document with the source ranges of its nodes.
 +pub(crate) type Located<S> = (Document<S>, <S as Storage>::Values<SourceNode>);
 +type Finished<S> = (Document<S>, Option<PositionRecorder<S>>);
++/// A parse, with the limit counter that outlives a failed parse.
++type Counted<S> = (Result<Finished<S>, ParseError<S>>, Option<LimitCounter<S>>);
++/// A parse that enforced its limits, with the counter that names a limit it
++/// stopped at.
++pub(crate) type Limited<S> = (Result<Located<S>, ParseError<S>>, LimitCounter<S>);
 +
  /// The core XML parser.
 -pub(crate) struct XmlParser<'a> {
@@ -4212,6 +4227,8 @@
      entity_depth: u32,
 +    /// Source ranges of the nodes, when the caller has no lexical sidecar.
 +    positions: Option<PositionRecorder<S>>,
++    /// The policy limits, when no pass before the parser enforced them.
++    limits: Option<LimitCounter<S>>,
  }
  
  impl<'a> XmlParser<'a> {
@@ -4259,29 +4276,77 @@
              entity_depth: 0,
 -        }
 +            positions: None,
++            limits: None,
 +        })
      }
  
      /// Main parse entry point. Parses the entire document.
 -    pub fn parse(&mut self) -> Result<Document, ParseError> {
 +    pub fn parse(self) -> Result<Document<S>, ParseError<S>> {
-+        self.parse_tree().map(|(document, _)| document)
++        self.parse_tree().0.map(|(document, _)| document)
 +    }
 +
 +    /// Parses a document without a DOCTYPE and returns its nodes' source ranges,
 +    /// in the order the projector visits them.
 +    pub(crate) fn parse_recording_positions(mut self) -> Result<Located<S>, ParseError<S>> {
 +        self.positions = Some(PositionRecorder::new(self.storage)?);
-+        let (document, positions) = self.parse_tree()?;
++        let (document, positions) = self.parse_tree().0?;
 +        let positions = positions.expect("recording was enabled above");
 +        Ok((document, positions.into_nodes()))
 +    }
 +
-+    fn parse_tree(mut self) -> Result<Finished<S>, ParseError<S>> {
++    /// Parses a document without a DOCTYPE as
++    /// [`parse_recording_positions`](Self::parse_recording_positions) does,
++    /// refusing it at the first of `limits` it passes before allocating the
++    /// node that passes it.
++    ///
++    /// # Errors
++    /// Returns a resource refusal when the counter cannot be set up; the
++    /// parse's own outcome is the first member of the result.
++    pub(crate) fn parse_enforcing_limits(
++        mut self,
++        limits: ParseLimits,
++    ) -> Result<Limited<S>, ParseError<S>> {
++        self.positions = Some(PositionRecorder::new(self.storage)?);
++        self.limits = Some(LimitCounter::new(limits, self.storage)?);
++        let (parsed, counter) = self.parse_tree();
++        let located = parsed.map(|(document, positions)| {
++            let positions = positions.expect("recording was enabled above");
++            (document, positions.into_nodes())
++        });
++        Ok((located, counter.expect("limits were enabled above")))
++    }
++
++    /// Report a construct to the limit counter, if the parse enforces limits.
++    fn limit(
++        &mut self,
++        report: impl FnOnce(&mut LimitCounter<S>) -> Result<(), crate::xml::dom::ParseError>,
++    ) -> Result<(), ParseError<S>> {
++        if let Some(limits) = &mut self.limits {
++            report(limits)?;
++        }
++        Ok(())
++    }
++
++    /// The parse, and the limit counter, which outlives a failed parse.
++    fn parse_tree(mut self) -> Counted<S> {
++        let parsed = self.parse_document();
++        let limits = self.limits.take();
++        let finished = parsed.map(|()| {
++            // Sync diagnostics from input to document before returning.
++            self.doc.diagnostics = self.input.diagnostics;
++            // Parsing is complete and the parser is consumed. Moving the arena
++            // avoids Document::default allocating a replacement tree on return.
++            (self.doc, self.positions)
++        });
++        (finished, limits)
++    }
++
++    fn parse_document(&mut self) -> Result<(), ParseError<S>> {
          // Parse optional XML declaration — must be at the very start of the
          // document with no leading whitespace (XML 1.0 §2.8).
          if self.input.looking_at(b"<?xml ")
-@@ -91,12 +163,12 @@
+@@ -91,12 +218,12 @@
              self.parse_xml_declaration()?;
              // Skip whitespace immediately after the XML declaration — the
              // serializer always emits its own newline after the declaration.
@@ -4296,7 +4361,7 @@
              // But if the whitespace was hiding an XML declaration, that's an error
              if had_leading_ws
                  && (self.input.looking_at(b"<?xml ")
-@@ -128,7 +200,7 @@
+@@ -128,7 +255,7 @@
              self.parse_element(self.doc.root())?;
          } else if self.options.recover {
              self.input
@@ -4305,7 +4370,7 @@
          } else {
              return Err(self.input.fatal("missing root element"));
          }
-@@ -136,40 +208,47 @@
+@@ -136,40 +263,44 @@
          // Parse trailing content (comments, PIs after root element)
          self.parse_misc(self.doc.root())?;
  
@@ -4314,15 +4379,12 @@
          if !self.input.at_end() && !self.options.recover {
              return Err(self.input.fatal("content after document element"));
          }
- 
-         // Sync diagnostics from input to document before returning.
+-
+-        // Sync diagnostics from input to document before returning.
 -        self.doc.diagnostics = std::mem::take(&mut self.input.diagnostics);
-+        self.doc.diagnostics = self.input.diagnostics;
- 
+-
 -        Ok(std::mem::take(&mut self.doc))
-+        // Parsing is complete and the parser is consumed. Moving the arena
-+        // avoids Document::default allocating a replacement tree on return.
-+        Ok((self.doc, self.positions))
++        Ok(())
      }
  
      // --- XML Declaration ---
@@ -4358,13 +4420,16 @@
 -                let ws_node = self.doc.create_node(NodeKind::Text {
 -                    content: "\n".to_string(),
 -                });
++                if let Some(limits) = &mut self.limits {
++                    limits.markup();
++                }
 +                let ws_node = self.doc.try_create_node(NodeKind::Text {
 +                    content: self.storage.text("\n")?,
 +                })?;
                  self.doc.append_child(parent, ws_node);
              }
              if self.input.at_end() {
-@@ -189,8 +268,49 @@
+@@ -189,8 +320,49 @@
      // --- DOCTYPE Declaration ---
      // See XML 1.0 §2.8: [28] doctypedecl
  
@@ -4416,7 +4481,7 @@
          // Consume <!DOCTYPE (case-insensitive match already checked by caller)
          self.input.expect_str(b"<!DOCTYPE")?;
          self.input.skip_whitespace_required()?;
-@@ -198,7 +318,7 @@
+@@ -198,7 +370,7 @@
          // Read the root element name
          let name = self.input.parse_name()?;
  
@@ -4425,7 +4490,7 @@
  
          // Check for external ID: SYSTEM or PUBLIC
          let mut system_id = None;
-@@ -208,23 +328,17 @@
+@@ -208,23 +380,17 @@
              self.input.expect_str(b"SYSTEM")?;
              self.input.skip_whitespace_required()?;
              system_id = Some(self.input.parse_quoted_value()?);
@@ -4452,13 +4517,14 @@
          }
  
          // Flag whether there's an external DTD subset. Per XML 1.0 §4.1 WFC:
-@@ -237,142 +351,82 @@
+@@ -237,142 +403,82 @@
          // Parse optional internal subset: [ ... ]
          let mut internal_subset = None;
          if self.input.peek() == Some(b'[') {
 -            self.input.advance(1);
 -            let start = self.input.pos();
--
++            let subset_text = self.scan_internal_subset()?;
+ 
 -            // Scan to matching ']', tracking depth for bracket chars inside
 -            // entity values. Quoted strings and comments are skipped to avoid
 -            // misinterpreting brackets or apostrophes in comments.
@@ -4497,8 +4563,7 @@
 -                    .input
 -                    .fatal("unexpected end of input in internal subset"));
 -            }
-+            let subset_text = self.scan_internal_subset()?;
- 
+-
 -            // Extract the internal subset text (between '[' and ']').
 -            let end = self.input.pos() - 1; // exclude the closing ']'
 -            let subset_text = std::str::from_utf8(self.input.slice(start, end))
@@ -4636,7 +4701,7 @@
          self.doc.append_child(parent, doctype_id);
          Ok(())
      }
-@@ -380,535 +434,515 @@
+@@ -380,535 +486,536 @@
      // --- Elements ---
      // See XML 1.0 §3.1: [40] STag, [42] ETag, [44] EmptyElemTag
  
@@ -5249,10 +5314,7 @@
 +        &mut self,
 +        parent: NodeId,
 +    ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
-+        self.input.increment_depth()?;
-+        if let Some(positions) = &mut self.positions {
-+            positions.start_element(self.input.pos())?;
-+        }
++        let start = self.input.pos();
 +        self.input.expect_byte(b'<')?;
 +        let name = self.input.parse_name()?;
 +        let mut attributes = self.storage.values(0)?;
@@ -5312,20 +5374,27 @@
 -                    attr.namespace = resolved;
 -                }
 -            }
-+        self.check_attribute_spellings(&attributes)?;
-+        self.apply_attribute_defaults(name, &mut attributes)?;
-+
-+        // --- Namespace processing (Namespaces in XML 1.0 section 3) ---
-+
-+        // Check for namespace declarations to skip namespace scope push/pop
-+        // when not needed. Skip the scan entirely when there are no attributes.
-+        let has_ns_decls = !attributes.is_empty()
-+            && attributes.iter().any(|a| {
-+                a.prefix.as_deref() == Some("xmlns")
-+                    || (a.prefix.is_none() && a.name.as_ref() == "xmlns")
-+            });
-+        if has_ns_decls {
-+            self.ns.push_scope()?;
++        // The tag is read; it is refused for a limit before it is checked
++        // or allocated, as a pass before the parser refused it.
++        let empty = self.input.looking_at(b"/>");
++        self.limit(|limits| {
++            limits.start_element(
++                attributes.iter().filter_map(|attribute| {
++                    let prefix = match attribute.prefix.as_deref() {
++                        Some("xmlns") => attribute.name.as_ref(),
++                        None if attribute.name.as_ref() == "xmlns" => "",
++                        _ => return None,
++                    };
++                    Some((prefix, attribute.value.is_empty()))
++                }),
++                empty,
++            )
++        })?;
++        // The absolute nesting ceilings follow the policy's own depth limit,
++        // which may equal them and is the refusal a document reports.
++        self.input.increment_depth()?;
++        if let Some(positions) = &mut self.positions {
++            positions.start_element(start)?;
          }
  
 -        // Namespace-aware attribute uniqueness: two attributes with the same
@@ -5368,6 +5437,22 @@
 -                        }
 -                    }
 -                }
++        self.check_attribute_spellings(&attributes)?;
++        self.apply_attribute_defaults(name, &mut attributes)?;
++
++        // --- Namespace processing (Namespaces in XML 1.0 section 3) ---
++
++        // Check for namespace declarations to skip namespace scope push/pop
++        // when not needed. Skip the scan entirely when there are no attributes.
++        let has_ns_decls = !attributes.is_empty()
++            && attributes.iter().any(|a| {
++                a.prefix.as_deref() == Some("xmlns")
++                    || (a.prefix.is_none() && a.name.as_ref() == "xmlns")
++            });
++        if has_ns_decls {
++            self.ns.push_scope()?;
++        }
++
 +        // Split into prefix and local name for namespace processing.
 +        let (prefix, local_name) = split_name(name);
 +
@@ -5518,6 +5603,7 @@
 +        if let Some(positions) = &mut self.positions {
 +            positions.end_element(self.input.pos());
 +        }
++        self.limit(LimitCounter::end_element)?;
  
          // Pop the namespace scope when leaving this element (only if we pushed).
          if has_ns_decls {
@@ -5531,7 +5617,7 @@
      }
  
      /// Normalizes an attribute value based on its DTD-declared type.
-@@ -921,105 +955,61 @@
+@@ -921,105 +1028,62 @@
          element_name: &str,
          attr_name: &str,
          value: &str,
@@ -5601,6 +5687,7 @@
 -    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError> {
 -        let mut text = String::new();
 +    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
++        self.limit(LimitCounter::character_data)?;
 +        let source_start = self.input.pos();
 +        let mut text = self.storage.text("")?;
  
@@ -5663,7 +5750,7 @@
                      }
                  }
                  continue;
-@@ -1034,10 +1024,10 @@
+@@ -1034,10 +1098,10 @@
                  if self.options.recover {
                      self.input.push_diagnostic(
                          ErrorSeverity::Error,
@@ -5678,7 +5765,7 @@
                      continue;
                  }
                  return Err(self.input.fatal("']]>' not allowed in character data"));
-@@ -1049,15 +1039,13 @@
+@@ -1049,15 +1113,13 @@
                  // node is created and the entity's replacement text is parsed
                  // as content, attached as children of the EntityRef node.
                  // Skip the peek for builtins at byte level to avoid String allocation.
@@ -5699,7 +5786,7 @@
                          self.doc.append_child(parent, text_id);
                      }
                      self.parse_entity_ref_in_content(parent)?;
-@@ -1066,17 +1054,24 @@
+@@ -1066,17 +1128,24 @@
                  self.input.parse_reference_into(&mut text)?;
              } else {
                  let ch = self.input.next_char()?;
@@ -5728,7 +5815,7 @@
          }
  
          Ok(())
-@@ -1089,60 +1084,82 @@
+@@ -1089,60 +1158,82 @@
      /// replacement text (XML 1.0 §4.5: character references expanded at
      /// declaration time) as content, attaching the resulting nodes as
      /// children of the `EntityRef` node.
@@ -5855,7 +5942,7 @@
          self.doc.append_child(parent, ref_id);
  
          let Some(replacement) = replacement else {
-@@ -1160,18 +1177,16 @@
+@@ -1160,18 +1251,16 @@
                  .fatal("maximum entity amplification factor exceeded"));
          }
  
@@ -5883,7 +5970,7 @@
          Ok(())
      }
  
-@@ -1187,14 +1202,15 @@
+@@ -1187,14 +1276,15 @@
          entity_name: &str,
          replacement: &str,
          ref_id: NodeId,
@@ -5902,7 +5989,7 @@
          sub.entity_depth = self.entity_depth + 1;
          sub.input_size = self.input_size;
          sub.expansion_size = self.expansion_size;
-@@ -1204,51 +1220,50 @@
+@@ -1204,51 +1294,50 @@
          // enough to overflow the stack).
          sub.input.set_depth(self.input.depth());
          // Move shared state into the sub-parser (returned below).
@@ -5974,7 +6061,7 @@
          Ok(())
      }
  
-@@ -1258,7 +1273,7 @@
+@@ -1258,7 +1347,7 @@
      /// Unlike [`parse_content`](Self::parse_content), end of input is the
      /// normal termination and an end tag (`</`) is an error (it would close
      /// an element opened outside the entity — WFC violation).
@@ -5983,7 +6070,7 @@
          while !self.input.at_end() {
              if self.input.looking_at(b"</") {
                  return Err(self.input.fatal("unbalanced end tag"));
-@@ -1278,20 +1293,9 @@
+@@ -1278,20 +1367,9 @@
          Ok(())
      }
  
@@ -6005,7 +6092,7 @@
      #[inline]
      fn is_looking_at_builtin_entity_ref(&self) -> bool {
          let remaining = self.input.remaining();
-@@ -1306,58 +1310,29 @@
+@@ -1306,58 +1384,29 @@
              || after_amp.starts_with(b"quot;")
      }
  
@@ -6076,7 +6163,7 @@
                      }
                      i = j + 1;
                  } else {
-@@ -1367,17 +1342,17 @@
+@@ -1367,17 +1416,17 @@
                  i += 1;
              }
          }
@@ -6098,7 +6185,7 @@
  
          // Capture raw attribute value text (before entity expansion) so we
          // can preserve entity references during serialization.
-@@ -1390,13 +1365,20 @@
+@@ -1390,13 +1439,20 @@
          // contain no '&' (most attributes have no entity references).
          let raw_value = if raw_end > raw_start + 2 {
              let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
@@ -6121,7 +6208,7 @@
              } else {
                  None
              }
-@@ -1404,12 +1386,12 @@
+@@ -1404,12 +1460,12 @@
              None
          };
  
@@ -6137,7 +6224,7 @@
              namespace: None,
              raw_value,
          })
-@@ -1418,51 +1400,51 @@
+@@ -1418,51 +1474,54 @@
      // --- Comments ---
      // See XML 1.0 §2.5: [15] Comment
  
@@ -6146,6 +6233,7 @@
 +        let start = self.input.pos();
          let content = parse_comment_content(&mut self.input)?;
 -        let comment_id = self.doc.create_node(NodeKind::Comment { content });
++        self.limit(LimitCounter::node)?;
 +        let comment_id = self.doc.try_create_node(NodeKind::Comment {
 +            content: self.storage.text(content)?,
 +        })?;
@@ -6164,6 +6252,7 @@
 +        let start = self.input.pos();
          let content = parse_cdata_content(&mut self.input)?;
 -        let cdata_id = self.doc.create_node(NodeKind::CData { content });
++        self.limit(LimitCounter::character_data)?;
 +        let cdata_id = self.doc.try_create_node(NodeKind::CData {
 +            content: self.storage.text(content)?,
 +        })?;
@@ -6184,6 +6273,7 @@
 -        let pi_id = self
 -            .doc
 -            .create_node(NodeKind::ProcessingInstruction { target, data });
++        self.limit(LimitCounter::node)?;
 +        let pi_id = self.doc.try_create_node(NodeKind::ProcessingInstruction {
 +            target: self.storage.text(target)?,
 +            data: self.storage.optional_text(data)?,
@@ -6214,7 +6304,7 @@
  }
  
  /// Strips an optional leading text declaration (`<?xml ...?>`) from external
-@@ -1471,10 +1453,10 @@
+@@ -1471,10 +1530,10 @@
      let rest = s.strip_prefix("<?xml").filter(|r| {
          r.starts_with(' ') || r.starts_with('\t') || r.starts_with('\r') || r.starts_with('\n')
      });
@@ -6229,7 +6319,7 @@
      }
      s
  }
-@@ -1488,14 +1470,122 @@
+@@ -1488,14 +1547,122 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -6354,7 +6444,7 @@
      fn test_parse_empty_element() {
          let doc = parse("<root/>");
          let root = doc.root_element().unwrap();
-@@ -1660,7 +1750,7 @@
+@@ -1660,7 +1827,7 @@
      fn test_roundtrip_simple() {
          let input = "<root><child>text</child></root>";
          let doc = parse(input);
@@ -6363,7 +6453,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1668,7 +1758,7 @@
+@@ -1668,7 +1835,7 @@
      fn test_roundtrip_attributes() {
          let input = "<root attr=\"value\"><child id=\"1\"/></root>";
          let doc = parse(input);
@@ -6372,7 +6462,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1676,7 +1766,7 @@
+@@ -1676,7 +1843,7 @@
      fn test_roundtrip_entities() {
          let input = "<root>&amp; &lt; &gt;</root>";
          let doc = parse(input);
@@ -6381,7 +6471,7 @@
          // After parsing, entities are resolved to characters.
          // Serialization re-escapes them.
          assert_eq!(output, format!("{DECL}<root>&amp; &lt; &gt;</root>\n"));
-@@ -1686,7 +1776,7 @@
+@@ -1686,7 +1853,7 @@
      fn test_roundtrip_comment() {
          let input = "<root><!-- comment --></root>";
          let doc = parse(input);
@@ -6390,7 +6480,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1694,7 +1784,7 @@
+@@ -1694,7 +1861,7 @@
      fn test_roundtrip_cdata() {
          let input = "<root><![CDATA[data & stuff]]></root>";
          let doc = parse(input);
@@ -6399,7 +6489,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1702,7 +1792,7 @@
+@@ -1702,7 +1869,7 @@
      fn test_roundtrip_pi() {
          let input = "<?target data?><root/>";
          let doc = parse(input);
@@ -6408,7 +6498,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1710,7 +1800,7 @@
+@@ -1710,7 +1877,7 @@
      fn test_roundtrip_xml_declaration() {
          let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
          let doc = parse(input);
@@ -6417,7 +6507,7 @@
          assert_eq!(
              output,
              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root/>\n"
-@@ -1898,13 +1988,13 @@
+@@ -1898,13 +2065,13 @@
          // Simple DOCTYPE (no whitespace between DOCTYPE and root in input)
          let input = "<!DOCTYPE html><html/>";
          let doc = parse(input);
@@ -6433,7 +6523,7 @@
          assert_eq!(
              output,
              format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\"><root/>\n")
-@@ -1914,7 +2004,7 @@
+@@ -1914,7 +2081,7 @@
          let input = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
                        \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>";
          let doc = parse(input);
@@ -6442,7 +6532,7 @@
          assert_eq!(
              output,
              format!(
-@@ -2061,7 +2151,7 @@
+@@ -2061,7 +2228,7 @@
          let element = doc.first_child(entity_ref).unwrap();
          assert_eq!(doc.node_name(element), Some("b"));
          // Serialization re-emits the entity reference, preserving roundtrip.
@@ -6451,7 +6541,7 @@
          assert!(
              out.contains("<d>&e;</d>"),
              "unexpected serialization: {out}"
-@@ -2069,6 +2159,20 @@
+@@ -2069,6 +2236,20 @@
      }
  
      #[test]
@@ -6472,7 +6562,7 @@
      fn test_parse_entity_charref_markup() {
          // "&#60;b>hi&#60;/b>" expands to "<b>hi</b>" at declaration time
          // (§4.5) and must be parsed as markup at reference time.
-@@ -2086,7 +2190,7 @@
+@@ -2086,7 +2267,7 @@
          // inside the entity expansion.
          let input = "<!DOCTYPE d [<!ENTITY e \"<b>hi</b>\">]><d>&e;</d>";
          let doc = parse(input);
@@ -6481,7 +6571,7 @@
          let doc2 = parse(&out);
          let root2 = doc2.root_element().unwrap();
          assert_eq!(doc2.text_content(root2), "hi");
-@@ -2144,9 +2248,9 @@
+@@ -2144,9 +2325,9 @@
              panic!("expected depth-limited parse to fail");
          };
          assert!(
@@ -6493,7 +6583,7 @@
          );
      }
  
-@@ -2169,9 +2273,10 @@
+@@ -2169,9 +2350,10 @@
              panic!("expected amplification attack to be rejected");
          };
          assert!(

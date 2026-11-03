@@ -489,37 +489,64 @@ impl<'input> Document<'input> {
         options: ParsingOptions,
         backend: XmlBackend,
     ) -> Result<Self, ParseError> {
-        let options = crate::document::preflight_dom_limits(input, options)?;
-        Self::parse_after_limit_preflight_with_backend(input, options, backend)
+        crate::document::parse_dom_checked(input, options, backend)
     }
 
-    pub(crate) fn parse_after_limit_preflight_with_backend(
+    /// Parses an input whose lexical pass before the parser `observer`
+    /// checks as it records the source positions.
+    pub(crate) fn parse_observed_with_backend<O: super::ScanObserver<'input>>(
         input: &'input str,
         options: ParsingOptions,
         backend: XmlBackend,
+        observer: &mut O,
     ) -> Result<Self, ParseError> {
-        let preflight = if backend.records_positions(input) {
-            super::LexicalPreflight::unscanned(super::storage::Native)?
-        } else {
-            super::LexicalPreflight::scan(input, options.allow_dtd)?
-        };
+        let preflight = super::LexicalPreflight::scan_observed(input, options.allow_dtd, observer)?;
         backend.parse(input, options, &preflight)
     }
 
+    /// [`parse_observed_with_backend`](Self::parse_observed_with_backend) in
+    /// the current query's storage.
     #[cfg(feature = "xmldsig")]
-    pub(crate) fn parse_after_limit_preflight_in<'w, W: structured_asn1::memory::Work>(
+    pub(crate) fn parse_observed_in<'w, W: structured_asn1::memory::Work, O>(
         input: &'input str,
         options: ParsingOptions,
         backend: XmlBackend,
         storage: super::storage::Accounted<'w, W>,
+        observer: &mut O,
     ) -> Result<Document<'input, super::storage::Accounted<'w, W>>, super::AccountedParseError>
+    where
+        O: super::ScanObserver<'input>,
     {
-        let preflight = if backend.records_positions(input) {
-            super::LexicalPreflight::unscanned(storage)?
-        } else {
-            super::LexicalPreflight::scan_in(input, options.allow_dtd, storage)?
-        };
+        let preflight =
+            super::LexicalPreflight::scan_observed_in(input, options.allow_dtd, storage, observer)?;
         backend.parse_in(input, options, &preflight, storage)
+    }
+
+    /// Parses an input whose policy limits the backend enforces as it reads
+    /// (see [`XmlBackend::records_positions`]), returning the document with
+    /// the most namespace bindings it had in scope at once.
+    #[cfg(feature = "xml-backend-xmloxide")]
+    pub(crate) fn parse_enforcing_limits(
+        input: &'input str,
+        options: ParsingOptions,
+        limits: super::ParseLimits,
+    ) -> Result<(Self, usize), super::Refused<ParseError>> {
+        super::xmloxide::XmloxideBackend::parse_enforcing_limits(input, options, limits)
+    }
+
+    /// [`parse_enforcing_limits`](Self::parse_enforcing_limits) in the
+    /// current query's storage.
+    #[cfg(all(feature = "xmldsig", feature = "xml-backend-xmloxide"))]
+    pub(crate) fn parse_enforcing_limits_in<'w, W: structured_asn1::memory::Work>(
+        input: &'input str,
+        options: ParsingOptions,
+        limits: super::ParseLimits,
+        storage: super::storage::Accounted<'w, W>,
+    ) -> Result<
+        (Document<'input, super::storage::Accounted<'w, W>>, usize),
+        super::Refused<super::AccountedParseError>,
+    > {
+        super::xmloxide::XmloxideBackend::parse_enforcing_limits_in(input, options, limits, storage)
     }
 }
 

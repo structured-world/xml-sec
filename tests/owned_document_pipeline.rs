@@ -96,28 +96,29 @@ fn public_owned_parser_enforces_cumulative_parse_work() {
         )) if actual == xml.len()
     ));
 
-    let dtd_capable = SigningPolicy {
+    // Allowing a DTD adds no parse of its own: one parse, the lexical pass
+    // and the parser reading the source once each, is the whole allowance.
+    let dtd_capable = |max_xml_parse_work_bytes| SigningPolicy {
         xml: xml_sec::policy::XmlInputPolicy {
             allow_internal_dtd: true,
         },
         resources: ResourcePolicy {
-            max_xml_parse_work_bytes: xml.len()
-                * (1 + usize::from(cfg!(feature = "xml-backend-xmloxide"))),
+            max_xml_parse_work_bytes,
             ..ResourcePolicy::default()
         },
         ..SigningPolicy::default()
     };
+    XmlDocument::parse_with_policy(xml, &dtd_capable(2 * xml.len()))
+        .expect("one parse fits its exact allowance");
     assert!(matches!(
-        XmlDocument::parse_with_policy(xml, &dtd_capable),
+        XmlDocument::parse_with_policy(xml, &dtd_capable(2 * xml.len() - 1)),
         Err(XmlDocumentError::Policy(
             xml_sec::policy::PolicyViolation::ResourceLimit {
                 resource: "cumulative XML parse-work bytes",
                 maximum,
                 actual,
             }
-        )) if maximum
-            == xml.len() * (1 + usize::from(cfg!(feature = "xml-backend-xmloxide")))
-            && actual == maximum + xml.len()
+        )) if maximum == 2 * xml.len() - 1 && actual == 2 * xml.len()
     ));
 }
 

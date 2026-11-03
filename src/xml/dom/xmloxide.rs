@@ -9,12 +9,20 @@ use crate::parser_xmloxide as xmloxide;
 use xmloxide::tree::{NodeId as XmloxNodeId, NodeKind as XmloxNodeKind};
 
 use super::{
-    Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackendImplementation,
+    Document, LexicalPreflight, ParseError, ParseLimits, ParsingOptions, Refused,
+    XmlBackendImplementation,
     preflight::{PositionCursor, SourceKind, SourceNode},
     tree::{AttributeData, NamespaceData, NamespaceSet, NodeId, NodeKind, TreeBuilder},
 };
 
 pub(super) struct XmloxideBackend;
+
+/// The parser's failure in storage `S`.
+#[cfg(feature = "xmldsig")]
+type XmloxideError<S> = xmloxide::error::ParseError<
+    <S as Storage>::FrozenText,
+    <S as Storage>::Values<xmloxide::error::ParseDiagnostic<<S as Storage>::FrozenText>>,
+>;
 
 #[cfg(feature = "xmldsig")]
 impl XmloxideBackend {
@@ -55,6 +63,80 @@ impl XmloxideBackend {
         Ok(project_in(
             input, parsed, options, preflight, positions, storage,
         )?)
+    }
+
+    /// [`parse_enforcing_limits`](Self::parse_enforcing_limits) in the
+    /// current query's storage.
+    pub(super) fn parse_enforcing_limits_in<'input, 'w, W: structured_asn1::memory::Work>(
+        input: &'input str,
+        options: ParsingOptions,
+        limits: ParseLimits,
+        storage: super::storage::Accounted<'w, W>,
+    ) -> Result<
+        Limited<'input, super::storage::Accounted<'w, W>>,
+        Refused<super::AccountedParseError>,
+    > {
+        let failure = |error: XmloxideError<super::storage::Accounted<'w, W>>| match error {
+            xmloxide::error::ParseError::Resource(error) => {
+                super::AccountedParseError::Semantic(error)
+            }
+            xmloxide::error::ParseError::Syntax {
+                message,
+                location,
+                diagnostics,
+            } => super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
+                message,
+                location,
+                diagnostics: diagnostics.into_owned(),
+            }),
+        };
+        let (parsed, counter) =
+            xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
+                .and_then(|parser| parser.parse_enforcing_limits(limits))
+                .map_err(|error| Refused::Parse(failure(error)))?;
+        let (parsed, positions) = parsed.map_err(|error| match counter.refusal() {
+            Some(refusal) => Refused::Limit(refusal),
+            None => Refused::Parse(failure(error)),
+        })?;
+        let preflight =
+            LexicalPreflight::unscanned(storage).map_err(|error| Refused::Parse(error.into()))?;
+        let document = project_in(input, parsed, options, &preflight, &positions, storage)
+            .map_err(|error| Refused::Parse(error.into()))?;
+        Ok((document, counter.peak_namespace_bindings()))
+    }
+}
+
+/// A document parsed under its limits, with the most namespace bindings it had
+/// in scope at once.
+pub(super) type Limited<'input, S> = (Document<'input, S>, usize);
+
+impl XmloxideBackend {
+    /// Parses a document without a DOCTYPE, refusing it at the first of
+    /// `limits` it passes as the parser reads it, so no pass over the source
+    /// precedes the parse.
+    pub(super) fn parse_enforcing_limits(
+        input: &str,
+        options: ParsingOptions,
+        limits: ParseLimits,
+    ) -> Result<Limited<'_, Native>, Refused<ParseError>> {
+        let failure = |error| match error {
+            xmloxide::error::ParseError::Resource(error) => error,
+            error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
+                backend: "xmloxide",
+                message: error.to_string(),
+            },
+        };
+        let (parsed, counter) =
+            xmloxide::parser::parse_str_enforcing_limits(input, &backend_options(), limits)
+                .map_err(|error| Refused::Parse(failure(error)))?;
+        let (parsed, positions) = parsed.map_err(|error| match counter.refusal() {
+            Some(refusal) => Refused::Limit(refusal),
+            None => Refused::Parse(failure(error)),
+        })?;
+        let preflight = LexicalPreflight::unscanned(Native).map_err(Refused::Parse)?;
+        let document = project_in(input, parsed, options, &preflight, &positions, Native)
+            .map_err(Refused::Parse)?;
+        Ok((document, counter.peak_namespace_bindings()))
     }
 }
 

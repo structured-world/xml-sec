@@ -161,6 +161,119 @@ impl<'input, 'w, W: structured_asn1::memory::Work>
     }
 }
 
+/// The checks the pass before the parser makes on what it reads, beside
+/// recording source positions, so that one lexical pass serves both.
+pub(crate) trait ScanObserver<'input> {
+    /// A document type declaration, read only where DTDs are allowed; every
+    /// attribute declaration of its internal subset goes to `attribute`.
+    ///
+    /// # Errors
+    /// The check's refusal, or `attribute`'s.
+    fn doctype<F>(&mut self, doctype: &'input str, attribute: F) -> Result<(), ParseError>
+    where
+        F: FnMut(
+            &'input str,
+            &'input str,
+            crate::document::DtdAttributeType,
+        ) -> Result<(), ParseError>;
+
+    /// A start tag or, with `empty`, an empty-element tag: `tag` is its
+    /// source, which starts at `tag_start` in the document.
+    ///
+    /// # Errors
+    /// The check's refusal.
+    fn start_element(
+        &mut self,
+        tag: &'input str,
+        tag_start: usize,
+        attributes: &[xml_sec_xml_input::lexical::Attribute<'input>],
+        empty: bool,
+    ) -> Result<(), ParseError>;
+
+    /// An end tag.
+    ///
+    /// # Errors
+    /// The check's refusal.
+    fn end_element(&mut self) -> Result<(), ParseError>;
+
+    /// Character data inside the document element: text, CDATA, or a
+    /// predefined or character reference.
+    ///
+    /// # Errors
+    /// The check's refusal.
+    fn character_data(&mut self) -> Result<(), ParseError>;
+
+    /// A reference to the general entity `name` in content.
+    ///
+    /// # Errors
+    /// The check's refusal.
+    fn entity_reference(&mut self, name: &'input str) -> Result<(), ParseError>;
+
+    /// A comment or processing instruction.
+    ///
+    /// # Errors
+    /// The check's refusal.
+    fn node(&mut self) -> Result<(), ParseError>;
+
+    /// Markup that is no node: the XML declaration, a document type
+    /// declaration, or whitespace outside the document element.
+    fn markup(&mut self);
+}
+
+/// The scan of a parse that checks nothing beyond the parser's own ceilings.
+#[cfg(any(feature = "benchmark-internals", test))]
+pub(crate) struct Unchecked;
+
+#[cfg(any(feature = "benchmark-internals", test))]
+impl<'input> ScanObserver<'input> for Unchecked {
+    fn doctype<F>(&mut self, doctype: &'input str, mut attribute: F) -> Result<(), ParseError>
+    where
+        F: FnMut(
+            &'input str,
+            &'input str,
+            crate::document::DtdAttributeType,
+        ) -> Result<(), ParseError>,
+    {
+        let mut failure = None;
+        crate::document::visit_dtd_attributes(doctype, |element, name, kind| {
+            if failure.is_none()
+                && let Err(error) = attribute(element, name, kind)
+            {
+                failure = Some(error);
+            }
+        });
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn start_element(
+        &mut self,
+        _: &'input str,
+        _: usize,
+        _: &[xml_sec_xml_input::lexical::Attribute<'input>],
+        _: bool,
+    ) -> Result<(), ParseError> {
+        Ok(())
+    }
+
+    fn end_element(&mut self) -> Result<(), ParseError> {
+        Ok(())
+    }
+
+    fn character_data(&mut self) -> Result<(), ParseError> {
+        Ok(())
+    }
+
+    fn entity_reference(&mut self, _: &'input str) -> Result<(), ParseError> {
+        Ok(())
+    }
+
+    fn node(&mut self) -> Result<(), ParseError> {
+        Ok(())
+    }
+
+    fn markup(&mut self) {}
+}
+
 pub(super) struct LexicalPreflight<'input, S: Storage = Native> {
     nodes: S::Values<SourceNode>,
     attributes: S::Declarations<'input>,
@@ -173,14 +286,24 @@ pub(super) struct LexicalPreflight<'input, S: Storage = Native> {
 }
 
 impl<'input> LexicalPreflight<'input> {
+    #[cfg(any(feature = "benchmark-internals", test))]
     pub(super) fn scan(input: &'input str, allow_dtd: bool) -> Result<Self, ParseError> {
         Self::scan_in(input, allow_dtd, Native)
+    }
+
+    pub(super) fn scan_observed<O: ScanObserver<'input>>(
+        input: &'input str,
+        allow_dtd: bool,
+        observer: &mut O,
+    ) -> Result<Self, ParseError> {
+        Self::scan_observed_in(input, allow_dtd, Native, observer)
     }
 }
 
 impl<'input, S: Storage> LexicalPreflight<'input, S> {
     /// The preflight of a document that declares nothing: no attribute
     /// declarations exist, and the parser supplies the positions.
+    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn unscanned(storage: S) -> Result<Self, ParseError> {
         Ok(Self {
             nodes: storage.values(0)?,
@@ -198,10 +321,22 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
         self.unscanned
     }
 
+    #[cfg(any(feature = "benchmark-internals", test))]
     pub(super) fn scan_in(
         input: &'input str,
         allow_dtd: bool,
         storage: S,
+    ) -> Result<Self, S::ParseFailure> {
+        Self::scan_observed_in(input, allow_dtd, storage, &mut Unchecked)
+    }
+
+    /// The scan, with `observer` checking each event before its position is
+    /// recorded, so the observer's refusal precedes the position ceilings.
+    pub(super) fn scan_observed_in<O: ScanObserver<'input>>(
+        input: &'input str,
+        allow_dtd: bool,
+        storage: S,
+        observer: &mut O,
     ) -> Result<Self, S::ParseFailure> {
         let mut reader = Scanner::with_storage(input, storage);
         let mut nodes: S::Values<SourceNode> = storage.values(0)?;
@@ -213,31 +348,30 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
             storage.charge(1)?;
             match event {
                 Event::Start(element) => {
-                    let depth = elements.len() + 1;
-                    enforce_depth(depth)?;
-                    let index = nodes.len();
-                    push_source_position(
-                        &mut nodes,
-                        SourceNode {
-                            kind: SourceKind::Element,
-                            range: element.range,
-                        },
+                    observer.start_element(
+                        &input[element.range.clone()],
+                        element.range.start,
+                        &element.attributes,
+                        false,
                     )?;
-                    elements.push(index)?;
+                    enforce_depth(elements.len() + 1)?;
+                    elements.push(nodes.len())?;
+                    push_leaf(&mut nodes, SourceKind::Element, element.range)?;
                     reader.recycle(element.attributes);
                 }
                 Event::Empty(element) => {
-                    enforce_depth(elements.len() + 1)?;
-                    push_source_position(
-                        &mut nodes,
-                        SourceNode {
-                            kind: SourceKind::Element,
-                            range: element.range,
-                        },
+                    observer.start_element(
+                        &input[element.range.clone()],
+                        element.range.start,
+                        &element.attributes,
+                        true,
                     )?;
+                    enforce_depth(elements.len() + 1)?;
+                    push_leaf(&mut nodes, SourceKind::Element, element.range)?;
                     reader.recycle(element.attributes);
                 }
                 Event::End { range, .. } => {
+                    observer.end_element()?;
                     if let Some(index) = elements.pop() {
                         nodes[index].range.end = range.end;
                     }
@@ -245,40 +379,30 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                 // Both supported DOMs omit whitespace outside the document
                 // element, so it must not shift the semantic sidecar.
                 Event::Text { range, .. } if !elements.is_empty() => {
+                    observer.character_data()?;
                     push_text_position(&mut nodes, range)?;
                 }
-                Event::Text { .. } | Event::Declaration { .. } => {}
-                Event::CData { range, .. } => push_source_position(
-                    &mut nodes,
-                    SourceNode {
-                        kind: SourceKind::CData,
-                        range,
-                    },
-                )?,
+                Event::Text { .. } | Event::Declaration { .. } => observer.markup(),
+                Event::CData { range, .. } => {
+                    observer.character_data()?;
+                    push_leaf(&mut nodes, SourceKind::CData, range)?;
+                }
                 Event::Reference { name, range } if is_builtin_or_character_reference(name) => {
+                    observer.character_data()?;
                     push_text_position(&mut nodes, range)?;
                 }
-                Event::Reference { range, .. } => push_source_position(
-                    &mut nodes,
-                    SourceNode {
-                        kind: SourceKind::EntityRef,
-                        range,
-                    },
-                )?,
-                Event::Comment { range, .. } => push_source_position(
-                    &mut nodes,
-                    SourceNode {
-                        kind: SourceKind::Comment,
-                        range,
-                    },
-                )?,
-                Event::ProcessingInstruction { range, .. } => push_source_position(
-                    &mut nodes,
-                    SourceNode {
-                        kind: SourceKind::Pi,
-                        range,
-                    },
-                )?,
+                Event::Reference { name, range } => {
+                    observer.entity_reference(name)?;
+                    push_leaf(&mut nodes, SourceKind::EntityRef, range)?;
+                }
+                Event::Comment { range, .. } => {
+                    observer.node()?;
+                    push_leaf(&mut nodes, SourceKind::Comment, range)?;
+                }
+                Event::ProcessingInstruction { range, .. } => {
+                    observer.node()?;
+                    push_leaf(&mut nodes, SourceKind::Pi, range)?;
+                }
                 Event::DocType { .. } if !allow_dtd => return Err(ParseError::DtdDetected.into()),
                 Event::DocType { range, .. } => {
                     // Internal declaration scanning is bounded by the actual
@@ -286,11 +410,10 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                     storage.charge(range.len())?;
                     storage.charge(range.len())?;
                     storage.charge(range.len())?;
-                    collect_attribute_declarations(
-                        &input[range.clone()],
-                        &mut attributes,
-                        storage,
-                    )?;
+                    observer.markup();
+                    observer.doctype(&input[range.clone()], |element, attribute, kind| {
+                        declare_attribute(&mut attributes, storage, element, attribute, kind)
+                    })?;
                     #[cfg(feature = "xml-backend-roxmltree")]
                     {
                         doctype = Some(range);
@@ -374,49 +497,40 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
     }
 }
 
-fn collect_attribute_declarations<'input, S: Storage>(
-    doctype: &'input str,
+/// Record the internal-subset declaration of `attribute` on `element`.
+fn declare_attribute<'input, S: Storage>(
     attributes: &mut S::Declarations<'input>,
     storage: S,
+    element: &'input str,
+    attribute: &'input str,
+    kind: crate::document::DtdAttributeType,
 ) -> Result<(), ParseError> {
-    let mut failure = None;
-    crate::document::visit_dtd_attributes(doctype, |element, attribute, kind| {
-        if failure.is_some() {
-            return;
-        }
-        let result = (|| -> Result<(), ParseError> {
-            storage.charge(element.len())?;
-            storage.charge(attribute.len())?;
-            let (element_prefix, element_local) = split_name(element);
-            let (attribute_prefix, attribute_local) = split_name(attribute);
-            // XML 1.0 3.3: the first declaration is binding.
-            // https://www.w3.org/TR/2008/REC-xml-20081126/#attdecls
-            let key = DtdAttributeName(
-                element_prefix,
-                element_local,
-                attribute_prefix,
-                attribute_local,
-            );
-            if let Some(info) = attributes.get_mut(&key, storage)? {
-                // xml:id 4 constrains all declarations, even shadowed ones.
-                // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
-                info.has_non_id_declaration |= kind != crate::document::DtdAttributeType::Id;
-            } else {
-                attributes.insert(
-                    key,
-                    DtdAttributeInfo {
-                        kind,
-                        has_non_id_declaration: kind != crate::document::DtdAttributeType::Id,
-                    },
-                )?;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            failure = Some(error);
-        }
-    });
-    failure.map_or(Ok(()), Err)
+    storage.charge(element.len())?;
+    storage.charge(attribute.len())?;
+    let (element_prefix, element_local) = split_name(element);
+    let (attribute_prefix, attribute_local) = split_name(attribute);
+    // XML 1.0 3.3: the first declaration is binding.
+    // https://www.w3.org/TR/2008/REC-xml-20081126/#attdecls
+    let key = DtdAttributeName(
+        element_prefix,
+        element_local,
+        attribute_prefix,
+        attribute_local,
+    );
+    if let Some(info) = attributes.get_mut(&key, storage)? {
+        // xml:id 4 constrains all declarations, even shadowed ones.
+        // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+        info.has_non_id_declaration |= kind != crate::document::DtdAttributeType::Id;
+    } else {
+        attributes.insert(
+            key,
+            DtdAttributeInfo {
+                kind,
+                has_non_id_declaration: kind != crate::document::DtdAttributeType::Id,
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn split_name(name: &str) -> (Option<&str>, &str) {
@@ -475,6 +589,14 @@ fn push_text_position<V: Values<SourceNode>>(
         )?;
     }
     Ok(())
+}
+
+fn push_leaf<V: Values<SourceNode>>(
+    nodes: &mut V,
+    kind: SourceKind,
+    range: Range<usize>,
+) -> Result<(), ParseError> {
+    push_source_position(nodes, SourceNode { kind, range })
 }
 
 fn push_source_position<V: Values<SourceNode>>(

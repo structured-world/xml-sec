@@ -250,3 +250,13 @@ pub(crate) fn parse_str_recording_positions(
 ) -> Result<(Document, alloc::vec::Vec<crate::xml::dom::SourceNode>), ParseError> {
     xml::XmlParser::new(input, options)?.parse_recording_positions()
 }
+
+/// Parses a document without a DOCTYPE as [`parse_str_recording_positions`]
+/// does, enforcing `limits` as it reads.
+pub(crate) fn parse_str_enforcing_limits(
+    input: &str,
+    options: &ParseOptions,
+    limits: crate::xml::dom::ParseLimits,
+) -> Result<xml::Limited<crate::xml::dom::storage::Native>, ParseError> {
+    xml::XmlParser::new(input, options)?.parse_enforcing_limits(limits)
+}
