@@ -16,7 +16,7 @@ use core::ops::Range;
 use std::cell::Cell;
 
 use super::super::{TransformError, TransformExecutionBudget, TransformScratch};
-use crate::c14n::scratch::{List as _, NamespaceMap as _, Scratch};
+use crate::c14n::scratch::{List as _, Scratch};
 use crate::c14n::serialize::{CanonicalObserver, ObservedAttribute, ObservedValue};
 use crate::c14n::sink::ByteSink;
 use crate::c14n::{C14nError, NodeVisibility};
@@ -273,21 +273,51 @@ struct Recorder<'n, 'c, S: Scratch> {
     nodes: u32,
     depth: usize,
     in_character_data: bool,
-    /// Prefixes bound at the current element, the default prefix as empty.
-    bindings: S::Namespaces<'n>,
-    bound: usize,
-    /// Each open element's binding changes, as a prefix and whether it was
-    /// bound before the element, and where each element's changes start.
-    changes: S::Values<(&'n str, bool)>,
-    scopes: S::Values<usize>,
-    /// The bytes the tape may hold.
+    scopes: Scopes<'n, S>,
+    /// The bytes the tape and the scopes may hold.
     limit: usize,
     /// The tape size a refused growth needed; it stops the walk.
     exceeded: Option<usize>,
 }
 
-/// A tape list a [`Recorder`] grows.
-type TapeList<'n, S, T> = for<'t> fn(&'t mut Tape<'n, S>) -> &'t mut <S as Scratch>::Values<T>;
+/// The namespace bindings in scope at the walk's position, held beside the
+/// tape in the same storage while the walk runs.
+struct Scopes<'n, S: Scratch> {
+    /// Bound prefixes in order, the default prefix as empty. A policy bounds
+    /// their number, so a sorted list keeps lookups logarithmic and every
+    /// byte countable.
+    bound: S::Values<&'n str>,
+    /// Each open element's binding changes, as a prefix and whether it was
+    /// bound before the element, and where each element's changes start.
+    changes: S::Values<(&'n str, bool)>,
+    starts: S::Values<usize>,
+}
+
+impl<S: Scratch> Scopes<'_, S> {
+    fn new(scratch: &S) -> Self {
+        Self {
+            bound: scratch.values(),
+            changes: scratch.values(),
+            starts: scratch.values(),
+        }
+    }
+
+    fn held_bytes(&self) -> usize {
+        // Each list's storage was allocated, so the sum fits the address space.
+        self.bound.capacity() * core::mem::size_of::<&str>()
+            + self.changes.capacity() * core::mem::size_of::<(&str, bool)>()
+            + self.starts.capacity() * core::mem::size_of::<usize>()
+    }
+
+    fn unbind_at(&mut self, index: usize) {
+        self.bound[index..].rotate_left(1);
+        self.bound.pop();
+    }
+}
+
+/// A list a [`Recorder`] grows.
+type Grown<'n, 'c, S, T> =
+    for<'r> fn(&'r mut Recorder<'n, 'c, S>) -> &'r mut <S as Scratch>::Values<T>;
 
 impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
     fn new(
@@ -308,10 +338,7 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
             nodes: 1,
             depth: 0,
             in_character_data: false,
-            bindings: scratch.namespaces(),
-            bound: 0,
-            changes: scratch.values(),
-            scopes: scratch.values(),
+            scopes: Scopes::new(scratch),
         }
     }
 
@@ -328,11 +355,12 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
         self.line_breaks.get() + 1
     }
 
-    /// Admit `bytes` more tape, or end the recording.
+    /// Admit `bytes` more storage beside the tape and the scopes, or end the
+    /// recording.
     fn admit(&mut self, bytes: usize) -> Result<(), C14nError> {
         // Each term is the size of live or requested storage, far below the
         // address space.
-        let needed = self.tape.held_bytes() + bytes;
+        let needed = self.tape.held_bytes() + self.scopes.held_bytes() + bytes;
         if needed > self.limit {
             self.exceeded = Some(needed);
             // Unwinds the construct being recorded; `Settled` ends it there
@@ -342,11 +370,11 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
         Ok(())
     }
 
-    /// Append `value` to the tape list `list` selects, admitting the list's
-    /// growth before it allocates.
-    fn push<T>(&mut self, list: TapeList<'n, S, T>, value: T) -> Result<(), C14nError> {
+    /// Append `value` to the list `list` selects, admitting the list's growth
+    /// before it allocates.
+    fn push<T>(&mut self, list: Grown<'n, 'c, S, T>, value: T) -> Result<(), C14nError> {
         let (length, capacity) = {
-            let values = list(&mut self.tape);
+            let values = list(self);
             (values.len(), values.capacity())
         };
         if length == capacity {
@@ -354,11 +382,11 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
             // Growth moves the list: the old allocation, which the tape
             // already holds, lives until the whole replacement has its copy.
             self.admit((capacity + additional) * core::mem::size_of::<T>())?;
-            list(&mut self.tape).reserve_exact(additional)?;
+            list(self).reserve_exact(additional)?;
             // An allocator may grant more than requested; what it granted is held.
             self.admit(0)?;
         }
-        list(&mut self.tape).push(value)
+        list(self).push(value)
     }
 
     fn refuse(&mut self, error: XmlDocumentError) {
@@ -397,14 +425,14 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
         match self.tape.events.last_mut() {
             Some(Event::Text { pieces, .. }) if pieces.end == end => pieces.end += 1,
             _ => self.push(
-                |tape| &mut tape.events,
+                |recorder| &mut recorder.tape.events,
                 Event::Text {
                     pieces: end..end + 1,
                     line,
                 },
             )?,
         }
-        self.push(|tape| &mut tape.pieces, piece)
+        self.push(|recorder| &mut recorder.tape.pieces, piece)
     }
 
     /// `text` as a parse of its escaping reads it: runs of unescaped
@@ -416,7 +444,7 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
             if escaped(character) {
                 self.literal(&text[run..index], line)?;
                 self.push(
-                    |tape| &mut tape.events,
+                    |recorder| &mut recorder.tape.events,
                     Event::Reference { character, line },
                 )?;
                 run = index + character.len_utf8();
@@ -431,49 +459,56 @@ impl<'n, 'c, S: Scratch> Recorder<'n, 'c, S> {
         let start = self.tape.pieces.len();
         let mut rest = value;
         while let Some(index) = rest.find('\r') {
-            self.push(|tape| &mut tape.pieces, &rest[..index])?;
-            self.push(|tape| &mut tape.pieces, "&#xD;")?;
+            self.push(|recorder| &mut recorder.tape.pieces, &rest[..index])?;
+            self.push(|recorder| &mut recorder.tape.pieces, "&#xD;")?;
             rest = &rest[index + 1..];
         }
-        self.push(|tape| &mut tape.pieces, rest)?;
+        self.push(|recorder| &mut recorder.tape.pieces, rest)?;
         Ok(start..self.tape.pieces.len())
     }
 
     /// Apply an element's namespace declarations to the bound prefixes.
     fn bind(&mut self, namespaces: &[(&'n str, &'n str)]) -> Result<(), C14nError> {
-        self.scopes.push(self.changes.len())?;
+        let start = self.scopes.changes.len();
+        self.push(|recorder| &mut recorder.scopes.starts, start)?;
         for &(prefix, uri) in namespaces {
-            let was_bound = self.bindings.get(prefix, false)?.is_present();
+            let position = self.scopes.bound.binary_search(&prefix);
             // An empty default namespace name undeclares the default namespace.
-            if prefix.is_empty() && uri.is_empty() {
-                if was_bound {
-                    self.bindings.remove(prefix)?;
-                    self.bound -= 1;
+            let undeclares = prefix.is_empty() && uri.is_empty();
+            match position {
+                Ok(index) if undeclares => self.scopes.unbind_at(index),
+                Err(index) if !undeclares => {
+                    self.push(|recorder| &mut recorder.scopes.bound, prefix)?;
+                    self.scopes.bound[index..].rotate_right(1);
                 }
-            } else if !was_bound {
-                self.bindings.insert(prefix, false, Some(uri))?;
-                self.bound += 1;
+                _ => {}
             }
-            self.changes.push((prefix, was_bound))?;
+            self.push(
+                |recorder| &mut recorder.scopes.changes,
+                (prefix, position.is_ok()),
+            )?;
         }
         Ok(())
     }
 
     /// Restore the bound prefixes the innermost element changed.
     fn unbind(&mut self) -> Result<(), C14nError> {
-        let start = self
-            .scopes
+        let scopes = &mut self.scopes;
+        let start = scopes
+            .starts
             .pop()
             .expect("an end tag closes an open element");
-        while self.changes.len() > start {
-            let (prefix, was_bound) = self.changes.pop().expect("changes above the scope start");
-            let is_bound = self.bindings.get(prefix, false)?.is_present();
-            if was_bound && !is_bound {
-                self.bindings.insert(prefix, false, Some(""))?;
-                self.bound += 1;
-            } else if !was_bound && is_bound {
-                self.bindings.remove(prefix)?;
-                self.bound -= 1;
+        while scopes.changes.len() > start {
+            let (prefix, was_bound) = scopes.changes.pop().expect("changes above the scope start");
+            match (was_bound, scopes.bound.binary_search(&prefix)) {
+                // The prefix was in the list before this element removed it,
+                // so its capacity holds it again without growing.
+                (true, Err(index)) => {
+                    scopes.bound.push(prefix)?;
+                    scopes.bound[index..].rotate_right(1);
+                }
+                (false, Ok(index)) => scopes.unbind_at(index),
+                _ => {}
             }
         }
         Ok(())
@@ -514,11 +549,12 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
         }
         self.in_character_data = false;
         self.bind(namespaces)?;
-        if self.bound > self.settings.namespace_bindings_limit {
+        let bound = self.scopes.bound.len();
+        if bound > self.settings.namespace_bindings_limit {
             self.refuse(XmlDocumentError::Parse(
                 ParseError::NamespaceBindingLimitReached {
                     maximum: self.settings.namespace_bindings_limit,
-                    actual: self.bound,
+                    actual: bound,
                 },
             ));
             return Ok(());
@@ -534,7 +570,7 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
         }
         let first_namespace = self.tape.namespaces.len();
         for &declaration in namespaces {
-            self.push(|tape| &mut tape.namespaces, declaration)?;
+            self.push(|recorder| &mut recorder.tape.namespaces, declaration)?;
         }
         let first_attribute = self.tape.attributes.len();
         for attribute in attributes {
@@ -545,11 +581,14 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
                     self.admit(text.len())?;
                     let copy = self.scratch.text(&[text])?;
                     self.tape.computed_bytes += copy.len();
-                    self.push(|tape| &mut tape.computed, copy)?;
+                    self.push(|recorder| &mut recorder.tape.computed, copy)?;
                     Value::Computed(self.tape.computed.len() - 1)
                 }
             };
-            self.push(|tape| &mut tape.attributes, (prefix, local, value))?;
+            self.push(
+                |recorder| &mut recorder.tape.attributes,
+                (prefix, local, value),
+            )?;
         }
         let line = self.line();
         let start = Event::Start {
@@ -559,7 +598,7 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
             attributes: first_attribute..self.tape.attributes.len(),
             line,
         };
-        self.push(|tape| &mut tape.events, start)
+        self.push(|recorder| &mut recorder.tape.events, start)
     }
 
     fn end_tag(&mut self) -> Result<(), C14nError> {
@@ -569,7 +608,7 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
         self.in_character_data = false;
         self.depth -= 1;
         self.unbind()?;
-        self.push(|tape| &mut tape.events, Event::End)
+        self.push(|recorder| &mut recorder.tape.events, Event::End)
     }
 
     fn text(&mut self, text: &'n str) -> Result<(), C14nError> {
@@ -593,7 +632,10 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
         self.node();
         let line = self.line();
         let pieces = self.value_pieces(text)?;
-        self.push(|tape| &mut tape.events, Event::Comment { pieces, line })
+        self.push(
+            |recorder| &mut recorder.tape.events,
+            Event::Comment { pieces, line },
+        )
     }
 
     fn processing_instruction(
@@ -609,7 +651,7 @@ impl<'n, S: Scratch> CanonicalObserver<'n> for Recorder<'n, '_, S> {
         let line = self.line();
         let value = value.map(|value| self.value_pieces(value)).transpose()?;
         self.push(
-            |tape| &mut tape.events,
+            |recorder| &mut recorder.tape.events,
             Event::Instruction {
                 target,
                 value,

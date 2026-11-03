@@ -2724,6 +2724,14 @@ impl DocumentBuilder<'_, '_> {
     /// # Errors
     /// Returns XML or budget failures a parse of the reference would return.
     pub fn character_reference(&mut self, character: char, line: usize) -> Result<()> {
+        // XML 1.0 section 4.1: the referenced character must match Char.
+        // https://www.w3.org/TR/xml/#wf-Legalchar
+        if !super::lexical::is_xml10_character(character) {
+            return Err(Error::Xml(format!(
+                "character reference to U+{:04X} is not an XML character",
+                u32::from(character)
+            )));
+        }
         self.0.character(character, line)
     }
 
@@ -3258,6 +3266,15 @@ fn push_semantic_element<'v>(
     }
     let mut raw_attributes = Vec::new();
     for (bound, name, value) in attributes {
+        // Namespaces 1.0 section 3: a parse reads `xmlns` and `xmlns:p` as
+        // namespace declarations, which reach this builder separately.
+        // https://www.w3.org/TR/xml-names/#ns-decl
+        if bound.map_or(name == "xmlns", |bound| bound == "xmlns") {
+            return Err(Error::Xml(format!(
+                "namespace declaration {} given as an attribute",
+                bound.map_or_else(|| name.to_owned(), |bound| format!("{bound}:{name}"))
+            )));
+        }
         // Admit the name and value copies before either allocates, each at
         // its exact size, so no growth outruns the admission.
         let lexical_bytes = name.len() + bound.map_or(0, |bound| bound.len() + 1);

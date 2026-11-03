@@ -298,15 +298,36 @@ fn tape_growth_admits_the_old_and_the_new_allocation_together() {
     let mut recorder = super::Recorder::new(&Native, &counters, settings(&budget), 10 * event);
     for _ in 0..4 {
         recorder
-            .push(|tape| &mut tape.events, super::Event::End)
+            .push(|recorder| &mut recorder.tape.events, super::Event::End)
             .expect("four events fit");
     }
     assert!(
         recorder
-            .push(|tape| &mut tape.events, super::Event::End)
+            .push(|recorder| &mut recorder.tape.events, super::Event::End)
             .is_err()
     );
     assert_eq!(recorder.exceeded, Some(12 * event));
+}
+
+#[test]
+fn namespace_bookkeeping_is_admitted_against_the_tape_limit() {
+    // The prefixes in scope and each element's binding changes live beside
+    // the tape while the walk runs, so their growth is admitted against the
+    // same limit before it allocates: 64 declarations cannot fit 256 bytes.
+    let budget = TransformExecutionBudget::from_resources(&ResourcePolicy::default());
+    let counters = (std::cell::Cell::new(0), std::cell::Cell::new(0));
+    let prefixes: Vec<String> = (0..64).map(|index| format!("p{index}")).collect();
+    let declarations: Vec<(&str, &str)> = prefixes
+        .iter()
+        .map(|prefix| (prefix.as_str(), "urn:x"))
+        .collect();
+    let mut recorder = super::Recorder::new(&Native, &counters, settings(&budget), 256);
+    assert!(recorder.bind(&declarations).is_err());
+    assert!(
+        recorder.exceeded.is_some_and(|needed| needed > 256),
+        "{:?}",
+        recorder.exceeded
+    );
 }
 
 #[test]

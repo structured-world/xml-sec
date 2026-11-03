@@ -81,6 +81,46 @@ fn constructs_a_parse_refuses_are_refused_when_built() {
 }
 
 #[test]
+fn references_and_attributes_no_parse_reads_are_refused_when_built() {
+    // XML 1.0 section 4.1: a character reference must match Char, so a parse
+    // refuses `&#0;` and `&#xFFFE;`; the builder refuses those characters too.
+    // https://www.w3.org/TR/xml/#wf-Legalchar
+    let reference = |character: char| {
+        move |builder: &mut DocumentBuilder<'_, '_>| {
+            builder.start_element((None, "r"), [], [], 1)?;
+            builder.character_reference(character, 1)?;
+            builder.end_element()
+        }
+    };
+    for (text, character) in [("<r>&#0;</r>", '\0'), ("<r>&#xFFFE;</r>", '\u{FFFE}')] {
+        let (built, parsed) = built_and_parsed(text, reference(character));
+        assert!(parsed.is_err(), "{text} parses");
+        assert!(built.is_err(), "{text} is built: {built:?}");
+    }
+    // Namespaces 1.0 section 3: a parse reads `xmlns` and `xmlns:p` as
+    // namespace declarations, never as attributes, so the builder, which
+    // takes declarations apart, refuses them as attributes.
+    // https://www.w3.org/TR/xml-names/#ns-decl
+    let attribute = |bound: Option<&'static str>, name: &'static str| {
+        move |builder: &mut DocumentBuilder<'_, '_>| {
+            builder.start_element((None, "r"), [], [(bound, name, "urn:a")], 1)?;
+            builder.end_element()
+        }
+    };
+    for (bound, name) in [(None, "xmlns"), (Some("xmlns"), "p")] {
+        let (built, _) = built_and_parsed("<r/>", attribute(bound, name));
+        assert!(built.is_err(), "{bound:?} {name} is built: {built:?}");
+    }
+    // Their valid neighbours are accepted by both.
+    let (built, parsed) = built_and_parsed(r#"<r xml:lang="urn:a">&#xFFFD;</r>"#, |builder| {
+        builder.start_element((None, "r"), [], [(Some("xml"), "lang", "urn:a")], 1)?;
+        builder.character_reference('\u{FFFD}', 1)?;
+        builder.end_element()
+    });
+    assert_eq!(built.expect("built"), parsed.expect("parsed"));
+}
+
+#[test]
 fn building_text_charges_the_parser_work_its_parse_charges() {
     // Copying character data into the tree is parser work: a budget that
     // admits only one pass over the text refuses the parse at the copy, and
