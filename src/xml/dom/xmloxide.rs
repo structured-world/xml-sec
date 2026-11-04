@@ -6,7 +6,7 @@ use core::ops::Range;
 use super::storage::names::NameStorage;
 use super::storage::{Native, Storage, Values};
 use crate::parser_xmloxide as xmloxide;
-use xmloxide::parser::{Span, Tree};
+use xmloxide::parser::{PushedElement, Span, Tree};
 use xmloxide::tree::NodeKind as XmloxNodeKind;
 
 use super::{
@@ -185,18 +185,20 @@ impl<'input, S: NameStorage> Semantic<'input, S> {
         self.tree.finish(preflight)
     }
 
+    /// The element node, and the parser's attribute list emptied of the
+    /// attributes it moved into the node.
     fn element(
         &mut self,
         parent: NodeId,
         kind: XmloxNodeKind<S>,
         range: Range<usize>,
         range_actionable: bool,
-    ) -> Result<NodeId, ParseError> {
+    ) -> Result<(NodeId, S::Values<xmloxide::tree::Attribute<S>>), ParseError> {
         let XmloxNodeKind::Element {
             name,
             prefix,
             namespace,
-            attributes,
+            mut attributes,
         } = kind
         else {
             unreachable!("element construction requires an element");
@@ -204,8 +206,15 @@ impl<'input, S: NameStorage> Semantic<'input, S> {
         self.admit_node()?;
         let storage = self.tree.storage();
         let namespaces = self.namespaces(parent, &attributes)?;
-        let mut semantic_attributes = storage.values(attributes.len())?;
-        for attribute in attributes {
+        // Declarations are namespace nodes, not attributes: an element that
+        // only declares allocates no attribute list.
+        storage.charge(attributes.len())?;
+        let declarations = attributes
+            .iter()
+            .filter(|attribute| namespace_declaration(attribute).is_some())
+            .count();
+        let mut semantic_attributes = storage.values(attributes.len() - declarations)?;
+        for attribute in attributes.drain_all()? {
             storage.charge(1)?;
             if namespace_declaration(&attribute).is_none() {
                 semantic_attributes.push(AttributeData {
@@ -218,7 +227,7 @@ impl<'input, S: NameStorage> Semantic<'input, S> {
                 })?;
             }
         }
-        self.tree.push_with_actionability(
+        let element = self.tree.push_with_actionability(
             Some(parent),
             NodeKind::Element {
                 name,
@@ -229,7 +238,8 @@ impl<'input, S: NameStorage> Semantic<'input, S> {
             },
             range,
             range_actionable,
-        )
+        )?;
+        Ok((element, attributes))
     }
 
     /// The element's in-scope set: its parent's, unless it declares bindings.
@@ -334,7 +344,7 @@ impl<S: NameStorage> Tree<S> for Semantic<'_, S> {
         let actionable = !span.expanded;
         match kind {
             kind @ XmloxNodeKind::Element { .. } => {
-                self.element(parent, kind, span.range, actionable)
+                Ok(self.element(parent, kind, span.range, actionable)?.0)
             }
             XmloxNodeKind::Text { content } => {
                 // Whitespace outside the document element is not content.
@@ -368,6 +378,15 @@ impl<S: NameStorage> Tree<S> for Semantic<'_, S> {
             },
             XmloxNodeKind::Document | XmloxNodeKind::DocumentType { .. } => Ok(parent),
         }
+    }
+    fn push_element(
+        &mut self,
+        parent: NodeId,
+        element: XmloxNodeKind<S>,
+        span: Span,
+    ) -> Result<PushedElement<NodeId, S>, ParseError> {
+        let (element, attributes) = self.element(parent, element, span.range, !span.expanded)?;
+        Ok((element, Some(attributes)))
     }
     fn element_name(&self, element: NodeId) -> (Option<&str>, &str) {
         self.tree.element_name(element)

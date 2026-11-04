@@ -61,7 +61,9 @@ The xmloxide parser is generic over the tree it writes to. xml-sec parses into
 the semantic arena directly, with no intermediate xmloxide DOM: the parser
 supplies every source range, and an entity's replacement text is read into the
 same tree, its nodes taking the outermost reference's range and remaining
-unactionable. A DOCTYPE is recognized only by its case-sensitive keyword
+unactionable. The semantic arena moves each start tag's attributes into its own
+list and hands the parser's list back empty, so one parser list serves the
+whole parse. A DOCTYPE is recognized only by its case-sensitive keyword
 (XML 1.0 production 28). When the text `<!DOCTYPE` occurs nowhere in the input,
 the parser itself enforces the node, depth and namespace limits as it reads.
 Any other input, including one that has the text only inside a comment or a

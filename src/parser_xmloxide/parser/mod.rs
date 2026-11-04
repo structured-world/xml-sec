@@ -13,7 +13,7 @@
 pub(crate) mod input;
 pub mod push;
 mod xml;
-pub(crate) use xml::{Span, Tree, XmlParser};
+pub(crate) use xml::{PushedElement, Span, Tree, XmlParser};
 
 pub use push::PushParser;
 
