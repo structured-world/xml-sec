@@ -254,6 +254,27 @@ fn runner_image_identity_is_read_at_runtime_rather_than_an_empty_env_context() {
 }
 
 #[test]
+fn the_heaviest_jobs_free_hosted_runner_disk_before_restoring_any_cache() {
+    // Full-workspace builds beside the caches and the native oracle exhaust the
+    // hosted image's disk; the space must be freed before anything is restored.
+    let action = read(".github/actions/free-runner-disk/action.yml");
+    assert!(action.contains("if: runner.os == 'Linux' && runner.environment == 'github-hosted'"));
+    let workflow = read(".github/workflows/ci.yml");
+    for job in ["coverage", "test-matrix"] {
+        let body = section(&workflow, job);
+        let freed = body
+            .find("uses: ./.github/actions/free-runner-disk")
+            .unwrap_or_else(|| panic!("{job} frees no disk"));
+        for cache in ["rust-build-cache", "xmlsec-oracle-cache"] {
+            let restored = body
+                .find(&format!("uses: ./.github/actions/{cache}"))
+                .unwrap();
+            assert!(freed < restored, "{job}: {cache}");
+        }
+    }
+}
+
+#[test]
 fn coverage_checkout_references_resolve_existing_pinned_oracle_revisions() {
     // Validate the actual setup program, not just YAML syntax: a misspelled
     // metadata filename otherwise prevents the coverage runner from starting.

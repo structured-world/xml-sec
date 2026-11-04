@@ -1,0 +1,16 @@
+name: Free runner disk
+description: Remove preinstalled toolchains the build never uses from a hosted Linux runner
+runs:
+  using: composite
+  steps:
+    # The hosted Ubuntu image leaves too little free space for a full
+    # instrumented or all-feature workspace build beside the restored caches
+    # and the native oracle. These toolchains are never used by this build.
+    # Self-hosted runners keep their own provisioning.
+    - name: Remove unused hosted toolchains
+      if: runner.os == 'Linux' && runner.environment == 'github-hosted'
+      shell: bash
+      run: |
+        df -h /
+        sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+        df -h /
