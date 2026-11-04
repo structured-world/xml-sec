@@ -94,6 +94,9 @@ impl Span {
     }
 }
 
+/// An appended element, and the emptied attribute list its tree hands back.
+pub(crate) type PushedElement<N, S> = (N, Option<<S as Storage>::Values<Attribute<S>>>);
+
 /// The tree a parse builds, node by node in document order.
 pub(crate) trait Tree<S: NameStorage> {
     /// A node that takes children.
@@ -121,6 +124,17 @@ pub(crate) trait Tree<S: NameStorage> {
         kind: NodeKind<S>,
         span: Span,
     ) -> Result<Self::Node, crate::xml::dom::ParseError>;
+    /// Appends an element as [`push`](Self::push) does. A tree that moves the
+    /// attributes into a list of its own returns the emptied one, which the
+    /// parser fills for the next start tag.
+    fn push_element(
+        &mut self,
+        parent: Self::Node,
+        element: NodeKind<S>,
+        span: Span,
+    ) -> Result<PushedElement<Self::Node, S>, crate::xml::dom::ParseError> {
+        Ok((self.push(parent, element, span)?, None))
+    }
     /// The prefix and local name of an open element.
     fn element_name(&self, element: Self::Node) -> (Option<&str>, &str);
     /// Closes `element`, whose source ends at `end` unless it came from a
@@ -160,6 +174,21 @@ impl<S: NameStorage, B: Tree<S, Base = B>> Tree<S> for Expansion<'_, B> {
         self.tree.push(
             parent,
             kind,
+            Span {
+                range: self.range.clone(),
+                expanded: true,
+            },
+        )
+    }
+    fn push_element(
+        &mut self,
+        parent: Self::Node,
+        element: NodeKind<S>,
+        _: Span,
+    ) -> Result<PushedElement<Self::Node, S>, crate::xml::dom::ParseError> {
+        self.tree.push_element(
+            parent,
+            element,
             Span {
                 range: self.range.clone(),
                 expanded: true,
@@ -253,6 +282,8 @@ pub(crate) struct XmlParser<'a, S: NameStorage = Native, T: Tree<S> = Document<S
     entity_depth: u32,
     /// The policy limits, when no pass before the parser enforced them.
     limits: Option<LimitCounter<S>>,
+    /// An empty attribute list the tree handed back, for the next start tag.
+    attributes: Option<S::Values<Attribute<S>>>,
 }
 
 impl<'a> XmlParser<'a> {
@@ -320,6 +351,7 @@ impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
             expansion_size: 0,
             entity_depth: 0,
             limits: None,
+            attributes: None,
         })
     }
 
@@ -1007,7 +1039,11 @@ impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
         let start = self.input.pos();
         self.input.expect_byte(b'<')?;
         let name = self.input.parse_name()?;
-        let mut attributes = self.storage.values(0)?;
+        let mut attributes = match self.attributes.take() {
+            Some(attributes) => attributes,
+            None => self.storage.values(0)?,
+        };
+        debug_assert!(attributes.is_empty());
 
         // Parse attributes
         loop {
@@ -1108,7 +1144,7 @@ impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
         let (elem_prefix, elem_local) = split_name(name);
         let elem_prefix_owned = self.storage.optional_text(elem_prefix)?;
         let elem_local_owned = self.storage.text(elem_local)?;
-        let elem_id = self.doc.push(
+        let (elem_id, reusable) = self.doc.push_element(
             parent,
             NodeKind::Element {
                 name: elem_local_owned,
@@ -1118,6 +1154,7 @@ impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
             },
             Span::source(start..start),
         )?;
+        self.attributes = reusable;
 
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {
