@@ -51,15 +51,26 @@ of a replacement node arena solely to drop the consumed parser.
 
 The maintained construction kernels specialize storage without changing parser
 selection or grammar. Scoped reference replay pays raw parser state, DTD models,
-namespace indexes, source positions and the semantic arena with its current
-execution. DTD entity/default tables move into runtime state; entity fragments
-move node payloads while rebasing links instead of cloning recursive subtrees.
-Element and DTD-group parsing use bounded, paid continuation stacks. Diagnostic
-labels retain their allocation charges, and resource refusal is terminal rather
-than a malformed-input rejection or a reason to try another backend.
+namespace indexes and the semantic arena with its current execution. DTD
+entity/default tables move into runtime state. Element and DTD-group parsing use
+bounded, paid continuation stacks. Diagnostic labels retain their allocation
+charges, and resource refusal is terminal rather than a malformed-input
+rejection or a reason to try another backend.
 
-The backend adapters continue to use the shared lexical preflight and semantic
-arena. Backend selection does not introduce implicit fallback, a second ID
-resolver or an external entity acquisition path. Differential mode still
-compares the two semantic projections rather than choosing whichever parser
-accepts an input.
+The xmloxide parser is generic over the tree it writes to. xml-sec parses into
+the semantic arena directly, with no intermediate xmloxide DOM: the parser
+supplies every source range, and an entity's replacement text is read into the
+same tree, its nodes taking the outermost reference's range and remaining
+unactionable. A DOCTYPE is recognized only by its case-sensitive keyword
+(XML 1.0 production 28). When the text `<!DOCTYPE` occurs nowhere in the input,
+the parser itself enforces the node, depth and namespace limits as it reads.
+Any other input, including one that has the text only inside a comment or a
+CDATA section, first passes the strict lexical scan that bounds a DOCTYPE's
+declarations and entity expansion; that path is stricter, never weaker.
+
+roxmltree builds its own DOM, which is projected into the same semantic arena
+through the source positions the lexical scan records; positions are recorded
+only for a backend that reads them. Backend selection does not introduce
+implicit fallback, a second ID resolver or an external entity acquisition path.
+Differential mode still compares the two semantic trees rather than choosing
+whichever parser accepts an input.
