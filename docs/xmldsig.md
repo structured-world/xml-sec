@@ -497,8 +497,11 @@ certificates provide key material and do not become trusted merely because they 
 certificate is present in both pools, its explicit trusted classification is retained.
 `ResourcePolicy::max_xml_document_bytes` rejects verification and signing inputs before DOM
 parsing; the same immutable ceiling is rechecked after signing mutations that enlarge the XML.
-The selected node and depth ceilings are enforced by a streaming preflight before either parser
-backend allocates a DOM, then rechecked on every staged copy, adapter parse, and committed generation.
+The selected node, depth and namespace-binding ceilings are enforced before the node that would
+exceed them is stored: an xmloxide parse of a document without a DOCTYPE counts them as it reads,
+while a document with a DOCTYPE, and every roxmltree or differential parse, passes one strict
+lexical scan that checks them before the parser runs. They are rechecked on every staged copy,
+adapter parse, and committed generation.
 `ResourcePolicy::max_xml_parse_work_bytes` separately bounds cumulative parser work across the
 whole operation. Initial parsing, generated-template validation, binary-to-node-set adapters,
 staged copies, digest dependency levels, Manifest recursion, and committed generations all charge

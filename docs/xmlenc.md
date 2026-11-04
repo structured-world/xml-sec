@@ -298,9 +298,10 @@ AES-GCM.
 Use `decrypt_document` to replace one typed `EncryptedData` in a complete XML string. Pass its
 `Id` when the document contains multiple encrypted regions. The compiled decryption policy checks
 the shared `ResourcePolicy::max_xml_document_bytes` ceiling before DOM allocation and applies its
-XML node and depth ceilings to the initial document and every replacement generation. A bounded
-streaming preflight enforces these limits before either parser backend allocates a DOM and charges
-recursive internal-entity replacement traversal to cumulative XML parse work.
+XML node and depth ceilings to the initial document and every replacement generation. A refusal
+comes before the node that exceeds them is stored: an xmloxide parse of a document without a
+DOCTYPE checks them as it reads, and any other parse passes one strict lexical scan first, which
+also charges recursive internal-entity replacement traversal to cumulative XML parse work.
 `encrypt_owned_document` and
 `decrypt_owned_document` reuse the retained parsed view, validate replacement XML in the parent
 namespace context, and invalidate prior node identities after a successful mutation. String APIs

@@ -45,9 +45,10 @@ selected provider. Rejection cases check corrupted signature evidence and malfor
 XML on every backend, rather than interpreting an error as a successful operation.
 RSA-SHA256 sign/verify use the
 selected provider's actual key handle.
-Projection calls the production normalizer over a prepared backend DOM and lexical
-positions, without a second parser invocation. Differential parsing has no
-single-backend projection measurement. Graph compilation and execution are separate
+Projection calls the production normalizer over a prepared roxmltree DOM and lexical
+positions, without a second parser invocation. It is measured for roxmltree only:
+xmloxide builds the semantic arena as it parses, so its parse case covers that
+work, and differential parsing has no single-backend projection. Graph compilation and execution are separate
 synthetic fan-out measurements at 1/8/32/64 references, not substitutes for complete
 operation measurements. Typed policy validation/checks are measured independently;
 their cost must not be subtracted from an end-to-end result to claim an unsafe path.
