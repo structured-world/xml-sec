@@ -305,7 +305,6 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
     }
 
     /// Ends the source range of `node`, pushed before its end was read.
-    #[cfg(feature = "xml-backend-xmloxide")]
     pub(super) fn end_range(&mut self, node: NodeId, end: usize) {
         self.nodes[node.index()].range.end = end;
     }
