@@ -14,7 +14,7 @@ use crate::xml::dom::{Document, Node, NodeId, NodeType};
 use super::ClosureVisibility;
 use super::escape::{escape_attr, escape_cr, escape_text};
 use super::prefix::{attribute_prefix, element_prefix};
-use super::scratch::{List, NamespaceMap, NamespaceRendering, Native, Scratch, Text};
+use super::scratch::{Declarations, List, NamespaceMap, NamespaceRendering, Native, Scratch, Text};
 use super::sink::ByteSink;
 use super::xml_base::{
     XmlBaseResolutionBudget, XmlBaseResolutionError, preserves_xml_base_context,
@@ -162,6 +162,7 @@ struct CanonicalOutput<'a, 'n, W: ByteSink + ?Sized, S: Scratch = Native, O = ()
     scratch: &'a S,
     /// Start-tag working space, empty between tags. One start tag finishes
     /// before the next begins, so one capacity serves the whole walk.
+    declarations: Declarations<'n, S>,
     attributes: S::Values<StartTagAttribute<'n, S>>,
 }
 
@@ -297,8 +298,8 @@ impl<'a> CanonicalOutputOptions<'a> {
 
 /// Trait for namespace rendering strategies (inclusive vs exclusive).
 pub(crate) trait NsRenderer<S: Scratch = Native, D: DomStorage = NativeDom> {
-    /// Compute namespace declarations to emit for this element.
-    /// Returns `(sorted_ns_decls, updated_rendered_map)`, the map `None` when
+    /// Compute namespace declarations to emit for this element into the empty
+    /// `declarations`, sorted. Returns the updated rendered map, `None` when
     /// children read `parent_rendered` unchanged.
     ///
     /// `parent_rendered` maps prefix → URI for what the nearest output ancestor
@@ -308,6 +309,7 @@ pub(crate) trait NsRenderer<S: Scratch = Native, D: DomStorage = NativeDom> {
         node: Node<'a, '_, D>,
         parent_rendered: &S::Namespaces<'a>,
         visibility: Option<&dyn NodeVisibility<D>>,
+        declarations: &mut Declarations<'a, S>,
         scratch: &S,
     ) -> Result<NamespaceRendering<'a, S>, C14nError>;
 
@@ -523,6 +525,7 @@ pub(super) fn serialize_with_scratch<
         tracked_positions: Vec::new(),
         xml_base_resolution: options.xml_base_resolution,
         scratch,
+        declarations: scratch.values(),
         attributes: scratch.values(),
     };
     let top = scratch.namespaces();
@@ -817,8 +820,14 @@ fn serialize_start_tag<
     parent_rendered: &S::Namespaces<'n>,
     output: &mut CanonicalOutput<'_, 'n, W, S, O>,
 ) -> Result<Option<S::Namespaces<'n>>, C14nError> {
-    let (ns_decls, rendered) =
-        ns_renderer.render_namespaces(node, parent_rendered, visibility, output.scratch)?;
+    let mut ns_decls = core::mem::replace(&mut output.declarations, output.scratch.values());
+    let rendered = ns_renderer.render_namespaces(
+        node,
+        parent_rendered,
+        visibility,
+        &mut ns_decls,
+        output.scratch,
+    )?;
 
     // Start tag: <prefix:localname
     output.track(node);
@@ -831,6 +840,55 @@ fn serialize_start_tag<
         write_namespace_declaration(prefix, uri, output)?;
     }
 
+    let mut all_attrs = core::mem::replace(&mut output.attributes, output.scratch.values());
+    collect_start_tag_attributes(node, visibility, config, output, &mut all_attrs)?;
+    for (_, local_name, prefix, value) in all_attrs.iter() {
+        output.write_all(b" ")?;
+        if !prefix.is_empty() {
+            output.write_all(prefix.as_bytes())?;
+            output.write_all(b":")?;
+        }
+        output.write_all(local_name.as_bytes())?;
+        output.write_all(b"=\"")?;
+        let value = value.view()?;
+        output.scratch.charge(value.len())?;
+        escape_attr(value, output)?;
+        output.write_all(b"\"")?;
+    }
+
+    // Always use <tag></tag> form, never self-closing.
+    output.write_all(b">")?;
+    output.observer.start_tag(
+        element_prefix(node),
+        node.tag_name().name(),
+        &ns_decls,
+        all_attrs
+            .iter()
+            .map(|(_, local_name, prefix, value)| Ok((*prefix, *local_name, value.observed()?))),
+    )?;
+
+    while all_attrs.pop().is_some() {}
+    output.attributes = all_attrs;
+    while ns_decls.pop().is_some() {}
+    output.declarations = ns_decls;
+    Ok(rendered)
+}
+
+/// Fill the empty `all_attrs` with the start tag's attributes in canonical
+/// order: `(namespace URI, local name, prefix, value)`.
+fn collect_start_tag_attributes<
+    'n,
+    W: ByteSink + ?Sized,
+    S: Scratch,
+    D: DomStorage,
+    O: CanonicalObserver<'n>,
+>(
+    node: Node<'n, '_, D>,
+    visibility: Option<&dyn NodeVisibility<D>>,
+    config: C14nConfig,
+    output: &mut CanonicalOutput<'_, 'n, W, S, O>,
+    all_attrs: &mut S::Values<StartTagAttribute<'n, S>>,
+) -> Result<(), C14nError> {
     // Regular attributes, sorted by (namespace-uri, local-name).
     //
     // For Inclusive C14N document subsets: when the parent element is not in
@@ -857,7 +915,6 @@ fn serialize_start_tag<
 
     // Build unified list: (ns_uri, local_name, prefix, value)
     // Using Cow to avoid allocations when no fixup is needed.
-    let mut all_attrs = core::mem::replace(&mut output.attributes, output.scratch.values());
     for (ordinal, attr) in node.attributes().enumerate() {
         output.scratch.charge(attr.name().len().saturating_add(1))?;
         if let Some(set) = visibility
@@ -914,36 +971,7 @@ fn serialize_start_tag<
                 .saturating_add(b.1.len()),
         )?;
         Ok((a.0, a.1).cmp(&(b.0, b.1)))
-    })?;
-
-    for (_, local_name, prefix, value) in all_attrs.iter() {
-        output.write_all(b" ")?;
-        if !prefix.is_empty() {
-            output.write_all(prefix.as_bytes())?;
-            output.write_all(b":")?;
-        }
-        output.write_all(local_name.as_bytes())?;
-        output.write_all(b"=\"")?;
-        let value = value.view()?;
-        output.scratch.charge(value.len())?;
-        escape_attr(value, output)?;
-        output.write_all(b"\"")?;
-    }
-
-    // Always use <tag></tag> form, never self-closing.
-    output.write_all(b">")?;
-    output.observer.start_tag(
-        element_prefix(node),
-        node.tag_name().name(),
-        &ns_decls,
-        all_attrs
-            .iter()
-            .map(|(_, local_name, prefix, value)| Ok((*prefix, *local_name, value.observed()?))),
-    )?;
-
-    while all_attrs.pop().is_some() {}
-    output.attributes = all_attrs;
-    Ok(rendered)
+    })
 }
 
 /// ` xmlns="uri"` for the default prefix, ` xmlns:prefix="uri"` otherwise.

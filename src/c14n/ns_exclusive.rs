@@ -12,7 +12,9 @@ use super::C14nError;
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
 use super::prefix::{attribute_prefix, element_prefix};
-use super::scratch::{List, NamespaceMap, NamespaceRendering, NamespaceState, Scratch, changed};
+use super::scratch::{
+    Declarations, List, NamespaceMap, NamespaceRendering, NamespaceState, Scratch, changed,
+};
 use super::serialize::NsRenderer;
 
 /// Exclusive C14N namespace renderer.
@@ -79,6 +81,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
         node: Node<'n, '_, D>,
         parent_rendered: &S::Namespaces<'n>,
         visibility: Option<&dyn NodeVisibility<D>>,
+        declarations: &mut Declarations<'n, S>,
         scratch: &S,
     ) -> Result<NamespaceRendering<'n, S>, C14nError> {
         let utilized = visibly_utilized_prefixes(node, visibility, scratch)?;
@@ -92,7 +95,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
         // from InclusiveNamespaces PrefixList are candidates.
         // Missing namespace nodes suppress a declaration but do not erase a
         // binding physically rendered by an output ancestor.
-        let (mut declarations, mut rendered) = collect_ns_declarations(
+        let mut rendered = collect_ns_declarations(
             node,
             parent_rendered,
             visibility,
@@ -101,6 +104,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
                 Ok(utilized.get(prefix, false)?.is_present()
                     || self.inclusive_prefixes.contains(prefix))
             },
+            declarations,
             scratch,
         )?;
 
@@ -152,7 +156,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for ExclusiveNsRenderer<'_> {
             }
         }
 
-        Ok((declarations, rendered))
+        Ok(rendered)
     }
 
     fn renders_selected_namespace_of_omitted_element(&self, prefix: &str) -> bool {
