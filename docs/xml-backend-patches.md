@@ -62,9 +62,11 @@ the semantic arena directly, with no intermediate xmloxide DOM: the parser
 supplies every source range, and an entity's replacement text is read into the
 same tree, its nodes taking the outermost reference's range and remaining
 unactionable. A DOCTYPE is recognized only by its case-sensitive keyword
-(XML 1.0 production 28). Without a DOCTYPE the parser itself enforces the node,
-depth and namespace limits as it reads; a document with a DOCTYPE first passes
-the strict lexical scan that bounds its declarations and entity expansion.
+(XML 1.0 production 28). When the text `<!DOCTYPE` occurs nowhere in the input,
+the parser itself enforces the node, depth and namespace limits as it reads.
+Any other input, including one that has the text only inside a comment or a
+CDATA section, first passes the strict lexical scan that bounds a DOCTYPE's
+declarations and entity expansion; that path is stricter, never weaker.
 
 roxmltree builds its own DOM, which is projected into the same semantic arena
 through the source positions the lexical scan records; positions are recorded
