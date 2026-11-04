@@ -4583,7 +4583,18 @@
              // But if the whitespace was hiding an XML declaration, that's an error
              if had_leading_ws
                  && (self.input.looking_at(b"<?xml ")
-@@ -128,7 +415,7 @@
+@@ -113,7 +400,9 @@
+         self.parse_misc(self.doc.root())?;
+ 
+         // Parse optional DOCTYPE declaration
+-        if self.input.looking_at(b"<!DOCTYPE") || self.input.looking_at(b"<!doctype") {
++        // The keyword is case-sensitive (XML 1.0 production 28): `<!doctype`
++        // is not a DOCTYPE but a malformed root element.
++        if self.input.looking_at(b"<!DOCTYPE") {
+             self.parse_doctype(self.doc.root())?;
+             self.parse_misc(self.doc.root())?; // more misc after doctype
+         }
+@@ -128,7 +417,7 @@
              self.parse_element(self.doc.root())?;
          } else if self.options.recover {
              self.input
@@ -4592,7 +4603,7 @@
          } else {
              return Err(self.input.fatal("missing root element"));
          }
-@@ -136,41 +423,48 @@
+@@ -136,41 +425,48 @@
          // Parse trailing content (comments, PIs after root element)
          self.parse_misc(self.doc.root())?;
  
@@ -4657,12 +4668,13 @@
              }
              if self.input.at_end() {
                  break;
-@@ -189,16 +483,58 @@
+@@ -189,16 +485,58 @@
      // --- DOCTYPE Declaration ---
      // See XML 1.0 §2.8: [28] doctypedecl
  
 -    #[allow(clippy::too_many_lines)]
 -    fn parse_doctype(&mut self, parent: NodeId) -> Result<(), ParseError> {
+-        // Consume <!DOCTYPE (case-insensitive match already checked by caller)
 +    fn scan_internal_subset(&mut self) -> Result<&'a str, ParseError<S>> {
 +        self.input.advance(1)?;
 +        let start = self.input.pos();
@@ -4706,7 +4718,7 @@
 +    }
 +
 +    fn parse_doctype(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
-         // Consume <!DOCTYPE (case-insensitive match already checked by caller)
++        // Consume <!DOCTYPE, which the caller has matched
 +        let start = self.input.pos();
          self.input.expect_str(b"<!DOCTYPE")?;
          self.input.skip_whitespace_required()?;
@@ -4719,7 +4731,7 @@
  
          // Check for external ID: SYSTEM or PUBLIC
          let mut system_id = None;
-@@ -208,23 +544,17 @@
+@@ -208,23 +546,17 @@
              self.input.expect_str(b"SYSTEM")?;
              self.input.skip_whitespace_required()?;
              system_id = Some(self.input.parse_quoted_value()?);
@@ -4746,7 +4758,7 @@
          }
  
          // Flag whether there's an external DTD subset. Per XML 1.0 §4.1 WFC:
-@@ -237,678 +567,610 @@
+@@ -237,678 +569,610 @@
          // Parse optional internal subset: [ ... ]
          let mut internal_subset = None;
          if self.input.peek() == Some(b'[') {
@@ -5852,7 +5864,7 @@
      }
  
      /// Normalizes an attribute value based on its DTD-declared type.
-@@ -921,105 +1183,62 @@
+@@ -921,105 +1185,62 @@
          element_name: &str,
          attr_name: &str,
          value: &str,
@@ -5985,7 +5997,7 @@
                      }
                  }
                  continue;
-@@ -1034,10 +1253,10 @@
+@@ -1034,10 +1255,10 @@
                  if self.options.recover {
                      self.input.push_diagnostic(
                          ErrorSeverity::Error,
@@ -6000,7 +6012,7 @@
                      continue;
                  }
                  return Err(self.input.fatal("']]>' not allowed in character data"));
-@@ -1049,34 +1268,42 @@
+@@ -1049,34 +1270,42 @@
                  // node is created and the entity's replacement text is parsed
                  // as content, attached as children of the EntityRef node.
                  // Skip the peek for builtins at byte level to avoid String allocation.
@@ -6056,7 +6068,7 @@
          }
  
          Ok(())
-@@ -1089,61 +1316,88 @@
+@@ -1089,61 +1318,88 @@
      /// replacement text (XML 1.0 §4.5: character references expanded at
      /// declaration time) as content, attaching the resulting nodes as
      /// children of the `EntityRef` node.
@@ -6190,7 +6202,7 @@
  
          let Some(replacement) = replacement else {
              return Ok(());
-@@ -1160,18 +1414,22 @@
+@@ -1160,18 +1416,22 @@
                  .fatal("maximum entity amplification factor exceeded"));
          }
  
@@ -6224,7 +6236,7 @@
          Ok(())
      }
  
-@@ -1186,15 +1444,23 @@
+@@ -1186,15 +1446,23 @@
          &mut self,
          entity_name: &str,
          replacement: &str,
@@ -6252,7 +6264,7 @@
          sub.entity_depth = self.entity_depth + 1;
          sub.input_size = self.input_size;
          sub.expansion_size = self.expansion_size;
-@@ -1204,51 +1470,46 @@
+@@ -1204,51 +1472,46 @@
          // enough to overflow the stack).
          sub.input.set_depth(self.input.depth());
          // Move shared state into the sub-parser (returned below).
@@ -6324,7 +6336,7 @@
          Ok(())
      }
  
-@@ -1258,7 +1519,7 @@
+@@ -1258,7 +1521,7 @@
      /// Unlike [`parse_content`](Self::parse_content), end of input is the
      /// normal termination and an end tag (`</`) is an error (it would close
      /// an element opened outside the entity — WFC violation).
@@ -6333,7 +6345,7 @@
          while !self.input.at_end() {
              if self.input.looking_at(b"</") {
                  return Err(self.input.fatal("unbalanced end tag"));
-@@ -1278,20 +1539,9 @@
+@@ -1278,20 +1541,9 @@
          Ok(())
      }
  
@@ -6355,7 +6367,7 @@
      #[inline]
      fn is_looking_at_builtin_entity_ref(&self) -> bool {
          let remaining = self.input.remaining();
-@@ -1306,58 +1556,29 @@
+@@ -1306,58 +1558,29 @@
              || after_amp.starts_with(b"quot;")
      }
  
@@ -6426,7 +6438,7 @@
                      }
                      i = j + 1;
                  } else {
-@@ -1367,17 +1588,17 @@
+@@ -1367,17 +1590,17 @@
                  i += 1;
              }
          }
@@ -6448,7 +6460,7 @@
  
          // Capture raw attribute value text (before entity expansion) so we
          // can preserve entity references during serialization.
-@@ -1390,13 +1611,20 @@
+@@ -1390,13 +1613,20 @@
          // contain no '&' (most attributes have no entity references).
          let raw_value = if raw_end > raw_start + 2 {
              let raw_bytes = self.input.slice(raw_start + 1, raw_end - 1);
@@ -6471,7 +6483,7 @@
              } else {
                  None
              }
-@@ -1404,12 +1632,12 @@
+@@ -1404,12 +1634,12 @@
              None
          };
  
@@ -6487,7 +6499,7 @@
              namespace: None,
              raw_value,
          })
-@@ -1418,63 +1646,62 @@
+@@ -1418,63 +1648,62 @@
      // --- Comments ---
      // See XML 1.0 §2.5: [15] Comment
  
@@ -6582,7 +6594,7 @@
      }
      s
  }
-@@ -1488,14 +1715,122 @@
+@@ -1488,14 +1717,122 @@
  #[allow(clippy::unwrap_used)]
  mod tests {
      use super::*;
@@ -6707,7 +6719,7 @@
      fn test_parse_empty_element() {
          let doc = parse("<root/>");
          let root = doc.root_element().unwrap();
-@@ -1660,7 +1995,7 @@
+@@ -1660,7 +1997,7 @@
      fn test_roundtrip_simple() {
          let input = "<root><child>text</child></root>";
          let doc = parse(input);
@@ -6716,7 +6728,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1668,7 +2003,7 @@
+@@ -1668,7 +2005,7 @@
      fn test_roundtrip_attributes() {
          let input = "<root attr=\"value\"><child id=\"1\"/></root>";
          let doc = parse(input);
@@ -6725,7 +6737,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1676,7 +2011,7 @@
+@@ -1676,7 +2013,7 @@
      fn test_roundtrip_entities() {
          let input = "<root>&amp; &lt; &gt;</root>";
          let doc = parse(input);
@@ -6734,7 +6746,7 @@
          // After parsing, entities are resolved to characters.
          // Serialization re-escapes them.
          assert_eq!(output, format!("{DECL}<root>&amp; &lt; &gt;</root>\n"));
-@@ -1686,7 +2021,7 @@
+@@ -1686,7 +2023,7 @@
      fn test_roundtrip_comment() {
          let input = "<root><!-- comment --></root>";
          let doc = parse(input);
@@ -6743,7 +6755,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1694,7 +2029,7 @@
+@@ -1694,7 +2031,7 @@
      fn test_roundtrip_cdata() {
          let input = "<root><![CDATA[data & stuff]]></root>";
          let doc = parse(input);
@@ -6752,7 +6764,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1702,7 +2037,7 @@
+@@ -1702,7 +2039,7 @@
      fn test_roundtrip_pi() {
          let input = "<?target data?><root/>";
          let doc = parse(input);
@@ -6761,7 +6773,7 @@
          assert_eq!(output, format!("{DECL}{input}\n"));
      }
  
-@@ -1710,7 +2045,7 @@
+@@ -1710,7 +2047,7 @@
      fn test_roundtrip_xml_declaration() {
          let input = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><root/>";
          let doc = parse(input);
@@ -6770,7 +6782,7 @@
          assert_eq!(
              output,
              "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<root/>\n"
-@@ -1898,13 +2233,13 @@
+@@ -1898,13 +2235,13 @@
          // Simple DOCTYPE (no whitespace between DOCTYPE and root in input)
          let input = "<!DOCTYPE html><html/>";
          let doc = parse(input);
@@ -6786,7 +6798,7 @@
          assert_eq!(
              output,
              format!("{DECL}<!DOCTYPE root SYSTEM \"root.dtd\"><root/>\n")
-@@ -1914,7 +2249,7 @@
+@@ -1914,7 +2251,7 @@
          let input = "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" \
                        \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd\"><html/>";
          let doc = parse(input);
@@ -6795,7 +6807,7 @@
          assert_eq!(
              output,
              format!(
-@@ -2061,7 +2396,7 @@
+@@ -2061,7 +2398,7 @@
          let element = doc.first_child(entity_ref).unwrap();
          assert_eq!(doc.node_name(element), Some("b"));
          // Serialization re-emits the entity reference, preserving roundtrip.
@@ -6804,7 +6816,7 @@
          assert!(
              out.contains("<d>&e;</d>"),
              "unexpected serialization: {out}"
-@@ -2069,6 +2404,20 @@
+@@ -2069,6 +2406,20 @@
      }
  
      #[test]
@@ -6825,7 +6837,7 @@
      fn test_parse_entity_charref_markup() {
          // "&#60;b>hi&#60;/b>" expands to "<b>hi</b>" at declaration time
          // (§4.5) and must be parsed as markup at reference time.
-@@ -2086,7 +2435,7 @@
+@@ -2086,7 +2437,7 @@
          // inside the entity expansion.
          let input = "<!DOCTYPE d [<!ENTITY e \"<b>hi</b>\">]><d>&e;</d>";
          let doc = parse(input);
@@ -6834,7 +6846,7 @@
          let doc2 = parse(&out);
          let root2 = doc2.root_element().unwrap();
          assert_eq!(doc2.text_content(root2), "hi");
-@@ -2144,9 +2493,9 @@
+@@ -2144,9 +2495,9 @@
              panic!("expected depth-limited parse to fail");
          };
          assert!(
@@ -6846,7 +6858,7 @@
          );
      }
  
-@@ -2169,9 +2518,10 @@
+@@ -2169,9 +2520,10 @@
              panic!("expected amplification attack to be rejected");
          };
          assert!(

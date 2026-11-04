@@ -129,6 +129,37 @@ fn the_parser_refuses_what_the_lexical_scan_refused() {
     assert!(gaps.is_empty(), "only the scanner refused: {gaps:?}");
 }
 
+/// A document without the literal `<!DOCTYPE` skips the scan that enforces
+/// `allow_dtd`, so the parser must not read a DOCTYPE in any other case: the
+/// keyword is case-sensitive (XML 1.0 production 28, "no case folding" in
+/// 1.2), and anything else is not well-formed.
+#[test]
+fn a_doctype_keyword_in_another_case_is_refused_without_a_scan() {
+    for xml in [
+        "<!doctype r><r/>",
+        "<!DocType r><r/>",
+        "<!doctype r [<!ENTITY e 'x'>]><r>&e;</r>",
+        "<!DOCTYPe r [<!ENTITY e 'x'>]><r>&e;</r>",
+    ] {
+        assert!(
+            Document::parse_with_options(xml, ParsingOptions::default()).is_err(),
+            "{xml}"
+        );
+        assert!(
+            XmloxideBackend::parse(
+                xml,
+                ParsingOptions {
+                    allow_dtd: true,
+                    ..ParsingOptions::default()
+                },
+                &LexicalPreflight::unscanned(Native),
+            )
+            .is_err(),
+            "{xml}"
+        );
+    }
+}
+
 #[test]
 fn replacement_text_nodes_take_the_reference_range() {
     // Nodes read from an entity's replacement text have no span of their own

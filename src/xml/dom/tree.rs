@@ -1377,6 +1377,9 @@ mod tests {
         let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
         let preflight = super::super::LexicalPreflight::scan_in(xml, false, Accounted(&memory))
             .expect("fixed XML preflight");
+        // What the scan retains depends on the build (positions are kept only
+        // for a backend that reads them); the tree is paid on top of it.
+        let scanned = memory.used();
         let document = super::super::xmloxide::XmloxideBackend::parse_in(
             xml,
             super::ParsingOptions::default(),
@@ -1384,12 +1387,10 @@ mod tests {
             Accounted(&memory),
         )
         .expect("paid parse fits");
+        assert!(memory.used() > scanned);
         assert_scoped_projection(&document);
-        let preflight_only = {
-            drop(document);
-            memory.used()
-        };
-        assert!(preflight_only > 0);
+        drop(document);
+        assert_eq!(memory.used(), scanned);
         let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 20)));
         assert!(matches!(
             super::super::xmloxide::XmloxideBackend::parse_in(
@@ -1775,20 +1776,32 @@ mod tests {
 
     #[test]
     fn selected_backend_bounds_source_positions_after_semantic_text_folding() {
-        // Many adjacent CDATA tokens retain one semantic text node, but the
-        // xmloxide range adapter still needs one source position per token.
-        // Bound that sidecar independently before constructing a backend DOM.
+        // Many adjacent CDATA tokens retain one semantic text node. A backend
+        // that maps its tree through the scan's source positions needs one per
+        // token, so that sidecar is bounded independently before its DOM is
+        // built; xmloxide reads each range as it parses and keeps none.
         let segments = crate::hard_limits::XML_SOURCE_POSITION_CEILING + 1;
         let xml = format!("<r>{}</r>", "<![CDATA[x]]>".repeat(segments));
+        let options = ParsingOptions {
+            allow_dtd: false,
+            nodes_limit: 3,
+        };
 
-        assert!(matches!(
-            Document::parse_with_options(
+        #[cfg(feature = "xml-backend-xmloxide")]
+        {
+            let document = Document::parse_with_options_and_backend(
                 &xml,
-                ParsingOptions {
-                    allow_dtd: false,
-                    nodes_limit: 3,
-                },
-            ),
+                options,
+                super::XmlBackend::Xmloxide,
+            )
+            .expect("folded text fits the node limit");
+            let text = document.root_element().first_child().expect("the text");
+            assert_eq!(text.text().map(str::len), Some(segments));
+            assert!(text.next_sibling().is_none());
+        }
+        #[cfg(feature = "xml-backend-roxmltree")]
+        assert!(matches!(
+            Document::parse_with_options_and_backend(&xml, options, super::XmlBackend::Roxmltree),
             Err(ParseError::SourcePositionLimitReached { maximum, actual })
                 if maximum == crate::hard_limits::XML_SOURCE_POSITION_CEILING
                     && actual == maximum + 1

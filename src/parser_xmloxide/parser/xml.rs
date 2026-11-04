@@ -400,7 +400,9 @@ impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
         self.parse_misc(self.doc.root())?;
 
         // Parse optional DOCTYPE declaration
-        if self.input.looking_at(b"<!DOCTYPE") || self.input.looking_at(b"<!doctype") {
+        // The keyword is case-sensitive (XML 1.0 production 28): `<!doctype`
+        // is not a DOCTYPE but a malformed root element.
+        if self.input.looking_at(b"<!DOCTYPE") {
             self.parse_doctype(self.doc.root())?;
             self.parse_misc(self.doc.root())?; // more misc after doctype
         }
@@ -526,7 +528,7 @@ impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
     }
 
     fn parse_doctype(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
-        // Consume <!DOCTYPE (case-insensitive match already checked by caller)
+        // Consume <!DOCTYPE, which the caller has matched
         let start = self.input.pos();
         self.input.expect_str(b"<!DOCTYPE")?;
         self.input.skip_whitespace_required()?;

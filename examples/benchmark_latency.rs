@@ -242,6 +242,12 @@ fn export_scenarios(
     Ok(())
 }
 
+/// Whether `backend` has `operation` to measure: only roxmltree builds a
+/// backend DOM to project, xmloxide builds the semantic tree as it parses.
+fn measurable(operation: &str, backend: XmlBackend) -> bool {
+    operation != "projection" || backend == XmlBackend::Roxmltree
+}
+
 /// Print every measurable operation, shape, backend and provider combination.
 fn list() {
     for spec in support::specs() {
@@ -256,7 +262,7 @@ fn list() {
             Engine::AwsLcFips => "aws-lc-fips",
         };
         for operation in OPERATIONS.into_iter().chain(PHASES) {
-            if operation == "projection" && spec.backend == XmlBackend::Differential {
+            if !measurable(operation, spec.backend) {
                 continue;
             }
             println!(
@@ -302,8 +308,8 @@ fn parse_request(args: &[String]) -> Result<Request<'_>, Box<dyn Error>> {
         "aws-lc-fips" => Engine::AwsLcFips,
         _ => return Err("unavailable provider".into()),
     };
-    if operation == "projection" && backend == XmlBackend::Differential {
-        return Err("projection requires one backend, not differential parsing".into());
+    if !measurable(operation, backend) {
+        return Err("projection requires the roxmltree backend".into());
     }
     let samples = args[5].parse::<usize>()?;
     if !(1..=100_000).contains(&samples) {
@@ -388,14 +394,5 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 #[cfg(test)]
-mod tests {
-    #[test]
-    fn nearest_rank_handles_single_and_non_hundred_sample_counts() {
-        // Tail percentiles use individual order statistics, including small smoke samples.
-        assert_eq!(super::percentile(&[7], 99), 7);
-        assert_eq!(super::percentile(&[10, 20, 30], 50), 20);
-        assert_eq!(super::percentile(&[10, 20, 30], 95), 30);
-        let values: Vec<_> = (1..=100).collect();
-        assert_eq!(super::percentile(&values, 99), 99);
-    }
-}
+#[path = "benchmark_latency/tests.rs"]
+mod tests;
