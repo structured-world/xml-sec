@@ -1,43 +1,25 @@
-//! Prepared backend DOMs for measuring the real projection independently.
+//! A prepared backend DOM for measuring its projection independently. Only
+//! roxmltree has one: xmloxide builds the semantic arena as it parses.
 
-use super::{Document, LexicalPreflight, ParseError, ParsingOptions, XmlBackend};
-use crate::{parser_roxmltree, parser_xmloxide};
-
-enum Parsed<'a> {
-    Roxmltree(parser_roxmltree::Document<'a>),
-    Xmloxide(parser_xmloxide::Document),
-}
+use super::{Document, LexicalPreflight, ParseError, XmlBackend};
+use crate::parser_roxmltree;
 
 pub(crate) struct Projection<'a> {
     input: &'a str,
     preflight: LexicalPreflight<'a>,
-    parsed: Parsed<'a>,
+    parsed: parser_roxmltree::Document<'a>,
 }
 
 impl<'a> Projection<'a> {
     pub(crate) fn new(input: &'a str, backend: XmlBackend) -> Result<Self, ParseError> {
+        if backend != XmlBackend::Roxmltree {
+            return Err(ParseError::BackendUnavailable { backend });
+        }
         let preflight = LexicalPreflight::scan(input, false)?;
-        let parsed = match backend {
-            XmlBackend::Roxmltree => {
-                Parsed::Roxmltree(parser_roxmltree::Document::parse(input).map_err(|e| {
-                    ParseError::Backend {
-                        backend: "roxmltree",
-                        message: e.to_string(),
-                    }
-                })?)
-            }
-            XmlBackend::Xmloxide => Parsed::Xmloxide(
-                parser_xmloxide::parser::parse_str_with_options(
-                    input,
-                    &super::xmloxide::backend_options(),
-                )
-                .map_err(|e| ParseError::Backend {
-                    backend: "xmloxide",
-                    message: e.to_string(),
-                })?,
-            ),
-            XmlBackend::Differential => return Err(ParseError::BackendUnavailable { backend }),
-        };
+        let parsed = parser_roxmltree::Document::parse(input).map_err(|e| ParseError::Backend {
+            backend: "roxmltree",
+            message: e.to_string(),
+        })?;
         Ok(Self {
             input,
             preflight,
@@ -46,16 +28,6 @@ impl<'a> Projection<'a> {
     }
 
     pub(crate) fn project(self) -> Result<Document<'a>, ParseError> {
-        match self.parsed {
-            Parsed::Roxmltree(parsed) => {
-                super::roxmltree::project(self.input, &parsed, &self.preflight)
-            }
-            Parsed::Xmloxide(parsed) => super::xmloxide::project(
-                self.input,
-                parsed,
-                ParsingOptions::default(),
-                &self.preflight,
-            ),
-        }
+        super::roxmltree::project(self.input, &self.parsed, &self.preflight)
     }
 }

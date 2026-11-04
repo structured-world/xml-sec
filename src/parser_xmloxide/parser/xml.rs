@@ -3,9 +3,11 @@
 //! Implements a hand-rolled recursive descent parser for XML 1.0 (Fifth Edition).
 //! See <https://www.w3.org/TR/xml/> for the specification.
 
+use core::ops::Range;
+
 use crate::xml::dom::storage::names::{NameStorage, Names};
 use crate::xml::dom::storage::{Native, Storage, Values};
-use crate::xml::dom::{LimitCounter, ParseLimits, PositionRecorder, SourceKind, SourceNode};
+use crate::xml::dom::{LimitCounter, ParseLimits};
 
 use crate::parser_xmloxide::error::{ErrorSeverity, ParseDiagnostic};
 use crate::parser_xmloxide::tree::{Attribute, Document, NodeId, NodeKind};
@@ -69,21 +71,169 @@ const DEFAULT_MAX_AMPLIFICATION: usize = 5;
 /// resolver-provided external entities and stack safety.
 const MAX_ENTITY_DEPTH: u32 = 32;
 
-/// A parsed document with the source ranges of its nodes.
-pub(crate) type Located<S> = (Document<S>, <S as Storage>::Values<SourceNode>);
-type Finished<S> = (Document<S>, Option<PositionRecorder<S>>);
-/// A parse, with the limit counter that outlives a failed parse.
-type Counted<S> = (Result<Finished<S>, ParseError<S>>, Option<LimitCounter<S>>);
-/// A parse that enforced its limits, with the counter that names a limit it
-/// stopped at.
-pub(crate) type Limited<S> = (Result<Located<S>, ParseError<S>>, LimitCounter<S>);
+/// A parse into a tree `T`, with the limit counter that outlives a failed parse.
+type Counted<T, S> = (Result<T, ParseError<S>>, Option<LimitCounter<S>>);
+/// A parse into a tree `T` that enforced its limits, with the counter that
+/// names a limit it stopped at.
+pub(crate) type Limited<T, S> = (Result<T, ParseError<S>>, LimitCounter<S>);
+
+/// Where a node's content lies in the source.
+pub(crate) struct Span {
+    pub(crate) range: Range<usize>,
+    /// The node comes from an entity's replacement text: `range` is that of
+    /// the outermost reference, which no edit may split.
+    pub(crate) expanded: bool,
+}
+
+impl Span {
+    fn source(range: Range<usize>) -> Self {
+        Self {
+            range,
+            expanded: false,
+        }
+    }
+}
+
+/// The tree a parse builds, node by node in document order.
+pub(crate) trait Tree<S: NameStorage> {
+    /// A node that takes children.
+    type Node: Copy;
+    /// The tree an entity's replacement text is read into.
+    type Base: Tree<S, Node = Self::Node, Base = Self::Base>;
+    /// Whether the tree keeps the DOCTYPE, with its serialized internal subset.
+    const DOCTYPE: bool;
+
+    fn root(&self) -> Self::Node;
+    fn base(&mut self) -> &mut Self::Base;
+    /// The range every node takes while the tree reads a replacement text.
+    fn expansion(&self) -> Option<Range<usize>>;
+    fn declaration(
+        &mut self,
+        version: S::Text,
+        encoding: Option<S::Text>,
+        standalone: Option<bool>,
+    );
+    /// Appends `kind` under `parent`. An element's span covers its start; the
+    /// end follows in [`end_element`](Self::end_element).
+    fn push(
+        &mut self,
+        parent: Self::Node,
+        kind: NodeKind<S>,
+        span: Span,
+    ) -> Result<Self::Node, crate::xml::dom::ParseError>;
+    /// The prefix and local name of an open element.
+    fn element_name(&self, element: Self::Node) -> (Option<&str>, &str);
+    /// Closes `element`, whose source ends at `end` unless it came from a
+    /// replacement text.
+    fn end_element(&mut self, element: Self::Node, end: Option<usize>);
+    fn finish(&mut self, diagnostics: S::Values<ParseDiagnostic<S::FrozenText>>);
+}
+
+/// A tree reading an entity's replacement text: its nodes take the range of
+/// the reference, and IDs inside it stay unregistered.
+pub(crate) struct Expansion<'t, B> {
+    tree: &'t mut B,
+    range: Range<usize>,
+}
+
+impl<S: NameStorage, B: Tree<S, Base = B>> Tree<S> for Expansion<'_, B> {
+    type Node = B::Node;
+    type Base = B;
+    const DOCTYPE: bool = B::DOCTYPE;
+
+    fn root(&self) -> Self::Node {
+        self.tree.root()
+    }
+    fn base(&mut self) -> &mut B {
+        self.tree
+    }
+    fn expansion(&self) -> Option<Range<usize>> {
+        Some(self.range.clone())
+    }
+    fn declaration(&mut self, _: S::Text, _: Option<S::Text>, _: Option<bool>) {}
+    fn push(
+        &mut self,
+        parent: Self::Node,
+        kind: NodeKind<S>,
+        _: Span,
+    ) -> Result<Self::Node, crate::xml::dom::ParseError> {
+        self.tree.push(
+            parent,
+            kind,
+            Span {
+                range: self.range.clone(),
+                expanded: true,
+            },
+        )
+    }
+    fn element_name(&self, element: Self::Node) -> (Option<&str>, &str) {
+        self.tree.element_name(element)
+    }
+    fn end_element(&mut self, element: Self::Node, _: Option<usize>) {
+        self.tree.end_element(element, None);
+    }
+    fn finish(&mut self, _: S::Values<ParseDiagnostic<S::FrozenText>>) {}
+}
+
+impl<S: NameStorage> Tree<S> for Document<S> {
+    type Node = NodeId;
+    type Base = Self;
+    const DOCTYPE: bool = true;
+
+    fn root(&self) -> NodeId {
+        Document::root(self)
+    }
+    fn base(&mut self) -> &mut Self {
+        self
+    }
+    fn expansion(&self) -> Option<Range<usize>> {
+        None
+    }
+    fn declaration(
+        &mut self,
+        version: S::Text,
+        encoding: Option<S::Text>,
+        standalone: Option<bool>,
+    ) {
+        self.version = Some(version);
+        self.encoding = encoding;
+        self.standalone = standalone;
+    }
+    fn push(
+        &mut self,
+        parent: NodeId,
+        kind: NodeKind<S>,
+        span: Span,
+    ) -> Result<NodeId, crate::xml::dom::ParseError> {
+        let element = matches!(kind, NodeKind::Element { .. });
+        let node = self.try_create_node(kind)?;
+        self.append_child(parent, node);
+        // Auto-populate id_map for "id" attributes (enables element_by_id
+        // and fast CSS #id selectors without requiring DTD validation).
+        // A replacement text's IDs stay its own, as a grafted fragment's do.
+        if element && !span.expanded {
+            self.try_register_element_id(node)?;
+        }
+        Ok(node)
+    }
+    fn element_name(&self, element: NodeId) -> (Option<&str>, &str) {
+        match &self.node(element).kind {
+            NodeKind::Element { name, prefix, .. } => (prefix.as_deref(), name.as_ref()),
+            _ => unreachable!("only an element is open"),
+        }
+    }
+    fn end_element(&mut self, _: NodeId, _: Option<usize>) {}
+    fn finish(&mut self, diagnostics: S::Values<ParseDiagnostic<S::FrozenText>>) {
+        self.diagnostics = diagnostics;
+    }
+}
 
 /// The core XML parser.
-pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
+pub(crate) struct XmlParser<'a, S: NameStorage = Native, T: Tree<S> = Document<S>> {
     /// Shared low-level input state (position, peek, advance, name parsing, etc.).
     input: ParserInput<'a, S>,
-    /// The document being built.
-    doc: Document<S>,
+    /// The tree being built.
+    doc: T,
     /// Parser options.
     options: ParseOptions,
     /// Namespace resolver managing the scope stack.
@@ -101,8 +251,6 @@ pub(crate) struct XmlParser<'a, S: NameStorage = Native> {
     expansion_size: usize,
     /// Current nesting depth of general entity expansion (0 = document level).
     entity_depth: u32,
-    /// Source ranges of the nodes, when the caller has no lexical sidecar.
-    positions: Option<PositionRecorder<S>>,
     /// The policy limits, when no pass before the parser enforced them.
     limits: Option<LimitCounter<S>>,
 }
@@ -117,11 +265,42 @@ impl<'a> XmlParser<'a> {
     }
 }
 
+impl<'a, T: Tree<Native>> XmlParser<'a, Native, T> {
+    /// A parser that builds `tree` and resolves external entities through
+    /// the resolver of `options`.
+    pub(crate) fn with_native_tree(
+        input: &'a str,
+        options: &ParseOptions,
+        tree: T,
+    ) -> Result<Self, ParseError> {
+        let mut parser = Self::with_tree(input, options, Native, tree)?;
+        parser
+            .input
+            .set_entity_resolver(options.entity_resolver.clone());
+        Ok(parser)
+    }
+}
+
 impl<'a, S: NameStorage> XmlParser<'a, S> {
     pub(crate) fn with_storage(
         input: &'a str,
         options: &ParseOptions,
         storage: S,
+    ) -> Result<Self, ParseError<S>> {
+        // Pre-size the node arena — roughly 1 node per 30 bytes of input.
+        let estimated_nodes = (input.len() / 30).max(64);
+        let document = Document::try_with_storage(estimated_nodes, storage)?;
+        Self::with_tree(input, options, storage, document)
+    }
+}
+
+impl<'a, S: NameStorage, T: Tree<S>> XmlParser<'a, S, T> {
+    /// A parser that builds `tree` from `input`.
+    pub(crate) fn with_tree(
+        input: &'a str,
+        options: &ParseOptions,
+        storage: S,
+        tree: T,
     ) -> Result<Self, ParseError<S>> {
         let mut pi = ParserInput::with_storage(input, storage)?;
         pi.set_recover(options.recover);
@@ -129,11 +308,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         pi.set_max_name_length(options.max_name_length);
         pi.set_max_entity_expansions(options.max_entity_expansions);
 
-        // Pre-size the node arena — roughly 1 node per 30 bytes of input.
-        let estimated_nodes = (input.len() / 30).max(64);
         Ok(Self {
             input: pi,
-            doc: Document::try_with_storage(estimated_nodes, storage)?,
+            doc: tree,
             options: options.clone(),
             ns: NamespaceResolver::with_storage(storage)?,
             attr_types: storage.names(),
@@ -142,29 +319,17 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             input_size: input.len(),
             expansion_size: 0,
             entity_depth: 0,
-            positions: None,
             limits: None,
         })
     }
 
     /// Main parse entry point. Parses the entire document.
-    pub fn parse(self) -> Result<Document<S>, ParseError<S>> {
-        self.parse_tree().0.map(|(document, _)| document)
+    pub fn parse(self) -> Result<T, ParseError<S>> {
+        self.parse_tree().0
     }
 
-    /// Parses a document without a DOCTYPE and returns its nodes' source ranges,
-    /// in the order the projector visits them.
-    pub(crate) fn parse_recording_positions(mut self) -> Result<Located<S>, ParseError<S>> {
-        self.positions = Some(PositionRecorder::new(self.storage)?);
-        let (document, positions) = self.parse_tree().0?;
-        let positions = positions.expect("recording was enabled above");
-        Ok((document, positions.into_nodes()))
-    }
-
-    /// Parses a document without a DOCTYPE as
-    /// [`parse_recording_positions`](Self::parse_recording_positions) does,
-    /// refusing it at the first of `limits` it passes before allocating the
-    /// node that passes it.
+    /// Parses a document without a DOCTYPE, refusing it at the first of
+    /// `limits` it passes before allocating the node that passes it.
     ///
     /// # Errors
     /// Returns a resource refusal when the counter cannot be set up; the
@@ -172,15 +337,10 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     pub(crate) fn parse_enforcing_limits(
         mut self,
         limits: ParseLimits,
-    ) -> Result<Limited<S>, ParseError<S>> {
-        self.positions = Some(PositionRecorder::new(self.storage)?);
+    ) -> Result<Limited<T, S>, ParseError<S>> {
         self.limits = Some(LimitCounter::new(limits, self.storage)?);
         let (parsed, counter) = self.parse_tree();
-        let located = parsed.map(|(document, positions)| {
-            let positions = positions.expect("recording was enabled above");
-            (document, positions.into_nodes())
-        });
-        Ok((located, counter.expect("limits were enabled above")))
+        Ok((parsed, counter.expect("limits were enabled above")))
     }
 
     /// Report a construct to the limit counter, if the parse enforces limits.
@@ -195,15 +355,15 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     }
 
     /// The parse, and the limit counter, which outlives a failed parse.
-    fn parse_tree(mut self) -> Counted<S> {
+    fn parse_tree(mut self) -> Counted<T, S> {
         let parsed = self.parse_document();
         let limits = self.limits.take();
         let finished = parsed.map(|()| {
             // Sync diagnostics from input to document before returning.
-            self.doc.diagnostics = self.input.diagnostics;
-            // Parsing is complete and the parser is consumed. Moving the arena
-            // avoids Document::default allocating a replacement tree on return.
-            (self.doc, self.positions)
+            self.doc.finish(self.input.diagnostics);
+            // Parsing is complete and the parser is consumed. Moving the tree
+            // avoids allocating a replacement on return.
+            self.doc
         });
         (finished, limits)
     }
@@ -240,7 +400,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         self.parse_misc(self.doc.root())?;
 
         // Parse optional DOCTYPE declaration
-        if self.input.looking_at(b"<!DOCTYPE") || self.input.looking_at(b"<!doctype") {
+        // The keyword is case-sensitive (XML 1.0 production 28): `<!doctype`
+        // is not a DOCTYPE but a malformed root element.
+        if self.input.looking_at(b"<!DOCTYPE") {
             self.parse_doctype(self.doc.root())?;
             self.parse_misc(self.doc.root())?; // more misc after doctype
         }
@@ -280,28 +442,31 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         if decl.version != "1.0" {
             return Err(self.input.fatal("unsupported XML version"));
         }
-        self.doc.version = Some(self.storage.text(decl.version)?);
-        self.doc.encoding = self.storage.optional_text(decl.encoding)?;
-        self.doc.standalone = decl.standalone;
+        let version = self.storage.text(decl.version)?;
+        let encoding = self.storage.optional_text(decl.encoding)?;
+        self.doc.declaration(version, encoding, decl.standalone);
         Ok(())
     }
 
     // --- Misc (comments, PIs, whitespace) ---
 
-    fn parse_misc(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_misc(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         loop {
             // Preserve document-level whitespace as text nodes (matches libxml2).
             // libxml2 normalizes prolog/epilog whitespace to a single `\n`
             // regardless of how many blank lines appear in the source.
+            let start = self.input.pos();
             let ws = self.input.consume_whitespace()?;
             if !ws.is_empty() {
                 if let Some(limits) = &mut self.limits {
                     limits.markup();
                 }
-                let ws_node = self.doc.try_create_node(NodeKind::Text {
-                    content: self.storage.text("\n")?,
-                })?;
-                self.doc.append_child(parent, ws_node);
+                let content = self.storage.text("\n")?;
+                self.doc.push(
+                    parent,
+                    NodeKind::Text { content },
+                    Span::source(start..self.input.pos()),
+                )?;
             }
             if self.input.at_end() {
                 break;
@@ -362,8 +527,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             .map_err(|_| self.input.fatal("invalid UTF-8 in internal subset"))
     }
 
-    fn parse_doctype(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
-        // Consume <!DOCTYPE (case-insensitive match already checked by caller)
+    fn parse_doctype(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
+        // Consume <!DOCTYPE, which the caller has matched
+        let start = self.input.pos();
         self.input.expect_str(b"<!DOCTYPE")?;
         self.input.skip_whitespace_required()?;
 
@@ -418,9 +584,11 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                     Ok(dtd) => {
                         // Serialize while the ordered declarations are intact,
                         // then move runtime tables instead of cloning payloads.
-                        let serialized = serialize_dtd_in(&dtd, self.storage)?;
-                        if !serialized.is_empty() {
-                            internal_subset = Some(serialized);
+                        if T::DOCTYPE {
+                            let serialized = serialize_dtd_in(&dtd, self.storage)?;
+                            if !serialized.is_empty() {
+                                internal_subset = Some(serialized);
+                            }
                         }
                         // Runtime resolution uses the declaration table's
                         // exact owning layout: no second table or rehash.
@@ -473,20 +641,23 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
 
         self.input.expect_byte(b'>')?;
 
-        let doctype_id = self.doc.try_create_node(NodeKind::DocumentType {
-            name: self.storage.text(name)?,
-            system_id: self.storage.optional_text(system_id)?,
-            public_id: self.storage.optional_text(public_id)?,
-            internal_subset,
-        })?;
-        self.doc.append_child(parent, doctype_id);
+        if T::DOCTYPE {
+            let doctype = NodeKind::DocumentType {
+                name: self.storage.text(name)?,
+                system_id: self.storage.optional_text(system_id)?,
+                public_id: self.storage.optional_text(public_id)?,
+                internal_subset,
+            };
+            self.doc
+                .push(parent, doctype, Span::source(start..self.input.pos()))?;
+        }
         Ok(())
     }
 
     // --- Elements ---
     // See XML 1.0 §3.1: [40] STag, [42] ETag, [44] EmptyElemTag
 
-    fn parse_element(&mut self, parent: NodeId) -> Result<NodeId, ParseError<S>> {
+    fn parse_element(&mut self, parent: T::Node) -> Result<T::Node, ParseError<S>> {
         let (root, open) = self.parse_element_start(parent)?;
         let mut pending = self.storage.values(0)?;
         if let Some(scope) = open {
@@ -831,8 +1002,8 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
 
     fn parse_element_start(
         &mut self,
-        parent: NodeId,
-    ) -> Result<(NodeId, Option<bool>), ParseError<S>> {
+        parent: T::Node,
+    ) -> Result<(T::Node, Option<bool>), ParseError<S>> {
         let start = self.input.pos();
         self.input.expect_byte(b'<')?;
         let name = self.input.parse_name()?;
@@ -870,9 +1041,6 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         // The absolute nesting ceilings follow the policy's own depth limit,
         // which may equal them and is the refusal a document reports.
         self.input.increment_depth()?;
-        if let Some(positions) = &mut self.positions {
-            positions.start_element(start)?;
-        }
 
         self.check_attribute_spellings(&attributes)?;
         self.apply_attribute_defaults(name, &mut attributes)?;
@@ -940,24 +1108,21 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         let (elem_prefix, elem_local) = split_name(name);
         let elem_prefix_owned = self.storage.optional_text(elem_prefix)?;
         let elem_local_owned = self.storage.text(elem_local)?;
-        // Auto-populate id_map for "id" attributes (enables element_by_id
-        // and fast CSS #id selectors without requiring DTD validation).
-        let elem_id = self.doc.try_create_node(NodeKind::Element {
-            name: elem_local_owned,
-            prefix: elem_prefix_owned,
-            namespace: elem_ns,
-            attributes,
-        })?;
-        self.doc.append_child(parent, elem_id);
-
-        self.doc.try_register_element_id(elem_id)?;
+        let elem_id = self.doc.push(
+            parent,
+            NodeKind::Element {
+                name: elem_local_owned,
+                prefix: elem_prefix_owned,
+                namespace: elem_ns,
+                attributes,
+            },
+            Span::source(start..start),
+        )?;
 
         // Empty element tag <foo/>
         if self.input.looking_at(b"/>") {
             self.input.advance(2)?;
-            if let Some(positions) = &mut self.positions {
-                positions.end_element(self.input.pos());
-            }
+            self.doc.end_element(elem_id, Some(self.input.pos()));
             if has_ns_decls {
                 self.ns.pop_scope()?;
             }
@@ -973,19 +1138,13 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
 
     fn parse_element_end(
         &mut self,
-        elem_id: NodeId,
+        elem_id: T::Node,
         has_ns_decls: bool,
     ) -> Result<(), ParseError<S>> {
         // Match the end tag against the node's retained parts without
         // formatting or allocating another qualified name.
         self.input.expect_str(b"</")?;
-        let (match_prefix, match_local) = {
-            let node = self.doc.node(elem_id);
-            match &node.kind {
-                NodeKind::Element { name, prefix, .. } => (prefix.as_deref(), name.as_ref()),
-                _ => unreachable!(),
-            }
-        };
+        let (match_prefix, match_local) = self.doc.element_name(elem_id);
         if let Some(end_name) = self.input.parse_name_eq_parts(match_prefix, match_local)? {
             let expected = QualifiedName {
                 prefix: match_prefix,
@@ -1004,9 +1163,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         }
         self.input.skip_whitespace()?;
         self.input.expect_byte(b'>')?;
-        if let Some(positions) = &mut self.positions {
-            positions.end_element(self.input.pos());
-        }
+        self.doc.end_element(elem_id, Some(self.input.pos()));
         self.limit(LimitCounter::end_element)?;
 
         // Pop the namespace scope when leaving this element (only if we pushed).
@@ -1045,9 +1202,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // --- Character Data ---
     // See XML 1.0 §2.4: [14] CharData
 
-    fn parse_char_data(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_char_data(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         self.limit(LimitCounter::character_data)?;
-        let source_start = self.input.pos();
+        let mut source_start = self.input.pos();
         let mut text = self.storage.text("")?;
 
         while !self.input.at_end() {
@@ -1117,12 +1274,15 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                     // Flush accumulated text before the entity ref
                     if !text.is_empty() {
                         let empty = self.storage.text("")?;
-                        let text_id = self.doc.try_create_node(NodeKind::Text {
-                            content: core::mem::replace(&mut text, empty),
-                        })?;
-                        self.doc.append_child(parent, text_id);
+                        let content = core::mem::replace(&mut text, empty);
+                        self.doc.push(
+                            parent,
+                            NodeKind::Text { content },
+                            Span::source(source_start..self.input.pos()),
+                        )?;
                     }
                     self.parse_entity_ref_in_content(parent)?;
+                    source_start = self.input.pos();
                     continue;
                 }
                 self.input.parse_reference_into(&mut text)?;
@@ -1141,11 +1301,11 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                     return Ok(());
                 }
             }
-            let text_id = self.doc.try_create_node(NodeKind::Text { content: text })?;
-            self.doc.append_child(parent, text_id);
-            if let Some(positions) = &mut self.positions {
-                positions.leaf(SourceKind::Text, source_start..self.input.pos())?;
-            }
+            self.doc.push(
+                parent,
+                NodeKind::Text { content: text },
+                Span::source(source_start..self.input.pos()),
+            )?;
         }
 
         Ok(())
@@ -1158,8 +1318,9 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     /// replacement text (XML 1.0 §4.5: character references expanded at
     /// declaration time) as content, attaching the resulting nodes as
     /// children of the `EntityRef` node.
-    fn parse_entity_ref_in_content(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_entity_ref_in_content(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         // Consume `&name;`
+        let start = self.input.pos();
         self.input.advance(1)?; // '&'
         let name = self.input.parse_name()?;
         self.input.expect_byte(b';')?;
@@ -1230,11 +1391,15 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                     .fatal(format_args!("unknown entity reference: &{name};")));
             };
 
-        let ref_id = self.doc.try_create_node(NodeKind::EntityRef {
+        // A nested reference's content takes the range of the outermost one.
+        let range = self.doc.expansion().unwrap_or(start..self.input.pos());
+        let reference = NodeKind::EntityRef {
             name: self.storage.text(name)?,
             value: self.storage.optional_text(replacement.as_deref())?,
-        })?;
-        self.doc.append_child(parent, ref_id);
+        };
+        let ref_id = self
+            .doc
+            .push(parent, reference, Span::source(range.clone()))?;
 
         let Some(replacement) = replacement else {
             return Ok(());
@@ -1253,14 +1418,20 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
 
         self.storage.charge(replacement.len())?;
         if replacement.bytes().any(|byte| byte == b'<' || byte == b'&') {
-            self.parse_replacement_as_content(name, &replacement, ref_id)?;
+            self.parse_replacement_as_content(name, &replacement, ref_id, range)?;
             return Ok(());
         }
         // Fast path: plain character data, without markup or references.
         let mut content = self.storage.text("")?;
         super::input::append_normalized_line_ends(self.storage, &mut content, &replacement)?;
-        let text_id = self.doc.try_create_node(NodeKind::Text { content })?;
-        self.doc.append_child(ref_id, text_id);
+        self.doc.base().push(
+            ref_id,
+            NodeKind::Text { content },
+            Span {
+                range,
+                expanded: true,
+            },
+        )?;
         Ok(())
     }
 
@@ -1275,7 +1446,8 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         &mut self,
         entity_name: &str,
         replacement: &str,
-        ref_id: NodeId,
+        ref_id: T::Node,
+        range: Range<usize>,
     ) -> Result<(), ParseError<S>> {
         if self.entity_depth >= MAX_ENTITY_DEPTH {
             return Err(self.input.fatal(format_args!(
@@ -1283,7 +1455,13 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
             )));
         }
 
-        let mut sub = XmlParser::with_storage(replacement, &self.options, self.storage)?;
+        // The replacement text is read straight into this tree, under the
+        // reference, so no fragment is built and grafted.
+        let tree = Expansion {
+            tree: self.doc.base(),
+            range,
+        };
+        let mut sub = XmlParser::with_tree(replacement, &self.options, self.storage, tree)?;
         sub.input.inherit_entity_resolver(&self.input);
         sub.entity_depth = self.entity_depth + 1;
         sub.input_size = self.input_size;
@@ -1302,8 +1480,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         core::mem::swap(&mut sub.attr_defaults, &mut self.attr_defaults);
         core::mem::swap(&mut sub.ns, &mut self.ns);
 
-        let sub_root = sub.doc.root();
-        let result = sub.parse_content_fragment(sub_root);
+        let result = sub.parse_content_fragment(ref_id);
 
         // Restore shared state regardless of outcome.
         core::mem::swap(&mut self.input.entity_map, &mut sub.input.entity_map);
@@ -1335,9 +1512,6 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
                  XML content: {message}"
             )));
         }
-
-        // Graft the parsed nodes into our arena under the EntityRef node.
-        self.doc.try_graft_children(sub.doc, ref_id)?;
         Ok(())
     }
 
@@ -1347,7 +1521,7 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     /// Unlike [`parse_content`](Self::parse_content), end of input is the
     /// normal termination and an end tag (`</`) is an error (it would close
     /// an element opened outside the entity — WFC violation).
-    fn parse_content_fragment(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_content_fragment(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         while !self.input.at_end() {
             if self.input.looking_at(b"</") {
                 return Err(self.input.fatal("unbalanced end tag"));
@@ -1474,52 +1648,48 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
     // --- Comments ---
     // See XML 1.0 §2.5: [15] Comment
 
-    fn parse_comment(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_comment(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         let start = self.input.pos();
         let content = parse_comment_content(&mut self.input)?;
         self.limit(LimitCounter::node)?;
-        let comment_id = self.doc.try_create_node(NodeKind::Comment {
-            content: self.storage.text(content)?,
-        })?;
-        self.doc.append_child(parent, comment_id);
-        if let Some(positions) = &mut self.positions {
-            positions.leaf(SourceKind::Comment, start..self.input.pos())?;
-        }
+        let content = self.storage.text(content)?;
+        self.doc.push(
+            parent,
+            NodeKind::Comment { content },
+            Span::source(start..self.input.pos()),
+        )?;
         Ok(())
     }
 
     // --- CDATA Sections ---
     // See XML 1.0 §2.7: [18] CDSect
 
-    fn parse_cdata(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_cdata(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         let start = self.input.pos();
         let content = parse_cdata_content(&mut self.input)?;
         self.limit(LimitCounter::character_data)?;
-        let cdata_id = self.doc.try_create_node(NodeKind::CData {
-            content: self.storage.text(content)?,
-        })?;
-        self.doc.append_child(parent, cdata_id);
-        if let Some(positions) = &mut self.positions {
-            positions.leaf(SourceKind::CData, start..self.input.pos())?;
-        }
+        let content = self.storage.text(content)?;
+        self.doc.push(
+            parent,
+            NodeKind::CData { content },
+            Span::source(start..self.input.pos()),
+        )?;
         Ok(())
     }
 
     // --- Processing Instructions ---
     // See XML 1.0 §2.6: [16] PI
 
-    fn parse_processing_instruction(&mut self, parent: NodeId) -> Result<(), ParseError<S>> {
+    fn parse_processing_instruction(&mut self, parent: T::Node) -> Result<(), ParseError<S>> {
         let start = self.input.pos();
         let (target, data) = parse_pi_content(&mut self.input)?;
         self.limit(LimitCounter::node)?;
-        let pi_id = self.doc.try_create_node(NodeKind::ProcessingInstruction {
+        let instruction = NodeKind::ProcessingInstruction {
             target: self.storage.text(target)?,
             data: self.storage.optional_text(data)?,
-        })?;
-        self.doc.append_child(parent, pi_id);
-        if let Some(positions) = &mut self.positions {
-            positions.leaf(SourceKind::Pi, start..self.input.pos())?;
-        }
+        };
+        self.doc
+            .push(parent, instruction, Span::source(start..self.input.pos()))?;
         Ok(())
     }
 }

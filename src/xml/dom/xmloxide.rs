@@ -1,17 +1,17 @@
-//! `xmloxide` parser adapter for the shared semantic arena.
+//! `xmloxide` parser adapter: the parser builds the shared semantic arena.
 
-use alloc::string::{String, ToString};
+use alloc::string::ToString;
 use core::ops::Range;
 
 use super::storage::names::NameStorage;
 use super::storage::{Native, Storage, Values};
 use crate::parser_xmloxide as xmloxide;
-use xmloxide::tree::{NodeId as XmloxNodeId, NodeKind as XmloxNodeKind};
+use xmloxide::parser::{Span, Tree};
+use xmloxide::tree::NodeKind as XmloxNodeKind;
 
 use super::{
     Document, LexicalPreflight, ParseError, ParseLimits, ParsingOptions, Refused,
     XmlBackendImplementation,
-    preflight::{PositionCursor, SourceKind, SourceNode},
     tree::{AttributeData, NamespaceData, NamespaceSet, NodeId, NodeKind, TreeBuilder},
 };
 
@@ -25,6 +25,34 @@ type XmloxideError<S> = xmloxide::error::ParseError<
 >;
 
 #[cfg(feature = "xmldsig")]
+fn accounted_failure<W: structured_asn1::memory::Work>(
+    error: XmloxideError<super::storage::Accounted<'_, W>>,
+) -> super::AccountedParseError {
+    match error {
+        xmloxide::error::ParseError::Resource(error) => super::AccountedParseError::Semantic(error),
+        xmloxide::error::ParseError::Syntax {
+            message,
+            location,
+            diagnostics,
+        } => super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
+            message,
+            location,
+            diagnostics: diagnostics.into_owned(),
+        }),
+    }
+}
+
+fn native_failure(error: xmloxide::error::ParseError) -> ParseError {
+    match error {
+        xmloxide::error::ParseError::Resource(error) => error,
+        error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
+            backend: "xmloxide",
+            message: error.to_string(),
+        },
+    }
+}
+
+#[cfg(feature = "xmldsig")]
 impl XmloxideBackend {
     pub(super) fn parse_in<'input, 'w, W: structured_asn1::memory::Work>(
         input: &'input str,
@@ -33,36 +61,11 @@ impl XmloxideBackend {
         storage: super::storage::Accounted<'w, W>,
     ) -> Result<Document<'input, super::storage::Accounted<'w, W>>, super::AccountedParseError>
     {
-        let (parsed, recorded) =
-            xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
-                .and_then(|parser| {
-                    if preflight.is_unscanned() {
-                        let (parsed, positions) = parser.parse_recording_positions()?;
-                        Ok((parsed, Some(positions)))
-                    } else {
-                        Ok((parser.parse()?, None))
-                    }
-                })
-                .map_err(|error| match error {
-                    xmloxide::error::ParseError::Resource(error) => {
-                        super::AccountedParseError::Semantic(error)
-                    }
-                    xmloxide::error::ParseError::Syntax {
-                        message,
-                        location,
-                        diagnostics,
-                    } => {
-                        super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
-                            message,
-                            location,
-                            diagnostics: diagnostics.into_owned(),
-                        })
-                    }
-                })?;
-        let positions = recorded.as_deref().unwrap_or(preflight.source_nodes());
-        Ok(project_in(
-            input, parsed, options, preflight, positions, storage,
-        )?)
+        let tree = Semantic::new(input, options, storage)?;
+        let tree = xmloxide::parser::XmlParser::with_tree(input, &backend_options(), storage, tree)
+            .and_then(xmloxide::parser::XmlParser::parse)
+            .map_err(accounted_failure)?;
+        Ok(tree.finish(preflight)?)
     }
 
     /// [`parse_enforcing_limits`](Self::parse_enforcing_limits) in the
@@ -76,31 +79,19 @@ impl XmloxideBackend {
         Limited<'input, super::storage::Accounted<'w, W>>,
         Refused<super::AccountedParseError>,
     > {
-        let failure = |error: XmloxideError<super::storage::Accounted<'w, W>>| match error {
-            xmloxide::error::ParseError::Resource(error) => {
-                super::AccountedParseError::Semantic(error)
-            }
-            xmloxide::error::ParseError::Syntax {
-                message,
-                location,
-                diagnostics,
-            } => super::AccountedParseError::Xmloxide(xmloxide::error::ParseError::Syntax {
-                message,
-                location,
-                diagnostics: diagnostics.into_owned(),
-            }),
-        };
+        let tree =
+            Semantic::new(input, options, storage).map_err(|error| Refused::Parse(error.into()))?;
         let (parsed, counter) =
-            xmloxide::parser::XmlParser::with_storage(input, &backend_options(), storage)
+            xmloxide::parser::XmlParser::with_tree(input, &backend_options(), storage, tree)
                 .and_then(|parser| parser.parse_enforcing_limits(limits))
-                .map_err(|error| Refused::Parse(failure(error)))?;
-        let (parsed, positions) = parsed.map_err(|error| match counter.refusal() {
+                .map_err(|error| Refused::Parse(accounted_failure(error)))?;
+        let tree = parsed.map_err(|error| match counter.refusal() {
             Some(refusal) => Refused::Limit(refusal),
-            None => Refused::Parse(failure(error)),
+            None => Refused::Parse(accounted_failure(error)),
         })?;
-        let preflight =
-            LexicalPreflight::unscanned(storage).map_err(|error| Refused::Parse(error.into()))?;
-        let document = project_in(input, parsed, options, &preflight, &positions, storage)
+        let preflight = LexicalPreflight::unscanned(storage);
+        let document = tree
+            .finish(&preflight)
             .map_err(|error| Refused::Parse(error.into()))?;
         Ok((document, counter.peak_namespace_bindings()))
     }
@@ -119,61 +110,18 @@ impl XmloxideBackend {
         options: ParsingOptions,
         limits: ParseLimits,
     ) -> Result<Limited<'_, Native>, Refused<ParseError>> {
-        let failure = |error| match error {
-            xmloxide::error::ParseError::Resource(error) => error,
-            error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
-                backend: "xmloxide",
-                message: error.to_string(),
-            },
-        };
+        let tree = Semantic::new(input, options, Native).map_err(Refused::Parse)?;
         let (parsed, counter) =
-            xmloxide::parser::parse_str_enforcing_limits(input, &backend_options(), limits)
-                .map_err(|error| Refused::Parse(failure(error)))?;
-        let (parsed, positions) = parsed.map_err(|error| match counter.refusal() {
+            xmloxide::parser::parse_str_enforcing_limits(input, &backend_options(), limits, tree)
+                .map_err(|error| Refused::Parse(native_failure(error)))?;
+        let tree = parsed.map_err(|error| match counter.refusal() {
             Some(refusal) => Refused::Limit(refusal),
-            None => Refused::Parse(failure(error)),
+            None => Refused::Parse(native_failure(error)),
         })?;
-        let preflight = LexicalPreflight::unscanned(Native).map_err(Refused::Parse)?;
-        let document = project_in(input, parsed, options, &preflight, &positions, Native)
-            .map_err(Refused::Parse)?;
+        let preflight = LexicalPreflight::unscanned(Native);
+        let document = tree.finish(&preflight).map_err(Refused::Parse)?;
         Ok((document, counter.peak_namespace_bindings()))
     }
-}
-
-/// Takes a backend text into the semantic tree. The two trees share one storage
-/// in a parse, so the text moves with its allocation and its charge.
-pub(super) trait AdoptText<R: Storage>: Storage {
-    fn adopt(&self, text: R::Text) -> Result<Self::Text, ParseError>;
-}
-
-impl AdoptText<Native> for Native {
-    fn adopt(&self, text: String) -> Result<String, ParseError> {
-        Ok(text)
-    }
-}
-
-#[cfg(feature = "xmldsig")]
-impl<'w, W: structured_asn1::memory::Work> AdoptText<super::storage::Accounted<'w, W>>
-    for super::storage::Accounted<'w, W>
-{
-    fn adopt(&self, text: Self::Text) -> Result<Self::Text, ParseError> {
-        Ok(text)
-    }
-}
-
-// Tests project a natively parsed tree into a limited account.
-#[cfg(all(test, feature = "xmldsig"))]
-impl<W: structured_asn1::memory::Work> AdoptText<Native> for super::storage::Accounted<'_, W> {
-    fn adopt(&self, text: String) -> Result<Self::Text, ParseError> {
-        self.text(&text)
-    }
-}
-
-fn adopt_optional<S: AdoptText<R>, R: Storage>(
-    storage: S,
-    text: Option<R::Text>,
-) -> Result<Option<S::Text>, ParseError> {
-    text.map(|text| storage.adopt(text)).transpose()
 }
 
 impl XmlBackendImplementation for XmloxideBackend {
@@ -182,70 +130,17 @@ impl XmlBackendImplementation for XmloxideBackend {
         options: ParsingOptions,
         preflight: &LexicalPreflight,
     ) -> Result<Document<'input>, ParseError> {
-        let failure = |error| match error {
-            xmloxide::error::ParseError::Resource(error) => error,
-            error @ xmloxide::error::ParseError::Syntax { .. } => ParseError::Backend {
-                backend: "xmloxide",
-                message: error.to_string(),
-            },
-        };
-        if preflight.is_unscanned() {
-            let (parsed, positions) =
-                xmloxide::parser::parse_str_recording_positions(input, &backend_options())
-                    .map_err(failure)?;
-            return project_in(input, parsed, options, preflight, &positions, Native);
-        }
-        let parsed =
-            xmloxide::parser::parse_str_with_options(input, &backend_options()).map_err(failure)?;
-        project(input, parsed, options, preflight)
+        let tree = Semantic::new(input, options, Native)?;
+        xmloxide::parser::parse_str_into(input, &backend_options(), tree)
+            .map_err(native_failure)?
+            .finish(preflight)
     }
-}
-
-pub(super) fn project<'input>(
-    input: &'input str,
-    parsed: xmloxide::Document,
-    options: ParsingOptions,
-    preflight: &LexicalPreflight,
-) -> Result<Document<'input>, ParseError> {
-    let positions = preflight.source_nodes();
-    project_in(input, parsed, options, preflight, positions, Native)
-}
-
-pub(super) fn project_in<'input, S: AdoptText<R>, P: Storage, R: NameStorage>(
-    input: &'input str,
-    parsed: xmloxide::Document<R>,
-    options: ParsingOptions,
-    preflight: &LexicalPreflight<'_, P>,
-    positions: &[SourceNode],
-    storage: S,
-) -> Result<Document<'input, S>, ParseError> {
-    if options.nodes_limit == 0 {
-        return Err(ParseError::NodesLimitReached);
-    }
-    let parsed_root = parsed.root();
-    let mut projector = Projector {
-        target: TreeBuilder::new(
-            input,
-            parsed.node_count().min(options.nodes_limit as usize),
-            storage,
-        )?,
-        source: parsed,
-        positions: PositionCursor::new(positions),
-        nodes_limit: options.nodes_limit,
-    };
-    let root = projector
-        .target
-        .push(None, NodeKind::Root, 0..input.len())?;
-    projector.project_children(parsed_root, root)?;
-    projector.positions.finish()?;
-    projector.target.finish_subtree(root);
-    projector.target.finish(preflight)
 }
 
 pub(super) fn backend_options() -> xmloxide::parser::ParseOptions {
     // The shared preflight owns the backend-neutral contract. These absolute
     // limits are defense in depth against a backend regression allocating
-    // expanded entity data before returning control to the projector.
+    // expanded entity data before returning control to the semantic tree.
     xmloxide::parser::ParseOptions::default()
         .max_depth(
             u32::try_from(crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING)
@@ -258,130 +153,43 @@ pub(super) fn backend_options() -> xmloxide::parser::ParseOptions {
         .max_entity_expansions(crate::hard_limits::XML_ENTITY_EXPANSION_CEILING)
 }
 
-struct Projector<'input, 'positions, S: Storage = Native, R: NameStorage = Native> {
-    source: xmloxide::Document<R>,
-    target: TreeBuilder<'input, S>,
-    positions: PositionCursor<'positions>,
+/// The semantic arena as the tree the parser builds: each node the parser
+/// reads lands in its final form, with no backend DOM between them.
+struct Semantic<'input, S: Storage> {
+    tree: TreeBuilder<'input, S>,
+    root: NodeId,
     nodes_limit: u32,
 }
 
-enum ProjectionFrame {
-    Enter {
-        source: XmloxNodeId,
-        parent: NodeId,
-        namespace_owner: Option<NodeId>,
-        inherited_range: Option<Range<usize>>,
-        range_actionable: bool,
-    },
-    Exit(NodeId),
-}
-
-impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
-    fn project_children(&mut self, source: XmloxNodeId, parent: NodeId) -> Result<(), ParseError> {
-        let storage = self.target.storage();
-        let mut stack = storage.values(0)?;
-        self.push_children(&mut stack, source, parent, None, None, true)?;
-        while let Some(frame) = stack.pop() {
-            storage.charge(1)?;
-            match frame {
-                ProjectionFrame::Exit(node) => self.target.finish_subtree(node),
-                ProjectionFrame::Enter {
-                    source,
-                    parent,
-                    namespace_owner,
-                    inherited_range,
-                    range_actionable,
-                } => {
-                    // The next sibling waits under this node's subtree, so the
-                    // stack grows with depth and not with an element's width.
-                    if let Some(next) = self.source.next_sibling(source) {
-                        stack.push(ProjectionFrame::Enter {
-                            source: next,
-                            parent,
-                            namespace_owner,
-                            inherited_range: inherited_range.clone(),
-                            range_actionable,
-                        })?;
-                    }
-                    // Each node is entered once, so its payload moves out.
-                    let kind = core::mem::replace(
-                        &mut self.source.node_mut(source).kind,
-                        XmloxNodeKind::Document,
-                    );
-                    match kind {
-                        XmloxNodeKind::Document | XmloxNodeKind::DocumentType { .. } => {
-                            self.push_children(
-                                &mut stack,
-                                source,
-                                parent,
-                                namespace_owner,
-                                inherited_range.as_ref(),
-                                range_actionable,
-                            )?;
-                        }
-                        kind @ XmloxNodeKind::Element { .. } => {
-                            let node = self.project_element(
-                                kind,
-                                parent,
-                                namespace_owner,
-                                inherited_range.as_ref(),
-                                range_actionable,
-                            )?;
-                            stack.push(ProjectionFrame::Exit(node))?;
-                            self.push_children(
-                                &mut stack,
-                                source,
-                                node,
-                                Some(node),
-                                inherited_range.as_ref(),
-                                range_actionable,
-                            )?;
-                        }
-                        kind @ (XmloxNodeKind::Text { .. }
-                        | XmloxNodeKind::CData { .. }
-                        | XmloxNodeKind::Comment { .. }
-                        | XmloxNodeKind::ProcessingInstruction { .. }) => {
-                            self.project_leaf(
-                                source,
-                                parent,
-                                kind,
-                                inherited_range,
-                                range_actionable,
-                            )?;
-                        }
-                        XmloxNodeKind::EntityRef { value, .. } => {
-                            let range = match inherited_range {
-                                Some(range) => range,
-                                None => self.positions.take(SourceKind::EntityRef)?,
-                            };
-                            if self.source.children(source).next().is_some() {
-                                self.push_children(
-                                    &mut stack,
-                                    source,
-                                    parent,
-                                    namespace_owner,
-                                    Some(&range),
-                                    false,
-                                )?;
-                            } else if let Some(value) = value {
-                                self.admit_text(parent)?;
-                                let value = self.target.storage().adopt(value)?;
-                                self.target.append_text(parent, value, range, false)?;
-                            }
-                        }
-                    }
-                }
-            }
+impl<'input, S: NameStorage> Semantic<'input, S> {
+    fn new(input: &'input str, options: ParsingOptions, storage: S) -> Result<Self, ParseError> {
+        if options.nodes_limit == 0 {
+            return Err(ParseError::NodesLimitReached);
         }
-        Ok(())
+        // About one node per 30 source bytes, never more than may be admitted.
+        let capacity = (input.len() / 30).max(64).min(options.nodes_limit as usize);
+        let mut tree = TreeBuilder::new(input, capacity, storage)?;
+        let root = tree.push(None, NodeKind::Root, 0..input.len())?;
+        Ok(Self {
+            tree,
+            root,
+            nodes_limit: options.nodes_limit,
+        })
     }
 
-    fn project_element(
+    fn finish<P: Storage>(
+        mut self,
+        preflight: &LexicalPreflight<'_, P>,
+    ) -> Result<Document<'input, S>, ParseError> {
+        self.tree.finish_subtree(self.root);
+        self.tree.finish(preflight)
+    }
+
+    fn element(
         &mut self,
-        kind: XmloxNodeKind<R>,
         parent: NodeId,
-        namespace_owner: Option<NodeId>,
-        inherited_range: Option<&Range<usize>>,
+        kind: XmloxNodeKind<S>,
+        range: Range<usize>,
         range_actionable: bool,
     ) -> Result<NodeId, ParseError> {
         let XmloxNodeKind::Element {
@@ -391,35 +199,31 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
             attributes,
         } = kind
         else {
-            unreachable!("element projection requires an element");
+            unreachable!("element construction requires an element");
         };
-        let storage = self.target.storage();
         self.admit_node()?;
-        let range = match inherited_range {
-            Some(range) => range.clone(),
-            None => self.positions.take(SourceKind::Element)?,
-        };
-        let namespaces = self.project_namespaces(&attributes, namespace_owner)?;
+        let storage = self.tree.storage();
+        let namespaces = self.namespaces(parent, &attributes)?;
         let mut semantic_attributes = storage.values(attributes.len())?;
         for attribute in attributes {
             storage.charge(1)?;
             if namespace_declaration(&attribute).is_none() {
                 semantic_attributes.push(AttributeData {
-                    name: storage.adopt(attribute.name)?,
-                    namespace: adopt_optional(storage, attribute.namespace)?,
-                    prefix: adopt_optional(storage, attribute.prefix)?,
-                    value: storage.adopt(attribute.value)?,
+                    name: attribute.name,
+                    namespace: attribute.namespace,
+                    prefix: attribute.prefix,
+                    value: attribute.value,
                     is_id: false,
                     xml_id_error: None,
                 })?;
             }
         }
-        self.target.push_with_actionability(
+        self.tree.push_with_actionability(
             Some(parent),
             NodeKind::Element {
-                name: storage.adopt(name)?,
-                namespace: adopt_optional(storage, namespace.filter(|uri| !uri.is_empty()))?,
-                prefix: adopt_optional(storage, prefix)?,
+                name,
+                namespace: namespace.filter(|uri| !uri.is_empty()),
+                prefix,
                 attributes: semantic_attributes,
                 namespaces,
             },
@@ -429,13 +233,13 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
     }
 
     /// The element's in-scope set: its parent's, unless it declares bindings.
-    fn project_namespaces(
+    fn namespaces(
         &mut self,
-        attributes: &[xmloxide::tree::Attribute<R>],
-        namespace_owner: Option<NodeId>,
+        parent: NodeId,
+        attributes: &[xmloxide::tree::Attribute<S>],
     ) -> Result<NamespaceSet, ParseError> {
-        let storage = self.target.storage();
-        let inherited = self.target.namespace_set_of(namespace_owner);
+        let storage = self.tree.storage();
+        let inherited = self.tree.namespace_set_of(Some(parent));
         storage.charge(attributes.len())?;
         if attributes
             .iter()
@@ -443,7 +247,7 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
         {
             return Ok(inherited);
         }
-        let inherited = self.target.namespace_bindings(inherited);
+        let inherited = self.tree.namespace_bindings(inherited);
         let mut namespaces = storage.values(inherited.len())?;
         for namespace in inherited {
             storage.charge(1)?;
@@ -462,111 +266,36 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
                 )?;
             }
         }
-        self.target.add_namespace_set(namespaces)
+        self.tree.add_namespace_set(namespaces)
     }
 
-    fn project_leaf(
+    fn text(
         &mut self,
-        source: XmloxNodeId,
         parent: NodeId,
-        kind: XmloxNodeKind<R>,
-        inherited_range: Option<Range<usize>>,
+        content: S::Text,
+        range: Range<usize>,
         range_actionable: bool,
-    ) -> Result<(), ParseError> {
-        let storage = self.target.storage();
-        match kind {
-            XmloxNodeKind::Text { content } => {
-                if self.source.parent(source) == Some(self.source.root()) {
-                    storage.charge(content.len())?;
-                    if content.chars().all(char::is_whitespace) {
-                        return Ok(());
-                    }
-                }
-                self.admit_text(parent)?;
-                let range = match inherited_range {
-                    Some(range) => range,
-                    None => self.positions.take(SourceKind::Text)?,
-                };
-                self.target.append_text(
-                    parent,
-                    storage.adopt(content)?,
-                    range,
-                    range_actionable,
-                )?;
-            }
-            XmloxNodeKind::CData { content } => {
-                self.admit_text(parent)?;
-                let range = match inherited_range {
-                    Some(range) => range,
-                    None => self.positions.take(SourceKind::CData)?,
-                };
-                self.target.append_text(
-                    parent,
-                    storage.adopt(content)?,
-                    range,
-                    range_actionable,
-                )?;
-            }
-            XmloxNodeKind::Comment { content } => {
-                self.admit_node()?;
-                let range = match inherited_range {
-                    Some(range) => range,
-                    None => self.positions.take(SourceKind::Comment)?,
-                };
-                self.target.push_with_actionability(
-                    Some(parent),
-                    NodeKind::Comment(storage.adopt(content)?),
-                    range,
-                    range_actionable,
-                )?;
-            }
-            XmloxNodeKind::ProcessingInstruction {
-                target: pi_target,
-                data,
-            } => {
-                self.admit_node()?;
-                let range = match inherited_range {
-                    Some(range) => range,
-                    None => self.positions.take(SourceKind::Pi)?,
-                };
-                self.target.push_with_actionability(
-                    Some(parent),
-                    NodeKind::PI {
-                        target: storage.adopt(pi_target)?,
-                        value: adopt_optional(storage, data)?,
-                    },
-                    range,
-                    range_actionable,
-                )?;
-            }
-            _ => unreachable!("leaf projection requires a leaf"),
-        }
-        Ok(())
+    ) -> Result<NodeId, ParseError> {
+        self.admit_text(parent)?;
+        self.tree
+            .append_text(parent, content, range, range_actionable)?;
+        Ok(parent)
     }
 
-    fn push_children(
-        &self,
-        stack: &mut S::Values<ProjectionFrame>,
-        source: XmloxNodeId,
+    fn leaf(
+        &mut self,
         parent: NodeId,
-        namespace_owner: Option<NodeId>,
-        inherited_range: Option<&Range<usize>>,
+        kind: NodeKind<S>,
+        range: Range<usize>,
         range_actionable: bool,
-    ) -> Result<(), ParseError> {
-        if let Some(first) = self.source.first_child(source) {
-            stack.push(ProjectionFrame::Enter {
-                source: first,
-                parent,
-                namespace_owner,
-                inherited_range: inherited_range.cloned(),
-                range_actionable,
-            })?;
-        }
-        Ok(())
+    ) -> Result<NodeId, ParseError> {
+        self.admit_node()?;
+        self.tree
+            .push_with_actionability(Some(parent), kind, range, range_actionable)
     }
 
     fn admit_node(&self) -> Result<(), ParseError> {
-        if self.target.len() >= self.nodes_limit as usize {
+        if self.tree.len() >= self.nodes_limit as usize {
             Err(ParseError::NodesLimitReached)
         } else {
             Ok(())
@@ -574,11 +303,82 @@ impl<S: AdoptText<R>, R: NameStorage> Projector<'_, '_, S, R> {
     }
 
     fn admit_text(&self, parent: NodeId) -> Result<(), ParseError> {
-        if self.target.len() < self.nodes_limit as usize || self.target.has_text_tail(parent) {
+        if self.tree.len() < self.nodes_limit as usize || self.tree.has_text_tail(parent) {
             return Ok(());
         }
         Err(ParseError::NodesLimitReached)
     }
+}
+
+impl<S: NameStorage> Tree<S> for Semantic<'_, S> {
+    type Node = NodeId;
+    type Base = Self;
+    const DOCTYPE: bool = false;
+
+    fn root(&self) -> NodeId {
+        self.root
+    }
+    fn base(&mut self) -> &mut Self {
+        self
+    }
+    fn expansion(&self) -> Option<Range<usize>> {
+        None
+    }
+    fn declaration(&mut self, _: S::Text, _: Option<S::Text>, _: Option<bool>) {}
+    fn push(
+        &mut self,
+        parent: NodeId,
+        kind: XmloxNodeKind<S>,
+        span: Span,
+    ) -> Result<NodeId, ParseError> {
+        let actionable = !span.expanded;
+        match kind {
+            kind @ XmloxNodeKind::Element { .. } => {
+                self.element(parent, kind, span.range, actionable)
+            }
+            XmloxNodeKind::Text { content } => {
+                // Whitespace outside the document element is not content.
+                if parent == self.root {
+                    self.tree.storage().charge(content.len())?;
+                    if content.chars().all(char::is_whitespace) {
+                        return Ok(parent);
+                    }
+                }
+                self.text(parent, content, span.range, actionable)
+            }
+            XmloxNodeKind::CData { content } => self.text(parent, content, span.range, actionable),
+            XmloxNodeKind::Comment { content } => {
+                self.leaf(parent, NodeKind::Comment(content), span.range, actionable)
+            }
+            XmloxNodeKind::ProcessingInstruction { target, data } => self.leaf(
+                parent,
+                NodeKind::PI {
+                    target,
+                    value: data,
+                },
+                span.range,
+                actionable,
+            ),
+            // A reference's content follows as its children, which belong to
+            // the reference's parent here. Only an empty replacement has none;
+            // it leaves an empty text no edit may split.
+            XmloxNodeKind::EntityRef { value, .. } => match value {
+                Some(value) if value.is_empty() => self.text(parent, value, span.range, false),
+                _ => Ok(parent),
+            },
+            XmloxNodeKind::Document | XmloxNodeKind::DocumentType { .. } => Ok(parent),
+        }
+    }
+    fn element_name(&self, element: NodeId) -> (Option<&str>, &str) {
+        self.tree.element_name(element)
+    }
+    fn end_element(&mut self, element: NodeId, end: Option<usize>) {
+        if let Some(end) = end {
+            self.tree.end_range(element, end);
+        }
+        self.tree.finish_subtree(element);
+    }
+    fn finish(&mut self, _: S::Values<xmloxide::error::ParseDiagnostic<S::FrozenText>>) {}
 }
 
 /// What a namespace declaration attribute binds.
@@ -597,8 +397,8 @@ impl<'a> Declared<'a> {
     }
 }
 
-fn namespace_declaration<R: NameStorage>(
-    attribute: &xmloxide::tree::Attribute<R>,
+fn namespace_declaration<S: NameStorage>(
+    attribute: &xmloxide::tree::Attribute<S>,
 ) -> Option<Declared<'_>> {
     if attribute.prefix.as_deref() == Some("xmlns") {
         Some(Declared::Prefix(&attribute.name))
@@ -629,3 +429,6 @@ fn set_namespace<S: Storage>(
     })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

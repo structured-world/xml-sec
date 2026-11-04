@@ -3769,6 +3769,60 @@ mod tests {
         assert_eq!(ns.resolve(Some("p")).unwrap(), None);
     }
 
+    /// Binds more prefixes than the short list holds, one per scope, then
+    /// unwinds them: every binding resolves while in scope and is gone after,
+    /// on both sides of the move to the keyed table.
+    fn bindings_cross_the_short_list<S: NameStorage>(storage: S) {
+        let prefixes = SHORT_PREFIXES + 4;
+        let text = |value: String| storage.text(&value).unwrap();
+        let mut ns = NamespaceResolver::with_storage(storage).unwrap();
+        for bound in 0..prefixes {
+            ns.push_scope().unwrap();
+            ns.bind(
+                Some(text(format!("p{bound}"))),
+                text(format!("urn:{bound}")),
+            )
+            .unwrap();
+            for earlier in 0..=bound {
+                let expected = format!("urn:{earlier}");
+                let prefix = format!("p{earlier}");
+                assert_eq!(ns.resolve(Some(&prefix)).unwrap(), Some(&*expected));
+            }
+        }
+        // Rebinding past the move restores the outer binding on pop.
+        ns.push_scope().unwrap();
+        ns.bind(Some(text("p0".into())), text("urn:inner".into()))
+            .unwrap();
+        assert_eq!(ns.resolve(Some("p0")).unwrap(), Some("urn:inner"));
+        ns.pop_scope().unwrap();
+        assert_eq!(ns.resolve(Some("p0")).unwrap(), Some("urn:0"));
+        for open in (0..prefixes).rev() {
+            ns.pop_scope().unwrap();
+            let prefix = format!("p{open}");
+            assert_eq!(ns.resolve(Some(&prefix)).unwrap(), None);
+            for earlier in 0..open {
+                let expected = format!("urn:{earlier}");
+                let prefix = format!("p{earlier}");
+                assert_eq!(ns.resolve(Some(&prefix)).unwrap(), Some(&*expected));
+            }
+        }
+        assert_eq!(ns.resolve(Some("xml")).unwrap(), Some(XML_NAMESPACE));
+    }
+
+    #[test]
+    fn bindings_cross_the_short_list_in_native_storage() {
+        bindings_cross_the_short_list(Native);
+    }
+
+    #[cfg(feature = "xmldsig")]
+    #[test]
+    fn bindings_cross_the_short_list_in_accounted_storage() {
+        use structured_asn1::memory::{Memory, MemoryAccount};
+        let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
+        bindings_cross_the_short_list(crate::xml::dom::storage::Accounted(&memory));
+        assert_eq!(memory.used(), 0);
+    }
+
     // -- QName validation edge cases --
 
     #[test]

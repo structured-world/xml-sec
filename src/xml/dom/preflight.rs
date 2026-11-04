@@ -24,43 +24,6 @@ pub(crate) struct SourceNode {
     range: Range<usize>,
 }
 
-/// The sidecar a parser fills while it walks a document that has no DOCTYPE,
-/// where no entity expansion separates its nodes from their source.
-#[cfg(feature = "xml-backend-xmloxide")]
-pub(crate) struct PositionRecorder<S: Storage> {
-    nodes: S::Values<SourceNode>,
-    open: S::Values<usize>,
-}
-
-#[cfg(feature = "xml-backend-xmloxide")]
-impl<S: Storage> PositionRecorder<S> {
-    pub(crate) fn new(storage: S) -> Result<Self, ParseError> {
-        Ok(Self {
-            nodes: storage.values(0)?,
-            open: storage.values(0)?,
-        })
-    }
-
-    pub(crate) fn start_element(&mut self, start: usize) -> Result<(), ParseError> {
-        enforce_depth(self.open.len() + 1)?;
-        self.open.push(self.nodes.len())?;
-        self.leaf(SourceKind::Element, start..start)
-    }
-
-    pub(crate) fn end_element(&mut self, end: usize) {
-        let index = self.open.pop().expect("every end follows its start");
-        self.nodes[index].range.end = end;
-    }
-
-    pub(crate) fn leaf(&mut self, kind: SourceKind, range: Range<usize>) -> Result<(), ParseError> {
-        push_source_position(&mut self.nodes, SourceNode { kind, range })
-    }
-
-    pub(crate) fn into_nodes(self) -> S::Values<SourceNode> {
-        self.nodes
-    }
-}
-
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DtdAttributeName<'a>(Option<&'a str>, &'a str, Option<&'a str>, &'a str);
 
@@ -275,12 +238,12 @@ impl<'input> ScanObserver<'input> for Unchecked {
 }
 
 pub(super) struct LexicalPreflight<'input, S: Storage = Native> {
-    nodes: S::Values<SourceNode>,
+    /// The source positions the roxmltree projection reads; none when the
+    /// preflight serves a backend that records its own.
+    #[cfg(feature = "xml-backend-roxmltree")]
+    nodes: Option<S::Values<SourceNode>>,
     attributes: S::Declarations<'input>,
     storage: S,
-    /// The backend records the source positions itself.
-    #[cfg(feature = "xml-backend-xmloxide")]
-    unscanned: bool,
     #[cfg(feature = "xml-backend-roxmltree")]
     doctype: Option<Range<usize>>,
 }
@@ -294,9 +257,10 @@ impl<'input> LexicalPreflight<'input> {
     pub(super) fn scan_observed<O: ScanObserver<'input>>(
         input: &'input str,
         allow_dtd: bool,
+        backend: super::XmlBackend,
         observer: &mut O,
     ) -> Result<Self, ParseError> {
-        Self::scan_observed_in(input, allow_dtd, Native, observer)
+        Self::scan_observed_in(input, allow_dtd, backend, Native, observer)
     }
 }
 
@@ -304,43 +268,45 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
     /// The preflight of a document that declares nothing: no attribute
     /// declarations exist, and the parser supplies the positions.
     #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn unscanned(storage: S) -> Result<Self, ParseError> {
-        Ok(Self {
-            nodes: storage.values(0)?,
+    pub(super) fn unscanned(storage: S) -> Self {
+        Self {
+            #[cfg(feature = "xml-backend-roxmltree")]
+            nodes: None,
             attributes: storage.declarations(),
             storage,
-            #[cfg(feature = "xml-backend-xmloxide")]
-            unscanned: true,
             #[cfg(feature = "xml-backend-roxmltree")]
             doctype: None,
-        })
+        }
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn is_unscanned(&self) -> bool {
-        self.unscanned
-    }
-
+    /// A scan recording the positions any backend of the build may read.
     #[cfg(any(feature = "benchmark-internals", test))]
     pub(super) fn scan_in(
         input: &'input str,
         allow_dtd: bool,
         storage: S,
     ) -> Result<Self, S::ParseFailure> {
-        Self::scan_observed_in(input, allow_dtd, storage, &mut Unchecked)
+        Self::scan_observed_in(
+            input,
+            allow_dtd,
+            super::XmlBackend::Differential,
+            storage,
+            &mut Unchecked,
+        )
     }
 
     /// The scan, with `observer` checking each event before its position is
     /// recorded, so the observer's refusal precedes the position ceilings.
+    /// Positions are recorded only for a `backend` that reads them.
     pub(super) fn scan_observed_in<O: ScanObserver<'input>>(
         input: &'input str,
         allow_dtd: bool,
+        backend: super::XmlBackend,
         storage: S,
         observer: &mut O,
     ) -> Result<Self, S::ParseFailure> {
         let mut reader = Scanner::with_storage(input, storage);
-        let mut nodes: S::Values<SourceNode> = storage.values(0)?;
-        let mut elements = storage.values(0)?;
+        let mut positions = Positions::new(storage, backend)?;
         let mut attributes = storage.declarations();
         #[cfg(feature = "xml-backend-roxmltree")]
         let mut doctype = None;
@@ -354,9 +320,7 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                         &element.attributes,
                         false,
                     )?;
-                    enforce_depth(elements.len() + 1)?;
-                    elements.push(nodes.len())?;
-                    push_leaf(&mut nodes, SourceKind::Element, element.range)?;
+                    positions.start_element(element.range, false)?;
                     reader.recycle(element.attributes);
                 }
                 Event::Empty(element) => {
@@ -366,42 +330,39 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
                         &element.attributes,
                         true,
                     )?;
-                    enforce_depth(elements.len() + 1)?;
-                    push_leaf(&mut nodes, SourceKind::Element, element.range)?;
+                    positions.start_element(element.range, true)?;
                     reader.recycle(element.attributes);
                 }
                 Event::End { range, .. } => {
                     observer.end_element()?;
-                    if let Some(index) = elements.pop() {
-                        nodes[index].range.end = range.end;
-                    }
+                    positions.end_element(range.end);
                 }
                 // Both supported DOMs omit whitespace outside the document
                 // element, so it must not shift the semantic sidecar.
-                Event::Text { range, .. } if !elements.is_empty() => {
+                Event::Text { range, .. } if positions.in_element() => {
                     observer.character_data()?;
-                    push_text_position(&mut nodes, range)?;
+                    positions.text(range)?;
                 }
                 Event::Text { .. } | Event::Declaration { .. } => observer.markup(),
                 Event::CData { range, .. } => {
                     observer.character_data()?;
-                    push_leaf(&mut nodes, SourceKind::CData, range)?;
+                    positions.leaf(SourceKind::CData, range)?;
                 }
                 Event::Reference { name, range } if is_builtin_or_character_reference(name) => {
                     observer.character_data()?;
-                    push_text_position(&mut nodes, range)?;
+                    positions.text(range)?;
                 }
                 Event::Reference { name, range } => {
                     observer.entity_reference(name)?;
-                    push_leaf(&mut nodes, SourceKind::EntityRef, range)?;
+                    positions.leaf(SourceKind::EntityRef, range)?;
                 }
                 Event::Comment { range, .. } => {
                     observer.node()?;
-                    push_leaf(&mut nodes, SourceKind::Comment, range)?;
+                    positions.leaf(SourceKind::Comment, range)?;
                 }
                 Event::ProcessingInstruction { range, .. } => {
                     observer.node()?;
-                    push_leaf(&mut nodes, SourceKind::Pi, range)?;
+                    positions.leaf(SourceKind::Pi, range)?;
                 }
                 Event::DocType { .. } if !allow_dtd => return Err(ParseError::DtdDetected.into()),
                 Event::DocType { range, .. } => {
@@ -422,11 +383,10 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
             }
         }
         Ok(Self {
-            nodes,
+            #[cfg(feature = "xml-backend-roxmltree")]
+            nodes: positions.into_nodes(),
             attributes,
             storage,
-            #[cfg(feature = "xml-backend-xmloxide")]
-            unscanned: false,
             #[cfg(feature = "xml-backend-roxmltree")]
             doctype,
         })
@@ -456,8 +416,13 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
     }
 
     #[cfg(feature = "xml-backend-roxmltree")]
+    fn positions(&self) -> &[SourceNode] {
+        self.nodes.as_deref().unwrap_or_default()
+    }
+
+    #[cfg(feature = "xml-backend-roxmltree")]
     pub(super) fn node_count(&self) -> usize {
-        self.nodes.len()
+        self.positions().len()
     }
 
     #[cfg(feature = "xml-backend-roxmltree")]
@@ -465,13 +430,14 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
         &self,
         start: usize,
     ) -> Result<Option<(Range<usize>, bool)>, ParseError> {
-        self.storage.charge(if self.nodes.is_empty() {
+        let nodes = self.positions();
+        self.storage.charge(if nodes.is_empty() {
             0
         } else {
-            self.nodes.len().ilog2() as usize + 1
+            nodes.len().ilog2() as usize + 1
         })?;
-        let first = self.nodes.partition_point(|node| node.range.start < start);
-        let Some(node) = self.nodes.get(first) else {
+        let first = nodes.partition_point(|node| node.range.start < start);
+        let Some(node) = nodes.get(first) else {
             return Ok(None);
         };
         if node.range.start != start || !node.kind.is_character_data() {
@@ -480,7 +446,7 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
 
         let mut range = node.range.clone();
         let mut actionable = node.kind != SourceKind::EntityRef;
-        for node in &self.nodes[first + 1..] {
+        for node in &nodes[first + 1..] {
             self.storage.charge(1)?;
             if !node.kind.is_character_data() || node.range.start != range.end {
                 break;
@@ -489,11 +455,6 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
             actionable &= node.kind != SourceKind::EntityRef;
         }
         Ok(Some((range, actionable)))
-    }
-
-    #[cfg(feature = "xml-backend-xmloxide")]
-    pub(super) fn source_nodes(&self) -> &[SourceNode] {
-        &self.nodes
     }
 }
 
@@ -547,26 +508,91 @@ impl SourceKind {
     }
 }
 
-#[cfg(feature = "xml-backend-xmloxide")]
-impl SourceKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Element => "element",
-            Self::Text => "text",
-            Self::CData => "CDATA",
-            Self::EntityRef => "entity reference",
-            Self::Comment => "comment",
-            Self::Pi => "processing instruction",
-        }
-    }
-}
-
 fn enforce_depth(actual: usize) -> Result<(), ParseError> {
     let maximum = crate::hard_limits::XML_DOCUMENT_DEPTH_CEILING;
     if actual > maximum {
         Err(ParseError::DepthLimitReached { maximum, actual })
     } else {
         Ok(())
+    }
+}
+
+/// The element depth a scan tracks, with the source positions it records
+/// for the roxmltree projection when the scan serves a backend that reads
+/// them.
+struct Positions<S: Storage> {
+    depth: usize,
+    sidecar: Option<Sidecar<S>>,
+}
+
+struct Sidecar<S: Storage> {
+    nodes: S::Values<SourceNode>,
+    /// The position of each open element, whose end is still unread.
+    open: S::Values<usize>,
+}
+
+impl<S: Storage> Positions<S> {
+    fn new(storage: S, backend: super::XmlBackend) -> Result<Self, ParseError> {
+        // Only the roxmltree projection reads source positions from the
+        // scan; xmloxide records the positions of its own tree as it parses.
+        let sidecar =
+            if cfg!(feature = "xml-backend-roxmltree") && backend != super::XmlBackend::Xmloxide {
+                Some(Sidecar {
+                    nodes: storage.values(0)?,
+                    open: storage.values(0)?,
+                })
+            } else {
+                None
+            };
+        Ok(Self { depth: 0, sidecar })
+    }
+
+    fn in_element(&self) -> bool {
+        self.depth > 0
+    }
+
+    fn start_element(&mut self, range: Range<usize>, empty: bool) -> Result<(), ParseError> {
+        enforce_depth(self.depth + 1)?;
+        if let Some(sidecar) = &mut self.sidecar {
+            if !empty {
+                sidecar.open.push(sidecar.nodes.len())?;
+            }
+            push_leaf(&mut sidecar.nodes, SourceKind::Element, range)?;
+        }
+        if !empty {
+            self.depth += 1;
+        }
+        Ok(())
+    }
+
+    fn end_element(&mut self, end: usize) {
+        if let Some(depth) = self.depth.checked_sub(1) {
+            self.depth = depth;
+        }
+        if let Some(sidecar) = &mut self.sidecar
+            && let Some(index) = sidecar.open.pop()
+        {
+            sidecar.nodes[index].range.end = end;
+        }
+    }
+
+    fn text(&mut self, range: Range<usize>) -> Result<(), ParseError> {
+        match &mut self.sidecar {
+            Some(sidecar) => push_text_position(&mut sidecar.nodes, range),
+            None => Ok(()),
+        }
+    }
+
+    fn leaf(&mut self, kind: SourceKind, range: Range<usize>) -> Result<(), ParseError> {
+        match &mut self.sidecar {
+            Some(sidecar) => push_leaf(&mut sidecar.nodes, kind, range),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(feature = "xml-backend-roxmltree")]
+    fn into_nodes(self) -> Option<S::Values<SourceNode>> {
+        self.sidecar.map(|sidecar| sidecar.nodes)
     }
 }
 
@@ -616,50 +642,6 @@ fn push_source_position<V: Values<SourceNode>>(
 fn is_builtin_or_character_reference(reference: &str) -> bool {
     reference.starts_with('#') || matches!(reference, "amp" | "lt" | "gt" | "apos" | "quot")
 }
-
-#[cfg(feature = "xml-backend-xmloxide")]
-pub(super) struct PositionCursor<'a> {
-    positions: &'a [SourceNode],
-    next: usize,
-}
-
-#[cfg(feature = "xml-backend-xmloxide")]
-impl<'a> PositionCursor<'a> {
-    pub(super) fn new(positions: &'a [SourceNode]) -> Self {
-        Self { positions, next: 0 }
-    }
-
-    pub(super) fn take(&mut self, expected: SourceKind) -> Result<Range<usize>, ParseError> {
-        let Some(node) = self.positions.get(self.next) else {
-            return Err(ParseError::SourceMapMismatch {
-                expected: expected.label(),
-                found: "end of stream",
-            });
-        };
-        if node.kind != expected {
-            return Err(ParseError::SourceMapMismatch {
-                expected: expected.label(),
-                found: node.kind.label(),
-            });
-        }
-        self.next += 1;
-        Ok(node.range.clone())
-    }
-
-    pub(super) fn finish(&self) -> Result<(), ParseError> {
-        if let Some(node) = self.positions.get(self.next) {
-            Err(ParseError::SourceMapMismatch {
-                expected: "end of stream",
-                found: node.kind.label(),
-            })
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[cfg(all(test, feature = "xml-backend-xmloxide"))]
-mod recorder_tests;
 
 #[cfg(all(test, feature = "xmldsig"))]
 mod accounted_tests {

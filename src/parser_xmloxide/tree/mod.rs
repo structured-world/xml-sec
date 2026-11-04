@@ -708,56 +708,6 @@ impl Document {
 }
 
 impl<S: NameStorage> Document<S> {
-    /// Moves a freshly parsed content fragment without duplicating any node
-    /// payload or walking the fragment recursively. Fragment-local ID entries
-    /// are not imported, matching the native subtree-import contract.
-    pub(crate) fn try_graft_children(
-        &mut self,
-        source: Self,
-        parent: NodeId,
-    ) -> Result<(), crate::xml::dom::ParseError> {
-        let count = source.nodes.len() - 2;
-        let base = self.nodes.len();
-        let end = base
-            .checked_add(count)
-            .ok_or(crate::xml::dom::ParseError::AllocationFailed)?;
-        if end > u32::MAX as usize {
-            return Err(crate::xml::dom::ParseError::AllocationFailed);
-        }
-        for _ in 0..6 {
-            self.storage.charge(count)?;
-        }
-        let first = source.first_child(source.root);
-        let last = source.last_child(source.root);
-        let rebase = |id: NodeId| NodeId::from_index(base + id.as_index() - 2);
-        for mut node in source.nodes.into_iter().skip(2) {
-            node.parent = node.parent.map(|id| {
-                if id == source.root {
-                    parent
-                } else {
-                    rebase(id)
-                }
-            });
-            node.first_child = node.first_child.map(rebase);
-            node.last_child = node.last_child.map(rebase);
-            node.next_sibling = node.next_sibling.map(rebase);
-            node.prev_sibling = node.prev_sibling.map(rebase);
-            self.nodes.push(node)?;
-        }
-        if let Some(first) = first {
-            let first = rebase(first);
-            let last = rebase(last.expect("nonempty fragment has a last child"));
-            if let Some(previous) = self.last_child(parent) {
-                self.node_mut(previous).next_sibling = Some(first);
-                self.node_mut(first).prev_sibling = Some(previous);
-            } else {
-                self.node_mut(parent).first_child = Some(first);
-            }
-            self.node_mut(parent).last_child = Some(last);
-        }
-        Ok(())
-    }
-
     pub(crate) fn try_create_node(
         &mut self,
         kind: NodeKind<S>,

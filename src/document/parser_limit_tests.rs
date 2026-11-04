@@ -43,14 +43,18 @@ fn limits(settings: DocumentParseSettings) -> (u32, usize, usize) {
     )
 }
 
-/// The refusal the parser itself makes for `xml`, before any projection could
-/// refuse it again.
+/// The refusal the parser itself makes for `xml`, into a tree that admits
+/// every node, so no tree could refuse it in the parser's place.
 fn parser_refusal(xml: &str, settings: DocumentParseSettings) -> Option<String> {
     let options = crate::parser_xmloxide::parser::ParseOptions::default();
+    let tree =
+        crate::parser_xmloxide::Document::try_with_storage(64, crate::xml::dom::storage::Native)
+            .expect("the tree sets up");
     let (parsed, counter) = crate::parser_xmloxide::parser::parse_str_enforcing_limits(
         xml,
         &options,
         parse_limits(settings),
+        tree,
     )
     .expect("the counter sets up");
     let refusal = counter
