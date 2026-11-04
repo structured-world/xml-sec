@@ -45,16 +45,14 @@ selected provider. Rejection cases check corrupted signature evidence and malfor
 XML on every backend, rather than interpreting an error as a successful operation.
 RSA-SHA256 sign/verify use the
 selected provider's actual key handle.
-Projection calls the production normalizer over a prepared roxmltree DOM and lexical
-positions, without a second parser invocation. It is measured for roxmltree only:
-xmloxide builds the semantic arena as it parses, so its parse case covers that
-work, and differential parsing has no single-backend projection. Graph compilation and execution are separate
+Every backend builds the semantic arena as it parses, so the parse case covers
+that work and no separate projection phase exists. Graph compilation and execution are separate
 synthetic fan-out measurements at 1/8/32/64 references, not substitutes for complete
 operation measurements. Typed policy validation/checks are measured independently;
 their cost must not be subtracted from an end-to-end result to claim an unsafe path.
 The latency runner also samples these phases individually. Its graph widths are
-16 and 64 (recorded in JSON), while Divan covers 1/8/32/64. Projection includes arena
-destruction; graph-input construction and destruction are outside the measured phase.
+16 and 64 (recorded in JSON), while Divan covers 1/8/32/64. Graph-input construction
+and destruction are outside the measured phase.
 Phase RSS still includes the common prepared corpus and is not an isolated phase heap.
 
 Node-set measurements parse one 1K/16K-element signed shape outside the timer.

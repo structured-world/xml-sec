@@ -7,27 +7,6 @@ use crate::operation::{
     OperationStage,
 };
 
-/// A pre-parsed backend tree; construction is excluded from projection timing.
-pub struct Projection<'a>(crate::xml::dom::benchmark::Projection<'a>);
-
-impl<'a> Projection<'a> {
-    /// Prepare lexical positions and one backend DOM outside measurement.
-    pub fn new(
-        input: &'a str,
-        backend: crate::XmlBackend,
-    ) -> Result<Self, crate::xml::dom::ParseError> {
-        Ok(Self(crate::xml::dom::benchmark::Projection::new(
-            input, backend,
-        )?))
-    }
-
-    /// Build the real normalized arena from the prepared tree, which it
-    /// consumes, retaining the arena until the caller drops it.
-    pub fn project(self) -> Result<crate::xml::dom::Document<'a>, crate::xml::dom::ParseError> {
-        self.0.project()
-    }
-}
-
 /// `XMLDSig` node sets over one prepared document, canonicalized after selection.
 pub struct NodeSets<'a> {
     document: crate::xml::dom::Document<'a>,

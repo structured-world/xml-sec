@@ -142,7 +142,7 @@ fn lib_rs_example_11() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1004; original runnable example.
+// lib.rs:1015; original runnable example.
 #[test]
 fn lib_rs_example_12() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -154,7 +154,7 @@ fn lib_rs_example_12() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1018; original runnable example.
+// lib.rs:1029; original runnable example.
 #[test]
 fn lib_rs_example_13() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -163,7 +163,7 @@ fn lib_rs_example_13() -> impl std::process::Termination {
     assert_eq!(doc.root_element().tag_name().name(), "e");
 }
 
-// lib.rs:1034; original runnable example.
+// lib.rs:1045; original runnable example.
 #[test]
 fn lib_rs_example_14() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -172,7 +172,7 @@ fn lib_rs_example_14() -> impl std::process::Termination {
         ExpandedName::from_static("urn:ietf:params:xml:ns:caldav:", "calendar-data");
 }
 
-// lib.rs:1193; original runnable example.
+// lib.rs:1204; original runnable example.
 #[test]
 fn lib_rs_example_15() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -185,7 +185,7 @@ fn lib_rs_example_15() -> impl std::process::Termination {
     assert_eq!(doc.root_element().tag_name().name(), "e");
 }
 
-// lib.rs:1211; original runnable example.
+// lib.rs:1222; original runnable example.
 #[test]
 fn lib_rs_example_16() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -198,7 +198,7 @@ fn lib_rs_example_16() -> impl std::process::Termination {
     assert!(!doc.root_element().has_tag_name(("http://www.w4.org", "e")));
 }
 
-// lib.rs:1239; original runnable example.
+// lib.rs:1250; original runnable example.
 #[test]
 fn lib_rs_example_17() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -210,7 +210,7 @@ fn lib_rs_example_17() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1245; original runnable example.
+// lib.rs:1256; original runnable example.
 #[test]
 fn lib_rs_example_18() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -219,7 +219,7 @@ fn lib_rs_example_18() -> impl std::process::Termination {
     assert_eq!(doc.root_element().default_namespace(), None);
 }
 
-// lib.rs:1260; original runnable example.
+// lib.rs:1271; original runnable example.
 #[test]
 fn lib_rs_example_19() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -231,7 +231,7 @@ fn lib_rs_example_19() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1266; original runnable example.
+// lib.rs:1277; original runnable example.
 #[test]
 fn lib_rs_example_20() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -244,7 +244,7 @@ fn lib_rs_example_20() -> impl std::process::Termination {
     assert_eq!(doc.root_element().lookup_prefix(""), None);
 }
 
-// lib.rs:1289; original runnable example.
+// lib.rs:1300; original runnable example.
 #[test]
 fn lib_rs_example_21() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -256,7 +256,7 @@ fn lib_rs_example_21() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1295; original runnable example.
+// lib.rs:1306; original runnable example.
 #[test]
 fn lib_rs_example_22() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -268,7 +268,7 @@ fn lib_rs_example_22() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1310; original runnable example.
+// lib.rs:1321; original runnable example.
 #[test]
 fn lib_rs_example_23() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -277,7 +277,7 @@ fn lib_rs_example_23() -> impl std::process::Termination {
     assert_eq!(doc.root_element().attribute("a"), Some("b"));
 }
 
-// lib.rs:1316; original runnable example.
+// lib.rs:1327; original runnable example.
 #[test]
 fn lib_rs_example_24() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -290,7 +290,7 @@ fn lib_rs_example_24() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1356; original runnable example.
+// lib.rs:1367; original runnable example.
 #[test]
 fn lib_rs_example_25() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -303,7 +303,7 @@ fn lib_rs_example_25() -> impl std::process::Termination {
     assert!(!doc.root_element().has_attribute(("http://www.w4.org", "a")));
 }
 
-// lib.rs:1378; original runnable example.
+// lib.rs:1389; original runnable example.
 #[test]
 fn lib_rs_example_26() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -312,7 +312,7 @@ fn lib_rs_example_26() -> impl std::process::Termination {
     assert_eq!(doc.root_element().attributes().len(), 2);
 }
 
-// lib.rs:1394; original runnable example.
+// lib.rs:1405; original runnable example.
 #[test]
 fn lib_rs_example_27() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -321,7 +321,7 @@ fn lib_rs_example_27() -> impl std::process::Termination {
     assert_eq!(doc.root_element().namespaces().len(), 1);
 }
 
-// lib.rs:1424; original runnable example.
+// lib.rs:1435; original runnable example.
 #[test]
 fn lib_rs_example_28() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -341,7 +341,7 @@ fn lib_rs_example_28() -> impl std::process::Termination {
     );
 }
 
-// lib.rs:1437; original runnable example.
+// lib.rs:1448; original runnable example.
 #[test]
 fn lib_rs_example_29() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -350,7 +350,7 @@ fn lib_rs_example_29() -> impl std::process::Termination {
     assert_eq!(doc.root().first_child().unwrap().text(), Some(" comment "));
 }
 
-// lib.rs:1468; original runnable example.
+// lib.rs:1479; original runnable example.
 #[test]
 fn lib_rs_example_30() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -369,7 +369,7 @@ fn lib_rs_example_30() -> impl std::process::Termination {
     assert_eq!(p.tail(), Some("\n    text2\n"));
 }
 
-// parse.rs:457; original runnable example.
+// parse.rs:739; original runnable example.
 #[test]
 fn parse_rs_example_1() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;
@@ -377,7 +377,7 @@ fn parse_rs_example_1() -> impl std::process::Termination {
     assert_eq!(doc.descendants().count(), 2); // root node + `e` element node
 }
 
-// parse.rs:473; original runnable example.
+// parse.rs:755; original runnable example.
 #[test]
 fn parse_rs_example_2() -> impl std::process::Termination {
     use crate::parser_roxmltree as roxmltree;

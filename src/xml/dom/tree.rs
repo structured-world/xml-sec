@@ -438,11 +438,6 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
             xpath_nodes,
         })
     }
-
-    #[cfg(feature = "xml-backend-roxmltree")]
-    pub(super) fn input(&self) -> &'input str {
-        self.input
-    }
 }
 
 /// Parsed backend-neutral XML document.
@@ -1267,40 +1262,43 @@ mod tests {
 
     #[cfg(all(feature = "xmldsig", feature = "xml-backend-roxmltree"))]
     #[test]
-    fn roxmltree_projection_uses_the_actual_scoped_tree_storage() {
-        // The source parser is deliberately outside this component test's
-        // account. Every *semantic projection* allocation must be retained by
-        // the supplied execution without changing IDs, namespaces or text.
+    fn roxmltree_tree_uses_the_actual_scoped_tree_storage() {
+        // roxmltree builds the semantic arena as it parses: the parser's state
+        // and every tree allocation are paid by the supplied execution, without
+        // changing IDs, namespaces or text.
+        use super::super::storage::Accounted;
         use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
         let xml = "<r xmlns:p='urn:p' xml:id=' a  b ' p:x='value'>left<![CDATA[middle]]>right</r>";
-        let preflight =
-            super::super::LexicalPreflight::scan(xml, false).expect("fixed XML preflight");
-        let raw = crate::parser_roxmltree::Document::parse(xml).expect("fixed backend XML");
         let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 20)));
-        let document = super::super::roxmltree::project_in(
+        let preflight = super::super::LexicalPreflight::scan_in(xml, false, Accounted(&memory))
+            .expect("fixed XML preflight");
+        let scanned = memory.used();
+        let document = super::super::roxmltree::RoxmltreeBackend::parse_in(
             xml,
-            &raw,
+            super::ParsingOptions::default(),
             &preflight,
-            super::super::storage::Accounted(&memory),
+            Accounted(&memory),
         )
-        .expect("paid projection fits");
+        .expect("paid parse fits");
+        assert!(memory.used() > scanned);
         assert_scoped_projection(&document);
-        assert!(memory.used() > 0);
         drop(document);
-        assert_eq!(memory.used(), 0);
+        assert_eq!(memory.used(), scanned);
         let denied = Memory::new(std::sync::Arc::new(MemoryAccount::new(0, 1 << 20)));
         assert!(matches!(
-            super::super::roxmltree::project_in(
+            super::super::roxmltree::RoxmltreeBackend::parse_in(
                 xml,
-                &raw,
+                super::ParsingOptions::default(),
                 &preflight,
-                super::super::storage::Accounted(&denied)
+                Accounted(&denied)
             ),
-            Err(super::ParseError::SharedExecution(
-                MemoryError::LimitExceeded
+            Err(super::super::AccountedParseError::Semantic(
+                super::ParseError::SharedExecution(MemoryError::LimitExceeded)
             ))
         ));
         assert_eq!(denied.used(), 0);
+        drop(preflight);
+        assert_eq!(memory.used(), 0);
     }
 
     #[cfg(all(feature = "xmldsig", feature = "xml-backend-roxmltree"))]

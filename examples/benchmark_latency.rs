@@ -11,12 +11,7 @@ use xml_sec::XmlBackend;
 /// outweighs the fixed cost of starting a process and loading keys.
 const COMPARISON_UNITS: [usize; 3] = [16, 256, 16_384];
 
-const PHASES: [&str; 4] = [
-    "projection",
-    "plan_compile",
-    "plan_execute",
-    "policy_validate",
-];
+const PHASES: [&str; 3] = ["plan_compile", "plan_execute", "policy_validate"];
 
 fn percentile(sorted: &[u128], percent: usize) -> u128 {
     sorted[(percent * sorted.len()).div_ceil(100) - 1]
@@ -25,15 +20,9 @@ fn percentile(sorted: &[u128], percent: usize) -> u128 {
 fn measure(
     fixture: &Fixture,
     operation: &str,
-    backend: XmlBackend,
     policy: &xml_sec::policy::VerificationPolicy,
 ) -> (u128, usize) {
     // Per-sample preparation is excluded, just as Divan's with_inputs excludes it.
-    // Projection consumes its backend DOM, so each sample prepares a new one.
-    let projection = (operation == "projection").then(|| {
-        xml_sec::benchmark_support::Projection::new(&fixture.unsigned, backend)
-            .expect("prepared projection")
-    });
     let mut plan = match operation {
         "plan_compile" | "plan_execute" => Some(xml_sec::benchmark_support::Plan::new(
             fixture.spec.units.min(64),
@@ -45,15 +34,6 @@ fn measure(
     }
     let start = Instant::now();
     let bytes = match operation {
-        "projection" => {
-            std::hint::black_box(
-                projection
-                    .expect("prepared projection")
-                    .project()
-                    .expect("project"),
-            );
-            fixture.unsigned.len()
-        }
         "plan_compile" => {
             plan.as_mut().expect("plan").compile();
             0
@@ -242,12 +222,6 @@ fn export_scenarios(
     Ok(())
 }
 
-/// Whether `backend` has `operation` to measure: only roxmltree builds a
-/// backend DOM to project, xmloxide builds the semantic tree as it parses.
-fn measurable(operation: &str, backend: XmlBackend) -> bool {
-    operation != "projection" || backend == XmlBackend::Roxmltree
-}
-
 /// Print every measurable operation, shape, backend and provider combination.
 fn list() {
     for spec in support::specs() {
@@ -262,9 +236,6 @@ fn list() {
             Engine::AwsLcFips => "aws-lc-fips",
         };
         for operation in OPERATIONS.into_iter().chain(PHASES) {
-            if !measurable(operation, spec.backend) {
-                continue;
-            }
             println!(
                 "{operation} {} {} {backend} {provider}",
                 SHAPES[spec.shape], spec.units
@@ -308,9 +279,6 @@ fn parse_request(args: &[String]) -> Result<Request<'_>, Box<dyn Error>> {
         "aws-lc-fips" => Engine::AwsLcFips,
         _ => return Err("unavailable provider".into()),
     };
-    if !measurable(operation, backend) {
-        return Err("projection requires the roxmltree backend".into());
-    }
     let samples = args[5].parse::<usize>()?;
     if !(1..=100_000).contains(&samples) {
         return Err("samples must be 1..=100000".into());
@@ -341,7 +309,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         spec,
         samples,
     } = parse_request(&args)?;
-    let (units, backend) = (spec.units, spec.backend);
+    let units = spec.units;
     let fixture = Fixture::new(spec);
     let policy = xml_sec::policy::VerificationPolicy {
         signature_algorithms: Some(
@@ -352,12 +320,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     };
     for _ in 0..8 {
-        std::hint::black_box(measure(&fixture, operation, backend, &policy));
+        std::hint::black_box(measure(&fixture, operation, &policy));
     }
     let mut timings = Vec::with_capacity(samples);
     let mut output_bytes = 0;
     for _ in 0..samples {
-        let (elapsed, bytes) = measure(&fixture, operation, backend, &policy);
+        let (elapsed, bytes) = measure(&fixture, operation, &policy);
         output_bytes = bytes;
         timings.push(elapsed);
     }

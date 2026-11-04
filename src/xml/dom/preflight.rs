@@ -184,10 +184,10 @@ pub(crate) trait ScanObserver<'input> {
 }
 
 /// The scan of a parse that checks nothing beyond the parser's own ceilings.
-#[cfg(any(feature = "benchmark-internals", test))]
+#[cfg(test)]
 pub(crate) struct Unchecked;
 
-#[cfg(any(feature = "benchmark-internals", test))]
+#[cfg(test)]
 impl<'input> ScanObserver<'input> for Unchecked {
     fn doctype<F>(&mut self, doctype: &'input str, mut attribute: F) -> Result<(), ParseError>
     where
@@ -249,7 +249,7 @@ pub(super) struct LexicalPreflight<'input, S: Storage = Native> {
 }
 
 impl<'input> LexicalPreflight<'input> {
-    #[cfg(any(feature = "benchmark-internals", test))]
+    #[cfg(test)]
     pub(super) fn scan(input: &'input str, allow_dtd: bool) -> Result<Self, ParseError> {
         Self::scan_in(input, allow_dtd, Native)
     }
@@ -280,7 +280,7 @@ impl<'input, S: Storage> LexicalPreflight<'input, S> {
     }
 
     /// A scan recording the positions any backend of the build may read.
-    #[cfg(any(feature = "benchmark-internals", test))]
+    #[cfg(test)]
     pub(super) fn scan_in(
         input: &'input str,
         allow_dtd: bool,
