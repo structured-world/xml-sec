@@ -12,7 +12,7 @@ use crate::xml::dom::storage::Storage as DomStorage;
 use super::C14nError;
 use super::NodeVisibility;
 use super::ns_common::collect_ns_declarations;
-use super::scratch::{NamespaceRendering, Scratch};
+use super::scratch::{Declarations, NamespaceRendering, Scratch};
 use super::serialize::NsRenderer;
 
 /// Inclusive C14N namespace renderer.
@@ -27,6 +27,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for InclusiveNsRenderer {
         node: Node<'a, '_, D>,
         parent_rendered: &S::Namespaces<'a>,
         visibility: Option<&dyn NodeVisibility<D>>,
+        declarations: &mut Declarations<'a, S>,
         scratch: &S,
     ) -> Result<NamespaceRendering<'a, S>, C14nError> {
         // Inclusive mode: all in-scope namespace bindings are candidates.
@@ -36,6 +37,7 @@ impl<S: Scratch, D: DomStorage> NsRenderer<S, D> for InclusiveNsRenderer {
             visibility,
             |_| true,
             |_, _| Ok(true),
+            declarations,
             scratch,
         )
     }

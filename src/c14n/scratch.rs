@@ -163,12 +163,12 @@ pub(crate) trait Scratch {
     fn text(&self, parts: &[&str]) -> Result<Self::Text, C14nError>;
 }
 
-/// An element's declarations, and the map its children read when it differs
-/// from the parent's. Most elements change nothing, so most copy nothing.
-pub(crate) type NamespaceRendering<'a, S> = (
-    <S as Scratch>::Values<(&'a str, &'a str)>,
-    Option<<S as Scratch>::Namespaces<'a>>,
-);
+/// The map an element's children read when it differs from the parent's. Most
+/// elements change nothing, so most copy nothing.
+pub(crate) type NamespaceRendering<'a, S> = Option<<S as Scratch>::Namespaces<'a>>;
+
+/// An element's namespace declarations as `(prefix, uri)`.
+pub(crate) type Declarations<'a, S> = <S as Scratch>::Values<(&'a str, &'a str)>;
 
 /// `rendered`, copied from `parent` before its first change.
 pub(crate) fn changed<'m, 'a, M: NamespaceMap<'a>>(

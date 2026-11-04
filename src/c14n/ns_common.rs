@@ -11,7 +11,7 @@ use crate::xml::dom::storage::Storage as DomStorage;
 use super::C14nError;
 use super::NodeVisibility;
 use super::prefix::has_in_scope_default_namespace;
-use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch, changed};
+use super::scratch::{Declarations, List, NamespaceMap, NamespaceRendering, Scratch, changed};
 
 /// Collect, filter, and sort namespace declarations for a single element.
 ///
@@ -30,20 +30,22 @@ use super::scratch::{List, NamespaceMap, NamespaceRendering, Scratch, changed};
 ///   - Exclusive C14N: returns `true` for visibly-utilized prefixes and
 ///     prefixes forced via `InclusiveNamespaces PrefixList`.
 ///
+/// * `decls` — empty on entry; receives the declarations to emit, sorted.
+///
 /// # Returns
 ///
-/// `(sorted_ns_decls, updated_rendered_map)` — the declarations to emit and
-/// the binding map for child elements, `None` when it is `parent_rendered`.
+/// The binding map for child elements, `None` when it is `parent_rendered`.
 pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
     node: Node<'a, '_, D>,
     parent_rendered: &S::Namespaces<'a>,
     visibility: Option<&dyn NodeVisibility<D>>,
     reset_invisible_binding: impl Fn(&str) -> bool,
     include_prefix: impl Fn(&str, &str) -> Result<bool, C14nError>,
+    decls: &mut Declarations<'a, S>,
     scratch: &S,
 ) -> Result<NamespaceRendering<'a, S>, C14nError> {
+    debug_assert!(decls.is_empty());
     let mut rendered = None;
-    let mut decls = scratch.values();
 
     for (ordinal, ns) in node.namespaces().enumerate() {
         let prefix = ns.name().unwrap_or(""); // None = default namespace
@@ -117,7 +119,7 @@ pub(super) fn collect_ns_declarations<'a, S: Scratch, D: DomStorage>(
         changed(&mut rendered, parent_rendered)?.insert(prefix, false, Some(uri))?;
     }
 
-    Ok((decls, rendered))
+    Ok(rendered)
 }
 
 #[cfg(test)]
@@ -141,12 +143,14 @@ mod tests {
         for (prefix, uri) in parent {
             namespaces.insert(prefix, false, Some(uri)).unwrap();
         }
-        let (declarations, rendered) = super::collect_ns_declarations(
+        let mut declarations = Native.values();
+        let rendered = super::collect_ns_declarations(
             node,
             &namespaces,
             visibility,
             reset,
             |p, u| Ok(include(p, u)),
+            &mut declarations,
             &Native,
         )
         .unwrap();
