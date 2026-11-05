@@ -1,7 +1,17 @@
-use super::{Request, loader, native_paths, parse};
+use super::{IDENTITY_FILES, Request, loader, native_paths, parse};
 
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|&value| value.to_owned()).collect()
+}
+
+#[test]
+fn every_harness_identity_file_exists() {
+    // The run's identity hashes these files; a removed one fails every run
+    // only once it starts, after the build.
+    let root = crate::repo::root();
+    for file in IDENTITY_FILES {
+        assert!(root.join(file).is_file(), "{file}");
+    }
 }
 
 #[test]
