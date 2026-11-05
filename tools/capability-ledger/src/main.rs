@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod abi;
+
 const EXPECTED_VERSION: &str = "1.3.13";
 const EXPECTED_COMMIT: &str =
     include_str!("../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
@@ -192,6 +194,13 @@ struct DonorAnchor {
 fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(usage)?;
+    if let Some(abi) = command.strip_prefix("abi-") {
+        return match abi {
+            "generate" => abi::run(false, args),
+            "check" => abi::run(true, args),
+            _ => Err(usage()),
+        };
+    }
     if !matches!(
         command.as_str(),
         "generate" | "check" | "behavior-generate" | "behavior-check"
@@ -251,7 +260,7 @@ fn main() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: xml-sec-capability-ledger <generate|check|behavior-generate|behavior-check> <donor> <rules.json> <ledger.json>".into()
+    "usage: xml-sec-capability-ledger <generate|check|behavior-generate|behavior-check> <donor> <rules.json> <ledger.json>\n       xml-sec-capability-ledger <abi-generate|abi-check> <ledger.json> <ownership-rules.json> <xmlsec1-prefix> <snapshot.json>".into()
 }
 
 fn generate_behavior_ledger(
