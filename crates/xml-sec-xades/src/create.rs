@@ -263,34 +263,30 @@ pub fn create<W: Work>(
         return Err(CreateError::NoDataObject);
     }
     let ids = Ids::new(request.id);
+    // Same-document URIs; the IDs are the text after '#'.
     let references: Vec<String> = (0..request.objects.len())
-        .map(|index| format!("{}-reference-{index}", ids.signature))
+        .map(|index| format!("#{}-reference-{index}", ids.signature))
         .collect();
     let objects: Vec<String> = (0..request.objects.len())
-        .map(|index| format!("{}-object-{index}", ids.signature))
+        .map(|index| format!("#{}-object-{index}", ids.signature))
         .collect();
-    require_free(
-        document,
-        [&ids.signature, &ids.properties, &ids.value]
-            .into_iter()
-            .chain(&references)
-            .chain(
-                request
-                    .objects
-                    .iter()
-                    .zip(&objects)
-                    .filter_map(|(object, id)| {
-                        matches!(object, DataObject::Enveloping { .. }).then_some(id)
-                    }),
-            ),
-        request.id_attributes,
-    )?;
+    let enveloping = request
+        .objects
+        .iter()
+        .zip(&objects)
+        .filter(|(object, _)| matches!(object, DataObject::Enveloping { .. }))
+        .map(|(_, uri)| &uri[1..]);
+    let new_ids: Vec<&str> = [ids.signature.as_str(), &ids.properties, &ids.value]
+        .into_iter()
+        .chain(references.iter().map(|uri| &uri[1..]))
+        .chain(enveloping)
+        .collect();
+    require_free(document, &new_ids, request.id_attributes)?;
 
-    let formats: Vec<String> = references.iter().map(|id| format!("#{id}")).collect();
     let described: Vec<produce::DataObject<'_>> = request
         .objects
         .iter()
-        .zip(&formats)
+        .zip(&references)
         .map(|(object, reference)| produce::DataObject {
             reference,
             mime_type: mime_type(object),
@@ -348,7 +344,7 @@ fn data_template(
     mut template: SignatureBuilder,
 ) -> SignatureBuilder {
     let mut enveloping = Vec::new();
-    for ((object, reference), object_id) in data.into_iter().zip(references).zip(objects) {
+    for ((object, reference), object_uri) in data.into_iter().zip(references).zip(objects) {
         let c14n = || Transform::C14n(signer.canonicalization.clone());
         let (uri, transforms) = match object {
             DataObject::Document { envelope, .. } => (
@@ -365,13 +361,13 @@ fn data_template(
             // Detached bytes are signed as they are, with no transform.
             DataObject::Detached { uri, .. } => (String::from(uri), Vec::new()),
             DataObject::Enveloping { content, .. } => {
-                enveloping.push(ObjectBuilder::new(content).id(object_id.as_str()));
-                (format!("#{object_id}"), Vec::from([c14n()]))
+                enveloping.push(ObjectBuilder::new(content).id(&object_uri[1..]));
+                (object_uri.clone(), Vec::from([c14n()]))
             }
         };
         let mut built = ReferenceBuilder::new(signer.digest)
             .uri(uri)
-            .id(reference.as_str());
+            .id(&reference[1..]);
         for transform in transforms {
             built = built.transform(transform);
         }
@@ -405,7 +401,7 @@ pub fn countersign<W: Work>(
     let countersigned = format!("{}-reference-0", ids.signature);
     require_free(
         document,
-        [&ids.signature, &ids.properties, &ids.value, &countersigned],
+        &[&ids.signature, &ids.properties, &ids.value, &countersigned],
         countersignature.id_attributes,
     )?;
     let parent = document.with_view(|view| {
@@ -496,19 +492,15 @@ fn mime_type<'a>(object: &DataObject<'a>) -> &'a str {
     }
 }
 
-/// Refuse any new ID the document already declares.
-fn require_free<'a>(
+/// Refuse any new ID the document already declares, in one document walk.
+fn require_free(
     document: &XmlDocument,
-    ids: impl IntoIterator<Item = &'a String>,
+    ids: &[&str],
     registrations: &[IdAttributeRegistration],
 ) -> Result<(), CreateError> {
-    document.with_view(|view| {
-        for id in ids {
-            if view.has_id(id, registrations) {
-                return Err(CreateError::IdInUse(id.clone()));
-            }
-        }
-        Ok(())
+    document.with_view(|view| match view.declared_id(ids, registrations) {
+        Some(id) => Err(CreateError::IdInUse(id.into())),
+        None => Ok(()),
     })
 }
 

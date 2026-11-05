@@ -2295,17 +2295,32 @@ impl<'a> DocumentView<'a> {
         matched.map(|node| self.node_identity_by_id(node))
     }
 
-    /// Return whether any element declares `value` as an ID, under the same
-    /// classification as [`Self::node_for_id`], including duplicate declarations.
+    /// Return the first of `values`, in document order, that an element
+    /// declares as an ID, under the same classification as
+    /// [`Self::node_for_id`], including duplicate declarations.
+    ///
+    /// One walk of the document answers for every value.
     #[must_use]
-    pub fn has_id(self, value: &str, registrations: &[IdAttributeRegistration]) -> bool {
-        self.parsed.document.descendants().any(|node| {
-            node.is_element()
-                && node.attributes().any(|attribute| {
-                    attribute.value() == value
-                        && crate::xml::is_id_attribute(node, attribute, registrations)
-                })
-        })
+    pub fn declared_id<'v>(
+        self,
+        values: &[&'v str],
+        registrations: &[IdAttributeRegistration],
+    ) -> Option<&'v str> {
+        for node in self.parsed.document.descendants() {
+            if !node.is_element() {
+                continue;
+            }
+            for attribute in node.attributes() {
+                // The value comparison is cheaper than ID classification.
+                let Some(&value) = values.iter().find(|value| **value == attribute.value()) else {
+                    continue;
+                };
+                if crate::xml::is_id_attribute(node, attribute, registrations) {
+                    return Some(value);
+                }
+            }
+        }
+        None
     }
 
     #[cfg(feature = "xmldsig")]

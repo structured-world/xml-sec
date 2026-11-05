@@ -71,17 +71,36 @@ fn insertion_respects_the_document_size_limit() {
 }
 
 #[test]
-fn has_id_counts_every_declaration_including_duplicates() {
+fn declared_id_counts_every_declaration_including_duplicates() {
     // node_for_id refuses an ambiguous ID; a new ID must still count as taken.
     let document =
         XmlDocument::parse("<r><a Id=\"one\"/><b ID=\"dup\"/><c id=\"dup\"/><d ref=\"x\"/></r>")
             .expect("fixture parses");
     document.with_view(|view| {
-        assert!(view.has_id("one", &[]));
-        assert!(view.has_id("dup", &[]));
+        assert_eq!(view.declared_id(&["one"], &[]), Some("one"));
+        assert_eq!(view.declared_id(&["dup"], &[]), Some("dup"));
         assert!(view.node_for_id("dup", &[]).is_none());
-        assert!(!view.has_id("absent", &[]));
-        assert!(!view.has_id("x", &[]));
-        assert!(view.has_id("x", &[IdAttributeRegistration::global("ref")]));
+        assert_eq!(view.declared_id(&["absent"], &[]), None);
+        // A value in a non-ID attribute is free unless that attribute is registered.
+        assert_eq!(view.declared_id(&["x"], &[]), None);
+        assert_eq!(
+            view.declared_id(&["x"], &[IdAttributeRegistration::global("ref")]),
+            Some("x")
+        );
+    });
+}
+
+#[test]
+fn declared_id_answers_for_several_values_in_document_order() {
+    // The first declaration in document order wins, whatever the value order.
+    let document =
+        XmlDocument::parse("<r><a Id=\"second\"/><b Id=\"first\"/></r>").expect("fixture parses");
+    document.with_view(|view| {
+        assert_eq!(
+            view.declared_id(&["absent", "first", "second"], &[]),
+            Some("second")
+        );
+        assert_eq!(view.declared_id(&["absent", "other"], &[]), None);
+        assert_eq!(view.declared_id(&[], &[]), None);
     });
 }
