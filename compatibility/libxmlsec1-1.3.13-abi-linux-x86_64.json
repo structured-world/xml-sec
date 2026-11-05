@@ -9520,6 +9520,11 @@
       "name": "xmlSecAddIDs",
       "returns": {
         "kind": "value"
+      },
+      "outputs": {
+        "ids": {
+          "kind": "input"
+        }
       }
     },
     {
@@ -11618,12 +11623,8 @@
     {
       "name": "xmlSecNodeSetAddList",
       "returns": {
-        "kind": "owned",
-        "release": "xmlSecNodeSetDestroy"
-      },
-      "adopts": [
-        "newNSet"
-      ]
+        "kind": "static"
+      }
     },
     {
       "name": "xmlSecNodeSetContains",
@@ -13545,18 +13546,33 @@
       "name": "xmlSecTmplTransformAddXPath",
       "returns": {
         "kind": "value"
+      },
+      "outputs": {
+        "nsList": {
+          "kind": "input"
+        }
       }
     },
     {
       "name": "xmlSecTmplTransformAddXPath2",
       "returns": {
         "kind": "value"
+      },
+      "outputs": {
+        "nsList": {
+          "kind": "input"
+        }
       }
     },
     {
       "name": "xmlSecTmplTransformAddXPointer",
       "returns": {
         "kind": "value"
+      },
+      "outputs": {
+        "nsList": {
+          "kind": "input"
+        }
       }
     },
     {
@@ -14984,12 +15000,24 @@
       "name": "xmlSecX509AttrValueStringRead",
       "returns": {
         "kind": "value"
+      },
+      "outputs": {
+        "in": {
+          "kind": "borrowed",
+          "owner": "in"
+        }
       }
     },
     {
       "name": "xmlSecX509EscapedStringRead",
       "returns": {
         "kind": "value"
+      },
+      "outputs": {
+        "in": {
+          "kind": "borrowed",
+          "owner": "in"
+        }
       }
     },
     {
