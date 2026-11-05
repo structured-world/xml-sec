@@ -856,7 +856,8 @@
         },
         {
           "name": "xmlSecErrorsPrintCryptoLibraryLogOnExitIsEnabled",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecErrorsPrintCryptoLibraryLogOnExitSet",
@@ -1865,27 +1866,33 @@
         },
         {
           "name": "xmlSecKeyDataBinaryValueBinRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueBinWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueDebugDump",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueDebugXmlDump",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueDuplicate",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueFinalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueGetBuffer",
@@ -1899,7 +1906,8 @@
         },
         {
           "name": "xmlSecKeyDataBinaryValueInitialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueSetBuffer",
@@ -1908,11 +1916,13 @@
         },
         {
           "name": "xmlSecKeyDataBinaryValueXmlRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataBinaryValueXmlWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataConcatKdfGetKlass",
@@ -1936,7 +1946,8 @@
         },
         {
           "name": "xmlSecKeyDataDebugDumpImpl",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataDebugXmlDump",
@@ -1945,7 +1956,8 @@
         },
         {
           "name": "xmlSecKeyDataDebugXmlDumpImpl",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataDerivedKeyGetKlass",
@@ -1969,11 +1981,13 @@
         },
         {
           "name": "xmlSecKeyDataDhXmlRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataDhXmlWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataDsaGetKlass",
@@ -1982,11 +1996,13 @@
         },
         {
           "name": "xmlSecKeyDataDsaXmlRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataDsaXmlWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataDuplicate",
@@ -2000,19 +2016,23 @@
         },
         {
           "name": "xmlSecKeyDataEcPublicKeyCombineComponents",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataEcPublicKeySplitComponents",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataEcXmlRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataEcXmlWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataEdDSAGetKlass",
@@ -2146,23 +2166,28 @@
         },
         {
           "name": "xmlSecKeyDataKAMGetKlass",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataKEMGetCiphertext",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataKEMGetKlass",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataKEMGetRecipientKey",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataKEMSetCiphertext",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataKeyInfoReferenceGetKlass",
@@ -2211,11 +2236,13 @@
         },
         {
           "name": "xmlSecKeyDataRsaXmlRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataRsaXmlWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataSLHDSAGetKlass",
@@ -2249,11 +2276,13 @@
         },
         {
           "name": "xmlSecKeyDataX509XmlRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataX509XmlWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecKeyDataXdhGetKlass",
@@ -4863,19 +4892,23 @@
         },
         {
           "name": "xmlSecTransformChaCha20ParamsRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformChaCha20ParamsWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformChaCha20Poly1305ParamsRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformChaCha20Poly1305ParamsWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformConcatKdfGetKlass",
@@ -4884,19 +4917,23 @@
         },
         {
           "name": "xmlSecTransformConcatKdfParamsFinalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformConcatKdfParamsGetFixedInfo",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformConcatKdfParamsInitialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformConcatKdfParamsRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformConnect",
@@ -5195,7 +5232,8 @@
         },
         {
           "name": "xmlSecTransformEdDSAReadContextString",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformEnvelopedGetKlass",
@@ -5259,15 +5297,18 @@
         },
         {
           "name": "xmlSecTransformHkdfParamsFinalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformHkdfParamsInitialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformHkdfParamsRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformHmacGetMinOutputBitsSize",
@@ -5281,7 +5322,8 @@
         },
         {
           "name": "xmlSecTransformHmacReadOutputBitsSize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformHmacRipemd160GetKlass",
@@ -5320,11 +5362,13 @@
         },
         {
           "name": "xmlSecTransformHmacVerify",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformHmacWriteOutput",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformIdListDebugDump",
@@ -5418,31 +5462,38 @@
         },
         {
           "name": "xmlSecTransformKAMExecuteKdf",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKAMFinalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKAMInitialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKAMRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKAMWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKEMRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKEMWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWAes128GetKlass",
@@ -5461,11 +5512,13 @@
         },
         {
           "name": "xmlSecTransformKWDes3Execute",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWDes3Finalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWDes3GetKlass",
@@ -5474,35 +5527,43 @@
         },
         {
           "name": "xmlSecTransformKWDes3Initialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWDes3SetKey",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWDes3SetKeyReq",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394Execute",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394Finalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394Initialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394SetKey",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformKWRfc3394SetKeyReq",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformMLDSA44GetKlass",
@@ -5561,15 +5622,18 @@
         },
         {
           "name": "xmlSecTransformPbkdf2ParamsFinalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformPbkdf2ParamsInitialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformPbkdf2ParamsRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformPopBin",
@@ -5598,7 +5662,8 @@
         },
         {
           "name": "xmlSecTransformReadKeyInfoNode",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformRelationshipGetKlass",
@@ -5637,15 +5702,18 @@
         },
         {
           "name": "xmlSecTransformRsaOaepParamsFinalize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformRsaOaepParamsInitialize",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformRsaOaepParamsRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformRsaPkcs1GetKlass",
@@ -5839,7 +5907,8 @@
         },
         {
           "name": "xmlSecTransformWriteKeyInfoNode",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecTransformX25519GetKlass",
@@ -5908,23 +5977,28 @@
         },
         {
           "name": "xmlSecX509AttrValueStringRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecX509EscapedStringRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecX509NameRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecX509SerialNumberRead",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecX509SerialNumberWrite",
-          "kind": "function"
+          "kind": "function",
+          "declaration": "internal-export"
         },
         {
           "name": "xmlSecX509StoreGetKlass",
@@ -10343,6 +10417,12 @@
       }
     },
     {
+      "name": "xmlSecErrorsPrintCryptoLibraryLogOnExitIsEnabled",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecErrorsPrintCryptoLibraryLogOnExitSet",
       "returns": {
         "kind": "value"
@@ -10559,6 +10639,48 @@
       }
     },
     {
+      "name": "xmlSecKeyDataBinaryValueBinRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueBinWrite",
+      "returns": {
+        "kind": "value"
+      },
+      "outputs": {
+        "buf": {
+          "kind": "owned",
+          "release": "xmlFree"
+        }
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueDebugDump",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueDebugXmlDump",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueDuplicate",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueFinalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecKeyDataBinaryValueGetBuffer",
       "returns": {
         "kind": "borrowed",
@@ -10572,7 +10694,25 @@
       }
     },
     {
+      "name": "xmlSecKeyDataBinaryValueInitialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecKeyDataBinaryValueSetBuffer",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueXmlRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataBinaryValueXmlWrite",
       "returns": {
         "kind": "value"
       }
@@ -10603,7 +10743,19 @@
       }
     },
     {
+      "name": "xmlSecKeyDataDebugDumpImpl",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecKeyDataDebugXmlDump",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataDebugXmlDumpImpl",
       "returns": {
         "kind": "value"
       }
@@ -10633,9 +10785,33 @@
       }
     },
     {
+      "name": "xmlSecKeyDataDhXmlRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataDhXmlWrite",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecKeyDataDsaGetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataDsaXmlRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataDsaXmlWrite",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -10649,6 +10825,30 @@
       "name": "xmlSecKeyDataEcGetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataEcPublicKeyCombineComponents",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataEcPublicKeySplitComponents",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataEcXmlRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataEcXmlWrite",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -10808,6 +11008,38 @@
       }
     },
     {
+      "name": "xmlSecKeyDataKAMGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataKEMGetCiphertext",
+      "returns": {
+        "kind": "borrowed",
+        "owner": "data"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataKEMGetKlass",
+      "returns": {
+        "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataKEMGetRecipientKey",
+      "returns": {
+        "kind": "borrowed",
+        "owner": "data"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataKEMSetCiphertext",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecKeyDataKeyInfoReferenceGetKlass",
       "returns": {
         "kind": "static"
@@ -10862,6 +11094,18 @@
       }
     },
     {
+      "name": "xmlSecKeyDataRsaXmlRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataRsaXmlWrite",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecKeyDataSLHDSAGetKlass",
       "returns": {
         "kind": "static"
@@ -10896,6 +11140,18 @@
       "name": "xmlSecKeyDataX509GetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataX509XmlRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecKeyDataX509XmlWrite",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -13414,9 +13670,57 @@
       }
     },
     {
+      "name": "xmlSecTransformChaCha20ParamsRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformChaCha20ParamsWrite",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformChaCha20Poly1305ParamsRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformChaCha20Poly1305ParamsWrite",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformConcatKdfGetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformConcatKdfParamsFinalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformConcatKdfParamsGetFixedInfo",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformConcatKdfParamsInitialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformConcatKdfParamsRead",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -13798,6 +14102,12 @@
       }
     },
     {
+      "name": "xmlSecTransformEdDSAReadContextString",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformEnvelopedGetKlass",
       "returns": {
         "kind": "static"
@@ -13870,6 +14180,24 @@
       }
     },
     {
+      "name": "xmlSecTransformHkdfParamsFinalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformHkdfParamsInitialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformHkdfParamsRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformHmacGetMinOutputBitsSize",
       "returns": {
         "kind": "value"
@@ -13879,6 +14207,12 @@
       "name": "xmlSecTransformHmacMd5GetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformHmacReadOutputBitsSize",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -13921,6 +14255,18 @@
       "name": "xmlSecTransformHmacSha512GetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformHmacVerify",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformHmacWriteOutput",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -14032,6 +14378,48 @@
       }
     },
     {
+      "name": "xmlSecTransformKAMExecuteKdf",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKAMFinalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKAMInitialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKAMRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKAMWrite",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKEMRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKEMWrite",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformKWAes128GetKlass",
       "returns": {
         "kind": "static"
@@ -14050,9 +14438,69 @@
       }
     },
     {
+      "name": "xmlSecTransformKWDes3Execute",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3Finalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformKWDes3GetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3Initialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3SetKey",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWDes3SetKeyReq",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWRfc3394Execute",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWRfc3394Finalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWRfc3394Initialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWRfc3394SetKey",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformKWRfc3394SetKeyReq",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -14124,6 +14572,24 @@
       }
     },
     {
+      "name": "xmlSecTransformPbkdf2ParamsFinalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformPbkdf2ParamsInitialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformPbkdf2ParamsRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformPopBin",
       "returns": {
         "kind": "value"
@@ -14157,6 +14623,13 @@
       "name": "xmlSecTransformPushXml",
       "returns": {
         "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformReadKeyInfoNode",
+      "returns": {
+        "kind": "owned",
+        "release": "xmlSecKeyDestroy"
       }
     },
     {
@@ -14199,6 +14672,24 @@
       "name": "xmlSecTransformRsaOaepGetKlass",
       "returns": {
         "kind": "static"
+      }
+    },
+    {
+      "name": "xmlSecTransformRsaOaepParamsFinalize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformRsaOaepParamsInitialize",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecTransformRsaOaepParamsRead",
+      "returns": {
+        "kind": "value"
       }
     },
     {
@@ -14430,6 +14921,12 @@
       }
     },
     {
+      "name": "xmlSecTransformWriteKeyInfoNode",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
       "name": "xmlSecTransformX25519GetKlass",
       "returns": {
         "kind": "static"
@@ -14481,6 +14978,37 @@
       "name": "xmlSecTransformXsltSetDefaultSecurityPrefs",
       "returns": {
         "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecX509AttrValueStringRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecX509EscapedStringRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecX509NameRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecX509SerialNumberRead",
+      "returns": {
+        "kind": "value"
+      }
+    },
+    {
+      "name": "xmlSecX509SerialNumberWrite",
+      "returns": {
+        "kind": "owned",
+        "release": "xmlFree"
       }
     },
     {
