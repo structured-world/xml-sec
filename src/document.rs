@@ -691,20 +691,34 @@ pub struct XmlDocument {
     requires_internal_dtd: bool,
     settings: DocumentParseSettings,
     cell: DocumentCell,
+    /// Open all-or-nothing mutations, innermost last.
     #[cfg(feature = "xmldsig-sign")]
-    atomic: AtomicMutation,
+    atomic: Vec<AtomicMutation>,
 }
 
 /// The generation an all-or-nothing mutation started from, kept from its first
 /// commit on, so that no copy of the document is parsed in advance.
 #[cfg(feature = "xmldsig-sign")]
 enum AtomicMutation {
-    /// No atomic mutation is running.
-    Idle,
-    /// One is running and has not committed yet.
+    /// Nothing committed since it began. An enclosing frame in this state
+    /// started from the same generation as the frame inside it.
     Started,
-    /// One is running; this is the cell and generation to return to.
+    /// This is the cell and generation to return to.
     Replaced(DocumentCell, u64),
+}
+
+/// Ends the innermost mutation when its closure returns or unwinds.
+#[cfg(feature = "xmldsig-sign")]
+struct AtomicGuard<'a> {
+    document: &'a mut XmlDocument,
+    succeeded: bool,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl Drop for AtomicGuard<'_> {
+    fn drop(&mut self) {
+        self.document.finish_atomic_mutation(self.succeeded);
+    }
 }
 
 /// The serialization with source ranges already replaced in text.
@@ -960,7 +974,7 @@ impl XmlDocument {
             settings,
             cell,
             #[cfg(feature = "xmldsig-sign")]
-            atomic: AtomicMutation::Idle,
+            atomic: Vec::new(),
         })
     }
 
@@ -1050,25 +1064,57 @@ impl XmlDocument {
         self.cell.into_owner()
     }
 
-    /// Make the following commits one all-or-nothing mutation.
+    /// Run `mutate` as one all-or-nothing mutation.
+    ///
+    /// When `mutate` returns `Ok`, everything it committed becomes one new
+    /// generation. When it returns `Err` or unwinds, the serialization and
+    /// generation are exactly those before the call, and identities captured
+    /// before it stay valid. Transactions nest: an inner one that fails rolls
+    /// back only its own commits, and an inner success is still undone by a
+    /// failing outer transaction.
+    ///
+    /// # Errors
+    /// Returns the error of `mutate` unchanged.
     #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn begin_atomic_mutation(&mut self) {
-        self.atomic = AtomicMutation::Started;
+    pub fn transaction<T, E>(
+        &mut self,
+        mutate: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.atomic.push(AtomicMutation::Started);
+        let mut guard = AtomicGuard {
+            document: self,
+            succeeded: false,
+        };
+        let result = mutate(guard.document);
+        guard.succeeded = result.is_ok();
+        result
     }
 
-    /// End the mutation: success leaves one new generation, failure leaves the
-    /// starting serialization and generation exactly as they were.
+    /// End the innermost mutation: success leaves one new generation, failure
+    /// leaves the starting serialization and generation exactly as they were.
     #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn finish_atomic_mutation(&mut self, succeeded: bool) {
-        match core::mem::replace(&mut self.atomic, AtomicMutation::Idle) {
-            AtomicMutation::Replaced(_, generation) if succeeded => {
-                self.generation = generation + 1;
-            }
-            AtomicMutation::Replaced(cell, generation) => {
-                self.cell = cell;
-                self.generation = generation;
-            }
-            AtomicMutation::Idle | AtomicMutation::Started => {}
+    fn finish_atomic_mutation(&mut self, succeeded: bool) {
+        let Some(frame) = self.atomic.pop() else {
+            debug_assert!(false, "a guard ends only the frame it began");
+            return;
+        };
+        let AtomicMutation::Replaced(cell, generation) = frame else {
+            return;
+        };
+        if !succeeded {
+            self.cell = cell;
+            self.generation = generation;
+            return;
+        }
+        // The starting generation was committed from, so it is below the
+        // current one and its successor cannot overflow.
+        self.generation = generation + 1;
+        // An enclosing transaction that committed nothing before this one
+        // began starts from this same cell; it now owns the way back.
+        if let Some(outer) = self.atomic.last_mut()
+            && matches!(outer, AtomicMutation::Started)
+        {
+            *outer = AtomicMutation::Replaced(cell, generation);
         }
     }
 
@@ -1836,9 +1882,13 @@ impl XmlDocument {
         })?;
         record_work(&mut next, recorded_work(&self.cell));
         let previous = core::mem::replace(&mut self.cell, next);
+        // Only the innermost frame takes the way back; enclosing frames still
+        // marked Started share its starting cell and inherit it on success.
         #[cfg(feature = "xmldsig-sign")]
-        if matches!(self.atomic, AtomicMutation::Started) {
-            self.atomic = AtomicMutation::Replaced(previous, self.generation);
+        if let Some(frame) = self.atomic.last_mut()
+            && matches!(frame, AtomicMutation::Started)
+        {
+            *frame = AtomicMutation::Replaced(previous, self.generation);
         }
         #[cfg(not(feature = "xmldsig-sign"))]
         drop(previous);
@@ -4497,6 +4547,9 @@ mod entity_ceiling_tests;
 
 #[cfg(test)]
 mod replacement_tests;
+
+#[cfg(all(test, feature = "xmldsig-sign"))]
+mod transaction_tests;
 
 // `xmlenc` enables `xmldsig` through `xmldsig-sign`, so every build of this
 // module has the verification policy its tests use.
