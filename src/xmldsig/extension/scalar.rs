@@ -393,14 +393,50 @@ fn simple_content_text<'a, W: Work>(
     Ok(Source::Text(value))
 }
 
+/// Check a value that is not read from a document, such as one about to be
+/// written, against a supported base datatype within a paid scope.
+///
+/// The text is the value's exact characters, before schema whitespace
+/// processing. A `QName` needs an element's namespace scope, so it is
+/// reported as [`ScalarFact::Unsupported`] here.
+///
+/// # Errors
+///
+/// Returns [`InspectionError::Processing`] for exhausted work and
+/// [`InspectionError::Visitor`] with the callback's error.
+pub fn with_lexical_scalar<W: Work, R, E>(
+    text: &str,
+    datatype: ScalarType<'_>,
+    work: &W,
+    consume: impl for<'a> FnOnce(ScalarFact<'a>) -> Result<R, E>,
+) -> Result<R, InspectionError<E>> {
+    admit_scalar_passes(work, text.len()).map_err(InspectionError::Processing)?;
+    let collapsed = match datatype {
+        ScalarType::QName => {
+            return consume(ScalarFact::Unsupported).map_err(InspectionError::Visitor);
+        }
+        ScalarType::Other { .. } | ScalarType::Integer => Text::Borrowed(text),
+        _ => collapse(text, work).map_err(InspectionError::Processing)?,
+    };
+    consume(value_fact(collapsed.view(), datatype)).map_err(InspectionError::Visitor)
+}
+
 fn scalar_fact<'a>(
     node: crate::xml::dom::Node<'a, 'a>,
     text: &'a str,
     datatype: ScalarType<'_>,
     work: &impl Work,
 ) -> Result<ScalarFact<'a>, ScalarError> {
-    Ok(match datatype {
-        ScalarType::Other { .. } => ScalarFact::Unsupported,
+    if let ScalarType::QName = datatype {
+        return inspect_qname(node, text, work);
+    }
+    Ok(value_fact(text, datatype))
+}
+
+/// The outcome of every datatype whose value needs no namespace scope.
+fn value_fact<'a>(text: &'a str, datatype: ScalarType<'_>) -> ScalarFact<'a> {
+    match datatype {
+        ScalarType::Other { .. } | ScalarType::QName => ScalarFact::Unsupported,
         ScalarType::Boolean => match text {
             "true" | "1" => ScalarFact::Value(ScalarValue::Boolean(true)),
             "false" | "0" => ScalarFact::Value(ScalarValue::Boolean(false)),
@@ -413,7 +449,6 @@ fn scalar_fact<'a>(
                 ScalarFact::Malformed
             }
         }
-        ScalarType::QName => inspect_qname(node, text, work)?,
         ScalarType::DateTime => parse_date_time(text).map_or(ScalarFact::Malformed, |value| {
             ScalarFact::Value(ScalarValue::DateTime(value))
         }),
@@ -433,7 +468,7 @@ fn scalar_fact<'a>(
                 ScalarFact::Malformed
             }
         }
-    })
+    }
 }
 
 fn whitespace(byte: u8) -> bool {
