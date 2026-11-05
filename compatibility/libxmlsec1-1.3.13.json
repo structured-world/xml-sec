@@ -4209,6 +4209,200 @@
         "#ifndef __XMLSEC_TREE_H__",
         "#if defined(XMLSEC_WINDOWS)"
       ]
+    },
+    {
+      "source": "src/errors_helpers.h",
+      "start_line": 976,
+      "end_line": 976,
+      "conditions": [
+        "#ifndef __XMLSEC_ERROR_HELPERS_H__"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 24,
+      "end_line": 81,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 116,
+      "end_line": 125,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__",
+        "#if !defined(XMLSEC_NO_EC)"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 170,
+      "end_line": 175,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__",
+        "#if !defined(XMLSEC_NO_RSA)"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 221,
+      "end_line": 226,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__",
+        "#if !defined(XMLSEC_NO_DH)"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 272,
+      "end_line": 277,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__",
+        "#if !defined(XMLSEC_NO_DSA)"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 305,
+      "end_line": 305,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__"
+      ]
+    },
+    {
+      "source": "src/keysdata_helpers.h",
+      "start_line": 327,
+      "end_line": 337,
+      "conditions": [
+        "#ifndef __XMLSEC_KEYSDATA_HELPERS_H__",
+        "#ifndef XMLSEC_NO_MLKEM"
+      ]
+    },
+    {
+      "source": "src/kw_helpers.h",
+      "start_line": 103,
+      "end_line": 115,
+      "conditions": [
+        "#ifndef __XMLSEC_KT_AES_DES_H__",
+        "#ifndef XMLSEC_NO_DES"
+      ]
+    },
+    {
+      "source": "src/kw_helpers.h",
+      "start_line": 173,
+      "end_line": 186,
+      "conditions": [
+        "#ifndef __XMLSEC_KT_AES_DES_H__",
+        "#if !defined(XMLSEC_NO_AES) || !defined(XMLSEC_NO_CAMELLIA)"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 27,
+      "end_line": 74,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 93,
+      "end_line": 96,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_MLKEM"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 116,
+      "end_line": 120,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_CONCATKDF"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 134,
+      "end_line": 141,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_HMAC"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 154,
+      "end_line": 154,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_MLDSA"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 164,
+      "end_line": 164,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_SLHDSA"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 174,
+      "end_line": 174,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_EDDSA"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 190,
+      "end_line": 192,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_PBKDF2"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 209,
+      "end_line": 211,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_HKDF"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 227,
+      "end_line": 244,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_CHACHA20"
+      ]
+    },
+    {
+      "source": "src/transform_helpers.h",
+      "start_line": 262,
+      "end_line": 264,
+      "conditions": [
+        "#ifndef __XMLSEC_TRANSFORMS_HELPERS_H__",
+        "#ifndef XMLSEC_NO_RSA"
+      ]
+    },
+    {
+      "source": "src/x509_helpers.h",
+      "start_line": 58,
+      "end_line": 115,
+      "conditions": [
+        "#ifndef __XMLSEC_X509_HELPERS_H__",
+        "#ifndef XMLSEC_NO_X509"
+      ]
     }
   ],
   "items": [
@@ -31509,6 +31703,630 @@
       "source": "include/xmlsec/xmltree.h",
       "line": 1,
       "detail": "installed public header",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecErrorsPrintCryptoLibraryLogOnExitIsEnabled",
+      "source": "src/errors_helpers.h",
+      "line": 976,
+      "detail": "XMLSEC_EXPORT int xmlSecErrorsPrintCryptoLibraryLogOnExitIsEnabled (void);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueBinRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 69,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataBinaryValueBinRead (xmlSecKeyDataId id, xmlSecKeyPtr key, const xmlSecByte* buf, xmlSecSize bufSize, xmlSecKeyInfoCtxPtr keyInfoCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueBinWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 74,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataBinaryValueBinWrite (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlSecByte** buf, xmlSecSize* bufSize, xmlSecKeyInfoCtxPtr keyInfoCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueDebugDump",
+      "source": "src/keysdata_helpers.h",
+      "line": 79,
+      "detail": "XMLSEC_EXPORT void xmlSecKeyDataBinaryValueDebugDump (xmlSecKeyDataPtr data, FILE* output);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueDebugXmlDump",
+      "source": "src/keysdata_helpers.h",
+      "line": 81,
+      "detail": "XMLSEC_EXPORT void xmlSecKeyDataBinaryValueDebugXmlDump (xmlSecKeyDataPtr data, FILE* output);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueDuplicate",
+      "source": "src/keysdata_helpers.h",
+      "line": 58,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataBinaryValueDuplicate (xmlSecKeyDataPtr dst, xmlSecKeyDataPtr src);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueFinalize",
+      "source": "src/keysdata_helpers.h",
+      "line": 60,
+      "detail": "XMLSEC_EXPORT void xmlSecKeyDataBinaryValueFinalize (xmlSecKeyDataPtr data);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueInitialize",
+      "source": "src/keysdata_helpers.h",
+      "line": 57,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataBinaryValueInitialize (xmlSecKeyDataPtr data);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueXmlRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 61,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataBinaryValueXmlRead (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataBinaryValueXmlWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 65,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataBinaryValueXmlWrite (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataDebugDumpImpl",
+      "source": "src/keysdata_helpers.h",
+      "line": 24,
+      "detail": "XMLSEC_EXPORT void xmlSecKeyDataDebugDumpImpl(xmlSecKeyDataPtr data, FILE* output);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataDebugXmlDumpImpl",
+      "source": "src/keysdata_helpers.h",
+      "line": 25,
+      "detail": "XMLSEC_EXPORT void xmlSecKeyDataDebugXmlDumpImpl(xmlSecKeyDataPtr data, FILE* output);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataDhXmlRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 221,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataDhXmlRead (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, xmlSecKeyDataDhRead readFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataDhXmlWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 226,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataDhXmlWrite (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, int base64LineSize, int addLineBreaks, xmlSecKeyDataDhWrite writeFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataDsaXmlRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 272,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataDsaXmlRead (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, xmlSecKeyDataDsaRead readFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataDsaXmlWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 277,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataDsaXmlWrite (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, int base64LineSize, int addLineBreaks, xmlSecKeyDataDsaWrite writeFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataEcPublicKeyCombineComponents",
+      "source": "src/keysdata_helpers.h",
+      "line": 117,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataEcPublicKeyCombineComponents (xmlSecKeyValueEcPtr ecValue);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataEcPublicKeySplitComponents",
+      "source": "src/keysdata_helpers.h",
+      "line": 116,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataEcPublicKeySplitComponents (xmlSecKeyValueEcPtr ecValue);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataEcXmlRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 120,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataEcXmlRead (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, xmlSecKeyDataEcRead readFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataEcXmlWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 125,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataEcXmlWrite (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, int base64LineSize, int addLineBreaks, xmlSecKeyDataEcWrite writeFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKAMGetKlass",
+      "source": "src/keysdata_helpers.h",
+      "line": 305,
+      "detail": "XMLSEC_EXPORT xmlSecKeyDataId xmlSecKeyDataKAMGetKlass (void);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKEMGetCiphertext",
+      "source": "src/keysdata_helpers.h",
+      "line": 329,
+      "detail": "XMLSEC_EXPORT xmlSecBufferPtr xmlSecKeyDataKEMGetCiphertext (xmlSecKeyDataPtr data);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKEMGetKlass",
+      "source": "src/keysdata_helpers.h",
+      "line": 327,
+      "detail": "XMLSEC_EXPORT xmlSecKeyDataId xmlSecKeyDataKEMGetKlass (void);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKEMGetRecipientKey",
+      "source": "src/keysdata_helpers.h",
+      "line": 328,
+      "detail": "XMLSEC_EXPORT xmlSecKeyPtr xmlSecKeyDataKEMGetRecipientKey (xmlSecKeyDataPtr data);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKEMNodeRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 333,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataKEMNodeRead (xmlSecKeyDataPtr data, xmlNodePtr node, xmlSecTransformPtr kemTransform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKEMNodeWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 337,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataKEMNodeWrite (xmlSecKeyDataPtr data, xmlNodePtr node, xmlSecTransformPtr kemTransform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataKEMSetCiphertext",
+      "source": "src/keysdata_helpers.h",
+      "line": 330,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataKEMSetCiphertext (xmlSecKeyDataPtr data, const xmlSecByte* buf, xmlSecSize bufSize);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataRsaXmlRead",
+      "source": "src/keysdata_helpers.h",
+      "line": 170,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataRsaXmlRead (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, xmlSecKeyDataRsaRead readFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataRsaXmlWrite",
+      "source": "src/keysdata_helpers.h",
+      "line": 175,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataRsaXmlWrite (xmlSecKeyDataId id, xmlSecKeyPtr key, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, int base64LineSize, int addLineBreaks, xmlSecKeyDataRsaWrite writeFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataX509XmlRead",
+      "source": "src/x509_helpers.h",
+      "line": 58,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataX509XmlRead (xmlSecKeyPtr key, xmlSecKeyDataPtr data, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, xmlSecKeyDataX509Read readFunc);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecKeyDataX509XmlWrite",
+      "source": "src/x509_helpers.h",
+      "line": 63,
+      "detail": "XMLSEC_EXPORT int xmlSecKeyDataX509XmlWrite (xmlSecKeyDataPtr data, xmlNodePtr node, xmlSecKeyInfoCtxPtr keyInfoCtx, int base64LineSize, int addLineBreaks, xmlSecKeyDataX509Write writeFunc, void* writeFuncContext);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformChaCha20ParamsRead",
+      "source": "src/transform_helpers.h",
+      "line": 227,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformChaCha20ParamsRead (xmlNodePtr node, xmlSecByte *iv, xmlSecSize ivSize, xmlSecSize *ivSizeOut, int *noncePresent);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformChaCha20ParamsWrite",
+      "source": "src/transform_helpers.h",
+      "line": 233,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformChaCha20ParamsWrite (xmlNodePtr node, const xmlSecByte *iv, xmlSecSize ivSize);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformChaCha20Poly1305ParamsRead",
+      "source": "src/transform_helpers.h",
+      "line": 237,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformChaCha20Poly1305ParamsRead (xmlNodePtr node, xmlSecBufferPtr aad, xmlSecByte *iv, xmlSecSize ivSize, xmlSecSize *ivSizeOut, int *noncePresent);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformChaCha20Poly1305ParamsWrite",
+      "source": "src/transform_helpers.h",
+      "line": 244,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformChaCha20Poly1305ParamsWrite (xmlNodePtr node, const xmlSecByte *iv, xmlSecSize ivSize);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformConcatKdfParamsFinalize",
+      "source": "src/transform_helpers.h",
+      "line": 117,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformConcatKdfParamsFinalize (xmlSecTransformConcatKdfParamsPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformConcatKdfParamsGetFixedInfo",
+      "source": "src/transform_helpers.h",
+      "line": 120,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformConcatKdfParamsGetFixedInfo (xmlSecTransformConcatKdfParamsPtr params, xmlSecBufferPtr bufFixedInfo);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformConcatKdfParamsInitialize",
+      "source": "src/transform_helpers.h",
+      "line": 116,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformConcatKdfParamsInitialize (xmlSecTransformConcatKdfParamsPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformConcatKdfParamsRead",
+      "source": "src/transform_helpers.h",
+      "line": 118,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformConcatKdfParamsRead (xmlSecTransformConcatKdfParamsPtr params, xmlNodePtr node);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformEdDSAReadContextString",
+      "source": "src/transform_helpers.h",
+      "line": 174,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformEdDSAReadContextString(xmlNodePtr node, xmlSecBufferPtr res);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformHkdfParamsFinalize",
+      "source": "src/transform_helpers.h",
+      "line": 210,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformHkdfParamsFinalize (xmlSecTransformHkdfParamsPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformHkdfParamsInitialize",
+      "source": "src/transform_helpers.h",
+      "line": 209,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformHkdfParamsInitialize (xmlSecTransformHkdfParamsPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformHkdfParamsRead",
+      "source": "src/transform_helpers.h",
+      "line": 211,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformHkdfParamsRead (xmlSecTransformHkdfParamsPtr params, xmlNodePtr node);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformHmacReadOutputBitsSize",
+      "source": "src/transform_helpers.h",
+      "line": 134,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformHmacReadOutputBitsSize (xmlNodePtr node, xmlSecSize defaultSize, xmlSecSize* res);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformHmacVerify",
+      "source": "src/transform_helpers.h",
+      "line": 141,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformHmacVerify (const xmlSecByte* data, xmlSecSize dataSize, const xmlSecByte * hmac, xmlSecSize hmacSizeInBits, xmlSecSize hmacMaxSizeInBytes);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformHmacWriteOutput",
+      "source": "src/transform_helpers.h",
+      "line": 137,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformHmacWriteOutput (const xmlSecByte * hmac, xmlSecSize hmacSizeInBits, xmlSecSize hmacMaxSizeInBytes, xmlSecBufferPtr out);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKAMExecuteKdf",
+      "source": "src/transform_helpers.h",
+      "line": 74,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKAMExecuteKdf (xmlSecTransformKAMPtr params, xmlSecTransformOperation operation, xmlSecBufferPtr secret, xmlSecBufferPtr out, xmlSecSize expectedOutputSize, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKAMFinalize",
+      "source": "src/transform_helpers.h",
+      "line": 63,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformKAMFinalize (xmlSecTransformKAMPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKAMInitialize",
+      "source": "src/transform_helpers.h",
+      "line": 62,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKAMInitialize (xmlSecTransformKAMPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKAMRead",
+      "source": "src/transform_helpers.h",
+      "line": 64,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKAMRead (xmlSecTransformKAMPtr params, xmlNodePtr node, xmlSecTransformPtr kamTransform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKAMWrite",
+      "source": "src/transform_helpers.h",
+      "line": 68,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKAMWrite (xmlSecTransformKAMPtr params, xmlNodePtr node, xmlSecTransformPtr kamTransform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKEMRead",
+      "source": "src/transform_helpers.h",
+      "line": 93,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKEMRead (xmlNodePtr node, xmlSecTransformPtr kemTransform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKEMWrite",
+      "source": "src/transform_helpers.h",
+      "line": 96,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKEMWrite (xmlNodePtr node, xmlSecTransformPtr kemTransform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWDes3Execute",
+      "source": "src/kw_helpers.h",
+      "line": 115,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWDes3Execute (xmlSecTransformPtr transform, xmlSecTransformKWDes3CtxPtr ctx, int last);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWDes3Finalize",
+      "source": "src/kw_helpers.h",
+      "line": 107,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformKWDes3Finalize (xmlSecTransformPtr transform, xmlSecTransformKWDes3CtxPtr ctx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWDes3Initialize",
+      "source": "src/kw_helpers.h",
+      "line": 103,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWDes3Initialize (xmlSecTransformPtr transform, xmlSecTransformKWDes3CtxPtr ctx, xmlSecKWDes3Id kwDes3Id, xmlSecKeyDataId keyId);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWDes3SetKey",
+      "source": "src/kw_helpers.h",
+      "line": 112,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWDes3SetKey (xmlSecTransformPtr transform, xmlSecTransformKWDes3CtxPtr ctx, xmlSecKeyPtr key);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWDes3SetKeyReq",
+      "source": "src/kw_helpers.h",
+      "line": 109,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWDes3SetKeyReq (xmlSecTransformPtr transform, xmlSecTransformKWDes3CtxPtr ctx, xmlSecKeyReqPtr keyReq);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWRfc3394Execute",
+      "source": "src/kw_helpers.h",
+      "line": 186,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWRfc3394Execute (xmlSecTransformPtr transform, xmlSecTransformKWRfc3394CtxPtr ctx, int last);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWRfc3394Finalize",
+      "source": "src/kw_helpers.h",
+      "line": 178,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformKWRfc3394Finalize (xmlSecTransformPtr transform, xmlSecTransformKWRfc3394CtxPtr ctx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWRfc3394Initialize",
+      "source": "src/kw_helpers.h",
+      "line": 173,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWRfc3394Initialize (xmlSecTransformPtr transform, xmlSecTransformKWRfc3394CtxPtr ctx, xmlSecKWRfc3394Id kwRfc3394Id, xmlSecKeyDataId keyId, xmlSecSize keyExpectedSize);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWRfc3394SetKey",
+      "source": "src/kw_helpers.h",
+      "line": 183,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWRfc3394SetKey (xmlSecTransformPtr transform, xmlSecTransformKWRfc3394CtxPtr ctx, xmlSecKeyPtr key);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformKWRfc3394SetKeyReq",
+      "source": "src/kw_helpers.h",
+      "line": 180,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformKWRfc3394SetKeyReq (xmlSecTransformPtr transform, xmlSecTransformKWRfc3394CtxPtr ctx, xmlSecKeyReqPtr keyReq);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformMLDSAReadContextString",
+      "source": "src/transform_helpers.h",
+      "line": 154,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformMLDSAReadContextString(xmlNodePtr node, xmlSecBufferPtr res);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformPbkdf2ParamsFinalize",
+      "source": "src/transform_helpers.h",
+      "line": 191,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformPbkdf2ParamsFinalize (xmlSecTransformPbkdf2ParamsPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformPbkdf2ParamsInitialize",
+      "source": "src/transform_helpers.h",
+      "line": 190,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformPbkdf2ParamsInitialize (xmlSecTransformPbkdf2ParamsPtr params);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformPbkdf2ParamsRead",
+      "source": "src/transform_helpers.h",
+      "line": 192,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformPbkdf2ParamsRead (xmlSecTransformPbkdf2ParamsPtr params, xmlNodePtr node);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformReadKeyInfoNode",
+      "source": "src/transform_helpers.h",
+      "line": 27,
+      "detail": "XMLSEC_EXPORT xmlSecKeyPtr xmlSecTransformReadKeyInfoNode (xmlSecKeyDataType keyType, xmlNodePtr node, xmlSecTransformPtr transform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformRsaOaepParamsFinalize",
+      "source": "src/transform_helpers.h",
+      "line": 263,
+      "detail": "XMLSEC_EXPORT void xmlSecTransformRsaOaepParamsFinalize (xmlSecTransformRsaOaepParamsPtr oaepParams);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformRsaOaepParamsInitialize",
+      "source": "src/transform_helpers.h",
+      "line": 262,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformRsaOaepParamsInitialize (xmlSecTransformRsaOaepParamsPtr oaepParams);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformRsaOaepParamsRead",
+      "source": "src/transform_helpers.h",
+      "line": 264,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformRsaOaepParamsRead (xmlSecTransformRsaOaepParamsPtr oaepParams, xmlNodePtr node);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformSLHDSAReadContextString",
+      "source": "src/transform_helpers.h",
+      "line": 164,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformSLHDSAReadContextString(xmlNodePtr node, xmlSecBufferPtr res);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecTransformWriteKeyInfoNode",
+      "source": "src/transform_helpers.h",
+      "line": 31,
+      "detail": "XMLSEC_EXPORT int xmlSecTransformWriteKeyInfoNode (xmlSecKeyPtr key, xmlNodePtr node, xmlSecTransformPtr transform, xmlSecTransformCtxPtr transformCtx);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecX509AttrValueStringRead",
+      "source": "src/x509_helpers.h",
+      "line": 103,
+      "detail": "XMLSEC_EXPORT int xmlSecX509AttrValueStringRead (const xmlChar **in, xmlSecSize *inSize, xmlSecByte *out, xmlSecSize outSize, xmlSecSize *outWritten, int *outType, xmlSecByte delim, int ingoreTrailingSpaces);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecX509EscapedStringRead",
+      "source": "src/x509_helpers.h",
+      "line": 95,
+      "detail": "XMLSEC_EXPORT int xmlSecX509EscapedStringRead (const xmlChar **in, xmlSecSize *inSize, xmlSecByte *out, xmlSecSize outSize, xmlSecSize *outWritten, xmlSecByte delim, int ingoreTrailingSpaces);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecX509NameRead",
+      "source": "src/x509_helpers.h",
+      "line": 88,
+      "detail": "XMLSEC_EXPORT int xmlSecX509NameRead (const xmlChar *str, xmlSecx509NameReplacements *replacements, xmlSecX509NameReadCallback callback, void * context);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecX509SerialNumberRead",
+      "source": "src/x509_helpers.h",
+      "line": 115,
+      "detail": "XMLSEC_EXPORT int xmlSecX509SerialNumberRead (const xmlChar *str, xmlSecByte *res, xmlSecSize resSize, xmlSecSize *written);",
+      "classification": "binary-c-surface"
+    },
+    {
+      "kind": "internal-export",
+      "name": "xmlSecX509SerialNumberWrite",
+      "source": "src/x509_helpers.h",
+      "line": 112,
+      "detail": "XMLSEC_EXPORT xmlChar* xmlSecX509SerialNumberWrite (const xmlSecByte *data, xmlSecSize dataSize);",
       "classification": "binary-c-surface"
     },
     {

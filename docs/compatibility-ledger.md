@@ -8,7 +8,9 @@ surface from the upstream commit recorded in the canonical
 pin:
 
 - installed headers (including configured template values), exported functions
-  and variables, every conditional macro definition, compiler-provided build
+  and variables, the functions libxmlsec1 exports for its crypto backends from
+  headers it does not install (`src/*.h`, kind `internal-export`), every
+  conditional macro definition, compiler-provided build
   defines, typedef aliases, public enums, structure layouts, callbacks, class
   IDs, complete registry families, and the exact nested preprocessor branch
   path controlling every header item;
@@ -89,6 +91,58 @@ changing platform or feature availability produces a generated ledger diff even
 when declaration text is unchanged. An item outside these spans is
 unconditional. Malformed, overlapping, or unbalanced donor condition data fails
 generation.
+
+## Binary ABI baseline
+
+The ledger describes the sources. The binary baseline at
+[`compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json`](../compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json)
+records what a C compatibility layer must match in an installed build of the
+same pinned commit, for one platform tuple:
+
+- the exported symbols of `libxmlsec1` and `libxmlsec1-openssl`, each tied to
+  the ledger item declaring it, including the internal exports prebuilt
+  backend libraries link against; exports outside the `xmlSec` namespace (the
+  build's statically embedded OpenSSL) are counted and digested, not listed;
+- the size, alignment and field offsets of every public struct, every
+  enumerator value, the sizes of pointers, `long`, `size_t` and `time_t`, and
+  the sizes of exported data objects, measured by a C program compiled with the
+  build's own `xmlsec1-config --cflags`, so members that depend on configure
+  options appear exactly as that build's consumers see them;
+- the feature defines of the build and its crypto backend;
+- the ownership of every exported function: whether a returned pointer is a
+  value, static, borrowed from an argument, owned by the caller (and released
+  with which function) or a container element; what each parameter pointing to
+  a writable pointer hands out (constness is checked at that pointer, so
+  `const xmlChar **` counts, and an array the function only reads is
+  classified as input explicitly); and which arguments the function adopts.
+
+Ownership comes from the reviewed
+[`compatibility/libxmlsec1-1.3.13-ownership-rules.json`](../compatibility/libxmlsec1-1.3.13-ownership-rules.json).
+A returned pointer or output parameter that no rule covers fails generation,
+and so does a rule that matches nothing, a release function the build does not
+export and a rule without a rationale. A few symbols are exported only because
+the donor links without a visibility list: no header declares them with an
+export marker, so no consumer can rely on them. The rules file lists each with
+its rationale; any other export without a declaration, or a listed name that
+is declared or not exported, fails generation.
+
+The committed tuple is the CI build: Linux x86_64, OpenSSL backend, built by
+`xml-sec-tools install-xmlsec1` with `XMLSEC1_MODERN_ORACLE=1`. Toolchain
+versions are not part of the baseline; the generator prints the compiler it
+used. CI regenerates the baseline from that build, keeps the result as the
+`libxmlsec1-abi-baseline` artifact and fails on any difference, so a reviewed
+change can be committed from the artifact.
+
+```sh
+cargo run -p xml-sec-capability-ledger -- abi-check \
+  compatibility/libxmlsec1-1.3.13.json \
+  compatibility/libxmlsec1-1.3.13-ownership-rules.json \
+  "$XMLSEC1_PREFIX" \
+  compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json
+```
+
+`abi-generate` takes the same arguments and writes the snapshot. Both refuse an
+installation built from another commit than the pinned one.
 
 ## Regenerating
 

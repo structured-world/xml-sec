@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod abi;
+
 const EXPECTED_VERSION: &str = "1.3.13";
 const EXPECTED_COMMIT: &str =
     include_str!("../../../compatibility/libxmlsec1-1.3.13-donor-commit.txt");
@@ -192,6 +194,13 @@ struct DonorAnchor {
 fn main() -> Result<(), String> {
     let mut args = env::args().skip(1);
     let command = args.next().ok_or_else(usage)?;
+    if let Some(abi) = command.strip_prefix("abi-") {
+        return match abi {
+            "generate" => abi::run(false, args),
+            "check" => abi::run(true, args),
+            _ => Err(usage()),
+        };
+    }
     if !matches!(
         command.as_str(),
         "generate" | "check" | "behavior-generate" | "behavior-check"
@@ -251,7 +260,7 @@ fn main() -> Result<(), String> {
 }
 
 fn usage() -> String {
-    "usage: xml-sec-capability-ledger <generate|check|behavior-generate|behavior-check> <donor> <rules.json> <ledger.json>".into()
+    "usage: xml-sec-capability-ledger <generate|check|behavior-generate|behavior-check> <donor> <rules.json> <ledger.json>\n       xml-sec-capability-ledger <abi-generate|abi-check> <ledger.json> <ownership-rules.json> <xmlsec1-prefix> <snapshot.json>".into()
 }
 
 fn generate_behavior_ledger(
@@ -605,6 +614,7 @@ fn extract_surface(donor: &Path) -> Result<Vec<SurfaceItem>, String> {
         items.push(item("header", header, header, 1, "installed public header"));
         extract_header(donor, header, &mut items)?;
     }
+    extract_internal_exports(donor, &mut items)?;
     extract_build_defines(donor, &mut items)?;
     extract_algorithm_uris(donor, &mut items)?;
     extract_cli(donor, &mut items)?;
@@ -937,6 +947,64 @@ fn extract_header(donor: &Path, source: &str, items: &mut Vec<SurfaceItem>) -> R
             entry.conditions.clone_from(&conditions[line_number - 1]);
         }
         index += 1;
+    }
+    Ok(())
+}
+
+/// Functions libxmlsec1 exports for its crypto backends from headers it does
+/// not install (`src/*.h`). Prebuilt backend libraries link against them, so
+/// they are part of the binary surface even though no consumer header
+/// declares them.
+fn extract_internal_exports(donor: &Path, items: &mut Vec<SurfaceItem>) -> Result<(), String> {
+    let root = donor.join("src");
+    let mut headers = Vec::new();
+    for entry in fs::read_dir(&root).map_err(|error| format!("read {}: {error}", root.display()))? {
+        let path = entry.map_err(|error| error.to_string())?.path();
+        if path.extension().is_some_and(|extension| extension == "h") {
+            headers.push(path);
+        }
+    }
+    headers.sort();
+    let start = items.len();
+    for path in headers {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("{} has no UTF-8 file name", path.display()))?;
+        let source = format!("src/{file_name}");
+        let content =
+            fs::read_to_string(&path).map_err(|error| format!("read {source}: {error}"))?;
+        let lines: Vec<_> = content.lines().collect();
+        let conditions = preprocessor_conditions(&content)
+            .map_err(|error| format!("parse conditions in {source}: {error}"))?;
+        let mut index = 0;
+        while index < lines.len() {
+            let line = lines[index];
+            let line_number = index + 1;
+            if line.contains("XMLSEC_EXPORT") && !line.trim_start().starts_with('#') {
+                let (block, end) = collect_declaration(&lines, index)
+                    .map_err(|error| format!("parse export at {source}:{line_number}: {error}"))?;
+                if block.contains("_EXPORT_VAR") {
+                    return Err(format!(
+                        "{source}:{line_number} exports a variable from an internal header"
+                    ));
+                }
+                let detail = normalize_c(&block).map_err(|error| {
+                    format!("normalize export at {source}:{line_number}: {error}")
+                })?;
+                let name = exported_name(&block).ok_or_else(|| {
+                    format!("cannot extract exported symbol at {source}:{line_number}: {detail}")
+                })?;
+                let mut entry = item("internal-export", &name, &source, line_number, &detail);
+                entry.conditions.clone_from(&conditions[index]);
+                items.push(entry);
+                index = end;
+            }
+            index += 1;
+        }
+    }
+    if items.len() == start {
+        return Err("no internal backend exports discovered".to_owned());
     }
     Ok(())
 }

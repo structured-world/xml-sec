@@ -173,7 +173,7 @@ fn complete_surface_categories_are_stable() {
     );
     assert_eq!(ledger.generated_by, "xml-sec-capability-ledger/2");
     assert_eq!(ledger.classifications.len(), 25);
-    assert_eq!(ledger.availability.len(), 427);
+    assert_eq!(ledger.availability.len(), 449);
 
     let counts = ledger
         .items
@@ -198,6 +198,7 @@ fn complete_surface_categories_are_stable() {
             ("export-function", 609),
             ("export-variable", 435),
             ("header", 59),
+            ("internal-export", 78),
             ("key-format", 11),
             ("macro", 1_499),
             ("registry", 15),
