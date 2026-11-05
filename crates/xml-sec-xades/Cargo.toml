@@ -15,12 +15,17 @@ structured-pkix = { version = "0.20.3", default-features = false, features = ["a
 structured-cms = { version = "0.20.3", default-features = false, features = ["alloc"] }
 structured-ltv = { version = "0.20.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
+base64 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
+roxmltree = "0.21"
 
 [features]
 default = ["std", "xml-backend-xmloxide"]
+# Signature creation over the XMLDSig signer. Verification-only builds,
+# including alloc and WASM ones, do not take the signing dependencies.
+produce = ["std", "xml-sec/xmldsig-sign", "dep:base64"]
 std = [
     "xml-sec/std",
     "structured-xades/std",

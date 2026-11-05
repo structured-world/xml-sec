@@ -87,6 +87,28 @@ pub enum Outcome<R> {
     },
 }
 
+impl<R> Outcome<R> {
+    /// The same outcome, with an assessed visitor result mapped by `map`.
+    pub fn map<S>(self, map: impl FnOnce(R) -> S) -> Outcome<S> {
+        match self {
+            Self::Assessed(value) => Outcome::Assessed(map(value)),
+            Self::Path { signature, failure } => Outcome::Path { signature, failure },
+            Self::CounterKey {
+                signature,
+                association,
+            } => Outcome::CounterKey {
+                signature,
+                association,
+            },
+            Self::Hashes(problem) => Outcome::Hashes(problem),
+            Self::Timestamp { property, failure } => Outcome::Timestamp { property, failure },
+            Self::Credential { node } => Outcome::Credential { node },
+            Self::Status(failure) => Outcome::Status(failure),
+            Self::Renewal { property, failure } => Outcome::Renewal { property, failure },
+        }
+    }
+}
+
 /// Countersignature traversal failure with the original selection cause.
 pub type CounterError =
     WalkError<Error, CounterSelectionError<CounterPathError, Error, NodeIdentity>, NodeIdentity>;

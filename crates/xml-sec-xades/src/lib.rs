@@ -31,6 +31,10 @@ use xml_sec::xmldsig::{DsigError, VerifiedSession, X509ChainError};
 mod accuracy;
 mod basic;
 mod binary;
+#[cfg(feature = "produce")]
+mod create;
+#[cfg(feature = "produce")]
+mod draft;
 mod level;
 mod path;
 mod signature;
@@ -43,6 +47,13 @@ pub use basic::{
     validate_basic,
 };
 pub use binary::DigestIdentity;
+#[cfg(feature = "produce")]
+pub use create::{
+    Assessment, Countersignature, CreateError, DataObject, Envelope, Request, Signer, countersign,
+    create,
+};
+#[cfg(feature = "produce")]
+pub use draft::{Draft, DraftError};
 pub use level::{
     ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure, validate,
 };

@@ -655,16 +655,41 @@ pub(crate) fn generate(generator: &Generator) -> Result<(), String> {
     Ok(())
 }
 
+/// Issues a fresh chain for the creation tests: the certificates and the
+/// signer's PKCS#8 key, with which xml-sec itself signs.
+pub(crate) fn creation(generator: &Generator) -> Result<(), String> {
+    for directory in [&generator.output, &generator.work] {
+        std::fs::create_dir_all(directory)
+            .map_err(|error| format!("create {}: {error}", directory.display()))?;
+    }
+    generator.issue()?;
+    for certificate in ["root", "intermediate", "signer"] {
+        write(
+            &generator.output.join(format!("{certificate}.der")),
+            generator.der(certificate)?,
+        )?;
+    }
+    let key = std::fs::read(generator.work.join("signer.key"))
+        .map_err(|error| format!("read signer.key: {error}"))?;
+    write(&generator.output.join("signer.key"), key)
+}
+
 pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage = "usage: xades fixtures [--levels] [--units N] [--output DIR] [--work DIR]";
-    let mut output = corpus.root.join("crates/xml-sec-xades/tests/fixtures");
+    let usage =
+        "usage: xades fixtures [--levels | --creation] [--units N] [--output DIR] [--work DIR]";
+    let mut output = None;
     let mut work = None;
     let mut levels = false;
+    let mut creating = false;
     let mut units = 0;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if arg == "--levels" {
             levels = true;
+            continue;
+        }
+        if arg == "--creation" {
+            creating = true;
             continue;
         }
         if arg == "--units" {
@@ -676,11 +701,22 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
         }
         let value = super::absolute(args.next().ok_or(usage)?)?;
         match arg.as_str() {
-            "--output" => output = value,
+            "--output" => output = Some(value),
             "--work" => work = Some(value),
             _ => return Err(usage.into()),
         }
     }
+    if levels && creating {
+        return Err(usage.into());
+    }
+    let fixtures = corpus.root.join("crates/xml-sec-xades/tests/fixtures");
+    let output = output.unwrap_or_else(|| {
+        if creating {
+            fixtures.join("creation")
+        } else {
+            fixtures
+        }
+    });
     // Without --work the keys and templates are removed with the scratch directory.
     let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
     let work = work.unwrap_or_else(|| scratch.path().to_owned());
@@ -692,6 +728,9 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
     };
     if levels {
         return Ok(super::levels::generate(&generator)?);
+    }
+    if creating {
+        return Ok(creation(&generator)?);
     }
     Ok(generate(&generator)?)
 }
