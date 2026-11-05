@@ -3,23 +3,28 @@
 //! each for the whole walk.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document};
 
-/// Counts fresh allocations of this test binary. Growing an existing block is
-/// not counted: the output buffer grows with the document by design.
+/// Counts fresh allocations per thread. Growing an existing block is not
+/// counted: the output buffer grows with the document by design.
 struct Counting;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Per thread, so the test harness allocating on its own threads while a
+    // serialization is measured does not count. A const initializer without
+    // a destructor never allocates, so the allocator may read it.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 // SAFETY: every call forwards to the system allocator with the caller's
 // layout; only the counter is added.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.set(ALLOCATIONS.get() + 1);
         // SAFETY: forwarded unchanged from the caller's contract.
         unsafe { System.alloc(layout) }
     }
@@ -51,9 +56,9 @@ fn document(elements: usize) -> XmlDocument {
 }
 
 fn allocations(document: &XmlDocument, algorithm: &C14nAlgorithm) -> usize {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.get();
     let canonical = canonicalize_document(document, algorithm).expect("canonicalization");
-    let count = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    let count = ALLOCATIONS.get() - before;
     drop(canonical);
     count
 }

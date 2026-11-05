@@ -4,22 +4,27 @@
 //! value and the element's one attribute list.
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use xml_sec::{XmlBackend, XmlDocument};
 
-/// Counts fresh allocations of this test binary. Growing an existing block is
-/// not counted: arena growth depends on the document size by design.
+/// Counts fresh allocations per thread. Growing an existing block is not
+/// counted: arena growth depends on the document size by design.
 struct Counting;
 
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Per thread, so the test harness allocating on its own threads while a
+    // parse is measured does not count. A const initializer without a
+    // destructor never allocates, so the allocator may read it.
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 // SAFETY: every call forwards to the system allocator with the caller's
 // layout; only the counter is added.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATIONS.set(ALLOCATIONS.get() + 1);
         // SAFETY: forwarded unchanged from the caller's contract.
         unsafe { System.alloc(layout) }
     }
@@ -51,10 +56,10 @@ fn source(attribute: &str) -> String {
 }
 
 fn allocations(xml: &str) -> usize {
-    let before = ALLOCATIONS.load(Ordering::Relaxed);
+    let before = ALLOCATIONS.get();
     let document =
         XmlDocument::parse_with_backend(xml, XmlBackend::Xmloxide).expect("test document");
-    let count = ALLOCATIONS.load(Ordering::Relaxed) - before;
+    let count = ALLOCATIONS.get() - before;
     drop(document);
     count
 }
