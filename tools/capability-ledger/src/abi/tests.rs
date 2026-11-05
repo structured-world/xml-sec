@@ -355,8 +355,93 @@ fn base_rules() -> serde_json::Value {
         ],
         "adopts": [
             {"id": "adopt", "name_regex": "Adopt", "parameters": ["$last-pointer"], "rationale": "adopters"}
-        ]
+        ],
+        "unmarked_exports": []
     })
+}
+
+/// Every exported symbol is declared with an export marker or listed as an
+/// unmarked export with a rationale; a listing must name an undeclared export.
+#[test]
+fn ownership_requires_every_export_to_be_declared_or_listed() {
+    let ledger = ledger();
+    let mut libraries = exported(&ledger);
+    let declared: BTreeMap<&str, &str> = ledger
+        .iter()
+        .filter(|item| item.kind == "export-function")
+        .map(|item| (item.name.as_str(), "export-function"))
+        .collect();
+    let mut exports: Vec<_> = declared
+        .keys()
+        .map(|name| export(name, Kind::Function))
+        .collect();
+    exports.push(export("xmlSecKeyHelper", Kind::Function));
+    libraries[0] = library("libxmlsec1", exports, &declared).expect("library");
+
+    let error = classify(&rules(base_rules()), &ledger, &libraries)
+        .err()
+        .expect("undeclared");
+    assert!(
+        error.contains("exports without a declaration: xmlSecKeyHelper"),
+        "{error}"
+    );
+
+    let mut listed = base_rules();
+    listed["unmarked_exports"] = serde_json::json!([
+        {"id": "helpers", "names": ["xmlSecKeyHelper"], "rationale": "private helper"}
+    ]);
+    classify(&rules(listed.clone()), &ledger, &libraries).expect("listed");
+
+    let mut declared_listing = listed.clone();
+    declared_listing["unmarked_exports"][0]["names"] =
+        serde_json::json!(["xmlSecKeyHelper", "xmlSecKeyDestroy"]);
+    let error = classify(&rules(declared_listing), &ledger, &libraries)
+        .err()
+        .expect("declared listing");
+    assert!(
+        error.contains("unmarked exports that are declared or not exported: xmlSecKeyDestroy"),
+        "{error}"
+    );
+
+    let mut silent = listed;
+    silent["unmarked_exports"][0]["rationale"] = " ".into();
+    let error = classify(&rules(silent), &ledger, &libraries)
+        .err()
+        .expect("rationale");
+    assert!(error.contains("helpers gives no rationale"), "{error}");
+}
+
+/// A function exported for the crypto backends from an internal header is
+/// classified like a public one.
+#[test]
+fn ownership_covers_internal_backend_exports() {
+    let mut ledger = ledger();
+    ledger.push(entry(
+        "internal-export",
+        "xmlSecKeyDataKEMGetRecipientKey",
+        "XMLSEC_EXPORT xmlSecKeyPtr xmlSecKeyDataKEMGetRecipientKey (xmlSecKeyDataPtr data);",
+    ));
+    let declared: BTreeMap<&str, &str> = ledger
+        .iter()
+        .filter(|item| matches!(item.kind.as_str(), "export-function" | "internal-export"))
+        .map(|item| (item.name.as_str(), item.kind.as_str()))
+        .collect();
+    let exports = declared
+        .keys()
+        .map(|name| export(name, Kind::Function))
+        .collect();
+    let libraries = vec![library("libxmlsec1", exports, &declared).expect("library")];
+    let functions = classify(&rules(base_rules()), &ledger, &libraries).expect("classify");
+    let json = serde_json::to_value(&functions).expect("serialize");
+    assert!(
+        json.as_array()
+            .expect("array")
+            .contains(&serde_json::json!({
+                "name": "xmlSecKeyDataKEMGetRecipientKey",
+                "returns": {"kind": "borrowed", "owner": "data"}
+            })),
+        "{json}"
+    );
 }
 
 /// Rules resolve placeholders: the destroy function from the returned type,

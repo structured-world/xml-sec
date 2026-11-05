@@ -56,10 +56,10 @@
     },
     {
       "id": "new-keys",
-      "names": ["xmlSecKeyGenerate", "xmlSecKeyGenerateByName", "xmlSecKeyReadBuffer", "xmlSecKeyReadBinaryFile", "xmlSecKeyReadMemory", "xmlSecKeysMngrGetKey", "xmlSecKeysMngrFindKey", "xmlSecKeyStoreFindKey", "xmlSecKeysMngrFindKeyFromX509Data", "xmlSecKeyStoreFindKeyFromX509Data", "xmlSecEncCtxAgreementMethodGenerate", "xmlSecEncCtxDerivedKeyGenerate", "xmlSecEncCtxEncapsulationMechanismGenerate"],
+      "names": ["xmlSecKeyGenerate", "xmlSecKeyGenerateByName", "xmlSecKeyReadBuffer", "xmlSecKeyReadBinaryFile", "xmlSecKeyReadMemory", "xmlSecKeysMngrGetKey", "xmlSecKeysMngrFindKey", "xmlSecKeyStoreFindKey", "xmlSecKeysMngrFindKeyFromX509Data", "xmlSecKeyStoreFindKeyFromX509Data", "xmlSecEncCtxAgreementMethodGenerate", "xmlSecEncCtxDerivedKeyGenerate", "xmlSecEncCtxEncapsulationMechanismGenerate", "xmlSecTransformReadKeyInfoNode"],
       "name_regex": "App(KeyLoad|KeyFromCertLoad|Pkcs12Load)",
       "returns": {"kind": "owned", "release": "xmlSecKeyDestroy"},
-      "rationale": "Each returns a newly created key: the lookups document that the caller destroys it (keysmngr.c), xmldsig.c destroys dsigCtx->signKey obtained from getKey, keyinfo.c destroys generated keys, and the loaders create the key they return."
+      "rationale": "Each returns a newly created key: the lookups document that the caller destroys it (keysmngr.c), xmldsig.c destroys dsigCtx->signKey obtained from getKey, keyinfo.c destroys generated keys, the loaders create the key they return, and xmlSecTransformReadKeyInfoNode hands over the key the keys manager found (transform_helpers.c)."
     },
     {
       "id": "new-key-data",
@@ -87,9 +87,9 @@
     },
     {
       "id": "strings",
-      "names": ["xmlSecBase64Encode", "xmlSecBnToString", "xmlSecBnToHexString", "xmlSecBnToDecString", "xmlSecGetNodeContentAndTrim", "xmlSecGetQName", "xmlSecQName2IntegerGetStringFromInteger", "xmlSecQName2BitMaskGetStringFromBitMask"],
+      "names": ["xmlSecBase64Encode", "xmlSecBnToString", "xmlSecBnToHexString", "xmlSecBnToDecString", "xmlSecGetNodeContentAndTrim", "xmlSecGetQName", "xmlSecQName2IntegerGetStringFromInteger", "xmlSecQName2BitMaskGetStringFromBitMask", "xmlSecX509SerialNumberWrite"],
       "returns": {"kind": "owned", "release": "xmlFree"},
-      "rationale": "Documented as freed with xmlFree (base64.c, bn.c, xmltree.c); xmlSecGetNodeContentAndTrim returns the xmlNodeGetContent allocation."
+      "rationale": "Documented as freed with xmlFree (base64.c, bn.c, xmltree.c, x509_helpers.c); xmlSecGetNodeContentAndTrim returns the xmlNodeGetContent allocation."
     },
     {
       "id": "template-roots",
@@ -135,10 +135,10 @@
     },
     {
       "id": "context-members",
-      "names": ["xmlSecEncCtxDecryptToBuffer", "xmlSecDSigCtxGetPreSignBuffer", "xmlSecDSigReferenceCtxGetPreDigestBuffer", "xmlSecTransformCtxCreateAndAppend", "xmlSecTransformCtxCreateAndPrepend", "xmlSecTransformCtxNodeRead", "xmlSecTransformCtxExtraKeyDataGet", "xmlSecTransformCtxExtraKeyDataEnsure", "xmlSecKeyEnsureData", "xmlSecKeyGetData", "xmlSecKeyGetValue", "xmlSecKeyGetName", "xmlSecKeyDataBinaryValueGetBuffer", "xmlSecTransformMemBufGetBuffer", "xmlSecBnGetData", "xmlSecBufferGetData", "xmlSecKeysMngrGetDataStore", "xmlSecKeysMngrGetKeysStore", "xmlSecSimpleKeysStoreGetKeys", "xmlSecPtrListGetItem", "xmlSecQName2IntegerGetInfo", "xmlSecQName2BitMaskGetInfo", "xmlSecOpenSSLKeyGetEvp", "xmlSecOpenSSLKeyDataX509GetCert", "xmlSecOpenSSLKeyDataX509GetCrl", "xmlSecOpenSSLKeyDataX509GetKeyCert", "xmlSecOpenSSLX509StoreFindCert", "xmlSecOpenSSLX509StoreFindCert_ex"],
+      "names": ["xmlSecEncCtxDecryptToBuffer", "xmlSecDSigCtxGetPreSignBuffer", "xmlSecDSigReferenceCtxGetPreDigestBuffer", "xmlSecTransformCtxCreateAndAppend", "xmlSecTransformCtxCreateAndPrepend", "xmlSecTransformCtxNodeRead", "xmlSecTransformCtxExtraKeyDataGet", "xmlSecTransformCtxExtraKeyDataEnsure", "xmlSecKeyEnsureData", "xmlSecKeyGetData", "xmlSecKeyGetValue", "xmlSecKeyGetName", "xmlSecKeyDataBinaryValueGetBuffer", "xmlSecTransformMemBufGetBuffer", "xmlSecBnGetData", "xmlSecBufferGetData", "xmlSecKeysMngrGetDataStore", "xmlSecKeysMngrGetKeysStore", "xmlSecSimpleKeysStoreGetKeys", "xmlSecPtrListGetItem", "xmlSecQName2IntegerGetInfo", "xmlSecQName2BitMaskGetInfo", "xmlSecOpenSSLKeyGetEvp", "xmlSecOpenSSLKeyDataX509GetCert", "xmlSecOpenSSLKeyDataX509GetCrl", "xmlSecOpenSSLKeyDataX509GetKeyCert", "xmlSecOpenSSLX509StoreFindCert", "xmlSecOpenSSLX509StoreFindCert_ex", "xmlSecKeyDataKEMGetRecipientKey", "xmlSecKeyDataKEMGetCiphertext"],
       "name_regex": "GetEvp$",
       "returns": {"kind": "borrowed", "owner": "$first"},
-      "rationale": "Accessors return a member of their first argument: a context's result or chain element, a key's data, a buffer's bytes, a store's certificate (openssl/x509vfy.c returns the stack element without a reference)."
+      "rationale": "Accessors return a member of their first argument: a context's result or chain element, a key's data, a buffer's bytes, a store's certificate (openssl/x509vfy.c returns the stack element without a reference), a KEM key data's recipient key or ciphertext buffer (keysdata_helpers.c)."
     },
     {
       "id": "verified-certificate",
@@ -150,10 +150,10 @@
   "outputs": [
     {
       "id": "written-key-data",
-      "names": ["xmlSecKeyDataBinWrite"],
+      "names": ["xmlSecKeyDataBinWrite", "xmlSecKeyDataBinaryValueBinWrite"],
       "parameter": "buf",
       "gives": {"kind": "owned", "release": "xmlFree"},
-      "rationale": "The klass writer allocates the buffer; keyinfo.c frees it with xmlFree."
+      "rationale": "The klass writer allocates the buffer (keysdata_helpers.c with xmlMalloc for binary values); keyinfo.c frees it with xmlFree."
     },
     {
       "id": "replaced-node",
@@ -226,6 +226,23 @@
       "names": ["xmlSecReplaceNode", "xmlSecReplaceNodeAndReturn", "xmlSecReplaceContent", "xmlSecReplaceContentAndReturn"],
       "parameters": ["newNode"],
       "rationale": "The new node takes the old one's place in the tree that frees it (xmltree.c)."
+    }
+  ],
+  "unmarked_exports": [
+    {
+      "id": "openssl-backend-private",
+      "names": ["xmlSecOpenSSLGenerateRandomBytes", "xmlSecOpenSSLKeyDataX509GetCerts", "xmlSecOpenSSLKeyDataX509GetCrls", "xmlSecOpenSSLKeyValueRsaCheckKeyType", "xmlSecOpenSSLX509Asn1TimeToTime", "xmlSecOpenSSLX509CertLoadBIO", "xmlSecOpenSSLX509CrlLoadBIO", "xmlSecOpenSSLX509FindCertCtxFinalize", "xmlSecOpenSSLX509FindCertCtxInitialize", "xmlSecOpenSSLX509FindCertCtxInitializeFromValue", "xmlSecOpenSSLX509FindCertCtxMatch", "xmlSecOpenSSLX509FindKeyByValue", "xmlSecOpenSSLX509GetDigestFromAlgorithm", "xmlSecOpenSSLX509NameToString", "xmlSecOpenSSLX509StoreFindCertByValue", "xmlSecOpenSslEvpGetProviderQuery"],
+      "rationale": "Helpers shared between the OpenSSL backend's own source files, declared without XMLSEC_CRYPTO_EXPORT in src/openssl/private.h and src/openssl/openssl_compat.h, which are not installed. They are exported only because the library is linked without a symbol visibility list; every caller is inside libxmlsec1-openssl."
+    },
+    {
+      "id": "xslt-lifecycle",
+      "names": ["xmlSecTransformXsltInitialize", "xmlSecTransformXsltShutdown"],
+      "rationale": "Declared without XMLSEC_EXPORT in src/xslt.h, which is not installed; called only by xmlSecInit and xmlSecShutdown (xmlsec.c)."
+    },
+    {
+      "id": "kdf-node-names",
+      "names": ["xmlSecNodeConcatKdfKeyValue", "xmlSecNodeHkdfKeyValue", "xmlSecNodePbkdf2KeyValue"],
+      "rationale": "Constant strings defined in strings.c that no header declares, unlike the other node names in strings.h; nothing outside libxmlsec1 can name them."
     }
   ]
 }

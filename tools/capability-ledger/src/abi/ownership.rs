@@ -2,7 +2,8 @@
 //! output parameters and adopts from its arguments, from reviewed rules over
 //! the ledger declarations. A returned pointer or a writable pointer-to-pointer
 //! parameter that no rule covers fails generation, and so does a rule that
-//! matches nothing.
+//! matches nothing. An export no header marks has no declaration to classify;
+//! each must be listed with a rationale, and any other fails generation.
 
 use super::LedgerEntry;
 use super::layout::declarator_names;
@@ -23,6 +24,16 @@ pub(super) struct Rules {
     outputs: Vec<OutputRule>,
     /// Every matching rule adds the arguments a function adopts.
     adopts: Vec<AdoptRule>,
+    /// Exports no header declares with an export marker, by reason.
+    unmarked_exports: Vec<UnmarkedExports>,
+}
+
+#[derive(Deserialize)]
+struct UnmarkedExports {
+    id: String,
+    names: Vec<String>,
+    /// Why no consumer can rely on these symbols, checked against the donor.
+    rationale: String,
 }
 
 #[derive(Deserialize)]
@@ -120,6 +131,7 @@ pub(super) fn classify(
             rules.schema_version
         ));
     }
+    check_unmarked(&rules.unmarked_exports, libraries)?;
     let pointer_types = pointer_typedefs(ledger);
     let exported: BTreeSet<&str> = libraries
         .iter()
@@ -149,8 +161,10 @@ pub(super) fn classify(
     };
     let mut functions = BTreeMap::new();
     for item in ledger {
-        if !matches!(item.kind.as_str(), "export-function" | "backend-api")
-            || !exported.contains(item.name.as_str())
+        if !matches!(
+            item.kind.as_str(),
+            "export-function" | "backend-api" | "internal-export"
+        ) || !exported.contains(item.name.as_str())
         {
             continue;
         }
@@ -162,6 +176,52 @@ pub(super) fn classify(
     }
     classifier.finish()?;
     Ok(functions.into_values().collect())
+}
+
+/// The listed unmarked exports are exactly the exports without a declaration.
+fn check_unmarked(groups: &[UnmarkedExports], libraries: &[Library]) -> Result<(), String> {
+    let mut ids = BTreeSet::new();
+    let mut listed = BTreeSet::new();
+    for group in groups {
+        if !ids.insert(group.id.as_str()) {
+            return Err(format!(
+                "unmarked export group {} is defined twice",
+                group.id
+            ));
+        }
+        if group.rationale.trim().is_empty() {
+            return Err(format!(
+                "unmarked export group {} gives no rationale",
+                group.id
+            ));
+        }
+        for name in &group.names {
+            if !listed.insert(name.as_str()) {
+                return Err(format!("unmarked export {name} is listed twice"));
+            }
+        }
+    }
+    let undeclared: BTreeSet<&str> = libraries
+        .iter()
+        .flat_map(|library| &library.symbols)
+        .filter(|symbol| symbol.declaration.is_none())
+        .map(|symbol| symbol.name.as_str())
+        .collect();
+    let unlisted: Vec<&str> = undeclared.difference(&listed).copied().collect();
+    if !unlisted.is_empty() {
+        return Err(format!(
+            "exports without a declaration: {}",
+            unlisted.join(", ")
+        ));
+    }
+    let stale: Vec<&str> = listed.difference(&undeclared).copied().collect();
+    if !stale.is_empty() {
+        return Err(format!(
+            "unmarked exports that are declared or not exported: {}",
+            stale.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// The compiled rules and what classifying the exports has found so far.

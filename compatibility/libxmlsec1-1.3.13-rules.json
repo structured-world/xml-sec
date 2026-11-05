@@ -158,7 +158,7 @@
     },
     {
       "id": "binary-c-surface",
-      "kinds": ["header", "export-function", "export-variable", "macro", "build-define", "enum", "struct-layout", "callback", "typedef", "class-id"],
+      "kinds": ["header", "export-function", "export-variable", "internal-export", "macro", "build-define", "enum", "struct-layout", "callback", "typedef", "class-id"],
       "outcome": "binary-abi-incompatible",
       "rationale": "The current deliverable is a native Rust crate and does not claim libxmlsec1 C source or binary compatibility.",
       "evidence": "c-surface-inventory"

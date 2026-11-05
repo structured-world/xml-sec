@@ -10,7 +10,12 @@ use std::fs;
 use std::path::Path;
 
 /// The ledger kinds that declare an exported symbol.
-const DECLARING_KINDS: [&str; 3] = ["export-function", "export-variable", "backend-api"];
+const DECLARING_KINDS: [&str; 4] = [
+    "export-function",
+    "export-variable",
+    "backend-api",
+    "internal-export",
+];
 
 #[derive(Serialize)]
 pub(super) struct Library {
@@ -29,8 +34,8 @@ pub(super) struct Symbol {
     /// The object size where the format records it (ELF data objects).
     #[serde(skip_serializing_if = "Option::is_none")]
     size: Option<u64>,
-    /// The ledger kind declaring it in a public header; absent for an export
-    /// no installed header declares.
+    /// The ledger kind declaring it with an export marker; absent for an
+    /// export no header marks, which the ownership rules must list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) declaration: Option<String>,
 }
