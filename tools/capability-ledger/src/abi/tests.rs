@@ -281,6 +281,32 @@ fn signatures_mark_writable_pointer_typedef_parameters_as_outputs() {
     assert_eq!(outputs, [("ids", true), ("known", false), ("id", false)]);
 }
 
+/// Constness counts at the level written through: `const xmlChar **` is a
+/// writable cursor over constant characters, `xmlChar * const *` is not.
+#[test]
+fn signatures_check_constness_at_the_written_pointer() {
+    let parsed = signature(
+        "xmlSecRead",
+        "XMLSEC_EXPORT int xmlSecRead (const xmlChar **in, xmlChar * const *fixed, const char* const* names, xmlChar ** out);",
+        &BTreeSet::new(),
+    )
+    .expect("signature");
+    let outputs: Vec<(&str, bool)> = parsed
+        .parameters
+        .iter()
+        .map(|parameter| (parameter.name.as_str(), parameter.output))
+        .collect();
+    assert_eq!(
+        outputs,
+        [
+            ("in", true),
+            ("fixed", false),
+            ("names", false),
+            ("out", true)
+        ]
+    );
+}
+
 fn entry(kind: &str, name: &str, detail: &str) -> LedgerEntry {
     LedgerEntry {
         kind: kind.to_owned(),
@@ -351,7 +377,8 @@ fn base_rules() -> serde_json::Value {
             {"id": "getter", "name_regex": "Get", "returns": {"kind": "borrowed", "owner": "$first"}, "rationale": "getters"}
         ],
         "outputs": [
-            {"id": "written", "names": ["xmlSecKeyWrite"], "parameter": "buf", "gives": {"kind": "owned", "release": "xmlFree"}, "rationale": "writers"}
+            {"id": "written", "names": ["xmlSecKeyWrite"], "parameter": "buf", "gives": {"kind": "owned", "release": "xmlFree"}, "rationale": "writers"},
+            {"id": "name-arrays", "names": ["xmlSecKeyWrite"], "parameter": "names", "gives": {"kind": "input"}, "rationale": "read-only name arrays"}
         ],
         "adopts": [
             {"id": "adopt", "name_regex": "Adopt", "parameters": ["$last-pointer"], "rationale": "adopters"}
@@ -458,12 +485,13 @@ fn ownership_rules_resolve_per_function() {
             {"name": "xmlSecKeyCreate", "returns": {"kind": "owned", "release": "xmlSecKeyDestroy"}},
             {"name": "xmlSecKeyDestroy", "returns": {"kind": "value"}},
             {"name": "xmlSecKeyGetName", "returns": {"kind": "borrowed", "owner": "key"}},
-            {"name": "xmlSecKeyWrite", "returns": {"kind": "value"}, "outputs": {"buf": {"kind": "owned", "release": "xmlFree"}}}
+            {"name": "xmlSecKeyWrite", "returns": {"kind": "value"}, "outputs": {"buf": {"kind": "owned", "release": "xmlFree"}, "names": {"kind": "input"}}}
         ])
     );
 }
 
-/// A writable pointer-to-pointer parameter needs a rule; a const one is input.
+/// Every pointer to a writable pointer needs a rule, including one to const
+/// characters; an input-only array is classified explicitly, never assumed.
 #[test]
 fn ownership_requires_a_rule_for_every_output_parameter() {
     let ledger = ledger();
@@ -473,7 +501,17 @@ fn ownership_requires_a_rule_for_every_output_parameter() {
         .err()
         .expect("unclassified output");
     assert!(error.contains("xmlSecKeyWrite (output buf)"), "{error}");
-    assert!(!error.contains("output names"), "{error}");
+    assert!(error.contains("xmlSecKeyWrite (output names)"), "{error}");
+
+    let mut input_return = base_rules();
+    input_return["returns"][1]["returns"] = serde_json::json!({"kind": "input"});
+    let error = classify(&rules(input_return), &ledger, &exported(&ledger))
+        .err()
+        .expect("input return");
+    assert!(
+        error.contains("return rule getter classifies a returned pointer as input"),
+        "{error}"
+    );
 }
 
 /// A pointer-returning function no rule covers fails generation by name.

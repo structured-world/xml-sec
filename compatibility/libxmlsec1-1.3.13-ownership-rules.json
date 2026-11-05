@@ -43,9 +43,15 @@
     },
     {
       "id": "constant-strings",
-      "names": ["xmlSecDSigCtxGetFailureReasonString", "xmlSecEncCtxGetFailureReasonString", "xmlSecDSigCtxGetStatusString", "xmlSecErrorsGetMsg", "xmlSecKeyDataGetIdentifier"],
+      "names": ["xmlSecDSigCtxGetFailureReasonString", "xmlSecEncCtxGetFailureReasonString", "xmlSecDSigCtxGetStatusString", "xmlSecErrorsGetMsg"],
       "returns": {"kind": "static"},
-      "rationale": "String literals from static tables; xmlSecKeyDataGetIdentifier is deprecated and always returns NULL (keysdata.c)."
+      "rationale": "String literals from static tables."
+    },
+    {
+      "id": "deprecated-stubs",
+      "names": ["xmlSecKeyDataGetIdentifier", "xmlSecNodeSetAddList"],
+      "returns": {"kind": "static"},
+      "rationale": "Deprecated stubs that always return NULL and touch no argument (keysdata.c, nodeset.c); the caller has nothing to release."
     },
     {
       "id": "create-destroy",
@@ -69,9 +75,9 @@
     },
     {
       "id": "node-sets",
-      "names": ["xmlSecNodeSetGetChildren", "xmlSecNodeSetAdd", "xmlSecNodeSetAddList"],
+      "names": ["xmlSecNodeSetGetChildren", "xmlSecNodeSetAdd"],
       "returns": {"kind": "owned", "release": "xmlSecNodeSetDestroy"},
-      "rationale": "GetChildren creates a set; Add and AddList link the new set into the ring of nset and return its head, which destroys the whole ring (nodeset.c)."
+      "rationale": "GetChildren creates a set; Add links the new set into the ring of nset and returns its head, which destroys the whole ring (nodeset.c)."
     },
     {
       "id": "unattached-transform",
@@ -182,6 +188,27 @@
       "parameter": "node",
       "gives": {"kind": "borrowed", "owner": "node"},
       "rationale": "An in/out cursor advanced to a following sibling in the same document."
+    },
+    {
+      "id": "string-cursors",
+      "names": ["xmlSecX509EscapedStringRead", "xmlSecX509AttrValueStringRead"],
+      "parameter": "in",
+      "gives": {"kind": "borrowed", "owner": "in"},
+      "rationale": "An in/out cursor moved forward within the caller's string as it is parsed (x509_helpers.c); nothing is allocated."
+    },
+    {
+      "id": "id-attribute-names",
+      "names": ["xmlSecAddIDs"],
+      "parameter": "ids",
+      "gives": {"kind": "input"},
+      "rationale": "A NULL-terminated list of attribute names the tree walk only compares against (xmltree.c)."
+    },
+    {
+      "id": "namespace-lists",
+      "names": ["xmlSecTmplTransformAddXPath", "xmlSecTmplTransformAddXPath2", "xmlSecTmplTransformAddXPointer"],
+      "parameter": "nsList",
+      "gives": {"kind": "input"},
+      "rationale": "A NULL-terminated list of prefix/href pairs copied into namespace declarations of the new node (templates.c xmlSecTmplNodeWriteNsList)."
     }
   ],
   "adopts": [
@@ -211,7 +238,7 @@
     },
     {
       "id": "node-set-ring",
-      "names": ["xmlSecNodeSetAdd", "xmlSecNodeSetAddList"],
+      "names": ["xmlSecNodeSetAdd"],
       "parameters": ["newNSet"],
       "rationale": "The new set joins the ring destroyed with it (nodeset.c)."
     },

@@ -111,9 +111,10 @@ same pinned commit, for one platform tuple:
 - the feature defines of the build and its crypto backend;
 - the ownership of every exported function: whether a returned pointer is a
   value, static, borrowed from an argument, owned by the caller (and released
-  with which function) or a container element; what each writable
-  pointer-to-pointer parameter hands out; and which arguments the function
-  adopts.
+  with which function) or a container element; what each parameter pointing to
+  a writable pointer hands out (constness is checked at that pointer, so
+  `const xmlChar **` counts, and an array the function only reads is
+  classified as input explicitly); and which arguments the function adopts.
 
 Ownership comes from the reviewed
 [`compatibility/libxmlsec1-1.3.13-ownership-rules.json`](../compatibility/libxmlsec1-1.3.13-ownership-rules.json).

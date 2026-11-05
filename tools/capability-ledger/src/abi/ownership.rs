@@ -95,6 +95,9 @@ enum Returns {
     /// The caller takes over a container element; the container's item class
     /// destroys it.
     OwnedElement,
+    /// An output-shaped parameter the function only reads, such as an array
+    /// of strings: nothing is handed out. Valid only in output rules.
+    Input,
 }
 
 #[derive(Serialize)]
@@ -129,6 +132,16 @@ pub(super) fn classify(
         return Err(format!(
             "unsupported ownership rules schema {}",
             rules.schema_version
+        ));
+    }
+    if let Some(rule) = rules
+        .returns
+        .iter()
+        .find(|rule| matches!(rule.returns, Returns::Input))
+    {
+        return Err(format!(
+            "return rule {} classifies a returned pointer as input",
+            rule.id
         ));
     }
     check_unmarked(&rules.unmarked_exports, libraries)?;
@@ -448,14 +461,21 @@ pub(super) fn is_pointer(type_text: &str, pointer_types: &BTreeSet<String>) -> b
     type_text.contains('*') || pointer_types.contains(last) || last.ends_with("Ptr")
 }
 
-/// Whether a parameter type is a writable pointer to a pointer, by the same
-/// pointer test as everything else, so every pointer typedef counts.
+/// Whether a parameter type is a pointer to a writable pointer, by the same
+/// pointer test as everything else, so every pointer typedef counts. Only a
+/// `const` on the pointee itself makes it read-only: `const xmlChar **` is a
+/// writable cursor, `xmlChar * const *` is not.
 fn is_output(type_text: &str, pointer_types: &BTreeSet<String>) -> bool {
-    !type_text.contains("const")
-        && type_text
-            .trim_end()
-            .strip_suffix('*')
-            .is_some_and(|pointee| is_pointer(pointee.trim_end(), pointer_types))
+    let Some(pointee) = type_text.trim_end().strip_suffix('*') else {
+        return false;
+    };
+    let pointee = pointee.trim_end();
+    let east_const = pointee
+        .strip_suffix("const")
+        .is_some_and(|rest| !rest.ends_with(|ch: char| ch.is_ascii_alphanumeric() || ch == '_'));
+    let west_const =
+        !pointee.contains('*') && pointee.split_whitespace().any(|word| word == "const");
+    !east_const && !west_const && is_pointer(pointee, pointer_types)
 }
 
 /// Splits `<return type> name(<parameters>);` as the ledger normalized it.
