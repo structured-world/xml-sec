@@ -10,12 +10,6 @@ use super::symbols::{Kind, Library};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::LazyLock;
-
-static POINTER_TO_POINTER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\*\s*\*|Ptr\s*\*|\b(?:xmlSecPtr|xmlSecKeyDataId|xmlSecTransformId)\s*\*")
-        .expect("valid pointer-to-pointer regex")
-});
 
 #[derive(Deserialize)]
 pub(super) struct Rules {
@@ -394,6 +388,16 @@ pub(super) fn is_pointer(type_text: &str, pointer_types: &BTreeSet<String>) -> b
     type_text.contains('*') || pointer_types.contains(last) || last.ends_with("Ptr")
 }
 
+/// Whether a parameter type is a writable pointer to a pointer, by the same
+/// pointer test as everything else, so every pointer typedef counts.
+fn is_output(type_text: &str, pointer_types: &BTreeSet<String>) -> bool {
+    !type_text.contains("const")
+        && type_text
+            .trim_end()
+            .strip_suffix('*')
+            .is_some_and(|pointee| is_pointer(pointee.trim_end(), pointer_types))
+}
+
 /// Splits `<return type> name(<parameters>);` as the ledger normalized it.
 pub(super) fn signature(
     name: &str,
@@ -450,7 +454,7 @@ pub(super) fn signature(
                     .map_or(text, |(before, _)| before);
                 parameters.push(Parameter {
                     pointer: is_pointer(type_text, pointer_types) || text.contains('['),
-                    output: POINTER_TO_POINTER.is_match(type_text) && !type_text.contains("const"),
+                    output: is_output(type_text, pointer_types),
                     name: parameter_name,
                 });
             }

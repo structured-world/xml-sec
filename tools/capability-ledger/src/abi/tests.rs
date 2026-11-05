@@ -262,6 +262,25 @@ fn signatures_split_return_type_and_parameters() {
     assert!(none.parameters.is_empty());
 }
 
+/// A writable pointer to any pointer typedef of the ledger is an output, not
+/// only the typedefs a fixed list names; a `const` one is not.
+#[test]
+fn signatures_mark_writable_pointer_typedef_parameters_as_outputs() {
+    let pointers = BTreeSet::from(["xmlSecKeyStoreId".to_owned()]);
+    let parsed = signature(
+        "xmlSecStoreIds",
+        "XMLSEC_EXPORT int xmlSecStoreIds (xmlSecKeyStoreId* ids, const xmlSecKeyStoreId* known, xmlSecKeyStoreId id);",
+        &pointers,
+    )
+    .expect("signature");
+    let outputs: Vec<(&str, bool)> = parsed
+        .parameters
+        .iter()
+        .map(|parameter| (parameter.name.as_str(), parameter.output))
+        .collect();
+    assert_eq!(outputs, [("ids", true), ("known", false), ("id", false)]);
+}
+
 fn entry(kind: &str, name: &str, detail: &str) -> LedgerEntry {
     LedgerEntry {
         kind: kind.to_owned(),
