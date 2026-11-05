@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 pub(crate) mod binding;
 pub(crate) mod check;
 pub(crate) mod corpus;
+pub(crate) mod creation;
 pub(crate) mod dss;
 pub(crate) mod fixtures;
 pub(crate) mod levels;
@@ -301,13 +302,14 @@ pub(crate) fn absolute(path: &str) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure> {
-    let usage = "usage: xades check|corpus|dss|binding|fixtures|levels|package ...";
+    let usage = "usage: xades check|corpus|creation|dss|binding|fixtures|levels|package ...";
     let action = args.next().ok_or(usage)?;
     let args: Vec<String> = args.collect();
     let corpus = Corpus::from_env();
     match action.as_str() {
         "check" => check::run(&corpus, &args),
         "corpus" => corpus::run(&corpus, &args),
+        "creation" => creation::run(&corpus, &args),
         "dss" => dss::run(&corpus, &args),
         "binding" => binding::run(&corpus, &args),
         "fixtures" => fixtures::run(&corpus, &args),

@@ -38,5 +38,9 @@ std = [
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
 
+[[example]]
+name = "create_probe"
+required-features = ["produce"]
+
 [lints]
 workspace = true
