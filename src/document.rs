@@ -3839,7 +3839,7 @@ fn collect_internal_dtd<'a, S: NameStorage>(
 
 /// Visit actual internal-subset attribute declarations, not declaration-like
 /// strings inside comments, PIs, or quoted entity replacement text.
-#[cfg(any(feature = "benchmark-internals", test))]
+#[cfg(test)]
 pub(crate) fn visit_dtd_attributes<'a>(
     doctype: &'a str,
     mut visitor: impl FnMut(&'a str, &'a str, DtdAttributeType),

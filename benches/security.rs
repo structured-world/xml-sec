@@ -83,21 +83,6 @@ fn large_reference_sign(bencher: divan::Bencher, units: usize) {
         .bench_local(|| fixture.run("sign"));
 }
 
-/// Projection of a prepared roxmltree DOM; xmloxide has none, its parse
-/// builds the semantic arena.
-#[divan::bench(args = specs().filter(|spec| spec.backend == xml_sec::XmlBackend::Roxmltree))]
-fn projection(bencher: divan::Bencher, spec: Spec) {
-    let fixture = Fixture::new(spec);
-    bencher
-        .counter(divan::counter::BytesCount::new(fixture.unsigned.len()))
-        // Projection consumes its backend DOM, so each sample prepares a new one.
-        .with_inputs(|| {
-            xml_sec::benchmark_support::Projection::new(&fixture.unsigned, spec.backend)
-                .expect("prepared backend")
-        })
-        .bench_local_values(|projection| projection.project().expect("project"));
-}
-
 /// Signed-document shape for node-set measurements: `elements` siblings with
 /// two attributes under two in-scope namespace declarations.
 fn node_set_document(elements: usize) -> String {

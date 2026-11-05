@@ -853,7 +853,10 @@ impl<'input, S: crate::xml::dom::storage::Storage> Namespace<'input, S> {
     }
 }
 
-struct Namespaces<'input, S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native> {
+pub(crate) struct Namespaces<
+    'input,
+    S: crate::xml::dom::storage::Storage = crate::xml::dom::storage::Native,
+> {
     // Deduplicated namespace values used throughout the document
     values: S::Values<Namespace<'input, S>>,
     // Indices into the above in tree order as the document is parsed
@@ -973,6 +976,14 @@ impl<'input> ExpandedNameIndexed<'input> {
         doc: &'a Document<'input, S>,
     ) -> Option<&'a Namespace<'input, S>> {
         self.namespace_idx.map(|idx| doc.namespaces.get(idx))
+    }
+
+    #[inline]
+    fn namespace_uri<'a, S: crate::xml::dom::storage::Storage>(
+        &self,
+        namespaces: &'a Namespaces<'input, S>,
+    ) -> Option<&'a str> {
+        self.namespace_idx.map(|idx| namespaces.get(idx).uri())
     }
 
     #[inline]

@@ -9,15 +9,14 @@ fn nearest_rank_handles_single_and_non_hundred_sample_counts() {
 }
 
 #[test]
-fn projection_is_requested_only_from_a_backend_that_has_one() {
-    // Only roxmltree builds a backend DOM to project; a projection request for
-    // any other backend is refused before a sample is prepared.
+fn no_backend_has_a_projection_phase() {
+    // Every backend builds the semantic tree as it parses, so a projection
+    // request is refused as an unknown operation for each of them.
     for backend in ["xmloxide", "roxmltree", "differential"] {
         let args = ["projection", "saml", "16", backend, "rustcrypto", "1"].map(String::from);
-        assert_eq!(
-            super::parse_request(&args).is_ok(),
-            backend == "roxmltree",
-            "{backend}"
-        );
+        let refusal = super::parse_request(&args)
+            .err()
+            .map(|error| error.to_string());
+        assert_eq!(refusal.as_deref(), Some("unknown operation"), "{backend}");
     }
 }

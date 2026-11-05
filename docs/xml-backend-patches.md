@@ -70,9 +70,14 @@ Any other input, including one that has the text only inside a comment or a
 CDATA section, first passes the strict lexical scan that bounds a DOCTYPE's
 declarations and entity expansion; that path is stricter, never weaker.
 
-roxmltree builds its own DOM, which is projected into the same semantic arena
-through the source positions the lexical scan records; positions are recorded
-only for a backend that reads them. Backend selection does not introduce
+The roxmltree parser is generic over the tree it writes to as well. Its own
+read-only DOM is one such tree; xml-sec parses into the semantic arena directly,
+so the namespace table, the open elements and the current start tag's attributes
+are parser state rather than parts of a DOM. Normalized values move into the
+arena without a copy. Its nodes take the form the source positions recorded by
+the lexical scan give them: character data folded across references and CDATA,
+declarations inside the DOCTYPE excluded. Positions are recorded only for a
+backend that reads them. Backend selection does not introduce
 implicit fallback, a second ID resolver or an external entity acquisition path.
 Differential mode still compares the two semantic trees rather than choosing
 whichever parser accepts an input.

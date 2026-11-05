@@ -9,8 +9,8 @@ use memchr::{memchr, memchr_iter, memchr2};
 
 use crate::parser_roxmltree::{
     AttributeData, Document, ExpandedNameIndexed, NS_XML_PREFIX, NS_XML_URI, NS_XMLNS_URI,
-    NamespaceIdx, Namespaces, NodeData, NodeId, NodeKind, PI, ShortRange, StringStorage, TextPos,
-    XMLNS,
+    Namespace, NamespaceIdx, Namespaces, NodeData, NodeId, NodeKind, PI, ShortRange, StringStorage,
+    TextPos, XMLNS,
 };
 
 use crate::parser_roxmltree::tokenizer::{self, Reference, StrSpan, Stream};
@@ -444,6 +444,288 @@ struct TempAttributeData<'input, S: Storage = Native> {
     eq_len: u8,
 }
 
+/// An attribute resolved against the namespaces in scope, with its prefix.
+struct ResolvedAttribute<'input, S: Storage = Native> {
+    prefix: &'input str,
+    data: AttributeData<'input, S>,
+}
+
+/// The tree a parse builds, node by node in document order.
+pub(crate) trait Tree<'input, S: Storage> {
+    /// A node that takes children.
+    type Node: Copy;
+
+    fn root(&self) -> Self::Node;
+    /// Appends a start tag's element under `parent`; `range` covers the tag.
+    fn element(
+        &mut self,
+        parent: Self::Node,
+        element: Element<'_, 'input, S>,
+        range: Range<usize>,
+    ) -> ScopedResult<Self::Node, S>;
+    /// Closes `element`. `end` is where its end tag ends, or `None` for an
+    /// empty-element tag, whose range is already complete.
+    fn end_element(&mut self, element: Self::Node, end: Option<usize>) -> ScopedResult<(), S>;
+    /// Appends a text node, every adjacent fragment already joined in `text`.
+    fn text(
+        &mut self,
+        parent: Self::Node,
+        text: StringStorage<'input, S>,
+        range: Range<usize>,
+    ) -> ScopedResult<(), S>;
+    fn comment(
+        &mut self,
+        parent: Self::Node,
+        text: &'input str,
+        range: Range<usize>,
+    ) -> ScopedResult<(), S>;
+    fn processing_instruction(
+        &mut self,
+        parent: Self::Node,
+        pi: PI<'input>,
+        range: Range<usize>,
+    ) -> ScopedResult<(), S>;
+}
+
+/// A start tag as the parser resolved it, for its tree to take.
+pub(crate) struct Element<'a, 'input, S: Storage = Native> {
+    prefix: &'input str,
+    tag_name: ExpandedNameIndexed<'input>,
+    namespaces: ShortRange,
+    attributes: &'a mut S::Values<ResolvedAttribute<'input, S>>,
+    table: &'a Namespaces<'input, S>,
+}
+
+/// An attribute of an [`Element`], its value moved out of the parser.
+pub(crate) struct ParsedAttribute<'a, 'input, S: Storage = Native> {
+    pub(crate) prefix: Option<&'input str>,
+    pub(crate) local: &'input str,
+    pub(crate) namespace: Option<&'a str>,
+    pub(crate) value: StringStorage<'input, S>,
+}
+
+impl<'a, 'input, S: Storage> Element<'a, 'input, S> {
+    pub(crate) fn prefix(&self) -> Option<&'input str> {
+        (!self.prefix.is_empty()).then_some(self.prefix)
+    }
+
+    pub(crate) fn local_name(&self) -> &'input str {
+        self.tag_name.local_name
+    }
+
+    pub(crate) fn namespace(&self) -> Option<&'a str> {
+        let table = self.table;
+        self.tag_name.namespace_idx.map(|idx| table.get(idx).uri())
+    }
+
+    /// The namespaces in scope, the element's own declarations first.
+    pub(crate) fn namespaces(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &'a Namespace<'input, S>> + use<'a, 'input, S> {
+        let table = self.table;
+        table.tree_order[self.namespaces.to_urange()]
+            .iter()
+            .map(move |idx| table.get(*idx))
+    }
+
+    pub(crate) fn attribute_count(&self) -> usize {
+        self.attributes.len()
+    }
+
+    /// Moves the attributes out in document order, leaving the parser's list
+    /// empty for the next start tag.
+    pub(crate) fn attributes(
+        &mut self,
+    ) -> core::result::Result<
+        impl Iterator<Item = ParsedAttribute<'a, 'input, S>> + '_,
+        crate::xml::dom::ParseError,
+    > {
+        let table = self.table;
+        Ok(self
+            .attributes
+            .drain_all()?
+            .map(move |attribute| ParsedAttribute {
+                prefix: (!attribute.prefix.is_empty()).then_some(attribute.prefix),
+                local: attribute.data.name.local_name,
+                namespace: attribute
+                    .data
+                    .name
+                    .namespace_idx
+                    .map(|idx| table.get(idx).uri()),
+                value: attribute.data.value,
+            }))
+    }
+}
+
+/// The parser's own read-only DOM as the tree it builds.
+struct DocumentTree<'input, S: Storage = Native> {
+    doc: Document<'input, S>,
+    /// Nodes whose next subtree is the next node appended.
+    awaiting_subtree: S::Values<NodeId>,
+    storage: S,
+}
+
+impl<'input, S: Storage> DocumentTree<'input, S> {
+    fn new(text: &'input str, storage: S) -> ScopedResult<Self, S> {
+        // Trying to guess rough nodes and attributes amount.
+        storage.charge(text.len())?;
+        let nodes_capacity = memchr_iter(b'<', text.as_bytes()).count();
+        storage.charge(text.len())?;
+        let attributes_capacity = memchr_iter(b'=', text.as_bytes()).count();
+
+        let mut doc = Document {
+            text,
+            nodes: storage.values(nodes_capacity)?,
+            attributes: storage.values(attributes_capacity)?,
+            namespaces: Namespaces::new(storage)?,
+        };
+        doc.nodes.push(NodeData {
+            parent: None,
+            prev_sibling: None,
+            next_subtree: None,
+            last_child: None,
+            kind: NodeKind::Root,
+            #[cfg(feature = "xml-backend-roxmltree")]
+            range: 0..text.len(),
+        })?;
+        Ok(Self {
+            doc,
+            awaiting_subtree: storage.values(0)?,
+            storage,
+        })
+    }
+
+    fn append(
+        &mut self,
+        parent: NodeId,
+        kind: NodeKind<'input, S>,
+        range: Range<usize>,
+    ) -> ScopedResult<NodeId, S> {
+        #[cfg(not(feature = "xml-backend-roxmltree"))]
+        let _ = range;
+
+        let new_child_id = NodeId::from(self.doc.nodes.len());
+
+        let appending_element = matches!(kind, NodeKind::Element { .. });
+        self.doc.nodes.push(NodeData {
+            parent: Some(parent),
+            prev_sibling: None,
+            next_subtree: None,
+            last_child: None,
+            kind,
+            #[cfg(feature = "xml-backend-roxmltree")]
+            range,
+        })?;
+
+        let last_child_id = self.doc.nodes[parent.get_usize()].last_child;
+        self.doc.nodes[new_child_id.get_usize()].prev_sibling = last_child_id;
+        self.doc.nodes[parent.get_usize()].last_child = Some(new_child_id);
+
+        self.storage.charge(self.awaiting_subtree.len())?;
+        for id in self.awaiting_subtree.iter() {
+            self.doc.nodes[id.get_usize()].next_subtree = Some(new_child_id);
+        }
+        self.awaiting_subtree.clear();
+
+        if !appending_element {
+            self.awaiting_subtree.push(new_child_id)?;
+        }
+
+        Ok(new_child_id)
+    }
+
+    fn finish(mut self, namespaces: Namespaces<'input, S>) -> ScopedResult<Document<'input, S>, S> {
+        self.doc.namespaces = namespaces;
+        self.storage.finish_values(&mut self.doc.nodes);
+        self.storage.finish_values(&mut self.doc.attributes);
+        self.doc.namespaces.shrink_to_fit()?;
+        Ok(self.doc)
+    }
+}
+
+impl<'input, S: Storage> Tree<'input, S> for DocumentTree<'input, S> {
+    type Node = NodeId;
+
+    fn root(&self) -> NodeId {
+        NodeId::new(0)
+    }
+
+    fn element(
+        &mut self,
+        parent: NodeId,
+        element: Element<'_, 'input, S>,
+        range: Range<usize>,
+    ) -> ScopedResult<NodeId, S> {
+        let start = self.doc.attributes.len();
+        for attribute in element.attributes.drain_all()? {
+            self.doc.attributes.push(attribute.data)?;
+        }
+        let attributes = if start == self.doc.attributes.len() {
+            ShortRange::new(0, 0)
+        } else {
+            (start..self.doc.attributes.len()).into()
+        };
+        self.append(
+            parent,
+            NodeKind::Element {
+                tag_name: element.tag_name,
+                attributes,
+                namespaces: element.namespaces,
+            },
+            range,
+        )
+    }
+
+    fn end_element(&mut self, element: NodeId, end: Option<usize>) -> ScopedResult<(), S> {
+        if let Some(end) = end {
+            #[cfg(feature = "xml-backend-roxmltree")]
+            {
+                self.doc.nodes[element.get_usize()].range.end = end;
+            }
+            #[cfg(not(feature = "xml-backend-roxmltree"))]
+            let _ = end;
+        }
+        // An empty element has no children to wait for; a closed one has
+        // pushed all of them, so its next subtree is the next node either way.
+        self.awaiting_subtree.push(element)?;
+        Ok(())
+    }
+
+    fn text(
+        &mut self,
+        parent: NodeId,
+        text: StringStorage<'input, S>,
+        range: Range<usize>,
+    ) -> ScopedResult<(), S> {
+        self.append(parent, NodeKind::Text(text), range)?;
+        Ok(())
+    }
+
+    fn comment(
+        &mut self,
+        parent: NodeId,
+        text: &'input str,
+        range: Range<usize>,
+    ) -> ScopedResult<(), S> {
+        self.append(
+            parent,
+            NodeKind::Comment(StringStorage::Borrowed(text)),
+            range,
+        )?;
+        Ok(())
+    }
+
+    fn processing_instruction(
+        &mut self,
+        parent: NodeId,
+        pi: PI<'input>,
+        range: Range<usize>,
+    ) -> ScopedResult<(), S> {
+        self.append(parent, NodeKind::PI(pi), range)?;
+        Ok(())
+    }
+}
+
 impl<'input> Document<'input> {
     /// Parses the input XML string.
     ///
@@ -477,7 +759,7 @@ impl<'input> Document<'input> {
     /// ```
     #[inline]
     pub fn parse_with_options(text: &'input str, opt: ParsingOptions<'input>) -> Result<Self> {
-        parse(text, opt, Native)
+        parse_document(text, opt, Native)
     }
 }
 
@@ -487,8 +769,18 @@ impl<'input, S: Storage> Document<'input, S> {
         opt: ParsingOptions<'input>,
         storage: S,
     ) -> ScopedResult<Self, S> {
-        parse(text, opt, storage)
+        parse_document(text, opt, storage)
     }
+}
+
+fn parse_document<'input, S: Storage>(
+    text: &'input str,
+    opt: ParsingOptions<'input>,
+    storage: S,
+) -> ScopedResult<Document<'input, S>, S> {
+    let mut tree = DocumentTree::new(text, storage)?;
+    let namespaces = parse_into(text, opt, storage, &mut tree)?;
+    tree.finish(namespaces)
 }
 
 struct Entity<'input> {
@@ -592,65 +884,60 @@ impl LoopDetector {
     }
 }
 
-struct Context<'input, S: Storage = Native> {
+/// An element whose end tag the parser has not read yet.
+struct Open<'input, N> {
+    node: N,
+    prefix: &'input str,
+    local: &'input str,
+    /// The namespaces in scope; the document root has none of its own.
+    namespaces: Option<ShortRange>,
+}
+
+struct Context<'input, 't, S: Storage, T: Tree<'input, S>> {
     opt: ParsingOptions<'input>,
+    text: &'input str,
+    tree: &'t mut T,
+    namespaces: Namespaces<'input, S>,
     namespace_start_idx: usize,
     current_attributes: S::Values<TempAttributeData<'input, S>>,
-    awaiting_subtree: S::Values<NodeId>,
-    parent_prefixes: S::Values<&'input str>,
+    /// The current start tag's attributes, resolved, until its tree takes them.
+    attributes: S::Values<ResolvedAttribute<'input, S>>,
+    /// Attributes of every element so far.
+    attribute_count: usize,
+    /// The document root, then each element still open.
+    open: S::Values<Open<'input, T::Node>>,
     entities: S::Values<Entity<'input>>,
-    after_text: bool,
+    /// The first fragment of a text node not appended yet, and its range.
+    pending_text: Option<(StringStorage<'input, S>, Range<usize>)>,
     text_fragments: S::Values<StringStorage<'input, S>>,
-    parent_id: NodeId,
     tag_name: TagNameSpan<'input>,
     loop_detector: LoopDetector,
-    doc: Document<'input, S>,
+    /// Nodes admitted so far, the root included.
+    nodes: usize,
+    has_root_element: bool,
     storage: S,
     failure: Option<Error<S::Text>>,
 }
 
-impl<'input, S: Storage> Context<'input, S> {
-    fn append_node(
-        &mut self,
-        kind: NodeKind<'input, S>,
-        range: Range<usize>,
-    ) -> ScopedResult<NodeId, S> {
-        if self.doc.nodes.len() >= self.opt.nodes_limit as usize {
+impl<'input, S: Storage, T: Tree<'input, S>> Context<'input, '_, S, T> {
+    fn text_pos_at(&self, pos: usize) -> TextPos {
+        tokenizer::Stream::new(self.text).gen_text_pos_from(pos)
+    }
+
+    fn parent(&self) -> T::Node {
+        self.open
+            .last()
+            .expect("the document root is never closed")
+            .node
+    }
+
+    /// Counts one more node, refusing it past the node limit.
+    fn admit_node(&mut self) -> ScopedResult<(), S> {
+        if self.nodes >= self.opt.nodes_limit as usize {
             return Err(Error::NodesLimitReached);
         }
-
-        #[cfg(not(feature = "xml-backend-roxmltree"))]
-        let _ = range;
-
-        let new_child_id = NodeId::from(self.doc.nodes.len());
-
-        let appending_element = matches!(kind, NodeKind::Element { .. });
-        self.doc.nodes.push(NodeData {
-            parent: Some(self.parent_id),
-            prev_sibling: None,
-            next_subtree: None,
-            last_child: None,
-            kind,
-            #[cfg(feature = "xml-backend-roxmltree")]
-            range,
-        })?;
-
-        let last_child_id = self.doc.nodes[self.parent_id.get_usize()].last_child;
-        self.doc.nodes[new_child_id.get_usize()].prev_sibling = last_child_id;
-        self.doc.nodes[self.parent_id.get_usize()].last_child = Some(new_child_id);
-
-        self.storage.charge(self.awaiting_subtree.len())?;
-        for id in self.awaiting_subtree.iter() {
-            self.doc.nodes[id.get_usize()].next_subtree = Some(new_child_id);
-        }
-        self.awaiting_subtree.clear();
-
-        if !appending_element {
-            self.awaiting_subtree
-                .push(NodeId::from(self.doc.nodes.len() - 1))?;
-        }
-
-        Ok(new_child_id)
+        self.nodes += 1;
+        Ok(())
     }
 
     fn append_text(
@@ -658,35 +945,29 @@ impl<'input, S: Storage> Context<'input, S> {
         text: StringStorage<'input, S>,
         range: Range<usize>,
     ) -> ScopedResult<(), S> {
-        if self.after_text {
+        if self.pending_text.is_some() {
             self.text_fragments.push(text)?;
         } else {
-            self.append_node(NodeKind::Text(text), range)?;
-            self.after_text = true;
+            // The text node is admitted at its first fragment and appended once
+            // its last one is read; no other node comes between.
+            self.admit_node()?;
+            self.pending_text = Some((text, range));
         }
         Ok(())
     }
 
     #[cold]
     #[inline(never)]
-    fn merge_text(&mut self) -> ScopedResult<(), S> {
-        let node = self
-            .doc
-            .nodes
-            .last_mut()
-            .expect("after_text is set only after appending a text node");
-
-        let NodeKind::Text(text) = &mut node.kind else {
-            unreachable!("after_text identifies a text node");
-        };
-
+    fn merge_text(
+        &mut self,
+        first: StringStorage<'input, S>,
+    ) -> ScopedResult<StringStorage<'input, S>, S> {
         self.storage.charge(self.text_fragments.len())?;
         let additional = self
             .text_fragments
             .iter()
             .try_fold(0usize, |length, part| length.checked_add(part.len()))
             .expect("coalesced text length fits the bounded source layout");
-        let first = core::mem::replace(text, StringStorage::Borrowed(""));
         let mut value = match first {
             StringStorage::Owned(value) => {
                 let mut value = value;
@@ -707,75 +988,62 @@ impl<'input, S: Storage> Context<'input, S> {
         for fragment in self.text_fragments.drain_all()? {
             self.storage.append(&mut value, fragment.as_str())?;
         }
-        *text = StringStorage::from_owned(value);
-        Ok(())
+        Ok(StringStorage::from_owned(value))
     }
 
+    /// Appends the pending text node, its fragments joined.
     #[inline]
     fn reset_after_text(&mut self) -> ScopedResult<(), S> {
-        if !self.after_text {
+        let Some((text, range)) = self.pending_text.take() else {
             return Ok(());
-        }
-
-        if !self.text_fragments.is_empty() {
-            self.merge_text()?;
-        }
-
-        self.after_text = false;
-        Ok(())
+        };
+        let text = if self.text_fragments.is_empty() {
+            text
+        } else {
+            self.merge_text(text)?
+        };
+        let parent = self.parent();
+        self.tree.text(parent, text, range)
     }
 }
 
-fn parse<'input, S: Storage>(
+/// Parses `text` into `tree`, returning the namespace table its elements
+/// index.
+pub(crate) fn parse_into<'input, S: Storage, T: Tree<'input, S>>(
     text: &'input str,
     opt: ParsingOptions<'input>,
     storage: S,
-) -> ScopedResult<Document<'input, S>, S> {
-    // Trying to guess rough nodes and attributes amount.
-    storage.charge(text.len())?;
-    let nodes_capacity = memchr_iter(b'<', text.as_bytes()).count();
-    storage.charge(text.len())?;
-    let attributes_capacity = memchr_iter(b'=', text.as_bytes()).count();
-
-    // Init document.
-    let mut doc = Document {
-        text,
-        nodes: storage.values(nodes_capacity)?,
-        attributes: storage.values(attributes_capacity)?,
-        namespaces: Namespaces::new(storage)?,
-    };
-
-    // Add a root node.
-    doc.nodes.push(NodeData {
-        parent: None,
-        prev_sibling: None,
-        next_subtree: None,
-        last_child: None,
-        kind: NodeKind::Root,
-        #[cfg(feature = "xml-backend-roxmltree")]
-        range: 0..text.len(),
-    })?;
-
-    doc.namespaces
-        .push_ns(Some(NS_XML_PREFIX), StringStorage::Borrowed(NS_XML_URI))?;
+    tree: &mut T,
+) -> ScopedResult<Namespaces<'input, S>, S> {
+    let mut namespaces = Namespaces::new(storage)?;
+    namespaces.push_ns(Some(NS_XML_PREFIX), StringStorage::Borrowed(NS_XML_URI))?;
 
     let allow_dtd = opt.allow_dtd;
 
-    let mut parent_prefixes = storage.values(1)?;
-    parent_prefixes.push("")?;
+    let mut open = storage.values(1)?;
+    open.push(Open {
+        node: tree.root(),
+        prefix: "",
+        local: "",
+        namespaces: None,
+    })?;
     let mut ctx = Context {
         opt,
+        text,
+        tree,
+        namespaces,
         namespace_start_idx: 1,
-        current_attributes: storage.values(attributes_capacity.min(16))?,
+        current_attributes: storage.values(0)?,
+        attributes: storage.values(0)?,
+        attribute_count: 0,
+        open,
         entities: storage.values(0)?,
-        awaiting_subtree: storage.values(0)?,
-        parent_prefixes,
-        after_text: false,
+        pending_text: None,
         text_fragments: storage.values(0)?,
-        parent_id: NodeId::new(0),
         tag_name: TagNameSpan::new_null(),
         loop_detector: LoopDetector::default(),
-        doc,
+        nodes: 1,
+        has_root_element: false,
         storage,
         failure: None,
     };
@@ -792,24 +1060,21 @@ fn parse<'input, S: Storage>(
     parsed.map_err(|error| adopt_error(error, storage))?;
 
     ctx.reset_after_text()?;
-    let mut doc = ctx.doc;
-    storage.charge(doc.nodes.len())?;
-    if !doc.root().children().any(|n| n.is_element()) {
+    storage.charge(ctx.nodes)?;
+    if !ctx.has_root_element {
         return Err(Error::NoRootNode);
     }
 
-    if ctx.parent_prefixes.len() > 1 {
+    if ctx.open.len() > 1 {
         return Err(Error::UnclosedRootNode);
     }
 
-    storage.finish_values(&mut doc.nodes);
-    storage.finish_values(&mut doc.attributes);
-    doc.namespaces.shrink_to_fit()?;
-
-    Ok(doc)
+    Ok(ctx.namespaces)
 }
 
-impl<'input, S: Storage> tokenizer::XmlEvents<'input> for Context<'input, S> {
+impl<'input, S: Storage, T: Tree<'input, S>> tokenizer::XmlEvents<'input>
+    for Context<'input, '_, S, T>
+{
     #[inline]
     fn token(&mut self, token: tokenizer::Token<'input>) -> Result<()> {
         if self.failure.is_some() {
@@ -845,17 +1110,21 @@ fn adopt_error<S: Storage>(error: Error, storage: S) -> Error<S::Text> {
     }
 }
 
-impl<'input, S: Storage> Context<'input, S> {
+impl<'input, S: Storage, T: Tree<'input, S>> Context<'input, '_, S, T> {
     fn process_token(&mut self, token: tokenizer::Token<'input>) -> ScopedResult<(), S> {
         match token {
             tokenizer::Token::ProcessingInstruction(target, value, range) => {
                 self.reset_after_text()?;
-                let pi = NodeKind::PI(PI { target, value });
-                self.append_node(pi, range)?;
+                self.admit_node()?;
+                let parent = self.parent();
+                self.tree
+                    .processing_instruction(parent, PI { target, value }, range)?;
             }
             tokenizer::Token::Comment(text, range) => {
                 self.reset_after_text()?;
-                self.append_node(NodeKind::Comment(StringStorage::Borrowed(text)), range)?;
+                self.admit_node()?;
+                let parent = self.parent();
+                self.tree.comment(parent, text, range)?;
             }
             tokenizer::Token::EntityDeclaration(name, definition) => {
                 self.entities.push(Entity {
@@ -867,7 +1136,7 @@ impl<'input, S: Storage> Context<'input, S> {
                 self.reset_after_text()?;
 
                 if prefix == XMLNS {
-                    let pos = self.doc.text_pos_at(start + 1);
+                    let pos = self.text_pos_at(start + 1);
                     return Err(Error::InvalidElementNamePrefix(pos));
                 }
 
@@ -898,14 +1167,14 @@ impl<'input, S: Storage> Context<'input, S> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn process_attribute<'input, S: Storage>(
+fn process_attribute<'input, S: Storage, T: Tree<'input, S>>(
     range: Range<usize>,
     qname_len: u16,
     eq_len: u8,
     prefix: &'input str,
     local: &'input str,
     value: StrSpan<'input>,
-    ctx: &mut Context<'input, S>,
+    ctx: &mut Context<'input, '_, S, T>,
 ) -> ScopedResult<(), S> {
     let value = normalize_attribute(value, ctx)?;
 
@@ -915,13 +1184,11 @@ fn process_attribute<'input, S: Storage>(
         // Default xmlns="" remains permitted by §6.2.
         // https://www.w3.org/TR/2009/REC-xml-names-20091208/#nsc-NoPrefixUndecl
         if value.as_str().is_empty() {
-            return Err(Error::EmptyPrefixedNamespace(
-                ctx.doc.text_pos_at(range.start),
-            ));
+            return Err(Error::EmptyPrefixedNamespace(ctx.text_pos_at(range.start)));
         }
         // The xmlns namespace MUST NOT be declared as the default namespace.
         if value.as_str() == NS_XMLNS_URI {
-            let pos = ctx.doc.text_pos_at(range.start);
+            let pos = ctx.text_pos_at(range.start);
             return Err(Error::UnexpectedXmlnsUri(pos));
         }
 
@@ -932,45 +1199,44 @@ fn process_attribute<'input, S: Storage>(
         // It MUST NOT be bound to any other namespace name.
         if local == NS_XML_PREFIX {
             if !is_xml_ns_uri {
-                let pos = ctx.doc.text_pos_at(range.start);
+                let pos = ctx.text_pos_at(range.start);
                 return Err(Error::InvalidXmlPrefixUri(pos));
             }
         } else {
             // The xml namespace MUST NOT be bound to a non-xml prefix.
             if is_xml_ns_uri {
-                let pos = ctx.doc.text_pos_at(range.start);
+                let pos = ctx.text_pos_at(range.start);
                 return Err(Error::UnexpectedXmlUri(pos));
             }
         }
 
         // Check for duplicated namespaces.
         if ctx
-            .doc
             .namespaces
             .exists(ctx.namespace_start_idx, Some(local))?
         {
-            let pos = ctx.doc.text_pos_at(range.start);
+            let pos = ctx.text_pos_at(range.start);
             return Err(Error::DuplicatedNamespace(ctx.storage.text(local)?, pos));
         }
 
         // Xml namespace should not be added to the namespaces.
         if !is_xml_ns_uri {
-            ctx.doc.namespaces.push_ns(Some(local), value)?;
+            ctx.namespaces.push_ns(Some(local), value)?;
         }
     } else if local == XMLNS {
         // The xml namespace MUST NOT be declared as the default namespace.
         if value.as_str() == NS_XML_URI {
-            let pos = ctx.doc.text_pos_at(range.start);
+            let pos = ctx.text_pos_at(range.start);
             return Err(Error::UnexpectedXmlUri(pos));
         }
 
         // The xmlns namespace MUST NOT be declared as the default namespace.
         if value.as_str() == NS_XMLNS_URI {
-            let pos = ctx.doc.text_pos_at(range.start);
+            let pos = ctx.text_pos_at(range.start);
             return Err(Error::UnexpectedXmlnsUri(pos));
         }
 
-        ctx.doc.namespaces.push_ns(None, value)?;
+        ctx.namespaces.push_ns(None, value)?;
     } else {
         #[cfg(not(feature = "xml-backend-roxmltree"))]
         let _ = (qname_len, eq_len);
@@ -990,10 +1256,10 @@ fn process_attribute<'input, S: Storage>(
     Ok(())
 }
 
-fn process_element<'input, S: Storage>(
+fn process_element<'input, S: Storage, T: Tree<'input, S>>(
     end_token: tokenizer::ElementEnd<'input>,
     token_range: Range<usize>,
-    ctx: &mut Context<'input, S>,
+    ctx: &mut Context<'input, '_, S, T>,
 ) -> ScopedResult<(), S> {
     if ctx.tag_name.name.is_empty() {
         // May occur in XML like this:
@@ -1002,142 +1268,128 @@ fn process_element<'input, S: Storage>(
 
         if let tokenizer::ElementEnd::Close(..) = end_token {
             return Err(Error::UnexpectedEntityCloseTag(
-                ctx.doc.text_pos_at(token_range.start),
+                ctx.text_pos_at(token_range.start),
             ));
         }
         unreachable!("should be already checked by the tokenizer");
     }
 
     let namespaces = ctx.resolve_namespaces()?;
-    ctx.namespace_start_idx = ctx.doc.namespaces.tree_order.len();
+    ctx.namespace_start_idx = ctx.namespaces.tree_order.len();
 
-    let attributes = resolve_attributes(namespaces, ctx)?;
+    resolve_attributes(namespaces, ctx)?;
 
     match end_token {
         tokenizer::ElementEnd::Empty => {
-            let tag_ns_idx = get_ns_idx_by_prefix(
-                namespaces,
-                ctx.tag_name.prefix_pos,
-                ctx.tag_name.prefix,
-                &ctx.doc,
-            )?;
-            let new_element_id = ctx.append_node(
-                NodeKind::Element {
-                    tag_name: ExpandedNameIndexed {
-                        namespace_idx: tag_ns_idx,
-                        local_name: ctx.tag_name.name,
-                    },
-                    attributes,
-                    namespaces,
-                },
-                ctx.tag_name.pos..token_range.end,
-            )?;
-            ctx.awaiting_subtree.push(new_element_id)?;
+            let element = ctx.push_element(namespaces, token_range.end)?;
+            ctx.tree.end_element(element, None)?;
         }
         tokenizer::ElementEnd::Close(prefix, local) => {
-            let parent_node = &mut ctx.doc.nodes[ctx.parent_id.get_usize()];
-            // should never panic as we start with the single prefix of the
-            // root node and always push another one when changing the parent
-            let parent_prefix = *ctx
-                .parent_prefixes
-                .last()
-                .expect("the document sentinel prefix is never removed");
-
-            #[cfg(feature = "xml-backend-roxmltree")]
-            {
-                parent_node.range.end = token_range.end;
-            }
-
-            if let NodeKind::Element { ref tag_name, .. } = parent_node.kind
-                && (prefix != parent_prefix || local != tag_name.local_name)
-            {
-                return Err(Error::UnexpectedCloseTag(
-                    gen_qname_string(parent_prefix, tag_name.local_name, ctx.storage)?,
-                    gen_qname_string(prefix, local, ctx.storage)?,
-                    ctx.doc.text_pos_at(token_range.start),
-                ));
-            }
-            ctx.awaiting_subtree.push(ctx.parent_id)?;
-
-            if let Some(id) = parent_node.parent {
-                ctx.parent_id = id;
-                ctx.parent_prefixes.pop();
-                debug_assert!(!ctx.parent_prefixes.is_empty());
-            } else {
+            if ctx.open.len() == 1 {
                 // May occur in XML like this:
                 // <!DOCTYPE test [ <!ENTITY p '<p></p></p>'> ]>
                 // <p>&p;&p;
 
                 return Err(Error::UnexpectedEntityCloseTag(
-                    ctx.doc.text_pos_at(token_range.start),
+                    ctx.text_pos_at(token_range.start),
                 ));
             }
+            let open = ctx
+                .open
+                .last()
+                .expect("an element is open above the document root");
+            if prefix != open.prefix || local != open.local {
+                return Err(Error::UnexpectedCloseTag(
+                    gen_qname_string(open.prefix, open.local, ctx.storage)?,
+                    gen_qname_string(prefix, local, ctx.storage)?,
+                    ctx.text_pos_at(token_range.start),
+                ));
+            }
+            let element = open.node;
+            ctx.tree.end_element(element, Some(token_range.end))?;
+            ctx.open.pop();
         }
         tokenizer::ElementEnd::Open => {
-            let tag_ns_idx = get_ns_idx_by_prefix(
-                namespaces,
-                ctx.tag_name.prefix_pos,
-                ctx.tag_name.prefix,
-                &ctx.doc,
-            )?;
-            ctx.parent_id = ctx.append_node(
-                NodeKind::Element {
-                    tag_name: ExpandedNameIndexed {
-                        namespace_idx: tag_ns_idx,
-                        local_name: ctx.tag_name.name,
-                    },
-                    attributes,
-                    namespaces,
-                },
-                ctx.tag_name.pos..token_range.end,
-            )?;
-            ctx.parent_prefixes.push(ctx.tag_name.prefix)?;
+            let element = ctx.push_element(namespaces, token_range.end)?;
+            ctx.open.push(Open {
+                node: element,
+                prefix: ctx.tag_name.prefix,
+                local: ctx.tag_name.name,
+                namespaces: Some(namespaces),
+            })?;
         }
     }
 
     Ok(())
 }
 
-impl<S: Storage> Context<'_, S> {
+impl<'input, S: Storage, T: Tree<'input, S>> Context<'input, '_, S, T> {
     fn resolve_namespaces(&mut self) -> ScopedResult<ShortRange, S> {
-        if let NodeKind::Element { ref namespaces, .. } =
-            self.doc.nodes[self.parent_id.get_usize()].kind
-        {
-            let parent_ns = *namespaces;
-            if self.namespace_start_idx == self.doc.namespaces.tree_order.len() {
+        let parent = self
+            .open
+            .last()
+            .expect("the document root is never closed")
+            .namespaces;
+        if let Some(parent_ns) = parent {
+            if self.namespace_start_idx == self.namespaces.tree_order.len() {
                 return Ok(parent_ns);
             }
 
             for i in parent_ns.to_urange() {
-                if !self.doc.namespaces.exists(
+                if !self.namespaces.exists(
                     self.namespace_start_idx,
-                    self.doc
-                        .namespaces
-                        .get(self.doc.namespaces.tree_order[i])
-                        .name,
+                    self.namespaces.get(self.namespaces.tree_order[i]).name,
                 )? {
-                    self.doc.namespaces.push_ref(i)?;
+                    self.namespaces.push_ref(i)?;
                 }
             }
         }
 
-        Ok((self.namespace_start_idx..self.doc.namespaces.tree_order.len()).into())
+        Ok((self.namespace_start_idx..self.namespaces.tree_order.len()).into())
+    }
+
+    /// Hands the current start tag, which ends at `end`, to the tree.
+    fn push_element(&mut self, namespaces: ShortRange, end: usize) -> ScopedResult<T::Node, S> {
+        let tag_ns_idx = get_ns_idx_by_prefix(
+            namespaces,
+            self.tag_name.prefix_pos,
+            self.tag_name.prefix,
+            &self.namespaces,
+            self.text,
+        )?;
+        self.admit_node()?;
+        let parent = self.parent();
+        self.has_root_element |= self.open.len() == 1;
+        self.tree.element(
+            parent,
+            Element {
+                prefix: self.tag_name.prefix,
+                tag_name: ExpandedNameIndexed {
+                    namespace_idx: tag_ns_idx,
+                    local_name: self.tag_name.name,
+                },
+                namespaces,
+                attributes: &mut self.attributes,
+                table: &self.namespaces,
+            },
+            self.tag_name.pos..end,
+        )
     }
 }
 
-fn resolve_attributes<S: Storage>(
+fn resolve_attributes<'input, S: Storage, T: Tree<'input, S>>(
     namespaces: ShortRange,
-    ctx: &mut Context<'_, S>,
-) -> ScopedResult<ShortRange, S> {
+    ctx: &mut Context<'input, '_, S, T>,
+) -> ScopedResult<(), S> {
+    debug_assert!(ctx.attributes.is_empty());
     if ctx.current_attributes.is_empty() {
-        return Ok(ShortRange::new(0, 0));
+        return Ok(());
     }
 
-    if ctx.doc.attributes.len() + ctx.current_attributes.len() >= u32::MAX as usize {
+    if ctx.attribute_count + ctx.current_attributes.len() >= u32::MAX as usize {
         return Err(Error::AttributesLimitReached);
     }
-
-    let start_idx = ctx.doc.attributes.len();
+    ctx.attribute_count += ctx.current_attributes.len();
 
     for attr in ctx.current_attributes.drain_all()? {
         let namespace_idx = if attr.prefix == NS_XML_PREFIX {
@@ -1150,7 +1402,13 @@ fn resolve_attributes<S: Storage>(
             // always has no value.'
             None
         } else {
-            get_ns_idx_by_prefix(namespaces, attr.range.start, attr.prefix, &ctx.doc)?
+            get_ns_idx_by_prefix(
+                namespaces,
+                attr.range.start,
+                attr.prefix,
+                &ctx.namespaces,
+                ctx.text,
+            )?
         };
 
         let attr_name = ExpandedNameIndexed {
@@ -1159,18 +1417,18 @@ fn resolve_attributes<S: Storage>(
         };
 
         // Check for duplicated attributes.
-        for previous in &ctx.doc.attributes[start_idx..] {
-            let previous = previous.name.as_expanded_name(&ctx.doc);
-            let current = attr_name.as_expanded_name(&ctx.doc);
-            if equal_text(previous.name(), current.name(), ctx.storage)?
-                && previous.namespace().is_some() == current.namespace().is_some()
+        let current_uri = attr_name.namespace_uri(&ctx.namespaces);
+        for previous in ctx.attributes.iter() {
+            let previous_uri = previous.data.name.namespace_uri(&ctx.namespaces);
+            if equal_text(previous.data.name.local_name, attr.local, ctx.storage)?
+                && previous_uri.is_some() == current_uri.is_some()
                 && equal_text(
-                    previous.namespace().unwrap_or(""),
-                    current.namespace().unwrap_or(""),
+                    previous_uri.unwrap_or(""),
+                    current_uri.unwrap_or(""),
                     ctx.storage,
                 )?
             {
-                let pos = ctx.doc.text_pos_at(attr.range.start);
+                let pos = tokenizer::Stream::new(ctx.text).gen_text_pos_from(attr.range.start);
                 return Err(Error::DuplicatedAttribute(
                     ctx.storage.text(attr.local)?,
                     pos,
@@ -1178,25 +1436,28 @@ fn resolve_attributes<S: Storage>(
             }
         }
 
-        ctx.doc.attributes.push(AttributeData {
-            name: attr_name,
-            value: attr.value,
-            #[cfg(feature = "xml-backend-roxmltree")]
-            range: attr.range,
-            #[cfg(feature = "xml-backend-roxmltree")]
-            qname_len: attr.qname_len,
-            #[cfg(feature = "xml-backend-roxmltree")]
-            eq_len: attr.eq_len,
+        ctx.attributes.push(ResolvedAttribute {
+            prefix: attr.prefix,
+            data: AttributeData {
+                name: attr_name,
+                value: attr.value,
+                #[cfg(feature = "xml-backend-roxmltree")]
+                range: attr.range,
+                #[cfg(feature = "xml-backend-roxmltree")]
+                qname_len: attr.qname_len,
+                #[cfg(feature = "xml-backend-roxmltree")]
+                eq_len: attr.eq_len,
+            },
         })?;
     }
 
-    Ok((start_idx..ctx.doc.attributes.len()).into())
+    Ok(())
 }
 
-fn process_text<'input, S: Storage>(
+fn process_text<'input, S: Storage, T: Tree<'input, S>>(
     text: &'input str,
     range: Range<usize>,
-    ctx: &mut Context<'input, S>,
+    ctx: &mut Context<'input, '_, S, T>,
 ) -> ScopedResult<(), S> {
     // Add text as is if it has only valid characters.
     ctx.storage.charge(text.len())?;
@@ -1208,7 +1469,7 @@ fn process_text<'input, S: Storage>(
     let mut text_buffer = TextBuffer::new(ctx.storage)?;
     ctx.storage.charge(text.len())?;
     let mut is_as_is = false; // TODO: explain
-    let mut stream = Stream::from_substr(ctx.doc.text, range.clone());
+    let mut stream = Stream::from_substr(ctx.text, range.clone());
     while !stream.at_end() {
         match parse_next_chunk(&mut stream, &ctx.entities, ctx.storage)? {
             NextChunk::Byte(c) => {
@@ -1244,7 +1505,7 @@ fn process_text<'input, S: Storage>(
                 let text = if fragment.range().start == 0 {
                     fragment.as_str()
                 } else {
-                    ctx.doc.text
+                    ctx.text
                 };
 
                 let mut stream = Stream::from_substr(text, fragment.range());
@@ -1270,10 +1531,10 @@ fn process_text<'input, S: Storage>(
 
 // While the whole purpose of CDATA is to indicate to an XML library that this text
 // has to be stored as is, carriage return (`\r`) is still has to be replaced with `\n`.
-fn process_cdata<'input, S: Storage>(
+fn process_cdata<'input, S: Storage, T: Tree<'input, S>>(
     mut text: &'input str,
     range: Range<usize>,
-    ctx: &mut Context<'input, S>,
+    ctx: &mut Context<'input, '_, S, T>,
 ) -> ScopedResult<(), S> {
     ctx.storage.charge(text.len())?;
     let mut pos = memchr(b'\r', text.as_bytes());
@@ -1372,9 +1633,9 @@ fn parse_next_chunk<'a, S: Storage>(
 }
 
 // https://www.w3.org/TR/REC-xml/#AVNormalize
-fn normalize_attribute<'input, S: Storage>(
+fn normalize_attribute<'input, S: Storage, T: Tree<'input, S>>(
     text: StrSpan<'input>,
-    ctx: &mut Context<'input, S>,
+    ctx: &mut Context<'input, '_, S, T>,
 ) -> ScopedResult<StringStorage<'input, S>, S> {
     // We assume that `&` indicates an entity or a character reference.
     // But in rare cases it can be just an another character.
@@ -1391,13 +1652,13 @@ fn normalize_attribute<'input, S: Storage>(
     }
 }
 
-fn normalize_attribute_into<S: Storage>(
+fn normalize_attribute_into<'input, S: Storage, T: Tree<'input, S>>(
     text: StrSpan,
     buffer: &mut TextBuffer<S>,
-    ctx: &mut Context<'_, S>,
+    ctx: &mut Context<'input, '_, S, T>,
 ) -> ScopedResult<(), S> {
     ctx.storage.charge(text.as_str().len())?;
-    let mut stream = Stream::from_substr(ctx.doc.text, text.range());
+    let mut stream = Stream::from_substr(ctx.text, text.range());
     while !stream.at_end() {
         // Safe, because we already checked that the stream is not at the end.
         let c = stream.curr_byte_unchecked();
@@ -1456,7 +1717,8 @@ fn get_ns_idx_by_prefix<S: Storage>(
     namespaces: ShortRange,
     prefix_pos: usize,
     prefix: &str,
-    doc: &Document<'_, S>,
+    table: &Namespaces<'_, S>,
+    text: &str,
 ) -> ScopedResult<Option<NamespaceIdx>, S> {
     // Prefix CAN be empty when the default namespace was defined.
     //
@@ -1469,11 +1731,11 @@ fn get_ns_idx_by_prefix<S: Storage>(
     };
 
     let mut idx = None;
-    for candidate in &doc.namespaces.tree_order[namespaces.to_urange()] {
-        let name = doc.namespaces.get(*candidate).name;
-        doc.namespaces.storage.charge(1)?;
+    for candidate in &table.tree_order[namespaces.to_urange()] {
+        let name = table.get(*candidate).name;
+        table.storage.charge(1)?;
         if name.is_some() == prefix_opt.is_some()
-            && equal_text(name.unwrap_or(""), prefix, doc.namespaces.storage)?
+            && equal_text(name.unwrap_or(""), prefix, table.storage)?
         {
             idx = Some(*candidate);
             break;
@@ -1492,11 +1754,8 @@ fn get_ns_idx_by_prefix<S: Storage>(
                 //
                 // Example:
                 // <e random:a='b'/>
-                let pos = doc.text_pos_at(prefix_pos);
-                Err(Error::UnknownNamespace(
-                    doc.namespaces.storage.text(prefix)?,
-                    pos,
-                ))
+                let pos = tokenizer::Stream::new(text).gen_text_pos_from(prefix_pos);
+                Err(Error::UnknownNamespace(table.storage.text(prefix)?, pos))
             }
         }
     }

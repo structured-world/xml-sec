@@ -10,14 +10,13 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 mod tests;
 
-const IDENTITY_FILES: [&str; 7] = [
+const IDENTITY_FILES: [&str; 6] = [
     "Cargo.toml",
     "benches/security.rs",
     "benches/support/mod.rs",
     "examples/benchmark_latency.rs",
     "tools/xml-sec-tools/src/bench/latency.rs",
     "src/benchmark_support.rs",
-    "src/xml/dom/benchmark.rs",
 ];
 
 fn usage(message: String) -> Failure {
