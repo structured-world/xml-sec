@@ -91,7 +91,10 @@ pub mod x509;
 mod xpath;
 
 #[cfg(feature = "xmldsig-sign")]
-pub use builder::{ReferenceBuilder, SignatureBuilder, SignatureBuilderError};
+pub use builder::{
+    ObjectBuilder, ObjectContent, ObjectElement, ReferenceBuilder, SignatureBuilder,
+    SignatureBuilderError,
+};
 pub(crate) use digest::finish_digest;
 pub use digest::{
     DigestAlgorithm, DigestOutput, MAX_DIGEST_OUTPUT, compute_digest, compute_digest_with_provider,

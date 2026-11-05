@@ -1,13 +1,18 @@
 //! All-or-nothing [`XmlDocument::transaction`] semantics, including nesting.
 
-use super::XmlDocument;
+use super::{DocumentView, NodeIdentity, XmlDocument};
+
+// A free function keeps the view's lifetime late-bound for `with_view`.
+fn root(view: DocumentView<'_>) -> NodeIdentity {
+    view.root_element()
+}
 
 fn document() -> XmlDocument {
     XmlDocument::parse("<root><a/></root>").expect("fixture parses")
 }
 
 fn append(document: &mut XmlDocument, child: &str) {
-    let root = document.with_view(|view| view.root_element());
+    let root = document.with_view(root);
     document.append_child(root, child).expect("append commits");
 }
 
