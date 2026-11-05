@@ -1416,8 +1416,8 @@ mod tests {
         let source = format!("<r a='{}'/>", "x".repeat(65536));
         let funded = Memory::new(std::sync::Arc::new(MemoryAccount::new(1 << 20, 1 << 24)));
         for limit in [0, 1] {
-            // The parser's own copy of the attribute fits; an arena reserved
-            // for the source's size, about one node per 30 bytes, does not.
+            // The parser's own copy of the attribute fits; the initial arena
+            // estimate for the source's size, 1024 nodes here, does not.
             let memory = Memory::new(std::sync::Arc::new(MemoryAccount::new(256 << 10, 1 << 24)));
             let preflight =
                 super::super::LexicalPreflight::scan_in(&source, false, Accounted(&funded))

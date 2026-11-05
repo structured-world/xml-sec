@@ -318,9 +318,8 @@ impl<'a, S: NameStorage> XmlParser<'a, S> {
         options: &ParseOptions,
         storage: S,
     ) -> Result<Self, ParseError<S>> {
-        // Pre-size the node arena — roughly 1 node per 30 bytes of input.
-        let estimated_nodes = (input.len() / 30).max(64);
-        let document = Document::try_with_storage(estimated_nodes, storage)?;
+        let document =
+            Document::try_with_storage(super::initial_node_capacity(input.len()), storage)?;
         Self::with_tree(input, options, storage, document)
     }
 }

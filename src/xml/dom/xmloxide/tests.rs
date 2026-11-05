@@ -160,6 +160,34 @@ fn a_doctype_keyword_in_another_case_is_refused_without_a_scan() {
     }
 }
 
+/// The arena is reserved for the nodes a document has, not for its bytes: a
+/// document of one large text node fits a budget that holds the text, where
+/// an arena of one node per 30 source bytes would not.
+#[cfg(feature = "xmldsig")]
+#[test]
+fn a_text_heavy_document_reserves_the_arena_for_its_nodes() {
+    use super::super::storage::Accounted;
+    use structured_asn1::memory::{Memory, MemoryAccount};
+    const TEXT: usize = 1 << 20;
+    let xml = alloc::format!("<r>{}</r>", "x".repeat(TEXT));
+    let limits = ParseLimits {
+        nodes: u32::MAX,
+        depth: 64,
+        namespace_bindings: 64,
+    };
+    // Twice the text covers its copy while it grows; the arena of the
+    // previous estimate alone (about 35 thousand nodes) is larger than that.
+    let memory = Memory::new(alloc::sync::Arc::new(MemoryAccount::new(2 * TEXT, 1 << 28)));
+    let (document, _) = XmloxideBackend::parse_enforcing_limits_in(
+        &xml,
+        ParsingOptions::default(),
+        limits,
+        Accounted(&memory),
+    )
+    .unwrap_or_else(|_| panic!("a {TEXT}-byte text document fits {} bytes", 2 * TEXT));
+    assert_eq!(document.root_element().text().map(str::len), Some(TEXT));
+}
+
 #[test]
 fn replacement_text_nodes_take_the_reference_range() {
     // Nodes read from an entity's replacement text have no span of their own
