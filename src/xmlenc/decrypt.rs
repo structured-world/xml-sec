@@ -1182,6 +1182,7 @@ impl<'a> DecryptContext<'a> {
                 ciphertext.len(),
                 operation.policy(),
             )?;
+            release_parsed_cipher_value(&mut encrypted);
             Ok::<_, XmlEncError>((encrypted, algorithm, ciphertext, origins, bound_references))
         });
         let (encrypted, algorithm, ciphertext, origins, bound_references) = parsed?;
@@ -2308,6 +2309,18 @@ fn resolve_key_cipher_references<'a>(
 
 /// Check typed values, content framing and the plaintext bound before any
 /// key source is resolved.
+/// Drops the content base64 of an `EncryptedData` this operation parsed. Its
+/// decoded ciphertext and the checks before key resolution are its last
+/// readers, so it goes before key resolution and the plaintext allocate
+/// rather than sharing their peak. A caller's `EncryptedData` is left as is.
+fn release_parsed_cipher_value(encrypted: &mut Cow<'_, EncryptedData>) {
+    if let Cow::Owned(parsed) = encrypted
+        && let super::CipherData::Value { value } = &mut parsed.cipher_data
+    {
+        drop(core::mem::take(value));
+    }
+}
+
 fn validate_before_key_resolution(
     encrypted: &EncryptedData,
     algorithm: DataEncryptionAlgorithm,
