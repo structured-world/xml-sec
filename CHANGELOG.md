@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/structured-world/xml-sec/compare/v0.5.0...v0.5.1) - 2026-11-05
+
+### Documentation
+
+- *(xml)* describe the parser that enforces limits and builds the tree ([#388](https://github.com/structured-world/xml-sec/pull/388))
+
+### Performance
+
+- *(xml)* size the xmloxide node arena by nodes, not bytes ([#402](https://github.com/structured-world/xml-sec/pull/402))
+- *(xmlenc)* release the parsed CipherValue before decryption ([#399](https://github.com/structured-world/xml-sec/pull/399))
+- *(xml)* build the semantic tree as roxmltree parses ([#396](https://github.com/structured-world/xml-sec/pull/396))
+- *(xml)* reuse the parser's attribute list ([#394](https://github.com/structured-world/xml-sec/pull/394))
+- *(c14n)* reuse the namespace declaration list ([#392](https://github.com/structured-world/xml-sec/pull/392))
+- *(xml)* build the semantic tree as xmloxide parses ([#386](https://github.com/structured-world/xml-sec/pull/386))
+- *(xml)* one lexical pass before the parser ([#381](https://github.com/structured-world/xml-sec/pull/381))
+- *(xslt)* project only changed bindings and uninterned values into SXD ([#380](https://github.com/structured-world/xml-sec/pull/380))
+
 ## [0.5.0](https://github.com/structured-world/xml-sec/compare/v0.4.1...v0.5.0) - 2026-11-03
 
 ### Added
