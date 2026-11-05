@@ -764,7 +764,7 @@ pub fn decode_numeric_character_reference(reference: &str) -> Result<char, Error
         .ok_or_else(|| Error::malformed("invalid XML character reference"))
 }
 
-/// Return whether `character` is in the XML 1.0 `Char` production [2].
+/// Return whether `character` is in the XML 1.0 `Char` production (rule 2).
 /// <https://www.w3.org/TR/xml/#charsets>
 #[must_use]
 pub fn is_xml_1_0_character(character: char) -> bool {
