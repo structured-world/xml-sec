@@ -224,6 +224,14 @@ impl ParseOptions {
     }
 }
 
+/// The node arena reserved before parsing `input_len` bytes: about one node
+/// per 30 source bytes, at most 1024 nodes. A larger document grows the arena
+/// as its nodes arrive, so one made mostly of text reserves for its nodes
+/// rather than its bytes.
+pub(crate) fn initial_node_capacity(input_len: usize) -> usize {
+    (input_len / 30).clamp(64, 1024)
+}
+
 /// Parses an XML string with default options.
 ///
 /// # Errors

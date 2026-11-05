@@ -166,8 +166,9 @@ impl<'input, S: NameStorage> Semantic<'input, S> {
         if options.nodes_limit == 0 {
             return Err(ParseError::NodesLimitReached);
         }
-        // About one node per 30 source bytes, never more than may be admitted.
-        let capacity = (input.len() / 30).max(64).min(options.nodes_limit as usize);
+        // Never more than may be admitted.
+        let capacity =
+            xmloxide::parser::initial_node_capacity(input.len()).min(options.nodes_limit as usize);
         let mut tree = TreeBuilder::new(input, capacity, storage)?;
         let root = tree.push(None, NodeKind::Root, 0..input.len())?;
         Ok(Self {
