@@ -1239,6 +1239,43 @@ impl XmlDocument {
         })
     }
 
+    /// Insert a well-formed XML fragment immediately before one node.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale mutation identities, fragments that are not valid
+    /// in the parent context and input-limit failures without committing a
+    /// generation.
+    pub fn insert_before(
+        &mut self,
+        target: NodeIdentity,
+        fragment: &str,
+    ) -> Result<(), XmlDocumentError> {
+        // The target keeps its exact original bytes after the new fragment, so
+        // the replacement changes nothing but the inserted content.
+        let maximum = self.settings.max_bytes;
+        let replacement = self.with_view(|view| {
+            let range = view.resolve_mutation_node(target)?.range();
+            // The projected document must fit before the copy is made; the
+            // replacement repeats this check on the exact candidate.
+            match view.xml().len().checked_add(fragment.len()) {
+                Some(projected) if projected <= maximum => {}
+                // A sum beyond usize is reported as the largest size there is.
+                projected => {
+                    return Err(XmlDocumentError::DocumentTooLarge {
+                        maximum,
+                        actual: projected.unwrap_or(usize::MAX),
+                    });
+                }
+            }
+            let original = &view.xml()[range];
+            let mut replacement = String::with_capacity(fragment.len() + original.len());
+            replacement.push_str(fragment);
+            replacement.push_str(original);
+            Ok::<_, XmlDocumentError>(replacement)
+        })?;
+        self.replace_node_with_fragment(target, &replacement)
+    }
+
     /// Parse the generation that replaces `target` with `replacement`, then
     /// check on that parse that the replacement stayed inside the target's
     /// slot. Budgeted operations report the node ceiling as a projected limit.
@@ -2256,6 +2293,19 @@ impl<'a> DocumentView<'a> {
             }
         }
         matched.map(|node| self.node_identity_by_id(node))
+    }
+
+    /// Return whether any element declares `value` as an ID, under the same
+    /// classification as [`Self::node_for_id`], including duplicate declarations.
+    #[must_use]
+    pub fn has_id(self, value: &str, registrations: &[IdAttributeRegistration]) -> bool {
+        self.parsed.document.descendants().any(|node| {
+            node.is_element()
+                && node.attributes().any(|attribute| {
+                    attribute.value() == value
+                        && crate::xml::is_id_attribute(node, attribute, registrations)
+                })
+        })
     }
 
     #[cfg(feature = "xmldsig")]
@@ -4550,6 +4600,9 @@ mod replacement_tests;
 
 #[cfg(all(test, feature = "xmldsig-sign"))]
 mod transaction_tests;
+
+#[cfg(test)]
+mod insertion_tests;
 
 // `xmlenc` enables `xmldsig` through `xmldsig-sign`, so every build of this
 // module has the verification policy its tests use.

@@ -764,7 +764,10 @@ pub fn decode_numeric_character_reference(reference: &str) -> Result<char, Error
         .ok_or_else(|| Error::malformed("invalid XML character reference"))
 }
 
-fn is_xml_1_0_character(character: char) -> bool {
+/// Return whether `character` is in the XML 1.0 `Char` production [2].
+/// <https://www.w3.org/TR/xml/#charsets>
+#[must_use]
+pub fn is_xml_1_0_character(character: char) -> bool {
     matches!(character, '\u{9}' | '\u{A}' | '\u{D}' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}')
 }
 
