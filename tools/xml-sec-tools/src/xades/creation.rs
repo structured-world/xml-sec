@@ -1,8 +1,9 @@
 //! `xades creation [--results DIR]`: EU DSS's independent reading of the
 //! signatures xml-sec creates and augments. The `create_probe` example signs
 //! every packaging mode with the creation fixtures, and `augment_probe` adds a
-//! TSA token to a B-B signature with the augmentation fixtures and the CRLs and
-//! OCSP response of the level fixtures to their B-T signature. DSS must
+//! TSA token to a B-B signature with the augmentation fixtures, the CRLs and
+//! OCSP response of the level fixtures to their B-T signature, and, from its
+//! own B-T signature and CRLs, an archive timestamp and its renewal. DSS must
 //! classify each signature at its expected level, find it cryptographically
 //! intact with every reference found and intact, identify the signing
 //! certificate and find every timestamp intact over its message imprint.
@@ -38,7 +39,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 8] = [
+pub(crate) const CASES: [Case; 10] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -58,6 +59,20 @@ pub(crate) const CASES: [Case; 8] = [
         format: "XAdES-BASELINE-LT",
         timestamps: 1,
         fixtures: "levels",
+    },
+    Case {
+        name: "b-lta",
+        signatures: 1,
+        format: "XAdES-BASELINE-LTA",
+        timestamps: 2,
+        fixtures: "augmentation",
+    },
+    Case {
+        name: "b-lta-renewed",
+        signatures: 1,
+        format: "XAdES-BASELINE-LTA",
+        timestamps: 3,
+        fixtures: "augmentation",
     },
 ];
 
@@ -208,6 +223,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         ("create_probe", None, "creation"),
         ("augment_probe", Some("complete"), "augmentation"),
         ("augment_probe", Some("extend"), "levels"),
+        ("augment_probe", Some("archive"), "augmentation"),
     ] {
         let mut probe = line(&[
             &"cargo",

@@ -1,9 +1,9 @@
-//! Native latency of B-T augmentation over the augmentation fixtures
-//! (RSA-SHA256 signer and an OpenSSL TSA under one root), and of B-LT
-//! augmentation over the level fixtures (the same signature at B-T and B-LT,
-//! with OpenSSL CRLs and a delegated OCSP response). Each run gets a fresh
-//! resource account and asserts its result; creating the B-B signature, the
-//! pending request and parsing the B-T document are excluded.
+//! Native latency of B-T and B-LTA augmentation over the augmentation fixtures
+//! (RSA-SHA256 signer, an OpenSSL TSA under one root and an empty CRL of each
+//! CA), and of B-LT augmentation over the level fixtures (the same signature
+//! at B-T and B-LT, with OpenSSL CRLs and a delegated OCSP response). Each run
+//! gets a fresh resource account and asserts its result; preparing the input
+//! document and the pending request is excluded.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use xml_sec::xmldsig::{
 use xml_sec_xades::{
     Assessment, Completion, DataAdded, DataObject, Envelope, Inputs, PendingTimestamp, Request,
     Requirements, Signer, TimestampRequest, ValidationData, add_validation_data,
-    complete_timestamp, create, request_timestamp,
+    complete_timestamp, create, request_archive_timestamp, request_timestamp,
 };
 
 const ROOT: &[u8] = include_bytes!("../tests/fixtures/augmentation/root.der");
@@ -31,6 +31,12 @@ const SIGNER: &[u8] = include_bytes!("../tests/fixtures/augmentation/signer.der"
 const KEY: &str = include_str!("../tests/fixtures/augmentation/signer.key");
 const REQUEST: &[u8] = include_bytes!("../tests/fixtures/augmentation/request.tsq");
 const RESPONSE: &[u8] = include_bytes!("../tests/fixtures/augmentation/response.tsr");
+const CRLS: &[&[u8]] = &[
+    include_bytes!("../tests/fixtures/augmentation/root.crl"),
+    include_bytes!("../tests/fixtures/augmentation/intermediate.crl"),
+];
+const ARCHIVE_REQUEST: &[u8] = include_bytes!("../tests/fixtures/augmentation/archive.tsq");
+const ARCHIVE_RESPONSE: &[u8] = include_bytes!("../tests/fixtures/augmentation/archive.tsr");
 const LEVELS_ROOT: &[u8] = include_bytes!("../tests/fixtures/levels/root.der");
 const B_T: &str = include_str!("../tests/fixtures/levels/b-t.xml");
 const B_LT: &str = include_str!("../tests/fixtures/levels/b-lt.xml");
@@ -196,6 +202,120 @@ fn complete_signature_timestamp(bencher: divan::Bencher) {
                     )
                 })
                 .expect("B-T completion");
+            assert!(document.generation() > generation);
+            (document, pending, work)
+        });
+}
+
+/// The caller's evidence for the archive steps: the chain and both CRLs.
+fn long_term_inputs(setup: &Setup, requirements: Requirements) -> Inputs<'_> {
+    Inputs {
+        requirements,
+        anchors: &[ROOT],
+        certificates: &[INTERMEDIATE],
+        utc: &setup.utc,
+        accuracies: &[],
+        responders: &[],
+        crls: CRLS,
+        responses: &[],
+    }
+}
+
+/// The created signature, completed to B-T and given its CRLs: B-LT.
+fn long_term(setup: &Setup) -> XmlDocument {
+    let mut document = setup.created();
+    let pending = setup.request(&document, &account());
+    setup
+        .with(|assessment| {
+            complete_timestamp(
+                &mut document,
+                &pending,
+                RESPONSE,
+                &Completion {
+                    assessment,
+                    inputs: &long_term_inputs(setup, Requirements::Timestamped),
+                    window: None,
+                    id_attributes: &[],
+                },
+                &account(),
+            )?;
+            add_validation_data(
+                &mut document,
+                &ValidationData {
+                    signature: "sig",
+                    assessment,
+                    inputs: &long_term_inputs(setup, Requirements::LongTerm),
+                    id_attributes: &[],
+                },
+                &account(),
+            )
+        })
+        .expect("B-LT document");
+    document
+}
+
+const ARCHIVE: TimestampRequest<'static> = TimestampRequest {
+    signature: "sig",
+    digest: Algorithm::Sha256,
+    policy: None,
+    nonce: Some(NONCE),
+    id_attributes: &[],
+};
+
+/// The B-LT assessment that gates an archive request, the archive input and
+/// its digest, and the DER request.
+#[divan::bench]
+fn request_archive(bencher: divan::Bencher) {
+    let setup = Setup::new();
+    let document = long_term(&setup);
+    let inputs = long_term_inputs(&setup, Requirements::LongTerm);
+    bencher.with_inputs(account).bench_local_values(|work| {
+        let pending = setup
+            .with(|assessment| {
+                request_archive_timestamp(&document, &ARCHIVE, assessment, &inputs, &work)
+            })
+            .expect("archive request");
+        assert_eq!(pending.request(), ARCHIVE_REQUEST);
+        (pending, work)
+    });
+}
+
+/// The B-LT assessment of the unchanged generation, the response check
+/// against the request and the archive input, staging, and the verification
+/// and B-LTA assessment that gate publication.
+#[divan::bench]
+fn complete_archive(bencher: divan::Bencher) {
+    let setup = Setup::new();
+    let gate = long_term_inputs(&setup, Requirements::LongTerm);
+    let inputs = long_term_inputs(&setup, Requirements::Archival);
+    bencher
+        .with_inputs(|| {
+            let document = long_term(&setup);
+            let pending = setup
+                .with(|assessment| {
+                    request_archive_timestamp(&document, &ARCHIVE, assessment, &gate, &account())
+                })
+                .expect("archive request");
+            (document, pending, account())
+        })
+        .bench_local_values(|(mut document, pending, work)| {
+            let generation = document.generation();
+            setup
+                .with(|assessment| {
+                    complete_timestamp(
+                        &mut document,
+                        &pending,
+                        ARCHIVE_RESPONSE,
+                        &Completion {
+                            assessment,
+                            inputs: &inputs,
+                            window: None,
+                            id_attributes: &[],
+                        },
+                        &work,
+                    )
+                })
+                .expect("archive completion");
             assert!(document.generation() > generation);
             (document, pending, work)
         });

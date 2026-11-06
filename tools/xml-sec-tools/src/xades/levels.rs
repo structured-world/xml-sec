@@ -93,8 +93,8 @@ fn element(xml: &str, open: &str, close: &str) -> Result<String, String> {
 }
 
 /// A signed document and its PKI in one scratch directory.
-struct Levels<'a> {
-    generator: &'a Generator,
+pub(super) struct Levels<'a> {
+    pub(super) generator: &'a Generator,
 }
 
 impl Levels<'_> {
@@ -179,7 +179,7 @@ impl Levels<'_> {
     }
 
     /// An empty complete CRL of `issuer`, as DER.
-    fn crl(&self, issuer: &str) -> Result<Vec<u8>, String> {
+    pub(super) fn crl(&self, issuer: &str) -> Result<Vec<u8>, String> {
         self.crl_listing(issuer, "")
     }
 

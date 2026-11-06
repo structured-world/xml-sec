@@ -91,7 +91,11 @@ verification and B-T assessment that gate publication); creating the signature
 and the pending request is outside the timer. It also measures B-LT augmentation
 of the B-T level fixture with the CRLs and OCSP response issued for its PKI: the
 B-LT census, staging the missing values, and the verification and B-LT
-assessment that gate publication. These are native measurements
+assessment that gate publication. The two halves of B-LTA augmentation run over
+the augmentation signature at B-LT: the archive request (B-LT assessment,
+archive input, imprint and DER request) and its completion (B-LT assessment of
+the unchanged generation, response check, staging, and the verification and
+B-LTA assessment that gate publication). These are native measurements
 only; comparison with EU DSS needs qualified equivalent operations and
 separates JVM metrics.
 

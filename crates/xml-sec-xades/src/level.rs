@@ -67,32 +67,29 @@ pub enum NoCredential {}
 /// holds, not that a status is usable, a chronology holds or a signer is trusted.
 pub type Level<'a> = Assessment<'a, NoCredential, N, D, G>;
 
-/// The caller side of one level validation.
-pub(crate) trait Visit: Sized {
+/// The caller side of one level validation in the session's execution `W`.
+pub(crate) trait Visit<W: Work>: Sized {
     /// What the visitor makes of the validation.
     type Output;
 
-    /// Read the reports of the requested level.
-    fn level(self, level: &Level<'_>) -> Self::Output;
+    /// Read the reports of the requested level, with the stage they belong to.
+    fn level(self, stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output;
 
     /// Read the material census of a B-LT or B-LTA request before its level is
     /// assessed, or give the visitor back to let the validation continue.
     #[cfg(feature = "produce")]
-    fn census<W: Work>(
-        self,
-        _census: &Census<'_, '_, '_, '_, '_, '_, '_, W>,
-    ) -> Result<Self::Output, Self> {
+    fn census(self, _census: &Census<'_, '_, '_, '_, '_, '_, '_, W>) -> Result<Self::Output, Self> {
         Err(self)
     }
 }
 
-impl<F, R> Visit for F
+impl<W: Work, F, R> Visit<W> for F
 where
     F: for<'a> FnOnce(&Level<'a>) -> R,
 {
     type Output = R;
 
-    fn level(self, level: &Level<'_>) -> R {
+    fn level(self, _stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> R {
         self(level)
     }
 }
@@ -206,7 +203,7 @@ pub fn validate<W: Work, R>(
 }
 
 /// [`validate`] for any [`Visit`]or.
-pub(crate) fn validate_with<W: Work, V: Visit>(
+pub(crate) fn validate_with<W: Work, V: Visit<W>>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signature: N,
     inputs: &Inputs<'_>,
@@ -233,7 +230,7 @@ pub(crate) fn validate_with<W: Work, V: Visit>(
             if requirements == Requirements::Basic {
                 let level =
                     baseline::assess(Evidence::Basic(basic)).map_err(ValidationError::Level)?;
-                return Ok(Outcome::Assessed(visitor.level(&level)));
+                return Ok(Outcome::Assessed(visitor.level(stage, &level)));
             }
             timed(stage, basic, inputs, visitor)
         },
@@ -265,7 +262,7 @@ struct Pools<'p, 't> {
     view: &'p Material<'t>,
 }
 
-fn timed<W: Work, V: Visit>(
+fn timed<W: Work, V: Visit<W>>(
     stage: &Stage<'_, '_, '_, '_, W>,
     basic: &Report<'_>,
     inputs: &Inputs<'_>,
@@ -522,7 +519,7 @@ macro_rules! token_fact {
     };
 }
 
-fn frozen<W: Work, V: Visit>(
+fn frozen<W: Work, V: Visit<W>>(
     stage: &Stage<'_, '_, '_, '_, W>,
     basic: &Report<'_>,
     inputs: &Inputs<'_>,
@@ -608,7 +605,7 @@ fn frozen<W: Work, V: Visit>(
     if inputs.requirements == Requirements::Timestamped {
         let level =
             baseline::assess(Evidence::Timestamped(&timed)).map_err(ValidationError::Level)?;
-        return Ok(Outcome::Assessed(visitor.level(&level)));
+        return Ok(Outcome::Assessed(visitor.level(stage, &level)));
     }
     long_term(
         &Chain {
@@ -726,7 +723,7 @@ fn status_sources<'p, 't: 'p>(
 }
 
 /// Every participant's status, its incorporation and, for B-LTA, each archive.
-fn long_term<W: Work, V: Visit>(
+fn long_term<W: Work, V: Visit<W>>(
     chain: &Chain<'_, '_, '_, '_, '_, '_, W>,
     visitor: V,
 ) -> Result<Outcome<V::Output>, ValidationError> {
@@ -780,6 +777,8 @@ fn long_term<W: Work, V: Visit>(
                     credentials: &credentials,
                     participants: &participants,
                     index: &index,
+                    #[cfg(feature = "produce")]
+                    carried: &carried,
                     statuses,
                     nodes,
                 },
@@ -799,6 +798,9 @@ struct Assessed<'a, W: Work> {
     credentials: &'a Credentials<'a>,
     participants: &'a Actors<'a>,
     index: &'a Index<'a, N, D, G, W>,
+    /// The revocation material the document's tokens carry in their CMS.
+    #[cfg(feature = "produce")]
+    carried: &'a CarriedMaterial<'a, N, D, G>,
     statuses: &'a [&'a PathStatuses<'a, 'a, 'a>],
     nodes: &'a [AuthorityNode<'a, 'a, 'a>],
 }
@@ -808,7 +810,7 @@ fn placement_error(error: impl core::fmt::Debug) -> ValidationError {
 }
 
 /// The B-LT reports, and the B-LTA census when the request asks for it.
-fn material_level<W: Work, V: Visit>(
+fn material_level<W: Work, V: Visit<W>>(
     chain: &Chain<'_, '_, '_, '_, '_, '_, W>,
     facts: &Assessed<'_, W>,
     visitor: V,
@@ -829,7 +831,11 @@ fn material_level<W: Work, V: Visit>(
     )
     .map_err(placement_error)?;
     #[cfg(feature = "produce")]
-    let visitor = match visitor.census(&Census { chain, x509: &x509 }) {
+    let visitor = match visitor.census(&Census {
+        chain,
+        carried: facts.carried,
+        x509: &x509,
+    }) {
         Ok(output) => return Ok(Outcome::Assessed(output)),
         Err(visitor) => visitor,
     };
@@ -848,7 +854,7 @@ fn material_level<W: Work, V: Visit>(
     if chain.inputs.requirements == Requirements::LongTerm {
         let level =
             baseline::assess(Evidence::LongTerm(&long_term)).map_err(ValidationError::Level)?;
-        return Ok(Outcome::Assessed(visitor.level(&level)));
+        return Ok(Outcome::Assessed(visitor.level(stage, &level)));
     }
     archival(chain, facts, &long_term, visitor)
 }
@@ -857,6 +863,7 @@ fn material_level<W: Work, V: Visit>(
 #[cfg(feature = "produce")]
 pub(crate) struct Census<'r, 'c, 'a, 'v, 's, 'i, 't, W: Work> {
     chain: &'r Chain<'c, 'a, 'v, 's, 'i, 't, W>,
+    carried: &'r CarriedMaterial<'r, N, D, G>,
     x509: &'r material::Checks<'r, 'r, 'r, 'r, 'r, N, D, G>,
 }
 
@@ -872,10 +879,11 @@ impl<'r, 'c, 'a, 'v, 's, 'i, W: Work> Census<'r, 'c, 'a, 'v, 's, 'i, '_, W> {
         self.x509
     }
 
-    /// The whole `OCSPResponse` that carries `basic`, the caller's or one the
-    /// document incorporates. The census refers to the very payload bytes
-    /// it was given, so their identity finds the envelope.
-    pub(crate) fn envelope(&self, basic: &BasicResponse<'_>) -> Option<&'c ResponseBytes<'c>> {
+    /// The whole `OCSPResponse` that carries `basic`: the caller's, one the
+    /// document incorporates, or one a token carries in its CMS. The census
+    /// refers to the very payload bytes it was given, so their identity finds
+    /// the envelope.
+    pub(crate) fn envelope(&self, basic: &BasicResponse<'_>) -> Option<&'r ResponseBytes<'r>> {
         let same =
             |response: &BasicResponse<'_>| core::ptr::eq(response.as_bytes(), basic.as_bytes());
         let external = self.chain.external;
@@ -883,14 +891,28 @@ impl<'r, 'c, 'a, 'v, 's, 'i, W: Work> Census<'r, 'c, 'a, 'v, 's, 'i, '_, W> {
             return external.envelopes.get(position);
         }
         let view = self.chain.pools.view;
-        let carried = view
+        if let Some(incorporated) = view
             .basic_responses()
             .iter()
-            .find(|carried| same(carried.response()))?;
-        match &view.values().get(carried.source_index())?.value {
-            Value::Ocsp(Response::Successful(envelope)) => Some(envelope),
-            _ => None,
+            .find(|incorporated| same(incorporated.response()))
+        {
+            return match &view.values().get(incorporated.source_index())?.value {
+                Value::Ocsp(Response::Successful(envelope)) => Some(envelope),
+                _ => None,
+            };
         }
+        // A token's basic response and its envelope share one CMS choice.
+        let origin = self
+            .carried
+            .basic_responses()
+            .iter()
+            .find(|carried| same(&carried.value))?
+            .origin;
+        self.carried
+            .responses()
+            .iter()
+            .find(|carried| carried.origin == origin)
+            .map(|carried| &carried.value)
     }
 }
 
@@ -967,7 +989,7 @@ fn archive_inputs<'c, W: Work>(
 }
 
 /// The census of every root archive, each over its own earlier scope.
-fn archival<W: Work, V: Visit>(
+fn archival<W: Work, V: Visit<W>>(
     chain: &Chain<'_, '_, '_, '_, '_, '_, W>,
     facts: &Assessed<'_, W>,
     long_term: &LongTermReport<'_>,
@@ -1065,7 +1087,7 @@ fn archival<W: Work, V: Visit>(
         archives: &archives,
     })
     .map_err(ValidationError::Level)?;
-    Ok(Outcome::Assessed(visitor.level(&level)))
+    Ok(Outcome::Assessed(visitor.level(stage, &level)))
 }
 
 /// The checked path of every path actor of `participants`, in census order.
