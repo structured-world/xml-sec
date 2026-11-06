@@ -8,6 +8,7 @@
 //! and publishes the new generation only after it meets the requested level.
 //! Nothing is fetched and no clock is read here.
 
+use crate::accuracy;
 use crate::basic::{Outcome, Stage, ValidationError, with_stage};
 use crate::create::Assessment;
 use crate::draft::{Draft, DraftError};
@@ -522,6 +523,8 @@ fn timestamped<W: Work>(
     let (certificate, certificate_parent) =
         authority(token, &carrier, [&supplied, &anchors], stage.operation)?
             .ok_or(AugmentError::MissingAuthority)?;
+    let stated = accuracy::read(parser, completion.inputs.accuracies)?;
+    let policy_accuracy = accuracy::select_outside(&stated, token, &carrier, stage.operation)?;
     let context = CheckContext {
         certificate,
         certificate_parent,
@@ -535,9 +538,9 @@ fn timestamped<W: Work>(
         // cannot timestamp it at that time.
         reference: Some(stage.signer_time),
         window: completion.window,
-        // RFC 3161 §2.4.2: policy accuracy only answers an absent field; the
-        // level validation of the new generation applies the caller's.
-        policy_accuracy: None,
+        // RFC 3161 §2.4.2: the caller's policy accuracy answers only an
+        // absent field, as in the level validation of the new generation.
+        policy_accuracy,
     };
     let cms = stage.session.cms_provider();
     let augmentation = Augmentation::new(stage.document, stage.prepared);

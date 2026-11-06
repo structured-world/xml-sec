@@ -13,7 +13,9 @@ use std::sync::Arc;
 use structured_asn1::Oid;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_cms::timestamp::response::Status;
-use structured_cms::timestamp::{ImprintAgreement, RequestAgreement, RequestWindow, Timeliness};
+use structured_cms::timestamp::{
+    Accuracy, ImprintAgreement, PolicyAccuracy, RequestAgreement, RequestWindow, Timeliness,
+};
 use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::{Instant as UtcInstant, LeapTable};
 use xml_sec::XmlDocument;
@@ -24,9 +26,10 @@ use xml_sec::xmldsig::{
     UriTypeSet, VerificationRequest, VerifyContext, with_verified_request,
 };
 use xml_sec_xades::{
-    Assessment, AugmentError, Completion, Countersignature, DataObject, Envelope, Inputs, Outcome,
-    PendingTimestamp, Request, Requirements, Signer, TimestampFailure, TimestampRequest,
-    TokenFacts, complete_timestamp, countersign, create, request_timestamp, validate,
+    Assessment, AugmentError, AuthorityAccuracy, Completion, Countersignature, DataObject,
+    Envelope, Inputs, Outcome, PendingTimestamp, Request, Requirements, Signer, TimestampFailure,
+    TimestampRequest, TokenFacts, complete_timestamp, countersign, create, request_timestamp,
+    validate,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/augmentation/root.der");
@@ -41,6 +44,11 @@ const RESPONSE_NO_NONCE: &[u8] = include_bytes!("fixtures/augmentation/response-
 const RESPONSE_OTHER_IMPRINT: &[u8] =
     include_bytes!("fixtures/augmentation/response-other-imprint.tsr");
 const RESPONSE_REJECTED: &[u8] = include_bytes!("fixtures/augmentation/response-rejected.tsr");
+const RESPONSE_NO_ACCURACY: &[u8] =
+    include_bytes!("fixtures/augmentation/response-no-accuracy.tsr");
+const TSA: &[u8] = include_bytes!("fixtures/augmentation/tsa.der");
+/// `1.3.6.1.4.1.13762.3`, the policy of the test TSA.
+const TSA_POLICY: &[u8] = &[0x2b, 0x06, 0x01, 0x04, 0x01, 0xeb, 0x42, 0x03];
 const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
@@ -78,6 +86,7 @@ struct Given<'a> {
     requirements: Requirements,
     anchors: &'a [&'a [u8]],
     certificates: &'a [&'a [u8]],
+    accuracies: &'a [AuthorityAccuracy<'a>],
     window: Option<RequestWindow>,
 }
 
@@ -85,6 +94,7 @@ const B_T: Given<'static> = Given {
     requirements: Requirements::Timestamped,
     anchors: &[ROOT],
     certificates: &[INTERMEDIATE],
+    accuracies: &[],
     window: None,
 };
 
@@ -193,7 +203,7 @@ impl Fixture {
             anchors: given.anchors,
             certificates: given.certificates,
             utc: &utc,
-            accuracies: &[],
+            accuracies: given.accuracies,
             responders: &[],
             crls: &[],
             responses: &[],
@@ -429,21 +439,77 @@ fn without_a_nonce_only_a_caller_window_proves_freshness() {
         |document| fixture.complete(document, &pending, RESPONSE_NO_NONCE, B_T, &account()),
         |error| unproven(error).is_some_and(|facts| facts.timeliness == Timeliness::Unverified),
     );
-    // 2026-01-01 to 2045-01-01, the fixtures' certificate validity.
-    let window = RequestWindow::for_unique_imprint(
-        UtcInstant::new(1_767_225_600, 0).expect("instant"),
-        UtcInstant::new(2_366_841_600, 0).expect("instant"),
-    );
     fixture
         .complete(
             &mut document,
             &pending,
             RESPONSE_NO_NONCE,
-            Given { window, ..B_T },
+            Given {
+                window: validity(),
+                ..B_T
+            },
             &account(),
         )
         .expect("completion within the window");
     assert!(fixture.meets_timestamped(document.as_xml()));
+}
+
+/// 2026-01-01 to 2045-01-01, the fixtures' certificate validity, as the
+/// caller's window for its uniquely outstanding request.
+fn validity() -> Option<RequestWindow> {
+    RequestWindow::for_unique_imprint(
+        UtcInstant::new(1_767_225_600, 0).expect("instant"),
+        UtcInstant::new(2_366_841_600, 0).expect("instant"),
+    )
+}
+
+#[test]
+fn caller_policy_accuracy_bounds_a_token_that_states_none() {
+    // RFC 3161 §2.4.2: without the token's accuracy field the TSA policy
+    // defines it, and the caller states it. A window proves freshness only
+    // when the token's whole generation interval is known to lie inside it.
+    let fixture = Fixture::new();
+    let mut document = fixture.created();
+    let pending = fixture
+        .request(&document, None, None, &account())
+        .expect("request");
+    let unstated = Given {
+        window: validity(),
+        ..B_T
+    };
+    refused(
+        &mut document,
+        |document| {
+            fixture.complete(
+                document,
+                &pending,
+                RESPONSE_NO_ACCURACY,
+                unstated,
+                &account(),
+            )
+        },
+        |error| {
+            unproven(error)
+                .is_some_and(|facts| matches!(facts.timeliness, Timeliness::Uncertain(_)))
+        },
+    );
+    let accuracies = [AuthorityAccuracy {
+        authority: TSA,
+        stated: PolicyAccuracy::new(Oid::from_bytes(TSA_POLICY), Accuracy::new(1, 0, 0))
+            .expect("accuracy"),
+    }];
+    fixture
+        .complete(
+            &mut document,
+            &pending,
+            RESPONSE_NO_ACCURACY,
+            Given {
+                accuracies: &accuracies,
+                ..unstated
+            },
+            &account(),
+        )
+        .expect("completion with the stated accuracy");
 }
 
 #[test]

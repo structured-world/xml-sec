@@ -10,15 +10,23 @@ use super::{Corpus, line, read, write};
 
 const TSA_EXTENSIONS: &str = "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=critical,timeStamping\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n";
 
-/// Each request the probe writes and the response the TSA gives to it.
-const ANSWERED: [(&str, &str); 2] = [
-    ("request.tsq", "response.tsr"),
-    ("request-no-nonce.tsq", "response-no-nonce.tsr"),
+/// Each request the probe writes, the response the TSA gives to it, and
+/// whether its token states the accuracy RFC 3161 §2.4.2 makes optional.
+const ANSWERED: [(&str, &str, bool); 3] = [
+    ("request.tsq", "response.tsr", true),
+    ("request-no-nonce.tsq", "response-no-nonce.tsr", true),
+    ("request-no-nonce.tsq", "response-no-accuracy.tsr", false),
 ];
 
 /// The TSA's reply to `query`, as a whole DER `TimeStampResp`.
-fn reply(generator: &Generator, query: &str, response: &str) -> Result<(), String> {
-    generator.write_tsa()?;
+fn reply(generator: &Generator, query: &str, response: &str, accuracy: bool) -> Result<(), String> {
+    let config = if accuracy {
+        TSA_CONFIG.to_owned()
+    } else {
+        TSA_CONFIG.replace("accuracy=secs:1\n", "")
+    };
+    write(&generator.work.join("tsa.serial"), "01\n")?;
+    write(&generator.work.join("tsa.cnf"), config)?;
     generator.openssl(&[
         "ts",
         "-reply",
@@ -33,13 +41,6 @@ fn reply(generator: &Generator, query: &str, response: &str) -> Result<(), Strin
         &generator.output.join(response),
         read(&generator.work.join(response))?,
     )
-}
-
-impl Generator {
-    fn write_tsa(&self) -> Result<(), String> {
-        write(&self.work.join("tsa.serial"), "01\n")?;
-        write(&self.work.join("tsa.cnf"), TSA_CONFIG)
-    }
 }
 
 /// Issues the chain and the TSA, then writes the requests and every response.
@@ -89,8 +90,8 @@ pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), Str
             read(&generator.work.join(name))?,
         )?;
     }
-    for (query, response) in ANSWERED {
-        reply(generator, query, response)?;
+    for (query, response, accuracy) in ANSWERED {
+        reply(generator, query, response, accuracy)?;
     }
     // A token over other data, and a rejection: the TSA issues only SHA-256
     // imprints (RFC 3161 §2.4.2 badAlg).
@@ -110,7 +111,7 @@ pub(crate) fn generate(corpus: &Corpus, generator: &Generator) -> Result<(), Str
             "-out",
             query,
         ])?;
-        reply(generator, query, response)?;
+        reply(generator, query, response, true)?;
     }
     Ok(())
 }
