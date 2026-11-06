@@ -1,6 +1,8 @@
 //! [`XmlDocument::carry`]: node identities across the commits of a transaction.
 
-use super::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError, carried_range};
+use core::ops::Range;
+
+use super::{Alignments, DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
 
 fn root(view: DocumentView<'_>) -> NodeIdentity {
     view.root_element()
@@ -147,19 +149,28 @@ fn a_text_node_is_not_carried() {
     );
 }
 
+fn carried(
+    old: &str,
+    new: &str,
+    range: Range<usize>,
+    content: Option<&Range<usize>>,
+) -> Option<Range<usize>> {
+    Alignments::new(old, new).carried(&range, content)
+}
+
 #[test]
 fn an_element_is_placed_by_the_alignment_that_keeps_it_whole() {
     // Appending "<n/>" to r: the prefix-first alignment cuts into r's end tag
     // and the suffix-first one into a's empty tag; each keeps one of them whole.
     let (old, new) = ("<r><a/></r>", "<r><a/><n/></r>");
-    assert_eq!(carried_range(old, new, 3..7, None), Some(3..7));
-    assert_eq!(carried_range(old, new, 0..11, Some(&(3..7))), Some(0..15));
+    assert_eq!(carried(old, new, 3..7, None), Some(3..7));
+    assert_eq!(carried(old, new, 0..11, Some(&(3..7))), Some(0..15));
     // A change inside an empty element's tag leaves no element whole.
     let (old, new) = ("<r><a/><b/><c/></r>", "<r><a/><bb/><c/></r>");
-    assert_eq!(carried_range(old, new, 11..15, None), Some(12..16));
-    assert_eq!(carried_range(old, new, 7..11, None), None);
+    assert_eq!(carried(old, new, 11..15, None), Some(12..16));
+    assert_eq!(carried(old, new, 7..11, None), None);
     // Identical texts change nothing.
-    assert_eq!(carried_range(old, old, 7..11, None), Some(7..11));
+    assert_eq!(carried(old, old, 7..11, None), Some(7..11));
 }
 
 #[test]
@@ -167,5 +178,62 @@ fn of_two_equal_siblings_neither_is_carried() {
     // Inserting "<a/>" next to "<a/>" reads as an insertion before or after
     // it; the original could be either copy.
     let (old, new) = ("<r><a/></r>", "<r><a/><a/></r>");
-    assert_eq!(carried_range(old, new, 3..7, None), None);
+    assert_eq!(carried(old, new, 3..7, None), None);
+    // Removing one of two equal siblings reads as removing either: one
+    // alignment keeps the first and removes the second, the other the
+    // reverse, so neither original may stand for the survivor.
+    let (old, new) = ("<r><a/><a/></r>", "<r><a/></r>");
+    assert_eq!(carried(old, new, 3..7, None), None);
+    assert_eq!(carried(old, new, 7..11, None), None);
+}
+
+#[test]
+fn identities_carry_in_one_pass_in_place() {
+    // Several identities of one generation, a repeated one included, are
+    // carried together; each keeps its position in the slice.
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let ids = ["after", "before", "after", "x"];
+    let mut identities: Vec<NodeIdentity> = ids.iter().map(|id| element(&document, id)).collect();
+    document
+        .transaction(|document| {
+            let parent = element(document, "parent");
+            document.append_child(parent, "<new/>")?;
+            document.carry_all(&mut identities)?;
+            for (id, identity) in ids.iter().zip(&identities) {
+                assert_eq!(*identity, element(document, id), "{id}");
+            }
+            Ok::<_, XmlDocumentError>(())
+        })
+        .expect("transaction succeeds");
+}
+
+#[test]
+fn identities_of_an_outer_start_carry_inside_and_after_inner_transactions() {
+    // The outer transaction keeps its starting text across inner ones, those
+    // that succeed and those that roll back, so its identities stay carried.
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let before = element(&document, "before");
+    document
+        .transaction(|document| {
+            let parent = element(document, "parent");
+            document.append_child(parent, "<one/>")?;
+            document.transaction(|document| {
+                let parent = element(document, "parent");
+                document.append_child(parent, "<two/>")?;
+                assert_eq!(document.carry(before)?, element(document, "before"));
+                Ok::<_, XmlDocumentError>(())
+            })?;
+            let rolled_back = document.transaction(|document| {
+                let parent = element(document, "parent");
+                document.append_child(parent, "<three/>")?;
+                Err::<(), _>(XmlDocumentError::MissingNode)
+            });
+            assert!(rolled_back.is_err());
+            assert_eq!(document.carry(before)?, element(document, "before"));
+            let parent = element(document, "parent");
+            document.append_child(parent, "<four/>")?;
+            assert_eq!(document.carry(before)?, element(document, "before"));
+            Ok::<_, XmlDocumentError>(())
+        })
+        .expect("transaction succeeds");
 }

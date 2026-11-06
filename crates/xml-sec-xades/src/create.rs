@@ -11,7 +11,7 @@ use crate::basic::{Outcome, ValidationError, validate_basic};
 use crate::draft::{Draft, DraftError};
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use structured_asn1::Parser;
-use structured_asn1::memory::{MemoryError, Work};
+use structured_asn1::memory::{MemoryError, OwnedVec, Work};
 use structured_pkix::Certificate;
 use structured_xades::produce::{self, ReferenceKind};
 use xml_sec::IdAttributeRegistration;
@@ -606,7 +606,7 @@ fn assess<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<(), CreateError> {
-    let carried = Carried::new(document, assessment.request)?;
+    let carried = Carried::new::<_, CreateError>(document, assessment.request, work)?;
     let outcome = with_verified_request(
         document,
         assessment.context,
@@ -636,36 +636,68 @@ fn assess<W: Work>(
 /// The node requirements of a verification request, carried into the current
 /// generation of a document inside the transaction that changed it.
 pub(crate) struct Carried<'k> {
-    targets: Vec<NodeIdentity>,
-    keys: Vec<CallerTrustedSignatureKey<'k>>,
+    /// The carried targets, then the carried signatures of the keys.
+    identities: OwnedVec<NodeIdentity>,
+    targets: usize,
+    keys: OwnedVec<CallerTrustedSignatureKey<'k>>,
 }
 
 impl<'k> Carried<'k> {
-    /// Carry every expected target and trusted key's signature of `request`.
+    /// Carry every expected target and trusted key's signature of `request`
+    /// in one pass, paid for by `work` before it starts.
+    ///
+    /// The request's own cardinality limits are the verification's to
+    /// enforce; the carrying in front of it is linear in the document and the
+    /// number of entries, and charged here, so an oversized request spends
+    /// the caller's budget rather than unaccounted work.
     ///
     /// # Errors
     /// The document's refusal when an element no longer has a counterpart, as
-    /// when the transaction replaced it.
-    pub(crate) fn new(
+    /// when the transaction replaced it, or the account's refusal of the work
+    /// or storage.
+    pub(crate) fn new<W: Work, E>(
         document: &XmlDocument,
         request: &VerificationRequest<'k>,
-    ) -> Result<Self, XmlDocumentError> {
-        let targets = request
-            .expected_targets
-            .iter()
-            .map(|target| document.carry(*target))
-            .collect::<Result<_, _>>()?;
-        let keys = request
-            .trusted_keys
-            .iter()
-            .map(|entry| {
-                Ok(CallerTrustedSignatureKey {
-                    signature: document.carry(entry.signature)?,
-                    key: entry.key,
-                })
-            })
-            .collect::<Result<_, XmlDocumentError>>()?;
-        Ok(Self { targets, keys })
+        work: &W,
+    ) -> Result<Self, E>
+    where
+        E: From<XmlDocumentError> + From<MemoryError>,
+    {
+        let (targets, keys) = (request.expected_targets, request.trusted_keys);
+        let entries = targets.len() + keys.len();
+        let mut identities = work.memory().vector();
+        if entries > 0 {
+            // The comparison reads the starting and current texts once and
+            // the walk visits the current tree once, each about the size of
+            // the document, then every entry is placed once.
+            let bytes = (document.as_xml().len() as u64)
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(entries as u64))
+                .ok_or(MemoryError::WorkExceeded)?;
+            work.charge_work(bytes)?;
+            identities.try_reserve_exact(entries)?;
+            for identity in targets
+                .iter()
+                .chain(keys.iter().map(|entry| &entry.signature))
+            {
+                identities.try_push(*identity)?;
+            }
+        }
+        let mut identities = identities.into_owned();
+        document.carry_all(&mut identities)?;
+        let mut carried = work.memory().vector();
+        carried.try_reserve_exact(keys.len())?;
+        for (entry, signature) in keys.iter().zip(&identities[targets.len()..]) {
+            carried.try_push(CallerTrustedSignatureKey {
+                signature: *signature,
+                key: entry.key,
+            })?;
+        }
+        Ok(Self {
+            identities,
+            targets: targets.len(),
+            keys: carried.into_owned(),
+        })
     }
 
     /// `request` with the carried targets and keys.
@@ -674,7 +706,7 @@ impl<'k> Carried<'k> {
         request: &VerificationRequest<'a>,
     ) -> VerificationRequest<'a> {
         VerificationRequest {
-            expected_targets: &self.targets,
+            expected_targets: &self.identities[..self.targets],
             trusted_keys: &self.keys,
             external_resources: request.external_resources,
             signatures: request.signatures,

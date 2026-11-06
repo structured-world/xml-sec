@@ -702,75 +702,119 @@ pub struct XmlDocument {
     issued: u64,
 }
 
-/// The generation an all-or-nothing mutation started from, kept from its first
-/// commit on, so that no copy of the document is parsed in advance.
-#[cfg(feature = "xmldsig-sign")]
-/// Where the element at `range` of `old` stands in `new`, when every change
-/// between them lies outside it or inside its `content` (absent for an empty
-/// element).
+/// Every minimal alignment of the change between two texts.
 ///
-/// One change between two texts aligns several ways when bytes repeat around
-/// it: from the longest common prefix, then the longest common suffix after
-/// it, or the other way round, and anything between. An element that one of
-/// the two extreme alignments leaves whole is the same element in `new`; when
-/// both leave it whole but in different places, as for two equal siblings,
-/// which one it is cannot be told, and it is not carried.
+/// One change aligns several ways when bytes repeat around it. The longest
+/// common prefix taken first and the longest common suffix taken first are
+/// the two extremes; every alignment between them shifts the same changed
+/// span of the old text, `span` bytes long, to start anywhere from `low` to
+/// `high`. The same new bytes replace it wherever it starts.
 #[cfg(feature = "xmldsig-sign")]
-fn carried_range(
-    old: &str,
-    new: &str,
-    range: Range<usize>,
-    content: Option<&Range<usize>>,
-) -> Option<Range<usize>> {
-    let (old, new) = (old.as_bytes(), new.as_bytes());
-    let common = |left: &[u8], right: &[u8]| {
-        left.iter()
-            .zip(right)
-            .take_while(|(left, right)| left == right)
-            .count()
-    };
-    let common_end = |left: &[u8], right: &[u8]| {
-        left.iter()
-            .rev()
-            .zip(right.iter().rev())
-            .take_while(|(left, right)| left == right)
-            .count()
-    };
-    let prefix_first = common(old, new);
-    let prefix_first = (
-        prefix_first,
-        common_end(&old[prefix_first..], &new[prefix_first..]),
-    );
-    let suffix_first = common_end(old, new);
-    let suffix_first = (
-        common(
-            &old[..old.len() - suffix_first],
-            &new[..new.len() - suffix_first],
-        ),
-        suffix_first,
-    );
-    let place = |(prefix, suffix): (usize, usize)| {
-        let changed = old.len() - suffix;
-        // `suffix` bytes end both texts, so a position past `changed` keeps
-        // its distance from the end and none of these subtractions can wrap.
-        let moved = |position: usize| new.len() - (old.len() - position);
-        if range.end <= prefix {
-            Some(range.clone())
-        } else if range.start >= changed {
-            Some(moved(range.start)..moved(range.end))
-        } else if content.is_some_and(|content| content.start <= prefix && changed <= content.end) {
-            Some(range.start..moved(range.end))
-        } else {
-            None
+struct Alignments {
+    old: usize,
+    new: usize,
+    /// The extremes do not shift one span, so no alignment is trusted.
+    family: Option<Family>,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+struct Family {
+    low: usize,
+    high: usize,
+    span: usize,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl Alignments {
+    fn new(old: &str, new: &str) -> Self {
+        let (old, new) = (old.as_bytes(), new.as_bytes());
+        let common = |left: &[u8], right: &[u8]| {
+            left.iter()
+                .zip(right)
+                .take_while(|(left, right)| left == right)
+                .count()
+        };
+        let common_end = |left: &[u8], right: &[u8]| {
+            left.iter()
+                .rev()
+                .zip(right.iter().rev())
+                .take_while(|(left, right)| left == right)
+                .count()
+        };
+        let high = common(old, new);
+        let after_high = common_end(&old[high..], &new[high..]);
+        let suffix = common_end(old, new);
+        let low = common(&old[..old.len() - suffix], &new[..new.len() - suffix]);
+        // Both extremes leave the same number of common bytes; the span is
+        // what remains of the old text, and both can only agree on it.
+        let family = (high + after_high == low + suffix).then(|| Family {
+            low,
+            high,
+            span: old.len() - (high + after_high),
+        });
+        Self {
+            old: old.len(),
+            new: new.len(),
+            family,
         }
-    };
-    match (place(prefix_first), place(suffix_first)) {
-        (Some(first), Some(second)) if first != second => None,
-        (Some(placed), _) | (None, Some(placed)) => Some(placed),
-        (None, None) => None,
+    }
+
+    /// Where the element at `range` of the old text stands in the new one,
+    /// when every change lies outside it or inside its `content` (absent for
+    /// an empty element).
+    ///
+    /// The element is carried only when every alignment that keeps it whole
+    /// keeps it at the same place and none removes it: where two equal
+    /// siblings were inserted or removed next to each other, which one the
+    /// element is cannot be told.
+    fn carried(
+        &self,
+        range: &Range<usize>,
+        content: Option<&Range<usize>>,
+    ) -> Option<Range<usize>> {
+        let Family { low, high, span } = *self.family.as_ref()?;
+        // A position after the span keeps its distance from the end of the
+        // text, which the common suffix bytes guarantee, so this cannot wrap.
+        let moved = |position: usize| self.new - (self.old - position);
+        // Whether some start of the span in `low..=high` lies in `from..=to`.
+        let starts =
+            |from: usize, to: Option<usize>| to.is_some_and(|to| low.max(from) <= high.min(to));
+        let mut kept: Option<Range<usize>> = None;
+        let mut keep = |placed: Range<usize>| match &kept {
+            Some(earlier) if *earlier != placed => false,
+            _ => {
+                kept = Some(placed);
+                true
+            }
+        };
+        // Before the span: some alignment starts it at or after the element's end.
+        if range.end <= high && !keep(range.clone()) {
+            return None;
+        }
+        // After the span: some alignment ends it at or before the element's start.
+        if range.start >= low + span && !keep(moved(range.start)..moved(range.end)) {
+            return None;
+        }
+        // Around the span: some alignment puts all of it inside the content.
+        if content.is_some_and(|content| starts(content.start, content.end.checked_sub(span)))
+            && !keep(range.start..moved(range.end))
+        {
+            return None;
+        }
+        // Removed: some alignment puts the whole element inside the span.
+        // The span cannot start before the text does: clamping at zero is the
+        // bound itself, not a hidden overflow.
+        let removed = range.end.saturating_sub(span);
+        if starts(removed, Some(range.start)) {
+            return None;
+        }
+        kept
     }
 }
 
+/// The generation an all-or-nothing mutation started from, kept from its first
+/// commit on, so that no copy of the document is parsed in advance.
+#[cfg(feature = "xmldsig-sign")]
 enum AtomicMutation {
     /// Nothing committed since it began. An enclosing frame in this state
     /// started from the same generation as the frame inside it.
@@ -1191,52 +1235,110 @@ impl XmlDocument {
     /// that the commits replaced, removed or changed into another element.
     #[cfg(feature = "xmldsig-sign")]
     pub fn carry(&self, identity: NodeIdentity) -> Result<NodeIdentity, XmlDocumentError> {
-        if identity.document != self.identity {
-            return Err(XmlDocumentError::ForeignIdentity);
-        }
-        if identity.generation == self.generation {
-            return self.with_view(|view| {
-                if view.resolve_node(identity)?.is_element() {
-                    Ok(identity)
-                } else {
-                    Err(XmlDocumentError::MissingNode)
-                }
-            });
-        }
-        let base = self.atomic.iter().find_map(|frame| match frame {
-            AtomicMutation::Replaced(cell, generation) if *generation == identity.generation => {
-                Some(cell)
+        let mut identities = [identity];
+        self.carry_all(&mut identities)?;
+        Ok(identities[0])
+    }
+
+    /// [`Self::carry`] for every identity of `identities`, replaced in place.
+    ///
+    /// The change and the current tree are each read once for all identities
+    /// of one starting generation, so the work grows with the document and
+    /// the number of identities, not with their product.
+    ///
+    /// # Errors
+    /// As [`Self::carry`], for the first identity that cannot be carried;
+    /// `identities` is then left partly carried.
+    #[cfg(feature = "xmldsig-sign")]
+    pub fn carry_all(&self, identities: &mut [NodeIdentity]) -> Result<(), XmlDocumentError> {
+        let mut earlier = Vec::new();
+        for (index, identity) in identities.iter().enumerate() {
+            if identity.document != self.identity {
+                return Err(XmlDocumentError::ForeignIdentity);
             }
+            if identity.generation == self.generation {
+                self.with_view(|view| {
+                    if view.resolve_node(*identity)?.is_element() {
+                        Ok(())
+                    } else {
+                        Err(XmlDocumentError::MissingNode)
+                    }
+                })?;
+            } else {
+                earlier.push(index);
+            }
+        }
+        while let Some(&first) = earlier.first() {
+            let generation = identities[first].generation;
+            let (group, rest): (Vec<usize>, Vec<usize>) = earlier
+                .iter()
+                .partition(|index| identities[**index].generation == generation);
+            earlier = rest;
+            self.carry_from(generation, &group, identities)?;
+        }
+        Ok(())
+    }
+
+    /// Carry the identities at `group`, all of `generation`, from the start
+    /// of the open transaction that began there.
+    #[cfg(feature = "xmldsig-sign")]
+    fn carry_from(
+        &self,
+        generation: u64,
+        group: &[usize],
+        identities: &mut [NodeIdentity],
+    ) -> Result<(), XmlDocumentError> {
+        let base = self.atomic.iter().find_map(|frame| match frame {
+            AtomicMutation::Replaced(cell, start) if *start == generation => Some(cell),
             _ => None,
         });
         let Some(base) = base else {
             return Err(XmlDocumentError::StaleIdentity {
-                identity: identity.generation,
+                identity: generation,
                 current: self.generation,
             });
         };
         base.with_dependent(|old, earlier| {
-            let element = SemanticDocument::node(&earlier.document, identity.semantic_id)
-                .filter(|node| node.is_element() && node.has_actionable_range())
-                .ok_or(XmlDocumentError::MissingNode)?;
-            let range = element.range();
-            let (content, _, empty) = element_content_range(&old[range.clone()])?;
-            let content = (!empty).then(|| range.start + content.start..range.start + content.end);
             self.with_view(|view| {
-                let range = carried_range(old, view.xml(), range, content.as_ref())
-                    .ok_or(XmlDocumentError::MissingNode)?;
-                let name = element.tag_name();
-                view.parsed
-                    .document
-                    .descendants()
-                    .find(|node| {
-                        node.is_element()
-                            && node.range() == range
-                            && node.tag_name().namespace() == name.namespace()
-                            && node.tag_name().name() == name.name()
-                    })
-                    .map(|node| view.node_identity(node))
-                    .ok_or(XmlDocumentError::MissingNode)
+                let alignments = Alignments::new(old, view.xml());
+                let mut wanted = Vec::with_capacity(group.len());
+                for &index in group {
+                    let element =
+                        SemanticDocument::node(&earlier.document, identities[index].semantic_id)
+                            .filter(|node| node.is_element() && node.has_actionable_range())
+                            .ok_or(XmlDocumentError::MissingNode)?;
+                    let range = element.range();
+                    let (content, _, empty) = element_content_range(&old[range.clone()])?;
+                    let content =
+                        (!empty).then(|| range.start + content.start..range.start + content.end);
+                    let range = alignments
+                        .carried(&range, content.as_ref())
+                        .ok_or(XmlDocumentError::MissingNode)?;
+                    wanted.push((range, element, index));
+                }
+                // Elements start in document order, so one walk of the current
+                // tree meets every wanted range in ascending order.
+                wanted.sort_unstable_by_key(|(range, ..)| range.start);
+                let mut wanted = wanted.into_iter().peekable();
+                for node in view.parsed.document.descendants().filter(Node::is_element) {
+                    let start = node.range().start;
+                    while let Some((range, element, index)) =
+                        wanted.next_if(|(range, ..)| range.start <= start)
+                    {
+                        let (name, found) = (element.tag_name(), node.tag_name());
+                        if range != node.range()
+                            || found.namespace() != name.namespace()
+                            || found.name() != name.name()
+                        {
+                            return Err(XmlDocumentError::MissingNode);
+                        }
+                        identities[index] = view.node_identity(node);
+                    }
+                }
+                match wanted.next() {
+                    Some(_) => Err(XmlDocumentError::MissingNode),
+                    None => Ok(()),
+                }
             })
         })
     }

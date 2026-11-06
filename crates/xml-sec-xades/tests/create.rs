@@ -16,8 +16,9 @@ use base64::engine::general_purpose::STANDARD;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::document::NodeIdentity;
+use xml_sec::document::{NodeIdentity, XmlDocumentError};
 use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::xmldsig::extension;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyInfoWriteError, KeyResolverConfig, ObjectContent,
     ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningError, UriTypeSet,
@@ -541,6 +542,35 @@ fn an_uncovered_expected_target_still_refuses() {
             })
         },
         |error| matches!(error, CreateError::NotAccepted),
+    );
+}
+
+#[test]
+fn a_target_that_cannot_be_carried_publishes_nothing() {
+    // A text node is no coverage target; it has no counterpart to carry into
+    // the signed generation, and the creation is refused whole.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let text = document.with_view(|view| {
+        let payload = view.node_for_id("payload", &[]).expect("payload");
+        extension::first_child(view, payload, &account(1 << 20))
+            .expect("tree")
+            .expect("text")
+    });
+    refused(
+        &mut document,
+        |document| {
+            fixture.with_targets(&fixture.resolver, &[text], |assessment| {
+                create(
+                    document,
+                    &fixture.signer(&[SIGNER, INTERMEDIATE]),
+                    request("sig", &enveloped(Envelope::Enveloped)),
+                    assessment,
+                    &account(1 << 30),
+                )
+            })
+        },
+        |error| matches!(error, CreateError::Document(XmlDocumentError::MissingNode)),
     );
 }
 
