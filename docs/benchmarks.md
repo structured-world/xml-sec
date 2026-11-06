@@ -72,7 +72,8 @@ allocation run's peak shows whether the Reference digest retains that output;
 with streamed digests the verification peak no longer grows with the payload.
 
 `builder_sign` signs the SAML-shaped document through `SignatureBuilder` with an
-escaped enveloping `Object` scaled with the document: each operation builds the
+escaped `Object`, scaled with the document and signed by its own Reference
+(enveloping) beside `#payload`: each operation builds the
 template, checks it against the signing policy and signs it in the document's
 transaction, as an application does per message; the sign case above starts from
 a prepared template instead. Parsing the input is outside the timer.

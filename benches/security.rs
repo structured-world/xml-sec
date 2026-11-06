@@ -84,9 +84,10 @@ fn large_reference_sign(bencher: divan::Bencher, units: usize) {
 }
 
 /// Signing through `SignatureBuilder`, as an application signs each new
-/// message: every operation builds the template with an escaped enveloping
-/// `Object` (`units` copies of its text), checks it against the policy, then
-/// signs it inside the document's transaction. Parsing the input is excluded.
+/// message: every operation builds the template with an escaped `Object`
+/// (`units` copies of its text) that a second Reference signs (enveloping),
+/// checks it against the policy, then digests `#payload` and `#object` and
+/// signs inside the document's transaction. Parsing the input is excluded.
 #[divan::bench(args = [16, 256])]
 fn builder_sign(bencher: divan::Bencher, units: usize) {
     use xml_sec::XmlDocument;
@@ -109,6 +110,7 @@ fn builder_sign(bencher: divan::Bencher, units: usize) {
     )
     .ns_prefix("ds")
     .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
+    .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#object"))
     .add_object(
         ObjectBuilder::new(ObjectContent::Text(
             "deterministic object text & escaping ".repeat(units),
@@ -124,6 +126,7 @@ fn builder_sign(bencher: divan::Bencher, units: usize) {
     let mut expected = parse();
     sign(&mut expected);
     let expected = expected.into_xml();
+    assert!(expected.contains("URI=\"#object\""), "the Object is signed");
     bencher
         .counter(divan::counter::BytesCount::new(unsigned.len()))
         .with_inputs(parse)
