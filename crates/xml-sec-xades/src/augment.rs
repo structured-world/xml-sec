@@ -1,4 +1,5 @@
-//! `XAdES` B-T augmentation over a caller-owned timestamp exchange.
+//! `XAdES` augmentation to B-T, B-LT and B-LTA over a caller-owned
+//! timestamp exchange.
 //!
 //! [`request_timestamp`] computes the `SignatureTimeStamp` input of one
 //! signature that meets B-B (EN 319 132-1 §5.3) and encodes the RFC 3161
@@ -7,7 +8,9 @@
 //! and the unchanged document, appends the token as a `SignatureTimeStamp`
 //! and publishes the new generation only after it meets the requested level.
 //! [`add_validation_data`] then appends the certificates and statuses a B-T
-//! signature lacks for B-LT. Nothing is fetched and no clock is read here.
+//! signature lacks for B-LT, and [`request_archive_timestamp`] requests the
+//! `ArchiveTimeStamp` of B-LTA or of its renewal, which [`complete_timestamp`]
+//! completes in the same way. Nothing is fetched and no clock is read here.
 
 mod validation_data;
 
@@ -17,7 +20,9 @@ use crate::accuracy;
 use crate::basic::{Outcome, Stage, ValidationError, with_stage};
 use crate::create::{Assessment, Carried};
 use crate::draft::{Draft, DraftError};
-use crate::level::{Inputs, Level, read_certificates, unrecognized, validate};
+use crate::level::{
+    Inputs, Level, Visit, read_certificates, unrecognized, validate, validate_with,
+};
 use crate::placement::{self, DS, PlacementError, Unsigned};
 use crate::{Error, Snapshot};
 use alloc::{boxed::Box, string::String};
@@ -75,6 +80,10 @@ pub struct PendingTimestamp {
     document: DocumentIdentity,
     generation: u64,
     signature: String,
+    kind: TimestampKind,
+    /// The level the signature met when the request was made, and must still
+    /// meet when it is completed.
+    basis: Requirements,
     request: OwnedVec<u8>,
 }
 
@@ -129,6 +138,9 @@ pub enum AugmentError {
     /// The completion asks for a level below B-T.
     #[error("a completed timestamp is assessed at B-T or above, not {0:?}")]
     BelowTimestamped(Requirements),
+    /// The completion of an archive timestamp asks for a level below B-LTA.
+    #[error("a completed archive timestamp is assessed at B-LTA, not {0:?}")]
+    BelowArchival(Requirements),
     /// Added validation data is assessed at a level below B-LT.
     #[error("added validation data is assessed at B-LT or above, not {0:?}")]
     BelowLongTerm(Requirements),
@@ -245,6 +257,110 @@ pub fn request_timestamp<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<PendingTimestamp, AugmentError> {
+    requested(
+        document,
+        request,
+        assessment,
+        &Gate::Basic(assessment.certificates),
+        TimestampKind::Signature,
+        work,
+    )
+}
+
+/// Compute the input of a new `ArchiveTimeStamp` (EN 319 132-1 §5.5.2.3) of
+/// `request.signature` and encode the RFC 3161 request for it.
+///
+/// The signature must meet `inputs.requirements`, B-LT for its first archive
+/// and B-LTA to renew earlier ones, under `assessment` and the caller's
+/// evidence in `inputs`. The archive input covers every earlier unsigned
+/// property, archives included, so each renewal protects all that came before.
+/// Validation data the next archive needs is added first with
+/// [`add_validation_data`]. Pass the response to [`complete_timestamp`].
+///
+/// # Errors
+/// Returns the original cause, [`AugmentError::BelowLongTerm`] for a level
+/// below B-LT; the document is never changed.
+///
+/// # Examples
+///
+/// ```no_run
+/// use structured_pkix::algorithm::digest::Algorithm;
+/// use xml_sec_xades::{
+///     Assessment, Completion, Inputs, Requirements, TimestampRequest, complete_timestamp,
+///     request_archive_timestamp,
+/// };
+/// # fn archive(
+/// #     document: &mut xml_sec::XmlDocument,
+/// #     assessment: &Assessment<'_, '_>,
+/// #     evidence: &Inputs<'_>,
+/// #     tsa: impl Fn(&[u8]) -> Vec<u8>,
+/// #     work: &structured_asn1::memory::Memory,
+/// # ) -> Result<(), xml_sec_xades::AugmentError> {
+/// let pending = request_archive_timestamp(
+///     document,
+///     &TimestampRequest {
+///         signature: "sig",
+///         digest: Algorithm::Sha256,
+///         policy: None,
+///         nonce: Some(&[0x2a; 8]),
+///         id_attributes: &[],
+///     },
+///     assessment,
+///     &Inputs { requirements: Requirements::LongTerm, ..*evidence },
+///     work,
+/// )?;
+/// let response = tsa(pending.request());
+/// complete_timestamp(
+///     document,
+///     &pending,
+///     &response,
+///     &Completion {
+///         assessment,
+///         inputs: &Inputs { requirements: Requirements::Archival, ..*evidence },
+///         window: None,
+///         id_attributes: &[],
+///     },
+///     work,
+/// )
+/// # }
+/// ```
+pub fn request_archive_timestamp<W: Work>(
+    document: &XmlDocument,
+    request: &TimestampRequest<'_>,
+    assessment: &Assessment<'_, '_>,
+    inputs: &Inputs<'_>,
+    work: &W,
+) -> Result<PendingTimestamp, AugmentError> {
+    if matches!(
+        inputs.requirements,
+        Requirements::Basic | Requirements::Timestamped
+    ) {
+        return Err(AugmentError::BelowLongTerm(inputs.requirements));
+    }
+    let certificates = pooled(inputs, assessment, work)?;
+    let inputs = Inputs {
+        certificates: &certificates,
+        ..*inputs
+    };
+    requested(
+        document,
+        request,
+        assessment,
+        &Gate::LongTerm(&inputs),
+        TimestampKind::Archive,
+        work,
+    )
+}
+
+/// The request of a `kind` timestamp over a signature that passes `gate`.
+fn requested<W: Work>(
+    document: &XmlDocument,
+    request: &TimestampRequest<'_>,
+    assessment: &Assessment<'_, '_>,
+    gate: &Gate<'_>,
+    kind: TimestampKind,
+    work: &W,
+) -> Result<PendingTimestamp, AugmentError> {
     let (identity, generation) = document.with_view(|view| {
         placement::locate(view, request.signature, request.id_attributes, work)?;
         Ok::<_, AugmentError>((view.identity(), view.generation()))
@@ -258,11 +374,11 @@ pub fn request_timestamp<W: Work>(
             Ok(
                 selected(document, &session, request.signature, request.id_attributes).and_then(
                     |node| {
-                        staged(&session, node, assessment.certificates, |stage, level| {
+                        gated(&session, node, gate, |stage, level| {
                             let method = signed_method(stage, request.signature)?;
                             let execution = stage.session.execution();
                             let mut input = Augmentation::new(stage.document, stage.prepared)
-                                .input(level, TimestampKind::Signature, method, execution)
+                                .input(level, kind, method, execution)
                                 .map_err(|error| match error {
                                     PreparationError::Admission(error) => {
                                         AugmentError::Construction(error)
@@ -287,14 +403,19 @@ pub fn request_timestamp<W: Work>(
         document: identity,
         generation,
         signature: request.signature.into(),
+        kind,
+        basis: gate.requirements(),
         request: encoded,
     })
 }
 
-/// Check `response` against `pending` and publish the token as a
-/// `SignatureTimeStamp` of the signature, as one new generation of
-/// `document`, after that generation meets `completion.inputs.requirements`.
+/// Check `response` against `pending` and publish its token as the
+/// `SignatureTimeStamp` or `ArchiveTimeStamp` the request was for, as one new
+/// generation of `document`, after that generation meets
+/// `completion.inputs.requirements`: B-T or above for a signature timestamp,
+/// B-LTA for an archive one.
 ///
+/// The unchanged generation must still meet the level it met at the request.
 /// The response must carry a token that the shared RFC 3161 checker accepts
 /// for the exact request and for the signature's current timestamp input,
 /// signed by a certificate the token carries or the caller supplies in
@@ -312,8 +433,15 @@ pub fn complete_timestamp<W: Work>(
     completion: &Completion<'_, '_>,
     work: &W,
 ) -> Result<(), AugmentError> {
-    if completion.inputs.requirements == Requirements::Basic {
-        return Err(AugmentError::BelowTimestamped(Requirements::Basic));
+    let requirements = completion.inputs.requirements;
+    match pending.kind {
+        TimestampKind::Signature if requirements == Requirements::Basic => {
+            return Err(AugmentError::BelowTimestamped(requirements));
+        }
+        TimestampKind::Archive if requirements != Requirements::Archival => {
+            return Err(AugmentError::BelowArchival(requirements));
+        }
+        TimestampKind::Signature | TimestampKind::Archive => {}
     }
     if document.with_view(|view| (view.identity(), view.generation()))
         != (pending.document, pending.generation)
@@ -326,6 +454,19 @@ pub fn complete_timestamp<W: Work>(
         placement::locate(view, signature, completion.id_attributes, work)
             .map(|located| located.unsigned)
     })?;
+    let certificates = pooled(completion.inputs, assessment, work)?;
+    let inputs = Inputs {
+        certificates: &certificates,
+        ..*completion.inputs
+    };
+    let basis = Inputs {
+        requirements: pending.basis,
+        ..inputs
+    };
+    let gate = match pending.kind {
+        TimestampKind::Signature => Gate::Basic(assessment.certificates),
+        TimestampKind::Archive => Gate::LongTerm(&basis),
+    };
     let property = with_verified_request(
         document,
         assessment.context,
@@ -335,7 +476,7 @@ pub fn complete_timestamp<W: Work>(
             Ok(
                 selected(document, &session, signature, completion.id_attributes).and_then(
                     |node| {
-                        staged(&session, node, assessment.certificates, |stage, level| {
+                        gated(&session, node, &gate, |stage, level| {
                             timestamped(stage, level, pending, response, completion, unsigned)
                         })
                     },
@@ -343,11 +484,6 @@ pub fn complete_timestamp<W: Work>(
             )
         },
     )??;
-    let certificates = pooled(completion.inputs, assessment, work)?;
-    let inputs = Inputs {
-        certificates: &certificates,
-        ..*completion.inputs
-    };
     publish(
         document,
         &Publication {
@@ -451,28 +587,63 @@ fn selected<W: Work>(
         .ok_or_else(|| AugmentError::UnknownSignature(id.into()))
 }
 
-/// Run `then` over the B-B assessment of `signature`, which must meet it.
-fn staged<W: Work, R>(
+/// The level a signature must meet before a timestamp is requested or added.
+enum Gate<'g> {
+    /// B-B, with these certificates beyond `KeyInfo` for the signer's path.
+    Basic(&'g [&'g [u8]]),
+    /// `inputs.requirements`, B-LT or B-LTA, with the caller's evidence.
+    LongTerm(&'g Inputs<'g>),
+}
+
+impl Gate<'_> {
+    fn requirements(&self) -> Requirements {
+        match self {
+            Self::Basic(_) => Requirements::Basic,
+            Self::LongTerm(inputs) => inputs.requirements,
+        }
+    }
+}
+
+/// Run `then` over the assessment of `signature` at `gate`. The shared rules
+/// refuse an assessment whose requirements are not all met.
+fn gated<W: Work, R>(
     session: &VerifiedSession<'_, '_, '_, W>,
     signature: NodeIdentity,
-    certificates: &[&[u8]],
+    gate: &Gate<'_>,
     then: impl for<'a, 'l> FnOnce(&Stage<'a, '_, '_, '_, W>, &Level<'l>) -> Result<R, AugmentError>,
 ) -> Result<R, AugmentError> {
-    let outcome = with_stage(
-        session,
-        signature,
-        Requirements::Basic,
-        [certificates, &[]],
-        None,
-        |stage, report| {
-            let level =
-                baseline::assess(Evidence::Basic(report)).map_err(ValidationError::Level)?;
-            Ok(Outcome::Assessed(then(stage, &level)))
-        },
-    )?;
+    let outcome = match gate {
+        Gate::Basic(certificates) => with_stage(
+            session,
+            signature,
+            Requirements::Basic,
+            [certificates, &[]],
+            None,
+            |stage, report| {
+                let level =
+                    baseline::assess(Evidence::Basic(report)).map_err(ValidationError::Level)?;
+                Ok(Outcome::Assessed(then(stage, &level)))
+            },
+        )?,
+        Gate::LongTerm(inputs) => validate_with(session, signature, inputs, Then(then))?,
+    };
     match outcome {
         Outcome::Assessed(result) => result,
         outcome => Err(AugmentError::Unmet(outcome.map(|_| ()))),
+    }
+}
+
+/// A level visitor that runs a step over the stage and its assessment.
+struct Then<F>(F);
+
+impl<W: Work, F, R> Visit<W> for Then<F>
+where
+    F: for<'a, 'l> FnOnce(&Stage<'a, '_, '_, '_, W>, &Level<'l>) -> Result<R, AugmentError>,
+{
+    type Output = Result<R, AugmentError>;
+
+    fn level(self, stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output {
+        (self.0)(stage, level)
     }
 }
 
@@ -568,7 +739,7 @@ fn encode(
     .map_err(|error| AugmentError::Encoding(Box::new(error)))
 }
 
-/// The `SignatureTimeStamp` property of a checked response, as markup.
+/// The timestamp property of a checked response, as markup.
 fn timestamped<W: Work>(
     stage: &Stage<'_, '_, '_, '_, W>,
     level: &Level<'_>,
@@ -625,7 +796,7 @@ fn timestamped<W: Work>(
     let checked = augmentation
         .check_response(
             level,
-            TimestampKind::Signature,
+            pending.kind,
             method,
             &ResponseCheck {
                 response: &response,

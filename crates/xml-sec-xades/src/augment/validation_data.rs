@@ -1,7 +1,7 @@
 //! B-LT augmentation: the validation data a B-T signature lacks.
 
 use super::{AugmentError, Publication, Staging, construction, pooled, publish, selected};
-use crate::basic::Outcome;
+use crate::basic::{Outcome, Stage};
 use crate::create::Assessment;
 use crate::draft::Draft;
 use crate::level::{Census, Inputs, Level, Visit, validate_with};
@@ -171,18 +171,15 @@ struct Missing {
     unsigned: Unsigned,
 }
 
-impl Visit for Missing {
+impl<W: Work> Visit<W> for Missing {
     type Output = Result<Option<String>, AugmentError>;
 
     // Only a validation that ended before its B-LT census reaches this.
-    fn level(self, level: &Level<'_>) -> Self::Output {
+    fn level(self, _stage: &Stage<'_, '_, '_, '_, W>, level: &Level<'_>) -> Self::Output {
         Err(AugmentError::BelowLongTerm(level.requested()))
     }
 
-    fn census<W: Work>(
-        self,
-        census: &Census<'_, '_, '_, '_, '_, '_, '_, W>,
-    ) -> Result<Self::Output, Self> {
+    fn census(self, census: &Census<'_, '_, '_, '_, '_, '_, '_, W>) -> Result<Self::Output, Self> {
         Ok(missing(census, self.unsigned))
     }
 }

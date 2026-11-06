@@ -38,6 +38,9 @@
 //! decides which certificates, CRLs and OCSP responses the document lacks, or
 //! holds only where a timestamp may not use them, and they are appended from
 //! the caller's inputs or the document as one `AnyValidationData`.
+//! `request_archive_timestamp` then takes a B-LT signature to B-LTA through the
+//! same completion, and a B-LTA one to its next renewal: each new
+//! `ArchiveTimeStamp` covers every earlier archive.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -69,7 +72,8 @@ pub use accuracy::AuthorityAccuracy;
 #[cfg(feature = "produce")]
 pub use augment::{
     AugmentError, Completion, DataAdded, PendingTimestamp, TimestampRequest, TokenFacts,
-    ValidationData, add_validation_data, complete_timestamp, request_timestamp,
+    ValidationData, add_validation_data, complete_timestamp, request_archive_timestamp,
+    request_timestamp,
 };
 pub use basic::{
     CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,

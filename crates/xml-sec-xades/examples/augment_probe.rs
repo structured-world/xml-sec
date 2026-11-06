@@ -1,8 +1,8 @@
-//! B-T and B-LT augmentation through the public API, for the augmentation
-//! fixtures and independent validation. Every assessment runs at Unix time
-//! 1800000000 against `FIXTURES/root.der`.
+//! B-T, B-LT and B-LTA augmentation through the public API, for the
+//! augmentation fixtures and independent validation. Every assessment runs at
+//! Unix time 1800000000 against `FIXTURES/root.der`.
 //!
-//! `request` and `complete` create the enveloped B-B signature `sig` with
+//! Every action but `extend` creates the enveloped B-B signature `sig` with
 //! `FIXTURES/signer.key` and the `signer.der`/`intermediate.der` chain.
 //!
 //! `augment_probe request FIXTURES OUTPUT` writes its timestamp requests to
@@ -11,6 +11,14 @@
 //!
 //! `augment_probe complete FIXTURES OUTPUT` completes `request.tsq` with
 //! `FIXTURES/response.tsr` and writes the B-T document `OUTPUT/b-t.xml`.
+//!
+//! The archive actions continue from that B-T document: they add the CRLs
+//! `FIXTURES/root.crl` and `FIXTURES/intermediate.crl` and request the first
+//! archive timestamp. `archive-request` writes `OUTPUT/archive.tsq`;
+//! otherwise `FIXTURES/archive.tsr` completes it and the renewal is
+//! requested, which `renewal-request` writes as `OUTPUT/renewal.tsq`.
+//! `archive` completes both and writes `OUTPUT/b-lta.xml` and
+//! `OUTPUT/b-lta-renewed.xml`.
 //!
 //! `augment_probe extend LEVELS OUTPUT` adds validation data to the B-T
 //! signature of `LEVELS/b-t.xml`, from the level fixtures: the CRLs and OCSP
@@ -36,7 +44,7 @@ use xml_sec::xmldsig::{
 use xml_sec_xades::{
     Assessment, Completion, DataObject, Envelope, Inputs, PendingTimestamp, Request, Requirements,
     Signer, TimestampRequest, ValidationData, add_validation_data, complete_timestamp, create,
-    request_timestamp,
+    request_archive_timestamp, request_timestamp,
 };
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
@@ -65,7 +73,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|complete|extend FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|complete|archive-request|renewal-request|archive|extend FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -109,13 +117,6 @@ fn main() -> Result<(), String> {
     };
     let work = Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 30)));
     let mut document = created(&signer, &assessment, &work)?;
-    let timestamp = |policy, nonce| TimestampRequest {
-        signature: "sig",
-        digest: Algorithm::Sha256,
-        policy,
-        nonce,
-        id_attributes: &[],
-    };
     let write = |name: &str, bytes: &[u8]| {
         std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
@@ -124,21 +125,9 @@ fn main() -> Result<(), String> {
     match action.to_str() {
         Some("request") => {
             write("request.tsq", pending.request())?;
-            for (name, policy, nonce) in [
-                (
-                    "request-policy.tsq",
-                    Some(Oid::from_bytes(OTHER_POLICY)),
-                    Some(NONCE),
-                ),
-                ("request-no-nonce.tsq", None, None),
-            ] {
-                let variant =
-                    request_timestamp(&document, &timestamp(policy, nonce), &assessment, &work)
-                        .map_err(|error| format!("{name}: {error}"))?;
-                write(name, variant.request())?;
-            }
+            requests(&document, &assessment, &write, &work)?;
         }
-        Some("complete") => {
+        Some(action @ ("complete" | "archive-request" | "renewal-request" | "archive")) => {
             let response = read(&fixtures, "response.tsr")?;
             complete(
                 &mut document,
@@ -148,9 +137,145 @@ fn main() -> Result<(), String> {
                 [&root, &intermediate],
                 &work,
             )?;
-            write("b-t.xml", document.as_xml().as_bytes())?;
+            if action == "complete" {
+                write("b-t.xml", document.as_xml().as_bytes())?;
+            } else {
+                archived(
+                    &mut document,
+                    &assessment,
+                    &fixtures,
+                    [&root, &intermediate],
+                    action,
+                    &write,
+                    &work,
+                )?;
+            }
         }
         _ => return Err(usage.into()),
+    }
+    Ok(())
+}
+
+/// A `SignatureTimeStamp` request for `sig` with this policy and nonce.
+fn timestamp(
+    policy: Option<Oid<'static>>,
+    nonce: Option<&'static [u8]>,
+) -> TimestampRequest<'static> {
+    TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy,
+        nonce,
+        id_attributes: &[],
+    }
+}
+
+/// The request variants beside `request.tsq`: one also asking for a policy,
+/// one without a nonce.
+fn requests(
+    document: &XmlDocument,
+    assessment: &Assessment<'_, '_>,
+    write: &impl Fn(&str, &[u8]) -> Result<(), String>,
+    work: &Memory,
+) -> Result<(), String> {
+    for (name, policy, nonce) in [
+        (
+            "request-policy.tsq",
+            Some(Oid::from_bytes(OTHER_POLICY)),
+            Some(NONCE),
+        ),
+        ("request-no-nonce.tsq", None, None),
+    ] {
+        let variant = request_timestamp(document, &timestamp(policy, nonce), assessment, work)
+            .map_err(|error| format!("{name}: {error}"))?;
+        write(name, variant.request())?;
+    }
+    Ok(())
+}
+
+/// From the B-T document: the CRLs of both CAs, the first archive timestamp
+/// and its renewal, each completed with the fixture response to its request.
+/// `action` stops at the request it names, or writes both archived documents.
+fn archived(
+    document: &mut XmlDocument,
+    assessment: &Assessment<'_, '_>,
+    fixtures: &Path,
+    [root, intermediate]: [&[u8]; 2],
+    action: &str,
+    write: &impl Fn(&str, &[u8]) -> Result<(), String>,
+    work: &Memory,
+) -> Result<(), String> {
+    let (root_crl, intermediate_crl) = (
+        read(fixtures, "root.crl")?,
+        read(fixtures, "intermediate.crl")?,
+    );
+    let crls: [&[u8]; 2] = [&root_crl, &intermediate_crl];
+    let utc = utc()?;
+    let (anchors, certificates) = ([root], [intermediate]);
+    let inputs = |requirements| Inputs {
+        requirements,
+        anchors: &anchors,
+        certificates: &certificates,
+        utc: &utc,
+        accuracies: &[],
+        responders: &[],
+        crls: &crls,
+        responses: &[],
+    };
+    let request = TimestampRequest {
+        signature: "sig",
+        digest: Algorithm::Sha256,
+        policy: None,
+        nonce: Some(NONCE),
+        id_attributes: &[],
+    };
+    for (requirements, query, response, archived) in [
+        (
+            Requirements::LongTerm,
+            "archive",
+            "archive.tsr",
+            "b-lta.xml",
+        ),
+        (
+            Requirements::Archival,
+            "renewal",
+            "renewal.tsr",
+            "b-lta-renewed.xml",
+        ),
+    ] {
+        // The next archive covers the validation data of every earlier token.
+        add_validation_data(
+            document,
+            &ValidationData {
+                signature: "sig",
+                assessment,
+                inputs: &inputs(requirements),
+                id_attributes: &[],
+            },
+            work,
+        )
+        .map_err(|error| format!("{query} validation data: {error}"))?;
+        let pending =
+            request_archive_timestamp(document, &request, assessment, &inputs(requirements), work)
+                .map_err(|error| format!("{query} request: {error}"))?;
+        if action == format!("{query}-request") {
+            return write(&format!("{query}.tsq"), pending.request());
+        }
+        let completion = Completion {
+            assessment,
+            inputs: &inputs(Requirements::Archival),
+            window: None,
+            id_attributes: &[],
+        };
+        complete_timestamp(
+            document,
+            &pending,
+            &read(fixtures, response)?,
+            &completion,
+            work,
+        )
+        .map_err(|error| format!("{query} completion: {error}"))?;
+        write(archived, document.as_xml().as_bytes())?;
     }
     Ok(())
 }
