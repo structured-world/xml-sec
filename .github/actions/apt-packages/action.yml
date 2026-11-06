@@ -26,11 +26,23 @@ runs:
           install+=(--no-install-recommends)
         fi
         # apt's own timeouts do not bound a mirror that keeps the connection
-        # open without sending, so each attempt also has a wall-clock limit.
-        # A failed attempt refreshes the index again: the mirror may have moved.
+        # open without sending, so each attempt also has a wall-clock limit,
+        # cut to what remains of one 600-second budget for the whole action:
+        # every retry starts well inside the shortest job limit (35 minutes),
+        # with the job's own work still ahead. A failed attempt refreshes the
+        # index again, since the mirror may have moved.
+        budget=600
+        bounded() {
+          local remaining=$((budget - SECONDS))
+          if [ "$remaining" -le 0 ]; then
+            echo "::error::apt-get exceeded its ${budget}-second budget"
+            exit 1
+          fi
+          sudo timeout --kill-after=30 $(($1 < remaining ? $1 : remaining)) apt-get "${options[@]}" "${@:2}"
+        }
         attempt=1
-        until { [ "${APT_INDEX_REFRESHED:-}" = 1 ] || sudo timeout --kill-after=30 300 apt-get "${options[@]}" update; } &&
-          sudo timeout --kill-after=30 900 apt-get "${options[@]}" "${install[@]}" "${packages[@]}"; do
+        until { [ "${APT_INDEX_REFRESHED:-}" = 1 ] || bounded 120 update; } &&
+          bounded 300 "${install[@]}" "${packages[@]}"; do
           if [ "$attempt" -ge 3 ]; then
             echo "::error::apt-get failed $attempt times"
             exit 1

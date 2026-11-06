@@ -263,6 +263,18 @@ fn apt(
     refreshed: bool,
     exits: &[u8],
 ) -> (bool, Vec<String>, String) {
+    apt_after(0, packages, recommends, refreshed, exits)
+}
+
+/// [`apt`] with the action's clock started `elapsed` seconds in, as bash
+/// takes `SECONDS` from the environment.
+fn apt_after(
+    elapsed: u32,
+    packages: &str,
+    recommends: &str,
+    refreshed: bool,
+    exits: &[u8],
+) -> (bool, Vec<String>, String) {
     let action = read(".github/actions/apt-packages/action.yml");
     let script = literal_block(&action, "      run: |\n", 8);
     let directory = tempfile::tempdir().unwrap();
@@ -304,6 +316,7 @@ fn apt(
         .env("GITHUB_ENV", &environment)
         .env("PACKAGES", packages)
         .env("RECOMMENDS", recommends)
+        .env("SECONDS", elapsed.to_string())
         .env_remove("APT_INDEX_REFRESHED");
     if refreshed {
         command.env("APT_INDEX_REFRESHED", "1");
@@ -330,12 +343,33 @@ fn a_stalled_apt_attempt_is_cut_off_and_retried_with_a_fresh_index() {
     assert_eq!(
         calls,
         [
-            format!("300 {APT} update"),
-            format!("300 {APT} update"),
-            format!("900 {APT} install --yes softhsm2 valgrind"),
+            format!("120 {APT} update"),
+            format!("120 {APT} update"),
+            format!("300 {APT} install --yes softhsm2 valgrind"),
         ]
     );
     assert_eq!(environment, "APT_INDEX_REFRESHED=1\n");
+}
+
+#[test]
+fn apt_retries_fit_one_budget_that_leaves_the_job_time() {
+    // Per-attempt limits alone let three stalled installs outlast the 35-minute
+    // fuzz job before the last retry starts; the whole action has a 600-second
+    // budget, every attempt is cut to what remains of it, and none starts once
+    // it is spent.
+    let (success, calls, _) = apt_after(550, "softhsm2", "true", false, &[]);
+    assert!(success);
+    assert_eq!(
+        calls,
+        [
+            format!("50 {APT} update"),
+            format!("50 {APT} install --yes softhsm2"),
+        ]
+    );
+    let (success, calls, environment) = apt_after(600, "softhsm2", "true", false, &[]);
+    assert!(!success);
+    assert!(calls.is_empty(), "{calls:?}");
+    assert_eq!(environment, "");
 }
 
 #[test]
@@ -347,7 +381,7 @@ fn the_package_index_is_refreshed_once_per_job_unless_an_install_fails() {
     assert_eq!(
         calls,
         [format!(
-            "900 {APT} install --yes --no-install-recommends mold"
+            "300 {APT} install --yes --no-install-recommends mold"
         )]
     );
     let (success, calls, _) = apt("mold", "true", true, &[100]);
@@ -355,9 +389,9 @@ fn the_package_index_is_refreshed_once_per_job_unless_an_install_fails() {
     assert_eq!(
         calls,
         [
-            format!("900 {APT} install --yes mold"),
-            format!("300 {APT} update"),
-            format!("900 {APT} install --yes mold"),
+            format!("300 {APT} install --yes mold"),
+            format!("120 {APT} update"),
+            format!("300 {APT} install --yes mold"),
         ]
     );
 }
@@ -368,7 +402,7 @@ fn apt_fails_the_step_after_three_attempts() {
     // not let it continue without its packages.
     let (success, calls, environment) = apt("softhsm2", "true", false, &[124, 124, 124, 0]);
     assert!(!success);
-    assert_eq!(calls, vec![format!("300 {APT} update"); 3]);
+    assert_eq!(calls, vec![format!("120 {APT} update"); 3]);
     assert_eq!(environment, "");
 }
 
