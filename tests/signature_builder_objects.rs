@@ -177,6 +177,44 @@ fn object_markup_is_bounded_by_the_document_limit() {
 }
 
 #[test]
+fn aggregate_object_output_is_bounded_before_the_template_is_written() {
+    // Text that grows when escaped, and objects that each fit, are measured
+    // together against the document ceiling before serialization: the refusal
+    // reports their projected output, not a template already built past it.
+    let policy = SigningPolicy {
+        resources: ResourcePolicy {
+            max_xml_document_bytes: 4096,
+            ..ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let escaped = builder()
+        .add_object(ObjectBuilder::new(ObjectContent::Text("&".repeat(1000))))
+        .build_template_with_policy(&policy);
+    let markup = format!("<p:d xmlns:p=\"urn:p\">{}</p:d>", "x".repeat(1000));
+    let mut many = builder();
+    for _ in 0..5 {
+        many = many.add_object(ObjectBuilder::new(element(&markup)));
+    }
+    for (built, projected) in [
+        (escaped, 5 * 1000),
+        (many.build_template_with_policy(&policy), 5 * markup.len()),
+    ] {
+        assert!(
+            matches!(
+                &built,
+                Err(SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                    resource: "XML document",
+                    maximum: 4096,
+                    actual,
+                })) if *actual == projected
+            ),
+            "{built:?}"
+        );
+    }
+}
+
+#[test]
 fn invalid_object_and_signature_value_attributes_are_rejected() {
     // Ids are XML IDs and Encoding is an anyURI; neither may be repaired silently.
     let text = || ObjectContent::Text("payload".to_owned());

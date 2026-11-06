@@ -4,7 +4,7 @@ use crate::xml_input as xml_sec_xml_input;
 use std::io::Write;
 
 use base64::Engine;
-use xml_sec_xml_input::lexical::Writer;
+use xml_sec_xml_input::lexical::{self, Writer};
 
 use crate::c14n::{
     C14nAlgorithm, C14nMode, SubtreeVisibility, canonicalize_visible_to_writer_bounded,
@@ -700,9 +700,19 @@ impl SignatureBuilder {
                 value: id.clone(),
             });
         }
+        // Object content and attributes are copied into the template and grow
+        // when escaped; their sum is bounded by the document limit before any
+        // of them is written.
+        let mut object_bytes = Some(0_usize);
         for object in &self.objects {
             Self::validate_object(object)?;
+            object_bytes = object_bytes
+                .zip(Self::object_output_len(object))
+                .and_then(|(sum, len)| sum.checked_add(len));
         }
+        policy
+            .resources
+            .validate_xml_document_len(object_bytes.unwrap_or(usize::MAX))?;
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
@@ -793,6 +803,21 @@ impl SignatureBuilder {
             ));
         }
         Ok(())
+    }
+
+    /// Escaped bytes of an object's content and attribute values, the part of
+    /// its output the caller controls; `None` when it exceeds `usize`.
+    fn object_output_len(object: &ObjectBuilder) -> Option<usize> {
+        let content = match &object.content {
+            ObjectContent::Text(text) => lexical::escaped_text_len(text)?,
+            ObjectContent::Element(element) => element.markup.len(),
+        };
+        [&object.id, &object.mime_type, &object.encoding]
+            .into_iter()
+            .flatten()
+            .try_fold(content, |sum, value| {
+                sum.checked_add(lexical::escaped_attribute_len(value)?)
+            })
     }
 
     fn validate_reference_transforms(
