@@ -165,6 +165,10 @@ jobs:
         run: |
           cargo nextest run --test benchmark_contract --example benchmark_latency --features benchmark-internals
           cargo clippy --bench security --example benchmark_latency --features benchmark-internals,benchmark-alloc -- -D warnings
+          # Each benchmark once, with its result assertions, so a broken
+          # workload fails here rather than in a later measurement.
+          cargo bench --bench security --features benchmark-internals -- --test
+          cargo bench -p xml-sec-xades --bench lifecycle --features produce -- --test
       - name: Exercise measurement runner (not a performance threshold)
         if: matrix.minimal
         run: cargo run --quiet -p xml-sec-tools -- bench-latency "$RUNNER_TEMP/benchmark-smoke-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" 1
