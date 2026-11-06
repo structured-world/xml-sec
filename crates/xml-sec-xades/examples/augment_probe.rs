@@ -1,9 +1,9 @@
-//! B-T augmentation through the public API, for the augmentation fixtures and
-//! independent validation.
+//! B-T and B-LT augmentation through the public API, for the augmentation
+//! fixtures and independent validation. Every assessment runs at Unix time
+//! 1800000000 against `FIXTURES/root.der`.
 //!
-//! Both actions create the enveloped B-B signature `sig` with
-//! `FIXTURES/signer.key` and the `signer.der`/`intermediate.der` chain,
-//! assessed against `FIXTURES/root.der` at Unix time 1800000000.
+//! `request` and `complete` create the enveloped B-B signature `sig` with
+//! `FIXTURES/signer.key` and the `signer.der`/`intermediate.der` chain.
 //!
 //! `augment_probe request FIXTURES OUTPUT` writes its timestamp requests to
 //! `OUTPUT`: `request.tsq` with a nonce, `request-policy.tsq` that also asks
@@ -11,10 +11,17 @@
 //!
 //! `augment_probe complete FIXTURES OUTPUT` completes `request.tsq` with
 //! `FIXTURES/response.tsr` and writes the B-T document `OUTPUT/b-t.xml`.
+//!
+//! `augment_probe extend LEVELS OUTPUT` adds validation data to the B-T
+//! signature of `LEVELS/b-t.xml`, from the level fixtures: the CRLs and OCSP
+//! response OpenSSL issued for its PKI, as `LEVELS/b-lt.xml` carries them. It
+//! writes the B-LT document `OUTPUT/b-lt.xml`.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use structured_asn1::Oid;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::algorithm::digest::Algorithm;
@@ -28,7 +35,8 @@ use xml_sec::xmldsig::{
 };
 use xml_sec_xades::{
     Assessment, Completion, DataObject, Envelope, Inputs, PendingTimestamp, Request, Requirements,
-    Signer, TimestampRequest, complete_timestamp, create, request_timestamp,
+    Signer, TimestampRequest, ValidationData, add_validation_data, complete_timestamp, create,
+    request_timestamp,
 };
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
@@ -42,15 +50,32 @@ fn read(directory: &Path, name: &str) -> Result<Vec<u8>, String> {
     std::fs::read(directory.join(name)).map_err(|error| format!("read {name}: {error}"))
 }
 
+/// The verification of every assessment: chains to `root` at the fixed instant.
+fn verification() -> VerificationPolicy {
+    let mut verification = VerificationPolicy::default();
+    verification.key_trust.verify_x509_chains = true;
+    verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
+    verification
+}
+
+fn utc() -> Result<LeapTable<'static>, String> {
+    LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
+        .map_err(|error| format!("UTC coverage: {error:?}"))
+}
+
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|complete FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|complete|extend FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
         return Err(usage.into());
     };
     let (fixtures, output) = (PathBuf::from(fixtures), PathBuf::from(output));
+    std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
+    if action.to_str() == Some("extend") {
+        return extend(&fixtures, &output);
+    }
     let root = read(&fixtures, "root.der")?;
     let intermediate = read(&fixtures, "intermediate.der")?;
     let signer_der = read(&fixtures, "signer.der")?;
@@ -69,15 +94,12 @@ fn main() -> Result<(), String> {
         digest: DigestAlgorithm::Sha256,
         canonicalization: C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
     };
-    let mut verification = VerificationPolicy::default();
-    verification.key_trust.verify_x509_chains = true;
-    verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
         ..KeyResolverConfig::default()
     });
     let context = VerifyContext::new()
-        .policy(verification)
+        .policy(verification())
         .key_resolver(&resolver);
     let request = VerificationRequest::default();
     let assessment = Assessment {
@@ -94,7 +116,6 @@ fn main() -> Result<(), String> {
         nonce,
         id_attributes: &[],
     };
-    std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
     let write = |name: &str, bytes: &[u8]| {
         std::fs::write(output.join(name), bytes).map_err(|error| format!("{name}: {error}"))
     };
@@ -172,8 +193,7 @@ fn complete(
     [root, intermediate]: [&[u8]; 2],
     work: &Memory,
 ) -> Result<(), String> {
-    let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
-        .map_err(|error| format!("UTC coverage: {error:?}"))?;
+    let utc = utc()?;
     let inputs = Inputs {
         requirements: Requirements::Timestamped,
         anchors: &[root],
@@ -192,4 +212,74 @@ fn complete(
     };
     complete_timestamp(document, pending, response, &completion, work)
         .map_err(|error| format!("complete: {error}"))
+}
+
+/// The DER of every distinct `xades:{local}` value of `xml`, in document order.
+fn values(xml: &str, local: &str) -> Result<Vec<Vec<u8>>, String> {
+    let (open, close) = (format!("<xades:{local}>"), format!("</xades:{local}>"));
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    for (start, _) in xml.match_indices(&open) {
+        let start = start + open.len();
+        let end = start
+            + xml[start..]
+                .find(&close)
+                .ok_or_else(|| format!("unterminated {local}"))?;
+        let value = STANDARD
+            .decode(&xml[start..end])
+            .map_err(|error| format!("{local}: {error}"))?;
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    Ok(values)
+}
+
+/// Add the issued CRLs and OCSP response to the B-T level fixture and require B-LT.
+fn extend(levels: &Path, output: &Path) -> Result<(), String> {
+    let text = |name: &str| {
+        String::from_utf8(read(levels, name)?).map_err(|error| format!("{name}: {error}"))
+    };
+    let root = read(levels, "root.der")?;
+    let issued = text("b-lt.xml")?;
+    let crls = values(&issued, "EncapsulatedCRLValue")?;
+    let responses = values(&issued, "EncapsulatedOCSPValue")?;
+    let crls: Vec<&[u8]> = crls.iter().map(Vec::as_slice).collect();
+    let responses: Vec<&[u8]> = responses.iter().map(Vec::as_slice).collect();
+    let mut document = XmlDocument::parse(&text("b-t.xml")?).map_err(|error| error.to_string())?;
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![root.clone()],
+        ..KeyResolverConfig::default()
+    });
+    let context = VerifyContext::new()
+        .policy(verification())
+        .key_resolver(&resolver);
+    let request = VerificationRequest::default();
+    let utc = utc()?;
+    let work = Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 30)));
+    add_validation_data(
+        &mut document,
+        &ValidationData {
+            signature: "sig",
+            assessment: &Assessment {
+                context: &context,
+                request: &request,
+                certificates: &[],
+            },
+            inputs: &Inputs {
+                requirements: Requirements::LongTerm,
+                anchors: &[&root],
+                certificates: &[],
+                utc: &utc,
+                accuracies: &[],
+                responders: &[],
+                crls: &crls,
+                responses: &responses,
+            },
+            id_attributes: &[],
+        },
+        &work,
+    )
+    .map_err(|error| format!("extend: {error}"))?;
+    std::fs::write(output.join("b-lt.xml"), document.as_xml())
+        .map_err(|error| format!("b-lt.xml: {error}"))
 }

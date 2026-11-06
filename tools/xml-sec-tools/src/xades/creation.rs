@@ -1,7 +1,8 @@
 //! `xades creation [--results DIR]`: EU DSS's independent reading of the
 //! signatures xml-sec creates and augments. The `create_probe` example signs
 //! every packaging mode with the creation fixtures, and `augment_probe` adds a
-//! TSA token to a B-B signature with the augmentation fixtures. DSS must
+//! TSA token to a B-B signature with the augmentation fixtures and the CRLs and
+//! OCSP response of the level fixtures to their B-T signature. DSS must
 //! classify each signature at its expected level, find it cryptographically
 //! intact with every reference found and intact, identify the signing
 //! certificate and find every timestamp intact over its message imprint.
@@ -37,7 +38,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 7] = [
+pub(crate) const CASES: [Case; 8] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -50,6 +51,13 @@ pub(crate) const CASES: [Case; 7] = [
         format: "XAdES-BASELINE-T",
         timestamps: 1,
         fixtures: "augmentation",
+    },
+    Case {
+        name: "b-lt",
+        signatures: 1,
+        format: "XAdES-BASELINE-LT",
+        timestamps: 1,
+        fixtures: "levels",
     },
 ];
 
@@ -199,6 +207,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
     for (example, action, directory) in [
         ("create_probe", None, "creation"),
         ("augment_probe", Some("complete"), "augmentation"),
+        ("augment_probe", Some("extend"), "levels"),
     ] {
         let mut probe = line(&[
             &"cargo",

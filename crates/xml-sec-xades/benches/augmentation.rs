@@ -1,10 +1,14 @@
 //! Native latency of B-T augmentation over the augmentation fixtures
-//! (RSA-SHA256 signer and an OpenSSL TSA under one root). Each run gets a
-//! fresh resource account and asserts its result; creating the B-B signature
-//! and the pending request is excluded.
+//! (RSA-SHA256 signer and an OpenSSL TSA under one root), and of B-LT
+//! augmentation over the level fixtures (the same signature at B-T and B-LT,
+//! with OpenSSL CRLs and a delegated OCSP response). Each run gets a fresh
+//! resource account and asserts its result; creating the B-B signature, the
+//! pending request and parsing the B-T document are excluded.
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use structured_asn1::memory::{Memory, MemoryAccount};
 use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::LeapTable;
@@ -16,8 +20,9 @@ use xml_sec::xmldsig::{
     UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::{
-    Assessment, Completion, DataObject, Envelope, Inputs, PendingTimestamp, Request, Requirements,
-    Signer, TimestampRequest, complete_timestamp, create, request_timestamp,
+    Assessment, Completion, DataAdded, DataObject, Envelope, Inputs, PendingTimestamp, Request,
+    Requirements, Signer, TimestampRequest, ValidationData, add_validation_data,
+    complete_timestamp, create, request_timestamp,
 };
 
 const ROOT: &[u8] = include_bytes!("../tests/fixtures/augmentation/root.der");
@@ -26,6 +31,9 @@ const SIGNER: &[u8] = include_bytes!("../tests/fixtures/augmentation/signer.der"
 const KEY: &str = include_str!("../tests/fixtures/augmentation/signer.key");
 const REQUEST: &[u8] = include_bytes!("../tests/fixtures/augmentation/request.tsq");
 const RESPONSE: &[u8] = include_bytes!("../tests/fixtures/augmentation/response.tsr");
+const LEVELS_ROOT: &[u8] = include_bytes!("../tests/fixtures/levels/root.der");
+const B_T: &str = include_str!("../tests/fixtures/levels/b-t.xml");
+const B_LT: &str = include_str!("../tests/fixtures/levels/b-lt.xml");
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
 const TIME: &str = "2026-10-18T12:00:00Z";
 const NONCE: &[u8] = &[0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71];
@@ -190,5 +198,73 @@ fn complete_signature_timestamp(bencher: divan::Bencher) {
                 .expect("B-T completion");
             assert!(document.generation() > generation);
             (document, pending, work)
+        });
+}
+
+/// The DER of every distinct `xades:{local}` value of `xml`.
+fn values(xml: &str, local: &str) -> Vec<Vec<u8>> {
+    let (open, close) = (format!("<xades:{local}>"), format!("</xades:{local}>"));
+    let mut values: Vec<Vec<u8>> = Vec::new();
+    for (start, _) in xml.match_indices(&open) {
+        let start = start + open.len();
+        let end = start + xml[start..].find(&close).expect("closed value");
+        let value = STANDARD.decode(&xml[start..end]).expect("base64 value");
+        if !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// The B-LT census over the caller's CRLs and OCSP response, staging the
+/// missing values, and the verification and B-LT assessment that gate
+/// publication.
+#[divan::bench]
+fn add_long_term_validation_data(bencher: divan::Bencher) {
+    let mut verification = VerificationPolicy::default();
+    verification.key_trust.verify_x509_chains = true;
+    verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![LEVELS_ROOT.to_vec()],
+        ..KeyResolverConfig::default()
+    });
+    let context = VerifyContext::new()
+        .policy(verification)
+        .key_resolver(&resolver);
+    let request = VerificationRequest::default();
+    let assessment = Assessment {
+        context: &context,
+        request: &request,
+        certificates: &[],
+    };
+    let (crls, responses) = (
+        values(B_LT, "EncapsulatedCRLValue"),
+        values(B_LT, "EncapsulatedOCSPValue"),
+    );
+    let crls: Vec<&[u8]> = crls.iter().map(Vec::as_slice).collect();
+    let responses: Vec<&[u8]> = responses.iter().map(Vec::as_slice).collect();
+    let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[]).expect("UTC coverage");
+    let inputs = Inputs {
+        requirements: Requirements::LongTerm,
+        anchors: &[LEVELS_ROOT],
+        certificates: &[],
+        utc: &utc,
+        accuracies: &[],
+        responders: &[],
+        crls: &crls,
+        responses: &responses,
+    };
+    let data = ValidationData {
+        signature: "sig",
+        assessment: &assessment,
+        inputs: &inputs,
+        id_attributes: &[],
+    };
+    bencher
+        .with_inputs(|| (XmlDocument::parse(B_T).expect("B-T fixture"), account()))
+        .bench_local_values(|(mut document, work)| {
+            let added = add_validation_data(&mut document, &data, &work).expect("B-LT addition");
+            assert_eq!(added, DataAdded::Published);
+            (document, work)
         });
 }

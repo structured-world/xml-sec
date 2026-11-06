@@ -34,6 +34,10 @@
 //! `SignatureTimeStamp` input, and `complete_timestamp` checks the response
 //! against that request and the unchanged generation, adds the token and
 //! publishes only a generation that meets the requested level.
+//! `add_validation_data` takes a B-T signature to B-LT: the level's own census
+//! decides which certificates, CRLs and OCSP responses the document lacks, or
+//! holds only where a timestamp may not use them, and they are appended from
+//! the caller's inputs or the document as one `AnyValidationData`.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -64,8 +68,8 @@ mod xml;
 pub use accuracy::AuthorityAccuracy;
 #[cfg(feature = "produce")]
 pub use augment::{
-    AugmentError, Completion, PendingTimestamp, TimestampRequest, TokenFacts, complete_timestamp,
-    request_timestamp,
+    AugmentError, Completion, DataAdded, PendingTimestamp, TimestampRequest, TokenFacts,
+    ValidationData, add_validation_data, complete_timestamp, request_timestamp,
 };
 pub use basic::{
     CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,
