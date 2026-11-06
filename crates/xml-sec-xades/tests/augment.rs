@@ -10,12 +10,13 @@
 
 use std::sync::Arc;
 
-use structured_asn1::Oid;
 use structured_asn1::memory::{Memory, MemoryAccount};
+use structured_asn1::{Oid, Parser};
 use structured_cms::timestamp::response::Status;
 use structured_cms::timestamp::{
     Accuracy, ImprintAgreement, PolicyAccuracy, RequestAgreement, RequestWindow, Timeliness,
 };
+use structured_pkix::Certificate;
 use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::{Instant as UtcInstant, LeapTable};
 use xml_sec::XmlDocument;
@@ -24,7 +25,7 @@ use xml_sec::document::NodeIdentity;
 use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
-    UriTypeSet, VerificationRequest, VerifyContext, with_verified_request,
+    UriTypeSet, VerificationKey, VerificationRequest, VerifyContext, with_verified_request,
 };
 use xml_sec_xades::{
     Assessment, AugmentError, AuthorityAccuracy, Completion, Countersignature, DataObject,
@@ -79,6 +80,20 @@ struct Fixture {
     signing: SigningPolicy,
     resolver: DefaultKeyResolver,
     verification: VerificationPolicy,
+    /// A caller-supplied key that verifies signatures without any path.
+    explicit: Option<VerificationKey>,
+}
+
+/// The signer's own public key, as a caller would configure it directly.
+fn signer_key() -> VerificationKey {
+    let parser = Parser::der(account());
+    let certificate = Certificate::read(&parser, SIGNER, 0).expect("signer certificate");
+    VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: certificate.tbs().public_key().as_bytes().to_vec(),
+        certificate_der: None,
+        name: None,
+    }
 }
 
 /// The caller evidence of a completion beyond its assessment.
@@ -117,6 +132,7 @@ impl Fixture {
                 ..KeyResolverConfig::default()
             }),
             verification,
+            explicit: None,
         }
     }
 
@@ -131,9 +147,11 @@ impl Fixture {
         targets: &[NodeIdentity],
         operation: impl FnOnce(&Assessment<'_, '_>) -> R,
     ) -> R {
-        let context = VerifyContext::new()
-            .policy(self.verification.clone())
-            .key_resolver(&self.resolver);
+        let context = VerifyContext::new().policy(self.verification.clone());
+        let context = match &self.explicit {
+            Some(key) => context.key(key),
+            None => context.key_resolver(&self.resolver),
+        };
         let request = VerificationRequest {
             expected_targets: targets,
             ..VerificationRequest::default()
@@ -439,6 +457,57 @@ fn a_rejection_publishes_nothing() {
         &mut document,
         |document| fixture.complete(document, &pending, RESPONSE_REJECTED, B_T, &account()),
         |error| matches!(error, AugmentError::Refused(Status::Rejection)),
+    );
+}
+
+#[test]
+fn a_token_with_an_altered_signature_is_refused() {
+    // The response ends with the token's SignerInfo signature value; a
+    // changed byte there leaves every other fact intact and no evidence.
+    let fixture = Fixture::new();
+    let mut document = fixture.created();
+    let pending = fixture
+        .request(&document, None, Some(NONCE), &account())
+        .expect("request");
+    let mut altered = RESPONSE.to_vec();
+    *altered.last_mut().expect("response bytes") ^= 0x01;
+    refused(
+        &mut document,
+        |document| fixture.complete(document, &pending, &altered, B_T, &account()),
+        |error| {
+            unproven(error).is_some_and(|facts| {
+                facts.imprint == ImprintAgreement::Matches
+                    && facts.requested_imprint == Some(RequestAgreement::Matches)
+            })
+        },
+    );
+}
+
+#[test]
+fn a_signature_without_b_b_is_neither_requested_nor_completed() {
+    // Both steps require B-B of the signature first. A key the caller
+    // supplies directly verifies the signature without any certificate path,
+    // so the signer has no validated path and B-B is unmet.
+    let mut fixture = Fixture::new();
+    let mut document = fixture.created();
+    let pending = fixture
+        .request(&document, None, Some(NONCE), &account())
+        .expect("request");
+    fixture.explicit = Some(signer_key());
+    let before = (document.as_xml().to_owned(), document.generation());
+    let result = fixture.request(&document, None, Some(NONCE), &account());
+    assert!(
+        matches!(result, Err(AugmentError::Unmet(Outcome::Path { .. }))),
+        "{result:?}"
+    );
+    assert_eq!(
+        (document.as_xml().to_owned(), document.generation()),
+        before
+    );
+    refused(
+        &mut document,
+        |document| fixture.complete(document, &pending, RESPONSE, B_T, &account()),
+        |error| matches!(error, AugmentError::Unmet(Outcome::Path { .. })),
     );
 }
 
