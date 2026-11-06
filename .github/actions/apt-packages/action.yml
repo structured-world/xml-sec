@@ -1,0 +1,41 @@
+name: Install Debian packages
+description: >-
+  Install packages with apt-get, refreshing the package index once per job.
+  Every attempt runs under a time limit and a failed or stalled attempt is
+  retried, so one unresponsive mirror cannot hold the job until its timeout.
+inputs:
+  packages:
+    description: Space-separated package names
+    required: true
+  recommends:
+    description: Whether recommended packages are installed as well
+    default: 'true'
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        RECOMMENDS: ${{ inputs.recommends }}
+      run: |
+        set -euo pipefail
+        read -r -a packages <<< "$PACKAGES"
+        options=(-q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        install=(install --yes)
+        if [ "$RECOMMENDS" != true ]; then
+          install+=(--no-install-recommends)
+        fi
+        # apt's own timeouts do not bound a mirror that keeps the connection
+        # open without sending, so each attempt also has a wall-clock limit.
+        # A failed attempt refreshes the index again: the mirror may have moved.
+        attempt=1
+        until { [ "${APT_INDEX_REFRESHED:-}" = 1 ] || sudo timeout --kill-after=30 300 apt-get "${options[@]}" update; } &&
+          sudo timeout --kill-after=30 900 apt-get "${options[@]}" "${install[@]}" "${packages[@]}"; do
+          if [ "$attempt" -ge 3 ]; then
+            echo "::error::apt-get failed $attempt times"
+            exit 1
+          fi
+          attempt=$((attempt + 1))
+          APT_INDEX_REFRESHED=
+        done
+        echo APT_INDEX_REFRESHED=1 >> "$GITHUB_ENV"

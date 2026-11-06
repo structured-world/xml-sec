@@ -39,9 +39,9 @@ jobs:
           domain: benchmark
           save: 'true'
       - name: Install native benchmark tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config valgrind
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config valgrind
       - uses: taiki-e/install-action@nextest
       - name: Test metric interpretation
         run: cargo nextest run -p xml-sec-tools bench

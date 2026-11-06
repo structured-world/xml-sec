@@ -25,12 +25,16 @@ runs:
     # mold links with fewer threads and less random I/O than the self-contained
     # rust-lld; it exists for Linux only. RUSTFLAGS is set before the cache step
     # so the restored artifacts match the flags they were built with.
+    - name: Install mold
+      if: runner.os == 'Linux' && inputs.mold == 'true'
+      uses: ./.github/actions/apt-packages
+      with:
+        packages: mold
+        recommends: 'false'
     - name: Link with mold
       if: runner.os == 'Linux' && inputs.mold == 'true'
       shell: bash
       run: |
-        sudo apt-get update -q
-        sudo apt-get install -y --no-install-recommends mold
         mold --version
         # Only x86_64 defaults to the self-contained rust-lld and accepts
         # turning it off on stable; elsewhere mold replaces the system linker.
