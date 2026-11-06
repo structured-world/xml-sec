@@ -705,6 +705,72 @@ pub struct XmlDocument {
 /// The generation an all-or-nothing mutation started from, kept from its first
 /// commit on, so that no copy of the document is parsed in advance.
 #[cfg(feature = "xmldsig-sign")]
+/// Where the element at `range` of `old` stands in `new`, when every change
+/// between them lies outside it or inside its `content` (absent for an empty
+/// element).
+///
+/// One change between two texts aligns several ways when bytes repeat around
+/// it: from the longest common prefix, then the longest common suffix after
+/// it, or the other way round, and anything between. An element that one of
+/// the two extreme alignments leaves whole is the same element in `new`; when
+/// both leave it whole but in different places, as for two equal siblings,
+/// which one it is cannot be told, and it is not carried.
+#[cfg(feature = "xmldsig-sign")]
+fn carried_range(
+    old: &str,
+    new: &str,
+    range: Range<usize>,
+    content: Option<&Range<usize>>,
+) -> Option<Range<usize>> {
+    let (old, new) = (old.as_bytes(), new.as_bytes());
+    let common = |left: &[u8], right: &[u8]| {
+        left.iter()
+            .zip(right)
+            .take_while(|(left, right)| left == right)
+            .count()
+    };
+    let common_end = |left: &[u8], right: &[u8]| {
+        left.iter()
+            .rev()
+            .zip(right.iter().rev())
+            .take_while(|(left, right)| left == right)
+            .count()
+    };
+    let prefix_first = common(old, new);
+    let prefix_first = (
+        prefix_first,
+        common_end(&old[prefix_first..], &new[prefix_first..]),
+    );
+    let suffix_first = common_end(old, new);
+    let suffix_first = (
+        common(
+            &old[..old.len() - suffix_first],
+            &new[..new.len() - suffix_first],
+        ),
+        suffix_first,
+    );
+    let place = |(prefix, suffix): (usize, usize)| {
+        let changed = old.len() - suffix;
+        // `suffix` bytes end both texts, so a position past `changed` keeps
+        // its distance from the end and none of these subtractions can wrap.
+        let moved = |position: usize| new.len() - (old.len() - position);
+        if range.end <= prefix {
+            Some(range.clone())
+        } else if range.start >= changed {
+            Some(moved(range.start)..moved(range.end))
+        } else if content.is_some_and(|content| content.start <= prefix && changed <= content.end) {
+            Some(range.start..moved(range.end))
+        } else {
+            None
+        }
+    };
+    match (place(prefix_first), place(suffix_first)) {
+        (Some(first), Some(second)) if first != second => None,
+        (Some(placed), _) | (None, Some(placed)) => Some(placed),
+        (None, None) => None,
+    }
+}
+
 enum AtomicMutation {
     /// Nothing committed since it began. An enclosing frame in this state
     /// started from the same generation as the frame inside it.
@@ -1082,7 +1148,8 @@ impl XmlDocument {
     /// Run `mutate` as one all-or-nothing mutation.
     ///
     /// When `mutate` returns `Ok`, everything it committed becomes one new
-    /// generation; identities captured between its commits are stale. When it
+    /// generation; identities captured between its commits are stale, and
+    /// [`Self::carry`] maps elements of the starting generation into it. When it
     /// returns `Err` or unwinds, the serialization and generation are exactly
     /// those before the call, identities captured before it stay valid, and
     /// those captured inside it never become valid again. Transactions nest: an inner one that fails rolls
@@ -1104,6 +1171,74 @@ impl XmlDocument {
         let result = mutate(guard.document);
         guard.succeeded = result.is_ok();
         result
+    }
+
+    /// The identity, in the current generation, of the element `identity`
+    /// names in the generation an open transaction started from.
+    ///
+    /// An element the transaction's commits left in place keeps its identity
+    /// across them: one entirely before or after every changed byte, or one
+    /// enclosing all of them, with the same expanded name. This lets a check
+    /// inside the transaction hold the caller's node requirements, such as
+    /// expected coverage targets, for the generation it is about to publish.
+    /// An identity of the current generation is returned as it is.
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::ForeignIdentity`] for another document,
+    /// [`XmlDocumentError::StaleIdentity`] for a generation that is neither
+    /// current nor the start of an open transaction, and
+    /// [`XmlDocumentError::MissingNode`] for a node that is not an element or
+    /// that the commits replaced, removed or changed into another element.
+    #[cfg(feature = "xmldsig-sign")]
+    pub fn carry(&self, identity: NodeIdentity) -> Result<NodeIdentity, XmlDocumentError> {
+        if identity.document != self.identity {
+            return Err(XmlDocumentError::ForeignIdentity);
+        }
+        if identity.generation == self.generation {
+            return self.with_view(|view| {
+                if view.resolve_node(identity)?.is_element() {
+                    Ok(identity)
+                } else {
+                    Err(XmlDocumentError::MissingNode)
+                }
+            });
+        }
+        let base = self.atomic.iter().find_map(|frame| match frame {
+            AtomicMutation::Replaced(cell, generation) if *generation == identity.generation => {
+                Some(cell)
+            }
+            _ => None,
+        });
+        let Some(base) = base else {
+            return Err(XmlDocumentError::StaleIdentity {
+                identity: identity.generation,
+                current: self.generation,
+            });
+        };
+        base.with_dependent(|old, earlier| {
+            let element = SemanticDocument::node(&earlier.document, identity.semantic_id)
+                .filter(|node| node.is_element() && node.has_actionable_range())
+                .ok_or(XmlDocumentError::MissingNode)?;
+            let range = element.range();
+            let (content, _, empty) = element_content_range(&old[range.clone()])?;
+            let content = (!empty).then(|| range.start + content.start..range.start + content.end);
+            self.with_view(|view| {
+                let range = carried_range(old, view.xml(), range, content.as_ref())
+                    .ok_or(XmlDocumentError::MissingNode)?;
+                let name = element.tag_name();
+                view.parsed
+                    .document
+                    .descendants()
+                    .find(|node| {
+                        node.is_element()
+                            && node.range() == range
+                            && node.tag_name().namespace() == name.namespace()
+                            && node.tag_name().name() == name.name()
+                    })
+                    .map(|node| view.node_identity(node))
+                    .ok_or(XmlDocumentError::MissingNode)
+            })
+        })
     }
 
     /// End the innermost mutation: success leaves one new generation, failure
@@ -4639,6 +4774,9 @@ mod replacement_tests;
 
 #[cfg(all(test, feature = "xmldsig-sign"))]
 mod transaction_tests;
+
+#[cfg(all(test, feature = "xmldsig-sign"))]
+mod carry_tests;
 
 #[cfg(test)]
 mod insertion_tests;

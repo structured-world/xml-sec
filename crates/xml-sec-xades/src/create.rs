@@ -22,11 +22,11 @@ use xml_sec::provider::{CryptoProvider, ProviderError};
 use xml_sec::xmldsig::extension::{self, InspectionError, NodeView, ScalarError, TreeError};
 use xml_sec::xmldsig::parse::{KeyInfoParsingSession, ParseError};
 use xml_sec::xmldsig::{
-    DigestAlgorithm, DsigError, KeyInfoWriteError, ObjectBuilder, ObjectContent, ObjectElement,
-    ReferenceBuilder, SignContext, SignatureAlgorithm, SignatureBuilder, SignatureBuilderError,
-    SignatureTemplateSelection, SigningError, SigningKey, Transform, VerificationRequest,
-    VerifyContext, X509CertificateKeyInfoWriter, compute_digest_with_provider,
-    with_verified_request,
+    CallerTrustedSignatureKey, DigestAlgorithm, DsigError, KeyInfoWriteError, ObjectBuilder,
+    ObjectContent, ObjectElement, ReferenceBuilder, SignContext, SignatureAlgorithm,
+    SignatureBuilder, SignatureBuilderError, SignatureTemplateSelection, SigningError, SigningKey,
+    Transform, VerificationRequest, VerifyContext, X509CertificateKeyInfoWriter,
+    compute_digest_with_provider, with_verified_request,
 };
 
 const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
@@ -597,7 +597,8 @@ fn context<'a>(
 ///
 /// The request's signature requirement (every signature, by default) must
 /// hold, so a new signature cannot leave an earlier one, or a countersignature,
-/// failing in the published generation.
+/// failing in the published generation. Its expected targets and trusted
+/// keys hold for the same elements, carried into that generation.
 fn assess<W: Work>(
     document: &XmlDocument,
     signature: &str,
@@ -605,10 +606,11 @@ fn assess<W: Work>(
     assessment: &Assessment<'_, '_>,
     work: &W,
 ) -> Result<(), CreateError> {
+    let carried = Carried::new(document, assessment.request)?;
     let outcome = with_verified_request(
         document,
         assessment.context,
-        assessment.request,
+        &carried.request(assessment.request),
         work,
         |session| {
             if !session.evidence().accepted(document)? {
@@ -628,6 +630,56 @@ fn assess<W: Work>(
     match outcome {
         Outcome::Assessed(true) => Ok(()),
         outcome => Err(CreateError::Unmet(outcome.map(|_| ()))),
+    }
+}
+
+/// The node requirements of a verification request, carried into the current
+/// generation of a document inside the transaction that changed it.
+pub(crate) struct Carried<'k> {
+    targets: Vec<NodeIdentity>,
+    keys: Vec<CallerTrustedSignatureKey<'k>>,
+}
+
+impl<'k> Carried<'k> {
+    /// Carry every expected target and trusted key's signature of `request`.
+    ///
+    /// # Errors
+    /// The document's refusal when an element no longer has a counterpart, as
+    /// when the transaction replaced it.
+    pub(crate) fn new(
+        document: &XmlDocument,
+        request: &VerificationRequest<'k>,
+    ) -> Result<Self, XmlDocumentError> {
+        let targets = request
+            .expected_targets
+            .iter()
+            .map(|target| document.carry(*target))
+            .collect::<Result<_, _>>()?;
+        let keys = request
+            .trusted_keys
+            .iter()
+            .map(|entry| {
+                Ok(CallerTrustedSignatureKey {
+                    signature: document.carry(entry.signature)?,
+                    key: entry.key,
+                })
+            })
+            .collect::<Result<_, XmlDocumentError>>()?;
+        Ok(Self { targets, keys })
+    }
+
+    /// `request` with the carried targets and keys.
+    pub(crate) fn request<'a>(
+        &'a self,
+        request: &VerificationRequest<'a>,
+    ) -> VerificationRequest<'a> {
+        VerificationRequest {
+            expected_targets: &self.targets,
+            trusted_keys: &self.keys,
+            external_resources: request.external_resources,
+            signatures: request.signatures,
+            correlation: request.correlation,
+        }
     }
 }
 

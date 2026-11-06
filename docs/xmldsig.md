@@ -239,7 +239,10 @@ relax the compiled security policy. The default requires all signatures to pass;
 explicitly tolerates other failures, while `Exactly(n)` requires exactly `n` signatures, all valid.
 Zero cardinality, duplicate targets, ambiguous key mappings, and foreign/stale identities are
 rejected before key or digest work. External bytes cannot be supplied simultaneously in the
-context and the request.
+context and the request. Inside `XmlDocument::transaction`, `XmlDocument::carry` maps an element
+of the generation the transaction started from into the current one, when the commits left it in
+place, so an operation that mutates and then verifies its result keeps the caller's targets and
+keys bound to the same elements.
 
 ```rust
 use xml_sec::XmlDocument;
