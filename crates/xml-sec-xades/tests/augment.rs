@@ -461,6 +461,43 @@ fn a_rejection_publishes_nothing() {
 }
 
 #[test]
+fn the_signer_path_keeps_the_assessment_certificates() {
+    // The assessment supplies the signer's root; the level inputs name no
+    // anchor. The signer's path still forms from the assessment's
+    // certificates, and only the TSA's path, which needs an anchor of the
+    // inputs, fails: those certificates are not promoted to TSA anchors.
+    let fixture = Fixture::new();
+    let mut document = fixture.created();
+    let pending = fixture
+        .request(&document, None, Some(NONCE), &account())
+        .expect("request");
+    refused(
+        &mut document,
+        |document| {
+            fixture.complete(
+                document,
+                &pending,
+                RESPONSE,
+                Given {
+                    anchors: &[],
+                    ..B_T
+                },
+                &account(),
+            )
+        },
+        |error| {
+            matches!(
+                error,
+                AugmentError::Unmet(Outcome::Timestamp {
+                    failure: TimestampFailure::Path(_),
+                    ..
+                })
+            )
+        },
+    );
+}
+
+#[test]
 fn a_token_with_an_altered_signature_is_refused() {
     // The response ends with the token's SignerInfo signature value; a
     // changed byte there leaves every other fact intact and no evidence.

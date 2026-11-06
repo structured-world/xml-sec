@@ -331,6 +331,25 @@ pub fn complete_timestamp<W: Work>(
             )
         },
     )??;
+    // The signer's path forms from the certificates its B-B assessment used,
+    // as it did before the token was added. They join the pool any path may
+    // use, never the anchors: a TSA path still has to end at an input anchor.
+    let mut certificates = work.memory().vector();
+    certificates
+        .try_reserve_exact(completion.inputs.certificates.len() + assessment.certificates.len())?;
+    for certificate in completion
+        .inputs
+        .certificates
+        .iter()
+        .chain(assessment.certificates)
+    {
+        certificates.try_push(*certificate)?;
+    }
+    let certificates = certificates.into_owned();
+    let inputs = Inputs {
+        certificates: &certificates,
+        ..*completion.inputs
+    };
     document.transaction(|document| {
         unsigned.insert(document, &property)?;
         // The caller's targets and keys name elements of the requested
@@ -345,7 +364,7 @@ pub fn complete_timestamp<W: Work>(
                 Ok(
                     selected(document, &session, signature, completion.id_attributes).and_then(
                         |node| {
-                            Ok(validate(&session, node, completion.inputs, |level| {
+                            Ok(validate(&session, node, &inputs, |level| {
                                 level.all_requirements_met()
                             })?)
                         },
