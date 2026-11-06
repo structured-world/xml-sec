@@ -359,12 +359,28 @@ fn apt_retries_fit_one_budget_that_leaves_the_job_time() {
     // it is spent.
     let (success, calls, _) = apt_after(550, "softhsm2", "true", false, &[]);
     assert!(success);
+    // Bash advances SECONDS on whole wall-clock seconds, so a second boundary
+    // between the two calls leaves one second less for the later one.
+    let limits: Vec<(u32, &str)> = calls
+        .iter()
+        .map(|call| {
+            let (limit, command) = call.split_once(' ').expect("limit before command");
+            (limit.parse().expect("numeric limit"), command)
+        })
+        .collect();
     assert_eq!(
-        calls,
+        limits
+            .iter()
+            .map(|&(_, command)| command)
+            .collect::<Vec<_>>(),
         [
-            format!("50 {APT} update"),
-            format!("50 {APT} install --yes softhsm2"),
+            format!("{APT} update"),
+            format!("{APT} install --yes softhsm2"),
         ]
+    );
+    assert!(
+        limits.iter().all(|&(limit, _)| limit == 49 || limit == 50),
+        "{limits:?}"
     );
     let (success, calls, environment) = apt_after(600, "softhsm2", "true", false, &[]);
     assert!(!success);
