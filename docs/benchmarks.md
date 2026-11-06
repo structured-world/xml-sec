@@ -13,6 +13,7 @@ unstable, hidden measurement entry points, not application APIs.
 ```sh
 cargo bench --bench security --features benchmark-internals
 cargo bench --bench security --features benchmark-alloc
+cargo bench -p xml-sec-xades --bench lifecycle --features produce
 cargo run -p xml-sec-tools -- bench-latency target/performance/run-1 1000
 # Optional native FIPS provider, never a fallback to RustCrypto:
 cargo run -p xml-sec-tools -- bench-latency target/performance/fips-1 1000 aws-lc-fips
@@ -69,6 +70,23 @@ Reference over 256 KiB and 4 MiB of entity-free text (the `bulk` shape, kept out
 of the general matrix). The canonical output dominates the input, so the
 allocation run's peak shows whether the Reference digest retains that output;
 with streamed digests the verification peak no longer grows with the payload.
+
+`builder_sign` signs the SAML-shaped document through `SignatureBuilder` with an
+escaped `Object`, scaled with the document and signed by its own Reference
+(enveloping) beside `#payload`: each operation builds the
+template, checks it against the signing policy and signs it in the document's
+transaction, as an application does per message; the sign case above starts from
+a prepared template instead. Parsing the input is outside the timer.
+
+The `xml-sec-xades` `lifecycle` benchmark measures enveloped B-B creation,
+countersigning (both new signature and parent assessed before publication), and
+verification followed by the B-B assessment of the parent or the
+countersignature, over the RSA-SHA256 creation fixtures. Each run uses a fresh
+resource account. These are native measurements only; comparison with EU DSS
+needs qualified equivalent operations and separates JVM metrics.
+
+CI runs every benchmark once with `-- --test`, assertions included, so a
+broken workload fails before any measurement.
 
 Setup imports keys, generates signatures/ciphertexts and validates verification
 and decryption before measurement. Timed operations retain correctness assertions:

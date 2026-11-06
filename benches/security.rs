@@ -83,6 +83,60 @@ fn large_reference_sign(bencher: divan::Bencher, units: usize) {
         .bench_local(|| fixture.run("sign"));
 }
 
+/// Signing through `SignatureBuilder`, as an application signs each new
+/// message: every operation builds the template with an escaped `Object`
+/// (`units` copies of its text) that a second Reference signs (enveloping),
+/// checks it against the policy, then digests `#payload` and `#object` and
+/// signs inside the document's transaction. Parsing the input is excluded.
+#[divan::bench(args = [16, 256])]
+fn builder_sign(bencher: divan::Bencher, units: usize) {
+    use xml_sec::XmlDocument;
+    use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+    use xml_sec::xmldsig::{
+        DigestAlgorithm, ObjectBuilder, ObjectContent, ReferenceBuilder, RsaSigningKey,
+        SignContext, SignatureAlgorithm, SignatureBuilder,
+    };
+    let shape = support::SHAPES
+        .iter()
+        .position(|shape| *shape == "saml")
+        .expect("saml shape");
+    let unsigned = reference_fixture(shape, units).unsigned;
+    let key =
+        RsaSigningKey::from_pkcs8_pem(include_str!("../tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("test key");
+    let builder = SignatureBuilder::new(
+        C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        SignatureAlgorithm::RsaSha256,
+    )
+    .ns_prefix("ds")
+    .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"))
+    .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#object"))
+    .add_object(
+        ObjectBuilder::new(ObjectContent::Text(
+            "deterministic object text & escaping ".repeat(units),
+        ))
+        .id("object"),
+    );
+    let sign = |document: &mut XmlDocument| {
+        SignContext::new(&key)
+            .sign_document_with_builder(document, &builder)
+            .expect("builder signing");
+    };
+    let parse = || XmlDocument::parse(&*unsigned).expect("unsigned document");
+    let mut expected = parse();
+    sign(&mut expected);
+    let expected = expected.into_xml();
+    assert!(expected.contains("URI=\"#object\""), "the Object is signed");
+    bencher
+        .counter(divan::counter::BytesCount::new(unsigned.len()))
+        .with_inputs(parse)
+        .bench_local_values(|mut document| {
+            sign(&mut document);
+            assert_eq!(document.as_xml(), expected);
+            document
+        });
+}
+
 /// Signed-document shape for node-set measurements: `elements` siblings with
 /// two attributes under two in-scope namespace declarations.
 fn node_set_document(elements: usize) -> String {

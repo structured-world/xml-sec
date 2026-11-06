@@ -275,6 +275,21 @@ fn apt_after(
     refreshed: bool,
     exits: &[u8],
 ) -> (bool, Vec<String>, String) {
+    let (success, calls, environment, _) =
+        apt_run(elapsed, packages, recommends, refreshed, exits, None);
+    (success, calls, environment)
+}
+
+/// [`apt_after`] on a runner whose mirror list holds `mirrors`, or has none;
+/// also returns the mirror list the action left.
+fn apt_run(
+    elapsed: u32,
+    packages: &str,
+    recommends: &str,
+    refreshed: bool,
+    exits: &[u8],
+    mirrors: Option<&str>,
+) -> (bool, Vec<String>, String, Option<String>) {
     let action = read(".github/actions/apt-packages/action.yml");
     let script = literal_block(&action, "      run: |\n", 8);
     let directory = tempfile::tempdir().unwrap();
@@ -302,9 +317,14 @@ fn apt_after(
         ),
     );
     let environment = directory.path().join("environment");
+    let list = directory.path().join("apt-mirrors.txt");
+    if let Some(mirrors) = mirrors {
+        std::fs::write(&list, mirrors).unwrap();
+    }
     let mut command = Command::new("bash");
     command
         .args(["-e", "-c", &script])
+        .env("MIRRORS", &list)
         .env(
             "PATH",
             format!(
@@ -327,7 +347,59 @@ fn apt_after(
         status.success(),
         calls.lines().map(str::to_owned).collect(),
         std::fs::read_to_string(environment).unwrap_or_default(),
+        std::fs::read_to_string(list).ok(),
     )
+}
+
+#[test]
+fn a_retry_leaves_the_mirror_the_failed_attempt_used() {
+    // An Azure mirror sent valgrind at about 50 KB/s: apt's timeouts never
+    // fire on a slow transfer, and the hosted runner's mirror list chose the
+    // same mirror for every retry until the budget ran out. Each failed
+    // attempt drops the mirror apt selects first and keeps the fallbacks.
+    let azure = "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\
+                 https://archive.ubuntu.com/ubuntu/\tpriority:2\n\
+                 https://security.ubuntu.com/ubuntu/\tpriority:3\n";
+    let (success, calls, _, mirrors) =
+        apt_run(0, "valgrind", "true", false, &[0, 124], Some(azure));
+    assert!(success);
+    assert_eq!(
+        calls,
+        [
+            format!("120 {APT} update"),
+            format!("300 {APT} install --yes valgrind"),
+            format!("120 {APT} update"),
+            format!("300 {APT} install --yes valgrind"),
+        ]
+    );
+    assert_eq!(
+        mirrors.as_deref(),
+        Some(
+            "https://archive.ubuntu.com/ubuntu/\tpriority:2\n\
+             https://security.ubuntu.com/ubuntu/\tpriority:3\n"
+        )
+    );
+    // The last mirror is never dropped: an empty list leaves apt no source.
+    let (success, _, _, mirrors) = apt_run(
+        0,
+        "valgrind",
+        "true",
+        false,
+        &[124, 124, 0],
+        Some("https://archive.ubuntu.com/ubuntu/\tpriority:2\n"),
+    );
+    assert!(success);
+    assert_eq!(
+        mirrors.as_deref(),
+        Some("https://archive.ubuntu.com/ubuntu/\tpriority:2\n")
+    );
+    // A first attempt that succeeds keeps the runner's own list, and a runner
+    // without a mirror list does not get one.
+    let (_, _, _, mirrors) = apt_run(0, "valgrind", "true", false, &[], Some(azure));
+    assert_eq!(mirrors.as_deref(), Some(azure));
+    let (success, _, _, mirrors) = apt_run(0, "valgrind", "true", false, &[0, 124], None);
+    assert!(success);
+    assert_eq!(mirrors, None);
 }
 
 const APT: &str =

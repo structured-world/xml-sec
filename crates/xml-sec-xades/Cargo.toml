@@ -19,6 +19,7 @@ base64 = { version = "0.23", default-features = false, features = ["alloc"], opt
 
 [dev-dependencies]
 base64 = "0.23"
+divan = "0.1.21"
 roxmltree = "0.21"
 
 [features]
@@ -40,6 +41,11 @@ xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
 
 [[example]]
 name = "create_probe"
+required-features = ["produce"]
+
+[[bench]]
+name = "lifecycle"
+harness = false
 required-features = ["produce"]
 
 [lints]

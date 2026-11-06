@@ -17,6 +17,8 @@ runs:
       env:
         PACKAGES: ${{ inputs.packages }}
         RECOMMENDS: ${{ inputs.recommends }}
+        # The mirror list of the hosted runner images' apt sources.
+        MIRRORS: /etc/apt/apt-mirrors.txt
       run: |
         set -euo pipefail
         read -r -a packages <<< "$PACKAGES"
@@ -49,5 +51,15 @@ runs:
           fi
           attempt=$((attempt + 1))
           APT_INDEX_REFRESHED=
+          # A mirror that keeps sending, only too slowly, never fails, so the
+          # mirror list of hosted runners would select it again. The entry
+          # apt selects first is dropped; the fallbacks after it stay, and the
+          # last one is kept so apt always has a source.
+          if [ -f "$MIRRORS" ]; then
+            mapfile -t mirrors < "$MIRRORS"
+            if [ "${#mirrors[@]}" -gt 1 ]; then
+              printf '%s\n' "${mirrors[@]:1}" | sudo tee "$MIRRORS" > /dev/null
+            fi
+          fi
         done
         echo APT_INDEX_REFRESHED=1 >> "$GITHUB_ENV"
