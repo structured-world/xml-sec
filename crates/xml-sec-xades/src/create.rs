@@ -9,6 +9,7 @@
 
 use crate::basic::{Outcome, ValidationError, validate_basic};
 use crate::draft::{Draft, DraftError};
+use crate::placement::{self, DS, PlacementError, XADES};
 use alloc::{collections::BTreeMap, format, string::String, vec::Vec};
 use structured_asn1::Parser;
 use structured_asn1::memory::{MemoryError, OwnedVec, Work};
@@ -19,7 +20,7 @@ use xml_sec::c14n::C14nAlgorithm;
 use xml_sec::document::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
 use xml_sec::policy::SigningPolicy;
 use xml_sec::provider::{CryptoProvider, ProviderError};
-use xml_sec::xmldsig::extension::{self, InspectionError, NodeView, ScalarError, TreeError};
+use xml_sec::xmldsig::extension::{ScalarError, TreeError};
 use xml_sec::xmldsig::parse::{KeyInfoParsingSession, ParseError};
 use xml_sec::xmldsig::{
     CallerTrustedSignatureKey, DigestAlgorithm, DsigError, KeyInfoWriteError, ObjectBuilder,
@@ -28,9 +29,6 @@ use xml_sec::xmldsig::{
     Transform, VerificationRequest, VerifyContext, X509CertificateKeyInfoWriter,
     compute_digest_with_provider, with_verified_request,
 };
-
-const DS: &str = "http://www.w3.org/2000/09/xmldsig#";
-const XADES: &str = "http://uri.etsi.org/01903/v1.3.2#";
 
 /// The signing key, its certificates and the algorithms of one signer.
 pub struct Signer<'a> {
@@ -225,6 +223,18 @@ impl From<MemoryError> for CreateError {
     }
 }
 
+impl From<PlacementError> for CreateError {
+    fn from(error: PlacementError) -> Self {
+        match error {
+            PlacementError::UnknownSignature(id) => Self::UnknownSignature(id),
+            PlacementError::NotXades(id) => Self::NotXades(id),
+            PlacementError::Tree(error) => Self::Tree(error),
+            PlacementError::Scalar(error) => Self::Scalar(error),
+            PlacementError::Resource(error) => Self::Resource(error),
+        }
+    }
+}
+
 /// The IDs of one new signature's parts.
 struct Ids {
     signature: String,
@@ -404,15 +414,17 @@ pub fn countersign<W: Work>(
         &[&ids.signature, &ids.properties, &ids.value, &countersigned],
         countersignature.id_attributes,
     )?;
-    let parent = document.with_view(|view| {
-        locate_parent(
+    let (located, value) = document.with_view(|view| {
+        let located = placement::locate(
             view,
             countersignature.parent,
             countersignature.id_attributes,
             work,
-        )
+        )?;
+        let value = signature_value_id(view, located.signature, countersignature.parent, work)?;
+        Ok::<_, CreateError>((located, value))
     })?;
-    let value_uri = format!("#{}", parent.value);
+    let value_uri = format!("#{value}");
 
     let target = format!("#{}", ids.signature);
     let properties = signed_properties(
@@ -440,34 +452,11 @@ pub fn countersign<W: Work>(
         .start_node_id(&ids.signature)
         .signature_template_selection(SignatureTemplateSelection::FirstDescendant);
 
-    // EN 319 132-1 §4.3: UnsignedSignatureProperties precedes
-    // UnsignedDataObjectProperties inside UnsignedProperties, which follows
-    // SignedProperties; a new property is appended after the existing ones.
     let counter = format!(
         "<xades:CounterSignature xmlns:xades=\"{XADES}\">{template}</xades:CounterSignature>"
     );
     document.transaction(|document| {
-        match parent.unsigned {
-            Unsigned::Signature(properties) => document.append_child(properties, &counter)?,
-            Unsigned::Data(data) => document.insert_before(
-                data,
-                &format!(
-                    "<xades:UnsignedSignatureProperties xmlns:xades=\"{XADES}\">{counter}</xades:UnsignedSignatureProperties>"
-                ),
-            )?,
-            Unsigned::Empty(properties) => document.append_child(
-                properties,
-                &format!(
-                    "<xades:UnsignedSignatureProperties xmlns:xades=\"{XADES}\">{counter}</xades:UnsignedSignatureProperties>"
-                ),
-            )?,
-            Unsigned::Absent(qualifying) => document.append_child(
-                qualifying,
-                &format!(
-                    "<xades:UnsignedProperties xmlns:xades=\"{XADES}\"><xades:UnsignedSignatureProperties>{counter}</xades:UnsignedSignatureProperties></xades:UnsignedProperties>"
-                ),
-            )?,
-        }
+        located.unsigned.insert(document, &counter)?;
         context.sign_document(document)?;
         // The parent's assessment binds every incorporated countersignature
         // (path, key, hash use) but not its own signing-certificate
@@ -715,138 +704,16 @@ impl<'k> Carried<'k> {
     }
 }
 
-/// Where a countersignature goes in the parent's qualifying properties.
-enum Unsigned {
-    /// The existing `UnsignedSignatureProperties`.
-    Signature(NodeIdentity),
-    /// `UnsignedProperties` holding only `UnsignedDataObjectProperties`,
-    /// which the new signature properties must precede.
-    Data(NodeIdentity),
-    /// `UnsignedProperties` without children.
-    Empty(NodeIdentity),
-    /// `QualifyingProperties` without `UnsignedProperties`.
-    Absent(NodeIdentity),
-}
-
-struct Parent {
-    value: String,
-    unsigned: Unsigned,
-}
-
-fn locate_parent<W: Work>(
+/// The ID of `signature`'s `SignatureValue`, which a countersignature
+/// references. Adding one would change bytes its timestamps may cover.
+fn signature_value_id<W: Work>(
     view: DocumentView<'_>,
+    signature: NodeIdentity,
     id: &str,
-    registrations: &[IdAttributeRegistration],
     work: &W,
-) -> Result<Parent, CreateError> {
-    let unknown = || CreateError::UnknownSignature(id.into());
-    let signature = view.node_for_id(id, registrations).ok_or_else(unknown)?;
-    if !is_element(view, signature, DS, "Signature", work)? {
-        return Err(unknown());
-    }
-    let value = child(view, signature, DS, "SignatureValue", work)?.ok_or_else(unknown)?;
-    let value = attribute(view, value, "Id", work)?
-        .ok_or_else(|| CreateError::Uncountersignable(id.into()))?;
-    let target = format!("#{id}");
-    let mut qualifying = None;
-    for object in children(view, signature, work)? {
-        if !is_element(view, object, DS, "Object", work)? {
-            continue;
-        }
-        for candidate in children(view, object, work)? {
-            if is_element(view, candidate, XADES, "QualifyingProperties", work)?
-                && attribute(view, candidate, "Target", work)?
-                    .is_some_and(|value| value.trim() == target)
-            {
-                qualifying = Some(candidate);
-            }
-        }
-    }
-    let qualifying = qualifying.ok_or_else(|| CreateError::NotXades(id.into()))?;
-    let unsigned = match child(view, qualifying, XADES, "UnsignedProperties", work)? {
-        None => Unsigned::Absent(qualifying),
-        Some(properties) => {
-            match child(view, properties, XADES, "UnsignedSignatureProperties", work)? {
-                Some(signature_properties) => Unsigned::Signature(signature_properties),
-                None => match child(
-                    view,
-                    properties,
-                    XADES,
-                    "UnsignedDataObjectProperties",
-                    work,
-                )? {
-                    Some(data) => Unsigned::Data(data),
-                    None => Unsigned::Empty(properties),
-                },
-            }
-        }
-    };
-    Ok(Parent { value, unsigned })
-}
-
-fn children<W: Work>(
-    view: DocumentView<'_>,
-    parent: NodeIdentity,
-    work: &W,
-) -> Result<Vec<NodeIdentity>, CreateError> {
-    let mut nodes = Vec::new();
-    let mut next = extension::first_child(view, parent, work)?;
-    while let Some(node) = next {
-        work.charge_work(1)?;
-        nodes.push(node);
-        next = extension::next_sibling(view, parent, node, work)?;
-    }
-    Ok(nodes)
-}
-
-fn child<W: Work>(
-    view: DocumentView<'_>,
-    parent: NodeIdentity,
-    namespace: &str,
-    local: &str,
-    work: &W,
-) -> Result<Option<NodeIdentity>, CreateError> {
-    for node in children(view, parent, work)? {
-        if is_element(view, node, namespace, local, work)? {
-            return Ok(Some(node));
-        }
-    }
-    Ok(None)
-}
-
-fn is_element<W: Work>(
-    view: DocumentView<'_>,
-    node: NodeIdentity,
-    namespace: &str,
-    local: &str,
-    work: &W,
-) -> Result<bool, CreateError> {
-    Ok(extension::inspect_node(
-        view,
-        node,
-        work,
-        |node| matches!(node, NodeView::Element { namespace: Some(actual), local_name } if actual == namespace && local_name == local),
-    )?)
-}
-
-/// An unqualified attribute's value.
-fn attribute<W: Work>(
-    view: DocumentView<'_>,
-    node: NodeIdentity,
-    local: &str,
-    work: &W,
-) -> Result<Option<String>, CreateError> {
-    let mut found = None;
-    let visited = extension::visit_direct_attributes(view, node, work, |attribute| {
-        if attribute.namespace.is_none() && attribute.local_name == local {
-            found = Some(String::from(attribute.value));
-            // Attribute names are unique on an element.
-            return Err(());
-        }
-        Ok(())
-    });
-    match visited {
-        Ok(()) | Err(InspectionError::Visitor(())) => Ok(found),
-        Err(InspectionError::Processing(error)) => Err(error.into()),
-    }
+) -> Result<String, CreateError> {
+    let value = placement::child(view, signature, DS, "SignatureValue", work)?
+        .ok_or_else(|| CreateError::UnknownSignature(id.into()))?;
+    placement::attribute(view, value, "Id", work)?
+        .ok_or_else(|| CreateError::Uncountersignable(id.into()))
 }

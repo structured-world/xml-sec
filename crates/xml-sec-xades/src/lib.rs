@@ -47,6 +47,8 @@ mod create;
 mod draft;
 mod level;
 mod path;
+#[cfg(feature = "produce")]
+mod placement;
 mod signature;
 mod status;
 mod xml;
