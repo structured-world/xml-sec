@@ -702,6 +702,116 @@ pub struct XmlDocument {
     issued: u64,
 }
 
+/// Every minimal alignment of the change between two texts.
+///
+/// One change aligns several ways when bytes repeat around it. The longest
+/// common prefix taken first and the longest common suffix taken first are
+/// the two extremes; every alignment between them shifts the same changed
+/// span of the old text, `span` bytes long, to start anywhere from `low` to
+/// `high`. The same new bytes replace it wherever it starts.
+#[cfg(feature = "xmldsig-sign")]
+struct Alignments {
+    old: usize,
+    new: usize,
+    /// The extremes do not shift one span, so no alignment is trusted.
+    family: Option<Family>,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+struct Family {
+    low: usize,
+    high: usize,
+    span: usize,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl Alignments {
+    fn new(old: &str, new: &str) -> Self {
+        let (old, new) = (old.as_bytes(), new.as_bytes());
+        let common = |left: &[u8], right: &[u8]| {
+            left.iter()
+                .zip(right)
+                .take_while(|(left, right)| left == right)
+                .count()
+        };
+        let common_end = |left: &[u8], right: &[u8]| {
+            left.iter()
+                .rev()
+                .zip(right.iter().rev())
+                .take_while(|(left, right)| left == right)
+                .count()
+        };
+        let high = common(old, new);
+        let after_high = common_end(&old[high..], &new[high..]);
+        let suffix = common_end(old, new);
+        let low = common(&old[..old.len() - suffix], &new[..new.len() - suffix]);
+        // Both extremes leave the same number of common bytes; the span is
+        // what remains of the old text, and both can only agree on it.
+        let family = (high + after_high == low + suffix).then(|| Family {
+            low,
+            high,
+            span: old.len() - (high + after_high),
+        });
+        Self {
+            old: old.len(),
+            new: new.len(),
+            family,
+        }
+    }
+
+    /// Where the element at `range` of the old text stands in the new one,
+    /// when every change lies outside it or inside its `content` (absent for
+    /// an empty element).
+    ///
+    /// The element is carried only when every alignment that keeps it whole
+    /// keeps it at the same place and none removes it: where two equal
+    /// siblings were inserted or removed next to each other, which one the
+    /// element is cannot be told.
+    fn carried(
+        &self,
+        range: &Range<usize>,
+        content: Option<&Range<usize>>,
+    ) -> Option<Range<usize>> {
+        let Family { low, high, span } = *self.family.as_ref()?;
+        // A position after the span keeps its distance from the end of the
+        // text, which the common suffix bytes guarantee, so this cannot wrap.
+        let moved = |position: usize| self.new - (self.old - position);
+        // Whether some start of the span in `low..=high` lies in `from..=to`.
+        let starts =
+            |from: usize, to: Option<usize>| to.is_some_and(|to| low.max(from) <= high.min(to));
+        let mut kept: Option<Range<usize>> = None;
+        let mut keep = |placed: Range<usize>| match &kept {
+            Some(earlier) if *earlier != placed => false,
+            _ => {
+                kept = Some(placed);
+                true
+            }
+        };
+        // Before the span: some alignment starts it at or after the element's end.
+        if range.end <= high && !keep(range.clone()) {
+            return None;
+        }
+        // After the span: some alignment ends it at or before the element's start.
+        if range.start >= low + span && !keep(moved(range.start)..moved(range.end)) {
+            return None;
+        }
+        // Around the span: some alignment puts all of it inside the content.
+        if content.is_some_and(|content| starts(content.start, content.end.checked_sub(span)))
+            && !keep(range.start..moved(range.end))
+        {
+            return None;
+        }
+        // Removed: some alignment puts the whole element inside the span.
+        // The span cannot start before the text does: clamping at zero is the
+        // bound itself, not a hidden overflow.
+        let removed = range.end.saturating_sub(span);
+        if starts(removed, Some(range.start)) {
+            return None;
+        }
+        kept
+    }
+}
+
 /// The generation an all-or-nothing mutation started from, kept from its first
 /// commit on, so that no copy of the document is parsed in advance.
 #[cfg(feature = "xmldsig-sign")]
@@ -1082,7 +1192,8 @@ impl XmlDocument {
     /// Run `mutate` as one all-or-nothing mutation.
     ///
     /// When `mutate` returns `Ok`, everything it committed becomes one new
-    /// generation; identities captured between its commits are stale. When it
+    /// generation; identities captured between its commits are stale, and
+    /// [`Self::carry`] maps elements of the starting generation into it. When it
     /// returns `Err` or unwinds, the serialization and generation are exactly
     /// those before the call, identities captured before it stay valid, and
     /// those captured inside it never become valid again. Transactions nest: an inner one that fails rolls
@@ -1104,6 +1215,132 @@ impl XmlDocument {
         let result = mutate(guard.document);
         guard.succeeded = result.is_ok();
         result
+    }
+
+    /// The identity, in the current generation, of the element `identity`
+    /// names in the generation an open transaction started from.
+    ///
+    /// An element the transaction's commits left in place keeps its identity
+    /// across them: one entirely before or after every changed byte, or one
+    /// enclosing all of them, with the same expanded name. This lets a check
+    /// inside the transaction hold the caller's node requirements, such as
+    /// expected coverage targets, for the generation it is about to publish.
+    /// An identity of the current generation is returned as it is.
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::ForeignIdentity`] for another document,
+    /// [`XmlDocumentError::StaleIdentity`] for a generation that is neither
+    /// current nor the start of an open transaction, and
+    /// [`XmlDocumentError::MissingNode`] for a node that is not an element or
+    /// that the commits replaced, removed or changed into another element.
+    #[cfg(feature = "xmldsig-sign")]
+    pub fn carry(&self, identity: NodeIdentity) -> Result<NodeIdentity, XmlDocumentError> {
+        let mut identities = [identity];
+        self.carry_all(&mut identities)?;
+        Ok(identities[0])
+    }
+
+    /// [`Self::carry`] for every identity of `identities`, replaced in place.
+    ///
+    /// The change and the current tree are each read once for all identities
+    /// of one starting generation, so the work grows with the document and
+    /// the number of identities, not with their product.
+    ///
+    /// # Errors
+    /// As [`Self::carry`], for the first identity that cannot be carried;
+    /// `identities` is then left partly carried.
+    #[cfg(feature = "xmldsig-sign")]
+    pub fn carry_all(&self, identities: &mut [NodeIdentity]) -> Result<(), XmlDocumentError> {
+        let mut earlier = Vec::new();
+        for (index, identity) in identities.iter().enumerate() {
+            if identity.document != self.identity {
+                return Err(XmlDocumentError::ForeignIdentity);
+            }
+            if identity.generation == self.generation {
+                self.with_view(|view| {
+                    if view.resolve_node(*identity)?.is_element() {
+                        Ok(())
+                    } else {
+                        Err(XmlDocumentError::MissingNode)
+                    }
+                })?;
+            } else {
+                earlier.push(index);
+            }
+        }
+        while let Some(&first) = earlier.first() {
+            let generation = identities[first].generation;
+            let (group, rest): (Vec<usize>, Vec<usize>) = earlier
+                .iter()
+                .partition(|index| identities[**index].generation == generation);
+            earlier = rest;
+            self.carry_from(generation, &group, identities)?;
+        }
+        Ok(())
+    }
+
+    /// Carry the identities at `group`, all of `generation`, from the start
+    /// of the open transaction that began there.
+    #[cfg(feature = "xmldsig-sign")]
+    fn carry_from(
+        &self,
+        generation: u64,
+        group: &[usize],
+        identities: &mut [NodeIdentity],
+    ) -> Result<(), XmlDocumentError> {
+        let base = self.atomic.iter().find_map(|frame| match frame {
+            AtomicMutation::Replaced(cell, start) if *start == generation => Some(cell),
+            _ => None,
+        });
+        let Some(base) = base else {
+            return Err(XmlDocumentError::StaleIdentity {
+                identity: generation,
+                current: self.generation,
+            });
+        };
+        base.with_dependent(|old, earlier| {
+            self.with_view(|view| {
+                let alignments = Alignments::new(old, view.xml());
+                let mut wanted = Vec::with_capacity(group.len());
+                for &index in group {
+                    let element =
+                        SemanticDocument::node(&earlier.document, identities[index].semantic_id)
+                            .filter(|node| node.is_element() && node.has_actionable_range())
+                            .ok_or(XmlDocumentError::MissingNode)?;
+                    let range = element.range();
+                    let (content, _, empty) = element_content_range(&old[range.clone()])?;
+                    let content =
+                        (!empty).then(|| range.start + content.start..range.start + content.end);
+                    let range = alignments
+                        .carried(&range, content.as_ref())
+                        .ok_or(XmlDocumentError::MissingNode)?;
+                    wanted.push((range, element, index));
+                }
+                // Elements start in document order, so one walk of the current
+                // tree meets every wanted range in ascending order.
+                wanted.sort_unstable_by_key(|(range, ..)| range.start);
+                let mut wanted = wanted.into_iter().peekable();
+                for node in view.parsed.document.descendants().filter(Node::is_element) {
+                    let start = node.range().start;
+                    while let Some((range, element, index)) =
+                        wanted.next_if(|(range, ..)| range.start <= start)
+                    {
+                        let (name, found) = (element.tag_name(), node.tag_name());
+                        if range != node.range()
+                            || found.namespace() != name.namespace()
+                            || found.name() != name.name()
+                        {
+                            return Err(XmlDocumentError::MissingNode);
+                        }
+                        identities[index] = view.node_identity(node);
+                    }
+                }
+                match wanted.next() {
+                    Some(_) => Err(XmlDocumentError::MissingNode),
+                    None => Ok(()),
+                }
+            })
+        })
     }
 
     /// End the innermost mutation: success leaves one new generation, failure
@@ -4639,6 +4876,9 @@ mod replacement_tests;
 
 #[cfg(all(test, feature = "xmldsig-sign"))]
 mod transaction_tests;
+
+#[cfg(all(test, feature = "xmldsig-sign"))]
+mod carry_tests;
 
 #[cfg(test)]
 mod insertion_tests;

@@ -16,7 +16,9 @@ use base64::engine::general_purpose::STANDARD;
 use structured_asn1::memory::{Memory, MemoryAccount, MemoryError};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::document::{NodeIdentity, XmlDocumentError};
 use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::xmldsig::extension;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyInfoWriteError, KeyResolverConfig, ObjectContent,
     ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningError, UriTypeSet,
@@ -111,10 +113,22 @@ impl Fixture {
         resolver: &DefaultKeyResolver,
         operation: impl FnOnce(&Assessment<'_, '_>) -> R,
     ) -> R {
+        self.with_targets(resolver, &[], operation)
+    }
+
+    /// [`Self::with_assessment`] whose request also expects these elements
+    /// of the document's current generation to be covered.
+    fn with_targets<R>(
+        &self,
+        resolver: &DefaultKeyResolver,
+        targets: &[NodeIdentity],
+        operation: impl FnOnce(&Assessment<'_, '_>) -> R,
+    ) -> R {
         let context = VerifyContext::new()
             .policy(self.context_policy.clone())
             .key_resolver(resolver);
         let request = VerificationRequest {
+            expected_targets: targets,
             external_resources: Some(&self.resources),
             ..VerificationRequest::default()
         };
@@ -446,6 +460,118 @@ fn a_second_countersignature_follows_the_first() {
         .collect();
     assert_eq!(order, ["counter-a", "counter-b"]);
     assert!(fixture.meets_basic(document.as_xml(), "sig"));
+}
+
+/// The element with ID `id` in the document's current generation.
+fn element(document: &XmlDocument, id: &str) -> NodeIdentity {
+    document.with_view(|view| view.node_for_id(id, &[]).expect("element has its ID"))
+}
+
+#[test]
+fn expected_targets_hold_for_the_published_generation() {
+    // The caller names the elements that must stay covered in the generation
+    // it hands over; signing publishes a new one, where the same elements are
+    // checked rather than refused as stale identities.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let payload = element(&document, "payload");
+    fixture
+        .with_targets(&fixture.resolver, &[payload], |assessment| {
+            create(
+                &mut document,
+                &fixture.signer(&[SIGNER, INTERMEDIATE]),
+                request(
+                    "sig",
+                    &[DataObject::Element {
+                        id: "payload",
+                        mime_type: "text/xml",
+                    }],
+                ),
+                assessment,
+                &account(1 << 30),
+            )
+        })
+        .expect("creation with an expected target");
+    let payload = element(&document, "payload");
+    fixture
+        .with_targets(&fixture.resolver, &[payload], |assessment| {
+            countersign(
+                &mut document,
+                &fixture.signer(&[SIGNER, INTERMEDIATE]),
+                &Countersignature {
+                    parent: "sig",
+                    id: "counter",
+                    signing_time: TIME,
+                    id_attributes: &[],
+                },
+                assessment,
+                &account(1 << 30),
+            )
+        })
+        .expect("countersignature with an expected target");
+    assert!(fixture.meets_basic(document.as_xml(), "sig"));
+}
+
+#[test]
+fn an_uncovered_expected_target_still_refuses() {
+    // Carrying the requirement into the new generation keeps it a
+    // requirement: an element no signature covers fails it there.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(
+        "<Document><Data Id=\"payload\">Created payload</Data><Other Id=\"other\"/></Document>",
+    )
+    .expect("fixture parses");
+    let other = element(&document, "other");
+    refused(
+        &mut document,
+        |document| {
+            fixture.with_targets(&fixture.resolver, &[other], |assessment| {
+                create(
+                    document,
+                    &fixture.signer(&[SIGNER, INTERMEDIATE]),
+                    request(
+                        "sig",
+                        &[DataObject::Element {
+                            id: "payload",
+                            mime_type: "text/xml",
+                        }],
+                    ),
+                    assessment,
+                    &account(1 << 30),
+                )
+            })
+        },
+        |error| matches!(error, CreateError::NotAccepted),
+    );
+}
+
+#[test]
+fn a_target_that_cannot_be_carried_publishes_nothing() {
+    // A text node is no coverage target; it has no counterpart to carry into
+    // the signed generation, and the creation is refused whole.
+    let fixture = Fixture::new();
+    let mut document = XmlDocument::parse(DOCUMENT).expect("fixture parses");
+    let text = document.with_view(|view| {
+        let payload = view.node_for_id("payload", &[]).expect("payload");
+        extension::first_child(view, payload, &account(1 << 20))
+            .expect("tree")
+            .expect("text")
+    });
+    refused(
+        &mut document,
+        |document| {
+            fixture.with_targets(&fixture.resolver, &[text], |assessment| {
+                create(
+                    document,
+                    &fixture.signer(&[SIGNER, INTERMEDIATE]),
+                    request("sig", &enveloped(Envelope::Enveloped)),
+                    assessment,
+                    &account(1 << 30),
+                )
+            })
+        },
+        |error| matches!(error, CreateError::Document(XmlDocumentError::MissingNode)),
+    );
 }
 
 #[test]
