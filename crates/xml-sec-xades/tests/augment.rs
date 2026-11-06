@@ -20,6 +20,7 @@ use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::{Instant as UtcInstant, LeapTable};
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+use xml_sec::document::NodeIdentity;
 use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
@@ -88,6 +89,8 @@ struct Given<'a> {
     certificates: &'a [&'a [u8]],
     accuracies: &'a [AuthorityAccuracy<'a>],
     window: Option<RequestWindow>,
+    /// Elements of the requested generation the verification must find covered.
+    targets: &'a [NodeIdentity],
 }
 
 const B_T: Given<'static> = Given {
@@ -96,6 +99,7 @@ const B_T: Given<'static> = Given {
     certificates: &[INTERMEDIATE],
     accuracies: &[],
     window: None,
+    targets: &[],
 };
 
 impl Fixture {
@@ -117,10 +121,23 @@ impl Fixture {
     }
 
     fn with_assessment<R>(&self, operation: impl FnOnce(&Assessment<'_, '_>) -> R) -> R {
+        self.with_targets(&[], operation)
+    }
+
+    /// [`Self::with_assessment`] whose request also expects these elements
+    /// of the document's current generation to be covered.
+    fn with_targets<R>(
+        &self,
+        targets: &[NodeIdentity],
+        operation: impl FnOnce(&Assessment<'_, '_>) -> R,
+    ) -> R {
         let context = VerifyContext::new()
             .policy(self.verification.clone())
             .key_resolver(&self.resolver);
-        let request = VerificationRequest::default();
+        let request = VerificationRequest {
+            expected_targets: targets,
+            ..VerificationRequest::default()
+        };
         operation(&Assessment {
             context: &context,
             request: &request,
@@ -208,7 +225,7 @@ impl Fixture {
             crls: &[],
             responses: &[],
         };
-        self.with_assessment(|assessment| {
+        self.with_targets(given.targets, |assessment| {
             complete_timestamp(
                 document,
                 pending,
@@ -510,6 +527,32 @@ fn caller_policy_accuracy_bounds_a_token_that_states_none() {
             &account(),
         )
         .expect("completion with the stated accuracy");
+}
+
+#[test]
+fn expected_targets_hold_for_the_completed_generation() {
+    // The caller's coverage requirement names elements of the generation it
+    // requested the timestamp for; the completed generation is checked for
+    // the same elements instead of refusing them as stale identities.
+    let fixture = Fixture::new();
+    let mut document = fixture.created();
+    let pending = fixture
+        .request(&document, None, Some(NONCE), &account())
+        .expect("request");
+    let payload = document.with_view(|view| view.node_for_id("payload", &[]).expect("payload"));
+    fixture
+        .complete(
+            &mut document,
+            &pending,
+            RESPONSE,
+            Given {
+                targets: &[payload],
+                ..B_T
+            },
+            &account(),
+        )
+        .expect("completion with an expected target");
+    assert!(fixture.meets_timestamped(document.as_xml()));
 }
 
 #[test]

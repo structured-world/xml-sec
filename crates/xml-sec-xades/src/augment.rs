@@ -10,7 +10,7 @@
 
 use crate::accuracy;
 use crate::basic::{Outcome, Stage, ValidationError, with_stage};
-use crate::create::Assessment;
+use crate::create::{Assessment, Carried};
 use crate::draft::{Draft, DraftError};
 use crate::level::{Inputs, Level, read_certificates, unrecognized, validate};
 use crate::placement::{self, DS, PlacementError, Unsigned};
@@ -333,10 +333,13 @@ pub fn complete_timestamp<W: Work>(
     )??;
     document.transaction(|document| {
         unsigned.insert(document, &property)?;
+        // The caller's targets and keys name elements of the requested
+        // generation; they hold for the same elements in the new one.
+        let carried = Carried::new(document, assessment.request)?;
         let outcome = with_verified_request(
             document,
             assessment.context,
-            assessment.request,
+            &carried.request(assessment.request),
             work,
             |session| {
                 Ok(
