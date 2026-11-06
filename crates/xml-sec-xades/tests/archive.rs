@@ -25,9 +25,9 @@ use xml_sec::xmldsig::{
 };
 use xml_sec_xades::{
     Assessment, AugmentError, Completion, DataObject, Envelope, Inputs, Level, Outcome,
-    PendingTimestamp, Request, Requirements, Signer, StatusFailure, TimestampRequest,
-    ValidationData, ValidationError, add_validation_data, complete_timestamp, create,
-    request_archive_timestamp, request_timestamp, validate,
+    PendingTimestamp, Request, Requirements, Signer, StatusFailure, TimestampFailure,
+    TimestampRequest, ValidationData, ValidationError, add_validation_data, complete_timestamp,
+    create, request_archive_timestamp, request_timestamp, validate,
 };
 
 const ROOT: &[u8] = include_bytes!("fixtures/augmentation/root.der");
@@ -340,6 +340,27 @@ fn a_renewal_covers_the_earlier_archive() {
     assert_eq!(xml.matches(ARCHIVE_END).count(), 2);
     let level = fixture.level(xml, Requirements::Archival);
     assert!(matches!(level, Outcome::Assessed(true)), "{level:?}");
+    // A change to the first archive's element leaves its own token valid,
+    // since its input precedes it: alone, that archive still meets B-LTA.
+    // The renewal's input includes the element, so its imprint breaks.
+    let open = "<xades141:ArchiveTimeStamp";
+    let changed = |xml: &str| xml.replacen(open, &format!("{open} Id=\"first-archive\""), 1);
+    let alone = fixture.level(
+        &changed(fixture.archived().as_xml()),
+        Requirements::Archival,
+    );
+    assert!(matches!(alone, Outcome::Assessed(true)), "{alone:?}");
+    let level = fixture.level(&changed(xml), Requirements::Archival);
+    assert!(
+        matches!(
+            level,
+            Outcome::Timestamp {
+                failure: TimestampFailure::Rejected,
+                ..
+            }
+        ),
+        "{level:?}"
+    );
 }
 
 #[test]
@@ -383,8 +404,17 @@ fn a_renewal_needs_a_document_with_an_archive() {
     let result = fixture.request(&document, Requirements::Archival, true);
     assert!(
         matches!(
-            result,
-            Err(AugmentError::Validation(ValidationError::Prepare(_)))
+            &result,
+            Err(AugmentError::Validation(ValidationError::Prepare(error)))
+                if matches!(
+                    error.as_ref(),
+                    structured_xades::prepare::Error::Property(
+                        structured_xades::properties::Error::Missing {
+                            local: "ArchiveTimeStamp",
+                            ..
+                        }
+                    )
+                )
         ),
         "{result:?}"
     );
@@ -438,7 +468,14 @@ fn the_renewal_token_does_not_complete_the_first_archive() {
     refused(
         &mut document,
         |document| fixture.complete(document, &pending, RENEWAL_RESPONSE, Requirements::Archival),
-        |error| matches!(error, AugmentError::Unproven(_)),
+        |error| {
+            matches!(
+                error,
+                AugmentError::Unproven(facts)
+                    if facts.imprint == ImprintAgreement::Differs
+                        && facts.requested_imprint == Some(RequestAgreement::HashDiffers)
+            )
+        },
     );
 }
 

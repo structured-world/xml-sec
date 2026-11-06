@@ -36,6 +36,8 @@ const B_LT: &str = include_str!("fixtures/levels/b-lt.xml");
 /// and no response carries that responder's certificate.
 const B_LT_UNCERTIFIED_RESPONDER: &str =
     include_str!("fixtures/levels/b-lt-uncertified-responder.xml");
+/// B-LTA with an archive and its renewal over the B-LT material.
+const B_LTA_RENEWED: &str = include_str!("fixtures/levels/b-lta-renewed.xml");
 /// Unix time `1_800_000_000`, inside every fixture certificate and CRL window.
 const AT: i64 = 500_000 * 3600;
 const CRL: &str = "EncapsulatedCRLValue";
@@ -475,6 +477,118 @@ fn a_timestamp_status_held_only_by_the_signature_is_copied_whole() {
     assert!(matches!(added, Ok(DataAdded::Published)), "{added:?}");
     let extended = document.as_xml().to_owned();
     assert_eq!(extended.matches(&tsa).count(), 2);
+    let level = fixture.level(&extended, Requirements::LongTerm);
+    assert!(matches!(level, Outcome::Assessed(true)), "{level:?}");
+}
+
+/// `(header length, content length)` of the DER element starting `der`.
+fn header(der: &[u8]) -> (usize, usize) {
+    let first = usize::from(der[1]);
+    if first < 0x80 {
+        return (2, first);
+    }
+    let count = first & 0x7f;
+    let length = der[2..2 + count]
+        .iter()
+        .fold(0, |length, byte| length << 8 | usize::from(*byte));
+    (2 + count, length)
+}
+
+/// The whole elements in `content`, in order.
+fn children(mut content: &[u8]) -> Vec<&[u8]> {
+    let mut elements = Vec::new();
+    while !content.is_empty() {
+        let (head, length) = header(content);
+        elements.push(&content[..head + length]);
+        content = &content[head + length..];
+    }
+    elements
+}
+
+/// The content of the DER element `der`.
+fn content(der: &[u8]) -> &[u8] {
+    let (head, length) = header(der);
+    &der[head..head + length]
+}
+
+/// A DER element with this tag and content.
+fn element(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut der = vec![tag];
+    // X.690 §8.1.3: the short form below 128, else the minimal long form.
+    match u8::try_from(content.len()) {
+        Ok(short) if short < 0x80 => der.push(short),
+        _ => {
+            let length = content.len().to_be_bytes();
+            let bytes: Vec<u8> = length
+                .iter()
+                .skip_while(|byte| **byte == 0)
+                .copied()
+                .collect();
+            der.push(0x80 | u8::try_from(bytes.len()).expect("a usize has at most 8 octets"));
+            der.extend(bytes);
+        }
+    }
+    der.extend(content);
+    der
+}
+
+/// `token` with `response` added to its unsigned `SignedData.crls` as an
+/// `id-ri-ocsp-response` choice (RFC 5940 §2.2). The field is outside every
+/// signed attribute (RFC 5652 §5.1), so the token's signature still holds.
+fn carrying(token: &[u8], response: &[u8]) -> Vec<u8> {
+    /// `1.3.6.1.5.5.7.16.2`, id-ri-ocsp-response.
+    const OCSP_RESPONSE: &[u8] = &[0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x10, 0x02];
+    let info = children(content(token));
+    let fields = children(content(content(info[1])));
+    let (signer_infos, middle) = fields[1..].split_last().expect("signerInfos");
+    // RFC 5652 §5.1: version 5 when another revocation format is present.
+    let mut signed = element(0x02, &[5]);
+    for field in middle {
+        assert_ne!(
+            field[0], 0xa1,
+            "the fixture token carries no revocation data"
+        );
+        signed.extend(*field);
+    }
+    let choice = element(0xa1, &[OCSP_RESPONSE, response].concat());
+    signed.extend(element(0xa1, &choice));
+    signed.extend(*signer_infos);
+    let wrapped = element(0xa0, &element(0x30, &signed));
+    element(0x30, &[info[0], wrapped.as_slice()].concat())
+}
+
+#[test]
+fn a_status_carried_only_by_another_token_is_copied_whole() {
+    // The TSA's OCSP response travels only in the last archive token's CMS
+    // revocation data. That token carries it for itself, but EN 319 132-1
+    // §6.3(x) does not accept one token's material for another, so the
+    // earlier tokens need a copy, which is that token's whole OCSPResponse.
+    let responses = encapsulated(B_LT_UNCERTIFIED_RESPONDER, OCSP);
+    let tsa_status = &responses[1];
+    let open = "<xades:EncapsulatedTimeStamp>";
+    let start = B_LTA_RENEWED.rfind(open).expect("last token") + open.len();
+    let end = start + B_LTA_RENEWED[start..].find('<').expect("token end");
+    let token = STANDARD
+        .decode(&B_LTA_RENEWED[start..end])
+        .expect("base64 token");
+    let carried = STANDARD.encode(carrying(&token, tsa_status));
+    let document_xml = format!(
+        "{}{carried}{}",
+        &B_LTA_RENEWED[..start],
+        &B_LTA_RENEWED[end..]
+    );
+    let fixture = Fixture::configured();
+    let mut document = parsed(&document_xml);
+    let added = fixture.add(&mut document, &Material::none(), Requirements::LongTerm);
+    assert!(matches!(added, Ok(DataAdded::Published)), "{added:?}");
+    let extended = document.as_xml().to_owned();
+    assert_eq!(
+        encapsulated(&extended, OCSP)
+            .iter()
+            .filter(|value| *value == tsa_status)
+            .count(),
+        1
+    );
     let level = fixture.level(&extended, Requirements::LongTerm);
     assert!(matches!(level, Outcome::Assessed(true)), "{level:?}");
 }
