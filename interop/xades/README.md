@@ -39,7 +39,8 @@ authenticated evidence channel.
 XAdES envelope has two references: business data and typed `#sp` SignedProperties.
 Every positive base input is signed by independent libxmlsec1 with RSA-SHA256/SHA-256.
 None of these base inputs is signed or verified by Rust alone. The only signatures Rust
-creates are those of the B-B creation row below, and EU DSS assesses them independently.
+creates or augments are those of the B-B creation and B-T augmentation rows below, and
+EU DSS assesses them independently.
 
 | Scenario / boundary | Status | Observation |
 | --- | --- | --- |
@@ -72,6 +73,7 @@ creates are those of the B-B creation row below, and EU DSS assesses them indepe
 | `RenewedDigestsV2` over a signed Manifest | verified | B-LTA with SHA-512 renewal of a SHA-256 Manifest reference; a wrong new digest or reference digest stops the level with `Outcome::Renewal` (EN 319 132-1 §5.5.3). No independent validator checked it |
 | Caller-supplied CRLs and OCSP responses | verified | They answer status but do not count as incorporated, so the level stays unmet |
 | B-B signatures created by `xml-sec-xades` (`produce`) | verified | `xades creation` signs enveloped, enveloping, internally detached, detached, parallel and countersigned documents through the public API (`crates/xml-sec-xades/tests/fixtures/creation`); DSS classifies every signature, the countersignature included, as XAdES-BASELINE-B with an intact value and intact references, and passes ISC and CV. The overall indication stays INDETERMINATE: no revocation data is supplied |
+| B-T augmentation by `xml-sec-xades` (`produce`) | verified | `xades creation` adds an OpenSSL TSA token, issued for the request `request_timestamp` encodes (`crates/xml-sec-xades/tests/fixtures/augmentation`), to a created B-B signature through `complete_timestamp`; DSS classifies it as XAdES-BASELINE-T with an intact token signature and message imprint. Responses for other data, without the requested nonce, under another policy or rejected are refused without changing the document |
 | EU Trusted Lists, legal qualification | not run or blocked | Outside this corpus; no such trust service inputs |
 | AL/SignedXml pipeline or direct Rust invocation from AL/SaaS | not run or blocked | No Business Central environment; no deployment assumption |
 
@@ -108,7 +110,7 @@ This is the same entry point used by the required `XAdES interoperability corpus
 It runs harness regressions, every retained signed fixture, both explicit here modes,
 authenticated replay, all independent octet vectors, default/strict DSS expectations,
 DSS's verdict on the baseline-level fixtures and DSS's validation of the signatures
-`xml-sec-xades` creates.
+`xml-sec-xades` creates and augments.
 No part may skip on a missing oracle. The existing aggregate `test` job requires its success.
 CI publishes actual octets, hashes, first-difference diagnostics and full DSS reports as
 `xades-interop-results` run artifacts. It never updates fixtures or expectations.

@@ -54,7 +54,7 @@ const CERTIFICATES: [(&str, &str, &str, &str); 5] = [
 
 const CA_CONFIG: &str = "[ca]\ndefault_ca=crl\n[crl]\ndatabase=NAME.index\ncrlnumber=NAME.crlnumber\ncertificate=NAME.pem\nprivate_key=NAME.key\ndefault_md=sha256\ndefault_crl_days=3650\ncrl_extensions=ext\n[ext]\nauthorityKeyIdentifier=keyid\n[delta]\nauthorityKeyIdentifier=keyid\n2.5.29.27=critical,DER:02:01:01\n";
 
-const TSA_CONFIG: &str = "[tsa]\ndefault_tsa=levels\n[levels]\nserial=tsa.serial\ncrypto_device=builtin\nsigner_cert=tsa.pem\nsigner_key=tsa.key\nsigner_digest=sha256\ndefault_policy=1.3.6.1.4.1.13762.3\ndigests=sha256\naccuracy=secs:1\nclock_precision_digits=0\nordering=no\ntsa_name=no\ness_cert_id_chain=no\ness_cert_id_alg=sha256\n";
+pub(crate) const TSA_CONFIG: &str = "[tsa]\ndefault_tsa=levels\n[levels]\nserial=tsa.serial\ncrypto_device=builtin\nsigner_cert=tsa.pem\nsigner_key=tsa.key\nsigner_digest=sha256\ndefault_policy=1.3.6.1.4.1.13762.3\ndigests=sha256\naccuracy=secs:1\nclock_precision_digits=0\nordering=no\ntsa_name=no\ness_cert_id_chain=no\ness_cert_id_alg=sha256\n";
 
 /// Runs `xmllint --exc-c14n` over `xml`, in `generator`'s scratch directory.
 fn canonical(generator: &Generator, xml: &str) -> Result<Vec<u8>, String> {

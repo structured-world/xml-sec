@@ -43,8 +43,17 @@ xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
 name = "create_probe"
 required-features = ["produce"]
 
+[[example]]
+name = "augment_probe"
+required-features = ["produce"]
+
 [[bench]]
 name = "lifecycle"
+harness = false
+required-features = ["produce"]
+
+[[bench]]
+name = "augmentation"
 harness = false
 required-features = ["produce"]
 

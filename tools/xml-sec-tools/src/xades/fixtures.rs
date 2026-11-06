@@ -254,7 +254,7 @@ impl Generator {
     }
 
     /// The test root, intermediate and signer certificates and keys.
-    fn issue(&self) -> Result<(), String> {
+    pub(crate) fn issue(&self) -> Result<(), String> {
         let validity = ["-not_before", NOT_BEFORE, "-not_after", NOT_AFTER];
         let mut root = vec![
             "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", "root.key", "-out",
@@ -270,52 +270,59 @@ impl Generator {
             "keyUsage=critical,keyCertSign,cRLSign",
         ]);
         self.openssl(&root)?;
-        for (name, issuer, subject, extensions) in [
-            (
-                "intermediate",
-                "root",
-                "/CN=xml-sec XAdES Test Intermediate",
-                "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
-            ),
-            (
-                "signer",
-                "intermediate",
-                "/CN=xml-sec XAdES Test Signer",
-                "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
-            ),
-        ] {
-            let (key, request, extension_file) = (
-                format!("{name}.key"),
-                format!("{name}.csr"),
-                format!("{name}.ext"),
-            );
-            self.openssl(&[
-                "req", "-newkey", "rsa:2048", "-nodes", "-keyout", &key, "-out", &request, "-subj",
-                subject,
-            ])?;
-            write(&self.work.join(&extension_file), extensions)?;
-            let (ca, ca_key, certificate) = (
-                format!("{issuer}.pem"),
-                format!("{issuer}.key"),
-                format!("{name}.pem"),
-            );
-            let mut sign = vec![
-                "x509",
-                "-req",
-                "-in",
-                &request,
-                "-CA",
-                &ca,
-                "-CAkey",
-                &ca_key,
-                "-out",
-                &certificate,
-            ];
-            sign.extend(validity);
-            sign.extend(["-extfile", &extension_file]);
-            self.openssl(&sign)?;
-        }
-        Ok(())
+        self.certify(
+            "intermediate",
+            "root",
+            "/CN=xml-sec XAdES Test Intermediate",
+            "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+        )?;
+        self.certify(
+            "signer",
+            "intermediate",
+            "/CN=xml-sec XAdES Test Signer",
+            "basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,nonRepudiation\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid\n",
+        )
+    }
+
+    /// A new key `name.key` and its certificate `name.pem`, issued by `issuer`
+    /// with these extensions and the fixtures' fixed validity.
+    pub(crate) fn certify(
+        &self,
+        name: &str,
+        issuer: &str,
+        subject: &str,
+        extensions: &str,
+    ) -> Result<(), String> {
+        let (key, request, extension_file) = (
+            format!("{name}.key"),
+            format!("{name}.csr"),
+            format!("{name}.ext"),
+        );
+        self.openssl(&[
+            "req", "-newkey", "rsa:2048", "-nodes", "-keyout", &key, "-out", &request, "-subj",
+            subject,
+        ])?;
+        write(&self.work.join(&extension_file), extensions)?;
+        let (ca, ca_key, certificate) = (
+            format!("{issuer}.pem"),
+            format!("{issuer}.key"),
+            format!("{name}.pem"),
+        );
+        let mut sign = vec![
+            "x509",
+            "-req",
+            "-in",
+            &request,
+            "-CA",
+            &ca,
+            "-CAkey",
+            &ca_key,
+            "-out",
+            &certificate,
+        ];
+        sign.extend(["-not_before", NOT_BEFORE, "-not_after", NOT_AFTER]);
+        sign.extend(["-extfile", &extension_file]);
+        self.openssl(&sign)
     }
 
     /// The DER encoding of `name.pem`.
@@ -674,22 +681,34 @@ pub(crate) fn creation(generator: &Generator) -> Result<(), String> {
     write(&generator.output.join("signer.key"), key)
 }
 
+/// Which fixture set one run regenerates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Set {
+    Baseline,
+    Levels,
+    Creation,
+    Augmentation,
+}
+
 pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage =
-        "usage: xades fixtures [--levels | --creation] [--units N] [--output DIR] [--work DIR]";
+    let usage = "usage: xades fixtures [--levels | --creation | --augmentation] [--units N] [--output DIR] [--work DIR]";
     let mut output = None;
     let mut work = None;
-    let mut levels = false;
-    let mut creating = false;
+    let mut set = Set::Baseline;
     let mut units = 0;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        if arg == "--levels" {
-            levels = true;
-            continue;
-        }
-        if arg == "--creation" {
-            creating = true;
+        let selected = match arg.as_str() {
+            "--levels" => Some(Set::Levels),
+            "--creation" => Some(Set::Creation),
+            "--augmentation" => Some(Set::Augmentation),
+            _ => None,
+        };
+        if let Some(selected) = selected {
+            if set != Set::Baseline {
+                return Err(usage.into());
+            }
+            set = selected;
             continue;
         }
         if arg == "--units" {
@@ -706,16 +725,11 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
             _ => return Err(usage.into()),
         }
     }
-    if levels && creating {
-        return Err(usage.into());
-    }
     let fixtures = corpus.root.join("crates/xml-sec-xades/tests/fixtures");
-    let output = output.unwrap_or_else(|| {
-        if creating {
-            fixtures.join("creation")
-        } else {
-            fixtures
-        }
+    let output = output.unwrap_or_else(|| match set {
+        Set::Creation => fixtures.join("creation"),
+        Set::Augmentation => fixtures.join("augmentation"),
+        Set::Baseline | Set::Levels => fixtures,
     });
     // Without --work the keys and templates are removed with the scratch directory.
     let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
@@ -726,11 +740,11 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
         output,
         units,
     };
-    if levels {
-        return Ok(super::levels::generate(&generator)?);
+    match set {
+        Set::Baseline => generate(&generator),
+        Set::Levels => super::levels::generate(&generator),
+        Set::Creation => creation(&generator),
+        Set::Augmentation => super::augmentation::generate(corpus, &generator),
     }
-    if creating {
-        return Ok(creation(&generator)?);
-    }
-    Ok(generate(&generator)?)
+    .map_err(Into::into)
 }
