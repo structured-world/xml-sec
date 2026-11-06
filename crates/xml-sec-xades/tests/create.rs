@@ -277,7 +277,7 @@ fn every_packaging_mode_meets_basic() {
         fixture
             .create(&mut document, request)
             .unwrap_or_else(|error| panic!("{id}: {error}"));
-        assert_eq!(document.generation(), start + 1, "{id}: one generation");
+        assert!(document.generation() > start, "{id}: a new generation");
         assert!(fixture.meets_basic(document.as_xml(), id), "{id}: B-B");
         let created = parse(document.as_xml());
         let formats = created

@@ -1,6 +1,6 @@
 //! All-or-nothing [`XmlDocument::transaction`] semantics, including nesting.
 
-use super::{DocumentView, NodeIdentity, XmlDocument};
+use super::{DocumentView, NodeIdentity, XmlDocument, XmlDocumentError};
 
 // A free function keeps the view's lifetime late-bound for `with_view`.
 fn root(view: DocumentView<'_>) -> NodeIdentity {
@@ -30,7 +30,46 @@ fn a_successful_transaction_commits_one_generation() {
         })
         .expect("transaction succeeds");
     assert_eq!(document.as_xml(), "<root><a/><b/><c/></root>");
-    assert_eq!(document.generation(), start + 1);
+    assert!(document.generation() > start);
+}
+
+#[test]
+fn an_identity_of_an_intermediate_state_is_stale_after_success() {
+    // The published generation must differ from every intermediate one: an
+    // identity captured between two commits names a node of bytes that no
+    // longer exist, and numbering the result start + 1 made it valid again.
+    let mut document = document();
+    let intermediate = document
+        .transaction(|document| {
+            append(document, "<b/>");
+            let root = document.with_view(root);
+            append(document, "<c/>");
+            Ok::<_, ()>(root)
+        })
+        .expect("transaction succeeds");
+    assert!(matches!(
+        document.append_child(intermediate, "<d/>"),
+        Err(XmlDocumentError::StaleIdentity { .. })
+    ));
+    assert_eq!(document.as_xml(), "<root><a/><b/><c/></root>");
+}
+
+#[test]
+fn an_identity_of_a_rolled_back_state_stays_stale_after_later_commits() {
+    // Rolling back restores the starting generation, but the generations the
+    // failed transaction issued are never issued again to other bytes.
+    let mut document = document();
+    let discarded = document.transaction(|document| {
+        append(document, "<b/>");
+        Err::<(), _>(document.with_view(root))
+    });
+    let discarded = discarded.expect_err("transaction fails");
+    append(&mut document, "<c/>");
+    assert!(matches!(
+        document.append_child(discarded, "<d/>"),
+        Err(XmlDocumentError::StaleIdentity { .. })
+    ));
+    assert_eq!(document.as_xml(), "<root><a/><c/></root>");
 }
 
 #[test]
@@ -77,7 +116,7 @@ fn an_inner_failure_keeps_the_outer_commits() {
         })
         .expect("outer transaction succeeds");
     assert_eq!(document.as_xml(), "<root><a/><b/></root>");
-    assert_eq!(document.generation(), start + 1);
+    assert!(document.generation() > start);
 }
 
 #[test]

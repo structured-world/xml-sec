@@ -711,7 +711,10 @@ impl<P, B> OperationExecutionContext<P, B> {
         for node in nodes {
             self.validate_ready(*node, None).map_err(E::from)?;
         }
-        let generation = document.generation();
+        // Exactly one commit numbers the result one above the generations
+        // issued so far; a rollback earlier on may have left those above the
+        // current generation.
+        let issued = document.issued_generation();
         let value = match action(document, &mut self.budgets) {
             Ok(value) => value,
             Err(error) => {
@@ -721,7 +724,7 @@ impl<P, B> OperationExecutionContext<P, B> {
                 return Err(error);
             }
         };
-        if document.generation() != generation.saturating_add(1) {
+        if issued.checked_add(1) != Some(document.generation()) {
             for node in nodes {
                 self.record(*node, false, OperationDecisionReason::ActionRejected);
             }

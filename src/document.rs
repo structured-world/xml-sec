@@ -570,7 +570,8 @@ pub enum XmlDocumentError {
     /// An identity belongs to another document.
     #[error("XML identity belongs to a different document")]
     ForeignIdentity,
-    /// An identity belongs to an earlier document generation.
+    /// An identity belongs to another generation of the document: an earlier
+    /// one, or one that a failed transaction discarded.
     #[error("XML identity belongs to stale generation {identity}; current generation is {current}")]
     StaleIdentity {
         /// Generation captured by the identity.
@@ -682,8 +683,8 @@ impl XmlDocumentError {
 /// Reusable owned XML document.
 ///
 /// The parsed view is retained across read-only operations. Every successful
-/// mutation increments [`Self::generation`] and invalidates all identities
-/// captured from previous views.
+/// mutation advances [`Self::generation`] to a number never issued before and
+/// invalidates all identities captured from previous views.
 pub struct XmlDocument {
     identity: DocumentIdentity,
     generation: u64,
@@ -694,6 +695,11 @@ pub struct XmlDocument {
     /// Open all-or-nothing mutations, innermost last.
     #[cfg(feature = "xmldsig-sign")]
     atomic: Vec<AtomicMutation>,
+    /// The highest generation ever issued. A rollback returns to an earlier
+    /// generation, so the next commit numbers from here, never from the
+    /// current one: an identity of discarded bytes must not become valid again.
+    #[cfg(feature = "xmldsig-sign")]
+    issued: u64,
 }
 
 /// The generation an all-or-nothing mutation started from, kept from its first
@@ -975,6 +981,8 @@ impl XmlDocument {
             cell,
             #[cfg(feature = "xmldsig-sign")]
             atomic: Vec::new(),
+            #[cfg(feature = "xmldsig-sign")]
+            issued: 0,
         })
     }
 
@@ -997,6 +1005,13 @@ impl XmlDocument {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The highest generation ever issued; the next commit is numbered one
+    /// above it, which after a rollback is above the current generation.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) const fn issued_generation(&self) -> u64 {
+        self.issued
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
@@ -1067,9 +1082,10 @@ impl XmlDocument {
     /// Run `mutate` as one all-or-nothing mutation.
     ///
     /// When `mutate` returns `Ok`, everything it committed becomes one new
-    /// generation. When it returns `Err` or unwinds, the serialization and
-    /// generation are exactly those before the call, and identities captured
-    /// before it stay valid. Transactions nest: an inner one that fails rolls
+    /// generation; identities captured between its commits are stale. When it
+    /// returns `Err` or unwinds, the serialization and generation are exactly
+    /// those before the call, identities captured before it stay valid, and
+    /// those captured inside it never become valid again. Transactions nest: an inner one that fails rolls
     /// back only its own commits, and an inner success is still undone by a
     /// failing outer transaction.
     ///
@@ -1106,9 +1122,9 @@ impl XmlDocument {
             self.generation = generation;
             return;
         }
-        // The starting generation was committed from, so it is below the
-        // current one and its successor cannot overflow.
-        self.generation = generation + 1;
+        // The last commit numbered the current cell with a generation never
+        // issued before, so it already stands for the published result; every
+        // intermediate generation stays below it and stale.
         // An enclosing transaction that committed nothing before this one
         // began starts from this same cell; it now owns the way back.
         if let Some(outer) = self.atomic.last_mut()
@@ -1914,7 +1930,11 @@ impl XmlDocument {
     }
 
     fn commit_cell(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
-        let next_generation = self.generation.checked_add(1).ok_or_else(|| {
+        #[cfg(feature = "xmldsig-sign")]
+        let issued = self.issued;
+        #[cfg(not(feature = "xmldsig-sign"))]
+        let issued = self.generation;
+        let next_generation = issued.checked_add(1).ok_or_else(|| {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
         })?;
         record_work(&mut next, recorded_work(&self.cell));
@@ -1930,6 +1950,10 @@ impl XmlDocument {
         #[cfg(not(feature = "xmldsig-sign"))]
         drop(previous);
         self.generation = next_generation;
+        #[cfg(feature = "xmldsig-sign")]
+        {
+            self.issued = next_generation;
+        }
         Ok(())
     }
 
