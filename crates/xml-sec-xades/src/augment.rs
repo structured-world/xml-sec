@@ -6,7 +6,12 @@
 //! [`complete_timestamp`] checks the TSA response against that exact request
 //! and the unchanged document, appends the token as a `SignatureTimeStamp`
 //! and publishes the new generation only after it meets the requested level.
-//! Nothing is fetched and no clock is read here.
+//! [`add_validation_data`] then appends the certificates and statuses a B-T
+//! signature lacks for B-LT. Nothing is fetched and no clock is read here.
+
+mod validation_data;
+
+pub use validation_data::{DataAdded, ValidationData, add_validation_data};
 
 use crate::accuracy;
 use crate::basic::{Outcome, Stage, ValidationError, with_stage};
@@ -124,6 +129,13 @@ pub enum AugmentError {
     /// The completion asks for a level below B-T.
     #[error("a completed timestamp is assessed at B-T or above, not {0:?}")]
     BelowTimestamped(Requirements),
+    /// Added validation data is assessed at a level below B-LT.
+    #[error("added validation data is assessed at B-LT or above, not {0:?}")]
+    BelowLongTerm(Requirements),
+    /// A required OCSP response has no whole `OCSPResponse` among the caller's
+    /// responses or the document's values.
+    #[error("a required OCSP response has no whole OCSPResponse to incorporate")]
+    MissingEnvelope,
     /// The document does not satisfy the assessment's verification request.
     #[error("the document does not satisfy the verification request")]
     NotAccepted,
@@ -331,27 +343,73 @@ pub fn complete_timestamp<W: Work>(
             )
         },
     )??;
-    // The signer's path forms from the certificates its B-B assessment used,
-    // as it did before the token was added. They join the pool any path may
-    // use, never the anchors: a TSA path still has to end at an input anchor.
-    let mut certificates = work.memory().vector();
-    certificates
-        .try_reserve_exact(completion.inputs.certificates.len() + assessment.certificates.len())?;
-    for certificate in completion
-        .inputs
-        .certificates
-        .iter()
-        .chain(assessment.certificates)
-    {
-        certificates.try_push(*certificate)?;
-    }
-    let certificates = certificates.into_owned();
+    let certificates = pooled(completion.inputs, assessment, work)?;
     let inputs = Inputs {
         certificates: &certificates,
         ..*completion.inputs
     };
+    publish(
+        document,
+        &Publication {
+            assessment,
+            inputs: &inputs,
+            signature,
+            id_attributes: completion.id_attributes,
+            unsigned,
+        },
+        Some(&property),
+        work,
+    )
+}
+
+/// The input certificates, then the ones the assessment's B-B path used.
+///
+/// The signer's path forms from the certificates its B-B assessment used, as
+/// it did before anything was added. They join the pool any path may use,
+/// never the anchors: every other path still has to end at an input anchor.
+fn pooled<'c, W: Work>(
+    inputs: &Inputs<'c>,
+    assessment: &Assessment<'c, '_>,
+    work: &W,
+) -> Result<OwnedVec<&'c [u8]>, AugmentError> {
+    let mut certificates = work.memory().vector();
+    certificates.try_reserve_exact(inputs.certificates.len() + assessment.certificates.len())?;
+    for certificate in inputs.certificates.iter().chain(assessment.certificates) {
+        certificates.try_push(*certificate)?;
+    }
+    Ok(certificates.into_owned())
+}
+
+/// Where a new generation is published and what it must meet.
+struct Publication<'p, 'a, 'inputs> {
+    assessment: &'p Assessment<'a, 'inputs>,
+    inputs: &'p Inputs<'p>,
+    signature: &'p str,
+    id_attributes: &'p [IdAttributeRegistration],
+    unsigned: Unsigned,
+}
+
+/// Insert `property`, if any, among the unsigned signature properties and
+/// keep the result only if it satisfies the assessment's verification request
+/// and meets `inputs.requirements`. Without a property nothing is committed,
+/// so the document keeps its generation either way.
+fn publish<W: Work>(
+    document: &mut XmlDocument,
+    publication: &Publication<'_, '_, '_>,
+    property: Option<&str>,
+    work: &W,
+) -> Result<(), AugmentError> {
+    let Publication {
+        assessment,
+        inputs,
+        signature,
+        id_attributes,
+        unsigned,
+    } = *publication;
     document.transaction(|document| {
-        unsigned.insert(document, &property)?;
+        if let Some(property) = property {
+            unsigned.insert(document, property)?;
+        }
         // The caller's targets and keys name elements of the requested
         // generation; they hold for the same elements in the new one.
         let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
@@ -362,13 +420,11 @@ pub fn complete_timestamp<W: Work>(
             work,
             |session| {
                 Ok(
-                    selected(document, &session, signature, completion.id_attributes).and_then(
-                        |node| {
-                            Ok(validate(&session, node, &inputs, |level| {
-                                level.all_requirements_met()
-                            })?)
-                        },
-                    ),
+                    selected(document, &session, signature, id_attributes).and_then(|node| {
+                        Ok(validate(&session, node, inputs, |level| {
+                            level.all_requirements_met()
+                        })?)
+                    }),
                 )
             },
         )??;

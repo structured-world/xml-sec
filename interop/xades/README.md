@@ -39,8 +39,8 @@ authenticated evidence channel.
 XAdES envelope has two references: business data and typed `#sp` SignedProperties.
 Every positive base input is signed by independent libxmlsec1 with RSA-SHA256/SHA-256.
 None of these base inputs is signed or verified by Rust alone. The only signatures Rust
-creates or augments are those of the B-B creation and B-T augmentation rows below, and
-EU DSS assesses them independently.
+creates or augments are those of the B-B creation and B-T and B-LT augmentation rows
+below, and EU DSS assesses them independently.
 
 | Scenario / boundary | Status | Observation |
 | --- | --- | --- |
@@ -74,6 +74,7 @@ EU DSS assesses them independently.
 | Caller-supplied CRLs and OCSP responses | verified | They answer status but do not count as incorporated, so the level stays unmet |
 | B-B signatures created by `xml-sec-xades` (`produce`) | verified | `xades creation` signs enveloped, enveloping, internally detached, detached, parallel and countersigned documents through the public API (`crates/xml-sec-xades/tests/fixtures/creation`); DSS classifies every signature, the countersignature included, as XAdES-BASELINE-B with an intact value and intact references, and passes ISC and CV. The overall indication stays INDETERMINATE: no revocation data is supplied |
 | B-T augmentation by `xml-sec-xades` (`produce`) | verified | `xades creation` adds an OpenSSL TSA token, issued for the request `request_timestamp` encodes (`crates/xml-sec-xades/tests/fixtures/augmentation`), to a created B-B signature through `complete_timestamp`; DSS classifies it as XAdES-BASELINE-T with an intact token signature and message imprint. Responses for other data, without the requested nonce, under another policy or rejected are refused without changing the document |
+| B-LT augmentation by `xml-sec-xades` (`produce`) | verified | `xades creation` adds, through `add_validation_data`, the OpenSSL CRLs and delegated OCSP response of the level fixtures (`crates/xml-sec-xades/tests/fixtures/levels`) to their xmlsec1 B-T signature as one `AnyValidationData`; DSS classifies it as XAdES-BASELINE-LT with TOTAL_PASSED. The values include the CA certificates the TSA shares with the signer, which EN 319 132-1 §6.3(x) does not accept from `KeyInfo` for a timestamp |
 | EU Trusted Lists, legal qualification | not run or blocked | Outside this corpus; no such trust service inputs |
 | AL/SignedXml pipeline or direct Rust invocation from AL/SaaS | not run or blocked | No Business Central environment; no deployment assumption |
 

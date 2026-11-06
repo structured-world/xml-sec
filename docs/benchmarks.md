@@ -88,7 +88,10 @@ augmentation over the augmentation fixtures: the timestamp request (B-B
 assessment, `SignatureTimeStamp` input, imprint and DER request) and its
 completion (response check against the request and the input, staging, and the
 verification and B-T assessment that gate publication); creating the signature
-and the pending request is outside the timer. These are native measurements
+and the pending request is outside the timer. It also measures B-LT augmentation
+of the B-T level fixture with the CRLs and OCSP response issued for its PKI: the
+B-LT census, staging the missing values, and the verification and B-LT
+assessment that gate publication. These are native measurements
 only; comparison with EU DSS needs qualified equivalent operations and
 separates JVM metrics.
 

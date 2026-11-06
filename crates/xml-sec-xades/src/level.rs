@@ -27,6 +27,8 @@ use structured_ltv::timestamp::{
 };
 use structured_pkix::Certificate;
 use structured_pkix::crl::CertificateList;
+#[cfg(feature = "produce")]
+use structured_pkix::ocsp::ResponseBytes;
 use structured_pkix::ocsp::{BasicResponse, Response};
 use structured_pkix::path::{Anchor, Interval, WorkingKey};
 use structured_pkix::temporal::{Instant, LeapTable};
@@ -64,6 +66,36 @@ pub enum NoCredential {}
 /// [`Assessment::all_requirements_met`] states that the requested structure
 /// holds, not that a status is usable, a chronology holds or a signer is trusted.
 pub type Level<'a> = Assessment<'a, NoCredential, N, D, G>;
+
+/// The caller side of one level validation.
+pub(crate) trait Visit: Sized {
+    /// What the visitor makes of the validation.
+    type Output;
+
+    /// Read the reports of the requested level.
+    fn level(self, level: &Level<'_>) -> Self::Output;
+
+    /// Read the material census of a B-LT or B-LTA request before its level is
+    /// assessed, or give the visitor back to let the validation continue.
+    #[cfg(feature = "produce")]
+    fn census<W: Work>(
+        self,
+        _census: &Census<'_, '_, '_, '_, '_, '_, '_, W>,
+    ) -> Result<Self::Output, Self> {
+        Err(self)
+    }
+}
+
+impl<F, R> Visit for F
+where
+    F: for<'a> FnOnce(&Level<'a>) -> R,
+{
+    type Output = R;
+
+    fn level(self, level: &Level<'_>) -> R {
+        self(level)
+    }
+}
 
 /// Caller evidence of one baseline validation. Nothing here is discovered or
 /// fetched: this is the whole outside world the validation sees.
@@ -170,6 +202,16 @@ pub fn validate<W: Work, R>(
     inputs: &Inputs<'_>,
     visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
 ) -> Result<Outcome<R>, ValidationError> {
+    validate_with(session, signature, inputs, visitor)
+}
+
+/// [`validate`] for any [`Visit`]or.
+pub(crate) fn validate_with<W: Work, V: Visit>(
+    session: &VerifiedSession<'_, '_, '_, W>,
+    signature: N,
+    inputs: &Inputs<'_>,
+    visitor: V,
+) -> Result<Outcome<V::Output>, ValidationError> {
     let requirements = inputs.requirements;
     let timing = (requirements != Requirements::Basic).then_some(Timing {
         utc: inputs.utc,
@@ -191,7 +233,7 @@ pub fn validate<W: Work, R>(
             if requirements == Requirements::Basic {
                 let level =
                     baseline::assess(Evidence::Basic(basic)).map_err(ValidationError::Level)?;
-                return Ok(Outcome::Assessed(visitor(&level)));
+                return Ok(Outcome::Assessed(visitor.level(&level)));
             }
             timed(stage, basic, inputs, visitor)
         },
@@ -223,12 +265,12 @@ struct Pools<'p, 't> {
     view: &'p Material<'t>,
 }
 
-fn timed<W: Work, R>(
+fn timed<W: Work, V: Visit>(
     stage: &Stage<'_, '_, '_, '_, W>,
     basic: &Report<'_>,
     inputs: &Inputs<'_>,
-    visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
-) -> Result<Outcome<R>, ValidationError> {
+    visitor: V,
+) -> Result<Outcome<V::Output>, ValidationError> {
     let stamps = timestamp::counter_timestamps(stage.access, stage.counters)
         .map_err(|error| ValidationError::Stamps(Box::new(error)))?;
     timestamp::with_counter_tokens(
@@ -480,13 +522,13 @@ macro_rules! token_fact {
     };
 }
 
-fn frozen<W: Work, R>(
+fn frozen<W: Work, V: Visit>(
     stage: &Stage<'_, '_, '_, '_, W>,
     basic: &Report<'_>,
     inputs: &Inputs<'_>,
     pools: &Pools<'_, '_>,
-    visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
-) -> Result<Outcome<R>, ValidationError> {
+    visitor: V,
+) -> Result<Outcome<V::Output>, ValidationError> {
     let session = stage.session;
     let memory = stage.parser.memory();
     let access = stage.access;
@@ -566,7 +608,7 @@ fn frozen<W: Work, R>(
     if inputs.requirements == Requirements::Timestamped {
         let level =
             baseline::assess(Evidence::Timestamped(&timed)).map_err(ValidationError::Level)?;
-        return Ok(Outcome::Assessed(visitor(&level)));
+        return Ok(Outcome::Assessed(visitor.level(&level)));
     }
     long_term(
         &Chain {
@@ -601,6 +643,9 @@ struct Chain<'c, 'a, 'v, 's, 'i, 't, W: Work> {
 struct External<'s> {
     crls: OwnedVec<CertificateList<'s>>,
     responses: OwnedVec<BasicResponse<'s>>,
+    /// The whole `OCSPResponse` of each of `responses`, at the same position.
+    #[cfg(feature = "produce")]
+    envelopes: OwnedVec<ResponseBytes<'s>>,
 }
 
 impl<'s> External<'s> {
@@ -613,6 +658,8 @@ impl<'s> External<'s> {
             ValidationError::Status(Box::new(StatusError::Pkix(cause)))
         };
         let (mut crls, mut responses) = (parser.memory().vector(), parser.memory().vector());
+        #[cfg(feature = "produce")]
+        let mut envelopes = parser.memory().vector();
         crls.try_reserve_exact(inputs.crls.len())
             .map_err(Error::from)?;
         for bytes in inputs.crls {
@@ -627,11 +674,15 @@ impl<'s> External<'s> {
             };
             if let Some(basic) = body.basic_in(query).map_err(status)? {
                 responses.try_push(basic).map_err(Error::from)?;
+                #[cfg(feature = "produce")]
+                envelopes.try_push(body).map_err(Error::from)?;
             }
         }
         Ok(Self {
             crls: crls.into_owned(),
             responses: responses.into_owned(),
+            #[cfg(feature = "produce")]
+            envelopes: envelopes.into_owned(),
         })
     }
 }
@@ -675,10 +726,10 @@ fn status_sources<'p, 't: 'p>(
 }
 
 /// Every participant's status, its incorporation and, for B-LTA, each archive.
-fn long_term<W: Work, R>(
+fn long_term<W: Work, V: Visit>(
     chain: &Chain<'_, '_, '_, '_, '_, '_, W>,
-    visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
-) -> Result<Outcome<R>, ValidationError> {
+    visitor: V,
+) -> Result<Outcome<V::Output>, ValidationError> {
     let stage = chain.stage;
     let access = stage.access;
     let memory = stage.parser.memory();
@@ -757,11 +808,11 @@ fn placement_error(error: impl core::fmt::Debug) -> ValidationError {
 }
 
 /// The B-LT reports, and the B-LTA census when the request asks for it.
-fn material_level<W: Work, R>(
+fn material_level<W: Work, V: Visit>(
     chain: &Chain<'_, '_, '_, '_, '_, '_, W>,
     facts: &Assessed<'_, W>,
-    visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
-) -> Result<Outcome<R>, ValidationError> {
+    visitor: V,
+) -> Result<Outcome<V::Output>, ValidationError> {
     let stage = chain.stage;
     let access = stage.access;
     let roots = census(facts.participants, facts.statuses, stage.parser.memory())?;
@@ -777,6 +828,11 @@ fn material_level<W: Work, R>(
         access,
     )
     .map_err(placement_error)?;
+    #[cfg(feature = "produce")]
+    let visitor = match visitor.census(&Census { chain, x509: &x509 }) {
+        Ok(output) => return Ok(Outcome::Assessed(output)),
+        Err(visitor) => visitor,
+    };
     let format = material::credentials::check(
         facts.credentials,
         stage.counters,
@@ -792,9 +848,50 @@ fn material_level<W: Work, R>(
     if chain.inputs.requirements == Requirements::LongTerm {
         let level =
             baseline::assess(Evidence::LongTerm(&long_term)).map_err(ValidationError::Level)?;
-        return Ok(Outcome::Assessed(visitor(&level)));
+        return Ok(Outcome::Assessed(visitor.level(&level)));
     }
     archival(chain, facts, &long_term, visitor)
+}
+
+/// The B-LT material census of one validation, before its level is assessed.
+#[cfg(feature = "produce")]
+pub(crate) struct Census<'r, 'c, 'a, 'v, 's, 'i, 't, W: Work> {
+    chain: &'r Chain<'c, 'a, 'v, 's, 'i, 't, W>,
+    x509: &'r material::Checks<'r, 'r, 'r, 'r, 'r, N, D, G>,
+}
+
+#[cfg(feature = "produce")]
+impl<'r, 'c, 'a, 'v, 's, 'i, W: Work> Census<'r, 'c, 'a, 'v, 's, 'i, '_, W> {
+    /// The stage the census was taken in.
+    pub(crate) fn stage(&self) -> &'c Stage<'a, 'v, 's, 'i, W> {
+        self.chain.stage
+    }
+
+    /// The X.509 material checks of the whole signature.
+    pub(crate) fn checks(&self) -> &'r material::Checks<'r, 'r, 'r, 'r, 'r, N, D, G> {
+        self.x509
+    }
+
+    /// The whole `OCSPResponse` that carries `basic`, the caller's or one the
+    /// document incorporates. The census refers to the very payload bytes
+    /// it was given, so their identity finds the envelope.
+    pub(crate) fn envelope(&self, basic: &BasicResponse<'_>) -> Option<&'c ResponseBytes<'c>> {
+        let same =
+            |response: &BasicResponse<'_>| core::ptr::eq(response.as_bytes(), basic.as_bytes());
+        let external = self.chain.external;
+        if let Some(position) = external.responses.iter().position(same) {
+            return external.envelopes.get(position);
+        }
+        let view = self.chain.pools.view;
+        let carried = view
+            .basic_responses()
+            .iter()
+            .find(|carried| same(carried.response()))?;
+        match &view.values().get(carried.source_index())?.value {
+            Value::Ocsp(Response::Successful(envelope)) => Some(envelope),
+            _ => None,
+        }
+    }
 }
 
 type EarlierScopes<'c> = (
@@ -870,12 +967,12 @@ fn archive_inputs<'c, W: Work>(
 }
 
 /// The census of every root archive, each over its own earlier scope.
-fn archival<W: Work, R>(
+fn archival<W: Work, V: Visit>(
     chain: &Chain<'_, '_, '_, '_, '_, '_, W>,
     facts: &Assessed<'_, W>,
     long_term: &LongTermReport<'_>,
-    visitor: impl for<'a> FnOnce(&Level<'a>) -> R,
-) -> Result<Outcome<R>, ValidationError> {
+    visitor: V,
+) -> Result<Outcome<V::Output>, ValidationError> {
     let stage = chain.stage;
     let (access, memory) = (stage.access, stage.parser.memory());
     let mut archives = memory.vector();
@@ -968,7 +1065,7 @@ fn archival<W: Work, R>(
         archives: &archives,
     })
     .map_err(ValidationError::Level)?;
-    Ok(Outcome::Assessed(visitor(&level)))
+    Ok(Outcome::Assessed(visitor.level(&level)))
 }
 
 /// The checked path of every path actor of `participants`, in census order.
