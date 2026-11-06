@@ -380,8 +380,8 @@ fn data_template(
 }
 
 /// Countersign one existing `XAdES` signature and publish the result as one
-/// new generation of `document`, after the parent still verifies and meets
-/// every B-B requirement with its countersignature incorporated.
+/// new generation of `document`, after the countersignature meets every B-B
+/// requirement and the parent still does with it incorporated.
 ///
 /// The countersignature is itself a B-B signature over the parent's
 /// `SignatureValue`. It is appended to the parent's unsigned signature
@@ -470,9 +470,17 @@ pub fn countersign<W: Work>(
         }
         context.sign_document(document)?;
         // The parent's assessment binds every incorporated countersignature
-        // (path, key, hash use); EN 319 132-1 §6.3(k) exempts the countersigned
-        // value from format coverage only within that binding, so the
-        // countersignature is not assessed as a signature of its own.
+        // (path, key, hash use) but not its own signing-certificate
+        // requirements, so the countersignature is assessed as well; its
+        // countersigned value is exempt from format coverage (EN 319 132-1
+        // §6.3(k)) through the binding that assessment derives.
+        assess(
+            document,
+            &ids.signature,
+            countersignature.id_attributes,
+            assessment,
+            work,
+        )?;
         assess(
             document,
             countersignature.parent,

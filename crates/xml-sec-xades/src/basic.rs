@@ -17,7 +17,9 @@ use structured_ltv::pki::{ParticipantClosureError, ParticipantError, TimestampBi
 use structured_ltv::timestamp::{ObligationError, TemporalError};
 use structured_pkix::temporal::{Instant, LeapTable};
 use structured_xades::baseline::{self, Basic, BasicInput, LevelError};
+use structured_xades::binding::{self, BindingError};
 use structured_xades::certificate::{self, CheckedPathCertificate, KeyAssociation};
+use structured_xades::container::{self, ContainerError, DS, XADES};
 use structured_xades::counter::{self, WalkError};
 use structured_xades::credential;
 use structured_xades::hashes::{self, HashError, ParticipantBinding, ParticipantProblem};
@@ -29,7 +31,7 @@ use structured_xades::timestamp::{
     self, CarriedError, CounterTimestampError, RequirementError, TokenPipelineError, TokenProfile,
 };
 use structured_xades::unsigned::Requirements;
-use structured_xades::xml::{Access, Xml};
+use structured_xades::xml::{Access, AccessError, Name, Xml};
 use xml_sec::document::{DocumentIdentity, NodeIdentity};
 use xml_sec::xmldsig::VerifiedSession;
 use xml_sec::xmldsig::cms::CmsProviderError;
@@ -113,6 +115,21 @@ impl<R> Outcome<R> {
 pub type CounterError =
     WalkError<Error, CounterSelectionError<CounterPathError, Error, NodeIdentity>, NodeIdentity>;
 
+/// Why the countersignature property enclosing a requested signature could
+/// not be bound to the `SignatureValue` it countersigns.
+#[derive(Debug)]
+pub enum EnclosingError {
+    /// The enclosing property or signature could not be read.
+    Access(AccessError<Error, NodeIdentity>),
+    /// The countersigned signature's qualifying properties could not be located.
+    Container(ContainerError<Error, NodeIdentity>),
+    /// The countersigned signature's qualifying properties are not bound to it.
+    Binding(BindingError<Error, NodeIdentity>),
+    /// The property is not a countersignature of that signature, or the
+    /// requested signature does not cover its `SignatureValue`.
+    Counter(counter::Error<Error, NodeIdentity>),
+}
+
 /// Processing failure of one pipeline stage, with the stage's original cause.
 ///
 /// Stage causes nest the adapter's error with original locations; they are
@@ -126,6 +143,9 @@ pub enum ValidationError {
     /// Qualifying-property structure, binding or reading failed.
     #[error("XAdES preparation failed: {0:?}")]
     Prepare(Box<prepare::Error<Error, NodeIdentity>>),
+    /// A requested countersignature could not be bound to its parent.
+    #[error("enclosing countersignature binding failed: {0:?}")]
+    Enclosing(Box<EnclosingError>),
     /// Signed property attributes, URIs or the claimed signing time failed.
     #[error("XAdES signed field check failed: {0:?}")]
     Fields(Box<prepare::FieldError<Error, NodeIdentity, DocumentIdentity, u64>>),
@@ -221,7 +241,9 @@ pub type TimestampCheckError =
 /// trust anchors and intermediates the verification's key resolver used.
 /// Each signer's path is the exact path verification validated, re-checked
 /// by the shared processor; countersignatures need validated paths of their
-/// own.
+/// own. A selected countersignature is prepared with its binding to the
+/// `SignatureValue` it countersigns, which exempts that reference from
+/// `DataObjectFormat` coverage (EN 319 132-1 §6.3(k)).
 ///
 /// All limits come from the session's compiled policy: XML queries spend the
 /// request's own execution, and certificate processing runs on a fresh
@@ -296,6 +318,52 @@ fn counter_fact<R>(error: CounterError) -> Result<Outcome<R>, ValidationError> {
     }
 }
 
+/// The binding of the `CounterSignature` property that encloses `signature`,
+/// when it is one. EN 319 132-1 §6.3(k) exempts a countersignature's
+/// countersigned-value reference from `DataObjectFormat` coverage, and only
+/// this binding proves which reference covers the parent's `SignatureValue`.
+/// <https://www.etsi.org/deliver/etsi_en/319100_319199/31913201/01.03.01_60/en_31913201v010301p.pdf>
+fn enclosing_counter<'a, 'v, 's, 'i, W: Work, Q: Work>(
+    document: &Document<'a, 'v, 's, 'i, W>,
+    access: &Access<'_, Document<'a, 'v, 's, 'i, W>, Q>,
+    signature: NodeIdentity,
+) -> Result<Option<counter::Checked<NodeIdentity, DocumentIdentity, u64>>, ValidationError> {
+    let enclosing = |error| ValidationError::Enclosing(Box::new(error));
+    let named = |node, namespace, local| {
+        access
+            .has_name(node, Name { namespace, local })
+            .map_err(|cause| enclosing(EnclosingError::Access(cause)))
+    };
+    let work = access.execution();
+    let Some(property) = document.parent(signature, work)? else {
+        return Ok(None);
+    };
+    if !named(property, XADES, "CounterSignature")? {
+        return Ok(None);
+    }
+    // The countersigned signature is the nearest enclosing ds:Signature;
+    // `counter::read` then requires the property in its unsigned properties.
+    let mut node = property;
+    let parent = loop {
+        let Some(next) = document.parent(node, work)? else {
+            return Ok(None);
+        };
+        if named(next, DS, "Signature")? {
+            break next;
+        }
+        node = next;
+    };
+    let layout = container::locate(access, parent)
+        .map_err(|cause| enclosing(EnclosingError::Container(cause)))?;
+    let bound = binding::bind(access, &layout)
+        .map_err(|cause| enclosing(EnclosingError::Binding(cause)))?;
+    let original = counter::read(access, &bound, property)
+        .map_err(|cause| enclosing(EnclosingError::Counter(cause)))?;
+    counter::bind(access, original)
+        .map(Some)
+        .map_err(|cause| enclosing(EnclosingError::Counter(cause)))
+}
+
 /// Run the B-B pipeline for the requested structural level, then `then` over
 /// its assembled report. A completed negative fact stops before `then`.
 pub(crate) fn with_stage<W: Work, R>(
@@ -314,7 +382,8 @@ pub(crate) fn with_stage<W: Work, R>(
 
     let document = Document::new(session);
     let access = Access::new(&document, document.snapshot(), work);
-    let prepared = prepare::prepare(&access, signature, requirements, None)
+    let enclosing = enclosing_counter(&document, &access, signature)?;
+    let prepared = prepare::prepare(&access, signature, requirements, enclosing.as_ref())
         .map_err(|error| ValidationError::Prepare(Box::new(error)))?;
     let fields = prepare::check_fields(&prepared, &access)
         .map_err(|error| ValidationError::Fields(Box::new(error)))?;

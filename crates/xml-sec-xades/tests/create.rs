@@ -390,6 +390,10 @@ fn a_countersignature_meets_basic_with_its_parent() {
         )
         .expect("countersignature");
     assert!(fixture.meets_basic(document.as_xml(), "sig"));
+    // Selected itself, the countersignature is a B-B signature too: its
+    // countersigned-value reference is exempt from DataObjectFormat (§6.3(k))
+    // through the binding to the SignatureValue it covers.
+    assert!(fixture.meets_basic(document.as_xml(), "counter"));
     let created = parse(document.as_xml());
     let counter = created
         .descendants()
