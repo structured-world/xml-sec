@@ -335,7 +335,7 @@ pub fn complete_timestamp<W: Work>(
         unsigned.insert(document, &property)?;
         // The caller's targets and keys name elements of the requested
         // generation; they hold for the same elements in the new one.
-        let carried = Carried::new(document, assessment.request)?;
+        let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
         let outcome = with_verified_request(
             document,
             assessment.context,
