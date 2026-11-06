@@ -215,6 +215,36 @@ fn aggregate_object_output_is_bounded_before_the_template_is_written() {
 }
 
 #[test]
+fn template_markup_is_never_written_past_the_document_limit() {
+    // Empty objects carry no caller content, yet each still writes its tags:
+    // the template sink itself stops at the limit, so the refusal reports the
+    // write that crossed it rather than a template built in full.
+    let policy = SigningPolicy {
+        resources: ResourcePolicy {
+            max_xml_document_bytes: 4096,
+            ..ResourcePolicy::default()
+        },
+        ..SigningPolicy::default()
+    };
+    let mut many = builder();
+    for _ in 0..1000 {
+        many = many.add_object(ObjectBuilder::new(ObjectContent::Text(String::new())));
+    }
+    let built = many.build_template_with_policy(&policy);
+    assert!(
+        matches!(
+            &built,
+            Err(SignatureBuilderError::Policy(PolicyViolation::ResourceLimit {
+                resource: "XML document",
+                maximum: 4096,
+                actual,
+            })) if *actual > 4096 && *actual < 4096 + 64
+        ),
+        "{built:?}"
+    );
+}
+
+#[test]
 fn invalid_object_and_signature_value_attributes_are_rejected() {
     // Ids are XML IDs and Encoding is an anyURI; neither may be repaired silently.
     let text = || ObjectContent::Text("payload".to_owned());

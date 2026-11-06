@@ -436,8 +436,29 @@ impl SignatureBuilder {
         policy.validate()?;
         self.validate(policy, xpath_parse_budget)?;
 
+        let mut writer = Writer::new(BoundedOutput {
+            bytes: Vec::new(),
+            maximum: policy.resources.max_xml_document_bytes,
+            refused: None,
+        });
+        let written = self.write_template(&mut writer, policy, encapsulation);
+        let output = writer.into_inner();
+        if let Some(actual) = output.refused {
+            policy.resources.validate_xml_document_len(actual)?;
+        }
+        written?;
+        let template = String::from_utf8(output.bytes)?;
+        self.validate_generated_template(&template, policy, signature_output_len, budget)?;
+        Ok(template)
+    }
+
+    fn write_template<W: Write>(
+        &self,
+        writer: &mut Writer<W>,
+        policy: &SigningPolicy,
+        encapsulation: Option<crate::provider::KeyEncapsulationAlgorithm>,
+    ) -> Result<(), SignatureBuilderError> {
         let prefix = self.ns_prefix.as_deref();
-        let mut writer = Writer::new(Vec::new());
         let signature_name = qualified_name(prefix, "Signature");
         let namespace_attr = prefix.map_or_else(|| "xmlns".to_owned(), |p| format!("xmlns:{p}"));
         let mut attributes = vec![(namespace_attr.as_str(), XMLDSIG_NS)];
@@ -446,25 +467,25 @@ impl SignatureBuilder {
         }
         writer.start(&signature_name, attributes)?;
 
-        write_start(&mut writer, prefix, "SignedInfo")?;
+        write_start(writer, prefix, "SignedInfo")?;
         write_algorithm(
-            &mut writer,
+            writer,
             prefix,
             "CanonicalizationMethod",
             self.c14n_method.uri(),
         )?;
-        self.write_signature_method(&mut writer, prefix)?;
+        self.write_signature_method(writer, prefix)?;
         for reference in &self.references {
-            write_reference(&mut writer, prefix, reference)?;
+            write_reference(writer, prefix, reference)?;
         }
-        write_end(&mut writer, prefix, "SignedInfo")?;
+        write_end(writer, prefix, "SignedInfo")?;
         writer.empty(
             &qualified_name(prefix, "SignatureValue"),
             self.signature_value_id.as_deref().map(|id| ("Id", id)),
         )?;
         if let Some(algorithm) = encapsulation {
             policy.key_establishment.check_encapsulation(algorithm)?;
-            write_start(&mut writer, prefix, "KeyInfo")?;
+            write_start(writer, prefix, "KeyInfo")?;
             writer.start(
                 "EncapsulationMechanism",
                 [
@@ -480,18 +501,15 @@ impl SignatureBuilder {
             writer.empty("CipherValue", std::iter::empty::<(&str, &str)>())?;
             writer.end("CipherData")?;
             writer.end("EncapsulationMechanism")?;
-            write_end(&mut writer, prefix, "KeyInfo")?;
+            write_end(writer, prefix, "KeyInfo")?;
         } else if self.include_key_info {
-            write_empty(&mut writer, prefix, "KeyInfo")?;
+            write_empty(writer, prefix, "KeyInfo")?;
         }
         for object in &self.objects {
-            write_object(&mut writer, prefix, object)?;
+            write_object(writer, prefix, object)?;
         }
         writer.end(&signature_name)?;
-
-        let template = String::from_utf8(writer.into_inner())?;
-        self.validate_generated_template(&template, policy, signature_output_len, budget)?;
-        Ok(template)
+        Ok(())
     }
 
     fn write_signature_method<W: Write>(
@@ -700,9 +718,9 @@ impl SignatureBuilder {
                 value: id.clone(),
             });
         }
-        // Object content and attributes are copied into the template and grow
-        // when escaped; their sum is bounded by the document limit before any
-        // of them is written.
+        // The template sink stops at the document limit, but escaping builds
+        // each value's escaped copy before it reaches the sink: Object content
+        // and attributes, the caller-sized values, are measured escaped first.
         let mut object_bytes = Some(0_usize);
         for object in &self.objects {
             Self::validate_object(object)?;
@@ -1048,6 +1066,36 @@ fn write_reference<W: Write>(
     write_empty(writer, prefix, "DigestValue")?;
     writer.end(&name)?;
     Ok(())
+}
+
+/// Template sink that refuses any write taking it past the policy's document
+/// limit, so no markup is ever buffered beyond it; `refused` keeps the length
+/// the refused write would have reached.
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    maximum: usize,
+    refused: Option<usize>,
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        match self.bytes.len().checked_add(data.len()) {
+            Some(len) if len <= self.maximum => {
+                self.bytes.extend_from_slice(data);
+                Ok(data.len())
+            }
+            projected => {
+                self.refused = Some(projected.unwrap_or(usize::MAX));
+                Err(std::io::Error::other(
+                    "template exceeds the XML document limit",
+                ))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn write_object<W: Write>(
