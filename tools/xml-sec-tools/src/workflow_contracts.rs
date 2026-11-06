@@ -355,9 +355,11 @@ fn apt_run(
 fn a_retry_leaves_the_mirror_the_failed_attempt_used() {
     // An Azure mirror sent valgrind at about 50 KB/s: apt's timeouts never
     // fire on a slow transfer, and the hosted runner's mirror list chose the
-    // same mirror for every retry until the budget ran out. After a failed
-    // attempt the list names only the primary archive.
-    let azure = "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n";
+    // same mirror for every retry until the budget ran out. Each failed
+    // attempt drops the mirror apt selects first and keeps the fallbacks.
+    let azure = "http://azure.archive.ubuntu.com/ubuntu/\tpriority:1\n\
+                 https://archive.ubuntu.com/ubuntu/\tpriority:2\n\
+                 https://security.ubuntu.com/ubuntu/\tpriority:3\n";
     let (success, calls, _, mirrors) =
         apt_run(0, "valgrind", "true", false, &[0, 124], Some(azure));
     assert!(success);
@@ -372,7 +374,24 @@ fn a_retry_leaves_the_mirror_the_failed_attempt_used() {
     );
     assert_eq!(
         mirrors.as_deref(),
-        Some("http://archive.ubuntu.com/ubuntu/\n")
+        Some(
+            "https://archive.ubuntu.com/ubuntu/\tpriority:2\n\
+             https://security.ubuntu.com/ubuntu/\tpriority:3\n"
+        )
+    );
+    // The last mirror is never dropped: an empty list leaves apt no source.
+    let (success, _, _, mirrors) = apt_run(
+        0,
+        "valgrind",
+        "true",
+        false,
+        &[124, 124, 0],
+        Some("https://archive.ubuntu.com/ubuntu/\tpriority:2\n"),
+    );
+    assert!(success);
+    assert_eq!(
+        mirrors.as_deref(),
+        Some("https://archive.ubuntu.com/ubuntu/\tpriority:2\n")
     );
     // A first attempt that succeeds keeps the runner's own list, and a runner
     // without a mirror list does not get one.
