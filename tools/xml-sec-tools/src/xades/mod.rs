@@ -8,6 +8,7 @@ use serde_json::{Map, Value, json};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
+pub(crate) mod augmentation;
 pub(crate) mod binding;
 pub(crate) mod check;
 pub(crate) mod corpus;

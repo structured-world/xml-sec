@@ -340,7 +340,8 @@ fn incorporated_certificates<'p>(
 }
 
 /// No token extension is recognized, so a critical one refuses its token.
-fn unrecognized() -> impl FnMut(&TokenExtension<'_>, &Execution<'_>) -> Result<bool, Infallible> {
+pub(crate) fn unrecognized()
+-> impl FnMut(&TokenExtension<'_>, &Execution<'_>) -> Result<bool, Infallible> {
     |_, _| Ok(false)
 }
 
@@ -1096,7 +1097,7 @@ pub(crate) fn signature_span<'s, W: Work>(
 }
 
 /// Parse caller DER under the operation's certificate parser.
-fn read_certificates<'s>(
+pub(crate) fn read_certificates<'s>(
     parser: &'s Parser,
     sources: &'s [&'s [u8]],
 ) -> Result<OwnedVec<Certificate<'s>>, Error> {

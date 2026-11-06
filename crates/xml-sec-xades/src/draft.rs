@@ -291,6 +291,13 @@ impl Draft {
         Ok(())
     }
 
+    /// Append part of one complete element serialized by its XML owner, such
+    /// as a canonical copy of an existing element, as content of the open one.
+    pub(crate) fn copied(&mut self, bytes: &[u8], work: &impl Work) -> Result<(), DraftError> {
+        self.content(work)?;
+        self.push(bytes, work)
+    }
+
     fn end(&mut self, work: &impl Work) -> Result<(), DraftError> {
         let frame = self
             .frames

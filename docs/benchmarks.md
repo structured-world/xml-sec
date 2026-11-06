@@ -14,6 +14,7 @@ unstable, hidden measurement entry points, not application APIs.
 cargo bench --bench security --features benchmark-internals
 cargo bench --bench security --features benchmark-alloc
 cargo bench -p xml-sec-xades --bench lifecycle --features produce
+cargo bench -p xml-sec-xades --bench augmentation --features produce
 cargo run -p xml-sec-tools -- bench-latency target/performance/run-1 1000
 # Optional native FIPS provider, never a fallback to RustCrypto:
 cargo run -p xml-sec-tools -- bench-latency target/performance/fips-1 1000 aws-lc-fips
@@ -82,8 +83,14 @@ The `xml-sec-xades` `lifecycle` benchmark measures enveloped B-B creation,
 countersigning (both new signature and parent assessed before publication), and
 verification followed by the B-B assessment of the parent or the
 countersignature, over the RSA-SHA256 creation fixtures. Each run uses a fresh
-resource account. These are native measurements only; comparison with EU DSS
-needs qualified equivalent operations and separates JVM metrics.
+resource account. The `augmentation` benchmark measures the two halves of B-T
+augmentation over the augmentation fixtures: the timestamp request (B-B
+assessment, `SignatureTimeStamp` input, imprint and DER request) and its
+completion (response check against the request and the input, staging, and the
+verification and B-T assessment that gate publication); creating the signature
+and the pending request is outside the timer. These are native measurements
+only; comparison with EU DSS needs qualified equivalent operations and
+separates JVM metrics.
 
 CI runs every benchmark once with `-- --test`, assertions included, so a
 broken workload fails before any measurement.

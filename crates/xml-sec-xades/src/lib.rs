@@ -28,6 +28,12 @@
 //! that generation satisfies the caller's verification request and meets
 //! every B-B requirement of [`validate_basic`]; otherwise the document is
 //! unchanged. Verification-only builds do not take the signing dependencies.
+//!
+//! B-T augmentation is two steps around the caller's own TSA exchange:
+//! `request_timestamp` encodes the RFC 3161 request over a B-B signature's
+//! `SignatureTimeStamp` input, and `complete_timestamp` checks the response
+//! against that request and the unchanged generation, adds the token and
+//! publishes only a generation that meets the requested level.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -39,6 +45,8 @@ use xml_sec::xmldsig::extension::{ScalarError, TreeError};
 use xml_sec::xmldsig::{DsigError, VerifiedSession, X509ChainError};
 
 mod accuracy;
+#[cfg(feature = "produce")]
+mod augment;
 mod basic;
 mod binary;
 #[cfg(feature = "produce")]
@@ -54,6 +62,11 @@ mod status;
 mod xml;
 
 pub use accuracy::AuthorityAccuracy;
+#[cfg(feature = "produce")]
+pub use augment::{
+    AugmentError, Completion, PendingTimestamp, TimestampRequest, TokenFacts, complete_timestamp,
+    request_timestamp,
+};
 pub use basic::{
     CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,
     validate_basic,
