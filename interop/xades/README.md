@@ -38,7 +38,8 @@ authenticated evidence channel.
 `cases.json` enumerates **34** synthetic signed documents and mutations. The base
 XAdES envelope has two references: business data and typed `#sp` SignedProperties.
 Every positive base input is signed by independent libxmlsec1 with RSA-SHA256/SHA-256.
-There is no Rust self-sign/self-verify evidence in this package.
+None of these base inputs is signed or verified by Rust alone. The only signatures Rust
+creates are those of the B-B creation row below, and EU DSS assesses them independently.
 
 | Scenario / boundary | Status | Observation |
 | --- | --- | --- |
