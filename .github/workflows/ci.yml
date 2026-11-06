@@ -90,13 +90,15 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
+      - name: Install oracle build dependencies and token
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2 cmake zlib1g-dev liblzma-dev
       - name: Provision independent oracles and disposable token support
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2 cmake zlib1g-dev liblzma-dev
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Execute every workspace target and enforce canonical coverage
@@ -142,7 +144,9 @@ jobs:
         run: cargo run --quiet -p xml-sec-tools -- check-features default
       - name: Provision isolated token provider
         if: matrix.minimal
-        run: sudo apt-get update && sudo apt-get install -y softhsm2
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: softhsm2
       - name: Qualify isolated minimal feature graphs
         if: matrix.minimal
         env:
@@ -189,7 +193,9 @@ jobs:
         with:
           domain: ordinary
       - name: Install isolated token oracle
-        run: sudo apt-get update && sudo apt-get install -y softhsm2
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: softhsm2
       - name: Check optional provider
         run: |
           for backend in xmloxide roxmltree differential; do
@@ -245,13 +251,15 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
+      - name: Install oracle build dependencies
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
       - name: Build the pinned libxmlsec1 the ABI baseline describes
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
       # The baseline is measured on Linux; a rebuilt snapshot is kept so a
       # reviewed drift can be committed without a local Linux build.
@@ -384,11 +392,11 @@ jobs:
         with:
           components: clippy
       - uses: taiki-e/install-action@nextest
-      - name: Refresh apt package index
-        run: sudo apt-get update
       - name: Provision all-feature token tests
         if: matrix.token
-        run: sudo apt-get install -y softhsm2
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: softhsm2
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: modern
@@ -398,12 +406,15 @@ jobs:
           # One complete dependency graph owns writes, not a race between
           # partial feature matrices for the same immutable entry.
           save: ${{ matrix.block == 'extended' }}
+      - name: Install oracle build dependencies
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
       - name: Build pinned xmlsec1 for external-oracle tests
         env:
           XMLSEC1_SOURCE_DIR: ${{ github.workspace }}/donors/xmlsec
           XMLSEC1_MODERN_ORACLE: "1"
         run: |
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           "$XMLSEC1_BIN" --version
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
@@ -477,10 +488,13 @@ jobs:
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
           profile: legacy
+      # valgrind, cmake and the compressors serve the XSLT phase contracts below.
+      - name: Install oracle build dependencies and native test tools
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config openjdk-21-jdk valgrind cmake zlib1g-dev liblzma-dev
       - name: Provision pinned XML signature oracle
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config openjdk-21-jdk
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
       - name: Verify live XMLDSig and XAdES corpus results
         run: cargo run --quiet -p xml-sec-tools -- xades check --output "$RUNNER_TEMP/xades-interop"
@@ -498,9 +512,7 @@ jobs:
       - name: Check XSLT phase and concurrent reuse contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
-        run: |
-          sudo apt-get install --yes valgrind cmake zlib1g-dev liblzma-dev
-          cargo nextest run -p xml-sec-xslt --all-features --test phase_contract
+        run: cargo nextest run -p xml-sec-xslt --all-features --test phase_contract
       - name: Measure XSLT phases against libxslt
         env:
           XSLT_BENCH_HEAP: '1'

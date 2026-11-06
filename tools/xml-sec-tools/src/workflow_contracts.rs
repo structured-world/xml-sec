@@ -253,6 +253,197 @@ fn runner_image_identity_is_read_at_runtime_rather_than_an_empty_env_context() {
     }
 }
 
+/// Runs the apt-packages action's script with recording `sudo`, `timeout` and
+/// `apt-get` stubs; `apt-get` call number N exits with `exits[N]` (0 past the
+/// end). Returns whether the action succeeded, each apt-get call prefixed by
+/// its time limit, and what the action exported to later steps.
+fn apt(
+    packages: &str,
+    recommends: &str,
+    refreshed: bool,
+    exits: &[u8],
+) -> (bool, Vec<String>, String) {
+    apt_after(0, packages, recommends, refreshed, exits)
+}
+
+/// [`apt`] with the action's clock started `elapsed` seconds in, as bash
+/// takes `SECONDS` from the environment.
+fn apt_after(
+    elapsed: u32,
+    packages: &str,
+    recommends: &str,
+    refreshed: bool,
+    exits: &[u8],
+) -> (bool, Vec<String>, String) {
+    let action = read(".github/actions/apt-packages/action.yml");
+    let script = literal_block(&action, "      run: |\n", 8);
+    let directory = tempfile::tempdir().unwrap();
+    let stub = |name: &str, body: String| {
+        let path = directory.path().join(name);
+        std::fs::write(&path, format!("#!/bin/bash\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let calls = directory.path().join("calls");
+    stub("sudo", "exec \"$@\"".into());
+    stub(
+        "timeout",
+        "[ \"$1\" = --kill-after=30 ] || exit 125\nLIMIT=$2 exec \"${@:3}\"".into(),
+    );
+    let codes: Vec<String> = exits.iter().map(u8::to_string).collect();
+    stub(
+        "apt-get",
+        format!(
+            "codes=({})\ncount={dir}/count\nn=$(cat \"$count\" 2>/dev/null || echo 0)\n\
+             echo $((n + 1)) > \"$count\"\necho \"${{LIMIT:--}} $*\" >> {calls}\n\
+             exit \"${{codes[$n]:-0}}\"",
+            codes.join(" "),
+            dir = directory.path().display(),
+            calls = calls.display(),
+        ),
+    );
+    let environment = directory.path().join("environment");
+    let mut command = Command::new("bash");
+    command
+        .args(["-e", "-c", &script])
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                directory.path().display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .env("GITHUB_ENV", &environment)
+        .env("PACKAGES", packages)
+        .env("RECOMMENDS", recommends)
+        .env("SECONDS", elapsed.to_string())
+        .env_remove("APT_INDEX_REFRESHED");
+    if refreshed {
+        command.env("APT_INDEX_REFRESHED", "1");
+    }
+    let status = command.status().unwrap();
+    let calls = std::fs::read_to_string(calls).unwrap_or_default();
+    (
+        status.success(),
+        calls.lines().map(str::to_owned).collect(),
+        std::fs::read_to_string(environment).unwrap_or_default(),
+    )
+}
+
+const APT: &str =
+    "-q -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30";
+
+#[test]
+fn a_stalled_apt_attempt_is_cut_off_and_retried_with_a_fresh_index() {
+    // A mirror that stops answering held a fuzz job until its 35-minute limit:
+    // every apt-get runs under a time limit (exit 124 when it fires), and the
+    // index refresh that stalled is attempted again.
+    let (success, calls, environment) = apt("softhsm2 valgrind", "true", false, &[124]);
+    assert!(success);
+    assert_eq!(
+        calls,
+        [
+            format!("120 {APT} update"),
+            format!("120 {APT} update"),
+            format!("300 {APT} install --yes softhsm2 valgrind"),
+        ]
+    );
+    assert_eq!(environment, "APT_INDEX_REFRESHED=1\n");
+}
+
+#[test]
+fn apt_retries_fit_one_budget_that_leaves_the_job_time() {
+    // Per-attempt limits alone let three stalled installs outlast the 35-minute
+    // fuzz job before the last retry starts; the whole action has a 600-second
+    // budget, every attempt is cut to what remains of it, and none starts once
+    // it is spent.
+    let (success, calls, _) = apt_after(550, "softhsm2", "true", false, &[]);
+    assert!(success);
+    // Bash advances SECONDS on whole wall-clock seconds, so a second boundary
+    // between the two calls leaves one second less for the later one.
+    let limits: Vec<(u32, &str)> = calls
+        .iter()
+        .map(|call| {
+            let (limit, command) = call.split_once(' ').expect("limit before command");
+            (limit.parse().expect("numeric limit"), command)
+        })
+        .collect();
+    assert_eq!(
+        limits
+            .iter()
+            .map(|&(_, command)| command)
+            .collect::<Vec<_>>(),
+        [
+            format!("{APT} update"),
+            format!("{APT} install --yes softhsm2"),
+        ]
+    );
+    assert!(
+        limits.iter().all(|&(limit, _)| limit == 49 || limit == 50),
+        "{limits:?}"
+    );
+    let (success, calls, environment) = apt_after(600, "softhsm2", "true", false, &[]);
+    assert!(!success);
+    assert!(calls.is_empty(), "{calls:?}");
+    assert_eq!(environment, "");
+}
+
+#[test]
+fn the_package_index_is_refreshed_once_per_job_unless_an_install_fails() {
+    // A later step installs from the index an earlier step refreshed; a failed
+    // install refreshes it again, since the mirror may have changed under it.
+    let (success, calls, _) = apt("mold", "false", true, &[]);
+    assert!(success);
+    assert_eq!(
+        calls,
+        [format!(
+            "300 {APT} install --yes --no-install-recommends mold"
+        )]
+    );
+    let (success, calls, _) = apt("mold", "true", true, &[100]);
+    assert!(success);
+    assert_eq!(
+        calls,
+        [
+            format!("300 {APT} install --yes mold"),
+            format!("120 {APT} update"),
+            format!("300 {APT} install --yes mold"),
+        ]
+    );
+}
+
+#[test]
+fn apt_fails_the_step_after_three_attempts() {
+    // Retries are bounded: a mirror that never answers fails the job, it does
+    // not let it continue without its packages.
+    let (success, calls, environment) = apt("softhsm2", "true", false, &[124, 124, 124, 0]);
+    assert!(!success);
+    assert_eq!(calls, vec![format!("120 {APT} update"); 3]);
+    assert_eq!(environment, "");
+}
+
+#[test]
+fn every_package_installation_goes_through_the_bounded_apt_action() {
+    // A direct apt-get bypasses the time limit and retries above.
+    let mut files = Vec::new();
+    for directory in [".github/workflows", ".github/actions"] {
+        for entry in std::fs::read_dir(crate::repo::root().join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            files.push(if path.is_dir() {
+                path.join("action.yml")
+            } else {
+                path
+            });
+        }
+    }
+    let owner = crate::repo::root().join(".github/actions/apt-packages/action.yml");
+    for file in files.iter().filter(|file| **file != owner && file.exists()) {
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(!text.contains("apt-get"), "{}", file.display());
+    }
+    assert!(files.contains(&owner));
+}
+
 #[test]
 fn the_heaviest_jobs_free_hosted_runner_disk_before_restoring_any_cache() {
     // Full-workspace builds beside the caches and the native oracle exhaust the

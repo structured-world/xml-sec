@@ -150,6 +150,15 @@ stages template append, optional `KeyInfo`, every `DigestValue`, and `SignatureV
 document. A successful operation commits the complete result as one generation; any policy,
 provider, key, transform, or serialization failure leaves the caller's XML and generation
 unchanged. Every staged mutation checks the active projected node count before commit.
+`XmlDocument::transaction` extends the same guarantee to a caller's sequence of mutations and
+signings: its commits publish as one generation or not at all, also when the closure unwinds, and
+nested transactions roll back only their own commits.
+`SignatureBuilder::add_object` places `<Object>` elements (`XMLDSig` 1.1 §4.5) after `KeyInfo`,
+with escaped text or one `ObjectElement`: an element that parses on its own under the signing
+policy and declares every prefix it uses, so it cannot close the enclosing `Object`. An element
+containing names in no namespace gains `xmlns=""`, keeping those names out of whatever default
+namespace is in scope where the signature is placed. `signature_value_id` gives `SignatureValue`
+the Id a countersignature references.
 Custom `KeyInfoWriter` output is treated as a separate untrusted XML input: its
 byte ceiling is enforced before namespace wrapping or parsing, and its merged nodes remain under
 the same operation ceiling as the rest of the signature.

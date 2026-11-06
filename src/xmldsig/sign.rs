@@ -1873,7 +1873,7 @@ impl<'a> SignContext<'a> {
             .transforms
             .xml_parse_work()
             .admit(document.as_xml().len())?;
-        atomically(document, |document| {
+        document.transaction(|document| {
             self.sign_document_in_place::<CommitDocument>(document, &mut budgets)
         })
     }
@@ -2647,7 +2647,7 @@ impl<'a> SignContext<'a> {
             .transforms
             .xml_parse_work()
             .admit(document.as_xml().len())?;
-        atomically(document, |document| {
+        document.transaction(|document| {
             self.sign_document_with_builder_in_place::<CommitDocument>(
                 document,
                 builder,
@@ -4131,34 +4131,6 @@ fn map_signing_digest_plan_error(error: &OperationPlanError) -> SigningDigestErr
 // A free function preserves the scoped view's late-bound lifetime.
 fn signing_document_root(view: crate::document::DocumentView<'_>) -> crate::NodeIdentity {
     view.root_element()
-}
-
-/// Returns `document` to its starting generation unless signing finished,
-/// including when signing unwinds.
-struct AtomicSigning<'a> {
-    document: &'a mut XmlDocument,
-    succeeded: bool,
-}
-
-impl Drop for AtomicSigning<'_> {
-    fn drop(&mut self) {
-        self.document.finish_atomic_mutation(self.succeeded);
-    }
-}
-
-/// Run `sign` so that it commits one generation or none.
-fn atomically<T>(
-    document: &mut XmlDocument,
-    sign: impl FnOnce(&mut XmlDocument) -> Result<T, SigningError>,
-) -> Result<T, SigningError> {
-    document.begin_atomic_mutation();
-    let mut guard = AtomicSigning {
-        document,
-        succeeded: false,
-    };
-    let result = sign(guard.document);
-    guard.succeeded = result.is_ok();
-    result
 }
 
 fn validate_signing_references(

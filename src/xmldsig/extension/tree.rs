@@ -116,6 +116,22 @@ pub fn next_sibling<W: Work>(
         .map(|sibling| view.node_identity(sibling)))
 }
 
+/// Return the parent of `node`, or `None` for the document root.
+///
+/// # Errors
+///
+/// Returns [`TreeError::Document`] for a foreign or stale identity and
+/// [`TreeError::Resource`] when current work is exhausted.
+pub fn parent<W: Work>(
+    view: DocumentView<'_>,
+    node: NodeIdentity,
+    work: &W,
+) -> Result<Option<NodeIdentity>, TreeError> {
+    charge(work, 1)?;
+    let node = view.resolve_node(node)?;
+    Ok(node.parent().map(|parent| view.node_identity(parent)))
+}
+
 /// Whether `node` is `ancestor` itself or one of its descendants.
 ///
 /// # Errors

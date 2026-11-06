@@ -82,13 +82,16 @@ jobs:
           toolchain: nightly
           save: ${{ matrix.target == 'asan' || matrix.target == 'xmldsig_verify' || matrix.fips == true }}
       - run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - name: Install oracle build dependencies
+        if: matrix.target == 'xmlsec_oracle'
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
       - name: Provision independent signature oracle
         if: matrix.target == 'xmlsec_oracle'
         env:
           XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-fuzz-oracle
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config
           cargo +nightly run --quiet -p xml-sec-tools -- install-xmlsec1
           {
             echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"
@@ -143,13 +146,15 @@ jobs:
         with:
           domain: differential
           save: 'true'
+      - name: Install oracle build dependencies and token
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2
       - name: Provision pinned independent oracle and isolated token
         env:
           XMLSEC1_MODERN_ORACLE: '1'
           XMLSEC1_PREFIX: ${{ github.workspace }}/.tools/xmlsec1-fuzz-oracle
         run: |
-          sudo apt-get update
-          sudo apt-get install --yes autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config softhsm2
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           {
             echo "XMLSEC1_BIN=$XMLSEC1_PREFIX/bin/xmlsec1"

@@ -570,7 +570,8 @@ pub enum XmlDocumentError {
     /// An identity belongs to another document.
     #[error("XML identity belongs to a different document")]
     ForeignIdentity,
-    /// An identity belongs to an earlier document generation.
+    /// An identity belongs to another generation of the document: an earlier
+    /// one, or one that a failed transaction discarded.
     #[error("XML identity belongs to stale generation {identity}; current generation is {current}")]
     StaleIdentity {
         /// Generation captured by the identity.
@@ -682,8 +683,8 @@ impl XmlDocumentError {
 /// Reusable owned XML document.
 ///
 /// The parsed view is retained across read-only operations. Every successful
-/// mutation increments [`Self::generation`] and invalidates all identities
-/// captured from previous views.
+/// mutation advances [`Self::generation`] to a number never issued before and
+/// invalidates all identities captured from previous views.
 pub struct XmlDocument {
     identity: DocumentIdentity,
     generation: u64,
@@ -691,20 +692,39 @@ pub struct XmlDocument {
     requires_internal_dtd: bool,
     settings: DocumentParseSettings,
     cell: DocumentCell,
+    /// Open all-or-nothing mutations, innermost last.
     #[cfg(feature = "xmldsig-sign")]
-    atomic: AtomicMutation,
+    atomic: Vec<AtomicMutation>,
+    /// The highest generation ever issued. A rollback returns to an earlier
+    /// generation, so the next commit numbers from here, never from the
+    /// current one: an identity of discarded bytes must not become valid again.
+    #[cfg(feature = "xmldsig-sign")]
+    issued: u64,
 }
 
 /// The generation an all-or-nothing mutation started from, kept from its first
 /// commit on, so that no copy of the document is parsed in advance.
 #[cfg(feature = "xmldsig-sign")]
 enum AtomicMutation {
-    /// No atomic mutation is running.
-    Idle,
-    /// One is running and has not committed yet.
+    /// Nothing committed since it began. An enclosing frame in this state
+    /// started from the same generation as the frame inside it.
     Started,
-    /// One is running; this is the cell and generation to return to.
+    /// This is the cell and generation to return to.
     Replaced(DocumentCell, u64),
+}
+
+/// Ends the innermost mutation when its closure returns or unwinds.
+#[cfg(feature = "xmldsig-sign")]
+struct AtomicGuard<'a> {
+    document: &'a mut XmlDocument,
+    succeeded: bool,
+}
+
+#[cfg(feature = "xmldsig-sign")]
+impl Drop for AtomicGuard<'_> {
+    fn drop(&mut self) {
+        self.document.finish_atomic_mutation(self.succeeded);
+    }
 }
 
 /// The serialization with source ranges already replaced in text.
@@ -960,7 +980,9 @@ impl XmlDocument {
             settings,
             cell,
             #[cfg(feature = "xmldsig-sign")]
-            atomic: AtomicMutation::Idle,
+            atomic: Vec::new(),
+            #[cfg(feature = "xmldsig-sign")]
+            issued: 0,
         })
     }
 
@@ -983,6 +1005,13 @@ impl XmlDocument {
     #[must_use]
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// The highest generation ever issued; the next commit is numbered one
+    /// above it, which after a rollback is above the current generation.
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) const fn issued_generation(&self) -> u64 {
+        self.issued
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
@@ -1050,25 +1079,58 @@ impl XmlDocument {
         self.cell.into_owner()
     }
 
-    /// Make the following commits one all-or-nothing mutation.
+    /// Run `mutate` as one all-or-nothing mutation.
+    ///
+    /// When `mutate` returns `Ok`, everything it committed becomes one new
+    /// generation; identities captured between its commits are stale. When it
+    /// returns `Err` or unwinds, the serialization and generation are exactly
+    /// those before the call, identities captured before it stay valid, and
+    /// those captured inside it never become valid again. Transactions nest: an inner one that fails rolls
+    /// back only its own commits, and an inner success is still undone by a
+    /// failing outer transaction.
+    ///
+    /// # Errors
+    /// Returns the error of `mutate` unchanged.
     #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn begin_atomic_mutation(&mut self) {
-        self.atomic = AtomicMutation::Started;
+    pub fn transaction<T, E>(
+        &mut self,
+        mutate: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E> {
+        self.atomic.push(AtomicMutation::Started);
+        let mut guard = AtomicGuard {
+            document: self,
+            succeeded: false,
+        };
+        let result = mutate(guard.document);
+        guard.succeeded = result.is_ok();
+        result
     }
 
-    /// End the mutation: success leaves one new generation, failure leaves the
-    /// starting serialization and generation exactly as they were.
+    /// End the innermost mutation: success leaves one new generation, failure
+    /// leaves the starting serialization and generation exactly as they were.
     #[cfg(feature = "xmldsig-sign")]
-    pub(crate) fn finish_atomic_mutation(&mut self, succeeded: bool) {
-        match core::mem::replace(&mut self.atomic, AtomicMutation::Idle) {
-            AtomicMutation::Replaced(_, generation) if succeeded => {
-                self.generation = generation + 1;
-            }
-            AtomicMutation::Replaced(cell, generation) => {
-                self.cell = cell;
-                self.generation = generation;
-            }
-            AtomicMutation::Idle | AtomicMutation::Started => {}
+    fn finish_atomic_mutation(&mut self, succeeded: bool) {
+        let Some(frame) = self.atomic.pop() else {
+            debug_assert!(false, "a guard ends only the frame it began");
+            return;
+        };
+        let AtomicMutation::Replaced(cell, generation) = frame else {
+            return;
+        };
+        if !succeeded {
+            self.cell = cell;
+            self.generation = generation;
+            return;
+        }
+        // The last commit numbered the current cell with a generation never
+        // issued before, so it already stands for the published result; every
+        // intermediate generation stays below it and stale.
+        // An enclosing transaction that committed nothing before this one
+        // began starts from this same cell; it now owns the way back.
+        if let Some(outer) = self.atomic.last_mut()
+            && matches!(outer, AtomicMutation::Started)
+        {
+            *outer = AtomicMutation::Replaced(cell, generation);
         }
     }
 
@@ -1191,6 +1253,43 @@ impl XmlDocument {
                 Some(budget),
             )?,
         })
+    }
+
+    /// Insert a well-formed XML fragment immediately before one node.
+    ///
+    /// # Errors
+    /// Rejects invalid/stale mutation identities, fragments that are not valid
+    /// in the parent context and input-limit failures without committing a
+    /// generation.
+    pub fn insert_before(
+        &mut self,
+        target: NodeIdentity,
+        fragment: &str,
+    ) -> Result<(), XmlDocumentError> {
+        // The target keeps its exact original bytes after the new fragment, so
+        // the replacement changes nothing but the inserted content.
+        let maximum = self.settings.max_bytes;
+        let replacement = self.with_view(|view| {
+            let range = view.resolve_mutation_node(target)?.range();
+            // The projected document must fit before the copy is made; the
+            // replacement repeats this check on the exact candidate.
+            match view.xml().len().checked_add(fragment.len()) {
+                Some(projected) if projected <= maximum => {}
+                // A sum beyond usize is reported as the largest size there is.
+                projected => {
+                    return Err(XmlDocumentError::DocumentTooLarge {
+                        maximum,
+                        actual: projected.unwrap_or(usize::MAX),
+                    });
+                }
+            }
+            let original = &view.xml()[range];
+            let mut replacement = String::with_capacity(fragment.len() + original.len());
+            replacement.push_str(fragment);
+            replacement.push_str(original);
+            Ok::<_, XmlDocumentError>(replacement)
+        })?;
+        self.replace_node_with_fragment(target, &replacement)
     }
 
     /// Parse the generation that replaces `target` with `replacement`, then
@@ -1831,18 +1930,30 @@ impl XmlDocument {
     }
 
     fn commit_cell(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
-        let next_generation = self.generation.checked_add(1).ok_or_else(|| {
+        #[cfg(feature = "xmldsig-sign")]
+        let issued = self.issued;
+        #[cfg(not(feature = "xmldsig-sign"))]
+        let issued = self.generation;
+        let next_generation = issued.checked_add(1).ok_or_else(|| {
             XmlDocumentError::InvalidReplacement("document generation overflow".into())
         })?;
         record_work(&mut next, recorded_work(&self.cell));
         let previous = core::mem::replace(&mut self.cell, next);
+        // Only the innermost frame takes the way back; enclosing frames still
+        // marked Started share its starting cell and inherit it on success.
         #[cfg(feature = "xmldsig-sign")]
-        if matches!(self.atomic, AtomicMutation::Started) {
-            self.atomic = AtomicMutation::Replaced(previous, self.generation);
+        if let Some(frame) = self.atomic.last_mut()
+            && matches!(frame, AtomicMutation::Started)
+        {
+            *frame = AtomicMutation::Replaced(previous, self.generation);
         }
         #[cfg(not(feature = "xmldsig-sign"))]
         drop(previous);
         self.generation = next_generation;
+        #[cfg(feature = "xmldsig-sign")]
+        {
+            self.issued = next_generation;
+        }
         Ok(())
     }
 
@@ -2206,6 +2317,34 @@ impl<'a> DocumentView<'a> {
             }
         }
         matched.map(|node| self.node_identity_by_id(node))
+    }
+
+    /// Return the first of `values`, in document order, that an element
+    /// declares as an ID, under the same classification as
+    /// [`Self::node_for_id`], including duplicate declarations.
+    ///
+    /// One walk of the document answers for every value.
+    #[must_use]
+    pub fn declared_id<'v>(
+        self,
+        values: &[&'v str],
+        registrations: &[IdAttributeRegistration],
+    ) -> Option<&'v str> {
+        for node in self.parsed.document.descendants() {
+            if !node.is_element() {
+                continue;
+            }
+            for attribute in node.attributes() {
+                // The value comparison is cheaper than ID classification.
+                let Some(&value) = values.iter().find(|value| **value == attribute.value()) else {
+                    continue;
+                };
+                if crate::xml::is_id_attribute(node, attribute, registrations) {
+                    return Some(value);
+                }
+            }
+        }
+        None
     }
 
     #[cfg(feature = "xmldsig")]
@@ -4497,6 +4636,12 @@ mod entity_ceiling_tests;
 
 #[cfg(test)]
 mod replacement_tests;
+
+#[cfg(all(test, feature = "xmldsig-sign"))]
+mod transaction_tests;
+
+#[cfg(test)]
+mod insertion_tests;
 
 // `xmlenc` enables `xmldsig` through `xmldsig-sign`, so every build of this
 // module has the verification policy its tests use.

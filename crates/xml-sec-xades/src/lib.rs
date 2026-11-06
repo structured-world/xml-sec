@@ -18,6 +18,16 @@
 //! every status, including a revoked or stale one, so usability, chronology and
 //! trust stay the caller's reading of those facts. Nothing is fetched and no
 //! clock is read: statuses are evaluated at the operation's verification time.
+//!
+//! With the `produce` feature, `create` signs B-B signatures over
+//! enveloped, enveloping, internally detached or detached data and
+//! `countersign` countersigns an existing one. The signed properties follow
+//! the shared `structured_xades::produce` rules through a `Draft`; the
+//! signature is made by the `XMLDSig` signer with the caller's key and
+//! provider. Each operation publishes one new document generation only after
+//! that generation satisfies the caller's verification request and meets
+//! every B-B requirement of [`validate_basic`]; otherwise the document is
+//! unchanged. Verification-only builds do not take the signing dependencies.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -31,6 +41,10 @@ use xml_sec::xmldsig::{DsigError, VerifiedSession, X509ChainError};
 mod accuracy;
 mod basic;
 mod binary;
+#[cfg(feature = "produce")]
+mod create;
+#[cfg(feature = "produce")]
+mod draft;
 mod level;
 mod path;
 mod signature;
@@ -43,6 +57,13 @@ pub use basic::{
     validate_basic,
 };
 pub use binary::DigestIdentity;
+#[cfg(feature = "produce")]
+pub use create::{
+    Assessment, Countersignature, CreateError, DataObject, Envelope, Request, Signer, countersign,
+    create,
+};
+#[cfg(feature = "produce")]
+pub use draft::{Draft, DraftError};
 pub use level::{
     ConfiguredResponder, Inputs, Level, NoCredential, RenewalFailure, TimestampFailure, validate,
 };

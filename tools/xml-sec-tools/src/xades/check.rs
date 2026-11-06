@@ -182,8 +182,9 @@ fn execute(corpus: &Corpus, output: &Path) -> Result<(), String> {
         &binding.join("strict-policy-summary.json"),
     )?;
     super::levels::execute(corpus, &output.join("levels"))?;
+    super::creation::execute(corpus, &output.join("creation"))?;
     println!(
-        "verified: live XMLDSig/XAdES, {count} independent octet vectors, DSS, strict-policy and baseline-level expectations"
+        "verified: live XMLDSig/XAdES, {count} independent octet vectors, DSS, strict-policy, baseline-level and created-signature expectations"
     );
     Ok(())
 }

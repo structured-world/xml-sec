@@ -4,7 +4,7 @@ use crate::xml_input as xml_sec_xml_input;
 use std::io::Write;
 
 use base64::Engine;
-use xml_sec_xml_input::lexical::Writer;
+use xml_sec_xml_input::lexical::{self, Writer};
 
 use crate::c14n::{
     C14nAlgorithm, C14nMode, SubtreeVisibility, canonicalize_visible_to_writer_bounded,
@@ -56,6 +56,17 @@ pub enum SignatureBuilderError {
     /// `XMLDSig` requires at least one reference in `SignedInfo`.
     #[error("a signature template requires at least one Reference")]
     MissingReference,
+    /// `<Object>` content is not one complete element.
+    #[error("invalid Object content: {0}")]
+    InvalidObjectContent(&'static str),
+    /// An `<Object>` attribute value is not valid for its type.
+    #[error("invalid Object {attribute}: {value:?}")]
+    InvalidObjectAttribute {
+        /// Rejected attribute.
+        attribute: &'static str,
+        /// Rejected value.
+        value: String,
+    },
     /// The immutable signing policy rejected the template.
     #[error("signing policy violation: {0}")]
     Policy(#[from] PolicyViolation),
@@ -150,6 +161,141 @@ impl ReferenceBuilder {
     }
 }
 
+/// One complete XML element for `<Object>` content.
+///
+/// The element declares every namespace prefix it uses and is copied into the
+/// template unchanged, apart from an `xmlns=""` added to its start tag when it
+/// contains an element in no namespace: that keeps such names out of whatever
+/// default namespace is in scope where the signature is placed.
+#[derive(Debug, Clone)]
+pub struct ObjectElement {
+    markup: String,
+}
+
+impl ObjectElement {
+    /// Check that `markup` is exactly one well-formed element under `policy`.
+    ///
+    /// Markup outside the element (an XML declaration, a document type
+    /// declaration, comments, processing instructions or whitespace) is
+    /// rejected, because it cannot appear inside `<Object>`.
+    ///
+    /// # Errors
+    /// Returns policy refusal, a parse failure, or
+    /// [`SignatureBuilderError::InvalidObjectContent`] for markup that is not
+    /// one complete element.
+    pub fn parse(
+        markup: impl Into<String>,
+        policy: &SigningPolicy,
+    ) -> Result<Self, SignatureBuilderError> {
+        let mut markup = markup.into();
+        policy.resources.validate_xml_document_len(markup.len())?;
+        let settings =
+            crate::document::DocumentParseSettings::from_policy(policy.xml, &policy.resources);
+        let unqualified = {
+            let document = super::mutation::parse_with_options_and_budget(&markup, settings, None)
+                .map_err(|error| match error.into_policy_violation(settings) {
+                    Ok(error) => SignatureBuilderError::Policy(error),
+                    Err(crate::document::XmlDocumentError::Parse(error)) => {
+                        SignatureBuilderError::GeneratedXml(error)
+                    }
+                    Err(error) => SignatureBuilderError::GeneratedMutation(
+                        super::mutation::XmlMutationError::Document(error),
+                    ),
+                })?;
+            let root = document.root_element();
+            if root.range() != (0..markup.len()) {
+                return Err(SignatureBuilderError::InvalidObjectContent(
+                    "content must be exactly one element",
+                ));
+            }
+            root.descendants()
+                .any(|node| node.is_element() && node.tag_name().namespace().is_none())
+        };
+        if !unqualified {
+            return Ok(Self { markup });
+        }
+        // Namespaces in XML 1.0 §6.2: an unprefixed element name takes the
+        // default namespace in scope, so a name in no namespace needs the
+        // default undeclared unless the element already declares one itself.
+        let position = {
+            let mut scanner = xml_sec_xml_input::lexical::Scanner::new(&markup);
+            let Ok(Some(
+                xml_sec_xml_input::lexical::Event::Start(tag)
+                | xml_sec_xml_input::lexical::Event::Empty(tag),
+            )) = scanner.next_event()
+            else {
+                return Err(SignatureBuilderError::InvalidObjectContent(
+                    "content must start with its element",
+                ));
+            };
+            if tag
+                .attributes
+                .iter()
+                .any(|attribute| attribute.name.is_qualified("xmlns"))
+            {
+                return Ok(Self { markup });
+            }
+            // The parsed root starts at offset zero, so its name follows `<`.
+            1 + tag.name.qualified().len()
+        };
+        markup.insert_str(position, " xmlns=\"\"");
+        policy.resources.validate_xml_document_len(markup.len())?;
+        Ok(Self { markup })
+    }
+}
+
+/// Content of one `<Object>` (`XMLDSig` 1.1 §4.5).
+#[derive(Debug, Clone)]
+pub enum ObjectContent {
+    /// Character data, escaped on output.
+    Text(String),
+    /// One complete element.
+    Element(ObjectElement),
+}
+
+/// Builder for one `XMLDSig` `<Object>` of a signature template.
+#[derive(Debug, Clone)]
+pub struct ObjectBuilder {
+    id: Option<String>,
+    mime_type: Option<String>,
+    encoding: Option<String>,
+    content: ObjectContent,
+}
+
+impl ObjectBuilder {
+    /// Create an object holding `content`.
+    #[must_use]
+    pub fn new(content: ObjectContent) -> Self {
+        Self {
+            id: None,
+            mime_type: None,
+            encoding: None,
+            content,
+        }
+    }
+
+    /// Set the Id a reference can select the object by.
+    #[must_use]
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// Set the advisory `MimeType` attribute.
+    #[must_use]
+    pub fn mime_type(mut self, mime_type: impl Into<String>) -> Self {
+        self.mime_type = Some(mime_type.into());
+        self
+    }
+
+    /// Set the advisory `Encoding` URI attribute.
+    #[must_use]
+    pub fn encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.encoding = Some(encoding.into());
+        self
+    }
+}
+
 /// Builder for a complete `XMLDSig` `<Signature>` template.
 #[derive(Debug, Clone)]
 pub struct SignatureBuilder {
@@ -158,8 +304,10 @@ pub struct SignatureBuilder {
     signature_context: SignatureContext,
     ns_prefix: Option<String>,
     signature_id: Option<String>,
+    signature_value_id: Option<String>,
     references: Vec<ReferenceBuilder>,
     include_key_info: bool,
+    objects: Vec<ObjectBuilder>,
 }
 
 impl SignatureBuilder {
@@ -172,8 +320,10 @@ impl SignatureBuilder {
             signature_context: SignatureContext::default(),
             ns_prefix: None,
             signature_id: None,
+            signature_value_id: None,
             references: Vec::new(),
             include_key_info: false,
+            objects: Vec::new(),
         }
     }
 
@@ -188,6 +338,20 @@ impl SignatureBuilder {
     #[must_use]
     pub fn signature_id(mut self, id: impl Into<String>) -> Self {
         self.signature_id = Some(id.into());
+        self
+    }
+
+    /// Set the optional `SignatureValue` Id, which a countersignature references.
+    #[must_use]
+    pub fn signature_value_id(mut self, id: impl Into<String>) -> Self {
+        self.signature_value_id = Some(id.into());
+        self
+    }
+
+    /// Append an `<Object>` after `KeyInfo`, preserving insertion order.
+    #[must_use]
+    pub fn add_object(mut self, object: ObjectBuilder) -> Self {
+        self.objects.push(object);
         self
     }
 
@@ -272,8 +436,29 @@ impl SignatureBuilder {
         policy.validate()?;
         self.validate(policy, xpath_parse_budget)?;
 
+        let mut writer = Writer::new(BoundedOutput {
+            bytes: Vec::new(),
+            maximum: policy.resources.max_xml_document_bytes,
+            refused: None,
+        });
+        let written = self.write_template(&mut writer, policy, encapsulation);
+        let output = writer.into_inner();
+        if let Some(actual) = output.refused {
+            policy.resources.validate_xml_document_len(actual)?;
+        }
+        written?;
+        let template = String::from_utf8(output.bytes)?;
+        self.validate_generated_template(&template, policy, signature_output_len, budget)?;
+        Ok(template)
+    }
+
+    fn write_template<W: Write>(
+        &self,
+        writer: &mut Writer<W>,
+        policy: &SigningPolicy,
+        encapsulation: Option<crate::provider::KeyEncapsulationAlgorithm>,
+    ) -> Result<(), SignatureBuilderError> {
         let prefix = self.ns_prefix.as_deref();
-        let mut writer = Writer::new(Vec::new());
         let signature_name = qualified_name(prefix, "Signature");
         let namespace_attr = prefix.map_or_else(|| "xmlns".to_owned(), |p| format!("xmlns:{p}"));
         let mut attributes = vec![(namespace_attr.as_str(), XMLDSIG_NS)];
@@ -282,22 +467,25 @@ impl SignatureBuilder {
         }
         writer.start(&signature_name, attributes)?;
 
-        write_start(&mut writer, prefix, "SignedInfo")?;
+        write_start(writer, prefix, "SignedInfo")?;
         write_algorithm(
-            &mut writer,
+            writer,
             prefix,
             "CanonicalizationMethod",
             self.c14n_method.uri(),
         )?;
-        self.write_signature_method(&mut writer, prefix)?;
+        self.write_signature_method(writer, prefix)?;
         for reference in &self.references {
-            write_reference(&mut writer, prefix, reference)?;
+            write_reference(writer, prefix, reference)?;
         }
-        write_end(&mut writer, prefix, "SignedInfo")?;
-        write_empty(&mut writer, prefix, "SignatureValue")?;
+        write_end(writer, prefix, "SignedInfo")?;
+        writer.empty(
+            &qualified_name(prefix, "SignatureValue"),
+            self.signature_value_id.as_deref().map(|id| ("Id", id)),
+        )?;
         if let Some(algorithm) = encapsulation {
             policy.key_establishment.check_encapsulation(algorithm)?;
-            write_start(&mut writer, prefix, "KeyInfo")?;
+            write_start(writer, prefix, "KeyInfo")?;
             writer.start(
                 "EncapsulationMechanism",
                 [
@@ -313,15 +501,15 @@ impl SignatureBuilder {
             writer.empty("CipherValue", std::iter::empty::<(&str, &str)>())?;
             writer.end("CipherData")?;
             writer.end("EncapsulationMechanism")?;
-            write_end(&mut writer, prefix, "KeyInfo")?;
+            write_end(writer, prefix, "KeyInfo")?;
         } else if self.include_key_info {
-            write_empty(&mut writer, prefix, "KeyInfo")?;
+            write_empty(writer, prefix, "KeyInfo")?;
+        }
+        for object in &self.objects {
+            write_object(writer, prefix, object)?;
         }
         writer.end(&signature_name)?;
-
-        let template = String::from_utf8(writer.into_inner())?;
-        self.validate_generated_template(&template, policy, signature_output_len, budget)?;
-        Ok(template)
+        Ok(())
     }
 
     fn write_signature_method<W: Write>(
@@ -522,6 +710,27 @@ impl SignatureBuilder {
                 value: id.clone(),
             });
         }
+        if let Some(id) = &self.signature_value_id
+            && !is_xml_ncname(id)
+        {
+            return Err(SignatureBuilderError::InvalidId {
+                element: "SignatureValue",
+                value: id.clone(),
+            });
+        }
+        // The template sink stops at the document limit, but escaping builds
+        // each value's escaped copy before it reaches the sink: Object content
+        // and attributes, the caller-sized values, are measured escaped first.
+        let mut object_bytes = Some(0_usize);
+        for object in &self.objects {
+            Self::validate_object(object)?;
+            object_bytes = object_bytes
+                .zip(Self::object_output_len(object))
+                .and_then(|(sum, len)| sum.checked_add(len));
+        }
+        policy
+            .resources
+            .validate_xml_document_len(object_bytes.unwrap_or(usize::MAX))?;
         if self.references.is_empty() {
             return Err(SignatureBuilderError::MissingReference);
         }
@@ -572,6 +781,61 @@ impl SignatureBuilder {
             policy.check_digest_algorithm(reference.digest_method)?;
         }
         Ok(())
+    }
+
+    /// `XMLDSig` 1.1 §4.5 types `Object/@Id` as ID, `MimeType` as string and
+    /// `Encoding` as anyURI; text content must use XML 1.0 characters.
+    /// <https://www.w3.org/TR/2013/REC-xmldsig-core1-20130411/#sec-Object>
+    fn validate_object(object: &ObjectBuilder) -> Result<(), SignatureBuilderError> {
+        if let Some(id) = &object.id
+            && !is_xml_ncname(id)
+        {
+            return Err(SignatureBuilderError::InvalidId {
+                element: "Object",
+                value: id.clone(),
+            });
+        }
+        let invalid = |attribute: &'static str, value: &str| {
+            Err(SignatureBuilderError::InvalidObjectAttribute {
+                attribute,
+                value: value.to_owned(),
+            })
+        };
+        if let Some(mime_type) = &object.mime_type
+            && !mime_type.chars().all(is_xml_1_0_character)
+        {
+            return invalid("MimeType", mime_type);
+        }
+        if let Some(encoding) = &object.encoding
+            && (encoding.is_empty()
+                || encoding.trim() != encoding
+                || !encoding.chars().all(is_xml_1_0_character))
+        {
+            return invalid("Encoding", encoding);
+        }
+        if let ObjectContent::Text(text) = &object.content
+            && !text.chars().all(is_xml_1_0_character)
+        {
+            return Err(SignatureBuilderError::InvalidObjectContent(
+                "text contains a character forbidden by XML 1.0",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Escaped bytes of an object's content and attribute values, the part of
+    /// its output the caller controls; `None` when it exceeds `usize`.
+    fn object_output_len(object: &ObjectBuilder) -> Option<usize> {
+        let content = match &object.content {
+            ObjectContent::Text(text) => lexical::escaped_text_len(text)?,
+            ObjectContent::Element(element) => element.markup.len(),
+        };
+        [&object.id, &object.mime_type, &object.encoding]
+            .into_iter()
+            .flatten()
+            .try_fold(content, |sum, value| {
+                sum.checked_add(lexical::escaped_attribute_len(value)?)
+            })
     }
 
     fn validate_reference_transforms(
@@ -802,6 +1066,58 @@ fn write_reference<W: Write>(
     write_empty(writer, prefix, "DigestValue")?;
     writer.end(&name)?;
     Ok(())
+}
+
+/// Template sink that refuses any write taking it past the policy's document
+/// limit, so no markup is ever buffered beyond it; `refused` keeps the length
+/// the refused write would have reached.
+struct BoundedOutput {
+    bytes: Vec<u8>,
+    maximum: usize,
+    refused: Option<usize>,
+}
+
+impl Write for BoundedOutput {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        match self.bytes.len().checked_add(data.len()) {
+            Some(len) if len <= self.maximum => {
+                self.bytes.extend_from_slice(data);
+                Ok(data.len())
+            }
+            projected => {
+                self.refused = Some(projected.unwrap_or(usize::MAX));
+                Err(std::io::Error::other(
+                    "template exceeds the XML document limit",
+                ))
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_object<W: Write>(
+    writer: &mut Writer<W>,
+    prefix: Option<&str>,
+    object: &ObjectBuilder,
+) -> Result<(), std::io::Error> {
+    let name = qualified_name(prefix, "Object");
+    let attributes = [
+        ("Id", object.id.as_deref()),
+        ("MimeType", object.mime_type.as_deref()),
+        ("Encoding", object.encoding.as_deref()),
+    ]
+    .into_iter()
+    .filter_map(|(attribute, value)| value.map(|value| (attribute, value)));
+    writer.start(&name, attributes)?;
+    match &object.content {
+        ObjectContent::Text(text) => writer.text(text)?,
+        // ObjectElement::parse proved this to be one self-contained element.
+        ObjectContent::Element(element) => writer.raw(&element.markup)?,
+    }
+    writer.end(&name)
 }
 
 fn reference_transforms_for_generation(reference: &ReferenceBuilder) -> Vec<Transform> {

@@ -9,18 +9,23 @@ description = "XAdES baseline validation of signatures verified by xml-sec"
 
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c14n", "cms"] }
-structured-xades = { version = "0.20.0", default-features = false, features = ["alloc"] }
-structured-asn1 = { version = "0.20.0", default-features = false, features = ["alloc"] }
-structured-pkix = { version = "0.20.0", default-features = false, features = ["alloc"] }
-structured-cms = { version = "0.20.0", default-features = false, features = ["alloc"] }
-structured-ltv = { version = "0.20.0", default-features = false, features = ["alloc"] }
+structured-xades = { version = "0.20.3", default-features = false, features = ["alloc"] }
+structured-asn1 = { version = "0.20.3", default-features = false, features = ["alloc"] }
+structured-pkix = { version = "0.20.3", default-features = false, features = ["alloc"] }
+structured-cms = { version = "0.20.3", default-features = false, features = ["alloc"] }
+structured-ltv = { version = "0.20.3", default-features = false, features = ["alloc"] }
 thiserror = { version = "2", default-features = false }
+base64 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
-base64 = "0.22"
+base64 = "0.23"
+roxmltree = "0.21"
 
 [features]
 default = ["std", "xml-backend-xmloxide"]
+# Signature creation over the XMLDSig signer. Verification-only builds,
+# including alloc and WASM ones, do not take the signing dependencies.
+produce = ["std", "xml-sec/xmldsig-sign", "dep:base64"]
 std = [
     "xml-sec/std",
     "structured-xades/std",
@@ -32,6 +37,10 @@ std = [
 ]
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
+
+[[example]]
+name = "create_probe"
+required-features = ["produce"]
 
 [lints]
 workspace = true

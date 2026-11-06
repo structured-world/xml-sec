@@ -101,6 +101,15 @@ impl<W: Work> Xml for Document<'_, '_, '_, '_, W> {
 }
 
 impl<W: Work> Document<'_, '_, '_, '_, W> {
+    /// The parent of `node` in the original document, `None` for the root.
+    pub(crate) fn parent<Q: Work>(
+        &self,
+        node: NodeIdentity,
+        execution: &Q,
+    ) -> Result<Option<NodeIdentity>, Error> {
+        Ok(extension::parent(self.session.view(), node, execution)?)
+    }
+
     /// Find one direct attribute by expanded name; the empty namespace name
     /// selects an unqualified attribute (Namespaces in XML 1.0 §6.2).
     pub(crate) fn with_attribute<R, Q: Work>(

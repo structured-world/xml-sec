@@ -38,7 +38,8 @@ authenticated evidence channel.
 `cases.json` enumerates **34** synthetic signed documents and mutations. The base
 XAdES envelope has two references: business data and typed `#sp` SignedProperties.
 Every positive base input is signed by independent libxmlsec1 with RSA-SHA256/SHA-256.
-There is no Rust self-sign/self-verify evidence in this package.
+None of these base inputs is signed or verified by Rust alone. The only signatures Rust
+creates are those of the B-B creation row below, and EU DSS assesses them independently.
 
 | Scenario / boundary | Status | Observation |
 | --- | --- | --- |
@@ -70,6 +71,7 @@ There is no Rust self-sign/self-verify evidence in this package.
 | OCSP responder outside the issuer | verified | Counts only as `Inputs::responders` configures it for that issuer (RFC 6960 §4.2.2.2) |
 | `RenewedDigestsV2` over a signed Manifest | verified | B-LTA with SHA-512 renewal of a SHA-256 Manifest reference; a wrong new digest or reference digest stops the level with `Outcome::Renewal` (EN 319 132-1 §5.5.3). No independent validator checked it |
 | Caller-supplied CRLs and OCSP responses | verified | They answer status but do not count as incorporated, so the level stays unmet |
+| B-B signatures created by `xml-sec-xades` (`produce`) | verified | `xades creation` signs enveloped, enveloping, internally detached, detached, parallel and countersigned documents through the public API (`crates/xml-sec-xades/tests/fixtures/creation`); DSS classifies every signature, the countersignature included, as XAdES-BASELINE-B with an intact value and intact references, and passes ISC and CV. The overall indication stays INDETERMINATE: no revocation data is supplied |
 | EU Trusted Lists, legal qualification | not run or blocked | Outside this corpus; no such trust service inputs |
 | AL/SignedXml pipeline or direct Rust invocation from AL/SaaS | not run or blocked | No Business Central environment; no deployment assumption |
 
@@ -104,8 +106,9 @@ XMLSEC1_BIN=/path/to/native/xmlsec1 cargo run -p xml-sec-tools -- xades check --
 
 This is the same entry point used by the required `XAdES interoperability corpus` CI job.
 It runs harness regressions, every retained signed fixture, both explicit here modes,
-authenticated replay, all independent octet vectors, default/strict DSS expectations and
-DSS's verdict on the baseline-level fixtures.
+authenticated replay, all independent octet vectors, default/strict DSS expectations,
+DSS's verdict on the baseline-level fixtures and DSS's validation of the signatures
+`xml-sec-xades` creates.
 No part may skip on a missing oracle. The existing aggregate `test` job requires its success.
 CI publishes actual octets, hashes, first-difference diagnostics and full DSS reports as
 `xades-interop-results` run artifacts. It never updates fixtures or expectations.
@@ -122,6 +125,7 @@ XMLSEC1_BIN=/opt/homebrew/bin/xmlsec1 cargo run -p xml-sec-tools -- xades corpus
 cargo nextest run -p xml-sec-tools xades
 cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck
 cargo run -p xml-sec-tools -- xades dss --results target/xades-dss-recheck --summarize
+cargo run -p xml-sec-tools -- xades creation --results target/xades-creation-recheck
 ```
 
 Set XMLSEC1_BIN to native **1.3.12 or 1.3.13 openssl**; both are explicitly qualified
