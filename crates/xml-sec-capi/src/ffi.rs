@@ -717,7 +717,7 @@ pub unsafe extern "C" fn xs_document_parse(
         let document = objects::parse_document(
             &*policy(policy_handle)?,
             objects::operation(operation)?,
-            xml.to_owned(),
+            xml,
         )?;
         let value = insert(Object::Document(parking_lot::Mutex::new(document)))?;
         out.write(XsDocument { value });

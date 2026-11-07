@@ -1,12 +1,12 @@
 use super::{
     XsBytes, XsCompileContext, XsDocument, XsError, XsPolicy, XsPolicyStore, XsProvider, contain,
-    xs_document_parse, xs_error_destroy, xs_error_message, xs_error_status, xs_policy_destroy,
-    xs_policy_store_destroy, xs_policy_store_load, xs_policy_store_new, xs_provider_destroy,
-    xs_provider_new_rustcrypto,
+    xs_document_parse, xs_error_destroy, xs_error_message, xs_error_policy_violation,
+    xs_error_status, xs_policy_destroy, xs_policy_store_destroy, xs_policy_store_load,
+    xs_policy_store_new, xs_provider_destroy, xs_provider_new_rustcrypto,
 };
 use crate::objects::Failure;
 use crate::status::{
-    XS_CONFIGURATION, XS_DOCUMENT, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XsStatus,
+    XS_CONFIGURATION, XS_DOCUMENT, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_POLICY, XsStatus,
 };
 use std::mem::MaybeUninit;
 
@@ -17,8 +17,15 @@ fn bytes(text: &str) -> XsBytes {
     }
 }
 
+const MODERN: &str = "schema_version = 1\n[profiles.app]\nbase = 'Modern'\n";
+
 /// A provider and a policy compiled from the Modern profile.
 fn policy() -> (XsProvider, XsPolicyStore, XsPolicy) {
+    policy_from(MODERN)
+}
+
+/// A provider and the `app` profile of `configuration`.
+fn policy_from(configuration: &str) -> (XsProvider, XsPolicyStore, XsPolicy) {
     let mut provider = XsProvider::default();
     let mut store = XsPolicyStore::default();
     let mut policy = XsPolicy::default();
@@ -34,7 +41,7 @@ fn policy() -> (XsProvider, XsPolicyStore, XsPolicy) {
         );
         assert_eq!(
             xs_policy_store_new(
-                bytes("schema_version = 1\n[profiles.app]\nbase = 'Modern'\n"),
+                bytes(configuration),
                 bytes("app"),
                 provider,
                 &raw const context,
@@ -143,6 +150,38 @@ fn invalid_pointers_and_lengths_are_refused_before_any_work() {
     };
     assert_eq!(status, XS_INVALID_ARGUMENT);
     release(handles);
+}
+
+#[test]
+fn a_document_beyond_a_policy_limit_is_a_typed_policy_refusal() {
+    // Byte, depth and parse-work ceilings of the compiled policy refuse a
+    // document as policy, with the resource-limit violation, not as
+    // malformed XML.
+    let deep = "<a><b><c><d><e><f/></e></d></c></b></a>";
+    let large = format!("<a>{}</a>", "x".repeat(256));
+    for (limit, xml) in [
+        ("max_xml_document_bytes = 64", large.as_str()),
+        ("max_xml_depth = 2", deep),
+        ("max_xml_parse_work_bytes = 64", large.as_str()),
+    ] {
+        let handles = policy_from(&format!(
+            "{MODERN}[profiles.app.verification.resources]\n{limit}\n"
+        ));
+        let mut document = XsDocument::default();
+        let mut error = XsError::default();
+        // SAFETY: the byte string names a live string; the outputs are live locals.
+        let status = unsafe {
+            xs_document_parse(handles.2, 1, bytes(xml), &raw mut document, &raw mut error)
+        };
+        assert_eq!((limit, status), (limit, XS_POLICY));
+        let mut violation = 0;
+        // SAFETY: the output is a live local.
+        let read = unsafe { xs_error_policy_violation(error, &raw mut violation) };
+        assert_eq!(read, XS_OK);
+        assert_eq!((limit, violation), (limit, 8));
+        assert_eq!(take_error(error).0, XS_POLICY);
+        release(handles);
+    }
 }
 
 #[test]

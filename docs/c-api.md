@@ -95,7 +95,9 @@ xs_evidence_accepted(evidence, document, &accepted, &error);
 - Keys are imported into an `XsKeys` manager from PEM or raw symmetric bytes,
   with usage bits, bounded by the resource policy of one operation.
 - Documents are parsed under the compiled policy of an operation
-  (`XS_OPERATION_*`). Signing, encryption and decryption replace the document
+  (`XS_OPERATION_*`). A document beyond its byte, depth or parse-work ceiling
+  is refused as `XS_POLICY` with `XS_VIOLATION_RESOURCE_LIMIT`; the byte
+  ceiling is checked before the library copies the input. Signing, encryption and decryption replace the document
   with its new generation; a failure leaves it unchanged.
 - Signing fills the `Signature` template the document already contains.
 - Verification names the element IDs that must be authenticated. Success is a

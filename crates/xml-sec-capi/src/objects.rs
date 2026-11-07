@@ -25,7 +25,7 @@ use xml_sec::xmlenc::{
     DataEncryptionAlgorithm, DecryptionKeyResolver, DocumentEncryptionOptions,
     EncryptedDataBuilder, EncryptionRecipient,
 };
-use xml_sec::{SharedSecurity, XmlBackend, XmlDocument, XmlSecError};
+use xml_sec::{SharedSecurity, XmlBackend, XmlDocument, XmlDocumentError, XmlSecError};
 use xml_sec_config::{Configuration, LoadLimits, PolicyStore, Source};
 
 /// Why a call failed: the status it returns, the `XS_VIOLATION_*` of a policy
@@ -68,8 +68,21 @@ impl From<XmlSecError> for Failure {
             | XmlSecError::Verification(xml_sec::xmldsig::DsigError::Policy(violation))
             | XmlSecError::Signing(xml_sec::xmldsig::SigningError::Policy(violation))
             | XmlSecError::KeyStore(xml_sec::key_manager::KeyStoreError::Policy(violation))
-            | XmlSecError::Encryption(xml_sec::xmlenc::XmlEncError::Policy(violation)) => {
+            | XmlSecError::Encryption(xml_sec::xmlenc::XmlEncError::Policy(violation))
+            | XmlSecError::Document(XmlDocumentError::Policy(violation)) => {
                 return Self::refused(violation, message);
+            }
+            // The compiled policy's byte and depth ceilings, reported by the
+            // parser with their own variants.
+            XmlSecError::Document(
+                XmlDocumentError::DocumentTooLarge { .. }
+                | XmlDocumentError::DocumentTooDeep { .. },
+            ) => {
+                return Self {
+                    status: XS_POLICY,
+                    violation: RESOURCE_LIMIT,
+                    message,
+                };
             }
             XmlSecError::OperationDisabled(_) => XS_OPERATION_DISABLED,
             XmlSecError::Document(_) => XS_DOCUMENT,
@@ -94,6 +107,9 @@ impl From<xml_sec_config::Error> for Failure {
     }
 }
 
+/// `XS_VIOLATION_RESOURCE_LIMIT`.
+const RESOURCE_LIMIT: u32 = 8;
+
 /// The `XS_VIOLATION_*` of `violation`; zero for a kind the header does not name.
 pub(crate) fn violation_code(violation: &PolicyViolation) -> u32 {
     match violation {
@@ -104,7 +120,9 @@ pub(crate) fn violation_code(violation: &PolicyViolation) -> u32 {
         PolicyViolation::AuthorizationExpired => 5,
         PolicyViolation::Algorithm { .. } => 6,
         PolicyViolation::HmacOutputLength { .. } => 7,
-        PolicyViolation::ResourceLimit { .. } | PolicyViolation::ResourceLimitExceeded { .. } => 8,
+        PolicyViolation::ResourceLimit { .. } | PolicyViolation::ResourceLimitExceeded { .. } => {
+            RESOURCE_LIMIT
+        }
         PolicyViolation::KdfIterationsOutsideLimit { .. } => 9,
         PolicyViolation::InvalidResourceLimit { .. } => 10,
         PolicyViolation::KeyTrust { .. } => 11,
@@ -358,11 +376,12 @@ pub(crate) fn security(
     )?)
 }
 
-/// Parse `xml` under the compiled policy of `operation`.
+/// Parse `xml` under the compiled policy of `operation`. The core checks the
+/// policy's byte ceiling before it copies the borrowed input.
 pub(crate) fn parse_document(
     policies: &CompiledPolicies,
     operation: Operation,
-    xml: String,
+    xml: &str,
 ) -> Result<XmlDocument, Failure> {
     let backend = XmlBackend::default();
     let parsed = match operation {
