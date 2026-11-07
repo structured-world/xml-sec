@@ -16,6 +16,7 @@ pub(crate) mod creation;
 pub(crate) mod dss;
 pub(crate) mod fixtures;
 pub(crate) mod levels;
+pub(crate) mod lifecycle;
 pub(crate) mod package;
 pub(crate) mod process;
 pub(crate) mod xml;
@@ -114,32 +115,41 @@ impl Corpus {
     /// Builds the Rust probe and returns the executable Cargo reported for
     /// this build, never a guessed default target path.
     pub(crate) fn build_probe(&self, log: &Path) -> Result<PathBuf, String> {
-        let build = self.command(
-            &line(&[
-                &"cargo",
-                &"build",
-                &"-p",
-                &"xml-sec-xades",
-                &"--example",
-                &"interop_probe",
-                &"--message-format=json-render-diagnostics",
-            ]),
-            log,
-        )?;
+        self.build_example("interop_probe", &[], log)
+    }
+
+    /// Builds the adapter's example `name` with `features` and returns its
+    /// executable as Cargo reported it.
+    pub(crate) fn build_example(
+        &self,
+        name: &str,
+        features: &[&str],
+        log: &Path,
+    ) -> Result<PathBuf, String> {
+        let mut args = line(&[&"cargo", &"build", &"-p", &"xml-sec-xades"]);
+        if !features.is_empty() {
+            args.extend(line(&[&"--features", &features.join(",")]));
+        }
+        args.extend(line(&[
+            &"--example",
+            &name,
+            &"--message-format=json-render-diagnostics",
+        ]));
+        let build = self.command(&args, log)?;
         if !build.success() {
             return Err(format!(
-                "probe build failed; inspect {}.stderr",
+                "{name} build failed; inspect {}.stderr",
                 log.display()
             ));
         }
-        probe_executable(&build.stdout, log)
+        probe_executable(&build.stdout, name, log)
     }
 }
 
-/// The one example executable in Cargo's build messages. Build scripts may
-/// also print plain lines; library artifacts have no executable.
+/// The one executable of example `name` in Cargo's build messages. Build
+/// scripts may also print plain lines; library artifacts have no executable.
 /// <https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages>
-pub(crate) fn probe_executable(messages: &[u8], log: &Path) -> Result<PathBuf, String> {
+pub(crate) fn probe_executable(messages: &[u8], name: &str, log: &Path) -> Result<PathBuf, String> {
     let ambiguous = || {
         format!(
             "probe build must report exactly one example executable; inspect {}.stdout",
@@ -159,8 +169,7 @@ pub(crate) fn probe_executable(messages: &[u8], log: &Path) -> Result<PathBuf, S
         let Some(executable) = message["executable"].as_str() else {
             continue;
         };
-        if message["reason"] != "compiler-artifact" || target["name"] != "interop_probe" || !example
-        {
+        if message["reason"] != "compiler-artifact" || target["name"] != name || !example {
             continue;
         }
         if binary.replace(PathBuf::from(executable)).is_some() {
@@ -303,7 +312,8 @@ pub(crate) fn absolute(path: &str) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure> {
-    let usage = "usage: xades check|corpus|creation|dss|binding|fixtures|levels|package ...";
+    let usage =
+        "usage: xades check|corpus|creation|dss|binding|fixtures|levels|lifecycle|package ...";
     let action = args.next().ok_or(usage)?;
     let args: Vec<String> = args.collect();
     let corpus = Corpus::from_env();
@@ -315,6 +325,7 @@ pub(crate) fn run(mut args: impl Iterator<Item = String>) -> Result<(), Failure>
         "binding" => binding::run(&corpus, &args),
         "fixtures" => fixtures::run(&corpus, &args),
         "levels" => levels::run(&corpus, &args),
+        "lifecycle" => lifecycle::run(&corpus, &args),
         "package" => package::run(&corpus, &args),
         _ => Err(usage.into()),
     }

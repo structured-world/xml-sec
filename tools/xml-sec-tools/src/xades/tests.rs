@@ -218,11 +218,13 @@ fn the_probe_is_the_one_example_cargo_reported() {
     .to_string();
     let messages = format!("build-script diagnostic\n{library}\n{artifact}\n");
     assert_eq!(
-        probe_executable(messages.as_bytes(), log).unwrap(),
+        probe_executable(messages.as_bytes(), "interop_probe", log).unwrap(),
         Path::new("/custom-target/interop_probe")
     );
+    // Another example's executable is not the requested one.
+    assert!(probe_executable(messages.as_bytes(), "level_probe", log).is_err());
     for messages in [library.clone(), format!("{artifact}\n{artifact}")] {
-        let error = probe_executable(messages.as_bytes(), log).unwrap_err();
+        let error = probe_executable(messages.as_bytes(), "interop_probe", log).unwrap_err();
         assert!(
             error.contains("exactly one") && error.contains("build.stdout"),
             "{error}"

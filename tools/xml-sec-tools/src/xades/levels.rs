@@ -20,7 +20,7 @@ const V141: &str = "http://uri.etsi.org/01903/v1.4.1#";
 const KEY: &str = "signer.key,signer.pem,issuer.pem";
 
 /// Name, issuing CA, subject and extensions of each end of the PKI.
-const CERTIFICATES: [(&str, &str, &str, &str); 5] = [
+pub(super) const CERTIFICATES: [(&str, &str, &str, &str); 5] = [
     (
         "issuer",
         "root",
@@ -112,7 +112,7 @@ impl Levels<'_> {
         self.generator.openssl(args)
     }
 
-    fn issue(&self) -> Result<(), String> {
+    pub(super) fn issue(&self) -> Result<(), String> {
         let validity = [
             "-not_before",
             super::fixtures::NOT_BEFORE,
@@ -187,7 +187,7 @@ impl Levels<'_> {
 
     /// A complete CRL of `issuer` listing `subject` as revoked before the
     /// fixtures' test instant, as DER.
-    fn crl_revoking(&self, issuer: &str, subject: &str) -> Result<Vec<u8>, String> {
+    pub(super) fn crl_revoking(&self, issuer: &str, subject: &str) -> Result<Vec<u8>, String> {
         let serial = self.serial(subject)?;
         self.crl_listing(
             issuer,
@@ -233,7 +233,7 @@ impl Levels<'_> {
 
     /// A delegated OCSP response for `subject`, as a whole DER `OCSPResponse`,
     /// naming its responder by key hash (RFC 6960 §4.2.1) when `by_key` is set.
-    fn ocsp(&self, subject: &str, by_key: bool) -> Result<Vec<u8>, String> {
+    pub(super) fn ocsp(&self, subject: &str, by_key: bool) -> Result<Vec<u8>, String> {
         self.ocsp_from("responder", subject, by_key)
     }
 

@@ -434,17 +434,19 @@ fn token_actors<'p, 't, W: Work>(
             provider: cms,
             context: &context,
         };
+        // The pool's entry carries the token in the encoding its profile
+        // accepted, so neither branch re-reads it in another encoding.
+        let entry = tokens.entry(ordinal).expect("ordinal within the pool");
         let actor = if let Some(stamp) = roots.get(source.stamp_index()) {
-            check.retain_actor(
+            check.retain_actor_from(
                 stage.prepared.bound(),
                 stamp,
-                source.token_index(),
+                entry,
                 operation,
                 unrecognized(),
             )
         } else {
             let counter = &stamps.entries()[source.stamp_index() - roots.len()];
-            let entry = tokens.entry(ordinal).expect("ordinal within the pool");
             check.retain_counter_from(counter, entry, operation, unrecognized())
         }
         .map_err(|error| ValidationError::Timestamp(Box::new(error)))?;
