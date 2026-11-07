@@ -383,7 +383,8 @@ fn finite_field_key_agreement_reaches_public_encryption_pipeline() {
         DecryptContext::new(&resolver)
             .policy(decryption.clone())
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"DH payload".to_vec())
     );
     let denied = DecryptionPolicy {

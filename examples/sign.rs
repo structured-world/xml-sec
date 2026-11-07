@@ -35,6 +35,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &signature_template,
         )?)?;
 
-    println!("{signed}");
+    println!("{}", signed.output);
     Ok(())
 }

@@ -42,6 +42,11 @@ mod identity;
 pub use identity::PolicyIdentity;
 
 #[cfg(feature = "xmldsig")]
+mod audit;
+#[cfg(feature = "xmldsig")]
+pub use audit::{AlgorithmRole, Audited, PolicyAudit, PolicyDecision, UriRole};
+
+#[cfg(feature = "xmldsig")]
 mod profiles;
 #[cfg(feature = "xmldsig")]
 pub use profiles::{

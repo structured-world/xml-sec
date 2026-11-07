@@ -157,17 +157,49 @@ fn text_projection_matches_the_committed_document() {
     for (name, xml, policy) in cases() {
         let key = RecordingSigningKey::default();
         let context = SignContext::new(&key).policy(policy);
-        let text = context
+        let signed = context
             .sign_template(&xml)
             .unwrap_or_else(|error| panic!("{name}: text signing failed: {error:?}"));
         let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
-        context
+        let audit = context
             .sign_document(&mut document)
             .unwrap_or_else(|error| panic!("{name}: document signing failed: {error:?}"));
+        let text = signed.output;
         assert_eq!(text, document.as_xml(), "{name}");
+        // Both entry points run the same operation, so its policy decided alike.
+        assert_eq!(signed.policy, audit, "{name}");
         assert!(!text.contains("<ds:DigestValue/>"), "{name}");
         assert!(!text.contains("AAAA"), "{name}");
     }
+}
+
+#[test]
+fn a_customized_snapshot_no_longer_claims_the_published_identity() {
+    // The identity names the published settings; once a builder changes them,
+    // an audit carrying that identity would misattribute the decision.
+    let (name, xml, _) = cases().swap_remove(0);
+    let policy = alloc::sync::Arc::new(crate::policy::SigningPolicy::default());
+    let identity =
+        alloc::sync::Arc::new(crate::policy::PolicyIdentity::new("modern", 1, 3, [7; 32]));
+    let key = FixedSigningKeyForLimits;
+    let published = SignContext::new(&key)
+        .snapshot(&policy, Some(&identity))
+        .sign_template(&xml)
+        .unwrap_or_else(|error| panic!("{name}: signing failed: {error:?}"));
+    assert_eq!(published.policy.identity.as_ref(), Some(&identity));
+    let customized = SignContext::new(&key)
+        .snapshot(&policy, Some(&identity))
+        .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
+        .sign_template(&xml)
+        .unwrap_or_else(|error| panic!("{name}: signing failed: {error:?}"));
+    assert_eq!(customized.policy.identity, None);
+    // Copy on write: the published snapshot itself is left untouched.
+    assert_eq!(
+        policy.transforms.xpath_here_semantics,
+        crate::policy::SigningPolicy::default()
+            .transforms
+            .xpath_here_semantics
+    );
 }
 
 #[test]
@@ -181,7 +213,8 @@ fn signed_canonical_signed_info_matches_the_final_document() {
         let signed = SignContext::new(&key)
             .policy(policy.clone())
             .sign_template(&xml)
-            .unwrap_or_else(|error| panic!("{name}: signing failed: {error:?}"));
+            .unwrap_or_else(|error| panic!("{name}: signing failed: {error:?}"))
+            .output;
         let signed_bytes = key.recorded();
         assert!(!signed_bytes.is_empty(), "{name}");
         assert_eq!(
@@ -207,7 +240,7 @@ fn projected_node_count_matches_the_commit_parse() {
             context.sign_template(&xml).map(|_| ())
         } else {
             let mut document = XmlDocument::parse(xml.as_str()).expect("fixture must parse");
-            context.sign_document(&mut document)
+            context.sign_document(&mut document).map(|_| ())
         }
     };
     let (mut low, mut high) = (1, 10_000);
@@ -272,7 +305,8 @@ fn deferred_digest_may_replace_longer_lexical_content() {
         .policy(policy)
         .xml_backend(crate::XmlBackend::Roxmltree)
         .sign_template(&xml)
-        .expect("a shrinking DigestValue replacement must sign");
+        .expect("a shrinking DigestValue replacement must sign")
+        .output;
     assert!(!signed.contains("&empty;"));
 }
 

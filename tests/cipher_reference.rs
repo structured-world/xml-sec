@@ -108,7 +108,8 @@ fn decrypt_descriptor_capture_shares_the_cipher_reference_xslt_allowance() {
                 .xml_backend(backend)
                 .external_resources(&resources)
                 .decrypt(&xml)
-                .expect("exact shared allowance fits"),
+                .expect("exact shared allowance fits")
+                .output,
             DecryptedContent::Bytes(b"one XSLT allowance".to_vec())
         );
         policy.resources.max_xslt_work -= 1;
@@ -182,9 +183,20 @@ fn external_cipher_reference_decrypts_authenticated_content() {
     let context = DecryptContext::new(&resolver)
         .policy(external_policy())
         .external_resources(&resources);
+    let decrypted = context.decrypt(&xml).unwrap();
     assert_eq!(
-        context.decrypt(&xml).unwrap(),
+        decrypted.output,
         DecryptedContent::Bytes(b"external ciphertext".to_vec())
+    );
+    // The audit names the permitted class of the reference, never its URI or bytes.
+    assert!(
+        decrypted
+            .policy
+            .decisions
+            .contains(&xml_sec::policy::PolicyDecision::Uri {
+                role: xml_sec::policy::UriRole::CipherReference,
+                class: xml_sec::xmldsig::UriClass::External,
+            })
     );
     assert!(matches!(
         DecryptContext::new(&resolver)
@@ -241,7 +253,8 @@ fn referenced_wrapped_key_and_content_share_external_budget() {
             .policy(policy.clone())
             .external_resources(&resources)
             .decrypt(&xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"wrapped reference".to_vec())
     );
     policy.resources.max_external_resource_total_bytes = total - 1;

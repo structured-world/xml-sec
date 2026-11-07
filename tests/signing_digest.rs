@@ -12,7 +12,8 @@ use base64::Engine as _;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 use xml_sec::policy::{
-    EcdsaSignatureValueEncoding, HmacPolicy, ManifestProcessing, SigningPolicy, VerificationPolicy,
+    EcdsaSignatureValueEncoding, HmacPolicy, ManifestProcessing, PolicyDecision, SigningPolicy,
+    UriRole, VerificationPolicy,
 };
 use xml_sec::xmldsig::mutation::append_signature_to_root;
 use xml_sec::xmldsig::parse::{find_signature_node, parse_signed_info};
@@ -143,7 +144,8 @@ fn preset_verification_keys_charge_the_operation_certificate_account() {
                 "<root><payload Id=\"payload\">signed</payload></root>",
                 &builder,
             )
-            .expect("signing");
+            .expect("signing")
+            .output;
         let key = VerificationKey {
             algorithm,
             public_key_bytes: spki_der,
@@ -201,7 +203,8 @@ fn public_xpath_id_uses_request_registration() {
         .id_attributes(&registrations)
         .key_info_writer(&KeyValueInfoWriter)
         .sign_with_builder(source, &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     // Prepare a fixed, independently signed XPath input: the signing dependency
     // analyzer deliberately treats arbitrary XPath value reads conservatively.
     let signed = signed.replace("<Transforms>",
@@ -277,7 +280,8 @@ fn public_sign_verify_share_dtd_and_namespaced_ids() {
             .id_attributes(&registrations)
             .key_info_writer(&KeyValueInfoWriter)
             .sign_with_builder(source, &builder)
-            .unwrap();
+            .unwrap()
+            .output;
         let result = VerifyContext::new()
             .policy(verification.clone())
             .id_attributes(&registrations)
@@ -351,7 +355,8 @@ fn public_sign_and_verify_accept_node_set_above_old_default() {
             &namespace_dense_document(257),
             &namespace_dense_signature_builder(),
         )
-        .expect("signing must accept a node set above the old default");
+        .expect("signing must accept a node set above the old default")
+        .output;
     let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
@@ -389,7 +394,8 @@ fn public_sign_and_verify_enforce_configured_node_set_boundary() {
             ..SigningPolicy::default()
         })
         .sign_with_builder(&xml, &builder)
-        .expect("raised signing policy must accept the same document");
+        .expect("raised signing policy must accept the same document")
+        .output;
     let resolver = DefaultKeyResolver::default();
     // The embedded certificate is untrusted; the mathematical mode lets the
     // verified signature reach the Reference whose node set is bounded.
@@ -1236,7 +1242,8 @@ fn sign_context_targets_the_last_signature_template_by_default() {
 
     let signed = SignContext::new(&private_key)
         .sign_template(&xml)
-        .expect("last signature template must sign");
+        .expect("last signature template must sign")
+        .output;
     let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
     let values = document
         .descendants()
@@ -1557,6 +1564,7 @@ fn sign_with_builder_preflights_exact_signature_value_growth() {
     let final_len = SignContext::new(&baseline_key)
         .sign_with_builder(xml, &builder)
         .expect("baseline signing must succeed")
+        .output
         .len();
     let calls = Arc::new(AtomicUsize::new(0));
     let key = CountingSigningKey {
@@ -1598,7 +1606,8 @@ fn sign_with_builder_preflights_exact_signature_value_growth() {
     let signed = SignContext::new(&allowed_key)
         .policy(exact_policy)
         .sign_with_builder(xml, &builder)
-        .expect("an exact final-document ceiling must remain usable");
+        .expect("an exact final-document ceiling must remain usable")
+        .output;
     assert_eq!(signed.len(), final_len);
     assert_eq!(allowed_calls.load(Ordering::Relaxed), 1);
 }
@@ -1997,7 +2006,8 @@ fn a_handed_over_signed_input_charges_its_parse_to_verification() {
         );
     let signed = SignContext::new(&private_key)
         .sign_with_builder("<root><payload ID=\"payload\">x</payload></root>", &builder)
-        .expect("signing");
+        .expect("signing")
+        .output;
     let key = VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
         public_key_bytes: rsa_spki(&private_key),
@@ -2105,7 +2115,8 @@ fn a_mutated_document_hands_over_the_parses_of_its_earlier_generations() {
         .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri("#payload"));
     let signed = SignContext::new(&private_key)
         .sign_with_builder(&padded, &builder)
-        .expect("signing");
+        .expect("signing")
+        .output;
     let key = VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
         public_key_bytes: rsa_spki(&private_key),
@@ -2396,7 +2407,8 @@ fn signing_internal_dtd_policy_reaches_builder_and_mutation_reparses() {
     let signed = SignContext::new(&private_key)
         .policy(policy)
         .sign_with_builder(xml, &builder)
-        .expect("internal-DTD opt-in must reach every signing parse and reparse");
+        .expect("internal-DTD opt-in must reach every signing parse and reparse")
+        .output;
     assert!(!signed.contains("<DigestValue></DigestValue>"));
     assert!(!signed.contains("<SignatureValue></SignatureValue>"));
 }
@@ -2457,7 +2469,7 @@ fn sign_context_processes_manifests_before_signed_info() {
     let verified = VerifyContext::new()
         .key(&verification_key)
         .process_manifests(true)
-        .verify(&signed)
+        .verify(&signed.output)
         .expect("signed Manifest must verify");
 
     assert_eq!(verified.status, DsigStatus::Valid);
@@ -2466,7 +2478,76 @@ fn sign_context_processes_manifests_before_signed_info() {
         verified.manifest_references[0].status,
         DsigStatus::Valid
     ));
-    assert!(!signed.contains(">stale</ds:DigestValue>"));
+    assert!(!signed.output.contains(">stale</ds:DigestValue>"));
+    // Both operations report the Manifest processing they applied and the
+    // Manifest reference their policy admitted, in the same order.
+    assert!(
+        signed
+            .policy
+            .decisions
+            .contains(&PolicyDecision::Manifests(ManifestProcessing::Process))
+    );
+    assert!(signed.policy.decisions.contains(&PolicyDecision::Uri {
+        role: UriRole::ManifestReference,
+        class: xml_sec::xmldsig::UriClass::SameDocument,
+    }));
+    assert_eq!(verified.policy.decisions, signed.policy.decisions);
+}
+
+#[test]
+fn verification_audits_a_manifest_reference_its_policy_refuses() {
+    // A Manifest Reference refused by the transform allowlist fails alone while
+    // the signature stays valid; the audit must record that refusal rather
+    // than drop it, so the log shows what the operation did not authenticate.
+    const XPATH: &str = "http://www.w3.org/TR/1999/REC-xpath-19991116";
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let verification_key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: rsa_spki(&private_key),
+        certificate_der: None,
+        name: None,
+    };
+    let template = manifest_signing_template().replace(
+        r##"<ds:Reference URI="#payload">"##,
+        &format!(
+            r##"<ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="{XPATH}"><ds:XPath>true()</ds:XPath></ds:Transform></ds:Transforms>"##
+        ),
+    );
+    let signed = SignContext::new(&private_key)
+        .policy(SigningPolicy {
+            manifest_processing: ManifestProcessing::Process,
+            ..SigningPolicy::default()
+        })
+        .sign_template(&template)
+        .expect("Manifest-aware signing must succeed")
+        .output;
+    let verified = VerifyContext::new()
+        .key(&verification_key)
+        .process_manifests(true)
+        // Signing materializes C14N 1.1 where a generated chain ends as a node set.
+        .allowed_transforms([
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "http://www.w3.org/2006/12/xml-c14n11",
+            DEFAULT_IMPLICIT_C14N_URI,
+        ])
+        .verify(&signed)
+        .expect("a refused Manifest Reference is that Reference's own result");
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert!(matches!(
+        verified.manifest_references[0].status,
+        DsigStatus::Invalid(xml_sec::xmldsig::FailureReason::ReferencePolicyViolation { .. })
+    ));
+    assert!(
+        verified.policy.decisions.iter().any(|decision| matches!(
+            decision,
+            PolicyDecision::Rejected(xml_sec::policy::PolicyViolation::Algorithm { algorithm, .. })
+                if algorithm == XPATH
+        )),
+        "{:?}",
+        verified.policy.decisions
+    );
 }
 
 #[test]
@@ -2492,7 +2573,8 @@ fn sign_context_orders_nested_manifest_dependencies() {
     let signed = SignContext::new(&private_key)
         .policy(policy)
         .sign_template(template)
-        .expect("nested Manifest dependencies must be signed in dependency order");
+        .expect("nested Manifest dependencies must be signed in dependency order")
+        .output;
     let verified = VerifyContext::new()
         .key(&verification_key)
         .process_manifests(true)
@@ -2566,7 +2648,8 @@ fn manifest_signing_allows_xpath_excluded_self_digest() {
         let signed = SignContext::new(&private_key)
             .policy(policy.clone())
             .sign_template(&template)
-            .expect("XPath-excluded self DigestValue must not form a dependency cycle");
+            .expect("XPath-excluded self DigestValue must not form a dependency cycle")
+            .output;
         let verified = VerifyContext::new()
             .key(&verification_key)
             .process_manifests(true)
@@ -2899,7 +2982,8 @@ fn signs_rsa_sha256_template_and_verifies_round_trip() {
 
     let signed = SignContext::new(&private_key)
         .sign_with_builder("<root><payload>hello</payload></root>", &builder)
-        .expect("RSA signing pipeline must succeed");
+        .expect("RSA signing pipeline must succeed")
+        .output;
     let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
         .expect("signed RSA XML must verify without pipeline errors");
 
@@ -2959,7 +3043,8 @@ fn signs_rsa_template_with_embedded_x509_key_info() {
             "<root><payload ID=\"payload\">hello</payload></root>",
             &builder,
         )
-        .expect("RSA signing with KeyInfo must succeed");
+        .expect("RSA signing with KeyInfo must succeed")
+        .output;
     let resolver = DefaultKeyResolver::default();
     let verify_result = cryptographic::context()
         .key_resolver(&resolver)
@@ -3009,7 +3094,8 @@ fn key_info_writer_populates_signed_key_info_before_reference_digests() {
     let signed = SignContext::new(&private_key)
         .key_info_writer(&key_info_writer)
         .sign_template(&xml)
-        .expect("signed KeyInfo template must succeed");
+        .expect("signed KeyInfo template must succeed")
+        .output;
     let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
@@ -3067,7 +3153,8 @@ fn key_info_writer_accepts_multiple_direct_child_fragments() {
             "<root><payload ID=\"payload\">hello</payload></root>",
             &builder,
         )
-        .expect("multiple KeyInfo child fragments must be accepted");
+        .expect("multiple KeyInfo child fragments must be accepted")
+        .output;
     let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
@@ -3120,7 +3207,8 @@ fn key_info_writer_replaces_stale_cryptographic_sources() {
     let signed = SignContext::new(&private_key)
         .key_info_writer(&writer)
         .sign_template(&xml)
-        .expect("authoritative KeyInfo source must replace stale material");
+        .expect("authoritative KeyInfo source must replace stale material")
+        .output;
     let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
@@ -3183,7 +3271,8 @@ fn key_info_writer_generated_id_can_be_signed() {
     let signed = SignContext::new(&private_key)
         .key_info_writer(&writer)
         .sign_template(&xml)
-        .expect("writer-generated ID must resolve during digesting");
+        .expect("writer-generated ID must resolve during digesting")
+        .output;
     let result = cryptographic::context()
         .key_resolver(&DefaultKeyResolver::default())
         .verify(&signed)
@@ -3366,7 +3455,8 @@ fn sign_with_builder_targets_appended_signature_when_existing_key_info_is_presen
             "<root><payload ID=\"first\">one</payload><payload ID=\"second\">two</payload></root>",
             &first_builder,
         )
-        .expect("initial signing with KeyInfo must succeed");
+        .expect("initial signing with KeyInfo must succeed")
+        .output;
     let second_builder = SignatureBuilder::new(exclusive_c14n(), SignatureAlgorithm::RsaSha256)
         .key_info(true)
         .add_reference(
@@ -3378,7 +3468,8 @@ fn sign_with_builder_targets_appended_signature_when_existing_key_info_is_presen
     let second_signed = SignContext::new(&private_key)
         .key_info_writer(&key_info_writer)
         .sign_with_builder(&first_signed, &second_builder)
-        .expect("existing Signature/KeyInfo must not block appended template signing");
+        .expect("existing Signature/KeyInfo must not block appended template signing")
+        .output;
     let document = roxmltree::Document::parse(&second_signed).expect("signed XML must parse");
     let signature_count = document
         .descendants()
@@ -3424,7 +3515,8 @@ fn sign_with_builder_appends_and_targets_within_the_selected_start_node() {
     let signed = SignContext::new(&private_key)
         .start_node_id("selected")
         .sign_with_builder(&xml, &new_builder)
-        .expect("builder signing must target its appended selected-node template");
+        .expect("builder signing must target its appended selected-node template")
+        .output;
     let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
     let scope = document
         .descendants()
@@ -3495,7 +3587,8 @@ fn signing_fills_only_top_level_signature_value() {
 
     let signed = SignContext::new(&private_key)
         .sign_template(&xml)
-        .expect("signing must ignore object SignatureValue");
+        .expect("signing must ignore object SignatureValue")
+        .output;
     let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
         .expect("signed RSA XML must verify without pipeline errors");
 
@@ -3524,7 +3617,8 @@ fn signs_ecdsa_p256_template_and_verifies_round_trip() {
             "<root><payload ID=\"payload\">hello</payload></root>",
             &builder,
         )
-        .expect("ECDSA signing pipeline must succeed");
+        .expect("ECDSA signing pipeline must succeed")
+        .output;
     let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
         .expect("signed ECDSA XML must verify without pipeline errors");
 
@@ -3567,7 +3661,8 @@ fn ecdsa_asn1_compatibility_is_explicit_across_the_signing_pipeline() {
             "<root><payload ID=\"payload\">hello</payload></root>",
             &builder,
         )
-        .expect("explicit ASN.1 signing must succeed");
+        .expect("explicit ASN.1 signing must succeed")
+        .output;
     let document = roxmltree::Document::parse(&signed).expect("signed XML must parse");
     let encoded = document
         .descendants()
@@ -3631,7 +3726,8 @@ fn signs_ecdsa_p384_template_and_verifies_round_trip() {
             "<root><payload ID=\"payload\">hello</payload></root>",
             &builder,
         )
-        .expect("P-384 signing pipeline must succeed");
+        .expect("P-384 signing pipeline must succeed")
+        .output;
     let verify_result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
         .expect("signed P-384 XML must verify without pipeline errors");
 
@@ -3677,7 +3773,8 @@ fn signs_ecdsa_with_digest_independent_of_curve() {
                 "<root><payload ID=\"payload\">hello</payload></root>",
                 &builder,
             )
-            .expect("curve-independent ECDSA signing must succeed");
+            .expect("curve-independent ECDSA signing must succeed")
+            .output;
         let public_key_pem = read_fixture(public_key_path);
         let result = verify_signature_with_pem_key(&signed, &public_key_pem, true)
             .expect("curve-independent ECDSA verification must run");
@@ -3713,7 +3810,8 @@ fn signs_rsa_donor_templates_and_verifies_round_trip() {
 
         let signed = SignContext::new(&private_key)
             .sign_template(&read_fixture(template_path))
-            .expect("RSA donor template must sign");
+            .expect("RSA donor template must sign")
+            .output;
 
         assert_signed_template_verifies(&signed, public_key_path);
     }
@@ -3750,7 +3848,8 @@ fn explicit_legacy_sha1_policy_builds_signs_and_verifies() {
             "<root><payload ID=\"payload\">legacy interop</payload></root>",
             &builder,
         )
-        .expect("explicit compatibility policy must enable RSA-SHA1 signing");
+        .expect("explicit compatibility policy must enable RSA-SHA1 signing")
+        .output;
 
     let mut verification_policy = VerificationPolicy::default();
     verification_policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
@@ -3803,7 +3902,8 @@ fn historical_rsa_methods_require_independent_digest_permission() {
             .policy(signing)
             .key_info_writer(&KeyValueInfoWriter)
             .sign_with_builder(source, &builder)
-            .unwrap();
+            .unwrap()
+            .output;
         let resolver = DefaultKeyResolver::default();
         assert!(
             VerifyContext::new()
@@ -3857,7 +3957,8 @@ fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
         .sign_template(&read_fixture(
             "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-ecdsa-sha256.tmpl",
         ))
-        .expect("P-256 donor template must sign");
+        .expect("P-256 donor template must sign")
+        .output;
     assert_signed_template_verifies(
         &p256_signed,
         "tests/fixtures/keys/ec/ec-prime256v1-pubkey.pem",
@@ -3871,7 +3972,8 @@ fn signs_ecdsa_donor_templates_and_verifies_round_trip() {
         .sign_template(&read_fixture(
             "tests/fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha384-ecdsa-sha384.tmpl",
         ))
-        .expect("P-384 donor template must sign");
+        .expect("P-384 donor template must sign")
+        .output;
     assert_signed_template_verifies(
         &p384_signed,
         "tests/fixtures/keys/ec/ec-prime384v1-pubkey.pem",

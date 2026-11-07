@@ -744,6 +744,22 @@ impl fmt::Debug for EncryptionRecipient {
 }
 
 impl EncryptionRecipient {
+    /// The role and URI of the method that carries the content key to it.
+    pub(crate) fn method(&self) -> (crate::policy::AlgorithmRole, &'static str) {
+        use crate::policy::AlgorithmRole;
+        match self {
+            #[cfg(feature = "legacy-algorithms")]
+            Self::RsaPkcs1v15 { .. } => (
+                AlgorithmRole::KeyTransport,
+                KeyTransportAlgorithm::RsaPkcs1v15.uri(),
+            ),
+            Self::RsaOaep { parameters, .. } => {
+                (AlgorithmRole::KeyTransport, parameters.algorithm.uri())
+            }
+            Self::AesKeyWrap { algorithm, .. } => (AlgorithmRole::KeyWrap, algorithm.uri()),
+        }
+    }
+
     /// Create a historical RSAES-PKCS1-v1_5 recipient. Defaults still deny it.
     #[cfg(feature = "legacy-algorithms")]
     #[must_use]
@@ -850,6 +866,8 @@ pub struct EncryptionResult {
     pub encrypted_data_xml: String,
     /// Required caller-owned document replacement operation.
     pub replacement: ReplacementMode,
+    /// What the encryption policy decided, and the published snapshot it enforced.
+    pub policy: crate::policy::PolicyAudit,
 }
 
 /// Caller-owned target selection for document encryption.

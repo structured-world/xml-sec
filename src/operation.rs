@@ -332,6 +332,9 @@ pub(crate) struct OperationExecutionContext<P, B> {
     authenticated_nodes: RefCell<Set<NodeIdentity>>,
     decisions: RefCell<Vec<OperationDecision>>,
     first_failure: RefCell<Option<OperationDecision>>,
+    // The policy decisions returned with the operation's result.
+    #[cfg(feature = "xmldsig")]
+    policy_decisions: RefCell<Vec<crate::policy::PolicyDecision>>,
 }
 
 impl<P, B> OperationExecutionContext<P, B> {
@@ -352,6 +355,26 @@ impl<P, B> OperationExecutionContext<P, B> {
             authenticated_nodes: RefCell::new(Set::default()),
             decisions: RefCell::new(Vec::new()),
             first_failure: RefCell::new(None),
+            #[cfg(feature = "xmldsig")]
+            policy_decisions: RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Record one decision of the operation's policy for its audit.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn record_policy(&self, decision: crate::policy::PolicyDecision) {
+        self.policy_decisions.borrow_mut().push(decision);
+    }
+
+    /// The audit of the operation so far, with the snapshot it enforced.
+    #[cfg(feature = "xmldsig")]
+    pub(crate) fn audit(
+        &self,
+        identity: Option<&alloc::sync::Arc<crate::policy::PolicyIdentity>>,
+    ) -> crate::policy::PolicyAudit {
+        crate::policy::PolicyAudit {
+            identity: identity.cloned(),
+            decisions: self.policy_decisions.take(),
         }
     }
 

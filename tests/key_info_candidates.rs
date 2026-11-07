@@ -49,7 +49,8 @@ fn signed_with(key_info: &str, object: &str) -> XmlDocument {
     );
     let mut xml = SignContext::new(&signer)
         .sign_with_builder("<root/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     // The second occurrence closes SignatureValue; its Base64 text holds no tag.
     let marker = "SignatureValue>";
     let open = xml.find(marker).unwrap() + marker.len();

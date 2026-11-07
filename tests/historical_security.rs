@@ -37,6 +37,7 @@ fn signed(parameters: &str) -> String {
         .policy(profile(PolicyProfile::Modern).signing().unwrap().clone())
         .sign_template(&template("#target", parameters, ""))
         .unwrap()
+        .output
 }
 
 #[test]
@@ -98,7 +99,8 @@ fn secure_saml_requires_the_authenticated_assertion_not_the_first_assertion() {
     let original = SignContext::new(&signer)
         .policy(policies.signing().unwrap().clone())
         .sign_template(&xml)
-        .unwrap();
+        .unwrap()
+        .output;
     let wrapped = format!(
         "<samlp:Response xmlns:samlp='urn:oasis:names:tc:SAML:2.0:protocol'><saml:Assertion xmlns:saml='urn:oasis:names:tc:SAML:2.0:assertion' ID='decoy'><payload>admin</payload></saml:Assertion><hidden>{original}</hidden></samlp:Response>"
     );
@@ -387,14 +389,15 @@ fn xslt_amplification_keeps_compatibility_but_cannot_escape_operation_limits() {
     let signer = HmacSigningKey::new(SECRET.to_vec()).unwrap();
     let key = HmacVerificationKey::new(SECRET.to_vec()).unwrap();
     let original = SignContext::new(&signer).policy(compatibility.signing().unwrap().clone())
-        .sign_with_builder("<root><items ID='target'><item>a</item><item>b</item><item>c</item><item>d</item><item>e</item><item>f</item><item>g</item><item>h</item></items></root>", &builder).unwrap();
+        .sign_with_builder("<root><items ID='target'><item>a</item><item>b</item><item>c</item><item>d</item><item>e</item><item>f</item><item>g</item><item>h</item></items></root>", &builder).unwrap().output;
     let small = SignContext::new(&signer)
         .policy(compatibility.signing().unwrap().clone())
         .sign_with_builder(
             "<root><items ID='target'><item>a</item></items></root>",
             &builder,
         )
-        .unwrap();
+        .unwrap()
+        .output;
     for backend in xml_sec::XmlBackend::available() {
         let context = VerifyContext::new().key(&key).xml_backend(backend);
         assert_eq!(
@@ -499,14 +502,14 @@ fn cbc_downgrade_and_padding_probes_have_one_pre_decryption_policy_refusal() {
             .xml_backend(backend)
             .policy(modern.decryption().unwrap().clone());
         assert_eq!(
-            context.decrypt(&good.encrypted_data_xml).unwrap(),
+            context.decrypt(&good.encrypted_data_xml).unwrap().output,
             DecryptedContent::Bytes(plaintext.to_vec())
         );
         let legacy = DecryptContext::new(&resolver)
             .xml_backend(backend)
             .policy(compatibility.decryption().unwrap().clone());
         assert_eq!(
-            legacy.decrypt(&cbc.encrypted_data_xml).unwrap(),
+            legacy.decrypt(&cbc.encrypted_data_xml).unwrap().output,
             DecryptedContent::Bytes(plaintext.to_vec())
         );
         let downgrade = good

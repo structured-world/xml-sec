@@ -59,7 +59,8 @@ fn every_hmac_algorithm_and_legal_octet_length_round_trips() {
             let signed = SignContext::new(&signing_key)
                 .policy(signing_policy.clone())
                 .sign_template(&template(algorithm, output))
-                .unwrap();
+                .unwrap()
+                .output;
             let result = VerifyContext::new()
                 .policy(policy.clone())
                 .key(&verifying_key)
@@ -115,7 +116,8 @@ fn hmac_parameter_and_signature_boundaries_are_strict() {
     }
     let signed = SignContext::new(&key)
         .sign_template(&template(algorithm, Some(128)))
-        .unwrap();
+        .unwrap()
+        .output;
     let implicit_full = signed.replace("<HMACOutputLength>128</HMACOutputLength>", "");
     assert!(matches!(
         VerifyContext::new().key(&verifier).verify(&implicit_full),
@@ -187,7 +189,8 @@ fn all_hmac_methods_interoperate_bidirectionally_with_xmlsec1() {
             let signed = SignContext::new(&signing_key)
                 .policy(signing_policy.clone())
                 .sign_template(&template)
-                .unwrap();
+                .unwrap()
+                .output;
             std::fs::write(&signed_path, signed).unwrap();
             let verified = xmlsec1::command()
                 .arg("verify")
@@ -300,7 +303,8 @@ fn valid_hmac_template_queries_key_metadata_once() {
         key.calls.set(0);
         let signed = SignContext::new(&key)
             .sign_template(&template(SignatureAlgorithm::HmacSha256, output))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(key.calls.get(), 1);
         assert_eq!(
             VerifyContext::new()

@@ -32,6 +32,7 @@ fn signed_saml_response() -> String {
         .key_info_writer(&key_info_writer)
         .sign_template(SAML_RESPONSE_TEMPLATE)
         .expect("SAML Response signing template must complete")
+        .output
 }
 
 #[test]

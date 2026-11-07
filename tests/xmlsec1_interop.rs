@@ -233,7 +233,8 @@ fn visa3d_direct_id_compatibility_matches_pinned_xmlsec1() {
             "<root><payload ID=\"visa'3d\">visa payload</payload></root>",
             &builder,
         )
-        .expect("Visa3D compatibility signing must succeed");
+        .expect("Visa3D compatibility signing must succeed")
+        .output;
 
     // The signature verifies first; the default semantics then cannot resolve
     // the apostrophe ID, which fails only that Reference.
@@ -297,6 +298,7 @@ fn signed_payload_xml(key: &dyn SigningKey, builder: &SignatureBuilder) -> Strin
             builder,
         )
         .expect("xml-sec must sign the XMLDSig payload")
+        .output
 }
 
 #[test]
@@ -413,7 +415,8 @@ fn xmlsec1_verifies_base64_reference_signature_from_xml_sec() {
     .expect("RSA private-key fixture must parse");
     let signed = SignContext::new(&key)
         .sign_with_builder(&encoded_payload_xml("ID"), &base64_signing_builder())
-        .expect("xml-sec must sign the Base64-transformed reference");
+        .expect("xml-sec must sign the Base64-transformed reference")
+        .output;
 
     assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
 }
@@ -479,7 +482,8 @@ fn xmlsec1_verifies_xslt_reference_signature_from_xml_sec() {
             ..SigningPolicy::default()
         })
         .sign_with_builder(xslt_payload_xml(), &xslt_signing_builder())
-        .expect("xml-sec must sign the XSLT references");
+        .expect("xml-sec must sign the XSLT references")
+        .output;
 
     assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
 }
@@ -572,7 +576,8 @@ fn xmlsec1_verifies_xpath_filter2_signature_from_xml_sec() {
             xpath_filter2_payload_xml(),
             &xpath_filter2_signing_builder(),
         )
-        .expect("xml-sec must sign the Filter 2.0 reference");
+        .expect("xml-sec must sign the Filter 2.0 reference")
+        .output;
 
     assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
 }
@@ -631,7 +636,8 @@ fn xmlsec1_verifies_selected_axes_without_their_owner_from_xml_sec() {
             omitted_owner_axes_payload_xml(),
             &omitted_owner_axes_signing_builder(),
         )
-        .expect("xml-sec must sign selected axes without their owner");
+        .expect("xml-sec must sign selected axes without their owner")
+        .output;
 
     assert_xmlsec1_accepts(&signed, "tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
 }
@@ -829,7 +835,8 @@ fn dsa_signatures_interoperate_in_both_directions() {
             .policy(signing.clone())
             .key_info_writer(&KeyValueInfoWriter)
             .sign_with_builder(payload, &builder)
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(signature_value_len(&signed), width);
         assert_xmlsec1_accepts(&signed, &public_path);
         let resolver = DefaultKeyResolver::default();

@@ -494,7 +494,8 @@ fn a_key_info_writer_adds_no_document_parse() {
         .policy(policy)
         .key_info_writer(&NameWriter)
         .sign_template(&xml)
-        .expect("text signing must succeed");
+        .expect("text signing must succeed")
+        .output;
     assert_eq!(text, document.as_xml());
 }
 
@@ -547,7 +548,8 @@ fn builder_signing_fits_the_document_to_parse_work_ratio() {
     let signed = SignContext::new(&FixedRsaSigningKey)
         .policy(policy.clone())
         .sign_with_builder(&xml, &builder)
-        .expect("string builder signing must fit the advertised parse-work ratio");
+        .expect("string builder signing must fit the advertised parse-work ratio")
+        .output;
     assert!(signed.contains("DigestValue>"));
     assert!(signed.contains("SignatureValue>"));
 

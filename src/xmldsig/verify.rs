@@ -384,11 +384,23 @@ pub struct UriTypeSet {
     allow_external: bool,
 }
 
+/// The structural class of a URI, which [`UriTypeSet`] permits or refuses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UriClass {
+pub enum UriClass {
+    /// The empty URI: the whole document holding the signature.
     Empty,
+    /// A fragment of the same document (`#id`, `#xpointer(...)`).
     SameDocument,
+    /// Anything else, resolved only from caller-supplied bytes.
     External,
+}
+
+impl UriClass {
+    /// The class of `uri`.
+    #[must_use]
+    pub fn of(uri: &str) -> Self {
+        classify_uri(uri)
+    }
 }
 
 fn classify_uri(uri: &str) -> UriClass {
@@ -1791,6 +1803,25 @@ impl ReferenceProcessingError {
         }
     }
 
+    /// The policy refusal that [`Self::into_reference_failure`] turns into this
+    /// Reference's own outcome; a resource refusal stays terminal and is none.
+    fn reference_policy_violation(&self) -> Option<&crate::policy::PolicyViolation> {
+        use crate::policy::PolicyViolation;
+        match self {
+            Self::Policy(PolicyViolation::ResourceLimit { .. })
+            | Self::UriDereference(TransformError::Policy(PolicyViolation::ResourceLimit {
+                ..
+            }))
+            | Self::Transform(TransformError::Policy(PolicyViolation::ResourceLimit { .. })) => {
+                None
+            }
+            Self::Policy(violation)
+            | Self::UriDereference(TransformError::Policy(violation))
+            | Self::Transform(TransformError::Policy(violation)) => Some(violation),
+            _ => None,
+        }
+    }
+
     /// `Ok` is this Reference's own outcome (`XMLDSig` 1.1 §3.2.1 validates each
     /// Reference independently); `Err` stays terminal for the whole operation.
     fn into_reference_failure(self, ref_index: usize) -> Result<FailureReason, Self> {
@@ -1895,6 +1926,9 @@ pub struct VerifyResult {
     /// Canonicalized `<SignedInfo>` bytes when `store_pre_digest` is enabled
     /// and verification reaches `SignedInfo` canonicalization.
     pub canonicalized_signed_info: Option<Vec<u8>>,
+    /// What the verification policy decided for this signature, and the
+    /// published snapshot it enforced.
+    pub policy: crate::policy::PolicyAudit,
 }
 
 impl From<base64::DecodeError> for DsigError {
@@ -2859,6 +2893,10 @@ fn process_signed_info_references<C: VerificationCapture>(
                 &execution,
             )
             .or_else(|error| {
+                if let Some(violation) = error.reference_policy_violation() {
+                    operation
+                        .record_policy(crate::policy::PolicyDecision::Rejected(violation.clone()));
+                }
                 let reason = error.into_reference_failure(index)?;
                 Ok::<_, ReferenceProcessingError>(reference_failure_result(
                     reference,
@@ -2920,7 +2958,7 @@ fn unauthenticated_result(
     signature_node: Node<'_, '_>,
     completion: VerificationCompletion<'_>,
     store_pre_digest: bool,
-    key_trust: super::KeyTrustEvidence,
+    (key_trust, policy): (super::KeyTrustEvidence, crate::policy::PolicyAudit),
     reason: FailureReason,
 ) -> VerifyResult {
     VerifyResult {
@@ -2933,6 +2971,7 @@ fn unauthenticated_result(
         ),
         manifest_references: Vec::new(),
         canonicalized_signed_info: store_pre_digest.then_some(completion.canonical_signed_info),
+        policy,
     }
 }
 
@@ -3114,6 +3153,59 @@ fn validate_verification_inputs(
     Ok(())
 }
 
+/// Record what [`validate_verification_inputs`] permitted: it checks every
+/// `SignedInfo` method, Reference URI class, digest and transform before any
+/// of them runs, so each one it passed is a decision of this operation.
+fn record_signed_info_decisions(
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    signed_info: &super::parse::SignedInfo,
+    policy: &crate::policy::VerificationPolicy,
+) {
+    use crate::policy::{AlgorithmRole, PolicyDecision, UriRole};
+    if let Some(validity) = &policy.validity {
+        operation.record_policy(PolicyDecision::exception(validity));
+    }
+    operation.record_policy(PolicyDecision::algorithm(
+        AlgorithmRole::Signature,
+        signed_info.signature_method.uri(),
+    ));
+    operation.record_policy(PolicyDecision::algorithm(
+        AlgorithmRole::Canonicalization,
+        signed_info.c14n_method.uri(),
+    ));
+    for reference in &signed_info.references {
+        record_reference_decisions(operation, reference, UriRole::Reference);
+    }
+}
+
+/// Record the URI class, digest and transforms of one admitted Reference.
+fn record_reference_decisions<P, B>(
+    operation: &OperationExecutionContext<P, B>,
+    reference: &Reference,
+    role: crate::policy::UriRole,
+) {
+    use crate::policy::{AlgorithmRole, PolicyDecision};
+    if let Some(uri) = reference.uri.as_deref() {
+        operation.record_policy(PolicyDecision::Uri {
+            role,
+            class: classify_uri(uri),
+        });
+    }
+    operation.record_policy(PolicyDecision::algorithm(
+        AlgorithmRole::Digest,
+        reference.digest_method.uri(),
+    ));
+    for transform in &reference.transforms {
+        operation.record_policy(PolicyDecision::algorithm(
+            AlgorithmRole::Transform,
+            transform.algorithm_uri(),
+        ));
+    }
+}
+
 struct PreparedVerificationSignature<'a> {
     children: SignatureChildNodes<'a, 'a>,
     signed_info: super::parse::SignedInfo,
@@ -3203,6 +3295,7 @@ fn prepare_verification_signature<'a, C: VerificationCapture>(
     )?;
     capture.method(view, signed_info_node, signed_info.signature_method)?;
     validate_verification_inputs(&signed_info, ctx)?;
+    record_signed_info_decisions(operation, &signed_info, &ctx.policy);
     let remaining_reference_capacity = ctx
         .policy
         .resources
@@ -3405,6 +3498,7 @@ fn finish_authenticated_verification<C: VerificationCapture>(
             signed_info_references: references.results,
             manifest_references: Vec::new(),
             canonicalized_signed_info,
+            policy: operation.audit(ctx.identity.as_ref()),
         });
     }
     // Every node core validation completed: the evidence and the first
@@ -3426,6 +3520,7 @@ fn finish_authenticated_verification<C: VerificationCapture>(
         signed_info_references: references.results,
         manifest_references,
         canonicalized_signed_info,
+        policy: operation.audit(ctx.identity.as_ref()),
     })
 }
 
@@ -3447,21 +3542,22 @@ fn finish_core_validation<C: VerificationCapture>(
     // Manifest syntax and references are authenticated content. Delay parsing
     // until core validation succeeds, then extend the same operation graph with
     // the newly trusted dependency subgraph and its evidence node.
-    let (manifest_references, manifest_digests) = if verification.context.policy.manifest_processing
-        == crate::policy::ManifestProcessing::Process
-    {
-        process_authenticated_manifest_references(
-            operation,
-            view,
-            signature_node,
-            resolver,
-            verification,
-            remaining_reference_capacity,
-            &core_validation,
-        )?
-    } else {
-        (Vec::new(), Vec::new())
-    };
+    let processing = verification.context.policy.manifest_processing;
+    operation.record_policy(crate::policy::PolicyDecision::Manifests(processing));
+    let (manifest_references, manifest_digests) =
+        if processing == crate::policy::ManifestProcessing::Process {
+            process_authenticated_manifest_references(
+                operation,
+                view,
+                signature_node,
+                resolver,
+                verification,
+                remaining_reference_capacity,
+                &core_validation,
+            )?
+        } else {
+            (Vec::new(), Vec::new())
+        };
     operation.extend();
     let evidence = operation.add_node(OperationNodeKind::Evidence, OperationStage::Evidence, None);
     for prerequisite in core_validation.into_iter().chain(manifest_digests) {
@@ -3527,7 +3623,10 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             signature_node,
             completion,
             ctx.store_pre_digest,
-            super::KeyTrustEvidence::NotEvaluated,
+            (
+                super::KeyTrustEvidence::NotEvaluated,
+                operation.audit(ctx.identity.as_ref()),
+            ),
             FailureReason::KeyNotFound,
         ));
     };
@@ -3566,7 +3665,7 @@ fn verify_signature_authenticator<C: VerificationCapture>(
             signature_node,
             completion,
             ctx.store_pre_digest,
-            key_trust,
+            (key_trust, operation.audit(ctx.identity.as_ref())),
             FailureReason::SignatureMismatch,
         ));
     }
@@ -5594,37 +5693,56 @@ fn schedule_manifest_references(
 }
 
 fn evaluate_manifest_reference<C: VerificationCapture>(
-    reference: &Reference,
-    index: usize,
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    compiled: &CompiledManifestReference,
     execution: &ReferenceExecutionContext<'_, C>,
     resolver: &UriReferenceResolver<'_>,
     signature_node: Node<'_, '_>,
     ctx: &VerifyContext<'_>,
-    reference_node: Option<Node<'_, '_>>,
 ) -> Result<ReferenceResult, SignatureVerificationPipelineError> {
-    if super::transforms::validate_relationship_chain(
-        &reference.transforms,
-        ctx.policy.transforms.opc_relationship_edition,
-    )
-    .is_err()
-        || reference.transforms.len() > ctx.policy.resources.max_transforms_per_reference
-        || ctx
-            .policy
-            .check_digest_algorithm(reference.digest_method)
-            .is_err()
-    {
+    use crate::policy::{PolicyDecision, PolicyViolation, UriRole};
+    let (reference, index) = (&compiled.reference, compiled.index);
+    let reference_node = resolver.node_for_node_id(compiled.reference_node_id);
+    let refused = |violation: Option<PolicyViolation>| {
+        if let Some(violation) = violation {
+            operation.record_policy(PolicyDecision::Rejected(violation));
+        }
         Ok(manifest_reference_invalid_result(
             reference,
             index,
             FailureReason::ReferencePolicyViolation { ref_index: index },
         ))
-    } else {
-        match enforce_reference_policies(
-            core::slice::from_ref(reference),
-            ctx.policy.uris.references,
-            ctx.allowed_transform_uris(),
-        ) {
-            Ok(()) => match process_reference_with_options(
+    };
+    if super::transforms::validate_relationship_chain(
+        &reference.transforms,
+        ctx.policy.transforms.opc_relationship_edition,
+    )
+    .is_err()
+    {
+        return refused(None);
+    }
+    let maximum = ctx.policy.resources.max_transforms_per_reference;
+    if reference.transforms.len() > maximum {
+        return refused(Some(PolicyViolation::ResourceLimit {
+            resource: crate::policy::resource_name::REFERENCE_TRANSFORMS,
+            maximum,
+            actual: reference.transforms.len(),
+        }));
+    }
+    if let Err(violation) = ctx.policy.check_digest_algorithm(reference.digest_method) {
+        return refused(Some(violation));
+    }
+    match enforce_reference_policies(
+        core::slice::from_ref(reference),
+        ctx.policy.uris.references,
+        ctx.allowed_transform_uris(),
+    ) {
+        Ok(()) => {
+            record_reference_decisions(operation, reference, UriRole::ManifestReference);
+            match process_reference_with_options(
                 reference,
                 resolver,
                 signature_node,
@@ -5634,25 +5752,24 @@ fn evaluate_manifest_reference<C: VerificationCapture>(
                 execution,
             ) {
                 Ok(result) => Ok(result),
-                Err(error) => Ok(manifest_reference_invalid_result(
-                    reference,
-                    index,
-                    manifest_reference_failure_reason(error, index)?,
-                )),
-            },
-            Err(SignatureVerificationPipelineError::Policy(_)) => {
-                Ok(manifest_reference_invalid_result(
-                    reference,
-                    index,
-                    FailureReason::ReferencePolicyViolation { ref_index: index },
-                ))
+                Err(error) => {
+                    if let Some(violation) = error.reference_policy_violation() {
+                        operation.record_policy(PolicyDecision::Rejected(violation.clone()));
+                    }
+                    Ok(manifest_reference_invalid_result(
+                        reference,
+                        index,
+                        manifest_reference_failure_reason(error, index)?,
+                    ))
+                }
             }
-            Err(_) => Ok(manifest_reference_invalid_result(
-                reference,
-                index,
-                FailureReason::ReferenceProcessingFailure { ref_index: index },
-            )),
         }
+        Err(SignatureVerificationPipelineError::Policy(violation)) => refused(Some(violation)),
+        Err(_) => Ok(manifest_reference_invalid_result(
+            reference,
+            index,
+            FailureReason::ReferenceProcessingFailure { ref_index: index },
+        )),
     }
 }
 
@@ -5699,13 +5816,12 @@ fn execute_manifest_reference<C: VerificationCapture>(
                     capture,
                 };
                 let mut result = evaluate_manifest_reference(
-                    reference,
-                    compiled.index,
+                    operation,
+                    &compiled,
                     &execution,
                     resolver,
                     signature_node,
                     ctx,
-                    resolver.node_for_node_id(compiled.reference_node_id),
                 )?;
                 bind_reference_evidence(
                     &mut result,
@@ -5831,6 +5947,32 @@ fn manifest_reference_invalid_result(
     )
 }
 
+/// Why a Manifest Reference with transform `uri` this build cannot run fails:
+/// a policy refusal, recorded in the operation's audit, when the allowlist
+/// excludes it, and a processing failure otherwise.
+fn unsupported_manifest_transform_reason(
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    allowed_transforms: Option<&BTreeSet<String>>,
+    uri: String,
+    ref_index: usize,
+) -> FailureReason {
+    if allowed_transforms.is_some_and(|allowed| !allowed.contains(&uri)) {
+        // The refusal enforce_transform_allowed reports.
+        operation.record_policy(crate::policy::PolicyDecision::Rejected(
+            crate::policy::PolicyViolation::Algorithm {
+                operation: "verification transform",
+                algorithm: uri,
+            },
+        ));
+        FailureReason::ReferencePolicyViolation { ref_index }
+    } else {
+        FailureReason::ReferenceProcessingFailure { ref_index }
+    }
+}
+
 fn parse_manifest_references(
     signature_node: Node<'_, '_>,
     operation: &OperationExecutionContext<
@@ -5910,16 +6052,12 @@ fn parse_manifest_references(
                 Err(ParseError::Transform(super::TransformError::UnsupportedTransform(uri))) => {
                     let digest_algorithm =
                         reference_digest_method(child).map_err(map_manifest_parse_error)?;
-                    let reason =
-                        if allowed_transforms.is_some_and(|allowed| !allowed.contains(&uri)) {
-                            FailureReason::ReferencePolicyViolation {
-                                ref_index: reference_index,
-                            }
-                        } else {
-                            FailureReason::ReferenceProcessingFailure {
-                                ref_index: reference_index,
-                            }
-                        };
+                    let reason = unsupported_manifest_transform_reason(
+                        operation,
+                        allowed_transforms,
+                        uri,
+                        reference_index,
+                    );
                     invalid.push(CompiledManifestInvalid {
                         result: ReferenceResult {
                             reference_identity: Some(view.node_identity(child)),

@@ -51,7 +51,8 @@ pub fn execute(project_root: &Path) -> BTreeSet<String> {
         let actual = xml_sec::xmlenc::DecryptContext::new(&key)
             .policy(policy)
             .decrypt_document(&xml, Some("ED"))
-            .unwrap();
+            .unwrap()
+            .output;
         let c14n = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
         assert_eq!(
             canonicalize_xml(actual.as_bytes(), &c14n).unwrap(),

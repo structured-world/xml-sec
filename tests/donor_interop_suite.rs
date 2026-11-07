@@ -557,7 +557,8 @@ fn hmac_donor_vectors_sign_and_verify_with_declared_output_lengths() {
         let generated = SignContext::new(&signing_key)
             .policy(signing_policy.clone())
             .sign_template(&template)
-            .unwrap_or_else(|error| panic!("{} must sign: {error}", path.display()));
+            .unwrap_or_else(|error| panic!("{} must sign: {error}", path.display()))
+            .output;
         let result = VerifyContext::new()
             .key(&verification_key)
             .policy(compatibility_verification_policy())
@@ -667,7 +668,8 @@ fn every_xmldsig11_template_signs_and_verifies() {
         }
         let signed = signing
             .sign_template(&template)
-            .unwrap_or_else(|error| panic!("{} must sign: {error}", path.display()));
+            .unwrap_or_else(|error| panic!("{} must sign: {error}", path.display()))
+            .output;
         let key_reference_resolver = if name.contains("keyinforeference") {
             let SigningPublicKeyInfo::Rsa { spki_der, .. } = key
                 .public_key_info()
@@ -865,7 +867,8 @@ fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
             .xml_backend(backend)
             .external_resources(&resources)
             .sign_template(&template)
-            .unwrap_or_else(|error| panic!("{backend:?} detached signing failed: {error}"));
+            .unwrap_or_else(|error| panic!("{backend:?} detached signing failed: {error}"))
+            .output;
         assert!(
             signed.contains(r#"<Transform Algorithm="http://www.w3.org/2006/12/xml-c14n11"/>"#),
             "{backend:?} generation must materialize the C14N 1.1 conversion"
@@ -894,8 +897,9 @@ fn second_edition_template_materializes_c14n11_and_signs_detached_xml() {
                 .external_resources(&resources)
                 .sign_template(&xslt_template);
             if cfg!(feature = "xslt") {
-                let signed =
-                    result.unwrap_or_else(|error| panic!("{backend:?} {name} signing: {error}"));
+                let signed = result
+                    .unwrap_or_else(|error| panic!("{backend:?} {name} signing: {error}"))
+                    .output;
                 assert!(
                     signed.contains(r#"Algorithm="http://www.w3.org/TR/1999/REC-xslt-19991116""#),
                     "{backend:?} {name} must keep its XSLT transform"
@@ -1118,7 +1122,8 @@ fn dsa_sha256_upstream_vector_verifies_and_signs() {
     .expect("DSA signing template must be readable");
     let signed = SignContext::new(&key)
         .sign_template(&template)
-        .expect("DSA-SHA256 template must sign");
+        .expect("DSA-SHA256 template must sign")
+        .output;
     let result = VerifyContext::new()
         .key(&verification_key)
         .verify(&signed)

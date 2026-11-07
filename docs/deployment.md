@@ -84,8 +84,12 @@ version, a revision that increases by one per publication of the store (also
 under concurrent publishers), and the SHA-256 of the canonical effective
 settings. Equal digests mean equal enforced settings whatever the file layout,
 so a digest change, not a revision change, shows that enforcement changed.
-Read it from the snapshot (`CompiledPolicies::identity`) to correlate an
-operation with the policy it enforced.
+Every operation returns it in its `PolicyAudit`, together with the decisions
+its policy made: the algorithms and URI classes it permitted, the Manifest
+processing it applied, the exception grant it ran under and the inputs it
+refused while continuing. The records hold no document content, URIs, keys or
+resource bytes, so they can go to the audit log as they are; see the
+[Rust API guide](rust-api.md#policy-audit).
 
 Rollback is a replacement with the earlier configuration: it is published as the
 next revision with the earlier digest. The store keeps no history; applications

@@ -86,7 +86,8 @@ fn rsa_verifier_size_limit_is_unsupported_not_signature_mismatch() {
     let document = xml_sec::xmldsig::SignContext::new(&signer)
         .policy(signing_policy)
         .sign_template(include_str!("fixtures/saml/response_signing_template.xml"))
-        .unwrap();
+        .unwrap()
+        .output;
     let mut verification_policy = xml_sec::policy::VerificationPolicy::default();
     verification_policy.key_trust.rsa_keys.minimum_modulus_bits = 1024;
     assert_eq!(
@@ -310,7 +311,8 @@ fn xml_signatures_interoperate_through_selected_provider() {
         let signed = SignContext::new(key)
             .provider(signer)
             .sign_template(template)
-            .unwrap();
+            .unwrap()
+            .output;
         for provider in [
             &AwsLcFipsProvider as &dyn CryptoProvider,
             &RustCryptoProvider as &dyn CryptoProvider,
@@ -500,7 +502,8 @@ fn rsa_recipient_xml_pipeline_interoperates_with_native_recovery() {
                 DecryptContext::new(resolver)
                     .provider(provider)
                     .decrypt(&encrypted.encrypted_data_xml)
-                    .unwrap(),
+                    .unwrap()
+                    .output,
                 DecryptedContent::Bytes(b"transported payload".to_vec())
             );
         }
@@ -535,7 +538,8 @@ fn xml_encryption_uses_the_selected_provider_end_to_end() {
                 let result = DecryptContext::new(&resolver)
                     .provider(decryptor)
                     .decrypt(&encrypted.encrypted_data_xml)
-                    .unwrap();
+                    .unwrap()
+                    .output;
                 assert_eq!(result, DecryptedContent::Bytes(b"binary\0payload".to_vec()));
             }
             let wrong_key = SymmetricKeyDecryptor::new(vec![0; algorithm.key_len()]);

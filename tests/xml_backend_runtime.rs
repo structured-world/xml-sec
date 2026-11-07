@@ -69,7 +69,8 @@ fn every_compiled_runtime_backend_runs_complete_security_pipelines() {
             .xml_backend(backend)
             .key_info_writer(&key_info)
             .sign_with_builder("<root><value>payload</value></root>", &signature)
-            .unwrap_or_else(|error| panic!("{backend:?} signing failed: {error}"));
+            .unwrap_or_else(|error| panic!("{backend:?} signing failed: {error}"))
+            .output;
         let verified = cryptographic::context()
             .xml_backend(backend)
             .key_resolver(&DefaultKeyResolver::default())
@@ -88,8 +89,10 @@ fn every_compiled_runtime_backend_runs_complete_security_pipelines() {
         let resolver = SymmetricKeyDecryptor::new(symmetric_key);
         let decrypted = DecryptContext::new(&resolver)
             .xml_backend(backend)
-            .decrypt_document(&encrypted, None)
+            .decrypt_document(&encrypted.output, None)
             .unwrap_or_else(|error| panic!("{backend:?} decryption failed: {error}"));
-        assert_eq!(decrypted, "<root><value>payload</value></root>");
+        assert_eq!(decrypted.output, "<root><value>payload</value></root>");
+        // The audit records the same decisions whichever XML backend parsed the input.
+        assert_eq!(decrypted.policy.decisions, encrypted.policy.decisions);
     }
 }

@@ -297,7 +297,8 @@ impl Fixture {
                 .external_resources(&resources)
                 .start_node_id(&format!("signature-{index}"))
                 .sign_template(&signed)
-                .expect("signing workload");
+                .expect("signing workload")
+                .output;
         }
         let document =
             XmlDocument::parse_with_backend(signed.clone(), spec.backend).expect("signed document");
@@ -384,7 +385,8 @@ impl Fixture {
                         .signer()
                         .start_node_id(&format!("signature-{index}"))
                         .sign_template(&signed)
-                        .expect("sign");
+                        .expect("sign")
+                        .output;
                 }
                 assert_eq!(signed, self.signed);
                 signed.len()
@@ -432,7 +434,8 @@ impl Fixture {
                     .provider(self.provider.as_ref())
                     .xml_backend(self.spec.backend)
                     .decrypt(&self.encrypted)
-                    .expect("decrypt");
+                    .expect("decrypt")
+                    .output;
                 match content {
                     DecryptedContent::Xml(xml) => {
                         assert_eq!(xml, self.unsigned);

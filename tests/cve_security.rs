@@ -241,7 +241,7 @@ fn cve_2026_32313_gcm_never_accepts_a_shortened_tag() {
     for backend in XmlBackend::available() {
         let context = DecryptContext::new(&resolver).xml_backend(backend);
         assert_eq!(
-            context.decrypt(&good).unwrap(),
+            context.decrypt(&good).unwrap().output,
             DecryptedContent::Bytes(b"x".to_vec())
         );
         for removed in 1..=16 {

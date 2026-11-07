@@ -113,6 +113,9 @@ and an explicit `CryptoProvider`, then create verification, signing, encryption
 or decryption handles. Keys, expected signed targets and external bytes remain
 request data; operation handles cannot replace policy or select a fallback engine.
 Verification returns document/generation-bound evidence, not just a boolean.
+Every operation also returns a [policy audit](docs/rust-api.md#policy-audit):
+the decisions its policy made and the identity of the published snapshot it
+enforced, with no document content, keys or resource bytes in it.
 The existing low-level C14N, XMLDSig and XMLEnc APIs remain available.
 
 Run `cargo run --example policy_roundtrip` from the source checkout for

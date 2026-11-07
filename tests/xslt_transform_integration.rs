@@ -75,6 +75,7 @@ fn sign_with_policy(
         .key_info_writer(&key_info)
         .policy(policy)
         .sign_with_builder(document, builder)
+        .map(|signed| signed.output)
 }
 
 /// Verify `signed` and return the pre-digest bytes of every `SignedInfo` reference.
@@ -146,7 +147,8 @@ fn detached_entity_uri_survives_sign_verify_and_current_query_replay() {
         .policy(signing)
         .external_resources(&resources)
         .sign_with_builder(r#"<root xml:base="https://example.org/data/"/>"#, &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let mut policy = VerificationPolicy::default();
     policy.uris.references = UriTypeSet::ALL;
     policy.xml.allow_internal_dtd = true;
@@ -224,7 +226,8 @@ fn referenced_whitespace_beside_stylesheet_signs_and_verifies() {
                 .policy(signing)
                 .xml_backend(backend)
                 .sign_with_builder(ITEMS, &signature)
-                .expect("referenced stylesheet whitespace must sign");
+                .expect("referenced stylesheet whitespace must sign")
+                .output;
             let mut verification = VerificationPolicy::default();
             verification.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
             verification.transforms.xslt_stylesheet_semantics = semantics;
@@ -655,6 +658,7 @@ fn stylesheets_keep_the_namespaces_in_scope_at_their_transform() {
         SignContext::new(&signing_key)
             .policy(policy)
             .sign_template(&template)
+            .map(|signed| signed.output)
     };
 
     let signed = sign(XsltStylesheetSemantics::Specification).expect("the stylesheet compiles");
@@ -713,7 +717,8 @@ fn entity_stylesheet_after_literal_misc_uses_expanded_children() {
             .xml_backend(backend)
             .policy(policy)
             .sign_template(&template)
-            .expect("entity-supplied stylesheet signs after Misc");
+            .expect("entity-supplied stylesheet signs after Misc")
+            .output;
         let mut policy = VerificationPolicy::default();
         policy.xml.allow_internal_dtd = true;
         let verified = xml_sec::xmldsig::VerifyContext::new()
@@ -764,7 +769,8 @@ fn stylesheets_use_the_entities_of_their_document() {
     let signed = SignContext::new(&signing_key)
         .policy(signing)
         .sign_template(&template)
-        .expect("the stylesheet compiles with the replaced entity");
+        .expect("the stylesheet compiles with the replaced entity")
+        .output;
     let mut verification = VerificationPolicy::default();
     verification.xml.allow_internal_dtd = true;
     let result = xml_sec::xmldsig::VerifyContext::new()
@@ -815,7 +821,8 @@ fn stylesheets_keep_namespace_declarations_defaulted_by_the_dtd() {
         .policy(signing)
         .xml_backend(xml_sec::XmlBackend::Xmloxide)
         .sign_template(&template)
-        .expect("the defaulted prefix is bound");
+        .expect("the defaulted prefix is bound")
+        .output;
     let mut verification = VerificationPolicy::default();
     verification.xml.allow_internal_dtd = true;
     let result = xml_sec::xmldsig::VerifyContext::new()

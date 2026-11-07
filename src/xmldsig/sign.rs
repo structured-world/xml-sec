@@ -1827,7 +1827,7 @@ impl<'a> SignContext<'a> {
     /// # Errors
     /// Returns XML/template, policy/resource, key-info, reference-processing,
     /// selected-provider signing or final mutation failures.
-    pub fn sign_template(&self, xml: &str) -> Result<String, SigningError> {
+    pub fn sign_template(&self, xml: &str) -> Result<crate::policy::Audited<String>, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
@@ -1842,6 +1842,7 @@ impl<'a> SignContext<'a> {
         .map_err(map_template_parse_error)?;
         self.validate_owned_document_input(&document)?;
         self.sign_document_in_place::<SerializeText>(&mut document, &mut budgets)
+            .map(|(xml, audit)| crate::policy::Audited::new(xml, audit))
     }
 
     /// Sign a parsed template the caller hands over, and return the signed XML.
@@ -1860,7 +1861,7 @@ impl<'a> SignContext<'a> {
     pub fn sign_template_document(
         &self,
         mut document: XmlDocument,
-    ) -> Result<String, SigningError> {
+    ) -> Result<crate::policy::Audited<String>, SigningError> {
         self.validate_owned_document_input(&document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
@@ -1874,6 +1875,7 @@ impl<'a> SignContext<'a> {
             .charge(document.parse_work())
             .map_err(map_template_parse_error)?;
         self.sign_document_in_place::<SerializeText>(&mut document, &mut budgets)
+            .map(|(xml, audit)| crate::policy::Audited::new(xml, audit))
     }
 
     /// Sign a template in a reusable owned document.
@@ -1884,7 +1886,10 @@ impl<'a> SignContext<'a> {
     /// # Errors
     /// Returns document provenance, template, policy/resource, key-info,
     /// reference or signing failures without committing the staged copy.
-    pub fn sign_document(&self, document: &mut XmlDocument) -> Result<(), SigningError> {
+    pub fn sign_document(
+        &self,
+        document: &mut XmlDocument,
+    ) -> Result<crate::policy::PolicyAudit, SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
@@ -1896,6 +1901,7 @@ impl<'a> SignContext<'a> {
             .admit(document.as_xml().len())?;
         document.transaction(|document| {
             self.sign_document_in_place::<CommitDocument>(document, &mut budgets)
+                .map(|((), audit)| audit)
         })
     }
 
@@ -1903,7 +1909,7 @@ impl<'a> SignContext<'a> {
         &self,
         document: &mut XmlDocument,
         budgets: &mut SigningOperationBudgets,
-    ) -> Result<O::Output, SigningError> {
+    ) -> Result<(O::Output, crate::policy::PolicyAudit), SigningError> {
         let target_signature = document.with_view(|view| {
             signing_signature_index(
                 view.document(),
@@ -1935,7 +1941,7 @@ impl<'a> SignContext<'a> {
         document: &XmlDocument,
         target_signature: usize,
         budget: &TransformExecutionBudget,
-    ) -> Result<SignatureAlgorithm, SigningError> {
+    ) -> Result<(SignatureAlgorithm, String), SigningError> {
         document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
@@ -1944,7 +1950,7 @@ impl<'a> SignContext<'a> {
             parse_signature_children(signature)
                 .map_err(|error| SigningDigestError::InvalidStructure(error.to_string()))?;
             self.policy.signature_constraints.check(signature, budget)?;
-            let (algorithm, output_bits) =
+            let (algorithm, output_bits, canonicalization) =
                 validate_signing_signed_info_methods(signature, &self.policy)?;
             self.policy.check_signature_algorithm(algorithm)?;
             if let Some(full_bits) = algorithm.hmac_output_bits() {
@@ -1958,7 +1964,7 @@ impl<'a> SignContext<'a> {
                     .hmac
                     .validate_output(algorithm, output_bits.unwrap_or(full_bits))?;
             }
-            Ok::<_, SigningError>(algorithm)
+            Ok::<_, SigningError>((algorithm, canonicalization))
         })
     }
 
@@ -2522,8 +2528,8 @@ impl<'a> SignContext<'a> {
         document: &mut XmlDocument,
         target_signature: usize,
         budgets: &mut SigningOperationBudgets,
-    ) -> Result<O::Output, SigningError> {
-        let signing_algorithm =
+    ) -> Result<(O::Output, crate::policy::PolicyAudit), SigningError> {
+        let (signing_algorithm, canonicalization) =
             self.signing_template_algorithm(document, target_signature, &budgets.transforms)?;
         let transform_options = TransformOptions::default()
             .id_attributes(self.id_attributes)
@@ -2539,6 +2545,12 @@ impl<'a> SignContext<'a> {
         let binding = (document.identity(), document.generation());
         let mut operation =
             OperationExecutionContext::new(self.policy.clone(), &mut *budgets, Some(binding));
+        record_signing_methods(
+            &operation,
+            &self.policy,
+            signing_algorithm,
+            &canonicalization,
+        );
         let key_info = operation.add_node(
             OperationNodeKind::Key { index: 0 },
             OperationStage::Resolve,
@@ -2593,6 +2605,7 @@ impl<'a> SignContext<'a> {
             key_info_content,
             generated,
         )?;
+        record_signing_references(&operation, &analyzed.0);
         let (plan_nodes, pending_digests) = fill_analyzed_reference_digest_values(
             document,
             transform_options,
@@ -2602,14 +2615,15 @@ impl<'a> SignContext<'a> {
             true,
             analyzed,
         )?;
-        self.finish_signing_template::<O>(
+        let output = self.finish_signing_template::<O>(
             document,
             target_signature,
             &mut operation,
             (plan_nodes, pending_digests),
             signing_key,
             splice.as_ref(),
-        )
+        )?;
+        Ok((output, operation.audit(self.identity.as_ref())))
     }
 
     /// Build a signature template, append it to the selected start node (or
@@ -2622,7 +2636,7 @@ impl<'a> SignContext<'a> {
         &self,
         xml: &str,
         builder: &SignatureBuilder,
-    ) -> Result<String, SigningError> {
+    ) -> Result<crate::policy::Audited<String>, SigningError> {
         self.policy.validate()?;
         self.policy.resources.validate_xml_document_len(xml.len())?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
@@ -2647,6 +2661,7 @@ impl<'a> SignContext<'a> {
             builder,
             &mut budgets,
         )
+        .map(|(xml, audit)| crate::policy::Audited::new(xml, audit))
     }
 
     /// Build, append, and sign a signature in an owned document.
@@ -2658,7 +2673,7 @@ impl<'a> SignContext<'a> {
         &self,
         document: &mut XmlDocument,
         builder: &SignatureBuilder,
-    ) -> Result<(), SigningError> {
+    ) -> Result<crate::policy::PolicyAudit, SigningError> {
         self.validate_owned_document_input(document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
@@ -2674,6 +2689,7 @@ impl<'a> SignContext<'a> {
                 builder,
                 &mut budgets,
             )
+            .map(|((), audit)| audit)
         })
     }
 
@@ -2682,7 +2698,7 @@ impl<'a> SignContext<'a> {
         document: &mut XmlDocument,
         builder: &SignatureBuilder,
         budgets: &mut SigningOperationBudgets,
-    ) -> Result<O::Output, SigningError> {
+    ) -> Result<(O::Output, crate::policy::PolicyAudit), SigningError> {
         self.policy.resources.validate_key_candidates(1)?;
         let expected_signature_len = if let Some(key) = self.signing_key {
             expected_signature_output_len(key, builder.signature_method(), &self.policy, None)?
@@ -2950,6 +2966,69 @@ struct SigningReference {
 
 type SigningExecution<'a> =
     OperationExecutionContext<Arc<crate::policy::SigningPolicy>, &'a mut SigningOperationBudgets>;
+
+/// Record the template methods the policy permitted before any signing work;
+/// every later refusal ends the operation, so they stand once it succeeds.
+fn record_signing_methods(
+    operation: &SigningExecution<'_>,
+    policy: &crate::policy::SigningPolicy,
+    algorithm: SignatureAlgorithm,
+    canonicalization: &str,
+) {
+    use crate::policy::{AlgorithmRole, PolicyDecision};
+    if let Some(validity) = &policy.validity {
+        operation.record_policy(PolicyDecision::exception(validity));
+    }
+    operation.record_policy(PolicyDecision::algorithm(
+        AlgorithmRole::Signature,
+        algorithm.uri(),
+    ));
+    operation.record_policy(PolicyDecision::algorithm(
+        AlgorithmRole::Canonicalization,
+        canonicalization,
+    ));
+}
+
+/// Record the URI class, digest and transforms of every Reference the
+/// operation digests, and the Manifest processing it applied, in the order
+/// verification records them; reference analysis refuses each Reference the
+/// policy denies.
+fn record_signing_references(operation: &SigningExecution<'_>, inputs: &SigningReferenceInputs) {
+    use crate::policy::{PolicyDecision, UriRole};
+    for reference in &inputs.signed_info {
+        record_signing_reference(operation, reference, UriRole::Reference);
+    }
+    operation.record_policy(PolicyDecision::Manifests(
+        operation.policy().manifest_processing,
+    ));
+    if inputs.process_manifests {
+        for reference in &inputs.manifests {
+            record_signing_reference(operation, reference, UriRole::ManifestReference);
+        }
+    }
+}
+
+fn record_signing_reference(
+    operation: &SigningExecution<'_>,
+    reference: &SigningReference,
+    role: crate::policy::UriRole,
+) {
+    use crate::policy::{AlgorithmRole, PolicyDecision};
+    operation.record_policy(PolicyDecision::Uri {
+        role,
+        class: super::UriClass::of(&reference.uri),
+    });
+    operation.record_policy(PolicyDecision::algorithm(
+        AlgorithmRole::Digest,
+        reference.digest_method.uri(),
+    ));
+    for transform in &reference.transforms {
+        operation.record_policy(PolicyDecision::algorithm(
+            AlgorithmRole::Transform,
+            transform.algorithm_uri(),
+        ));
+    }
+}
 
 type SigningKeyOutput = (
     Option<String>,
@@ -4199,10 +4278,12 @@ fn validate_signing_references(
     Ok(())
 }
 
+/// The signature method, its HMAC output length and the canonicalization URI
+/// of a template's `SignedInfo`, once the policy permits the canonicalization.
 fn validate_signing_signed_info_methods(
     signature: Node<'_, '_>,
     policy: &crate::policy::SigningPolicy,
-) -> Result<(SignatureAlgorithm, Option<usize>), SigningError> {
+) -> Result<(SignatureAlgorithm, Option<usize>, String), SigningError> {
     let signed_info = find_required_child(signature, "SignedInfo")?;
     let canonicalization_method =
         element_children(signed_info)
@@ -4230,8 +4311,9 @@ fn validate_signing_signed_info_methods(
             .ok_or(SigningDigestError::MissingElement {
                 element: "SignatureMethod",
             })?;
+    let canonicalization = algorithm.to_owned();
     super::parse::parse_signature_method(signature_method, &policy.resources)
-        .map(|(algorithm, hmac, _context)| (algorithm, hmac))
+        .map(|(algorithm, hmac, _context)| (algorithm, hmac, canonicalization))
         .map_err(SigningError::from)
 }
 

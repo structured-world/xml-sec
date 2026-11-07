@@ -4135,7 +4135,8 @@ fn selected_weak_rsa_decryptor_obeys_default_policy() {
         crate::xmlenc::DecryptContext::new(resolver.as_ref())
             .policy(decryption)
             .decrypt(&encrypted.encrypted_data_xml)
-            .expect("explicit legacy recovery"),
+            .expect("explicit legacy recovery")
+            .output,
         crate::xmlenc::DecryptedContent::Bytes(b"legacy consent".to_vec())
     );
     assert!(matches!(
@@ -4480,7 +4481,8 @@ fn inventory_decryption_resolver_enforces_aes_usage_end_to_end() {
         .expect("decrypt use is allowed");
     let content = DecryptContext::new(resolver.as_ref())
         .decrypt(&encrypted.encrypted_data_xml)
-        .expect("inventory key decrypts");
+        .expect("inventory key decrypts")
+        .output;
     assert!(
         matches!(content, DecryptedContent::Bytes(bytes) if bytes == b"inventory decrypt payload")
     );

@@ -56,6 +56,7 @@ fn sign_encoded_xml(xml: &str) -> String {
         .key_info_writer(&key_info)
         .sign_with_builder(xml, &base64_signature_builder())
         .expect("Base64 reference must sign")
+        .output
 }
 
 #[test]
@@ -103,7 +104,8 @@ fn enveloped_base64_reference_does_not_depend_on_its_own_signature_value() {
             "<root>ZXh0ZXJuYWwgdmVyaWZpZXIgY29udHJhY3Q=</root>",
             &builder,
         )
-        .expect("enveloped Base64 reference must sign");
+        .expect("enveloped Base64 reference must sign")
+        .output;
 
     let resolver = DefaultKeyResolver::default();
     let verified = cryptographic::context()
@@ -183,7 +185,8 @@ fn decoded_xml_is_adapted_to_a_node_set_for_xpath() {
     let signed = SignContext::new(&key)
         .key_info_writer(&key_info)
         .sign_with_builder(&document, &builder)
-        .expect("Base64-to-XPath transform chain must sign");
+        .expect("Base64-to-XPath transform chain must sign")
+        .output;
     let resolver = DefaultKeyResolver::default();
 
     let verified = cryptographic::context()
@@ -230,7 +233,8 @@ fn decoded_xml_is_adapted_for_xpath_filter2() {
     let signed = SignContext::new(&key)
         .key_info_writer(&key_info)
         .sign_with_builder(&document, &builder)
-        .expect("Base64-to-Filter2 transform chain must sign");
+        .expect("Base64-to-Filter2 transform chain must sign")
+        .output;
     let resolver = DefaultKeyResolver::default();
     let result = cryptographic::context()
         .key_resolver(&resolver)
@@ -273,7 +277,8 @@ fn decoded_utf16_xml_is_adapted_to_a_node_set() {
         let signed = SignContext::new(&key)
             .key_info_writer(&key_info)
             .sign_with_builder(&document, &builder)
-            .expect("BOM-marked UTF-16 XML must enter the XPath node-set pipeline");
+            .expect("BOM-marked UTF-16 XML must enter the XPath node-set pipeline")
+            .output;
         let verified = cryptographic::context()
             .key_resolver(&resolver)
             .verify(&signed)
@@ -344,6 +349,7 @@ fn sign_with_base64_limits(xml: &str, input: usize, output: usize) -> Result<Str
         .policy(policy)
         .key_info_writer(&key_info)
         .sign_with_builder(xml, &base64_signature_builder())
+        .map(|signed| signed.output)
 }
 
 #[test]

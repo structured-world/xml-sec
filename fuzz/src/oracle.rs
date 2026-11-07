@@ -78,7 +78,8 @@ pub fn xmlsec_oracle(data: &[u8]) {
     let signed = SignContext::new(&signer)
         .key_info_writer(&NamedHmac)
         .sign_with_builder(&xml, &builder)
-        .expect("native signature");
+        .expect("native signature")
+        .output;
     std::fs::write(&native, &signed).expect("oracle input");
     let mut verify = Command::new(&executable);
     verify

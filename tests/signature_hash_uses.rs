@@ -30,7 +30,10 @@ fn signed_manifest_named(digest: &str, suffix: &str) -> (XmlDocument, HmacVerifi
             .replace(&format!("Id=\"{id}\""), &format!("Id=\"{id}{suffix}\""))
             .replace(&format!("URI=\"#{id}\""), &format!("URI=\"#{id}{suffix}\""));
     }
-    let xml = SignContext::new(&signer).sign_template(&template).unwrap();
+    let xml = SignContext::new(&signer)
+        .sign_template(&template)
+        .unwrap()
+        .output;
     (
         XmlDocument::parse(xml).unwrap(),
         HmacVerificationKey::new(vec![0x61; 32]).unwrap(),
@@ -59,8 +62,13 @@ fn completed_nested_manifest_hash_survives_a_later_frontier_error() {
         .replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", &digest)
         .replace("</r>", &format!("{nested}</r>"));
     let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     with_verified_request(
         &document,
@@ -199,7 +207,8 @@ fn pure_and_prehash_eddsa_keep_distinct_algorithm_semantics() {
         let document = XmlDocument::parse(
             SignContext::new(&signer)
                 .sign_with_builder("<r/>", &builder)
-                .unwrap(),
+                .unwrap()
+                .output,
         )
         .unwrap();
         let key = VerificationKey {
@@ -416,8 +425,13 @@ fn reference_metadata_scans_are_paid_but_hash_projection_skips_unused_attributes
         .as_xml()
         .replace("Id=\"inside\"", &format!("Id=\"inside\"{attributes}"));
     let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     for hash_only in [true, false] {
         let work = account();
@@ -476,9 +490,13 @@ fn malformed_authenticated_methods_keep_original_provenance() {
             replacement,
         );
         let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
-        let document =
-            XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap())
-                .unwrap();
+        let document = XmlDocument::parse(
+            SignContext::new(&signer)
+                .sign_template(&template)
+                .unwrap()
+                .output,
+        )
+        .unwrap();
         let context = VerifyContext::new().key(&key).process_manifests(true);
         with_verified_request(
             &document,
@@ -610,7 +628,8 @@ fn independently_parameterized_pss_hashes_come_from_the_original_method() {
             ..Default::default()
         })
         .sign_with_builder("<root/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let key = VerificationKey {
         algorithm,

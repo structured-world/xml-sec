@@ -157,7 +157,7 @@ fn decrypts_every_chacha_donor_vector_and_authenticates_aad() {
             continue;
         }
         assert_eq!(
-            context.decrypt(&xml).unwrap(),
+            context.decrypt(&xml).unwrap().output,
             DecryptedContent::Bytes(std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap()),
             "{name}"
         );
@@ -247,7 +247,8 @@ fn decrypts_all_direct_camellia_donor_widths() {
             DecryptContext::new(&resolver)
                 .policy(policy.clone())
                 .decrypt(&xml)
-                .unwrap(),
+                .unwrap()
+                .output,
             DecryptedContent::Bytes(std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap())
         );
         let wrong_family = SymmetricKeyDecryptor::new(key.bytes.to_vec());
@@ -268,7 +269,8 @@ fn decrypts_all_direct_camellia_donor_widths() {
             DecryptContext::new(&resolver)
                 .policy(policy.clone())
                 .decrypt(&xml)
-                .unwrap(),
+                .unwrap()
+                .output,
             DecryptedContent::Bytes(std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap())
         );
         completed_vector(VECTOR_DIR, &name, CorpusOutcome::Decrypted);
@@ -569,7 +571,8 @@ fn decrypts_ecdh_p384_and_p521_donor_plaintexts() {
             DecryptContext::new(&resolver)
                 .policy(policy)
                 .decrypt(&xml)
-                .expect("complete donor ECDH decrypt"),
+                .expect("complete donor ECDH decrypt")
+                .output,
             DecryptedContent::Xml(expected_element.into()),
             "{name}"
         );
@@ -679,7 +682,7 @@ fn decrypts_ecdh_hkdf_and_pbkdf2_donor_plaintexts() {
             continue;
         }
         assert_eq!(
-            result.expect("complete ECDH KDF decrypt"),
+            result.expect("complete ECDH KDF decrypt").output,
             DecryptedContent::Xml(expected_element.into()),
             "{name}"
         );
@@ -724,7 +727,8 @@ fn decrypts_direct_pbkdf2_and_hkdf_donor_plaintexts() {
             assert_eq!(
                 context
                     .decrypt(&xml)
-                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .output,
                 DecryptedContent::Bytes(expected),
                 "{name}"
             );
@@ -767,7 +771,7 @@ fn decrypts_hkdf_with_only_the_prf_parameter() {
     )
     .master_key_name("hkdf-ikm");
     assert_eq!(
-        DecryptContext::new(&resolver).decrypt(&xml).unwrap(),
+        DecryptContext::new(&resolver).decrypt(&xml).unwrap().output,
         DecryptedContent::Bytes(std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap()),
     );
     completed_vector(VECTOR_DIR, name, CorpusOutcome::Decrypted);
@@ -829,7 +833,8 @@ fn decrypts_dh_es_concatkdf_with_pinned_domain_and_parties() {
     let actual = DecryptContext::new(&resolver)
         .policy(policy)
         .decrypt_document(&xml, None)
-        .unwrap();
+        .unwrap()
+        .output;
     let expected = std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap();
     let c14n = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
     assert_eq!(
@@ -1025,7 +1030,9 @@ fn classifies_all_pinned_xdh_concat_and_hkdf_vectors() {
                 );
                 continue;
             }
-            let actual = result.unwrap_or_else(|error| panic!("{name}: {error}"));
+            let actual = result
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .output;
             let plaintext = std::fs::read(format!("{VECTOR_DIR}/{name}.data")).unwrap();
             let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
             assert_eq!(
@@ -1054,7 +1061,8 @@ fn decrypts_xmlsec1_direct_aes_keyname_vectors() {
             .expect("tracked donor plaintext must be readable");
         let key = keys.get(key_name).expect("named donor AES key must exist");
         let decrypted = decrypt(&xml, &SymmetricKeyDecryptor::new(key.clone()))
-            .expect("xmlsec1 donor ciphertext must decrypt");
+            .expect("xmlsec1 donor ciphertext must decrypt")
+            .output;
         assert_eq!(decrypted, DecryptedContent::Bytes(expected), "{name}");
         completed_vector(VECTOR_DIR, name, CorpusOutcome::Decrypted);
     }
@@ -1103,7 +1111,8 @@ fn decrypts_aleksey_legacy_direct_and_reference_shapes() {
         if xml_output {
             let actual = context
                 .decrypt_document(&encrypted, None)
-                .unwrap_or_else(|error| panic!("{name}: {error}"));
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .output;
             let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
             assert_eq!(
                 canonicalize_dtd_document(&actual, &algorithm),
@@ -1149,7 +1158,7 @@ fn decrypts_aleksey_legacy_direct_and_reference_shapes() {
                 value: STANDARD.encode(ciphertext),
             };
             assert_eq!(
-                context.decrypt_data(&parsed).unwrap(),
+                context.decrypt_data(&parsed).unwrap().output,
                 DecryptedContent::Bytes(expected),
                 "{name}"
             );
@@ -1157,7 +1166,8 @@ fn decrypts_aleksey_legacy_direct_and_reference_shapes() {
             assert_eq!(
                 context
                     .decrypt(&encrypted)
-                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .output,
                 DecryptedContent::Bytes(expected),
                 "{name}"
             );
@@ -1210,7 +1220,8 @@ fn decrypts_aleksey_rsa_oaep_document_vectors() {
             Some("ED"),
             &PrivateKeyDecryptor::new(private_key.clone()),
         )
-        .unwrap_or_else(|error| panic!("{name} must decrypt: {error}"));
+        .unwrap_or_else(|error| panic!("{name} must decrypt: {error}"))
+        .output;
         let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
         let actual_c14n = canonicalize_xml(decrypted.as_bytes(), &algorithm)
             .expect("decrypted Aleksey document must canonicalize");
@@ -1244,7 +1255,8 @@ fn decrypts_each_recipient_in_the_two_transport_key_vector() {
         let actual = DecryptContext::new(&resolver)
             .policy(policy.clone())
             .decrypt_document(&xml, None)
-            .unwrap_or_else(|error| panic!("recipient {bits}: {error}"));
+            .unwrap_or_else(|error| panic!("recipient {bits}: {error}"))
+            .output;
         assert_eq!(
             canonicalize_dtd_document(&actual, &c14n),
             canonicalize_dtd_document(std::str::from_utf8(&expected).unwrap(), &c14n),
@@ -1330,7 +1342,8 @@ fn decrypts_rsa15_documents_with_certificate_selector_metadata() {
         let expected = std::fs::read_to_string(format!("{VECTOR_DIR}/{name}.data")).unwrap();
         let actual = context
             .decrypt_document(&xml, None)
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+            .output;
         assert_eq!(
             canonicalize_dtd_document(&actual, &c14n),
             canonicalize_dtd_document(&expected, &c14n),
@@ -1368,7 +1381,8 @@ fn legacy_oaep_donor_hashes_require_permission_then_decrypt() {
             let plaintext = DecryptContext::new(&resolver)
                 .policy(policy.clone())
                 .decrypt_document(&xml, Some("ED"))
-                .unwrap();
+                .unwrap()
+                .output;
             let c14n = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
             assert_eq!(
                 canonicalize_xml(plaintext.as_bytes(), &c14n).unwrap(),
@@ -1422,7 +1436,8 @@ fn decrypts_merlin_standalone_aes128_cbc_vector() {
     let key = keys.get("job").expect("Merlin job key must exist");
     assert_eq!(
         decrypt_data(&parsed, &SymmetricKeyDecryptor::new(key.clone()))
-            .expect("Merlin AES-128-CBC vector must decrypt"),
+            .expect("Merlin AES-128-CBC vector must decrypt")
+            .output,
         DecryptedContent::Bytes(expected)
     );
 }
@@ -1506,7 +1521,8 @@ fn replaces_merlin_aes256_cbc_encrypted_content() {
     let decrypted = DecryptContext::new(&SymmetricKeyDecryptor::new(key.clone()))
         .policy(policy)
         .decrypt_document(&encrypted, Some("encrypt-data-0"))
-        .expect("Merlin encrypted Content must be replaced");
+        .expect("Merlin encrypted Content must be replaced")
+        .output;
     let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
     let actual_c14n = canonicalize_dtd_document(&decrypted, &algorithm);
     let expected = std::str::from_utf8(&expected).expect("Merlin plaintext must be UTF-8");
@@ -1545,7 +1561,7 @@ fn decrypts_merlin_signature_documents_without_mutating_other_targets() {
             .find(|node| node.attribute("Id") == Some("encrypt-data-0"))
             .unwrap();
         let cipher = parse_encrypted_data(&xml[target.range()]).unwrap();
-        let DecryptedContent::Xml(decrypted) = context.decrypt_data(&cipher).unwrap() else {
+        let DecryptedContent::Xml(decrypted) = context.decrypt_data(&cipher).unwrap().output else {
             panic!("{name}: Content plaintext must be XML");
         };
         let wrapper =
@@ -1561,9 +1577,10 @@ fn decrypts_merlin_signature_documents_without_mutating_other_targets() {
             expected_content,
             &xml[target.range().end..]
         );
-        let actual = context
+        let decrypted = context
             .decrypt_document(&xml, Some("encrypt-data-0"))
             .unwrap();
+        let actual = decrypted.output;
         assert_eq!(
             canonicalize_xml(actual.as_bytes(), &algorithm).unwrap(),
             canonicalize_xml(expected.as_bytes(), &algorithm).unwrap(),
@@ -1587,10 +1604,12 @@ fn decrypts_merlin_signature_documents_without_mutating_other_targets() {
             );
         }
         let mut owned = xml_sec::XmlDocument::parse(&xml).unwrap();
-        context
+        let owned_audit = context
             .decrypt_owned_document(&mut owned, Some("encrypt-data-0"))
             .unwrap();
         assert_eq!(owned.as_xml(), actual, "{name}: owned replacement differs");
+        // Both entry points run one operation, so its policy decided alike.
+        assert_eq!(owned_audit, decrypted.policy, "{name}: audit differs");
         completed_vector(MERLIN_DIR, name, CorpusOutcome::Decrypted);
     }
 }
@@ -1679,14 +1698,16 @@ fn decrypts_merlin_direct_and_wrapped_document_shapes() {
             assert_eq!(
                 context
                     .decrypt(&encrypted)
-                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .output,
                 DecryptedContent::Bytes(expected),
                 "{name}"
             );
         } else {
             let actual = context
                 .decrypt_document(&encrypted, None)
-                .unwrap_or_else(|error| panic!("{name}: {error}"));
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .output;
             let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
             assert_eq!(
                 canonicalize_dtd_document(&actual, &algorithm),
@@ -1730,14 +1751,16 @@ fn decrypts_merlin_rsa_transport_shapes() {
             assert_eq!(
                 context
                     .decrypt(&encrypted)
-                    .unwrap_or_else(|error| panic!("{name}: {error}")),
+                    .unwrap_or_else(|error| panic!("{name}: {error}"))
+                    .output,
                 DecryptedContent::Bytes(expected),
                 "{name}"
             );
         } else {
             let actual = context
                 .decrypt_document(&encrypted, None)
-                .unwrap_or_else(|error| panic!("{name}: {error}"));
+                .unwrap_or_else(|error| panic!("{name}: {error}"))
+                .output;
             let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
             assert_eq!(
                 canonicalize_dtd_document(&actual, &algorithm),
@@ -1767,7 +1790,8 @@ fn decrypts_merlin_same_document_cipher_reference() {
     let actual = DecryptContext::new(&resolver)
         .policy(policy)
         .decrypt_document(&encrypted, None)
-        .unwrap();
+        .unwrap()
+        .output;
     let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);
     assert_eq!(
         canonicalize_dtd_document(&actual, &algorithm),
@@ -1790,7 +1814,8 @@ fn decrypts_merlin_carried_key_name_without_altering_other_recipients() {
     let plain = std::fs::read_to_string(format!("{MERLIN_DIR}/plaintext.xml")).unwrap();
     let actual = DecryptContext::new(&resolver)
         .decrypt_document(&encrypted, None)
-        .unwrap();
+        .unwrap()
+        .output;
     let plain_document = Document::parse(&plain).unwrap();
     let payment = plain_document
         .descendants()
@@ -1995,7 +2020,7 @@ fn validates_merlin_rsa_transported_hmac_keys_without_exporting_recovered_keys()
             STANDARD.encode(cipher),
         );
         assert_eq!(
-            context.decrypt(&envelope).unwrap(),
+            context.decrypt(&envelope).unwrap().output,
             DecryptedContent::Bytes(challenge.to_vec()),
             "{name}"
         );
@@ -2155,7 +2180,8 @@ fn decrypts_merlin_dh_encryption_vectors(dh: &MerlinDh) {
         let actual = DecryptContext::new(&resolver)
             .policy(dh.policy.clone())
             .decrypt_document(&encrypted, None)
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+            .output;
         assert_eq!(
             canonicalize_fixture_document(actual.as_bytes()),
             canonicalize_fixture_document(&expected),
@@ -2504,7 +2530,7 @@ fn classifies_complete_nist_aes_gcm_corpus() {
                     .decode(encoded.trim())
                     .expect("NIST plaintext must be base64");
                 assert_eq!(
-                    result.expect("valid NIST vector must decrypt"),
+                    result.expect("valid NIST vector must decrypt").output,
                     DecryptedContent::Bytes(expected),
                     "{}",
                     xml_path.display()
@@ -2569,7 +2595,8 @@ fn decrypts_xmlsec1_rsa_oaep_interop_vectors() {
             .expect("xmlsec1 interop RSA key must be valid PKCS#1 DER");
 
         let decrypted = decrypt(&xml, &PrivateKeyDecryptor::new(private_key))
-            .expect("xmlsec1 RSA-OAEP vector must decrypt");
+            .expect("xmlsec1 RSA-OAEP vector must decrypt")
+            .output;
         let DecryptedContent::Xml(plaintext) = decrypted else {
             panic!("donor Type=Element vector must return XML plaintext");
         };
@@ -2586,6 +2613,7 @@ fn decrypts_xmlsec1_rsa_oaep_interop_vectors() {
 fn decrypts_aes_kw_pipeline_and_rejects_wrapped_key_tampering() {
     // Exercises embedded EncryptedKey parsing and RFC 3394 integrity validation,
     // not merely the key unwrap primitive in isolation.
+    use xml_sec::policy::{AlgorithmRole, PolicyDecision};
     let kek = [0x22_u8; 32];
     let session_key = [0x41_u8; 16];
     let plaintext = b"<Assertion ID=\"wrapped\">trusted</Assertion>";
@@ -2601,9 +2629,25 @@ fn decrypts_aes_kw_pipeline_and_rejects_wrapped_key_tampering() {
     let decrypted = decrypt_data(&parsed, &KekDecryptor::new(kek))
         .expect("embedded AES-KW session key must decrypt content");
     assert_eq!(
-        decrypted,
+        decrypted.output,
         DecryptedContent::Xml(String::from_utf8(plaintext.to_vec()).expect("test XML is UTF-8"))
     );
+    // The audit names the content method and the key wrap the policy permitted,
+    // in the order the operation decided them.
+    assert_eq!(
+        decrypted.policy.decisions,
+        [
+            PolicyDecision::Algorithm {
+                role: AlgorithmRole::DataEncryption,
+                uri: "http://www.w3.org/2009/xmlenc11#aes128-gcm".into(),
+            },
+            PolicyDecision::Algorithm {
+                role: AlgorithmRole::KeyWrap,
+                uri: "http://www.w3.org/2001/04/xmlenc#kw-aes256".into(),
+            },
+        ]
+    );
+    assert!(decrypted.policy.identity.is_none());
 
     let last = wrapped_key.len() - 1;
     wrapped_key[last] ^= 1;
@@ -2654,7 +2698,8 @@ fn assert_phaos_document(name: &str, resolver: &dyn xml_sec::xmlenc::DecryptionK
     let expected = std::fs::read(format!("{PHAOS_DIR}/{name}.data"))
         .expect("tracked Phaos plaintext must be readable");
     let decrypted = decrypt_document(&encrypted, Some("ED"), resolver)
-        .unwrap_or_else(|error| panic!("{name} must decrypt: {error}"));
+        .unwrap_or_else(|error| panic!("{name} must decrypt: {error}"))
+        .output;
     assert_eq!(
         canonicalize_fixture_document(decrypted.as_bytes()),
         canonicalize_fixture_document(&expected),
@@ -2779,7 +2824,8 @@ fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
         let actual = DecryptContext::new(resolver.as_ref())
             .policy(policy.clone())
             .decrypt_document(&encrypted, Some("ED"))
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+            .output;
         assert_eq!(
             canonicalize_fixture_document(actual.as_bytes()),
             canonicalize_fixture_document(&expected),
@@ -2789,10 +2835,40 @@ fn decrypts_all_phaos_legacy_transport_and_wrap_vectors() {
     }
 }
 
+/// The DH public value of the originator certificate in `node`'s `KeyInfo`.
+#[cfg(feature = "legacy-algorithms")]
+fn originator_dh_public_key(node: xml_sec::Node<'_, '_>) -> Vec<u8> {
+    use der::Decode as _;
+    let certificate = node
+        .descendants()
+        .find(|n| n.tag_name().name() == "X509Certificate")
+        .expect("originator certificate");
+    let certificate = STANDARD
+        .decode(
+            certificate
+                .text()
+                .expect("certificate bytes")
+                .split_whitespace()
+                .collect::<String>(),
+        )
+        .expect("certificate base64");
+    let certificate =
+        x509_cert::Certificate::from_der(&certificate).expect("originator certificate DER");
+    let peer_der = certificate
+        .tbs_certificate()
+        .subject_public_key_info()
+        .subject_public_key
+        .as_bytes()
+        .expect("byte-aligned DH public key");
+    der::asn1::UintRef::from_der(peer_der)
+        .expect("DH public integer")
+        .as_bytes()
+        .to_vec()
+}
+
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn decrypts_all_phaos_dh_vectors_from_original_text_key() {
-    use der::Decode as _;
     use xml_sec::policy::{DecryptionPolicy, KeyAgreementAlgorithm};
     use xml_sec::provider::{RUST_CRYPTO_PROVIDER, RustCryptoDhKey};
     use xml_sec::xmlenc::{
@@ -2857,38 +2933,18 @@ fn decrypts_all_phaos_dh_vectors_from_original_text_key() {
             .expect("EncryptedData");
         let parsed = xml_sec::xmlenc::parse_encrypted_data_node_with_policy(node, &policy)
             .expect("DH agreement metadata");
-        let certificate = node
-            .descendants()
-            .find(|n| n.tag_name().name() == "X509Certificate")
-            .expect("originator certificate");
-        let certificate = STANDARD
-            .decode(
-                certificate
-                    .text()
-                    .expect("certificate bytes")
-                    .split_whitespace()
-                    .collect::<String>(),
-            )
-            .expect("certificate base64");
-        let certificate =
-            x509_cert::Certificate::from_der(&certificate).expect("originator certificate DER");
-        let peer_der = certificate
-            .tbs_certificate()
-            .subject_public_key_info()
-            .subject_public_key
-            .as_bytes()
-            .expect("byte-aligned DH public key");
-        let peer = der::asn1::UintRef::from_der(peer_der).expect("DH public integer");
+        let peer = originator_dh_public_key(node);
         let resolver = AgreementDecryptor::content(
             &parsed.agreement_methods[0],
             &key,
-            peer.as_bytes(),
+            &peer,
             D::from_uri(&parsed.encryption_method.algorithm).expect("donor content algorithm"),
         );
         let actual = DecryptContext::new(&resolver)
             .policy(policy.clone())
             .decrypt_document(&xml, Some("ED"))
-            .unwrap_or_else(|error| panic!("{name}: {error}"));
+            .unwrap_or_else(|error| panic!("{name}: {error}"))
+            .output;
         assert_eq!(
             canonicalize_xml(actual.as_bytes(), &algorithm).expect("decrypted payment C14N"),
             canonicalize_xml(&expected, &algorithm).expect("original payment C14N"),

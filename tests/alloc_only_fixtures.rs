@@ -56,10 +56,12 @@ fn two_signatures_over_distinct_ids() {
             "<root><payload ID=\"first\">one</payload><payload ID=\"second\">two</payload></root>",
             &reference("#first"),
         )
-        .unwrap();
+        .unwrap()
+        .output;
     let xml = SignContext::new(&second)
         .sign_with_builder(&xml, &reference("#second"))
-        .unwrap();
+        .unwrap()
+        .output;
     check("two-signatures.xml", &xml);
 }
 
@@ -83,6 +85,7 @@ fn detached_payload_signature() {
             "<root><payload ID=\"local\">here</payload></root>",
             &builder,
         )
-        .unwrap();
+        .unwrap()
+        .output;
     check("detached.xml", &xml);
 }

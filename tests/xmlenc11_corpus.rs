@@ -197,6 +197,7 @@ fn decrypt_case(
             .policy(policy.clone())
             .xml_backend(backend)
             .decrypt(xml)
+            .map(|decrypted| decrypted.output)
     };
     match case.credential {
         Credential::Aes => {

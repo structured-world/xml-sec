@@ -128,5 +128,6 @@ atomically as the next revision, or publishes nothing when it is refused.
 `load` hands an operation one snapshot that later publications do not change.
 Every published `CompiledPolicies` carries a `PolicyIdentity`: profile name,
 schema version, revision and the SHA-256 of the `to_toml` effective output, so
-equal enforced settings have equal digests. The
+equal enforced settings have equal digests. Each operation returns that identity
+with its decisions in its `PolicyAudit`. The
 [deployment runbook](deployment.md#hot-reload) covers reload and rollback.

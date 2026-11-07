@@ -84,7 +84,8 @@ fn plaintext_is_not_allocated_while_the_base64_copy_is_held() {
     let decrypt = peak_growth(|| {
         let content = DecryptContext::new(&decryptor)
             .decrypt(&encrypted)
-            .expect("decrypt");
+            .expect("decrypt")
+            .output;
         assert!(matches!(&content, DecryptedContent::Bytes(bytes) if bytes.len() == PAYLOAD));
         content
     });

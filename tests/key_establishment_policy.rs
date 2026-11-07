@@ -227,7 +227,8 @@ fn public_ecdh_encryption_roundtrips_each_named_curve() {
         assert_eq!(
             DecryptContext::new(&resolver)
                 .decrypt(&encrypted.encrypted_data_xml)
-                .unwrap(),
+                .unwrap()
+                .output,
             xml_sec::xmlenc::DecryptedContent::Bytes(b"ECDH payload".to_vec()),
             "{curve:?}"
         );
@@ -293,7 +294,8 @@ fn public_encryption_and_decryption_agree_without_exporting_secret() {
     assert_eq!(
         DecryptContext::new(&resolver)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"agreement payload".to_vec())
     );
     // Invalid or non-contributory peers must never become KDF input, even
@@ -353,7 +355,8 @@ fn encryption_defers_derivation_to_final_operation_policy() {
     assert_eq!(
         DecryptContext::new(&resolver)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
     );
     let wrong_width = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes256Gcm)
@@ -478,7 +481,8 @@ fn xml_derivation_matches_context_before_provider_work() {
         DecryptContext::new(&resolver)
             .provider(&provider)
             .decrypt(&named)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
@@ -506,7 +510,10 @@ fn xml_derivation_omission_requires_explicit_request_method() {
         DataEncryptionAlgorithm::Aes128Gcm,
     );
     assert_eq!(
-        DecryptContext::new(&resolver).decrypt(&omitted).unwrap(),
+        DecryptContext::new(&resolver)
+            .decrypt(&omitted)
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
     );
 }
@@ -697,7 +704,8 @@ fn public_decrypt_uses_operation_policy_for_derived_content_keys() {
         DecryptContext::new(&resolver)
             .provider(&provider)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"derived content".to_vec())
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
@@ -752,7 +760,8 @@ fn derived_wrapping_key_recovers_a_different_width_content_key() {
         DecryptContext::new(&resolver)
             .provider(&provider)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"derived wrapping key".to_vec())
     );
     assert_eq!(provider.calls.load(Ordering::Relaxed), 1);
@@ -985,7 +994,8 @@ fn public_decrypt_executes_agreement_and_kdf_inside_resolution() {
     assert_eq!(
         DecryptContext::new(&resolver)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"agreement content".to_vec())
     );
 }

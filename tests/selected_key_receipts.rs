@@ -127,7 +127,8 @@ fn fixed_format_eddsa_keys_report_proven_mismatch() {
         let document = XmlDocument::parse(
             SignContext::new(&signer)
                 .sign_with_builder("<root/>", &builder)
-                .unwrap(),
+                .unwrap()
+                .output,
         )
         .unwrap();
         let key = VerificationKey {
@@ -203,7 +204,8 @@ fn signed() -> XmlDocument {
     XmlDocument::parse(
         SignContext::new(&signer)
             .sign_with_builder("<root/>", &builder)
-            .unwrap(),
+            .unwrap()
+            .output,
     )
     .unwrap()
 }
@@ -223,6 +225,7 @@ fn signed_named(id: &str) -> String {
             &builder,
         )
         .unwrap()
+        .output
 }
 
 #[test]
@@ -553,7 +556,8 @@ fn equivalent_ec_encodings_use_only_the_selected_providers_semantics() {
     let document = XmlDocument::parse(
         SignContext::new(&signer)
             .sign_with_builder("<root/>", &builder)
-            .unwrap(),
+            .unwrap()
+            .output,
     )
     .unwrap();
     let key = VerificationKey {
@@ -687,7 +691,8 @@ fn pss_method_compatibility_does_not_erase_effective_key_restrictions() {
     let document = XmlDocument::parse(
         SignContext::new(&signer)
             .sign_with_builder("<root/>", &builder)
-            .unwrap(),
+            .unwrap()
+            .output,
     )
     .unwrap();
     let key = VerificationKey {

@@ -2804,7 +2804,9 @@ mod tests {
                 .uri("")
                 .transform(super::super::Transform::Enveloped),
         );
-        let xml = super::super::SignContext::new(signer).sign_with_builder("<root/>", &builder)?;
+        let xml = super::super::SignContext::new(signer)
+            .sign_with_builder("<root/>", &builder)?
+            .output;
         let document = crate::XmlDocument::parse(xml)?;
         let context = super::super::VerifyContext::new().key(&verification_key);
         super::super::with_verified_request(

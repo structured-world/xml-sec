@@ -70,6 +70,9 @@ impl PolicyStore {
     /// # Errors
     /// Returns a schema error when `source` names another profile than this
     /// store's, and every [`Configuration::compile`] refusal.
+    ///
+    /// # Panics
+    /// Panics if the store has already published `u64::MAX` revisions.
     pub fn replace(&self, source: Source<'_>) -> Result<Arc<CompiledPolicies>, Error> {
         if source.profile != self.profile {
             return Err(Error::Schema(format!(

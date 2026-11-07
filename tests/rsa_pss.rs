@@ -184,7 +184,8 @@ fn pss_family_permission_preserves_independent_legacy_gate() {
     let signed = SignContext::new(&key)
         .policy(signing)
         .sign_with_builder("<root/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     policy.parameterized_rsa_pss = xml_sec::policy::RsaPssPermission::AllSupported;
     let verification = xml_sec::xmldsig::VerificationKey {
         algorithm: method,
@@ -395,7 +396,8 @@ fn pss_public_sign_and_verify_all_secure_methods() {
                 "<root><payload Id=\"payload\">value</payload></root>",
                 &builder,
             )
-            .unwrap();
+            .unwrap()
+            .output;
         let resolver = xml_sec::xmldsig::DefaultKeyResolver::default();
         let result = cryptographic::context()
             .key_resolver(&resolver)
@@ -816,7 +818,8 @@ fn pss_donor_family_verifies_and_signs_every_template() {
             let signed = SignContext::new(&key)
                 .policy(signing.clone())
                 .sign_template(&template)
-                .unwrap();
+                .unwrap()
+                .output;
             if std::env::var_os("XMLSEC1_BIN").is_some() {
                 assert!(xmlsec1::is_available(), "{}", xmlsec1::skip_reason());
                 let directory = tempfile::tempdir().unwrap();
