@@ -47,6 +47,10 @@ required-features = ["produce"]
 name = "augment_probe"
 required-features = ["produce"]
 
+[[example]]
+name = "lifecycle_probe"
+required-features = ["produce"]
+
 [[bench]]
 name = "lifecycle"
 harness = false

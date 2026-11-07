@@ -183,8 +183,9 @@ fn execute(corpus: &Corpus, output: &Path) -> Result<(), String> {
     )?;
     super::levels::execute(corpus, &output.join("levels"))?;
     super::creation::execute(corpus, &output.join("creation"))?;
+    super::lifecycle::execute(corpus, &output.join("lifecycle"), false)?;
     println!(
-        "verified: live XMLDSig/XAdES, {count} independent octet vectors, DSS, strict-policy, baseline-level and created-signature expectations"
+        "verified: live XMLDSig/XAdES, {count} independent octet vectors, DSS, strict-policy, baseline-level, created-signature and bidirectional lifecycle expectations"
     );
     Ok(())
 }
