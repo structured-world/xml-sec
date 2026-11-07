@@ -21,6 +21,7 @@ base64 = { version = "0.23", default-features = false, features = ["alloc"], opt
 base64 = "0.23"
 divan = "0.1.21"
 roxmltree = "0.21"
+serde_json = "1"
 
 [features]
 default = ["std", "xml-backend-xmloxide"]
@@ -38,6 +39,9 @@ std = [
 ]
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide"]
 xml-backend-roxmltree = ["xml-sec/xml-backend-roxmltree"]
+# Benchmark instrumentation of the probe examples: a counting global allocator
+# in a separate build whose timings are never reported. The library is unchanged.
+allocation-profile = []
 
 [[example]]
 name = "create_probe"
