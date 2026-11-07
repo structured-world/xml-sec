@@ -231,6 +231,36 @@ fn both_token_profiles_meet_every_level_on_der_tokens() {
     }
 }
 
+/// `xml` with its first token's outer `ContentInfo` re-encoded in the indefinite
+/// length form: valid BER (X.690 §8.1.3.6) that DER forbids (X.690 §10.1), with
+/// every signed byte unchanged.
+fn indefinite_token(xml: &str) -> String {
+    let value = token_value(xml, 0);
+    let der = STANDARD.decode(value).expect("base64");
+    assert_eq!(der[..2], [0x30, 0x82], "a long-form SEQUENCE");
+    let mut ber = vec![0x30, 0x80];
+    ber.extend_from_slice(&der[4..]);
+    ber.extend_from_slice(&[0, 0]);
+    xml.replace(value, &STANDARD.encode(ber))
+}
+
+#[test]
+fn a_ber_root_token_meets_b_t_only_under_the_cms_reading() {
+    // EN 319 132-1 §5.1.3 lets the declared reading refuse a non-DER token,
+    // while the CMS reading accepts it; the evidence must come from the same
+    // BER reading rather than a DER re-read of the root token.
+    let xml = indefinite_token(B_T);
+    let given = Given {
+        anchors: &[ROOT],
+        cms: true,
+        ..Given::default()
+    };
+    let result = met(&xml, Requirements::Timestamped, &given);
+    assert!(matches!(result, Ok(Outcome::Assessed(true))), "{result:?}");
+    let result = level(&xml, Requirements::Timestamped, &[ROOT], &[]);
+    assert!(!matches!(result, Ok(Outcome::Assessed(true))), "{result:?}");
+}
+
 #[test]
 fn a_changed_token_never_yields_evidence() {
     // A change inside the signed token breaks its CMS signature or its imprint.

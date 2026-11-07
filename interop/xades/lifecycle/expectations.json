@@ -6,7 +6,7 @@
     "trust": "DSS reports indication/subindication under its default policy with the run's root as the only anchor. xml-sec gives no trust verdict: statuses are the caller's reading. B-B and B-T stay INDETERMINATE/CERTIFICATE_CHAIN_GENERAL_FAILURE for DSS because no revocation data exists before B-LT.",
     "preserved": "SignedInfo and SignatureValue of the B-B signature appear byte for byte in every later document.",
     "Tokens": "xml-sec under TimestampTokenEncoding::Declared refuses a token DSS made: BouncyCastle writes its certificate SET OF unsorted, which is not DER, and an unmarked token is DER (EN 319 132-1 §5.1.3). Normative difference, intended.",
-    "Timestamp": "Known defect, not a normative difference: under TimestampTokenEncoding::Ber the token pool reads the same token as RFC 5652 BER, but structured-xades 0.21 checks a root timestamp by re-reading it in its declared XML encoding (DER), so the check refuses SetOrder. Reported to the signature-primitives owner; the BER rows and xml-sec's renewal of a DSS archive change when the shared check honours the token profile.",
+    "unmet": "Under TimestampTokenEncoding::Ber xml-sec reads DSS's tokens and finds DSS's B-T met, but not the B-LT and B-LTA DSS makes: DSS places the CRL that covers the TSA certificate only in RevocationValues, while EN 319 132-1 §6.3(x) requires the validation data of a time-stamp in TimeStampValidationData, AnyValidationData or the token itself. Normative difference, intended. xml-sec therefore refuses to renew such an archive (§6.3(aa)).",
     "revoked": "The CRL lists the signer as revoked before signing. DSS refuses to augment to B-LT or to renew; xml-sec adds the evidence, because a level states what the document carries, and DSS then reads it as INDETERMINATE/REVOKED_NO_POE.",
     "crl": "Every certificate of the run carries a CRL distribution point that is never fetched: DSS looks a CRL up only through one (RFC 5280 §4.2.1.13), while the run supplies the CRLs offline."
   },
@@ -38,7 +38,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -50,7 +50,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -62,14 +62,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -101,7 +101,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -113,7 +113,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -125,14 +125,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -164,7 +164,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -176,7 +176,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -188,14 +188,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -227,7 +227,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -239,7 +239,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -251,14 +251,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -290,7 +290,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -302,7 +302,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -314,14 +314,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -353,7 +353,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -365,7 +365,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -377,14 +377,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -416,7 +416,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -428,7 +428,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -440,14 +440,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -479,7 +479,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -491,7 +491,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -503,14 +503,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -542,7 +542,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -554,7 +554,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -566,14 +566,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -605,7 +605,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -617,7 +617,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -629,14 +629,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -668,7 +668,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -680,7 +680,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -692,14 +692,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -731,7 +731,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -743,7 +743,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -755,14 +755,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -794,7 +794,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -806,7 +806,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -818,14 +818,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -857,7 +857,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -869,7 +869,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -881,14 +881,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -920,7 +920,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -932,7 +932,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -944,14 +944,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -983,7 +983,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -995,7 +995,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
@@ -1007,14 +1007,14 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "unmet"
           }
         },
         {
           "step": "renew",
           "by": "xml-sec",
           "made": {
-            "refused": "validation data: timestamp check failed: Token"
+            "refused": "completion: the required level is not met: Assessed(())"
           }
         }
       ]
@@ -1046,7 +1046,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         },
         {
@@ -1129,7 +1129,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1205,7 +1205,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1281,7 +1281,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1357,7 +1357,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1433,7 +1433,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1509,7 +1509,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1585,7 +1585,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1661,7 +1661,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1737,7 +1737,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1813,7 +1813,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1889,7 +1889,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -1965,7 +1965,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -2041,7 +2041,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -2117,7 +2117,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -2193,7 +2193,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
@@ -2269,7 +2269,7 @@
             "crypto": "Valid",
             "structure": "Tokens",
             "trust": "not assessed",
-            "structure_ber": "Timestamp"
+            "structure_ber": "met"
           }
         }
       ]
