@@ -171,7 +171,7 @@ impl Levels<'_> {
     /// The hexadecimal serial number of `subject`'s certificate.
     fn serial(&self, subject: &str) -> Result<String, String> {
         let certificate = format!("{subject}.pem");
-        let serial = Command::new("openssl")
+        let serial = Command::new(&self.generator.openssl)
             .args(["x509", "-in", &certificate, "-noout", "-serial"])
             .current_dir(&self.generator.work)
             .output()

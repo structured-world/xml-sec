@@ -429,6 +429,7 @@ fn explicit_outputs_get_their_missing_parents_before_any_engine_runs() {
     let corpus = Corpus {
         root: directory.path().to_owned(),
         xmlsec: "/nonexistent/xmlsec1".into(),
+        openssl: "openssl".into(),
     };
     let results = directory.path().join("missing-parent/evidence");
     assert!(super::corpus::run_all(&corpus, &results).is_err());

@@ -71,16 +71,37 @@ fn preservation_requires_both_signature_parts_unchanged() {
     // value, no longer carries the created signature.
     let created = "<S><SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue></S>";
     let augmented = "<S><SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue><Q/></S>";
-    assert!(preserved(created, augmented));
-    assert!(!preserved(
-        created,
+    let kept = |later: &str| preserved(created, created, later).unwrap();
+    assert!(kept(augmented));
+    assert!(!kept(
         "<S><SignedInfo >a</SignedInfo><SignatureValue>v</SignatureValue></S>"
     ));
-    assert!(!preserved(
-        created,
+    assert!(!kept(
         "<S><SignedInfo>a</SignedInfo><SignatureValue>w</SignatureValue></S>"
     ));
-    assert!(!preserved("<S/>", created));
+    assert!(!preserved("<S/>", "<S/>", created).unwrap());
+}
+
+#[test]
+fn preservation_requires_earlier_unsigned_properties_unchanged() {
+    // A later step only appends: rewriting or dropping a property an earlier
+    // step made, such as its timestamp or evidence, is not preservation.
+    let signed = "<SignedInfo>a</SignedInfo><SignatureValue>v</SignatureValue>";
+    let document = |unsigned: &str| {
+        format!(
+            "<S>{signed}<UnsignedSignatureProperties>{unsigned}</UnsignedSignatureProperties></S>"
+        )
+    };
+    let timestamped = document(r#"<T xmlns:a="urn:a">1</T>"#);
+    let kept = |later: &str| preserved(&timestamped, &timestamped, later).unwrap();
+    assert!(kept(&document(r#"<T xmlns:a="urn:a">1</T><V>2</V>"#)));
+    // An archive timestamp covers the exclusive canonical form, so dropping a
+    // namespace declaration nothing uses, as EU DSS does when it serializes
+    // the document again, changes nothing it covers.
+    assert!(kept(&document("<T>1</T><V>2</V>")));
+    assert!(!kept(&document("<T>9</T><V>2</V>")));
+    assert!(!kept(&document("<V>2</V><T>1</T>")));
+    assert!(!kept(&format!("<S>{signed}</S>")));
 }
 
 #[test]
@@ -133,6 +154,15 @@ fn a_refusal_is_the_stated_reason_not_a_stack_frame() {
             "Error: \"validation data: timestamp check failed: Token(Callback { offset: 1100 })\"\n"
         ),
         "validation data: timestamp check failed: Token"
+    );
+    // A variant's payload is cut whatever it opens with, so a unit or tuple
+    // payload is no part of the recorded reason; only the variant name is.
+    assert_eq!(
+        refusal(
+            "",
+            "Error: \"completion: the required level is not met: Assessed(())\"\n"
+        ),
+        "completion: the required level is not met: Assessed"
     );
 }
 

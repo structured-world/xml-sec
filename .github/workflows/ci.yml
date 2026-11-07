@@ -501,6 +501,7 @@ jobs:
       - name: Provision pinned XML signature oracle
         run: |
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
+          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Verify live XMLDSig and XAdES corpus results
         run: cargo run --quiet -p xml-sec-tools -- xades check --output "$RUNNER_TEMP/xades-interop"
       - uses: actions/upload-artifact@v7

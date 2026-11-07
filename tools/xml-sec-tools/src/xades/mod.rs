@@ -39,16 +39,25 @@ pub(crate) fn line(parts: &[&dyn AsRef<OsStr>]) -> Vec<OsString> {
 pub(crate) struct Corpus {
     pub(crate) root: PathBuf,
     pub(crate) xmlsec: OsString,
+    /// The OpenSSL that issues every PKI and token: certificate validity
+    /// options need OpenSSL 3.4 or later, which the provisioned oracle has and
+    /// a distribution's may not.
+    pub(crate) openssl: OsString,
 }
 
 impl Corpus {
-    /// The checkout's corpus with `XMLSEC1_BIN`, or `xmlsec1` from `PATH`.
+    /// The checkout's corpus with `XMLSEC1_BIN` and `OPENSSL_BIN`, or
+    /// `xmlsec1` and `openssl` from `PATH`.
     pub(crate) fn from_env() -> Self {
+        let binary = |variable: &str, default: &str| {
+            std::env::var_os(variable)
+                .filter(|binary| !binary.is_empty())
+                .unwrap_or_else(|| default.into())
+        };
         Self {
             root: crate::repo::root(),
-            xmlsec: std::env::var_os("XMLSEC1_BIN")
-                .filter(|binary| !binary.is_empty())
-                .unwrap_or_else(|| "xmlsec1".into()),
+            xmlsec: binary("XMLSEC1_BIN", "xmlsec1"),
+            openssl: binary("OPENSSL_BIN", "openssl"),
         }
     }
 

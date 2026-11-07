@@ -24,6 +24,7 @@ use serde_json::{Map, Value, json};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 
 #[cfg(test)]
 mod tests;
@@ -219,11 +220,50 @@ pub(crate) fn element<'a>(text: &'a str, local: &str) -> Option<&'a str> {
     None
 }
 
-/// Whether `later` keeps the signature of `created` byte for byte.
-pub(crate) fn preserved(created: &str, later: &str) -> bool {
-    ["SignedInfo", "SignatureValue"].iter().all(|local| {
+/// The exclusive canonical form of every property of the first
+/// `UnsignedSignatureProperties` of `text`, in document order. An archive
+/// timestamp covers this form (EN 319 132-1 §5.5.2), so a serializer may drop
+/// a redundant namespace declaration without changing what it covers.
+fn unsigned_properties(text: &str) -> Result<Vec<Vec<u8>>, String> {
+    let document = xml::parse(text, "lifecycle document")?;
+    let Some(properties) = document
+        .root_element()
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "UnsignedSignatureProperties")
+    else {
+        return Ok(Vec::new());
+    };
+    let algorithm = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    properties
+        .children()
+        .filter(xml::Node::is_element)
+        .map(|property| {
+            let within = |node: xml::Node<'_, '_>| {
+                node.id() == property.id()
+                    || node
+                        .ancestors()
+                        .any(|ancestor| ancestor.id() == property.id())
+            };
+            let mut canonical = Vec::new();
+            canonicalize(&document, Some(&within), &algorithm, &mut canonical)
+                .map_err(|error| format!("canonicalize an unsigned property: {error}"))?;
+            Ok(canonical)
+        })
+        .collect()
+}
+
+/// Whether `later` keeps the signature of `created` byte for byte and every
+/// unsigned property of `previous` canonically unchanged and in place: a step
+/// only appends properties.
+pub(crate) fn preserved(created: &str, previous: &str, later: &str) -> Result<bool, String> {
+    let signature = ["SignedInfo", "SignatureValue"].iter().all(|local| {
         element(created, local).is_some_and(|bytes| element(later, local) == Some(bytes))
-    })
+    });
+    if !signature {
+        return Ok(false);
+    }
+    let earlier = unsigned_properties(previous)?;
+    Ok(unsigned_properties(later)?.starts_with(&earlier))
 }
 
 /// What xml-sec's `level_probe` reports, reduced to the compared fields: the
@@ -349,11 +389,18 @@ pub(crate) fn refusal(stdout: &str, stderr: &str) -> String {
         })
         .or_else(|| stderr.lines().rfind(|line| !line.trim().is_empty()))
         .unwrap_or_default();
-    // A Rust `Debug` payload opens with `(` before a capitalized variant; a
-    // parenthesis in prose, as in "certificate(s)", stays.
+    // A Rust `Debug` payload opens with `(` right after a capitalized variant
+    // name or before one; a parenthesis in prose, as in "certificate(s)", stays.
     let payload = reason
         .match_indices('(')
-        .find(|(at, _)| reason[at + 1..].starts_with(|c: char| c.is_ascii_uppercase()))
+        .find(|&(at, _)| {
+            let word = reason[..at]
+                .rsplit(|c: char| !c.is_ascii_alphanumeric())
+                .next()
+                .unwrap_or_default();
+            word.starts_with(|c: char| c.is_ascii_uppercase())
+                || reason[at + 1..].starts_with(|c: char| c.is_ascii_uppercase())
+        })
         .map(|(at, _)| at);
     let end = [" [", " {"]
         .iter()
@@ -425,6 +472,7 @@ impl Run<'_> {
     fn levels(&self) -> Generator {
         Generator {
             xmlsec: self.corpus.xmlsec.clone(),
+            openssl: self.corpus.openssl.clone(),
             work: self.pki.clone(),
             output: self.pki.clone(),
             units: 0,
@@ -668,7 +716,7 @@ impl Run<'_> {
                 }
                 args.extend(line(&[
                     &"--",
-                    &"openssl",
+                    &self.corpus.openssl,
                     &"ts",
                     &"-reply",
                     &"-config",
@@ -767,6 +815,7 @@ impl Run<'_> {
         let mut steps = Vec::new();
         let mut previous: Option<PathBuf> = None;
         let mut created: Option<String> = None;
+        let mut previous_text: Option<String> = None;
         for (name, actor) in case.steps() {
             if name == "lt" || name == "lta" {
                 // Strictly after the token it follows, at one-second resolution.
@@ -794,10 +843,15 @@ impl Run<'_> {
             let output = step.output();
             let text = xml::read(&output)?;
             let created = created.get_or_insert_with(|| text.clone());
-            row.insert("preserved".into(), preserved(created, &text).into());
+            let earlier = previous_text.as_deref().unwrap_or(created);
+            row.insert(
+                "preserved".into(),
+                preserved(created, earlier, &text)?.into(),
+            );
             row.insert("validated".into(), self.validate(&step)?);
             steps.push(Value::Object(row));
             previous = Some(output);
+            previous_text = Some(text);
         }
         Ok(json!({ "case": case.name(), "steps": steps }))
     }
