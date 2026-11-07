@@ -151,3 +151,11 @@ fn cases_are_selected_by_name_or_all() {
     );
     assert!(selected(Some("enveloped-dsa")).is_err());
 }
+
+#[test]
+fn a_case_selected_twice_is_refused() {
+    // A repeated case would rebuild its chain into the directories, and over
+    // the recorded timestamps, of its first pass.
+    let error = selected(Some("enveloped-rsa,detached-ec,enveloped-rsa")).unwrap_err();
+    assert_eq!(error, "case enveloped-rsa is selected twice");
+}

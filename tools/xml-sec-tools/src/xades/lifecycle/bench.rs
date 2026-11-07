@@ -697,7 +697,8 @@ pub(crate) fn case_name(packaging: Packaging, algorithm: Algorithm) -> String {
     format!("{}-{}", packaging.name(), algorithm.name())
 }
 
-/// Every case, or those `selection` names.
+/// Every case, or those `selection` names, each once: a case owns its
+/// directories and recorded timestamps for the whole run.
 pub(crate) fn selected(selection: Option<&str>) -> Result<Vec<(Packaging, Algorithm)>, String> {
     let all: Vec<(Packaging, Algorithm)> = Packaging::ALL
         .iter()
@@ -708,15 +709,19 @@ pub(crate) fn selected(selection: Option<&str>) -> Result<Vec<(Packaging, Algori
     let Some(selection) = selection else {
         return Ok(all);
     };
-    selection
-        .split(',')
-        .map(|name| {
-            all.iter()
-                .find(|(packaging, algorithm)| case_name(*packaging, *algorithm) == name)
-                .copied()
-                .ok_or_else(|| format!("unknown case {name}"))
-        })
-        .collect()
+    let mut chosen = Vec::new();
+    for name in selection.split(',') {
+        let case = all
+            .iter()
+            .find(|(packaging, algorithm)| case_name(*packaging, *algorithm) == name)
+            .copied()
+            .ok_or_else(|| format!("unknown case {name}"))?;
+        if chosen.contains(&case) {
+            return Err(format!("case {name} is selected twice"));
+        }
+        chosen.push(case);
+    }
+    Ok(chosen)
 }
 
 /// The first line a version command printed, on stdout or stderr.

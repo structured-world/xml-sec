@@ -24,7 +24,8 @@
 //! command an unrecorded request is refused, so a timed run never acquires.
 //!
 //! `--samples N` on either command times `N` runs from the serialized input to
-//! the serialized output, after the first run and warmups (see `timing`).
+//! the serialized output, after the first run and warmups (see `timing`). It
+//! takes no TSA command: every run replays the tokens a previous run recorded.
 
 #[path = "support/timing.rs"]
 mod timing;
@@ -545,6 +546,11 @@ impl Options {
 fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
     let split = args.iter().position(|arg| arg == "--").ok_or(AUGMENT)?;
     let command = &args[split + 1..];
+    if samples.is_some() && !command.is_empty() {
+        return Err(
+            "--samples replays recorded tokens: record them first, without --samples".into(),
+        );
+    }
     let Options {
         encoding,
         resources,

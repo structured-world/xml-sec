@@ -28,7 +28,8 @@ import eu.europa.esig.dss.spi.x509.tsp.TSPSource;
  * evidence are loaded once, before any run. Every timestamp comes from
  * {@code TOKENS}: a recorded token answers the identical imprint again, and
  * without {@code --tsa} an unrecorded imprint is refused, so a timed run never
- * acquires. With {@code --samples N} the first run's result is written,
+ * acquires; {@code --samples} takes no {@code --tsa}, every run replays the
+ * tokens a previous run recorded. With {@code --samples N} the first run's result is written,
  * {@code W} warmups follow (three by default) and {@code N} runs are timed;
  * the last stdout line reports
  * them, with the JVM's thread allocation, GC and heap counters of the timed
@@ -136,6 +137,10 @@ public class LifecycleBench {
             case "augment" -> {
                 String tsaStore = take(args, "--tsa");
                 String tsaTime = take(args, "--tsa-time");
+                if (tsaStore != null && count != null) {
+                    throw new IllegalArgumentException(
+                        "--samples replays recorded tokens: record them first, without --samples");
+                }
                 Path input = Path.of(args.get(1));
                 byte[] bytes = Files.readAllBytes(input);
                 String name = input.getFileName().toString();
