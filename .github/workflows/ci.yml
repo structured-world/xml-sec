@@ -503,6 +503,8 @@ jobs:
       - name: Provision pinned XML signature oracle
         env:
           XMLSEC1_MODERN_ORACLE: "1"
+        # The installer keeps that OpenSSL's configuration below the prefix, which
+        # is its OPENSSLDIR, so it needs no OPENSSL_CONF.
         run: |
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
           echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
