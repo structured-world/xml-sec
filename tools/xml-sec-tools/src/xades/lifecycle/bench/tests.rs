@@ -1,4 +1,4 @@
-use super::{Operation, accepted, case_name, distribution, qualified, report, selected};
+use super::{Operation, accepted, case_name, distribution, qualified, report, same_data, selected};
 use crate::xades::lifecycle::{Actor, Algorithm, Packaging};
 use serde_json::json;
 
@@ -150,6 +150,48 @@ fn cases_are_selected_by_name_or_all() {
         "internally-detached-ec"
     );
     assert!(selected(Some("enveloped-dsa")).is_err());
+}
+
+#[test]
+fn creations_compare_only_when_they_sign_the_same_data() {
+    // Two B-B signatures are the same work only over the same data: their
+    // data references agree, whatever their signed properties digest.
+    let signature = |data: &str, properties: &str| {
+        format!(
+            "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>\
+             <ds:Reference URI=\"#document\"><ds:DigestValue>{data}</ds:DigestValue></ds:Reference>\
+             <ds:Reference URI=\"#props\"><ds:DigestValue>{properties}</ds:DigestValue></ds:Reference>\
+             </ds:SignedInfo></ds:Signature>"
+        )
+    };
+    let xml_sec = signature("r3A4", "ORcw");
+    assert!(same_data(&xml_sec, &signature("r3A4", "nqLB")).unwrap());
+    assert!(!same_data(&xml_sec, &signature("jUsJ", "ORcw")).unwrap());
+    assert!(same_data("<Signed/>", &xml_sec).is_err());
+}
+
+#[test]
+fn enveloping_creations_compare_the_data_their_objects_carry() {
+    // xml-sec carries the data element in its Object, DSS the same data
+    // base64-encoded: each reference covers its own Object, so the digests
+    // differ even over the same data, and only the carried data decides.
+    let xml_sec = "<Signed><ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\">\
+        <ds:SignedInfo><ds:Reference URI=\"#sig-object-0\"><ds:DigestValue>2rk/</ds:DigestValue>\
+        </ds:Reference></ds:SignedInfo><ds:Object Id=\"sig-object-0\" MimeType=\"text/xml\">\
+        <Document Id=\"document\"><Data>x</Data></Document></ds:Object></ds:Signature></Signed>";
+    let dss = |content: &str| {
+        format!(
+            "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>\
+             <ds:Reference URI=\"#o-1\"><ds:Transforms>\
+             <ds:Transform Algorithm=\"http://www.w3.org/2000/09/xmldsig#base64\"/>\
+             </ds:Transforms><ds:DigestValue>r3A4</ds:DigestValue></ds:Reference>\
+             </ds:SignedInfo><ds:Object Id=\"o-1\">{content}</ds:Object></ds:Signature>"
+        )
+    };
+    let x = "PERvY3VtZW50IElkPSJkb2N1bWVudCI+PERhdGE+eDwvRGF0YT48L0RvY3VtZW50Pg==";
+    let y = "PERvY3VtZW50IElkPSJkb2N1bWVudCI+PERhdGE+eTwvRGF0YT48L0RvY3VtZW50Pg==";
+    assert!(same_data(xml_sec, &dss(x)).unwrap());
+    assert!(!same_data(xml_sec, &dss(y)).unwrap());
 }
 
 #[test]

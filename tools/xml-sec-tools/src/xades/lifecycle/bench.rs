@@ -8,7 +8,8 @@
 //! other implementation before anything is timed. An operation whose result
 //! the other implementation does not accept at its level is recorded with that
 //! reading and never timed: its work is not equivalent. A validation is timed
-//! only when both implementations accept its input.
+//! only when both implementations accept its input, a creation only when both
+//! signed the same data.
 //!
 //! Timestamp tokens are acquired once, by the run that qualifies a result, and
 //! replayed afterwards; a timed run is given no TSA and fails if it would
@@ -25,18 +26,21 @@ use crate::bench::{
     architecture, capture, cpu_model, digest_file, number, percentile, platform, resources,
     timestamp, to_f64,
 };
-use crate::xades::{Build, Corpus, line, write_json};
+use crate::xades::{Build, Corpus, line, write_json, xml};
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 
 #[cfg(test)]
 mod tests;
 
 /// Repetitions of every warm and cold measurement, in alternating order.
 const REPETITIONS: usize = 3;
+/// The `XMLDSig` base64 transform (`XMLDSig` §6.6.2).
+const BASE64_TRANSFORM: &str = "http://www.w3.org/2000/09/xmldsig#base64";
 
 /// What one sample of each boundary contains.
 pub(crate) const BOUNDARIES: [(&str, &str); 3] = [
@@ -148,6 +152,75 @@ pub(crate) fn qualified(maker: Actor, level: &str, reading: &Value) -> bool {
         }
         Actor::Dss => reading["crypto"] == "Valid" && reading["structure_ber"] == "met",
     }
+}
+
+/// What the data reference of a B-B signature signs.
+#[derive(Debug, PartialEq, Eq)]
+enum Signed {
+    /// The digest of data outside the signature, as its reference states it.
+    Digest(String),
+    /// The data carried in the signature's own `Object`.
+    Carried(Vec<u8>),
+}
+
+/// What the first reference of the B-B signature `text` signs. A reference to
+/// the signature's own `Object` covers that `Object`, whose `Id` and
+/// attributes each implementation chooses, so its data is the content: the
+/// decoded text under a base64 transform (`XMLDSig` §6.6.2), otherwise the
+/// exclusive canonical form of its element.
+fn signed(text: &str, what: &str) -> Result<Signed, String> {
+    use base64::Engine;
+    const DS: &str = crate::xades::DS;
+    let document = xml::parse(text, what)?;
+    let root = document.root_element();
+    let reference = xml::below(root, "Reference", Some(DS))
+        .next()
+        .ok_or_else(|| format!("{what} has no reference"))?;
+    let digest = Signed::Digest(xml::text_at(reference, &["DigestValue"]).unwrap_or_default());
+    let Some(id) = reference
+        .attribute("URI")
+        .and_then(|uri| uri.strip_prefix('#'))
+    else {
+        return Ok(digest);
+    };
+    let Some(object) =
+        xml::below(root, "Object", Some(DS)).find(|object| object.attribute("Id") == Some(id))
+    else {
+        return Ok(digest);
+    };
+    let base64 = xml::below(reference, "Transform", Some(DS))
+        .any(|transform| transform.attribute("Algorithm") == Some(BASE64_TRANSFORM));
+    if base64 {
+        let encoded: String = object
+            .text()
+            .unwrap_or_default()
+            .split_ascii_whitespace()
+            .collect();
+        return base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map(Signed::Carried)
+            .map_err(|error| format!("{what}: the Object is not base64: {error}"));
+    }
+    let element = xml::elements(object)
+        .next()
+        .ok_or_else(|| format!("{what}: the Object carries no element"))?;
+    let within = |node: xml::Node<'_, '_>| {
+        node.id() == element.id() || node.ancestors().any(|above| above.id() == element.id())
+    };
+    let mut canonical = Vec::new();
+    canonicalize(
+        &document,
+        Some(&within),
+        &C14nAlgorithm::new(C14nMode::Exclusive1_0, false),
+        &mut canonical,
+    )
+    .map_err(|error| format!("{what}: canonicalize the Object's element: {error}"))?;
+    Ok(Signed::Carried(canonical))
+}
+
+/// Whether the B-B signatures `xml_sec` and `dss` made sign the same data.
+pub(crate) fn same_data(xml_sec: &str, dss: &str) -> Result<bool, String> {
+    Ok(signed(xml_sec, "xml-sec's signature")? == signed(dss, "DSS's signature")?)
 }
 
 /// Whether `engine`'s own validation `output` accepts its input at `level`.
@@ -618,6 +691,22 @@ impl Bench<'_> {
                     "not_measured".into(),
                     "the other implementation does not accept this input".into(),
                 );
+            }
+        }
+        if target.operation == Operation::Create && measured.len() == 2 {
+            let made = |engine| {
+                crate::xades::read(&target.output(engine))
+                    .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            };
+            if !same_data(&made(Actor::XmlSec)?, &made(Actor::Dss)?)? {
+                // Signing different data is not the same work, however both verify.
+                for (_, index) in measured.drain(..) {
+                    entries[index].insert("qualified".into(), false.into());
+                    entries[index].insert(
+                        "not_measured".into(),
+                        "the implementations signed different data".into(),
+                    );
+                }
             }
         }
         for (_, index) in &measured {

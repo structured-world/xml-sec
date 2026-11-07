@@ -127,7 +127,13 @@ other implementation reads each result at its level. DSS must find it intact in
 that baseline format, and from B-LT on `TOTAL_PASSED`. xml-sec reads DSS's
 timestamp tokens under its CMS profile, as RFC 5652 BER, and must find the level
 met. A validation is timed only when both implementations accept its input.
-Anything else is recorded with the reading that decided and is never timed. In
+Both create B-B over the case's data laid out as DSS lays out that packaging
+(the `Document` element of the data, or the detached file), and a creation is
+timed only when both sign the same data: the same digest of data outside the
+signature, or the same data in its `Object`, which xml-sec carries as XML and
+DSS base64-encoded. xml-sec places an
+enveloping or detached signature in a one-element host document, where DSS
+makes it the document element. Anything else is recorded with the reading that decided and is never timed. In
 particular, DSS's B-LT and B-LTA augmentation places the CRL that covers its TSA
 only in `RevocationValues`, which EN 319 132-1 §6.3(x) does not accept for a
 timestamp's validation data, so those two operations are compared for xml-sec

@@ -4,9 +4,10 @@
 //!
 //! `lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT`
 //! creates the B-B signature `sig` with `PKI/signer.key` (PKCS#8) and the
-//! `signer.der`/`issuer.der` chain. `PACKAGING` is `enveloped`, `enveloping`,
-//! `internally-detached` or `detached`; a detached reference names `DATA` by
-//! its file name. `SIGNING_TIME` is the `SigningTime` value, and the result is
+//! `signer.der`/`issuer.der` chain over `DATA`, laid out as EU DSS lays out
+//! the same packaging. `PACKAGING` is `enveloped`, `enveloping` or
+//! `internally-detached` over an XML `DATA` with the root `Id` `document`, or
+//! `detached`, whose reference names `DATA` by its file name. `SIGNING_TIME` is the `SigningTime` value, and the result is
 //! assessed against `PKI/root.der` at Unix time `AT`.
 //!
 //! `lifecycle_probe augment t|lt|lta|renew PKI EVIDENCE AT INPUT OUTPUT
@@ -46,7 +47,8 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, SigningPolicy, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, EcdsaP256SigningKey, KeyResolverConfig, ObjectContent,
-    RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest, VerifyContext,
+    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest,
+    VerifyContext,
 };
 use xml_sec_xades::{
     Assessment, Completion, DataObject, Envelope, Inputs, Request, Requirements, Signer,
@@ -54,7 +56,9 @@ use xml_sec_xades::{
     request_archive_timestamp, request_timestamp,
 };
 
-const DOCUMENT: &str = "<Document><Data Id=\"payload\">Lifecycle payload</Data></Document>";
+/// The document an enveloping or detached signature is appended to: DSS makes
+/// those the document element, xml-sec places a signature in a document.
+const HOST: &str = "<Signed/>";
 /// The nonce of every request.
 const NONCE: &[u8] = &[0x1d, 0x2e, 0x3f, 0x40, 0x51, 0x62, 0x73, 0x84];
 
@@ -159,25 +163,49 @@ fn signing_key(
     })
 }
 
-/// The signed data object of `packaging`; a detached one is named `uri`.
-fn data_object<'a>(packaging: &str, uri: &'a str) -> Result<DataObject<'a>, String> {
+/// The document a signature of `packaging` is made in and its signed data
+/// object, laid out as EU DSS lays out the same packaging of `data`: the
+/// `data` document itself (enveloped), its root element in an `Object`
+/// (enveloping), its root `#document` beside the signature
+/// (internally detached), or the bytes `uri` names (detached).
+fn signed<'a>(
+    packaging: &str,
+    data: &[u8],
+    uri: &'a str,
+    policy: &SigningPolicy,
+) -> Result<(String, DataObject<'a>), String> {
+    let xml = || String::from_utf8(data.to_vec()).map_err(|error| format!("DATA: {error}"));
     Ok(match packaging {
-        "enveloped" => DataObject::Document {
-            mime_type: "text/xml",
-            envelope: Envelope::Enveloped,
-        },
-        "enveloping" => DataObject::Enveloping {
-            content: ObjectContent::Text("Lifecycle enveloping text".to_owned()),
-            mime_type: "text/plain",
-        },
-        "internally-detached" => DataObject::Element {
-            id: "payload",
-            mime_type: "text/xml",
-        },
-        "detached" => DataObject::Detached {
-            uri,
-            mime_type: "text/plain",
-        },
+        "enveloped" => (
+            xml()?,
+            DataObject::Document {
+                mime_type: "text/xml",
+                envelope: Envelope::Enveloped,
+            },
+        ),
+        "enveloping" => (
+            HOST.to_owned(),
+            DataObject::Enveloping {
+                content: ObjectContent::Element(
+                    ObjectElement::parse(xml()?, policy).map_err(|error| error.to_string())?,
+                ),
+                mime_type: "text/xml",
+            },
+        ),
+        "internally-detached" => (
+            format!("<internally-detached>{}</internally-detached>", xml()?),
+            DataObject::Element {
+                id: "document",
+                mime_type: "text/xml",
+            },
+        ),
+        "detached" => (
+            HOST.to_owned(),
+            DataObject::Detached {
+                uri,
+                mime_type: "text/plain",
+            },
+        ),
         _ => return Err(format!("unknown packaging {packaging}")),
     })
 }
@@ -198,9 +226,10 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         .map_err(|error| format!("signer.key: {error}"))?;
     let (key, method) = signing_key(algorithm, &key_pem)?;
     let uri = file_name(&data)?;
-    data_object(packaging, &uri)?;
+    let bytes = read(&data)?;
     let mut signing = SigningPolicy::default();
     signing.uris.references = UriTypeSet::ALL;
+    let (host, object) = signed(packaging, &bytes, &uri, &signing)?;
     let chain: [&[u8]; 2] = [&signer_der, &issuer];
     let signer = Signer {
         key: key.as_ref(),
@@ -218,7 +247,8 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
     let context = VerifyContext::new()
         .policy(verification(at, true, TimestampTokenEncoding::Declared))
         .key_resolver(&resolver);
-    let resources = BTreeMap::from([(uri.clone(), read(&data)?)]);
+    let input_bytes = bytes.len();
+    let resources = BTreeMap::from([(uri.clone(), bytes)]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..VerificationRequest::default()
@@ -228,31 +258,26 @@ fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), Str
         request: &request,
         certificates: &[&root],
     };
-    run(
-        "create",
-        DOCUMENT.len(),
-        samples,
-        Path::new(output),
-        |work| {
-            let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
-            create(
-                &mut document,
-                &signer,
-                Request {
-                    id: "sig",
-                    signing_time,
-                    objects: vec![data_object(packaging, &uri)?],
-                    parent: None,
-                    resources: Some(&resources),
-                    id_attributes: &[],
-                },
-                &assessment,
-                work,
-            )
-            .map_err(|error| format!("create: {error}"))?;
-            Ok(document.into_xml())
-        },
-    )
+    run("create", input_bytes, samples, Path::new(output), |work| {
+        let mut document = XmlDocument::parse(&host).map_err(|error| error.to_string())?;
+        create(
+            &mut document,
+            &signer,
+            Request {
+                id: "sig",
+                signing_time,
+                // `create` takes its objects; the prepared one is copied per run.
+                objects: vec![object.clone()],
+                parent: None,
+                resources: Some(&resources),
+                id_attributes: &[],
+            },
+            &assessment,
+            work,
+        )
+        .map_err(|error| format!("create: {error}"))?;
+        Ok(document.into_xml())
+    })
 }
 
 /// The caller's evidence: every file of `directory` by its extension.
