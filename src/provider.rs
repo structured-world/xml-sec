@@ -1055,6 +1055,8 @@ pub trait CryptoProvider: Send + Sync {
 
     /// Import original PKCS#8 input into this engine without exporting another
     /// provider's private handle. Policy and input budgets are enforced by the caller.
+    /// Like the provider's recovery and transport handles, the imported key
+    /// may be shared across threads.
     ///
     /// # Errors
     /// Returns an unsupported method, malformed or mismatched key encoding,
@@ -1064,7 +1066,8 @@ pub trait CryptoProvider: Send + Sync {
         &self,
         algorithm: crate::xmldsig::SignatureAlgorithm,
         _pkcs8: &[u8],
-    ) -> Result<Box<dyn crate::xmldsig::SigningKey>, crate::xmldsig::SigningKeyError> {
+    ) -> Result<Box<dyn crate::xmldsig::SigningKey + Send + Sync>, crate::xmldsig::SigningKeyError>
+    {
         Err(ProviderError::Unsupported {
             operation: ProviderOperation::Sign,
             algorithm: Some(algorithm.uri().into()),
@@ -1998,7 +2001,8 @@ impl CryptoProvider for RustCryptoProvider {
         &self,
         algorithm: crate::xmldsig::SignatureAlgorithm,
         der: &[u8],
-    ) -> Result<Box<dyn crate::xmldsig::SigningKey>, crate::xmldsig::SigningKeyError> {
+    ) -> Result<Box<dyn crate::xmldsig::SigningKey + Send + Sync>, crate::xmldsig::SigningKeyError>
+    {
         #[cfg(feature = "experimental-pq")]
         use crate::xmldsig::PostQuantumSigningKey;
         use crate::xmldsig::{

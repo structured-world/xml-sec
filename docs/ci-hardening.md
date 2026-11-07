@@ -48,8 +48,13 @@ retains a yanked dependency; do not weaken the gate to accept that lock.
 
 The native safety gate lints all workspace library targets with unsafe-code
 refusal. Test/benchmark diagnostic allocator probes are not product library
-permission to use unsafe. Native dependencies retain their separate upstream
-safety and FIPS/module boundaries; this check is not an audit of external code.
+permission to use unsafe. The one exception is the `ffi` module of
+`xml-sec-capi`, where C pointers become Rust values: it carries the crate's only
+`unsafe_code` expectation, every other module of the crate forbids unsafe code,
+and its invariants are recorded in the crate's `SAFETY.md` and qualified by
+`xml-sec-tools capi --sanitize` (see the [C API](c-api.md#qualification)).
+Native dependencies retain their separate upstream safety and FIPS/module
+boundaries; this check is not an audit of external code.
 
 ## Packaged Crate
 

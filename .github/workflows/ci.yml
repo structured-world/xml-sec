@@ -147,6 +147,9 @@ jobs:
       # so every operating system repeats the store's concurrency contract.
       - name: Qualify policy reload concurrency
         run: cargo nextest run -p xml-sec-config --test store --stress-count 100
+      # Each platform's own C and C++ compilers and loader.
+      - name: Qualify the C ABI round trips
+        run: cargo run --quiet -p xml-sec-tools -- capi
       - name: Provision isolated token provider
         if: matrix.minimal
         uses: ./.github/actions/apt-packages
@@ -184,6 +187,29 @@ jobs:
           name: benchmark-smoke-rustcrypto
           path: ${{ runner.temp }}/benchmark-smoke-${{ github.run_id }}-${{ github.run_attempt }}
           retention-days: 1
+
+  capi-sanitizers:
+    name: C ABI under sanitizers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The tool itself builds on stable, installed last as the default; the
+      # sanitized library and tests build on nightly.
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/rust-build-cache
+        with:
+          domain: capi-asan
+          toolchain: nightly
+          save: 'true'
+      - name: Qualify the C ABI under address, leak and undefined-behavior sanitizers
+        env:
+          CC: clang
+          CXX: clang++
+        run: cargo run --quiet -p xml-sec-tools -- capi --sanitize
 
   benchmark-comparison:
     uses: ./.github/workflows/benchmark-comparison.yml
@@ -448,11 +474,12 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    needs: [test-matrix, feature-contract, xslt-oracle, pkcs11, benchmark-comparison, capability-ledger, build, alloc-only, clippy, fmt, fuzz-smoke, hardening, coverage]
+    needs: [test-matrix, feature-contract, capi-sanitizers, xslt-oracle, pkcs11, benchmark-comparison, capability-ledger, build, alloc-only, clippy, fmt, fuzz-smoke, hardening, coverage]
     if: ${{ always() }}
     steps:
       - run: test "${{ needs.test-matrix.result }}" = "success"
       - run: test "${{ needs.feature-contract.result }}" = "success"
+      - run: test "${{ needs.capi-sanitizers.result }}" = "success"
       - run: test "${{ needs.xslt-oracle.result }}" = "success"
       - run: test "${{ needs.pkcs11.result }}" = "success"
       - run: test "${{ needs.benchmark-comparison.result }}" = "success"

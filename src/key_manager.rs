@@ -1238,7 +1238,7 @@ impl KeyInventory {
         name: &str,
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::SigningPolicy,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         self.signing_key_with_budget(name, algorithm, policy, &mut SigningLookupBudget::default())
     }
 
@@ -1254,7 +1254,7 @@ impl KeyInventory {
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::SigningPolicy,
         budget: &mut SigningLookupBudget,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         self.signing_key_with_provider_and_budget(
             name,
             algorithm,
@@ -1276,7 +1276,7 @@ impl KeyInventory {
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::SigningPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         self.signing_key_with_provider_and_budget(
             name,
             algorithm,
@@ -1299,7 +1299,7 @@ impl KeyInventory {
         policy: &crate::policy::SigningPolicy,
         provider: &dyn crate::provider::CryptoProvider,
         budget: &mut SigningLookupBudget,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         policy.validate()?;
         policy.check_signature_algorithm(algorithm)?;
         provider
@@ -1362,7 +1362,7 @@ impl KeyInventory {
         &self,
         name: &str,
         policy: &crate::policy::DecryptionPolicy,
-    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, KeyStoreError> {
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, KeyStoreError> {
         self.decryption_resolver_with_provider(name, policy, crate::provider::default_provider())
     }
 
@@ -1377,7 +1377,7 @@ impl KeyInventory {
         name: &str,
         policy: &crate::policy::DecryptionPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, KeyStoreError> {
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, KeyStoreError> {
         policy.validate()?;
         let mut visited = 0;
         if let Some(entry) = find_named_entry(

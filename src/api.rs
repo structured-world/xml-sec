@@ -21,9 +21,9 @@ use crate::xmldsig::{
     KeyResolver, VerificationRequest, VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
 };
 use crate::{IdAttributeRegistration, XmlBackend, XmlDocument, XmlSecError};
-use alloc::string::String;
 #[cfg(feature = "xmldsig-sign")]
 use alloc::{boxed::Box, collections::BTreeMap, vec::Vec};
+use alloc::{string::String, sync::Arc};
 
 /// The operation whose immutable policy governs document preparation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,7 +172,7 @@ impl<'a> XmlSecurity<'a> {
         inventory: &KeyInventory,
         name: &str,
         algorithm: SignatureAlgorithm,
-    ) -> Result<Box<dyn SigningKey>, XmlSecError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, XmlSecError> {
         let policy = self
             .policies
             .signing()
@@ -241,12 +241,69 @@ impl<'a> XmlSecurity<'a> {
         &self,
         inventory: &KeyInventory,
         name: &str,
-    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, XmlSecError> {
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, XmlSecError> {
         let policy = self
             .policies
             .decryption()
             .ok_or(XmlSecError::OperationDisabled(Operation::Decrypt))?;
         Ok(inventory.decryption_resolver_with_provider(name, policy, self.provider)?)
+    }
+}
+
+/// An owned [`XmlSecurity`]: shared compiled policies and provider, validated
+/// against each other once, for callers that keep a binding across calls
+/// (application state, foreign-language handles) instead of borrowing it.
+///
+/// The compiled snapshot is immutable, so the validation stays true for the
+/// binding's life; every operation still rechecks authorization expiry at its
+/// own entry.
+#[derive(Clone)]
+pub struct SharedSecurity {
+    policies: Arc<CompiledPolicies>,
+    provider: Arc<dyn CryptoProvider>,
+    backend: XmlBackend,
+}
+
+impl SharedSecurity {
+    /// Bind `policies` to `provider` as [`XmlSecurity::new`] does.
+    ///
+    /// # Errors
+    /// Returns a policy violation if the provider cannot satisfy the compiled
+    /// permissions or an authorization is no longer valid.
+    pub fn new(
+        policies: Arc<CompiledPolicies>,
+        provider: Arc<dyn CryptoProvider>,
+    ) -> Result<Self, XmlSecError> {
+        policies.validate_provider(&*provider)?;
+        Ok(Self {
+            policies,
+            provider,
+            backend: XmlBackend::default(),
+        })
+    }
+
+    /// Select a compiled parser implementation, not a different XML policy.
+    #[must_use]
+    pub fn xml_backend(mut self, backend: XmlBackend) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// The borrowed binding operations are created from, without validating
+    /// again.
+    #[must_use]
+    pub fn binding(&self) -> XmlSecurity<'_> {
+        XmlSecurity {
+            policies: &self.policies,
+            provider: &*self.provider,
+            backend: self.backend,
+        }
+    }
+
+    /// The compiled policies this binding enforces.
+    #[must_use]
+    pub fn policies(&self) -> &CompiledPolicies {
+        &self.policies
     }
 }
 

@@ -65,7 +65,7 @@ pub mod document;
 pub mod encoding;
 pub mod error;
 #[cfg(feature = "xmldsig")]
-pub use api::XmlSecurity;
+pub use api::{SharedSecurity, XmlSecurity};
 mod hard_limits;
 // These XML parser kernels are checksum-pinned in scripts/import-xml-backends.sh.
 // Embedding the maintained sources also preserves the patch for package users.

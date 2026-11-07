@@ -12,6 +12,7 @@ implied by this documentation.
 | Goal | Guide |
 | --- | --- |
 | Sign, authorize signed targets, encrypt and decrypt in Rust | [Policy-bound Rust API](rust-api.md) |
+| Call the policy-bound API from C or C++ | [C API](c-api.md) |
 | Run high-level and low-level examples | [Executable examples](examples.md) |
 | Select a deployment profile and compose restrictions | [Profiles](policy-profiles.md), [deployment runbook](deployment.md) |
 | Load explicit policy configuration | [Configuration](policy-configuration.md), [schema v1](policy-schema-v1.md) |

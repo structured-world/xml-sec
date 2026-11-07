@@ -1,6 +1,7 @@
 //! Public facade contracts: real crypto, policy boundaries and document provenance.
 #![cfg(feature = "xmldsig-sign")]
 
+use std::sync::Arc;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{
     CompiledPolicies, PolicyCompileContext, PolicyCompiler, PolicyProfile, PolicySet,
@@ -14,7 +15,7 @@ use xml_sec::xmldsig::{
     DigestAlgorithm, DsigStatus, FailureReason, HmacSigningKey, HmacVerificationKey,
     ReferenceBuilder, SignatureAlgorithm, SignatureBuilder, Transform, VerificationRequest,
 };
-use xml_sec::{XmlDocument, XmlSecError, XmlSecurity, api::Operation};
+use xml_sec::{SharedSecurity, XmlDocument, XmlSecError, XmlSecurity, api::Operation};
 
 fn policies() -> CompiledPolicies {
     PolicyCompiler::new(PolicyProfile::Modern, &RustCryptoProvider, None)
@@ -319,6 +320,42 @@ fn capability_mismatch_is_rejected_when_binding_the_real_provider() {
     let compiled = policies();
     assert!(matches!(
         XmlSecurity::new(&compiled, &RefusingProvider { available: false }),
+        Err(XmlSecError::Policy(_))
+    ));
+}
+
+#[test]
+fn a_shared_binding_is_validated_once_and_serves_every_thread() {
+    // An owned binding outlives the borrow the facade needs; operations from
+    // any thread run under its one validated snapshot and provider, and an
+    // engine that cannot satisfy the policy is refused when binding.
+    let shared = SharedSecurity::new(Arc::new(policies()), Arc::new(RustCryptoProvider)).unwrap();
+    let key = HmacSigningKey::new(vec![0x42; 32]).unwrap();
+    let signed = shared
+        .binding()
+        .signer(&key)
+        .unwrap()
+        .sign_xml("<root><p Id='payload'>signed</p></root>", &builder())
+        .unwrap()
+        .output;
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                let key = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
+                let binding = shared.binding();
+                let verifier = binding.verifier().unwrap().key(&key);
+                assert_eq!(
+                    verifier.verify_signature_xml(&signed).unwrap().status,
+                    DsigStatus::Valid
+                );
+            });
+        }
+    });
+    assert!(matches!(
+        SharedSecurity::new(
+            Arc::new(policies()),
+            Arc::new(RefusingProvider { available: false })
+        ),
         Err(XmlSecError::Policy(_))
     ));
 }

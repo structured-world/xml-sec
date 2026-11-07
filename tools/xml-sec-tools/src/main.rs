@@ -1,6 +1,7 @@
 //! Repository tooling: one subcommand per responsibility.
 
 mod bench;
+mod capi;
 mod check_features;
 mod ci_blocks;
 mod coverage;
@@ -39,6 +40,7 @@ commands:
   bench-library COMPARISON_DIR SAMPLES
   bench-regression BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
   bench-xslt NEW_OUTPUT [SAMPLES]
+  capi [--sanitize]
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
   competitor-lock
@@ -70,6 +72,7 @@ fn main() -> ExitCode {
         Some("bench-library") => bench::library::run(args),
         Some("bench-regression") => bench::regression::run(args),
         Some("bench-xslt") => bench::xslt::run(args),
+        Some("capi") => capi::run(args),
         Some("check-features") => check_features::run(args),
         Some("ci-blocks") => ci_blocks::run(args).map_err(Failure::from),
         Some("competitor-lock") => bench::compare::run_lock(args),

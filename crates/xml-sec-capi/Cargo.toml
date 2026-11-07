@@ -1,0 +1,30 @@
+[package]
+name = "xml-sec-capi"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0 AND MIT"
+publish = false
+description = "Clean C ABI over the policy-bound xml-sec API"
+
+[lib]
+# `rlib` lets the crate's own Rust tests call the exported functions.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n"] }
+xml-sec-config = { path = "../xml-sec-config", default-features = false, features = ["xmlenc"] }
+parking_lot = "0.12"
+
+[features]
+# The XML backend is the application's choice, as in the core crate; a
+# workspace build with one backend must not pull in another.
+default = ["xml-backend-xmloxide"]
+xml-backend-xmloxide = ["xml-sec-config/xml-backend-xmloxide"]
+xml-backend-roxmltree = ["xml-sec-config/xml-backend-roxmltree"]
+xml-backend-differential = ["xml-sec-config/xml-backend-differential"]
+xml-backends-all = ["xml-sec-config/xml-backends-all"]
+aws-lc-fips = ["xml-sec-config/aws-lc-fips"]
+
+[lints]
+workspace = true
