@@ -35,6 +35,14 @@ pub(crate) fn line(parts: &[&dyn AsRef<OsStr>]) -> Vec<OsString> {
     parts.iter().map(|part| part.as_ref().to_owned()).collect()
 }
 
+/// The Cargo profile a probe is built in: qualification runs the development
+/// build, measurements the optimized one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Build {
+    Dev,
+    Release,
+}
+
 /// The repository, its corpus and the native oracle every action runs against.
 pub(crate) struct Corpus {
     pub(crate) root: PathBuf,
@@ -124,18 +132,22 @@ impl Corpus {
     /// Builds the Rust probe and returns the executable Cargo reported for
     /// this build, never a guessed default target path.
     pub(crate) fn build_probe(&self, log: &Path) -> Result<PathBuf, String> {
-        self.build_example("interop_probe", &[], log)
+        self.build_example("interop_probe", &[], Build::Dev, log)
     }
 
-    /// Builds the adapter's example `name` with `features` and returns its
-    /// executable as Cargo reported it.
+    /// Builds the adapter's example `name` with `features` in `build` and
+    /// returns its executable as Cargo reported it.
     pub(crate) fn build_example(
         &self,
         name: &str,
         features: &[&str],
+        build: Build,
         log: &Path,
     ) -> Result<PathBuf, String> {
         let mut args = line(&[&"cargo", &"build", &"-p", &"xml-sec-xades"]);
+        if build == Build::Release {
+            args.push("--release".into());
+        }
         if !features.is_empty() {
             args.extend(line(&[&"--features", &features.join(",")]));
         }

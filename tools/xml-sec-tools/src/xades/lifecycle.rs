@@ -19,13 +19,14 @@
 
 use super::fixtures::Generator;
 use super::levels::{CERTIFICATES, Levels};
-use super::{Corpus, absolute, line, read, write, write_json, xml};
+use super::{Build, Corpus, absolute, line, read, write, write_json, xml};
 use serde_json::{Map, Value, json};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize};
 
+mod bench;
 #[cfg(test)]
 mod tests;
 
@@ -908,11 +909,13 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
         lifecycle_probe: corpus.build_example(
             "lifecycle_probe",
             &["produce"],
+            Build::Dev,
             &results.join("lifecycle-probe-build"),
         )?,
         level_probe: corpus.build_example(
             "level_probe",
             &[],
+            Build::Dev,
             &results.join("level-probe-build"),
         )?,
         at: now()? + 86_400,
@@ -966,16 +969,45 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
 }
 
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage = "usage: xades lifecycle [--results DIR] [--record]";
-    let mut results = corpus.root.join("target/xades-lifecycle-results");
+    let usage = "usage: xades lifecycle [--results DIR] [--record] | [--results DIR] --bench SAMPLES [--warmups COUNT] [--cold SAMPLES] [--cases PACKAGING-ALGORITHM,...]";
+    let mut results = None;
     let mut record = false;
+    let (mut samples, mut warmups, mut cold, mut cases) = (None, None, None, None);
     let mut args = args.iter();
+    let count = |value: Option<&String>| {
+        value
+            .and_then(|value| crate::bench::sample_count(value, 100_000))
+            .and_then(|count| usize::try_from(count).ok())
+            .ok_or(usage)
+    };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--results" => results = absolute(args.next().ok_or(usage)?)?,
+            "--results" => results = Some(absolute(args.next().ok_or(usage)?)?),
             "--record" => record = true,
+            "--bench" => samples = Some(count(args.next())?),
+            "--warmups" => warmups = Some(count(args.next())?),
+            "--cold" => cold = Some(count(args.next())?),
+            "--cases" => cases = Some(args.next().ok_or(usage)?.clone()),
             _ => return Err(usage.into()),
         }
     }
-    Ok(execute(corpus, &results, record)?)
+    let Some(samples) = samples else {
+        if warmups.is_some() || cold.is_some() || cases.is_some() {
+            return Err(usage.into());
+        }
+        let results = results.unwrap_or_else(|| corpus.root.join("target/xades-lifecycle-results"));
+        return Ok(execute(corpus, &results, record)?);
+    };
+    if record {
+        return Err(usage.into());
+    }
+    let options = bench::Options {
+        samples,
+        // Enough runs for the JVM's compiler to settle before the samples.
+        warmups: warmups.unwrap_or(100),
+        cold: cold.unwrap_or(3),
+        cases: bench::selected(cases.as_deref())?,
+    };
+    let results = results.unwrap_or_else(|| corpus.root.join("target/xades-lifecycle-bench"));
+    Ok(bench::execute(corpus, &results, &options)?)
 }

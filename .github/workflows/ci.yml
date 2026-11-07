@@ -517,6 +517,16 @@ jobs:
           path: ${{ runner.temp }}/xades-interop
           if-no-files-found: error
           retention-days: 7
+      # One sample proves the lifecycle comparison harnesses, not performance.
+      - name: Smoke-run the XAdES lifecycle comparison with EU DSS
+        run: cargo run --quiet -p xml-sec-tools -- xades lifecycle --bench 1 --warmups 1 --cold 1 --cases enveloped-rsa --results "$RUNNER_TEMP/xades-lifecycle-bench"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: xades-lifecycle-bench
+          path: ${{ runner.temp }}/xades-lifecycle-bench/lifecycle-bench.json
+          if-no-files-found: error
+          retention-days: 7
       - name: Qualify XSLT engine, signature chains and failure contracts
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt

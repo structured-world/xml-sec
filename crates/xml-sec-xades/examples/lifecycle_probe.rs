@@ -1,28 +1,40 @@
 //! The lifecycle steps xml-sec takes in a bidirectional qualification with
 //! another implementation, one step per run so the other side can validate
-//! each result.
+//! each result, and the harness that times the same steps.
 //!
 //! `lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT`
 //! creates the B-B signature `sig` with `PKI/signer.key` (PKCS#8) and the
-//! `signer.der`/`issuer.der` chain. `PACKAGING` is `enveloped`, `enveloping`,
-//! `internally-detached` or `detached`; a detached reference names `DATA` by
-//! its file name. `SIGNING_TIME` is the `SigningTime` value, and the result is
+//! `signer.der`/`issuer.der` chain over `DATA`, laid out as EU DSS lays out
+//! the same packaging. `PACKAGING` is `enveloped`, `enveloping` or
+//! `internally-detached` over an XML `DATA` with the root `Id` `document`, or
+//! `detached`, whose reference names `DATA` by its file name. `SIGNING_TIME` is the `SigningTime` value, and the result is
 //! assessed against `PKI/root.der` at Unix time `AT`.
 //!
 //! `lifecycle_probe augment t|lt|lta|renew PKI EVIDENCE AT INPUT OUTPUT
-//! [--detached FILE] [--accuracy SECONDS] [--ber] -- TSA...` takes the first signature
-//! of `INPUT` one step further: a signature timestamp, the validation data of
-//! B-LT, the first archive timestamp, or the next archive over a B-LTA
-//! signature. `EVIDENCE` holds the DER certificates (`*.cer`), CRLs (`*.crl`)
-//! and OCSP responses (`*.ocsp`) the caller supplies. The TSA command runs
-//! with `{request}` and `{response}` replaced by the request it must answer
-//! and the file the response goes to. `SECONDS` states the accuracy of tokens
-//! that omit it, as the corpus's interoperability setting (RFC 3161 §2.4.2).
-//! `--ber` reads unmarked tokens as RFC 5652 BER rather than DER.
+//! [--detached FILE] [--accuracy SECONDS] [--ber] [--tokens DIR] -- [TSA...]`
+//! takes the first signature of `INPUT` one step further: a signature
+//! timestamp, the validation data of B-LT, the first archive timestamp, or the
+//! next archive over a B-LTA signature. `EVIDENCE` holds the DER certificates
+//! (`*.cer`), CRLs (`*.crl`) and OCSP responses (`*.ocsp`) the caller supplies.
+//! The TSA command runs with `{request}` and `{response}` replaced by the
+//! request it must answer and the file the response goes to. `SECONDS` states
+//! the accuracy of tokens that omit it, as the corpus's interoperability
+//! setting (RFC 3161 §2.4.2). `--ber` reads unmarked tokens as RFC 5652 BER
+//! rather than DER. `--tokens DIR` keeps each exchange as `N.tsq`/`N.tsr`: a
+//! recorded response answers the identical request again, and without a TSA
+//! command an unrecorded request is refused, so a timed run never acquires.
+//!
+//! `--samples N` on either command times `N` runs from the serialized input to
+//! the serialized output, after the first run and warmups (see `timing`). It
+//! takes no TSA command: every run replays the tokens a previous run recorded.
 
+#[path = "support/timing.rs"]
+mod timing;
 #[path = "support/tokens.rs"]
 mod tokens;
 
+use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +47,8 @@ use xml_sec::c14n::{C14nAlgorithm, C14nMode};
 use xml_sec::policy::{Instant, SigningPolicy, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, EcdsaP256SigningKey, KeyResolverConfig, ObjectContent,
-    RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest, VerifyContext,
+    ObjectElement, RsaSigningKey, SignatureAlgorithm, SigningKey, UriTypeSet, VerificationRequest,
+    VerifyContext,
 };
 use xml_sec_xades::{
     Assessment, Completion, DataObject, Envelope, Inputs, Request, Requirements, Signer,
@@ -43,12 +56,18 @@ use xml_sec_xades::{
     request_archive_timestamp, request_timestamp,
 };
 
-const DOCUMENT: &str = "<Document><Data Id=\"payload\">Lifecycle payload</Data></Document>";
+/// The document an enveloping or detached signature is appended to: DSS makes
+/// those the document element, xml-sec places a signature in a document.
+const HOST: &str = "<Signed/>";
 /// The nonce of every request.
 const NONCE: &[u8] = &[0x1d, 0x2e, 0x3f, 0x40, 0x51, 0x62, 0x73, 0x84];
 
 fn read(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))
+}
+
+fn write(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    std::fs::write(path, bytes).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 fn file_name(path: &Path) -> Result<String, String> {
@@ -94,15 +113,104 @@ fn signature_id(text: &str) -> Option<&str> {
 }
 
 fn main() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let samples = timing::sampling(&mut args)?;
     match args.first().map(String::as_str) {
-        Some("create") => created(&args[1..]),
-        Some("augment") => augment(&args[1..]),
-        _ => Err("usage: lifecycle_probe create ... | augment ...".into()),
+        Some("create") => created(&args[1..], samples),
+        Some("augment") => augment(&args[1..], samples),
+        _ => Err("usage: lifecycle_probe create ... | augment ... [--samples N]".into()),
     }
 }
 
-fn created(args: &[String]) -> Result<(), String> {
+/// Runs `operation` once and writes its result to `output`, or, given
+/// `samples`, times it and prints the report as well.
+fn run(
+    name: &str,
+    input_bytes: usize,
+    samples: Option<timing::Sampling>,
+    output: &Path,
+    mut operation: impl FnMut(&Memory) -> Result<String, String>,
+) -> Result<(), String> {
+    let Some(samples) = samples else {
+        return write(output, operation(&work())?.as_bytes());
+    };
+    let measurement = timing::measure(
+        samples,
+        || Ok::<_, String>(work()),
+        |work| operation(&work),
+        |text| Some(text.clone().into_bytes()),
+    )?;
+    write(output, measurement.output.as_deref().unwrap_or_default())?;
+    println!("{}", timing::report(name, input_bytes, &measurement));
+    Ok(())
+}
+
+/// The signer's key of `algorithm` from its PKCS#8 `pem`, and its method.
+fn signing_key(
+    algorithm: &str,
+    pem: &str,
+) -> Result<(Box<dyn SigningKey>, SignatureAlgorithm), String> {
+    Ok(match algorithm {
+        "rsa" => (
+            Box::new(RsaSigningKey::from_pkcs8_pem(pem).map_err(|error| error.to_string())?),
+            SignatureAlgorithm::RsaSha256,
+        ),
+        "ec" => (
+            Box::new(EcdsaP256SigningKey::from_pkcs8_pem(pem).map_err(|error| error.to_string())?),
+            SignatureAlgorithm::EcdsaSha256,
+        ),
+        _ => return Err("the algorithm is rsa or ec".into()),
+    })
+}
+
+/// The document a signature of `packaging` is made in and its signed data
+/// object, laid out as EU DSS lays out the same packaging of `data`: the
+/// `data` document itself (enveloped), its root element in an `Object`
+/// (enveloping), its root `#document` beside the signature
+/// (internally detached), or the bytes `uri` names (detached).
+fn signed<'a>(
+    packaging: &str,
+    data: &[u8],
+    uri: &'a str,
+    policy: &SigningPolicy,
+) -> Result<(String, DataObject<'a>), String> {
+    let xml = || String::from_utf8(data.to_vec()).map_err(|error| format!("DATA: {error}"));
+    Ok(match packaging {
+        "enveloped" => (
+            xml()?,
+            DataObject::Document {
+                mime_type: "text/xml",
+                envelope: Envelope::Enveloped,
+            },
+        ),
+        "enveloping" => (
+            HOST.to_owned(),
+            DataObject::Enveloping {
+                content: ObjectContent::Element(
+                    ObjectElement::parse(xml()?, policy).map_err(|error| error.to_string())?,
+                ),
+                mime_type: "text/xml",
+            },
+        ),
+        "internally-detached" => (
+            format!("<internally-detached>{}</internally-detached>", xml()?),
+            DataObject::Element {
+                id: "document",
+                mime_type: "text/xml",
+            },
+        ),
+        "detached" => (
+            HOST.to_owned(),
+            DataObject::Detached {
+                uri,
+                mime_type: "text/plain",
+            },
+        ),
+        _ => return Err(format!("unknown packaging {packaging}")),
+    })
+}
+
+fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
     let [algorithm, packaging, pki, data, signing_time, at, output] = args else {
         return Err(
             "usage: lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT".into(),
@@ -116,41 +224,12 @@ fn created(args: &[String]) -> Result<(), String> {
     let issuer = read(&pki.join("issuer.der"))?;
     let key_pem = String::from_utf8(read(&pki.join("signer.key"))?)
         .map_err(|error| format!("signer.key: {error}"))?;
-    let (key, method): (Box<dyn SigningKey>, _) = match algorithm.as_str() {
-        "rsa" => (
-            Box::new(RsaSigningKey::from_pkcs8_pem(&key_pem).map_err(|error| error.to_string())?),
-            SignatureAlgorithm::RsaSha256,
-        ),
-        "ec" => (
-            Box::new(
-                EcdsaP256SigningKey::from_pkcs8_pem(&key_pem).map_err(|error| error.to_string())?,
-            ),
-            SignatureAlgorithm::EcdsaSha256,
-        ),
-        _ => return Err("the algorithm is rsa or ec".into()),
-    };
+    let (key, method) = signing_key(algorithm, &key_pem)?;
     let uri = file_name(&data)?;
-    let object = match packaging.as_str() {
-        "enveloped" => DataObject::Document {
-            mime_type: "text/xml",
-            envelope: Envelope::Enveloped,
-        },
-        "enveloping" => DataObject::Enveloping {
-            content: ObjectContent::Text("Lifecycle enveloping text".to_owned()),
-            mime_type: "text/plain",
-        },
-        "internally-detached" => DataObject::Element {
-            id: "payload",
-            mime_type: "text/xml",
-        },
-        "detached" => DataObject::Detached {
-            uri: &uri,
-            mime_type: "text/plain",
-        },
-        _ => return Err(format!("unknown packaging {packaging}")),
-    };
+    let bytes = read(&data)?;
     let mut signing = SigningPolicy::default();
     signing.uris.references = UriTypeSet::ALL;
+    let (host, object) = signed(packaging, &bytes, &uri, &signing)?;
     let chain: [&[u8]; 2] = [&signer_der, &issuer];
     let signer = Signer {
         key: key.as_ref(),
@@ -168,7 +247,8 @@ fn created(args: &[String]) -> Result<(), String> {
     let context = VerifyContext::new()
         .policy(verification(at, true, TimestampTokenEncoding::Declared))
         .key_resolver(&resolver);
-    let resources = BTreeMap::from([(uri.clone(), read(&data)?)]);
+    let input_bytes = bytes.len();
+    let resources = BTreeMap::from([(uri.clone(), bytes)]);
     let request = VerificationRequest {
         external_resources: Some(&resources),
         ..VerificationRequest::default()
@@ -178,23 +258,26 @@ fn created(args: &[String]) -> Result<(), String> {
         request: &request,
         certificates: &[&root],
     };
-    let mut document = XmlDocument::parse(DOCUMENT).map_err(|error| error.to_string())?;
-    create(
-        &mut document,
-        &signer,
-        Request {
-            id: "sig",
-            signing_time,
-            objects: vec![object],
-            parent: None,
-            resources: Some(&resources),
-            id_attributes: &[],
-        },
-        &assessment,
-        &work(),
-    )
-    .map_err(|error| format!("create: {error}"))?;
-    std::fs::write(output, document.as_xml()).map_err(|error| format!("{output}: {error}"))
+    run("create", input_bytes, samples, Path::new(output), |work| {
+        let mut document = XmlDocument::parse(&host).map_err(|error| error.to_string())?;
+        create(
+            &mut document,
+            &signer,
+            Request {
+                id: "sig",
+                signing_time,
+                // `create` takes its objects; the prepared one is copied per run.
+                objects: vec![object.clone()],
+                parent: None,
+                resources: Some(&resources),
+                id_attributes: &[],
+            },
+            &assessment,
+            work,
+        )
+        .map_err(|error| format!("create: {error}"))?;
+        Ok(document.into_xml())
+    })
 }
 
 /// The caller's evidence: every file of `directory` by its extension.
@@ -233,26 +316,92 @@ impl Evidence {
     }
 }
 
-/// The TSA's response to `request`, through the caller's command.
-fn exchange(command: &[String], request: &[u8], output: &Path) -> Result<Vec<u8>, String> {
-    let (query, reply) = (output.with_extension("tsq"), output.with_extension("tsr"));
-    std::fs::write(&query, request).map_err(|error| format!("{}: {error}", query.display()))?;
-    let substitute = |arg: &String| match arg.as_str() {
-        "{request}" => query.display().to_string(),
-        "{response}" => reply.display().to_string(),
-        _ => arg.clone(),
-    };
-    let [program, args @ ..] = command else {
-        return Err("no TSA command".into());
-    };
-    let status = std::process::Command::new(program)
-        .args(args.iter().map(substitute))
-        .status()
-        .map_err(|error| format!("{program}: {error}"))?;
-    if !status.success() {
-        return Err(format!("TSA command failed: {status}"));
+/// The caller-owned TSA: its command, and the recorded exchanges of `tokens`.
+struct Tsa<'a> {
+    command: &'a [String],
+    tokens: Option<&'a Path>,
+    /// The exchanges `tokens` holds, read before any run so that a timed run
+    /// replays them from memory: request and response by ordinal.
+    recorded: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Where the command's request and response files go.
+    scratch: &'a Path,
+    /// The ordinal of the next exchange of the current run.
+    next: Cell<usize>,
+}
+
+impl<'a> Tsa<'a> {
+    fn new(
+        command: &'a [String],
+        tokens: Option<&'a Path>,
+        scratch: &'a Path,
+    ) -> Result<Self, String> {
+        let mut recorded = Vec::new();
+        if let Some(tokens) = tokens {
+            std::fs::create_dir_all(tokens)
+                .map_err(|error| format!("{}: {error}", tokens.display()))?;
+            while tokens.join(format!("{}.tsr", recorded.len())).exists() {
+                let ordinal = recorded.len();
+                recorded.push((
+                    read(&tokens.join(format!("{ordinal}.tsq")))?,
+                    read(&tokens.join(format!("{ordinal}.tsr")))?,
+                ));
+            }
+        }
+        Ok(Self {
+            command,
+            tokens,
+            recorded,
+            scratch,
+            next: Cell::new(0),
+        })
     }
-    read(&reply)
+
+    /// The response to `request`: recorded for this exchange, or acquired and
+    /// recorded.
+    fn respond(&self, request: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+        let ordinal = self.next.replace(self.next.get() + 1);
+        if let Some((query, reply)) = self.recorded.get(ordinal) {
+            if query.as_slice() != request {
+                return Err(format!(
+                    "the request differs from recorded exchange {ordinal}"
+                ));
+            }
+            return Ok(Cow::Borrowed(reply));
+        }
+        let response = self.acquire(request)?;
+        if let Some(tokens) = self.tokens {
+            write(&tokens.join(format!("{ordinal}.tsq")), request)?;
+            write(&tokens.join(format!("{ordinal}.tsr")), &response)?;
+        }
+        Ok(Cow::Owned(response))
+    }
+
+    /// The TSA's response to `request`, through the caller's command.
+    fn acquire(&self, request: &[u8]) -> Result<Vec<u8>, String> {
+        let [program, args @ ..] = self.command else {
+            return Err(
+                "no recorded response and no TSA command: this run acquires nothing".into(),
+            );
+        };
+        let (query, reply) = (
+            self.scratch.with_extension("tsq"),
+            self.scratch.with_extension("tsr"),
+        );
+        write(&query, request)?;
+        let substitute = |arg: &String| match arg.as_str() {
+            "{request}" => query.display().to_string(),
+            "{response}" => reply.display().to_string(),
+            _ => arg.clone(),
+        };
+        let status = std::process::Command::new(program)
+            .args(args.iter().map(substitute))
+            .status()
+            .map_err(|error| format!("{program}: {error}"))?;
+        if !status.success() {
+            return Err(format!("TSA command failed: {status}"));
+        }
+        read(&reply)
+    }
 }
 
 /// One augmentation step's inputs, borrowed from the run.
@@ -265,9 +414,7 @@ struct Stepper<'a> {
     responses: &'a [&'a [u8]],
     accuracies: &'a [xml_sec_xades::AuthorityAccuracy<'a>],
     utc: &'a LeapTable<'a>,
-    tsa: &'a [String],
-    output: &'a Path,
-    work: Memory,
+    tsa: &'a Tsa<'a>,
 }
 
 impl Stepper<'_> {
@@ -300,8 +447,9 @@ impl Stepper<'_> {
         document: &mut XmlDocument,
         pending: &xml_sec_xades::PendingTimestamp,
         requirements: Requirements,
+        work: &Memory,
     ) -> Result<(), String> {
-        let response = exchange(self.tsa, pending.request(), self.output)?;
+        let response = self.tsa.respond(pending.request())?;
         complete_timestamp(
             document,
             pending,
@@ -312,7 +460,7 @@ impl Stepper<'_> {
                 window: None,
                 id_attributes: &[],
             },
-            &self.work,
+            work,
         )
         .map_err(|error| format!("completion: {error}"))
     }
@@ -321,8 +469,9 @@ impl Stepper<'_> {
         &self,
         document: &mut XmlDocument,
         requirements: Requirements,
+        work: &Memory,
     ) -> Result<(), String> {
-        let added = add_validation_data(
+        add_validation_data(
             document,
             &ValidationData {
                 signature: self.signature,
@@ -330,22 +479,22 @@ impl Stepper<'_> {
                 inputs: &self.inputs(requirements),
                 id_attributes: &[],
             },
-            &self.work,
+            work,
         )
         .map_err(|error| format!("validation data: {error}"))?;
-        println!("validation data: {added:?}");
         Ok(())
     }
 
-    fn advance(&self, document: &mut XmlDocument, step: &str) -> Result<(), String> {
+    fn advance(&self, document: &mut XmlDocument, step: &str, work: &Memory) -> Result<(), String> {
+        // Every run makes the same exchanges in the same order.
+        self.tsa.next.set(0);
         match step {
             "t" => {
-                let pending =
-                    request_timestamp(document, &self.timestamp(), self.assessment, &self.work)
-                        .map_err(|error| format!("request: {error}"))?;
-                self.complete(document, &pending, Requirements::Timestamped)
+                let pending = request_timestamp(document, &self.timestamp(), self.assessment, work)
+                    .map_err(|error| format!("request: {error}"))?;
+                self.complete(document, &pending, Requirements::Timestamped, work)
             }
-            "lt" => self.validation_data(document, Requirements::LongTerm),
+            "lt" => self.validation_data(document, Requirements::LongTerm, work),
             "lta" | "renew" => {
                 // A first archive needs B-LT; a renewal keeps B-LTA.
                 let requirements = if step == "lta" {
@@ -353,49 +502,89 @@ impl Stepper<'_> {
                 } else {
                     Requirements::Archival
                 };
-                self.validation_data(document, requirements)?;
+                self.validation_data(document, requirements, work)?;
                 let pending = request_archive_timestamp(
                     document,
                     &self.timestamp(),
                     self.assessment,
                     &self.inputs(requirements),
-                    &self.work,
+                    work,
                 )
                 .map_err(|error| format!("archive request: {error}"))?;
-                self.complete(document, &pending, Requirements::Archival)
+                self.complete(document, &pending, Requirements::Archival, work)
             }
             _ => Err(format!("unknown step {step}")),
         }
     }
 }
 
-fn augment(args: &[String]) -> Result<(), String> {
-    let usage = "usage: lifecycle_probe augment t|lt|lta|renew PKI EVIDENCE AT INPUT OUTPUT [--detached FILE] [--accuracy SECONDS] [--ber] -- TSA...";
-    let split = args.iter().position(|arg| arg == "--").ok_or(usage)?;
-    let (mut options, tsa) = (args[..split].to_vec(), &args[split + 1..]);
-    let encoding = match options.iter().position(|arg| arg == "--ber") {
-        Some(index) => {
-            options.remove(index);
-            TimestampTokenEncoding::Ber
-        }
-        None => TimestampTokenEncoding::Declared,
-    };
-    let mut resources = BTreeMap::new();
-    let mut seconds = None;
-    for flag in ["--detached", "--accuracy"] {
-        if let Some(index) = options.iter().position(|arg| arg == flag) {
-            let value = options.get(index + 1).ok_or(usage)?.clone();
-            if flag == "--detached" {
-                let path = PathBuf::from(&value);
-                resources.insert(file_name(&path)?, read(&path)?);
-            } else {
-                seconds = Some(value.parse::<u64>().map_err(|error| error.to_string())?);
+const AUGMENT: &str = "usage: lifecycle_probe augment t|lt|lta|renew PKI EVIDENCE AT INPUT OUTPUT [--detached FILE] [--accuracy SECONDS] [--ber] [--tokens DIR] -- [TSA...]";
+
+/// The options of `augment`, taken out of its arguments.
+struct Options {
+    encoding: TimestampTokenEncoding,
+    resources: BTreeMap<String, Vec<u8>>,
+    seconds: Option<u64>,
+    tokens: Option<PathBuf>,
+    /// The positional arguments left.
+    positional: Vec<String>,
+}
+
+impl Options {
+    fn take(mut options: Vec<String>) -> Result<Self, String> {
+        let encoding = match options.iter().position(|arg| arg == "--ber") {
+            Some(index) => {
+                options.remove(index);
+                TimestampTokenEncoding::Ber
             }
-            options.drain(index..index + 2);
+            None => TimestampTokenEncoding::Declared,
+        };
+        let mut taken = Self {
+            encoding,
+            resources: BTreeMap::new(),
+            seconds: None,
+            tokens: None,
+            positional: Vec::new(),
+        };
+        for flag in ["--detached", "--accuracy", "--tokens"] {
+            if let Some(index) = options.iter().position(|arg| arg == flag) {
+                let value = options.get(index + 1).ok_or(AUGMENT)?.clone();
+                match flag {
+                    "--detached" => {
+                        let path = PathBuf::from(&value);
+                        taken.resources.insert(file_name(&path)?, read(&path)?);
+                    }
+                    "--accuracy" => {
+                        taken.seconds =
+                            Some(value.parse::<u64>().map_err(|error| error.to_string())?);
+                    }
+                    _ => taken.tokens = Some(PathBuf::from(value)),
+                }
+                options.drain(index..index + 2);
+            }
         }
+        taken.positional = options;
+        Ok(taken)
     }
-    let [step, pki, evidence, at, input, output] = options.as_slice() else {
-        return Err(usage.into());
+}
+
+fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
+    let split = args.iter().position(|arg| arg == "--").ok_or(AUGMENT)?;
+    let command = &args[split + 1..];
+    if samples.is_some() && !command.is_empty() {
+        return Err(
+            "--samples replays recorded tokens: record them first, without --samples".into(),
+        );
+    }
+    let Options {
+        encoding,
+        resources,
+        seconds,
+        tokens,
+        positional,
+    } = Options::take(args[..split].to_vec())?;
+    let [step, pki, evidence, at, input, output] = positional.as_slice() else {
+        return Err(AUGMENT.into());
     };
     let at: i64 = at.parse().map_err(|error| format!("AT: {error}"))?;
     let output = PathBuf::from(output);
@@ -410,7 +599,6 @@ fn augment(args: &[String]) -> Result<(), String> {
         Vec::new()
     };
     let accuracies = tokens::stated(&authorities, seconds.unwrap_or_default())?;
-    let mut document = XmlDocument::parse(&text).map_err(|error| error.to_string())?;
     let resolver = DefaultKeyResolver::new(KeyResolverConfig {
         trusted_certs: vec![root.clone()],
         ..KeyResolverConfig::default()
@@ -433,7 +621,8 @@ fn augment(args: &[String]) -> Result<(), String> {
     let certificates: Vec<&[u8]> = evidence.certificates.iter().map(Vec::as_slice).collect();
     let crls: Vec<&[u8]> = evidence.crls.iter().map(Vec::as_slice).collect();
     let responses: Vec<&[u8]> = evidence.responses.iter().map(Vec::as_slice).collect();
-    Stepper {
+    let tsa = Tsa::new(command, tokens.as_deref(), &output)?;
+    let stepper = Stepper {
         signature,
         assessment: &assessment,
         anchors: &anchors,
@@ -442,13 +631,22 @@ fn augment(args: &[String]) -> Result<(), String> {
         responses: &responses,
         accuracies: &accuracies,
         utc: &utc,
-        tsa,
-        output: &output,
-        work: work(),
+        tsa: &tsa,
+    };
+    run(
+        &format!("augment-{step}"),
+        text.len(),
+        samples,
+        &output,
+        |work| {
+            let mut document = XmlDocument::parse(&text).map_err(|error| error.to_string())?;
+            stepper.advance(&mut document, step, work)?;
+            Ok(document.into_xml())
+        },
+    )?;
+    // A measurement's report stays the last line.
+    if samples.is_none() {
+        println!("augmented {step}");
     }
-    .advance(&mut document, step)?;
-    std::fs::write(&output, document.as_xml())
-        .map_err(|error| format!("{}: {error}", output.display()))?;
-    println!("augmented {step}");
     Ok(())
 }
