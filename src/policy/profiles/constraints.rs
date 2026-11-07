@@ -1,6 +1,6 @@
 #[cfg(feature = "xmlenc")]
 use super::OAEP_MGF_DIGESTS;
-use super::{PolicyCompileContext, PolicySet, SignatureConstraints, configuration};
+use super::{PolicyCompileContext, PolicyView, SignatureConstraints, configuration};
 use crate::policy::{
     CertificateSignatureAlgorithms, HmacPolicy, KeyTrustPolicy, PolicyViolation, TransformPolicy,
     UriPolicy,
@@ -14,7 +14,7 @@ use crate::xml::dom::Node;
 use crate::xmldsig::{DigestAlgorithm, SignatureAlgorithm};
 use alloc::collections::BTreeSet;
 
-impl PolicySet {
+impl PolicyView<'_> {
     pub(super) fn validate(
         &self,
         context: PolicyCompileContext,

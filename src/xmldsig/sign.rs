@@ -31,6 +31,7 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, HashMap},
     ops::Range,
+    sync::Arc,
 };
 use zeroize::Zeroizing;
 
@@ -1670,7 +1671,9 @@ pub struct SignContext<'a> {
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a BTreeMap<String, Vec<u8>>>,
     template_selection: SignatureTemplateSelection,
-    policy: crate::policy::SigningPolicy,
+    // Shared with the compiled snapshot it came from.
+    policy: Arc<crate::policy::SigningPolicy>,
+    identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
 }
@@ -1686,7 +1689,8 @@ impl<'a> SignContext<'a> {
             id_attributes: &[],
             external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
-            policy: crate::policy::SigningPolicy::default(),
+            policy: Arc::new(crate::policy::SigningPolicy::default()),
+            identity: None,
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
         }
@@ -1704,7 +1708,8 @@ impl<'a> SignContext<'a> {
             id_attributes: &[],
             external_resources: None,
             template_selection: SignatureTemplateSelection::default(),
-            policy: crate::policy::SigningPolicy::default(),
+            policy: Arc::new(crate::policy::SigningPolicy::default()),
+            identity: None,
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
         }
@@ -1713,7 +1718,19 @@ impl<'a> SignContext<'a> {
     /// Replace the complete immutable signing policy snapshot.
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::SigningPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a published snapshot as is and report its identity.
+    pub(crate) fn snapshot(
+        mut self,
+        policy: &Arc<crate::policy::SigningPolicy>,
+        identity: Option<&Arc<crate::policy::PolicyIdentity>>,
+    ) -> Self {
+        self.policy = Arc::clone(policy);
+        self.identity = identity.cloned();
         self
     }
 
@@ -1790,7 +1807,11 @@ impl<'a> SignContext<'a> {
     /// signatures compatible with libxmlsec1's `<Transform>` interpretation.
     #[must_use]
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
-        self.policy.transforms.xpath_here_semantics = semantics;
+        // A customization: the published snapshot's identity no longer applies.
+        self.identity = None;
+        Arc::make_mut(&mut self.policy)
+            .transforms
+            .xpath_here_semantics = semantics;
         self
     }
 
@@ -2928,7 +2949,7 @@ struct SigningReference {
 }
 
 type SigningExecution<'a> =
-    OperationExecutionContext<crate::policy::SigningPolicy, &'a mut SigningOperationBudgets>;
+    OperationExecutionContext<Arc<crate::policy::SigningPolicy>, &'a mut SigningOperationBudgets>;
 
 type SigningKeyOutput = (
     Option<String>,
@@ -3662,10 +3683,7 @@ fn compute_deferred_reference_digests(
 fn fill_reference_digest_values_in_dependency_order_with_operation(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
-    operation: &mut OperationExecutionContext<
-        crate::policy::SigningPolicy,
-        &mut SigningOperationBudgets,
-    >,
+    operation: &mut SigningExecution<'_>,
     request: SigningReferenceRequest<'_, '_>,
     setup_gate: Option<OperationNodeId>,
     defer_digests: bool,
@@ -3687,14 +3705,12 @@ type AnalyzedReferences = (SigningReferenceInputs, SigningDependencyPlan);
 
 fn analyze_signing_references(
     document: &XmlDocument,
-    operation: &mut OperationExecutionContext<
-        crate::policy::SigningPolicy,
-        &mut SigningOperationBudgets,
-    >,
+    operation: &mut SigningExecution<'_>,
     request: SigningReferenceRequest<'_, '_>,
     transform_options: TransformOptions<'_>,
 ) -> Result<AnalyzedReferences, SigningDigestError> {
-    let policy = operation.policy().clone();
+    // A shared handle, so the budgets can be borrowed mutably beside it.
+    let policy = Arc::clone(operation.policy());
     let references =
         collect_signing_reference_inputs(document, &policy, operation.budgets_mut(), request)?;
     let dependency_plan = analyze_signing_reference_inputs(
@@ -3732,10 +3748,7 @@ fn digests_can_defer(
 fn fill_analyzed_reference_digest_values(
     document: &mut XmlDocument,
     transform_options: TransformOptions<'_>,
-    operation: &mut OperationExecutionContext<
-        crate::policy::SigningPolicy,
-        &mut SigningOperationBudgets,
-    >,
+    operation: &mut SigningExecution<'_>,
     request: SigningReferenceRequest<'_, '_>,
     setup_gate: Option<OperationNodeId>,
     defer_digests: bool,
@@ -3743,7 +3756,8 @@ fn fill_analyzed_reference_digest_values(
 ) -> Result<(SigningPlanNodes, Vec<(crate::NodeIdentity, String)>), SigningDigestError> {
     let can_defer = defer_digests && digests_can_defer(document, &analyzed);
     let (references, dependency_plan) = analyzed;
-    let policy = operation.policy().clone();
+    // A shared handle, so the budgets can be borrowed mutably beside it.
+    let policy = Arc::clone(operation.policy());
     let (node_levels, plan_nodes) =
         compile_signing_operation_plan(operation, &dependency_plan, setup_gate)?;
     let level_request = LevelDigestRequest {
@@ -3811,7 +3825,8 @@ fn fill_reference_digest_values_in_dependency_order(
         policy.resources.max_external_resource_total_bytes,
     );
     let binding = (document.identity(), document.generation());
-    let mut operation = OperationExecutionContext::new(policy.clone(), budgets, Some(binding));
+    let mut operation =
+        OperationExecutionContext::new(Arc::new(policy.clone()), budgets, Some(binding));
     fill_reference_digest_values_in_dependency_order_with_operation(
         document,
         transform_options,
@@ -4031,10 +4046,7 @@ fn signing_reference_origin<'doc, 'input>(
 }
 
 fn compile_signing_operation_plan(
-    operation: &mut OperationExecutionContext<
-        crate::policy::SigningPolicy,
-        &mut SigningOperationBudgets,
-    >,
+    operation: &mut SigningExecution<'_>,
     dependency_plan: &SigningDependencyPlan,
     setup_gate: Option<OperationNodeId>,
 ) -> Result<(Vec<Vec<OperationNodeId>>, SigningPlanNodes), SigningDigestError> {

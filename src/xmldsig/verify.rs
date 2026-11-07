@@ -19,6 +19,7 @@ use alloc::{
     collections::{BTreeMap, BTreeSet},
     format,
     string::{String, ToString},
+    sync::Arc,
     vec,
     vec::Vec,
 };
@@ -463,7 +464,10 @@ pub struct VerifyContext<'a> {
     decapsulation_key: Option<&'a dyn crate::provider::KeyDecapsulationKey>,
     key: Option<&'a dyn VerifyingKey>,
     key_resolver: Option<&'a dyn KeyResolver>,
-    policy: crate::policy::VerificationPolicy,
+    // Shared with the compiled snapshot it came from; copied only when a
+    // builder method customizes it, which also drops the snapshot's identity.
+    policy: Arc<crate::policy::VerificationPolicy>,
+    identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     store_pre_digest: bool,
@@ -487,7 +491,8 @@ impl<'a> VerifyContext<'a> {
             decapsulation_key: None,
             key: None,
             key_resolver: None,
-            policy: crate::policy::VerificationPolicy::default(),
+            policy: Arc::new(crate::policy::VerificationPolicy::default()),
+            identity: None,
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
             store_pre_digest: false,
@@ -531,8 +536,27 @@ impl<'a> VerifyContext<'a> {
 
     /// Replace the complete immutable verification policy snapshot.
     pub fn policy(mut self, policy: crate::policy::VerificationPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Arc::new(policy);
+        self.identity = None;
         self
+    }
+
+    /// Enforce a published snapshot as is and report its identity.
+    pub(crate) fn snapshot(
+        mut self,
+        policy: &Arc<crate::policy::VerificationPolicy>,
+        identity: Option<&Arc<crate::policy::PolicyIdentity>>,
+    ) -> Self {
+        self.policy = Arc::clone(policy);
+        self.identity = identity.cloned();
+        self
+    }
+
+    /// The policy to change for a builder customization: no longer the
+    /// published snapshot, so its identity no longer describes it.
+    fn customized_policy(&mut self) -> &mut crate::policy::VerificationPolicy {
+        self.identity = None;
+        Arc::make_mut(&mut self.policy)
     }
 
     /// Select the cryptographic provider for this verification operation.
@@ -572,7 +596,7 @@ impl<'a> VerifyContext<'a> {
     /// returned as `Err(...)`, as does a spent operation resource limit, which
     /// says nothing about the Reference that reached it.
     pub fn process_manifests(mut self, enabled: bool) -> Self {
-        self.policy.manifest_processing = if enabled {
+        self.customized_policy().manifest_processing = if enabled {
             crate::policy::ManifestProcessing::Process
         } else {
             crate::policy::ManifestProcessing::Ignore
@@ -582,7 +606,7 @@ impl<'a> VerifyContext<'a> {
 
     /// Restrict allowed reference URI classes.
     pub fn allowed_uri_types(mut self, types: UriTypeSet) -> Self {
-        self.policy.uris.references = types;
+        self.customized_policy().uris.references = types;
         self
     }
 
@@ -593,7 +617,7 @@ impl<'a> VerifyContext<'a> {
     /// Same-document retrieval is enabled by default; external retrieval requires
     /// an explicit opt-in and still uses only caller-supplied resources.
     pub fn allowed_retrieval_method_uri_types(mut self, types: UriTypeSet) -> Self {
-        self.policy.uris.retrieval_methods = types;
+        self.customized_policy().uris.retrieval_methods = types;
         self
     }
 
@@ -637,7 +661,7 @@ impl<'a> VerifyContext<'a> {
     /// Allow bounded internal DTD declarations while keeping external entity
     /// resolution disabled. This is off by default.
     pub fn allow_internal_dtd(mut self, enabled: bool) -> Self {
-        self.policy.xml.allow_internal_dtd = enabled;
+        self.customized_policy().xml.allow_internal_dtd = enabled;
         self
     }
 
@@ -656,7 +680,7 @@ impl<'a> VerifyContext<'a> {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.policy.transforms.allowed_algorithms =
+        self.customized_policy().transforms.allowed_algorithms =
             Some(transforms.into_iter().map(Into::into).collect());
         self
     }
@@ -679,7 +703,7 @@ impl<'a> VerifyContext<'a> {
     /// Use [`XPathHereSemantics::XmlSecLegacy`] only for documents known to
     /// have been generated with libxmlsec1's `<Transform>` interpretation.
     pub fn xpath_here_semantics(mut self, semantics: XPathHereSemantics) -> Self {
-        self.policy.transforms.xpath_here_semantics = semantics;
+        self.customized_policy().transforms.xpath_here_semantics = semantics;
         self
     }
 
@@ -2504,8 +2528,11 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
             }
             if capture_time {
                 // Without a host clock this stays `None`; key resolution then
-                // reports the missing verification time.
-                captured.policy.key_trust.verification_time = crate::policy::clock::host_now();
+                // reports the missing verification time. The clock reading
+                // enforces the snapshot as published, so its identity stays.
+                Arc::make_mut(&mut captured.policy)
+                    .key_trust
+                    .verification_time = crate::policy::clock::host_now();
             }
             captured
         };
@@ -2542,7 +2569,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
             // wide. A valid first signature cannot authenticate a Manifest
             // belonging to an invalid second signature.
             let mut operation = OperationExecutionContext::new(
-                &ctx.policy,
+                &*ctx.policy,
                 &budgets,
                 Some((view.identity(), view.generation())),
             );
@@ -2599,7 +2626,11 @@ fn verify_signature_document_with_context_and_transforms(
     {
         captured_context = {
             let mut context = ctx.clone();
-            context.policy.key_trust.verification_time = crate::policy::clock::host_now();
+            // Filling in the operation's clock reading enforces the snapshot
+            // as published, so its identity stays.
+            Arc::make_mut(&mut context.policy)
+                .key_trust
+                .verification_time = crate::policy::clock::host_now();
             context
         };
         &captured_context
@@ -2609,7 +2640,7 @@ fn verify_signature_document_with_context_and_transforms(
     let budgets =
         VerificationOperationBudgets::with_transforms(&ctx.policy, transforms, ctx.utc_facts);
     let mut operation = OperationExecutionContext::new(
-        &ctx.policy,
+        &*ctx.policy,
         &budgets,
         Some((document.identity(), document.generation())),
     );
@@ -2957,7 +2988,7 @@ fn materialize_verification_hints(
                 resolver,
                 &ctx.policy.resources,
                 &budgets.transforms,
-                Some((&ctx.policy, ctx.xml_backend)),
+                Some((&*ctx.policy, ctx.xml_backend)),
                 Some(&mut materialization),
             )?;
         } else if !should_parse_key_info {
@@ -2966,7 +2997,7 @@ fn materialize_verification_hints(
                 resolver,
                 &ctx.policy.resources,
                 &budgets.transforms,
-                Some((&ctx.policy, ctx.xml_backend)),
+                Some((&*ctx.policy, ctx.xml_backend)),
             )? {
                 return Err(crate::key_establishment::KeyEstablishmentError::Structure(
                     "mechanism and explicit recipient key must be supplied together",
@@ -2995,7 +3026,7 @@ fn materialize_verification_hints(
             info,
             origins.as_deref_mut(),
             resolver,
-            &ctx.policy,
+            &*ctx.policy,
             ctx.provider,
             &mut retrieval_budgets,
             &mut materialization,
@@ -3004,7 +3035,7 @@ fn materialize_verification_hints(
             info,
             origins,
             resolver,
-            &ctx.policy,
+            &*ctx.policy,
             ctx.provider,
             &mut retrieval_budgets,
             &mut materialization.candidate_work,

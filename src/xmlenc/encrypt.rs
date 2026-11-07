@@ -73,7 +73,8 @@ pub struct EncryptedDataBuilder {
     direct_key: Option<DirectEncryptionKey>,
     direct_key_name: Option<String>,
     recipients: Vec<EncryptionRecipient>,
-    policy: crate::policy::EncryptionPolicy,
+    policy: Arc<crate::policy::EncryptionPolicy>,
+    identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: Arc<dyn crate::provider::CryptoProvider>,
     xml_backend: crate::XmlBackend,
 }
@@ -174,11 +175,12 @@ impl EncryptionOperationBudgets {
     }
 }
 
+/// One encryption operation, sharing its policy snapshot.
+type EncryptionExecution =
+    OperationExecutionContext<Arc<crate::policy::EncryptionPolicy>, EncryptionOperationBudgets>;
+
 fn compile_encryption_plan(
-    operation: &mut OperationExecutionContext<
-        crate::policy::EncryptionPolicy,
-        EncryptionOperationBudgets,
-    >,
+    operation: &mut EncryptionExecution,
     key_count: usize,
     mutation: bool,
     input_resource: OperationResourceIdentity,
@@ -275,7 +277,8 @@ impl EncryptedDataBuilder {
             direct_key: None,
             direct_key_name: None,
             recipients: Vec::new(),
-            policy: crate::policy::EncryptionPolicy::default(),
+            policy: Arc::new(crate::policy::EncryptionPolicy::default()),
+            identity: None,
             provider: Arc::new(crate::provider::RustCryptoProvider),
             xml_backend: crate::XmlBackend::default(),
         }
@@ -284,7 +287,8 @@ impl EncryptedDataBuilder {
     /// Replace the complete immutable encryption policy snapshot.
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::EncryptionPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Arc::new(policy);
+        self.identity = None;
         self
     }
 
@@ -430,20 +434,27 @@ impl EncryptedDataBuilder {
 
     pub(crate) fn bind<'a>(
         &'a self,
-        policy: &'a crate::policy::EncryptionPolicy,
+        policy: &'a Arc<crate::policy::EncryptionPolicy>,
+        identity: Option<&'a Arc<crate::policy::PolicyIdentity>>,
         provider: &'a dyn crate::provider::CryptoProvider,
         xml_backend: crate::XmlBackend,
     ) -> BoundEncryption<'a> {
         BoundEncryption {
             builder: self,
             policy,
+            identity,
             provider,
             xml_backend,
         }
     }
 
     fn execution(&self) -> BoundEncryption<'_> {
-        self.bind(&self.policy, self.provider.as_ref(), self.xml_backend)
+        self.bind(
+            &self.policy,
+            self.identity.as_ref(),
+            self.provider.as_ref(),
+            self.xml_backend,
+        )
     }
 
     /// Encrypt one complete XML element or XML content fragment.
@@ -502,7 +513,9 @@ impl EncryptedDataBuilder {
 /// Borrow request material while fixing the operation's policy and provider.
 pub(crate) struct BoundEncryption<'a> {
     builder: &'a EncryptedDataBuilder,
-    policy: &'a crate::policy::EncryptionPolicy,
+    // Each operation shares this snapshot rather than copying it.
+    policy: &'a Arc<crate::policy::EncryptionPolicy>,
+    identity: Option<&'a Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
 }
@@ -734,10 +747,7 @@ impl BoundEncryption<'_> {
     /// Replace the encrypted target with `result` as the operation's mutation.
     fn replace_document_target(
         &self,
-        operation: &mut OperationExecutionContext<
-            crate::policy::EncryptionPolicy,
-            EncryptionOperationBudgets,
-        >,
+        operation: &mut EncryptionExecution,
         mutation: Option<OperationNodeId>,
         document: &mut XmlDocument,
         target: crate::document::NodeIdentity,
@@ -768,10 +778,7 @@ impl BoundEncryption<'_> {
     /// serialize when the key was encapsulated.
     fn establish_content_key(
         &self,
-        operation: &OperationExecutionContext<
-            crate::policy::EncryptionPolicy,
-            EncryptionOperationBudgets,
-        >,
+        operation: &EncryptionExecution,
     ) -> Result<(OperationContentKey<'_>, Option<Vec<u8>>), XmlEncError> {
         let content_key = match &self.direct_key {
             Some(DirectEncryptionKey::Encapsulation(key)) => {
@@ -874,10 +881,7 @@ impl BoundEncryption<'_> {
         &self,
         plaintext: &[u8],
         encrypted_type: Option<&EncryptedDataType>,
-        operation: &mut OperationExecutionContext<
-            crate::policy::EncryptionPolicy,
-            EncryptionOperationBudgets,
-        >,
+        operation: &mut EncryptionExecution,
         mutates_document: bool,
     ) -> Result<GeneratedEncryption, XmlEncError> {
         // Bound caller-controlled inputs before hashing or allocating one plan

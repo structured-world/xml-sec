@@ -128,11 +128,11 @@ impl<'a> XmlSecurity<'a> {
     pub fn verifier(&self) -> Result<Verifier<'_>, XmlSecError> {
         let policy = self
             .policies
-            .verification()
+            .shared_verification()
             .ok_or(XmlSecError::OperationDisabled(Operation::Verify))?;
         Ok(Verifier {
             context: VerifyContext::new()
-                .policy(policy.clone())
+                .snapshot(policy, self.policies.shared_identity())
                 .provider(self.provider)
                 .xml_backend(self.backend),
         })
@@ -149,11 +149,11 @@ impl<'a> XmlSecurity<'a> {
     {
         let policy = self
             .policies
-            .signing()
+            .shared_signing()
             .ok_or(XmlSecError::OperationDisabled(Operation::Sign))?;
         Ok(Signer {
             context: SignContext::new(key)
-                .policy(policy.clone())
+                .snapshot(policy, self.policies.shared_identity())
                 .provider(self.provider)
                 .xml_backend(self.backend),
         })
@@ -193,10 +193,15 @@ impl<'a> XmlSecurity<'a> {
     {
         let policy = self
             .policies
-            .encryption()
+            .shared_encryption()
             .ok_or(XmlSecError::OperationDisabled(Operation::Encrypt))?;
         Ok(Encryptor {
-            execution: builder.bind(policy, self.provider, self.backend),
+            execution: builder.bind(
+                policy,
+                self.policies.shared_identity(),
+                self.provider,
+                self.backend,
+            ),
         })
     }
 
@@ -214,11 +219,11 @@ impl<'a> XmlSecurity<'a> {
     {
         let policy = self
             .policies
-            .decryption()
+            .shared_decryption()
             .ok_or(XmlSecError::OperationDisabled(Operation::Decrypt))?;
         Ok(Decryptor {
             context: crate::xmlenc::DecryptContext::new(resolver)
-                .policy(policy.clone())
+                .snapshot(policy, self.policies.shared_identity())
                 .provider(self.provider)
                 .xml_backend(self.backend),
         })

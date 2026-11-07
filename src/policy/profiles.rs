@@ -1,5 +1,6 @@
 //! Trusted profile selection and compilation; no configuration discovery or I/O.
 
+use super::PolicyIdentity;
 use super::clock::Instant;
 #[cfg(feature = "xmlenc")]
 use super::{
@@ -12,7 +13,7 @@ use super::{
     UriTypeSet, VerificationPolicy, XsltStylesheetSemantics,
 };
 use crate::provider::{CryptoProvider, ProviderCapability};
-use alloc::{borrow::ToOwned, collections::BTreeSet, string::String};
+use alloc::{borrow::ToOwned, collections::BTreeSet, string::String, sync::Arc};
 
 mod composition;
 mod constraints;
@@ -131,13 +132,47 @@ pub struct PolicyCompileContext {
     pub target_evidence: bool,
 }
 
-/// Immutable compiled output. Operation snapshots retain all constraints and
-/// authorization metadata when cloned into existing processing contexts.
+/// One borrowed reading of every operation policy, editable or compiled, so
+/// both are validated by the same checks.
+pub(super) struct PolicyView<'a> {
+    pub(super) verification: Option<&'a VerificationPolicy>,
+    pub(super) signing: Option<&'a SigningPolicy>,
+    #[cfg(feature = "xmlenc")]
+    pub(super) encryption: Option<&'a EncryptionPolicy>,
+    #[cfg(feature = "xmlenc")]
+    pub(super) decryption: Option<&'a DecryptionPolicy>,
+}
+
+impl PolicySet {
+    pub(super) fn view(&self) -> PolicyView<'_> {
+        PolicyView {
+            verification: self.verification.as_ref(),
+            signing: self.signing.as_ref(),
+            #[cfg(feature = "xmlenc")]
+            encryption: self.encryption.as_ref(),
+            #[cfg(feature = "xmlenc")]
+            decryption: self.decryption.as_ref(),
+        }
+    }
+}
+
+/// Immutable compiled output: one shared snapshot per enabled operation.
+///
+/// Cloning shares the snapshots instead of copying them, so every operation
+/// built from one `CompiledPolicies` enforces exactly the same policy and
+/// reports the same [`PolicyIdentity`], whichever replacement is published
+/// later.
 #[derive(Debug, Clone)]
 pub struct CompiledPolicies {
     profile: PolicyProfile,
-    policies: PolicySet,
+    verification: Option<Arc<VerificationPolicy>>,
+    signing: Option<Arc<SigningPolicy>>,
+    #[cfg(feature = "xmlenc")]
+    encryption: Option<Arc<EncryptionPolicy>>,
+    #[cfg(feature = "xmlenc")]
+    decryption: Option<Arc<DecryptionPolicy>>,
     context: PolicyCompileContext,
+    identity: Option<Arc<PolicyIdentity>>,
 }
 
 impl CompiledPolicies {
@@ -145,7 +180,33 @@ impl CompiledPolicies {
         &self,
         provider: &dyn CryptoProvider,
     ) -> Result<(), PolicyViolation> {
-        self.policies.validate(self.context, provider)
+        PolicyView {
+            verification: self.verification.as_deref(),
+            signing: self.signing.as_deref(),
+            #[cfg(feature = "xmlenc")]
+            encryption: self.encryption.as_deref(),
+            #[cfg(feature = "xmlenc")]
+            decryption: self.decryption.as_deref(),
+        }
+        .validate(self.context, provider)
+    }
+
+    /// Name this snapshot for audit; operations built from it report `identity`.
+    /// The publisher is trusted to describe exactly these policies.
+    #[must_use]
+    pub fn with_identity(mut self, identity: PolicyIdentity) -> Self {
+        self.identity = Some(Arc::new(identity));
+        self
+    }
+
+    /// The audit identity the publisher assigned, if any.
+    #[must_use]
+    pub fn identity(&self) -> Option<&PolicyIdentity> {
+        self.identity.as_deref()
+    }
+
+    pub(crate) fn shared_identity(&self) -> Option<&Arc<PolicyIdentity>> {
+        self.identity.as_ref()
     }
 
     /// Explicit trusted profile identity, not inferred from XML.
@@ -156,24 +217,39 @@ impl CompiledPolicies {
     /// Borrow the compiled verification snapshot, if enabled.
     #[must_use]
     pub fn verification(&self) -> Option<&VerificationPolicy> {
-        self.policies.verification.as_ref()
+        self.verification.as_deref()
+    }
+    pub(crate) fn shared_verification(&self) -> Option<&Arc<VerificationPolicy>> {
+        self.verification.as_ref()
     }
     /// Borrow the compiled signing snapshot, if enabled.
     #[must_use]
     pub fn signing(&self) -> Option<&SigningPolicy> {
-        self.policies.signing.as_ref()
+        self.signing.as_deref()
+    }
+    #[cfg(feature = "xmldsig-sign")]
+    pub(crate) fn shared_signing(&self) -> Option<&Arc<SigningPolicy>> {
+        self.signing.as_ref()
     }
     /// Borrow the compiled encryption snapshot, if enabled.
     #[cfg(feature = "xmlenc")]
     #[must_use]
     pub fn encryption(&self) -> Option<&EncryptionPolicy> {
-        self.policies.encryption.as_ref()
+        self.encryption.as_deref()
+    }
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn shared_encryption(&self) -> Option<&Arc<EncryptionPolicy>> {
+        self.encryption.as_ref()
     }
     /// Borrow the compiled decryption snapshot, if enabled.
     #[cfg(feature = "xmlenc")]
     #[must_use]
     pub fn decryption(&self) -> Option<&DecryptionPolicy> {
-        self.policies.decryption.as_ref()
+        self.decryption.as_deref()
+    }
+    #[cfg(feature = "xmlenc")]
+    pub(crate) fn shared_decryption(&self) -> Option<&Arc<DecryptionPolicy>> {
+        self.decryption.as_ref()
     }
 }
 
@@ -250,11 +326,25 @@ impl<'a> PolicyCompiler<'a> {
         self,
         context: &PolicyCompileContext,
     ) -> Result<CompiledPolicies, PolicyViolation> {
-        self.policies.validate(*context, self.provider)?;
+        self.policies.view().validate(*context, self.provider)?;
+        let PolicySet {
+            verification,
+            signing,
+            #[cfg(feature = "xmlenc")]
+            encryption,
+            #[cfg(feature = "xmlenc")]
+            decryption,
+        } = self.policies;
         Ok(CompiledPolicies {
             profile: self.profile,
-            policies: self.policies,
+            verification: verification.map(Arc::new),
+            signing: signing.map(Arc::new),
+            #[cfg(feature = "xmlenc")]
+            encryption: encryption.map(Arc::new),
+            #[cfg(feature = "xmlenc")]
+            decryption: decryption.map(Arc::new),
             context: *context,
+            identity: None,
         })
     }
 

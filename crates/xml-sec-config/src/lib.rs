@@ -3,6 +3,9 @@
 #![forbid(unsafe_code)]
 
 mod settings;
+mod store;
+
+pub use store::{PolicyStore, Source};
 
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read, path::Path};

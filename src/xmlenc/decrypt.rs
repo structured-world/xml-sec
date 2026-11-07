@@ -693,12 +693,18 @@ pub struct DocumentDecryptionOptions<'a> {
 /// Immutable `XMLEnc` decryption operation context.
 pub struct DecryptContext<'a> {
     resolver: &'a dyn DecryptionKeyResolver,
-    policy: crate::policy::DecryptionPolicy,
+    // Shared with the compiled snapshot it came from.
+    policy: Arc<crate::policy::DecryptionPolicy>,
+    identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a std::collections::BTreeMap<String, Vec<u8>>>,
 }
+
+/// One decryption operation, sharing its policy snapshot.
+type DecryptionExecution =
+    OperationExecutionContext<Arc<crate::policy::DecryptionPolicy>, DecryptionOperationBudgets>;
 
 struct DecryptionPlanNodes {
     document: OperationNodeId,
@@ -715,8 +721,7 @@ struct DecryptionOperationBudgets {
 }
 
 struct DecryptionReferenceGate<'a> {
-    operation:
-        &'a OperationExecutionContext<crate::policy::DecryptionPolicy, DecryptionOperationBudgets>,
+    operation: &'a DecryptionExecution,
     document: OperationNodeId,
     ciphertext: OperationNodeId,
 }
@@ -744,10 +749,7 @@ impl DecryptionOperationBudgets {
 }
 
 fn compile_decryption_plan(
-    operation: &mut OperationExecutionContext<
-        crate::policy::DecryptionPolicy,
-        DecryptionOperationBudgets,
-    >,
+    operation: &mut DecryptionExecution,
     mutation: bool,
 ) -> Result<DecryptionPlanNodes, XmlEncError> {
     let document = operation.add_node(OperationNodeKind::Document, OperationStage::Parse, None);
@@ -792,8 +794,7 @@ fn compile_decryption_plan(
 
 struct ProcessedDecryption<T> {
     output: T,
-    operation:
-        OperationExecutionContext<crate::policy::DecryptionPolicy, DecryptionOperationBudgets>,
+    operation: DecryptionExecution,
     mutation: Option<OperationNodeId>,
 }
 
@@ -846,7 +847,8 @@ impl<'a> DecryptContext<'a> {
     pub fn new(resolver: &'a dyn DecryptionKeyResolver) -> Self {
         Self {
             resolver,
-            policy: crate::policy::DecryptionPolicy::default(),
+            policy: Arc::new(crate::policy::DecryptionPolicy::default()),
+            identity: None,
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
             id_attributes: &[],
@@ -857,7 +859,19 @@ impl<'a> DecryptContext<'a> {
     /// Replace the complete immutable decryption policy snapshot.
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::DecryptionPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a published snapshot as is and report its identity.
+    pub(crate) fn snapshot(
+        mut self,
+        policy: &Arc<crate::policy::DecryptionPolicy>,
+        identity: Option<&Arc<crate::policy::PolicyIdentity>>,
+    ) -> Self {
+        self.policy = Arc::clone(policy);
+        self.identity = identity.cloned();
         self
     }
 
@@ -955,10 +969,7 @@ impl<'a> DecryptContext<'a> {
         input: DecryptionInput<'input>,
         source_document: Option<(&crate::XmlDomDocument<'_>, Option<usize>)>,
         reference_context: &super::CipherReferenceContext<'_>,
-        operation: &OperationExecutionContext<
-            crate::policy::DecryptionPolicy,
-            DecryptionOperationBudgets,
-        >,
+        operation: &DecryptionExecution,
     ) -> Result<(Cow<'input, EncryptedData>, Vec<Option<crate::NodeId>>), XmlEncError> {
         match input {
             DecryptionInput::Xml { .. } | DecryptionInput::Document { .. } => {
@@ -976,7 +987,7 @@ impl<'a> DecryptContext<'a> {
                 };
                 let (encrypted, origins) = super::parse::parse_encrypted_data_node_with_origins(
                     selected,
-                    operation.policy().into(),
+                    (&**operation.policy()).into(),
                     false,
                     self.id_attributes,
                     self.provider,
@@ -1035,10 +1046,7 @@ impl<'a> DecryptContext<'a> {
         algorithm: DataEncryptionAlgorithm,
         encrypted: &EncryptedData,
         ciphertext: &[u8],
-        operation: &OperationExecutionContext<
-            crate::policy::DecryptionPolicy,
-            DecryptionOperationBudgets,
-        >,
+        operation: &DecryptionExecution,
         accept: &mut impl FnMut(DecryptedContent, &XmlParseWorkBudget) -> Result<T, XmlEncError>,
     ) -> Result<T, XmlEncError> {
         let mut last_error = None;
