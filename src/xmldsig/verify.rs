@@ -3273,20 +3273,19 @@ fn record_reference_decisions<P, B>(
     role: crate::policy::UriRole,
 ) {
     use crate::policy::{AlgorithmRole, PolicyDecision};
-    if let Some(uri) = reference.uri.as_deref() {
-        operation.record_policy(PolicyDecision::Uri {
-            role,
-            class: classify_uri(uri),
-        });
+    let class = reference.uri.as_deref().map(classify_uri);
+    if let Some(class) = class {
+        operation.record_policy(PolicyDecision::Uri { role, class });
     }
     operation.record_policy(PolicyDecision::algorithm(
         AlgorithmRole::Digest,
         reference.digest_method.uri(),
     ));
-    for transform in &reference.transforms {
+    let external = class == Some(UriClass::External);
+    for algorithm in super::transforms::transform_algorithms(external, &reference.transforms) {
         operation.record_policy(PolicyDecision::algorithm(
             AlgorithmRole::Transform,
-            transform.algorithm_uri(),
+            algorithm,
         ));
     }
 }

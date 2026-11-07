@@ -3014,18 +3014,17 @@ fn record_signing_reference(
     role: crate::policy::UriRole,
 ) {
     use crate::policy::{AlgorithmRole, PolicyDecision};
-    operation.record_policy(PolicyDecision::Uri {
-        role,
-        class: super::UriClass::of(&reference.uri),
-    });
+    let class = super::UriClass::of(&reference.uri);
+    operation.record_policy(PolicyDecision::Uri { role, class });
     operation.record_policy(PolicyDecision::algorithm(
         AlgorithmRole::Digest,
         reference.digest_method.uri(),
     ));
-    for transform in &reference.transforms {
+    let external = class == super::UriClass::External;
+    for algorithm in super::transforms::transform_algorithms(external, &reference.transforms) {
         operation.record_policy(PolicyDecision::algorithm(
             AlgorithmRole::Transform,
-            transform.algorithm_uri(),
+            algorithm,
         ));
     }
 }

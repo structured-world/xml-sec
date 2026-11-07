@@ -2500,34 +2500,36 @@ fn resolve_nested_key(
             continue;
         }
         // A refused nested method ends the operation, as any policy failure
-        // below the content key does.
-        admit_encrypted_key(operation, nested)?;
-        let resolution = if nested.sources.is_empty() {
-            budget.require_available(3)?;
-            let remaining = budget.remaining();
-            key_resolver
-                .resolve_key_encryption_keys_with_policy(
+        // below the content key does; a method this build cannot run is one
+        // failed candidate, and the next nested key is still tried.
+        let resolution = admit_encrypted_key(operation, nested).and_then(|()| {
+            if nested.sources.is_empty() {
+                budget.require_available(3)?;
+                let remaining = budget.remaining();
+                key_resolver
+                    .resolve_key_encryption_keys_with_policy(
+                        provider,
+                        wrap,
+                        KeyEncryptionKeySource::Encrypted(nested),
+                        policy,
+                        budget,
+                    )
+                    .and_then(|returned| {
+                        budget.account_returned_candidates(remaining, returned.len())?;
+                        Ok(returned)
+                    })
+            } else {
+                resolve_nested_key(
                     provider,
-                    wrap,
-                    KeyEncryptionKeySource::Encrypted(nested),
-                    policy,
+                    source,
+                    wrap.key_len(),
+                    key_resolver,
+                    operation,
                     budget,
+                    depth + 1,
                 )
-                .and_then(|returned| {
-                    budget.account_returned_candidates(remaining, returned.len())?;
-                    Ok(returned)
-                })
-        } else {
-            resolve_nested_key(
-                provider,
-                source,
-                wrap.key_len(),
-                key_resolver,
-                operation,
-                budget,
-                depth + 1,
-            )
-        };
+            }
+        });
         match resolution {
             Ok(returned) => keys.extend(returned),
             Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,

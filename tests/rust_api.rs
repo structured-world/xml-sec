@@ -387,6 +387,63 @@ fn builder() -> SignatureBuilder {
 }
 
 #[test]
+fn the_audit_names_the_implicit_canonicalization_a_reference_digests_with() {
+    // A same-document Reference without a canonicalizing transform is digested
+    // through inclusive C14N 1.0; signing and verification audits name it
+    // like any explicit transform the policy admitted.
+    use xml_sec::policy::{AlgorithmRole, PolicyAudit, PolicyDecision};
+    use xml_sec::xmldsig::DEFAULT_IMPLICIT_C14N_URI;
+    let names_implicit = |audit: &PolicyAudit| {
+        audit.decisions.iter().any(|decision| {
+            matches!(
+                decision,
+                PolicyDecision::Algorithm { role: AlgorithmRole::Transform, uri }
+                    if uri == DEFAULT_IMPLICIT_C14N_URI
+            )
+        })
+    };
+    let compiled = policies();
+    let api = XmlSecurity::new(&compiled, &RustCryptoProvider).unwrap();
+    // A received Reference without Transforms; the values need not verify,
+    // the audit records what the policy admitted before digesting.
+    let received = |value: &str| {
+        format!(
+            "<root><p Id='payload'>signed</p>\
+             <ds:Signature xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><ds:SignedInfo>\
+             <ds:CanonicalizationMethod Algorithm='http://www.w3.org/2001/10/xml-exc-c14n#'/>\
+             <ds:SignatureMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#hmac-sha256'/>\
+             <ds:Reference URI='#payload'>\
+             <ds:DigestMethod Algorithm='http://www.w3.org/2001/04/xmlenc#sha256'/>\
+             <ds:DigestValue>{value}</ds:DigestValue></ds:Reference></ds:SignedInfo>\
+             <ds:SignatureValue>{value}</ds:SignatureValue></ds:Signature></root>"
+        )
+    };
+    let verify_key = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
+    let result = api
+        .verifier()
+        .unwrap()
+        .key(&verify_key)
+        .verify_signature_xml(&received("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
+        .unwrap();
+    assert_ne!(result.status, DsigStatus::Valid);
+    assert!(names_implicit(&result.policy));
+    // Signing such a template generates an explicit C14N 1.1 transform, so
+    // nothing is applied implicitly and the audit names the explicit one.
+    let key = HmacSigningKey::new(vec![0x42; 32]).unwrap();
+    let signed = api
+        .signer(&key)
+        .unwrap()
+        .sign_template_xml(&received(""))
+        .unwrap();
+    assert!(!names_implicit(&signed.policy));
+    assert!(signed.policy.decisions.iter().any(|decision| matches!(
+        decision,
+        PolicyDecision::Algorithm { role: AlgorithmRole::Transform, uri }
+            if uri == "http://www.w3.org/2006/12/xml-c14n11"
+    )));
+}
+
+#[test]
 fn retained_evidence_authenticates_only_the_requested_generation_and_target() {
     // Mathematical success cannot authorize an unsigned sibling or mutated document.
     let compiled = policies();

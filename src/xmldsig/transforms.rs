@@ -2957,6 +2957,19 @@ pub(crate) fn transform_chain_uses_implicit_c14n<I: Instruction>(
     !binary
 }
 
+/// Every transform algorithm running `transforms` executes: the explicit ones
+/// in order, then the implicit inclusive C14N 1.0 when the chain applies it.
+/// Policy admits exactly these, so audits name exactly these.
+pub(crate) fn transform_algorithms(
+    initial_binary: bool,
+    transforms: &[Transform],
+) -> impl Iterator<Item = &'static str> {
+    transforms.iter().map(Transform::algorithm_uri).chain(
+        transform_chain_uses_implicit_c14n(initial_binary, transforms)
+            .then_some(DEFAULT_IMPLICIT_C14N_URI),
+    )
+}
+
 /// Map every C14N resource failure governed by the operation policy.
 ///
 /// The output parameters apply only to the bounded-writer case; XML Base

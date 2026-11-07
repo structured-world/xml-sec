@@ -1185,6 +1185,51 @@ fn nested_encrypted_key_recovers_the_outer_kek_not_a_second_content_key() {
     ));
 }
 
+#[test]
+fn an_unsupported_nested_method_falls_through_to_the_next_nested_key() {
+    // A nested recipient whose method this build cannot run is one failed
+    // candidate, as a key that does not unwrap is, not the end of the outer
+    // key: the next nested key still recovers the KEK.
+    let root = [9; 16];
+    let intermediate = [7; 16];
+    let content = [3; 16];
+    let wrap = KeyWrapAlgorithm::AesKw128;
+    let inner_bytes = RUST_CRYPTO_PROVIDER
+        .wrap_key(wrap, &root, &intermediate)
+        .unwrap();
+    let outer_bytes = RUST_CRYPTO_PROVIDER
+        .wrap_key(wrap, &intermediate, &content)
+        .unwrap();
+    let inner = key("").replace(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        &STANDARD.encode(inner_bytes),
+    );
+    let unsupported = inner.replace(&format!("{X}kw-aes128"), "urn:example:unsupported-wrap");
+    let outer = key(&format!("<d:KeyInfo>{unsupported}{inner}</d:KeyInfo>")).replacen(
+        "<x:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</x:CipherValue>",
+        &format!(
+            "<x:CipherValue>{}</x:CipherValue>",
+            STANDARD.encode(outer_bytes)
+        ),
+        1,
+    );
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content)
+        .encrypt_binary(b"nested fallback")
+        .unwrap();
+    let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+    let wire = data(&outer).replace(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+        parsed.cipher_data.inline_value().unwrap(),
+    );
+    let resolver = KekDecryptor::new(root);
+    let decrypted = DecryptContext::new(&resolver).decrypt(&wire).unwrap();
+    assert_eq!(
+        decrypted.output,
+        DecryptedContent::Bytes(b"nested fallback".to_vec())
+    );
+}
+
 #[cfg(feature = "legacy-algorithms")]
 #[test]
 fn nested_implicit_rejection_reaches_final_content_authentication() {
