@@ -736,6 +736,10 @@ impl super::cipher_reference::ReferenceOperationGate for DecryptionReferenceGate
         self.operation
             .run_discovered_resource(self.document, self.ciphertext, identity, action)
     }
+
+    fn record_reference(&self, uri: &str, transforms: &[crate::xmldsig::transforms::Transform]) {
+        record_cipher_reference(self.operation, uri, transforms);
+    }
 }
 
 impl DecryptionOperationBudgets {
@@ -1182,8 +1186,7 @@ impl<'a> DecryptContext<'a> {
                             uri,
                             transforms,
                             &operation.budgets().xml_parse,
-                        )
-                        .inspect(|_| record_cipher_reference(&operation, uri, transforms))?
+                        )?
                 }
                 _ => encrypted.cipher_data.octets()?.into_owned(),
             };

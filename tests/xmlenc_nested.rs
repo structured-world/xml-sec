@@ -790,15 +790,25 @@ fn external_retrieval_and_transforms_share_caller_owned_resources() {
         ),
     ] {
         let wire = data(&format!("<d:RetrievalMethod xml:base='https://example.test/keys/' URI='{path}' Type='{X}EncryptedKey'>{transforms}</d:RetrievalMethod>")).replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==", parsed.cipher_data.inline_value().unwrap());
+        let decrypted = DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .external_resources(&resources)
+            .decrypt(&wire)
+            .expect("caller-owned key retrieval");
         assert_eq!(
-            DecryptContext::new(&resolver)
-                .policy(policy.clone())
-                .external_resources(&resources)
-                .decrypt(&wire)
-                .expect("caller-owned key retrieval")
-                .output,
+            decrypted.output,
             DecryptedContent::Bytes(b"retrieved external key".to_vec())
         );
+        // A retrieved key's own CipherReference is part of the same operation.
+        let referenced =
+            decrypted
+                .policy
+                .decisions
+                .contains(&xml_sec::policy::PolicyDecision::Uri {
+                    role: xml_sec::policy::UriRole::CipherReference,
+                    class: xml_sec::xmldsig::UriClass::External,
+                });
+        assert_eq!(referenced, path == "referenced.xml", "{path}");
         assert!(matches!(
             DecryptContext::new(&resolver)
                 .external_resources(&resources)

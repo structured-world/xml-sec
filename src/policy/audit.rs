@@ -4,6 +4,11 @@ use super::{Instant, ManifestProcessing, PolicyIdentity, PolicyValidity, PolicyV
 use crate::xmldsig::UriClass;
 use alloc::{string::String, sync::Arc, vec::Vec};
 
+/// What a [`PolicyDecision::Rejected`] record names instead of an algorithm
+/// this build does not recognize: such a value is document text, not a
+/// public algorithm identifier.
+pub const UNRECOGNIZED_ALGORITHM: &str = "unrecognized algorithm";
+
 /// The policy decisions one operation made, and the snapshot it enforced.
 ///
 /// Records name algorithms by their public URI and URIs only by class: they
@@ -70,7 +75,8 @@ pub enum PolicyDecision {
         expires_at: Instant,
     },
     /// The policy refused one input and the operation went on without it,
-    /// such as one Reference among several.
+    /// such as one Reference among several. A refused algorithm this build
+    /// does not recognize is named [`UNRECOGNIZED_ALGORITHM`].
     Rejected(PolicyViolation),
 }
 

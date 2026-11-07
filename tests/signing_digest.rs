@@ -2495,6 +2495,60 @@ fn sign_context_processes_manifests_before_signed_info() {
 }
 
 #[test]
+fn an_unrecognized_transform_does_not_carry_document_text_into_the_audit() {
+    // The Algorithm of a transform this build does not know is document text;
+    // the audit names the refusal without copying that text into the log.
+    const SECRET: &str = "urn:x:account-4111111111111111";
+    let private_key =
+        RsaSigningKey::from_pkcs8_pem(&read_fixture("tests/fixtures/keys/rsa/rsa-2048-key.pem"))
+            .expect("RSA private key fixture must parse");
+    let verification_key = VerificationKey {
+        algorithm: SignatureAlgorithm::RsaSha256,
+        public_key_bytes: rsa_spki(&private_key),
+        certificate_der: None,
+        name: None,
+    };
+    // The default signing policy leaves the Manifest as application data, so
+    // its unknown transform is signed rather than executed.
+    let template = manifest_signing_template()
+        .replace(
+            r##"<ds:Reference URI="#payload">"##,
+            &format!(
+                r##"<ds:Reference URI="#payload"><ds:Transforms><ds:Transform Algorithm="{SECRET}"/></ds:Transforms>"##
+            ),
+        )
+        .replace(">stale<", ">AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=<");
+    let tampered = SignContext::new(&private_key)
+        .sign_template(&template)
+        .expect("signing must leave the Manifest untouched")
+        .output;
+    let verified = VerifyContext::new()
+        .key(&verification_key)
+        .process_manifests(true)
+        .allowed_transforms([
+            "http://www.w3.org/2001/10/xml-exc-c14n#",
+            "http://www.w3.org/2006/12/xml-c14n11",
+            DEFAULT_IMPLICIT_C14N_URI,
+        ])
+        .verify(&tampered)
+        .expect("a refused Manifest Reference is that Reference's own result");
+    assert!(
+        verified.policy.decisions.iter().any(|decision| matches!(
+            decision,
+            PolicyDecision::Rejected(xml_sec::policy::PolicyViolation::Algorithm { algorithm, .. })
+                if algorithm == xml_sec::policy::UNRECOGNIZED_ALGORITHM
+        )),
+        "{:?}",
+        verified.policy.decisions
+    );
+    assert!(
+        !format!("{:?}", verified.policy).contains(SECRET),
+        "{:?}",
+        verified.policy
+    );
+}
+
+#[test]
 fn verification_audits_a_manifest_reference_its_policy_refuses() {
     // A Manifest Reference refused by the transform allowlist fails alone while
     // the signature stays valid; the audit must record that refusal rather

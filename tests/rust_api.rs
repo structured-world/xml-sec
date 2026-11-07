@@ -249,6 +249,71 @@ fn every_operation_reports_the_identity_of_the_snapshot_it_enforced() {
 }
 
 #[test]
+fn batch_verification_audits_every_signature_and_the_operation() {
+    // A signature that fails is still part of the operation: its refusal and
+    // the snapshot that refused it belong in the audit, and a document with
+    // no signature at all still reports which snapshot examined it.
+    use xml_sec::policy::{PolicyDecision, PolicyIdentity, PolicyViolation, SigningPolicy};
+    use xml_sec::xmldsig::SignContext;
+    let identity = PolicyIdentity::new("modern", 1, 9, [0x3c; 32]);
+    let compiled = policies().with_identity(identity.clone());
+    let api = XmlSecurity::new(&compiled, &RustCryptoProvider).unwrap();
+    let key = HmacSigningKey::new(vec![8; 32]).unwrap();
+    let reference = |id: &str, algorithm| {
+        SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(format!("#{id}")))
+    };
+    let first = api
+        .signer(&key)
+        .unwrap()
+        .sign_xml(
+            "<root><p Id='first'>one</p><p Id='second'>two</p></root>",
+            &reference("first", SignatureAlgorithm::HmacSha256),
+        )
+        .unwrap()
+        .output;
+    // A SHA-1 signature the modern verification profile refuses.
+    let both = SignContext::new(&key)
+        .policy(SigningPolicy {
+            signature_algorithms: Some([SignatureAlgorithm::HmacSha1].into()),
+            ..SigningPolicy::default()
+        })
+        .sign_with_builder(&first, &reference("second", SignatureAlgorithm::HmacSha1))
+        .unwrap()
+        .output;
+    let verify_key = HmacVerificationKey::new(vec![8; 32]).unwrap();
+    let verifier = api.verifier().unwrap().key(&verify_key);
+    let document = api.parse_document(both, Operation::Verify).unwrap();
+    let evidence = verifier
+        .verify(&document, &VerificationRequest::default())
+        .unwrap();
+    assert_eq!(evidence.policy_identity(), Some(&identity));
+    let [valid, refused] = evidence.signatures() else {
+        panic!("two signatures")
+    };
+    assert_eq!(valid.result().as_ref().unwrap().status, DsigStatus::Valid);
+    assert_eq!(valid.policy(), &valid.result().as_ref().unwrap().policy);
+    assert!(refused.result().is_err());
+    assert_eq!(refused.policy().identity.as_deref(), Some(&identity));
+    assert!(
+        refused.policy().decisions.iter().any(|decision| matches!(
+            decision,
+            PolicyDecision::Rejected(PolicyViolation::Algorithm { algorithm, .. })
+                if algorithm == SignatureAlgorithm::HmacSha1.uri()
+        )),
+        "{:?}",
+        refused.policy()
+    );
+
+    let unsigned = api.parse_document("<root/>", Operation::Verify).unwrap();
+    let evidence = verifier
+        .verify(&unsigned, &VerificationRequest::default())
+        .unwrap();
+    assert!(evidence.signatures().is_empty());
+    assert_eq!(evidence.policy_identity(), Some(&identity));
+}
+
+#[test]
 fn capability_mismatch_is_rejected_when_binding_the_real_provider() {
     // Compilation with one provider cannot authorize an unavailable engine.
     let compiled = policies();

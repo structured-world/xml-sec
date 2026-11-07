@@ -72,10 +72,16 @@ available in their existing low-level modules.
 ### Policy Audit
 
 Every operation reports what its policy decided as a `PolicyAudit`:
-`VerifyResult::policy` for verification, `Audited<T>` (`output` plus `policy`)
-from the string, fragment and binary operations, and a bare `PolicyAudit` from
-the retained-document operations, whose output is the document itself.
-`EncryptionResult::policy` carries it for the low-level encryption builder.
+`VerifyResult::policy` for single-signature verification, `Audited<T>`
+(`output` plus `policy`) from the string, fragment and binary operations, and a
+bare `PolicyAudit` from the retained-document operations, whose output is the
+document itself. `EncryptionResult::policy` carries it for the low-level
+encryption builder. Retained-document verification reports per Signature:
+`SignatureEvidence::policy` holds each Signature's decisions whatever its
+outcome, ending with the refusal when the policy failed it, and
+`VerifyEvidence::policy_identity` names the enforced snapshot even for a
+document without a Signature. Completing detached References in a verified
+session appends the Manifest processing it runs to that Signature's audit.
 
 - `identity` names the published snapshot the operation enforced: profile,
   configuration schema version, publication revision and the SHA-256 of the
@@ -94,7 +100,8 @@ the retained-document operations, whose output is the document itself.
 
 Records carry public algorithm URIs and URI classes only, never document
 content, URIs, key material or resource bytes, so they can be logged as they
-are. How a verification key was authorized stays in `VerifyResult::key_trust`.
+are; a refused algorithm this build does not recognize is named
+`UNRECOGNIZED_ALGORITHM`. How a verification key was authorized stays in `VerifyResult::key_trust`.
 
 ### Ownership And Errors
 

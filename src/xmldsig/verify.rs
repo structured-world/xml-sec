@@ -877,6 +877,9 @@ pub struct VerificationRequest<'a> {
 pub struct SignatureEvidence {
     identity: NodeIdentity,
     result: Result<VerifyResult, DsigError>,
+    /// The audit of a failed verification; a completed one keeps its audit in
+    /// [`VerifyResult::policy`].
+    failure_policy: crate::policy::PolicyAudit,
 }
 
 impl SignatureEvidence {
@@ -890,6 +893,76 @@ impl SignatureEvidence {
     pub const fn result(&self) -> &Result<VerifyResult, DsigError> {
         &self.result
     }
+
+    /// What the policy decided while verifying this Signature, whatever the
+    /// outcome. A failure the policy caused is its last decision, recorded as
+    /// [`crate::policy::PolicyDecision::Rejected`]: the operation went on to
+    /// the document's other Signatures.
+    #[must_use]
+    pub const fn policy(&self) -> &crate::policy::PolicyAudit {
+        match &self.result {
+            Ok(result) => &result.policy,
+            Err(_) => &self.failure_policy,
+        }
+    }
+
+    /// Turn a completed verification into `error`, keeping the decisions it
+    /// made and appending those `operation` made since.
+    fn fail(
+        &mut self,
+        error: DsigError,
+        operation: &OperationExecutionContext<
+            &crate::policy::VerificationPolicy,
+            &VerificationOperationBudgets,
+        >,
+    ) {
+        let mut audit = match &mut self.result {
+            Ok(result) => core::mem::take(&mut result.policy),
+            Err(_) => core::mem::take(&mut self.failure_policy),
+        };
+        let failure = failed_signature_audit(operation, &error, audit.identity.as_ref());
+        audit.decisions.extend(failure.decisions);
+        self.failure_policy = audit;
+        self.result = Err(error);
+    }
+
+    fn new(
+        identity: NodeIdentity,
+        result: Result<VerifyResult, DsigError>,
+        operation: &OperationExecutionContext<
+            &crate::policy::VerificationPolicy,
+            &VerificationOperationBudgets,
+        >,
+        policy_identity: Option<&Arc<crate::policy::PolicyIdentity>>,
+    ) -> Self {
+        let failure_policy = match &result {
+            Ok(_) => crate::policy::PolicyAudit::default(),
+            Err(error) => failed_signature_audit(operation, error, policy_identity),
+        };
+        Self {
+            identity,
+            result,
+            failure_policy,
+        }
+    }
+}
+
+/// The audit of a Signature whose verification failed: the decisions made
+/// before the failure, then the refusal when the policy caused it.
+fn failed_signature_audit(
+    operation: &OperationExecutionContext<
+        &crate::policy::VerificationPolicy,
+        &VerificationOperationBudgets,
+    >,
+    error: &DsigError,
+    identity: Option<&Arc<crate::policy::PolicyIdentity>>,
+) -> crate::policy::PolicyAudit {
+    if let DsigError::Policy(violation) = error {
+        // Verification names refused algorithms by their typed URI; an
+        // unrecognized one fails parsing before any allowlist check.
+        operation.record_policy(crate::policy::PolicyDecision::Rejected(violation.clone()));
+    }
+    operation.audit(identity)
 }
 
 /// Bounded outcomes for all signatures in one document generation.
@@ -900,6 +973,7 @@ pub struct VerifyEvidence<V = Vec<SignatureEvidence>> {
     signatures: V,
     accepted: bool,
     correlation: Option<[u8; 16]>,
+    policy_identity: Option<Arc<crate::policy::PolicyIdentity>>,
 }
 
 impl<V: core::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
@@ -919,6 +993,14 @@ impl<V: core::ops::Deref<Target = [SignatureEvidence]>> VerifyEvidence<V> {
     #[must_use]
     pub const fn correlation(&self) -> Option<[u8; 16]> {
         self.correlation
+    }
+
+    /// The published snapshot this operation enforced, also when the document
+    /// held no Signature; `None` when the caller built or customized the
+    /// policy. Each Signature's decisions are in [`SignatureEvidence::policy`].
+    #[must_use]
+    pub fn policy_identity(&self) -> Option<&crate::policy::PolicyIdentity> {
+        self.policy_identity.as_deref()
     }
 
     /// Prove complete expanded element content under an authorized signature.
@@ -2624,10 +2706,12 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
                 signature,
                 &capture,
             );
-            signatures.push_signature(SignatureEvidence {
-                identity: view.node_identity(signature),
+            signatures.push_signature(SignatureEvidence::new(
+                view.node_identity(signature),
                 result,
-            })?;
+                &operation,
+                ctx.identity.as_ref(),
+            ))?;
             operations.retain(operation, capture)?;
         }
         let mut evidence = VerifyEvidence {
@@ -2635,6 +2719,7 @@ fn with_verified_document<'inputs, R, S: RequestStorage>(
             signatures,
             accepted: false,
             correlation: request.correlation,
+            policy_identity: ctx.identity.clone(),
         };
         accept_verification_evidence(
             view,
@@ -5956,15 +6041,17 @@ fn unsupported_manifest_transform_reason(
         &VerificationOperationBudgets,
     >,
     allowed_transforms: Option<&BTreeSet<String>>,
-    uri: String,
+    uri: &str,
     ref_index: usize,
 ) -> FailureReason {
-    if allowed_transforms.is_some_and(|allowed| !allowed.contains(&uri)) {
-        // The refusal enforce_transform_allowed reports.
+    if allowed_transforms.is_some_and(|allowed| !allowed.contains(uri)) {
+        // The refusal enforce_transform_allowed reports. This build does not
+        // recognize the transform, so its Algorithm is document text, not a
+        // public identifier, and stays out of the audit.
         operation.record_policy(crate::policy::PolicyDecision::Rejected(
             crate::policy::PolicyViolation::Algorithm {
                 operation: "verification transform",
-                algorithm: uri,
+                algorithm: crate::policy::UNRECOGNIZED_ALGORITHM.into(),
             },
         ));
         FailureReason::ReferencePolicyViolation { ref_index }
@@ -6055,7 +6142,7 @@ fn parse_manifest_references(
                     let reason = unsupported_manifest_transform_reason(
                         operation,
                         allowed_transforms,
-                        uri,
+                        &uri,
                         reference_index,
                     );
                     invalid.push(CompiledManifestInvalid {

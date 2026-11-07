@@ -105,6 +105,7 @@ fn sign(args: &Args, ids: &[IdAttributeRegistration], input: &str) -> Result<Out
             |()| {
                 context
                     .sign_template(input)
+                    .map(|signed| signed.output)
                     .map_err(|error| error.to_string())
             },
             |signed: &String| Some(signed.as_bytes().to_vec()),
@@ -115,7 +116,7 @@ fn sign(args: &Args, ids: &[IdAttributeRegistration], input: &str) -> Result<Out
             |mut document| {
                 context
                     .sign_document(&mut document)
-                    .map(|()| document)
+                    .map(|_audit| document)
                     .map_err(|error| error.to_string())
             },
             |document: &XmlDocument| Some(document.as_xml().as_bytes().to_vec()),
@@ -250,6 +251,7 @@ fn encrypt(args: &Args, input: &str) -> Result<Outcome, String> {
             |()| {
                 builder
                     .encrypt_document(input, options)
+                    .map(|encrypted| encrypted.output)
                     .map_err(|error| error.to_string())
             },
             |encrypted: &String| Some(encrypted.as_bytes().to_vec()),
@@ -260,7 +262,7 @@ fn encrypt(args: &Args, input: &str) -> Result<Outcome, String> {
             |mut document| {
                 builder
                     .encrypt_owned_document(&mut document, options)
-                    .map(|()| document)
+                    .map(|_audit| document)
                     .map_err(|error| error.to_string())
             },
             |document: &XmlDocument| Some(document.as_xml().as_bytes().to_vec()),
@@ -290,6 +292,7 @@ fn decrypt(args: &Args, input: &str) -> Result<Outcome, String> {
             |()| {
                 context
                     .decrypt_document(input, None)
+                    .map(|decrypted| decrypted.output)
                     .map_err(|error| error.to_string())
             },
             |plain: &String| Some(plain.as_bytes().to_vec()),
@@ -300,7 +303,7 @@ fn decrypt(args: &Args, input: &str) -> Result<Outcome, String> {
             |mut document| {
                 context
                     .decrypt_owned_document(&mut document, None)
-                    .map(|()| document)
+                    .map(|_audit| document)
                     .map_err(|error| error.to_string())
             },
             |document: &XmlDocument| Some(document.as_xml().as_bytes().to_vec()),

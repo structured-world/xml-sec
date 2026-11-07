@@ -957,6 +957,20 @@ fn completing_core_validation_processes_the_authenticated_manifest() {
     assert_eq!(result.status, DsigStatus::Valid);
     assert_eq!(result.manifest_references.len(), 1);
     assert_eq!(result.manifest_references[0].status, DsigStatus::Valid);
+    // The Manifest processing the completion ran is in the Signature's audit.
+    for decision in [
+        xml_sec::policy::PolicyDecision::Manifests(ManifestProcessing::Process),
+        xml_sec::policy::PolicyDecision::Uri {
+            role: xml_sec::policy::UriRole::ManifestReference,
+            class: xml_sec::xmldsig::UriClass::SameDocument,
+        },
+    ] {
+        assert!(
+            result.policy.decisions.contains(&decision),
+            "{decision:?}: {:?}",
+            result.policy.decisions
+        );
+    }
     assert!(evidence.all_valid());
     assert!(evidence.accepted(&document).unwrap());
 }
