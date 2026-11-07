@@ -742,7 +742,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
     };
     match set {
         Set::Baseline => generate(&generator),
-        Set::Levels => super::levels::generate(&generator),
+        Set::Levels => super::levels::generate(corpus, &generator),
         Set::Creation => creation(&generator),
         Set::Augmentation => super::augmentation::generate(corpus, &generator),
     }

@@ -1,8 +1,10 @@
 //! `xades fixtures --levels`: B-T, B-LT and B-LTA signatures over a complete
 //! test PKI. OpenSSL issues the certificates, CRLs, OCSP responses and RFC 3161
 //! tokens, libxml2 computes every timestamp input and xmlsec1 the XML
-//! signature; xml-sec takes no part. Unsigned properties are added after
-//! signing, as a real signature gains them over its life.
+//! signature; xml-sec takes no part in the signatures. Unsigned properties
+//! are added after signing, as a real signature gains them over its life.
+//! Last, the `augment_probe` example requests an archive with a digest
+//! renewal of the `Manifest` signature, which the same TSA answers.
 
 use super::fixtures::{
     Digests, Generator, RSA_SHA256_PROFILE, Signature, TEST_INSTANT, baseline, counter_signature,
@@ -511,7 +513,13 @@ impl Shared<'_> {
             STANDARD.encode(Sha256::digest(payload))
         );
         let signature = Signature {
-            data_reference: target_reference("sig", "#manifest", profile),
+            // XMLDSig 1.1 §5.1: this Type identifies the referenced Manifest,
+            // which DSS needs to see its references as signed objects.
+            data_reference: target_reference("sig", "#manifest", profile).replacen(
+                "<ds:Reference ",
+                r#"<ds:Reference Type="http://www.w3.org/2000/09/xmldsig#Manifest" "#,
+                1,
+            ),
             objects: format!(
                 r#"<ds:Object><ds:Manifest Id="manifest">{reference}</ds:Manifest></ds:Object>"#
             ),
@@ -527,6 +535,8 @@ impl Shared<'_> {
             self.tail
         );
         let earlier = with_properties(&signed, &material);
+        // The same signature before its archive, for xml-sec to renew.
+        write(&self.directory.join("b-lt-manifest.xml"), &earlier)?;
         let manifest = element(&signed, "<ds:Manifest", "</ds:Manifest>")?;
         let mut input = archive_input_over(
             generator,
@@ -791,8 +801,53 @@ fn payload(units: usize) -> String {
     items
 }
 
+/// The archive request with a SHA-512 renewal that `augment_probe` makes for
+/// `b-lt-manifest.xml`, as `renew.tsq`, and the test TSA's whole response to
+/// it, as `renew.tsr`.
+fn write_renewal_reply(
+    corpus: &super::Corpus,
+    levels: &Levels<'_>,
+    directory: &std::path::Path,
+) -> Result<(), String> {
+    let generator = levels.generator;
+    corpus.require(
+        &super::line(&[
+            &"cargo",
+            &"run",
+            &"-q",
+            &"-p",
+            &"xml-sec-xades",
+            &"--features",
+            &"produce",
+            &"--example",
+            &"augment_probe",
+            &"--",
+            &"renew-request",
+            &directory,
+            &generator.work,
+        ]),
+        &generator.work.join("augment-probe-renew-request"),
+    )?;
+    // The serial file goes on from the last token, so this one has its own.
+    levels.write("tsa.cnf", TSA_CONFIG)?;
+    levels.openssl(&[
+        "ts",
+        "-reply",
+        "-config",
+        "tsa.cnf",
+        "-queryfile",
+        "renew.tsq",
+        "-out",
+        "renew.tsr",
+    ])?;
+    for name in ["renew.tsq", "renew.tsr"] {
+        write(&directory.join(name), levels.read(name)?)?;
+    }
+    Ok(())
+}
+
 /// Writes the level fixtures and their anchor into `levels/` of the output.
-pub(crate) fn generate(generator: &Generator) -> Result<(), String> {
+pub(crate) fn generate(corpus: &super::Corpus, generator: &Generator) -> Result<(), String> {
     let directory = generator.output.join("levels");
     for path in [&directory, &generator.work] {
         std::fs::create_dir_all(path)
@@ -884,7 +939,7 @@ pub(crate) fn generate(generator: &Generator) -> Result<(), String> {
     for name in ["root", "issuer", "outsider"] {
         write(&directory.join(format!("{name}.der")), generator.der(name)?)?;
     }
-    Ok(())
+    write_renewal_reply(corpus, &levels, &directory)
 }
 
 /// B-LT variants of `material`: a responder only local configuration authorizes,

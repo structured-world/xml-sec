@@ -10,6 +10,7 @@ use structured_asn1::{Parser, Reader};
 use structured_xades::binary::{BinaryXml, Decoded, OwnedBinaryXml, OwnedDecoded};
 use structured_xades::certificate::DigestProvider;
 use structured_xades::hashes::HashClass;
+use structured_xades::renewed::MethodProvider;
 use structured_xades::xml::{Access, Name};
 use xml_sec::document::NodeIdentity;
 pub use xml_sec::xmldsig::DigestOutput;
@@ -218,5 +219,28 @@ impl<W: Work> DigestProvider<'_, Self> for Document<'_, '_, '_, '_, W> {
             DigestIdentity::Md5 => HashClass::Md5,
             DigestIdentity::Digest(algorithm) => crate::signature::hash_class(*algorithm),
         }
+    }
+}
+
+impl<W: Work> MethodProvider<'_, Self> for Document<'_, '_, '_, '_, W> {
+    fn resolve_new<Q: Work>(
+        &self,
+        algorithm: &str,
+        work: &Q,
+    ) -> Result<Resolution<DigestIdentity>, Error> {
+        // The URI is written as given, so a spelling an anyURI reader would
+        // collapse (XSD 1.0 §4.3.6) is not the method it names.
+        // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#rf-whiteSpace
+        work.charge_work(algorithm.len() as u64)?;
+        if any_uri(algorithm) != algorithm {
+            return Ok(Resolution::Malformed);
+        }
+        Ok(match self.session.resolve_digest_uri_in(algorithm, work)? {
+            DigestMethodResolution::Supported(algorithm) => {
+                Resolution::Supported(DigestIdentity::Digest(algorithm))
+            }
+            DigestMethodResolution::Unsupported => Resolution::Unsupported,
+            DigestMethodResolution::Malformed => Resolution::Malformed,
+        })
     }
 }

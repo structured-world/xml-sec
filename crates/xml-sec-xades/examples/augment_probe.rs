@@ -24,7 +24,14 @@
 //! signature of `LEVELS/b-t.xml`, from the level fixtures: the CRLs and OCSP
 //! response OpenSSL issued for its PKI, as `LEVELS/b-lt.xml` carries them. It
 //! writes the B-LT document `OUTPUT/b-lt.xml`.
+//!
+//! `augment_probe renew-request LEVELS OUTPUT` requests an archive timestamp
+//! of the B-LT `Manifest` signature `LEVELS/b-lt-manifest.xml` with a SHA-512
+//! renewal of its detached object `LEVELS/detached.txt`, written as
+//! `OUTPUT/renew.tsq`. `augment_probe renew LEVELS OUTPUT` completes it with
+//! `LEVELS/renew.tsr` and writes the B-LTA document `OUTPUT/b-lta-manifest.xml`.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -36,15 +43,16 @@ use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
     UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::{
-    Assessment, Completion, DataObject, Envelope, Inputs, PendingTimestamp, Request, Requirements,
-    Signer, TimestampRequest, ValidationData, add_validation_data, complete_timestamp, create,
-    request_archive_timestamp, request_timestamp,
+    Assessment, Completion, DataObject, DigestRenewal, Envelope, Inputs, PendingTimestamp, Request,
+    Requirements, Signer, TimestampRequest, ValidationData, add_validation_data,
+    complete_timestamp, create, request_archive_timestamp, request_archive_timestamp_with_renewal,
+    request_timestamp,
 };
 
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
@@ -73,7 +81,7 @@ fn utc() -> Result<LeapTable<'static>, String> {
 
 fn main() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
-    let usage = "usage: augment_probe request|complete|archive-request|renewal-request|archive|extend FIXTURES OUTPUT";
+    let usage = "usage: augment_probe request|complete|archive-request|renewal-request|archive|extend|renew-request|renew FIXTURES OUTPUT";
     let (Some(action), Some(fixtures), Some(output), None) =
         (args.next(), args.next(), args.next(), args.next())
     else {
@@ -81,8 +89,11 @@ fn main() -> Result<(), String> {
     };
     let (fixtures, output) = (PathBuf::from(fixtures), PathBuf::from(output));
     std::fs::create_dir_all(&output).map_err(|error| error.to_string())?;
-    if action.to_str() == Some("extend") {
-        return extend(&fixtures, &output);
+    match action.to_str() {
+        Some("extend") => return extend(&fixtures, &output),
+        Some("renew-request") => return renew(&fixtures, &output, false),
+        Some("renew") => return renew(&fixtures, &output, true),
+        _ => {}
     }
     let root = read(&fixtures, "root.der")?;
     let intermediate = read(&fixtures, "intermediate.der")?;
@@ -357,6 +368,85 @@ fn values(xml: &str, local: &str) -> Result<Vec<Vec<u8>>, String> {
         }
     }
     Ok(values)
+}
+
+/// Archive the `Manifest` signature of the level fixtures with a SHA-512
+/// renewal of its SHA-256 detached object; `complete` adds the TSA's response
+/// and requires B-LTA, otherwise the request is written.
+fn renew(levels: &Path, output: &Path, complete: bool) -> Result<(), String> {
+    let root = read(levels, "root.der")?;
+    let resources = BTreeMap::from([("detached.txt".to_owned(), read(levels, "detached.txt")?)]);
+    let text = String::from_utf8(read(levels, "b-lt-manifest.xml")?)
+        .map_err(|error| format!("b-lt-manifest.xml: {error}"))?;
+    let mut document = XmlDocument::parse(&text).map_err(|error| error.to_string())?;
+    let resolver = DefaultKeyResolver::new(KeyResolverConfig {
+        trusted_certs: vec![root.clone()],
+        ..KeyResolverConfig::default()
+    });
+    let mut policy = verification();
+    policy.uris.references = UriTypeSet::ALL;
+    // The renewed objects are those of an authenticated Manifest.
+    policy.manifest_processing = ManifestProcessing::Process;
+    let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
+    let request = VerificationRequest {
+        external_resources: Some(&resources),
+        ..VerificationRequest::default()
+    };
+    let assessment = Assessment {
+        context: &context,
+        request: &request,
+        certificates: &[],
+    };
+    let utc = utc()?;
+    let anchors: [&[u8]; 1] = [&root];
+    let inputs = |requirements| Inputs {
+        requirements,
+        anchors: &anchors,
+        certificates: &[],
+        utc: &utc,
+        accuracies: &[],
+        responders: &[],
+        crls: &[],
+        responses: &[],
+    };
+    let work = Memory::new(Arc::new(MemoryAccount::new(1 << 26, 1 << 30)));
+    let pending = request_archive_timestamp_with_renewal(
+        &mut document,
+        &TimestampRequest {
+            signature: "sig",
+            digest: Algorithm::Sha256,
+            policy: None,
+            nonce: Some(NONCE),
+            id_attributes: &[],
+        },
+        &DigestRenewal {
+            method: "http://www.w3.org/2001/04/xmlenc#sha512",
+            references: &["detached-object"],
+        },
+        &assessment,
+        &inputs(Requirements::LongTerm),
+        &work,
+    )
+    .map_err(|error| format!("renewal request: {error}"))?;
+    if !complete {
+        return std::fs::write(output.join("renew.tsq"), pending.request())
+            .map_err(|error| format!("renew.tsq: {error}"));
+    }
+    complete_timestamp(
+        &mut document,
+        &pending,
+        &read(levels, "renew.tsr")?,
+        &Completion {
+            assessment: &assessment,
+            inputs: &inputs(Requirements::Archival),
+            window: None,
+            id_attributes: &[],
+        },
+        &work,
+    )
+    .map_err(|error| format!("renewal completion: {error}"))?;
+    std::fs::write(output.join("b-lta-manifest.xml"), document.as_xml())
+        .map_err(|error| format!("b-lta-manifest.xml: {error}"))
 }
 
 /// Add the issued CRLs and OCSP response to the B-T level fixture and require B-LT.

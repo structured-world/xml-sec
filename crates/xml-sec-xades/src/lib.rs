@@ -41,6 +41,9 @@
 //! `request_archive_timestamp` then takes a B-LT signature to B-LTA through the
 //! same completion, and a B-LTA one to its next renewal: each new
 //! `ArchiveTimeStamp` covers every earlier archive.
+//! `request_archive_timestamp_with_renewal` first digests the detached objects
+//! of a signed `Manifest` under a new method as a `RenewedDigestsV2`, which
+//! the completion publishes together with the archive that protects it.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -71,9 +74,9 @@ mod xml;
 pub use accuracy::AuthorityAccuracy;
 #[cfg(feature = "produce")]
 pub use augment::{
-    AugmentError, Completion, DataAdded, PendingTimestamp, TimestampRequest, TokenFacts,
-    ValidationData, add_validation_data, complete_timestamp, request_archive_timestamp,
-    request_timestamp,
+    AugmentError, Completion, DataAdded, DigestRenewal, PendingTimestamp, TimestampRequest,
+    TokenFacts, ValidationData, add_validation_data, complete_timestamp, request_archive_timestamp,
+    request_archive_timestamp_with_renewal, request_timestamp,
 };
 pub use basic::{
     CounterError, Outcome, PathFailure, Report, TimestampCheckError, ValidationError,

@@ -1,10 +1,13 @@
 //! Native latency of B-T and B-LTA augmentation over the augmentation fixtures
 //! (RSA-SHA256 signer, an OpenSSL TSA under one root and an empty CRL of each
 //! CA), and of B-LT augmentation over the level fixtures (the same signature
-//! at B-T and B-LT, with OpenSSL CRLs and a delegated OCSP response). Each run
+//! at B-T and B-LT, with OpenSSL CRLs and a delegated OCSP response) and of
+//! an archive with a SHA-512 digest renewal of their B-LT `Manifest`
+//! signature's detached object. Each run
 //! gets a fresh resource account and asserts its result; preparing the input
 //! document and the pending request is excluded.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -14,15 +17,16 @@ use structured_pkix::algorithm::digest::Algorithm;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::policy::{Instant, SigningPolicy, VerificationPolicy};
+use xml_sec::policy::{Instant, ManifestProcessing, SigningPolicy, VerificationPolicy};
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, KeyResolverConfig, RsaSigningKey, SignatureAlgorithm,
     UriTypeSet, VerificationRequest, VerifyContext,
 };
 use xml_sec_xades::{
-    Assessment, Completion, DataAdded, DataObject, Envelope, Inputs, PendingTimestamp, Request,
-    Requirements, Signer, TimestampRequest, ValidationData, add_validation_data,
-    complete_timestamp, create, request_archive_timestamp, request_timestamp,
+    Assessment, Completion, DataAdded, DataObject, DigestRenewal, Envelope, Inputs,
+    PendingTimestamp, Request, Requirements, Signer, TimestampRequest, ValidationData,
+    add_validation_data, complete_timestamp, create, request_archive_timestamp,
+    request_archive_timestamp_with_renewal, request_timestamp,
 };
 
 const ROOT: &[u8] = include_bytes!("../tests/fixtures/augmentation/root.der");
@@ -40,6 +44,10 @@ const ARCHIVE_RESPONSE: &[u8] = include_bytes!("../tests/fixtures/augmentation/a
 const LEVELS_ROOT: &[u8] = include_bytes!("../tests/fixtures/levels/root.der");
 const B_T: &str = include_str!("../tests/fixtures/levels/b-t.xml");
 const B_LT: &str = include_str!("../tests/fixtures/levels/b-lt.xml");
+const B_LT_MANIFEST: &str = include_str!("../tests/fixtures/levels/b-lt-manifest.xml");
+const DETACHED: &[u8] = include_bytes!("../tests/fixtures/levels/detached.txt");
+const RENEW_REQUEST: &[u8] = include_bytes!("../tests/fixtures/levels/renew.tsq");
+const RENEW_RESPONSE: &[u8] = include_bytes!("../tests/fixtures/levels/renew.tsr");
 const DOCUMENT: &str = "<Document><Data Id=\"payload\">Augmented payload</Data></Document>";
 const TIME: &str = "2026-10-18T12:00:00Z";
 const NONCE: &[u8] = &[0x0a, 0x1b, 0x2c, 0x3d, 0x4e, 0x5f, 0x60, 0x71];
@@ -316,6 +324,134 @@ fn complete_archive(bencher: divan::Bencher) {
                     )
                 })
                 .expect("archive completion");
+            assert!(document.generation() > generation);
+            (document, pending, work)
+        });
+}
+
+/// The level fixtures' B-LT `Manifest` signature and what renewing its
+/// detached object needs: the object, `Manifest` processing and the root.
+struct Renewing {
+    resolver: DefaultKeyResolver,
+    verification: VerificationPolicy,
+    resources: BTreeMap<String, Vec<u8>>,
+    utc: LeapTable<'static>,
+}
+
+const RENEWAL: DigestRenewal<'static> = DigestRenewal {
+    method: "http://www.w3.org/2001/04/xmlenc#sha512",
+    references: &["detached-object"],
+};
+
+impl Renewing {
+    fn new() -> Self {
+        let mut verification = VerificationPolicy::default();
+        verification.key_trust.verify_x509_chains = true;
+        verification.key_trust.verification_time = Instant::new(1_800_000_000, 0);
+        verification.uris.references = UriTypeSet::ALL;
+        verification.manifest_processing = ManifestProcessing::Process;
+        Self {
+            resolver: DefaultKeyResolver::new(KeyResolverConfig {
+                trusted_certs: vec![LEVELS_ROOT.to_vec()],
+                ..KeyResolverConfig::default()
+            }),
+            verification,
+            resources: BTreeMap::from([("detached.txt".to_owned(), DETACHED.to_vec())]),
+            utc: LeapTable::new(-2_208_988_800, 4_102_444_800, &[]).expect("UTC coverage"),
+        }
+    }
+
+    fn with<R>(
+        &self,
+        requirements: Requirements,
+        operation: impl FnOnce(&Assessment<'_, '_>, &Inputs<'_>) -> R,
+    ) -> R {
+        let context = VerifyContext::new()
+            .policy(self.verification.clone())
+            .key_resolver(&self.resolver);
+        let request = VerificationRequest {
+            external_resources: Some(&self.resources),
+            ..VerificationRequest::default()
+        };
+        operation(
+            &Assessment {
+                context: &context,
+                request: &request,
+                certificates: &[],
+            },
+            &Inputs {
+                requirements,
+                anchors: &[LEVELS_ROOT],
+                certificates: &[],
+                utc: &self.utc,
+                accuracies: &[],
+                responders: &[],
+                crls: &[],
+                responses: &[],
+            },
+        )
+    }
+
+    fn request(&self, document: &mut XmlDocument, work: &Memory) -> PendingTimestamp {
+        self.with(Requirements::LongTerm, |assessment, inputs| {
+            request_archive_timestamp_with_renewal(
+                document, &ARCHIVE, &RENEWAL, assessment, inputs, work,
+            )
+        })
+        .expect("renewal request")
+    }
+}
+
+/// The B-LT assessment over the processed `Manifest`, the SHA-512 digests of
+/// the detached object and its `Reference`, then the archive input of the
+/// staged generation with the renewal, its digest and the DER request.
+#[divan::bench]
+fn request_renewed_archive(bencher: divan::Bencher) {
+    let renewing = Renewing::new();
+    bencher
+        .with_inputs(|| {
+            (
+                XmlDocument::parse(B_LT_MANIFEST).expect("B-LT fixture"),
+                account(),
+            )
+        })
+        .bench_local_values(|(mut document, work)| {
+            let pending = renewing.request(&mut document, &work);
+            assert_eq!(pending.request(), RENEW_REQUEST);
+            (document, pending, work)
+        });
+}
+
+/// Inserting the renewal, the B-LT assessment of that generation, the
+/// response check, and the verification and B-LTA assessment, renewal
+/// confirmed, that gate publication of both properties.
+#[divan::bench]
+fn complete_renewed_archive(bencher: divan::Bencher) {
+    let renewing = Renewing::new();
+    bencher
+        .with_inputs(|| {
+            let mut document = XmlDocument::parse(B_LT_MANIFEST).expect("B-LT fixture");
+            let pending = renewing.request(&mut document, &account());
+            (document, pending, account())
+        })
+        .bench_local_values(|(mut document, pending, work)| {
+            let generation = document.generation();
+            renewing
+                .with(Requirements::Archival, |assessment, inputs| {
+                    complete_timestamp(
+                        &mut document,
+                        &pending,
+                        RENEW_RESPONSE,
+                        &Completion {
+                            assessment,
+                            inputs,
+                            window: None,
+                            id_attributes: &[],
+                        },
+                        &work,
+                    )
+                })
+                .expect("renewal completion");
             assert!(document.generation() > generation);
             (document, pending, work)
         });
