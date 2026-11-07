@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/structured-world/xml-sec/compare/v0.5.1...v0.6.0) - 2026-11-07
+
+### Added
+
+- *(xades)* [**breaking**] create RenewedDigestsV2 before an archive timestamp ([#424](https://github.com/structured-world/xml-sec/pull/424))
+- *(xades)* add and renew archive timestamps for B-LTA ([#422](https://github.com/structured-world/xml-sec/pull/422))
+- *(xades)* add validation data to reach B-LT ([#420](https://github.com/structured-world/xml-sec/pull/420))
+- *(xades)* augment B-B signatures to B-T ([#416](https://github.com/structured-world/xml-sec/pull/416))
+- *(xades)* create B-B signatures and countersignatures ([#412](https://github.com/structured-world/xml-sec/pull/412))
+- *(compat)* record and check the libxmlsec1 binary ABI baseline ([#409](https://github.com/structured-world/xml-sec/pull/409))
+
+### Fixed
+
+- *(document)* carry node identities across committed mutations ([#418](https://github.com/structured-world/xml-sec/pull/418))
+
 ## [0.5.1](https://github.com/structured-world/xml-sec/compare/v0.5.0...v0.5.1) - 2026-11-05
 
 ### Documentation
