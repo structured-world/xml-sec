@@ -58,16 +58,36 @@ with authority, reason and expiry before using `authorize_replacement` or
 scoped and time-limited; earlier grant lifetimes still intersect and operation
 entry rechecks expiry. Never choose compatibility from the document's algorithms.
 
-## Replacement And Rollback
+## Hot Reload
 
-Configuration loading and compilation are explicit, not a watcher or policy
-store. Applications can construct a complete replacement off to the side and
-pass it only to newly created operations after successful validation. Keep old
-snapshots alive for in-flight operations. Failed replacement must leave the
-previous selection intact. Relaxing replacement requires authenticated authority,
-not a changed config file or a claimed newer revision.
+`xml_sec_config::PolicyStore` publishes one profile's compiled snapshot and
+replaces it atomically. The application decides when to reload: watching files
+or a database, debouncing changes and retrying failed reads stay with it.
 
-There is currently no built-in hot-reload store, canonical policy audit identity
-or deployment watcher. This runbook does not claim those future APIs exist.
-Applications own atomic publication, rollback storage, redaction and correlation;
-never log passwords, private key material, recovered plaintext or raw token errors.
+1. Create one store per tenant profile with `PolicyStore::new`; it publishes
+   revision 1. A store never publishes another profile, so replacing one
+   tenant's policy cannot change what another tenant enforces.
+2. Start every operation with `store.load()` and bind `XmlSecurity` to that
+   snapshot before parsing. The operation enforces it to the end; snapshots
+   already taken stay alive and unchanged while a replacement is published.
+3. On a change, load the new configuration with the usual bounded loaders and
+   call `store.replace` with the same provider, compile-context promises and
+   authenticated grant. The replacement is validated and compiled completely
+   first; a refusal (schema, composition, provider capability, an expired or
+   missing grant) publishes nothing and the previous revision stays in force.
+4. Review `policy diff` between the effective outputs before publishing a
+   relaxing change. A relaxation needs authenticated authority, not a changed
+   file or a higher revision number.
+
+Each publication carries a `PolicyIdentity`: the profile name, the schema
+version, a revision that increases by one per publication of the store (also
+under concurrent publishers), and the SHA-256 of the canonical effective
+settings. Equal digests mean equal enforced settings whatever the file layout,
+so a digest change, not a revision change, shows that enforcement changed.
+Read it from the snapshot (`CompiledPolicies::identity`) to correlate an
+operation with the policy it enforced.
+
+Rollback is a replacement with the earlier configuration: it is published as the
+next revision with the earlier digest. The store keeps no history; applications
+own rollback storage, redaction and correlation, and never log passwords,
+private key material, recovered plaintext or raw token errors.

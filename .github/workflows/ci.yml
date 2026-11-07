@@ -142,6 +142,10 @@ jobs:
           save: ${{ !matrix.minimal }}
       - name: Qualify actual core defaults
         run: cargo run --quiet -p xml-sec-tools -- check-features default
+      # Publication races depend on the platform's scheduler and memory model,
+      # so every operating system repeats the store's concurrency contract.
+      - name: Qualify policy reload concurrency
+        run: cargo nextest run -p xml-sec-config --test store --stress-count 100
       - name: Provision isolated token provider
         if: matrix.minimal
         uses: ./.github/actions/apt-packages
