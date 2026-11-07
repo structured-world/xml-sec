@@ -95,7 +95,13 @@ assessment that gate publication. The two halves of B-LTA augmentation run over
 the augmentation signature at B-LT: the archive request (B-LT assessment,
 archive input, imprint and DER request) and its completion (B-LT assessment of
 the unchanged generation, response check, staging, and the verification and
-B-LTA assessment that gate publication). These are native measurements
+B-LTA assessment that gate publication). The same two halves with a SHA-512
+`RenewedDigestsV2` run over the B-LT `Manifest` level fixture: the request
+(B-B assessment, both renewed digests, then the B-LT assessment, archive input,
+imprint and DER request over the generation staged with the renewal) and its
+completion (the renewal inserted, B-LT assessment, response check, and the
+verification and B-LTA assessment with the renewal confirmed that gate
+publication). These are native measurements
 only; comparison with EU DSS needs qualified equivalent operations and
 separates JVM metrics.
 

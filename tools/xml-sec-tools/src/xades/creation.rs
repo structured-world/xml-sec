@@ -2,8 +2,10 @@
 //! signatures xml-sec creates and augments. The `create_probe` example signs
 //! every packaging mode with the creation fixtures, and `augment_probe` adds a
 //! TSA token to a B-B signature with the augmentation fixtures, the CRLs and
-//! OCSP response of the level fixtures to their B-T signature, and, from its
-//! own B-T signature and CRLs, an archive timestamp and its renewal. DSS must
+//! OCSP response of the level fixtures to their B-T signature, from its own
+//! B-T signature and CRLs, an archive timestamp and its renewal, and to the
+//! level fixtures' B-LT `Manifest` signature an archive timestamp over a
+//! `RenewedDigestsV2` of its detached object. DSS must
 //! classify each signature at its expected level, find it cryptographically
 //! intact with every reference found and intact, identify the signing
 //! certificate and find every timestamp intact over its message imprint.
@@ -39,7 +41,7 @@ const fn created(name: &'static str, signatures: usize) -> Case {
     }
 }
 
-pub(crate) const CASES: [Case; 10] = [
+pub(crate) const CASES: [Case; 11] = [
     created("enveloped", 1),
     created("enveloping", 1),
     created("internally-detached", 1),
@@ -73,6 +75,14 @@ pub(crate) const CASES: [Case; 10] = [
         format: "XAdES-BASELINE-LTA",
         timestamps: 3,
         fixtures: "augmentation",
+    },
+    // DSS does not process RenewedDigestsV2; the archive's imprint covers it.
+    Case {
+        name: "b-lta-manifest",
+        signatures: 1,
+        format: "XAdES-BASELINE-LTA",
+        timestamps: 2,
+        fixtures: "levels",
     },
 ];
 
@@ -224,6 +234,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
         ("augment_probe", Some("complete"), "augmentation"),
         ("augment_probe", Some("extend"), "levels"),
         ("augment_probe", Some("archive"), "augmentation"),
+        ("augment_probe", Some("renew"), "levels"),
     ] {
         let mut probe = line(&[
             &"cargo",
@@ -256,8 +267,11 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path) -> Result<(), String> {
             &TIME,
             &reports,
         ]);
-        if case.name == "detached" {
-            probe.push(signed.join("detached.txt").into());
+        match case.name {
+            "detached" => probe.push(signed.join("detached.txt").into()),
+            // The object its signed Manifest names.
+            "b-lta-manifest" => probe.push(fixtures.join("levels/detached.txt").into()),
+            _ => {}
         }
         let run = corpus.require(&probe, &results.join(format!("{}-run", case.name)))?;
         let output = String::from_utf8_lossy(&run.stdout).into_owned();

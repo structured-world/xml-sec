@@ -10,7 +10,9 @@
 //! [`add_validation_data`] then appends the certificates and statuses a B-T
 //! signature lacks for B-LT, and [`request_archive_timestamp`] requests the
 //! `ArchiveTimeStamp` of B-LTA or of its renewal, which [`complete_timestamp`]
-//! completes in the same way. Nothing is fetched and no clock is read here.
+//! completes in the same way; [`request_archive_timestamp_with_renewal`] puts
+//! a `RenewedDigestsV2` before that archive. Nothing is fetched and no clock
+//! is read here.
 
 mod validation_data;
 
@@ -45,6 +47,7 @@ use structured_xades::produce::{
     self, Augmentation, Event, PreparationError, ResponseCheck, ResponseError, TimestampKind,
     Transaction, Writer,
 };
+use structured_xades::renewed::{self, CreationError};
 use structured_xades::timestamp::InputError;
 use structured_xades::unsigned::Requirements;
 use structured_xades::xml::Xml;
@@ -53,7 +56,10 @@ use xml_sec::document::{DocumentIdentity, NodeIdentity, XmlDocument, XmlDocument
 use xml_sec::xmldsig::DigestAlgorithm;
 use xml_sec::xmldsig::cms::{CmsProvider, CmsProviderError, DigestOutput};
 use xml_sec::xmldsig::extension::{ScalarError, TreeError};
-use xml_sec::xmldsig::{DsigError, ReplayError, VerifiedSession, with_verified_request};
+use xml_sec::xmldsig::{
+    DsigError, ReplayError, VerificationRequest, VerifiedSession, VerifyContext,
+    with_verified_request,
+};
 
 /// The timestamp to request for one signature.
 pub struct TimestampRequest<'a> {
@@ -68,6 +74,21 @@ pub struct TimestampRequest<'a> {
     pub nonce: Option<&'a [u8]>,
     /// ID attributes beyond the standard spellings.
     pub id_attributes: &'a [IdAttributeRegistration],
+}
+
+/// Detached objects of a signed `Manifest` to digest again under a new method
+/// before an archive timestamp protects them (EN 319 132-1 §5.5.3).
+///
+/// Which digests are losing strength is the caller's decision; the format
+/// only requires the new method to differ from each old one.
+#[derive(Debug, Clone, Copy)]
+pub struct DigestRenewal<'a> {
+    /// `Algorithm` URI of the new digest, written as given. The operation's
+    /// digest policy must allow it.
+    pub method: &'a str,
+    /// IDs of the `Manifest` `Reference` elements whose detached objects are
+    /// renewed; the verification request supplies their bytes.
+    pub references: &'a [&'a str],
 }
 
 /// A timestamp request bound to the document generation it covers.
@@ -85,6 +106,9 @@ pub struct PendingTimestamp {
     /// meet when it is completed.
     basis: Requirements,
     request: OwnedVec<u8>,
+    /// The `RenewedDigestsV2` the archive input covers, computed over the
+    /// requested generation and published only together with the archive.
+    renewal: Option<String>,
 }
 
 impl PendingTimestamp {
@@ -135,6 +159,15 @@ pub enum AugmentError {
     /// The document changed since the request was made.
     #[error("the document changed since the timestamp was requested")]
     Changed,
+    /// A digest renewal names no reference.
+    #[error("a digest renewal names no reference")]
+    NothingToRenew,
+    /// No authenticated `Manifest` reference of the signature has the ID.
+    #[error("no signed Manifest reference has the ID {0:?}")]
+    UnknownReference(String),
+    /// The shared renewal rules refused the selected references or method.
+    #[error("digest renewal refused: {0:?}")]
+    Renewal(Box<CreationError<Error, Error, NodeIdentity, DocumentIdentity, u64>>),
     /// The completion asks for a level below B-T.
     #[error("a completed timestamp is assessed at B-T or above, not {0:?}")]
     BelowTimestamped(Requirements),
@@ -261,7 +294,7 @@ pub fn request_timestamp<W: Work>(
         document,
         request,
         assessment,
-        &Gate::Basic(assessment.certificates),
+        &Gate::Basic([assessment.certificates, &[]]),
         TimestampKind::Signature,
         work,
     )
@@ -331,13 +364,7 @@ pub fn request_archive_timestamp<W: Work>(
     inputs: &Inputs<'_>,
     work: &W,
 ) -> Result<PendingTimestamp, AugmentError> {
-    if matches!(
-        inputs.requirements,
-        Requirements::Basic | Requirements::Timestamped
-    ) {
-        return Err(AugmentError::BelowLongTerm(inputs.requirements));
-    }
-    let certificates = pooled(inputs, assessment, work)?;
+    let certificates = archival(inputs, assessment, work)?;
     let inputs = Inputs {
         certificates: &certificates,
         ..*inputs
@@ -350,6 +377,219 @@ pub fn request_archive_timestamp<W: Work>(
         TimestampKind::Archive,
         work,
     )
+}
+
+/// [`request_archive_timestamp`] over the signature with a `RenewedDigestsV2`
+/// (EN 319 132-1 §5.5.3) of `renewal` added, which the archive then protects.
+///
+/// The renewal digests each selected detached object, and the canonical
+/// `Reference` that names it, under `renewal.method`, with the signature's
+/// own `CanonicalizationMethod`. Only references of a signed `Manifest` whose
+/// objects verified as detached ones qualify. The property is computed over
+/// the current generation but never published on its own:
+/// [`complete_timestamp`] adds it with the archive timestamp as one new
+/// generation. The document is borrowed mutably only to compute the archive
+/// input with the property in place; that generation is discarded.
+///
+/// # Errors
+/// Returns the original cause, among them [`AugmentError::UnknownReference`]
+/// for an ID that names no signed `Manifest` reference and
+/// [`AugmentError::Renewal`] for a reference or method the shared rules
+/// refuse; the document is never changed.
+///
+/// # Examples
+///
+/// ```no_run
+/// use structured_pkix::algorithm::digest::Algorithm;
+/// use xml_sec_xades::{
+///     Assessment, DigestRenewal, Inputs, Requirements, TimestampRequest,
+///     request_archive_timestamp_with_renewal,
+/// };
+/// # fn renew(
+/// #     document: &mut xml_sec::XmlDocument,
+/// #     assessment: &Assessment<'_, '_>,
+/// #     evidence: &Inputs<'_>,
+/// #     work: &structured_asn1::memory::Memory,
+/// # ) -> Result<xml_sec_xades::PendingTimestamp, xml_sec_xades::AugmentError> {
+/// let pending = request_archive_timestamp_with_renewal(
+///     document,
+///     &TimestampRequest {
+///         signature: "sig",
+///         digest: Algorithm::Sha256,
+///         policy: None,
+///         nonce: Some(&[0x2a; 8]),
+///         id_attributes: &[],
+///     },
+///     &DigestRenewal {
+///         method: "http://www.w3.org/2001/04/xmlenc#sha512",
+///         references: &["detached-object"],
+///     },
+///     assessment,
+///     &Inputs { requirements: Requirements::LongTerm, ..*evidence },
+///     work,
+/// )?;
+/// // Send `pending.request()` to the TSA, then pass its response to
+/// // `complete_timestamp`, which adds the renewal and the archive together.
+/// # Ok(pending)
+/// # }
+/// ```
+pub fn request_archive_timestamp_with_renewal<W: Work>(
+    document: &mut XmlDocument,
+    request: &TimestampRequest<'_>,
+    renewal: &DigestRenewal<'_>,
+    assessment: &Assessment<'_, '_>,
+    inputs: &Inputs<'_>,
+    work: &W,
+) -> Result<PendingTimestamp, AugmentError> {
+    if renewal.references.is_empty() {
+        return Err(AugmentError::NothingToRenew);
+    }
+    let certificates = archival(inputs, assessment, work)?;
+    let inputs = Inputs {
+        certificates: &certificates,
+        ..*inputs
+    };
+    let gate = Gate::LongTerm(&inputs);
+    let (identity, generation, unsigned) = document.with_view(|view| {
+        let located = placement::locate(view, request.signature, request.id_attributes, work)?;
+        Ok::<_, AugmentError>((view.identity(), view.generation(), located.unsigned))
+    })?;
+    // The renewal needs only the checked references; the staged generation
+    // below is the one assessed at `inputs.requirements`, and the property
+    // adds nothing a lower generation lacks for that level.
+    let property = with_verified_request(
+        document,
+        assessment.context,
+        assessment.request,
+        work,
+        |session| {
+            Ok(
+                selected(document, &session, request.signature, request.id_attributes).and_then(
+                    |node| {
+                        gated(
+                            &session,
+                            node,
+                            &Gate::Basic([inputs.anchors, inputs.certificates]),
+                            |stage, _| renewed_digests(stage, request, renewal, unsigned),
+                        )
+                    },
+                ),
+            )
+        },
+    )??;
+    // The transaction only stages the property: failing it on purpose
+    // restores the requested generation, which completion checks for.
+    let Err(encoded) = document.transaction(|document| {
+        Err::<Infallible, _>(staged(
+            document, request, assessment, &gate, unsigned, &property, work,
+        ))
+    });
+    Ok(PendingTimestamp {
+        document: identity,
+        generation,
+        signature: request.signature.into(),
+        kind: TimestampKind::Archive,
+        basis: gate.requirements(),
+        request: encoded?,
+        renewal: Some(property),
+    })
+}
+
+/// The pooled certificates of an archive request at `inputs.requirements`,
+/// which must be B-LT or above.
+fn archival<'c, W: Work>(
+    inputs: &Inputs<'c>,
+    assessment: &Assessment<'c, '_>,
+    work: &W,
+) -> Result<OwnedVec<&'c [u8]>, AugmentError> {
+    if matches!(
+        inputs.requirements,
+        Requirements::Basic | Requirements::Timestamped
+    ) {
+        return Err(AugmentError::BelowLongTerm(inputs.requirements));
+    }
+    pooled(inputs, assessment, work)
+}
+
+/// The archive request over `document` with `property` inserted at `unsigned`.
+fn staged<W: Work>(
+    document: &mut XmlDocument,
+    request: &TimestampRequest<'_>,
+    assessment: &Assessment<'_, '_>,
+    gate: &Gate<'_>,
+    unsigned: Unsigned,
+    property: &str,
+    work: &W,
+) -> Result<OwnedVec<u8>, AugmentError> {
+    unsigned.insert(document, property)?;
+    let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
+    encoded(
+        document,
+        request,
+        assessment.context,
+        &carried.request(assessment.request),
+        gate,
+        TimestampKind::Archive,
+        work,
+    )
+}
+
+/// The `RenewedDigestsV2` of `renewal` over the stage's generation, as markup.
+fn renewed_digests<W: Work>(
+    stage: &Stage<'_, '_, '_, '_, W>,
+    request: &TimestampRequest<'_>,
+    renewal: &DigestRenewal<'_>,
+    unsigned: Unsigned,
+) -> Result<String, AugmentError> {
+    let view = stage.session.view();
+    let execution = stage.session.execution();
+    let mut wanted = execution.memory().vector();
+    wanted.try_reserve_exact(renewal.references.len())?;
+    for id in renewal.references {
+        let node = view
+            .node_for_id(id, request.id_attributes)
+            .ok_or_else(|| AugmentError::UnknownReference((*id).into()))?;
+        wanted.try_push((node, false))?;
+    }
+    let method = signed_method(stage, request.signature)?;
+    let created = renewed::create(
+        stage.document,
+        stage.prepared.bound(),
+        method,
+        renewal.method,
+        stage.document,
+        execution,
+        |candidate, work| {
+            work.charge_work(wanted.len() as u64)?;
+            let mut chosen = false;
+            for (node, seen) in &mut wanted {
+                if *node == candidate.reference {
+                    *seen = true;
+                    chosen = true;
+                }
+            }
+            Ok(chosen)
+        },
+    )
+    .map_err(|error| AugmentError::Renewal(Box::new(error)))?;
+    // An ID of an element that is no authenticated Manifest reference was
+    // never offered for selection.
+    if let Some(index) = wanted.iter().position(|(_, seen)| !seen) {
+        return Err(AugmentError::UnknownReference(
+            renewal.references[index].into(),
+        ));
+    }
+    let mut staging = Staging {
+        session: stage.session,
+        base: stage.document.snapshot(),
+        signature: stage.prepared.bound().containers().signature(),
+        unsigned: unsigned.signature_properties(),
+        draft: Draft::new(),
+    };
+    created
+        .write(&mut staging, execution)
+        .map_err(construction)?;
+    Ok(staging.draft.finish()?.0)
 }
 
 /// The request of a `kind` timestamp over a signature that passes `gate`.
@@ -365,40 +605,15 @@ fn requested<W: Work>(
         placement::locate(view, request.signature, request.id_attributes, work)?;
         Ok::<_, AugmentError>((view.identity(), view.generation()))
     })?;
-    let encoded = with_verified_request(
+    let encoded = encoded(
         document,
+        request,
         assessment.context,
         assessment.request,
+        gate,
+        kind,
         work,
-        |session| {
-            Ok(
-                selected(document, &session, request.signature, request.id_attributes).and_then(
-                    |node| {
-                        gated(&session, node, gate, |stage, level| {
-                            let method = signed_method(stage, request.signature)?;
-                            let execution = stage.session.execution();
-                            let mut input = Augmentation::new(stage.document, stage.prepared)
-                                .input(level, kind, method, execution)
-                                .map_err(|error| match error {
-                                    PreparationError::Admission(error) => {
-                                        AugmentError::Construction(error)
-                                    }
-                                    PreparationError::Input(error) => {
-                                        AugmentError::Input(Box::new(error))
-                                    }
-                                })?;
-                            let cms = stage.session.cms_provider();
-                            let identity = cms
-                                .identity(request.digest)
-                                .ok_or(AugmentError::UnsupportedDigest)?;
-                            let hashed = imprint(&cms, identity, &mut input, execution)?;
-                            encode(stage.parser, request, hashed.as_ref())
-                        })
-                    },
-                ),
-            )
-        },
-    )??;
+    )?;
     Ok(PendingTimestamp {
         document: identity,
         generation,
@@ -406,7 +621,49 @@ fn requested<W: Work>(
         kind,
         basis: gate.requirements(),
         request: encoded,
+        renewal: None,
     })
+}
+
+/// The DER request of a `kind` timestamp over the signature of `document`
+/// that passes `gate` under `verification`.
+fn encoded<W: Work>(
+    document: &XmlDocument,
+    request: &TimestampRequest<'_>,
+    context: &VerifyContext<'_>,
+    verification: &VerificationRequest<'_>,
+    gate: &Gate<'_>,
+    kind: TimestampKind,
+    work: &W,
+) -> Result<OwnedVec<u8>, AugmentError> {
+    with_verified_request(document, context, verification, work, |session| {
+        Ok(
+            selected(document, &session, request.signature, request.id_attributes).and_then(
+                |node| {
+                    gated(&session, node, gate, |stage, level| {
+                        let method = signed_method(stage, request.signature)?;
+                        let execution = stage.session.execution();
+                        let mut input = Augmentation::new(stage.document, stage.prepared)
+                            .input(level, kind, method, execution)
+                            .map_err(|error| match error {
+                                PreparationError::Admission(error) => {
+                                    AugmentError::Construction(error)
+                                }
+                                PreparationError::Input(error) => {
+                                    AugmentError::Input(Box::new(error))
+                                }
+                            })?;
+                        let cms = stage.session.cms_provider();
+                        let identity = cms
+                            .identity(request.digest)
+                            .ok_or(AugmentError::UnsupportedDigest)?;
+                        let hashed = imprint(&cms, identity, &mut input, execution)?;
+                        encode(stage.parser, request, hashed.as_ref())
+                    })
+                },
+            ),
+        )
+    })?
 }
 
 /// Check `response` against `pending` and publish its token as the
@@ -450,10 +707,6 @@ pub fn complete_timestamp<W: Work>(
     }
     let assessment = completion.assessment;
     let signature = pending.signature.as_str();
-    let unsigned = document.with_view(|view| {
-        placement::locate(view, signature, completion.id_attributes, work)
-            .map(|located| located.unsigned)
-    })?;
     let certificates = pooled(completion.inputs, assessment, work)?;
     let inputs = Inputs {
         certificates: &certificates,
@@ -464,38 +717,52 @@ pub fn complete_timestamp<W: Work>(
         ..inputs
     };
     let gate = match pending.kind {
-        TimestampKind::Signature => Gate::Basic(assessment.certificates),
+        TimestampKind::Signature => Gate::Basic([assessment.certificates, &[]]),
         TimestampKind::Archive => Gate::LongTerm(&basis),
     };
-    let property = with_verified_request(
-        document,
-        assessment.context,
-        assessment.request,
-        work,
-        |session| {
-            Ok(
-                selected(document, &session, signature, completion.id_attributes).and_then(
-                    |node| {
-                        gated(&session, node, &gate, |stage, level| {
-                            timestamped(stage, level, pending, response, completion, unsigned)
-                        })
-                    },
-                ),
-            )
-        },
-    )??;
-    publish(
-        document,
-        &Publication {
-            assessment,
-            inputs: &inputs,
-            signature,
-            id_attributes: completion.id_attributes,
-            unsigned,
-        },
-        Some(&property),
-        work,
-    )
+    let unsigned = |document: &XmlDocument| {
+        document.with_view(|view| {
+            placement::locate(view, signature, completion.id_attributes, work)
+                .map(|located| located.unsigned)
+        })
+    };
+    // A renewal and the archive that protects it form one generation.
+    document.transaction(|document| {
+        if let Some(renewal) = &pending.renewal {
+            unsigned(document)?.insert(document, renewal)?;
+        }
+        let unsigned = unsigned(document)?;
+        let carried = Carried::new::<_, AugmentError>(document, assessment.request, work)?;
+        let property = with_verified_request(
+            document,
+            assessment.context,
+            &carried.request(assessment.request),
+            work,
+            |session| {
+                Ok(
+                    selected(document, &session, signature, completion.id_attributes).and_then(
+                        |node| {
+                            gated(&session, node, &gate, |stage, level| {
+                                timestamped(stage, level, pending, response, completion, unsigned)
+                            })
+                        },
+                    ),
+                )
+            },
+        )??;
+        publish(
+            document,
+            &Publication {
+                assessment,
+                inputs: &inputs,
+                signature,
+                id_attributes: completion.id_attributes,
+                unsigned,
+            },
+            Some(&property),
+            work,
+        )
+    })
 }
 
 /// The input certificates, then the ones the assessment's B-B path used.
@@ -589,8 +856,9 @@ fn selected<W: Work>(
 
 /// The level a signature must meet before a timestamp is requested or added.
 enum Gate<'g> {
-    /// B-B, with these certificates beyond `KeyInfo` for the signer's path.
-    Basic(&'g [&'g [u8]]),
+    /// B-B, with certificates beyond `KeyInfo` the signer's path may end at,
+    /// then ones it may only pass through.
+    Basic([&'g [&'g [u8]]; 2]),
     /// `inputs.requirements`, B-LT or B-LTA, with the caller's evidence.
     LongTerm(&'g Inputs<'g>),
 }
@@ -617,7 +885,7 @@ fn gated<W: Work, R>(
             session,
             signature,
             Requirements::Basic,
-            [certificates, &[]],
+            *certificates,
             None,
             |stage, report| {
                 let level =

@@ -173,7 +173,22 @@ impl<W: Work> VerifiedSession<'_, '_, '_, W> {
         // collapse (XSD 1.0 §4.3.6). No algorithm URI has interior whitespace,
         // so trimming the four XML whitespace characters decides the same.
         // https://www.w3.org/TR/2004/REC-xmlschema-2-20041028/#rf-whiteSpace
-        let uri = uri.trim_matches([' ', '\t', '\r', '\n']);
+        self.resolve_digest_uri_in(uri.trim_matches([' ', '\t', '\r', '\n']), work)
+    }
+
+    /// Interpret exactly `uri` as a digest `Algorithm` under the compiled
+    /// digest policy, as for a new `DigestMethod` this operation writes. The
+    /// value is not normalized.
+    ///
+    /// # Errors
+    /// Returns an error for exhausted query work or a recognized digest denied
+    /// by policy.
+    pub fn resolve_digest_uri_in<Q: Work>(
+        &self,
+        uri: &str,
+        work: &Q,
+    ) -> Result<DigestMethodResolution, DsigError> {
+        work.charge_work(u64::try_from(uri.len()).map_err(|_| MemoryError::WorkExceeded)?)?;
         let Some(algorithm) = DigestAlgorithm::from_uri(uri) else {
             return Ok(DigestMethodResolution::Unsupported);
         };
