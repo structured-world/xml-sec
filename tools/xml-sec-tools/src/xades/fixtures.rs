@@ -225,6 +225,7 @@ pub(crate) struct Digests {
 /// One fixture run: the native signer, the scratch directory and the output.
 pub(crate) struct Generator {
     pub(crate) xmlsec: OsString,
+    pub(crate) openssl: OsString,
     pub(crate) work: PathBuf,
     pub(crate) output: PathBuf,
     /// Repeated payload elements of the level fixtures, for size measurements.
@@ -244,13 +245,25 @@ fn succeed(mut command: Command, what: &str) -> Result<(), String> {
 }
 
 impl Generator {
+    /// Runs OpenSSL in the scratch directory. Its progress output stays quiet;
+    /// a failure carries its diagnostics.
     pub(crate) fn openssl(&self, args: &[&str]) -> Result<(), String> {
-        let mut command = Command::new("openssl");
-        command
+        let output = Command::new(&self.openssl)
             .args(args)
             .current_dir(&self.work)
-            .stderr(Stdio::null());
-        succeed(command, &format!("openssl {}", args[0]))
+            .stdout(Stdio::null())
+            .output()
+            .map_err(|error| format!("openssl {}: {error}", args[0]))?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "openssl {} failed: {}: {}",
+                args[0],
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ))
+        }
     }
 
     /// The test root, intermediate and signer certificates and keys.
@@ -327,7 +340,7 @@ impl Generator {
 
     /// The DER encoding of `name.pem`.
     pub(crate) fn der(&self, name: &str) -> Result<Vec<u8>, String> {
-        let output = Command::new("openssl")
+        let output = Command::new(&self.openssl)
             .args(["x509", "-in", &format!("{name}.pem"), "-outform", "DER"])
             .current_dir(&self.work)
             .output()
@@ -339,8 +352,8 @@ impl Generator {
     }
 
     /// MD5 of `data`: a deliberately weak digest no product dependency offers here.
-    fn md5(data: &[u8]) -> Result<Vec<u8>, String> {
-        let mut child = Command::new("openssl")
+    fn md5(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        let mut child = Command::new(&self.openssl)
             .args(["dgst", "-md5", "-binary"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -365,7 +378,7 @@ impl Generator {
             signer_sha256: STANDARD.encode(sha2::Sha256::digest(&signer)),
             signer_sha384: STANDARD.encode(sha2::Sha384::digest(&signer)),
             root_sha256: STANDARD.encode(sha2::Sha256::digest(self.der("root")?)),
-            signer_md5: STANDARD.encode(Self::md5(&signer)?),
+            signer_md5: STANDARD.encode(self.md5(&signer)?),
         })
     }
 
@@ -736,6 +749,7 @@ pub(crate) fn run(corpus: &super::Corpus, args: &[String]) -> Result<(), crate::
     let work = work.unwrap_or_else(|| scratch.path().to_owned());
     let generator = Generator {
         xmlsec: corpus.xmlsec.clone(),
+        openssl: corpus.openssl.clone(),
         work,
         output,
         units,

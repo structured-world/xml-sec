@@ -204,8 +204,8 @@ fn ordinary_jobs_have_one_matrix_writer_and_separate_instrumented_domains() {
 fn cached_native_oracles_still_pass_installer_provenance_and_capability_validation() {
     // A cache hit must not bypass validation or share modern and earlier profiles.
     let workflow = read(".github/workflows/ci.yml");
-    assert_eq!(count(&workflow, "profile: modern"), 3);
-    assert_eq!(count(&workflow, "profile: legacy"), 1);
+    assert_eq!(count(&workflow, "profile: modern"), 4);
+    assert_eq!(count(&workflow, "profile: legacy"), 0);
     assert!(!pattern(r"if:.*cache-hit").is_match(&workflow));
     assert!(read(".github/actions/xmlsec-oracle-cache/action.yml").contains(
         "hashFiles('tools/xml-sec-tools/src/install_xmlsec1.rs', 'compatibility/libxmlsec1-1.3.13-donor-commit.txt')"

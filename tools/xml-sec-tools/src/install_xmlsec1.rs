@@ -15,6 +15,9 @@ const REPOSITORY: &str = "https://github.com/lsh123/xmlsec.git";
 /// test-oracle dependency never replaces the host OpenSSL or enters the Rust runtime.
 const OPENSSL_VERSION: &str = "3.5.9";
 const OPENSSL_SHA256: &str = "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a";
+/// Where the oracle's OpenSSL reads its configuration, below the prefix: its
+/// `OPENSSLDIR` is the installation, not the build directory removed after it.
+const OPENSSL_CONFIGURATION: &str = "ssl/openssl.cnf";
 /// Historical algorithms are disabled by default upstream; the oracle must
 /// expose them to validate the optional compatibility path independently.
 /// The XSLT interoperability tests need the transform, which xmlsec1 builds
@@ -116,7 +119,8 @@ fn capable(run: &mut impl Run, install: &Install) -> Result<bool, String> {
         return Ok(true);
     }
     let openssl = install.prefix.join("bin/openssl");
-    if !executable(&openssl) {
+    // Without its configuration the binary refuses `req` and `ca`.
+    if !executable(&openssl) || !install.prefix.join(OPENSSL_CONFIGURATION).is_file() {
         return Ok(false);
     }
     let (status, version) = run.stdout(&Step::new(
@@ -265,8 +269,15 @@ fn fetch(run: &mut impl Run, commit: &str, destination: &Path) -> Result<(), Str
 
 /// A private static OpenSSL with `EdDSA` and ML-KEM, verified by digest. Its
 /// PIC `libcrypto` is embedded in the oracle's backend, so removing the build
-/// directory leaves no runtime dependency on it.
-fn build_openssl(run: &mut impl Run, work: &Path, jobs: &str) -> Result<PathBuf, String> {
+/// directory leaves no runtime dependency on it; its `OPENSSLDIR` is
+/// `openssldir`, where the installation keeps the configuration. Returns the
+/// build prefix and the configuration to install.
+fn build_openssl(
+    run: &mut impl Run,
+    work: &Path,
+    jobs: &str,
+    openssldir: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
     use sha2::Digest as _;
     let archive = work.join("openssl.tar.gz");
     let url = format!(
@@ -300,6 +311,7 @@ fn build_openssl(run: &mut impl Run, work: &Path, jobs: &str) -> Result<PathBuf,
     let prefix = work.join("openssl-install");
     let configure = source.join("Configure").display().to_string();
     let install_prefix = format!("--prefix={}", prefix.display());
+    let openssldir = format!("--openssldir={}", openssldir.display());
     let configure = Step::new(
         "OpenSSL configure",
         &configure,
@@ -309,6 +321,7 @@ fn build_openssl(run: &mut impl Run, work: &Path, jobs: &str) -> Result<PathBuf,
             "no-tests",
             "-fPIC",
             &install_prefix,
+            &openssldir,
             "--libdir=lib",
         ],
     )
@@ -331,7 +344,7 @@ fn build_openssl(run: &mut impl Run, work: &Path, jobs: &str) -> Result<PathBuf,
             &["--directory", &directory, "install_sw"],
         ),
     )?;
-    Ok(prefix)
+    Ok((prefix, source.join("apps/openssl.cnf")))
 }
 
 /// Builds and installs the oracle below `stage`; returns the staged prefix.
@@ -342,7 +355,9 @@ fn build(run: &mut impl Run, install: &Install, work: &Path) -> Result<PathBuf, 
         .to_string();
     obtain_source(run, install, work, &source)?;
     let openssl = if install.modern {
-        Some(build_openssl(run, work, &jobs)?)
+        let openssldir = install.prefix.join(OPENSSL_CONFIGURATION);
+        let openssldir = openssldir.parent().ok_or("configuration directory")?;
+        Some(build_openssl(run, work, &jobs, openssldir)?)
     } else {
         None
     };
@@ -352,7 +367,7 @@ fn build(run: &mut impl Run, install: &Install, work: &Path) -> Result<PathBuf, 
     let prefix = format!("--prefix={}", install.prefix.display());
     let with_openssl = openssl.as_ref().map_or_else(
         || "--with-openssl".to_owned(),
-        |openssl| format!("--with-openssl={}", openssl.display()),
+        |(openssl, _)| format!("--with-openssl={}", openssl.display()),
     );
     let mut options = vec![
         prefix.as_str(),
@@ -395,9 +410,15 @@ fn build(run: &mut impl Run, install: &Install, work: &Path) -> Result<PathBuf, 
         .strip_prefix("/")
         .map_err(|_| "the prefix is absolute")?;
     let staged = stage.join(relative);
-    if let Some(openssl) = openssl {
-        // The primitive oracle stays with the installation instead of leaving
-        // with its temporary build directory.
+    if let Some((openssl, configuration)) = openssl {
+        // The primitive oracle and the configuration its `req` reads stay with
+        // the installation instead of leaving with the build directory.
+        let installed = staged.join(OPENSSL_CONFIGURATION);
+        if let Some(directory) = installed.parent() {
+            std::fs::create_dir_all(directory).map_err(|error| error.to_string())?;
+        }
+        std::fs::copy(&configuration, &installed)
+            .map_err(|error| format!("install openssl.cnf: {error}"))?;
         let binary = staged.join("bin/openssl");
         std::fs::copy(openssl.join("bin/openssl"), &binary)
             .map_err(|error| format!("install openssl: {error}"))?;

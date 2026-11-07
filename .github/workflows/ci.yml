@@ -490,17 +490,24 @@ jobs:
         env:
           LIBXSLT_SOURCE_DIR: ${{ github.workspace }}/donors/libxslt
         run: cargo run --quiet -p xml-sec-tools -- libxslt-fixtures --check
+      # The modern profile carries the oracle's own OpenSSL, which the XAdES
+      # corpus needs to issue certificates with a fixed validity.
       - uses: ./.github/actions/xmlsec-oracle-cache
         with:
-          profile: legacy
+          profile: modern
       # valgrind, cmake and the compressors serve the XSLT phase contracts below.
       - name: Install oracle build dependencies and native test tools
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config openjdk-21-jdk valgrind cmake zlib1g-dev liblzma-dev
       - name: Provision pinned XML signature oracle
+        env:
+          XMLSEC1_MODERN_ORACLE: "1"
+        # The installer keeps that OpenSSL's configuration below the prefix, which
+        # is its OPENSSLDIR, so it needs no OPENSSL_CONF.
         run: |
           cargo run --quiet -p xml-sec-tools -- install-xmlsec1
+          echo "OPENSSL_BIN=$XMLSEC1_PREFIX/bin/openssl" >> "$GITHUB_ENV"
       - name: Verify live XMLDSig and XAdES corpus results
         run: cargo run --quiet -p xml-sec-tools -- xades check --output "$RUNNER_TEMP/xades-interop"
       - uses: actions/upload-artifact@v7

@@ -1,7 +1,30 @@
 use super::{
-    Digests, NOT_AFTER, NOT_BEFORE, RSA_SHA256_PROFILE, TEST_INSTANT, TIME_COMPACT, baseline,
-    counter_signature, document, enveloped_reference, plain_signature,
+    Digests, Generator, NOT_AFTER, NOT_BEFORE, RSA_SHA256_PROFILE, TEST_INSTANT, TIME_COMPACT,
+    baseline, counter_signature, document, enveloped_reference, plain_signature,
 };
+
+#[test]
+fn a_failed_openssl_run_names_the_configured_binary_and_its_diagnostics() {
+    // The configured binary runs, not whichever `openssl` is on PATH, and a
+    // failure keeps what it printed: an option the binary lacks must be
+    // visible in the error rather than a bare exit status.
+    let directory = tempfile::tempdir().unwrap();
+    let generator = Generator {
+        xmlsec: "xmlsec1".into(),
+        openssl: "sh".into(),
+        work: directory.path().to_owned(),
+        output: directory.path().to_owned(),
+        units: 0,
+    };
+    let error = generator
+        .openssl(&["-c", "echo 'req: Unknown option: -not_before' >&2; exit 1"])
+        .unwrap_err();
+    assert!(
+        error.ends_with(": req: Unknown option: -not_before"),
+        "{error}"
+    );
+    assert!(generator.openssl(&["-c", "echo progress >&2"]).is_ok());
+}
 
 fn digests() -> Digests {
     Digests {

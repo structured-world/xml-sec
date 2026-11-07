@@ -10,7 +10,7 @@ use super::{
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::{Map, Value, json};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 /// Decodes base64 text, ignoring the whitespace XML allows inside it.
@@ -142,6 +142,7 @@ fn template(corpus: &Corpus, fixtures: &Path, work: &Path) -> Result<String, Str
     }
     super::fixtures::generate(&super::fixtures::Generator {
         xmlsec: corpus.xmlsec.clone(),
+        openssl: corpus.openssl.clone(),
         work: work.to_owned(),
         output: fixtures.join("baseline"),
         units: 0,
@@ -512,13 +513,13 @@ fn versions(corpus: &Corpus, results: &Path) -> Result<Map<String, Value>, Strin
             "sha256": digest(&read(&executable)?),
         }),
     );
-    let tools: [(&str, &[&str]); 3] = [
-        ("rustc", &["rustc", "-Vv"]),
-        ("cargo", &["cargo", "-V"]),
-        ("openssl", &["openssl", "version"]),
+    let tools: [(&str, &[&OsStr]); 3] = [
+        ("rustc", &["rustc".as_ref(), "-Vv".as_ref()]),
+        ("cargo", &["cargo".as_ref(), "-V".as_ref()]),
+        ("openssl", &[&corpus.openssl, "version".as_ref()]),
     ];
     for (name, args) in tools {
-        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let args: Vec<OsString> = args.iter().map(|&part| part.to_owned()).collect();
         let result = corpus.command(&args, &log(name))?;
         versions.insert(
             name.into(),

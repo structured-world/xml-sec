@@ -104,6 +104,7 @@ impl Run for Toolchain {
                 .take()
                 .unwrap_or_else(|| self.version.clone()),
             "xmlsec1 --list-transforms" => self.transforms.clone(),
+            "openssl version" => "OpenSSL 3.5.9 30 Sep 2026\n".to_owned(),
             other => return Err(format!("unexpected query: {other}")),
         };
         Ok((exit(0), answer))
@@ -341,4 +342,31 @@ fn a_modern_cache_without_eddsa_is_rebuilt_and_a_failed_rebuild_keeps_it() {
     let error = execute(&mut toolchain, &prefix.install(true, None)).unwrap_err();
     assert!(error.contains("OpenSSL download"), "{error}");
     assert!(prefix.previous_kept());
+}
+
+#[test]
+fn a_modern_cache_is_reused_only_with_its_openssl_configuration() {
+    // The oracle's OpenSSL reads its configuration from the installation, so
+    // `openssl req` works once the build directory is gone; a cache without
+    // that file cannot issue certificates and is rebuilt.
+    for configured in [true, false] {
+        let prefix = cached();
+        executable(&prefix.path().join("bin/openssl"), "#!/bin/sh\n");
+        if configured {
+            std::fs::create_dir_all(prefix.path().join("ssl")).unwrap();
+            std::fs::write(prefix.path().join("ssl/openssl.cnf"), "").unwrap();
+        }
+        let mut toolchain = Toolchain::new(&prefix.path());
+        let mut transforms = COMPATIBILITY.to_vec();
+        transforms.extend(MODERN);
+        toolchain.transforms = listed(&transforms);
+        let result = execute(&mut toolchain, &prefix.install(true, None));
+        // A rebuild starts by downloading OpenSSL, which this toolchain refuses.
+        let rebuilt = result
+            .as_ref()
+            .is_err_and(|error| error.contains("OpenSSL download"));
+        assert_eq!(rebuilt, !configured, "{result:?}");
+        assert_eq!(result.is_ok(), configured, "{result:?}");
+        assert!(prefix.previous_kept(), "configured: {configured}");
+    }
 }

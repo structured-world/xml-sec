@@ -1,52 +1,30 @@
 //! One baseline level of every signature of a document, through the public API.
 //!
-//! `level_probe XML ANCHOR_DER UNIX_TIME b|t|lt|lta [ACCURACY_SECONDS]`, where
-//! `ANCHOR_DER` may be `-` to anchor where each chain the document carries ends,
-//! and `ACCURACY_SECONDS` states that accuracy for the policy
-//! of every token the document carries. Both are interoperability settings for
-//! test corpora, never a trust decision.
+//! `level_probe XML ANCHOR_DER UNIX_TIME b|t|lt|lta [ACCURACY_SECONDS [cms]]
+//! [--detached FILE]`, where `ANCHOR_DER` may be `-` to anchor where each
+//! chain the document carries ends, `ACCURACY_SECONDS` states that accuracy
+//! for the policy of every token the document carries, and `FILE` supplies the
+//! detached object a reference names by the file's name. The anchor and the
+//! accuracy are interoperability settings for test corpora, never a trust
+//! decision.
 
-use std::convert::Infallible;
+#[path = "support/tokens.rs"]
+mod tokens;
+
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use base64::Engine as _;
+use structured_asn1::Parser;
 use structured_asn1::memory::{Memory, MemoryAccount};
-use structured_asn1::{Oid, Parser};
-use structured_cms::timestamp::{Accuracy, PolicyAccuracy, Token};
 use structured_pkix::Certificate;
 use structured_pkix::temporal::LeapTable;
 use xml_sec::XmlDocument;
 use xml_sec::policy::{Instant, TimestampTokenEncoding, VerificationPolicy};
 use xml_sec::xmldsig::{
-    DefaultKeyResolver, KeyResolverConfig, VerificationRequest, VerifyContext,
+    DefaultKeyResolver, KeyResolverConfig, UriTypeSet, VerificationRequest, VerifyContext,
     with_verified_request,
 };
-use xml_sec_xades::{AuthorityAccuracy, ConfiguredResponder, Inputs, Requirements, validate};
-
-/// Every base64 value between `open` and `close` in the source text.
-fn values(text: &str, tag: &str) -> Vec<Vec<u8>> {
-    let mut found = Vec::new();
-    for (start, _) in text.match_indices(tag) {
-        let closing = text[..start]
-            .rfind('<')
-            .is_some_and(|tag| text[tag..].starts_with("</"));
-        let Some(open) = text[start..].find('>').filter(|_| !closing) else {
-            continue;
-        };
-        let body = start + open + 1;
-        let Some(end) = text[body..].find('<') else {
-            continue;
-        };
-        let compact: String = text[body..body + end]
-            .chars()
-            .filter(|character| !character.is_ascii_whitespace())
-            .collect();
-        if let Ok(value) = base64::engine::general_purpose::STANDARD.decode(compact) {
-            found.push(value);
-        }
-    }
-    found
-}
+use xml_sec_xades::{ConfiguredResponder, Inputs, Requirements, validate};
 
 /// Where the chain of `certificate` ends among `pool`: it is self-issued, or
 /// `pool` holds no other certificate naming its issuer.
@@ -72,41 +50,31 @@ fn terminal(certificate: &[u8], pool: &[Vec<u8>]) -> bool {
             .any(|other| names(&other))
 }
 
-/// A DER certificate and a token's encoded policy identifier.
-type Authority = (Vec<u8>, Vec<u8>);
-
-/// Each certificate a token or the document carries, with the token's policy.
-fn token_authorities(text: &str, carried: &[Vec<u8>]) -> Result<Vec<Authority>, String> {
-    let mut found = Vec::new();
-    for token in values(text, "EncapsulatedTimeStamp") {
-        let parser = Parser::ber(Memory::new(Arc::new(MemoryAccount::new(1 << 24, 1 << 28))));
-        let token = Token::read(&parser, &token, 0).map_err(|error| format!("{error:?}"))?;
-        let parent = parser.read(&[], 0).map_err(|error| format!("{error:?}"))?;
-        let policy = token
-            .with_info(&parent, |info, _, _| {
-                Ok::<_, Infallible>(info.policy().as_bytes().to_vec())
-            })
-            .map_err(|error| format!("{error:?}"))?;
-        let own = token.message().certificates().iter();
-        for certificate in own.map(|parsed| parsed.as_bytes().to_vec()) {
-            found.push((certificate, policy.clone()));
-        }
-        for certificate in carried {
-            found.push((certificate.clone(), policy.clone()));
-        }
+/// The `--detached FILE` object, by its file name, taken out of `args`.
+fn detached(
+    args: &mut Vec<String>,
+) -> Result<BTreeMap<String, Vec<u8>>, Box<dyn std::error::Error>> {
+    let mut resources = BTreeMap::new();
+    if let Some(flag) = args.iter().position(|arg| arg == "--detached") {
+        let path = args.get(flag + 1).ok_or("--detached needs a file")?.clone();
+        let name = std::path::Path::new(&path)
+            .file_name()
+            .ok_or("--detached needs a file")?
+            .to_string_lossy()
+            .into_owned();
+        resources.insert(name, std::fs::read(&path)?);
+        args.drain(flag..flag + 2);
     }
-    Ok(found)
+    Ok(resources)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    let resources = detached(&mut args)?;
     let [_, xml, anchor, at, level, rest @ ..] = &args[..] else {
-        return Err(
-            "usage: level_probe XML ANCHOR_DER|- UNIX_TIME b|t|lt|lta [ACCURACY_SECONDS [cms]]"
-                .into(),
-        );
+        return Err("usage: level_probe XML ANCHOR_DER|- UNIX_TIME b|t|lt|lta [ACCURACY_SECONDS [cms]] [--detached FILE]".into());
     };
-    let seconds = rest.first().map(|value| value.parse()).transpose()?;
+    let seconds: Option<u64> = rest.first().map(|value| value.parse()).transpose()?;
     let timestamp_token_encoding = match rest.get(1) {
         Some(profile) if profile == "cms" => TimestampTokenEncoding::Ber,
         _ => TimestampTokenEncoding::Declared,
@@ -119,8 +87,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("the level is b, t, lt or lta".into()),
     };
     let text = std::fs::read_to_string(xml)?;
-    let carried = values(&text, "X509Certificate");
-    let mut authorities = token_authorities(&text, &carried)?;
+    let carried = tokens::values(&text, "X509Certificate");
+    let mut authorities = tokens::token_authorities(&text, &carried)?;
     let mut pool = carried.clone();
     pool.extend(
         authorities
@@ -145,9 +113,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     policy.key_trust.verify_x509_chains = true;
     policy.key_trust.verification_time = Instant::new(at.parse()?, 0);
     policy.timestamp_token_encoding = timestamp_token_encoding;
+    if !resources.is_empty() {
+        policy.uris.references = UriTypeSet::ALL;
+    }
     let context = VerifyContext::new().policy(policy).key_resolver(&resolver);
     let document = XmlDocument::parse(text.as_str())?;
-    let request = VerificationRequest::default();
+    let request = VerificationRequest {
+        external_resources: (!resources.is_empty()).then_some(&resources),
+        ..VerificationRequest::default()
+    };
     let account = Memory::new(Arc::new(MemoryAccount::new(1 << 27, 1 << 33)));
     let utc = LeapTable::new(-2_208_988_800, 4_102_444_800, &[])
         .map_err(|error| format!("UTC coverage: {error:?}"))?;
@@ -164,15 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    let mut accuracies = Vec::with_capacity(authorities.len());
-    for (authority, policy) in &authorities {
-        let accuracy = Accuracy::new(seconds.unwrap_or_default(), 0, 0);
-        accuracies.push(AuthorityAccuracy {
-            authority,
-            stated: PolicyAccuracy::new(Oid::from_bytes(policy), accuracy)
-                .map_err(|error| error.to_string())?,
-        });
-    }
+    let accuracies = tokens::stated(&authorities, seconds.unwrap_or_default())?;
     with_verified_request(&document, &context, &request, &account, |session| {
         for entry in session.evidence().signatures() {
             println!("signature: {:?}", entry.result().as_ref().map(|r| r.status));

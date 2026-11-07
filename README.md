@@ -240,7 +240,9 @@ Its synthetic fixtures and reproducible commands distinguish transform/XMLDSig i
 XAdES property binding, expected-object coverage, and trust-validation limits. Baseline levels
 are compared with EU DSS conclusions on fixtures issued by OpenSSL, libxml2 and xmlsec1, and
 checked on signatures DSS itself produced. Signatures created by `xml-sec-xades` are validated by
-EU DSS as XAdES-BASELINE-B in every packaging mode.
+EU DSS as XAdES-BASELINE-B in every packaging mode. The lifecycle is also run in both directions:
+each implementation creates signatures the other augments to B-LTA and renews, every step validated
+by the side that did not make it, with the remaining differences recorded and explained.
 
 ## Safe-Rust XSLT
 

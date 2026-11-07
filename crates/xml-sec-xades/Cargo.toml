@@ -9,7 +9,7 @@ description = "XAdES baseline validation of signatures verified by xml-sec"
 
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c14n", "cms"] }
-structured-xades = { version = "0.21.0", default-features = false, features = ["alloc"] }
+structured-xades = { version = "0.21.1", default-features = false, features = ["alloc"] }
 structured-asn1 = { version = "0.21.0", default-features = false, features = ["alloc"] }
 structured-pkix = { version = "0.21.0", default-features = false, features = ["alloc"] }
 structured-cms = { version = "0.21.0", default-features = false, features = ["alloc"] }
@@ -45,6 +45,10 @@ required-features = ["produce"]
 
 [[example]]
 name = "augment_probe"
+required-features = ["produce"]
+
+[[example]]
+name = "lifecycle_probe"
 required-features = ["produce"]
 
 [[bench]]

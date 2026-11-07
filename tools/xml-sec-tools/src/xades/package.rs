@@ -14,7 +14,7 @@ const NOTICES: [&str; 2] = ["LICENSE", "LICENSE-THIRD-PARTY"];
 const COMMIT: &str = "COMMIT";
 
 /// Maintained corpus files outside the per-case directories.
-const DOCUMENTS: [&str; 15] = [
+const DOCUMENTS: [&str; 18] = [
     ".gitattributes",
     "README.md",
     "PROVENANCE.md",
@@ -25,6 +25,9 @@ const DOCUMENTS: [&str; 15] = [
     "dss/src/main/java/Probe.java",
     "dss/src/main/java/BindingProbe.java",
     "dss/src/main/java/LevelProbe.java",
+    "dss/src/main/java/SignProbe.java",
+    "dss/src/main/java/AugmentProbe.java",
+    "lifecycle/expectations.json",
     "dss-evidence/expectations.json",
     "dss-investigation/README.md",
     "dss-investigation/expectations.json",
