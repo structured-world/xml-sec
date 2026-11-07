@@ -102,8 +102,64 @@ imprint and DER request over the generation staged with the renewal) and its
 completion (the renewal inserted, B-LT assessment, response check, and the
 verification and B-LTA assessment with the renewal confirmed that gate
 publication). These are native measurements
-only; comparison with EU DSS needs qualified equivalent operations and
-separates JVM metrics.
+only; the comparison with EU DSS follows.
+
+## XAdES Lifecycle Against EU DSS
+
+```sh
+cargo run -p xml-sec-tools -- xades lifecycle --bench 30 --cold 5 --results target/performance/lifecycle-1
+# One case of the eight, as CI's smoke run does:
+cargo run -p xml-sec-tools -- xades lifecycle --bench 1 --warmups 1 --cold 1 --cases enveloped-rsa --results target/performance/lifecycle-smoke
+```
+
+The run needs Java 21 and builds the pinned EU DSS 6.5.1 probes, the release
+`lifecycle_probe` and `level_probe` examples, and their `allocation-profile`
+builds. It issues a PKI for the run with the oracle's OpenSSL (`OPENSSL_BIN`).
+Each case is a packaging (`enveloped`, `enveloping`, `internally-detached`,
+`detached`) with an RSA or ECDSA P-256 signer and CRL evidence; `--cases` selects
+some by name, such as `enveloped-rsa,detached-ec`.
+
+Per case, xml-sec first makes a chain, B-B to B-LTA, that DSS accepts at every
+level. Both implementations then perform the same seven operations over the
+same chain document: B-B creation, B-B validation, augmentation to B-T, B-LT and
+B-LTA, archive renewal, and B-LTA validation. Before anything is timed, the
+other implementation reads each result at its level. DSS must find it intact in
+that baseline format, and from B-LT on `TOTAL_PASSED`. xml-sec reads DSS's
+timestamp tokens under its CMS profile, as RFC 5652 BER, and must find the level
+met. A validation is timed only when both implementations accept its input.
+Anything else is recorded with the reading that decided and is never timed. In
+particular, DSS's B-LT and B-LTA augmentation places the CRL that covers its TSA
+only in `RevocationValues`, which EN 319 132-1 §6.3(x) does not accept for a
+timestamp's validation data, so those two operations are compared for xml-sec
+alone.
+
+Equivalent results do not mean identical work inside the boundary. xml-sec
+publishes an augmentation only after the verification and level assessment
+that gate it: the existing level before a request, the new one after the
+property is staged. DSS's `extendDocument` collects validation data but does not
+assess the result it returns. Read augmentation and renewal timings with that
+difference in mind.
+
+| Boundary | Inside each sample |
+|----------|--------------------|
+| Warm | One in-process run from the serialized input to the serialized output. Keys, anchors and evidence are loaded and `--warmups` runs (100 by default, the same for both implementations) precede the samples, so that the JVM's compiler has settled. |
+| Cold | A fresh process: native or JVM start, loading keys, anchors and evidence, the run and writing its output. Wall time includes the launch of the measuring `/usr/bin/time`. |
+| Acquisition | Not measured. The run that qualifies a result acquires its timestamp tokens once, from the run's TSA, and records them; timed runs replay them and fail if they would acquire. |
+
+Warm and cold measurements each have three repetitions per implementation in
+alternating order. A warm repetition is one process: its raw samples with
+p50/p95/p99, and its CPU and peak RSS from `/usr/bin/time`, which cover the
+whole process. A cold repetition keeps every process's wall time, CPU and RSS.
+Native allocations (calls, bytes and peak live bytes of one run) come from the
+separate `allocation-profile` build, whose timings are not used. For DSS, each
+warm repetition carries the JVM's thread allocation per sample and the GC count,
+GC time and peak heap of its samples. These are JVM counters, not native
+allocations, and the two are never added or compared as one total.
+
+`lifecycle-bench.json` holds every entry with its qualification reading, the
+environment (platform, CPU, `rustc` and `java` versions), the boundaries and the
+probe binaries' digests. As elsewhere, the results carry no threshold and no
+superiority claim; a one-sample run shows that the harnesses work.
 
 CI runs every benchmark once with `-- --test`, assertions included, so a
 broken workload fails before any measurement.

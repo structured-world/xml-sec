@@ -42,7 +42,7 @@ const REPETITIONS: usize = 3;
 pub(crate) const BOUNDARIES: [(&str, &str); 3] = [
     (
         "warm",
-        "one in-process run from the serialized input to the serialized output; keys, anchors and evidence are loaded and three warmups run before the samples",
+        "one in-process run from the serialized input to the serialized output; keys, anchors and evidence are loaded and the run's warmups, the same count for both implementations, precede the samples",
     ),
     (
         "cold",
@@ -317,6 +317,9 @@ struct Bench<'a> {
     binaries: &'a Binaries,
     /// The signing time of every creation, in Unix seconds.
     time: u64,
+    /// Untimed runs before the warm samples of either implementation: enough
+    /// for the JVM's compiler to settle, the same count for the native side.
+    warmups: usize,
 }
 
 impl Bench<'_> {
@@ -333,7 +336,12 @@ impl Bench<'_> {
             Actor::Dss => self.dss(target, mode, output),
         };
         if let Some(samples) = mode.samples() {
-            args.extend(line(&[&"--samples", &samples.to_string()]));
+            args.extend(line(&[
+                &"--samples",
+                &samples.to_string(),
+                &"--warmups",
+                &self.warmups.to_string(),
+            ]));
         }
         args
     }
@@ -591,11 +599,14 @@ impl Bench<'_> {
             if qualified {
                 measured.push((engine, entries.len()));
             } else {
-                entry.insert(
-                    "not_measured".into(),
-                    "the other implementation does not accept the result at its level, or the implementation refused its input"
-                        .into(),
-                );
+                let reason = if entry["reading"].get("refused").is_some() {
+                    "the implementation refused the operation"
+                } else if target.operation.validates() {
+                    "the implementation does not accept this input"
+                } else {
+                    "the other implementation does not accept the result at its level"
+                };
+                entry.insert("not_measured".into(), reason.into());
             }
             entries.push(entry);
         }
@@ -726,6 +737,7 @@ fn version(program: &str, args: &[&str]) -> Value {
 /// The measurement options of `--bench`.
 pub(crate) struct Options {
     pub(crate) samples: usize,
+    pub(crate) warmups: usize,
     pub(crate) cold: usize,
     pub(crate) cases: Vec<(Packaging, Algorithm)>,
 }
@@ -753,6 +765,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, options: &Options) -> Res
         run: &run,
         binaries: &binaries,
         time: now()?,
+        warmups: options.warmups,
     };
     let empty = results.join("no-evidence");
     std::fs::create_dir_all(&empty).map_err(|error| error.to_string())?;
@@ -808,6 +821,7 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, options: &Options) -> Res
                 "architecture": architecture(),
                 "cpu": cpu_model(),
                 "samples": options.samples,
+                "warmups": options.warmups,
                 "cold_samples": options.cold,
                 "repetitions": REPETITIONS,
                 "rustc": version("rustc", &["-V"]),

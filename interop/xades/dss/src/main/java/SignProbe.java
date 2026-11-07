@@ -10,6 +10,6 @@ public class SignProbe {
     public static void main(String[] args) throws Exception {
         var signer = Lifecycle.Signer.load(Path.of(args[0]));
         var data = Lifecycle.named(Path.of(args[2]));
-        Lifecycle.sign(signer, args[1], data, Long.parseLong(args[3])).save(args[4]);
+        Lifecycle.sign(Lifecycle.signing(), signer, args[1], data, Long.parseLong(args[3])).save(args[4]);
     }
 }

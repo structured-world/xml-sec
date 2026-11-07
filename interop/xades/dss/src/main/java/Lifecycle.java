@@ -61,12 +61,18 @@ final class Lifecycle {
         return document;
     }
 
+    /** The signing service, nothing fetched: B-B creation needs no evidence. */
+    static XAdESService signing() {
+        return new XAdESService(new CommonCertificateVerifier());
+    }
+
     /**
-     * A XAdES-BASELINE-B signature over {@code data} in {@code packaging}
-     * (ENVELOPED, ENVELOPING, DETACHED or INTERNALLY_DETACHED), signed at Unix
-     * time {@code time}.
+     * A XAdES-BASELINE-B signature by {@code service} over {@code data} in
+     * {@code packaging} (ENVELOPED, ENVELOPING, DETACHED or
+     * INTERNALLY_DETACHED), signed at Unix time {@code time}.
      */
-    static DSSDocument sign(Signer signer, String packaging, DSSDocument data, long time) throws Exception {
+    static DSSDocument sign(XAdESService service, Signer signer, String packaging, DSSDocument data, long time)
+            throws Exception {
         var parameters = new XAdESSignatureParameters();
         parameters.setSignatureLevel(SignatureLevel.XAdES_BASELINE_B);
         parameters.setSignaturePackaging(SignaturePackaging.valueOf(packaging));
@@ -74,7 +80,6 @@ final class Lifecycle {
         parameters.setSigningCertificate(signer.chain().get(0));
         parameters.setCertificateChain(signer.chain());
         parameters.bLevel().setSigningDate(Date.from(Instant.ofEpochSecond(time)));
-        var service = new XAdESService(new CommonCertificateVerifier());
         var toSign = service.getDataToSign(data, parameters);
         var encryption = EncryptionAlgorithm.forKey(signer.chain().get(0).getPublicKey());
         var algorithm = SignatureAlgorithm.getAlgorithm(encryption, DigestAlgorithm.SHA256);
@@ -128,14 +133,19 @@ final class Lifecycle {
         return tsa;
     }
 
-    /**
-     * {@code input} augmented to {@code level} (T, LT or LTA; LTA on a B-LTA
-     * signature renews it), with the content a detached reference names.
-     */
-    static DSSDocument extend(
-            CommonCertificateVerifier verifier, TSPSource tsa, DSSDocument input, String level, DSSDocument detached) {
+    /** The augmentation service of {@code verifier} with timestamps from {@code tsa}. */
+    static XAdESService augmenting(CommonCertificateVerifier verifier, TSPSource tsa) {
         var service = new XAdESService(verifier);
         service.setTspSource(tsa);
+        return service;
+    }
+
+    /**
+     * {@code input} augmented by {@code service} to {@code level} (T, LT or
+     * LTA; LTA on a B-LTA signature renews it), with the content a detached
+     * reference names.
+     */
+    static DSSDocument extend(XAdESService service, DSSDocument input, String level, DSSDocument detached) {
         var parameters = new XAdESSignatureParameters();
         parameters.setSignatureLevel(SignatureLevel.valueOf("XAdES_BASELINE_" + level));
         if (detached != null) {
@@ -144,11 +154,17 @@ final class Lifecycle {
         return service.extendDocument(input, parameters);
     }
 
-    /** The reports of {@code document} at {@code level} and Unix time {@code time}. */
+    /**
+     * The reports of {@code document} at {@code level} and Unix time
+     * {@code time}, through {@code verifier}: {@code verifier(anchor, null)}
+     * reads only the document's own material.
+     */
     static Reports validate(
-            DSSDocument document, byte[] anchor, long time, ValidationLevel level, DSSDocument detached)
-            throws Exception {
-        var verifier = verifier(anchor, null);
+            DSSDocument document,
+            CommonCertificateVerifier verifier,
+            long time,
+            ValidationLevel level,
+            DSSDocument detached) {
         var validator = SignedDocumentValidator.fromDocument(document);
         validator.setCertificateVerifier(verifier);
         if (detached != null) {

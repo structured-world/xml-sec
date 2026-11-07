@@ -26,7 +26,24 @@ use std::process::ExitCode;
 #[path = "../../support/measure.rs"]
 mod timing;
 
-pub use timing::{Allocations, Measurement, measure};
+pub use timing::{Allocations, Measurement};
+
+/// Untimed runs before the samples, matching the other library harnesses.
+const WARMUPS: usize = 3;
+
+/// Validate once, warm up three runs, then time `samples` runs of
+/// `operation` on fresh inputs from `prepare`; see the shared timing loop.
+///
+/// # Errors
+/// Returns the first preparation or operation failure.
+pub fn measure<I, O, E: std::fmt::Display>(
+    samples: usize,
+    prepare: impl FnMut() -> Result<I, E>,
+    operation: impl FnMut(I) -> Result<O, E>,
+    output: impl FnOnce(&O) -> Option<Vec<u8>>,
+) -> Result<Measurement, String> {
+    timing::measure_warmed(samples, WARMUPS, prepare, operation, output)
+}
 
 /// Which work a sample contains.
 #[derive(Clone, Copy, PartialEq, Eq)]

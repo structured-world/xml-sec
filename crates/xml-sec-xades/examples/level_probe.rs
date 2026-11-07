@@ -73,7 +73,7 @@ fn detached(
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().collect();
-    let samples = timing::samples(&mut args)?;
+    let samples = timing::sampling(&mut args)?;
     let resources = detached(&mut args)?;
     let [_, xml, anchor, at, level, rest @ ..] = &args[..] else {
         return Err("usage: level_probe XML ANCHOR_DER|- UNIX_TIME b|t|lt|lta [ACCURACY_SECONDS [cms]] [--detached FILE]".into());
@@ -206,7 +206,7 @@ impl Material {
 /// Prints the report lines of one run of `levels`, or with `samples` times
 /// it and prints the measurement after them.
 fn emit(
-    samples: Option<usize>,
+    samples: Option<timing::Sampling>,
     operation: &str,
     input_bytes: usize,
     mut levels: impl FnMut(&Memory) -> Result<String, String>,

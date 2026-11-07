@@ -24,32 +24,45 @@ import eu.europa.esig.dss.spi.x509.tsp.TSPSource;
  * LifecycleBench validate INPUT ANCHOR TIME b|t|lt|lta OUTPUT
  * </pre>
  *
- * each with {@code [--detached FILE] [--samples N]}. Keys, anchors and
+ * each with {@code [--detached FILE] [--samples N [--warmups W]]}. Keys, anchors and
  * evidence are loaded once, before any run. Every timestamp comes from
  * {@code TOKENS}: a recorded token answers the identical imprint again, and
  * without {@code --tsa} an unrecorded imprint is refused, so a timed run never
- * acquires. With {@code --samples N} the first run's result is written, three
- * warmups follow and {@code N} runs are timed; the last stdout line reports
+ * acquires. With {@code --samples N} the first run's result is written,
+ * {@code W} warmups follow (three by default) and {@code N} runs are timed;
+ * the last stdout line reports
  * them, with the JVM's thread allocation, GC and heap counters of the timed
  * runs as a separate block. Without it one run is made, for a cold process.
  */
 public class LifecycleBench {
+    /** Untimed runs before the samples unless {@code --warmups} asks for another count. */
     private static final int WARMUPS = 3;
+    private static int warmups = WARMUPS;
 
     /** One run of the operation: its serialized result. */
     interface Operation {
         byte[] run() throws Exception;
     }
 
-    /** The recorded timestamps of {@code tokens}, acquired only through {@code tsa}. */
+    /**
+     * The recorded timestamps of {@code tokens}, read before any run so that a
+     * timed run replays them from memory; acquired only through {@code tsa}.
+     */
     static final class Replay implements TSPSource {
         private final transient Path tokens;
         private final transient TSPSource tsa;
+        private final transient List<byte[]> imprints = new ArrayList<>();
+        private final transient List<TimestampBinary> recorded = new ArrayList<>();
         private int next;
 
-        Replay(Path tokens, TSPSource tsa) {
+        Replay(Path tokens, TSPSource tsa) throws java.io.IOException {
             this.tokens = tokens;
             this.tsa = tsa;
+            while (Files.exists(tokens.resolve(recorded.size() + ".tst"))) {
+                int ordinal = recorded.size();
+                imprints.add(Files.readAllBytes(tokens.resolve(ordinal + ".imprint")));
+                recorded.add(new TimestampBinary(Files.readAllBytes(tokens.resolve(ordinal + ".tst"))));
+            }
         }
 
         /** Every run makes the same requests in the same order. */
@@ -60,25 +73,23 @@ public class LifecycleBench {
         @Override
         public TimestampBinary getTimeStampResponse(DigestAlgorithm algorithm, byte[] digest) {
             int ordinal = next++;
-            Path imprint = tokens.resolve(ordinal + ".imprint");
-            Path token = tokens.resolve(ordinal + ".tst");
+            if (ordinal < recorded.size()) {
+                if (!Arrays.equals(imprints.get(ordinal), digest)) {
+                    throw new DSSException("the imprint differs from recorded token " + ordinal);
+                }
+                return recorded.get(ordinal);
+            }
+            if (tsa == null) {
+                throw new DSSException("no recorded token and no TSA: this run acquires nothing");
+            }
+            var binary = tsa.getTimeStampResponse(algorithm, digest);
             try {
-                if (Files.exists(token)) {
-                    if (!Arrays.equals(Files.readAllBytes(imprint), digest)) {
-                        throw new DSSException("the imprint differs from the one " + token + " answers");
-                    }
-                    return new TimestampBinary(Files.readAllBytes(token));
-                }
-                if (tsa == null) {
-                    throw new DSSException("no recorded token and no TSA: this run acquires nothing");
-                }
-                var binary = tsa.getTimeStampResponse(algorithm, digest);
-                Files.write(imprint, digest);
-                Files.write(token, binary.getBytes());
-                return binary;
+                Files.write(tokens.resolve(ordinal + ".imprint"), digest);
+                Files.write(tokens.resolve(ordinal + ".tst"), binary.getBytes());
             } catch (java.io.IOException failure) {
                 throw new DSSException(failure);
             }
+            return binary;
         }
     }
 
@@ -106,6 +117,8 @@ public class LifecycleBench {
     public static void main(String[] arguments) throws Exception {
         List<String> args = new ArrayList<>(List.of(arguments));
         String samples = take(args, "--samples");
+        String warmupCount = take(args, "--warmups");
+        warmups = warmupCount == null ? WARMUPS : Integer.parseInt(warmupCount);
         String detachedPath = take(args, "--detached");
         DSSDocument detached = detachedPath == null ? null : Lifecycle.named(Path.of(detachedPath));
         Integer count = samples == null ? null : Integer.valueOf(samples);
@@ -116,8 +129,9 @@ public class LifecycleBench {
                 byte[] bytes = Files.readAllBytes(data);
                 String name = data.getFileName().toString();
                 long time = Long.parseLong(args.get(4));
+                var service = Lifecycle.signing();
                 measure("create", bytes.length, count, Path.of(args.get(5)), () -> DSSUtils.toByteArray(
-                    Lifecycle.sign(signer, args.get(2), new InMemoryDocument(bytes, name), time)));
+                    Lifecycle.sign(service, signer, args.get(2), new InMemoryDocument(bytes, name), time)));
             }
             case "augment" -> {
                 String tsaStore = take(args, "--tsa");
@@ -132,21 +146,22 @@ public class LifecycleBench {
                     tokens,
                     tsaStore == null ? null : Lifecycle.tsa(Path.of(tsaStore), Long.parseLong(tsaTime)));
                 String step = args.get(3);
+                var service = Lifecycle.augmenting(verifier, replay);
                 measure("augment-" + step.toLowerCase(), bytes.length, count, Path.of(args.get(2)), () -> {
                     replay.reset();
                     return DSSUtils.toByteArray(
-                        Lifecycle.extend(verifier, replay, new InMemoryDocument(bytes, name), step, detached));
+                        Lifecycle.extend(service, new InMemoryDocument(bytes, name), step, detached));
                 });
             }
             case "validate" -> {
                 Path input = Path.of(args.get(1));
                 byte[] bytes = Files.readAllBytes(input);
                 String name = input.getFileName().toString();
-                byte[] anchor = Files.readAllBytes(Path.of(args.get(2)));
+                var verifier = Lifecycle.verifier(Files.readAllBytes(Path.of(args.get(2))), null);
                 long time = Long.parseLong(args.get(3));
                 var validation = level(args.get(4));
                 measure("validate-" + args.get(4), bytes.length, count, Path.of(args.get(5)), () -> Lifecycle
-                    .lines(Lifecycle.validate(new InMemoryDocument(bytes, name), anchor, time, validation, detached))
+                    .lines(Lifecycle.validate(new InMemoryDocument(bytes, name), verifier, time, validation, detached))
                     .getBytes(java.nio.charset.StandardCharsets.UTF_8));
             }
             default -> throw new IllegalArgumentException("the operation is create, augment or validate");
@@ -180,7 +195,7 @@ public class LifecycleBench {
         if (samples == null) {
             return;
         }
-        for (int warmup = 0; warmup < WARMUPS; warmup++) {
+        for (int warmup = 0; warmup < warmups; warmup++) {
             operation.run();
         }
         var threads = (com.sun.management.ThreadMXBean) ManagementFactory.getThreadMXBean();

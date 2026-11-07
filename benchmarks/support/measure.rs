@@ -1,14 +1,12 @@
 //! In-process timing shared by the benchmark harnesses: validate once, warm
-//! up, then time each sample around the operation alone.
+//! up as many runs as the harness asks, then time each sample around the
+//! operation alone.
 //!
 //! A harness built with its `allocation-profile` feature counts the heap work
 //! of one further untimed run; that build's timings are never reported.
 
 use std::fmt::Display;
 use std::time::Instant;
-
-/// Untimed runs before the samples, the same in every harness.
-const WARMUPS: usize = 3;
 
 #[cfg(all(test, feature = "allocation-profile"))]
 #[path = "measure_tests.rs"]
@@ -144,14 +142,16 @@ pub struct Measurement {
     pub output: Option<Vec<u8>>,
 }
 
-/// Validate once, warm up, then time `samples` runs of `operation` on fresh
-/// inputs from `prepare`. Preparation, result conversion and drops stay outside
-/// every sample. The profile build counts one further untimed run.
+/// Validate once, run `warmups` untimed runs, then time `samples` runs of
+/// `operation` on fresh inputs from `prepare`. Preparation, result conversion
+/// and drops stay outside every sample. The profile build counts one further
+/// untimed run.
 ///
 /// # Errors
 /// Returns the first preparation or operation failure.
-pub fn measure<I, O, E: Display>(
+pub fn measure_warmed<I, O, E: Display>(
     samples: usize,
+    warmups: usize,
     mut prepare: impl FnMut() -> Result<I, E>,
     mut operation: impl FnMut(I) -> Result<O, E>,
     output: impl FnOnce(&O) -> Option<Vec<u8>>,
@@ -172,7 +172,7 @@ pub fn measure<I, O, E: Display>(
     let (first, _) = run(false)?;
     let output = output(&first);
     drop(first);
-    for _ in 0..WARMUPS {
+    for _ in 0..warmups {
         run(false)?;
     }
     let mut samples_ns = Vec::with_capacity(samples);

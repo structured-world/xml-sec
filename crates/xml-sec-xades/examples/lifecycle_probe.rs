@@ -31,6 +31,7 @@ mod timing;
 #[path = "support/tokens.rs"]
 mod tokens;
 
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -108,7 +109,7 @@ fn signature_id(text: &str) -> Option<&str> {
 
 fn main() -> Result<(), String> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let samples = timing::samples(&mut args)?;
+    let samples = timing::sampling(&mut args)?;
     match args.first().map(String::as_str) {
         Some("create") => created(&args[1..], samples),
         Some("augment") => augment(&args[1..], samples),
@@ -121,7 +122,7 @@ fn main() -> Result<(), String> {
 fn run(
     name: &str,
     input_bytes: usize,
-    samples: Option<usize>,
+    samples: Option<timing::Sampling>,
     output: &Path,
     mut operation: impl FnMut(&Memory) -> Result<String, String>,
 ) -> Result<(), String> {
@@ -180,7 +181,7 @@ fn data_object<'a>(packaging: &str, uri: &'a str) -> Result<DataObject<'a>, Stri
     })
 }
 
-fn created(args: &[String], samples: Option<usize>) -> Result<(), String> {
+fn created(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
     let [algorithm, packaging, pki, data, signing_time, at, output] = args else {
         return Err(
             "usage: lifecycle_probe create rsa|ec PACKAGING PKI DATA SIGNING_TIME AT OUTPUT".into(),
@@ -293,36 +294,60 @@ impl Evidence {
 struct Tsa<'a> {
     command: &'a [String],
     tokens: Option<&'a Path>,
+    /// The exchanges `tokens` holds, read before any run so that a timed run
+    /// replays them from memory: request and response by ordinal.
+    recorded: Vec<(Vec<u8>, Vec<u8>)>,
     /// Where the command's request and response files go.
     scratch: &'a Path,
     /// The ordinal of the next exchange of the current run.
     next: Cell<usize>,
 }
 
-impl Tsa<'_> {
-    /// The response to `request`: recorded for this exchange, or acquired.
-    fn respond(&self, request: &[u8]) -> Result<Vec<u8>, String> {
-        let ordinal = self.next.replace(self.next.get() + 1);
-        let Some(tokens) = self.tokens else {
-            return self.acquire(request);
-        };
-        let (query, reply) = (
-            tokens.join(format!("{ordinal}.tsq")),
-            tokens.join(format!("{ordinal}.tsr")),
-        );
-        if reply.exists() {
-            if read(&query)? != request {
-                return Err(format!(
-                    "the request differs from the one {} answers",
-                    reply.display()
+impl<'a> Tsa<'a> {
+    fn new(
+        command: &'a [String],
+        tokens: Option<&'a Path>,
+        scratch: &'a Path,
+    ) -> Result<Self, String> {
+        let mut recorded = Vec::new();
+        if let Some(tokens) = tokens {
+            std::fs::create_dir_all(tokens)
+                .map_err(|error| format!("{}: {error}", tokens.display()))?;
+            while tokens.join(format!("{}.tsr", recorded.len())).exists() {
+                let ordinal = recorded.len();
+                recorded.push((
+                    read(&tokens.join(format!("{ordinal}.tsq")))?,
+                    read(&tokens.join(format!("{ordinal}.tsr")))?,
                 ));
             }
-            return read(&reply);
+        }
+        Ok(Self {
+            command,
+            tokens,
+            recorded,
+            scratch,
+            next: Cell::new(0),
+        })
+    }
+
+    /// The response to `request`: recorded for this exchange, or acquired and
+    /// recorded.
+    fn respond(&self, request: &[u8]) -> Result<Cow<'_, [u8]>, String> {
+        let ordinal = self.next.replace(self.next.get() + 1);
+        if let Some((query, reply)) = self.recorded.get(ordinal) {
+            if query.as_slice() != request {
+                return Err(format!(
+                    "the request differs from recorded exchange {ordinal}"
+                ));
+            }
+            return Ok(Cow::Borrowed(reply));
         }
         let response = self.acquire(request)?;
-        write(&query, request)?;
-        write(&reply, &response)?;
-        Ok(response)
+        if let Some(tokens) = self.tokens {
+            write(&tokens.join(format!("{ordinal}.tsq")), request)?;
+            write(&tokens.join(format!("{ordinal}.tsr")), &response)?;
+        }
+        Ok(Cow::Owned(response))
     }
 
     /// The TSA's response to `request`, through the caller's command.
@@ -517,7 +542,7 @@ impl Options {
     }
 }
 
-fn augment(args: &[String], samples: Option<usize>) -> Result<(), String> {
+fn augment(args: &[String], samples: Option<timing::Sampling>) -> Result<(), String> {
     let split = args.iter().position(|arg| arg == "--").ok_or(AUGMENT)?;
     let command = &args[split + 1..];
     let Options {
@@ -532,10 +557,6 @@ fn augment(args: &[String], samples: Option<usize>) -> Result<(), String> {
     };
     let at: i64 = at.parse().map_err(|error| format!("AT: {error}"))?;
     let output = PathBuf::from(output);
-    if let Some(tokens) = &tokens {
-        std::fs::create_dir_all(tokens)
-            .map_err(|error| format!("{}: {error}", tokens.display()))?;
-    }
     let root = read(&Path::new(pki).join("root.der"))?;
     let evidence = Evidence::read(Path::new(evidence))?;
     let text = String::from_utf8(read(Path::new(input))?).map_err(|error| error.to_string())?;
@@ -569,12 +590,7 @@ fn augment(args: &[String], samples: Option<usize>) -> Result<(), String> {
     let certificates: Vec<&[u8]> = evidence.certificates.iter().map(Vec::as_slice).collect();
     let crls: Vec<&[u8]> = evidence.crls.iter().map(Vec::as_slice).collect();
     let responses: Vec<&[u8]> = evidence.responses.iter().map(Vec::as_slice).collect();
-    let tsa = Tsa {
-        command,
-        tokens: tokens.as_deref(),
-        scratch: &output,
-        next: Cell::new(0),
-    };
+    let tsa = Tsa::new(command, tokens.as_deref(), &output)?;
     let stepper = Stepper {
         signature,
         assessment: &assessment,
@@ -597,6 +613,9 @@ fn augment(args: &[String], samples: Option<usize>) -> Result<(), String> {
             Ok(document.into_xml())
         },
     )?;
-    println!("augmented {step}");
+    // A measurement's report stays the last line.
+    if samples.is_none() {
+        println!("augmented {step}");
+    }
     Ok(())
 }

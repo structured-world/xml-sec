@@ -138,6 +138,12 @@ cargo run -p xml-sec-tools -- xades lifecycle --results target/xades-lifecycle-r
 `xades lifecycle --record` writes the observed outcomes to `lifecycle/expectations.json`
 for review instead of comparing them; the reviewed `notes` stay.
 
+`xades lifecycle --bench SAMPLES [--warmups COUNT] [--cold SAMPLES] [--cases PACKAGING-ALGORITHM,...]`
+times the operations both implementations perform equivalently over the same
+input (`LifecycleBench.java` on the DSS side), after the other implementation
+has accepted each result. The [benchmark runbook](../../docs/benchmarks.md#xades-lifecycle-against-eu-dss)
+documents its boundaries and metrics.
+
 Set XMLSEC1_BIN to native **1.3.12 or 1.3.13 openssl**; both are explicitly qualified
 against the retained independent vectors. The XML verification run uses only empty/same-document
 Reference, RetrievalMethod and KeyInfoReference URI classes, plus explicit Id registrations

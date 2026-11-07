@@ -14,7 +14,7 @@ public class LevelProbe {
         DSSDocument detached = args.length > 4 ? Lifecycle.named(Path.of(args[4])) : null;
         var reports = Lifecycle.validate(
             new FileDocument(args[0]),
-            Files.readAllBytes(Path.of(args[1])),
+            Lifecycle.verifier(Files.readAllBytes(Path.of(args[1])), null),
             Long.parseLong(args[2]),
             ValidationLevel.ARCHIVAL_DATA,
             detached);

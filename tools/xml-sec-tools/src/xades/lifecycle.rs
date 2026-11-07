@@ -969,10 +969,10 @@ pub(crate) fn execute(corpus: &Corpus, results: &Path, record: bool) -> Result<(
 }
 
 pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::Failure> {
-    let usage = "usage: xades lifecycle [--results DIR] [--record] | [--results DIR] --bench SAMPLES [--cold SAMPLES] [--cases PACKAGING-ALGORITHM,...]";
+    let usage = "usage: xades lifecycle [--results DIR] [--record] | [--results DIR] --bench SAMPLES [--warmups COUNT] [--cold SAMPLES] [--cases PACKAGING-ALGORITHM,...]";
     let mut results = None;
     let mut record = false;
-    let (mut samples, mut cold, mut cases) = (None, None, None);
+    let (mut samples, mut warmups, mut cold, mut cases) = (None, None, None, None);
     let mut args = args.iter();
     let count = |value: Option<&String>| {
         value
@@ -985,13 +985,14 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
             "--results" => results = Some(absolute(args.next().ok_or(usage)?)?),
             "--record" => record = true,
             "--bench" => samples = Some(count(args.next())?),
+            "--warmups" => warmups = Some(count(args.next())?),
             "--cold" => cold = Some(count(args.next())?),
             "--cases" => cases = Some(args.next().ok_or(usage)?.clone()),
             _ => return Err(usage.into()),
         }
     }
     let Some(samples) = samples else {
-        if cold.is_some() || cases.is_some() {
+        if warmups.is_some() || cold.is_some() || cases.is_some() {
             return Err(usage.into());
         }
         let results = results.unwrap_or_else(|| corpus.root.join("target/xades-lifecycle-results"));
@@ -1002,6 +1003,8 @@ pub(crate) fn run(corpus: &Corpus, args: &[String]) -> Result<(), crate::repo::F
     }
     let options = bench::Options {
         samples,
+        // Enough runs for the JVM's compiler to settle before the samples.
+        warmups: warmups.unwrap_or(100),
         cold: cold.unwrap_or(3),
         cases: bench::selected(cases.as_deref())?,
     };

@@ -7,7 +7,7 @@ public class Probe {
     public static void main(String[] args) throws Exception {
         var reports = Lifecycle.validate(
             new FileDocument(args[0]),
-            Files.readAllBytes(Path.of(args[1])),
+            Lifecycle.verifier(Files.readAllBytes(Path.of(args[1])), null),
             1800000000L,
             ValidationLevel.BASIC_SIGNATURES,
             null);

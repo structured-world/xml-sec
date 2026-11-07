@@ -18,7 +18,8 @@ public class AugmentProbe {
         DSSDocument detached = args.length > 7 ? Lifecycle.named(Path.of(args[7])) : null;
         DSSDocument extended;
         try {
-            extended = Lifecycle.extend(verifier, tsa, new FileDocument(args[0]), args[2], detached);
+            extended = Lifecycle.extend(
+                Lifecycle.augmenting(verifier, tsa), new FileDocument(args[0]), args[2], detached);
         } catch (RuntimeException refusal) {
             System.out.println("refused " + refusal.getMessage());
             System.exit(3);
