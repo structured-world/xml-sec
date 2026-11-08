@@ -14,7 +14,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n"] }
 xml-sec-config = { path = "../xml-sec-config", default-features = false, features = ["xmlenc"] }
-parking_lot = "0.12"
+parking_lot = "0.13"
 
 [features]
 # The XML backend is the application's choice, as in the core crate; a
