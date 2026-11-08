@@ -522,6 +522,10 @@ struct ParsedDocument<'input> {
     /// the validation parses of the mutations between them.
     #[cfg(feature = "xmldsig")]
     parse_work: usize,
+    /// For a tree-backed document, the external node each arena node came
+    /// from, indexed by arena position; empty for a parsed document.
+    #[cfg(feature = "external-tree")]
+    external: Vec<Option<crate::xml::dom::external::ExternalNode>>,
 }
 
 self_cell!(
@@ -596,6 +600,11 @@ pub enum XmlDocumentError {
     /// Process-local document provenance space is exhausted.
     #[error("XML document identity space is exhausted")]
     IdentityExhausted,
+    /// A tree-backed document has no serialization to splice; it changes
+    /// only through edits of its tree.
+    #[cfg(feature = "external-tree")]
+    #[error("a tree-backed XML document changes only through edits of its tree")]
+    TreeBackedSerialization,
     /// A projected mutation exceeds the caller's active node ceiling.
     #[error("projected XML document exceeds the maximum node count of {maximum}")]
     ProjectedNodeLimit {
@@ -700,6 +709,10 @@ pub struct XmlDocument {
     /// current one: an identity of discarded bytes must not become valid again.
     #[cfg(feature = "xmldsig-sign")]
     issued: u64,
+    /// The tree that owns this document's content, when it is not parsed
+    /// from a serialization; its arena carries no source ranges.
+    #[cfg(feature = "external-tree")]
+    tree: Option<alloc::boxed::Box<dyn external::ExternalTree>>,
 }
 
 /// Every minimal alignment of the change between two texts.
@@ -1109,6 +1122,67 @@ impl XmlDocument {
             atomic: Vec::new(),
             #[cfg(feature = "xmldsig-sign")]
             issued: 0,
+            #[cfg(feature = "external-tree")]
+            tree: None,
+        })
+    }
+
+    /// Build a document whose content is owned by `tree`, reading it under
+    /// the XML input policy and resource limits of `policy`'s operation.
+    ///
+    /// The tree is walked once into the document's semantic view; nothing is
+    /// serialized or parsed. Mutating operations change `tree` itself.
+    ///
+    /// # Errors
+    /// The limit or DTD allowance the tree passes, or a tree its
+    /// implementation cannot report.
+    #[cfg(all(
+        feature = "external-tree",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    pub fn from_external_tree(
+        tree: alloc::boxed::Box<dyn external::ExternalTree>,
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        policy.resource_policy().validate()?;
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
+        );
+        let (cell, has_dtd) = project_external(tree.as_ref(), settings)?;
+        let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
+        Ok(Self {
+            identity,
+            generation: 0,
+            requires_internal_dtd: has_dtd,
+            settings,
+            cell,
+            #[cfg(feature = "xmldsig-sign")]
+            atomic: Vec::new(),
+            #[cfg(feature = "xmldsig-sign")]
+            issued: 0,
+            tree: Some(tree),
+        })
+    }
+
+    /// The external node `identity` came from, for a tree-backed document.
+    ///
+    /// # Errors
+    /// A foreign or stale identity, a parsed document, or a node produced by
+    /// an entity expansion, which keeps no external node.
+    #[cfg(feature = "external-tree")]
+    pub fn external_node(
+        &self,
+        identity: NodeIdentity,
+    ) -> Result<external::ExternalNode, XmlDocumentError> {
+        self.with_view(|view| {
+            view.validate_identity(identity)?;
+            view.parsed
+                .external
+                .get(identity.semantic_id.raw() as usize)
+                .copied()
+                .flatten()
+                .ok_or(XmlDocumentError::MissingNode)
         })
     }
 
@@ -2183,6 +2257,12 @@ impl XmlDocument {
     }
 
     fn commit_cell(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
+        // A serialization splice would change the arena and leave the tree
+        // that owns the content behind it.
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return Err(XmlDocumentError::TreeBackedSerialization);
+        }
         #[cfg(feature = "xmldsig-sign")]
         let issued = self.issued;
         #[cfg(not(feature = "xmldsig-sign"))]
@@ -2877,9 +2957,50 @@ fn build_semantic_cell(
             peak_namespace_bindings,
             #[cfg(feature = "xmldsig")]
             parse_work: 0,
+            #[cfg(feature = "external-tree")]
+            external: Vec::new(),
         })
     })?;
     Ok((cell, declares_doctype))
+}
+
+/// Builds a generation by walking `tree`, and returns whether the tree has a
+/// document type declaration.
+#[cfg(feature = "external-tree")]
+fn project_external(
+    tree: &dyn external::ExternalTree,
+    settings: DocumentParseSettings,
+) -> Result<(DocumentCell, bool), XmlDocumentError> {
+    use crate::xml::dom::external::{ProjectionLimits, TreeSink};
+    let limits = ProjectionLimits {
+        nodes: settings.nodes_limit,
+        depth: settings.depth_limit,
+        namespace_bindings: settings.namespace_bindings_limit,
+        bytes: settings.max_bytes,
+        allow_dtd: settings.allow_dtd,
+    };
+    let mut has_dtd = false;
+    let cell = DocumentCell::try_new(String::new(), |source| {
+        let mut sink = TreeSink::new(source, tree.document(), limits)?;
+        tree.project(&mut sink)?;
+        let (document, external, metrics) = sink.finish()?;
+        has_dtd = metrics.has_dtd;
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let _ = metrics.peak_namespace_bindings;
+        Ok::<_, XmlDocumentError>(ParsedDocument {
+            node_count: external.len(),
+            document,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+            max_depth: metrics.max_depth,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+            peak_namespace_bindings: metrics.peak_namespace_bindings,
+            // Walking the tree is the work a parse of it would be.
+            #[cfg(feature = "xmldsig")]
+            parse_work: metrics.bytes,
+            external,
+        })
+    })?;
+    Ok((cell, has_dtd))
 }
 
 pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
@@ -4883,6 +5004,9 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
         "element start tag is incomplete".into(),
     ))
 }
+
+#[cfg(feature = "external-tree")]
+pub mod external;
 
 #[cfg(test)]
 mod entity_ceiling_tests;

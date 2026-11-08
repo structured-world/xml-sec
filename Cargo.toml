@@ -441,6 +441,9 @@ aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = []
 xml-backend-roxmltree = ["dep:memchr"]
+# Documents whose content is an application-owned tree (a libxml2 document,
+# for one) walked into the semantic view instead of parsed.
+external-tree = []
 xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
 # Compatibility alias for existing CI/fuzz builds. Unlike `xml-backends-all`,
 # this also selects differential parsing as the default runtime mode.

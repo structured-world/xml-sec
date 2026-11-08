@@ -6,6 +6,8 @@
 
 #[cfg(all(feature = "xml-backend-roxmltree", feature = "xml-backend-xmloxide"))]
 mod differential;
+#[cfg(feature = "external-tree")]
+pub(crate) mod external;
 mod limits;
 mod preflight;
 #[cfg(feature = "xml-backend-roxmltree")]
@@ -411,7 +413,7 @@ impl SemanticNodeId {
     pub(super) const fn new(raw: u32) -> Self {
         Self(raw)
     }
-    pub(super) const fn raw(self) -> u32 {
+    pub(crate) const fn raw(self) -> u32 {
         self.0
     }
 }
