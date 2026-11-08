@@ -20,6 +20,13 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use xml_sec::key_manager::{KeyInventory, KeyUsages};
+use xml_sec::policy::{DecryptionPolicy, ResourcePolicy};
+use xml_sec::provider::RUST_CRYPTO_PROVIDER;
+use xml_sec::xmlenc::{
+    DataEncryptionAlgorithm, EncryptedDataBuilder, KeyCandidateBudget, KeyWrapAlgorithm,
+    parse_encrypted_data,
+};
 
 /// The system allocator, recording the largest single request, so a test can
 /// show an input was refused before the library copied it. Tests hold
@@ -368,6 +375,8 @@ struct Store {
     method: &'static str,
     /// Import the key a second time, as "second", for an unnamed request.
     twice: bool,
+    /// A key name the store fails to look up with `XS_KEY`.
+    refuse: &'static str,
     result: XsStatus,
     queries: Vec<(Vec<String>, String)>,
     kept: XsKeys,
@@ -401,6 +410,9 @@ unsafe extern "C" fn store_lookup(
     store.kept = keys;
     if store.result != XS_OK {
         return store.result;
+    }
+    if names.iter().any(|name| name == store.refuse) {
+        return XS_KEY;
     }
     if method != store.method {
         return XS_OK;
@@ -518,6 +530,7 @@ fn a_lookup_supplies_the_verification_key_for_the_name_the_document_gives() {
         usages: 2,
         method: RSA_SHA256,
         twice: false,
+        refuse: "",
         result: XS_OK,
         queries: Vec::new(),
         kept: XsKeys::default(),
@@ -680,6 +693,7 @@ fn a_failing_lookup_fails_the_call_with_its_status() {
             usages: 2,
             method: RSA_SHA256,
             twice: false,
+            refuse: "",
             result: returned,
             queries: Vec::new(),
             kept: XsKeys::default(),
@@ -764,6 +778,103 @@ fn a_lookup_may_destroy_the_key_manager_it_is_given() {
         Ok(result) if result.status == xml_sec::xmldsig::DsigStatus::Valid
     ));
     drop(held);
+    assert_eq!(xs_evidence_destroy(evidence), XS_OK);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_verifier_destroy(verifier), XS_OK);
+    release(handles);
+}
+
+/// The policy a lookup creates objects under, and the key manager it made.
+struct Replacing {
+    policy: XsPolicy,
+    created: XsKeys,
+}
+
+/// Destroys the key manager it is given and creates another one, which takes
+/// over the freed table slot, then finds nothing.
+unsafe extern "C" fn replacing_lookup(
+    user_data: *mut std::ffi::c_void,
+    _query: *const XsKeyQuery,
+    keys: XsKeys,
+) -> XsStatus {
+    // SAFETY: the test passes a live `Replacing` as user data.
+    let state = unsafe { &mut *user_data.cast::<Replacing>() };
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    // SAFETY: the output is a live field.
+    let created = unsafe {
+        xs_keys_new(
+            state.policy,
+            2,
+            &raw mut state.created,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(created, XS_OK);
+    XS_OK
+}
+
+#[test]
+fn a_lookup_may_destroy_its_key_manager_and_create_objects() {
+    let _serial = crate::test_support::serial();
+    // Both are supported actions of a lookup: the new object reuses the freed
+    // slot under a newer generation, and the call neither fails releasing the
+    // handle it gave out nor touches the object that replaced it.
+    let signed = signed_with_key_name();
+    let handles = policy();
+    let mut state = Replacing {
+        policy: handles.2,
+        created: XsKeys::default(),
+    };
+    let lookup = XsKeyLookup {
+        lookup: Some(replacing_lookup),
+        user_data: std::ptr::from_mut(&mut state).cast(),
+    };
+    let (mut verifier, mut document, mut evidence) = (
+        XsVerifier::default(),
+        XsDocument::default(),
+        XsEvidence::default(),
+    );
+    let ids = [bytes("payload")];
+    let request = XsVerifyRequest {
+        expected_target_ids: ids.as_ptr(),
+        expected_target_count: 1,
+        requirement: 0,
+        count: 0,
+    };
+    // SAFETY: every pointer names a live local, array or string.
+    let status = unsafe {
+        assert_eq!(
+            xs_verifier_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                &raw mut verifier,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                1,
+                bytes(&signed),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_verify(
+            verifier,
+            document,
+            &raw const request,
+            &raw const lookup,
+            &raw mut evidence,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, XS_OK);
+    assert_ne!(state.created.value, 0);
+    assert_eq!(xs_keys_destroy(state.created), XS_OK);
     assert_eq!(xs_evidence_destroy(evidence), XS_OK);
     assert_eq!(xs_document_destroy(document), XS_OK);
     assert_eq!(xs_verifier_destroy(verifier), XS_OK);
@@ -896,6 +1007,7 @@ fn recipient_store() -> Store {
         usages: 8,
         method: RSA_OAEP,
         twice: false,
+        refuse: "",
         result: XS_OK,
         queries: Vec::new(),
         kept: XsKeys::default(),
@@ -937,6 +1049,149 @@ fn a_lookup_supplies_the_recovery_key_by_name_or_as_the_only_key() {
     let (status, xml) = decrypt_through(&unnamed, &mut store);
     assert_ne!(status, XS_OK);
     assert!(!xml.contains("<secret"));
+}
+
+/// `<root><secret Id="s">42</secret></root>` with `secret` encrypted under a
+/// content key AES-256-wrapped by a key that a nested RSA-OAEP
+/// `EncryptedKey` naming "recipient" transports.
+fn encrypted_through_a_nested_recipient() -> String {
+    // The RSA-OAEP EncryptedKey of a document encrypted for "recipient", and
+    // the 256-bit key it transports, recovered here to wrap the outer key.
+    let transport = encrypted_for_recipient();
+    let start = transport.find("<xenc:EncryptedKey>").unwrap();
+    let end = transport.find("</xenc:EncryptedKey>").unwrap() + "</xenc:EncryptedKey>".len();
+    let nested = &transport[start..end];
+    let data = &transport["<root>".len()..transport.len() - "</root>".len()];
+    let mut inventory = KeyInventory::default();
+    inventory
+        .add_private_pem(
+            "recipient",
+            recipient_store().pem.as_bytes(),
+            None,
+            KeyUsages::DECRYPT,
+            &ResourcePolicy::default(),
+        )
+        .unwrap();
+    let policy_snapshot = DecryptionPolicy::default();
+    let kek = inventory
+        .decryption_resolver_with_provider("recipient", &policy_snapshot, &RUST_CRYPTO_PROVIDER)
+        .unwrap()
+        .resolve_content_keys_with_policy(
+            &RUST_CRYPTO_PROVIDER,
+            DataEncryptionAlgorithm::Aes256Gcm,
+            Some(&parse_encrypted_data(data).unwrap().encrypted_keys[0]),
+            &policy_snapshot,
+            &mut KeyCandidateBudget::for_operation(),
+        )
+        .unwrap()
+        .remove(0)
+        .into_key()
+        .unwrap();
+    let outer = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .recipient_aes_kw(kek, KeyWrapAlgorithm::AesKw256)
+        .encrypt_xml("<secret Id=\"s\">42</secret>")
+        .unwrap()
+        .encrypted_data_xml;
+    let method =
+        "<xenc:EncryptionMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#kw-aes256\"/>";
+    assert!(outer.contains(method), "{outer}");
+    format!(
+        "<root>{}</root>",
+        outer.replacen(
+            method,
+            &format!("{method}<ds:KeyInfo>{nested}</ds:KeyInfo>"),
+            1
+        )
+    )
+}
+
+#[test]
+fn a_lookup_is_asked_for_a_nested_key_with_its_own_method() {
+    let _serial = crate::test_support::serial();
+    // The lookup is asked for "recipient" with RSA-OAEP, the method the key
+    // it holds serves, not with the outer AES wrap method.
+    let document = encrypted_through_a_nested_recipient();
+    let handles = policy();
+    let mut store = recipient_store();
+    let lookup = XsKeyLookup {
+        lookup: Some(store_lookup),
+        user_data: std::ptr::from_mut(&mut store).cast(),
+    };
+    let (mut decryptor, mut parsed) = (XsDecryptor::default(), XsDocument::default());
+    let mut error = XsError::default();
+    // SAFETY: every pointer names a live local or a live string.
+    let status = unsafe {
+        assert_eq!(
+            xs_decryptor_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                bytes(""),
+                &raw mut decryptor,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                4,
+                bytes(&document),
+                &raw mut parsed,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_decrypt(
+            decryptor,
+            parsed,
+            bytes(""),
+            &raw const lookup,
+            std::ptr::null_mut(),
+            &raw mut error,
+        )
+    };
+    let message = if error.value == 0 {
+        String::new()
+    } else {
+        take_error(error).1
+    };
+    let xml = serialized(parsed);
+    assert_eq!(xs_document_destroy(parsed), XS_OK);
+    assert_eq!(xs_decryptor_destroy(decryptor), XS_OK);
+    release(handles);
+    assert_eq!(status, XS_OK, "{message}: {:?}", store.queries);
+    assert!(xml.contains("<secret Id=\"s\">42</secret>"), "{xml}");
+    assert!(
+        store
+            .queries
+            .contains(&(vec!["recipient".to_owned()], RSA_OAEP.to_owned())),
+        "{:?}",
+        store.queries
+    );
+}
+
+#[test]
+fn a_failed_lookup_leaves_the_document_encrypted() {
+    let _serial = crate::test_support::serial();
+    // The first recipient's key recovers the content, the lookup for the
+    // second fails: the call fails with the lookup's status before the
+    // plaintext replaces the EncryptedData, not after.
+    let encrypted = encrypted_for_recipient();
+    let start = encrypted.find("<xenc:EncryptedKey>").unwrap();
+    let end = encrypted.find("</xenc:EncryptedKey>").unwrap() + "</xenc:EncryptedKey>".len();
+    let other = encrypted[start..end].replace(
+        "<ds:KeyName>recipient</ds:KeyName>",
+        "<ds:KeyName>other</ds:KeyName>",
+    );
+    let two = format!("{}{other}{}", &encrypted[..end], &encrypted[end..]);
+    let mut store = Store {
+        refuse: "other",
+        ..recipient_store()
+    };
+    let (status, xml) = decrypt_through(&two, &mut store);
+    assert_eq!(status, XS_KEY, "{:?}", store.queries);
+    assert_eq!(xml, two);
 }
 
 #[test]

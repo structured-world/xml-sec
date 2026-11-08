@@ -1185,6 +1185,77 @@ fn nested_encrypted_key_recovers_the_outer_kek_not_a_second_content_key() {
     ));
 }
 
+/// Supplies the content key directly and fails every `EncryptedKey` with
+/// the error `refusal` builds.
+struct RefusingRecipients {
+    content: [u8; 16],
+    refusal: fn() -> XmlEncError,
+}
+
+impl xml_sec::xmlenc::DecryptionKeyResolver for RefusingRecipients {
+    fn resolve_key(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        Err(XmlEncError::KeyNotFound)
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&xml_sec::xmlenc::EncryptedKey>,
+        _policy: &DecryptionPolicy,
+        _budget: &mut xml_sec::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<xml_sec::provider::RecoveredContentKey>, XmlEncError> {
+        match encrypted_key {
+            None => Ok(vec![xml_sec::provider::RecoveredContentKey::confirmed(
+                self.content.to_vec(),
+            )]),
+            Some(_) => Err((self.refusal)()),
+        }
+    }
+}
+
+#[test]
+fn a_resolver_abort_ends_decryption_although_another_source_found_the_key() {
+    // A key a recipient cannot supply leaves the next source eligible, but a
+    // resolver that aborts ends the operation: the directly resolved content
+    // key that would decrypt the data is not used.
+    let content = [3; 16];
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content)
+        .encrypt_binary(b"resolver abort")
+        .unwrap();
+    let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+    let wire = data(&key("")).replace(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+        parsed.cipher_data.inline_value().unwrap(),
+    );
+    let not_found = RefusingRecipients {
+        content,
+        refusal: || XmlEncError::KeyNotFound,
+    };
+    assert_eq!(
+        DecryptContext::new(&not_found)
+            .decrypt(&wire)
+            .unwrap()
+            .output,
+        DecryptedContent::Bytes(b"resolver abort".to_vec())
+    );
+    let aborting = RefusingRecipients {
+        content,
+        refusal: || XmlEncError::KeyResolverAborted,
+    };
+    let outcome = DecryptContext::new(&aborting).decrypt(&wire);
+    assert!(
+        matches!(outcome, Err(XmlEncError::KeyResolverAborted)),
+        "{outcome:?}"
+    );
+}
+
 #[test]
 fn an_unsupported_nested_method_falls_through_to_the_next_nested_key() {
     // A nested recipient whose method this build cannot run is one failed

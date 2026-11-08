@@ -34,7 +34,7 @@ extern "C" {
 #endif
 
 /* The ABI revision this header describes; compare with xs_abi_version(). */
-#define XS_ABI_VERSION 1u
+#define XS_ABI_VERSION 2u
 
 typedef int32_t xs_status;
 

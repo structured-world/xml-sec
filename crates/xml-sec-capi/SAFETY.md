@@ -69,12 +69,15 @@ behaviour the library cannot detect.
 - The query and the names it points to live on the library's stack for the
   invocation only. The key manager handle it receives is destroyed when the
   invocation returns; the call keeps the manager itself for its remaining
-  lookups, and a later use of that handle reports it destroyed. A handle
-  still in use on another thread when the invocation returns fails the call
-  with `XS_BUSY`.
+  lookups, and a later use of that handle reports it destroyed, or stale once
+  a newer object holds the slot. The release never reaches that newer object,
+  also when the callback destroyed the handle itself. A handle still in use
+  on another thread when the invocation returns fails the call with
+  `XS_BUSY`.
 - Keys imported by a lookup reach the operation only through the key
   manager's validation and resource policy, counted once for the whole call,
   never as raw pointers into application memory.
 - A lookup's status other than `XS_OK` ends the call with that status, or
-  `XS_INTERNAL` for a value the header does not name, and no output is
-  written.
+  `XS_INTERNAL` for a value the header does not name: no output is written
+  and a decryption leaves the document unchanged, even when another lookup of
+  the call already supplied a working key.

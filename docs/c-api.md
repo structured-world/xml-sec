@@ -119,9 +119,20 @@ An application that keeps its keys in its own store passes a key lookup to
 
 ```c
 xs_status lookup(void *store, const XsKeyQuery *query, XsKeys keys) {
-    /* query->names: the KeyName values the document gives;
-       query->method: the signature, transport, wrap or content method URI */
-    return xs_keys_add_public_pem(keys, query->names[0], pem, XS_KEY_USAGE_VERIFY, NULL);
+    /* query->names: the KeyName values the document gives, null when it
+       gives none; query->method: the signature, transport, wrap or content
+       method URI the key serves. */
+    for (size_t i = 0; i < query->name_count; i++) {
+        XsBytes pem = my_store_find(store, query->names[i], query->method);
+        if (pem.ptr != NULL) {
+            xs_status status = xs_keys_add_public_pem(keys, query->names[i], pem,
+                                                      XS_KEY_USAGE_VERIFY, NULL);
+            if (status != XS_OK) {
+                return status;
+            }
+        }
+    }
+    return XS_OK; /* finding nothing is not a failure */
 }
 
 XsKeyLookup key_lookup = {lookup, &my_store};
@@ -134,14 +145,17 @@ xs_verify(verifier, document, &request, &key_lookup, &evidence, &error);
 - Keys it imports are resolved by the rules of any key manager: bounded by the
   operation's resource policy, the document's names select them, and they are
   trusted as keys the application supplied. `keys` belongs to the running
-  call: keys imported into it serve the rest of that call, a name already
-  imported is not asked for again, and its handle is destroyed when the
-  callback returns.
-- A decryption selects the key the `EncryptedKey` names; when the document
-  names none, the one key the callback imported for that request. A decryptor
-  created with the zero key manager decrypts only through a lookup.
-- Any status other than `XS_OK` fails the call with that status; a value the
-  header does not name becomes `XS_INTERNAL`.
+  call: keys imported into it serve the rest of that call, so the callback is
+  asked only for names not yet imported, and once per method for a request
+  without names. Its handle is destroyed when the callback returns.
+- A decryption selects the key the `EncryptedKey` names, asked for with that
+  key's own transport or wrap method, also when it is nested in another
+  `EncryptedKey`; when the document names none, the one key the callback
+  imported for that request. A decryptor created with the zero key manager
+  decrypts only through a lookup.
+- Any status other than `XS_OK` fails the call with that status, before a
+  decryption changes the document; a value the header does not name becomes
+  `XS_INTERNAL`.
 - The callback may call the library. Destroying a handle the running call
   uses, or operating on its document, returns `XS_BUSY`.
 

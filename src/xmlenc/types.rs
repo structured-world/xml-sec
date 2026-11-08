@@ -1284,6 +1284,10 @@ pub enum XmlEncError {
     /// No caller-provided resolver could supply a usable key.
     #[error("no suitable decryption key was resolved")]
     KeyNotFound,
+    /// The caller's key resolver ended the operation: no later key source is
+    /// tried and nothing is decrypted, unlike [`XmlEncError::KeyNotFound`].
+    #[error("the key resolver ended the operation")]
+    KeyResolverAborted,
     /// No `EncryptedData` matched the requested document selection.
     #[error("no matching EncryptedData element was found")]
     EncryptedDataNotFound,

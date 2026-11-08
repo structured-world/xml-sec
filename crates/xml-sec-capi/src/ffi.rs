@@ -8,8 +8,8 @@ use crate::objects::{
     self, Audit, Decryptor, Encryptor, Failure, Grant, Keys, Object, PolicySource, Signer, Verifier,
 };
 use crate::status::{
-    XS_BUSY, XS_DESTROYED_HANDLE, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_WRONG_HANDLE,
-    XsStatus,
+    XS_BUSY, XS_DESTROYED_HANDLE, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_STALE_HANDLE,
+    XS_WRONG_HANDLE, XsStatus,
 };
 use crate::table::{self, InUse, Kind};
 use std::mem::MaybeUninit;
@@ -22,7 +22,7 @@ use xml_sec::provider::{CryptoProvider, RustCryptoProvider};
 mod tests;
 
 /// The ABI revision of this library; a header declares the one it expects.
-pub const XS_ABI_VERSION: u32 = 1;
+pub const XS_ABI_VERSION: u32 = 2;
 
 /// A borrowed byte string: `ptr` may be null only when `len` is zero.
 #[repr(C)]
@@ -187,9 +187,10 @@ impl objects::KeyLookup for CallerLookup {
         let status =
             unsafe { (self.lookup)(self.user_data, &raw const query, XsKeys { value: handle }) };
         // The key manager stays the operation's; only its handle ends here. A
-        // callback that destroyed it already leaves nothing to release.
+        // callback that destroyed it already leaves nothing to release, also
+        // once a newer object took over the slot, which stays untouched.
         match table::destroy(handle, Kind::Keys) {
-            Ok(()) | Err(XS_DESTROYED_HANDLE) => {}
+            Ok(()) | Err(XS_DESTROYED_HANDLE | XS_STALE_HANDLE) => {}
             Err(busy) => {
                 return Err(Failure::new(
                     busy,

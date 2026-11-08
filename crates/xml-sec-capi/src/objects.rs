@@ -31,6 +31,9 @@ use xml_sec::xmlenc::{
 use xml_sec::{SharedSecurity, XmlBackend, XmlDocument, XmlDocumentError, XmlSecError};
 use xml_sec_config::{Configuration, LoadLimits, PolicyStore, Source};
 
+#[cfg(test)]
+mod tests;
+
 /// Why a call failed: the status it returns, the `XS_VIOLATION_*` of a policy
 /// refusal (zero otherwise), and the diagnostic its error handle carries.
 pub(crate) struct Failure {
@@ -395,6 +398,8 @@ pub(crate) trait KeyLookup {
 struct LookupScope<'a> {
     lookup: &'a dyn KeyLookup,
     keys: Mutex<Option<Arc<Keys>>>,
+    /// Methods already asked for without a key name.
+    unnamed: Mutex<Vec<String>>,
     failure: Mutex<Option<Failure>>,
 }
 
@@ -403,13 +408,15 @@ impl<'a> LookupScope<'a> {
         Self {
             lookup,
             keys: Mutex::new(None),
+            unnamed: Mutex::new(Vec::new()),
             failure: Mutex::new(None),
         }
     }
 
     /// The operation's key manager after asking the lookup for `names`, and
-    /// the names that lookup imported. A lookup is not asked again for names
-    /// it already imported; after a failure none is asked at all.
+    /// the names that lookup imported. A lookup is asked only for names it
+    /// has not imported, and once per method for a request without names, so
+    /// a store never imports one key twice; after a failure none is asked.
     fn fill(
         &self,
         names: &[&str],
@@ -424,22 +431,31 @@ impl<'a> LookupScope<'a> {
                 .lock()
                 .get_or_insert_with(|| Arc::new(Keys::bounded_by(resources.clone()))),
         );
-        let (before, held_already) = {
+        let (before, missing) = {
             let held = keys.names.lock();
-            (
-                held.len(),
-                !names.is_empty()
-                    && names
-                        .iter()
-                        .all(|name| held.iter().any(|held| held == name)),
-            )
+            let missing: Vec<&str> = names
+                .iter()
+                .copied()
+                .filter(|name| !held.iter().any(|held| held == name))
+                .collect();
+            (held.len(), missing)
         };
-        if held_already {
+        let asked = if names.is_empty() {
+            let mut unnamed = self.unnamed.lock();
+            let asked = unnamed.iter().any(|served| served == method);
+            if !asked {
+                unnamed.push(method.to_owned());
+            }
+            asked
+        } else {
+            missing.is_empty()
+        };
+        if asked {
             return Some((keys, Vec::new()));
         }
         // No lock of this scope is held while the application runs, so its
         // lookup may import into `keys` and reenter the library.
-        if let Err(failure) = self.lookup.lookup(names, method, &keys) {
+        if let Err(failure) = self.lookup.lookup(&missing, method, &keys) {
             *self.failure.lock() = Some(failure);
             return None;
         }
@@ -579,7 +595,9 @@ impl LookupDecryption<'_> {
         let (keys, imported) = self
             .scope
             .fill(name.as_slice(), method, &policy.resources)
-            .ok_or(XmlEncError::KeyNotFound)?;
+            // A failed lookup ends the operation before any recovered key
+            // can decrypt and replace the content.
+            .ok_or(XmlEncError::KeyResolverAborted)?;
         let selected = match (name, imported.as_slice()) {
             (Some(name), _) => name.to_owned(),
             (None, [only]) => only.clone(),
@@ -628,11 +646,17 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        let name = match &source {
-            KeyEncryptionKeySource::Encrypted(key) => key.key_name.as_deref(),
-            _ => None,
+        // A nested key is asked for under its own name and transport method,
+        // the ones the key that unwraps it serves; the outer wrap method still
+        // drives the recovery below.
+        let (name, method) = match &source {
+            KeyEncryptionKeySource::Encrypted(key) => (
+                key.key_name.as_deref(),
+                key.encryption_method.algorithm.as_str(),
+            ),
+            _ => (None, algorithm.uri()),
         };
-        self.resolver(name, algorithm.uri(), policy, provider)?
+        self.resolver(name, method, policy, provider)?
             .resolve_key_encryption_keys_with_policy(provider, algorithm, source, policy, budget)
     }
 

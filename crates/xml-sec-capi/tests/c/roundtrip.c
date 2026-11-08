@@ -349,33 +349,33 @@ int main(int argc, char **argv) {
             XsSignatureOutcome outcome;
             XsError error = {0};
             xs_status status;
-            KeyStore store = {0};
-            store.pem = public_pem;
-            store.pem_len = public_len;
-            store.usages = XS_KEY_USAGE_VERIFY;
-            store.method = RSA_SHA256;
+            KeyStore key_store = {0};
+            key_store.pem = public_pem;
+            key_store.pem_len = public_len;
+            key_store.usages = XS_KEY_USAGE_VERIFY;
+            key_store.method = RSA_SHA256;
 
             MUST(xs_verifier_new(policy, provider, none, &verifier, NULL));
             received = parse(policy, XS_OPERATION_VERIFY, signed_xml);
-            store.running = verifier;
-            store.document = received;
-            evidence = verify_with(verifier, received, &store, NULL, &status);
+            key_store.running = verifier;
+            key_store.document = received;
+            evidence = verify_with(verifier, received, &key_store, NULL, &status);
             CHECK(status == XS_OK);
-            CHECK(store.calls == 1);
-            CHECK(store.matched == 1);
-            CHECK(store.reentry_busy);
+            CHECK(key_store.calls == 1);
+            CHECK(key_store.matched == 1);
+            CHECK(key_store.reentry_busy);
             MUST(xs_evidence_signature(evidence, 0, &outcome, NULL));
             CHECK(outcome.outcome == XS_SIGNATURE_VALID);
             CHECK(outcome.key_trust == XS_KEY_TRUST_CALLER_TRUSTED);
             CHECK(xs_evidence_destroy(evidence) == XS_OK);
             /* The lookup's key manager ended with its invocation. */
-            CHECK(xs_keys_add_symmetric(store.kept, text("late"), XS_SYMMETRIC_HMAC,
+            CHECK(xs_keys_add_symmetric(key_store.kept, text("late"), XS_SYMMETRIC_HMAC,
                                         text("0123456789abcdef"), XS_KEY_USAGE_VERIFY,
                                         NULL) == XS_DESTROYED_HANDLE);
 
-            store.running.value = 0;
-            store.result = XS_KEY;
-            evidence = verify_with(verifier, received, &store, &error, &status);
+            key_store.running.value = 0;
+            key_store.result = XS_KEY;
+            evidence = verify_with(verifier, received, &key_store, &error, &status);
             CHECK(status == XS_KEY);
             CHECK(evidence.value == 0);
             MUST(xs_error_status(error, &status));
@@ -458,21 +458,21 @@ int main(int argc, char **argv) {
             XsDecryptor keyless = {0};
             XsKeys none = {0};
             XsKeyLookup key_lookup;
-            KeyStore store = {0};
-            store.pem = private_pem;
-            store.pem_len = private_len;
-            store.private_key = 1;
-            store.usages = XS_KEY_USAGE_DECRYPT;
-            store.method = "http://www.w3.org/2009/xmlenc11#rsa-oaep";
+            KeyStore key_store = {0};
+            key_store.pem = private_pem;
+            key_store.pem_len = private_len;
+            key_store.private_key = 1;
+            key_store.usages = XS_KEY_USAGE_DECRYPT;
+            key_store.method = "http://www.w3.org/2009/xmlenc11#rsa-oaep";
             key_lookup.lookup = lookup;
-            key_lookup.user_data = &store;
+            key_lookup.user_data = &key_store;
 
             MUST(xs_decryptor_new(policy, provider, none, text(""), &keyless, NULL));
             received = parse(policy, XS_OPERATION_DECRYPT, encrypted);
             CHECK(xs_decrypt(keyless, received, text(""), NULL, NULL, NULL) ==
                   XS_INVALID_ARGUMENT);
             MUST(xs_decrypt(keyless, received, text(""), &key_lookup, NULL, NULL));
-            CHECK(store.matched == 1);
+            CHECK(key_store.matched == 1);
             decrypted = serialize(received);
             CHECK(strstr(decrypted, "<secret Id=\"s\">42</secret>") != NULL);
             free(decrypted);

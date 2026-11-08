@@ -147,8 +147,8 @@ int main() {
             "<ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo>"
             "<ds:SignatureValue></ds:SignatureValue>"
             "<ds:KeyInfo><ds:KeyName>mac</ds:KeyName></ds:KeyInfo></ds:Signature></root>";
-        MacStore store;
-        store.secret = std::string(32, 'k');
+        MacStore mac_store;
+        mac_store.secret = std::string(32, 'k');
         std::string signed_xml;
         {
             Keys keys;
@@ -157,7 +157,7 @@ int main() {
             check(xs_keys_new(policy.get(), XS_OPERATION_SIGN, keys.out(), nullptr) == XS_OK,
                   "signing keys");
             check(xs_keys_add_symmetric(keys.get(), bytes("mac"), XS_SYMMETRIC_HMAC,
-                                        bytes(store.secret), XS_KEY_USAGE_SIGN,
+                                        bytes(mac_store.secret), XS_KEY_USAGE_SIGN,
                                         nullptr) == XS_OK,
                   "HMAC key");
             check(xs_signer_new(policy.get(), provider.get(), keys.get(), bytes("mac"),
@@ -188,8 +188,10 @@ int main() {
                 return xs_keys_add_symmetric(keys, query->names[0], XS_SYMMETRIC_HMAC,
                                              bytes(found->secret), XS_KEY_USAGE_VERIFY, nullptr);
             },
-            &store};
-        const XsBytes ids[1] = {bytes("payload")};
+            &mac_store};
+        // The request borrows the ID's bytes, so they outlive the call.
+        const std::string payload = "payload";
+        const XsBytes ids[1] = {bytes(payload)};
         const XsVerifyRequest request{ids, 1, XS_REQUIRE_ALL, 0};
         check(xs_verify(verifier.get(), received.get(), &request, &lookup, evidence.out(),
                         nullptr) == XS_OK,
@@ -197,7 +199,7 @@ int main() {
         XsSignatureOutcome outcome{};
         check(xs_evidence_signature(evidence.get(), 0, &outcome, nullptr) == XS_OK, "outcome");
         check(outcome.outcome == XS_SIGNATURE_VALID, "the looked-up key verifies");
-        check(store.calls == 1, "asked once");
+        check(mac_store.calls == 1, "asked once");
     }
 
     if (failures != 0) {
