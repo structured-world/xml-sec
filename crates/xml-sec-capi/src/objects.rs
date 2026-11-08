@@ -360,7 +360,7 @@ impl Keys {
         let (kind, usages) = (symmetric_kind(kind)?, usages(usage_bits)?);
         self.inventory
             .write()
-            .add_symmetric(name.into(), kind, key.to_vec(), usages, &self.resources)
+            .add_symmetric(name.into(), kind, key, usages, &self.resources)
             .map_err(key_failure)
     }
 }

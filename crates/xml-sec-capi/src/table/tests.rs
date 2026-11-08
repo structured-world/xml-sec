@@ -48,6 +48,23 @@ fn a_handle_outside_the_table_is_stale() {
 }
 
 #[test]
+fn a_forged_type_tag_cannot_reach_or_destroy_another_object() {
+    // The slot, not the caller's handle, records the object's type: an error
+    // handle relabeled as a provider keeps its slot and generation but is a
+    // wrong handle, before and after the error object is destroyed.
+    let handle = insert(error_object()).unwrap();
+    let relabeled = (handle & 0x00ff_ffff_ffff_ffff) | (u64::from(Kind::Provider as u8) << 56);
+    assert_eq!(
+        use_handle(relabeled, Kind::Provider).err(),
+        Some(XS_WRONG_HANDLE)
+    );
+    assert_eq!(destroy(relabeled, Kind::Provider), Err(XS_WRONG_HANDLE));
+    assert!(use_handle(handle, Kind::Error).is_ok());
+    destroy(handle, Kind::Error).unwrap();
+    assert_eq!(destroy(relabeled, Kind::Provider), Err(XS_WRONG_HANDLE));
+}
+
+#[test]
 fn an_object_in_use_cannot_be_destroyed() {
     // A running call keeps its object; destroying it meanwhile reports busy
     // and leaves the handle valid.

@@ -29,9 +29,12 @@ behaviour the library cannot detect.
 - Lengths: a byte length or an array count whose size exceeds `isize::MAX` is
   refused before a slice is formed.
 - Text is UTF-8; enumerators and usage bits are known values.
-- Handles: never dereferenced. The table resolves each one by type tag, slot
-  index and generation, and reports wrong, stale or destroyed handles. Slot
-  generations never wrap: a slot whose generation is exhausted is retired.
+- Handles: never dereferenced. The table resolves each one by slot index and
+  generation, checks its type tag against the type the slot records, and
+  reports wrong, stale or destroyed handles. Slot generations never wrap: a
+  slot whose generation is exhausted is retired.
+- Inputs bounded by the compiled policy (document and key bytes) are checked
+  against it before the library copies them.
 
 ## What the library guarantees
 
@@ -39,8 +42,9 @@ behaviour the library cannot detect.
   `catch_unwind`, and a panic returns `XS_INTERNAL`.
 - No output is written on failure except the error handle.
 - An object is dropped only when its handle is destroyed and no running call
-  or other object uses it. Destruction during a call returns `XS_BUSY`, and
-  the object is released outside the table lock.
+  or other object uses it. A call keeps every handle it reads in use until it
+  returns, so destruction during the call returns `XS_BUSY`, and the object is
+  released outside the table lock.
 - A document is used by one operation at a time; a concurrent one returns
   `XS_BUSY`. All other objects are `Send + Sync` and serve concurrent calls.
 - Text views returned in `XsBytes` point into memory owned by the handle they

@@ -310,25 +310,54 @@ fn wrong() -> Failure {
     Failure::from(XS_WRONG_HANDLE)
 }
 
-fn provider(handle: XsProvider) -> Result<Arc<dyn CryptoProvider>, Failure> {
-    match take(handle.value, Kind::Provider)?.object() {
-        Object::Provider(provider) => Ok(Arc::clone(provider)),
-        _ => Err(wrong()),
+/// A shared object one call reads, with the handle kept in use until the call
+/// drops it, so destroying the handle meanwhile reports busy.
+struct Held<T: ?Sized> {
+    value: Arc<T>,
+    _in_use: InUse,
+}
+
+impl<T: ?Sized> std::ops::Deref for Held<T> {
+    type Target = Arc<T>;
+
+    fn deref(&self) -> &Arc<T> {
+        &self.value
     }
 }
 
-fn policy(handle: XsPolicy) -> Result<Arc<xml_sec::policy::CompiledPolicies>, Failure> {
-    match take(handle.value, Kind::Policy)?.object() {
-        Object::Policy(policy) => Ok(Arc::clone(policy)),
-        _ => Err(wrong()),
-    }
+/// Hold the shared object `handle` names, as `project` reads it.
+fn hold<T: ?Sized>(
+    handle: u64,
+    kind: Kind,
+    project: impl FnOnce(&Object) -> Option<&Arc<T>>,
+) -> Result<Held<T>, Failure> {
+    let in_use = take(handle, kind)?;
+    let value = Arc::clone(project(in_use.object()).ok_or_else(wrong)?);
+    Ok(Held {
+        value,
+        _in_use: in_use,
+    })
 }
 
-fn keys(handle: XsKeys) -> Result<Arc<Keys>, Failure> {
-    match take(handle.value, Kind::Keys)?.object() {
-        Object::Keys(keys) => Ok(Arc::clone(keys)),
-        _ => Err(wrong()),
-    }
+fn provider(handle: XsProvider) -> Result<Held<dyn CryptoProvider>, Failure> {
+    hold(handle.value, Kind::Provider, |object| match object {
+        Object::Provider(provider) => Some(provider),
+        _ => None,
+    })
+}
+
+fn policy(handle: XsPolicy) -> Result<Held<xml_sec::policy::CompiledPolicies>, Failure> {
+    hold(handle.value, Kind::Policy, |object| match object {
+        Object::Policy(policy) => Some(policy),
+        _ => None,
+    })
+}
+
+fn keys(handle: XsKeys) -> Result<Held<Keys>, Failure> {
+    hold(handle.value, Kind::Keys, |object| match object {
+        Object::Keys(keys) => Some(keys),
+        _ => None,
+    })
 }
 
 /// Lock `document` for one operation; another running operation makes it busy.
@@ -528,7 +557,8 @@ pub unsafe extern "C" fn xs_policy_store_new(
         let out = unsafe { output(out) }?;
         let provider = provider(provider_handle)?;
         // SAFETY: the caller's contract for the source arguments.
-        let source = unsafe { source(configuration, profile, &*provider, context, authorization) }?;
+        let source =
+            unsafe { source(configuration, profile, &**provider, context, authorization) }?;
         let value = insert(Object::PolicyStore(source.new_store()?))?;
         out.write(XsPolicyStore { value });
         Ok(())
@@ -555,7 +585,8 @@ pub unsafe extern "C" fn xs_policy_store_replace(
     contain(error, || {
         let provider = provider(provider_handle)?;
         // SAFETY: the caller's contract for the source arguments.
-        let source = unsafe { source(configuration, profile, &*provider, context, authorization) }?;
+        let source =
+            unsafe { source(configuration, profile, &**provider, context, authorization) }?;
         let store = take(store.value, Kind::PolicyStore)?;
         let Object::PolicyStore(store) = store.object() else {
             return Err(wrong());
@@ -790,8 +821,12 @@ pub unsafe extern "C" fn xs_signer_new(
         // SAFETY: the caller's contract for `out` and the byte strings.
         let (out, name, method) =
             unsafe { (output(out)?, text(key_name)?, text(signature_method)?) };
-        let security = objects::security(&policy(policy_handle)?, &provider(provider_handle)?)?;
-        let signer = Signer::new(security, &*keys(keys_handle)?, name, method)?;
+        let (policy, provider, keys) = (
+            policy(policy_handle)?,
+            provider(provider_handle)?,
+            keys(keys_handle)?,
+        );
+        let signer = Signer::new(objects::security(&policy, &provider)?, &keys, name, method)?;
         let value = insert(Object::Signer(signer))?;
         out.write(XsSigner { value });
         Ok(())
@@ -844,12 +879,16 @@ pub unsafe extern "C" fn xs_verifier_new(
     contain(error, || {
         // SAFETY: the caller's contract for `out`.
         let out = unsafe { output(out) }?;
-        let security = objects::security(&policy(policy_handle)?, &provider(provider_handle)?)?;
+        let (policy, provider) = (policy(policy_handle)?, provider(provider_handle)?);
         let keys = match keys_handle.value {
             0 => None,
             _ => Some(keys(keys_handle)?),
         };
-        let value = insert(Object::Verifier(Verifier::new(security, keys)))?;
+        let verifier = Verifier::new(
+            objects::security(&policy, &provider)?,
+            keys.as_deref().map(Arc::clone),
+        );
+        let value = insert(Object::Verifier(verifier))?;
         out.write(XsVerifier { value });
         Ok(())
     })
@@ -941,8 +980,13 @@ pub unsafe extern "C" fn xs_encryptor_new(
         // SAFETY: the caller's contract for `out` and the byte strings.
         let (out, recipient, method) =
             unsafe { (output(out)?, text(recipient)?, text(content_method)?) };
-        let security = objects::security(&policy(policy_handle)?, &provider(provider_handle)?)?;
-        let encryptor = Encryptor::new(security, &*keys(keys_handle)?, recipient, method)?;
+        let (policy, provider, keys) = (
+            policy(policy_handle)?,
+            provider(provider_handle)?,
+            keys(keys_handle)?,
+        );
+        let security = objects::security(&policy, &provider)?;
+        let encryptor = Encryptor::new(security, &keys, recipient, method)?;
         let value = insert(Object::Encryptor(Box::new(encryptor)))?;
         out.write(XsEncryptor { value });
         Ok(())
@@ -996,8 +1040,12 @@ pub unsafe extern "C" fn xs_decryptor_new(
     contain(error, || {
         // SAFETY: the caller's contract for `out` and `key_name`.
         let (out, name) = unsafe { (output(out)?, text(key_name)?) };
-        let security = objects::security(&policy(policy_handle)?, &provider(provider_handle)?)?;
-        let decryptor = Decryptor::new(security, &*keys(keys_handle)?, name)?;
+        let (policy, provider, keys) = (
+            policy(policy_handle)?,
+            provider(provider_handle)?,
+            keys(keys_handle)?,
+        );
+        let decryptor = Decryptor::new(objects::security(&policy, &provider)?, &keys, name)?;
         let value = insert(Object::Decryptor(decryptor))?;
         out.write(XsDecryptor { value });
         Ok(())

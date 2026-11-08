@@ -44,6 +44,9 @@ pub(crate) struct Entry {
 
 struct Slot {
     generation: u32,
+    /// The type of the object this generation holds or held; a handle's tag
+    /// is checked against it, never trusted alone.
+    kind: Kind,
     entry: Option<Arc<Entry>>,
 }
 
@@ -84,6 +87,7 @@ pub(crate) fn insert(object: Object) -> Result<u64, XsStatus> {
         // the destroyed object reports destroyed, not stale. Cannot overflow:
         // `destroy` retires a slot at `u32::MAX` instead of freeing it.
         slot.generation += 1;
+        slot.kind = kind;
         slot.entry = Some(entry);
         return Ok(encode(kind, index, slot.generation));
     }
@@ -93,6 +97,7 @@ pub(crate) fn insert(object: Object) -> Result<u64, XsStatus> {
     let index = u32::try_from(table.slots.len()).expect("fewer than 2^24 slots");
     table.slots.push(Slot {
         generation: 0,
+        kind,
         entry: Some(entry),
     });
     Ok(encode(kind, index, 0))
@@ -124,6 +129,10 @@ fn locate(table: &Table, handle: u64, kind: Kind) -> Result<&Slot, XsStatus> {
     let slot = table.slots.get(index).ok_or(XS_STALE_HANDLE)?;
     if slot.generation != generation {
         return Err(XS_STALE_HANDLE);
+    }
+    // A forged tag over a live slot and generation names another type.
+    if slot.kind != kind {
+        return Err(XS_WRONG_HANDLE);
     }
     Ok(slot)
 }

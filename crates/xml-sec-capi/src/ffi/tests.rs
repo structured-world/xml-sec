@@ -1,14 +1,49 @@
 use super::{
-    XsBytes, XsCompileContext, XsDocument, XsError, XsPolicy, XsPolicyStore, XsProvider, contain,
+    XsBytes, XsCompileContext, XsDocument, XsError, XsKeys, XsPolicy, XsPolicyStore, XsProvider,
+    contain, keys as hold_keys, policy as hold_policy, provider as hold_provider,
     xs_document_parse, xs_error_destroy, xs_error_message, xs_error_policy_violation,
-    xs_error_status, xs_policy_destroy, xs_policy_store_destroy, xs_policy_store_load,
-    xs_policy_store_new, xs_provider_destroy, xs_provider_new_rustcrypto,
+    xs_error_status, xs_keys_add_symmetric, xs_keys_destroy, xs_keys_new, xs_policy_destroy,
+    xs_policy_store_destroy, xs_policy_store_load, xs_policy_store_new, xs_provider_destroy,
+    xs_provider_new_rustcrypto,
 };
 use crate::objects::Failure;
 use crate::status::{
-    XS_CONFIGURATION, XS_DOCUMENT, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_POLICY, XsStatus,
+    XS_BUSY, XS_CONFIGURATION, XS_DOCUMENT, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_POLICY,
+    XsStatus,
 };
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::mem::MaybeUninit;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// The system allocator, recording the largest single request, so a test can
+/// show an input was refused before the library copied it. Every test runs
+/// in its own process, so no other test's allocations interleave.
+struct Largest;
+
+static LARGEST: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: every request is forwarded unchanged to the system allocator.
+unsafe impl GlobalAlloc for Largest {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        LARGEST.fetch_max(layout.size(), Ordering::Relaxed);
+        // SAFETY: forwarded caller contract.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: forwarded caller contract.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        LARGEST.fetch_max(new_size, Ordering::Relaxed);
+        // SAFETY: forwarded caller contract.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Largest = Largest;
 
 fn bytes(text: &str) -> XsBytes {
     XsBytes {
@@ -182,6 +217,86 @@ fn a_document_beyond_a_policy_limit_is_a_typed_policy_refusal() {
         assert_eq!(take_error(error).0, XS_POLICY);
         release(handles);
     }
+}
+
+/// A key manager under `[profiles.app.verification.resources]` `limits`.
+fn keys_under(limits: &str) -> ((XsProvider, XsPolicyStore, XsPolicy), XsKeys) {
+    let handles = policy_from(&format!(
+        "{MODERN}[profiles.app.verification.resources]\n{limits}\n"
+    ));
+    let mut keys = XsKeys::default();
+    // SAFETY: the output is a live local.
+    let status = unsafe { xs_keys_new(handles.2, 1, &raw mut keys, std::ptr::null_mut()) };
+    assert_eq!(status, XS_OK);
+    (handles, keys)
+}
+
+#[test]
+fn input_beyond_a_policy_limit_is_refused_before_it_is_copied() {
+    // A caller's bytes past the compiled ceiling are refused without the
+    // library allocating their size, so an oversized input cannot exhaust
+    // memory and abort the process before the refusal.
+    let (handles, keys) = keys_under("max_external_resource_bytes = 64");
+    let key = vec![7_u8; 1 << 20];
+    let large = format!("<a>{}</a>", "x".repeat(1 << 20));
+    let parse_handles = policy_from(&format!(
+        "{MODERN}[profiles.app.verification.resources]\nmax_xml_document_bytes = 64\n"
+    ));
+    LARGEST.store(0, Ordering::Relaxed);
+    let mut error = XsError::default();
+    // SAFETY: the byte strings name live buffers; the output is a live local.
+    let status = unsafe {
+        xs_keys_add_symmetric(
+            keys,
+            bytes("hmac"),
+            1,
+            XsBytes {
+                ptr: key.as_ptr(),
+                len: key.len(),
+            },
+            1,
+            &raw mut error,
+        )
+    };
+    assert_eq!(status, XS_POLICY);
+    assert_eq!(take_error(error).0, XS_POLICY);
+    let mut document = XsDocument::default();
+    // SAFETY: as above.
+    let status = unsafe {
+        xs_document_parse(
+            parse_handles.2,
+            1,
+            bytes(&large),
+            &raw mut document,
+            &raw mut error,
+        )
+    };
+    assert_eq!(status, XS_POLICY);
+    assert_eq!(take_error(error).0, XS_POLICY);
+    assert!(LARGEST.load(Ordering::Relaxed) < 1 << 20);
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    release(handles);
+    release(parse_handles);
+}
+
+#[test]
+fn a_held_object_is_busy_until_the_call_that_holds_it_ends() {
+    // A call keeps the provider, policy and key handles it reads in use for
+    // its whole length, so destroying them meanwhile reports busy.
+    let (handles, keys_handle) = keys_under("");
+    let (Ok(held_provider), Ok(held_policy), Ok(held_keys)) = (
+        hold_provider(handles.0),
+        hold_policy(handles.2),
+        hold_keys(keys_handle),
+    ) else {
+        panic!("live handles must be held");
+    };
+    assert_eq!(xs_provider_destroy(handles.0), XS_BUSY);
+    assert_eq!(xs_policy_destroy(handles.2), XS_BUSY);
+    assert_eq!(xs_keys_destroy(keys_handle), XS_BUSY);
+    drop((held_provider, held_policy, held_keys));
+    assert_eq!(xs_keys_destroy(keys_handle), XS_OK);
+    release(handles);
 }
 
 #[test]

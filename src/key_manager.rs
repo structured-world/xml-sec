@@ -1449,19 +1449,21 @@ impl KeyInventory {
     pub fn verification_resolver(&self) -> InventoryVerificationResolver<'_> {
         InventoryVerificationResolver { inventory: self }
     }
-    /// Register raw symmetric bytes under a unique name.
+    /// Register raw symmetric bytes under a unique name. Borrowed bytes are
+    /// copied only once every check has accepted them.
     ///
     /// # Errors
     /// Returns invalid policy, duplicate names, resource exhaustion, invalid
     /// family-specific key widths or incompatible/empty usage permissions.
-    pub fn add_symmetric(
+    pub fn add_symmetric<B: AsRef<[u8]> + Into<Vec<u8>>>(
         &mut self,
         name: String,
         kind: SymmetricKeyKind,
-        bytes: Vec<u8>,
+        key: B,
         usages: KeyUsages,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
+        let bytes = key.as_ref();
         self.check_new_name(&name, resources)?;
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
@@ -1481,7 +1483,7 @@ impl KeyInventory {
             SymmetricKeyKind::Aes | SymmetricKeyKind::Camellia | SymmetricKeyKind::ChaCha20 => {
                 KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT)
             }
-            SymmetricKeyKind::Des => des_key_usages(&bytes)?,
+            SymmetricKeyKind::Des => des_key_usages(bytes)?,
         };
         if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
             return Err(KeyStoreError::Selection(
@@ -1492,7 +1494,7 @@ impl KeyInventory {
         self.symmetric_keys.push(StoredSymmetricKey {
             name,
             kind,
-            bytes: Zeroizing::new(bytes),
+            bytes: Zeroizing::new(key.into()),
             usages,
         });
         self.entry_count += 1;
