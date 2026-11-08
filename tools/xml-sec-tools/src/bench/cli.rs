@@ -5,7 +5,7 @@
 use super::{
     Captured, capture, case_files, checked, cpu_model, create_evidence_directory, digest_file,
     document_body, heap_stats, number, operations, platform, policy_refusal, read_json, resources,
-    sample_count, tamper, timestamp, to_f64, unsupported, wrap, write_json,
+    sample_count, tamper, timestamp, to_f64, wrap, write_json,
 };
 use crate::repo::Failure;
 use serde_json::{Map, Value, json};
@@ -19,7 +19,6 @@ const VALIDATION: Duration = Duration::from_mins(2);
 /// One measured engine; `kind` selects its argument dialect.
 pub(crate) struct Engine {
     pub(crate) name: &'static str,
-    pub(crate) id: &'static str,
     pub(crate) kind: Kind,
     pub(crate) binary: PathBuf,
     pub(crate) backend: Option<&'static str>,
@@ -116,6 +115,31 @@ const BERG_ELEMENT_ENCRYPT: &[Arg] = &[
     Plain,
     Literal("--cert"),
     Corpus("leaf.pem"),
+    Literal("--output"),
+    Destination,
+];
+/// The signer certificate goes into the template's `X509Data`.
+const BERG_ASSERTION_SIGN: &[Arg] = &[
+    Literal("sign"),
+    Template,
+    Literal("--key"),
+    Corpus("private.pem"),
+    Literal("--cert"),
+    Corpus("leaf.pem"),
+    Literal("--output"),
+    Destination,
+];
+const BERG_IN_PLACE_ENCRYPT: &[Arg] = &[
+    Literal("encrypt"),
+    Corpus("element.template.xml"),
+    Literal("--data"),
+    Plain,
+    Literal("--cert"),
+    Corpus("leaf.pem"),
+    Literal("--id-attr"),
+    Literal("Id"),
+    Literal("--node-id"),
+    Literal("payment"),
     Literal("--output"),
     Destination,
 ];
@@ -241,12 +265,14 @@ const XMLSEC_XSLT_VERIFY: &[Arg] = &[
 /// The invocation template of one engine dialect, workload and operation.
 fn template(kind: Kind, scenario: &str, operation: &str) -> Option<&'static [Arg]> {
     Some(match (kind, scenario, operation) {
-        (Kind::Bergshamra, "payload", "sign") => BERG_PAYLOAD_SIGN,
-        (Kind::Bergshamra, "payload", "verify") => BERG_PAYLOAD_VERIFY,
+        (Kind::Bergshamra, "payload" | "xslt", "sign") => BERG_PAYLOAD_SIGN,
+        (Kind::Bergshamra, "payload" | "xslt", "verify") => BERG_PAYLOAD_VERIFY,
         (Kind::Bergshamra, "payload", "encrypt") => BERG_PAYLOAD_ENCRYPT,
         (Kind::Bergshamra, "payload", "decrypt") => BERG_PAYLOAD_DECRYPT,
+        (Kind::Bergshamra, "assertion", "sign") => BERG_ASSERTION_SIGN,
         (Kind::Bergshamra, "assertion", "verify") => BERG_ASSERTION_VERIFY,
         (Kind::Bergshamra, "element", "encrypt") => BERG_ELEMENT_ENCRYPT,
+        (Kind::Bergshamra, "element_in_place", "encrypt") => BERG_IN_PLACE_ENCRYPT,
         (Kind::Bergshamra, "element" | "element_in_place", "decrypt") => BERG_ELEMENT_DECRYPT,
         (Kind::Xmlsec, "payload", "sign") => XMLSEC_PAYLOAD_SIGN,
         (Kind::Xmlsec, "payload", "verify") => XMLSEC_PAYLOAD_VERIFY,
@@ -420,25 +446,19 @@ impl Run {
     }
 
     /// The engines able to run `operation` for this case, by index.
-    fn able(&self, refused: &Refusals, scenario: &str, operation: &str) -> Vec<usize> {
+    fn able(&self, refused: &Refusals, operation: &str) -> Vec<usize> {
         (0..self.engines.len())
-            .filter(|&index| {
-                refused
-                    .blocked(&self.engines[index], scenario, operation)
-                    .is_none()
-            })
+            .filter(|&index| refused.blocked(&self.engines[index], operation).is_none())
             .collect()
     }
 }
 
 /// Engines refused for one case, by `engine name/operation`.
-struct Refusals(BTreeMap<String, String>);
+pub(crate) struct Refusals(pub(crate) BTreeMap<String, String>);
 
 impl Refusals {
-    fn blocked(&self, engine: &Engine, scenario: &str, operation: &str) -> Option<String> {
-        unsupported(engine.id, scenario, operation)
-            .map(String::from)
-            .or_else(|| self.0.get(&format!("{}/{operation}", engine.name)).cloned())
+    pub(crate) fn blocked(&self, engine: &Engine, operation: &str) -> Option<String> {
+        self.0.get(&format!("{}/{operation}", engine.name)).cloned()
     }
 
     fn refuse(&mut self, engine: &Engine, operation: &str, reason: &str) {
@@ -446,6 +466,29 @@ impl Refusals {
             format!("{}/{operation}", engine.name),
             format!("refused under the engine's default policy: {reason}"),
         );
+    }
+
+    /// Records the failed cross-check `error` of `producer`'s output read by
+    /// `consumer`. The competitor is measured at its current code, so a wrong
+    /// result of its own is a gap this run observed and reports; a failure
+    /// of xml-sec or the reference oracle fails the run.
+    pub(crate) fn observe(
+        &mut self,
+        producer: (&Engine, &str),
+        consumer: (&Engine, &str),
+        error: String,
+    ) -> Result<(), String> {
+        let Some((engine, operation)) = [consumer, producer]
+            .into_iter()
+            .find(|(engine, _)| engine.kind == Kind::Bergshamra)
+        else {
+            return Err(error);
+        };
+        self.0.insert(
+            format!("{}/{operation}", engine.name),
+            format!("incorrect result in this run: {error}"),
+        );
+        Ok(())
     }
 }
 
@@ -455,32 +498,47 @@ impl Refusals {
 fn validate_signing(run: &Run, item: &Value, refused: &mut Refusals) -> Result<(), String> {
     let (name, scenario) = (text(item, "name"), text(item, "scenario"));
     let mut outputs = Vec::new();
-    for (position, index) in run.able(refused, &scenario, "sign").into_iter().enumerate() {
+    for (position, index) in run.able(refused, "sign").into_iter().enumerate() {
         let signer = &run.engines[index];
         let output = run.file(&format!("{name}.signed-{position}.xml"));
-        if let Some(refusal) = attempt(&run.command(signer, item, "sign", Some(&output), None)?)? {
-            refused.refuse(signer, "sign", &refusal);
-            continue;
+        let line = run.command(signer, item, "sign", Some(&output), None)?;
+        let outcome = attempt(&line).and_then(|refusal| {
+            if refusal.is_none() && scenario == "assertion" {
+                let contents =
+                    std::fs::read_to_string(&output).map_err(|error| error.to_string())?;
+                if !contents.contains("X509Certificate>") {
+                    return Err(format!("No signer certificate: {}, {name}", signer.name));
+                }
+            }
+            Ok(refusal)
+        });
+        match outcome {
+            Ok(Some(refusal)) => refused.refuse(signer, "sign", &refusal),
+            Ok(None) => outputs.push((index, output)),
+            Err(error) => refused.observe((signer, "sign"), (signer, "sign"), error)?,
         }
-        let contents = std::fs::read_to_string(&output).map_err(|error| error.to_string())?;
-        if scenario == "assertion" && !contents.contains("X509Certificate>") {
-            return Err(format!("No signer certificate: {}, {name}", signer.name));
-        }
-        outputs.push(output);
     }
-    let first = outputs
-        .first()
-        .ok_or_else(|| format!("No engine signed {name}"))?;
-    for signed in &outputs {
-        for index in run.able(refused, &scenario, "verify") {
+    for (signer, signed) in &outputs {
+        for index in run.able(refused, "verify") {
             let verifier = &run.engines[index];
-            if let Some(refusal) =
-                attempt(&run.command(verifier, item, "verify", None, Some(signed))?)?
-            {
-                refused.refuse(verifier, "verify", &refusal);
+            let line = run.command(verifier, item, "verify", None, Some(signed))?;
+            match attempt(&line) {
+                Ok(Some(refusal)) => refused.refuse(verifier, "verify", &refusal),
+                Ok(None) => {}
+                Err(error) => {
+                    refused.observe(
+                        (&run.engines[*signer], "sign"),
+                        (verifier, "verify"),
+                        error,
+                    )?;
+                }
             }
         }
     }
+    outputs.retain(|(signer, _)| refused.blocked(&run.engines[*signer], "sign").is_none());
+    let (_, first) = outputs
+        .first()
+        .ok_or_else(|| format!("No engine signed {name}"))?;
     let canonical = run.file(&format!("{name}.signed.xml"));
     std::fs::copy(first, &canonical).map_err(|error| error.to_string())?;
     let signed_text = std::fs::read_to_string(&canonical).map_err(|error| error.to_string())?;
@@ -492,8 +550,11 @@ fn validate_signing(run: &Run, item: &Value, refused: &mut Refusals) -> Result<(
         let path = run.file(&format!("{name}.{kind}.xml"));
         std::fs::write(&path, forged).map_err(|error| error.to_string())?;
         // A refusing verifier says nothing about forgery detection, so it is not counted.
-        for index in run.able(refused, &scenario, "verify") {
-            run.reject(&run.engines[index], item, &path, kind)?;
+        for index in run.able(refused, "verify") {
+            let verifier = &run.engines[index];
+            if let Err(error) = run.reject(verifier, item, &path, kind) {
+                refused.observe((verifier, "verify"), (verifier, "verify"), error)?;
+            }
         }
     }
     Ok(())
@@ -506,54 +567,67 @@ fn validate_encryption(run: &Run, item: &Value, refused: &mut Refusals) -> Resul
     let files = case_files(&name, &scenario, &item["units"]);
     let plain = std::fs::read(run.file(&files.plain)).map_err(|error| error.to_string())?;
     let mut outputs = Vec::new();
-    for (position, index) in run
-        .able(refused, &scenario, "encrypt")
-        .into_iter()
-        .enumerate()
-    {
+    for (position, index) in run.able(refused, "encrypt").into_iter().enumerate() {
         let encryptor = &run.engines[index];
         let encrypted = run.file(&format!("{name}.encrypted-{position}.xml"));
-        if let Some(refusal) =
-            attempt(&run.command(encryptor, item, "encrypt", Some(&encrypted), None)?)?
-        {
-            refused.refuse(encryptor, "encrypt", &refusal);
-            continue;
+        let line = run.command(encryptor, item, "encrypt", Some(&encrypted), None)?;
+        match attempt(&line) {
+            Ok(Some(refusal)) => refused.refuse(encryptor, "encrypt", &refusal),
+            Ok(None) => outputs.push((index, encrypted)),
+            Err(error) => refused.observe((encryptor, "encrypt"), (encryptor, "encrypt"), error)?,
         }
-        outputs.push((index, encrypted));
     }
-    let (_, first) = outputs
-        .first()
-        .ok_or_else(|| format!("No engine encrypted {name}"))?;
     for (encryptor, encrypted) in &outputs {
-        for index in run.able(refused, &scenario, "decrypt") {
+        for index in run.able(refused, "decrypt") {
             let decryptor = &run.engines[index];
             let decrypted = run.file(&format!("{name}.decrypted.xml"));
-            if let Some(refusal) = attempt(&run.command(
+            let line = run.command(
                 decryptor,
                 item,
                 "decrypt",
                 Some(&decrypted),
                 Some(encrypted),
-            )?)? {
-                refused.refuse(decryptor, "decrypt", &refusal);
-                continue;
-            }
-            // Byte payloads must round-trip exactly; XML results may differ only in
-            // the declaration and surrounding whitespace the writing engine adds.
-            let output = std::fs::read(&decrypted).map_err(|error| error.to_string())?;
-            let equal = if scenario == "payload" {
-                output == plain
-            } else {
-                document_body(&output) == document_body(&plain)
-            };
-            if !equal {
-                return Err(format!(
-                    "Plaintext mismatch: {} -> {}, {name}",
-                    run.engines[*encryptor].name, decryptor.name
-                ));
+            )?;
+            let recovered = attempt(&line).and_then(|refusal| {
+                if refusal.is_some() {
+                    return Ok(refusal);
+                }
+                // Byte payloads must round-trip exactly; XML results may differ only in
+                // the declaration and surrounding whitespace the writing engine adds.
+                let output = std::fs::read(&decrypted).map_err(|error| error.to_string())?;
+                let equal = if scenario == "payload" {
+                    output == plain
+                } else {
+                    document_body(&output) == document_body(&plain)
+                };
+                if equal {
+                    Ok(None)
+                } else {
+                    Err(format!(
+                        "Plaintext mismatch: {} -> {}, {name}",
+                        run.engines[*encryptor].name, decryptor.name
+                    ))
+                }
+            });
+            match recovered {
+                Ok(Some(refusal)) => refused.refuse(decryptor, "decrypt", &refusal),
+                Ok(None) => {}
+                Err(error) => refused.observe(
+                    (&run.engines[*encryptor], "encrypt"),
+                    (decryptor, "decrypt"),
+                    error,
+                )?,
             }
         }
     }
+    outputs.retain(|(encryptor, _)| {
+        refused
+            .blocked(&run.engines[*encryptor], "encrypt")
+            .is_none()
+    });
+    let (_, first) = outputs
+        .first()
+        .ok_or_else(|| format!("No engine encrypted {name}"))?;
     std::fs::copy(first, run.file(&format!("{name}.encrypted.xml")))
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -654,7 +728,7 @@ fn measure(
     heap: Option<&Path>,
 ) -> Result<Vec<Value>, String> {
     let (name, scenario) = (text(item, "name"), text(item, "scenario"));
-    let able = run.able(refused, &scenario, operation);
+    let able = run.able(refused, operation);
     let mut lines = Vec::new();
     for (position, &index) in able.iter().enumerate() {
         let output = run.file(&format!("{name}.{operation}-{position}.output"));
@@ -705,7 +779,7 @@ fn measure(
         results.push(Value::Object(entry));
     }
     for engine in &run.engines {
-        if let Some(reason) = refused.blocked(engine, &scenario, operation) {
+        if let Some(reason) = refused.blocked(engine, operation) {
             let mut entry = base_entry(engine, operation, item);
             entry.insert("unsupported".into(), reason.into());
             results.push(Value::Object(entry));
@@ -822,28 +896,24 @@ fn execute(output: &Path, samples: u32, heap: bool, binaries: &Binaries) -> Resu
     let engines = vec![
         Engine {
             name: "xml-sec / xmloxide / RustCrypto",
-            id: "xml-sec",
             kind: Kind::Xmlsec,
             binary: binaries.xml_sec.clone(),
             backend: Some("xmloxide"),
         },
         Engine {
             name: "xml-sec / roxmltree / RustCrypto",
-            id: "xml-sec",
             kind: Kind::Xmlsec,
             binary: binaries.xml_sec.clone(),
             backend: Some("roxmltree"),
         },
         Engine {
             name: "bergshamra / Uppsala / RustCrypto",
-            id: "bergshamra",
             kind: Kind::Bergshamra,
             binary: binaries.bergshamra.clone(),
             backend: None,
         },
         Engine {
             name: "libxmlsec1 / libxml2 / OpenSSL",
-            id: "libxmlsec1",
             kind: Kind::Xmlsec,
             binary: binaries.xmlsec1.clone(),
             backend: None,

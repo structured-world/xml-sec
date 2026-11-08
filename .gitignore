@@ -6,8 +6,6 @@
 !/fuzz/corpus/xmldsig_verify/signature.xml
 /fuzz/target
 Cargo.lock
-# The competitor benchmark pins its own dependency graph.
-!/benchmarks/competitors/Cargo.lock
 *.swp
 *.swo
 .DS_Store

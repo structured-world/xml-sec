@@ -1,9 +1,7 @@
 //! `bench-compare NEW_OUTPUT_DIR [SAMPLES] [--heap]`: builds every engine at
 //! its pinned revision, runs the command-line and library comparisons and
-//! records the evidence a regression report needs.
-//!
-//! `competitor-lock`: refreshes only the xml-sec entry of the competitor
-//! project's lockfile.
+//! records the evidence a regression report needs. The competitor is measured
+//! at its current default-branch commit, which the evidence records.
 
 use super::identity::build_identity;
 use crate::repo::{Failure, Step, TOOL, root, spawn};
@@ -13,7 +11,7 @@ use std::process::{Command, Stdio};
 #[cfg(test)]
 mod tests;
 
-const SOURCE_PATHS: [&str; 15] = [
+const SOURCE_PATHS: [&str; 14] = [
     "Cargo.toml",
     "rust-toolchain.toml",
     "src",
@@ -23,7 +21,6 @@ const SOURCE_PATHS: [&str; 15] = [
     "examples",
     "tools",
     "benchmarks",
-    "compatibility/bergshamra-0.9.2-benchmark-commit.txt",
     "compatibility/libxmlsec1-1.3.13-donor-commit.txt",
     "tests/fixtures/keys/rsa",
     "tests/fixtures/keys/cacert.pem",
@@ -152,57 +149,48 @@ fn lock_identity(root: &Path, competitor: &Path) -> Result<String, Failure> {
     Ok(lines.join("\n"))
 }
 
-/// Every `[[package]]` block of a lockfile except xml-sec's own.
-pub(crate) fn other_packages(lock: &str) -> Vec<&str> {
-    lock.split("\n\n")
-        .map(|block| block.trim_matches('\n'))
-        .filter(|block| {
-            !block.is_empty() && !block.starts_with("[[package]]\nname = \"xml-sec\"\n")
-        })
-        .collect()
+const BERGSHAMRA_REPOSITORY: &str = "https://github.com/kushaldas/bergshamra.git";
+
+/// The commit the competitor's default branch points at now: comparisons
+/// measure its current code, and the run records this commit.
+fn latest_competitor(root: &Path) -> Result<String, Failure> {
+    let listed = run_in(
+        root,
+        "git",
+        &["ls-remote", BERGSHAMRA_REPOSITORY, "HEAD"],
+        &[],
+    )?;
+    let revision = listed.split_whitespace().next().unwrap_or_default();
+    if revision.len() != 40
+        || !revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("the competitor's HEAD is not a commit: {listed}").into());
+    }
+    Ok(revision.to_owned())
 }
 
-/// Refreshes only the xml-sec entry of the competitor lockfile. A product
-/// dependency the locked graph cannot satisfy changes the competitor's graph,
-/// which is a reviewed lockfile change, not a side effect of a run; a refused
-/// refresh restores the lockfile so a rerun cannot accept what this one refused.
-pub(crate) fn refresh_competitor_lock(root: &Path) -> Result<(), Failure> {
-    let manifest = root.join("benchmarks/competitors/Cargo.toml");
-    let lock = root.join("benchmarks/competitors/Cargo.lock");
-    let saved =
-        std::fs::read_to_string(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
-    let restore = |message: String| -> Failure {
-        match std::fs::write(&lock, &saved) {
-            Ok(()) => message.into(),
-            Err(error) => format!("{message}; restoring {} failed: {error}", lock.display()).into(),
-        }
-    };
-    let manifest = manifest.display().to_string();
-    if status_in(
+/// Moves the library harness to `revision`, the commit the command-line build
+/// uses, so both levels measure the same competitor code.
+fn align_competitor_library(root: &Path, revision: &str) -> Result<(), Failure> {
+    status_in(
         root,
         "cargo",
-        &["update", "--manifest-path", &manifest, "-p", "xml-sec"],
+        &[
+            "update",
+            "--manifest-path",
+            "benchmarks/competitors/Cargo.toml",
+            "-p",
+            "bergshamra-dsig",
+            "--precise",
+            revision,
+        ],
         &[],
     )
-    .is_err()
-    {
-        return Err(restore(format!(
-            "Refreshing xml-sec in {} failed",
-            lock.display()
-        )));
-    }
-    let refreshed =
-        std::fs::read_to_string(&lock).map_err(|error| format!("{}: {error}", lock.display()))?;
-    if other_packages(&saved) != other_packages(&refreshed) {
-        return Err(restore(format!(
-            "Refreshing xml-sec changed other entries of {}; update and commit that lockfile deliberately",
-            lock.display()
-        )));
-    }
-    Ok(())
 }
 
-/// The pinned competitor checkout, fetched once and refused unless clean.
+/// The competitor checkout at `revision`, fetched once and refused unless clean.
 fn competitor(root: &Path, revision: &str) -> Result<PathBuf, Failure> {
     let source = std::env::var("BERGSHAMRA_SOURCE_DIR")
         .ok()
@@ -223,7 +211,7 @@ fn competitor(root: &Path, revision: &str) -> Result<PathBuf, Failure> {
                 "remote",
                 "add",
                 "origin",
-                "https://github.com/kushaldas/bergshamra.git",
+                BERGSHAMRA_REPOSITORY,
             ],
             &[],
         )?;
@@ -241,7 +229,7 @@ fn competitor(root: &Path, revision: &str) -> Result<PathBuf, Failure> {
         )?;
     }
     if run_in(root, "git", &["-C", &text, "rev-parse", "HEAD"], &[])?.trim() != revision {
-        return Err("the competitor checkout is not at the pinned revision".into());
+        return Err("the competitor checkout is not at the measured revision".into());
     }
     if !run_in(root, "git", &["-C", &text, "status", "--porcelain"], &[])?
         .trim()
@@ -527,14 +515,7 @@ fn measurement_env(target: &Path, prefix: &Path, built: &Built) -> Vec<(String, 
 
 fn execute(request: &Request) -> Result<(), Failure> {
     let root = root();
-    let revision = pinned(&root, "compatibility/bergshamra-0.9.2-benchmark-commit.txt")?;
-    if revision.len() != 40
-        || !revision
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err("the pinned competitor revision is not a commit".into());
-    }
+    let revision = latest_competitor(&root)?;
     let competitor = competitor(&root, &revision)?;
     let target = std::env::var("CARGO_TARGET_DIR")
         .ok()
@@ -562,7 +543,7 @@ fn execute(request: &Request) -> Result<(), Failure> {
         &["install-xmlsec1"],
         &[("XMLSEC1_PREFIX".into(), prefix.display().to_string())],
     )?;
-    refresh_competitor_lock(&root)?;
+    align_competitor_library(&root, &revision)?;
     let before = source_identity(&root)?;
     let built = build_engines(&root, &target, &competitor, &prefix)?;
     if source_identity(&root)? != before {
@@ -700,13 +681,6 @@ fn record(
 pub(crate) fn run(args: impl Iterator<Item = String>) -> Result<(), Failure> {
     let args: Vec<String> = args.collect();
     execute(&parse(&args)?)
-}
-
-pub(crate) fn run_lock(mut args: impl Iterator<Item = String>) -> Result<(), Failure> {
-    if args.next().is_some() {
-        return Err("usage: xml-sec-tools competitor-lock".into());
-    }
-    refresh_competitor_lock(&root())
 }
 
 /// Runs another subcommand of this tool with `env`.

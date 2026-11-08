@@ -43,7 +43,6 @@ commands:
   capi [--sanitize]
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
-  competitor-lock
   documentation [all|docs]
   donor-fixtures [--xmlenc-corpora | PATH... | --cli [--check]]
   fetch-standards
@@ -75,7 +74,6 @@ fn main() -> ExitCode {
         Some("capi") => capi::run(args),
         Some("check-features") => check_features::run(args),
         Some("ci-blocks") => ci_blocks::run(args).map_err(Failure::from),
-        Some("competitor-lock") => bench::compare::run_lock(args),
         Some("documentation") => documentation::run(args),
         Some("donor-fixtures") => donor_fixtures::run(args),
         Some("fetch-standards") => fetch_standards::run(args),

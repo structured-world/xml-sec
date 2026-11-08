@@ -252,7 +252,43 @@ fn reason(outcome: &Outcome, otherwise: &str) -> String {
     }
 }
 
+/// The competitor, measured at its current code.
+const COMPETITOR: &str = "bergshamra";
+
 impl Case<'_> {
+    /// Records the failed check `error` of `producer`'s output read by
+    /// `consumer`. A wrong result of the competitor is a gap this run observed
+    /// in its current code and reports for that operation at every boundary;
+    /// a failure of xml-sec or the reference oracle fails the run.
+    fn observe(
+        &mut self,
+        producer: (&Engine, &str),
+        consumer: (&Engine, &str),
+        error: String,
+    ) -> Result<(), String> {
+        let Some((engine, operation)) = [consumer, producer]
+            .into_iter()
+            .find(|(engine, _)| engine.id == COMPETITOR)
+        else {
+            return Err(error);
+        };
+        for (boundary, _) in BOUNDARIES {
+            self.unsupported.insert(
+                key(engine, operation, boundary),
+                format!("incorrect result in this run: {error}"),
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether `engine` was found unable to run `operation` in this case.
+    fn blocked(&self, engine: &Engine, operation: &str) -> bool {
+        BOUNDARIES.iter().any(|(boundary, _)| {
+            self.unsupported
+                .contains_key(&key(engine, operation, boundary))
+        })
+    }
+
     /// Runs one probe; an unsupported operation is recorded, any other refusal fails.
     fn probe(
         &mut self,
@@ -280,12 +316,16 @@ impl Case<'_> {
                 validate_report(&report, &request)?;
                 Ok(true)
             }
-            other => Err(format!(
-                "{} {operation} {boundary}, {}: {}",
-                engine.name,
-                self.name,
-                reason(&other, "unexpected rejection")
-            )),
+            other => {
+                let error = format!(
+                    "{} {operation} {boundary}, {}: {}",
+                    engine.name,
+                    self.name,
+                    reason(&other, "unexpected rejection")
+                );
+                self.observe((engine, operation), (engine, operation), error)?;
+                Ok(false)
+            }
         }
     }
 
@@ -339,6 +379,17 @@ fn validate_case(
             }
         }
     }
+    if case.scenario == "assertion" {
+        for entry in &produced {
+            let text = std::fs::read_to_string(&entry.out).map_err(|error| error.to_string())?;
+            if !text.contains("X509Certificate>") {
+                let signer = &engines[entry.engine];
+                let error = format!("No signer certificate: {}, {name}", signer.name);
+                case.observe((signer, case.producing), (signer, case.producing), error)?;
+            }
+        }
+        produced.retain(|entry| !case.blocked(&engines[entry.engine], case.producing));
+    }
     let parsed: Vec<&Produced> = produced
         .iter()
         .filter(|entry| entry.boundary == "parse")
@@ -348,23 +399,16 @@ fn validate_case(
         .find(|entry| engines[entry.engine].id == "xml-sec")
         .or_else(|| parsed.first())
         .ok_or_else(|| format!("no engine produced a {} result for {name}", case.producing))?;
-    let (canonical_out, canonical_origin) = (
+    let (canonical_engine, canonical_out, canonical_origin) = (
+        &engines[canonical.engine],
         canonical.out.clone(),
         format!("{} {}", engines[canonical.engine].name, canonical.boundary),
     );
-    if case.scenario == "assertion" {
-        for entry in &produced {
-            let text = std::fs::read_to_string(&entry.out).map_err(|error| error.to_string())?;
-            if !text.contains("X509Certificate>") {
-                return Err(format!(
-                    "No signer certificate: {}, {name}",
-                    engines[entry.engine].name
-                ));
-            }
-        }
-    }
     for engine in engines {
         for (boundary, _) in BOUNDARIES {
+            if case.blocked(engine, case.consuming) {
+                break;
+            }
             // Each boundary is timed on its own, so its result is checked on its own.
             let probed = work.join(format!(
                 "{name}.{}-probe-{}-{boundary}.xml",
@@ -380,7 +424,14 @@ fn validate_case(
             )? {
                 continue;
             }
-            case.check_plaintext(&probed, &canonical_origin, engine, boundary)?;
+            if let Err(error) = case.check_plaintext(&probed, &canonical_origin, engine, boundary) {
+                case.observe(
+                    (canonical_engine, case.producing),
+                    (engine, case.consuming),
+                    error,
+                )?;
+                continue;
+            }
             if boundary == "parse" {
                 cross_check(
                     harness,
@@ -401,21 +452,22 @@ fn validate_case(
 fn cross_check(
     harness: &Harness<'_>,
     engines: &[Engine],
-    case: &Case<'_>,
+    case: &mut Case<'_>,
     engine: &Engine,
     produced: &[Produced],
     canonical: &Path,
     work: &Path,
 ) -> Result<(), String> {
-    let name = case.name;
+    let (name, scenario) = (case.name, case.scenario);
     let request = |operation| Request {
         engine: engine.id,
-        scenario: case.scenario,
+        scenario,
         operation,
         boundary: "parse",
         samples: 1,
     };
     for entry in produced {
+        let source = &engines[entry.engine];
         let out = work.join(format!("{name}.{}-{}.xml", case.consuming, engine.id));
         let outcome = invoke(&harness.line(
             &engine.binary,
@@ -423,18 +475,22 @@ fn cross_check(
             &entry.out,
             Some(&out),
         ));
-        let origin = format!("{} {}", engines[entry.engine].name, entry.boundary);
-        if !matches!(outcome, Outcome::Measured(_)) {
-            return Err(format!(
+        let origin = format!("{} {}", source.name, entry.boundary);
+        let consumed = if matches!(outcome, Outcome::Measured(_)) {
+            case.check_plaintext(&out, &origin, engine, "parse")
+        } else {
+            Err(format!(
                 "{} cannot {} {origin} output, {name}: {}",
                 engine.name,
                 case.consuming,
                 reason(&outcome, "rejected")
-            ));
+            ))
+        };
+        if let Err(error) = consumed {
+            case.observe((source, case.producing), (engine, case.consuming), error)?;
         }
-        case.check_plaintext(&out, &origin, engine, "parse")?;
     }
-    if case.consuming == "verify" {
+    if case.consuming == "verify" && !case.blocked(engine, "verify") {
         let signed = std::fs::read_to_string(canonical).map_err(|error| error.to_string())?;
         let mut forged = vec![("tampered", tamper(&signed, case.scenario)?)];
         if case.scenario == "assertion" {
@@ -445,7 +501,9 @@ fn cross_check(
             std::fs::write(&input, text).map_err(|error| error.to_string())?;
             let outcome = invoke(&harness.line(&engine.binary, &request("reject"), &input, None));
             if !matches!(outcome, Outcome::Rejected(_)) {
-                return Err(format!("Invalid {kind} rejection: {}, {name}", engine.name));
+                let error = format!("Invalid {kind} rejection: {}, {name}", engine.name);
+                case.observe((engine, "verify"), (engine, "verify"), error)?;
+                break;
             }
         }
     }

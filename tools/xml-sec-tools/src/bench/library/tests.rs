@@ -229,13 +229,33 @@ fn fake_comparison(
 }
 
 #[test]
-fn a_verifier_that_accepts_a_forgery_stops_the_run_before_any_timing() {
+fn a_verifier_that_accepts_a_forgery_is_never_timed() {
     // Timing a verifier that cannot refuse a forgery would rank a broken engine.
+    // The competitor's acceptance is a gap of its current code, reported with
+    // the observed reason; a reference engine's acceptance stops the run.
     let (result, report) = fake_comparison("assertion", &[("bergshamra", "accept-forgery")]);
+    result.unwrap();
+    let report = report.unwrap();
+    let verify: Vec<&Value> = report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["operation"] == "verify"
+                && entry["engine"].as_str().unwrap().starts_with("bergshamra")
+        })
+        .collect();
+    // One entry per boundary, neither of them timed.
+    assert_eq!(verify.len(), 2, "{verify:?}");
+    for entry in verify {
+        let reason = entry["unsupported"].as_str().unwrap();
+        assert!(reason.contains("Invalid tampered rejection"), "{reason}");
+    }
+    let (result, report) = fake_comparison("assertion", &[("libxmlsec1", "accept-forgery")]);
     assert!(
         result
             .unwrap_err()
-            .contains("Invalid tampered rejection: bergshamra")
+            .contains("Invalid tampered rejection: libxmlsec1")
     );
     assert_eq!(report, None);
 }

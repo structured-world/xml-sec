@@ -48,8 +48,7 @@ jobs:
       - name: Lint the in-process competitor harnesses
         run: |
           cargo fmt --manifest-path benchmarks/competitors/Cargo.toml --check
-          cargo run --quiet -p xml-sec-tools -- competitor-lock
-          cargo clippy --locked --manifest-path benchmarks/competitors/Cargo.toml --target-dir target/competitors/library-profile --all-targets --features allocation-profile -- -D warnings
+          cargo clippy --manifest-path benchmarks/competitors/Cargo.toml --target-dir target/competitors/library-profile --all-targets --features allocation-profile -- -D warnings
       - name: Validate interoperability and compare identical CLI and library work
         env:
           SAMPLES: ${{ inputs.samples }}
