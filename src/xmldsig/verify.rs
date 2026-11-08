@@ -872,6 +872,26 @@ pub struct VerificationRequest<'a> {
     pub correlation: Option<[u8; 16]>,
 }
 
+impl VerificationRequest<'_> {
+    /// Refuse `count` expected targets beyond what `policy` admits, so a
+    /// caller resolving targets from IDs can refuse before resolving any.
+    ///
+    /// # Errors
+    /// Returns [`DsigError::InvalidRequest`] when `count` exceeds the policy's
+    /// `max_references`.
+    pub const fn check_target_count(
+        policy: &crate::policy::VerificationPolicy,
+        count: usize,
+    ) -> Result<(), DsigError> {
+        if count > policy.resources.max_references {
+            return Err(DsigError::InvalidRequest {
+                reason: "too many expected coverage targets",
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Outcome for one exact Signature, including pipeline failures.
 #[derive(Debug)]
 pub struct SignatureEvidence {
@@ -2523,11 +2543,7 @@ fn validate_verification_request(
         }
         _ => {}
     }
-    if request.expected_targets.len() > policy.resources.max_references {
-        return Err(DsigError::InvalidRequest {
-            reason: "too many expected coverage targets",
-        });
-    }
+    VerificationRequest::check_target_count(policy, request.expected_targets.len())?;
     if request.trusted_keys.len() > policy.resources.max_signatures {
         return Err(DsigError::InvalidRequest {
             reason: "too many trusted signature keys",

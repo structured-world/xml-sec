@@ -153,7 +153,7 @@ impl CryptoProvider for AwsLcFipsProvider {
         &self,
         algorithm: SignatureAlgorithm,
         der: &[u8],
-    ) -> Result<Box<dyn SigningKey>, SigningKeyError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, SigningKeyError> {
         Ok(Box::new(AwsLcSigningKey::from_pkcs8_der(algorithm, der)?))
     }
 

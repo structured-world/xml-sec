@@ -964,83 +964,99 @@ impl XmlDocument {
     /// The policy's byte ceiling is checked before borrowed input is copied.
     ///
     /// # Errors
-    /// Returns invalid-policy, input-limit, decoding, or parsing errors.
+    /// Returns [`XmlDocumentError::Policy`] for an invalid policy or any of its
+    /// ceilings exceeded, or a decoding or parsing error.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy(
         xml: impl AsRef<str> + Into<String>,
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
+        );
+        Self::under_policy(policy, settings, |budget| {
+            let xml = own_bounded_xml(xml, settings.max_bytes)?;
+            Self::parse_with_settings_and_optional_budget(xml, settings, Some(budget))
+        })
+    }
+
+    /// Run a policy-bound parse, reporting every ceiling of the compiled policy
+    /// as its typed resource-limit violation rather than as a parser error.
+    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+    fn under_policy(
+        policy: &impl XmlDocumentPolicy,
+        settings: DocumentParseSettings,
+        parse: impl FnOnce(&XmlParseWorkBudget) -> Result<Self, XmlDocumentError>,
+    ) -> Result<Self, XmlDocumentError> {
         let resources = policy.resource_policy();
         resources.validate()?;
-        let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
-        Self::parse_with_settings_and_optional_budget(
-            xml,
-            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources),
-            Some(&budget),
-        )
+        parse(&XmlParseWorkBudget::from_resources(resources)).map_err(|error| {
+            match error.into_policy_violation(settings) {
+                Ok(violation) => XmlDocumentError::Policy(violation),
+                Err(error) => error,
+            }
+        })
     }
 
     /// Decode and parse XML bytes under the operation's immutable policy.
     ///
     /// # Errors
-    /// Returns invalid-policy, byte/work-limit, decoding, or parsing errors.
+    /// As for [`Self::parse_with_policy`].
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_bytes_with_policy(
         bytes: &[u8],
         policy: &impl XmlDocumentPolicy,
     ) -> Result<Self, XmlDocumentError> {
-        let resources = policy.resource_policy();
-        resources.validate()?;
-        let budget = XmlParseWorkBudget::from_resources(resources);
-        Self::parse_encoded(
-            bytes,
-            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources),
-            Some(&budget),
-        )
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
+        );
+        Self::under_policy(policy, settings, |budget| {
+            Self::parse_encoded(bytes, settings, Some(budget))
+        })
     }
 
     /// Parse and own XML under an operation policy and explicit parser backend.
     ///
     /// # Errors
-    /// Returns invalid-policy, input-limit, backend-selection/divergence, or parsing errors.
+    /// As for [`Self::parse_with_policy`], or a backend selection or
+    /// divergence error.
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_with_policy_and_backend(
         xml: impl AsRef<str> + Into<String>,
         policy: &impl XmlDocumentPolicy,
         backend: XmlBackend,
     ) -> Result<Self, XmlDocumentError> {
-        let resources = policy.resource_policy();
-        resources.validate()?;
-        let budget = XmlParseWorkBudget::from_resources(resources);
-        let xml = own_bounded_xml(xml, resources.max_xml_document_bytes)?;
-        Self::parse_with_settings_and_optional_budget(
-            xml,
-            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
-                .with_backend(backend),
-            Some(&budget),
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
         )
+        .with_backend(backend);
+        Self::under_policy(policy, settings, |budget| {
+            let xml = own_bounded_xml(xml, settings.max_bytes)?;
+            Self::parse_with_settings_and_optional_budget(xml, settings, Some(budget))
+        })
     }
 
     /// Decode and parse XML bytes under policy with an explicit semantic backend.
     ///
     /// # Errors
-    /// Returns invalid-policy, decoding, input-limit, backend-selection/divergence, or parsing errors.
+    /// As for [`Self::parse_with_policy_and_backend`].
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
     pub fn parse_bytes_with_policy_and_backend(
         bytes: &[u8],
         policy: &impl XmlDocumentPolicy,
         backend: XmlBackend,
     ) -> Result<Self, XmlDocumentError> {
-        let resources = policy.resource_policy();
-        resources.validate()?;
-        let budget = XmlParseWorkBudget::from_resources(resources);
-        Self::parse_encoded(
-            bytes,
-            DocumentParseSettings::from_policy(*policy.xml_input_policy(), resources)
-                .with_backend(backend),
-            Some(&budget),
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
         )
+        .with_backend(backend);
+        Self::under_policy(policy, settings, |budget| {
+            Self::parse_encoded(bytes, settings, Some(budget))
+        })
     }
 
     /// Decode and parse, recording the decoding pass as part of the parse's work.
@@ -6027,10 +6043,13 @@ mod tests {
             policy.resources.max_xml_document_bytes = 8;
             assert!(matches!(
                 XmlDocument::parse_with_policy(OversizedBorrowedInput("<root/>xx"), &policy),
-                Err(XmlDocumentError::DocumentTooLarge {
-                    maximum: 8,
-                    actual: 9,
-                })
+                Err(XmlDocumentError::Policy(
+                    crate::policy::PolicyViolation::ResourceLimit {
+                        resource: crate::policy::resource_name::XML_DOCUMENT,
+                        maximum: 8,
+                        actual: 9,
+                    }
+                ))
             ));
         }
     }

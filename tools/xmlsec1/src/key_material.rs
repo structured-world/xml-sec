@@ -878,7 +878,7 @@ pub(crate) fn import_private_key(
     if !generic || pkcs8_container_kind(bytes, format).is_some() {
         return match format {
             PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => {
-                inventory.add_private_pem(name.into(), bytes, password, usages, resources)
+                inventory.add_private_pem(name, bytes, password, usages, resources)
             }
             PrivateKeyFormat::Der | PrivateKeyFormat::Pkcs8Der => {
                 inventory.add_private_der(name.into(), bytes, password, usages, resources)
@@ -1445,7 +1445,7 @@ pub fn decode_rsa_private_with_inventory(
         let password = password.ok_or(KeyMaterialError::ProtectedContainer)?;
         let imported = match format {
             PrivateKeyFormat::Pem | PrivateKeyFormat::Pkcs8Pem => inventory.add_private_pem(
-                "cli-rsa".into(),
+                "cli-rsa",
                 bytes,
                 Some(password),
                 KeyUsages::DECRYPT,

@@ -162,7 +162,9 @@ fn an_element_past_two_limits_is_refused_for_the_first_the_pass_checked() {
 #[test]
 fn policy_limits_refuse_at_one_over_through_the_public_entry() {
     // Exact boundaries through the policy entry point: a document needing N
-    // of a resource is accepted at N and refused at N - 1.
+    // of a resource is accepted at N and refused at N - 1, as the policy's
+    // typed resource-limit violation rather than a parser error.
+    use crate::policy::{PolicyViolation, resource_name};
     let xml = "<r xmlns:a='urn:a'><c><d/></c>text<!--c--></r>";
     let mut policy = crate::policy::VerificationPolicy::default();
     let parse = |policy: &crate::policy::VerificationPolicy| {
@@ -170,37 +172,32 @@ fn policy_limits_refuse_at_one_over_through_the_public_entry() {
             .map(drop)
             .map_err(|error| format!("{error:?}"))
     };
-    let refused = |error: XmlDocumentError| Err(format!("{error:?}"));
+    let refused = |resource, maximum, actual| {
+        Err(format!(
+            "{:?}",
+            XmlDocumentError::Policy(PolicyViolation::ResourceLimit {
+                resource,
+                maximum,
+                actual,
+            })
+        ))
+    };
     // Root, r, c, d, text and comment.
     policy.resources.max_xml_nodes = 6;
     assert_eq!(parse(&policy), Ok(()));
     policy.resources.max_xml_nodes = 5;
-    assert_eq!(
-        parse(&policy),
-        refused(XmlDocumentError::Parse(ParseError::NodesLimitReached))
-    );
+    assert_eq!(parse(&policy), refused(resource_name::XML_NODES, 5, 6));
     policy = crate::policy::VerificationPolicy::default();
     policy.resources.max_xml_depth = 3;
     assert_eq!(parse(&policy), Ok(()));
     policy.resources.max_xml_depth = 2;
-    assert_eq!(
-        parse(&policy),
-        refused(XmlDocumentError::DocumentTooDeep {
-            maximum: 2,
-            actual: 3,
-        })
-    );
+    assert_eq!(parse(&policy), refused(resource_name::XML_DEPTH, 2, 3));
     policy = crate::policy::VerificationPolicy::default();
     policy.resources.max_xml_namespace_bindings = 1;
     assert_eq!(parse(&policy), Ok(()));
     policy.resources.max_xml_namespace_bindings = 0;
     assert_eq!(
         parse(&policy),
-        refused(XmlDocumentError::Parse(
-            ParseError::NamespaceBindingLimitReached {
-                maximum: 0,
-                actual: 1,
-            }
-        ))
+        refused(resource_name::XML_NAMESPACE_BINDINGS, 0, 1)
     );
 }

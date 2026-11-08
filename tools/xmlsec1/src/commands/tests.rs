@@ -1021,7 +1021,7 @@ fn store_signing_retries_key_info_mismatch_in_lax_mode() {
     for (name, pem) in [("wrong", wrong), ("right", right)] {
         inventory
             .add_private_pem(
-                name.into(),
+                name,
                 &pem,
                 None,
                 key_manager::KeyUsages::SIGN,
@@ -1076,7 +1076,7 @@ fn lax_store_signing_shares_lookup_budget_across_retries() {
     for (name, pem) in [("wrong-a", &wrong), ("wrong-b", &wrong), ("right", &right)] {
         inventory
             .add_private_pem(
-                name.into(),
+                name,
                 pem,
                 None,
                 key_manager::KeyUsages::SIGN,
@@ -1291,7 +1291,7 @@ fn stored_verification_sources_share_candidate_budget() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_public_pem(
-            "valid".into(),
+            "valid",
             include_bytes!("../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
             &ResourcePolicy::default(),
         )

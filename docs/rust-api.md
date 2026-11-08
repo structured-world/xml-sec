@@ -124,7 +124,12 @@ single parse+operation cumulative-budget path, without an extra facade parse.
 
 `XmlSecurity` is `Send + Sync`; individual handles do not impose additional bounds
 on non-thread-safe caller keys/resolvers. Share immutable policies/providers using
-application-owned storage or `Arc`, not a global registry. The facade requires
+application-owned storage or `Arc`, not a global registry. `SharedSecurity` is
+that owned form: it holds the `Arc`s of one compiled snapshot and provider,
+validates them against each other once, and `binding()` returns the borrowed
+facade without validating again, for state kept across calls or threads.
+Keys from `signing_key` and resolvers from `decryption_key` are
+`Send + Sync`, so a binding and its selected keys can be shared the same way. The facade requires
 `xmldsig`, which builds without `std`; its signer, `Operation::Sign` and the
 signing error variant need `xmldsig-sign`, which requires `std`. C14N-only
 builds remain independent of both.

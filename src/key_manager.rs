@@ -1238,7 +1238,7 @@ impl KeyInventory {
         name: &str,
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::SigningPolicy,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         self.signing_key_with_budget(name, algorithm, policy, &mut SigningLookupBudget::default())
     }
 
@@ -1254,7 +1254,7 @@ impl KeyInventory {
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::SigningPolicy,
         budget: &mut SigningLookupBudget,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         self.signing_key_with_provider_and_budget(
             name,
             algorithm,
@@ -1276,7 +1276,7 @@ impl KeyInventory {
         algorithm: SignatureAlgorithm,
         policy: &crate::policy::SigningPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         self.signing_key_with_provider_and_budget(
             name,
             algorithm,
@@ -1299,7 +1299,7 @@ impl KeyInventory {
         policy: &crate::policy::SigningPolicy,
         provider: &dyn crate::provider::CryptoProvider,
         budget: &mut SigningLookupBudget,
-    ) -> Result<Box<dyn SigningKey>, KeyStoreError> {
+    ) -> Result<Box<dyn SigningKey + Send + Sync>, KeyStoreError> {
         policy.validate()?;
         policy.check_signature_algorithm(algorithm)?;
         provider
@@ -1362,7 +1362,7 @@ impl KeyInventory {
         &self,
         name: &str,
         policy: &crate::policy::DecryptionPolicy,
-    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, KeyStoreError> {
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, KeyStoreError> {
         self.decryption_resolver_with_provider(name, policy, crate::provider::default_provider())
     }
 
@@ -1377,7 +1377,7 @@ impl KeyInventory {
         name: &str,
         policy: &crate::policy::DecryptionPolicy,
         provider: &dyn crate::provider::CryptoProvider,
-    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver>, KeyStoreError> {
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, KeyStoreError> {
         policy.validate()?;
         let mut visited = 0;
         if let Some(entry) = find_named_entry(
@@ -1449,20 +1449,23 @@ impl KeyInventory {
     pub fn verification_resolver(&self) -> InventoryVerificationResolver<'_> {
         InventoryVerificationResolver { inventory: self }
     }
-    /// Register raw symmetric bytes under a unique name.
+    /// Register raw symmetric bytes under a unique name. A borrowed name and
+    /// borrowed bytes are copied only once the checks on them have passed.
     ///
     /// # Errors
     /// Returns invalid policy, duplicate names, resource exhaustion, invalid
     /// family-specific key widths or incompatible/empty usage permissions.
-    pub fn add_symmetric(
+    pub fn add_symmetric<B: AsRef<[u8]> + Into<Vec<u8>>>(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         kind: SymmetricKeyKind,
-        bytes: Vec<u8>,
+        key: B,
         usages: KeyUsages,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
-        self.check_new_name(&name, resources)?;
+        let bytes = key.as_ref();
+        self.check_new_name(name.as_ref(), resources)?;
+        let name = name.into();
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
                 crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -1481,7 +1484,7 @@ impl KeyInventory {
             SymmetricKeyKind::Aes | SymmetricKeyKind::Camellia | SymmetricKeyKind::ChaCha20 => {
                 KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT)
             }
-            SymmetricKeyKind::Des => des_key_usages(&bytes)?,
+            SymmetricKeyKind::Des => des_key_usages(bytes)?,
         };
         if usages.0 == 0 || usages.0 & !permitted.0 != 0 {
             return Err(KeyStoreError::Selection(
@@ -1492,7 +1495,7 @@ impl KeyInventory {
         self.symmetric_keys.push(StoredSymmetricKey {
             name,
             kind,
-            bytes: Zeroizing::new(bytes),
+            bytes: Zeroizing::new(key.into()),
             usages,
         });
         self.entry_count += 1;
@@ -1685,7 +1688,7 @@ impl KeyInventory {
     /// unsupported key material or failure decoding/normalizing the public key.
     pub fn add_public_pem(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
@@ -1699,7 +1702,7 @@ impl KeyInventory {
     /// including usage permissions incompatible with the key family.
     pub fn add_public_pem_with_usages(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         usages: KeyUsages,
         resources: &ResourcePolicy,
@@ -1709,13 +1712,14 @@ impl KeyInventory {
 
     fn add_public_pem_inner(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         usages: Option<KeyUsages>,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
-        self.check_new_name(&name, resources)?;
+        self.check_new_name(name.as_ref(), resources)?;
+        let name = name.into();
         self.check_material_capacity(named_material_length(&name, bytes.len(), 2)?, resources)?;
         let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
         if !matches!(block.label, "PUBLIC KEY" | "RSA PUBLIC KEY") {
@@ -2034,7 +2038,7 @@ impl KeyInventory {
     /// usage refusal, required-password/decryption failure or KDF-budget exhaustion.
     pub fn add_private_pem(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         password: Option<&[u8]>,
         usages: KeyUsages,
@@ -2047,7 +2051,8 @@ impl KeyInventory {
         }
 
         ensure_resource_policy(resources)?;
-        self.check_new_name(&name, resources)?;
+        self.check_new_name(name.as_ref(), resources)?;
+        let name = name.into();
         self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
         validate_private_key_usages(usages)?;
