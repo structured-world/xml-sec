@@ -32,25 +32,36 @@ const PAYLOAD: &str = concat!(
     "<app:inner a=\"1\"/></app:secret><public>kept</public></root>"
 );
 
-fn signed_xml() -> String {
-    let mut document = XmlDocument::parse(PAYLOAD).expect("owned XML fixture must parse");
+/// A signature over the whole document, enveloped, with the certificate in
+/// `KeyInfo`; `canonical_transform` adds an explicit C14N transform, without
+/// which signing generates the C14N 1.1 transform itself.
+fn builder(canonical_transform: bool) -> SignatureBuilder {
+    let canonicalization = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let mut reference = ReferenceBuilder::new(DigestAlgorithm::Sha256)
+        .uri("")
+        .transform(Transform::Enveloped);
+    if canonical_transform {
+        reference = reference.transform(Transform::C14n(canonicalization.clone()));
+    }
+    SignatureBuilder::new(canonicalization, SignatureAlgorithm::RsaSha256)
+        .add_reference(reference)
+        .key_info(true)
+}
+
+fn sign(document: &mut XmlDocument, builder: &SignatureBuilder) {
     let signing_key =
         RsaSigningKey::from_pkcs8_pem(PRIVATE_KEY).expect("tracked private key must parse");
     let key_info = X509CertificateKeyInfoWriter::from_pem(CERTIFICATE)
         .expect("tracked certificate must parse");
-    let canonicalization = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
-    let builder = SignatureBuilder::new(canonicalization.clone(), SignatureAlgorithm::RsaSha256)
-        .add_reference(
-            ReferenceBuilder::new(DigestAlgorithm::Sha256)
-                .uri("")
-                .transform(Transform::Enveloped)
-                .transform(Transform::C14n(canonicalization)),
-        )
-        .key_info(true);
     SignContext::new(&signing_key)
         .key_info_writer(&key_info)
-        .sign_document_with_builder(&mut document, &builder)
-        .expect("owned document must sign");
+        .sign_document_with_builder(document, builder)
+        .expect("the document signs");
+}
+
+fn signed_xml() -> String {
+    let mut document = XmlDocument::parse(PAYLOAD).expect("owned XML fixture must parse");
+    sign(&mut document, &builder(true));
     document.into_xml()
 }
 
@@ -74,6 +85,45 @@ fn canonical(xml: &str) -> Vec<u8> {
         &C14nAlgorithm::new(C14nMode::Inclusive1_0, true),
     )
     .expect("canonicalizes")
+}
+
+/// Sign `PAYLOAD` once as a tree and once as text, and check the tree
+/// result against the text one.
+fn signs_like_text(canonical_transform: bool) {
+    let builder = builder(canonical_transform);
+    let tree = ModelTree::parse(PAYLOAD);
+    let public = tree.element("public");
+    let mut document = tree_document(&tree);
+    sign(&mut document, &builder);
+    let signed = tree.to_xml();
+    assert!(signed.contains("X509Certificate"), "{signed}");
+    assert_eq!(
+        signed.contains("http://www.w3.org/2006/12/xml-c14n11"),
+        !canonical_transform,
+        "{signed}"
+    );
+    // The signed content keeps its nodes; the signature joined the tree.
+    assert!(tree.nodes().contains(&public));
+    assert_eq!(status(&document), DsigStatus::Valid);
+    assert_eq!(status(&tree_document(&tree)), DsigStatus::Valid);
+    assert_eq!(tree.pending_undo(), 0);
+    // RSA PKCS#1 v1.5 is deterministic, so the same request over the same
+    // content gives the same signature through either backing.
+    let mut text = XmlDocument::parse(PAYLOAD).expect("parses");
+    sign(&mut text, &builder);
+    assert_eq!(canonical(&signed), canonical(text.as_xml()));
+}
+
+#[test]
+fn signing_fills_the_template_in_the_tree_like_text() {
+    signs_like_text(true);
+}
+
+#[test]
+fn signing_generates_the_c14n_transform_in_the_tree_like_text() {
+    // Without a canonicalizing transform the reference gains the C14N 1.1
+    // transform, which the tree receives as a node of its own.
+    signs_like_text(false);
 }
 
 #[test]

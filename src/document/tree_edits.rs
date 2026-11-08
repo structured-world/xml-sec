@@ -18,7 +18,7 @@ const WRAPPER_NAMESPACE: &str = "urn:xml-sec:owned-document-validation";
 
 /// What one tree edit does at its target.
 #[derive(Clone, Copy)]
-pub(super) enum TreeChange<'a> {
+pub(crate) enum TreeChange<'a> {
     /// The element's content becomes this character data.
     SetText(&'a str),
     /// The element's content becomes this fragment.
@@ -189,7 +189,7 @@ impl XmlDocument {
     }
 
     /// Validate and commit `changes` as one generation.
-    pub(super) fn change_tree(
+    pub(crate) fn change_tree(
         &mut self,
         changes: &[(NodeIdentity, TreeChange<'_>)],
         settings: DocumentParseSettings,
@@ -249,7 +249,7 @@ fn apply_all(
 
 /// `fragment` inside a wrapper element that declares every binding in scope
 /// at `context`, so the fragment parses with exactly its insertion scope.
-fn wrap_in_scope(
+pub(crate) fn wrap_in_scope(
     fragment: &str,
     context: Option<Node<'_, '_>>,
 ) -> Result<String, XmlDocumentError> {

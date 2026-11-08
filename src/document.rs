@@ -2402,6 +2402,31 @@ impl XmlDocument {
         self.commit_generation(next)
     }
 
+    /// Whether this document's content is an external tree.
+    #[cfg(feature = "external-tree")]
+    pub(crate) const fn is_tree_backed(&self) -> bool {
+        self.tree.is_some()
+    }
+
+    /// The content length after `added` bytes join `target`, as an upper
+    /// bound: what the edit removes is not subtracted.
+    #[cfg(feature = "external-tree")]
+    fn projected_tree_len(
+        &self,
+        target: NodeIdentity,
+        added: usize,
+    ) -> Result<usize, XmlDocumentError> {
+        self.with_view(|view| {
+            if !view.resolve_mutation_node(target)?.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            Ok(())
+        })?;
+        self.content_len()
+            .checked_add(added)
+            .ok_or_else(|| XmlDocumentError::InvalidReplacement("content length overflow".into()))
+    }
+
     /// Whether an all-or-nothing mutation is open.
     #[cfg(feature = "external-tree")]
     fn in_transaction(&self) -> bool {
@@ -2446,6 +2471,10 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement_len: usize,
     ) -> Result<usize, XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return self.projected_tree_len(target, replacement_len);
+        }
         self.with_view(|view| {
             let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
@@ -2496,6 +2525,10 @@ impl XmlDocument {
         target: NodeIdentity,
         child_len: usize,
     ) -> Result<usize, XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return self.projected_tree_len(target, child_len);
+        }
         self.with_view(|view| {
             let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
@@ -2756,6 +2789,12 @@ impl<'a> DocumentView<'a> {
         self.parsed.document.input_text()
     }
 
+    /// Whether this generation was projected from an external tree.
+    #[cfg(feature = "external-tree")]
+    pub(crate) fn is_tree_backed(self) -> bool {
+        !self.parsed.external.is_empty()
+    }
+
     /// The markup of `node` as this generation holds it: its exact source
     /// bytes, or for a tree-backed document the node written from the view.
     pub(crate) fn markup(self, node: Node<'a, 'a>) -> alloc::borrow::Cow<'a, str> {
@@ -2973,6 +3012,14 @@ impl<'a> DocumentView<'a> {
         identity: NodeIdentity,
     ) -> Result<Node<'a, 'a>, XmlDocumentError> {
         let node = self.resolve_node(identity)?;
+        // A tree-backed node is a target when it has a node of the tree to edit.
+        #[cfg(feature = "external-tree")]
+        if self.is_tree_backed() {
+            return match self.parsed.external.get(node.id().get_usize()) {
+                Some(Some(_)) => Ok(node),
+                _ => Err(XmlDocumentError::EntityExpandedMutationTarget),
+            };
+        }
         if !node.has_actionable_range() {
             return Err(XmlDocumentError::EntityExpandedMutationTarget);
         }
@@ -4967,7 +5014,7 @@ fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, X
 
 /// What a node replacement must leave in its parent.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplacementShape {
+pub(crate) enum ReplacementShape {
     /// Exactly one element, beside whitespace, comments and processing instructions.
     SingleElement,
     /// Any content that is well-formed in the parent context.
@@ -5225,7 +5272,7 @@ mod markup;
 #[cfg(feature = "external-tree")]
 mod tree_edits;
 #[cfg(feature = "external-tree")]
-use tree_edits::TreeChange;
+pub(crate) use tree_edits::{TreeChange, wrap_in_scope};
 
 #[cfg(test)]
 mod entity_ceiling_tests;
