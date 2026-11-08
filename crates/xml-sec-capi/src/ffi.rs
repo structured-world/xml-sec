@@ -7,7 +7,10 @@
 use crate::objects::{
     self, Audit, Decryptor, Encryptor, Failure, Grant, Keys, Object, PolicySource, Signer, Verifier,
 };
-use crate::status::{XS_BUSY, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_WRONG_HANDLE, XsStatus};
+use crate::status::{
+    XS_BUSY, XS_DESTROYED_HANDLE, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_STALE_HANDLE,
+    XS_WRONG_HANDLE, XsStatus,
+};
 use crate::table::{self, InUse, Kind};
 use std::mem::MaybeUninit;
 use std::panic::AssertUnwindSafe;
@@ -19,7 +22,7 @@ use xml_sec::provider::{CryptoProvider, RustCryptoProvider};
 mod tests;
 
 /// The ABI revision of this library; a header declares the one it expects.
-pub const XS_ABI_VERSION: u32 = 1;
+pub const XS_ABI_VERSION: u32 = 2;
 
 /// A borrowed byte string: `ptr` may be null only when `len` is zero.
 #[repr(C)]
@@ -122,6 +125,111 @@ pub struct XsVerifyRequest {
     pub requirement: u32,
     /// The signature count the requirement names.
     pub count: usize,
+}
+
+/// What a key lookup is asked for: the `KeyName` values the document gives
+/// for the key and the URI of the method the key serves, borrowed for the
+/// callback only.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct XsKeyQuery {
+    /// Key names the call has not imported yet, in document order and each
+    /// once; null when there are none.
+    pub names: *const XsBytes,
+    /// Number of names.
+    pub name_count: usize,
+    /// Signature, key transport, key wrap or content method URI.
+    pub method: XsBytes,
+}
+
+/// Imports the keys matching `query` into `keys`, a key manager valid only
+/// until the callback returns, and returns `XS_OK`, also when it found none.
+/// Any other status fails the call that invoked it with that status, and a
+/// value the header does not name fails it with `XS_INTERNAL`.
+pub type XsKeyLookupFn = unsafe extern "C" fn(
+    user_data: *mut std::ffi::c_void,
+    query: *const XsKeyQuery,
+    keys: XsKeys,
+) -> XsStatus;
+
+/// A key lookup and its caller-owned data, used only during the call that
+/// receives it.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct XsKeyLookup {
+    /// The callback; it must not be null.
+    pub lookup: Option<XsKeyLookupFn>,
+    /// Passed unchanged to every invocation.
+    pub user_data: *mut std::ffi::c_void,
+}
+
+/// One call's C key lookup.
+struct CallerLookup {
+    lookup: XsKeyLookupFn,
+    user_data: *mut std::ffi::c_void,
+}
+
+impl objects::KeyLookup for CallerLookup {
+    fn lookup(&self, names: &[&str], method: &str, keys: &Arc<Keys>) -> Result<(), Failure> {
+        let handle = insert(Object::Keys(Arc::clone(keys)))?;
+        let names: Vec<XsBytes> = names.iter().map(|name| borrowed(name)).collect();
+        let query = XsKeyQuery {
+            names: if names.is_empty() {
+                std::ptr::null()
+            } else {
+                names.as_ptr()
+            },
+            name_count: names.len(),
+            method: borrowed(method),
+        };
+        // SAFETY: the caller of the operation passed `lookup` for this call
+        // with its `user_data`; `query` and the names it points to live on
+        // this frame until the callback returns, and no table or object lock
+        // is held, so the callback may reenter the library.
+        let status =
+            unsafe { (self.lookup)(self.user_data, &raw const query, XsKeys { value: handle }) };
+        // The key manager stays the operation's; only its handle ends here. A
+        // callback that destroyed it already leaves nothing to release, also
+        // once a newer object took over the slot, which stays untouched.
+        match table::destroy(handle, Kind::Keys) {
+            Ok(()) | Err(XS_DESTROYED_HANDLE | XS_STALE_HANDLE) => {}
+            Err(busy) => {
+                return Err(Failure::new(
+                    busy,
+                    "the key manager given to a key lookup is still in use",
+                ));
+            }
+        }
+        if status == XS_OK {
+            return Ok(());
+        }
+        // The callback's status is the call's, when it names a failure.
+        let status = if (1..=XS_INTERNAL).contains(&status) {
+            status
+        } else {
+            XS_INTERNAL
+        };
+        Err(Failure::new(status, "the key lookup failed"))
+    }
+}
+
+/// The caller's optional key lookup.
+///
+/// # Safety
+/// `lookup` is null or valid for reads of one `XsKeyLookup` whose callback
+/// may be called with its user data during this call.
+unsafe fn key_lookup(lookup: *const XsKeyLookup) -> Result<Option<CallerLookup>, Failure> {
+    // SAFETY: forwarded caller contract.
+    let Some(lookup) = (unsafe { optional(lookup) })? else {
+        return Ok(None);
+    };
+    let callback = lookup
+        .lookup
+        .ok_or_else(|| Failure::new(XS_INVALID_ARGUMENT, "null key lookup callback"))?;
+    Ok(Some(CallerLookup {
+        lookup: callback,
+        user_data: lookup.user_data,
+    }))
 }
 
 /// The outcome of one signature in an evidence handle.
@@ -896,25 +1004,31 @@ pub unsafe extern "C" fn xs_verifier_new(
 }
 
 /// Verify every signature of the document. Success is a report, not
-/// acceptance: ask [`xs_evidence_accepted`] with the same document.
+/// acceptance: ask [`xs_evidence_accepted`] with the same document. A
+/// non-null `lookup` supplies the keys for this call in place of the
+/// verifier's key manager.
 ///
 /// # Safety
 /// `request` is valid for reads of one `XsVerifyRequest`, whose ID array is
-/// valid for reads of its count; `out` is valid for writes of one
-/// `XsEvidence`; `error` is null or valid for writes of one `XsError`.
+/// valid for reads of its count; `lookup` is null or valid for reads of one
+/// `XsKeyLookup` whose callback may be called during this call; `out` is
+/// valid for writes of one `XsEvidence`; `error` is null or valid for writes
+/// of one `XsError`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xs_verify(
     verifier: XsVerifier,
     document: XsDocument,
     request: *const XsVerifyRequest,
+    lookup: *const XsKeyLookup,
     out: *mut XsEvidence,
     error: *mut XsError,
 ) -> XsStatus {
     // SAFETY: the caller's contract for `error`.
     let error = unsafe { error_slot(error) };
     contain(error, || {
-        // SAFETY: the caller's contract for `out` and `request`.
-        let (out, request) = unsafe { (output(out)?, optional(request)?) };
+        // SAFETY: the caller's contract for `out`, `request` and `lookup`.
+        let (out, request, lookup) =
+            unsafe { (output(out)?, optional(request)?, key_lookup(lookup)?) };
         let request = request.ok_or_else(|| Failure::new(XS_INVALID_ARGUMENT, "null request"))?;
         let verifier = take(verifier.value, Kind::Verifier)?;
         let Object::Verifier(verifier) = verifier.object() else {
@@ -954,7 +1068,14 @@ pub unsafe extern "C" fn xs_verify(
         let requirement = objects::requirement(request.requirement, request.count)?;
         let slot = table::reserve().map_err(Failure::from)?;
         let evidence = with_document(document, |document| {
-            verifier.verify(document, &ids, requirement)
+            verifier.verify(
+                document,
+                &ids,
+                requirement,
+                lookup
+                    .as_ref()
+                    .map(|lookup| lookup as &dyn objects::KeyLookup),
+            )
         })?;
         out.write(XsEvidence {
             value: slot.publish(Object::Evidence(evidence)),
@@ -1027,7 +1148,8 @@ pub unsafe extern "C" fn xs_encrypt(
 }
 
 /// Create a decryptor with recovery key `key_name` from `keys`, under `policy`
-/// and `provider`.
+/// and `provider`; with the zero `keys` handle, every decryption supplies its
+/// keys through a lookup.
 ///
 /// # Safety
 /// As for [`xs_signer_new`], writing one `XsDecryptor`.
@@ -1045,12 +1167,15 @@ pub unsafe extern "C" fn xs_decryptor_new(
     contain(error, || {
         // SAFETY: the caller's contract for `out` and `key_name`.
         let (out, name) = unsafe { (output(out)?, text(key_name)?) };
-        let (policy, provider, keys) = (
-            policy(policy_handle)?,
-            provider(provider_handle)?,
-            keys(keys_handle)?,
-        );
-        let decryptor = Decryptor::new(objects::security(&policy, &provider)?, &keys, name)?;
+        let (policy, provider) = (policy(policy_handle)?, provider(provider_handle)?);
+        let keys = match keys_handle.value {
+            0 => None,
+            _ => Some(keys(keys_handle)?),
+        };
+        let decryptor = Decryptor::new(
+            objects::security(&policy, &provider)?,
+            keys.as_deref().map(|keys| (&**keys, name)),
+        )?;
         let value = insert(Object::Decryptor(decryptor))?;
         out.write(XsDecryptor { value });
         Ok(())
@@ -1058,28 +1183,46 @@ pub unsafe extern "C" fn xs_decryptor_new(
 }
 
 /// Recover the `EncryptedData` whose schema `Id` is `encrypted_data_id`, or
-/// the first one when it is empty, as one new document generation.
+/// the first one when it is empty, as one new document generation. A
+/// non-null `lookup` supplies the keys for this call in place of the
+/// decryptor's key.
 ///
 /// # Safety
-/// As for [`xs_encrypt`].
+/// As for [`xs_encrypt`]; `lookup` is null or valid for reads of one
+/// `XsKeyLookup` whose callback may be called during this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn xs_decrypt(
     decryptor: XsDecryptor,
     document: XsDocument,
     encrypted_data_id: XsBytes,
+    lookup: *const XsKeyLookup,
     audit: *mut XsAudit,
     error: *mut XsError,
 ) -> XsStatus {
     // SAFETY: the caller's contract for `error`.
     let error = unsafe { error_slot(error) };
     contain(error, || {
-        // SAFETY: the caller's contract for `audit` and the ID.
-        let (audit, id) = unsafe { (audit_slot(audit)?, optional_text(encrypted_data_id)?) };
+        // SAFETY: the caller's contract for `audit`, the ID and `lookup`.
+        let (audit, id, lookup) = unsafe {
+            (
+                audit_slot(audit)?,
+                optional_text(encrypted_data_id)?,
+                key_lookup(lookup)?,
+            )
+        };
         let decryptor = take(decryptor.value, Kind::Decryptor)?;
         let Object::Decryptor(decryptor) = decryptor.object() else {
             return Err(wrong());
         };
-        let decided = with_document(document, |document| decryptor.decrypt(document, id))?;
+        let decided = with_document(document, |document| {
+            decryptor.decrypt(
+                document,
+                id,
+                lookup
+                    .as_ref()
+                    .map(|lookup| lookup as &dyn objects::KeyLookup),
+            )
+        })?;
         audit_out(audit, &decided);
         Ok(())
     })

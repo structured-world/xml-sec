@@ -34,7 +34,7 @@ extern "C" {
 #endif
 
 /* The ABI revision this header describes; compare with xs_abi_version(). */
-#define XS_ABI_VERSION 1u
+#define XS_ABI_VERSION 2u
 
 typedef int32_t xs_status;
 
@@ -191,6 +191,31 @@ typedef struct XsVerifyRequest {
     size_t count;
 } XsVerifyRequest;
 
+/* What a key lookup is asked for, borrowed for the callback only. */
+typedef struct XsKeyQuery {
+    /* The KeyName values the document gives that the call has not imported
+     * yet, in order and each once; null when none. */
+    const XsBytes *names;
+    size_t name_count;
+    /* The signature, key transport, key wrap or content method URI. */
+    XsBytes method;
+} XsKeyQuery;
+
+/* Imports the keys matching `query` into `keys` with xs_keys_add_*. `keys`
+ * belongs to the running call and is destroyed when the callback returns;
+ * keys it imported serve the rest of that call. Returns XS_OK, also when it
+ * found nothing; any other status fails the call with that status, and a
+ * value this header does not name fails it with XS_INTERNAL. The
+ * callback may call the library; destroying a handle the running call
+ * uses, or operating on its document, returns XS_BUSY. */
+typedef xs_status (*XsKeyLookupFn)(void *user_data, const XsKeyQuery *query, XsKeys keys);
+
+/* A key lookup, used only during the call that receives it. */
+typedef struct XsKeyLookup {
+    XsKeyLookupFn lookup; /* not null */
+    void *user_data;      /* passed unchanged to every invocation */
+} XsKeyLookup;
+
 /* The outcome of one signature in an evidence handle. */
 typedef struct XsSignatureOutcome {
     uint32_t outcome;   /* XS_SIGNATURE_* */
@@ -267,11 +292,12 @@ xs_status xs_signer_new(XsPolicy policy, XsProvider provider, XsKeys keys, XsByt
 xs_status xs_sign(XsSigner signer, XsDocument document, XsAudit *audit, XsError *error);
 
 /* Verification: `keys` may be the zero handle. Success is a report, not
- * acceptance: ask xs_evidence_accepted with the same document. */
+ * acceptance: ask xs_evidence_accepted with the same document. A non-null
+ * `lookup` supplies this call's keys in place of the verifier's. */
 xs_status xs_verifier_new(XsPolicy policy, XsProvider provider, XsKeys keys, XsVerifier *out,
                           XsError *error);
 xs_status xs_verify(XsVerifier verifier, XsDocument document, const XsVerifyRequest *request,
-                    XsEvidence *out, XsError *error);
+                    const XsKeyLookup *lookup, XsEvidence *out, XsError *error);
 
 /* Encryption for an RSA-OAEP recipient. An empty `element_id` encrypts the
  * root. `audit` may be null. */
@@ -280,12 +306,15 @@ xs_status xs_encryptor_new(XsPolicy policy, XsProvider provider, XsKeys keys, Xs
 xs_status xs_encrypt(XsEncryptor encryptor, XsDocument document, XsBytes element_id,
                      XsAudit *audit, XsError *error);
 
-/* Decryption. An empty `encrypted_data_id` recovers the first EncryptedData.
- * `audit` may be null. */
+/* Decryption. With the zero `keys` handle every decryption needs a lookup.
+ * An empty `encrypted_data_id` recovers the first EncryptedData. A non-null
+ * `lookup` supplies this call's keys in place of the decryptor's: the
+ * document's key name selects one, or the single key the lookup imported
+ * when it names none. `audit` may be null. */
 xs_status xs_decryptor_new(XsPolicy policy, XsProvider provider, XsKeys keys, XsBytes key_name,
                            XsDecryptor *out, XsError *error);
 xs_status xs_decrypt(XsDecryptor decryptor, XsDocument document, XsBytes encrypted_data_id,
-                     XsAudit *audit, XsError *error);
+                     const XsKeyLookup *lookup, XsAudit *audit, XsError *error);
 
 /* Evidence. */
 xs_status xs_evidence_accepted(XsEvidence evidence, XsDocument document, uint8_t *accepted,

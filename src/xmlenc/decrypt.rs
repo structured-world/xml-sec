@@ -2724,10 +2724,11 @@ fn record_candidate_source_error_or_fail_operation(
 ) -> Result<(), XmlEncError> {
     // Candidate-specific failures permit the next ordered key source. The
     // shared work ceiling is operation-wide and must never be recoverable by
-    // advancing to another recipient.
+    // advancing to another recipient, and neither is a resolver's abort.
     if matches!(
         &error,
         XmlEncError::Policy(_)
+            | XmlEncError::KeyResolverAborted
             | XmlEncError::KeyEstablishment(
                 crate::key_establishment::KeyEstablishmentError::Policy(_)
             )

@@ -819,6 +819,29 @@ impl KeyResolver for InventoryVerificationResolver<'_> {
         provider: &dyn crate::provider::CryptoProvider,
         inspected_candidates: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'k>>, DsigError> {
+        self.resolve_owned(key_info, algorithm, policy, provider, inspected_candidates)
+    }
+
+    fn consumes_document_key_info(&self) -> bool {
+        true
+    }
+}
+
+impl InventoryVerificationResolver<'_> {
+    /// Resolve as [`KeyResolver::resolve_for_verification_with_budget`] does,
+    /// returning a key that does not borrow the inventory, so a caller may
+    /// fill an inventory for one resolution and drop it afterwards.
+    ///
+    /// # Errors
+    /// As for [`KeyResolver::resolve_for_verification_with_budget`].
+    pub fn resolve_owned(
+        &self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        inspected_candidates: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'static>>, DsigError> {
         policy.validate()?;
         inspected_candidates.bind_policy(policy)?;
         if let Some(info) = key_info {
@@ -925,10 +948,6 @@ impl KeyResolver for InventoryVerificationResolver<'_> {
             provider,
             inspected_candidates,
         )
-    }
-
-    fn consumes_document_key_info(&self) -> bool {
-        true
     }
 }
 
