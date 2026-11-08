@@ -193,7 +193,8 @@ typedef struct XsVerifyRequest {
 
 /* What a key lookup is asked for, borrowed for the callback only. */
 typedef struct XsKeyQuery {
-    /* The KeyName values the document gives, in order; null when none. */
+    /* The KeyName values the document gives that the call has not imported
+     * yet, in order and each once; null when none. */
     const XsBytes *names;
     size_t name_count;
     /* The signature, key transport, key wrap or content method URI. */
@@ -203,7 +204,8 @@ typedef struct XsKeyQuery {
 /* Imports the keys matching `query` into `keys` with xs_keys_add_*. `keys`
  * belongs to the running call and is destroyed when the callback returns;
  * keys it imported serve the rest of that call. Returns XS_OK, also when it
- * found nothing; any other status fails the call with that status. The
+ * found nothing; any other status fails the call with that status, and a
+ * value this header does not name fails it with XS_INTERNAL. The
  * callback may call the library; destroying a handle the running call
  * uses, or operating on its document, returns XS_BUSY. */
 typedef xs_status (*XsKeyLookupFn)(void *user_data, const XsKeyQuery *query, XsKeys keys);

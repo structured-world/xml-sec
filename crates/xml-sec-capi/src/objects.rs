@@ -433,11 +433,13 @@ impl<'a> LookupScope<'a> {
         );
         let (before, missing) = {
             let held = keys.names.lock();
-            let missing: Vec<&str> = names
-                .iter()
-                .copied()
-                .filter(|name| !held.iter().any(|held| held == name))
-                .collect();
+            // A document may repeat a KeyName; each name is asked for once.
+            let mut missing: Vec<&str> = Vec::with_capacity(names.len());
+            for &name in names {
+                if !held.iter().any(|held| held == name) && !missing.contains(&name) {
+                    missing.push(name);
+                }
+            }
             (held.len(), missing)
         };
         let asked = if names.is_empty() {

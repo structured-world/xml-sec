@@ -133,7 +133,8 @@ pub struct XsVerifyRequest {
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct XsKeyQuery {
-    /// Key names, in document order; null when there are none.
+    /// Key names the call has not imported yet, in document order and each
+    /// once; null when there are none.
     pub names: *const XsBytes,
     /// Number of names.
     pub name_count: usize,
@@ -143,7 +144,8 @@ pub struct XsKeyQuery {
 
 /// Imports the keys matching `query` into `keys`, a key manager valid only
 /// until the callback returns, and returns `XS_OK`, also when it found none.
-/// Any other status fails the call that invoked it with that status.
+/// Any other status fails the call that invoked it with that status, and a
+/// value the header does not name fails it with `XS_INTERNAL`.
 pub type XsKeyLookupFn = unsafe extern "C" fn(
     user_data: *mut std::ffi::c_void,
     query: *const XsKeyQuery,
