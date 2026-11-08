@@ -516,12 +516,12 @@ fn signed_with_key_name() -> String {
     output
 }
 
+/// A verifier without keys resolves the signer through the lookup: it is
+/// asked for the `KeyName` and the signature method, its key is trusted as any
+/// application key, and its key manager ends with the invocation.
 #[test]
 fn a_lookup_supplies_the_verification_key_for_the_name_the_document_gives() {
     let _serial = crate::test_support::serial();
-    // A verifier without keys resolves the signer through the lookup: it is
-    // asked for the KeyName and the signature method, its key is trusted as
-    // any application key, and its key manager ends with the invocation.
     let signed = signed_with_key_name();
     let handles = policy();
     let mut store = Store {
@@ -679,12 +679,12 @@ fn verify_through(signed: &str, store: &mut Store) -> (XsStatus, XsStatus, XsEvi
     (status, reported, evidence)
 }
 
+/// The callback's failure is the call's typed status, not a signature the
+/// verification could not resolve; a code the header does not name is an
+/// internal failure rather than a status the caller cannot interpret.
 #[test]
 fn a_failing_lookup_fails_the_call_with_its_status() {
     let _serial = crate::test_support::serial();
-    // The callback's failure is the call's typed status, not a signature the
-    // verification could not resolve; a code the header does not name is an
-    // internal failure rather than a status the caller cannot interpret.
     let signed = signed_with_key_name();
     for (returned, expected) in [(XS_KEY, XS_KEY), (77, XS_INTERNAL), (-1, XS_INTERNAL)] {
         let mut store = Store {
@@ -704,6 +704,47 @@ fn a_failing_lookup_fails_the_call_with_its_status() {
     }
 }
 
+/// Whether the first signature `evidence` reports verified.
+fn first_signature_valid(evidence: XsEvidence) -> bool {
+    let held = crate::table::use_handle(evidence.value, crate::table::Kind::Evidence).unwrap();
+    let crate::objects::Object::Evidence(report) = held.object() else {
+        panic!("an evidence handle holds evidence");
+    };
+    matches!(
+        report.signatures()[0].result(),
+        Ok(result) if result.status == xml_sec::xmldsig::DsigStatus::Valid
+    )
+}
+
+/// A signature without `KeyInfo` names no key: the lookup is asked without
+/// names, and the one key it imports verifies the signature as a key the
+/// application selected, as a preset key would.
+#[test]
+fn a_lookup_supplies_the_key_for_a_signature_without_key_info() {
+    let _serial = crate::test_support::serial();
+    let signed = signed_with_key_name().replace(
+        "<ds:KeyInfo><ds:KeyName>signer</ds:KeyName></ds:KeyInfo>",
+        "",
+    );
+    assert!(!signed.contains("KeyInfo"), "{signed}");
+    let mut store = Store {
+        pem: include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+        private_key: false,
+        usages: 2,
+        method: RSA_SHA256,
+        twice: false,
+        refuse: "",
+        result: XS_OK,
+        queries: Vec::new(),
+        kept: XsKeys::default(),
+    };
+    let (status, reported, evidence) = verify_through(&signed, &mut store);
+    assert_eq!((status, reported), (XS_OK, XS_OK));
+    assert_eq!(store.queries, [(Vec::new(), RSA_SHA256.to_owned())]);
+    assert!(first_signature_valid(evidence));
+    assert_eq!(xs_evidence_destroy(evidence), XS_OK);
+}
+
 /// Destroys the key manager it is given, then finds nothing.
 unsafe extern "C" fn destroying_lookup(
     _user_data: *mut std::ffi::c_void,
@@ -714,11 +755,11 @@ unsafe extern "C" fn destroying_lookup(
     XS_OK
 }
 
+/// The key manager belongs to the call; a callback destroying its handle only
+/// ends that handle, and the call completes without the key.
 #[test]
 fn a_lookup_may_destroy_the_key_manager_it_is_given() {
     let _serial = crate::test_support::serial();
-    // The key manager belongs to the call; a callback destroying its handle
-    // only ends that handle, and the call completes without the key.
     let signed = signed_with_key_name();
     let handles = policy();
     let lookup = XsKeyLookup {
@@ -813,12 +854,12 @@ unsafe extern "C" fn replacing_lookup(
     XS_OK
 }
 
+/// Both are supported actions of a lookup: the new object reuses the freed
+/// slot under a newer generation, and the call neither fails releasing the
+/// handle it gave out nor touches the object that replaced it.
 #[test]
 fn a_lookup_may_destroy_its_key_manager_and_create_objects() {
     let _serial = crate::test_support::serial();
-    // Both are supported actions of a lookup: the new object reuses the freed
-    // slot under a newer generation, and the call neither fails releasing the
-    // handle it gave out nor touches the object that replaced it.
     let signed = signed_with_key_name();
     let handles = policy();
     let mut state = Replacing {
@@ -1014,12 +1055,12 @@ fn recipient_store() -> Store {
     }
 }
 
+/// The `EncryptedKey`'s `KeyName` selects the imported key; without a name, the
+/// one key the lookup imported for that transport serves, and two imported
+/// keys are no selection at all.
 #[test]
 fn a_lookup_supplies_the_recovery_key_by_name_or_as_the_only_key() {
     let _serial = crate::test_support::serial();
-    // The EncryptedKey's KeyName selects the imported key; without a name,
-    // the one key the lookup imported for that transport serves, and two
-    // imported keys are no selection at all.
     let encrypted = encrypted_for_recipient();
     let mut store = recipient_store();
     let (status, xml) = decrypt_through(&encrypted, &mut store);
@@ -1049,6 +1090,173 @@ fn a_lookup_supplies_the_recovery_key_by_name_or_as_the_only_key() {
     let (status, xml) = decrypt_through(&unnamed, &mut store);
     assert_ne!(status, XS_OK);
     assert!(!xml.contains("<secret"));
+}
+
+const KW_AES128: &str = "http://www.w3.org/2001/04/xmlenc#kw-aes128";
+
+/// An AES key-encryption key a lookup imports, for one wrap method, under
+/// the names asked for or "found"; and what it was asked.
+struct KekStore {
+    key: [u8; 16],
+    method: &'static str,
+    queries: Vec<(usize, String)>,
+}
+
+/// Import the stored key-encryption key for its wrap method, under the names
+/// asked for or "found", recording each request.
+unsafe extern "C" fn kek_lookup(
+    user_data: *mut std::ffi::c_void,
+    query: *const XsKeyQuery,
+    keys: XsKeys,
+) -> XsStatus {
+    // SAFETY: the test passes a live `KekStore` as user data, and the library
+    // passes a query valid for this invocation.
+    let (store, query) = unsafe { (&mut *user_data.cast::<KekStore>(), &*query) };
+    // SAFETY: the query's byte strings are borrowed for this invocation.
+    let method = unsafe { std::slice::from_raw_parts(query.method.ptr, query.method.len) };
+    let method = String::from_utf8(method.to_vec()).unwrap();
+    store.queries.push((query.name_count, method.clone()));
+    if method != store.method {
+        return XS_OK;
+    }
+    let names: Vec<XsBytes> = if query.name_count == 0 {
+        vec![bytes("found")]
+    } else {
+        // SAFETY: as above.
+        unsafe { std::slice::from_raw_parts(query.names, query.name_count) }.to_vec()
+    };
+    for name in names {
+        let key = XsBytes {
+            ptr: store.key.as_ptr(),
+            len: store.key.len(),
+        };
+        // SAFETY: the name and the key are live for this call.
+        let status = unsafe { xs_keys_add_symmetric(keys, name, 2, key, 8, std::ptr::null_mut()) };
+        if status != XS_OK {
+            return status;
+        }
+    }
+    XS_OK
+}
+
+/// Decrypt `document` under `configuration` with a keyless decryptor through
+/// a lookup over `store`; the status, the error message and the resulting XML.
+fn decrypt_with_aes_lookup(
+    configuration: &str,
+    document: &str,
+    store: &mut KekStore,
+) -> (XsStatus, String, String) {
+    let handles = policy_from(configuration);
+    let lookup = XsKeyLookup {
+        lookup: Some(kek_lookup),
+        user_data: std::ptr::from_mut(store).cast(),
+    };
+    let (mut decryptor, mut parsed) = (XsDecryptor::default(), XsDocument::default());
+    let mut error = XsError::default();
+    // SAFETY: every pointer names a live local or a live string.
+    let status = unsafe {
+        assert_eq!(
+            xs_decryptor_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                bytes(""),
+                &raw mut decryptor,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                4,
+                bytes(document),
+                &raw mut parsed,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_decrypt(
+            decryptor,
+            parsed,
+            bytes(""),
+            &raw const lookup,
+            std::ptr::null_mut(),
+            &raw mut error,
+        )
+    };
+    let message = if error.value == 0 {
+        String::new()
+    } else {
+        take_error(error).1
+    };
+    let xml = serialized(parsed);
+    assert_eq!(xs_document_destroy(parsed), XS_OK);
+    assert_eq!(xs_decryptor_destroy(decryptor), XS_OK);
+    release(handles);
+    (status, message, xml)
+}
+
+/// The content key is AES-128 wrapped: the lookup is asked with the wrap
+/// method and imports the key-encryption key, which unwraps the content key
+/// rather than being taken for a content key itself.
+#[test]
+fn a_lookup_supplies_an_aes_key_encryption_key() {
+    let _serial = crate::test_support::serial();
+    let kek = [5; 16];
+    let document = format!(
+        "<root>{}</root>",
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .recipient_aes_kw(kek, KeyWrapAlgorithm::AesKw128)
+            .encrypt_xml("<secret Id=\"s\">42</secret>")
+            .unwrap()
+            .encrypted_data_xml
+    );
+    let mut store = KekStore {
+        key: kek,
+        method: KW_AES128,
+        queries: Vec::new(),
+    };
+    let (status, message, xml) = decrypt_with_aes_lookup(MODERN, &document, &mut store);
+    assert_eq!(status, XS_OK, "{message}: {:?}", store.queries);
+    assert!(xml.contains("<secret Id=\"s\">42</secret>"), "{xml}");
+    assert!(store.queries.contains(&(0, KW_AES128.to_owned())));
+}
+
+const AES128_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes128-cbc";
+
+/// A CBC content method is also a wrap method name; a lookup asked for the
+/// direct content key of CBC data supplies a content key, not a
+/// key-encryption key, and the data decrypts with it.
+#[test]
+fn a_lookup_supplies_a_direct_cbc_content_key() {
+    let _serial = crate::test_support::serial();
+    let key = [8; 16];
+    let document = format!(
+        "<root>{}</root>",
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Cbc)
+            .direct_key(key)
+            .policy(xml_sec::policy::EncryptionPolicy {
+                data_algorithms: Some([DataEncryptionAlgorithm::Aes128Cbc].into()),
+                ..Default::default()
+            })
+            .encrypt_xml("<secret Id=\"s\">42</secret>")
+            .unwrap()
+            .encrypted_data_xml
+    );
+    let mut store = KekStore {
+        key,
+        method: AES128_CBC,
+        queries: Vec::new(),
+    };
+    let (status, message, xml) = decrypt_with_aes_lookup(
+        "schema_version = 1\n[profiles.app]\nbase = 'XmlSecCompatible'\n",
+        &document,
+        &mut store,
+    );
+    assert_eq!(status, XS_OK, "{message}: {:?}", store.queries);
+    assert!(xml.contains("<secret Id=\"s\">42</secret>"), "{xml}");
+    assert!(store.queries.contains(&(0, AES128_CBC.to_owned())));
 }
 
 /// `<root><secret Id="s">42</secret></root>` with `secret` encrypted under a
@@ -1105,11 +1313,11 @@ fn encrypted_through_a_nested_recipient() -> String {
     )
 }
 
+/// The lookup is asked for "recipient" with RSA-OAEP, the method the key it
+/// holds serves, not with the outer AES wrap method.
 #[test]
 fn a_lookup_is_asked_for_a_nested_key_with_its_own_method() {
     let _serial = crate::test_support::serial();
-    // The lookup is asked for "recipient" with RSA-OAEP, the method the key
-    // it holds serves, not with the outer AES wrap method.
     let document = encrypted_through_a_nested_recipient();
     let handles = policy();
     let mut store = recipient_store();
@@ -1171,12 +1379,12 @@ fn a_lookup_is_asked_for_a_nested_key_with_its_own_method() {
     );
 }
 
+/// The first recipient's key recovers the content, the lookup for the second
+/// fails: the call fails with the lookup's status before the plaintext
+/// replaces the `EncryptedData`, not after.
 #[test]
 fn a_failed_lookup_leaves_the_document_encrypted() {
     let _serial = crate::test_support::serial();
-    // The first recipient's key recovers the content, the lookup for the
-    // second fails: the call fails with the lookup's status before the
-    // plaintext replaces the EncryptedData, not after.
     let encrypted = encrypted_for_recipient();
     let start = encrypted.find("<xenc:EncryptedKey>").unwrap();
     let end = encrypted.find("</xenc:EncryptedKey>").unwrap() + "</xenc:EncryptedKey>".len();
@@ -1194,12 +1402,12 @@ fn a_failed_lookup_leaves_the_document_encrypted() {
     assert_eq!(xml, two);
 }
 
+/// Error messages are the Rust API's redacted diagnostics: a wrong password,
+/// malformed private key material and a rejected secret key each fail with a
+/// message that contains none of the caller's secrets.
 #[test]
 fn diagnostics_never_carry_passwords_or_key_bytes() {
     let _serial = crate::test_support::serial();
-    // Error messages are the Rust API's redacted diagnostics: a wrong
-    // password, malformed private key material and a rejected secret key
-    // each fail with a message that contains none of the caller's secrets.
     let encrypted =
         include_str!("../../../../tests/fixtures/xmldsig/keys/eddsa/eddsa-ed25519-key.p8-pem");
     let malformed =
@@ -1260,12 +1468,12 @@ fn diagnostics_never_carry_passwords_or_key_bytes() {
     release(handles);
 }
 
+/// Threads racing to destroy one handle: exactly one succeeds and every other
+/// one is told the handle is destroyed, round after round, so no object is
+/// released twice or reached after release.
 #[test]
 fn concurrent_destroys_release_an_object_exactly_once() {
     let _serial = crate::test_support::serial();
-    // Threads racing to destroy one handle: exactly one succeeds and every
-    // other one is told the handle is destroyed, round after round, so no
-    // object is released twice or reached after release.
     for _ in 0..200 {
         let handle =
             crate::table::insert(crate::objects::Object::Error(Failure::new(XS_KEY, "x"))).unwrap();
@@ -1292,13 +1500,13 @@ fn concurrent_destroys_release_an_object_exactly_once() {
     }
 }
 
+/// Readers use one error handle while another thread destroys it: a read
+/// either completes on the live object or reports the handle destroyed, the
+/// destroyer sees busy until no read is running, and once destroyed the
+/// handle stays destroyed.
 #[test]
 fn a_destroy_racing_running_calls_waits_for_them_and_ends_every_later_use() {
     let _serial = crate::test_support::serial();
-    // Readers use one error handle while another thread destroys it: a read
-    // either completes on the live object or reports the handle destroyed,
-    // the destroyer sees busy until no read is running, and once destroyed
-    // the handle stays destroyed.
     for _ in 0..50 {
         let handle =
             crate::table::insert(crate::objects::Object::Error(Failure::new(XS_KEY, "x"))).unwrap();

@@ -4644,3 +4644,91 @@ fn decryption_selection_checks_operation_limits_before_material_use() {
     assert!(keys.decryption_resolver("aes", &policy).is_err());
     assert!(keys.decryption_resolver("rsa", &policy).is_err());
 }
+
+#[cfg(feature = "xmlenc")]
+#[test]
+fn a_key_wrap_selection_unwraps_and_is_never_a_content_key() {
+    // A named AES key selected as a key-encryption key recovers a content
+    // key it wrapped; the same bytes used directly as the content key are
+    // not found, so one selection never serves both purposes.
+    use crate::xmlenc::{
+        DataEncryptionAlgorithm, DecryptContext, DecryptedContent, EncryptedDataBuilder,
+        KeyWrapAlgorithm, XmlEncError,
+    };
+    let kek = [6; 16];
+    let mut keys = KeyInventory::default();
+    keys.add_symmetric(
+        "kek",
+        SymmetricKeyKind::Aes,
+        kek.to_vec(),
+        KeyUsages::DECRYPT,
+        &ResourcePolicy::default(),
+    )
+    .expect("AES imports");
+    let policy = crate::policy::DecryptionPolicy::default();
+    let resolver = keys
+        .key_wrap_resolver("kek", &policy)
+        .expect("KEK resolver");
+    let wrapped = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .recipient_aes_kw(kek, KeyWrapAlgorithm::AesKw128)
+        .encrypt_binary(b"wrapped")
+        .expect("encrypts");
+    assert_eq!(
+        DecryptContext::new(resolver.as_ref())
+            .decrypt(&wrapped.encrypted_data_xml)
+            .expect("unwraps")
+            .output,
+        DecryptedContent::Bytes(b"wrapped".to_vec())
+    );
+    let direct = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(kek)
+        .encrypt_binary(b"direct")
+        .expect("encrypts");
+    assert!(matches!(
+        DecryptContext::new(resolver.as_ref()).decrypt(&direct.encrypted_data_xml),
+        Err(XmlEncError::KeyNotFound)
+    ));
+    assert!(matches!(
+        keys.key_wrap_resolver("absent", &policy),
+        Err(KeyStoreError::Selection(_))
+    ));
+}
+
+#[test]
+fn a_preset_selection_resolves_the_named_key_only_where_policy_admits_it() {
+    // The application's choice of key needs no document source but is still
+    // a preset key: it resolves as caller trusted, a missing name resolves
+    // nothing, and a policy without preset keys refuses it.
+    let mut keys = KeyInventory::default();
+    keys.add_symmetric(
+        "mac",
+        SymmetricKeyKind::Hmac,
+        vec![4; 32],
+        KeyUsages::VERIFY,
+        &ResourcePolicy::default(),
+    )
+    .expect("HMAC imports");
+    let resolver = keys.verification_resolver();
+    let provider = crate::provider::RustCryptoProvider;
+    let mut policy = crate::policy::VerificationPolicy::default();
+    let resolve = |name: &str, policy: &crate::policy::VerificationPolicy| {
+        resolver.resolve_preset_owned(
+            name,
+            SignatureAlgorithm::HmacSha256,
+            policy,
+            &provider,
+            &mut InspectedKeyCandidateBudget::new(policy),
+        )
+    };
+    assert!(matches!(
+        resolve("mac", &policy),
+        Ok(Some(
+            crate::xmldsig::ResolvedVerificationKey::CallerTrusted(_)
+        ))
+    ));
+    assert!(matches!(resolve("absent", &policy), Ok(None)));
+    policy
+        .key_sources
+        .remove(crate::policy::KeySourceKind::PresetKey);
+    assert!(resolve("mac", &policy).is_err());
+}

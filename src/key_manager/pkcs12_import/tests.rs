@@ -103,7 +103,8 @@ fn requests_password(bytes: &[u8]) -> bool {
 }
 
 fn legacy_mac(safe: &[u8], password: &str, hash: Oid, salt: &[u8], rounds: u16) -> Vec<u8> {
-    let key = derive_key::<sha1::Sha1>(&bmp(password), salt, Pkcs12KeyType::Mac, rounds.into(), 20);
+    let key = derive_key::<sha1::Sha1>(&bmp(password), salt, Pkcs12KeyType::Mac, rounds.into(), 20)
+        .expect("one or more KDF rounds");
     let mut mac = Hmac::<sha1::Sha1>::new_from_slice(&key).expect("HMAC key");
     mac.update(safe);
     let digest = mac.finalize().into_bytes();
@@ -653,8 +654,10 @@ fn legacy_shrouded_key_and_hidden_limits() {
     // prove an encrypted SafeContents cannot reset the inner KDF budget.
     let password = "secret";
     let salt = b"12345678";
-    let key = derive_key::<sha1::Sha1>(&bmp(password), salt, Pkcs12KeyType::EncryptionKey, 2, 24);
-    let iv = derive_key::<sha1::Sha1>(&bmp(password), salt, Pkcs12KeyType::Iv, 2, 8);
+    let key = derive_key::<sha1::Sha1>(&bmp(password), salt, Pkcs12KeyType::EncryptionKey, 2, 24)
+        .expect("two KDF rounds");
+    let iv = derive_key::<sha1::Sha1>(&bmp(password), salt, Pkcs12KeyType::Iv, 2, 8)
+        .expect("two KDF rounds");
     let algorithm = sequence(&[
         oid(pkcs12::PKCS_12_PBE_WITH_SHAAND3_KEY_TRIPLE_DES_CBC),
         sequence(&[encoded(4, salt), integer(2)]),

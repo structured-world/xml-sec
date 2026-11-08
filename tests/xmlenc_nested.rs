@@ -1193,6 +1193,7 @@ struct RefusingRecipients {
 }
 
 impl xml_sec::xmlenc::DecryptionKeyResolver for RefusingRecipients {
+    /// Never used: the policy-bound resolution below answers every request.
     fn resolve_key(
         &self,
         _provider: &dyn CryptoProvider,
@@ -1202,6 +1203,7 @@ impl xml_sec::xmlenc::DecryptionKeyResolver for RefusingRecipients {
         Err(XmlEncError::KeyNotFound)
     }
 
+    /// The content key for the direct source, the refusal for a recipient.
     fn resolve_content_keys_with_policy(
         &self,
         _provider: &dyn CryptoProvider,
@@ -1219,11 +1221,11 @@ impl xml_sec::xmlenc::DecryptionKeyResolver for RefusingRecipients {
     }
 }
 
+/// A key a recipient cannot supply leaves the next source eligible, but a
+/// resolver that aborts ends the operation: the directly resolved content key
+/// that would decrypt the data is not used.
 #[test]
 fn a_resolver_abort_ends_decryption_although_another_source_found_the_key() {
-    // A key a recipient cannot supply leaves the next source eligible, but a
-    // resolver that aborts ends the operation: the directly resolved content
-    // key that would decrypt the data is not used.
     let content = [3; 16];
     let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
         .direct_key(content)

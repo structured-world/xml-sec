@@ -5,6 +5,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -55,8 +57,25 @@ using Keys = Owned<XsKeys, xs_keys_destroy>;
 using Signer = Owned<XsSigner, xs_signer_destroy>;
 using Verifier = Owned<XsVerifier, xs_verifier_destroy>;
 using Evidence = Owned<XsEvidence, xs_evidence_destroy>;
+using Encryptor = Owned<XsEncryptor, xs_encryptor_destroy>;
+using Decryptor = Owned<XsDecryptor, xs_decryptor_destroy>;
 
 const char HMAC_SHA256[] = "http://www.w3.org/2001/04/xmldsig-more#hmac-sha256";
+const char AES256_GCM[] = "http://www.w3.org/2009/xmlenc11#aes256-gcm";
+const char RSA_OAEP[] = "http://www.w3.org/2009/xmlenc11#rsa-oaep";
+
+// The whole content of the file at `path`, empty when it cannot be read.
+std::string read_file(const char *path) {
+    std::ifstream file(path, std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+// The recipient's private key a decryption lookup imports, and how often it
+// was asked for the RSA-OAEP transport.
+struct RecipientStore {
+    std::string pem;
+    int calls = 0;
+};
 
 std::string serialize(XsDocument document) {
     XsBuffer buffer{};
@@ -82,7 +101,16 @@ std::string message(const Error &error) {
 
 } // namespace
 
-int main() {
+// Runs the round trip with the RSA recipient's private and public key files;
+// exits non-zero on any failed check.
+int main(int argc, char **argv) {
+    if (argc != 3) {
+        std::fprintf(stderr, "usage: roundtrip <private.pem> <public.pem>\n");
+        return 2;
+    }
+    const std::string private_pem = read_file(argv[1]);
+    const std::string public_pem = read_file(argv[2]);
+    check(!private_pem.empty() && !public_pem.empty(), "key files");
     const std::string configuration = "schema_version = 1\n[profiles.app]\nbase = 'Modern'\n";
     const XsCompileContext context{0, 1};
     Provider provider;
@@ -200,6 +228,65 @@ int main() {
         check(xs_evidence_signature(evidence.get(), 0, &outcome, nullptr) == XS_OK, "outcome");
         check(outcome.outcome == XS_SIGNATURE_VALID, "the looked-up key verifies");
         check(mac_store.calls == 1, "asked once");
+    }
+
+    // Encrypt for the RSA recipient, then decrypt with a keyless decryptor:
+    // the recovery key comes only from the lookup, for the name and the
+    // transport method the EncryptedKey gives.
+    {
+        std::string encrypted;
+        {
+            Keys keys;
+            Encryptor encryptor;
+            Document document;
+            check(xs_keys_new(policy.get(), XS_OPERATION_ENCRYPT, keys.out(), nullptr) == XS_OK,
+                  "encryption keys");
+            check(xs_keys_add_public_pem(keys.get(), bytes("recipient"), bytes(public_pem),
+                                         XS_KEY_USAGE_ENCRYPT, nullptr) == XS_OK,
+                  "recipient public key");
+            check(xs_encryptor_new(policy.get(), provider.get(), keys.get(), bytes("recipient"),
+                                   bytes(AES256_GCM), encryptor.out(), nullptr) == XS_OK,
+                  "encryptor");
+            check(xs_document_parse(policy.get(), XS_OPERATION_ENCRYPT,
+                                    bytes("<root><secret Id=\"s\">42</secret></root>"),
+                                    document.out(), nullptr) == XS_OK,
+                  "plaintext document");
+            check(xs_encrypt(encryptor.get(), document.get(), bytes("s"), nullptr, nullptr) ==
+                      XS_OK,
+                  "encrypt");
+            encrypted = serialize(document.get());
+        }
+        check(encrypted.find(">42<") == std::string::npos, "content encrypted");
+        RecipientStore recipient_store;
+        recipient_store.pem = private_pem;
+        Decryptor decryptor;
+        Document received;
+        check(xs_decryptor_new(policy.get(), provider.get(), XsKeys{}, bytes(""),
+                               decryptor.out(), nullptr) == XS_OK,
+              "keyless decryptor");
+        check(xs_document_parse(policy.get(), XS_OPERATION_DECRYPT, bytes(encrypted),
+                                received.out(), nullptr) == XS_OK,
+              "encrypted document");
+        const XsKeyLookup lookup{
+            [](void *user_data, const XsKeyQuery *query, XsKeys keys) -> xs_status {
+                auto *found = static_cast<RecipientStore *>(user_data);
+                const std::string method(reinterpret_cast<const char *>(query->method.ptr),
+                                         query->method.len);
+                if (method != RSA_OAEP || query->name_count != 1) {
+                    return XS_OK;
+                }
+                ++found->calls;
+                return xs_keys_add_private_pem(keys, query->names[0], bytes(found->pem),
+                                               bytes(""), XS_KEY_USAGE_DECRYPT, nullptr);
+            },
+            &recipient_store};
+        check(xs_decrypt(decryptor.get(), received.get(), bytes(""), &lookup, nullptr,
+                         nullptr) == XS_OK,
+              "decrypt through the lookup");
+        check(serialize(received.get()).find("<secret Id=\"s\">42</secret>") !=
+                  std::string::npos,
+              "recovered plaintext");
+        check(recipient_store.calls == 1, "recipient key asked once");
     }
 
     if (failures != 0) {
