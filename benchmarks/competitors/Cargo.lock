@@ -417,9 +417,9 @@ dependencies = [
 
 [[package]]
 name = "cms"
-version = "0.3.0-pre.1"
+version = "0.3.0-rc.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "758d5272932ff167e96ec9641a04d96ab1901cccc5ea9f47c15b4cbaa6f9ea53"
+checksum = "6e99ff55bfffd019bf15e3f0d5edef2ca1e3af5ade276ed100e3c0c3455050c2"
 dependencies = [
  "const-oid 0.10.2",
  "der 0.8.2",
@@ -1787,11 +1787,11 @@ dependencies = [
 
 [[package]]
 name = "pkcs12"
-version = "0.2.0-pre.0"
+version = "0.2.0-rc.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8059bd79345d1d1c125656025814704bab5cdd204b1cefd5fab59b0fdd7476d2"
+checksum = "9fd993500a1de8a428a2e6cc9a2ec942c99a801a88d58a24fb986c5ad3b767ca"
 dependencies = [
- "cms 0.3.0-pre.1",
+ "cms 0.3.0-rc.1",
  "const-oid 0.10.2",
  "der 0.8.2",
  "digest 0.11.3",
