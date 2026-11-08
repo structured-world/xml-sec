@@ -174,6 +174,23 @@ fn an_invalid_fragment_leaves_the_tree_and_generation_unchanged() {
 }
 
 #[test]
+fn a_tree_backed_document_has_no_serialization_to_return() {
+    // Signing that returns signed text needs a serialization; a tree's
+    // signature is committed into the tree instead.
+    let tree =
+        ModelTree::parse(r#"<root><Signature xmlns="http://www.w3.org/2000/09/xmldsig#"/></root>"#);
+    let document = document(&tree);
+    let key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).expect("a key");
+    let error = xml_sec::xmldsig::SignContext::new(&key)
+        .sign_template_document(document)
+        .expect_err("there is no text to return");
+    assert!(
+        error.to_string().contains("tree"),
+        "the refusal names the tree: {error}"
+    );
+}
+
+#[test]
 fn a_failed_transaction_rolls_the_tree_back() {
     // Every commit inside the transaction changed the tree; failure undoes
     // all of them, newest first.

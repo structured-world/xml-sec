@@ -1867,6 +1867,14 @@ impl<'a> SignContext<'a> {
         &self,
         mut document: XmlDocument,
     ) -> Result<crate::policy::Audited<String>, SigningError> {
+        // A tree's content is the tree: there is no signed text to return,
+        // so the tree is signed in place with `sign_document` instead.
+        #[cfg(feature = "external-tree")]
+        if document.is_tree_backed() {
+            return Err(map_owned_document_mutation_error(
+                crate::XmlDocumentError::TreeBackedSerialization,
+            ));
+        }
         self.validate_owned_document_input(&document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,

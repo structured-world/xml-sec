@@ -2032,6 +2032,12 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         spliced: Option<&SplicedElement>,
     ) -> Result<String, XmlDocumentError> {
+        // There is no serialization of a tree to return; its signature is
+        // committed into the tree instead.
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return Err(XmlDocumentError::TreeBackedSerialization);
+        }
         validate_base64_replacements(replacements)?;
         let (mut edits, mut projected) =
             self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
