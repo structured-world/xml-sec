@@ -587,32 +587,50 @@ impl KeyResolver for LookupVerification<'_> {
 /// acceptance checks.
 struct LookupDecryption<'a> {
     scope: LookupScope<'a>,
-    /// One resolver per key name and method: a content key and a transport
-    /// key without names are different requests.
+    /// One resolver per key name, method and role: a content key and a
+    /// transport key without names are different requests.
     resolvers: Mutex<Vec<DecryptionResolution>>,
 }
 
-/// A resolved request: its key name and method, and the selected resolver.
+/// What a decryption request asks a key for. The method alone cannot tell:
+/// a CBC URI names both a content cipher and a key-wrap cipher.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KeyRole {
+    /// The content key itself, or the key an agreement, derivation or
+    /// encapsulation descriptor starts from.
+    Content,
+    /// The key that recovers the key an `EncryptedKey` carries, or the
+    /// application's wrapping key itself.
+    Recipient,
+}
+
+/// A resolved request: its key name, method and role, and the selected
+/// resolver.
 type DecryptionResolution = (
     Option<String>,
     String,
+    KeyRole,
     Arc<dyn DecryptionKeyResolver + Send + Sync>,
 );
 
 impl LookupDecryption<'_> {
-    /// The resolver for the key `name` selects, asking the lookup for it.
+    /// The resolver for the key `name` selects in `role`, asking the lookup
+    /// for it.
     fn resolver(
         &self,
         name: Option<&str>,
         method: &str,
+        role: KeyRole,
         policy: &xml_sec::policy::DecryptionPolicy,
         provider: &dyn CryptoProvider,
     ) -> Result<Arc<dyn DecryptionKeyResolver + Send + Sync>, XmlEncError> {
-        if let Some((_, _, found)) = self
-            .resolvers
-            .lock()
-            .iter()
-            .find(|(cached, served, _)| cached.as_deref() == name && served == method)
+        if let Some((_, _, _, found)) =
+            self.resolvers
+                .lock()
+                .iter()
+                .find(|(cached, served, cached_role, _)| {
+                    cached.as_deref() == name && served == method && *cached_role == role
+                })
         {
             return Ok(Arc::clone(found));
         }
@@ -628,9 +646,11 @@ impl LookupDecryption<'_> {
             (None, _) => return Err(XmlEncError::KeyNotFound),
         };
         let inventory = keys.inventory.read();
-        // A wrap method asks for a key-encryption key: the key then only
-        // unwraps, and is never taken for a content key of the same width.
-        let selection = if KeyWrapAlgorithm::from_uri(method).is_ok() {
+        // A recipient with a wrap method asks for a key-encryption key: the
+        // key then only unwraps, and is never taken for a content key of the
+        // same width.
+        let selection = if role == KeyRole::Recipient && KeyWrapAlgorithm::from_uri(method).is_ok()
+        {
             inventory.key_wrap_resolver(&selected, policy)
         } else {
             inventory.decryption_resolver_with_provider(&selected, policy, provider)
@@ -646,6 +666,7 @@ impl LookupDecryption<'_> {
         self.resolvers.lock().push((
             name.map(str::to_owned),
             method.to_owned(),
+            role,
             Arc::clone(&resolver),
         ));
         Ok(resolver)
@@ -662,7 +683,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        self.resolver(None, algorithm.uri(), policy, provider)?
+        self.resolver(None, algorithm.uri(), KeyRole::Content, policy, provider)?
             .resolve_encapsulation_content_keys_with_policy(
                 provider, algorithm, descriptor, policy, budget,
             )
@@ -679,14 +700,18 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        let (name, method) = match &source {
+        let (name, method, role) = match &source {
             KeyEncryptionKeySource::Encrypted(key) => (
                 key.key_name.as_deref(),
                 key.encryption_method.algorithm.as_str(),
+                KeyRole::Recipient,
             ),
-            _ => (None, algorithm.uri()),
+            KeyEncryptionKeySource::Direct => (None, algorithm.uri(), KeyRole::Recipient),
+            // An agreement, derivation or encapsulation starts from its own
+            // key, which is not a key-encryption key.
+            _ => (None, algorithm.uri(), KeyRole::Content),
         };
-        self.resolver(name, method, policy, provider)?
+        self.resolver(name, method, role, policy, provider)?
             .resolve_key_encryption_keys_with_policy(provider, algorithm, source, policy, budget)
     }
 
@@ -699,7 +724,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        self.resolver(None, algorithm.uri(), policy, provider)?
+        self.resolver(None, algorithm.uri(), KeyRole::Content, policy, provider)?
             .resolve_agreement_content_keys_with_policy(
                 provider, algorithm, descriptor, policy, budget,
             )
@@ -714,7 +739,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        self.resolver(None, algorithm.uri(), policy, provider)?
+        self.resolver(None, algorithm.uri(), KeyRole::Content, policy, provider)?
             .resolve_derived_content_keys_with_policy(
                 provider, algorithm, descriptor, policy, budget,
             )
@@ -729,8 +754,8 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        let (name, method) = recipient(encrypted_key, algorithm);
-        self.resolver(name, method, policy, provider)?
+        let (name, method, role) = recipient(encrypted_key, algorithm);
+        self.resolver(name, method, role, policy, provider)?
             .resolve_content_keys_with_policy(provider, algorithm, encrypted_key, policy, budget)
     }
 
@@ -743,8 +768,8 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<Vec<u8>>, XmlEncError> {
-        let (name, method) = recipient(encrypted_key, algorithm);
-        self.resolver(name, method, policy, provider)?
+        let (name, method, role) = recipient(encrypted_key, algorithm);
+        self.resolver(name, method, role, policy, provider)?
             .resolve_key_candidates_with_policy(provider, algorithm, encrypted_key, policy, budget)
     }
 
@@ -760,16 +785,18 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
     }
 }
 
-/// The key name and method a content key's source names: an `EncryptedKey`'s
-/// own `KeyName` and transport method, or none and the content method.
+/// The key name, method and role a content key's source names: an
+/// `EncryptedKey`'s own `KeyName` and transport or wrap method for its
+/// recipient, or none and the content method for the content key itself.
 fn recipient(
     encrypted_key: Option<&EncryptedKey>,
     algorithm: DataEncryptionAlgorithm,
-) -> (Option<&str>, &str) {
-    encrypted_key.map_or((None, algorithm.uri()), |key| {
+) -> (Option<&str>, &str, KeyRole) {
+    encrypted_key.map_or((None, algorithm.uri(), KeyRole::Content), |key| {
         (
             key.key_name.as_deref(),
             key.encryption_method.algorithm.as_str(),
+            KeyRole::Recipient,
         )
     })
 }

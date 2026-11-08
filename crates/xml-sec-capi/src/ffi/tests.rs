@@ -1139,30 +1139,17 @@ unsafe extern "C" fn kek_lookup(
     XS_OK
 }
 
-/// The content key is AES-128 wrapped: the lookup is asked with the wrap
-/// method and imports the key-encryption key, which unwraps the content key
-/// rather than being taken for a content key itself.
-#[test]
-fn a_lookup_supplies_an_aes_key_encryption_key() {
-    let _serial = crate::test_support::serial();
-    let kek = [5; 16];
-    let document = format!(
-        "<root>{}</root>",
-        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
-            .recipient_aes_kw(kek, KeyWrapAlgorithm::AesKw128)
-            .encrypt_xml("<secret Id=\"s\">42</secret>")
-            .unwrap()
-            .encrypted_data_xml
-    );
-    let handles = policy();
-    let mut store = KekStore {
-        key: kek,
-        method: KW_AES128,
-        queries: Vec::new(),
-    };
+/// Decrypt `document` under `configuration` with a keyless decryptor through
+/// a lookup over `store`; the status, the error message and the resulting XML.
+fn decrypt_with_aes_lookup(
+    configuration: &str,
+    document: &str,
+    store: &mut KekStore,
+) -> (XsStatus, String, String) {
+    let handles = policy_from(configuration);
     let lookup = XsKeyLookup {
         lookup: Some(kek_lookup),
-        user_data: std::ptr::from_mut(&mut store).cast(),
+        user_data: std::ptr::from_mut(store).cast(),
     };
     let (mut decryptor, mut parsed) = (XsDecryptor::default(), XsDocument::default());
     let mut error = XsError::default();
@@ -1183,7 +1170,7 @@ fn a_lookup_supplies_an_aes_key_encryption_key() {
             xs_document_parse(
                 handles.2,
                 4,
-                bytes(&document),
+                bytes(document),
                 &raw mut parsed,
                 std::ptr::null_mut()
             ),
@@ -1207,9 +1194,69 @@ fn a_lookup_supplies_an_aes_key_encryption_key() {
     assert_eq!(xs_document_destroy(parsed), XS_OK);
     assert_eq!(xs_decryptor_destroy(decryptor), XS_OK);
     release(handles);
+    (status, message, xml)
+}
+
+/// The content key is AES-128 wrapped: the lookup is asked with the wrap
+/// method and imports the key-encryption key, which unwraps the content key
+/// rather than being taken for a content key itself.
+#[test]
+fn a_lookup_supplies_an_aes_key_encryption_key() {
+    let _serial = crate::test_support::serial();
+    let kek = [5; 16];
+    let document = format!(
+        "<root>{}</root>",
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+            .recipient_aes_kw(kek, KeyWrapAlgorithm::AesKw128)
+            .encrypt_xml("<secret Id=\"s\">42</secret>")
+            .unwrap()
+            .encrypted_data_xml
+    );
+    let mut store = KekStore {
+        key: kek,
+        method: KW_AES128,
+        queries: Vec::new(),
+    };
+    let (status, message, xml) = decrypt_with_aes_lookup(MODERN, &document, &mut store);
     assert_eq!(status, XS_OK, "{message}: {:?}", store.queries);
     assert!(xml.contains("<secret Id=\"s\">42</secret>"), "{xml}");
     assert!(store.queries.contains(&(0, KW_AES128.to_owned())));
+}
+
+const AES128_CBC: &str = "http://www.w3.org/2001/04/xmlenc#aes128-cbc";
+
+/// A CBC content method is also a wrap method name; a lookup asked for the
+/// direct content key of CBC data supplies a content key, not a
+/// key-encryption key, and the data decrypts with it.
+#[test]
+fn a_lookup_supplies_a_direct_cbc_content_key() {
+    let _serial = crate::test_support::serial();
+    let key = [8; 16];
+    let document = format!(
+        "<root>{}</root>",
+        EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Cbc)
+            .direct_key(key)
+            .policy(xml_sec::policy::EncryptionPolicy {
+                data_algorithms: Some([DataEncryptionAlgorithm::Aes128Cbc].into()),
+                ..Default::default()
+            })
+            .encrypt_xml("<secret Id=\"s\">42</secret>")
+            .unwrap()
+            .encrypted_data_xml
+    );
+    let mut store = KekStore {
+        key,
+        method: AES128_CBC,
+        queries: Vec::new(),
+    };
+    let (status, message, xml) = decrypt_with_aes_lookup(
+        "schema_version = 1\n[profiles.app]\nbase = 'XmlSecCompatible'\n",
+        &document,
+        &mut store,
+    );
+    assert_eq!(status, XS_OK, "{message}: {:?}", store.queries);
+    assert!(xml.contains("<secret Id=\"s\">42</secret>"), "{xml}");
+    assert!(store.queries.contains(&(0, AES128_CBC.to_owned())));
 }
 
 /// `<root><secret Id="s">42</secret></root>` with `secret` encrypted under a
