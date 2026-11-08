@@ -680,7 +680,7 @@ fn named_inventory_uses_the_same_policy_and_verification_resolver() {
     let resources = &compiled.signing().unwrap().resources;
     inventory
         .add_symmetric(
-            "trusted".into(),
+            "trusted",
             SymmetricKeyKind::Hmac,
             vec![7; 32],
             KeyUsages::SIGN.union(KeyUsages::VERIFY),
@@ -721,7 +721,7 @@ fn named_inventory_uses_the_same_policy_and_verification_resolver() {
         use xml_sec::xmlenc::{DataEncryptionAlgorithm, EncryptedDataBuilder};
         inventory
             .add_symmetric(
-                "content".into(),
+                "content",
                 SymmetricKeyKind::Aes,
                 vec![9; 16],
                 KeyUsages::ENCRYPT.union(KeyUsages::DECRYPT),

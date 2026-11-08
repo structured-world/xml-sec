@@ -40,7 +40,9 @@ behaviour the library cannot detect.
 
 - No unwinding crosses the boundary: every body runs under
   `catch_unwind`, and a panic returns `XS_INTERNAL`.
-- No output is written on failure except the error handle.
+- No output is written on failure except the error handle. A call that
+  changes a document holds the table slot of the handle it returns before the
+  change, so a full table refuses it with the document unchanged.
 - An object is dropped only when its handle is destroyed and no running call
   or other object uses it. A call keeps every handle it reads in use until it
   returns, so destruction during the call returns `XS_BUSY`, and the object is

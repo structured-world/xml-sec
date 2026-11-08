@@ -323,7 +323,7 @@ impl Keys {
         let usages = usages(usage_bits)?;
         self.inventory
             .write()
-            .add_private_pem(name.into(), pem, password, usages, &self.resources)
+            .add_private_pem(name, pem, password, usages, &self.resources)
             .map_err(key_failure)
     }
 
@@ -336,7 +336,7 @@ impl Keys {
         let usages = usages(usage_bits)?;
         self.inventory
             .write()
-            .add_public_pem_with_usages(name.into(), pem, usages, &self.resources)
+            .add_public_pem_with_usages(name, pem, usages, &self.resources)
             .map_err(key_failure)
     }
 
@@ -350,7 +350,7 @@ impl Keys {
         let (kind, usages) = (symmetric_kind(kind)?, usages(usage_bits)?);
         self.inventory
             .write()
-            .add_symmetric(name.into(), kind, key, usages, &self.resources)
+            .add_symmetric(name, kind, key, usages, &self.resources)
             .map_err(key_failure)
     }
 }
@@ -455,6 +455,18 @@ pub(crate) fn requirement(kind: u32, count: usize) -> Result<SignatureRequiremen
 impl Verifier {
     pub(crate) fn new(security: SharedSecurity, keys: Option<Arc<Keys>>) -> Self {
         Self { security, keys }
+    }
+
+    /// Refuse a request for more expected targets than the policy admits,
+    /// before any ID is read or looked up in the document.
+    pub(crate) fn check_target_count(&self, count: usize) -> Result<(), Failure> {
+        let policy = self
+            .security
+            .policies()
+            .verification()
+            .ok_or_else(|| disabled(Operation::Verify))?;
+        VerificationRequest::check_target_count(policy, count)
+            .map_err(|error| XmlSecError::from(error).into())
     }
 
     /// Verify `document`, requiring the elements whose ID is in

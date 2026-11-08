@@ -373,30 +373,30 @@ fn with_document<T>(
     body(&mut document)
 }
 
+/// The caller's audit output with its handle slot already held: an operation
+/// that changes the document can then always report its audit, and a full
+/// table refuses the call before the document changes.
+type AuditOut<'a> = Option<(&'a mut MaybeUninit<XsAudit>, table::Reservation)>;
+
 /// Publish an audit as a handle, unless the caller declined it with null.
-fn audit_out(
-    out: Option<&mut MaybeUninit<XsAudit>>,
-    audit: &xml_sec::policy::PolicyAudit,
-) -> Result<(), Failure> {
-    if let Some(out) = out {
-        let value = insert(Object::Audit(Audit::from(audit)))?;
+fn audit_out(out: AuditOut<'_>, audit: &xml_sec::policy::PolicyAudit) {
+    if let Some((out, slot)) = out {
+        let value = slot.publish(Object::Audit(Audit::from(audit)));
         out.write(XsAudit { value });
     }
-    Ok(())
 }
 
-/// The caller's optional audit slot.
+/// The caller's optional audit slot, with a table slot held for its handle.
 ///
 /// # Safety
 /// `out` is null or valid for writes of one `XsAudit`.
-unsafe fn audit_slot<'a>(
-    out: *mut XsAudit,
-) -> Result<Option<&'a mut MaybeUninit<XsAudit>>, Failure> {
+unsafe fn audit_slot<'a>(out: *mut XsAudit) -> Result<AuditOut<'a>, Failure> {
     if out.is_null() {
         return Ok(None);
     }
     // SAFETY: forwarded caller contract.
-    unsafe { output(out) }.map(Some)
+    let out = unsafe { output(out) }?;
+    Ok(Some((out, table::reserve().map_err(Failure::from)?)))
 }
 
 macro_rules! destroy_functions {
@@ -856,7 +856,8 @@ pub unsafe extern "C" fn xs_sign(
             return Err(wrong());
         };
         let decided = with_document(document, |document| signer.sign(document))?;
-        audit_out(audit, &decided)
+        audit_out(audit, &decided);
+        Ok(())
     })
 }
 
@@ -915,6 +916,11 @@ pub unsafe extern "C" fn xs_verify(
         // SAFETY: the caller's contract for `out` and `request`.
         let (out, request) = unsafe { (output(out)?, optional(request)?) };
         let request = request.ok_or_else(|| Failure::new(XS_INVALID_ARGUMENT, "null request"))?;
+        let verifier = take(verifier.value, Kind::Verifier)?;
+        let Object::Verifier(verifier) = verifier.object() else {
+            return Err(wrong());
+        };
+        verifier.check_target_count(request.expected_target_count)?;
         let entries = if request.expected_target_count == 0 {
             &[][..]
         } else {
@@ -946,15 +952,13 @@ pub unsafe extern "C" fn xs_verify(
             .map(|id| unsafe { text(*id) })
             .collect::<Result<Vec<_>, _>>()?;
         let requirement = objects::requirement(request.requirement, request.count)?;
-        let verifier = take(verifier.value, Kind::Verifier)?;
-        let Object::Verifier(verifier) = verifier.object() else {
-            return Err(wrong());
-        };
+        let slot = table::reserve().map_err(Failure::from)?;
         let evidence = with_document(document, |document| {
             verifier.verify(document, &ids, requirement)
         })?;
-        let value = insert(Object::Evidence(evidence))?;
-        out.write(XsEvidence { value });
+        out.write(XsEvidence {
+            value: slot.publish(Object::Evidence(evidence)),
+        });
         Ok(())
     })
 }
@@ -1017,7 +1021,8 @@ pub unsafe extern "C" fn xs_encrypt(
             return Err(wrong());
         };
         let decided = with_document(document, |document| encryptor.encrypt(document, id))?;
-        audit_out(audit, &decided)
+        audit_out(audit, &decided);
+        Ok(())
     })
 }
 
@@ -1075,7 +1080,8 @@ pub unsafe extern "C" fn xs_decrypt(
             return Err(wrong());
         };
         let decided = with_document(document, |document| decryptor.decrypt(document, id))?;
-        audit_out(audit, &decided)
+        audit_out(audit, &decided);
+        Ok(())
     })
 }
 

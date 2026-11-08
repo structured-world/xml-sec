@@ -65,6 +65,22 @@ fn a_forged_type_tag_cannot_reach_or_destroy_another_object() {
 }
 
 #[test]
+fn an_unpublished_reservation_returns_its_slot() {
+    // A call refused after holding a slot for its output does not leak the
+    // slot, and the next object reuses it under a newer generation.
+    let held = super::reserve().unwrap();
+    drop(held);
+    let first = insert(error_object()).unwrap();
+    destroy(first, Kind::Error).unwrap();
+    let held = super::reserve().unwrap();
+    let second = held.publish(error_object());
+    assert_eq!(second >> 32, first >> 32);
+    assert_ne!(second, first);
+    assert_eq!(use_handle(first, Kind::Error).err(), Some(XS_STALE_HANDLE));
+    destroy(second, Kind::Error).unwrap();
+}
+
+#[test]
 fn an_object_in_use_cannot_be_destroyed() {
     // A running call keeps its object; destroying it meanwhile reports busy
     // and leaves the handle valid.

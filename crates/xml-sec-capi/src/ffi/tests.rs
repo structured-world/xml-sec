@@ -1,15 +1,18 @@
 use super::{
-    XsBytes, XsCompileContext, XsDocument, XsError, XsKeys, XsPolicy, XsPolicyStore, XsProvider,
-    contain, keys as hold_keys, policy as hold_policy, provider as hold_provider,
-    xs_document_parse, xs_error_destroy, xs_error_message, xs_error_policy_violation,
-    xs_error_status, xs_keys_add_symmetric, xs_keys_destroy, xs_keys_new, xs_policy_destroy,
+    XsAudit, XsBytes, XsCompileContext, XsDocument, XsError, XsEvidence, XsKeys, XsPolicy,
+    XsPolicyStore, XsProvider, XsSigner, XsVerifier, XsVerifyRequest, contain, keys as hold_keys,
+    policy as hold_policy, provider as hold_provider, xs_audit_destroy, xs_buffer_free,
+    xs_document_destroy, xs_document_parse, xs_document_serialize, xs_error_destroy,
+    xs_error_message, xs_error_policy_violation, xs_error_status, xs_keys_add_private_pem,
+    xs_keys_add_public_pem, xs_keys_add_symmetric, xs_keys_destroy, xs_keys_new, xs_policy_destroy,
     xs_policy_store_destroy, xs_policy_store_load, xs_policy_store_new, xs_provider_destroy,
-    xs_provider_new_rustcrypto,
+    xs_provider_new_rustcrypto, xs_sign, xs_signer_destroy, xs_signer_new, xs_verifier_destroy,
+    xs_verifier_new, xs_verify,
 };
 use crate::objects::Failure;
 use crate::status::{
-    XS_BUSY, XS_CONFIGURATION, XS_DOCUMENT, XS_INTERNAL, XS_INVALID_ARGUMENT, XS_OK, XS_POLICY,
-    XsStatus,
+    XS_BUSY, XS_CONFIGURATION, XS_DOCUMENT, XS_HANDLE_LIMIT, XS_INTERNAL, XS_INVALID_ARGUMENT,
+    XS_OK, XS_POLICY, XS_VERIFICATION, XsStatus,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
@@ -252,6 +255,7 @@ fn input_beyond_a_policy_limit_is_refused_before_it_is_copied() {
     let (handles, keys) = keys_under("max_external_resource_bytes = 64");
     let key = vec![7_u8; 1 << 20];
     let large = format!("<a>{}</a>", "x".repeat(1 << 20));
+    let name = "n".repeat(1 << 20);
     let parse_handles = policy_from(&format!(
         "{MODERN}[profiles.app.verification.resources]\nmax_xml_document_bytes = 64\n"
     ));
@@ -286,10 +290,198 @@ fn input_beyond_a_policy_limit_is_refused_before_it_is_copied() {
     };
     assert_eq!(status, XS_POLICY);
     assert_eq!(take_error(error).0, XS_POLICY);
+    // A key name past the ceiling, through each of the three imports.
+    // SAFETY: as above.
+    let statuses = unsafe {
+        [
+            xs_keys_add_symmetric(
+                keys,
+                bytes(&name),
+                1,
+                bytes("0123456789abcdef"),
+                1,
+                &raw mut error,
+            ),
+            xs_keys_add_private_pem(
+                keys,
+                bytes(&name),
+                bytes("pem"),
+                bytes(""),
+                1,
+                &raw mut error,
+            ),
+            xs_keys_add_public_pem(keys, bytes(&name), bytes("pem"), 2, &raw mut error),
+        ]
+    };
+    assert_eq!(statuses, [XS_POLICY; 3]);
+    assert_eq!(take_error(error).0, XS_POLICY);
     assert!(LARGEST.load(Ordering::Relaxed) < 1 << 20);
     assert_eq!(xs_keys_destroy(keys), XS_OK);
     release(handles);
     release(parse_handles);
+}
+
+const TEMPLATE: &str = concat!(
+    "<root><p Id=\"payload\">signed</p>",
+    "<ds:Signature xmlns:ds=\"http://www.w3.org/2000/09/xmldsig#\"><ds:SignedInfo>",
+    "<ds:CanonicalizationMethod Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>",
+    "<ds:SignatureMethod Algorithm=\"http://www.w3.org/2001/04/xmldsig-more#rsa-sha256\"/>",
+    "<ds:Reference URI=\"#payload\"><ds:Transforms>",
+    "<ds:Transform Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/></ds:Transforms>",
+    "<ds:DigestMethod Algorithm=\"http://www.w3.org/2001/04/xmlenc#sha256\"/>",
+    "<ds:DigestValue></ds:DigestValue></ds:Reference></ds:SignedInfo>",
+    "<ds:SignatureValue></ds:SignatureValue></ds:Signature></root>"
+);
+
+/// The document's current XML.
+fn serialized(document: XsDocument) -> String {
+    let mut buffer = MaybeUninit::uninit();
+    // SAFETY: the output is a live local; the buffer is copied, then released
+    // once with the library that allocated it.
+    unsafe {
+        assert_eq!(
+            xs_document_serialize(document, buffer.as_mut_ptr(), std::ptr::null_mut()),
+            XS_OK
+        );
+        let buffer = buffer.assume_init();
+        let xml = String::from_utf8(std::slice::from_raw_parts(buffer.ptr, buffer.len).to_vec());
+        xs_buffer_free(buffer);
+        xml.unwrap()
+    }
+}
+
+#[test]
+fn an_audit_that_cannot_be_published_leaves_the_document_unchanged() {
+    // The audit handle's slot is held before the document changes: a full
+    // table refuses the call and keeps the document's generation, so a retry
+    // cannot sign an already signed document.
+    let handles = policy();
+    let key = include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let (mut keys, mut signer, mut document) = (
+        XsKeys::default(),
+        XsSigner::default(),
+        XsDocument::default(),
+    );
+    // SAFETY: every pointer names a live local or a live string.
+    unsafe {
+        assert_eq!(
+            xs_keys_new(handles.2, 2, &raw mut keys, std::ptr::null_mut()),
+            XS_OK
+        );
+        assert_eq!(
+            xs_keys_add_private_pem(
+                keys,
+                bytes("signer"),
+                bytes(key),
+                bytes(""),
+                1,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_signer_new(
+                handles.2,
+                handles.0,
+                keys,
+                bytes("signer"),
+                bytes("http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"),
+                &raw mut signer,
+                std::ptr::null_mut(),
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                2,
+                bytes(TEMPLATE),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+    }
+    crate::table::EXHAUSTED.store(true, Ordering::Relaxed);
+    let mut audit = XsAudit::default();
+    // SAFETY: the outputs are live locals.
+    let status = unsafe { xs_sign(signer, document, &raw mut audit, std::ptr::null_mut()) };
+    crate::table::EXHAUSTED.store(false, Ordering::Relaxed);
+    assert_eq!(status, XS_HANDLE_LIMIT);
+    assert_eq!(audit.value, 0);
+    assert_eq!(serialized(document), TEMPLATE);
+    // With a slot available the same call signs and reports its audit.
+    // SAFETY: as above.
+    let status = unsafe { xs_sign(signer, document, &raw mut audit, std::ptr::null_mut()) };
+    assert_eq!(status, XS_OK);
+    assert_ne!(serialized(document), TEMPLATE);
+    assert_eq!(xs_audit_destroy(audit), XS_OK);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_signer_destroy(signer), XS_OK);
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    release(handles);
+}
+
+#[test]
+fn a_request_for_more_targets_than_the_policy_admits_is_refused_before_lookup() {
+    // Each expected ID is a scan of the document: a request over the
+    // compiled reference ceiling is refused before any of them is resolved,
+    // so its IDs, here none of them present, are never looked up.
+    let handles = policy_from(&format!(
+        "{MODERN}[profiles.app.verification.resources]\nmax_references = 2\n"
+    ));
+    let (mut verifier, mut document) = (XsVerifier::default(), XsDocument::default());
+    let ids = [bytes("a"), bytes("b"), bytes("c")];
+    let request = XsVerifyRequest {
+        expected_target_ids: ids.as_ptr(),
+        expected_target_count: ids.len(),
+        requirement: 0,
+        count: 0,
+    };
+    let mut evidence = XsEvidence::default();
+    let mut error = XsError::default();
+    // SAFETY: every pointer names a live local, array or string.
+    let status = unsafe {
+        assert_eq!(
+            xs_verifier_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                &raw mut verifier,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                1,
+                bytes("<root/>"),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_verify(
+            verifier,
+            document,
+            &raw const request,
+            &raw mut evidence,
+            &raw mut error,
+        )
+    };
+    let (_, message) = take_error(error);
+    assert_eq!(
+        (status, message.as_str()),
+        (
+            XS_VERIFICATION,
+            "invalid verification request: too many expected coverage targets"
+        )
+    );
+    assert_eq!(evidence.value, 0);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_verifier_destroy(verifier), XS_OK);
+    release(handles);
 }
 
 #[test]

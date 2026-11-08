@@ -1369,12 +1369,8 @@ fn xmlsec1_decrypts_rsa_recipient_imported_by_key_inventory() {
     let private_path = Path::new(fixture_name!("tests/fixtures/keys/rsa/rsa-2048-key.pem"));
     let public_pem = fs::read(public_path).expect("public-key fixture must load");
     let mut keys = KeyInventory::default();
-    keys.add_public_pem(
-        "inventory-rsa".into(),
-        &public_pem,
-        &ResourcePolicy::default(),
-    )
-    .expect("named public key must import");
+    keys.add_public_pem("inventory-rsa", &public_pem, &ResourcePolicy::default())
+        .expect("named public key must import");
     let public = keys
         .rsa_encryption_key(
             "inventory-rsa",

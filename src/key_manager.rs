@@ -1449,22 +1449,23 @@ impl KeyInventory {
     pub fn verification_resolver(&self) -> InventoryVerificationResolver<'_> {
         InventoryVerificationResolver { inventory: self }
     }
-    /// Register raw symmetric bytes under a unique name. Borrowed bytes are
-    /// copied only once every check has accepted them.
+    /// Register raw symmetric bytes under a unique name. A borrowed name and
+    /// borrowed bytes are copied only once the checks on them have passed.
     ///
     /// # Errors
     /// Returns invalid policy, duplicate names, resource exhaustion, invalid
     /// family-specific key widths or incompatible/empty usage permissions.
     pub fn add_symmetric<B: AsRef<[u8]> + Into<Vec<u8>>>(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         kind: SymmetricKeyKind,
         key: B,
         usages: KeyUsages,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         let bytes = key.as_ref();
-        self.check_new_name(&name, resources)?;
+        self.check_new_name(name.as_ref(), resources)?;
+        let name = name.into();
         if bytes.len() > resources.max_external_resource_bytes {
             return Err(import_resource_limit(
                 crate::policy::resource_name::EXTERNAL_RESOURCE_BYTES,
@@ -1687,7 +1688,7 @@ impl KeyInventory {
     /// unsupported key material or failure decoding/normalizing the public key.
     pub fn add_public_pem(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
@@ -1701,7 +1702,7 @@ impl KeyInventory {
     /// including usage permissions incompatible with the key family.
     pub fn add_public_pem_with_usages(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         usages: KeyUsages,
         resources: &ResourcePolicy,
@@ -1711,13 +1712,14 @@ impl KeyInventory {
 
     fn add_public_pem_inner(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         usages: Option<KeyUsages>,
         resources: &ResourcePolicy,
     ) -> Result<(), KeyStoreError> {
         ensure_resource_policy(resources)?;
-        self.check_new_name(&name, resources)?;
+        self.check_new_name(name.as_ref(), resources)?;
+        let name = name.into();
         self.check_material_capacity(named_material_length(&name, bytes.len(), 2)?, resources)?;
         let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
         if !matches!(block.label, "PUBLIC KEY" | "RSA PUBLIC KEY") {
@@ -2036,7 +2038,7 @@ impl KeyInventory {
     /// usage refusal, required-password/decryption failure or KDF-budget exhaustion.
     pub fn add_private_pem(
         &mut self,
-        name: String,
+        name: impl AsRef<str> + Into<String>,
         bytes: &[u8],
         password: Option<&[u8]>,
         usages: KeyUsages,
@@ -2049,7 +2051,8 @@ impl KeyInventory {
         }
 
         ensure_resource_policy(resources)?;
-        self.check_new_name(&name, resources)?;
+        self.check_new_name(name.as_ref(), resources)?;
+        let name = name.into();
         self.check_material_capacity(named_material_length(&name, bytes.len(), 1)?, resources)?;
         let block = BorrowedPem::parse(bytes, resources.max_external_resource_bytes)?;
         validate_private_key_usages(usages)?;

@@ -920,7 +920,7 @@ fn donor_key_containers(algorithm: xml_sec::xmldsig::SignatureAlgorithm, family:
                 )
             } else if suffix.ends_with("pem") {
                 inventory.add_private_pem(
-                    "key".into(),
+                    "key",
                     &bytes,
                     protected.then_some(password.as_bytes()),
                     KeyUsages::SIGN,

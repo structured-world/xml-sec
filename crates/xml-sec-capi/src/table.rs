@@ -75,33 +75,81 @@ fn decode(handle: u64) -> (u8, usize, u32) {
 
 /// Publish `object` and return its handle.
 pub(crate) fn insert(object: Object) -> Result<u64, XsStatus> {
-    let kind = object.kind();
-    let entry = Arc::new(Entry {
-        active: AtomicUsize::new(0),
-        object,
-    });
+    Ok(reserve()?.publish(object))
+}
+
+/// A slot held for an object a call publishes only once its work has
+/// committed, so that publication cannot fail after the work. Dropped
+/// unpublished, it releases the slot.
+pub(crate) struct Reservation(Option<u32>);
+
+/// Hold a slot for one later object.
+pub(crate) fn reserve() -> Result<Reservation, XsStatus> {
+    #[cfg(test)]
+    if EXHAUSTED.load(Ordering::Relaxed) {
+        return Err(XS_HANDLE_LIMIT);
+    }
     let mut table = TABLE.lock();
     if let Some(index) = table.free.pop() {
         let slot = &mut table.slots[usize::try_from(index).expect("slot indexes fit usize")];
         // A destroyed slot keeps its generation until reuse, so a handle to
         // the destroyed object reports destroyed, not stale. Cannot overflow:
-        // `destroy` retires a slot at `u32::MAX` instead of freeing it.
+        // a slot is retired at `u32::MAX` instead of freed.
         slot.generation += 1;
-        slot.kind = kind;
-        slot.entry = Some(entry);
-        return Ok(encode(kind, index, slot.generation));
+        return Ok(Reservation(Some(index)));
     }
     if table.slots.len() >= MAX_SLOTS {
         return Err(XS_HANDLE_LIMIT);
     }
     let index = u32::try_from(table.slots.len()).expect("fewer than 2^24 slots");
+    // No handle names generation 0 of this slot until it is published, so the
+    // kind recorded meanwhile is never trusted.
     table.slots.push(Slot {
         generation: 0,
-        kind,
-        entry: Some(entry),
+        kind: Kind::Error,
+        entry: None,
     });
-    Ok(encode(kind, index, 0))
+    Ok(Reservation(Some(index)))
 }
+
+impl Reservation {
+    /// Publish `object` in the held slot and return its handle.
+    pub(crate) fn publish(mut self, object: Object) -> u64 {
+        let index = self.0.take().expect("a reservation publishes once");
+        let kind = object.kind();
+        let entry = Arc::new(Entry {
+            active: AtomicUsize::new(0),
+            object,
+        });
+        let mut table = TABLE.lock();
+        let slot = &mut table.slots[usize::try_from(index).expect("slot indexes fit usize")];
+        slot.kind = kind;
+        slot.entry = Some(entry);
+        encode(kind, index, slot.generation)
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if let Some(index) = self.0.take() {
+            let mut table = TABLE.lock();
+            release(&mut table, index);
+        }
+    }
+}
+
+/// Return an empty slot for reuse, or retire it once its generation is
+/// exhausted, so no later handle can match an old one.
+fn release(table: &mut Table, index: u32) {
+    if table.slots[usize::try_from(index).expect("slot indexes fit usize")].generation != u32::MAX {
+        table.free.push(index);
+    }
+}
+
+/// Makes every reservation fail as a full table would.
+#[cfg(test)]
+pub(crate) static EXHAUSTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// A call's use of one object; destroying the object meanwhile reports busy.
 pub(crate) struct InUse(Arc<Entry>);
@@ -161,15 +209,11 @@ pub(crate) fn destroy(handle: u64, kind: Kind) -> Result<(), XsStatus> {
             }
             decode(handle).1
         };
-        let slot = &mut table.slots[index];
-        let released = slot.entry.take();
-        // A slot whose generation is exhausted is retired, never reused, so
-        // no later handle can match an old one.
-        if slot.generation != u32::MAX {
-            table
-                .free
-                .push(u32::try_from(index).expect("slot indexes fit u32"));
-        }
+        let released = table.slots[index].entry.take();
+        release(
+            &mut table,
+            u32::try_from(index).expect("slot indexes fit u32"),
+        );
         released
     };
     // The object is released outside the lock.

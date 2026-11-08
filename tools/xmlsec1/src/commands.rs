@@ -5794,7 +5794,7 @@ fn select_encapsulation_key<P: xml_sec::document::XmlDocumentPolicy>(
             let mut store = KeyInventory::default();
             if option.name == "pubkey-pem" {
                 store.add_public_pem_with_usages(
-                    "recipient".into(),
+                    "recipient",
                     &bytes,
                     key_manager::KeyUsages::ENCRYPT,
                     resources,

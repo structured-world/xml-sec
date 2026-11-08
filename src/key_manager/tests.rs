@@ -257,7 +257,7 @@ fn pkcs12_temporary_memory_shares_existing_inventory_budget() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "hmac".into(),
+            "hmac",
             SymmetricKeyKind::Hmac,
             vec![1; 2000],
             KeyUsages::SIGN,
@@ -326,7 +326,7 @@ fn stored_signing_keys_obey_operation_material_limits() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "hmac".into(),
+            "hmac",
             SymmetricKeyKind::Hmac,
             b"0123456789abcdef0123456789abcdef".to_vec(),
             KeyUsages::SIGN,
@@ -335,7 +335,7 @@ fn stored_signing_keys_obey_operation_material_limits() {
         .expect("HMAC imports");
     inventory
         .add_private_pem(
-            "rsa".into(),
+            "rsa",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
             None,
             KeyUsages::SIGN,
@@ -391,7 +391,7 @@ fn named_signing_lookup_obeys_active_candidate_budget() {
     for name in ["first", "second"] {
         inventory
             .add_symmetric(
-                name.into(),
+                name,
                 SymmetricKeyKind::Hmac,
                 vec![0x42; 32],
                 KeyUsages::SIGN,
@@ -426,7 +426,7 @@ fn named_decryption_lookup_shares_candidate_budget_across_key_kinds() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "aes".into(),
+            "aes",
             SymmetricKeyKind::Aes,
             vec![0x42; 32],
             KeyUsages::DECRYPT,
@@ -435,7 +435,7 @@ fn named_decryption_lookup_shares_candidate_budget_across_key_kinds() {
         .expect("AES imports");
     inventory
         .add_private_pem(
-            "rsa".into(),
+            "rsa",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
             None,
             KeyUsages::DECRYPT,
@@ -491,7 +491,7 @@ fn pkcs12_temporary_budget_excludes_live_input() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "old".into(),
+            "old",
             SymmetricKeyKind::Hmac,
             vec![7; 32],
             KeyUsages::SIGN,
@@ -943,7 +943,7 @@ fn aes_imports_require_supported_key_widths() {
         assert!(
             inventory
                 .add_symmetric(
-                    "aes".into(),
+                    "aes",
                     SymmetricKeyKind::Aes,
                     vec![0; length],
                     KeyUsages::ENCRYPT,
@@ -968,7 +968,7 @@ fn aes_imports_require_supported_key_widths() {
         let mut inventory = KeyInventory::default();
         inventory
             .add_symmetric(
-                "aes".into(),
+                "aes",
                 SymmetricKeyKind::Aes,
                 vec![0; length],
                 KeyUsages::ENCRYPT,
@@ -987,7 +987,7 @@ fn unsupported_des_material_is_not_authorized() {
     assert!(
         inventory
             .add_symmetric(
-                "des".into(),
+                "des",
                 SymmetricKeyKind::Des,
                 vec![0x42; 8],
                 KeyUsages::ENCRYPT,
@@ -1184,7 +1184,7 @@ fn xml_store_import_limits_preserve_policy_errors() {
     };
     assert!(matches!(
         inventory.add_symmetric(
-            "key".into(),
+            "key",
             SymmetricKeyKind::Hmac,
             vec![7; 32],
             KeyUsages::SIGN,
@@ -1272,12 +1272,12 @@ fn ec_public_key_cannot_authorize_encryption() {
     let cert = include_bytes!("../../tests/fixtures/keys/ec/ec-prime256v1-cert.pem");
     let mut store = KeyInventory::default();
     store
-        .add_public_pem("ec".into(), ec, &resources)
+        .add_public_pem("ec", ec, &resources)
         .expect("EC public key imports");
     assert_eq!(store.public_keys()[0].usages, KeyUsages::VERIFY);
     assert!(
         store
-            .add_public_pem_with_usages("ec-encrypt".into(), ec, KeyUsages::ENCRYPT, &resources)
+            .add_public_pem_with_usages("ec-encrypt", ec, KeyUsages::ENCRYPT, &resources)
             .is_err()
     );
     let cert_der = pem::parse(cert)
@@ -1318,7 +1318,7 @@ fn xml_store_rejects_policy_above_absolute_ceiling() {
     assert!(
         KeyInventory::default()
             .add_symmetric(
-                "key".into(),
+                "key",
                 SymmetricKeyKind::Hmac,
                 b"secret".to_vec(),
                 KeyUsages::SIGN,
@@ -1335,7 +1335,7 @@ fn ec_private_key_cannot_advertise_rsa_decryption() {
     assert!(
         KeyInventory::default()
             .add_private_pem(
-                "ec".into(),
+                "ec",
                 pem,
                 None,
                 KeyUsages::DECRYPT,
@@ -1389,17 +1389,17 @@ fn rejects_unknown_pem_text_and_duplicate_names() {
     let mut inventory = KeyInventory::default();
     let resources = ResourcePolicy::default();
     inventory
-        .add_public_pem("first".into(), public, &resources)
+        .add_public_pem("first", public, &resources)
         .expect("public PEM imports");
     assert!(matches!(
-        inventory.add_public_pem("first".into(), public, &resources),
+        inventory.add_public_pem("first", public, &resources),
         Err(KeyStoreError::Selection("duplicate key name"))
     ));
     let mut trailing = public.to_vec();
     trailing.extend_from_slice(b"\nnot a key");
     assert!(
         inventory
-            .add_public_pem("other".into(), &trailing, &resources)
+            .add_public_pem("other", &trailing, &resources)
             .is_err()
     );
 }
@@ -1417,7 +1417,7 @@ fn public_pem_label_rejects_certificate_payload() {
     for usages in [None, Some(KeyUsages::VERIFY)] {
         let mut inventory = KeyInventory::default();
         assert!(matches!(
-            inventory.add_public_pem_inner("key".into(), mislabeled.as_bytes(), usages, &resources),
+            inventory.add_public_pem_inner("key", mislabeled.as_bytes(), usages, &resources),
             Err(KeyStoreError::Selection("invalid PUBLIC KEY payload"))
         ));
         assert!(inventory.public_keys().is_empty());
@@ -1427,7 +1427,7 @@ fn public_pem_label_rejects_certificate_payload() {
         .expect("generic DER intentionally accepts certificates");
     KeyInventory::default()
         .add_public_pem(
-            "spki".into(),
+            "spki",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
             &resources,
         )
@@ -1470,7 +1470,7 @@ fn rsa_public_pkcs1_pem_is_bounded_before_bigint_decode() {
     ));
     assert!(matches!(
         KeyInventory::default().add_public_pem(
-            "oversized".into(),
+            "oversized",
             pem.as_bytes(),
             &ResourcePolicy::default(),
         ),
@@ -1535,7 +1535,7 @@ fn private_pem_label_cannot_enable_der_fallback() {
         let mut inventory = KeyInventory::default();
         assert!(matches!(
             inventory.add_private_pem(
-                "key".into(),
+                "key",
                 mislabeled.as_bytes(),
                 password,
                 KeyUsages::SIGN,
@@ -1771,7 +1771,7 @@ fn certificate_and_crl_capacity_precedes_der_parsing() {
             };
             inventory
                 .add_symmetric(
-                    "a".into(),
+                    "a",
                     SymmetricKeyKind::Hmac,
                     vec![0],
                     KeyUsages::SIGN,
@@ -2090,13 +2090,7 @@ fn private_pem_preflight_precedes_payload_parsing() {
         };
         let mut store = KeyInventory::default();
         assert!(matches!(
-            store.add_private_pem(
-                "key".into(),
-                pem.as_bytes(),
-                None,
-                KeyUsages::SIGN,
-                &resources
-            ),
+            store.add_private_pem("key", pem.as_bytes(), None, KeyUsages::SIGN, &resources),
             Err(KeyStoreError::Policy(_))
         ));
         assert_eq!(store.entry_count(), 0);
@@ -2205,7 +2199,7 @@ fn public_pem_import_accounts_for_simultaneous_buffers() {
             let mut inventory = KeyInventory::default();
             inventory
                 .add_symmetric(
-                    "existing".into(),
+                    "existing",
                     SymmetricKeyKind::Hmac,
                     vec![1; 16],
                     KeyUsages::SIGN,
@@ -2222,7 +2216,7 @@ fn public_pem_import_accounts_for_simultaneous_buffers() {
                     - usize::from(!exact),
                 ..ResourcePolicy::default()
             };
-            let result = inventory.add_public_pem("new".into(), encoded.as_bytes(), &resources);
+            let result = inventory.add_public_pem("new", encoded.as_bytes(), &resources);
             if exact {
                 result.expect("exact peak allowance");
                 assert_eq!(inventory.entry_count(), 2);
@@ -2263,7 +2257,7 @@ fn plaintext_private_import_checks_all_live_copies() {
                 let mut inventory = KeyInventory::default();
                 let result = if encoded {
                     inventory.add_private_pem(
-                        "new".into(),
+                        "new",
                         pem.as_bytes(),
                         None,
                         KeyUsages::SIGN,
@@ -2393,7 +2387,7 @@ fn encrypted_pem_workspace_accounts_for_live_encoded_input() {
         ..ResourcePolicy::default()
     };
     assert!(matches!(
-        inventory.add_private_pem("new".into(), pem.as_bytes(), None, KeyUsages::SIGN, &tight),
+        inventory.add_private_pem("new", pem.as_bytes(), None, KeyUsages::SIGN, &tight),
         Err(KeyStoreError::Policy(crate::policy::PolicyViolation::ResourceLimit {
             resource: crate::policy::resource_name::AGGREGATE_EXTERNAL_RESOURCE_BYTES,
             actual, ..
@@ -2404,7 +2398,7 @@ fn encrypted_pem_workspace_accounts_for_live_encoded_input() {
         ..tight
     };
     assert!(matches!(
-        inventory.add_private_pem("new".into(), pem.as_bytes(), None, KeyUsages::SIGN, &exact),
+        inventory.add_private_pem("new", pem.as_bytes(), None, KeyUsages::SIGN, &exact),
         Err(KeyStoreError::ProtectedContainer)
     ));
     assert!(matches!(
@@ -2442,7 +2436,7 @@ fn encrypted_pem_workspace_accounts_for_live_encoded_input() {
     };
     inventory
         .add_private_pem(
-            "new".into(),
+            "new",
             pem.as_bytes(),
             Some(b"correct"),
             KeyUsages::SIGN,
@@ -2475,7 +2469,7 @@ fn pkcs8_scrypt_workspace_shares_retained_inventory_budget() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "old".into(),
+            "old",
             SymmetricKeyKind::Hmac,
             vec![7; 1024],
             KeyUsages::SIGN,
@@ -2731,7 +2725,7 @@ fn named_hmac_resolution_enforces_usage_and_method() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "verify".into(),
+            "verify",
             SymmetricKeyKind::Hmac,
             b"sufficiently-long-hmac-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -2740,7 +2734,7 @@ fn named_hmac_resolution_enforces_usage_and_method() {
         .expect("verification HMAC imports");
     inventory
         .add_symmetric(
-            "sign-only".into(),
+            "sign-only",
             SymmetricKeyKind::Hmac,
             b"another-hmac-secret".to_vec(),
             KeyUsages::SIGN,
@@ -2777,7 +2771,7 @@ fn named_hmac_resolution_rejects_invalid_policy_snapshot() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "verify".into(),
+            "verify",
             SymmetricKeyKind::Hmac,
             b"sufficiently-long-hmac-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -2809,7 +2803,7 @@ fn named_hmac_resolution_uses_active_resource_limits() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "verify".into(),
+            "verify",
             SymmetricKeyKind::Hmac,
             secret.to_vec(),
             KeyUsages::VERIFY,
@@ -2859,7 +2853,7 @@ fn one_named_verification_entry_fits_one_candidate() {
     let mut policy = crate::policy::VerificationPolicy::default();
     inventory
         .add_symmetric(
-            "only".into(),
+            "only",
             SymmetricKeyKind::Hmac,
             b"sufficiently-long-hmac-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -2904,14 +2898,14 @@ fn pem_imports_charge_encoded_input_to_aggregate_budget() {
         let import = |inventory: &mut KeyInventory, name: &str| {
             if is_private {
                 inventory.add_private_pem(
-                    name.into(),
+                    name,
                     padded.as_bytes(),
                     None,
                     KeyUsages::SIGN,
                     &resources,
                 )
             } else {
-                inventory.add_public_pem(name.into(), padded.as_bytes(), &resources)
+                inventory.add_public_pem(name, padded.as_bytes(), &resources)
             }
         };
         import(&mut inventory, "first").expect("first PEM import fits");
@@ -2938,7 +2932,7 @@ fn repeated_key_name_selects_one_inventory_entry() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "secret".into(),
+            "secret",
             SymmetricKeyKind::Hmac,
             b"sufficiently-long-hmac-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -2947,7 +2941,7 @@ fn repeated_key_name_selects_one_inventory_entry() {
         .expect("HMAC key imports");
     inventory
         .add_symmetric(
-            "other-secret".into(),
+            "other-secret",
             SymmetricKeyKind::Hmac,
             b"another-long-hmac-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -2956,7 +2950,7 @@ fn repeated_key_name_selects_one_inventory_entry() {
         .expect("second HMAC key imports");
     inventory
         .add_public_pem(
-            "public".into(),
+            "public",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
             &resources,
         )
@@ -2995,7 +2989,7 @@ fn named_lookup_charges_inspected_inventory_entries() {
     for name in ["first", "second"] {
         inventory
             .add_symmetric(
-                name.into(),
+                name,
                 SymmetricKeyKind::Hmac,
                 b"sufficiently-long-hmac-secret".to_vec(),
                 KeyUsages::VERIFY,
@@ -3036,7 +3030,7 @@ fn private_import_rejects_public_only_usage() {
     assert!(
         inventory
             .add_private_pem(
-                "wrong-use".into(),
+                "wrong-use",
                 private,
                 None,
                 KeyUsages::SIGN.union(KeyUsages::VERIFY),
@@ -3426,7 +3420,7 @@ fn hmac_resolution_does_not_load_unrelated_certificate_material() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "hmac".into(),
+            "hmac",
             SymmetricKeyKind::Hmac,
             b"secret".to_vec(),
             KeyUsages::VERIFY,
@@ -3477,7 +3471,7 @@ fn named_key_resolution_obeys_source_policy() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "blocked-name".into(),
+            "blocked-name",
             SymmetricKeyKind::Hmac,
             b"policy-guarded-hmac-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -3856,7 +3850,7 @@ fn named_key_does_not_bypass_other_source_permissions() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "named".into(),
+            "named",
             SymmetricKeyKind::Hmac,
             b"verification-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -3897,7 +3891,7 @@ fn named_public_key_is_trusted_inventory_material() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_public_pem(
-            "named".into(),
+            "named",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
             &ResourcePolicy::default(),
         )
@@ -3936,7 +3930,7 @@ fn named_public_key_obeys_current_verification_limits() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_public_pem(
-            "named".into(),
+            "named",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
             &ResourcePolicy::default(),
         )
@@ -4014,7 +4008,7 @@ fn public_import_rejects_incompatible_usage() {
     let mut inventory = KeyInventory::default();
     assert!(
         inventory
-            .add_public_pem_with_usages("invalid".into(), public, KeyUsages::SIGN, &resources,)
+            .add_public_pem_with_usages("invalid", public, KeyUsages::SIGN, &resources,)
             .is_err()
     );
     assert_eq!(inventory.entry_count(), 0);
@@ -4051,7 +4045,7 @@ fn imported_usage_restricts_operation_selection() {
     let bundle = include_bytes!("../../tests/fixtures/xmlenc/01-phaos-xmlenc-3/rsa-priv-key.p12");
     let mut inventory = KeyInventory::default();
     inventory
-        .add_public_pem_with_usages("verify".into(), public, KeyUsages::VERIFY, &resources)
+        .add_public_pem_with_usages("verify", public, KeyUsages::VERIFY, &resources)
         .expect("verification-only public key imports");
     assert!(
         inventory
@@ -4158,7 +4152,7 @@ fn selected_rsa_recipient_obeys_operation_modulus_policy() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_public_pem(
-            "rsa".into(),
+            "rsa",
             include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
             &ResourcePolicy::default(),
         )
@@ -4187,7 +4181,7 @@ fn inventory_merge_checks_names_and_budget_atomically() {
     let mut first = KeyInventory::default();
     first
         .add_symmetric(
-            "one".into(),
+            "one",
             SymmetricKeyKind::Hmac,
             b"first-secret".to_vec(),
             KeyUsages::SIGN,
@@ -4197,7 +4191,7 @@ fn inventory_merge_checks_names_and_budget_atomically() {
     let mut duplicate = KeyInventory::default();
     duplicate
         .add_symmetric(
-            "one".into(),
+            "one",
             SymmetricKeyKind::Hmac,
             b"second-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -4212,7 +4206,7 @@ fn inventory_merge_checks_names_and_budget_atomically() {
     let mut second = KeyInventory::default();
     second
         .add_symmetric(
-            "two".into(),
+            "two",
             SymmetricKeyKind::Hmac,
             b"second-secret".to_vec(),
             KeyUsages::VERIFY,
@@ -4469,7 +4463,7 @@ fn inventory_decryption_resolver_enforces_aes_usage_end_to_end() {
     let resources = ResourcePolicy::default();
     let mut keys = KeyInventory::default();
     keys.add_symmetric(
-        "decrypt".into(),
+        "decrypt",
         SymmetricKeyKind::Aes,
         key.to_vec(),
         KeyUsages::DECRYPT,
@@ -4490,7 +4484,7 @@ fn inventory_decryption_resolver_enforces_aes_usage_end_to_end() {
     let mut restricted = KeyInventory::default();
     restricted
         .add_symmetric(
-            "encrypt-only".into(),
+            "encrypt-only",
             SymmetricKeyKind::Aes,
             key.to_vec(),
             KeyUsages::ENCRYPT,
@@ -4513,7 +4507,7 @@ fn inventory_direct_aes_rechecks_execution_policy() {
     let mut inventory = KeyInventory::default();
     inventory
         .add_symmetric(
-            "aes".into(),
+            "aes",
             SymmetricKeyKind::Aes,
             vec![1; 16],
             KeyUsages::DECRYPT,
@@ -4564,7 +4558,7 @@ fn inventory_direct_aes_does_not_consume_recipient_candidates() {
     };
     let mut keys = KeyInventory::default();
     keys.add_symmetric(
-        "direct".into(),
+        "direct",
         SymmetricKeyKind::Aes,
         vec![1; 16],
         KeyUsages::DECRYPT,
@@ -4629,7 +4623,7 @@ fn decryption_selection_checks_operation_limits_before_material_use() {
     let resources = ResourcePolicy::default();
     let mut keys = KeyInventory::default();
     keys.add_symmetric(
-        "aes".into(),
+        "aes",
         SymmetricKeyKind::Aes,
         vec![0x31; 16],
         KeyUsages::DECRYPT,
@@ -4637,7 +4631,7 @@ fn decryption_selection_checks_operation_limits_before_material_use() {
     )
     .expect("AES key imports");
     keys.add_private_pem(
-        "rsa".into(),
+        "rsa",
         include_bytes!("../../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
         None,
         KeyUsages::DECRYPT,
