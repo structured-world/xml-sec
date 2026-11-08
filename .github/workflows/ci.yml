@@ -33,7 +33,7 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-deny@0.19.0
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
@@ -82,7 +82,8 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov@0.8.5,cargo-nextest
+          tool: cargo-llvm-cov@0.8.5
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: coverage
@@ -135,7 +136,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
@@ -197,7 +198,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
@@ -354,7 +355,7 @@ jobs:
           cargo clippy -p xml-sec-xades --lib --no-default-features
           --features xml-backend-roxmltree
           --target thumbv7em-none-eabihf -- -D warnings
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - name: Target coverage on the build without std
         run: |
           for backend in xmloxide roxmltree; do
@@ -400,7 +401,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - name: Provision all-feature token tests
         if: matrix.token
         uses: ./.github/actions/apt-packages
@@ -486,7 +487,7 @@ jobs:
           path: donors/libxslt
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary

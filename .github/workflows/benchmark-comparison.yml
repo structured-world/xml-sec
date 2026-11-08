@@ -42,7 +42,7 @@ jobs:
         uses: ./.github/actions/apt-packages
         with:
           packages: autoconf automake build-essential curl libltdl-dev libssl-dev libtool libxml2-dev libxslt1-dev perl pkg-config valgrind
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - name: Test metric interpretation
         run: cargo nextest run -p xml-sec-tools bench
       - name: Lint the in-process competitor harnesses

@@ -1,0 +1,24 @@
+name: Install cargo-nextest
+description: >-
+  Install the prebuilt, checksum-verified cargo-nextest release, or build it
+  from crates.io when the release download fails. GitHub's release storage
+  has refused the macOS archive with HTTP 504 for longer than the installer
+  retries, while crates.io is served separately; a job that gets nextest from
+  neither source fails.
+runs:
+  using: composite
+  steps:
+    # The failure is not ignored: the fallback below replaces the missing tool
+    # and the last step fails the job unless one of the two installed it.
+    - id: prebuilt
+      continue-on-error: true
+      uses: taiki-e/install-action@nextest
+    - name: Build cargo-nextest from crates.io
+      if: steps.prebuilt.outcome == 'failure'
+      shell: bash
+      run: |
+        cargo install --locked cargo-nextest
+    - name: Require cargo-nextest
+      shell: bash
+      run: |
+        cargo nextest --version
