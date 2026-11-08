@@ -12,6 +12,7 @@ use crate::operation::{
     OperationExecutionContext, OperationNodeId, OperationNodeKind, OperationPlanError,
     OperationStage,
 };
+use crate::policy::{Audited, PolicyAudit, PolicyDecision};
 use rsa::RsaPrivateKey;
 
 use super::parse::validate_encrypted_data_metadata;
@@ -693,12 +694,18 @@ pub struct DocumentDecryptionOptions<'a> {
 /// Immutable `XMLEnc` decryption operation context.
 pub struct DecryptContext<'a> {
     resolver: &'a dyn DecryptionKeyResolver,
-    policy: crate::policy::DecryptionPolicy,
+    // Shared with the compiled snapshot it came from.
+    policy: Arc<crate::policy::DecryptionPolicy>,
+    identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
     id_attributes: &'a [crate::IdAttributeRegistration],
     external_resources: Option<&'a std::collections::BTreeMap<String, Vec<u8>>>,
 }
+
+/// One decryption operation, sharing its policy snapshot.
+type DecryptionExecution =
+    OperationExecutionContext<Arc<crate::policy::DecryptionPolicy>, DecryptionOperationBudgets>;
 
 struct DecryptionPlanNodes {
     document: OperationNodeId,
@@ -715,8 +722,7 @@ struct DecryptionOperationBudgets {
 }
 
 struct DecryptionReferenceGate<'a> {
-    operation:
-        &'a OperationExecutionContext<crate::policy::DecryptionPolicy, DecryptionOperationBudgets>,
+    operation: &'a DecryptionExecution,
     document: OperationNodeId,
     ciphertext: OperationNodeId,
 }
@@ -729,6 +735,10 @@ impl super::cipher_reference::ReferenceOperationGate for DecryptionReferenceGate
     ) -> Result<Vec<u8>, XmlEncError> {
         self.operation
             .run_discovered_resource(self.document, self.ciphertext, identity, action)
+    }
+
+    fn record_reference(&self, uri: &str, transforms: &[crate::xmldsig::transforms::Transform]) {
+        record_cipher_reference(self.operation, uri, transforms);
     }
 }
 
@@ -744,10 +754,7 @@ impl DecryptionOperationBudgets {
 }
 
 fn compile_decryption_plan(
-    operation: &mut OperationExecutionContext<
-        crate::policy::DecryptionPolicy,
-        DecryptionOperationBudgets,
-    >,
+    operation: &mut DecryptionExecution,
     mutation: bool,
 ) -> Result<DecryptionPlanNodes, XmlEncError> {
     let document = operation.add_node(OperationNodeKind::Document, OperationStage::Parse, None);
@@ -792,8 +799,7 @@ fn compile_decryption_plan(
 
 struct ProcessedDecryption<T> {
     output: T,
-    operation:
-        OperationExecutionContext<crate::policy::DecryptionPolicy, DecryptionOperationBudgets>,
+    operation: DecryptionExecution,
     mutation: Option<OperationNodeId>,
 }
 
@@ -846,7 +852,8 @@ impl<'a> DecryptContext<'a> {
     pub fn new(resolver: &'a dyn DecryptionKeyResolver) -> Self {
         Self {
             resolver,
-            policy: crate::policy::DecryptionPolicy::default(),
+            policy: Arc::new(crate::policy::DecryptionPolicy::default()),
+            identity: None,
             provider: crate::provider::default_provider(),
             xml_backend: crate::XmlBackend::default(),
             id_attributes: &[],
@@ -857,7 +864,19 @@ impl<'a> DecryptContext<'a> {
     /// Replace the complete immutable decryption policy snapshot.
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::DecryptionPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Arc::new(policy);
+        self.identity = None;
+        self
+    }
+
+    /// Enforce a published snapshot as is and report its identity.
+    pub(crate) fn snapshot(
+        mut self,
+        policy: &Arc<crate::policy::DecryptionPolicy>,
+        identity: Option<&Arc<crate::policy::PolicyIdentity>>,
+    ) -> Self {
+        self.policy = Arc::clone(policy);
+        self.identity = identity.cloned();
         self
     }
 
@@ -902,7 +921,7 @@ impl<'a> DecryptContext<'a> {
     /// # Errors
     /// Returns an error for invalid XML or encryption metadata, policy/resource
     /// refusal, unavailable keys, failed authentication, or invalid plaintext.
-    pub fn decrypt(&self, xml: &str) -> Result<DecryptedContent, XmlEncError> {
+    pub fn decrypt(&self, xml: &str) -> Result<Audited<DecryptedContent>, XmlEncError> {
         let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
         self.process_decryption_input(
             DecryptionInput::Xml {
@@ -914,7 +933,7 @@ impl<'a> DecryptContext<'a> {
             budgets,
             |content, _| Ok(content),
         )
-        .map(|processed| processed.output)
+        .map(|processed| self.audited(processed))
     }
 
     /// Decrypt an already parsed `EncryptedData` value.
@@ -922,7 +941,10 @@ impl<'a> DecryptContext<'a> {
     /// # Errors
     /// Returns an error for invalid encryption metadata, policy/resource refusal,
     /// unavailable keys, provider failure, or failed content authentication.
-    pub fn decrypt_data(&self, encrypted: &EncryptedData) -> Result<DecryptedContent, XmlEncError> {
+    pub fn decrypt_data(
+        &self,
+        encrypted: &EncryptedData,
+    ) -> Result<Audited<DecryptedContent>, XmlEncError> {
         self.process_decryption_candidates(
             encrypted,
             None,
@@ -930,7 +952,15 @@ impl<'a> DecryptContext<'a> {
             DecryptionOperationBudgets::from_policy(&self.policy),
             |content, _| Ok(content),
         )
-        .map(|processed| processed.output)
+        .map(|processed| self.audited(processed))
+    }
+
+    /// A finished operation's output with its audit.
+    fn audited<T>(&self, processed: ProcessedDecryption<T>) -> Audited<T> {
+        Audited::new(
+            processed.output,
+            processed.operation.audit(self.identity.as_ref()),
+        )
     }
 
     fn process_decryption_candidates<T>(
@@ -955,10 +985,7 @@ impl<'a> DecryptContext<'a> {
         input: DecryptionInput<'input>,
         source_document: Option<(&crate::XmlDomDocument<'_>, Option<usize>)>,
         reference_context: &super::CipherReferenceContext<'_>,
-        operation: &OperationExecutionContext<
-            crate::policy::DecryptionPolicy,
-            DecryptionOperationBudgets,
-        >,
+        operation: &DecryptionExecution,
     ) -> Result<(Cow<'input, EncryptedData>, Vec<Option<crate::NodeId>>), XmlEncError> {
         match input {
             DecryptionInput::Xml { .. } | DecryptionInput::Document { .. } => {
@@ -976,7 +1003,7 @@ impl<'a> DecryptContext<'a> {
                 };
                 let (encrypted, origins) = super::parse::parse_encrypted_data_node_with_origins(
                     selected,
-                    operation.policy().into(),
+                    (&**operation.policy()).into(),
                     false,
                     self.id_attributes,
                     self.provider,
@@ -1035,10 +1062,7 @@ impl<'a> DecryptContext<'a> {
         algorithm: DataEncryptionAlgorithm,
         encrypted: &EncryptedData,
         ciphertext: &[u8],
-        operation: &OperationExecutionContext<
-            crate::policy::DecryptionPolicy,
-            DecryptionOperationBudgets,
-        >,
+        operation: &DecryptionExecution,
         accept: &mut impl FnMut(DecryptedContent, &XmlParseWorkBudget) -> Result<T, XmlEncError>,
     ) -> Result<T, XmlEncError> {
         let mut last_error = None;
@@ -1148,6 +1172,7 @@ impl<'a> DecryptContext<'a> {
                 &operation,
             )?;
             let algorithm = self.validate_decryption_metadata(&encrypted, operation.policy())?;
+            record_decryption_method(&operation, algorithm);
             let bound_references =
                 source_document.map(|(document, _)| reference_context.bind_document(document));
             let ciphertext = match (&encrypted.cipher_data, source_document) {
@@ -1194,8 +1219,7 @@ impl<'a> DecryptContext<'a> {
                 algorithm,
                 &encrypted,
                 self.resolver,
-                operation.policy(),
-                &mut operation.budgets().key_candidates.borrow_mut(),
+                &operation,
                 document,
             )
         })?;
@@ -1228,7 +1252,7 @@ impl<'a> DecryptContext<'a> {
         &self,
         xml: &str,
         encrypted_data_id: Option<&str>,
-    ) -> Result<String, XmlEncError> {
+    ) -> Result<Audited<String>, XmlEncError> {
         decrypt_document_with_context(
             xml,
             DocumentEncryptedDataSelector::EncryptedDataId(encrypted_data_id),
@@ -1236,7 +1260,8 @@ impl<'a> DecryptContext<'a> {
         )
     }
 
-    /// Decrypt and replace one selected `EncryptedData` in an owned document.
+    /// Decrypt and replace one selected `EncryptedData` in an owned document,
+    /// and return what the decryption policy decided.
     ///
     /// # Errors
     /// Returns an error for invalid selection or document policy, failed
@@ -1245,7 +1270,7 @@ impl<'a> DecryptContext<'a> {
         &self,
         document: &mut XmlDocument,
         encrypted_data_id: Option<&str>,
-    ) -> Result<(), XmlEncError> {
+    ) -> Result<PolicyAudit, XmlEncError> {
         let budgets = DecryptionOperationBudgets::from_policy(&self.policy);
         decrypt_owned_document_with_context(
             document,
@@ -1265,7 +1290,7 @@ impl<'a> DecryptContext<'a> {
         &self,
         xml: &str,
         start_node_id: Option<&str>,
-    ) -> Result<String, XmlEncError> {
+    ) -> Result<Audited<String>, XmlEncError> {
         decrypt_document_with_context(
             xml,
             DocumentEncryptedDataSelector::UniqueBelowStartNode(start_node_id),
@@ -1283,7 +1308,7 @@ impl<'a> DecryptContext<'a> {
         &self,
         xml: &str,
         start_node_id: Option<&str>,
-    ) -> Result<String, XmlEncError> {
+    ) -> Result<Audited<String>, XmlEncError> {
         decrypt_document_with_context(
             xml,
             DocumentEncryptedDataSelector::FirstBelowStartNode(start_node_id),
@@ -1866,7 +1891,7 @@ fn recover_rsa_oaep(
 pub fn decrypt(
     xml: &str,
     resolver: &dyn DecryptionKeyResolver,
-) -> Result<DecryptedContent, XmlEncError> {
+) -> Result<Audited<DecryptedContent>, XmlEncError> {
     DecryptContext::new(resolver).decrypt(xml)
 }
 
@@ -1884,7 +1909,7 @@ pub fn decrypt_document(
     xml: &str,
     encrypted_data_id: Option<&str>,
     resolver: &dyn DecryptionKeyResolver,
-) -> Result<String, XmlEncError> {
+) -> Result<Audited<String>, XmlEncError> {
     decrypt_document_with_options(
         xml,
         DocumentDecryptionOptions { encrypted_data_id },
@@ -1904,7 +1929,7 @@ pub fn decrypt_document_with_options(
     xml: &str,
     options: DocumentDecryptionOptions<'_>,
     resolver: &dyn DecryptionKeyResolver,
-) -> Result<String, XmlEncError> {
+) -> Result<Audited<String>, XmlEncError> {
     DecryptContext::new(resolver).decrypt_document(xml, options.encrypted_data_id)
 }
 
@@ -1919,7 +1944,7 @@ fn decrypt_document_with_context(
     xml: &str,
     selector: DocumentEncryptedDataSelector<'_>,
     context: &DecryptContext<'_>,
-) -> Result<String, XmlEncError> {
+) -> Result<Audited<String>, XmlEncError> {
     context.policy.resources.validate()?;
     validate_encryption_document_len(xml.len(), &context.policy)?;
     let budgets = DecryptionOperationBudgets::from_policy(&context.policy);
@@ -1927,8 +1952,8 @@ fn decrypt_document_with_context(
     let mut document =
         XmlDocument::parse_with_settings_and_budget(xml.to_owned(), settings, &budgets.xml_parse)
             .map_err(|error| map_document_error(error, settings))?;
-    decrypt_owned_document_with_context(&mut document, selector, context, budgets)?;
-    Ok(document.into_xml())
+    let policy = decrypt_owned_document_with_context(&mut document, selector, context, budgets)?;
+    Ok(Audited::new(document.into_xml(), policy))
 }
 
 /// The XML replacement an `EncryptedData` `Type` attribute requests, if any.
@@ -1945,7 +1970,7 @@ fn decrypt_owned_document_with_context(
     selector: DocumentEncryptedDataSelector<'_>,
     context: &DecryptContext<'_>,
     budgets: DecryptionOperationBudgets,
-) -> Result<(), XmlEncError> {
+) -> Result<PolicyAudit, XmlEncError> {
     context.policy.resources.validate()?;
     document.validate_operation_policy(context.policy.xml, &context.policy.resources)?;
     let (target, target_len, target_start, replacement_type) = document.with_view(|view| {
@@ -2043,7 +2068,8 @@ fn decrypt_owned_document_with_context(
             document
                 .commit_prepared(processed.output)
                 .map_err(|error| map_document_error(error, context.document_parse_settings()))
-        })
+        })?;
+    Ok(processed.operation.audit(context.identity.as_ref()))
 }
 
 fn validate_encryption_document_len(
@@ -2074,19 +2100,87 @@ fn validate_recipient_count(actual: usize, maximum: usize) -> Result<(), XmlEncE
 pub fn decrypt_data(
     encrypted: &EncryptedData,
     resolver: &dyn DecryptionKeyResolver,
-) -> Result<DecryptedContent, XmlEncError> {
+) -> Result<Audited<DecryptedContent>, XmlEncError> {
     DecryptContext::new(resolver).decrypt_data(encrypted)
 }
 
+/// Record the content method the policy permitted before any key work.
+fn record_decryption_method(operation: &DecryptionExecution, algorithm: DataEncryptionAlgorithm) {
+    if let Some(validity) = &operation.policy().validity {
+        operation.record_policy(PolicyDecision::exception(validity));
+    }
+    operation.record_policy(PolicyDecision::algorithm(
+        crate::policy::AlgorithmRole::DataEncryption,
+        algorithm.uri(),
+    ));
+}
+
+/// Record a `CipherReference` the policy let the operation resolve: its URI
+/// class and every transform applied to the bytes it names.
+fn record_cipher_reference(
+    operation: &DecryptionExecution,
+    uri: &str,
+    transforms: &[crate::xmldsig::transforms::Transform],
+) {
+    operation.record_policy(PolicyDecision::Uri {
+        role: crate::policy::UriRole::CipherReference,
+        class: crate::xmldsig::UriClass::of(uri),
+    });
+    for transform in transforms {
+        operation.record_policy(PolicyDecision::algorithm(
+            crate::policy::AlgorithmRole::Transform,
+            transform.algorithm_uri(),
+        ));
+    }
+}
+
+/// Check `key`'s method against the operation's policy and record the
+/// decision: the permitted method, or the refusal the error carries.
+fn admit_encrypted_key(
+    operation: &DecryptionExecution,
+    key: &EncryptedKey,
+) -> Result<(), XmlEncError> {
+    let uri = &key.encryption_method.algorithm;
+    match validate_encrypted_key_policy(key, operation.policy()) {
+        Ok(()) => {
+            let role = if KeyTransportAlgorithm::from_uri(uri).is_ok() {
+                crate::policy::AlgorithmRole::KeyTransport
+            } else {
+                crate::policy::AlgorithmRole::KeyWrap
+            };
+            operation.record_policy(PolicyDecision::algorithm(role, uri));
+            Ok(())
+        }
+        Err(error) => {
+            if let XmlEncError::Policy(violation) = &error {
+                operation.record_policy(PolicyDecision::Rejected(violation.clone()));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// The content-key candidates of `encrypted`, under the operation's policy
+/// and key-candidate budget. Each `EncryptedKey` the policy refuses is
+/// skipped, not fatal, so the operation's audit records both its refusals and
+/// the methods it permits.
 fn resolve_content_key_candidates(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     encrypted: &EncryptedData,
     resolver: &dyn DecryptionKeyResolver,
-    policy: &crate::policy::DecryptionPolicy,
-    budget: &mut KeyCandidateBudget,
+    operation: &DecryptionExecution,
     mut document: Option<KeySourceDocument<'_, '_>>,
 ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+    let policy: &crate::policy::DecryptionPolicy = operation.policy();
+    let budget = &mut *operation.budgets().key_candidates.borrow_mut();
+    let data_target = |document| {
+        ReferenceTarget::new(
+            document,
+            encrypted.id.as_deref(),
+            policy.transforms.same_document_id_semantics,
+        )
+    };
     let mut last_error = None;
     let mut candidates = if encrypted.derived_keys.is_empty()
         && encrypted.agreement_methods.is_empty()
@@ -2135,11 +2229,7 @@ fn resolve_content_key_candidates(
     for descriptor in &encrypted.derived_keys {
         if !reference_list_applies_to_target(
             descriptor.reference_list.as_ref(),
-            ReferenceTarget::new(
-                document,
-                encrypted.id.as_deref(),
-                policy.transforms.same_document_id_semantics,
-            ),
+            data_target(document),
             ReferenceKind::Data,
         ) {
             continue;
@@ -2161,22 +2251,14 @@ fn resolve_content_key_candidates(
             key: encrypted_key,
             document: take_key_document(&mut document, encrypted_key)?,
         };
-        if !encrypted_key_applies_to_data(
-            encrypted_key,
-            encrypted,
-            ReferenceTarget::new(
-                document,
-                encrypted.id.as_deref(),
-                policy.transforms.same_document_id_semantics,
-            ),
-        ) {
+        if !encrypted_key_applies_to_data(encrypted_key, encrypted, data_target(document)) {
             continue;
         }
-        if let Err(error) = validate_encrypted_key_policy(encrypted_key, policy) {
+        if let Err(error) = admit_encrypted_key(operation, encrypted_key) {
             last_error = Some(error);
             continue;
         }
-        match resolve_encrypted_key(provider, algorithm, source, resolver, policy, budget) {
+        match resolve_encrypted_key(provider, algorithm, source, resolver, operation, budget) {
             Ok(keys) => candidates.extend(keys),
             Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,
         }
@@ -2188,14 +2270,15 @@ fn resolve_content_key_candidates(
     }
 }
 
-/// Recover content keys from one applicable `EncryptedKey`, from the resolver
-/// directly or through the key's own nested key sources.
+/// Recover content keys from one applicable `EncryptedKey` the operation's
+/// policy admitted, from the resolver directly or through the key's own nested
+/// key sources.
 fn resolve_encrypted_key(
     provider: &dyn crate::provider::CryptoProvider,
     algorithm: DataEncryptionAlgorithm,
     source: KeySourceView<'_, '_>,
     resolver: &dyn DecryptionKeyResolver,
-    policy: &crate::policy::DecryptionPolicy,
+    operation: &DecryptionExecution,
     budget: &mut KeyCandidateBudget,
 ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
     if source.key.sources.is_empty() {
@@ -2204,7 +2287,7 @@ fn resolve_encrypted_key(
             provider,
             algorithm,
             Some(source.key),
-            policy,
+            operation.policy(),
             budget,
         )
     } else {
@@ -2213,7 +2296,7 @@ fn resolve_encrypted_key(
             source,
             algorithm.key_len(),
             resolver,
-            policy,
+            operation,
             budget,
             1,
         )
@@ -2346,15 +2429,19 @@ fn validate_before_key_resolution(
     )
 }
 
+/// Unwrap `source`, whose method the caller already admitted and recorded,
+/// with key-encryption keys from its own nested sources. Each nested
+/// `EncryptedKey` is admitted and recorded here before any key work.
 fn resolve_nested_key(
     provider: &dyn crate::provider::CryptoProvider,
     source: KeySourceView<'_, '_>,
     output_len: usize,
     key_resolver: &dyn DecryptionKeyResolver,
-    policy: &crate::policy::DecryptionPolicy,
+    operation: &DecryptionExecution,
     budget: &mut KeyCandidateBudget,
     depth: usize,
 ) -> Result<Vec<crate::provider::RecoveredContentKey>, XmlEncError> {
+    let policy: &crate::policy::DecryptionPolicy = operation.policy();
     let key = source.key;
     let mut document = source.document;
     let target = ReferenceTarget::new(
@@ -2363,7 +2450,6 @@ fn resolve_nested_key(
         policy.transforms.same_document_id_semantics,
     );
     policy.resources.validate_key_info_reference_depth(depth)?;
-    validate_encrypted_key_policy(key, policy)?;
     let wrap = KeyWrapAlgorithm::from_uri(&key.encryption_method.algorithm)?;
     provider.require_capability(crate::provider::ProviderCapability::KeyUnwrap(wrap))?;
     let ciphertext = key.cipher_data.octets()?;
@@ -2413,32 +2499,37 @@ fn resolve_nested_key(
         ) {
             continue;
         }
-        let resolution = if nested.sources.is_empty() {
-            budget.require_available(3)?;
-            let remaining = budget.remaining();
-            key_resolver
-                .resolve_key_encryption_keys_with_policy(
+        // A refused nested method ends the operation, as any policy failure
+        // below the content key does; a method this build cannot run is one
+        // failed candidate, and the next nested key is still tried.
+        let resolution = admit_encrypted_key(operation, nested).and_then(|()| {
+            if nested.sources.is_empty() {
+                budget.require_available(3)?;
+                let remaining = budget.remaining();
+                key_resolver
+                    .resolve_key_encryption_keys_with_policy(
+                        provider,
+                        wrap,
+                        KeyEncryptionKeySource::Encrypted(nested),
+                        policy,
+                        budget,
+                    )
+                    .and_then(|returned| {
+                        budget.account_returned_candidates(remaining, returned.len())?;
+                        Ok(returned)
+                    })
+            } else {
+                resolve_nested_key(
                     provider,
-                    wrap,
-                    KeyEncryptionKeySource::Encrypted(nested),
-                    policy,
+                    source,
+                    wrap.key_len(),
+                    key_resolver,
+                    operation,
                     budget,
+                    depth + 1,
                 )
-                .and_then(|returned| {
-                    budget.account_returned_candidates(remaining, returned.len())?;
-                    Ok(returned)
-                })
-        } else {
-            resolve_nested_key(
-                provider,
-                source,
-                wrap.key_len(),
-                key_resolver,
-                policy,
-                budget,
-                depth + 1,
-            )
-        };
+            }
+        });
         match resolution {
             Ok(returned) => keys.extend(returned),
             Err(error) => record_candidate_source_error_or_fail_operation(error, &mut last_error)?,
@@ -3571,7 +3662,8 @@ mod tests {
         assert_eq!(
             DecryptContext::new(&direct)
                 .decrypt_data(&encrypted)
-                .expect("direct AES does not require RSA metadata"),
+                .expect("direct AES does not require RSA metadata")
+                .output,
             DecryptedContent::Bytes(b"payload".to_vec())
         );
     }
@@ -4210,7 +4302,8 @@ mod tests {
             STANDARD.encode(&wire)
         );
         let decrypted = decrypt(&xml, &SymmetricKeyDecryptor::new(key))
-            .expect("valid AES-GCM XML must decrypt");
+            .expect("valid AES-GCM XML must decrypt")
+            .output;
         assert_eq!(
             decrypted,
             DecryptedContent::Xml("<Assertion>trusted</Assertion>".into())
@@ -4263,7 +4356,8 @@ mod tests {
 
         let decrypted = DecryptContext::new(&resolver)
             .decrypt_data(&encrypted)
-            .expect("a later authenticated candidate must decrypt");
+            .expect("a later authenticated candidate must decrypt")
+            .output;
 
         assert_eq!(
             decrypted,
@@ -4306,7 +4400,8 @@ mod tests {
         let result = DecryptContext::new(&resolver)
             .provider(&provider)
             .decrypt_data(&encrypted)
-            .expect("the first successful candidate must be returned");
+            .expect("the first successful candidate must be returned")
+            .output;
 
         assert_eq!(result, DecryptedContent::Bytes(b"accepted".to_vec()));
         assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 1);
@@ -4332,7 +4427,8 @@ mod tests {
         let result = DecryptContext::new(&resolver)
             .provider(&provider)
             .decrypt_document(&encrypted, None)
-            .expect("a later candidate with valid replacement XML must succeed");
+            .expect("a later candidate with valid replacement XML must succeed")
+            .output;
 
         assert_eq!(result, "<x/>");
         assert_eq!(provider.decrypt_calls.load(Ordering::Relaxed), 2);
@@ -4427,7 +4523,8 @@ mod tests {
         assert_eq!(
             DecryptContext::new(&resolver)
                 .decrypt_data(&encrypted)
-                .expect("one distinct CBC key identity must decrypt"),
+                .expect("one distinct CBC key identity must decrypt")
+                .output,
             DecryptedContent::Bytes(b"duplicate identity".to_vec())
         );
     }
@@ -4595,7 +4692,8 @@ mod tests {
 
         let plaintext = DecryptContext::new(&resolver)
             .decrypt_data(&encrypted)
-            .expect("the second recipient key must authenticate");
+            .expect("the second recipient key must authenticate")
+            .output;
         assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
     }
 
@@ -4616,7 +4714,8 @@ mod tests {
 
         let plaintext = DecryptContext::new(&resolver)
             .decrypt_data(&encrypted)
-            .expect("the embedded recipient must remain available after a direct candidate");
+            .expect("the embedded recipient must remain available after a direct candidate")
+            .output;
 
         assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
     }
@@ -4635,7 +4734,8 @@ mod tests {
 
         let plaintext = DecryptContext::new(&resolver)
             .decrypt_data(&encrypted)
-            .expect("recipient lookup must follow a candidate-local direct error");
+            .expect("recipient lookup must follow a candidate-local direct error")
+            .output;
 
         assert_eq!(plaintext, DecryptedContent::Bytes(b"payload".to_vec()));
     }
@@ -4736,7 +4836,8 @@ mod tests {
         assert_eq!(
             DecryptContext::new(&resolver)
                 .decrypt_data(&encrypted)
-                .expect("the sole width-compatible CBC key must be selected"),
+                .expect("the sole width-compatible CBC key must be selected")
+                .output,
             DecryptedContent::Bytes(b"payload".to_vec())
         );
     }
@@ -4882,7 +4983,9 @@ mod tests {
         };
 
         assert_eq!(
-            decrypt(&xml, &resolver).expect("second recipient key must be tried"),
+            decrypt(&xml, &resolver)
+                .expect("second recipient key must be tried")
+                .output,
             DecryptedContent::Bytes(plaintext.as_bytes().to_vec())
         );
     }
@@ -5684,7 +5787,8 @@ mod tests {
             DecryptContext::new(&SymmetricKeyDecryptor::new([0_u8; 16]))
                 .policy(policy)
                 .decrypt_data(&bounded_cbc)
-                .expect("CBC plaintext at the configured limit must decrypt"),
+                .expect("CBC plaintext at the configured limit must decrypt")
+                .output,
             DecryptedContent::Bytes(b"four".to_vec())
         );
     }
@@ -6065,7 +6169,8 @@ mod tests {
         assert_eq!(
             DecryptContext::new(&resolver)
                 .decrypt_data(&encrypted)
-                .expect("explicit legacy OAEP MGF must reach key resolution"),
+                .expect("explicit legacy OAEP MGF must reach key resolution")
+                .output,
             DecryptedContent::Bytes(b"data".to_vec())
         );
         assert_eq!(resolver.candidate_calls.get(), 1);
@@ -6263,7 +6368,8 @@ mod tests {
         );
         assert_eq!(
             decrypt_document(&element, None, &SymmetricKeyDecryptor::new(key))
-                .expect("root Element replacement must succeed"),
+                .expect("root Element replacement must succeed")
+                .output,
             "<secret id=\"visible\">value</secret>"
         );
 
@@ -6277,7 +6383,8 @@ mod tests {
         let document =
             format!("<root xmlns:xenc=\"{XMLENC_NS}\"><prefix/>{content}<suffix/></root>");
         let replaced = decrypt_document(&document, None, &SymmetricKeyDecryptor::new(key))
-            .expect("nested Content replacement must succeed");
+            .expect("nested Content replacement must succeed")
+            .output;
         assert_eq!(
             replaced,
             format!(
@@ -6302,7 +6409,8 @@ mod tests {
 
         assert_eq!(
             decrypt_document(&encrypted, None, &SymmetricKeyDecryptor::new(key))
-                .expect("one element with boundary trivia must be accepted"),
+                .expect("one element with boundary trivia must be accepted")
+                .output,
             plaintext
         );
     }
@@ -6333,7 +6441,8 @@ mod tests {
         for encrypted in [unknown, empty] {
             assert_eq!(
                 decrypt(&encrypted, &SymmetricKeyDecryptor::new(key))
-                    .expect("opaque Type hints must not block decryption"),
+                    .expect("opaque Type hints must not block decryption")
+                    .output,
                 DecryptedContent::Bytes(plaintext.as_bytes().to_vec())
             );
         }
@@ -6365,7 +6474,8 @@ mod tests {
             Err(XmlEncError::AmbiguousEncryptedData)
         ));
         let replaced = decrypt_document(&document, Some("second"), &resolver)
-            .expect("Id selection must choose exactly one encrypted region");
+            .expect("Id selection must choose exactly one encrypted region")
+            .output;
         assert!(replaced.contains("second"));
         assert!(replaced.contains("Id=\"first\""));
         assert!(matches!(
@@ -6400,7 +6510,8 @@ mod tests {
         let context = DecryptContext::new(&resolver);
         let replaced = context
             .decrypt_document_from_start_node(&document, Some("second"))
-            .expect("ancestor ID must select its encrypted descendant");
+            .expect("ancestor ID must select its encrypted descendant")
+            .output;
         assert!(replaced.contains("<scope Id=\"second\">second</scope>"));
         assert!(replaced.contains("<scope Id=\"first\"><xenc:EncryptedData"));
 
@@ -6423,7 +6534,8 @@ mod tests {
 
         let first_replaced = context
             .decrypt_first_document_from_start_node(&ambiguous, Some("selected"))
-            .expect("first-match selection must leave later encrypted descendants untouched");
+            .expect("first-match selection must leave later encrypted descendants untouched")
+            .output;
         assert!(first_replaced.contains("<scope Id=\"selected\">first<xenc:EncryptedData"));
         let replaced_document =
             Document::parse(&first_replaced).expect("first-match output must remain valid XML");
@@ -6497,6 +6609,7 @@ mod tests {
                 .policy(policy)
                 .decrypt_document(&with_dtd, None)
                 .expect("explicit internal-DTD opt-in must decrypt")
+                .output
                 .contains("plaintext")
         );
     }
@@ -6631,7 +6744,8 @@ mod tests {
         let document = format!("<root xmlns:xenc=\"{XMLENC_NS}\">{encrypted}</root>");
         let resolver = SymmetricKeyDecryptor::new(key);
         let expected = decrypt_document(&document, None, &resolver)
-            .expect("unbounded setup decryption must succeed");
+            .expect("unbounded setup decryption must succeed")
+            .output;
         let exact_output_nodes = Document::parse(&expected)
             .expect("decrypted output must parse")
             .descendants()
@@ -6648,7 +6762,8 @@ mod tests {
             DecryptContext::new(&resolver)
                 .policy(policy)
                 .decrypt_document(&document, None)
-                .expect("temporary wrapper must not consume caller node budget"),
+                .expect("temporary wrapper must not consume caller node budget")
+                .output,
             expected
         );
     }
@@ -6760,7 +6875,7 @@ mod tests {
         let decrypted = decrypt_document(&document, None, &SymmetricKeyDecryptor::new(key))
             .expect("inherited namespace prefixes must remain valid");
         assert_eq!(
-            decrypted,
+            decrypted.output,
             format!(
                 "<root xmlns:xenc=\"{XMLENC_NS}\" xmlns:shared=\"urn:shared\"><shared:child/></root>"
             )

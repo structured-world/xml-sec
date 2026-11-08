@@ -540,7 +540,7 @@ fn manifest_processing_stops_after_c14n_budget_exhaustion() {
                 ctx.utc_facts,
             );
             let mut operation = OperationExecutionContext::new(
-                &ctx.policy,
+                &*ctx.policy,
                 &budgets,
                 Some((view.identity(), view.generation())),
             );

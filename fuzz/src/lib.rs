@@ -136,7 +136,8 @@ pub fn security_roundtrip(data: &[u8]) {
         let signed = SignContext::new(&signer)
             .xml_backend(backend)
             .sign_with_builder(&xml, &builder)
-            .expect("generated signature");
+            .expect("generated signature")
+            .output;
         let mut exhausted = xml_sec::policy::SigningPolicy::default();
         exhausted.resources.max_xml_parse_work_bytes = 1;
         assert!(
@@ -201,14 +202,16 @@ pub fn security_roundtrip(data: &[u8]) {
             .xml_backend(backend)
             .direct_key([0x51; 16])
             .encrypt_document(&xml, DocumentEncryptionOptions::default())
-            .expect("encrypt generated XML");
+            .expect("encrypt generated XML")
+            .output;
         let key = SymmetricKeyDecryptor::new([0x51; 16]);
         let wrong_key = SymmetricKeyDecryptor::new([0x52; 16]);
         for decrypt_backend in BACKENDS {
             let decrypted = DecryptContext::new(&key)
                 .xml_backend(decrypt_backend)
                 .decrypt_document(&encrypted, None)
-                .expect("decrypt generated ciphertext");
+                .expect("decrypt generated ciphertext")
+                .output;
             assert_eq!(decrypted, xml, "cross-backend encryption round trip");
             assert!(
                 DecryptContext::new(&wrong_key)

@@ -30,8 +30,13 @@ fn with_session_in(
         r##"<r xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><target Id="target">payload</target><numeric Id="12345"/><twin Id="twin"/><twin Id="twin"/><methods><ds:DigestMethod Id="known" Algorithm="{SHA256}"/><ds:DigestMethod Id="padded" Algorithm="&#10; {SHA256}&#9;"/><ds:DigestMethod Id="unknown" Algorithm="urn:example:digest"/><ds:DigestMethod Id="absent"/><ds:DigestMethod Id="restricted" Algorithm="{SHA1}"/><other Id="other"/></methods><ds:Signature><ds:SignedInfo><ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/><ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#hmac-sha256"/><ds:Reference URI="#target"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="{SHA256}"/><ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/></ds:Signature></r>"##
     );
     let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let key = HmacVerificationKey::new(vec![0x61; 32]).unwrap();
     let mut policy = VerificationPolicy {
         digest_algorithms: Some(BTreeSet::from([DigestAlgorithm::Sha256])),

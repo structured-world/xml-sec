@@ -254,7 +254,8 @@ fn derived_retrieval_accepts_both_specification_identifiers() {
                 .policy(policy.clone())
                 .external_resources(&resources)
                 .decrypt(&wire)
-                .unwrap(),
+                .unwrap()
+                .output,
             DecryptedContent::Bytes(b"external derived".to_vec())
         );
         let wrong = wire.replace(kind, &format!("{X}EncryptedKey"));
@@ -378,7 +379,8 @@ fn detached_derivation_executes_for_content_and_nested_wrapping() {
             let result = DecryptContext::new(&resolver)
                 .id_attributes(&registrations)
                 .decrypt_document(&wire, None)
-                .expect("detached derivation execution");
+                .expect("detached derivation execution")
+                .output;
             assert!(result.contains("<secret>derived</secret>"));
             let wrong = wire.replace(
                 &association,
@@ -548,7 +550,8 @@ fn detached_key_association_preserves_registered_ids() {
         let result = DecryptContext::new(&resolver)
             .id_attributes(&registrations)
             .decrypt_document(&wire, None)
-            .expect("registered node association");
+            .expect("registered node association")
+            .output;
         assert!(result.contains("<secret>registered</secret>"));
         // Duplicate registered values must never become an ID-string match
         // after the source document's resolver refused the ambiguous identity.
@@ -604,7 +607,8 @@ fn detached_nested_key_association_keeps_registered_consumer_identity() {
     let result = DecryptContext::new(&resolver)
         .id_attributes(&registrations)
         .decrypt_document(&wire, None)
-        .expect("registered nested-key association");
+        .expect("registered nested-key association")
+        .output;
     assert!(result.contains("<secret>registered nested</secret>"));
 }
 
@@ -712,7 +716,8 @@ fn retrieved_key_decrypts_in_the_original_document_context() {
     let resolver = KekDecryptor::new(kek);
     let result = DecryptContext::new(&resolver)
         .decrypt_document(&wire, None)
-        .unwrap();
+        .unwrap()
+        .output;
     assert!(result.contains("<secret>retrieved</secret>"));
     assert!(!result.contains("<x:EncryptedData"));
     assert!(result.contains("Id='transport'"));
@@ -785,14 +790,25 @@ fn external_retrieval_and_transforms_share_caller_owned_resources() {
         ),
     ] {
         let wire = data(&format!("<d:RetrievalMethod xml:base='https://example.test/keys/' URI='{path}' Type='{X}EncryptedKey'>{transforms}</d:RetrievalMethod>")).replace("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==", parsed.cipher_data.inline_value().unwrap());
+        let decrypted = DecryptContext::new(&resolver)
+            .policy(policy.clone())
+            .external_resources(&resources)
+            .decrypt(&wire)
+            .expect("caller-owned key retrieval");
         assert_eq!(
-            DecryptContext::new(&resolver)
-                .policy(policy.clone())
-                .external_resources(&resources)
-                .decrypt(&wire)
-                .expect("caller-owned key retrieval"),
+            decrypted.output,
             DecryptedContent::Bytes(b"retrieved external key".to_vec())
         );
+        // A retrieved key's own CipherReference is part of the same operation.
+        let referenced =
+            decrypted
+                .policy
+                .decisions
+                .contains(&xml_sec::policy::PolicyDecision::Uri {
+                    role: xml_sec::policy::UriRole::CipherReference,
+                    class: xml_sec::xmldsig::UriClass::External,
+                });
+        assert_eq!(referenced, path == "referenced.xml", "{path}");
         assert!(matches!(
             DecryptContext::new(&resolver)
                 .external_resources(&resources)
@@ -1140,9 +1156,26 @@ fn nested_encrypted_key_recovers_the_outer_kek_not_a_second_content_key() {
         parsed.cipher_data.inline_value().unwrap(),
     );
     let resolver = KekDecryptor::new(root);
+    let decrypted = DecryptContext::new(&resolver).decrypt(&wire).unwrap();
     assert_eq!(
-        DecryptContext::new(&resolver).decrypt(&wire).unwrap(),
+        decrypted.output,
         DecryptedContent::Bytes(b"nested key path".to_vec())
+    );
+    // Every EncryptedKey level the path unwrapped is a recorded key-wrap decision.
+    assert_eq!(
+        decrypted
+            .policy
+            .decisions
+            .iter()
+            .filter(|decision| matches!(
+                decision,
+                xml_sec::policy::PolicyDecision::Algorithm {
+                    role: xml_sec::policy::AlgorithmRole::KeyWrap,
+                    ..
+                }
+            ))
+            .count(),
+        2
     );
     let mut policy = xml_sec::policy::DecryptionPolicy::default();
     policy.resources.max_key_candidates = 2;
@@ -1150,6 +1183,51 @@ fn nested_encrypted_key_recovers_the_outer_kek_not_a_second_content_key() {
         DecryptContext::new(&resolver).policy(policy).decrypt(&wire),
         Err(XmlEncError::Policy(_))
     ));
+}
+
+#[test]
+fn an_unsupported_nested_method_falls_through_to_the_next_nested_key() {
+    // A nested recipient whose method this build cannot run is one failed
+    // candidate, as a key that does not unwrap is, not the end of the outer
+    // key: the next nested key still recovers the KEK.
+    let root = [9; 16];
+    let intermediate = [7; 16];
+    let content = [3; 16];
+    let wrap = KeyWrapAlgorithm::AesKw128;
+    let inner_bytes = RUST_CRYPTO_PROVIDER
+        .wrap_key(wrap, &root, &intermediate)
+        .unwrap();
+    let outer_bytes = RUST_CRYPTO_PROVIDER
+        .wrap_key(wrap, &intermediate, &content)
+        .unwrap();
+    let inner = key("").replace(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        &STANDARD.encode(inner_bytes),
+    );
+    let unsupported = inner.replace(&format!("{X}kw-aes128"), "urn:example:unsupported-wrap");
+    let outer = key(&format!("<d:KeyInfo>{unsupported}{inner}</d:KeyInfo>")).replacen(
+        "<x:CipherValue>AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA</x:CipherValue>",
+        &format!(
+            "<x:CipherValue>{}</x:CipherValue>",
+            STANDARD.encode(outer_bytes)
+        ),
+        1,
+    );
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content)
+        .encrypt_binary(b"nested fallback")
+        .unwrap();
+    let parsed = parse_encrypted_data(&encrypted.encrypted_data_xml).unwrap();
+    let wire = data(&outer).replace(
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+        parsed.cipher_data.inline_value().unwrap(),
+    );
+    let resolver = KekDecryptor::new(root);
+    let decrypted = DecryptContext::new(&resolver).decrypt(&wire).unwrap();
+    assert_eq!(
+        decrypted.output,
+        DecryptedContent::Bytes(b"nested fallback".to_vec())
+    );
 }
 
 #[cfg(feature = "legacy-algorithms")]

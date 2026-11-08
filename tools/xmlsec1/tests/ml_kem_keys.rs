@@ -899,7 +899,8 @@ fn signing_resolves_referenced_encapsulation_target() {
     let signed = xml_sec::xmldsig::SignContext::new_encapsulation(&public)
         .policy(policy.clone())
         .sign_template(&input)
-        .unwrap();
+        .unwrap()
+        .output;
     check_encapsulation_signing_rejects_ambiguity(&public, &policy, &input, &target);
     assert_ne!(signed, input);
     assert!(signed.contains("URI=\"#recipient\""));
@@ -1052,8 +1053,8 @@ fn hmac_templates_establish_fresh_keys_and_obey_policy() {
             .insert(private.algorithm());
         let context =
             xml_sec::xmldsig::SignContext::new_encapsulation(&public).policy(signing.clone());
-        let first = context.sign_template(&template).unwrap();
-        let second = context.sign_template(&template).unwrap();
+        let first = context.sign_template(&template).unwrap().output;
+        let second = context.sign_template(&template).unwrap().output;
         assert_ne!(first, second);
         let mut verification = xml_sec::policy::VerificationPolicy {
             key_establishment: signing.key_establishment.clone(),
@@ -1114,7 +1115,8 @@ fn pinned_hmac_rejects_referenced_encapsulation() {
     let key = xml_sec::xmldsig::HmacSigningKey::new(vec![7; 32]).unwrap();
     let signed = xml_sec::xmldsig::SignContext::new(&key)
         .sign_template(&ordinary)
-        .unwrap();
+        .unwrap()
+        .output;
     let verification = xml_sec::policy::VerificationPolicy {
         key_trust: xml_sec::policy::KeyTrustPolicy {
             mode: xml_sec::policy::VerificationTrustMode::CryptographicOnly,
@@ -1356,11 +1358,13 @@ fn multiple_signatures_share_the_encapsulation_allowance() {
         .policy(signing.clone())
         .signature_template_selection(xml_sec::xmldsig::SignatureTemplateSelection::FirstDescendant)
         .sign_template(&xml)
-        .unwrap();
+        .unwrap()
+        .output;
     let signed = xml_sec::xmldsig::SignContext::new_encapsulation(&public)
         .policy(signing.clone())
         .sign_template(&first)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = xml_sec::XmlDocument::parse(&signed).unwrap();
     let mut policy = xml_sec::policy::VerificationPolicy {
         key_establishment: signing.key_establishment,
@@ -1446,7 +1450,8 @@ fn hmac_builder_establishes_a_recipient_key() {
     let signed = xml_sec::xmldsig::SignContext::new_encapsulation(&public)
         .policy(policy.clone())
         .sign_with_builder("<root>message</root>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let mut verification = xml_sec::policy::VerificationPolicy {
         key_establishment: policy.key_establishment,
         ..xml_sec::policy::VerificationPolicy::default()
@@ -1550,7 +1555,8 @@ fn direct_kem_cbc_requires_external_authentication_permission() {
         let decrypted = xml_sec::xmlenc::DecryptContext::new(&resolver)
             .policy(policy.clone())
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(
             decrypted,
             xml_sec::xmlenc::DecryptedContent::Bytes(b"payload".to_vec())
@@ -1658,7 +1664,8 @@ fn decrypt_resolves_external_encapsulation_recipient() {
     let expected = xml_sec::xmlenc::DecryptContext::new(&resolver)
         .policy(policy.clone())
         .decrypt_document(&xml, Some("ED"))
-        .unwrap();
+        .unwrap()
+        .output;
     let resources = std::collections::BTreeMap::from([(
         "https://example.test/recipient.xml".to_owned(),
         target.into_bytes(),
@@ -1722,6 +1729,7 @@ impl ExternalRecipientCheck<'_> {
             .policy(policy)
             .external_resources(resources)
             .decrypt_document(input, Some("ED"))
+            .map(|decrypted| decrypted.output)
     }
 
     /// Select the target, not the external document root; preserve ancestor
@@ -1845,7 +1853,8 @@ fn encrypted_data_builder_round_trips_all_kem_parameter_sets() {
         let output = xml_sec::xmlenc::DecryptContext::new(&resolver)
             .policy(decrypt)
             .decrypt(&result.encrypted_data_xml)
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(
             output,
             xml_sec::xmlenc::DecryptedContent::Bytes(b"KEM content".to_vec())
@@ -2240,7 +2249,8 @@ fn nested_kem_wrap_recovery_shares_the_operation_budget() {
         xml_sec::xmlenc::DecryptContext::new(&resolver)
             .policy(policy.clone())
             .decrypt(&xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"nested KEM plaintext".to_vec())
     );
     policy.key_establishment.max_encapsulation_operations = 0;

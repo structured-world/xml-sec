@@ -69,11 +69,46 @@ the original document. They never create a new parser, crypto dispatcher or
 certificate stack. C14N and advanced scoped extension/current-query APIs remain
 available in their existing low-level modules.
 
+### Policy Audit
+
+Every operation reports what its policy decided as a `PolicyAudit`:
+`VerifyResult::policy` for single-signature verification, `Audited<T>`
+(`output` plus `policy`) from the string, fragment and binary operations, and a
+bare `PolicyAudit` from the retained-document operations, whose output is the
+document itself. `EncryptionResult::policy` carries it for the low-level
+encryption builder. Retained-document verification reports per Signature:
+`SignatureEvidence::policy` holds each Signature's decisions whatever its
+outcome, ending with the refusal when the policy failed it, and
+`VerifyEvidence::policy_identity` names the enforced snapshot even for a
+document without a Signature. Completing detached References in a verified
+session appends the Manifest processing it runs to that Signature's audit.
+
+- `identity` names the published snapshot the operation enforced: profile,
+  configuration schema version, publication revision and the SHA-256 of the
+  canonical effective settings. It is present when the compiled policies carry
+  one (`CompiledPolicies::with_identity`, or every `xml-sec-config`
+  `PolicyStore` publication) and absent once a low-level builder customized the
+  policy, because the settings then differ from the published ones. Limits the
+  operation stayed within are identified by that digest.
+- `decisions` lists, in the order the operation made them, every algorithm the
+  policy permitted with its role (signature, canonicalization, digest,
+  transform, content encryption, key transport, key wrap), including the
+  inclusive C14N 1.0 a Reference's transform chain applies implicitly, the class of every
+  Reference, Manifest Reference and `CipherReference` URI it resolved, the
+  Manifest processing it applied, the exception grant it ran under, and each
+  input it refused while continuing, such as one Reference among several. A
+  refusal that ends the operation is its error instead.
+
+Records carry public algorithm URIs and URI classes only, never document
+content, URIs, key material or resource bytes, so they can be logged as they
+are; a refused algorithm this build does not recognize is named
+`UNRECOGNIZED_ALGORITHM`. How a verification key was authorized stays in `VerifyResult::key_trust`.
+
 ### Ownership And Errors
 
 The facade borrows its provider and compiled policies. Copying it copies only
-references and the parser selection. Operation contexts retain the existing owned
-policy snapshot at creation; no per-node policy cloning is added. Keys/resolvers,
+references and the parser selection. Operation contexts share the compiled policy
+snapshot at creation instead of copying it; no per-node policy cloning is added. Keys/resolvers,
 external resource maps and writers are borrowed for the operation handle's lifetime.
 Encryption execution also borrows its builder, avoiding secret copies and provider
 reference-count operations. Signing, encryption and decryption handles can outlive

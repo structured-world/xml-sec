@@ -65,6 +65,7 @@ fn sign_document() -> String {
         .key_info_writer(&key_info)
         .sign_with_builder(DOCUMENT, &filter2_builder())
         .expect("XPath Filter 2.0 document must sign")
+        .output
 }
 
 fn verify(signed: &str) -> Result<xml_sec::xmldsig::VerifyResult, DsigError> {
@@ -185,7 +186,8 @@ fn filter2_union_restores_a_subtree_to_the_signed_set() {
     let signed = SignContext::new(&key)
         .key_info_writer(&key_info)
         .sign_with_builder(DOCUMENT, &builder)
-        .expect("Filter 2.0 Union document must sign");
+        .expect("Filter 2.0 Union document must sign")
+        .output;
 
     let verified = verify(&signed).expect("generated Union signature must verify");
     assert_eq!(verified.status, DsigStatus::Valid);
@@ -216,7 +218,8 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
     let standard = SignContext::new(&key)
         .key_info_writer(&key_info)
         .sign_with_builder(DOCUMENT, &builder)
-        .expect("standards-mode XPath document must sign");
+        .expect("standards-mode XPath document must sign")
+        .output;
     let standard_result = cryptographic::context()
         .key_resolver(&resolver)
         .allowed_transforms([
@@ -241,7 +244,8 @@ fn here_semantics_are_explicit_across_signing_and_verification() {
         .key_info_writer(&key_info)
         .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)
         .sign_with_builder(DOCUMENT, &builder)
-        .expect("xmlsec-legacy XPath document must sign");
+        .expect("xmlsec-legacy XPath document must sign")
+        .output;
     let legacy_result = cryptographic::context()
         .key_resolver(&resolver)
         .xpath_here_semantics(XPathHereSemantics::XmlSecLegacy)

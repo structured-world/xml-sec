@@ -47,9 +47,13 @@
 //! let signed = SignContext::new(&signing_key)
 //!     .key_info_writer(&key_info)
 //!     .sign_template(&xml)?;
+//! // Every operation also reports the policy decisions it made.
+//! assert!(!signed.policy.decisions.is_empty());
 //!
 //! let resolver = DefaultKeyResolver::default();
-//! let result = VerifyContext::new().key_resolver(&resolver).verify(&signed)?;
+//! let result = VerifyContext::new()
+//!     .key_resolver(&resolver)
+//!     .verify(&signed.output)?;
 //! assert!(matches!(result.status, xml_sec::xmldsig::DsigStatus::Valid));
 //! # Ok(())
 //! # }
@@ -147,9 +151,10 @@ pub use verify::{
     ReferenceResolution, ReferenceResult, ReferenceSet, ReferencesResult, ReplayError, ReplayMode,
     ReplayOutcome, SelectedKeyReceipt, SelectedSignature, SelectedSignatureMethod, SessionDigest,
     SignatureEvidence, SignatureHashUse, SignatureKeyInfoMetadata, SignatureRequirement,
-    SignatureSelection, UriTypeSet, VerificationRequest, VerificationScope, VerifiedSession,
-    VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey, has_same_document_encapsulation,
-    inspect_pinned_verification_key_info, inspect_signing_key_info, inspect_verification_key_info,
+    SignatureSelection, UriClass, UriTypeSet, VerificationRequest, VerificationScope,
+    VerifiedSession, VerifyContext, VerifyEvidence, VerifyResult, VerifyingKey,
+    has_same_document_encapsulation, inspect_pinned_verification_key_info,
+    inspect_signing_key_info, inspect_verification_key_info,
     materialize_signing_key_info_references, materialize_verification_key_info_references,
     process_all_references, process_reference, verify_signature_with_pem_key,
     with_verified_request,

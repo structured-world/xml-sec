@@ -105,7 +105,8 @@ fn builder_preserves_context_through_public_signing_pipeline() {
             );
     let signed = SignContext::new(&key)
         .sign_with_builder("<root>payload</root>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     assert!(signed.contains(">Zm9v</"));
     let verifier = VerificationKey {
         algorithm,
@@ -170,7 +171,8 @@ fn all_eddsa_context_and_prehash_methods_complete_xml_pipeline() {
         assert!(xml.contains(&marker));
         let signed = SignContext::new(&key)
             .sign_template(&xml.replace(&marker, &replacement))
-            .unwrap();
+            .unwrap()
+            .output;
         let verifier = VerificationKey {
             algorithm,
             public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -217,7 +219,7 @@ fn context_whitespace_uses_the_operation_document_budget() {
         " ".repeat(4097)
     );
     let xml = template(algorithm).replace(&marker, &method);
-    let signed = SignContext::new(&key).sign_template(&xml).unwrap();
+    let signed = SignContext::new(&key).sign_template(&xml).unwrap().output;
     let verifier = xml_sec::xmldsig::VerificationKey {
         algorithm,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -333,7 +335,8 @@ fn pq_pipeline(algorithm: xml_sec::xmldsig::PqAlgorithm, der: &[u8]) {
     let signed = SignContext::new(&key)
         .policy(signing_policy)
         .sign_with_builder("<root>authenticated</root>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let verifier = VerificationKey {
         algorithm: method,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -403,7 +406,8 @@ fn pq_signature_whitespace_uses_the_operation_document_budget() {
             ..Default::default()
         })
         .sign_template(&template(method))
-        .unwrap();
+        .unwrap()
+        .output;
     let verifier = VerificationKey {
         algorithm: method,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -648,7 +652,8 @@ fn pure_eddsa_round_trips_keys_and_complete_xml_pipeline() {
         };
         let signed = SignContext::new(&key)
             .sign_template(&template(algorithm))
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(
             VerifyContext::new()
                 .key(&verifier)
@@ -671,7 +676,8 @@ fn pure_eddsa_round_trips_keys_and_complete_xml_pipeline() {
         let signed = SignContext::new(&key)
             .key_info_writer(&DerEncodedKeyValueInfoWriter)
             .sign_template(&xml)
-            .unwrap();
+            .unwrap()
+            .output;
         assert!(signed.contains("DEREncodedKeyValue"));
         let resolver = xml_sec::xmldsig::DefaultKeyResolver::default();
         // An embedded key is not application authorization. The same signed
@@ -772,7 +778,7 @@ fn ed448_context_survives_the_provider_boundary() {
         .unwrap();
     let key = EdDsaSigningKey::from_pkcs8_der(algorithm, der.as_bytes()).unwrap();
     let xml = template(algorithm).replace("#eddsa-ed448\"/>", "#eddsa-ed448\"><e:EdDSAContextString xmlns:e=\"http://www.aleksey.com/xmlsec/2025/12/xmldsig-more#\">Zm9v</e:EdDSAContextString></SignatureMethod>");
-    let signed = SignContext::new(&key).sign_template(&xml).unwrap();
+    let signed = SignContext::new(&key).sign_template(&xml).unwrap().output;
     let verifier = VerificationKey {
         algorithm,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -1060,7 +1066,8 @@ fn every_ecdsa_curve_and_modern_digest_runs_the_full_pipeline() {
             let signed = SignContext::new(key.as_ref())
                 .policy(policy)
                 .sign_template(&template(algorithm))
-                .unwrap_or_else(|error| panic!("curve {curve}/{algorithm:?}: {error}"));
+                .unwrap_or_else(|error| panic!("curve {curve}/{algorithm:?}: {error}"))
+                .output;
             let verifier = VerificationKey {
                 algorithm,
                 public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -1154,7 +1161,7 @@ fn sha3_capability_never_overrides_the_operation_policy() {
                 .is_err()
         );
     }
-    let signed = SignContext::new(&key).sign_template(&xml).unwrap();
+    let signed = SignContext::new(&key).sign_template(&xml).unwrap().output;
     let verifier = VerificationKey {
         algorithm,
         public_key_bytes: key.public_key_info().unwrap().spki_der().unwrap().to_vec(),
@@ -1223,7 +1230,8 @@ fn assert_bidirectional_xmlsec1(
     let signed = SignContext::new(key)
         .policy(signing_policy)
         .sign_template(&xml)
-        .unwrap();
+        .unwrap()
+        .output;
     std::fs::write(&signed_path, signed).unwrap();
     let verified = xmlsec1::command()
         .args(["verify", "--lax-key-search", "--privkey-pem"])

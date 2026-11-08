@@ -40,10 +40,12 @@ fn signed_pair() -> (XmlDocument, HmacVerificationKey, HmacVerificationKey) {
             "<root><payload ID=\"first\">one</payload><payload ID=\"second\">two</payload></root>",
             &builder("first"),
         )
-        .unwrap();
+        .unwrap()
+        .output;
     let xml = SignContext::new(&second)
         .sign_with_builder(&xml, &builder("second"))
-        .unwrap();
+        .unwrap()
+        .output;
     (
         XmlDocument::parse(xml).unwrap(),
         HmacVerificationKey::new(first_secret).unwrap(),
@@ -73,7 +75,8 @@ fn empty_uri_authenticates_document_elements_but_not_its_signature() {
                 "<root><payload ID=\"target\">signed</payload></root>",
                 &builder,
             )
-            .unwrap();
+            .unwrap()
+            .output;
         let document = XmlDocument::parse(xml).unwrap();
         let (root, targets) = document.with_view(|view| {
             (
@@ -462,7 +465,8 @@ fn external_evidence_identifies_resolved_bytes_not_the_lexical_uri() {
         .policy(signing_policy)
         .external_resources(&resources)
         .sign_with_builder("<root xml:base=\"https://example.test/data/\"/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let mut policy = VerificationPolicy::default();
     policy.uris.references = UriTypeSet::ALL;
@@ -518,7 +522,8 @@ fn external_reference_fingerprint(
         .policy(signing_policy)
         .external_resources(&resources)
         .sign_with_builder("<root/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let mut policy = VerificationPolicy::default();
     policy.uris.references = UriTypeSet::ALL;
@@ -653,7 +658,8 @@ fn wrapping_preserves_crypto_validity_but_cannot_authorize_the_decoy() {
             "<root><payload ID=\"authentic\">signed</payload></root>",
             &builder,
         )
-        .unwrap();
+        .unwrap()
+        .output;
     let wrapped = xml.replace(
         "<payload ID=\"authentic\">signed</payload>",
         "<hidden><payload ID=\"authentic\">signed</payload></hidden><payload ID=\"decoy\">unsigned</payload>",

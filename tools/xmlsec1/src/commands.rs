@@ -1017,7 +1017,7 @@ fn sign_with_policy(
     let signed = context
         .sign_template_document(document)
         .map_err(|error| CommandError::Signature(error.to_string()))?;
-    write_result_then_stdout_diagnostics(invocation, signed.as_bytes(), stdout, |stdout| {
+    write_result_then_stdout_diagnostics(invocation, signed.output.as_bytes(), stdout, |stdout| {
         write_signing_diagnostics(invocation, signature.algorithm, stdout)
     })
 }
@@ -4792,7 +4792,7 @@ fn decrypt_with_encapsulation(
             .provider(selected_provider(invocation)?)
             .policy(policy)
             .decrypt_data(parsed.data())
-            .map(|content| match content {
+            .map(|content| match content.output {
                 DecryptedContent::Xml(xml) => xml.into_bytes(),
                 DecryptedContent::Bytes(bytes) => bytes,
             })
@@ -5641,7 +5641,7 @@ fn decrypt_input(
     if standalone {
         return context
             .decrypt(xml)
-            .map(|content| match content {
+            .map(|content| match content.output {
                 DecryptedContent::Xml(xml) => xml.into_bytes(),
                 DecryptedContent::Bytes(bytes) => bytes,
             })
@@ -5649,7 +5649,7 @@ fn decrypt_input(
     }
     context
         .decrypt_first_document_from_start_node(xml, encrypted_data_id)
-        .map(String::into_bytes)
+        .map(|decrypted| decrypted.output.into_bytes())
         .map_err(|error| CommandError::Encryption(error.to_string()))
 }
 

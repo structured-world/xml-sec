@@ -464,13 +464,13 @@ mod merlin {
         let context = DecryptContext::new(resolver).policy(inputs.policy.clone());
         if case.is_binary() {
             assert_eq!(
-                context.decrypt(wire).unwrap(),
+                context.decrypt(wire).unwrap().output,
                 DecryptedContent::Bytes(BINARY.to_vec()),
                 "{}",
                 case.name
             );
         } else {
-            let actual = context.decrypt_document(wire, None).unwrap();
+            let actual = context.decrypt_document(wire, None).unwrap().output;
             assert_plaintext(case, actual.as_bytes());
         }
     }
@@ -604,7 +604,8 @@ fn camellia_cbc_and_key_wrap_interoperate_at_every_key_width() {
             xml_sec::xmlenc::DecryptContext::new(&resolver)
                 .policy(decryption)
                 .decrypt(&empty.encrypted_data_xml)
-                .unwrap(),
+                .unwrap()
+                .output,
             xml_sec::xmlenc::DecryptedContent::Bytes(Vec::new())
         );
         for plaintext in [b"short".as_slice(), &[0x52; 16], &[0x73; 33]] {
@@ -749,7 +750,8 @@ fn chacha_wire_parameters_interoperate_with_the_oracle() {
                     DecryptContext::new(&resolver)
                         .policy(decryption.clone())
                         .decrypt(&encrypted.encrypted_data_xml)
-                        .unwrap(),
+                        .unwrap()
+                        .output,
                     DecryptedContent::Bytes(payload.clone())
                 );
                 // The xmlsec1 CLI has no result buffer for an empty plaintext;
@@ -841,7 +843,8 @@ fn cipher_reference_has_reciprocal_libxmlsec1_interoperability() {
     assert_eq!(
         DecryptContext::new(&SymmetricKeyDecryptor::new(secret))
             .decrypt(&wire)
-            .expect("Rust reference decryption"),
+            .expect("Rust reference decryption")
+            .output,
         DecryptedContent::Bytes(plaintext.to_vec())
     );
 }
@@ -1025,7 +1028,8 @@ fn check_kdf_case(sha: &str, option: &str, xml: &str, key: &Path, data: &Path) {
         DecryptContext::new(&resolver)
             .policy(inbound)
             .decrypt(&fs::read_to_string(&output.path).unwrap())
-            .unwrap(),
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(KDF_PLAINTEXT.to_vec()),
         "{option}/{sha}"
     );
@@ -1188,7 +1192,10 @@ fn ecdh_xml_has_reciprocal_libxmlsec1_interoperability() {
             DataEncryptionAlgorithm::Aes128Gcm,
         );
         assert_eq!(
-            DecryptContext::new(&resolver).decrypt(&donor).unwrap(),
+            DecryptContext::new(&resolver)
+                .decrypt(&donor)
+                .unwrap()
+                .output,
             DecryptedContent::Bytes(plaintext.to_vec())
         );
     }

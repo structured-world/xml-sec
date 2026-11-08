@@ -89,13 +89,16 @@ fn example() -> Result<(), Box<dyn std::error::Error>> {
         .direct_key_name("application-content-key")
         .encrypt_xml("<secret>value</secret>")?;
 
+    let decrypted = decrypt(
+        &encrypted.encrypted_data_xml,
+        &SymmetricKeyDecryptor::new(key),
+    )?;
     assert_eq!(
-        decrypt(
-            &encrypted.encrypted_data_xml,
-            &SymmetricKeyDecryptor::new(key),
-        )?,
+        decrypted.output,
         DecryptedContent::Xml("<secret>value</secret>".into()),
     );
+    // Both operations audit the same content algorithm decision.
+    assert_eq!(decrypted.policy.decisions, encrypted.policy.decisions);
     Ok(())
 }
 ```
@@ -178,7 +181,7 @@ fn example(encrypted_xml: &str) -> Result<(), Box<dyn std::error::Error>> {
     let resolver = SymmetricKeyDecryptor::new([0_u8; 16]);
     let plaintext = decrypt_data(&encrypted, &resolver)?;
 
-    match plaintext {
+    match plaintext.output {
         DecryptedContent::Xml(xml) => println!("{xml}"),
         DecryptedContent::Bytes(bytes) => println!("{} plaintext bytes", bytes.len()),
     }

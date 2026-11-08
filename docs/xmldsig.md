@@ -393,7 +393,7 @@ let signed = SignContext::new(&HmacSigningKey::new(secret.clone())?)
         ),
     )?;
 
-let document = XmlDocument::parse(signed)?;
+let document = XmlDocument::parse(signed.output)?;
 let key = HmacVerificationKey::new(secret)?;
 let mut policy = VerificationPolicy::default();
 policy.uris.references = UriTypeSet::ALL;

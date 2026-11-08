@@ -468,7 +468,8 @@ fn configured_snapshots_enforce_real_encrypt_and_decrypt_limits() {
         DecryptContext::new(&resolver)
             .policy(policies.compiled().decryption().unwrap().clone())
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"protected".to_vec())
     );
     let restricted = effective(
@@ -793,7 +794,8 @@ fn configured_snapshots_enforce_real_sign_and_verify_limits() {
     let signed = SignContext::new(&signing_key)
         .policy(policies.compiled().signing().unwrap().clone())
         .sign_template(input)
-        .unwrap();
+        .unwrap()
+        .output;
     let result = VerifyContext::new()
         .key(&verifier)
         .policy(policies.compiled().verification().unwrap().clone())

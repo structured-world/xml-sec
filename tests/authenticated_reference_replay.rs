@@ -424,7 +424,8 @@ fn current_query_base64_charges_local_and_aggregate_once() {
         .policy(signing_policy)
         .external_resources(&resources)
         .sign_template(&template)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let request = VerificationRequest {
         external_resources: Some(&resources),
@@ -597,8 +598,13 @@ fn outside_manifest_enveloped_replay_has_no_invented_signature_context() {
         "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
         "47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=",
     );
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     with_verified_request(
         &document,
@@ -665,7 +671,8 @@ fn replay_excludes_the_actual_containing_signature_not_the_selected_one() {
                 xml_sec::xmldsig::SignatureTemplateSelection::FirstDescendant,
             )
             .sign_template(&template)
-            .unwrap(),
+            .unwrap()
+            .output,
     )
     .unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
@@ -715,9 +722,13 @@ fn terminal_replay_memory_does_not_scale_with_output_length() {
         let key = HmacVerificationKey::new(secret).unwrap();
         let template = manifest_template("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "")
             .replace("payload", &"x".repeat(length));
-        let document =
-            XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap())
-                .unwrap();
+        let document = XmlDocument::parse(
+            SignContext::new(&signer)
+                .sign_template(&template)
+                .unwrap()
+                .output,
+        )
+        .unwrap();
         let work = Memory::new(Arc::new(MemoryAccount::new(16384, 1 << 28)));
         let context = VerifyContext::new().key(&key).process_manifests(true);
         with_verified_request(
@@ -889,7 +900,10 @@ fn signed_manifest(uri: &str, algorithm: &str, transforms: &str) -> (String, Hma
     // Manifest bytes, including intentionally stale/unsupported child digests.
     let xml = manifest_template(uri, algorithm, transforms);
     (
-        SignContext::new(&signer).sign_template(&xml).unwrap(),
+        SignContext::new(&signer)
+            .sign_template(&xml)
+            .unwrap()
+            .output,
         HmacVerificationKey::new(secret).unwrap(),
     )
 }
@@ -921,8 +935,13 @@ fn authenticated_manifest_outside_signature_uses_the_same_catalogue_and_replay()
     let xml = manifest_template("#target", "http://www.w3.org/2001/04/xmlenc#sha256", "")
         .replace("<ds:Object>", "</ds:Signature>")
         .replace("</ds:Object></ds:Signature>", "");
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&xml).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&xml)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     with_verified_request(
         &document,
@@ -1178,7 +1197,10 @@ fn replay_layout_diagnostic_retains_current_capacity_until_error_drop() {
             "</ds:DigestValue></ds:Reference>\n</ds:Manifest>",
             &format!("</ds:DigestValue><{name}/></ds:Reference>\n</ds:Manifest>"),
         );
-    let xml = SignContext::new(&signer).sign_template(&template).unwrap();
+    let xml = SignContext::new(&signer)
+        .sign_template(&template)
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     with_verified_request(
@@ -1400,8 +1422,13 @@ fn external_enveloped_replay_refuses_a_foreign_document() {
         .replace("</ds:Object></ds:Signature>", "");
     let signer = HmacSigningKey::new(vec![0x61; 32]).unwrap();
     let key = HmacVerificationKey::new(vec![0x61; 32]).unwrap();
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let resources = BTreeMap::from([(uri.to_owned(), b"<payload/>".to_vec())]);
     let context = VerifyContext::new()
         .key(&key)
@@ -1518,8 +1545,13 @@ fn terminal_c14n_xml_base_refusals_keep_their_policy_resources() {
             "Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"",
             "Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2006/12/xml-c14n11\"",
         );
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     for components in [true, false] {
         let mut policy = xml_sec::policy::VerificationPolicy::default();
         let expected = if components {
@@ -1764,8 +1796,13 @@ fn replay_accounts_c14n11_xml_base_and_releases_temporary_capacity() {
             "Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2006/12/xml-c14n11\"",
             1,
         );
-    let document =
-        XmlDocument::parse(SignContext::new(&signer).sign_template(&template).unwrap()).unwrap();
+    let document = XmlDocument::parse(
+        SignContext::new(&signer)
+            .sign_template(&template)
+            .unwrap()
+            .output,
+    )
+    .unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     let work = account();
     with_verified_request(&document, &context, &VerificationRequest::default(), &work, |session| {
@@ -2127,7 +2164,10 @@ fn real_signed_nested_manifest_resolves_original_properties_and_visitor_refusal(
         .replace("URI=\"#manifest\"", "URI=\"#container\"")
         .replace("<ds:Object>", r##"<ds:Object Id="container"><nested><property Id="property" URI="#inside"/><unsupported Id="unsupported" URI="#"/><content Id="content">#in<!--split-->side</content>"##)
         .replace("</ds:Object>", "</nested></ds:Object>");
-    let xml = SignContext::new(&signer).sign_template(&template).unwrap();
+    let xml = SignContext::new(&signer)
+        .sign_template(&template)
+        .unwrap()
+        .output;
     for backend in backends() {
         let document = XmlDocument::parse_with_backend(xml.clone(), backend).unwrap();
         let context = VerifyContext::new()
@@ -2220,7 +2260,10 @@ fn timestamp_preserves_comments_and_inclusive_prefix_list() {
     let key = HmacVerificationKey::new(secret).unwrap();
     let template = manifest_template("#xpointer(id('target'))", "http://www.w3.org/2001/04/xmlenc#sha256", "")
         .replacen("Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#\"/>", "Id=\"timestamp-method\" Algorithm=\"http://www.w3.org/2001/10/xml-exc-c14n#WithComments\"><ec:InclusiveNamespaces xmlns:ec=\"http://www.w3.org/2001/10/xml-exc-c14n#\" PrefixList=\"u\"/></ds:CanonicalizationMethod>", 1);
-    let xml = SignContext::new(&signer).sign_template(&template).unwrap();
+    let xml = SignContext::new(&signer)
+        .sign_template(&template)
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let context = VerifyContext::new().key(&key).process_manifests(true);
     with_verified_request(

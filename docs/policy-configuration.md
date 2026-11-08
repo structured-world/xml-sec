@@ -3,7 +3,8 @@
 `xml-sec-config` is the versioned TOML boundary above `xml-sec`. It uses the
 existing typed compiler and one caller-selected `CryptoProvider`. It neither
 implements cryptography nor reads environment variables, searches directories,
-fetches resources, reloads policies, loads keys or decides caller authority.
+fetches resources, watches for changes, loads keys or decides caller authority.
+Its `PolicyStore` publishes a replacement the application hands it.
 Both the config and native CLI packages currently build from the workspace;
 their manifests do not opt into the core's single-package release workflow.
 
@@ -117,4 +118,16 @@ Adding a validity window is one restrictive change; removing it is relaxing.
 When both policies have a window, its boundaries remain individually classified.
 The CLI prints all changes and exits successfully when both inputs compile;
 operators must inspect classifications rather than equating exit zero with a
-safe rollout. Store/reload atomicity and policy audit identity are separate APIs.
+safe rollout.
+
+## Publication and Identity
+
+`PolicyStore::new` compiles one profile and publishes it as revision 1;
+`replace` validates and compiles a replacement completely, then publishes it
+atomically as the next revision, or publishes nothing when it is refused.
+`load` hands an operation one snapshot that later publications do not change.
+Every published `CompiledPolicies` carries a `PolicyIdentity`: profile name,
+schema version, revision and the SHA-256 of the `to_toml` effective output, so
+equal enforced settings have equal digests. Each operation returns that identity
+with its decisions in its `PolicyAudit`. The
+[deployment runbook](deployment.md#hot-reload) covers reload and rollback.

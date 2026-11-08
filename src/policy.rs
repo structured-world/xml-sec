@@ -38,6 +38,16 @@ mod key_sources;
 #[cfg(feature = "xmldsig")]
 pub use key_sources::{KeySourceKind, KeySourcePolicy};
 
+mod identity;
+pub use identity::PolicyIdentity;
+
+#[cfg(feature = "xmldsig")]
+mod audit;
+#[cfg(feature = "xmldsig")]
+pub use audit::{
+    AlgorithmRole, Audited, PolicyAudit, PolicyDecision, UNRECOGNIZED_ALGORITHM, UriRole,
+};
+
 #[cfg(feature = "xmldsig")]
 mod profiles;
 #[cfg(feature = "xmldsig")]

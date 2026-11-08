@@ -112,7 +112,8 @@ fn url_maps_do_not_authorize_external_key_retrieval() {
     .unwrap();
     let signed = SignContext::new(&key)
         .sign_template(signature_template_without_key_info())
-        .unwrap();
+        .unwrap()
+        .output;
     let certificate =
         pem::parse(fs::read(root.join("tests/fixtures/keys/rsa/rsa-2048-cert.pem")).unwrap())
             .unwrap();
@@ -325,7 +326,8 @@ fn parameterized_rsa_pss_cli_preserves_effective_parameters() {
                 ..Default::default()
             })
             .sign_with_builder("<root>CLI PSS</root>", &builder)
-            .unwrap();
+            .unwrap()
+            .output;
         let template = temp.path().join("template.xml");
         let output = temp.path().join("signed.xml");
         fs::write(&template, signed).unwrap();
@@ -831,7 +833,8 @@ fn compatibility_cli_verifies_a_pq_signed_certificate_path() {
     );
     let signed = SignContext::new(&key)
         .sign_with_builder("<root>payload</root>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let signed_path = temp.path().join("signed.xml");
     fs::write(&signed_path, &signed).unwrap();
     let verify = || {
@@ -3378,7 +3381,8 @@ fn xml_debug_reports_authenticated_manifest_reference_failure_at_the_root() {
             "<root><payload Id=\"manifest-payload\">original</payload></root>",
             &digest_probe,
         )
-        .unwrap();
+        .unwrap()
+        .output;
     let probe_document = roxmltree::Document::parse(&probe).unwrap();
     let manifest_digest = probe_document
         .descendants()
@@ -3406,7 +3410,8 @@ fn xml_debug_reports_authenticated_manifest_reference_failure_at_the_root() {
     .unwrap();
     let signed = SignContext::new(&private_key)
         .sign_template(&unsigned)
-        .unwrap();
+        .unwrap()
+        .output;
     let tampered = temp.path().join("manifest-tampered.xml");
     fs::write(&tampered, signed.replace(">original<", ">tampered<")).unwrap();
 

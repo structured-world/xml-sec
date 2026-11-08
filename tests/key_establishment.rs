@@ -460,7 +460,8 @@ fn assert_agreement_wraps_content(
                     &encrypted.encrypted_data_xml,
                     &KekDecryptor::new(recipient_kek.clone())
                 )
-                .unwrap(),
+                .unwrap()
+                .output,
                 DecryptedContent::Bytes(b"agreement-derived recipient key".to_vec())
             );
             let mut wrong = zeroize::Zeroizing::new(recipient_kek);

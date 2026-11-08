@@ -685,7 +685,8 @@ fn authenticated_manifest_uses_the_same_relationship_contract() {
             .policy(signing)
             .external_resources(&resources)
             .sign_template(&template)
-            .unwrap();
+            .unwrap()
+            .output;
         let mut verification = VerificationPolicy {
             manifest_processing: ManifestProcessing::Process,
             ..VerificationPolicy::default()
@@ -701,6 +702,16 @@ fn authenticated_manifest_uses_the_same_relationship_contract() {
         assert_eq!(result.status, DsigStatus::Valid);
         assert_eq!(result.manifest_references.len(), 1);
         assert_eq!(result.manifest_references[0].status, DsigStatus::Valid);
+        // The audit records the Manifest processing and its caller-supplied part.
+        for decision in [
+            xml_sec::policy::PolicyDecision::Manifests(ManifestProcessing::Process),
+            xml_sec::policy::PolicyDecision::Uri {
+                role: xml_sec::policy::UriRole::ManifestReference,
+                class: xml_sec::xmldsig::UriClass::External,
+            },
+        ] {
+            assert!(result.policy.decisions.contains(&decision), "{decision:?}");
+        }
     }
 }
 
@@ -798,7 +809,8 @@ fn signed_external_part(
         .key_info_writer(&key_info)
         .external_resources(&resources)
         .sign_with_builder("<root/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     (signed, resources)
 }
 
@@ -1003,7 +1015,8 @@ fn upstream_office_relationship_fixture_signs_and_verifies() {
         .key_info_writer(&key_info)
         .external_resources(&resources)
         .sign_template(&template)
-        .unwrap();
+        .unwrap()
+        .output;
     let resolver = DefaultKeyResolver::default();
     let mut verification = VerificationPolicy::default();
     verification.key_trust.mode = VerificationTrustMode::CryptographicOnly;

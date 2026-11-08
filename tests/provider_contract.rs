@@ -209,7 +209,8 @@ fn opaque_provider_keys_cross_the_public_encrypt_and_decrypt_pipelines() {
     let decrypted = DecryptContext::new(&resolver)
         .provider(&ExternalProvider::RECOVERY_ONLY)
         .decrypt(&xml)
-        .expect("external recovery and content decryption must complete");
+        .expect("external recovery and content decryption must complete")
+        .output;
     assert_eq!(
         decrypted,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"external plaintext".to_vec())

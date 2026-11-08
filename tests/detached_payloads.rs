@@ -83,7 +83,8 @@ fn signed(detached: &[Detached<'_>], local_tampered: bool) -> XmlDocument {
             "<root xml:base=\"https://example.test/data/\"><local ID=\"local\">kept</local></root>",
             &builder,
         )
-        .unwrap();
+        .unwrap()
+        .output;
     let xml = if local_tampered {
         xml.replacen(">kept<", ">changed<", 1)
     } else {
@@ -410,7 +411,8 @@ fn chain_needing_xml_is_not_offered_for_streaming() {
         .policy(signing_policy())
         .external_resources(&resources)
         .sign_with_builder("<root xml:base=\"https://example.test/data/\"/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let (pending, references, _) = session(&document, verification_policy(), |session| {
         Ok(session
@@ -769,7 +771,8 @@ fn manifest_document(payload: &[u8]) -> XmlDocument {
         .policy(signing)
         .external_resources(&resources)
         .sign_template(&template)
-        .unwrap();
+        .unwrap()
+        .output;
     XmlDocument::parse(xml).unwrap()
 }
 
@@ -954,6 +957,20 @@ fn completing_core_validation_processes_the_authenticated_manifest() {
     assert_eq!(result.status, DsigStatus::Valid);
     assert_eq!(result.manifest_references.len(), 1);
     assert_eq!(result.manifest_references[0].status, DsigStatus::Valid);
+    // The Manifest processing the completion ran is in the Signature's audit.
+    for decision in [
+        xml_sec::policy::PolicyDecision::Manifests(ManifestProcessing::Process),
+        xml_sec::policy::PolicyDecision::Uri {
+            role: xml_sec::policy::UriRole::ManifestReference,
+            class: xml_sec::xmldsig::UriClass::SameDocument,
+        },
+    ] {
+        assert!(
+            result.policy.decisions.contains(&decision),
+            "{decision:?}: {:?}",
+            result.policy.decisions
+        );
+    }
     assert!(evidence.all_valid());
     assert!(evidence.accepted(&document).unwrap());
 }
@@ -1189,7 +1206,8 @@ fn listing_does_not_reparse_chains_that_cannot_stream() {
         .policy(signing_policy())
         .external_resources(&resources)
         .sign_template(&template)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let mut policy = verification_policy();
     policy.resources.max_xpath_expressions = 1;

@@ -239,7 +239,8 @@ fn denying_certificate_signatures_keeps_trusted_preset_keys_usable() {
     let xml = SignContext::new(&key)
         .policy(compiled.signing().unwrap().clone())
         .sign_template(&template("urn:test", "root"))
-        .unwrap();
+        .unwrap()
+        .output;
     let result = VerifyContext::new()
         .key(&verifier)
         .policy(compiled.verification().unwrap().clone())
@@ -312,7 +313,8 @@ fn decryption_profile_uses_only_inbound_provider_capabilities() {
             .provider(&provider)
             .policy(policy.clone())
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap();
+            .unwrap()
+            .output;
         assert_eq!(
             decrypted,
             xml_sec::xmlenc::DecryptedContent::Bytes(b"inbound-only".to_vec())
@@ -354,7 +356,8 @@ fn assert_inbound_round_trip(
     let result = DecryptContext::new(&resolver)
         .policy(inbound.clone())
         .decrypt(&encrypted.encrypted_data_xml)
-        .unwrap();
+        .unwrap()
+        .output;
     assert_eq!(
         result,
         xml_sec::xmlenc::DecryptedContent::Bytes(b"compatibility profile".to_vec())
@@ -760,7 +763,8 @@ fn saml_profile_signs_and_authenticates_explicit_parent_target() {
             "urn:oasis:names:tc:SAML:2.0:assertion",
             "assertion",
         ))
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let targets = document.with_view(|view| [view.root_element()]);
     let context = VerifyContext::new()
@@ -911,7 +915,8 @@ fn xades_profile_authenticates_nonempty_ordered_properties() {
     let xml = SignContext::new(&key)
         .policy(compiled.signing().unwrap().clone())
         .sign_template(&xades_template(properties))
-        .unwrap();
+        .unwrap()
+        .output;
     let document = XmlDocument::parse(xml).unwrap();
     let targets = document.with_view(|view| [view.root_element()]);
     let evidence = VerifyContext::new()

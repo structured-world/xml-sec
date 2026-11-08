@@ -76,7 +76,8 @@ fn x448_public_encryption_and_decryption_obey_typed_permission() {
         DecryptContext::new(&resolver)
             .policy(decryption)
             .decrypt(&wire.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"X448 public pipeline".to_vec())
     );
 }
@@ -328,7 +329,10 @@ fn xml_agreement_gates_content_key_and_preserves_mixed_content() {
         DataEncryptionAlgorithm::Aes128Gcm,
     );
     assert_eq!(
-        DecryptContext::new(&resolver).decrypt(&wire).unwrap(),
+        DecryptContext::new(&resolver)
+            .decrypt(&wire)
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"agreement XML pipeline".to_vec())
     );
     assert!(
@@ -428,7 +432,10 @@ fn xml_recipient_agreement_derives_a_kek_before_unwrapping_content() {
     let peer = sender.public_key();
     let resolver = AgreementDecryptor::wrapping(&descriptor, &recipient, &peer, wrap);
     assert_eq!(
-        DecryptContext::new(&resolver).decrypt(&wire).unwrap(),
+        DecryptContext::new(&resolver)
+            .decrypt(&wire)
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"agreement recipient".to_vec())
     );
     assert!(

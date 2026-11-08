@@ -567,17 +567,22 @@ impl<'view, 'scope, 'inputs, W: Work> VerifiedSession<'view, 'scope, 'inputs, W>
         }
         let manifests = self.process_manifests(signature, reference_count);
         let entry = &mut self.evidence.signatures[signature];
+        let operation = &self.operations[signature].operation;
         match manifests {
             Ok(manifest_references) => {
                 if let Ok(result) = &mut entry.result {
                     result.status = DsigStatus::Valid;
                     result.manifest_references = manifest_references;
+                    // The Manifest processing this completion ran belongs to
+                    // the Signature's audit, after its verification's decisions.
+                    let completion = operation.audit(result.policy.identity.as_ref());
+                    result.policy.decisions.extend(completion.decisions);
                 }
                 Ok(())
             }
             Err(error) => {
                 let refusal = resource_refusal(&error);
-                entry.result = Err(error);
+                entry.fail(error, operation);
                 refusal.map_or(Ok(()), Err)
             }
         }

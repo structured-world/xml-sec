@@ -9,6 +9,8 @@
 #[cfg(feature = "xmldsig-sign")]
 use crate::key_manager::KeyInventory;
 use crate::policy::CompiledPolicies;
+#[cfg(feature = "xmldsig-sign")]
+use crate::policy::{Audited, PolicyAudit};
 use crate::provider::CryptoProvider;
 #[cfg(feature = "xmldsig-sign")]
 use crate::xmldsig::{
@@ -128,11 +130,11 @@ impl<'a> XmlSecurity<'a> {
     pub fn verifier(&self) -> Result<Verifier<'_>, XmlSecError> {
         let policy = self
             .policies
-            .verification()
+            .shared_verification()
             .ok_or(XmlSecError::OperationDisabled(Operation::Verify))?;
         Ok(Verifier {
             context: VerifyContext::new()
-                .policy(policy.clone())
+                .snapshot(policy, self.policies.shared_identity())
                 .provider(self.provider)
                 .xml_backend(self.backend),
         })
@@ -149,11 +151,11 @@ impl<'a> XmlSecurity<'a> {
     {
         let policy = self
             .policies
-            .signing()
+            .shared_signing()
             .ok_or(XmlSecError::OperationDisabled(Operation::Sign))?;
         Ok(Signer {
             context: SignContext::new(key)
-                .policy(policy.clone())
+                .snapshot(policy, self.policies.shared_identity())
                 .provider(self.provider)
                 .xml_backend(self.backend),
         })
@@ -193,10 +195,15 @@ impl<'a> XmlSecurity<'a> {
     {
         let policy = self
             .policies
-            .encryption()
+            .shared_encryption()
             .ok_or(XmlSecError::OperationDisabled(Operation::Encrypt))?;
         Ok(Encryptor {
-            execution: builder.bind(policy, self.provider, self.backend),
+            execution: builder.bind(
+                policy,
+                self.policies.shared_identity(),
+                self.provider,
+                self.backend,
+            ),
         })
     }
 
@@ -214,11 +221,11 @@ impl<'a> XmlSecurity<'a> {
     {
         let policy = self
             .policies
-            .decryption()
+            .shared_decryption()
             .ok_or(XmlSecError::OperationDisabled(Operation::Decrypt))?;
         Ok(Decryptor {
             context: crate::xmlenc::DecryptContext::new(resolver)
-                .policy(policy.clone())
+                .snapshot(policy, self.policies.shared_identity())
                 .provider(self.provider)
                 .xml_backend(self.backend),
         })
@@ -338,7 +345,8 @@ impl<'a> Signer<'a> {
         self.context = self.context.signature_template_selection(selection);
         self
     }
-    /// Stage and commit a signature as one document generation on success.
+    /// Stage and commit a signature as one document generation on success,
+    /// and return what the signing policy decided.
     ///
     /// # Errors
     /// Returns target/template, provenance, policy, resource, resolver or signing
@@ -347,7 +355,7 @@ impl<'a> Signer<'a> {
         &self,
         document: &mut XmlDocument,
         builder: &SignatureBuilder,
-    ) -> Result<(), XmlSecError> {
+    ) -> Result<PolicyAudit, XmlSecError> {
         Ok(self.context.sign_document_with_builder(document, builder)?)
     }
     /// Parse, sign and return XML through the same cumulative-budget pipeline.
@@ -355,22 +363,27 @@ impl<'a> Signer<'a> {
     /// # Errors
     /// Returns parsing, template/target, policy, resource, signing or output
     /// serialization failures from the operation pipeline.
-    pub fn sign_xml(&self, xml: &str, builder: &SignatureBuilder) -> Result<String, XmlSecError> {
+    pub fn sign_xml(
+        &self,
+        xml: &str,
+        builder: &SignatureBuilder,
+    ) -> Result<Audited<String>, XmlSecError> {
         Ok(self.context.sign_with_builder(xml, builder)?)
     }
-    /// Fill an existing template in a retained document atomically.
+    /// Fill an existing template in a retained document atomically, and
+    /// return what the signing policy decided.
     ///
     /// # Errors
     /// Returns provenance, template, policy, resource, resolver or signing
     /// failures without committing a partial mutation.
-    pub fn sign_template(&self, document: &mut XmlDocument) -> Result<(), XmlSecError> {
+    pub fn sign_template(&self, document: &mut XmlDocument) -> Result<PolicyAudit, XmlSecError> {
         Ok(self.context.sign_document(document)?)
     }
     /// Fill an existing template using the string convenience path.
     ///
     /// # Errors
     /// Returns XML/template, policy, resource, resolver, signing or serialization failures.
-    pub fn sign_template_xml(&self, xml: &str) -> Result<String, XmlSecError> {
+    pub fn sign_template_xml(&self, xml: &str) -> Result<Audited<String>, XmlSecError> {
         Ok(self.context.sign_template(xml)?)
     }
 }
@@ -383,7 +396,8 @@ pub struct Encryptor<'a> {
 
 #[cfg(feature = "xmlenc")]
 impl Encryptor<'_> {
-    /// Encrypt and commit one selected retained-document target.
+    /// Encrypt and commit one selected retained-document target, and return
+    /// what the encryption policy decided.
     ///
     /// # Errors
     /// Returns target/provenance, policy, resource, key establishment, cipher
@@ -392,7 +406,7 @@ impl Encryptor<'_> {
         &self,
         document: &mut XmlDocument,
         options: crate::xmlenc::DocumentEncryptionOptions<'_>,
-    ) -> Result<(), XmlSecError> {
+    ) -> Result<PolicyAudit, XmlSecError> {
         Ok(self.execution.encrypt_owned_document(document, options)?)
     }
     /// Parse, replace and return a complete encrypted document.
@@ -404,7 +418,7 @@ impl Encryptor<'_> {
         &self,
         xml: &str,
         options: crate::xmlenc::DocumentEncryptionOptions<'_>,
-    ) -> Result<String, XmlSecError> {
+    ) -> Result<Audited<String>, XmlSecError> {
         Ok(self.execution.encrypt_document(xml, options)?)
     }
     /// Encrypt a standalone XML element/content fragment without insertion.
@@ -452,13 +466,18 @@ impl<'a> Decryptor<'a> {
         self.context = self.context.id_attributes(attributes);
         self
     }
-    /// Recover and atomically replace one retained `EncryptedData` target.
+    /// Recover and atomically replace one retained `EncryptedData` target, and
+    /// return what the decryption policy decided.
     /// `id` optionally selects its schema `Id` attribute, not another ID spelling.
     ///
     /// # Errors
     /// Returns target/provenance, policy, resource, key resolution, ciphertext
     /// or plaintext-structure failures without committing a partial replacement.
-    pub fn decrypt(&self, document: &mut XmlDocument, id: Option<&str>) -> Result<(), XmlSecError> {
+    pub fn decrypt(
+        &self,
+        document: &mut XmlDocument,
+        id: Option<&str>,
+    ) -> Result<PolicyAudit, XmlSecError> {
         Ok(self.context.decrypt_owned_document(document, id)?)
     }
     /// Parse, recover and return a complete document.
@@ -466,7 +485,7 @@ impl<'a> Decryptor<'a> {
     /// # Errors
     /// Returns parsing/target, policy, resource, key resolution, ciphertext,
     /// plaintext-structure or serialization failures.
-    pub fn decrypt_xml(&self, xml: &str, id: Option<&str>) -> Result<String, XmlSecError> {
+    pub fn decrypt_xml(&self, xml: &str, id: Option<&str>) -> Result<Audited<String>, XmlSecError> {
         Ok(self.context.decrypt_document(xml, id)?)
     }
     /// Recover a standalone `EncryptedData` fragment without document insertion.
@@ -477,7 +496,7 @@ impl<'a> Decryptor<'a> {
     pub fn decrypt_fragment(
         &self,
         xml: &str,
-    ) -> Result<crate::xmlenc::DecryptedContent, XmlSecError> {
+    ) -> Result<Audited<crate::xmlenc::DecryptedContent>, XmlSecError> {
         Ok(self.context.decrypt(xml)?)
     }
 }

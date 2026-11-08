@@ -73,7 +73,8 @@ pub struct EncryptedDataBuilder {
     direct_key: Option<DirectEncryptionKey>,
     direct_key_name: Option<String>,
     recipients: Vec<EncryptionRecipient>,
-    policy: crate::policy::EncryptionPolicy,
+    policy: Arc<crate::policy::EncryptionPolicy>,
+    identity: Option<Arc<crate::policy::PolicyIdentity>>,
     provider: Arc<dyn crate::provider::CryptoProvider>,
     xml_backend: crate::XmlBackend,
 }
@@ -147,9 +148,21 @@ impl AsRef<[u8]> for OperationContentKey<'_> {
 }
 
 struct GeneratedEncryption {
-    result: EncryptionResult,
+    encrypted_data_xml: String,
+    replacement: ReplacementMode,
     xml_nodes: usize,
     mutation: Option<OperationNodeId>,
+}
+
+impl GeneratedEncryption {
+    /// The result of the whole operation, once nothing more can refuse it.
+    fn into_result(self, policy: crate::policy::PolicyAudit) -> EncryptionResult {
+        EncryptionResult {
+            encrypted_data_xml: self.encrypted_data_xml,
+            replacement: self.replacement,
+            policy,
+        }
+    }
 }
 
 struct EncryptionPlanNodes {
@@ -174,11 +187,12 @@ impl EncryptionOperationBudgets {
     }
 }
 
+/// One encryption operation, sharing its policy snapshot.
+type EncryptionExecution =
+    OperationExecutionContext<Arc<crate::policy::EncryptionPolicy>, EncryptionOperationBudgets>;
+
 fn compile_encryption_plan(
-    operation: &mut OperationExecutionContext<
-        crate::policy::EncryptionPolicy,
-        EncryptionOperationBudgets,
-    >,
+    operation: &mut EncryptionExecution,
     key_count: usize,
     mutation: bool,
     input_resource: OperationResourceIdentity,
@@ -253,6 +267,7 @@ impl fmt::Debug for EncryptedDataBuilder {
             .field("direct_key_name", &self.direct_key_name)
             .field("recipients", &self.recipients)
             .field("policy", &self.policy)
+            .field("identity", &self.identity)
             .field("provider", &self.provider.name())
             .field("xml_backend", &self.xml_backend)
             .finish()
@@ -275,7 +290,8 @@ impl EncryptedDataBuilder {
             direct_key: None,
             direct_key_name: None,
             recipients: Vec::new(),
-            policy: crate::policy::EncryptionPolicy::default(),
+            policy: Arc::new(crate::policy::EncryptionPolicy::default()),
+            identity: None,
             provider: Arc::new(crate::provider::RustCryptoProvider),
             xml_backend: crate::XmlBackend::default(),
         }
@@ -284,7 +300,8 @@ impl EncryptedDataBuilder {
     /// Replace the complete immutable encryption policy snapshot.
     #[must_use]
     pub fn policy(mut self, policy: crate::policy::EncryptionPolicy) -> Self {
-        self.policy = policy;
+        self.policy = Arc::new(policy);
+        self.identity = None;
         self
     }
 
@@ -430,20 +447,27 @@ impl EncryptedDataBuilder {
 
     pub(crate) fn bind<'a>(
         &'a self,
-        policy: &'a crate::policy::EncryptionPolicy,
+        policy: &'a Arc<crate::policy::EncryptionPolicy>,
+        identity: Option<&'a Arc<crate::policy::PolicyIdentity>>,
         provider: &'a dyn crate::provider::CryptoProvider,
         xml_backend: crate::XmlBackend,
     ) -> BoundEncryption<'a> {
         BoundEncryption {
             builder: self,
             policy,
+            identity,
             provider,
             xml_backend,
         }
     }
 
     fn execution(&self) -> BoundEncryption<'_> {
-        self.bind(&self.policy, self.provider.as_ref(), self.xml_backend)
+        self.bind(
+            &self.policy,
+            self.identity.as_ref(),
+            self.provider.as_ref(),
+            self.xml_backend,
+        )
     }
 
     /// Encrypt one complete XML element or XML content fragment.
@@ -473,11 +497,12 @@ impl EncryptedDataBuilder {
         &self,
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
-    ) -> Result<String, XmlEncError> {
+    ) -> Result<crate::policy::Audited<String>, XmlEncError> {
         self.execution().encrypt_document(xml, options)
     }
 
-    /// Encrypt one retained document, committing one generation on success.
+    /// Encrypt one retained document, committing one generation on success,
+    /// and return what the encryption policy decided.
     ///
     /// # Errors
     /// Returns an error for invalid document policy or target selection,
@@ -486,7 +511,7 @@ impl EncryptedDataBuilder {
         &self,
         document: &mut XmlDocument,
         options: DocumentEncryptionOptions<'_>,
-    ) -> Result<(), XmlEncError> {
+    ) -> Result<crate::policy::PolicyAudit, XmlEncError> {
         self.execution().encrypt_owned_document(document, options)
     }
 
@@ -502,7 +527,9 @@ impl EncryptedDataBuilder {
 /// Borrow request material while fixing the operation's policy and provider.
 pub(crate) struct BoundEncryption<'a> {
     builder: &'a EncryptedDataBuilder,
-    policy: &'a crate::policy::EncryptionPolicy,
+    // Each operation shares this snapshot rather than copying it.
+    policy: &'a Arc<crate::policy::EncryptionPolicy>,
+    identity: Option<&'a Arc<crate::policy::PolicyIdentity>>,
     provider: &'a dyn crate::provider::CryptoProvider,
     xml_backend: crate::XmlBackend,
 }
@@ -546,7 +573,7 @@ impl BoundEncryption<'_> {
             generated.xml_nodes,
             operation.policy().resources.effective_xml_nodes() as usize,
         )?;
-        Ok(generated.result)
+        Ok(generated.into_result(operation.audit(self.identity)))
     }
 
     /// Encrypt opaque bytes, preserving a configured non-XML `Type` hint.
@@ -570,7 +597,7 @@ impl BoundEncryption<'_> {
             generated.xml_nodes,
             operation.policy().resources.effective_xml_nodes() as usize,
         )?;
-        Ok(generated.result)
+        Ok(generated.into_result(operation.audit(self.identity)))
     }
 
     /// Encrypt and replace the document root or one element selected by XML ID.
@@ -578,7 +605,7 @@ impl BoundEncryption<'_> {
         &self,
         xml: &str,
         options: DocumentEncryptionOptions<'_>,
-    ) -> Result<String, XmlEncError> {
+    ) -> Result<crate::policy::Audited<String>, XmlEncError> {
         self.policy.validate()?;
         self.validate_document_len(xml.len())?;
         let budgets = EncryptionOperationBudgets::from_policy(self.policy);
@@ -589,11 +616,12 @@ impl BoundEncryption<'_> {
             &budgets.xml_parse,
         )
         .map_err(|error| map_document_error(error, settings))?;
-        self.encrypt_owned_document_with_budgets(&mut document, options, budgets)?;
-        Ok(document.into_xml())
+        let policy = self.encrypt_owned_document_with_budgets(&mut document, options, budgets)?;
+        Ok(crate::policy::Audited::new(document.into_xml(), policy))
     }
 
-    /// Encrypt and replace a node in a reusable owned XML document.
+    /// Encrypt and replace a node in a reusable owned XML document, and
+    /// return what the encryption policy decided.
     ///
     /// Successful mutation advances the document generation and invalidates
     /// identities captured before this call.
@@ -601,7 +629,7 @@ impl BoundEncryption<'_> {
         &self,
         document: &mut XmlDocument,
         options: DocumentEncryptionOptions<'_>,
-    ) -> Result<(), XmlEncError> {
+    ) -> Result<crate::policy::PolicyAudit, XmlEncError> {
         self.encrypt_owned_document_with_budgets(
             document,
             options,
@@ -614,7 +642,7 @@ impl BoundEncryption<'_> {
         document: &mut XmlDocument,
         options: DocumentEncryptionOptions<'_>,
         budgets: EncryptionOperationBudgets,
-    ) -> Result<(), XmlEncError> {
+    ) -> Result<crate::policy::PolicyAudit, XmlEncError> {
         self.policy.validate()?;
         document.validate_operation_policy(self.policy.xml, &self.policy.resources)?;
         let document_nodes = document.with_view(view_node_count);
@@ -646,11 +674,10 @@ impl BoundEncryption<'_> {
                     &mut operation,
                     true,
                 )?;
-                let result = generated.result;
                 validate_replacement_document_len(
                     document.as_xml().len(),
                     source.len(),
-                    result.encrypted_data_xml.len(),
+                    generated.encrypted_data_xml.len(),
                     operation.policy().resources.max_xml_document_bytes,
                 )?;
                 validate_replacement_node_counts(
@@ -660,13 +687,8 @@ impl BoundEncryption<'_> {
                     ReplacementMode::ReplaceElement,
                     operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
-                self.replace_document_target(
-                    &mut operation,
-                    generated.mutation,
-                    document,
-                    target,
-                    &result,
-                )
+                self.replace_document_target(&mut operation, document, target, &generated)?;
+                Ok(operation.audit(self.identity))
             }
             EncryptedDataType::Content => {
                 let boundaries = content_boundaries.ok_or_else(|| {
@@ -681,9 +703,11 @@ impl BoundEncryption<'_> {
                     &mut operation,
                     true,
                 )?;
-                let result = generated.result;
-                let (removed, inserted) =
-                    content_replacement_lengths(&source, &boundaries, &result.encrypted_data_xml)?;
+                let (removed, inserted) = content_replacement_lengths(
+                    &source,
+                    &boundaries,
+                    &generated.encrypted_data_xml,
+                )?;
                 validate_replacement_document_len(
                     document.as_xml().len(),
                     removed,
@@ -697,13 +721,8 @@ impl BoundEncryption<'_> {
                     ReplacementMode::ReplaceContent,
                     operation.policy().resources.effective_xml_nodes() as usize,
                 )?;
-                self.replace_document_target(
-                    &mut operation,
-                    generated.mutation,
-                    document,
-                    target,
-                    &result,
-                )
+                self.replace_document_target(&mut operation, document, target, &generated)?;
+                Ok(operation.audit(self.identity))
             }
             EncryptedDataType::Other(_) => Err(XmlEncError::InvalidEncryptionConfig(
                 "document encryption requires Element or Content Type".into(),
@@ -734,17 +753,13 @@ impl BoundEncryption<'_> {
     /// Replace the encrypted target with `result` as the operation's mutation.
     fn replace_document_target(
         &self,
-        operation: &mut OperationExecutionContext<
-            crate::policy::EncryptionPolicy,
-            EncryptionOperationBudgets,
-        >,
-        mutation: Option<OperationNodeId>,
+        operation: &mut EncryptionExecution,
         document: &mut XmlDocument,
         target: crate::document::NodeIdentity,
-        result: &EncryptionResult,
+        result: &GeneratedEncryption,
     ) -> Result<(), XmlEncError> {
         let settings = self.document_parse_settings();
-        let mutation = require_encryption_mutation(mutation)?;
+        let mutation = require_encryption_mutation(result.mutation)?;
         operation.run_document_transition(mutation, document, |document, budgets| {
             match result.replacement {
                 ReplacementMode::ReplaceElement => document.replace_element_with_budget(
@@ -768,10 +783,7 @@ impl BoundEncryption<'_> {
     /// serialize when the key was encapsulated.
     fn establish_content_key(
         &self,
-        operation: &OperationExecutionContext<
-            crate::policy::EncryptionPolicy,
-            EncryptionOperationBudgets,
-        >,
+        operation: &EncryptionExecution,
     ) -> Result<(OperationContentKey<'_>, Option<Vec<u8>>), XmlEncError> {
         let content_key = match &self.direct_key {
             Some(DirectEncryptionKey::Encapsulation(key)) => {
@@ -870,14 +882,28 @@ impl BoundEncryption<'_> {
         encrypt_content(self.provider, self.algorithm, key, plaintext, parameters)
     }
 
+    /// Record the methods [`Self::validate_configuration_with_policy`] permitted:
+    /// it checks every one before any key or ciphertext exists.
+    fn record_configuration(&self, operation: &EncryptionExecution) {
+        use crate::policy::{AlgorithmRole, PolicyDecision};
+        if let Some(validity) = &operation.policy().validity {
+            operation.record_policy(PolicyDecision::exception(validity));
+        }
+        operation.record_policy(PolicyDecision::algorithm(
+            AlgorithmRole::DataEncryption,
+            self.algorithm.uri(),
+        ));
+        for recipient in &self.recipients {
+            let (role, uri) = recipient.method();
+            operation.record_policy(PolicyDecision::algorithm(role, uri));
+        }
+    }
+
     fn encrypt_payload_with_operation(
         &self,
         plaintext: &[u8],
         encrypted_type: Option<&EncryptedDataType>,
-        operation: &mut OperationExecutionContext<
-            crate::policy::EncryptionPolicy,
-            EncryptionOperationBudgets,
-        >,
+        operation: &mut EncryptionExecution,
         mutates_document: bool,
     ) -> Result<GeneratedEncryption, XmlEncError> {
         // Bound caller-controlled inputs before hashing or allocating one plan
@@ -887,6 +913,7 @@ impl BoundEncryption<'_> {
             operation.policy().resources.max_encryption_plaintext_bytes,
         )?;
         self.validate_configuration_with_policy(operation.policy())?;
+        self.record_configuration(operation);
         let input_resource = OperationResourceIdentity::external("encryption-input", plaintext);
         let plan = compile_encryption_plan(
             operation,
@@ -972,10 +999,8 @@ impl BoundEncryption<'_> {
             }
         };
         Ok(GeneratedEncryption {
-            result: EncryptionResult {
-                encrypted_data_xml,
-                replacement,
-            },
+            encrypted_data_xml,
+            replacement,
             xml_nodes,
             mutation: plan.mutation,
         })
@@ -2318,7 +2343,8 @@ mod tests {
                         &encrypted.encrypted_data_xml,
                         &SymmetricKeyDecryptor::new(key)
                     )
-                    .expect("generated ciphertext must decrypt"),
+                    .expect("generated ciphertext must decrypt")
+                    .output,
                     super::super::DecryptedContent::Bytes(plaintext.to_vec())
                 );
             }
@@ -2348,7 +2374,8 @@ mod tests {
         );
         assert_eq!(
             decrypt(&encrypted.encrypted_data_xml, &KekDecryptor::new(kek))
-                .expect("wrapped key must decrypt"),
+                .expect("wrapped key must decrypt")
+                .output,
             super::super::DecryptedContent::Xml("<secret>value</secret>".into())
         );
     }
@@ -2387,7 +2414,8 @@ mod tests {
                 &encrypted.encrypted_data_xml,
                 &PrivateKeyDecryptor::new(private)
             )
-            .expect("RSA recipient must recover content key"),
+            .expect("RSA recipient must recover content key")
+            .output,
             super::super::DecryptedContent::Xml("<secret/>".into())
         );
     }
@@ -2459,10 +2487,12 @@ mod tests {
                     element_id: Some("element"),
                 },
             )
-            .expect("element replacement must succeed");
+            .expect("element replacement must succeed")
+            .output;
         let decrypted_element =
             decrypt_document(&encrypted_element, None, &SymmetricKeyDecryptor::new(key))
-                .expect("element replacement must round-trip");
+                .expect("element replacement must round-trip")
+                .output;
         assert_eq!(decrypted_element, document);
 
         let encrypted_content = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
@@ -2474,11 +2504,13 @@ mod tests {
                     element_id: Some("content"),
                 },
             )
-            .expect("self-closing content replacement must expand the element");
+            .expect("self-closing content replacement must expand the element")
+            .output;
         assert!(encrypted_content.contains("<empty ID=\"content\"><xenc:EncryptedData"));
         let decrypted_content =
             decrypt_document(&encrypted_content, None, &SymmetricKeyDecryptor::new(key))
-                .expect("empty content must decrypt");
+                .expect("empty content must decrypt")
+                .output;
         assert_eq!(
             decrypted_content,
             "<root><target ID=\"element\"><child/></target><empty ID=\"content\"></empty></root>"

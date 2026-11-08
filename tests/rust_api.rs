@@ -143,7 +143,8 @@ fn request_handles_outlive_the_temporary_facade() {
         .unwrap();
     let document = signer
         .sign_xml("<root><p Id='payload'>secret</p></root>", &builder())
-        .unwrap();
+        .unwrap()
+        .output;
     let verify_key = HmacVerificationKey::new(vec![7; 32]).unwrap();
     let api = XmlSecurity::new(&compiled, &provider).unwrap();
     assert_eq!(
@@ -170,17 +171,146 @@ fn request_handles_outlive_the_temporary_facade() {
             .unwrap();
         let encrypted = encryptor
             .encrypt_xml("<root>secret</root>", DocumentEncryptionOptions::default())
-            .unwrap();
+            .unwrap()
+            .output;
         let resolver = SymmetricKeyDecryptor::new(vec![9; 16]);
         let decryptor = XmlSecurity::new(&compiled, &provider)
             .unwrap()
             .decryptor(&resolver)
             .unwrap();
         assert_eq!(
-            decryptor.decrypt_xml(&encrypted, None).unwrap(),
+            decryptor.decrypt_xml(&encrypted, None).unwrap().output,
             "<root>secret</root>"
         );
     }
+}
+
+#[test]
+fn every_operation_reports_the_identity_of_the_snapshot_it_enforced() {
+    // An audit must name the published policy the operation actually used;
+    // losing the identity anywhere between the facade and the result would
+    // leave evidence that cannot be tied to a configuration revision.
+    use xml_sec::policy::PolicyIdentity;
+    let identity = PolicyIdentity::new("modern", 1, 7, [0x5a; 32]);
+    let compiled = policies().with_identity(identity.clone());
+    let api = XmlSecurity::new(&compiled, &RustCryptoProvider).unwrap();
+    let sign_key = HmacSigningKey::new(vec![8; 32]).unwrap();
+    let signed = api
+        .signer(&sign_key)
+        .unwrap()
+        .sign_xml("<root><p Id='payload'>secret</p></root>", &builder())
+        .unwrap();
+    assert_eq!(signed.policy.identity.as_deref(), Some(&identity));
+    assert!(
+        signed
+            .policy
+            .decisions
+            .contains(&xml_sec::policy::PolicyDecision::Algorithm {
+                role: xml_sec::policy::AlgorithmRole::Signature,
+                uri: SignatureAlgorithm::HmacSha256.uri().into(),
+            })
+    );
+    let verify_key = HmacVerificationKey::new(vec![8; 32]).unwrap();
+    let verified = api
+        .verifier()
+        .unwrap()
+        .key(&verify_key)
+        .verify_signature_xml(&signed.output)
+        .unwrap();
+    assert_eq!(verified.status, DsigStatus::Valid);
+    assert_eq!(verified.policy.identity.as_deref(), Some(&identity));
+    // Verification permits exactly what signing permitted for this signature.
+    assert_eq!(verified.policy.decisions, signed.policy.decisions);
+
+    #[cfg(feature = "xmlenc")]
+    {
+        use xml_sec::xmlenc::{
+            DataEncryptionAlgorithm, DocumentEncryptionOptions, EncryptedDataBuilder,
+            SymmetricKeyDecryptor,
+        };
+        let builder =
+            EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm).direct_key(vec![2; 16]);
+        let encrypted = api
+            .encryptor(&builder)
+            .unwrap()
+            .encrypt_xml("<root>secret</root>", DocumentEncryptionOptions::default())
+            .unwrap();
+        assert_eq!(encrypted.policy.identity.as_deref(), Some(&identity));
+        let resolver = SymmetricKeyDecryptor::new(vec![2; 16]);
+        let decrypted = api
+            .decryptor(&resolver)
+            .unwrap()
+            .decrypt_xml(&encrypted.output, None)
+            .unwrap();
+        assert_eq!(decrypted.output, "<root>secret</root>");
+        assert_eq!(decrypted.policy.identity.as_deref(), Some(&identity));
+        assert_eq!(decrypted.policy.decisions, encrypted.policy.decisions);
+    }
+}
+
+#[test]
+fn batch_verification_audits_every_signature_and_the_operation() {
+    // A signature that fails is still part of the operation: its refusal and
+    // the snapshot that refused it belong in the audit, and a document with
+    // no signature at all still reports which snapshot examined it.
+    use xml_sec::policy::{PolicyDecision, PolicyIdentity, PolicyViolation, SigningPolicy};
+    use xml_sec::xmldsig::SignContext;
+    let identity = PolicyIdentity::new("modern", 1, 9, [0x3c; 32]);
+    let compiled = policies().with_identity(identity.clone());
+    let api = XmlSecurity::new(&compiled, &RustCryptoProvider).unwrap();
+    let key = HmacSigningKey::new(vec![8; 32]).unwrap();
+    let reference = |id: &str, algorithm| {
+        SignatureBuilder::new(C14nAlgorithm::new(C14nMode::Exclusive1_0, false), algorithm)
+            .add_reference(ReferenceBuilder::new(DigestAlgorithm::Sha256).uri(format!("#{id}")))
+    };
+    let first = api
+        .signer(&key)
+        .unwrap()
+        .sign_xml(
+            "<root><p Id='first'>one</p><p Id='second'>two</p></root>",
+            &reference("first", SignatureAlgorithm::HmacSha256),
+        )
+        .unwrap()
+        .output;
+    // A SHA-1 signature the modern verification profile refuses.
+    let both = SignContext::new(&key)
+        .policy(SigningPolicy {
+            signature_algorithms: Some([SignatureAlgorithm::HmacSha1].into()),
+            ..SigningPolicy::default()
+        })
+        .sign_with_builder(&first, &reference("second", SignatureAlgorithm::HmacSha1))
+        .unwrap()
+        .output;
+    let verify_key = HmacVerificationKey::new(vec![8; 32]).unwrap();
+    let verifier = api.verifier().unwrap().key(&verify_key);
+    let document = api.parse_document(both, Operation::Verify).unwrap();
+    let evidence = verifier
+        .verify(&document, &VerificationRequest::default())
+        .unwrap();
+    assert_eq!(evidence.policy_identity(), Some(&identity));
+    let [valid, refused] = evidence.signatures() else {
+        panic!("two signatures")
+    };
+    assert_eq!(valid.result().as_ref().unwrap().status, DsigStatus::Valid);
+    assert_eq!(valid.policy(), &valid.result().as_ref().unwrap().policy);
+    assert!(refused.result().is_err());
+    assert_eq!(refused.policy().identity.as_deref(), Some(&identity));
+    assert!(
+        refused.policy().decisions.iter().any(|decision| matches!(
+            decision,
+            PolicyDecision::Rejected(PolicyViolation::Algorithm { algorithm, .. })
+                if algorithm == SignatureAlgorithm::HmacSha1.uri()
+        )),
+        "{:?}",
+        refused.policy()
+    );
+
+    let unsigned = api.parse_document("<root/>", Operation::Verify).unwrap();
+    let evidence = verifier
+        .verify(&unsigned, &VerificationRequest::default())
+        .unwrap();
+    assert!(evidence.signatures().is_empty());
+    assert_eq!(evidence.policy_identity(), Some(&identity));
 }
 
 #[test]
@@ -257,6 +387,63 @@ fn builder() -> SignatureBuilder {
 }
 
 #[test]
+fn the_audit_names_the_implicit_canonicalization_a_reference_digests_with() {
+    // A same-document Reference without a canonicalizing transform is digested
+    // through inclusive C14N 1.0; signing and verification audits name it
+    // like any explicit transform the policy admitted.
+    use xml_sec::policy::{AlgorithmRole, PolicyAudit, PolicyDecision};
+    use xml_sec::xmldsig::DEFAULT_IMPLICIT_C14N_URI;
+    let names_implicit = |audit: &PolicyAudit| {
+        audit.decisions.iter().any(|decision| {
+            matches!(
+                decision,
+                PolicyDecision::Algorithm { role: AlgorithmRole::Transform, uri }
+                    if uri == DEFAULT_IMPLICIT_C14N_URI
+            )
+        })
+    };
+    let compiled = policies();
+    let api = XmlSecurity::new(&compiled, &RustCryptoProvider).unwrap();
+    // A received Reference without Transforms; the values need not verify,
+    // the audit records what the policy admitted before digesting.
+    let received = |value: &str| {
+        format!(
+            "<root><p Id='payload'>signed</p>\
+             <ds:Signature xmlns:ds='http://www.w3.org/2000/09/xmldsig#'><ds:SignedInfo>\
+             <ds:CanonicalizationMethod Algorithm='http://www.w3.org/2001/10/xml-exc-c14n#'/>\
+             <ds:SignatureMethod Algorithm='http://www.w3.org/2001/04/xmldsig-more#hmac-sha256'/>\
+             <ds:Reference URI='#payload'>\
+             <ds:DigestMethod Algorithm='http://www.w3.org/2001/04/xmlenc#sha256'/>\
+             <ds:DigestValue>{value}</ds:DigestValue></ds:Reference></ds:SignedInfo>\
+             <ds:SignatureValue>{value}</ds:SignatureValue></ds:Signature></root>"
+        )
+    };
+    let verify_key = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
+    let result = api
+        .verifier()
+        .unwrap()
+        .key(&verify_key)
+        .verify_signature_xml(&received("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="))
+        .unwrap();
+    assert_ne!(result.status, DsigStatus::Valid);
+    assert!(names_implicit(&result.policy));
+    // Signing such a template generates an explicit C14N 1.1 transform, so
+    // nothing is applied implicitly and the audit names the explicit one.
+    let key = HmacSigningKey::new(vec![0x42; 32]).unwrap();
+    let signed = api
+        .signer(&key)
+        .unwrap()
+        .sign_template_xml(&received(""))
+        .unwrap();
+    assert!(!names_implicit(&signed.policy));
+    assert!(signed.policy.decisions.iter().any(|decision| matches!(
+        decision,
+        PolicyDecision::Algorithm { role: AlgorithmRole::Transform, uri }
+            if uri == "http://www.w3.org/2006/12/xml-c14n11"
+    )));
+}
+
+#[test]
 fn retained_evidence_authenticates_only_the_requested_generation_and_target() {
     // Mathematical success cannot authorize an unsigned sibling or mutated document.
     let compiled = policies();
@@ -314,7 +501,7 @@ fn borrowed_string_and_template_paths_share_the_existing_crypto_pipeline() {
     let verify_key = HmacVerificationKey::new(vec![0x42; 32]).unwrap();
     let xml = "<root><p Id='payload'>signed</p></root>";
     let signer = api.signer(&sign_key).unwrap();
-    let document = signer.sign_xml(xml, &builder()).unwrap();
+    let document = signer.sign_xml(xml, &builder()).unwrap().output;
     let verifier = api.verifier().unwrap().key(&verify_key);
     assert_eq!(
         verifier.verify_signature_xml(&document).unwrap().status,
@@ -331,7 +518,7 @@ fn borrowed_string_and_template_paths_share_the_existing_crypto_pipeline() {
     ));
     let template = builder().build_template().unwrap();
     let templated = format!("<root><p Id='payload'>signed</p>{template}</root>");
-    let signed_template = signer.sign_template_xml(&templated).unwrap();
+    let signed_template = signer.sign_template_xml(&templated).unwrap().output;
     assert_eq!(
         verifier
             .verify_signature_xml(&signed_template)
@@ -514,7 +701,7 @@ fn named_inventory_uses_the_same_policy_and_verification_resolver() {
             .encrypt_binary(b"inventory")
             .unwrap();
         assert!(
-            matches!(api.decryptor(key.as_ref()).unwrap().decrypt_fragment(&encrypted.encrypted_data_xml).unwrap(), xml_sec::xmlenc::DecryptedContent::Bytes(value) if value == b"inventory")
+            matches!(api.decryptor(key.as_ref()).unwrap().decrypt_fragment(&encrypted.encrypted_data_xml).unwrap().output, xml_sec::xmlenc::DecryptedContent::Bytes(value) if value == b"inventory")
         );
     }
 }
@@ -637,7 +824,8 @@ fn detached_signatures_use_only_request_supplied_external_bytes() {
         .unwrap()
         .external_resources(&inputs)
         .sign_xml("<root/>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     let document = api.parse_document(signed, Operation::Verify).unwrap();
     let verifier = api.verifier().unwrap().key(&verify_key);
     assert!(
@@ -749,7 +937,7 @@ fn recovery_request_ids_and_external_ciphertext_are_not_implicit() {
             .is_err()
     );
     assert!(
-        matches!(api.decryptor(&resolver).unwrap().external_resources(&inputs).decrypt_fragment(&detached).unwrap(), DecryptedContent::Bytes(value) if value == b"<p>secret</p>")
+        matches!(api.decryptor(&resolver).unwrap().external_resources(&inputs).decrypt_fragment(&detached).unwrap().output, DecryptedContent::Bytes(value) if value == b"<p>secret</p>")
     );
 }
 
@@ -787,15 +975,19 @@ fn retained_and_string_encryption_preserve_one_generation_and_rollback() {
     assert_eq!(document.as_xml(), original);
     let encrypted = encryptor
         .encrypt_xml(original, DocumentEncryptionOptions { element_id: None })
-        .unwrap();
-    assert_eq!(decryptor.decrypt_xml(&encrypted, None).unwrap(), original);
+        .unwrap()
+        .output;
+    assert_eq!(
+        decryptor.decrypt_xml(&encrypted, None).unwrap().output,
+        original
+    );
     let fragment = encryptor.encrypt_fragment("<p>secret</p>").unwrap();
     assert!(
-        matches!(decryptor.decrypt_fragment(&fragment.encrypted_data_xml).unwrap(), xml_sec::xmlenc::DecryptedContent::Xml(value) if value == "<p>secret</p>")
+        matches!(decryptor.decrypt_fragment(&fragment.encrypted_data_xml).unwrap().output, xml_sec::xmlenc::DecryptedContent::Xml(value) if value == "<p>secret</p>")
     );
     let binary = encryptor.encrypt_binary(b"not XML\0").unwrap();
     assert!(
-        matches!(decryptor.decrypt_fragment(&binary.encrypted_data_xml).unwrap(), xml_sec::xmlenc::DecryptedContent::Bytes(value) if value == b"not XML\0")
+        matches!(decryptor.decrypt_fragment(&binary.encrypted_data_xml).unwrap().output, xml_sec::xmlenc::DecryptedContent::Bytes(value) if value == b"not XML\0")
     );
     let mut broken = api.parse_document(encrypted, Operation::Decrypt).unwrap();
     let before = broken.as_xml().to_owned();

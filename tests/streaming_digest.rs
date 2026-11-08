@@ -118,7 +118,8 @@ fn a_storage_refusal_stays_typed_and_terminal() {
     let key = signing_key();
     let signed = SignContext::new(&key)
         .sign_template(&template())
-        .expect("signing with the default provider");
+        .expect("signing with the default provider")
+        .output;
     let provider = RefusingStateProvider::after(0);
     let error = VerifyContext::new()
         .key(&verification_key(&key))
@@ -162,7 +163,8 @@ fn a_storage_refusal_in_a_manifest_reference_ends_the_operation() {
             ..xml_sec::policy::SigningPolicy::default()
         })
         .sign_template(template)
-        .expect("signing with the default provider");
+        .expect("signing with the default provider")
+        .output;
     let public = verification_key(&key);
     let verify = |provider: &RefusingStateProvider| {
         VerifyContext::new()
@@ -362,7 +364,8 @@ fn a_provider_refusal_mid_stream_keeps_its_typed_cause() {
     let key = signing_key();
     let signed = SignContext::new(&key)
         .sign_template(&template())
-        .expect("signing with the default provider");
+        .expect("signing with the default provider")
+        .output;
     let public = verification_key(&key);
     for updates in [0, 3] {
         let provider = FailingDigestProvider::refusing_after(updates);
@@ -417,7 +420,8 @@ fn token_sized_serializer_writes_reach_the_provider_in_blocks() {
     let signed = SignContext::new(&key)
         .provider(&provider)
         .sign_template(&template)
-        .expect("signing");
+        .expect("signing")
+        .output;
     assert!(signed.contains("<SignatureValue>"));
     // About 75 KB of canonical output is under 20 blocks of 4 KiB, plus the
     // one-shot SignedInfo hash; per-write updates would number in the
@@ -432,7 +436,8 @@ fn streamed_reference_digests_round_trip_through_sign_and_verify() {
     let key = signing_key();
     let signed = SignContext::new(&key)
         .sign_template(&template())
-        .expect("signing");
+        .expect("signing")
+        .output;
     let result = VerifyContext::new()
         .key(&verification_key(&key))
         .verify(&signed)
@@ -451,7 +456,8 @@ fn canonical_output_limit_stops_the_streamed_digest() {
     let key = signing_key();
     let signed = SignContext::new(&key)
         .sign_template(&template())
-        .expect("signing");
+        .expect("signing")
+        .output;
     let mut policy = xml_sec::policy::VerificationPolicy::default();
     policy.resources.max_canonicalized_bytes = 1_024;
     let error = VerifyContext::new()

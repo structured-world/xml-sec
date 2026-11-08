@@ -32,7 +32,8 @@ fn signed(xml: &str, policy: &crate::policy::SigningPolicy) -> (String, Vec<u8>)
     let text = SignContext::new(&key)
         .policy(policy.clone())
         .sign_template(xml)
-        .unwrap_or_else(|error| panic!("{error}: {xml}"));
+        .unwrap_or_else(|error| panic!("{error}: {xml}"))
+        .output;
     let canonical = key.signed.take();
     let mut document = XmlDocument::parse(xml).expect("fixture parses");
     SignContext::new(&key)

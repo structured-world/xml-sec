@@ -98,6 +98,9 @@ pub(super) trait ReferenceOperationGate {
         identity: &crate::operation::OperationResourceIdentity,
         action: &mut dyn FnMut() -> Result<Vec<u8>, XmlEncError>,
     ) -> Result<Vec<u8>, XmlEncError>;
+
+    /// Record in the operation's audit a reference the policy let it resolve.
+    fn record_reference(&self, uri: &str, transforms: &[crate::xmldsig::transforms::Transform]);
 }
 
 /// One lazily indexed source document, borrowed for this operation only.
@@ -132,14 +135,20 @@ impl<'context: 'doc, 'doc> BoundCipherReferenceContext<'context, 'doc> {
                 "foreign CipherReference origin".into(),
             ));
         }
-        self.context.resolve_with_resolver(
+        let bytes = self.context.resolve_with_resolver(
             node,
             uri,
             transforms,
             xml_parse,
             self.resolver(),
             self.document_base,
-        )
+        )?;
+        // Every CipherReference of a decryption, of its content or of any
+        // EncryptedKey however it was reached, is resolved here.
+        if let Some(operation) = self.context.operation {
+            operation.record_reference(uri, transforms);
+        }
+        Ok(bytes)
     }
 }
 

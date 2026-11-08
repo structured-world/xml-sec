@@ -268,7 +268,8 @@ fn token_signed_document(
     let signed = xml_sec::xmldsig::SignContext::new(private)
         .provider(provider)
         .sign_with_builder("<root><payload>signed</payload></root>", &builder)
-        .unwrap();
+        .unwrap()
+        .output;
     // An opaque handle does not bypass the operation's RSA strength policy.
     let mut strict = xml_sec::policy::VerificationPolicy::default();
     strict.key_trust.rsa_keys.minimum_modulus_bits = 3072;
@@ -613,7 +614,8 @@ fn assert_xmlenc_pipelines(provider: &Pkcs11Provider, kek: &[u8]) {
         xml_sec::xmlenc::DecryptContext::new(&resolver)
             .provider(provider)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(MESSAGE.to_vec())
     );
     let recipient = xml_sec::xmlenc::EncryptionRecipient::aes_key_wrap(
@@ -630,7 +632,8 @@ fn assert_xmlenc_pipelines(provider: &Pkcs11Provider, kek: &[u8]) {
         xml_sec::xmlenc::DecryptContext::new(&resolver)
             .provider(provider)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(MESSAGE.to_vec())
     );
 }
@@ -696,7 +699,8 @@ fn assert_token_oaep(
         xml_sec::xmlenc::DecryptContext::new(&resolver)
             .provider(provider)
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         xml_sec::xmlenc::DecryptedContent::Bytes(MESSAGE.to_vec())
     );
 }

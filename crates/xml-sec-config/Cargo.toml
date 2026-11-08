@@ -12,6 +12,7 @@ xml-sec = { path = "../..", default-features = false, features = ["xmldsig", "c1
 toml = { version = "1.1.8", default-features = false, features = ["parse", "serde", "display"] }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 thiserror = "2"
+arc-swap = "1.9"
 
 [features]
 default = ["xmlenc", "xml-backend-xmloxide"]

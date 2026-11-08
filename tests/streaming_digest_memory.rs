@@ -84,7 +84,8 @@ fn verifying_a_large_reference_never_holds_its_canonical_output() {
     let template = unsigned.replace("</Envelope>", &format!("{template}</Envelope>"));
     let signed = SignContext::new(&key)
         .sign_template(&template)
-        .expect("signing");
+        .expect("signing")
+        .output;
     let verification_key = VerificationKey {
         algorithm: SignatureAlgorithm::RsaSha256,
         public_key_bytes: key

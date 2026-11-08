@@ -164,7 +164,8 @@ fn pkcs1v15_transport_is_parameterless_and_explicitly_permitted() {
         DecryptContext::new(&resolver)
             .policy(policy.clone())
             .decrypt(&encrypted.encrypted_data_xml)
-            .unwrap(),
+            .unwrap()
+            .output,
         DecryptedContent::Bytes(b"legacy transport".to_vec())
     );
     // Implicit RSA padding rejection must not release plaintext with a wrong
@@ -270,7 +271,8 @@ fn legacy_content_requires_permission_on_both_public_paths() {
                     ..DecryptionPolicy::default()
                 })
                 .decrypt(&encrypted.encrypted_data_xml)
-                .unwrap(),
+                .unwrap()
+                .output,
             DecryptedContent::Bytes(b"secret".to_vec())
         );
     }
@@ -365,7 +367,8 @@ fn donor_direct_templates_match_generated_algorithm_and_key_contracts() {
                 &generated.encrypted_data_xml,
                 &SymmetricKeyDecryptor::new(key)
             )
-            .expect("generated donor-shaped ciphertext must decrypt"),
+            .expect("generated donor-shaped ciphertext must decrypt")
+            .output,
             DecryptedContent::Bytes(format!("{name} plaintext").into_bytes()),
             "{name}"
         );
@@ -442,27 +445,10 @@ fn donor_rsa_templates_match_legacy_and_xmlenc11_oaep_contracts() {
                     .decode(value)
                     .expect("donor OAEP label must be base64")
             });
-        assert_eq!(
-            generated_data.encrypted_keys[0]
-                .encryption_method
-                .oaep_digest,
-            donor_digest,
-            "{name}"
-        );
-        assert_eq!(
-            generated_data.encrypted_keys[0]
-                .encryption_method
-                .mgf_algorithm,
-            donor_mgf,
-            "{name}"
-        );
-        assert_eq!(
-            generated_data.encrypted_keys[0]
-                .encryption_method
-                .oaep_params,
-            donor_label,
-            "{name}"
-        );
+        let transport = &generated_data.encrypted_keys[0].encryption_method;
+        assert_eq!(transport.oaep_digest, donor_digest, "{name}");
+        assert_eq!(transport.mgf_algorithm, donor_mgf, "{name}");
+        assert_eq!(transport.oaep_params, donor_label, "{name}");
         assert_eq!(
             generated_data.encrypted_keys[0].key_name.as_deref(),
             Some(donor_key_name(&template_document).as_str()),
@@ -473,7 +459,8 @@ fn donor_rsa_templates_match_legacy_and_xmlenc11_oaep_contracts() {
                 &generated.encrypted_data_xml,
                 &PrivateKeyDecryptor::new(private.clone())
             )
-            .expect("generated donor-shaped OAEP ciphertext must decrypt"),
+            .expect("generated donor-shaped OAEP ciphertext must decrypt")
+            .output,
             DecryptedContent::Xml("<PaymentInfo><Name>John Smith</Name></PaymentInfo>".into()),
             "{name}"
         );
@@ -506,7 +493,8 @@ fn every_supported_oaep_digest_and_mgf_combination_round_trips() {
                     &encrypted.encrypted_data_xml,
                     &PrivateKeyDecryptor::new(private.clone())
                 )
-                .expect("supported OAEP combination must decrypt"),
+                .expect("supported OAEP combination must decrypt")
+                .output,
                 DecryptedContent::Bytes(b"OAEP matrix".to_vec()),
                 "digest={digest:?}, mgf={mgf_digest:?}"
             );
@@ -531,7 +519,8 @@ fn every_supported_oaep_digest_and_mgf_combination_round_trips() {
                 &encrypted.encrypted_data_xml,
                 &PrivateKeyDecryptor::new(private.clone())
             )
-            .expect("legacy OAEP digest with default MGF1-SHA1 must decrypt"),
+            .expect("legacy OAEP digest with default MGF1-SHA1 must decrypt")
+            .output,
             DecryptedContent::Bytes(b"legacy OAEP digest matrix".to_vec()),
             "legacy digest={digest:?}"
         );
@@ -573,7 +562,8 @@ fn one_session_key_is_recoverable_by_each_rsa_recipient() {
                 &encrypted.encrypted_data_xml,
                 &PrivateKeyDecryptor::new(private_key(key_path))
             )
-            .expect("each recipient must decrypt the shared content"),
+            .expect("each recipient must decrypt the shared content")
+            .output,
             DecryptedContent::Xml("<secret>shared</secret>".into()),
             "{key_path}"
         );
@@ -601,7 +591,8 @@ fn both_aes_key_wrap_sizes_cover_both_content_key_sizes() {
                     &encrypted.encrypted_data_xml,
                     &KekDecryptor::new(kek.clone())
                 )
-                .expect("supported AES-KW combination must decrypt"),
+                .expect("supported AES-KW combination must decrypt")
+                .output,
                 DecryptedContent::Bytes(b"wrapped content key".to_vec())
             );
         }
@@ -625,7 +616,8 @@ fn document_encryption_selects_one_id_and_preserves_surrounding_xml() {
                     element_id: Some("chosen"),
                 },
             )
-            .expect("selected document node must encrypt");
+            .expect("selected document node must encrypt")
+            .output;
         assert!(encrypted.contains("<before/>"));
         assert!(encrypted.contains("<after/>"));
         assert_eq!(
@@ -634,7 +626,8 @@ fn document_encryption_selects_one_id_and_preserves_surrounding_xml() {
                 Some("encrypted-target"),
                 &SymmetricKeyDecryptor::new(key)
             )
-            .expect("selected document node must decrypt"),
+            .expect("selected document node must decrypt")
+            .output,
             document
         );
     }
@@ -655,11 +648,13 @@ fn content_encryption_preserves_cdata_with_closing_markers() {
                 element_id: Some("chosen"),
             },
         )
-        .expect("CDATA content containing a closing marker must encrypt");
+        .expect("CDATA content containing a closing marker must encrypt")
+        .output;
 
     assert_eq!(
         decrypt_document(&encrypted, None, &SymmetricKeyDecryptor::new(key))
-            .expect("CDATA content containing a closing marker must decrypt"),
+            .expect("CDATA content containing a closing marker must decrypt")
+            .output,
         document
     );
 }
@@ -687,11 +682,13 @@ fn saml_encrypted_assertion_round_trips_through_rsa_transport() {
     let decrypted = decrypt_document(&response, None, &PrivateKeyDecryptor::new(private))
         .expect("SAML EncryptedAssertion child must decrypt");
     assert_eq!(
-        decrypted,
+        decrypted.output,
         format!(
             "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\"><saml:EncryptedAssertion>{assertion}</saml:EncryptedAssertion></samlp:Response>"
         )
     );
+    // Both sides audit the same content cipher and RSA key transport.
+    assert_eq!(decrypted.policy.decisions, encrypted.policy.decisions);
 }
 
 #[test]
@@ -834,7 +831,8 @@ fn generated_metadata_is_xml_escaped_and_legacy_mgf_is_explicit() {
         &encrypted.encrypted_data_xml,
         &PrivateKeyDecryptor::new(private_key(RSA_2048_PRIVATE)),
     )
-    .expect("serialized legacy OAEP parameters must round trip");
+    .expect("serialized legacy OAEP parameters must round trip")
+    .output;
     assert_eq!(
         decrypted,
         DecryptedContent::Bytes(b"explicit legacy MGF".to_vec())

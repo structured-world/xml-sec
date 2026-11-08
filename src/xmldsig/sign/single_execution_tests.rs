@@ -58,7 +58,8 @@ fn sign_counting(xml: &str, policy: crate::policy::SigningPolicy) -> (String, us
     let signed = SignContext::new(&FixedKey)
         .policy(policy)
         .sign_template(xml)
-        .expect("template must sign");
+        .expect("template must sign")
+        .output;
     (signed, take_transform_chains_started())
 }
 
@@ -298,7 +299,8 @@ fn a_stylesheet_over_an_unfilled_value_runs_once_the_value_is_filled() {
     let signed = SignContext::new(&FixedKey)
         .policy(policy.clone())
         .sign_template(&xml)
-        .expect("the stylesheet runs on the filled Manifest value");
+        .expect("the stylesheet runs on the filled Manifest value")
+        .output;
     assert_digests_match_final_document(&signed, &policy);
 }
 

@@ -78,8 +78,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .encrypt_xml(original, DocumentEncryptionOptions::default())?;
     let decrypted = security
         .decryptor(&resolver)?
-        .decrypt_xml(&encrypted, None)?;
-    assert_eq!(decrypted, original);
+        .decrypt_xml(&encrypted.output, None)?;
+    assert_eq!(decrypted.output, original);
+    // Each operation reports the policy decisions it took under its snapshot.
+    assert_eq!(decrypted.policy.decisions, encrypted.policy.decisions);
     println!("policy-bound sign/verify/encrypt/decrypt and rejection checks passed");
     Ok(())
 }
