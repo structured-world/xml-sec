@@ -20,8 +20,8 @@ use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// The system allocator, recording the largest single request, so a test can
-/// show an input was refused before the library copied it. Every test runs
-/// in its own process, so no other test's allocations interleave.
+/// show an input was refused before the library copied it. Tests hold
+/// [`crate::test_support::serial`], so no other test's allocations interleave.
 struct Largest;
 
 static LARGEST: AtomicUsize = AtomicUsize::new(0);
@@ -124,6 +124,7 @@ fn take_error(error: XsError) -> (XsStatus, String) {
 
 #[test]
 fn a_panic_becomes_an_internal_status_and_error() {
+    let _serial = crate::test_support::serial();
     // No unwinding may cross into C: the panic is contained and reported.
     let mut error = MaybeUninit::uninit();
     let status = contain(Some(&mut error), || panic!("contained"));
@@ -136,6 +137,7 @@ fn a_panic_becomes_an_internal_status_and_error() {
 
 #[test]
 fn success_clears_the_error_slot() {
+    let _serial = crate::test_support::serial();
     // A caller reusing one error variable never sees a previous failure.
     let mut error = MaybeUninit::new(XsError { value: 7 });
     assert_eq!(contain(Some(&mut error), || Ok(())), XS_OK);
@@ -149,6 +151,7 @@ fn success_clears_the_error_slot() {
 
 #[test]
 fn invalid_pointers_and_lengths_are_refused_before_any_work() {
+    let _serial = crate::test_support::serial();
     // A length without bytes, a length past the address space, invalid UTF-8
     // and a null output are argument errors, never dereferenced.
     let handles = policy();
@@ -193,6 +196,7 @@ fn invalid_pointers_and_lengths_are_refused_before_any_work() {
 
 #[test]
 fn a_document_beyond_a_policy_limit_is_a_typed_policy_refusal() {
+    let _serial = crate::test_support::serial();
     // Byte, depth, parse-work, node and namespace-binding ceilings of the
     // compiled policy refuse a document as policy, with the resource-limit
     // violation, not as malformed XML.
@@ -249,6 +253,7 @@ fn keys_under(limits: &str) -> ((XsProvider, XsPolicyStore, XsPolicy), XsKeys) {
 
 #[test]
 fn input_beyond_a_policy_limit_is_refused_before_it_is_copied() {
+    let _serial = crate::test_support::serial();
     // A caller's bytes past the compiled ceiling are refused without the
     // library allocating their size, so an oversized input cannot exhaust
     // memory and abort the process before the refusal.
@@ -352,6 +357,7 @@ fn serialized(document: XsDocument) -> String {
 
 #[test]
 fn an_audit_that_cannot_be_published_leaves_the_document_unchanged() {
+    let _serial = crate::test_support::serial();
     // The audit handle's slot is held before the document changes: a full
     // table refuses the call and keeps the document's generation, so a retry
     // cannot sign an already signed document.
@@ -424,6 +430,7 @@ fn an_audit_that_cannot_be_published_leaves_the_document_unchanged() {
 
 #[test]
 fn a_request_for_more_targets_than_the_policy_admits_is_refused_before_lookup() {
+    let _serial = crate::test_support::serial();
     // Each expected ID is a scan of the document: a request over the
     // compiled reference ceiling is refused before any of them is resolved,
     // so its IDs, here none of them present, are never looked up.
@@ -486,6 +493,7 @@ fn a_request_for_more_targets_than_the_policy_admits_is_refused_before_lookup() 
 
 #[test]
 fn a_held_object_is_busy_until_the_call_that_holds_it_ends() {
+    let _serial = crate::test_support::serial();
     // A call keeps the provider, policy and key handles it reads in use for
     // its whole length, so destroying them meanwhile reports busy.
     let (handles, keys_handle) = keys_under("");
@@ -506,6 +514,7 @@ fn a_held_object_is_busy_until_the_call_that_holds_it_ends() {
 
 #[test]
 fn configuration_and_document_failures_carry_their_class() {
+    let _serial = crate::test_support::serial();
     // The status names the failing layer, and the message comes with it.
     let handles = policy();
     let context = XsCompileContext {

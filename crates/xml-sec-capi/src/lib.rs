@@ -31,3 +31,5 @@ pub mod ffi;
 mod objects;
 pub mod status;
 mod table;
+#[cfg(test)]
+mod test_support;
