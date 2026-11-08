@@ -69,20 +69,10 @@ impl From<XmlSecError> for Failure {
             | XmlSecError::Signing(xml_sec::xmldsig::SigningError::Policy(violation))
             | XmlSecError::KeyStore(xml_sec::key_manager::KeyStoreError::Policy(violation))
             | XmlSecError::Encryption(xml_sec::xmlenc::XmlEncError::Policy(violation))
+            // The policy-bound parse reports every ceiling of the compiled
+            // policy as a typed violation.
             | XmlSecError::Document(XmlDocumentError::Policy(violation)) => {
                 return Self::refused(violation, message);
-            }
-            // The compiled policy's byte and depth ceilings, reported by the
-            // parser with their own variants.
-            XmlSecError::Document(
-                XmlDocumentError::DocumentTooLarge { .. }
-                | XmlDocumentError::DocumentTooDeep { .. },
-            ) => {
-                return Self {
-                    status: XS_POLICY,
-                    violation: RESOURCE_LIMIT,
-                    message,
-                };
             }
             XmlSecError::OperationDisabled(_) => XS_OPERATION_DISABLED,
             XmlSecError::Document(_) => XS_DOCUMENT,

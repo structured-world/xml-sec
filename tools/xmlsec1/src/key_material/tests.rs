@@ -1013,11 +1013,11 @@ fn signature_discovery_obeys_the_verification_node_ceiling() {
     let Err(error) = parse_operation_document(xml, &policy, xml_sec::XmlBackend::default()) else {
         panic!("a document over the node ceiling must not parse");
     };
-    // The parser's own text, as the CLI reported it before discovery shared the
-    // operation's document; no document-layer prefix is added.
+    // The ceiling is the operation policy's, reported as its resource-limit
+    // violation, as every other policy-bound parse reports it.
     assert_eq!(
         error.to_string(),
-        "invalid XML signature: nodes limit reached"
+        "invalid XML signature: XML document policy violation: XML nodes exceeds policy maximum 4: got 5"
     );
 }
 

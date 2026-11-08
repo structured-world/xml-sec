@@ -12,6 +12,7 @@ use crate::status::{
     XsStatus,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::fmt::Write as _;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -189,15 +190,24 @@ fn invalid_pointers_and_lengths_are_refused_before_any_work() {
 
 #[test]
 fn a_document_beyond_a_policy_limit_is_a_typed_policy_refusal() {
-    // Byte, depth and parse-work ceilings of the compiled policy refuse a
-    // document as policy, with the resource-limit violation, not as
-    // malformed XML.
+    // Byte, depth, parse-work, node and namespace-binding ceilings of the
+    // compiled policy refuse a document as policy, with the resource-limit
+    // violation, not as malformed XML.
     let deep = "<a><b><c><d><e><f/></e></d></c></b></a>";
     let large = format!("<a>{}</a>", "x".repeat(256));
+    let wide = format!("<a>{}</a>", "<b/>".repeat(64));
+    // Bindings in scope at once, all declared on one element.
+    let mut bound = String::from("<a");
+    for n in 0..16 {
+        write!(bound, " xmlns:p{n}='urn:{n}'").expect("a String accepts every write");
+    }
+    bound.push_str("/>");
     for (limit, xml) in [
         ("max_xml_document_bytes = 64", large.as_str()),
         ("max_xml_depth = 2", deep),
         ("max_xml_parse_work_bytes = 64", large.as_str()),
+        ("max_xml_nodes = 8", wide.as_str()),
+        ("max_xml_namespace_bindings = 4", bound.as_str()),
     ] {
         let handles = policy_from(&format!(
             "{MODERN}[profiles.app.verification.resources]\n{limit}\n"
@@ -208,13 +218,16 @@ fn a_document_beyond_a_policy_limit_is_a_typed_policy_refusal() {
         let status = unsafe {
             xs_document_parse(handles.2, 1, bytes(xml), &raw mut document, &raw mut error)
         };
-        assert_eq!((limit, status), (limit, XS_POLICY));
         let mut violation = 0;
         // SAFETY: the output is a live local.
         let read = unsafe { xs_error_policy_violation(error, &raw mut violation) };
         assert_eq!(read, XS_OK);
-        assert_eq!((limit, violation), (limit, 8));
-        assert_eq!(take_error(error).0, XS_POLICY);
+        let (error_status, message) = take_error(error);
+        assert_eq!(
+            (status, error_status, violation),
+            (XS_POLICY, XS_POLICY, 8),
+            "{limit}: {message}"
+        );
         release(handles);
     }
 }

@@ -48,10 +48,15 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
         },
         ..SigningPolicy::default()
     };
+    // The policy's ceilings are refused as its typed resource-limit violation.
     assert!(matches!(
         XmlDocument::parse_with_policy("<root><child/></root>", &bounded),
-        Err(XmlDocumentError::Parse(
-            xml_sec::ParseError::NodesLimitReached
+        Err(XmlDocumentError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML nodes",
+                maximum: 1,
+                ..
+            }
         ))
     ));
 
@@ -66,10 +71,13 @@ fn public_owned_parser_uses_the_operation_policy_snapshot() {
         .expect("the exact configured nesting depth must be accepted");
     assert!(matches!(
         XmlDocument::parse_with_policy("<root><child><leaf/></child></root>", &depth_bounded),
-        Err(XmlDocumentError::DocumentTooDeep {
-            maximum: 2,
-            actual: 3,
-        })
+        Err(XmlDocumentError::Policy(
+            xml_sec::policy::PolicyViolation::ResourceLimit {
+                resource: "XML element depth",
+                maximum: 2,
+                actual: 3,
+            }
+        ))
     ));
 }
 
