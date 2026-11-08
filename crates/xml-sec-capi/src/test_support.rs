@@ -4,7 +4,7 @@
 
 use parking_lot::{Mutex, MutexGuard};
 
-static SERIAL: Mutex<()> = parking_lot::const_mutex(());
+static SERIAL: Mutex<()> = Mutex::new(());
 
 /// Hold the process-wide state for one test, so tests run one at a time
 /// whether the runner gives each its own process or threads them in one.

@@ -916,21 +916,17 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Adapter<'_, F, S> {
             let bmp = legacy_password(&mut self.bmp, password, query, ceilings)?;
             self.charges
                 .legacy_workspace(salt.len(), bmp.len(), 64, key_len, query.memory())?;
-            let derived = Zeroizing::new(derive_key::<sha1::Sha1>(
-                bmp,
-                &salt,
-                Pkcs12KeyType::EncryptionKey,
-                rounds,
-                key_len,
-            ));
+            // RFC 7292 Appendix C: iterations INTEGER (1..MAX); the KDF
+            // refuses zero rounds, which is a malformed container.
+            let derived = Zeroizing::new(
+                derive_key::<sha1::Sha1>(bmp, &salt, Pkcs12KeyType::EncryptionKey, rounds, key_len)
+                    .map_err(|_| KeyStoreError::ProtectedContainer)?,
+            );
             key[..key_len].copy_from_slice(&derived);
-            let derived = Zeroizing::new(derive_key::<sha1::Sha1>(
-                bmp,
-                &salt,
-                Pkcs12KeyType::Iv,
-                rounds,
-                8,
-            ));
+            let derived = Zeroizing::new(
+                derive_key::<sha1::Sha1>(bmp, &salt, Pkcs12KeyType::Iv, rounds, 8)
+                    .map_err(|_| KeyStoreError::ProtectedContainer)?,
+            );
             iv[..8].copy_from_slice(&derived);
         }
         drop(salt);
@@ -1005,11 +1001,15 @@ impl<S: Secret, F: FnOnce() -> Option<S>> Backend for Adapter<'_, F, S> {
         )?;
         let rounds =
             i32::try_from(scheme.rounds).expect("KDF admission limits iterations to i32::MAX");
-        let key = Zeroizing::new(with_hash!(
-            scheme.hash,
-            D,
-            derive_key::<D>(bmp, &salt, Pkcs12KeyType::Mac, rounds, scheme.hash.size())
-        ));
+        // RFC 7292 Appendix C: a MAC iteration count below one is malformed.
+        let key = Zeroizing::new(
+            with_hash!(
+                scheme.hash,
+                D,
+                derive_key::<D>(bmp, &salt, Pkcs12KeyType::Mac, rounds, scheme.hash.size())
+            )
+            .map_err(|_| KeyStoreError::ProtectedContainer)?,
+        );
         let verified = with_hash!(scheme.hash, D, {
             let mut mac =
                 Hmac::<D>::new_from_slice(&key).map_err(|_| KeyStoreError::ProtectedContainer)?;

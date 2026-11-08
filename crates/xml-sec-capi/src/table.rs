@@ -56,7 +56,7 @@ struct Table {
     free: Vec<u32>,
 }
 
-static TABLE: Mutex<Table> = parking_lot::const_mutex(Table {
+static TABLE: Mutex<Table> = Mutex::new(Table {
     slots: Vec::new(),
     free: Vec::new(),
 });
