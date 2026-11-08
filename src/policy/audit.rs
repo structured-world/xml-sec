@@ -96,6 +96,10 @@ pub enum AlgorithmRole {
     DataEncryption,
     /// A key transport `EncryptionMethod`.
     KeyTransport,
+    /// The `DigestMethod` of an RSA-OAEP key transport.
+    OaepDigest,
+    /// The MGF1 mask generation of an RSA-OAEP key transport.
+    MaskGeneration,
     /// A key wrap `EncryptionMethod`.
     KeyWrap,
 }

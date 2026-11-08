@@ -893,8 +893,11 @@ impl BoundEncryption<'_> {
             AlgorithmRole::DataEncryption,
             self.algorithm.uri(),
         ));
-        for recipient in &self.recipients {
-            let (role, uri) = recipient.method();
+        for (role, uri) in self
+            .recipients
+            .iter()
+            .flat_map(EncryptionRecipient::methods)
+        {
             operation.record_policy(PolicyDecision::algorithm(role, uri));
         }
     }

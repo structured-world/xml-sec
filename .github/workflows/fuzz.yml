@@ -27,7 +27,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - name: Check corpus admission, failure propagation and replay
         run: cargo nextest run -p xml-sec-tools fuzz_security
 
@@ -41,7 +41,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: fuzz-harness
@@ -141,7 +141,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: differential

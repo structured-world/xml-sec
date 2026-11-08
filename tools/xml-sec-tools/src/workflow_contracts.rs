@@ -517,6 +517,48 @@ fn every_package_installation_goes_through_the_bounded_apt_action() {
 }
 
 #[test]
+fn every_nextest_installation_has_a_source_besides_the_release_download() {
+    // GitHub's release storage refused the macOS nextest archive with HTTP 504
+    // across a whole run while crates.io served the crate: a direct install
+    // fails the job on that one download, the local action falls back to a
+    // crates.io build and fails only when neither source installed nextest.
+    let action = read(".github/actions/nextest/action.yml");
+    assert!(
+        pattern(
+            r"- id: prebuilt\n\s+continue-on-error: true\n\s+uses: taiki-e/install-action@nextest\n"
+        )
+        .is_match(&action)
+    );
+    assert!(pattern(
+        r"if: steps\.prebuilt\.outcome == 'failure'\n\s+shell: bash\n\s+run: \|\n\s+cargo install --locked cargo-nextest\n"
+    )
+    .is_match(&action));
+    let required = action.find("cargo nextest --version").unwrap();
+    assert!(required > action.find("cargo install --locked cargo-nextest").unwrap());
+    assert!(!action[required..].contains("if:"));
+    let owner = crate::repo::root().join(".github/actions/nextest/action.yml");
+    for directory in [".github/workflows", ".github/actions"] {
+        for entry in std::fs::read_dir(crate::repo::root().join(directory)).unwrap() {
+            let path = entry.unwrap().path();
+            let file = if path.is_dir() {
+                path.join("action.yml")
+            } else {
+                path
+            };
+            if file == owner || !file.exists() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(
+                !text.contains("install-action@nextest") && !text.contains("cargo-nextest"),
+                "{}",
+                file.display()
+            );
+        }
+    }
+}
+
+#[test]
 fn the_heaviest_jobs_free_hosted_runner_disk_before_restoring_any_cache() {
     // Full-workspace builds beside the caches and the native oracle exhaust the
     // hosted image's disk; the space must be freed before anything is restored.

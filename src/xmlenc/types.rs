@@ -744,20 +744,34 @@ impl fmt::Debug for EncryptionRecipient {
 }
 
 impl EncryptionRecipient {
-    /// The role and URI of the method that carries the content key to it.
-    pub(crate) fn method(&self) -> (crate::policy::AlgorithmRole, &'static str) {
+    /// The roles and URIs of the methods that carry the content key to it: the
+    /// transport or wrap, then an RSA-OAEP transport's digest and mask, each of
+    /// which the policy admits on its own.
+    pub(crate) fn methods(
+        &self,
+    ) -> impl Iterator<Item = (crate::policy::AlgorithmRole, &'static str)> {
         use crate::policy::AlgorithmRole;
-        match self {
+        let (method, oaep) = match self {
             #[cfg(feature = "legacy-algorithms")]
             Self::RsaPkcs1v15 { .. } => (
-                AlgorithmRole::KeyTransport,
-                KeyTransportAlgorithm::RsaPkcs1v15.uri(),
+                (
+                    AlgorithmRole::KeyTransport,
+                    KeyTransportAlgorithm::RsaPkcs1v15.uri(),
+                ),
+                None,
             ),
-            Self::RsaOaep { parameters, .. } => {
-                (AlgorithmRole::KeyTransport, parameters.algorithm.uri())
-            }
-            Self::AesKeyWrap { algorithm, .. } => (AlgorithmRole::KeyWrap, algorithm.uri()),
-        }
+            Self::RsaOaep { parameters, .. } => (
+                (AlgorithmRole::KeyTransport, parameters.algorithm.uri()),
+                parameters.mgf_digest.mgf_uri().map(|mgf| {
+                    [
+                        (AlgorithmRole::OaepDigest, parameters.digest.uri()),
+                        (AlgorithmRole::MaskGeneration, mgf),
+                    ]
+                }),
+            ),
+            Self::AesKeyWrap { algorithm, .. } => ((AlgorithmRole::KeyWrap, algorithm.uri()), None),
+        };
+        core::iter::once(method).chain(oaep.into_iter().flatten())
     }
 
     /// Create a historical RSAES-PKCS1-v1_5 recipient. Defaults still deny it.

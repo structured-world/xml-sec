@@ -2140,15 +2140,30 @@ fn admit_encrypted_key(
     operation: &DecryptionExecution,
     key: &EncryptedKey,
 ) -> Result<(), XmlEncError> {
+    use crate::policy::AlgorithmRole;
     let uri = &key.encryption_method.algorithm;
     match validate_encrypted_key_policy(key, operation.policy()) {
-        Ok(()) => {
+        Ok(oaep) => {
             let role = if KeyTransportAlgorithm::from_uri(uri).is_ok() {
-                crate::policy::AlgorithmRole::KeyTransport
+                AlgorithmRole::KeyTransport
             } else {
-                crate::policy::AlgorithmRole::KeyWrap
+                AlgorithmRole::KeyWrap
             };
             operation.record_policy(PolicyDecision::algorithm(role, uri));
+            // Standard URIs, so an alias or an implied default on the wire
+            // audits as the algorithm the encrypting side names.
+            if let Some(AdmittedOaep { digest, mgf_digest }) = oaep {
+                operation.record_policy(PolicyDecision::algorithm(
+                    AlgorithmRole::OaepDigest,
+                    digest.uri(),
+                ));
+                if let Some(mgf) = mgf_digest.mgf_uri() {
+                    operation.record_policy(PolicyDecision::algorithm(
+                        AlgorithmRole::MaskGeneration,
+                        mgf,
+                    ));
+                }
+            }
             Ok(())
         }
         Err(error) => {
@@ -2977,17 +2992,27 @@ fn validate_decryption_key_candidates(
     Ok(())
 }
 
+/// The OAEP digest and MGF1 digest a key transport selected, defaults
+/// included, once the policy admitted both.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AdmittedOaep {
+    digest: OaepDigestAlgorithm,
+    mgf_digest: OaepDigestAlgorithm,
+}
+
 fn validate_encrypted_key_policy(
     encrypted_key: &EncryptedKey,
     policy: &crate::policy::DecryptionPolicy,
-) -> Result<(), XmlEncError> {
+) -> Result<Option<AdmittedOaep>, XmlEncError> {
     validate_key_encryption_method_policy(&encrypted_key.encryption_method, policy)
 }
 
+/// Check a key transport or wrap method against `policy`; an RSA-OAEP
+/// transport also returns the digests it admitted.
 pub(super) fn validate_key_encryption_method_policy(
     method: &super::EncryptionMethod,
     policy: &crate::policy::DecryptionPolicy,
-) -> Result<(), XmlEncError> {
+) -> Result<Option<AdmittedOaep>, XmlEncError> {
     method.validate_structure()?;
     let uri = &method.algorithm;
     if let Ok(transport) = KeyTransportAlgorithm::from_uri(uri) {
@@ -3006,7 +3031,7 @@ pub(super) fn validate_key_encryption_method_policy(
         }
         #[cfg(feature = "legacy-algorithms")]
         if transport == KeyTransportAlgorithm::RsaPkcs1v15 {
-            return Ok(());
+            return Ok(None);
         }
         let digest = parse_oaep_digest(method.oaep_digest.as_deref())?;
         let mgf_digest = parse_oaep_mgf_digest(method.mgf_algorithm.as_deref())?;
@@ -3052,6 +3077,7 @@ pub(super) fn validate_key_encryption_method_policy(
                 .into());
             }
         }
+        Ok(Some(AdmittedOaep { digest, mgf_digest }))
     } else {
         let wrap = KeyWrapAlgorithm::from_uri(uri)?;
         if policy
@@ -3067,8 +3093,8 @@ pub(super) fn validate_key_encryption_method_policy(
             }
             .into());
         }
+        Ok(None)
     }
-    Ok(())
 }
 
 fn validate_content_framing_before_resolution(
@@ -3089,7 +3115,7 @@ fn validate_content_framing_before_resolution(
         let mut last_key_error = None;
         for encrypted_key in encrypted_keys {
             match validate_encrypted_key_policy(encrypted_key, policy) {
-                Ok(()) => return Err(framing_error),
+                Ok(_) => return Err(framing_error),
                 Err(error) => last_key_error = Some(error),
             }
         }
