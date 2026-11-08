@@ -624,6 +624,8 @@ fn algorithm_role(role: AlgorithmRole) -> u32 {
         AlgorithmRole::DataEncryption => 5,
         AlgorithmRole::KeyTransport => 6,
         AlgorithmRole::KeyWrap => 7,
+        AlgorithmRole::OaepDigest => 8,
+        AlgorithmRole::MaskGeneration => 9,
         _ => 0,
     }
 }

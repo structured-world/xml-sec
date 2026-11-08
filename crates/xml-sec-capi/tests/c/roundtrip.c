@@ -299,12 +299,29 @@ int main(int argc, char **argv) {
         XsDocument document =
             parse(policy, XS_OPERATION_ENCRYPT, "<root><secret Id=\"s\">42</secret></root>");
         XsDocument received;
+        XsAudit audit = {0};
+        XsDecision decision;
+        size_t count = 0;
+        size_t index;
+        int oaep_digest_seen = 0;
+        int mask_generation_seen = 0;
         char *encrypted;
         char *decrypted;
 
         MUST(xs_encryptor_new(policy, provider, encrypt_keys, text("recipient"), text(AES256_GCM),
                               &encryptor, NULL));
-        MUST(xs_encrypt(encryptor, document, text("s"), NULL, NULL));
+        MUST(xs_encrypt(encryptor, document, text("s"), &audit, NULL));
+        /* The OAEP digest and mask the policy admitted have their own roles. */
+        MUST(xs_audit_decision_count(audit, &count, NULL));
+        for (index = 0; index < count; index++) {
+            MUST(xs_audit_decision(audit, index, &decision, NULL));
+            if (decision.kind == XS_DECISION_ALGORITHM) {
+                oaep_digest_seen |= decision.role == XS_ALGORITHM_ROLE_OAEP_DIGEST;
+                mask_generation_seen |= decision.role == XS_ALGORITHM_ROLE_MASK_GENERATION;
+            }
+        }
+        CHECK(oaep_digest_seen && mask_generation_seen);
+        CHECK(xs_audit_destroy(audit) == XS_OK);
         encrypted = serialize(document);
         CHECK(strstr(encrypted, ">42<") == NULL);
         CHECK(strstr(encrypted, "EncryptedData") != NULL);
