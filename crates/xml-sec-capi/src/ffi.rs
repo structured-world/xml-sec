@@ -170,6 +170,8 @@ struct CallerLookup {
 }
 
 impl objects::KeyLookup for CallerLookup {
+    /// Give the callback a handle to `keys` and the query, then release the
+    /// handle; the callback's failure status becomes the call's.
     fn lookup(&self, names: &[&str], method: &str, keys: &Arc<Keys>) -> Result<(), Failure> {
         let handle = insert(Object::Keys(Arc::clone(keys)))?;
         let names: Vec<XsBytes> = names.iter().map(|name| borrowed(name)).collect();

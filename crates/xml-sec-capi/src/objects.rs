@@ -320,6 +320,7 @@ impl Keys {
         ))
     }
 
+    /// An empty key manager whose imports `resources` bound.
     fn bounded_by(resources: ResourcePolicy) -> Self {
         Self {
             inventory: RwLock::new(KeyInventory::default()),
@@ -398,12 +399,14 @@ pub(crate) trait KeyLookup {
 struct LookupScope<'a> {
     lookup: &'a dyn KeyLookup,
     keys: Mutex<Option<Arc<Keys>>>,
-    /// Methods already asked for without a key name.
-    unnamed: Mutex<Vec<String>>,
+    /// Methods already asked for without a key name, with the names that
+    /// request imported, so a later request for the method selects them again.
+    unnamed: Mutex<Vec<(String, Vec<String>)>>,
     failure: Mutex<Option<Failure>>,
 }
 
 impl<'a> LookupScope<'a> {
+    /// A scope that has asked `lookup` nothing yet.
     fn new(lookup: &'a dyn KeyLookup) -> Self {
         Self {
             lookup,
@@ -415,8 +418,9 @@ impl<'a> LookupScope<'a> {
 
     /// The operation's key manager after asking the lookup for `names`, and
     /// the names that lookup imported. A lookup is asked only for names it
-    /// has not imported, and once per method for a request without names, so
-    /// a store never imports one key twice; after a failure none is asked.
+    /// has not imported, and once per method for a request without names,
+    /// whose later requests get the names the first one imported, so a store
+    /// never imports one key twice; after a failure none is asked.
     fn fill(
         &self,
         names: &[&str],
@@ -431,6 +435,15 @@ impl<'a> LookupScope<'a> {
                 .lock()
                 .get_or_insert_with(|| Arc::new(Keys::bounded_by(resources.clone()))),
         );
+        if names.is_empty()
+            && let Some((_, imported)) = self
+                .unnamed
+                .lock()
+                .iter()
+                .find(|(served, _)| served == method)
+        {
+            return Some((keys, imported.clone()));
+        }
         let (before, missing) = {
             let held = keys.names.lock();
             // A document may repeat a KeyName; each name is asked for once.
@@ -442,17 +455,7 @@ impl<'a> LookupScope<'a> {
             }
             (held.len(), missing)
         };
-        let asked = if names.is_empty() {
-            let mut unnamed = self.unnamed.lock();
-            let asked = unnamed.iter().any(|served| served == method);
-            if !asked {
-                unnamed.push(method.to_owned());
-            }
-            asked
-        } else {
-            missing.is_empty()
-        };
-        if asked {
+        if !names.is_empty() && missing.is_empty() {
             return Some((keys, Vec::new()));
         }
         // No lock of this scope is held while the application runs, so its
@@ -462,6 +465,11 @@ impl<'a> LookupScope<'a> {
             return None;
         }
         let imported = keys.names.lock()[before..].to_vec();
+        if names.is_empty() {
+            self.unnamed
+                .lock()
+                .push((method.to_owned(), imported.clone()));
+        }
         Some((keys, imported))
     }
 
@@ -491,6 +499,7 @@ struct LookupVerification<'a> {
 }
 
 impl KeyResolver for LookupVerification<'_> {
+    /// Resolve under the default policy and provider.
     fn resolve<'k>(
         &'k self,
         key_info: Option<&KeyInfo>,
@@ -504,6 +513,7 @@ impl KeyResolver for LookupVerification<'_> {
         )
     }
 
+    /// The resolved key without its trust evidence.
     fn resolve_with_policy_and_provider<'k>(
         &'k self,
         key_info: Option<&KeyInfo>,
@@ -515,6 +525,7 @@ impl KeyResolver for LookupVerification<'_> {
             .map(|key| key.map(ResolvedVerificationKey::into_key))
     }
 
+    /// Resolve with a fresh candidate budget of `policy`.
     fn resolve_for_verification<'k>(
         &'k self,
         key_info: Option<&KeyInfo>,
@@ -532,6 +543,8 @@ impl KeyResolver for LookupVerification<'_> {
         )
     }
 
+    /// Ask the lookup for the keys the document names under the signature
+    /// method, then resolve over what the operation's key manager holds.
     fn resolve_for_verification_with_budget<'k>(
         &'k self,
         key_info: Option<&KeyInfo>,
@@ -540,20 +553,29 @@ impl KeyResolver for LookupVerification<'_> {
         provider: &dyn CryptoProvider,
         budget: &mut InspectedKeyCandidateBudget,
     ) -> Result<Option<ResolvedVerificationKey<'k>>, DsigError> {
-        let Some((keys, _)) =
-            self.scope
-                .fill(&key_names(key_info), algorithm.uri(), &policy.resources)
+        let names = key_names(key_info);
+        let Some((keys, imported)) = self.scope.fill(&names, algorithm.uri(), &policy.resources)
         else {
             return Err(DsigError::InvalidStructure {
                 reason: "key lookup failed",
             });
         };
         let inventory = keys.inventory.read();
-        inventory
-            .verification_resolver()
-            .resolve_owned(key_info, algorithm, policy, provider, budget)
+        let resolver = inventory.verification_resolver();
+        let from_document =
+            resolver.resolve_owned(key_info, algorithm, policy, provider, budget)?;
+        // A document that names no key leaves the choice to the application:
+        // the one key the lookup imported for this request serves as a preset
+        // key, after the document's own sources found none.
+        match (from_document, names.is_empty(), imported.as_slice()) {
+            (None, true, [only]) => {
+                resolver.resolve_preset_owned(only, algorithm, policy, provider, budget)
+            }
+            (from_document, _, _) => Ok(from_document),
+        }
     }
 
+    /// The document's `KeyInfo` selects and supplies keys.
     fn consumes_document_key_info(&self) -> bool {
         true
     }
@@ -605,10 +627,15 @@ impl LookupDecryption<'_> {
             (None, [only]) => only.clone(),
             (None, _) => return Err(XmlEncError::KeyNotFound),
         };
-        let resolver: Arc<dyn DecryptionKeyResolver + Send + Sync> = keys
-            .inventory
-            .read()
-            .decryption_resolver_with_provider(&selected, policy, provider)
+        let inventory = keys.inventory.read();
+        // A wrap method asks for a key-encryption key: the key then only
+        // unwraps, and is never taken for a content key of the same width.
+        let selection = if KeyWrapAlgorithm::from_uri(method).is_ok() {
+            inventory.key_wrap_resolver(&selected, policy)
+        } else {
+            inventory.decryption_resolver_with_provider(&selected, policy, provider)
+        };
+        let resolver: Arc<dyn DecryptionKeyResolver + Send + Sync> = selection
             .map_err(|error| match error {
                 // A policy refusal ends the operation; any other selection
                 // failure leaves later key sources eligible.
@@ -626,6 +653,7 @@ impl LookupDecryption<'_> {
 }
 
 impl DecryptionKeyResolver for LookupDecryption<'_> {
+    /// The decapsulation key the lookup imports for the content method.
     fn resolve_encapsulation_content_keys_with_policy(
         &self,
         provider: &dyn CryptoProvider,
@@ -640,6 +668,9 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
             )
     }
 
+    /// The key that recovers a wrapping key. A nested key is asked for under
+    /// its own name and transport method, the ones the key that unwraps it
+    /// serves; the outer wrap method still drives the recovery.
     fn resolve_key_encryption_keys_with_policy(
         &self,
         provider: &dyn CryptoProvider,
@@ -648,9 +679,6 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
         policy: &xml_sec::policy::DecryptionPolicy,
         budget: &mut KeyCandidateBudget,
     ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
-        // A nested key is asked for under its own name and transport method,
-        // the ones the key that unwraps it serves; the outer wrap method still
-        // drives the recovery below.
         let (name, method) = match &source {
             KeyEncryptionKeySource::Encrypted(key) => (
                 key.key_name.as_deref(),
@@ -662,6 +690,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
             .resolve_key_encryption_keys_with_policy(provider, algorithm, source, policy, budget)
     }
 
+    /// The agreement key the lookup imports for the content method.
     fn resolve_agreement_content_keys_with_policy(
         &self,
         provider: &dyn CryptoProvider,
@@ -676,6 +705,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
             )
     }
 
+    /// The master key the lookup imports for the content method.
     fn resolve_derived_content_keys_with_policy(
         &self,
         provider: &dyn CryptoProvider,
@@ -690,6 +720,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
             )
     }
 
+    /// The key the recipient names, or the direct content key.
     fn resolve_content_keys_with_policy(
         &self,
         provider: &dyn CryptoProvider,
@@ -703,6 +734,7 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
             .resolve_content_keys_with_policy(provider, algorithm, encrypted_key, policy, budget)
     }
 
+    /// Raw candidates of the key the recipient names, or the direct key.
     fn resolve_key_candidates_with_policy(
         &self,
         provider: &dyn CryptoProvider,
@@ -716,8 +748,8 @@ impl DecryptionKeyResolver for LookupDecryption<'_> {
             .resolve_key_candidates_with_policy(provider, algorithm, encrypted_key, policy, budget)
     }
 
-    // A lookup's keys are bounded by the operation's policy, so a resolution
-    // without one finds nothing rather than importing unbounded.
+    /// Nothing: a lookup's keys are bounded by the operation's policy, so a
+    /// resolution without one finds nothing rather than importing unbounded.
     fn resolve_key(
         &self,
         _provider: &dyn CryptoProvider,
@@ -959,6 +991,8 @@ pub(crate) struct Decryptor {
 }
 
 impl Decryptor {
+    /// A decryptor bound to `security`, with the recovery key `key` names
+    /// selected now, or none when every call supplies keys through a lookup.
     pub(crate) fn new(
         security: SharedSecurity,
         key: Option<(&Keys, &str)>,

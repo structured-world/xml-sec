@@ -148,11 +148,16 @@ xs_verify(verifier, document, &request, &key_lookup, &evidence, &error);
   call: keys imported into it serve the rest of that call, so the callback is
   asked only for names not yet imported, and once per method for a request
   without names. Its handle is destroyed when the callback returns.
+- A verification whose signature names no key (no `KeyName`, or no
+  `KeyInfo` at all) uses the one key the callback imported for that request,
+  as a preset key the policy must admit, when the document's own sources give
+  none.
 - A decryption selects the key the `EncryptedKey` names, asked for with that
   key's own transport or wrap method, also when it is nested in another
   `EncryptedKey`; when the document names none, the one key the callback
-  imported for that request. A decryptor created with the zero key manager
-  decrypts only through a lookup.
+  imported for that request. A key imported for a key wrap method (for
+  example `kw-aes128`) only unwraps and is never taken for a content key. A
+  decryptor created with the zero key manager decrypts only through a lookup.
 - Any status other than `XS_OK` fails the call with that status, before a
   decryption changes the document; a value the header does not name becomes
   `XS_INTERNAL`.

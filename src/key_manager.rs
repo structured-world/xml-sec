@@ -847,7 +847,74 @@ impl InventoryVerificationResolver<'_> {
         if let Some(info) = key_info {
             crate::xmldsig::keys::validate_key_info_source_permissions(info, policy.key_sources)?;
         }
-        let (candidate, secret_candidate) = self.select_named(key_info, inspected_candidates)?;
+        let selection = self.select_named(key_info, inspected_candidates)?;
+        self.resolve_selected(
+            key_info,
+            selection,
+            algorithm,
+            policy,
+            provider,
+            inspected_candidates,
+        )
+    }
+
+    /// Resolve the inventory key `name` that the application chose for a
+    /// signature, independently of the document's `KeyInfo`, as a preset key:
+    /// the policy must admit preset keys, and the key keeps its usage and
+    /// candidate-budget checks. `Ok(None)` when no key has that name.
+    ///
+    /// # Errors
+    /// A policy that disables preset keys, and otherwise as for
+    /// [`KeyResolver::resolve_for_verification_with_budget`].
+    pub fn resolve_preset_owned(
+        &self,
+        name: &str,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        inspected_candidates: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'static>>, DsigError> {
+        policy.validate()?;
+        inspected_candidates.bind_policy(policy)?;
+        if !policy
+            .key_sources
+            .contains(crate::policy::KeySourceKind::PresetKey)
+        {
+            return Err(crate::policy::PolicyViolation::KeyTrust {
+                reason: "pre-resolved verification keys are disabled",
+            }
+            .into());
+        }
+        // The name is the application's choice, not a document source, so
+        // the document's key-source permissions do not apply to it.
+        let chosen = KeyInfo {
+            sources: vec![KeyInfoSource::KeyName(name.to_owned())],
+        };
+        let selection = self.select_named(Some(&chosen), inspected_candidates)?;
+        if selection.0.is_none() && selection.1.is_none() {
+            return Ok(None);
+        }
+        self.resolve_selected(
+            None,
+            selection,
+            algorithm,
+            policy,
+            provider,
+            inspected_candidates,
+        )
+    }
+
+    /// Resolve the keys `select_named` chose, with `key_info` the document's
+    /// own `KeyInfo` for the sources the selection leaves to it.
+    fn resolve_selected(
+        &self,
+        key_info: Option<&KeyInfo>,
+        (candidate, secret_candidate): NamedVerificationKeys<'_>,
+        algorithm: SignatureAlgorithm,
+        policy: &crate::policy::VerificationPolicy,
+        provider: &dyn crate::provider::CryptoProvider,
+        inspected_candidates: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<crate::xmldsig::ResolvedVerificationKey<'static>>, DsigError> {
         if let Some(candidate) = secret_candidate {
             let key = Self::named_hmac_key(candidate, algorithm, &policy.resources)?;
             return Ok(Some(
@@ -1021,6 +1088,80 @@ impl crate::xmlenc::DecryptionKeyResolver for InventoryDirectSymmetric {
             }
         })?;
         self.resolve_key_candidates(provider, algorithm, None, budget)
+    }
+}
+
+/// A named symmetric key selected as a key-encryption key: it only unwraps
+/// `EncryptedKey` values whose wrap method its family serves, and is never
+/// offered as a content key.
+#[cfg(feature = "xmlenc")]
+struct InventoryKeyWrap {
+    bytes: Zeroizing<Vec<u8>>,
+    kind: SymmetricKeyKind,
+}
+
+#[cfg(feature = "xmlenc")]
+impl InventoryKeyWrap {
+    fn kek(&self) -> crate::xmlenc::KekDecryptor<'_> {
+        crate::xmlenc::KekDecryptor::borrowed_with_kind(&self.bytes, self.kind)
+    }
+}
+
+#[cfg(feature = "xmlenc")]
+impl crate::xmlenc::DecryptionKeyResolver for InventoryKeyWrap {
+    fn resolve_key(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+        encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
+    ) -> Result<Vec<u8>, crate::xmlenc::XmlEncError> {
+        self.kek().resolve_key(provider, algorithm, encrypted_key)
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+        encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut crate::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, crate::xmlenc::XmlEncError> {
+        self.kek().resolve_content_keys_with_policy(
+            provider,
+            algorithm,
+            encrypted_key,
+            policy,
+            budget,
+        )
+    }
+
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::DataEncryptionAlgorithm,
+        encrypted_key: Option<&crate::xmlenc::EncryptedKey>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut crate::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, crate::xmlenc::XmlEncError> {
+        self.kek().resolve_key_candidates_with_policy(
+            provider,
+            algorithm,
+            encrypted_key,
+            policy,
+            budget,
+        )
+    }
+
+    fn resolve_key_encryption_keys_with_policy(
+        &self,
+        provider: &dyn crate::provider::CryptoProvider,
+        algorithm: crate::xmlenc::KeyWrapAlgorithm,
+        source: crate::xmlenc::KeyEncryptionKeySource<'_>,
+        policy: &crate::policy::DecryptionPolicy,
+        budget: &mut crate::xmlenc::KeyCandidateBudget,
+    ) -> Result<Vec<crate::provider::RecoveredContentKey>, crate::xmlenc::XmlEncError> {
+        self.kek()
+            .resolve_key_encryption_keys_with_policy(provider, algorithm, source, policy, budget)
     }
 }
 
@@ -1383,6 +1524,44 @@ impl KeyInventory {
         policy: &crate::policy::DecryptionPolicy,
     ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, KeyStoreError> {
         self.decryption_resolver_with_provider(name, policy, crate::provider::default_provider())
+    }
+
+    /// Select the named symmetric key as a key-encryption key, for a caller
+    /// that knows the document asks for a key wrap rather than a content
+    /// key. The resolver unwraps only through the wrap methods of the key's
+    /// family, so it never doubles as a content key.
+    ///
+    /// # Errors
+    /// Returns policy, lookup or material budget refusal, or an absent,
+    /// non-encryption or unauthorized key.
+    #[cfg(feature = "xmlenc")]
+    pub fn key_wrap_resolver(
+        &self,
+        name: &str,
+        policy: &crate::policy::DecryptionPolicy,
+    ) -> Result<Box<dyn crate::xmlenc::DecryptionKeyResolver + Send + Sync>, KeyStoreError> {
+        policy.validate()?;
+        let mut visited = 0;
+        let entry = find_named_entry(
+            &self.symmetric_keys,
+            name,
+            &policy.resources,
+            &mut visited,
+            |entry| &entry.name,
+        )?
+        .ok_or(KeyStoreError::Selection(
+            "named key-encryption key not found",
+        ))?;
+        if !entry.kind.is_encryption_key() || !entry.usages.allows(KeyUsage::Decrypt) {
+            return Err(KeyStoreError::Selection(
+                "key is not authorized for decryption",
+            ));
+        }
+        check_selected_material_size(entry.bytes.len(), &policy.resources)?;
+        Ok(Box::new(InventoryKeyWrap {
+            bytes: Zeroizing::new(entry.bytes.to_vec()),
+            kind: entry.kind,
+        }))
     }
 
     /// Select an authorized recovery key owned by the chosen native engine.

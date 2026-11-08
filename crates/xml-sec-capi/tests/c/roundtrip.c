@@ -183,6 +183,8 @@ static xs_status lookup(void *user_data, const XsKeyQuery *query, XsKeys keys) {
     return XS_OK;
 }
 
+/* Verify `document` requiring the `payload` element, with the keys a lookup
+ * over `store` supplies; stores the call's status and returns the evidence. */
 static XsEvidence verify_with(XsVerifier verifier, XsDocument document, KeyStore *store,
                               XsError *error, xs_status *status) {
     XsBytes ids[1];
@@ -207,6 +209,8 @@ static void check_identity(XsPolicyIdentity identity, uint64_t revision) {
     CHECK(equals(identity.profile, "app"));
 }
 
+/* Runs the round trip with the RSA recipient's private and public key files;
+ * exits non-zero on any failed check. */
 int main(int argc, char **argv) {
     size_t private_len = 0;
     size_t public_len = 0;

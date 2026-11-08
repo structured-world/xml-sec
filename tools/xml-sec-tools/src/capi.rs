@@ -329,16 +329,12 @@ pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> 
 
     let scratch = tempfile::tempdir().map_err(|error| format!("scratch directory: {error}"))?;
     let keys = root().join("tests/fixtures/keys/rsa");
-    for (source, args) in [
-        (
-            "tests/c/roundtrip.c",
-            vec![
-                keys.join("rsa-2048-key.pem"),
-                keys.join("rsa-2048-pubkey.pem"),
-            ],
-        ),
-        ("tests/cpp/roundtrip.cpp", Vec::new()),
-    ] {
+    // Both programs receive the RSA recipient's private and public key.
+    let key_files = [
+        keys.join("rsa-2048-key.pem"),
+        keys.join("rsa-2048-pubkey.pem"),
+    ];
+    for source in ["tests/c/roundtrip.c", "tests/cpp/roundtrip.cpp"] {
         let source = root().join(CRATE_DIR).join(source);
         let compiler = cc::Build::new()
             .target(&host)
@@ -373,7 +369,7 @@ pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> 
         )?;
         print!(
             "{}",
-            checked(runner, &program_step(&output, &args, &library))?
+            checked(runner, &program_step(&output, &key_files, &library))?
         );
     }
 
