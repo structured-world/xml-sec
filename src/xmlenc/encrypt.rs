@@ -648,11 +648,11 @@ impl BoundEncryption<'_> {
         let document_nodes = document.with_view(view_node_count);
         let (target, source, content_boundaries, selected_nodes) = document.with_view(|view| {
             let selected = select_encryption_target(view.document(), options.element_id)?;
-            let source = &view.xml()[selected.range()];
-            let content_boundaries = self.checked_content_boundaries(source)?;
+            let source = view.markup(selected);
+            let content_boundaries = self.checked_content_boundaries(&source)?;
             Ok::<_, XmlEncError>((
                 view.node_identity(selected),
-                source.to_owned(),
+                source.into_owned(),
                 content_boundaries,
                 selected.descendants().count(),
             ))
@@ -675,7 +675,7 @@ impl BoundEncryption<'_> {
                     true,
                 )?;
                 validate_replacement_document_len(
-                    document.as_xml().len(),
+                    document.content_len(),
                     source.len(),
                     generated.encrypted_data_xml.len(),
                     operation.policy().resources.max_xml_document_bytes,
@@ -709,7 +709,7 @@ impl BoundEncryption<'_> {
                     &generated.encrypted_data_xml,
                 )?;
                 validate_replacement_document_len(
-                    document.as_xml().len(),
+                    document.content_len(),
                     removed,
                     inserted,
                     operation.policy().resources.max_xml_document_bytes,

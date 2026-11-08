@@ -80,7 +80,24 @@ impl ExternalTree for Mirror {
         }
         Ok(())
     }
+
+    read_only!();
 }
+
+/// The edit methods of a tree these tests only read.
+macro_rules! read_only {
+    () => {
+        fn apply(&mut self, _: &[super::TreeEdit<'_>]) -> Result<(), super::TreeEditError> {
+            Err(super::TreeEditError("read-only test tree".into()))
+        }
+        fn checkpoint(&mut self) -> usize {
+            0
+        }
+        fn rollback(&mut self, _: usize) {}
+        fn release(&mut self, _: usize) {}
+    };
+}
+use read_only;
 
 /// A tree that reports whatever `walk` reports, for shapes no parse produces.
 struct Scripted(fn(&mut TreeSink<'_>) -> Result<(), ParseError>);
@@ -93,6 +110,8 @@ impl ExternalTree for Scripted {
     fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
         (self.0)(sink)
     }
+
+    read_only!();
 }
 
 fn with_comments() -> C14nAlgorithm {

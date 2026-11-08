@@ -1,87 +1,39 @@
-//! A document owned by an application's own tree, read by the operations
-//! exactly like a parsed one.
+//! A document owned by an application's own tree, read and changed by the
+//! operations exactly like a parsed one.
 
-#![cfg(all(feature = "external-tree", feature = "xmldsig-sign"))]
+#![cfg(all(
+    feature = "external-tree",
+    feature = "xmldsig-sign",
+    feature = "xmlenc"
+))]
 
 #[path = "support/cryptographic.rs"]
 mod cryptographic;
+#[path = "support/model_tree.rs"]
+mod model_tree;
 
-use xml_sec::c14n::{C14nAlgorithm, C14nMode};
-use xml_sec::document::external::{ExternalNode, ExternalTree, TreeSink};
+use model_tree::ModelTree;
+use xml_sec::XmlDocument;
+use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document, canonicalize_xml};
 use xml_sec::policy::VerificationPolicy;
 use xml_sec::xmldsig::{
     DefaultKeyResolver, DigestAlgorithm, DsigStatus, ReferenceBuilder, RsaSigningKey, SignContext,
     SignatureAlgorithm, SignatureBuilder, Transform, X509CertificateKeyInfoWriter,
 };
-use xml_sec::{Document, Node, NodeType, ParseError, XmlDocument};
+use xml_sec::xmlenc::{
+    DataEncryptionAlgorithm, DecryptContext, DocumentEncryptionOptions, EncryptedDataBuilder,
+    SymmetricKeyDecryptor,
+};
 
 const PRIVATE_KEY: &str = include_str!("fixtures/keys/rsa/rsa-2048-key.pem");
 const CERTIFICATE: &str = include_str!("fixtures/keys/rsa/rsa-2048-cert.pem");
-
-/// An application tree, here held as XML and walked node by node through the
-/// public DOM, the way a libxml2 walk reports its tree.
-struct Mirror(String);
-
-fn report(node: Node<'_, '_>, sink: &mut TreeSink<'_>, next: &mut u64) -> Result<(), ParseError> {
-    *next += 1;
-    let reference = ExternalNode(*next);
-    match node.node_type() {
-        NodeType::Element => {
-            let name = node.tag_name();
-            sink.begin_element(reference, name.name(), node.prefix(), name.namespace())?;
-            for namespace in node.namespaces() {
-                let inherited = node.parent_element().is_some_and(|parent| {
-                    parent.lookup_namespace_uri(namespace.name()) == Some(namespace.uri())
-                });
-                if !inherited {
-                    sink.declare_namespace(namespace.name(), namespace.uri())?;
-                }
-            }
-            for attribute in node.attributes() {
-                sink.attribute(
-                    attribute.name(),
-                    attribute.prefix(),
-                    attribute.namespace(),
-                    attribute.value(),
-                    false,
-                )?;
-            }
-            sink.open_element()?;
-            for child in node.children() {
-                report(child, sink, next)?;
-            }
-            sink.end_element()
-        }
-        NodeType::Text => sink.text(reference, node.text().unwrap_or_default()),
-        NodeType::Comment => sink.comment(reference, node.text().unwrap_or_default()),
-        NodeType::PI => {
-            let pi = node.pi().expect("a processing instruction");
-            sink.processing_instruction(reference, pi.target, pi.value)
-        }
-        NodeType::Root => unreachable!("the root is reported by its children"),
-    }
-}
-
-impl ExternalTree for Mirror {
-    fn document(&self) -> ExternalNode {
-        ExternalNode(1)
-    }
-
-    fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
-        let document = Document::parse(&self.0)?;
-        let mut next = 1;
-        for child in document.root().children() {
-            report(child, sink, &mut next)?;
-        }
-        Ok(())
-    }
-}
+const PAYLOAD: &str = concat!(
+    "<root xmlns:app=\"urn:app\"><app:secret ID=\"secret\">payload",
+    "<app:inner a=\"1\"/></app:secret><public>kept</public></root>"
+);
 
 fn signed_xml() -> String {
-    let mut document = XmlDocument::parse(
-        "<root xmlns:app=\"urn:app\"><app:secret ID=\"secret\">payload</app:secret></root>",
-    )
-    .expect("owned XML fixture must parse");
+    let mut document = XmlDocument::parse(PAYLOAD).expect("owned XML fixture must parse");
     let signing_key =
         RsaSigningKey::from_pkcs8_pem(PRIVATE_KEY).expect("tracked private key must parse");
     let key_info = X509CertificateKeyInfoWriter::from_pem(CERTIFICATE)
@@ -102,28 +54,87 @@ fn signed_xml() -> String {
     document.into_xml()
 }
 
-fn verify(xml: String) -> DsigStatus {
-    let document =
-        XmlDocument::from_external_tree(Box::new(Mirror(xml)), &VerificationPolicy::default())
-            .expect("the tree must project");
+fn tree_document(tree: &ModelTree) -> XmlDocument {
+    XmlDocument::from_external_tree(Box::new(tree.clone()), &VerificationPolicy::default())
+        .expect("the tree must project")
+}
+
+fn status(document: &XmlDocument) -> DsigStatus {
     let resolver = DefaultKeyResolver::default();
     cryptographic::context()
         .key_resolver(&resolver)
-        .verify_document(&document)
+        .verify_document(document)
         .expect("verification must run")
         .status
+}
+
+fn canonical(xml: &str) -> Vec<u8> {
+    canonicalize_xml(
+        xml.as_bytes(),
+        &C14nAlgorithm::new(C14nMode::Inclusive1_0, true),
+    )
+    .expect("canonicalizes")
 }
 
 #[test]
 fn a_signature_verifies_on_the_tree_it_was_made_for() {
     // The projection is the whole signed content: an exact walk verifies.
-    assert_eq!(verify(signed_xml()), DsigStatus::Valid);
+    let tree = ModelTree::parse(&signed_xml());
+    assert_eq!(status(&tree_document(&tree)), DsigStatus::Valid);
 }
 
 #[test]
 fn a_changed_tree_does_not_verify() {
     // The digest is computed from the projected tree, not from a source the
     // tree no longer matches.
-    let tampered = signed_xml().replace(">payload<", ">changed<");
-    assert!(matches!(verify(tampered), DsigStatus::Invalid(_)));
+    let tree = ModelTree::parse(&signed_xml().replace(">payload<", ">changed<"));
+    assert!(matches!(
+        status(&tree_document(&tree)),
+        DsigStatus::Invalid(_)
+    ));
+}
+
+#[test]
+fn encryption_and_decryption_change_the_tree_in_place() {
+    // The element is encrypted into the caller's tree and decrypted back;
+    // every node outside it is the same node throughout, and the restored
+    // tree still carries a valid signature.
+    let tree = ModelTree::parse(&signed_xml());
+    let mut document = tree_document(&tree);
+    let original =
+        canonicalize_document(&document, &C14nAlgorithm::new(C14nMode::Inclusive1_0, true))
+            .expect("canonicalizes");
+    let public = tree.element("public");
+    let signature = tree.element("Signature");
+
+    let content_key = [0x5a; 16];
+    EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content_key)
+        .encrypt_owned_document(
+            &mut document,
+            DocumentEncryptionOptions {
+                element_id: Some("secret"),
+            },
+        )
+        .expect("the selected element encrypts in the tree");
+    let encrypted = tree.to_xml();
+    assert!(encrypted.contains("EncryptedData"), "{encrypted}");
+    assert!(!encrypted.contains("payload"), "{encrypted}");
+    let nodes = tree.nodes();
+    assert!(nodes.contains(&public) && nodes.contains(&signature));
+
+    DecryptContext::new(&SymmetricKeyDecryptor::new(content_key))
+        .decrypt_owned_document(&mut document, None)
+        .expect("the encrypted element decrypts in the tree");
+    assert_eq!(
+        canonicalize_document(&document, &C14nAlgorithm::new(C14nMode::Inclusive1_0, true))
+            .expect("canonicalizes"),
+        original
+    );
+    assert_eq!(canonical(&tree.to_xml()), original);
+    let nodes = tree.nodes();
+    assert!(nodes.contains(&public) && nodes.contains(&signature));
+    assert_eq!(status(&document), DsigStatus::Valid);
+    // Each operation committed its own edits; nothing waits to be undone.
+    assert_eq!(tree.pending_undo(), 0);
 }

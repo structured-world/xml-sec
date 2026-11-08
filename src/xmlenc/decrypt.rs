@@ -807,12 +807,12 @@ struct ProcessedDecryption<T> {
 enum DecryptionInput<'a> {
     Xml {
         source: &'a str,
-        node_start: Option<usize>,
+        node: Option<crate::NodeId>,
     },
-    /// An already parsed document whose `EncryptedData` starts at `node_start`.
+    /// An already parsed document whose `EncryptedData` is `node`.
     Document {
         document: &'a crate::XmlDomDocument<'a>,
-        node_start: usize,
+        node: crate::NodeId,
     },
     Parsed(&'a EncryptedData),
 }
@@ -832,12 +832,12 @@ fn cipher_reference_node<'doc, 'input>(
 
 fn selected_encrypted_node<'doc, 'input>(
     document: &'doc crate::xml::dom::Document<'input>,
-    start: Option<usize>,
+    selected: Option<crate::NodeId>,
 ) -> Result<crate::xml::dom::Node<'doc, 'input>, XmlEncError> {
-    match start {
-        Some(start) => document
-            .descendants()
-            .find(|node| node.is_element() && node.range().start == start)
+    match selected {
+        Some(selected) => document
+            .get_node(selected)
+            .filter(crate::xml::dom::Node::is_element)
             .ok_or_else(|| XmlEncError::OperationPlan("selected encrypted node is absent".into())),
         None => Ok(document.root_element()),
     }
@@ -926,7 +926,7 @@ impl<'a> DecryptContext<'a> {
         self.process_decryption_input(
             DecryptionInput::Xml {
                 source: xml,
-                node_start: None,
+                node: None,
             },
             None,
             false,
@@ -983,24 +983,14 @@ impl<'a> DecryptContext<'a> {
     fn parse_decryption_metadata<'input>(
         &self,
         input: DecryptionInput<'input>,
-        source_document: Option<(&crate::XmlDomDocument<'_>, Option<usize>)>,
+        source_document: Option<(&crate::XmlDomDocument<'_>, Option<crate::NodeId>)>,
         reference_context: &super::CipherReferenceContext<'_>,
         operation: &DecryptionExecution,
     ) -> Result<(Cow<'input, EncryptedData>, Vec<Option<crate::NodeId>>), XmlEncError> {
         match input {
             DecryptionInput::Xml { .. } | DecryptionInput::Document { .. } => {
-                let (document, node_start) = source_document.expect("XML input parsed once");
-                let selected = match node_start {
-                    Some(start) => document
-                        .descendants()
-                        .find(|node| node.is_element() && node.range().start == start)
-                        .ok_or_else(|| {
-                            XmlEncError::OperationPlan(
-                                "selected encrypted node changed during policy parsing".into(),
-                            )
-                        })?,
-                    None => document.root_element(),
-                };
+                let (document, node) = source_document.expect("XML input parsed once");
+                let selected = selected_encrypted_node(document, node)?;
                 let (encrypted, origins) = super::parse::parse_encrypted_data_node_with_origins(
                     selected,
                     (&**operation.policy()).into(),
@@ -1122,15 +1112,15 @@ impl<'a> DecryptContext<'a> {
         &self,
         input: DecryptionInput<'s>,
         parse: &XmlParseWorkBudget,
-    ) -> Result<Option<(crate::XmlDomDocument<'s>, Option<usize>)>, XmlEncError> {
-        let DecryptionInput::Xml { source, node_start } = input else {
+    ) -> Result<Option<(crate::XmlDomDocument<'s>, Option<crate::NodeId>)>, XmlEncError> {
+        let DecryptionInput::Xml { source, node } = input else {
             return Ok(None);
         };
         let settings = self.document_parse_settings();
         let document =
             crate::document::parse_borrowed_with_settings_and_budget(source, settings, Some(parse))
                 .map_err(|error| map_document_error(error, settings))?;
-        Ok(Some((document, node_start)))
+        Ok(Some((document, node)))
     }
 
     fn process_decryption_input<T>(
@@ -1973,7 +1963,7 @@ fn decrypt_owned_document_with_context(
 ) -> Result<PolicyAudit, XmlEncError> {
     context.policy.resources.validate()?;
     document.validate_operation_policy(context.policy.xml, &context.policy.resources)?;
-    let (target, target_len, target_start, replacement_type) = document.with_view(|view| {
+    let (target, target_len, target_node, replacement_type) = document.with_view(|view| {
         let start = match selector {
             DocumentEncryptedDataSelector::UniqueBelowStartNode(Some(id))
             | DocumentEncryptedDataSelector::FirstBelowStartNode(Some(id)) => view
@@ -2004,8 +1994,8 @@ fn decrypt_owned_document_with_context(
         }
         Ok::<_, XmlEncError>((
             view.node_identity(selected),
-            selected.range().len(),
-            selected.range().start,
+            view.markup(selected).len(),
+            selected.id(),
             replacement_type(selected.attribute("Type")),
         ))
     })?;
@@ -2017,7 +2007,7 @@ fn decrypt_owned_document_with_context(
         context.process_decryption_input(
             DecryptionInput::Document {
                 document: view.document(),
-                node_start: target_start,
+                node: target_node,
             },
             document_binding,
             true,
@@ -2028,8 +2018,7 @@ fn decrypt_owned_document_with_context(
                 };
                 validate_encryption_document_len(
                     current
-                        .as_xml()
-                        .len()
+                        .content_len()
                         .saturating_sub(target_len)
                         .saturating_add(plaintext.len()),
                     &context.policy,
@@ -2357,31 +2346,28 @@ pub(super) fn resolve_nested_cipher_references<'a>(
 /// parse of its serialization.
 fn source_document_view<'a>(
     input: DecryptionInput<'a>,
-    parsed: Option<&'a (crate::XmlDomDocument<'a>, Option<usize>)>,
-) -> Option<(&'a crate::XmlDomDocument<'a>, Option<usize>)> {
+    parsed: Option<&'a (crate::XmlDomDocument<'a>, Option<crate::NodeId>)>,
+) -> Option<(&'a crate::XmlDomDocument<'a>, Option<crate::NodeId>)> {
     match input {
-        DecryptionInput::Document {
-            document,
-            node_start,
-        } => Some((document, Some(node_start))),
+        DecryptionInput::Document { document, node } => Some((document, Some(node))),
         DecryptionInput::Xml { .. } | DecryptionInput::Parsed(_) => {
-            parsed.map(|(document, node_start)| (document, *node_start))
+            parsed.map(|(document, node)| (document, *node))
         }
     }
 }
 
 /// The selected `EncryptedData` of an XML source, for key-source association.
 fn key_source_document<'a, 'doc>(
-    source: Option<(&crate::XmlDomDocument<'_>, Option<usize>)>,
+    source: Option<(&crate::XmlDomDocument<'_>, Option<crate::NodeId>)>,
     references: Option<&'a super::cipher_reference::BoundCipherReferenceContext<'doc, 'doc>>,
     origins: &'a [Option<crate::NodeId>],
 ) -> Result<Option<KeySourceDocument<'a, 'doc>>, XmlEncError> {
-    let (Some((document, start)), Some(references)) = (source, references) else {
+    let (Some((document, selected)), Some(references)) = (source, references) else {
         return Ok(None);
     };
     Ok(Some(KeySourceDocument {
         references,
-        target: selected_encrypted_node(document, start)?.id(),
+        target: selected_encrypted_node(document, selected)?.id(),
         origins,
     }))
 }
