@@ -70,7 +70,7 @@ fn mask(out: &mut [u8], algorithm: DigestAlgorithm, seed: &[u8]) {
 }
 
 fn valid_key(parameters: RsaPssParameters, key: &impl PublicKeyParts) -> bool {
-    let bits = key.n().bits() as usize;
+    let bits = key.n().bit_width() as usize;
     bits <= crate::hard_limits::RSA_MODULUS_BIT_CEILING && parameters.fits_modulus_bits(bits)
 }
 
@@ -120,7 +120,7 @@ pub(crate) fn sign(
     if !valid_key(parameters, key) {
         return Err(SigningKeyError::SigningFailed);
     }
-    let bits = key.n().bits() as usize - 1;
+    let bits = key.n().bit_width() as usize - 1;
     let em_len = bits.div_ceil(8);
     let h_len = parameters.digest.output_len();
     let mut m_hash = [0u8; 64];
@@ -171,7 +171,7 @@ pub(crate) fn verify(
         return false;
     };
     let mut encoded = value.to_be_bytes();
-    let bits = key.n().bits() as usize - 1;
+    let bits = key.n().bit_width() as usize - 1;
     let em_len = bits.div_ceil(8);
     let leading = encoded.len() - em_len;
     // RFC 8017 section 8.1.2 step 2 requires an emLen-octet representative.

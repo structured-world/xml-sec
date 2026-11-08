@@ -1794,11 +1794,11 @@ impl KeyRecoveryKey for rsa::RsaPrivateKey {
     }
     fn rsa_modulus_bits(&self) -> usize {
         use rsa::traits::PublicKeyParts as _;
-        self.n().bits_vartime() as usize
+        self.n().bit_width_vartime() as usize
     }
     fn rsa_public_exponent(&self) -> Option<u64> {
         use rsa::traits::PublicKeyParts as _;
-        if self.e().bits_vartime() > 64 {
+        if self.e().bit_width_vartime() > 64 {
             return None;
         }
         let mut exponent = 0_u64;
@@ -2542,7 +2542,7 @@ pub(crate) mod rustcrypto_x509 {
         digest: DigestAlgorithm,
         salt_len: usize,
     ) -> bool {
-        let Some(em_bits) = key.n().bits().checked_sub(1) else {
+        let Some(em_bits) = key.n().bit_width().checked_sub(1) else {
             return false;
         };
         let Ok(em_len) = usize::try_from(em_bits.div_ceil(8)) else {

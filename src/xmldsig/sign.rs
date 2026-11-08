@@ -1181,10 +1181,15 @@ impl SigningKey for DsaSigningKey {
                 });
             }
         };
-        let component_len =
-            usize::try_from(self.key.verifying_key().components().q().bits_vartime())
-                .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
-                .div_ceil(8);
+        let component_len = usize::try_from(
+            self.key
+                .verifying_key()
+                .components()
+                .q()
+                .bit_width_vartime(),
+        )
+        .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
+        .div_ceil(8);
         if algorithm.dsa_component_len() != Some(component_len) {
             return Err(SigningKeyError::InvalidPublicKeyInfo);
         }
@@ -1217,9 +1222,9 @@ impl SigningKey for DsaSigningKey {
             .to_public_key_der()
             .map(|doc| doc.as_bytes().to_vec())
             .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
-        let modulus_bits = usize::try_from(verifying_key.components().p().bits_vartime())
+        let modulus_bits = usize::try_from(verifying_key.components().p().bit_width_vartime())
             .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?;
-        let component_len = usize::try_from(verifying_key.components().q().bits_vartime())
+        let component_len = usize::try_from(verifying_key.components().q().bit_width_vartime())
             .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
             .div_ceil(8);
         let components = verifying_key.components();
