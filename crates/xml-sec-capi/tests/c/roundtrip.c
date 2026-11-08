@@ -128,7 +128,75 @@ static XsEvidence verify(XsVerifier verifier, XsDocument document) {
     request.expected_target_count = 1;
     request.requirement = XS_REQUIRE_ALL;
     request.count = 0;
-    MUST(xs_verify(verifier, document, &request, &evidence, NULL));
+    MUST(xs_verify(verifier, document, &request, NULL, &evidence, NULL));
+    return evidence;
+}
+
+/* An application key store a lookup reads, and what the lookup observed. */
+typedef struct KeyStore {
+    const char *pem;
+    size_t pem_len;
+    int private_key;
+    uint32_t usages;
+    const char *method; /* the method URI the lookup expects */
+    xs_status result;   /* what the lookup returns */
+    int calls;
+    int matched; /* invocations for the method the stored key serves */
+    XsKeys kept;        /* the key manager of the last invocation */
+    /* Handles of the running call: destroying them must report busy. */
+    XsVerifier running;
+    XsDocument document;
+    int reentry_busy;
+} KeyStore;
+
+/* For the method the stored key serves, import it under every name the
+ * document gives, or under "found" when it gives none; find nothing for any
+ * other method. */
+static xs_status lookup(void *user_data, const XsKeyQuery *query, XsKeys keys) {
+    KeyStore *store = (KeyStore *)user_data;
+    XsBytes pem = {(const uint8_t *)store->pem, store->pem_len};
+    size_t index;
+    store->calls++;
+    store->kept = keys;
+    if (store->running.value != 0) {
+        store->reentry_busy = xs_verifier_destroy(store->running) == XS_BUSY &&
+                              xs_document_destroy(store->document) == XS_BUSY;
+    }
+    if (store->result != XS_OK) {
+        return store->result;
+    }
+    if (!equals(query->method, store->method)) {
+        return XS_OK;
+    }
+    store->matched++;
+    for (index = 0; index < query->name_count || (index == 0 && query->name_count == 0);
+         index++) {
+        XsBytes name = query->name_count == 0 ? text("found") : query->names[index];
+        xs_status status =
+            store->private_key
+                ? xs_keys_add_private_pem(keys, name, pem, text(""), store->usages, NULL)
+                : xs_keys_add_public_pem(keys, name, pem, store->usages, NULL);
+        if (status != XS_OK) {
+            return status;
+        }
+    }
+    return XS_OK;
+}
+
+static XsEvidence verify_with(XsVerifier verifier, XsDocument document, KeyStore *store,
+                              XsError *error, xs_status *status) {
+    XsBytes ids[1];
+    XsVerifyRequest request;
+    XsKeyLookup key_lookup;
+    XsEvidence evidence = {0};
+    ids[0] = text("payload");
+    request.expected_target_ids = ids;
+    request.expected_target_count = 1;
+    request.requirement = XS_REQUIRE_ALL;
+    request.count = 0;
+    key_lookup.lookup = lookup;
+    key_lookup.user_data = store;
+    *status = xs_verify(verifier, document, &request, &key_lookup, &evidence, error);
     return evidence;
 }
 
@@ -235,6 +303,7 @@ int main(int argc, char **argv) {
                 XsDocument altered;
                 tampered[1] = 'S';
                 altered = parse(policy, XS_OPERATION_VERIFY, signed_xml);
+                tampered[1] = 's';
                 evidence = verify(verifier, altered);
                 MUST(xs_evidence_signature(evidence, 0, &outcome, NULL));
                 CHECK(outcome.outcome != XS_SIGNATURE_VALID);
@@ -254,7 +323,8 @@ int main(int argc, char **argv) {
                 xs_status status;
                 XsBytes message = {0};
                 wrong.value = received.value;
-                CHECK(xs_verify(wrong, received, &request, &unused, &error) == XS_WRONG_HANDLE);
+                CHECK(xs_verify(wrong, received, &request, NULL, &unused, &error) ==
+                      XS_WRONG_HANDLE);
                 CHECK(error.value != 0);
                 MUST(xs_error_status(error, &status));
                 CHECK(status == XS_WRONG_HANDLE);
@@ -267,6 +337,53 @@ int main(int argc, char **argv) {
             CHECK(xs_keys_destroy(verify_keys) == XS_OK);
             CHECK(xs_document_destroy(received) == XS_OK);
             CHECK(xs_document_destroy(received) == XS_DESTROYED_HANDLE);
+        }
+
+        /* Verify with the key supplied only by a lookup, which reenters the
+         * library, then with a lookup that fails. */
+        {
+            XsVerifier verifier = {0};
+            XsKeys none = {0};
+            XsDocument received;
+            XsEvidence evidence;
+            XsSignatureOutcome outcome;
+            XsError error = {0};
+            xs_status status;
+            KeyStore store = {0};
+            store.pem = public_pem;
+            store.pem_len = public_len;
+            store.usages = XS_KEY_USAGE_VERIFY;
+            store.method = RSA_SHA256;
+
+            MUST(xs_verifier_new(policy, provider, none, &verifier, NULL));
+            received = parse(policy, XS_OPERATION_VERIFY, signed_xml);
+            store.running = verifier;
+            store.document = received;
+            evidence = verify_with(verifier, received, &store, NULL, &status);
+            CHECK(status == XS_OK);
+            CHECK(store.calls == 1);
+            CHECK(store.matched == 1);
+            CHECK(store.reentry_busy);
+            MUST(xs_evidence_signature(evidence, 0, &outcome, NULL));
+            CHECK(outcome.outcome == XS_SIGNATURE_VALID);
+            CHECK(outcome.key_trust == XS_KEY_TRUST_CALLER_TRUSTED);
+            CHECK(xs_evidence_destroy(evidence) == XS_OK);
+            /* The lookup's key manager ended with its invocation. */
+            CHECK(xs_keys_add_symmetric(store.kept, text("late"), XS_SYMMETRIC_HMAC,
+                                        text("0123456789abcdef"), XS_KEY_USAGE_VERIFY,
+                                        NULL) == XS_DESTROYED_HANDLE);
+
+            store.running.value = 0;
+            store.result = XS_KEY;
+            evidence = verify_with(verifier, received, &store, &error, &status);
+            CHECK(status == XS_KEY);
+            CHECK(evidence.value == 0);
+            MUST(xs_error_status(error, &status));
+            CHECK(status == XS_KEY);
+            CHECK(xs_error_destroy(error) == XS_OK);
+
+            CHECK(xs_document_destroy(received) == XS_OK);
+            CHECK(xs_verifier_destroy(verifier) == XS_OK);
         }
         free(signed_xml);
     }
@@ -329,13 +446,41 @@ int main(int argc, char **argv) {
         received = parse(policy, XS_OPERATION_DECRYPT, encrypted);
         MUST(xs_decryptor_new(policy, provider, decrypt_keys, text("recipient"), &decryptor,
                               NULL));
-        MUST(xs_decrypt(decryptor, received, text(""), NULL, NULL));
+        MUST(xs_decrypt(decryptor, received, text(""), NULL, NULL, NULL));
         decrypted = serialize(received);
         CHECK(strstr(decrypted, "<secret Id=\"s\">42</secret>") != NULL);
-
-        free(encrypted);
         free(decrypted);
         CHECK(xs_document_destroy(received) == XS_OK);
+
+        /* Decrypt with the recovery key supplied only by a lookup, for the
+         * key name the EncryptedKey gives. */
+        {
+            XsDecryptor keyless = {0};
+            XsKeys none = {0};
+            XsKeyLookup key_lookup;
+            KeyStore store = {0};
+            store.pem = private_pem;
+            store.pem_len = private_len;
+            store.private_key = 1;
+            store.usages = XS_KEY_USAGE_DECRYPT;
+            store.method = "http://www.w3.org/2009/xmlenc11#rsa-oaep";
+            key_lookup.lookup = lookup;
+            key_lookup.user_data = &store;
+
+            MUST(xs_decryptor_new(policy, provider, none, text(""), &keyless, NULL));
+            received = parse(policy, XS_OPERATION_DECRYPT, encrypted);
+            CHECK(xs_decrypt(keyless, received, text(""), NULL, NULL, NULL) ==
+                  XS_INVALID_ARGUMENT);
+            MUST(xs_decrypt(keyless, received, text(""), &key_lookup, NULL, NULL));
+            CHECK(store.matched == 1);
+            decrypted = serialize(received);
+            CHECK(strstr(decrypted, "<secret Id=\"s\">42</secret>") != NULL);
+            free(decrypted);
+            CHECK(xs_document_destroy(received) == XS_OK);
+            CHECK(xs_decryptor_destroy(keyless) == XS_OK);
+        }
+
+        free(encrypted);
         CHECK(xs_document_destroy(document) == XS_OK);
         CHECK(xs_encryptor_destroy(encryptor) == XS_OK);
         CHECK(xs_decryptor_destroy(decryptor) == XS_OK);

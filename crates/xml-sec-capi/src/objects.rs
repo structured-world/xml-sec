@@ -10,20 +10,23 @@ use crate::table::Kind;
 use parking_lot::{Mutex, RwLock};
 use std::sync::Arc;
 use xml_sec::api::Operation;
-use xml_sec::key_manager::{KeyInventory, KeyUsages, SymmetricKeyKind};
+use xml_sec::key_establishment::EncapsulationMechanism;
+use xml_sec::key_manager::{KeyInventory, KeyStoreError, KeyUsages, SymmetricKeyKind};
 use xml_sec::policy::{
     AlgorithmRole, CompiledPolicies, Instant, ManifestProcessing, PolicyAudit,
     PolicyCompileContext, PolicyDecision, PolicyIdentity, PolicyValidity, PolicyViolation,
     ResourcePolicy, UriRole,
 };
-use xml_sec::provider::CryptoProvider;
+use xml_sec::provider::{CryptoProvider, RecoveredContentKey};
 use xml_sec::xmldsig::{
-    DsigStatus, KeyTrustEvidence, SignatureAlgorithm, SignatureRequirement, SigningKey, UriClass,
-    VerificationRequest, VerifyEvidence,
+    DsigError, DsigStatus, InspectedKeyCandidateBudget, KeyInfo, KeyInfoSource, KeyResolver,
+    KeyTrustEvidence, ResolvedVerificationKey, SignatureAlgorithm, SignatureRequirement,
+    SigningKey, UriClass, VerificationRequest, VerifyEvidence, VerifyingKey,
 };
 use xml_sec::xmlenc::{
-    DataEncryptionAlgorithm, DecryptionKeyResolver, DocumentEncryptionOptions,
-    EncryptedDataBuilder, EncryptionRecipient,
+    AgreementMethod, DataEncryptionAlgorithm, DecryptionKeyResolver, DerivedKey,
+    DocumentEncryptionOptions, EncryptedDataBuilder, EncryptedKey, EncryptionRecipient,
+    KeyCandidateBudget, KeyEncryptionKeySource, KeyWrapAlgorithm, XmlEncError,
 };
 use xml_sec::{SharedSecurity, XmlBackend, XmlDocument, XmlDocumentError, XmlSecError};
 use xml_sec_config::{Configuration, LoadLimits, PolicyStore, Source};
@@ -258,10 +261,12 @@ impl PolicySource<'_> {
     }
 }
 
-/// A key manager, with the resource policy its imports are bounded by.
+/// A key manager, with the resource policy its imports are bounded by and
+/// the names it holds, in import order.
 pub(crate) struct Keys {
     inventory: RwLock<KeyInventory>,
     resources: ResourcePolicy,
+    names: Mutex<Vec<String>>,
 }
 
 /// `XS_KEY_USAGE_*` bits, the same values as [`KeyUsages`].
@@ -305,12 +310,26 @@ fn key_failure(error: xml_sec::key_manager::KeyStoreError) -> Failure {
 
 impl Keys {
     pub(crate) fn new(policies: &CompiledPolicies, operation: Operation) -> Result<Self, Failure> {
-        Ok(Self {
-            inventory: RwLock::new(KeyInventory::default()),
-            resources: resources(policies, operation)
+        Ok(Self::bounded_by(
+            resources(policies, operation)
                 .ok_or_else(|| disabled(operation))?
                 .clone(),
-        })
+        ))
+    }
+
+    fn bounded_by(resources: ResourcePolicy) -> Self {
+        Self {
+            inventory: RwLock::new(KeyInventory::default()),
+            resources,
+            names: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Record `name` once `imported` succeeded.
+    fn named(&self, name: &str, imported: Result<(), Failure>) -> Result<(), Failure> {
+        imported?;
+        self.names.lock().push(name.to_owned());
+        Ok(())
     }
 
     pub(crate) fn add_private_pem(
@@ -321,10 +340,12 @@ impl Keys {
         usage_bits: u32,
     ) -> Result<(), Failure> {
         let usages = usages(usage_bits)?;
-        self.inventory
+        let imported = self
+            .inventory
             .write()
             .add_private_pem(name, pem, password, usages, &self.resources)
-            .map_err(key_failure)
+            .map_err(key_failure);
+        self.named(name, imported)
     }
 
     pub(crate) fn add_public_pem(
@@ -334,10 +355,12 @@ impl Keys {
         usage_bits: u32,
     ) -> Result<(), Failure> {
         let usages = usages(usage_bits)?;
-        self.inventory
+        let imported = self
+            .inventory
             .write()
             .add_public_pem_with_usages(name, pem, usages, &self.resources)
-            .map_err(key_failure)
+            .map_err(key_failure);
+        self.named(name, imported)
     }
 
     pub(crate) fn add_symmetric(
@@ -348,11 +371,349 @@ impl Keys {
         usage_bits: u32,
     ) -> Result<(), Failure> {
         let (kind, usages) = (symmetric_kind(kind)?, usages(usage_bits)?);
-        self.inventory
+        let imported = self
+            .inventory
             .write()
             .add_symmetric(name, kind, key, usages, &self.resources)
-            .map_err(key_failure)
+            .map_err(key_failure);
+        self.named(name, imported)
     }
+}
+
+/// An application's key store, asked while an operation resolves one key:
+/// given the key names the document gives and the method the key serves, it
+/// imports the keys it holds into `keys`. Keys found reach the operation
+/// through the same validation, resource policy and trust as any key manager.
+pub(crate) trait KeyLookup {
+    /// Import the keys matching `names` and `method` into `keys`.
+    fn lookup(&self, names: &[&str], method: &str, keys: &Arc<Keys>) -> Result<(), Failure>;
+}
+
+/// The key manager every lookup of one operation fills, so the operation's
+/// key-import work, material and candidate allowances are counted once for
+/// the whole operation; and the first lookup failure, which fails the call.
+struct LookupScope<'a> {
+    lookup: &'a dyn KeyLookup,
+    keys: Mutex<Option<Arc<Keys>>>,
+    failure: Mutex<Option<Failure>>,
+}
+
+impl<'a> LookupScope<'a> {
+    fn new(lookup: &'a dyn KeyLookup) -> Self {
+        Self {
+            lookup,
+            keys: Mutex::new(None),
+            failure: Mutex::new(None),
+        }
+    }
+
+    /// The operation's key manager after asking the lookup for `names`, and
+    /// the names that lookup imported. A lookup is not asked again for names
+    /// it already imported; after a failure none is asked at all.
+    fn fill(
+        &self,
+        names: &[&str],
+        method: &str,
+        resources: &ResourcePolicy,
+    ) -> Option<(Arc<Keys>, Vec<String>)> {
+        if self.failure.lock().is_some() {
+            return None;
+        }
+        let keys = Arc::clone(
+            self.keys
+                .lock()
+                .get_or_insert_with(|| Arc::new(Keys::bounded_by(resources.clone()))),
+        );
+        let (before, held_already) = {
+            let held = keys.names.lock();
+            (
+                held.len(),
+                !names.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| held.iter().any(|held| held == name)),
+            )
+        };
+        if held_already {
+            return Some((keys, Vec::new()));
+        }
+        // No lock of this scope is held while the application runs, so its
+        // lookup may import into `keys` and reenter the library.
+        if let Err(failure) = self.lookup.lookup(names, method, &keys) {
+            *self.failure.lock() = Some(failure);
+            return None;
+        }
+        let imported = keys.names.lock()[before..].to_vec();
+        Some((keys, imported))
+    }
+
+    /// The failure that ends the call, if a lookup failed.
+    fn into_failure(self) -> Option<Failure> {
+        self.failure.into_inner()
+    }
+}
+
+/// The `KeyName` values of `key_info`, in document order.
+fn key_names(key_info: Option<&KeyInfo>) -> Vec<&str> {
+    key_info
+        .into_iter()
+        .flat_map(|info| &info.sources)
+        .filter_map(|source| match source {
+            KeyInfoSource::KeyName(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Verification keys from a lookup, resolved by the key-manager rules over
+/// what it imported: the document's names select application keys, and its
+/// other `KeyInfo` sources go through the policy's X.509 and key-source rules.
+struct LookupVerification<'a> {
+    scope: LookupScope<'a>,
+}
+
+impl KeyResolver for LookupVerification<'_> {
+    fn resolve<'k>(
+        &'k self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'k>>, DsigError> {
+        self.resolve_with_policy_and_provider(
+            key_info,
+            algorithm,
+            &xml_sec::policy::VerificationPolicy::default(),
+            xml_sec::provider::default_provider(),
+        )
+    }
+
+    fn resolve_with_policy_and_provider<'k>(
+        &'k self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &xml_sec::policy::VerificationPolicy,
+        provider: &dyn CryptoProvider,
+    ) -> Result<Option<Box<dyn VerifyingKey + 'k>>, DsigError> {
+        self.resolve_for_verification(key_info, algorithm, policy, provider)
+            .map(|key| key.map(ResolvedVerificationKey::into_key))
+    }
+
+    fn resolve_for_verification<'k>(
+        &'k self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &xml_sec::policy::VerificationPolicy,
+        provider: &dyn CryptoProvider,
+    ) -> Result<Option<ResolvedVerificationKey<'k>>, DsigError> {
+        let mut budget = InspectedKeyCandidateBudget::new(policy);
+        self.resolve_for_verification_with_budget(
+            key_info,
+            algorithm,
+            policy,
+            provider,
+            &mut budget,
+        )
+    }
+
+    fn resolve_for_verification_with_budget<'k>(
+        &'k self,
+        key_info: Option<&KeyInfo>,
+        algorithm: SignatureAlgorithm,
+        policy: &xml_sec::policy::VerificationPolicy,
+        provider: &dyn CryptoProvider,
+        budget: &mut InspectedKeyCandidateBudget,
+    ) -> Result<Option<ResolvedVerificationKey<'k>>, DsigError> {
+        let Some((keys, _)) =
+            self.scope
+                .fill(&key_names(key_info), algorithm.uri(), &policy.resources)
+        else {
+            return Err(DsigError::InvalidStructure {
+                reason: "key lookup failed",
+            });
+        };
+        let inventory = keys.inventory.read();
+        inventory
+            .verification_resolver()
+            .resolve_owned(key_info, algorithm, policy, provider, budget)
+    }
+
+    fn consumes_document_key_info(&self) -> bool {
+        true
+    }
+}
+
+/// Decryption keys from a lookup, selected by the document's key name, or by
+/// the one key the lookup imported when the document names none. Every
+/// resolver method is forwarded, so recipient keys keep the core's
+/// acceptance checks.
+struct LookupDecryption<'a> {
+    scope: LookupScope<'a>,
+    /// One resolver per key name and method: a content key and a transport
+    /// key without names are different requests.
+    resolvers: Mutex<Vec<DecryptionResolution>>,
+}
+
+/// A resolved request: its key name and method, and the selected resolver.
+type DecryptionResolution = (
+    Option<String>,
+    String,
+    Arc<dyn DecryptionKeyResolver + Send + Sync>,
+);
+
+impl LookupDecryption<'_> {
+    /// The resolver for the key `name` selects, asking the lookup for it.
+    fn resolver(
+        &self,
+        name: Option<&str>,
+        method: &str,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        provider: &dyn CryptoProvider,
+    ) -> Result<Arc<dyn DecryptionKeyResolver + Send + Sync>, XmlEncError> {
+        if let Some((_, _, found)) = self
+            .resolvers
+            .lock()
+            .iter()
+            .find(|(cached, served, _)| cached.as_deref() == name && served == method)
+        {
+            return Ok(Arc::clone(found));
+        }
+        let (keys, imported) = self
+            .scope
+            .fill(name.as_slice(), method, &policy.resources)
+            .ok_or(XmlEncError::KeyNotFound)?;
+        let selected = match (name, imported.as_slice()) {
+            (Some(name), _) => name.to_owned(),
+            (None, [only]) => only.clone(),
+            (None, _) => return Err(XmlEncError::KeyNotFound),
+        };
+        let resolver: Arc<dyn DecryptionKeyResolver + Send + Sync> = keys
+            .inventory
+            .read()
+            .decryption_resolver_with_provider(&selected, policy, provider)
+            .map_err(|error| match error {
+                // A policy refusal ends the operation; any other selection
+                // failure leaves later key sources eligible.
+                KeyStoreError::Policy(violation) => XmlEncError::Policy(violation),
+                _ => XmlEncError::KeyNotFound,
+            })?
+            .into();
+        self.resolvers.lock().push((
+            name.map(str::to_owned),
+            method.to_owned(),
+            Arc::clone(&resolver),
+        ));
+        Ok(resolver)
+    }
+}
+
+impl DecryptionKeyResolver for LookupDecryption<'_> {
+    fn resolve_encapsulation_content_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        descriptor: &EncapsulationMechanism,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
+        self.resolver(None, algorithm.uri(), policy, provider)?
+            .resolve_encapsulation_content_keys_with_policy(
+                provider, algorithm, descriptor, policy, budget,
+            )
+    }
+
+    fn resolve_key_encryption_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: KeyWrapAlgorithm,
+        source: KeyEncryptionKeySource<'_>,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
+        let name = match &source {
+            KeyEncryptionKeySource::Encrypted(key) => key.key_name.as_deref(),
+            _ => None,
+        };
+        self.resolver(name, algorithm.uri(), policy, provider)?
+            .resolve_key_encryption_keys_with_policy(provider, algorithm, source, policy, budget)
+    }
+
+    fn resolve_agreement_content_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        descriptor: &AgreementMethod,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
+        self.resolver(None, algorithm.uri(), policy, provider)?
+            .resolve_agreement_content_keys_with_policy(
+                provider, algorithm, descriptor, policy, budget,
+            )
+    }
+
+    fn resolve_derived_content_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        descriptor: &DerivedKey,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
+        self.resolver(None, algorithm.uri(), policy, provider)?
+            .resolve_derived_content_keys_with_policy(
+                provider, algorithm, descriptor, policy, budget,
+            )
+    }
+
+    fn resolve_content_keys_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<RecoveredContentKey>, XmlEncError> {
+        let (name, method) = recipient(encrypted_key, algorithm);
+        self.resolver(name, method, policy, provider)?
+            .resolve_content_keys_with_policy(provider, algorithm, encrypted_key, policy, budget)
+    }
+
+    fn resolve_key_candidates_with_policy(
+        &self,
+        provider: &dyn CryptoProvider,
+        algorithm: DataEncryptionAlgorithm,
+        encrypted_key: Option<&EncryptedKey>,
+        policy: &xml_sec::policy::DecryptionPolicy,
+        budget: &mut KeyCandidateBudget,
+    ) -> Result<Vec<Vec<u8>>, XmlEncError> {
+        let (name, method) = recipient(encrypted_key, algorithm);
+        self.resolver(name, method, policy, provider)?
+            .resolve_key_candidates_with_policy(provider, algorithm, encrypted_key, policy, budget)
+    }
+
+    // A lookup's keys are bounded by the operation's policy, so a resolution
+    // without one finds nothing rather than importing unbounded.
+    fn resolve_key(
+        &self,
+        _provider: &dyn CryptoProvider,
+        _algorithm: DataEncryptionAlgorithm,
+        _encrypted_key: Option<&EncryptedKey>,
+    ) -> Result<Vec<u8>, XmlEncError> {
+        Err(XmlEncError::KeyNotFound)
+    }
+}
+
+/// The key name and method a content key's source names: an `EncryptedKey`'s
+/// own `KeyName` and transport method, or none and the content method.
+fn recipient(
+    encrypted_key: Option<&EncryptedKey>,
+    algorithm: DataEncryptionAlgorithm,
+) -> (Option<&str>, &str) {
+    encrypted_key.map_or((None, algorithm.uri()), |key| {
+        (
+            key.key_name.as_deref(),
+            key.encryption_method.algorithm.as_str(),
+        )
+    })
 }
 
 /// Bind `policies` to `provider` once for an operation handle.
@@ -470,12 +831,14 @@ impl Verifier {
     }
 
     /// Verify `document`, requiring the elements whose ID is in
-    /// `expected_ids` to be authenticated.
+    /// `expected_ids` to be authenticated. A `lookup` supplies the keys for
+    /// this call in place of the verifier's key manager.
     pub(crate) fn verify(
         &self,
         document: &XmlDocument,
         expected_ids: &[&str],
         signatures: SignatureRequirement,
+        lookup: Option<&dyn KeyLookup>,
     ) -> Result<VerifyEvidence, Failure> {
         let targets = document.with_view(|view| {
             expected_ids
@@ -494,6 +857,18 @@ impl Verifier {
         };
         let binding = self.security.binding();
         let verifier = binding.verifier()?;
+        if let Some(lookup) = lookup {
+            let resolver = LookupVerification {
+                scope: LookupScope::new(lookup),
+            };
+            let outcome = verifier.key_resolver(&resolver).verify(document, &request);
+            // A failed lookup fails the call with its own status, whatever
+            // the verification made of the signature it could not resolve.
+            if let Some(failure) = resolver.scope.into_failure() {
+                return Err(failure);
+            }
+            return Ok(outcome?);
+        }
         Ok(match &self.keys {
             Some(keys) => {
                 let inventory = keys.inventory.read();
@@ -550,31 +925,55 @@ impl Encryptor {
     }
 }
 
-/// A decryption operation with its recovery key selected once.
+/// A decryption operation with its recovery key selected once, or none when
+/// every call supplies its keys through a lookup.
 pub(crate) struct Decryptor {
     security: SharedSecurity,
-    resolver: Box<dyn DecryptionKeyResolver + Send + Sync>,
+    resolver: Option<Box<dyn DecryptionKeyResolver + Send + Sync>>,
 }
 
 impl Decryptor {
-    pub(crate) fn new(security: SharedSecurity, keys: &Keys, name: &str) -> Result<Self, Failure> {
-        let resolver = security
-            .binding()
-            .decryption_key(&keys.inventory.read(), name)?;
+    pub(crate) fn new(
+        security: SharedSecurity,
+        key: Option<(&Keys, &str)>,
+    ) -> Result<Self, Failure> {
+        let resolver = key
+            .map(|(keys, name)| {
+                security
+                    .binding()
+                    .decryption_key(&keys.inventory.read(), name)
+            })
+            .transpose()?;
         Ok(Self { security, resolver })
     }
 
-    /// Recover the `EncryptedData` with schema `Id` `id`, or the first one.
+    /// Recover the `EncryptedData` with schema `Id` `id`, or the first one. A
+    /// `lookup` supplies the keys for this call in place of the selected key.
     pub(crate) fn decrypt(
         &self,
         document: &mut XmlDocument,
         id: Option<&str>,
+        lookup: Option<&dyn KeyLookup>,
     ) -> Result<PolicyAudit, Failure> {
-        Ok(self
-            .security
-            .binding()
-            .decryptor(&*self.resolver)?
-            .decrypt(document, id)?)
+        let binding = self.security.binding();
+        if let Some(lookup) = lookup {
+            let resolver = LookupDecryption {
+                scope: LookupScope::new(lookup),
+                resolvers: Mutex::new(Vec::new()),
+            };
+            let decrypted = binding.decryptor(&resolver)?.decrypt(document, id);
+            if let Some(failure) = resolver.scope.into_failure() {
+                return Err(failure);
+            }
+            return Ok(decrypted?);
+        }
+        let resolver = self.resolver.as_deref().ok_or_else(|| {
+            Failure::new(
+                XS_INVALID_ARGUMENT,
+                "a decryptor without a key needs a key lookup",
+            )
+        })?;
+        Ok(binding.decryptor(resolver)?.decrypt(document, id)?)
     }
 }
 

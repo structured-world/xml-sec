@@ -88,7 +88,7 @@ xs_sign(signer, document, &audit, &error);         /* fills the template */
 
 XsVerifier verifier;
 xs_verifier_new(policy, provider, keys, &verifier, &error);
-xs_verify(verifier, document, &request, &evidence, &error);
+xs_verify(verifier, document, &request, NULL, &evidence, &error);
 xs_evidence_accepted(evidence, document, &accepted, &error);
 ```
 
@@ -110,7 +110,40 @@ xs_evidence_accepted(evidence, document, &accepted, &error);
   the snapshot identity. `xs_evidence_signature_audit` returns the audit of one
   signature, whatever its outcome.
 
-Callbacks, external resources and PKCS#11 tokens are not exposed yet.
+External resources and PKCS#11 tokens are not exposed yet.
+
+## Key lookup
+
+An application that keeps its keys in its own store passes a key lookup to
+`xs_verify` or `xs_decrypt` instead of filling a key manager up front:
+
+```c
+xs_status lookup(void *store, const XsKeyQuery *query, XsKeys keys) {
+    /* query->names: the KeyName values the document gives;
+       query->method: the signature, transport, wrap or content method URI */
+    return xs_keys_add_public_pem(keys, query->names[0], pem, XS_KEY_USAGE_VERIFY, NULL);
+}
+
+XsKeyLookup key_lookup = {lookup, &my_store};
+xs_verify(verifier, document, &request, &key_lookup, &evidence, &error);
+```
+
+- The callback is called only during the call that received it, once for each
+  key the operation needs. It imports what it finds into `keys` with
+  `xs_keys_add_*` and returns `XS_OK`, also when it found nothing.
+- Keys it imports are resolved by the rules of any key manager: bounded by the
+  operation's resource policy, the document's names select them, and they are
+  trusted as keys the application supplied. `keys` belongs to the running
+  call: keys imported into it serve the rest of that call, a name already
+  imported is not asked for again, and its handle is destroyed when the
+  callback returns.
+- A decryption selects the key the `EncryptedKey` names; when the document
+  names none, the one key the callback imported for that request. A decryptor
+  created with the zero key manager decrypts only through a lookup.
+- Any status other than `XS_OK` fails the call with that status; a value the
+  header does not name becomes `XS_INTERNAL`.
+- The callback may call the library. Destroying a handle the running call
+  uses, or operating on its document, returns `XS_BUSY`.
 
 ## Qualification
 
@@ -119,10 +152,13 @@ Callbacks, external resources and PKCS#11 tokens are not exposed yet.
 (C++17) with the platform's compiler against the header and that library, runs
 them, and checks that the library exports exactly the functions the header
 declares. The C program signs, verifies a valid and a tampered document,
-encrypts, decrypts, replaces the policy and exercises policy refusals and
-wrong, destroyed and invalid arguments. CI runs it on Linux, macOS and Windows.
-`capi --sanitize` repeats it on Linux with the library and the crate's own
-tests (handle table, argument validation, panic containment) under
+encrypts, decrypts, verifies and decrypts with keys from a lookup, replaces the
+policy and exercises policy refusals, callback reentry and failure, and wrong,
+destroyed and invalid arguments; the C++ program verifies through a lambda
+lookup. CI runs them on Linux, macOS and Windows. `capi --sanitize` repeats
+them on Linux with the library and the crate's own tests (handle table,
+concurrent destroy, argument validation, callbacks, panic containment,
+redacted diagnostics) under
 AddressSanitizer and the programs under AddressSanitizer, LeakSanitizer and
 UndefinedBehaviorSanitizer. `SAFETY.md` in the crate records the invariants of
 its one `unsafe` module.

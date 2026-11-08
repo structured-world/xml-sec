@@ -1,9 +1,11 @@
 use super::{
-    XsAudit, XsBytes, XsCompileContext, XsDocument, XsError, XsEvidence, XsKeys, XsPolicy,
-    XsPolicyStore, XsProvider, XsSigner, XsVerifier, XsVerifyRequest, contain, keys as hold_keys,
-    policy as hold_policy, provider as hold_provider, xs_audit_destroy, xs_buffer_free,
-    xs_document_destroy, xs_document_parse, xs_document_serialize, xs_error_destroy,
-    xs_error_message, xs_error_policy_violation, xs_error_status, xs_keys_add_private_pem,
+    XsAudit, XsBytes, XsCompileContext, XsDecryptor, XsDocument, XsEncryptor, XsError, XsEvidence,
+    XsKeyLookup, XsKeyQuery, XsKeys, XsPolicy, XsPolicyStore, XsProvider, XsSigner, XsVerifier,
+    XsVerifyRequest, contain, keys as hold_keys, policy as hold_policy, provider as hold_provider,
+    xs_audit_destroy, xs_buffer_free, xs_decrypt, xs_decryptor_destroy, xs_decryptor_new,
+    xs_document_destroy, xs_document_parse, xs_document_serialize, xs_encrypt,
+    xs_encryptor_destroy, xs_encryptor_new, xs_error_destroy, xs_error_message,
+    xs_error_policy_violation, xs_error_status, xs_evidence_destroy, xs_keys_add_private_pem,
     xs_keys_add_public_pem, xs_keys_add_symmetric, xs_keys_destroy, xs_keys_new, xs_policy_destroy,
     xs_policy_store_destroy, xs_policy_store_load, xs_policy_store_new, xs_provider_destroy,
     xs_provider_new_rustcrypto, xs_sign, xs_signer_destroy, xs_signer_new, xs_verifier_destroy,
@@ -11,8 +13,8 @@ use super::{
 };
 use crate::objects::Failure;
 use crate::status::{
-    XS_BUSY, XS_CONFIGURATION, XS_DOCUMENT, XS_HANDLE_LIMIT, XS_INTERNAL, XS_INVALID_ARGUMENT,
-    XS_OK, XS_POLICY, XS_VERIFICATION, XsStatus,
+    XS_BUSY, XS_CONFIGURATION, XS_DESTROYED_HANDLE, XS_DOCUMENT, XS_HANDLE_LIMIT, XS_INTERNAL,
+    XS_INVALID_ARGUMENT, XS_KEY, XS_OK, XS_POLICY, XS_VERIFICATION, XsStatus,
 };
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::fmt::Write as _;
@@ -355,6 +357,731 @@ fn serialized(document: XsDocument) -> String {
     }
 }
 
+const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
+
+/// A key store a test lookup reads, and what that lookup observed.
+struct Store {
+    pem: &'static str,
+    private_key: bool,
+    usages: u32,
+    /// The method the stored key serves; other requests find nothing.
+    method: &'static str,
+    /// Import the key a second time, as "second", for an unnamed request.
+    twice: bool,
+    result: XsStatus,
+    queries: Vec<(Vec<String>, String)>,
+    kept: XsKeys,
+}
+
+/// Import the stored key under each name the document gives, or "found".
+unsafe extern "C" fn store_lookup(
+    user_data: *mut std::ffi::c_void,
+    query: *const XsKeyQuery,
+    keys: XsKeys,
+) -> XsStatus {
+    // SAFETY: the tests pass a live `Store` as user data, and the library
+    // passes a query valid for this invocation.
+    let (store, query) = unsafe { (&mut *user_data.cast::<Store>(), &*query) };
+    let view = |bytes: XsBytes| {
+        // SAFETY: the query's byte strings are borrowed for this invocation.
+        String::from_utf8(unsafe { std::slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec())
+            .unwrap()
+    };
+    let names: Vec<String> = if query.name_count == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: as above.
+        unsafe { std::slice::from_raw_parts(query.names, query.name_count) }
+            .iter()
+            .map(|name| view(*name))
+            .collect()
+    };
+    let method = view(query.method);
+    store.queries.push((names.clone(), method.clone()));
+    store.kept = keys;
+    if store.result != XS_OK {
+        return store.result;
+    }
+    if method != store.method {
+        return XS_OK;
+    }
+    let names = match (names.is_empty(), store.twice) {
+        (false, _) => names,
+        (true, false) => vec!["found".to_owned()],
+        (true, true) => vec!["found".to_owned(), "second".to_owned()],
+    };
+    for name in names {
+        // SAFETY: the byte strings name live strings.
+        let status = unsafe {
+            if store.private_key {
+                xs_keys_add_private_pem(
+                    keys,
+                    bytes(&name),
+                    bytes(store.pem),
+                    bytes(""),
+                    store.usages,
+                    std::ptr::null_mut(),
+                )
+            } else {
+                xs_keys_add_public_pem(
+                    keys,
+                    bytes(&name),
+                    bytes(store.pem),
+                    store.usages,
+                    std::ptr::null_mut(),
+                )
+            }
+        };
+        if status != XS_OK {
+            return status;
+        }
+    }
+    XS_OK
+}
+
+/// `TEMPLATE` signed with the RSA test key, its `KeyInfo` naming "signer".
+fn signed_with_key_name() -> String {
+    let handles = policy();
+    let key = include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem");
+    let template = TEMPLATE.replace(
+        "</ds:Signature>",
+        "<ds:KeyInfo><ds:KeyName>signer</ds:KeyName></ds:KeyInfo></ds:Signature>",
+    );
+    let (mut keys, mut signer, mut document) = (
+        XsKeys::default(),
+        XsSigner::default(),
+        XsDocument::default(),
+    );
+    // SAFETY: every pointer names a live local or a live string.
+    unsafe {
+        assert_eq!(
+            xs_keys_new(handles.2, 2, &raw mut keys, std::ptr::null_mut()),
+            XS_OK
+        );
+        assert_eq!(
+            xs_keys_add_private_pem(
+                keys,
+                bytes("signer"),
+                bytes(key),
+                bytes(""),
+                1,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_signer_new(
+                handles.2,
+                handles.0,
+                keys,
+                bytes("signer"),
+                bytes(RSA_SHA256),
+                &raw mut signer,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                2,
+                bytes(&template),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_sign(signer, document, std::ptr::null_mut(), std::ptr::null_mut()),
+            XS_OK
+        );
+    }
+    let output = serialized(document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_signer_destroy(signer), XS_OK);
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    release(handles);
+    output
+}
+
+#[test]
+fn a_lookup_supplies_the_verification_key_for_the_name_the_document_gives() {
+    let _serial = crate::test_support::serial();
+    // A verifier without keys resolves the signer through the lookup: it is
+    // asked for the KeyName and the signature method, its key is trusted as
+    // any application key, and its key manager ends with the invocation.
+    let signed = signed_with_key_name();
+    let handles = policy();
+    let mut store = Store {
+        pem: include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem"),
+        private_key: false,
+        usages: 2,
+        method: RSA_SHA256,
+        twice: false,
+        result: XS_OK,
+        queries: Vec::new(),
+        kept: XsKeys::default(),
+    };
+    let lookup = XsKeyLookup {
+        lookup: Some(store_lookup),
+        user_data: (&raw mut store).cast(),
+    };
+    let (mut verifier, mut document, mut evidence) = (
+        XsVerifier::default(),
+        XsDocument::default(),
+        XsEvidence::default(),
+    );
+    let ids = [bytes("payload")];
+    let request = XsVerifyRequest {
+        expected_target_ids: ids.as_ptr(),
+        expected_target_count: 1,
+        requirement: 0,
+        count: 0,
+    };
+    // SAFETY: every pointer names a live local, array or string.
+    let status = unsafe {
+        assert_eq!(
+            xs_verifier_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                &raw mut verifier,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                1,
+                bytes(&signed),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_verify(
+            verifier,
+            document,
+            &raw const request,
+            &raw const lookup,
+            &raw mut evidence,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, XS_OK);
+    assert_eq!(
+        store.queries,
+        [(vec!["signer".to_owned()], RSA_SHA256.to_owned())]
+    );
+    let held = crate::table::use_handle(evidence.value, crate::table::Kind::Evidence).unwrap();
+    let crate::objects::Object::Evidence(report) = held.object() else {
+        panic!("an evidence handle holds evidence");
+    };
+    let outcome = report.signatures()[0].result();
+    assert!(
+        matches!(outcome, Ok(result) if result.status == xml_sec::xmldsig::DsigStatus::Valid),
+        "{outcome:?}"
+    );
+    drop(held);
+    assert_eq!(
+        // SAFETY: the byte strings name live strings.
+        unsafe {
+            xs_keys_add_symmetric(
+                store.kept,
+                bytes("late"),
+                1,
+                bytes("0123456789abcdef"),
+                2,
+                std::ptr::null_mut(),
+            )
+        },
+        XS_DESTROYED_HANDLE
+    );
+    assert_eq!(xs_evidence_destroy(evidence), XS_OK);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_verifier_destroy(verifier), XS_OK);
+    release(handles);
+}
+
+/// Verify `signed` through a lookup over `store`; the status and evidence.
+fn verify_through(signed: &str, store: &mut Store) -> (XsStatus, XsStatus, XsEvidence) {
+    let handles = policy();
+    let lookup = XsKeyLookup {
+        lookup: Some(store_lookup),
+        user_data: std::ptr::from_mut(store).cast(),
+    };
+    let (mut verifier, mut document, mut evidence) = (
+        XsVerifier::default(),
+        XsDocument::default(),
+        XsEvidence::default(),
+    );
+    let mut error = XsError::default();
+    let ids = [bytes("payload")];
+    let request = XsVerifyRequest {
+        expected_target_ids: ids.as_ptr(),
+        expected_target_count: 1,
+        requirement: 0,
+        count: 0,
+    };
+    // SAFETY: every pointer names a live local, array or string.
+    let status = unsafe {
+        assert_eq!(
+            xs_verifier_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                &raw mut verifier,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                1,
+                bytes(signed),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_verify(
+            verifier,
+            document,
+            &raw const request,
+            &raw const lookup,
+            &raw mut evidence,
+            &raw mut error,
+        )
+    };
+    let reported = if error.value == 0 {
+        XS_OK
+    } else {
+        take_error(error).0
+    };
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_verifier_destroy(verifier), XS_OK);
+    release(handles);
+    (status, reported, evidence)
+}
+
+#[test]
+fn a_failing_lookup_fails_the_call_with_its_status() {
+    let _serial = crate::test_support::serial();
+    // The callback's failure is the call's typed status, not a signature the
+    // verification could not resolve; a code the header does not name is an
+    // internal failure rather than a status the caller cannot interpret.
+    let signed = signed_with_key_name();
+    for (returned, expected) in [(XS_KEY, XS_KEY), (77, XS_INTERNAL), (-1, XS_INTERNAL)] {
+        let mut store = Store {
+            pem: "",
+            private_key: false,
+            usages: 2,
+            method: RSA_SHA256,
+            twice: false,
+            result: returned,
+            queries: Vec::new(),
+            kept: XsKeys::default(),
+        };
+        let (status, reported, evidence) = verify_through(&signed, &mut store);
+        assert_eq!((returned, status, reported), (returned, expected, expected));
+        assert_eq!(evidence.value, 0);
+    }
+}
+
+/// Destroys the key manager it is given, then finds nothing.
+unsafe extern "C" fn destroying_lookup(
+    _user_data: *mut std::ffi::c_void,
+    _query: *const XsKeyQuery,
+    keys: XsKeys,
+) -> XsStatus {
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    XS_OK
+}
+
+#[test]
+fn a_lookup_may_destroy_the_key_manager_it_is_given() {
+    let _serial = crate::test_support::serial();
+    // The key manager belongs to the call; a callback destroying its handle
+    // only ends that handle, and the call completes without the key.
+    let signed = signed_with_key_name();
+    let handles = policy();
+    let lookup = XsKeyLookup {
+        lookup: Some(destroying_lookup),
+        user_data: std::ptr::null_mut(),
+    };
+    let (mut verifier, mut document, mut evidence) = (
+        XsVerifier::default(),
+        XsDocument::default(),
+        XsEvidence::default(),
+    );
+    let ids = [bytes("payload")];
+    let request = XsVerifyRequest {
+        expected_target_ids: ids.as_ptr(),
+        expected_target_count: 1,
+        requirement: 0,
+        count: 0,
+    };
+    // SAFETY: every pointer names a live local, array or string.
+    let status = unsafe {
+        assert_eq!(
+            xs_verifier_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                &raw mut verifier,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                1,
+                bytes(&signed),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_verify(
+            verifier,
+            document,
+            &raw const request,
+            &raw const lookup,
+            &raw mut evidence,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(status, XS_OK);
+    let held = crate::table::use_handle(evidence.value, crate::table::Kind::Evidence).unwrap();
+    let crate::objects::Object::Evidence(report) = held.object() else {
+        panic!("an evidence handle holds evidence");
+    };
+    assert!(!matches!(
+        report.signatures()[0].result(),
+        Ok(result) if result.status == xml_sec::xmldsig::DsigStatus::Valid
+    ));
+    drop(held);
+    assert_eq!(xs_evidence_destroy(evidence), XS_OK);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_verifier_destroy(verifier), XS_OK);
+    release(handles);
+}
+
+const AES256_GCM: &str = "http://www.w3.org/2009/xmlenc11#aes256-gcm";
+const RSA_OAEP: &str = "http://www.w3.org/2009/xmlenc11#rsa-oaep";
+
+/// `<root><secret Id="s">42</secret></root>` with `secret` encrypted for the
+/// RSA test key, its `EncryptedKey` naming "recipient".
+fn encrypted_for_recipient() -> String {
+    let handles = policy();
+    let public = include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-pubkey.pem");
+    let (mut keys, mut encryptor, mut document) = (
+        XsKeys::default(),
+        XsEncryptor::default(),
+        XsDocument::default(),
+    );
+    // SAFETY: every pointer names a live local or a live string.
+    unsafe {
+        assert_eq!(
+            xs_keys_new(handles.2, 3, &raw mut keys, std::ptr::null_mut()),
+            XS_OK
+        );
+        assert_eq!(
+            xs_keys_add_public_pem(
+                keys,
+                bytes("recipient"),
+                bytes(public),
+                4,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_encryptor_new(
+                handles.2,
+                handles.0,
+                keys,
+                bytes("recipient"),
+                bytes(AES256_GCM),
+                &raw mut encryptor,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                3,
+                bytes("<root><secret Id=\"s\">42</secret></root>"),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_encrypt(
+                encryptor,
+                document,
+                bytes("s"),
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+    }
+    let encrypted = serialized(document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_encryptor_destroy(encryptor), XS_OK);
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    release(handles);
+    encrypted
+}
+
+/// Decrypt `encrypted` with a keyless decryptor through a lookup over
+/// `store`; the status and the resulting XML.
+fn decrypt_through(encrypted: &str, store: &mut Store) -> (XsStatus, String) {
+    let handles = policy();
+    let lookup = XsKeyLookup {
+        lookup: Some(store_lookup),
+        user_data: std::ptr::from_mut(store).cast(),
+    };
+    let (mut decryptor, mut document) = (XsDecryptor::default(), XsDocument::default());
+    // SAFETY: every pointer names a live local or a live string.
+    let status = unsafe {
+        assert_eq!(
+            xs_decryptor_new(
+                handles.2,
+                handles.0,
+                XsKeys::default(),
+                bytes(""),
+                &raw mut decryptor,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        assert_eq!(
+            xs_document_parse(
+                handles.2,
+                4,
+                bytes(encrypted),
+                &raw mut document,
+                std::ptr::null_mut()
+            ),
+            XS_OK
+        );
+        xs_decrypt(
+            decryptor,
+            document,
+            bytes(""),
+            &raw const lookup,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    let xml = serialized(document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(xs_decryptor_destroy(decryptor), XS_OK);
+    release(handles);
+    (status, xml)
+}
+
+/// A key store that answers only for RSA-OAEP key transport.
+fn recipient_store() -> Store {
+    Store {
+        pem: include_str!("../../../../tests/fixtures/keys/rsa/rsa-2048-key.pem"),
+        private_key: true,
+        usages: 8,
+        method: RSA_OAEP,
+        twice: false,
+        result: XS_OK,
+        queries: Vec::new(),
+        kept: XsKeys::default(),
+    }
+}
+
+#[test]
+fn a_lookup_supplies_the_recovery_key_by_name_or_as_the_only_key() {
+    let _serial = crate::test_support::serial();
+    // The EncryptedKey's KeyName selects the imported key; without a name,
+    // the one key the lookup imported for that transport serves, and two
+    // imported keys are no selection at all.
+    let encrypted = encrypted_for_recipient();
+    let mut store = recipient_store();
+    let (status, xml) = decrypt_through(&encrypted, &mut store);
+    assert_eq!(status, XS_OK, "{:?}", store.queries);
+    assert!(xml.contains("<secret Id=\"s\">42</secret>"));
+    assert!(
+        store
+            .queries
+            .contains(&(vec!["recipient".to_owned()], RSA_OAEP.to_owned()))
+    );
+
+    let unnamed = encrypted.replace(
+        "<ds:KeyInfo><ds:KeyName>recipient</ds:KeyName></ds:KeyInfo>",
+        "",
+    );
+    assert_ne!(unnamed, encrypted, "{encrypted}");
+    let mut store = recipient_store();
+    let (status, xml) = decrypt_through(&unnamed, &mut store);
+    assert_eq!(status, XS_OK, "{:?}", store.queries);
+    assert!(xml.contains("<secret Id=\"s\">42</secret>"));
+    assert!(store.queries.contains(&(Vec::new(), RSA_OAEP.to_owned())));
+
+    let mut store = Store {
+        twice: true,
+        ..recipient_store()
+    };
+    let (status, xml) = decrypt_through(&unnamed, &mut store);
+    assert_ne!(status, XS_OK);
+    assert!(!xml.contains("<secret"));
+}
+
+#[test]
+fn diagnostics_never_carry_passwords_or_key_bytes() {
+    let _serial = crate::test_support::serial();
+    // Error messages are the Rust API's redacted diagnostics: a wrong
+    // password, malformed private key material and a rejected secret key
+    // each fail with a message that contains none of the caller's secrets.
+    let encrypted =
+        include_str!("../../../../tests/fixtures/xmldsig/keys/eddsa/eddsa-ed25519-key.p8-pem");
+    let malformed =
+        "-----BEGIN PRIVATE KEY-----\nU0VDUkVUS0VZQllURVM=\n-----END PRIVATE KEY-----\n";
+    let handles = policy();
+    let mut keys = XsKeys::default();
+    // SAFETY: the output is a live local.
+    let created = unsafe { xs_keys_new(handles.2, 2, &raw mut keys, std::ptr::null_mut()) };
+    assert_eq!(created, XS_OK);
+    let mut messages = Vec::new();
+    for attempt in 0..3 {
+        let mut error = XsError::default();
+        // SAFETY: the byte strings name live strings; the output is a live local.
+        let status = unsafe {
+            match attempt {
+                0 => xs_keys_add_private_pem(
+                    keys,
+                    bytes("a"),
+                    bytes(encrypted),
+                    bytes("hunter2-correct-horse"),
+                    1,
+                    &raw mut error,
+                ),
+                1 => xs_keys_add_private_pem(
+                    keys,
+                    bytes("b"),
+                    bytes(malformed),
+                    bytes(""),
+                    1,
+                    &raw mut error,
+                ),
+                _ => xs_keys_add_symmetric(
+                    keys,
+                    bytes("c"),
+                    2,
+                    bytes("TOPSECRETAES"),
+                    8,
+                    &raw mut error,
+                ),
+            }
+        };
+        assert_ne!(status, XS_OK, "attempt {attempt}");
+        messages.push(take_error(error).1);
+    }
+    for message in &messages {
+        assert_ne!(message, "");
+        for secret in [
+            "hunter2",
+            "U0VDUkVUS0VZQllURVM",
+            "SECRETKEYBYTES",
+            "TOPSECRET",
+            "MC4CAQAw",
+        ] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+    assert_eq!(xs_keys_destroy(keys), XS_OK);
+    release(handles);
+}
+
+#[test]
+fn concurrent_destroys_release_an_object_exactly_once() {
+    let _serial = crate::test_support::serial();
+    // Threads racing to destroy one handle: exactly one succeeds and every
+    // other one is told the handle is destroyed, round after round, so no
+    // object is released twice or reached after release.
+    for _ in 0..200 {
+        let handle =
+            crate::table::insert(crate::objects::Object::Error(Failure::new(XS_KEY, "x"))).unwrap();
+        let outcomes: Vec<XsStatus> = std::thread::scope(|scope| {
+            let racers: Vec<_> = (0..8)
+                .map(|_| scope.spawn(move || xs_error_destroy(XsError { value: handle })))
+                .collect();
+            racers
+                .into_iter()
+                .map(|racer| racer.join().unwrap())
+                .collect()
+        });
+        assert_eq!(
+            outcomes.iter().filter(|status| **status == XS_OK).count(),
+            1,
+            "{outcomes:?}"
+        );
+        assert!(
+            outcomes
+                .iter()
+                .all(|status| [XS_OK, XS_DESTROYED_HANDLE].contains(status)),
+            "{outcomes:?}"
+        );
+    }
+}
+
+#[test]
+fn a_destroy_racing_running_calls_waits_for_them_and_ends_every_later_use() {
+    let _serial = crate::test_support::serial();
+    // Readers use one error handle while another thread destroys it: a read
+    // either completes on the live object or reports the handle destroyed,
+    // the destroyer sees busy until no read is running, and once destroyed
+    // the handle stays destroyed.
+    for _ in 0..50 {
+        let handle =
+            crate::table::insert(crate::objects::Object::Error(Failure::new(XS_KEY, "x"))).unwrap();
+        let error = XsError { value: handle };
+        std::thread::scope(|scope| {
+            let readers: Vec<_> = (0..4)
+                .map(|_| {
+                    scope.spawn(move || {
+                        for _ in 0..200 {
+                            let mut status = 0;
+                            // SAFETY: the output is a live local.
+                            match unsafe { xs_error_status(error, &raw mut status) } {
+                                XS_OK => assert_eq!(status, XS_KEY),
+                                outcome => assert_eq!(outcome, XS_DESTROYED_HANDLE),
+                            }
+                        }
+                    })
+                })
+                .collect();
+            loop {
+                match xs_error_destroy(error) {
+                    XS_OK => break,
+                    XS_BUSY => std::hint::spin_loop(),
+                    other => panic!("destroy returned {other}"),
+                }
+            }
+            for reader in readers {
+                reader.join().unwrap();
+            }
+        });
+        assert_eq!(xs_error_destroy(error), XS_DESTROYED_HANDLE);
+        let mut status = 0;
+        // SAFETY: the output is a live local.
+        let read = unsafe { xs_error_status(error, &raw mut status) };
+        assert_eq!(read, XS_DESTROYED_HANDLE);
+    }
+}
+
 #[test]
 fn an_audit_that_cannot_be_published_leaves_the_document_unchanged() {
     let _serial = crate::test_support::serial();
@@ -473,6 +1200,7 @@ fn a_request_for_more_targets_than_the_policy_admits_is_refused_before_lookup() 
             verifier,
             document,
             &raw const request,
+            std::ptr::null(),
             &raw mut evidence,
             &raw mut error,
         )

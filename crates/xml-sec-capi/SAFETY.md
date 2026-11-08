@@ -19,6 +19,9 @@ behaviour the library cannot detect.
    request's ID array is readable for its count of `XsBytes`.
 3. `xs_buffer_free` receives exactly a buffer the library returned, once.
 4. Text the library returns is read only while the handle it came from lives.
+5. A non-null `XsKeyLookup` names a function that may be called with its
+   `user_data` until the call that received it returns, and that does not
+   unwind. The `XsKeyQuery` it receives is read only during the invocation.
 
 ## What the library checks
 
@@ -55,3 +58,23 @@ behaviour the library cannot detect.
   the same layout.
 - Error messages are the diagnostics the Rust API reports for the same
   failure; key bytes and passwords never enter them.
+
+## Callbacks
+
+- A key lookup runs on the calling thread, only inside the call that received
+  it, and no table, document or key-manager lock is held while it runs, so it
+  may reenter the library. The running call's own handles stay in use and its
+  document stays locked: destroying them, or operating on that document,
+  returns `XS_BUSY` rather than reaching state the call is using.
+- The query and the names it points to live on the library's stack for the
+  invocation only. The key manager handle it receives is destroyed when the
+  invocation returns; the call keeps the manager itself for its remaining
+  lookups, and a later use of that handle reports it destroyed. A handle
+  still in use on another thread when the invocation returns fails the call
+  with `XS_BUSY`.
+- Keys imported by a lookup reach the operation only through the key
+  manager's validation and resource policy, counted once for the whole call,
+  never as raw pointers into application memory.
+- A lookup's status other than `XS_OK` ends the call with that status, or
+  `XS_INTERNAL` for a value the header does not name, and no output is
+  written.
