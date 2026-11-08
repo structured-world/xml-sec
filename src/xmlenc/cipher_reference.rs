@@ -193,7 +193,7 @@ impl<'a> CipherReferenceContext<'a> {
             provider.require_capability(crate::provider::ProviderCapability::Decrypt(algorithm))?;
             Ok(())
         } else {
-            super::decrypt::validate_key_encryption_method_policy(method, self.policy)
+            super::decrypt::validate_key_encryption_method_policy(method, self.policy).map(drop)
         }
     }
 

@@ -92,8 +92,10 @@ session appends the Manifest processing it runs to that Signature's audit.
   operation stayed within are identified by that digest.
 - `decisions` lists, in the order the operation made them, every algorithm the
   policy permitted with its role (signature, canonicalization, digest,
-  transform, content encryption, key transport, key wrap), including the
-  inclusive C14N 1.0 a Reference's transform chain applies implicitly, the class of every
+  transform, content encryption, key transport, OAEP digest, mask generation,
+  key wrap), including the inclusive C14N 1.0 that a Reference's transform
+  chain applies implicitly and the OAEP digests a key transport implies (each
+  by its standard URI), the class of every
   Reference, Manifest Reference and `CipherReference` URI it resolved, the
   Manifest processing it applied, the exception grant it ran under, and each
   input it refused while continuing, such as one Reference among several. A

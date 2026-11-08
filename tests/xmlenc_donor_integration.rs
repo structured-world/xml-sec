@@ -2571,18 +2571,24 @@ fn classifies_complete_nist_aes_gcm_corpus() {
 fn decrypts_xmlsec1_rsa_oaep_interop_vectors() {
     // These independent vectors cover legacy OAEP defaults, OAEP 1.1 digest/MGF
     // separation, and a non-empty OAEP label through the complete XML pipeline.
-    for (name, key_name) in [
+    // The audit names each admitted OAEP digest by its standard URI, whichever
+    // alias the vector uses, and the MGF1-SHA1 that rsa-oaep-mgf1p implies.
+    use xml_sec::policy::{AlgorithmRole, PolicyDecision};
+    for (name, key_name, oaep_digest) in [
         (
             "cipherText__RSA-2048__aes128-gcm__rsa-oaep-mgf1p",
             "RSA-2048_SHA256WithRSA.der",
+            "http://www.w3.org/2000/09/xmldsig#sha1",
         ),
         (
             "cipherText__RSA-3072__aes256-gcm__rsa-oaep__Sha384-MGF_Sha1",
             "RSA-3072_SHA256WithRSA.der",
+            "http://www.w3.org/2001/04/xmlenc#sha384",
         ),
         (
             "cipherText__RSA-4096__aes256-gcm__rsa-oaep__Sha512-MGF_Sha1_PSource",
             "RSA-4096_SHA256WithRSA.der",
+            "http://www.w3.org/2001/04/xmlenc#sha512",
         ),
     ] {
         let xml = std::fs::read_to_string(format!("{INTEROP_DIR}/{name}.xml"))
@@ -2595,9 +2601,22 @@ fn decrypts_xmlsec1_rsa_oaep_interop_vectors() {
             .expect("xmlsec1 interop RSA key must be valid PKCS#1 DER");
 
         let decrypted = decrypt(&xml, &PrivateKeyDecryptor::new(private_key))
-            .expect("xmlsec1 RSA-OAEP vector must decrypt")
-            .output;
-        let DecryptedContent::Xml(plaintext) = decrypted else {
+            .expect("xmlsec1 RSA-OAEP vector must decrypt");
+        assert_eq!(
+            decrypted.policy.decisions[2..],
+            [
+                PolicyDecision::Algorithm {
+                    role: AlgorithmRole::OaepDigest,
+                    uri: oaep_digest.into(),
+                },
+                PolicyDecision::Algorithm {
+                    role: AlgorithmRole::MaskGeneration,
+                    uri: "http://www.w3.org/2009/xmlenc11#mgf1sha1".into(),
+                },
+            ],
+            "{name}"
+        );
+        let DecryptedContent::Xml(plaintext) = decrypted.output else {
             panic!("donor Type=Element vector must return XML plaintext");
         };
         let algorithm = C14nAlgorithm::new(C14nMode::Inclusive1_0, false);

@@ -692,6 +692,57 @@ fn saml_encrypted_assertion_round_trips_through_rsa_transport() {
 }
 
 #[test]
+fn the_audit_names_the_oaep_digest_and_mask_the_policy_admitted() {
+    // The OAEP digest and MGF1 digest are admitted against the policy apart
+    // from the transport URI; two operations that differ only in them must
+    // leave different audits, on both sides of the round trip.
+    use xml_sec::policy::{AlgorithmRole, PolicyDecision};
+    let private = private_key(RSA_2048_PRIVATE);
+    let encrypted = EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes256Gcm)
+        .add_recipient(
+            EncryptionRecipient::rsa_oaep(RsaPublicKey::from(&private)).oaep_parameters(
+                RsaOaepParameters::xmlenc11(
+                    OaepDigestAlgorithm::Sha384,
+                    OaepDigestAlgorithm::Sha512,
+                ),
+            ),
+        )
+        .encrypt_binary(b"audited OAEP")
+        .expect("permitted OAEP digests must encrypt");
+    let algorithm = |role, uri: &str| PolicyDecision::Algorithm {
+        role,
+        uri: uri.into(),
+    };
+    assert_eq!(
+        encrypted.policy.decisions,
+        [
+            algorithm(
+                AlgorithmRole::DataEncryption,
+                "http://www.w3.org/2009/xmlenc11#aes256-gcm"
+            ),
+            algorithm(
+                AlgorithmRole::KeyTransport,
+                "http://www.w3.org/2009/xmlenc11#rsa-oaep"
+            ),
+            algorithm(
+                AlgorithmRole::OaepDigest,
+                "http://www.w3.org/2001/04/xmlenc#sha384"
+            ),
+            algorithm(
+                AlgorithmRole::MaskGeneration,
+                "http://www.w3.org/2009/xmlenc11#mgf1sha512"
+            ),
+        ]
+    );
+    let decrypted = decrypt(
+        &encrypted.encrypted_data_xml,
+        &PrivateKeyDecryptor::new(private),
+    )
+    .expect("permitted OAEP digests must decrypt");
+    assert_eq!(decrypted.policy.decisions, encrypted.policy.decisions);
+}
+
+#[test]
 fn invalid_targets_configuration_and_keys_fail_closed() {
     // Malformed XML, ambiguous IDs, missing IDs, incompatible key sources, and
     // wrong KEKs must fail explicitly rather than processing unintended data.
