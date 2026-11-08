@@ -199,7 +199,7 @@ jobs:
       # sanitized library and tests build on nightly.
       - uses: dtolnay/rust-toolchain@nightly
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      - uses: ./.github/actions/nextest
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: capi-asan
