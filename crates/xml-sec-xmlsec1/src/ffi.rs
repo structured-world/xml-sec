@@ -11,6 +11,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 pub(crate) mod buffer;
 pub(crate) mod list;
+pub(crate) mod nodeset;
+pub(crate) mod tree;
+pub(crate) mod xmltree;
 
 #[cfg(test)]
 mod tests;
@@ -24,6 +27,7 @@ unsafe extern "C" {
     fn xs_xmlsec1_malloc(size: usize) -> *mut c_void;
     fn xs_xmlsec1_realloc(mem: *mut c_void, size: usize) -> *mut c_void;
     fn xs_xmlsec1_free(mem: *mut c_void);
+    fn xs_xmlsec1_fputs(stream: *mut c_void, text: *const std::ffi::c_char) -> c_int;
     #[cfg(test)]
     static xs_xmlsec1_layout: [usize; 0];
     #[cfg(test)]
@@ -53,6 +57,21 @@ unsafe fn realloc(mem: *mut c_void, size: usize) -> *mut c_void {
 unsafe fn free(mem: *mut c_void) {
     // SAFETY: the caller passes null or a live libxml2 allocation.
     unsafe { xs_xmlsec1_free(mem) }
+}
+
+/// Writes `text` to the C stream `stream`; text with an interior NUL is
+/// written up to it, as C would.
+///
+/// # Safety
+/// `stream` is a live C `FILE*`.
+unsafe fn write_stream(stream: *mut c_void, text: &str) {
+    let end = text.find('\0').unwrap_or(text.len());
+    let Ok(text) = std::ffi::CString::new(&text[..end]) else {
+        return;
+    };
+    // SAFETY: `stream` is a live stream and `text` is NUL-terminated. A
+    // short write is the stream's state to report, as with fprintf.
+    unsafe { xs_xmlsec1_fputs(stream, text.as_ptr()) };
 }
 
 /// The size an allocation grows to for `size` bytes or items under

@@ -7,6 +7,7 @@
 #include <stddef.h>
 #include <libxml/entities.h>
 #include <libxml/tree.h>
+#include <libxml/xpath.h>
 
 const size_t xs_libxml2_layout[] = {
     offsetof(xmlNode, type),
@@ -29,6 +30,7 @@ const size_t xs_libxml2_layout[] = {
     offsetof(xmlAttr, ns),
     offsetof(xmlAttr, atype),
     offsetof(xmlNs, next),
+    offsetof(xmlNs, type),
     offsetof(xmlNs, href),
     offsetof(xmlNs, prefix),
     offsetof(xmlDoc, type),
@@ -52,6 +54,11 @@ const size_t xs_libxml2_layout[] = {
     XML_XINCLUDE_END,
     XML_ATTRIBUTE_ID,
     XML_INTERNAL_PREDEFINED_ENTITY,
+    XML_ATTRIBUTE_NODE,
+    XML_NAMESPACE_DECL,
+    offsetof(xmlNodeSet, nodeNr),
+    offsetof(xmlNodeSet, nodeMax),
+    offsetof(xmlNodeSet, nodeTab),
 };
 
 const size_t xs_libxml2_layout_len = sizeof(xs_libxml2_layout) / sizeof(xs_libxml2_layout[0]);

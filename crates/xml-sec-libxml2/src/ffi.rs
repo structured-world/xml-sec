@@ -22,47 +22,50 @@ mod tests;
 
 type XmlChar = u8;
 
+// The declarations are public so that crates over the bridge read trees
+// through the one set of declarations `layout_matches` verifies.
+
 /// `xmlNs`: a namespace declaration.
 #[repr(C)]
 pub struct XmlNs {
-    next: *mut XmlNs,
-    kind: c_int,
-    href: *const XmlChar,
-    prefix: *const XmlChar,
+    pub next: *mut XmlNs,
+    pub kind: c_int,
+    pub href: *const XmlChar,
+    pub prefix: *const XmlChar,
 }
 
 /// `xmlAttr`, up to the last member the bridge reads.
 #[repr(C)]
 pub struct XmlAttr {
-    private: *mut c_void,
-    kind: c_int,
-    name: *const XmlChar,
-    children: *mut XmlNode,
-    last: *mut XmlNode,
-    parent: *mut XmlNode,
-    next: *mut XmlAttr,
-    prev: *mut XmlAttr,
-    doc: *mut XmlDoc,
-    ns: *mut XmlNs,
-    atype: c_int,
+    pub private: *mut c_void,
+    pub kind: c_int,
+    pub name: *const XmlChar,
+    pub children: *mut XmlNode,
+    pub last: *mut XmlNode,
+    pub parent: *mut XmlNode,
+    pub next: *mut XmlAttr,
+    pub prev: *mut XmlAttr,
+    pub doc: *mut XmlDoc,
+    pub ns: *mut XmlNs,
+    pub atype: c_int,
 }
 
 /// `xmlNode`, up to the last member the bridge reads.
 #[repr(C)]
 pub struct XmlNode {
-    private: *mut c_void,
-    kind: c_int,
-    name: *const XmlChar,
-    children: *mut XmlNode,
-    last: *mut XmlNode,
-    parent: *mut XmlNode,
-    next: *mut XmlNode,
-    prev: *mut XmlNode,
-    doc: *mut XmlDoc,
-    ns: *mut XmlNs,
-    content: *mut XmlChar,
-    properties: *mut XmlAttr,
-    ns_def: *mut XmlNs,
+    pub private: *mut c_void,
+    pub kind: c_int,
+    pub name: *const XmlChar,
+    pub children: *mut XmlNode,
+    pub last: *mut XmlNode,
+    pub parent: *mut XmlNode,
+    pub next: *mut XmlNode,
+    pub prev: *mut XmlNode,
+    pub doc: *mut XmlDoc,
+    pub ns: *mut XmlNs,
+    pub content: *mut XmlChar,
+    pub properties: *mut XmlAttr,
+    pub ns_def: *mut XmlNs,
 }
 
 /// `xmlEntity`, the declaration an entity reference's `children` points to,
@@ -89,30 +92,53 @@ pub struct XmlEntity {
 /// of its top-level nodes like any element.
 #[repr(C)]
 pub struct XmlDoc {
-    private: *mut c_void,
-    kind: c_int,
-    name: *mut c_char,
-    children: *mut XmlNode,
-    last: *mut XmlNode,
-    parent: *mut XmlNode,
-    next: *mut XmlNode,
-    prev: *mut XmlNode,
-    doc: *mut XmlDoc,
-    compression: c_int,
-    standalone: c_int,
-    int_subset: *mut c_void,
+    pub private: *mut c_void,
+    pub kind: c_int,
+    pub name: *mut c_char,
+    pub children: *mut XmlNode,
+    pub last: *mut XmlNode,
+    pub parent: *mut XmlNode,
+    pub next: *mut XmlNode,
+    pub prev: *mut XmlNode,
+    pub doc: *mut XmlDoc,
+    pub compression: c_int,
+    pub standalone: c_int,
+    pub int_subset: *mut c_void,
 }
 
-const XML_ELEMENT_NODE: c_int = 1;
-const XML_TEXT_NODE: c_int = 3;
-const XML_CDATA_SECTION_NODE: c_int = 4;
-const XML_ENTITY_REF_NODE: c_int = 5;
-const XML_PI_NODE: c_int = 7;
-const XML_COMMENT_NODE: c_int = 8;
-const XML_DOCUMENT_NODE: c_int = 9;
-const XML_DTD_NODE: c_int = 14;
-const XML_XINCLUDE_START: c_int = 19;
-const XML_XINCLUDE_END: c_int = 20;
+/// `xmlNodeSet`: an `XPath` node set. Namespace members are `xmlNs` copies
+/// whose `next` names the element they belong to.
+#[repr(C)]
+pub struct XmlNodeSet {
+    pub node_nr: c_int,
+    pub node_max: c_int,
+    pub node_tab: *mut *mut XmlNode,
+}
+
+/// `XML_ELEMENT_NODE`.
+pub const XML_ELEMENT_NODE: c_int = 1;
+/// `XML_ATTRIBUTE_NODE`.
+pub const XML_ATTRIBUTE_NODE: c_int = 2;
+/// `XML_TEXT_NODE`.
+pub const XML_TEXT_NODE: c_int = 3;
+/// `XML_CDATA_SECTION_NODE`.
+pub const XML_CDATA_SECTION_NODE: c_int = 4;
+/// `XML_ENTITY_REF_NODE`.
+pub const XML_ENTITY_REF_NODE: c_int = 5;
+/// `XML_PI_NODE`.
+pub const XML_PI_NODE: c_int = 7;
+/// `XML_COMMENT_NODE`.
+pub const XML_COMMENT_NODE: c_int = 8;
+/// `XML_DOCUMENT_NODE`.
+pub const XML_DOCUMENT_NODE: c_int = 9;
+/// `XML_DTD_NODE`.
+pub const XML_DTD_NODE: c_int = 14;
+/// `XML_NAMESPACE_DECL`: a namespace node of an `XPath` node set.
+pub const XML_NAMESPACE_DECL: c_int = 18;
+/// `XML_XINCLUDE_START`.
+pub const XML_XINCLUDE_START: c_int = 19;
+/// `XML_XINCLUDE_END`.
+pub const XML_XINCLUDE_END: c_int = 20;
 const XML_ATTRIBUTE_ID: c_int = 2;
 const XML_INTERNAL_PREDEFINED_ENTITY: c_int = 6;
 
@@ -151,7 +177,7 @@ unsafe extern "C" {
 
 /// The layout record this crate's declarations stand for, in the order of
 /// `layout.c`.
-fn expected_layout() -> [usize; 43] {
+fn expected_layout() -> [usize; 49] {
     use std::mem::{offset_of, size_of};
     [
         offset_of!(XmlNode, kind),
@@ -174,6 +200,7 @@ fn expected_layout() -> [usize; 43] {
         offset_of!(XmlAttr, ns),
         offset_of!(XmlAttr, atype),
         offset_of!(XmlNs, next),
+        offset_of!(XmlNs, kind),
         offset_of!(XmlNs, href),
         offset_of!(XmlNs, prefix),
         offset_of!(XmlDoc, kind),
@@ -197,6 +224,11 @@ fn expected_layout() -> [usize; 43] {
         XML_XINCLUDE_END as usize,
         XML_ATTRIBUTE_ID as usize,
         XML_INTERNAL_PREDEFINED_ENTITY as usize,
+        XML_ATTRIBUTE_NODE as usize,
+        XML_NAMESPACE_DECL as usize,
+        offset_of!(XmlNodeSet, node_nr),
+        offset_of!(XmlNodeSet, node_max),
+        offset_of!(XmlNodeSet, node_tab),
     ]
 }
 
@@ -214,8 +246,10 @@ fn linked_layout() -> &'static [usize] {
 }
 
 /// Whether the linked libxml2 lays its structures out as declared here;
-/// computed once, and every entry point refuses to touch a tree otherwise.
-fn layout_matches() -> bool {
+/// computed once, and every entry point, here and in crates reading trees
+/// through these declarations, refuses to touch a tree otherwise.
+#[must_use]
+pub fn layout_matches() -> bool {
     static MATCHES: OnceLock<bool> = OnceLock::new();
     *MATCHES.get_or_init(|| linked_layout() == expected_layout())
 }

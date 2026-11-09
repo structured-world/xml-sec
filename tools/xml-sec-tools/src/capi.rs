@@ -120,7 +120,7 @@ impl Target {
         match self {
             Self::Clean => &["tests/c/roundtrip.c", "tests/cpp/roundtrip.cpp"],
             Self::Libxml2 => &["tests/c/roundtrip.c"],
-            Self::Xmlsec1 => &["tests/c/core.c"],
+            Self::Xmlsec1 => &["tests/c/core.c", "tests/c/nodeset.c"],
         }
     }
 }

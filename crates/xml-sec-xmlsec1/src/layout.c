@@ -8,6 +8,7 @@
 #include <xmlsec/xmlsec.h>
 #include <xmlsec/buffer.h>
 #include <xmlsec/list.h>
+#include <xmlsec/nodeset.h>
 
 const size_t xs_xmlsec1_layout[] = {
     sizeof(xmlSecBuffer),
@@ -30,6 +31,18 @@ const size_t xs_xmlsec1_layout[] = {
     offsetof(struct _xmlSecPtrListKlass, destroyItem),
     offsetof(struct _xmlSecPtrListKlass, debugDumpItem),
     offsetof(struct _xmlSecPtrListKlass, debugXmlDumpItem),
+    sizeof(xmlSecNodeSet),
+    offsetof(xmlSecNodeSet, nodes),
+    offsetof(xmlSecNodeSet, doc),
+    offsetof(xmlSecNodeSet, destroyDoc),
+    offsetof(xmlSecNodeSet, type),
+    offsetof(xmlSecNodeSet, op),
+    offsetof(xmlSecNodeSet, next),
+    offsetof(xmlSecNodeSet, prev),
+    offsetof(xmlSecNodeSet, reserved),
+    xmlSecNodeSetTreeWithoutCommentsInvert,
+    xmlSecNodeSetList,
+    xmlSecNodeSetUnion,
 };
 
 const size_t xs_xmlsec1_layout_len = sizeof(xs_xmlsec1_layout) / sizeof(xs_xmlsec1_layout[0]);

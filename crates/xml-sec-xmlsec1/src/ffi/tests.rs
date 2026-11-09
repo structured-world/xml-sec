@@ -1,5 +1,6 @@
 use super::buffer::XmlSecBuffer;
 use super::list::{XmlSecPtrList, XmlSecPtrListKlass};
+use super::nodeset::{self, XmlSecNodeSet};
 use super::{ALLOC_MODE_DOUBLE, ALLOC_MODE_EXACT, grown, header_layout};
 use std::ffi::c_int;
 use std::mem::{offset_of, size_of};
@@ -29,6 +30,18 @@ fn rust_layouts_match_the_headers() {
         offset_of!(XmlSecPtrListKlass, destroy_item),
         offset_of!(XmlSecPtrListKlass, debug_dump_item),
         offset_of!(XmlSecPtrListKlass, debug_xml_dump_item),
+        size_of::<XmlSecNodeSet>(),
+        offset_of!(XmlSecNodeSet, nodes),
+        offset_of!(XmlSecNodeSet, doc),
+        offset_of!(XmlSecNodeSet, destroy_doc),
+        offset_of!(XmlSecNodeSet, kind),
+        offset_of!(XmlSecNodeSet, op),
+        offset_of!(XmlSecNodeSet, next),
+        offset_of!(XmlSecNodeSet, prev),
+        offset_of!(XmlSecNodeSet, reserved),
+        usize::try_from(nodeset::TREE_WITHOUT_COMMENTS_INVERT).expect("non-negative"),
+        usize::try_from(nodeset::LIST).expect("non-negative"),
+        usize::try_from(nodeset::UNION).expect("non-negative"),
     ];
     assert_eq!(header_layout(), expected);
 }
