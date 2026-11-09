@@ -637,21 +637,81 @@ fn tree_document(doc: &Libxml, policy: &impl xml_sec::XmlDocumentPolicy) -> xml_
     .expect("the tree projects")
 }
 
-/// Whether `document`'s signature verifies with the certificate it carries;
-/// trust is not under test.
+/// Whether `document`'s signature verifies with the certificate it carries,
+/// with `ids` registered; trust is not under test.
 fn carried_key_verifies(
     document: &xml_sec::XmlDocument,
     mut policy: xml_sec::policy::VerificationPolicy,
+    ids: &[xml_sec::IdAttributeRegistration],
 ) -> bool {
     policy.key_trust.mode = xml_sec::policy::VerificationTrustMode::CryptographicOnly;
     let resolver = xml_sec::xmldsig::DefaultKeyResolver::default();
     xml_sec::xmldsig::VerifyContext::new()
         .policy(policy)
         .key_resolver(&resolver)
+        .id_attributes(ids)
         .verify_document(document)
         .expect("verification runs")
         .status
         == xml_sec::xmldsig::DsigStatus::Valid
+}
+
+/// Append a signature over `#payload` to `document`'s root, with the test
+/// certificate in `KeyInfo` and `ids` registered.
+fn sign_payload(
+    document: &mut xml_sec::XmlDocument,
+    policy: xml_sec::policy::SigningPolicy,
+    ids: &[xml_sec::IdAttributeRegistration],
+) -> Result<(), xml_sec::xmldsig::SigningError> {
+    use xml_sec::c14n::{C14nAlgorithm, C14nMode};
+    use xml_sec::xmldsig::{
+        DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
+        SignatureBuilder, Transform, X509CertificateKeyInfoWriter,
+    };
+    let key = RsaSigningKey::from_pkcs8_pem(PRIVATE_KEY).expect("the test key parses");
+    let certificate = X509CertificateKeyInfoWriter::from_pem(include_str!(
+        "../../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
+    ))
+    .expect("the test certificate parses");
+    let canonical = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let builder = SignatureBuilder::new(canonical.clone(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#payload")
+                .transform(Transform::C14n(canonical)),
+        )
+        .key_info(true);
+    SignContext::new(&key)
+        .policy(policy)
+        .key_info_writer(&certificate)
+        .id_attributes(ids)
+        .sign_document_with_builder(document, &builder)
+        .map(drop)
+}
+
+#[test]
+fn caller_registered_ids_resolve_in_the_tree() {
+    // An ID attribute the caller registers selects the reference target in
+    // the projected tree; without the registration the reference has no
+    // target and signing fails.
+    use xml_sec::policy::{SigningPolicy, VerificationPolicy};
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ids = [xml_sec::IdAttributeRegistration::global("Token")];
+    let doc = Libxml::parse("<root><p Token=\"payload\">signed</p></root>", 0);
+    let mut document = tree_document(&doc, &SigningPolicy::default());
+    sign_payload(&mut document, SigningPolicy::default(), &ids).expect("the tree signs");
+    drop(document);
+    let verification = VerificationPolicy::default();
+    let document = tree_document(&doc, &verification);
+    assert!(carried_key_verifies(&document, verification, &ids));
+    let unregistered = Libxml::parse("<root><p Token=\"payload\">signed</p></root>", 0);
+    let mut document = tree_document(&unregistered, &SigningPolicy::default());
+    assert!(
+        sign_payload(&mut document, SigningPolicy::default(), &[]).is_err(),
+        "an unregistered Token is no ID"
+    );
 }
 
 #[test]
@@ -661,12 +721,7 @@ fn dtd_ids_and_kept_entity_references_are_read_from_the_tree() {
     // entity's replacement (XML 1.0 section 4.4.2) and resolves `#payload`
     // through that ID, so the signature made on this tree verifies on a
     // substituted parse as well.
-    use xml_sec::c14n::{C14nAlgorithm, C14nMode};
     use xml_sec::policy::{SigningPolicy, VerificationPolicy, XmlInputPolicy};
-    use xml_sec::xmldsig::{
-        DigestAlgorithm, ReferenceBuilder, RsaSigningKey, SignContext, SignatureAlgorithm,
-        SignatureBuilder, Transform, X509CertificateKeyInfoWriter,
-    };
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -687,24 +742,7 @@ fn dtd_ids_and_kept_entity_references_are_read_from_the_tree() {
     };
     let kept = Libxml::parse(xml, 0);
     let mut document = tree_document(&kept, &signing);
-    let key = RsaSigningKey::from_pkcs8_pem(PRIVATE_KEY).expect("the test key parses");
-    let certificate = X509CertificateKeyInfoWriter::from_pem(include_str!(
-        "../../../../tests/fixtures/keys/rsa/rsa-2048-cert.pem"
-    ))
-    .expect("the test certificate parses");
-    let canonical = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
-    let builder = SignatureBuilder::new(canonical.clone(), SignatureAlgorithm::RsaSha256)
-        .add_reference(
-            ReferenceBuilder::new(DigestAlgorithm::Sha256)
-                .uri("#payload")
-                .transform(Transform::C14n(canonical)),
-        )
-        .key_info(true);
-    SignContext::new(&key)
-        .policy(signing)
-        .key_info_writer(&certificate)
-        .sign_document_with_builder(&mut document, &builder)
-        .expect("the tree signs");
+    sign_payload(&mut document, signing, &[]).expect("the tree signs");
     drop(document);
     let dumped = kept.dump();
     assert!(
@@ -713,12 +751,14 @@ fn dtd_ids_and_kept_entity_references_are_read_from_the_tree() {
     );
     assert!(carried_key_verifies(
         &tree_document(&kept, &verification),
-        verification.clone()
+        verification.clone(),
+        &[]
     ));
     let substituted = Libxml::parse(&dumped, SUBSTITUTE_ENTITIES);
     assert!(carried_key_verifies(
         &tree_document(&substituted, &verification),
-        verification
+        verification,
+        &[]
     ));
 }
 
