@@ -414,6 +414,24 @@ fn a_change_the_caller_makes_between_calls_is_seen() {
     assert_eq!(xs_document_destroy(verifying), XS_OK);
 }
 
+#[test]
+fn an_xml_id_in_the_tree_is_a_reference_target() {
+    // xml:id is an ID without any declaration (xml:id 1.0 section 4), so a
+    // reference to it resolves in the projected tree as in parsed text.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = Policy::modern();
+    let xml = TEMPLATE.replace("<p Id=\"payload\">", "<p xml:id=\"payload\">");
+    let doc = Libxml::parse(&xml, 0);
+    let document = handle(&policy, 2, &doc);
+    sign(&policy, document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    let verifying = handle(&policy, 1, &doc);
+    assert!(verifies(&policy, verifying));
+    assert_eq!(xs_document_destroy(verifying), XS_OK);
+}
+
 /// Encrypt the element with ID `s` of `doc` for the RSA test key.
 fn encrypt(policy: &Policy, doc: &Libxml) {
     let (mut keys, mut encryptor) = (XsKeys::default(), XsEncryptor::default());
