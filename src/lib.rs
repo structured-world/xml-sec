@@ -60,7 +60,6 @@ pub mod api;
 #[doc(hidden)]
 pub mod benchmark_support;
 pub mod c14n;
-pub mod codec;
 mod collections;
 pub mod document;
 pub mod encoding;

@@ -1,7 +1,7 @@
-//! `xmlsec/base64.h`: libxmlsec1's streaming Base64 API over the core's
-//! [`Base64Codec`].
+//! `xmlsec/base64.h`: libxmlsec1's streaming Base64 API over the shared
+//! [`Base64Codec`] of `structured-base64`.
 //!
-//! The codec and its rules live in the core; this module keeps
+//! The codec and its rules live in that crate; this module keeps
 //! `xmlSecBase64Ctx` in libxmlsec1's layout (the Base64 transform holds one
 //! in its object tail, so the klass reports the same object size), moves the
 //! state between that structure and the codec around each call, and adds the
@@ -10,7 +10,7 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use xml_sec::codec::Base64Codec;
+use structured_base64::Base64Codec;
 
 use super::{contain, free, malloc};
 

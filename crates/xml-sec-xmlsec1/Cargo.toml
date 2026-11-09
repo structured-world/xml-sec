@@ -16,6 +16,8 @@ xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsi
 xml-sec-libxml2 = { path = "../xml-sec-libxml2" }
 # C `fputs` for debug dumps to a caller's `FILE*`.
 libc = "0.2"
+# The resumable Base64 codec behind `xmlSecBase64Ctx`.
+structured-base64 = "0.21"
 
 [dev-dependencies]
 tempfile = "3"
