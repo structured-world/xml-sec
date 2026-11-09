@@ -67,6 +67,53 @@ pub enum SelectedNode<'a> {
 /// An invalid expression, a scalar result for [`XPathForm::NodeSet`], a `here`
 /// node outside the document, or an exhausted resource limit. A selected node
 /// that an entity expansion produced has no external node and is refused.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::document::external::{ExternalNode, ExternalTree, TreeEdit, TreeEditError, TreeSink};
+/// use xml_sec::policy::{ResourcePolicy, VerificationPolicy};
+/// use xml_sec::xmldsig::select::{SelectedNode, XPathForm, select_xpath};
+/// use xml_sec::xmldsig::transforms::XPathExpression;
+/// use xml_sec::{ParseError, XmlDocument};
+///
+/// /// `<r><k a="1"/></r>`, as a caller's tree reports it.
+/// struct Tree;
+///
+/// impl ExternalTree for Tree {
+///     fn document(&self) -> ExternalNode { ExternalNode(1) }
+///     fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
+///         sink.begin_element(ExternalNode(2), "r", None, None)?;
+///         sink.open_element()?;
+///         sink.begin_element(ExternalNode(3), "k", None, None)?;
+///         sink.attribute("a", None, None, "1", false)?;
+///         sink.open_element()?;
+///         sink.end_element()?;
+///         sink.end_element()
+///     }
+///     fn apply(&mut self, _: &[TreeEdit<'_>]) -> Result<(), TreeEditError> {
+///         Err(TreeEditError("read-only".into()))
+///     }
+///     fn checkpoint(&mut self) -> usize { 0 }
+///     fn rollback(&mut self, _: usize) {}
+///     fn release(&mut self, _: usize) {}
+/// }
+///
+/// let document = XmlDocument::from_external_tree(Box::new(Tree), &VerificationPolicy::default())?;
+/// let attribute = document.with_view(|view| {
+///     select_xpath(
+///         view,
+///         &XPathExpression::new("//k/@a"),
+///         None,
+///         XPathForm::NodeSet,
+///         &[],
+///         &ResourcePolicy::default(),
+///     )
+///     .map(|nodes| nodes.len())
+/// })?;
+/// assert_eq!(attribute, 1);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn select_xpath<'a>(
     view: crate::DocumentView<'a>,
     expression: &XPathExpression,
@@ -151,6 +198,53 @@ pub fn select_xpath<'a>(
 /// naming no element, or no part identifying a subresource), one that breaks
 /// the Framework grammar, an invalid `element()` child sequence, an
 /// `xpointer()` part [`select_xpath`] refuses, or an exhausted resource limit.
+///
+/// # Examples
+///
+/// ```
+/// use xml_sec::document::external::{ExternalNode, ExternalTree, TreeEdit, TreeEditError, TreeSink};
+/// use xml_sec::policy::{ResourcePolicy, VerificationPolicy};
+/// use xml_sec::xmldsig::select::{SelectedNode, select_xpointer};
+/// use xml_sec::{ParseError, XmlDocument};
+///
+/// /// `<r xmlns="urn:t"><k/></r>`, as a caller's tree reports it.
+/// struct Tree;
+///
+/// impl ExternalTree for Tree {
+///     fn document(&self) -> ExternalNode { ExternalNode(1) }
+///     fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
+///         sink.begin_element(ExternalNode(2), "r", None, Some("urn:t"))?;
+///         sink.declare_namespace(None, "urn:t")?;
+///         sink.open_element()?;
+///         sink.begin_element(ExternalNode(3), "k", None, Some("urn:t"))?;
+///         sink.open_element()?;
+///         sink.end_element()?;
+///         sink.end_element()
+///     }
+///     fn apply(&mut self, _: &[TreeEdit<'_>]) -> Result<(), TreeEditError> {
+///         Err(TreeEditError("read-only".into()))
+///     }
+///     fn checkpoint(&mut self) -> usize { 0 }
+///     fn rollback(&mut self, _: usize) {}
+///     fn release(&mut self, _: usize) {}
+/// }
+///
+/// let document = XmlDocument::from_external_tree(Box::new(Tree), &VerificationPolicy::default())?;
+/// // The first part identifies nothing; the second, with its binding, does.
+/// let nodes = document.with_view(|view| {
+///     select_xpointer(
+///         view,
+///         "xpointer(//nothing) xmlns(t=urn:t) xpointer(//t:k)",
+///         &[],
+///         None,
+///         &[],
+///         &ResourcePolicy::default(),
+///     )
+///     .map(|nodes| nodes == [SelectedNode::Node(ExternalNode(3))])
+/// })?;
+/// assert!(nodes);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 pub fn select_xpointer<'a>(
     view: crate::DocumentView<'a>,
     pointer: &str,
