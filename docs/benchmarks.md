@@ -252,7 +252,11 @@ operation of every workload is attempted, and a Bergshamra result that fails
 the cross-checks below is recorded as unsupported with the observed reason and
 never timed, while a failure of xml-sec or libxmlsec1 stops the run. Its
 library API encrypts a template-supplied payload only, so in-place encryption
-and the prepared-document boundaries are reported as unsupported there.
+is reported as unsupported there, and its signing, encryption and decryption
+accept serialized XML only, so they are unsupported at the prepared-document
+boundary; its verification runs at both boundaries. Each boundary is excluded
+on its own, so a result from the boundary an engine does support is still
+cross-checked before it is timed.
 
 Before timing, each engine's signature is verified by every engine, each
 ciphertext is decrypted by every engine, and all engines must reject a modified

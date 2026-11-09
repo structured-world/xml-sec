@@ -161,14 +161,20 @@ fn fake_harness(directory: &Path, name: &str, behaviour: &str) -> PathBuf {
 scenario=$1 operation=$2 boundary=$3 corpus=$4 output=$6 samples=$7
 behaviour='{behaviour}'
 signed='<samlp:Response><saml:Assertion ID="assertion"><ds:Signature><ds:X509Certificate>c</ds:X509Certificate></ds:Signature><saml:Subject><saml:NameID>user@example.invalid</saml:NameID></saml:Subject><saml:AttributeValue>value</saml:AttributeValue></saml:Assertion></samlp:Response>'
+bad='<samlp:Response><saml:Assertion ID="assertion"><ds:Signature><ds:X509Certificate>BAD</ds:X509Certificate></ds:Signature><saml:Subject><saml:NameID>user@example.invalid</saml:NameID></saml:Subject><saml:AttributeValue>value</saml:AttributeValue></saml:Assertion></samlp:Response>'
 if [ "$operation" = sign ] && [ "$behaviour" = no-signing ]; then echo 'unsupported: cannot sign' >&2; exit 3; fi
+if [ "$operation" = sign ] && [ "$behaviour" = bad-parse-signature ] && [ "$boundary" = prepared ]; then echo 'unsupported: parse only' >&2; exit 3; fi
+if [ "$operation" = verify ] && [ "$5" != - ]; then
+  case $(cat "$5") in *BAD*) echo 'signature invalid' >&2; exit 4 ;; esac
+fi
 if [ "$operation" = reject ]; then
   if [ "$behaviour" = accept-forgery ]; then echo 'verification accepted an input it must refuse' >&2; exit 4; fi
   printf '{{"engine":"{name}","rejected":true}}\n'; exit 0
 fi
 result=
 case $operation in
-  sign) result=$signed ;;
+  sign)
+    if [ "$behaviour" = bad-parse-signature ]; then result=$bad; else result=$signed; fi ;;
   encrypt) result='<EncryptedData/>' ;;
   decrypt)
     if [ "$behaviour" = wrong-plaintext ] || {{ [ "$behaviour" = wrong-prepared-plaintext ] && [ "$boundary" = prepared ]; }}; then result='<Other/>'
@@ -282,6 +288,36 @@ fn a_prepared_decryptor_that_returns_other_plaintext_stops_the_run_before_any_ti
         "{error}"
     );
     assert_eq!(report, None);
+}
+
+#[test]
+fn a_signature_from_the_one_supported_boundary_is_still_cross_checked() {
+    // The competitor signs at the parse boundary only. That signature is
+    // timed, so every other engine must verify it first; one they refuse is
+    // an incorrect result and never timed.
+    let (result, report) = fake_comparison("assertion", &[("bergshamra", "bad-parse-signature")]);
+    result.unwrap();
+    let report = report.unwrap();
+    let signing: Vec<(&str, Option<&str>)> = report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| {
+            entry["operation"] == "sign"
+                && entry["engine"].as_str().unwrap().starts_with("bergshamra")
+        })
+        .map(|entry| {
+            (
+                entry["boundary"].as_str().unwrap(),
+                entry["unsupported"].as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(signing.len(), 2, "{signing:?}");
+    for (boundary, reason) in signing {
+        let reason = reason.unwrap_or_else(|| panic!("{boundary} signing was timed"));
+        assert!(reason.contains("incorrect result"), "{boundary}: {reason}");
+    }
 }
 
 #[test]

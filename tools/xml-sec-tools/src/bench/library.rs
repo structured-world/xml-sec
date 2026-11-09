@@ -281,12 +281,12 @@ impl Case<'_> {
         Ok(())
     }
 
-    /// Whether `engine` was found unable to run `operation` in this case.
-    fn blocked(&self, engine: &Engine, operation: &str) -> bool {
-        BOUNDARIES.iter().any(|(boundary, _)| {
-            self.unsupported
-                .contains_key(&key(engine, operation, boundary))
-        })
+    /// Whether `engine` was found unable to run `operation` at `boundary` in
+    /// this case. Each boundary is timed on its own, so each is excluded on its
+    /// own; an incorrect result excludes every boundary (`observe`).
+    fn blocked(&self, engine: &Engine, operation: &str, boundary: &str) -> bool {
+        self.unsupported
+            .contains_key(&key(engine, operation, boundary))
     }
 
     /// Runs one probe; an unsupported operation is recorded, any other refusal fails.
@@ -388,7 +388,8 @@ fn validate_case(
                 case.observe((signer, case.producing), (signer, case.producing), error)?;
             }
         }
-        produced.retain(|entry| !case.blocked(&engines[entry.engine], case.producing));
+        produced
+            .retain(|entry| !case.blocked(&engines[entry.engine], case.producing, entry.boundary));
     }
     let parsed: Vec<&Produced> = produced
         .iter()
@@ -406,8 +407,8 @@ fn validate_case(
     );
     for engine in engines {
         for (boundary, _) in BOUNDARIES {
-            if case.blocked(engine, case.consuming) {
-                break;
+            if case.blocked(engine, case.consuming, boundary) {
+                continue;
             }
             // Each boundary is timed on its own, so its result is checked on its own.
             let probed = work.join(format!(
@@ -490,7 +491,8 @@ fn cross_check(
             case.observe((source, case.producing), (engine, case.consuming), error)?;
         }
     }
-    if case.consuming == "verify" && !case.blocked(engine, "verify") {
+    // The forgeries are verified at the parse boundary, like the cross-check.
+    if case.consuming == "verify" && !case.blocked(engine, "verify", "parse") {
         let signed = std::fs::read_to_string(canonical).map_err(|error| error.to_string())?;
         let mut forged = vec![("tampered", tamper(&signed, case.scenario)?)];
         if case.scenario == "assertion" {
