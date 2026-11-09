@@ -150,6 +150,25 @@ fn libxmlsec1_declarations_are_found_across_alignment_spaces() {
 }
 
 #[test]
+fn exported_variables_are_declarations_too() {
+    // The string constants are data exports; a function prototype is not a
+    // variable.
+    let header = "XMLSEC_EXPORT_VAR const xmlChar xmlSecNs[];\n\
+                  XMLSEC_EXPORT_VAR int xmlSecFlag;\n\
+                  XMLSEC_EXPORT int xmlSecInit(void);\n";
+    assert_eq!(
+        super::declared_variables(header, "xmlSec"),
+        names(&["xmlSecFlag", "xmlSecNs"])
+    );
+    let real = super::declared_variables(
+        &read("crates/xml-sec-xmlsec1/include/xmlsec/strings.h"),
+        "xmlSec",
+    );
+    assert!(real.contains("xmlSecDSigNs"));
+    assert!(real.contains("xmlSecNameBase64"));
+}
+
+#[test]
 fn the_template_defines_are_what_a_consumer_compiles_with() {
     // Only the `-D` flags of the Cflags line; the include path is the
     // installation's and differs between the oracle and the library.

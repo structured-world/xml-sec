@@ -120,7 +120,12 @@ impl Target {
         match self {
             Self::Clean => &["tests/c/roundtrip.c", "tests/cpp/roundtrip.cpp"],
             Self::Libxml2 => &["tests/c/roundtrip.c"],
-            Self::Xmlsec1 => &["tests/c/core.c", "tests/c/nodeset.c"],
+            Self::Xmlsec1 => &[
+                "tests/c/core.c",
+                "tests/c/nodeset.c",
+                "tests/c/base64.c",
+                "tests/c/transforms.c",
+            ],
         }
     }
 }
@@ -714,7 +719,26 @@ fn oracle_flags(runner: &mut impl Run, prefix: &Path) -> Result<Vec<String>, Fai
     Ok(flags)
 }
 
-/// Every function the libxmlsec1-compatible headers declare.
+/// Exported variables starting with `prefix` that `header` declares:
+/// `XMLSEC_EXPORT_VAR <type> name[];` or `... name;`.
+pub(crate) fn declared_variables(header: &str, prefix: &str) -> BTreeSet<String> {
+    let identifier = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    header
+        .lines()
+        .filter(|line| line.trim_start().starts_with("XMLSEC_EXPORT_VAR"))
+        .filter_map(|line| {
+            let end = line.find(['[', ';'])?;
+            let before = line[..end].trim_end();
+            let start = before
+                .rfind(|c: char| !identifier(c))
+                .map_or(0, |at| at + 1);
+            let name = &before[start..];
+            name.starts_with(prefix).then(|| name.to_owned())
+        })
+        .collect()
+}
+
+/// Every function and variable the libxmlsec1-compatible headers declare.
 fn xmlsec1_declarations() -> Result<BTreeSet<String>, Failure> {
     let directory = root().join(XMLSEC1_CRATE).join("include/xmlsec");
     let mut names = BTreeSet::new();
@@ -728,6 +752,7 @@ fn xmlsec1_declarations() -> Result<BTreeSet<String>, Failure> {
             let text = std::fs::read_to_string(&path)
                 .map_err(|error| format!("read {}: {error}", path.display()))?;
             names.extend(declared_with(&text, "xmlSec"));
+            names.extend(declared_variables(&text, "xmlSec"));
         }
     }
     Ok(names)

@@ -9,9 +9,13 @@
 use std::ffi::{c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
+pub(crate) mod base64;
 pub(crate) mod buffer;
 pub(crate) mod list;
 pub(crate) mod nodeset;
+pub(crate) mod policy;
+pub(crate) mod strings;
+pub(crate) mod transforms;
 pub(crate) mod tree;
 pub(crate) mod xmltree;
 

@@ -134,6 +134,27 @@ pub(crate) unsafe extern "C" fn xmlSecFindParent(
     })
 }
 
+/// `xmlSecGetNextElementNode`: `cur` or its first following sibling that is
+/// an element.
+///
+/// # Safety
+/// `cur` is null or a live node.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecGetNextElementNode(cur: *mut XmlNode) -> *mut XmlNode {
+    contain(std::ptr::null_mut(), || {
+        if !readable() {
+            return std::ptr::null_mut();
+        }
+        let mut node = cur;
+        // SAFETY: `node` is `cur` or one of its live siblings.
+        while !node.is_null() && unsafe { (*node).kind } != XML_ELEMENT_NODE {
+            // SAFETY: as above.
+            node = unsafe { (*node).next };
+        }
+        node
+    })
+}
+
 /// What [`find_node`] looks for and found.
 struct FindNode {
     name: *const u8,
