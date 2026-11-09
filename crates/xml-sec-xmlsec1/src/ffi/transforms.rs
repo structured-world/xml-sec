@@ -27,6 +27,7 @@ use super::{contain, free, malloc, write_stream};
 pub(crate) mod builtin;
 pub(crate) mod ctx;
 pub(crate) mod io;
+pub(crate) mod xpath;
 
 #[cfg(test)]
 mod tests;

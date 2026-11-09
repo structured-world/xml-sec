@@ -1,6 +1,7 @@
 //! The built-in transform klasses: the memory-buffer terminal, Base64,
 //! canonicalization, the tag-removing conversion and the enveloped-signature
-//! transform, with the identities of the others.
+//! transform, with the identities of the others; the `XPath` family lives in
+//! [`super::xpath`].
 //!
 //! Canonicalization takes its semantics from the core: the caller's tree is
 //! projected under the library's policy and canonicalized with exactly the
@@ -33,17 +34,16 @@ use super::super::strings::{
     xmlSecHrefExcC14N, xmlSecHrefExcC14NWithComments, xmlSecHrefRelationship, xmlSecNameBase64,
     xmlSecNameC14N, xmlSecNameC14N11, xmlSecNameC14N11WithComments, xmlSecNameC14NWithComments,
     xmlSecNameEnveloped, xmlSecNameExcC14N, xmlSecNameExcC14NWithComments, xmlSecNameMemBuf,
-    xmlSecNameRelationship, xmlSecNameXPath, xmlSecNameXPath2, xmlSecNameXPointer,
-    xmlSecNodeInclusiveNamespaces, xmlSecNodeSignature, xmlSecNsExcC14N, xmlSecXPath2Ns,
-    xmlSecXPathNs, xmlSecXPointerNs,
+    xmlSecNameRelationship, xmlSecNodeInclusiveNamespaces, xmlSecNodeSignature, xmlSecNsExcC14N,
 };
-use super::super::tree::{readable, xmlSearchNs};
+use super::super::tree::{readable, xmlGetProp, xmlSearchNs};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecFindParent, xmlSecGetNextElementNode};
 use super::super::{contain, free, policy};
 use super::io::{
     xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
 };
+use super::xpath;
 use super::{
     OPERATION_DECODE, OPERATION_ENCODE, STATUS_FINISHED, STATUS_NONE, STATUS_WORKING,
     USAGE_C14N_METHOD, USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx,
@@ -53,7 +53,7 @@ use super::{
 };
 
 /// A klass with sizes, name, href and usage, and no methods.
-const fn klass(
+pub(crate) const fn klass(
     obj_size: usize,
     name: *const u8,
     href: *const u8,
@@ -94,9 +94,9 @@ pub(crate) fn defaults() -> [*const XmlSecTransformKlass; 12] {
         &raw const INCL_C14N11_WITH_COMMENTS,
         &raw const EXCL_C14N,
         &raw const EXCL_C14N_WITH_COMMENTS,
-        &raw const XPATH,
-        &raw const XPATH2,
-        xpointer(),
+        xpath::xpath(),
+        xpath::xpath2(),
+        xpath::xpointer(),
         &raw const RELATIONSHIP,
     ]
 }
@@ -489,10 +489,10 @@ klass_getter! {
     xmlSecTransformExclC14NWithCommentsGetKlass => &raw const EXCL_C14N_WITH_COMMENTS;
     xmlSecTransformRemoveXmlTagsC14NGetKlass => remove_xml_tags_c14n();
     xmlSecTransformEnvelopedGetKlass => &raw const ENVELOPED;
-    xmlSecTransformXPathGetKlass => &raw const XPATH;
-    xmlSecTransformXPath2GetKlass => &raw const XPATH2;
-    xmlSecTransformXPointerGetKlass => xpointer();
-    xmlSecTransformVisa3DHackGetKlass => visa3d_hack();
+    xmlSecTransformXPathGetKlass => xpath::xpath();
+    xmlSecTransformXPath2GetKlass => xpath::xpath2();
+    xmlSecTransformXPointerGetKlass => xpath::xpointer();
+    xmlSecTransformVisa3DHackGetKlass => xpath::visa3d_hack();
     xmlSecTransformRelationshipGetKlass => &raw const RELATIONSHIP;
 }
 
@@ -511,10 +511,6 @@ unsafe extern "C" fn c14n_finalize(transform: *mut XmlSecTransform) {
         // SAFETY: an initialized strings list.
         unsafe { xmlSecPtrListFinalize(list) };
     }
-}
-
-unsafe extern "C" {
-    fn xmlGetProp(node: *mut XmlNode, name: *const u8) -> *mut u8;
 }
 
 /// Reads the optional `ec:InclusiveNamespaces PrefixList` of an exclusive
@@ -901,30 +897,6 @@ unsafe extern "C" fn enveloped_execute(
 // ----------------------------------------------------------------------------
 // XPath family, XML parser, URI input and OPC relationships
 
-static XPATH: XmlSecTransformKlass = klass(
-    size_of::<XmlSecTransform>(),
-    xmlSecNameXPath.as_ptr(),
-    xmlSecXPathNs.as_ptr(),
-    USAGE_DSIG_TRANSFORM,
-);
-static XPATH2: XmlSecTransformKlass = klass(
-    size_of::<XmlSecTransform>(),
-    xmlSecNameXPath2.as_ptr(),
-    xmlSecXPath2Ns.as_ptr(),
-    USAGE_DSIG_TRANSFORM,
-);
-static XPOINTER: XmlSecTransformKlass = klass(
-    size_of::<XmlSecTransform>(),
-    xmlSecNameXPointer.as_ptr(),
-    xmlSecXPointerNs.as_ptr(),
-    USAGE_DSIG_TRANSFORM,
-);
-static VISA3D_HACK: XmlSecTransformKlass = klass(
-    size_of::<XmlSecTransform>(),
-    c"Visa3DHackTransform".as_ptr().cast(),
-    std::ptr::null(),
-    USAGE_DSIG_TRANSFORM,
-);
 static XML_PARSER: XmlSecTransformKlass = klass(
     size_of::<XmlSecTransform>(),
     c"xml-parser".as_ptr().cast(),
@@ -944,16 +916,6 @@ static RELATIONSHIP: XmlSecTransformKlass = klass(
     USAGE_DSIG_TRANSFORM,
 );
 
-/// The `XPointer` klass, which selects a URI fragment.
-pub(crate) fn xpointer() -> *const XmlSecTransformKlass {
-    &raw const XPOINTER
-}
-
-/// The `Visa3D` id-lookup klass.
-pub(crate) fn visa3d_hack() -> *const XmlSecTransformKlass {
-    &raw const VISA3D_HACK
-}
-
 /// The XML parser klass, the automatic binary-to-XML adapter.
 pub(crate) fn xml_parser() -> *const XmlSecTransformKlass {
     &raw const XML_PARSER
@@ -962,34 +924,6 @@ pub(crate) fn xml_parser() -> *const XmlSecTransformKlass {
 /// The URI input klass.
 pub(crate) fn input_uri() -> *const XmlSecTransformKlass {
     &raw const INPUT_URI
-}
-
-/// `xmlSecTransformXPointerSetExpr`: the expression an `XPointer` transform
-/// selects with.
-///
-/// # Safety
-/// `transform` is null or a valid transform; `expr` is null or
-/// NUL-terminated; `here` is null or a live node.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
-    _transform: *mut XmlSecTransform,
-    _expr: *const u8,
-    _kind: c_int,
-    _here: *mut XmlNode,
-) -> c_int {
-    -1
-}
-
-/// `xmlSecTransformVisa3DHackSetID`: the id a `Visa3D` transform selects.
-///
-/// # Safety
-/// `transform` is null or a valid transform; `id` is null or NUL-terminated.
-#[unsafe(no_mangle)]
-pub(crate) unsafe extern "C" fn xmlSecTransformVisa3DHackSetID(
-    _transform: *mut XmlSecTransform,
-    _id: *const u8,
-) -> c_int {
-    -1
 }
 
 /// `xmlSecTransformInputURIOpen`: opens the resource a URI input transform

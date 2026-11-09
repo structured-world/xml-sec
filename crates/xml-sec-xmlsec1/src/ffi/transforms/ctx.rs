@@ -24,7 +24,7 @@ use super::{
     xmlSecTransformDebugXmlDump, xmlSecTransformDestroy, xmlSecTransformGetDataType,
     xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump, xmlSecTransformIdListFind,
     xmlSecTransformIdListFindByHref, xmlSecTransformIdListGetKlass, xmlSecTransformIdsGet,
-    xmlSecTransformPump, xmlSecTransformPushBin, xmlSecTransformPushXml,
+    xmlSecTransformPump, xmlSecTransformPushBin, xmlSecTransformPushXml, xpath,
 };
 
 /// `xmlSecTransformCtxPreExecuteCallback`.
@@ -611,12 +611,12 @@ unsafe fn select_fragment(
             if fragment.starts_with(b"#xpointer(") || fragment.starts_with(b"#xmlns(") {
                 (fragment[1..].to_vec(), TREE)
             } else if visa3d {
-                let transform = xmlSecTransformCtxCreateAndPrepend(ctx, builtin::visa3d_hack());
+                let transform = xmlSecTransformCtxCreateAndPrepend(ctx, xpath::visa3d_hack());
                 if valid(transform).is_none() {
                     return -1;
                 }
                 let id = duplicate(&fragment[1..]);
-                let result = builtin::xmlSecTransformVisa3DHackSetID(transform, id);
+                let result = xpath::xmlSecTransformVisa3DHackSetID(transform, id);
                 free(id.cast::<c_void>());
                 return result;
             } else {
@@ -627,12 +627,12 @@ unsafe fn select_fragment(
                 expression.extend_from_slice(b"'))");
                 (expression, TREE_WITHOUT_COMMENTS)
             };
-        let transform = xmlSecTransformCtxCreateAndPrepend(ctx, builtin::xpointer());
+        let transform = xmlSecTransformCtxCreateAndPrepend(ctx, xpath::xpointer());
         if valid(transform).is_none() {
             return -1;
         }
         let expression = duplicate(&expression);
-        let result = builtin::xmlSecTransformXPointerSetExpr(transform, expression, kind, here);
+        let result = xpath::xmlSecTransformXPointerSetExpr(transform, expression, kind, here);
         free(expression.cast::<c_void>());
         result
     }

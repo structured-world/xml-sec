@@ -934,6 +934,8 @@ fn xpath_evaluation_work<S: crate::c14n::scratch::Scratch>(
     let parent_step_contexts = match mode {
         XPathEvaluationMode::XmlDsigPerNodeFilter => 1,
         XPathEvaluationMode::Filter2NodeSetSelection => document_size,
+        #[cfg(feature = "external-tree")]
+        XPathEvaluationMode::ExactNodeSet => document_size,
     };
     work = work.saturating_add(parent_step_contexts.saturating_mul(parent_steps));
 
@@ -1315,6 +1317,32 @@ impl<'source, 'd, K: Keys, D: crate::xml::dom::storage::Storage> Mirror<'source,
             node => self.project_leaf(source, result, node, budget)?,
         }
         Ok(())
+    }
+
+    /// The projection of a node-set result: each node as itself for
+    /// [`XPathEvaluationMode::ExactNodeSet`], otherwise Filter 2.0's subtree
+    /// expansion.
+    fn project_node_set<'a>(
+        &self,
+        source: &'a Document<'a, D>,
+        input: &Projection<'a, K, D>,
+        selected: &nodeset::Nodeset<'d>,
+        mode: XPathEvaluationMode,
+        materialization_budget: &NodeSetMaterializationBudget,
+    ) -> Result<Projection<'a, K, D>, TransformError> {
+        #[cfg(feature = "external-tree")]
+        if matches!(mode, XPathEvaluationMode::ExactNodeSet) {
+            // A projection is a set: membership, not evaluation order, matters.
+            let mut exact = input.empty_like();
+            for node in selected {
+                self.project_exact_node(source, &mut exact, &node, materialization_budget)?;
+            }
+            return Ok(exact);
+        }
+        #[cfg(not(feature = "external-tree"))]
+        let (XPathEvaluationMode::XmlDsigPerNodeFilter
+        | XPathEvaluationMode::Filter2NodeSetSelection) = mode;
+        self.project_expanded(source, input, selected, materialization_budget)
     }
 
     fn project_expanded<'a>(
@@ -2062,6 +2090,10 @@ impl XPathDocumentRelation {
 enum XPathEvaluationMode {
     XmlDsigPerNodeFilter,
     Filter2NodeSetSelection,
+    /// The node-set the expression returns, each node as itself, without
+    /// Filter 2.0's subtree expansion.
+    #[cfg(feature = "external-tree")]
+    ExactNodeSet,
 }
 
 #[derive(Clone, Copy)]
@@ -2284,7 +2316,35 @@ fn evaluate_expression<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
             "XPath Filter 2.0 expression must return a node-set"
         )));
     };
-    mirror.project_expanded(document, input, &selected, materialization_budget)
+    mirror.project_node_set(document, input, &selected, mode, materialization_budget)
+}
+
+/// The nodes of `input`'s document that `expression` selects: with
+/// `each_node`, every node of `input` for which it is true (`XMLDSig` 1.1
+/// section 6.6.3); otherwise the node-set it evaluates to, unexpanded.
+#[cfg(feature = "external-tree")]
+pub(super) fn select_projection<'a, 'r, K: Keys, D: crate::xml::dom::storage::Storage>(
+    input: &Projection<'a, K, D>,
+    expression: &impl super::transforms::ExpressionParameter,
+    each_node: bool,
+    request: impl Into<XPathRequestContext<'r>>,
+    work_budget: &XPathWorkBudget,
+    materialization_budget: &NodeSetMaterializationBudget,
+) -> Result<Projection<'a, K, D>, TransformError> {
+    let mode = if each_node {
+        XPathEvaluationMode::XmlDsigPerNodeFilter
+    } else {
+        XPathEvaluationMode::ExactNodeSet
+    };
+    evaluate_expression(
+        input,
+        expression,
+        mode,
+        request,
+        XPathDocumentRelation::SameDocument,
+        work_budget,
+        materialization_budget,
+    )
 }
 
 #[cfg(test)]

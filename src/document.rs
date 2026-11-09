@@ -3065,6 +3065,20 @@ impl<'a> DocumentView<'a> {
             .flatten()
     }
 
+    /// The node of this view's tree projected from `external`, if any.
+    #[cfg(feature = "external-tree")]
+    #[must_use]
+    pub fn node_of_external(
+        self,
+        external: crate::document::external::ExternalNode,
+    ) -> Option<Node<'a, 'a>> {
+        self.parsed
+            .document
+            .root()
+            .descendants()
+            .find(|node| self.external_node_of(*node) == Some(external))
+    }
+
     pub(crate) fn node_identity(self, node: Node<'_, '_>) -> NodeIdentity {
         NodeIdentity {
             document: self.identity,

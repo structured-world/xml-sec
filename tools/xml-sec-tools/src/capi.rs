@@ -125,6 +125,7 @@ impl Target {
                 "tests/c/nodeset.c",
                 "tests/c/base64.c",
                 "tests/c/transforms.c",
+                "tests/c/xpath.c",
             ],
         }
     }
