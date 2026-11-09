@@ -174,6 +174,49 @@ fn an_invalid_fragment_leaves_the_tree_and_generation_unchanged() {
 }
 
 #[test]
+fn a_refresh_reads_changes_the_application_made_to_the_tree() {
+    // The application changed its tree outside the document; the next
+    // generation is the tree as it is now, and earlier identities are stale.
+    let tree = ModelTree::parse(XML);
+    let mut document = document(&tree);
+    let first = node(&document, "first");
+    let mut other =
+        XmlDocument::from_external_tree(Box::new(tree.clone()), &VerificationPolicy::default())
+            .expect("a second view of the same tree");
+    let other_first = node(&other, "first");
+    other
+        .replace_content(other_first, "outside")
+        .expect("the tree changes through another document");
+    document.refresh_tree().expect("the tree is read again");
+    assert_eq!(document.generation(), 1);
+    assert!(matches!(
+        document.replace_content(first, "x"),
+        Err(XmlDocumentError::StaleIdentity { .. })
+    ));
+    document.with_view(|view| {
+        let first = view
+            .document()
+            .root_element()
+            .first_element_child()
+            .expect("first");
+        assert_eq!(
+            first.first_child().and_then(xml_sec::Node::text),
+            Some("outside")
+        );
+    });
+}
+
+#[test]
+fn a_parsed_document_has_no_tree_to_refresh() {
+    let mut document = XmlDocument::parse(XML).expect("parses");
+    assert!(!document.is_tree_backed());
+    assert!(matches!(
+        document.refresh_tree(),
+        Err(XmlDocumentError::NotTreeBacked)
+    ));
+}
+
+#[test]
 fn a_tree_backed_document_has_no_serialization_to_return() {
     // Signing that returns signed text needs a serialization; a tree's
     // signature is committed into the tree instead.

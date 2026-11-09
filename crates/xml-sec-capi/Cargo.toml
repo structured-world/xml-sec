@@ -25,6 +25,9 @@ xml-backend-roxmltree = ["xml-sec-config/xml-backend-roxmltree"]
 xml-backend-differential = ["xml-sec-config/xml-backend-differential"]
 xml-backends-all = ["xml-sec-config/xml-backends-all"]
 aws-lc-fips = ["xml-sec-config/aws-lc-fips"]
+# Documents whose content is an application's own tree; the libxml2 bridge
+# creates them through `document_from_tree`.
+external-tree = ["xml-sec/external-tree"]
 
 [lints]
 workspace = true

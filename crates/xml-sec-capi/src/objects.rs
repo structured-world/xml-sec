@@ -846,6 +846,36 @@ pub(crate) fn parse_document(
     Ok(parsed.map_err(XmlSecError::from)?)
 }
 
+/// A document whose content is `tree`, read under the compiled policy of
+/// `operation`.
+#[cfg(feature = "external-tree")]
+pub(crate) fn tree_document(
+    policies: &CompiledPolicies,
+    operation: Operation,
+    tree: Box<dyn xml_sec::document::external::ExternalTree>,
+) -> Result<XmlDocument, Failure> {
+    let projected = match operation {
+        Operation::Verify => XmlDocument::from_external_tree(
+            tree,
+            policies.verification().ok_or_else(|| disabled(operation))?,
+        ),
+        Operation::Sign => XmlDocument::from_external_tree(
+            tree,
+            policies.signing().ok_or_else(|| disabled(operation))?,
+        ),
+        Operation::Encrypt => XmlDocument::from_external_tree(
+            tree,
+            policies.encryption().ok_or_else(|| disabled(operation))?,
+        ),
+        Operation::Decrypt => XmlDocument::from_external_tree(
+            tree,
+            policies.decryption().ok_or_else(|| disabled(operation))?,
+        ),
+        _ => return Err(disabled(operation)),
+    };
+    Ok(projected.map_err(XmlSecError::from)?)
+}
+
 /// A signing operation with its key selected once.
 pub(crate) struct Signer {
     security: SharedSecurity,

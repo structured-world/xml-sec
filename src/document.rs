@@ -609,6 +609,10 @@ pub enum XmlDocumentError {
     #[cfg(feature = "external-tree")]
     #[error("a tree-backed XML document changes only through edits of its tree")]
     TreeBackedSerialization,
+    /// A tree operation was asked of a document parsed from text.
+    #[cfg(feature = "external-tree")]
+    #[error("the XML document was parsed from text and has no external tree")]
+    NotTreeBacked,
     /// The external tree could not carry out an edit; it was rolled back.
     #[cfg(feature = "external-tree")]
     #[error("external tree edit failed: {0}")]
@@ -2410,8 +2414,33 @@ impl XmlDocument {
 
     /// Whether this document's content is an external tree.
     #[cfg(feature = "external-tree")]
-    pub(crate) const fn is_tree_backed(&self) -> bool {
+    #[must_use]
+    pub const fn is_tree_backed(&self) -> bool {
         self.tree.is_some()
+    }
+
+    /// Read the external tree again as a new generation, under the limits
+    /// the document was created with.
+    ///
+    /// An application whose code may have changed the tree since the last
+    /// operation calls this before the next one, so the operation reads the
+    /// tree as it is; every identity of the earlier generation becomes stale.
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::NotTreeBacked`] for a parsed document, or what
+    /// the projection refuses; the document then keeps its generation.
+    #[cfg(feature = "external-tree")]
+    pub fn refresh_tree(&mut self) -> Result<(), XmlDocumentError> {
+        let tree = self.tree.as_ref().ok_or(XmlDocumentError::NotTreeBacked)?;
+        let (cell, has_dtd) = project_external(tree.as_ref(), self.settings)?;
+        self.commit_generation(cell)?;
+        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+        {
+            self.requires_internal_dtd = has_dtd;
+        }
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let _ = has_dtd;
+        Ok(())
     }
 
     /// The content length after `added` bytes join `target`, as an upper

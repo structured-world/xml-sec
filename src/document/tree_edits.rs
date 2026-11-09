@@ -147,10 +147,7 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
-        let tree = self
-            .tree
-            .as_mut()
-            .ok_or(XmlDocumentError::TreeBackedSerialization)?;
+        let tree = self.tree.as_mut().ok_or(XmlDocumentError::NotTreeBacked)?;
         let mark = tree.checkpoint();
         let projected = apply_all(tree.as_mut(), changes).and_then(|()| {
             let (cell, _) = project_external(tree.as_ref(), settings).map_err(|error| {
