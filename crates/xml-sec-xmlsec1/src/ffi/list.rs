@@ -550,6 +550,79 @@ pub(crate) unsafe extern "C" fn xmlSecPtrListPopLast(list: *mut XmlSecPtrList) -
     })
 }
 
+/// Writes `header`, each non-null item through `dump`, then `footer`.
+///
+/// # Safety
+/// `list` is null or a list; `output` is null or a C stream.
+unsafe fn dump_items(
+    list: *mut XmlSecPtrList,
+    output: *mut c_void,
+    header: &str,
+    footer: &str,
+    dump: impl Fn(&XmlSecPtrListKlass) -> DebugDumpItem,
+) {
+    // SAFETY: by the caller's contract; the items precede `used`.
+    unsafe {
+        let Some(checked) = valid(list) else {
+            return;
+        };
+        if output.is_null() {
+            return;
+        }
+        super::write_stream(output, header);
+        if let Some(item_dump) = checked.id.as_ref().and_then(dump) {
+            for pos in 0..checked.used {
+                let item = checked.data.add(pos).read();
+                if !item.is_null() {
+                    item_dump(item, output);
+                }
+            }
+        }
+        super::write_stream(output, footer);
+    }
+}
+
+/// `xmlSecPtrListDebugDump`: the size, then each item by its klass.
+///
+/// # Safety
+/// `list` is null or a list; `output` is null or a C stream.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecPtrListDebugDump(
+    list: *mut XmlSecPtrList,
+    output: *mut c_void,
+) {
+    contain((), || {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            let used = valid(list).map_or(0, |checked| checked.used);
+            let header = format!("=== list size: {used}\n");
+            dump_items(list, output, &header, "", |klass| klass.debug_dump_item);
+        }
+    });
+}
+
+/// `xmlSecPtrListDebugXmlDump`: the size, then each item by its klass, in
+/// XML.
+///
+/// # Safety
+/// `list` is null or a list; `output` is null or a C stream.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecPtrListDebugXmlDump(
+    list: *mut XmlSecPtrList,
+    output: *mut c_void,
+) {
+    contain((), || {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            let used = valid(list).map_or(0, |checked| checked.used);
+            let header = format!("<List size=\"{used}\">\n");
+            dump_items(list, output, &header, "</List>\n", |klass| {
+                klass.debug_xml_dump_item
+            });
+        }
+    });
+}
+
 /// Duplicates a string item with libxml2's allocator.
 unsafe extern "C" fn string_duplicate(item: *mut c_void) -> *mut c_void {
     if item.is_null() {
