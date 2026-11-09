@@ -65,6 +65,25 @@ pub struct XmlNode {
     ns_def: *mut XmlNs,
 }
 
+/// `xmlEntity`, the declaration an entity reference's `children` points to,
+/// up to the last member the bridge reads.
+#[repr(C)]
+pub struct XmlEntity {
+    private: *mut c_void,
+    kind: c_int,
+    name: *const XmlChar,
+    children: *mut XmlNode,
+    last: *mut XmlNode,
+    parent: *mut c_void,
+    next: *mut XmlNode,
+    prev: *mut XmlNode,
+    doc: *mut XmlDoc,
+    orig: *mut XmlChar,
+    content: *mut XmlChar,
+    length: c_int,
+    etype: c_int,
+}
+
 /// `xmlDoc`, up to the last member the bridge reads. Its first members are
 /// the common part every libxml2 node shares, so the document is the parent
 /// of its top-level nodes like any element.
@@ -95,6 +114,7 @@ const XML_DTD_NODE: c_int = 14;
 const XML_XINCLUDE_START: c_int = 19;
 const XML_XINCLUDE_END: c_int = 20;
 const XML_ATTRIBUTE_ID: c_int = 2;
+const XML_INTERNAL_PREDEFINED_ENTITY: c_int = 6;
 
 unsafe extern "C" {
     static xs_libxml2_layout: [usize; 0];
@@ -131,7 +151,7 @@ unsafe extern "C" {
 
 /// The layout record this crate's declarations stand for, in the order of
 /// `layout.c`.
-fn expected_layout() -> [usize; 38] {
+fn expected_layout() -> [usize; 43] {
     use std::mem::{offset_of, size_of};
     [
         offset_of!(XmlNode, kind),
@@ -160,6 +180,10 @@ fn expected_layout() -> [usize; 38] {
         offset_of!(XmlDoc, children),
         offset_of!(XmlDoc, last),
         offset_of!(XmlDoc, int_subset),
+        offset_of!(XmlEntity, children),
+        offset_of!(XmlEntity, content),
+        offset_of!(XmlEntity, length),
+        offset_of!(XmlEntity, etype),
         size_of::<c_int>(),
         XML_ELEMENT_NODE as usize,
         XML_TEXT_NODE as usize,
@@ -172,6 +196,7 @@ fn expected_layout() -> [usize; 38] {
         XML_XINCLUDE_START as usize,
         XML_XINCLUDE_END as usize,
         XML_ATTRIBUTE_ID as usize,
+        XML_INTERNAL_PREDEFINED_ENTITY as usize,
     ]
 }
 
@@ -229,6 +254,47 @@ unsafe fn string<'a>(text: *const XmlChar) -> Result<Option<&'a str>, ParseError
     std::str::from_utf8(bytes)
         .map(Some)
         .map_err(|_| backend_error("a tree string is not UTF-8"))
+}
+
+/// What an entity reference stands for in the tree.
+enum Replacement<'a> {
+    /// The declaration's parsed replacement, from this node on.
+    Nodes(*mut XmlNode),
+    /// Character data: a predefined entity's character (XML 1.0 section
+    /// 4.6), or nothing for an empty replacement (section 2.3, production 9).
+    Text(&'a str),
+}
+
+/// The replacement of the entity reference `reference`. A declaration whose
+/// replacement libxml2 holds only as unparsed text that is not a predefined
+/// character is refused: reading it would mean parsing its markup here,
+/// which the tree's own parser has not done.
+///
+/// # Safety
+/// `reference` is a live entity-reference node of a live tree.
+unsafe fn replacement<'a>(reference: &XmlNode) -> Result<Replacement<'a>, ParseError> {
+    let entity = reference.children.cast::<XmlEntity>();
+    if entity.is_null() {
+        return Err(backend_error("an entity reference without its declaration"));
+    }
+    // SAFETY: a reference's `children` is its live declaration.
+    let entity = unsafe { &*entity };
+    if !entity.children.is_null() {
+        return Ok(Replacement::Nodes(entity.children));
+    }
+    if entity.length == 0 {
+        return Ok(Replacement::Text(""));
+    }
+    if entity.etype == XML_INTERNAL_PREDEFINED_ENTITY {
+        // SAFETY: a predefined declaration's content is its NUL-terminated
+        // character, static in libxml2.
+        return Ok(Replacement::Text(
+            unsafe { string(entity.content) }?.unwrap_or_default(),
+        ));
+    }
+    Err(backend_error(
+        "an entity reference whose replacement the tree has not parsed",
+    ))
 }
 
 /// One undo step of an edit.
@@ -324,21 +390,24 @@ impl LibxmlTree {
                     )?;
                 }
                 XML_ENTITY_REF_NODE => {
-                    // An entity reference's `children` is its declaration,
-                    // whose children are the parsed replacement (XML 1.0
-                    // section 4.4.2: included in the content).
-                    let entity = node.children;
-                    // SAFETY: a declaration shares the common node part.
-                    let replacement = (!entity.is_null()).then(|| unsafe { (*entity).children });
-                    let Some(replacement) = replacement.filter(|first| !first.is_null()) else {
-                        return Err(backend_error(
-                            "an entity reference whose replacement the tree does not hold",
-                        ));
-                    };
-                    sink.enter_entity()?;
-                    stack.push(Frame::Entity(current));
-                    current = replacement;
-                    continue;
+                    // The replacement is included in the content (XML 1.0
+                    // section 4.4.2).
+                    // SAFETY: a live entity reference of the walked tree.
+                    match unsafe { replacement(node) }? {
+                        Replacement::Nodes(first) => {
+                            sink.enter_entity()?;
+                            stack.push(Frame::Entity(current));
+                            current = first;
+                            continue;
+                        }
+                        Replacement::Text(text) => {
+                            sink.enter_entity()?;
+                            if !text.is_empty() {
+                                sink.text(reference(current), text)?;
+                            }
+                            sink.leave_entity()?;
+                        }
+                    }
                 }
                 // The document type was reported before the walk; XInclude
                 // markers carry no content.
@@ -488,6 +557,10 @@ impl Builder {
                 self.place(element.node);
                 Ok(())
             }
+            // White space at the document level is not content (XML 1.0
+            // section 2.8, production 27) and a libxml2 document holds no
+            // text children; the core admits only white space there.
+            FragmentEvent::Text(_) if self.context.is_null() && self.open.is_empty() => Ok(()),
             FragmentEvent::Text(text) => {
                 let text = c_string(text)?;
                 // SAFETY: `doc` is live; libxml2 copies the content, unescaped.
@@ -843,11 +916,20 @@ unsafe fn attribute_value(attr: &XmlAttr, sink: &mut TreeSink<'_>) -> Result<Str
                 value.push_str(text);
                 current = node.next;
             }
-            XML_ENTITY_REF_NODE if !node.children.is_null() => {
+            XML_ENTITY_REF_NODE => {
                 sink.expand_attribute_entity()?;
-                resume.push(node.next);
-                // SAFETY: the declaration shares the common node part.
-                current = unsafe { (*node.children).children };
+                // SAFETY: a live entity reference of the attribute's tree.
+                match unsafe { replacement(node) }? {
+                    Replacement::Nodes(first) => {
+                        resume.push(node.next);
+                        current = first;
+                    }
+                    Replacement::Text(text) => {
+                        sink.admit_attribute_bytes(value.len() + text.len())?;
+                        value.push_str(text);
+                        current = node.next;
+                    }
+                }
             }
             _ => return Err(backend_error("an attribute value the tree cannot report")),
         }

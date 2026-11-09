@@ -5,6 +5,7 @@
  * structure itself, and later releases append members. */
 
 #include <stddef.h>
+#include <libxml/entities.h>
 #include <libxml/tree.h>
 
 const size_t xs_libxml2_layout[] = {
@@ -34,6 +35,10 @@ const size_t xs_libxml2_layout[] = {
     offsetof(xmlDoc, children),
     offsetof(xmlDoc, last),
     offsetof(xmlDoc, intSubset),
+    offsetof(xmlEntity, children),
+    offsetof(xmlEntity, content),
+    offsetof(xmlEntity, length),
+    offsetof(xmlEntity, etype),
     sizeof(xmlElementType),
     XML_ELEMENT_NODE,
     XML_TEXT_NODE,
@@ -46,6 +51,7 @@ const size_t xs_libxml2_layout[] = {
     XML_XINCLUDE_START,
     XML_XINCLUDE_END,
     XML_ATTRIBUTE_ID,
+    XML_INTERNAL_PREDEFINED_ENTITY,
 };
 
 const size_t xs_libxml2_layout_len = sizeof(xs_libxml2_layout) / sizeof(xs_libxml2_layout[0]);

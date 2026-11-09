@@ -487,16 +487,20 @@ fn with_document<T>(
 ///
 /// The application may have changed a tree-backed document's tree since the
 /// last call, and no tree reports that: the operation reads it as it is now,
-/// as a new generation.
+/// under `policy`, the operation's own compiled policy (`None`: the limits
+/// the current generation was read with).
 fn with_operation_document<T>(
     handle: XsDocument,
+    #[cfg_attr(not(feature = "external-tree"), expect(unused_variables))] policy: Option<
+        &dyn xml_sec::XmlDocumentPolicy,
+    >,
     body: impl FnOnce(&mut xml_sec::XmlDocument) -> Result<T, Failure>,
 ) -> Result<T, Failure> {
     with_document(handle, |document| {
         #[cfg(feature = "external-tree")]
         if document.is_tree_backed() {
             document
-                .refresh_tree()
+                .refresh_tree(policy)
                 .map_err(|error| Failure::from(xml_sec::XmlSecError::from(error)))?;
         }
         body(document)
@@ -1029,7 +1033,9 @@ pub unsafe extern "C" fn xs_sign(
         let Object::Signer(signer) = signer.object() else {
             return Err(wrong());
         };
-        let decided = with_operation_document(document, |document| signer.sign(document))?;
+        let decided = with_operation_document(document, signer.document_policy(), |document| {
+            signer.sign(document)
+        })?;
         audit_out(audit, &decided);
         Ok(())
     })
@@ -1133,7 +1139,7 @@ pub unsafe extern "C" fn xs_verify(
             .collect::<Result<Vec<_>, _>>()?;
         let requirement = objects::requirement(request.requirement, request.count)?;
         let slot = table::reserve().map_err(Failure::from)?;
-        let evidence = with_operation_document(document, |document| {
+        let evidence = with_operation_document(document, verifier.document_policy(), |document| {
             verifier.verify(
                 document,
                 &ids,
@@ -1207,8 +1213,9 @@ pub unsafe extern "C" fn xs_encrypt(
         let Object::Encryptor(encryptor) = encryptor.object() else {
             return Err(wrong());
         };
-        let decided =
-            with_operation_document(document, |document| encryptor.encrypt(document, id))?;
+        let decided = with_operation_document(document, encryptor.document_policy(), |document| {
+            encryptor.encrypt(document, id)
+        })?;
         audit_out(audit, &decided);
         Ok(())
     })
@@ -1281,7 +1288,7 @@ pub unsafe extern "C" fn xs_decrypt(
         let Object::Decryptor(decryptor) = decryptor.object() else {
             return Err(wrong());
         };
-        let decided = with_operation_document(document, |document| {
+        let decided = with_operation_document(document, decryptor.document_policy(), |document| {
             decryptor.decrypt(
                 document,
                 id,
@@ -1327,7 +1334,7 @@ pub unsafe extern "C" fn xs_evidence_accepted(
         // A tree the caller changed since verification is a new generation
         // the evidence does not cover; an unchanged tree keeps its generation.
         let verdict = with_evidence(evidence, |evidence| {
-            with_operation_document(document, |document| {
+            with_operation_document(document, None, |document| {
                 evidence
                     .accepted(document)
                     .map_err(|error| Failure::from(xml_sec::XmlSecError::from(error)))

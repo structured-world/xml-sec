@@ -92,13 +92,11 @@ impl XmlDocument {
                     }
                     TreeChange::Content(fragment) => {
                         require_element(node)?;
-                        let shape = ReplacementShape::Fragment;
-                        (Placement::Content, fragment, shape, Some(node))
+                        (Placement::Content, fragment, Shape::Fragment, Some(node))
                     }
                     TreeChange::Append(fragment) => {
                         require_element(node)?;
-                        let shape = ReplacementShape::Fragment;
-                        (Placement::Append, fragment, shape, Some(node))
+                        (Placement::Append, fragment, Shape::Fragment, Some(node))
                     }
                     TreeChange::Node(fragment, shape) => {
                         if shape == ReplacementShape::SingleElement {
@@ -108,21 +106,21 @@ impl XmlDocument {
                         // replacement must stay one element (XML 1.0 production 1).
                         let parent = node.parent_element();
                         let shape = if parent.is_none() {
-                            ReplacementShape::SingleElement
+                            Shape::SingleElement
                         } else {
-                            shape
+                            shape.into()
                         };
                         (Placement::Node, fragment, shape, parent)
                     }
-                    TreeChange::Before(fragment) => {
-                        let parent = node.parent_element().ok_or_else(|| {
-                            XmlDocumentError::InvalidReplacement(
-                                "nothing may precede the document element".into(),
-                            )
-                        })?;
-                        let shape = ReplacementShape::Fragment;
-                        (Placement::Before, fragment, shape, Some(parent))
-                    }
+                    TreeChange::Before(fragment) => match node.parent_element() {
+                        Some(parent) => {
+                            (Placement::Before, fragment, Shape::Fragment, Some(parent))
+                        }
+                        // A node at the document level is preceded by prolog
+                        // or misc content: comments, processing instructions
+                        // and whitespace (XML 1.0 productions 22 and 27).
+                        None => (Placement::Before, fragment, Shape::Misc, None),
+                    },
                 };
                 let wrapper = wrap_in_scope(fragment, context)?;
                 // The wrapper is the fragment plus the markup around it.
@@ -210,7 +208,7 @@ impl XmlDocument {
 enum Planned {
     Text(ExternalNode, String),
     /// The fragment in its wrapper, and the wrapper's own bytes.
-    Fragment(ExternalNode, Placement, String, usize, ReplacementShape),
+    Fragment(ExternalNode, Placement, String, usize, Shape),
 }
 
 /// Refuse targets one of which lies inside another: an edit at the outer
@@ -341,25 +339,59 @@ fn parse_fragment(
     build_cell(wrapper, fragment_settings, budget)
 }
 
-fn check_shape(cell: &DocumentCell, shape: ReplacementShape) -> Result<(), XmlDocumentError> {
-    if shape == ReplacementShape::Fragment {
+/// The node sequence a fragment must parse to at its placement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Shape {
+    /// Any content.
+    Fragment,
+    /// Exactly one element, with markup and whitespace around it.
+    SingleElement,
+    /// Document-level `Misc`: comments, processing instructions and
+    /// whitespace, no element and no other character data (XML 1.0
+    /// production 27).
+    Misc,
+}
+
+impl From<ReplacementShape> for Shape {
+    fn from(shape: ReplacementShape) -> Self {
+        match shape {
+            ReplacementShape::Fragment => Self::Fragment,
+            ReplacementShape::SingleElement => Self::SingleElement,
+        }
+    }
+}
+
+fn check_shape(cell: &DocumentCell, shape: Shape) -> Result<(), XmlDocumentError> {
+    if shape == Shape::Fragment {
         return Ok(());
     }
     cell.with_dependent(|_, parsed| {
         let wrapper = parsed.document.root_element();
         let elements = wrapper.children().filter(Node::is_element).count();
-        let only_markup = wrapper.children().all(|node| {
-            node.is_element()
-                || node.is_comment()
+        // White space is S (XML 1.0 production 3), not every Unicode space.
+        let markup = |node: Node<'_, '_>| {
+            node.is_comment()
                 || node.is_pi()
-                || node.text().is_some_and(|text| text.trim().is_empty())
-        });
-        if elements == 1 && only_markup {
+                || node.text().is_some_and(|text| {
+                    text.chars()
+                        .all(|character| matches!(character, ' ' | '\t' | '\r' | '\n'))
+                })
+        };
+        let (expected, message) = match shape {
+            Shape::SingleElement => (1, "element replacement must contain exactly one element"),
+            _ => (
+                0,
+                "only comments, processing instructions and white space may stand outside the document element",
+            ),
+        };
+        if elements == expected
+            && wrapper
+                .children()
+                .all(|node| node.is_element() || markup(node))
+        {
             Ok(())
         } else {
-            Err(XmlDocumentError::InvalidReplacement(
-                "element replacement must contain exactly one element".into(),
-            ))
+            Err(XmlDocumentError::InvalidReplacement(message.into()))
         }
     })
 }

@@ -2420,36 +2420,50 @@ impl XmlDocument {
         self.tree.is_some()
     }
 
-    /// Read the external tree again under the limits the document was
-    /// created with; a tree that changed becomes a new generation.
+    /// Read the external tree again; a tree that changed becomes a new
+    /// generation.
     ///
     /// An application whose code may have changed the tree since the last
-    /// operation calls this before the next one, so the operation reads the
-    /// tree as it is. If the tree changed, every identity of the earlier
-    /// generation becomes stale; an unchanged tree keeps its generation, its
-    /// identities and evidence bound to it.
+    /// operation calls this before the next one, with that operation's
+    /// policy, so the operation reads the tree as it is under its own XML
+    /// input and resource limits; those limits then govern the document's
+    /// later edits too. `None` reads under the limits the current generation
+    /// was read with, to learn whether anything changed. If the tree
+    /// changed, every identity of the earlier generation becomes stale; an
+    /// unchanged tree keeps its generation, its identities and evidence bound
+    /// to it.
     ///
     /// # Errors
-    /// [`XmlDocumentError::NotTreeBacked`] for a parsed document, or what
-    /// the projection refuses; the document then keeps its generation.
-    #[cfg(feature = "external-tree")]
-    pub fn refresh_tree(&mut self) -> Result<(), XmlDocumentError> {
+    /// [`XmlDocumentError::NotTreeBacked`] for a parsed document, an invalid
+    /// resource policy, or what the projection refuses; the document then
+    /// keeps its generation and limits.
+    #[cfg(all(
+        feature = "external-tree",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    pub fn refresh_tree(
+        &mut self,
+        policy: Option<&dyn XmlDocumentPolicy>,
+    ) -> Result<(), XmlDocumentError> {
         let tree = self.tree.as_ref().ok_or(XmlDocumentError::NotTreeBacked)?;
-        let (cell, has_dtd) = project_external(tree.as_ref(), self.settings)?;
-        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-        let same_dtd = self.requires_internal_dtd == has_dtd;
-        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-        let same_dtd = true;
-        if same_dtd && same_projection(self.cell.borrow_dependent(), cell.borrow_dependent()) {
-            return Ok(());
-        }
-        self.commit_generation(cell)?;
-        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-        {
+        let settings = match policy {
+            Some(policy) => {
+                policy.resource_policy().validate()?;
+                DocumentParseSettings::from_policy(
+                    *policy.xml_input_policy(),
+                    policy.resource_policy(),
+                )
+            }
+            None => self.settings,
+        };
+        let (cell, has_dtd) = project_external(tree.as_ref(), settings)?;
+        let unchanged = self.requires_internal_dtd == has_dtd
+            && same_projection(self.cell.borrow_dependent(), cell.borrow_dependent());
+        if !unchanged {
+            self.commit_generation(cell)?;
             self.requires_internal_dtd = has_dtd;
         }
-        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
-        let _ = has_dtd;
+        self.settings = settings;
         Ok(())
     }
 
@@ -3320,7 +3334,10 @@ fn project_external(
 /// Whether two projections of a tree are the same generation: the same
 /// tree nodes, in the same shape, with every name, namespace scope,
 /// attribute (and its ID typing), text and instruction equal.
-#[cfg(feature = "external-tree")]
+#[cfg(all(
+    feature = "external-tree",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
 fn same_projection(current: &ParsedDocument<'_>, next: &ParsedDocument<'_>) -> bool {
     if current.external != next.external || current.external_bytes != next.external_bytes {
         return false;
@@ -3338,7 +3355,10 @@ fn same_projection(current: &ParsedDocument<'_>, next: &ParsedDocument<'_>) -> b
 
 /// Node ids follow document order in both projections, so equal parent ids
 /// give equal shape.
-#[cfg(feature = "external-tree")]
+#[cfg(all(
+    feature = "external-tree",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
 fn same_node(left: Node<'_, '_>, right: Node<'_, '_>) -> bool {
     left.node_type() == right.node_type()
         && left.parent().map(Node::id) == right.parent().map(Node::id)

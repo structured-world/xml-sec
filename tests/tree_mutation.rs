@@ -187,7 +187,9 @@ fn a_refresh_reads_changes_the_application_made_to_the_tree() {
     other
         .replace_content(other_first, "outside")
         .expect("the tree changes through another document");
-    document.refresh_tree().expect("the tree is read again");
+    document
+        .refresh_tree(Some(&VerificationPolicy::default()))
+        .expect("the tree is read again");
     assert_eq!(document.generation(), 1);
     assert!(matches!(
         document.replace_content(first, "x"),
@@ -213,7 +215,7 @@ fn a_refresh_of_an_unchanged_tree_keeps_the_generation() {
     let tree = ModelTree::parse(XML);
     let mut document = document(&tree);
     let first = node(&document, "first");
-    document.refresh_tree().expect("the tree is read again");
+    document.refresh_tree(None).expect("the tree is read again");
     assert_eq!(document.generation(), 0);
     document
         .replace_content(first, "still valid")
@@ -225,7 +227,7 @@ fn a_parsed_document_has_no_tree_to_refresh() {
     let mut document = XmlDocument::parse(XML).expect("parses");
     assert!(!document.is_tree_backed());
     assert!(matches!(
-        document.refresh_tree(),
+        document.refresh_tree(None),
         Err(XmlDocumentError::NotTreeBacked)
     ));
 }

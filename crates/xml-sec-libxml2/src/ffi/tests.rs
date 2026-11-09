@@ -32,6 +32,8 @@ unsafe extern "C" {
     fn xmlDocDumpMemory(doc: *mut XmlDoc, memory: *mut *mut u8, size: *mut c_int);
     fn xmlGetID(doc: *mut XmlDoc, id: *const u8) -> *mut c_void;
     fn xmlNodeSetContent(node: *mut XmlNode, content: *const u8);
+    fn xmlNewReference(doc: *mut XmlDoc, name: *const u8) -> *mut XmlNode;
+    fn xmlAddChild(parent: *mut XmlNode, node: *mut XmlNode) -> *mut XmlNode;
     static xmlFree: unsafe extern "C" fn(*mut c_void);
 }
 
@@ -489,8 +491,14 @@ fn an_xml_id_in_the_tree_is_a_reference_target() {
 
 /// Encrypt the element with ID `s` of `doc` for the RSA test key.
 fn encrypt(policy: &Policy, doc: &Libxml) {
-    let (mut keys, mut encryptor) = (XsKeys::default(), XsEncryptor::default());
     let document = handle(policy, 3, doc);
+    encrypt_in(policy, document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+}
+
+/// Encrypt the element with ID `s` of the document behind `document`.
+fn encrypt_in(policy: &Policy, document: XsDocument) {
+    let (mut keys, mut encryptor) = (XsKeys::default(), XsEncryptor::default());
     // SAFETY: every pointer names a live local or string.
     unsafe {
         assert_eq!(
@@ -530,15 +538,20 @@ fn encrypt(policy: &Policy, doc: &Libxml) {
             XS_OK
         );
     }
-    assert_eq!(xs_document_destroy(document), XS_OK);
     assert_eq!(xs_encryptor_destroy(encryptor), XS_OK);
     assert_eq!(xs_keys_destroy(keys), XS_OK);
 }
 
 /// Decrypt the one `EncryptedData` of `doc` with the RSA test key.
 fn decrypt(policy: &Policy, doc: &Libxml) {
-    let (mut keys, mut decryptor) = (XsKeys::default(), XsDecryptor::default());
     let document = handle(policy, 4, doc);
+    decrypt_in(policy, document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+}
+
+/// Decrypt the one `EncryptedData` of the document behind `document`.
+fn decrypt_in(policy: &Policy, document: XsDocument) {
+    let (mut keys, mut decryptor) = (XsKeys::default(), XsDecryptor::default());
     // SAFETY: as above.
     unsafe {
         assert_eq!(
@@ -578,9 +591,29 @@ fn decrypt(policy: &Policy, doc: &Libxml) {
         );
         assert!(status == XS_OK, "decryption failed: {}", message(error));
     }
-    assert_eq!(xs_document_destroy(document), XS_OK);
     assert_eq!(xs_decryptor_destroy(decryptor), XS_OK);
     assert_eq!(xs_keys_destroy(keys), XS_OK);
+}
+
+#[test]
+fn each_operation_reads_the_tree_under_its_own_policy() {
+    // A handle created for verification with a small node limit is later
+    // used to encrypt and decrypt: the encrypted tree is larger than the
+    // verification limit allows, but each operation reads the tree under its
+    // own compiled policy, never the one the handle was created for.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = Policy::from(concat!(
+        "schema_version = 1\n[profiles.app]\nbase = 'Modern'\n",
+        "[profiles.app.verification.resources]\nmax_xml_nodes = 8\n"
+    ));
+    let doc = Libxml::parse("<root><secret Id=\"s\">42</secret></root>", 0);
+    let document = handle(&policy, 1, &doc);
+    encrypt_in(&policy, document);
+    decrypt_in(&policy, document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert!(doc.dump().contains("<secret Id=\"s\">42</secret>"));
 }
 
 #[test]
@@ -670,6 +703,44 @@ fn a_replacement_that_keeps_an_id_keeps_it_registered() {
     // SAFETY: the replacement is live and its first attribute is xml:id.
     let attribute = unsafe { (*secret).properties };
     assert_eq!(id(&doc), attribute.cast(), "the new attribute is the ID");
+}
+
+/// The identity of the document element, for `XmlDocument::with_view`.
+fn root_of(view: xml_sec::DocumentView<'_>) -> xml_sec::NodeIdentity {
+    view.root_element()
+}
+
+#[test]
+fn comments_and_instructions_insert_before_the_document_element() {
+    // The prolog holds comments, processing instructions and whitespace
+    // before the document element (XML 1.0 section 2.8, productions 22 and
+    // 27); inserting them there is an edit of the document node's children.
+    // Whitespace is not content outside the document element and is not
+    // kept as a node of the tree.
+    use xml_sec::policy::VerificationPolicy;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let doc = Libxml::parse("<root>t</root>", 0);
+    let root = doc.element("root");
+    let mut document = tree_document(&doc, &VerificationPolicy::default());
+    let root_identity = |document: &xml_sec::XmlDocument| document.with_view(root_of);
+    let target = root_identity(&document);
+    document
+        .insert_before(target, "<!--before-->\n<?pi data?>")
+        .expect("prolog content inserts");
+    assert!(
+        doc.dump()
+            .contains("<!--before-->\n<?pi data?>\n<root>t</root>"),
+        "{}",
+        doc.dump()
+    );
+    assert_eq!(doc.element("root"), root, "the document element is kept");
+    let refused = document.insert_before(root_identity(&document), "<x/>");
+    assert!(
+        refused.is_err(),
+        "a second element may not precede the document element"
+    );
 }
 
 #[test]
@@ -935,6 +1006,76 @@ fn chained_attribute_entities(levels: usize) -> Libxml {
     doc
 }
 
+/// The text of the root element's children and the value of its attribute
+/// `a`, as the projection of `doc` under a policy admitting a DTD reads them.
+fn projected_root(doc: &Libxml) -> Result<(String, Option<String>), xml_sec::XmlDocumentError> {
+    use xml_sec::policy::{VerificationPolicy, XmlInputPolicy};
+    let policy = VerificationPolicy {
+        xml: XmlInputPolicy {
+            allow_internal_dtd: true,
+        },
+        ..VerificationPolicy::default()
+    };
+    let document = xml_sec::XmlDocument::from_external_tree(
+        Box::new(super::LibxmlTree {
+            doc: doc.0,
+            journal: Vec::new(),
+        }),
+        &policy,
+    )?;
+    Ok(document.with_view(|view| {
+        let root = view.document().root_element();
+        let text = root.children().filter_map(xml_sec::Node::text).collect();
+        (text, root.attribute("a").map(String::from))
+    }))
+}
+
+#[test]
+fn an_entity_with_an_empty_replacement_projects_as_nothing() {
+    // XML 1.0 section 2.3 (production 9) admits an empty entity value; libxml2
+    // then keeps no replacement nodes for the declaration.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let doc = Libxml::parse("<!DOCTYPE r [<!ENTITY e ''>]><r a=\"x\">t&e;u</r>", 0);
+    assert_eq!(
+        projected_root(&doc).expect("an empty entity projects"),
+        ("tu".to_owned(), Some("x".to_owned()))
+    );
+}
+
+#[test]
+fn a_predefined_entity_reference_projects_as_its_character() {
+    // A reference the application builds to a predefined entity
+    // (XML 1.0 section 4.6) points to a declaration that holds its character
+    // as content and no replacement nodes; in content and in an attribute it
+    // reads as that character, as libxml2 itself reads it.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let doc = Libxml::parse("<r a=\"x\">t</r>", 0);
+    let root = doc.element("r");
+    // SAFETY: a live document and element; the references are new, detached
+    // nodes, one appended to the root and one made the attribute's only
+    // child in place of its text, which is unlinked and freed.
+    unsafe {
+        let content = xmlNewReference(doc.0, c"&amp;".as_ptr().cast());
+        assert!(!xmlAddChild(root, content).is_null());
+        let attribute = (*root).properties;
+        let value = xmlNewReference(doc.0, c"&lt;".as_ptr().cast());
+        let old = (*attribute).children;
+        super::xmlUnlinkNode(old);
+        super::xmlFreeNode(old);
+        (*attribute).children = value;
+        (*attribute).last = value;
+        (*value).parent = attribute.cast();
+    }
+    assert_eq!(
+        projected_root(&doc).expect("a predefined reference projects"),
+        ("t&".to_owned(), Some("<".to_owned()))
+    );
+}
+
 #[test]
 fn attribute_entity_expansion_is_bounded_while_the_value_is_built() {
     // References the tree keeps inside an attribute value are expanded by
@@ -974,14 +1115,14 @@ fn attribute_entity_expansion_is_bounded_while_the_value_is_built() {
     // is 100 expansions and one byte, within every limit, and the walk keeps
     // its levels on the heap.
     let chain = chained_attribute_entities(100);
-    let projected = xml_sec::XmlDocument::from_external_tree(
-        Box::new(super::LibxmlTree {
-            doc: chain.0,
-            journal: Vec::new(),
-        }),
-        &policy,
+    assert_eq!(
+        projected_root(&chain)
+            .expect("the chain projects")
+            .1
+            .as_deref(),
+        Some("x"),
+        "the value is the leaf the chain expands to"
     );
-    assert!(projected.is_ok(), "{:?}", projected.err());
     // 2^16 bytes through 2^11 expansions: refused at the byte limit before
     // the value is built past it.
     let mut limited = policy;
