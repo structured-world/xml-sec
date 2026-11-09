@@ -714,9 +714,6 @@ pub struct XmlDocument {
     requires_internal_dtd: bool,
     settings: DocumentParseSettings,
     cell: DocumentCell,
-    /// The encoding name the source declared, when decoding to UTF-8
-    /// rewrote it in the held text.
-    source_encoding: Option<alloc::boxed::Box<str>>,
     /// Open all-or-nothing mutations, innermost last.
     #[cfg(feature = "xmldsig-sign")]
     atomic: Vec<AtomicMutation>,
@@ -939,19 +936,6 @@ enum PreparedChange {
     Tree(Vec<tree_edits::ValidatedChange>, DocumentParseSettings),
 }
 
-/// The XML declaration of a parsed document (XML 1.0 section 2.8,
-/// production 23), as written; the text is held decoded to UTF-8, so
-/// `encoding` names the source encoding, not the held one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct XmlDeclaration<'a> {
-    /// The declared version.
-    pub version: &'a str,
-    /// The declared encoding name, if any.
-    pub encoding: Option<&'a str>,
-    /// The standalone declaration, if any.
-    pub standalone: Option<bool>,
-}
-
 /// Borrowed semantic view of one immutable [`XmlDocument`] generation.
 #[derive(Clone, Copy)]
 pub struct DocumentView<'a> {
@@ -1119,11 +1103,8 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<Self, XmlDocumentError> {
-        let (xml, source_encoding) = decode_xml_keeping_label(bytes, settings.max_bytes, budget)?;
-        let mut document =
-            Self::parse_recording_prior_work(xml.into_owned(), settings, budget, bytes.len())?;
-        document.source_encoding = source_encoding;
-        Ok(document)
+        let xml = decode_owned_xml(bytes, settings.max_bytes, budget)?;
+        Self::parse_recording_prior_work(xml, settings, budget, bytes.len())
     }
 
     pub(crate) fn parse_with_settings(
@@ -1162,7 +1143,6 @@ impl XmlDocument {
             requires_internal_dtd,
             settings,
             cell,
-            source_encoding: None,
             #[cfg(feature = "xmldsig-sign")]
             atomic: Vec::new(),
             #[cfg(feature = "xmldsig-sign")]
@@ -1204,7 +1184,6 @@ impl XmlDocument {
             requires_internal_dtd: has_dtd,
             settings,
             cell,
-            source_encoding: None,
             #[cfg(feature = "xmldsig-sign")]
             atomic: Vec::new(),
             #[cfg(feature = "xmldsig-sign")]
@@ -1262,51 +1241,6 @@ impl XmlDocument {
     #[cfg(feature = "xmldsig-sign")]
     pub(crate) const fn issued_generation(&self) -> u64 {
         self.issued
-    }
-
-    /// The XML declaration of the source; `None` when it has none, as for a
-    /// tree-backed document. `encoding` is the name the source declared, also
-    /// when its bytes were decoded from that encoding.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use xml_sec::XmlDocument;
-    ///
-    /// let document =
-    ///     XmlDocument::parse_bytes(b"<?xml version='1.0' encoding='ISO-8859-1'?><r>\xE9</r>").unwrap();
-    /// let declaration = document.declaration().unwrap();
-    /// assert_eq!(declaration.encoding, Some("ISO-8859-1"));
-    /// assert_eq!(declaration.standalone, None);
-    /// ```
-    #[must_use]
-    pub fn declaration(&self) -> Option<XmlDeclaration<'_>> {
-        // The held text was parsed whole, so its first token is well formed.
-        let Ok(xmlparser::Token::Declaration {
-            version,
-            encoding,
-            standalone,
-            ..
-        }) = xmlparser::Tokenizer::from(self.cell.borrow_owner().as_str()).next()?
-        else {
-            return None;
-        };
-        Some(XmlDeclaration {
-            version: version.as_str(),
-            encoding: self
-                .source_encoding
-                .as_deref()
-                .or(encoding.map(|name| name.as_str())),
-            standalone,
-        })
-    }
-
-    /// Whether the document has a document type declaration, whose
-    /// declarations its content depends on.
-    #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
-    #[must_use]
-    pub const fn declares_dtd(&self) -> bool {
-        self.requires_internal_dtd
     }
 
     #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
@@ -3113,16 +3047,6 @@ impl<'a> DocumentView<'a> {
     #[must_use]
     pub fn document(self) -> &'a Document<'a> {
         &self.parsed.document
-    }
-
-    /// The document's top-level nodes as a [`Fragment`], from which an
-    /// external tree builds the whole document.
-    ///
-    /// [`Fragment`]: crate::document::external::Fragment
-    #[cfg(feature = "external-tree")]
-    #[must_use]
-    pub fn content(self) -> crate::document::external::Fragment<'a> {
-        crate::document::external::Fragment::children_of(self.parsed.document.root())
     }
 
     /// The external node `node` of this view's tree was projected from, for
@@ -5193,21 +5117,19 @@ fn own_bounded_xml(
     Ok(xml.into())
 }
 
+fn decode_owned_xml(
+    bytes: &[u8],
+    maximum: usize,
+    budget: Option<&XmlParseWorkBudget>,
+) -> Result<String, XmlDocumentError> {
+    decode_xml_with_budget(bytes, maximum, budget).map(Cow::into_owned)
+}
+
 pub(crate) fn decode_xml_with_budget<'a>(
     bytes: &'a [u8],
     maximum: usize,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<Cow<'a, str>, XmlDocumentError> {
-    decode_xml_keeping_label(bytes, maximum, budget).map(|(text, _)| text)
-}
-
-/// Decode as [`decode_xml_with_budget`], also returning the encoding name
-/// the declaration gave when transcoding replaced it with `UTF-8`.
-fn decode_xml_keeping_label<'a>(
-    bytes: &'a [u8],
-    maximum: usize,
-    budget: Option<&XmlParseWorkBudget>,
-) -> Result<(Cow<'a, str>, Option<alloc::boxed::Box<str>>), XmlDocumentError> {
     if bytes.len() > maximum {
         return Err(XmlDocumentError::DocumentTooLarge {
             maximum,
@@ -5218,27 +5140,12 @@ fn decode_xml_keeping_label<'a>(
     // Charge it before encoding detection/transcoding and retain that charge
     // in the same sticky budget used by preflight and semantic construction.
     charge_parse_work(budget, bytes.len())?;
-    let label = core::cell::RefCell::new(None);
-    let text = crate::xml_input_shared::decode_xml_bounded_with_encoding_guard(
-        bytes,
-        maximum,
-        |selected, declared| {
-            // UTF-8 text keeps its declaration as written.
-            if let Some(declared) = declared
-                && selected != encoding_rs::UTF_8.name()
-            {
-                *label.borrow_mut() = Some(declared.into());
-            }
-            Ok(())
-        },
-    )
-    .map_err(|error| match error {
+    xml_sec_xml_input::decode_xml_bounded(bytes, None, maximum).map_err(|error| match error {
         xml_sec_xml_input::Error::DecodedLimit { actual, .. } => {
             XmlDocumentError::DocumentTooLarge { maximum, actual }
         }
         error => XmlDocumentError::Encoding(error),
-    })?;
-    Ok((text, label.into_inner()))
+    })
 }
 
 fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, XmlDocumentError> {

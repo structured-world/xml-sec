@@ -10,10 +10,10 @@
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
+use xml_sec::ParseError;
 use xml_sec::document::external::{
     ExternalNode, ExternalTree, Fragment, FragmentEvent, TreeEdit, TreeEditError, TreeSink,
 };
-use xml_sec::{ParseError, XmlDocument};
 use xml_sec_capi::ffi::{XsDocument, XsError, XsPolicy};
 use xml_sec_capi::status::{XS_INTERNAL, XS_INVALID_ARGUMENT, XsStatus};
 
@@ -104,10 +104,6 @@ pub struct XmlDoc {
     pub compression: c_int,
     pub standalone: c_int,
     pub int_subset: *mut c_void,
-    pub ext_subset: *mut c_void,
-    pub old_ns: *mut XmlNs,
-    pub version: *const XmlChar,
-    pub encoding: *const XmlChar,
 }
 
 /// `xmlNodeSet`: an `XPath` node set. Namespace members are `xmlNs` copies
@@ -170,9 +166,6 @@ unsafe extern "C" {
     fn xmlSearchNs(doc: *mut XmlDoc, node: *mut XmlNode, prefix: *const XmlChar) -> *mut XmlNs;
     fn xmlUnlinkNode(node: *mut XmlNode);
     fn xmlFreeNode(node: *mut XmlNode);
-    fn xmlNewDoc(version: *const XmlChar) -> *mut XmlDoc;
-    fn xmlFreeDoc(doc: *mut XmlDoc);
-    fn xmlStrdup(text: *const XmlChar) -> *mut XmlChar;
     fn xmlIsID(doc: *mut XmlDoc, element: *mut XmlNode, attribute: *mut XmlAttr) -> c_int;
     fn xmlAddID(
         context: *mut c_void,
@@ -184,7 +177,7 @@ unsafe extern "C" {
 
 /// The layout record this crate's declarations stand for, in the order of
 /// `layout.c`.
-fn expected_layout() -> [usize; 52] {
+fn expected_layout() -> [usize; 49] {
     use std::mem::{offset_of, size_of};
     [
         offset_of!(XmlNode, kind),
@@ -214,9 +207,6 @@ fn expected_layout() -> [usize; 52] {
         offset_of!(XmlDoc, children),
         offset_of!(XmlDoc, last),
         offset_of!(XmlDoc, int_subset),
-        offset_of!(XmlDoc, standalone),
-        offset_of!(XmlDoc, version),
-        offset_of!(XmlDoc, encoding),
         offset_of!(XmlEntity, children),
         offset_of!(XmlEntity, content),
         offset_of!(XmlEntity, length),
@@ -898,79 +888,6 @@ impl LibxmlTree {
         }
         Ok(())
     }
-}
-
-/// A new libxml2 document holding `document`, which the core parsed under
-/// its policy: the nodes are created with libxml2's constructors from the
-/// core's tree, so libxml2 parses nothing, and the declaration's version,
-/// encoding name and standalone value are carried as libxml2's parser would
-/// record them. The caller owns the result and frees it with `xmlFreeDoc`.
-///
-/// # Errors
-/// A document with a document type declaration, whose declarations a
-/// libxml2 tree would have to carry as a DTD this build does not create, a
-/// linked libxml2 laid out differently, or a node libxml2 cannot create.
-pub fn new_document(document: &XmlDocument) -> Result<*mut XmlDoc, TreeEditError> {
-    if !layout_matches() {
-        return Err(edit_error(
-            "the linked libxml2 lays out its tree differently",
-        ));
-    }
-    if document.declares_dtd() {
-        return Err(edit_error("a document type declaration is not built"));
-    }
-    let declaration = document.declaration();
-    let version = c_string(declaration.map_or("1.0", |declaration| declaration.version))?;
-    let encoding = declaration
-        .and_then(|declaration| declaration.encoding)
-        .map(c_string)
-        .transpose()?;
-    // SAFETY: libxml2 copies the version.
-    let doc = unsafe { xmlNewDoc(version.as_ptr().cast()) };
-    if doc.is_null() {
-        return Err(edit_error("libxml2 could not create a document"));
-    }
-    // The document owns everything built from here on, so freeing it is the
-    // whole cleanup of a failed build.
-    let free = move |error| {
-        // SAFETY: `doc` was created above and nothing else refers to it.
-        unsafe { xmlFreeDoc(doc) };
-        Err(error)
-    };
-    if let Some(encoding) = encoding {
-        // SAFETY: libxml2 frees the copy with the document.
-        let copy = unsafe { xmlStrdup(encoding.as_ptr().cast()) };
-        if copy.is_null() {
-            return free(edit_error("libxml2 could not copy the encoding name"));
-        }
-        // SAFETY: a fresh document has no encoding yet.
-        unsafe { (*doc).encoding = copy };
-    }
-    // libxml2's parser records -1 without a declaration and -2 for one
-    // without a standalone value.
-    let standalone = match declaration.map(|declaration| declaration.standalone) {
-        None => -1,
-        Some(None) => -2,
-        Some(Some(standalone)) => c_int::from(standalone),
-    };
-    // SAFETY: a live document.
-    unsafe { (*doc).standalone = standalone };
-    let mut builder = Builder {
-        doc,
-        context: std::ptr::null_mut(),
-        top: Vec::new(),
-        open: Vec::new(),
-    };
-    let built = document.with_view(|view| view.content().walk(&mut |event| builder.event(event)));
-    if let Err(error) = built {
-        builder.discard();
-        return free(error);
-    }
-    for node in builder.top {
-        // SAFETY: built detached in `doc`, whose node part is its common part.
-        unsafe { link(doc.cast(), std::ptr::null_mut(), node) };
-    }
-    Ok(doc)
 }
 
 /// An element a fragment build created whose end tag has not come yet.
