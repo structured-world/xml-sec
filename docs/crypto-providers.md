@@ -84,7 +84,16 @@ and encryption pipelines, usage restrictions, wrong PINs, tampering, stale
 objects, provider binding and concurrent operations. CI runs both parser
 backends and differential mode against this same harness.
 
-RustCrypto is the default. Enable `aws-lc-fips` to additionally compile the official
+RustCrypto is the default provider, compiled by the `rustcrypto` feature. A
+verification-only build without it (`xmldsig` alone) carries no RSA, DSA,
+elliptic-curve, EdDSA, HMAC or digest backend: an application that ships its
+own primitives implements `CryptoProvider` and passes it to
+`VerifyContext::provider`. Its `verify` receives the key's SPKI from
+`VerifyingKey::verification_spki`, after the core has read that key, checked
+it against the operation policy and framed `SignatureValue` for its width.
+`KeyValue` keys reach it as their canonical DER `SubjectPublicKeyInfo`.
+
+Enable `aws-lc-fips` to additionally compile the official
 `aws-lc-rs` wrapper with its `fips` feature and without its default features. This
 links the AWS-LC FIPS module, not the ordinary AWS-LC module. It requires the native
 toolchain described in the [AWS build requirements](https://aws.github.io/aws-lc-rs/requirements/index.html).

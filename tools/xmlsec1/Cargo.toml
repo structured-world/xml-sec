@@ -61,7 +61,8 @@ pkcs1 = { version = "0.8.0-rc.5", default-features = false, features = ["alloc",
 [features]
 default = ["std", "xmldsig", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = ["xml-sec/std"]
-xmldsig = ["xml-sec/xmldsig"]
+# The command verifies with the built-in provider.
+xmldsig = ["xml-sec/xmldsig", "xml-sec/rustcrypto"]
 xmlenc = ["xmldsig", "xml-sec/xmlenc", "xml-sec-config/xmlenc"]
 c14n = ["xml-sec/c14n"]
 xml-backend-xmloxide = ["xml-sec/xml-backend-xmloxide", "xml-sec-config/xml-backend-xmloxide"]

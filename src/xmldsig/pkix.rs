@@ -957,6 +957,9 @@ fn critical_extension_text(
         .to_owned())
 }
 
+/// `id-dsa`, 1.2.840.10040.4.1 (RFC 3279 section 2.3.2), as content octets.
+pub(crate) const ID_DSA: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x38, 0x04, 0x01];
+
 fn materialize_effective_spki<W: Work>(
     key: structured_pkix::path::WorkingKey<'_>,
     execution: &W,
@@ -979,7 +982,7 @@ fn materialize_effective_spki<W: Work>(
                     own.offset(),
                 ))
             })?;
-        if own.algorithm().as_bytes() == dsa::OID.as_bytes() {
+        if own.algorithm().as_bytes() == ID_DSA {
             structured_pkix::key::dsa::read(key, execution).map_err(X509ChainError::Processing)?;
         }
     }
@@ -1141,7 +1144,7 @@ impl ProviderVerifier<'_> {
                 .map_err(X509ChainError::Processing)?;
         }
         if matches!(algorithm, crate::provider::X509SignatureAlgorithm::Dsa(_))
-            && key_algorithm.algorithm().as_bytes() == dsa::OID.as_bytes()
+            && key_algorithm.algorithm().as_bytes() == ID_DSA
             && parameters.is_none()
         {
             // RFC 5280 6.1.4(e) needs the prospective path's working parameters.
@@ -1698,7 +1701,7 @@ impl CertificateSession {
                 SpkiAlgorithm::RsaPss
             } else if algorithm == structured_pkix::oid::EC_PUBLIC_KEY {
                 SpkiAlgorithm::Ec
-            } else if algorithm.as_bytes() == dsa::OID.as_bytes() {
+            } else if algorithm.as_bytes() == ID_DSA {
                 SpkiAlgorithm::Dsa
             } else if algorithm == structured_pkix::oid::ED25519 {
                 SpkiAlgorithm::Ed25519

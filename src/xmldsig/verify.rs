@@ -50,9 +50,10 @@ use super::parse::{
     parse_reference_with_xpath_budget, parse_signed_info_with_xpath_budget,
     parse_x509_data_dispatch_with_budget_and_provider, reference_digest_method,
 };
+use super::signature::SignatureVerificationError;
+#[cfg(feature = "rustcrypto")]
 use super::signature::{
-    SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
-    verify_rsa_signature_pem,
+    verify_dsa_signature_spki, verify_ecdsa_signature_pem, verify_rsa_signature_pem,
 };
 #[cfg(test)]
 use super::transforms::BASE64_TRANSFORM_URI;
@@ -2219,6 +2220,7 @@ impl From<OperationPlanError> for DsigError {
 /// # Errors
 /// Returns an error for invalid XML, signature structure, key encoding, denied
 /// algorithms, resource exhaustion, or reference-processing failures.
+#[cfg(feature = "rustcrypto")]
 pub fn verify_signature_with_pem_key(
     xml: &str,
     public_key_pem: &str,
@@ -6689,6 +6691,7 @@ fn signature_value_limits(
 }
 
 /// Verify a method whose key the PEM block's SPKI carries for `modern::verify`.
+#[cfg(feature = "rustcrypto")]
 fn verify_modern_pem(
     algorithm: SignatureAlgorithm,
     public_key_pem: &str,
@@ -6707,6 +6710,7 @@ fn verify_modern_pem(
     )?)
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_with_algorithm(
     algorithm: SignatureAlgorithm,
     public_key_pem: &str,

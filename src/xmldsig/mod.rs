@@ -99,9 +99,11 @@ pub use builder::{
     ObjectBuilder, ObjectContent, ObjectElement, ReferenceBuilder, SignatureBuilder,
     SignatureBuilderError,
 };
+#[cfg(feature = "rustcrypto")]
+pub use digest::compute_digest;
 pub(crate) use digest::finish_digest;
 pub use digest::{
-    DigestAlgorithm, DigestOutput, MAX_DIGEST_OUTPUT, compute_digest, compute_digest_with_provider,
+    DigestAlgorithm, DigestOutput, MAX_DIGEST_OUTPUT, compute_digest_with_provider,
     constant_time_eq,
 };
 pub use keys::{
@@ -125,8 +127,10 @@ pub use sign::{
     SigningError, X509CertificateKeyInfoWriter, X509DigestKeyInfoWriter,
     compute_reference_digest_values, fill_reference_digest_values, validate_signing_key,
 };
+pub use signature::SignatureVerificationError;
+#[cfg(feature = "rustcrypto")]
 pub use signature::{
-    SignatureVerificationError, verify_dsa_signature_spki, verify_ecdsa_signature_pem,
+    verify_dsa_signature_spki, verify_ecdsa_signature_pem,
     verify_ecdsa_signature_pem_with_encoding, verify_ecdsa_signature_spki,
     verify_ecdsa_signature_spki_with_encoding, verify_rsa_signature_pem, verify_rsa_signature_spki,
 };
@@ -141,6 +145,8 @@ pub use transforms::{
 };
 pub use trust::{KeyTrustEvidence, ResolvedVerificationKey, TrustedPublicKey, X509TrustEvidence};
 pub use types::{NodeSet, TransformData, TransformError};
+#[cfg(feature = "rustcrypto")]
+pub use verify::verify_signature_with_pem_key;
 pub use verify::{
     AuthenticatedReference, BareNameTarget, CallerTrustedSignatureKey, CatalogueCompleteness,
     CatalogueError, DetachedChain, DetachedCompletion, DetachedPayload, DigestMethodResolution,
@@ -156,8 +162,7 @@ pub use verify::{
     has_same_document_encapsulation, inspect_pinned_verification_key_info,
     inspect_signing_key_info, inspect_verification_key_info,
     materialize_signing_key_info_references, materialize_verification_key_info_references,
-    process_all_references, process_reference, verify_signature_with_pem_key,
-    with_verified_request,
+    process_all_references, process_reference, with_verified_request,
 };
 pub use x509::{
     X509ChainError, X509ChainOptions, verify_x509_certificate_chain,

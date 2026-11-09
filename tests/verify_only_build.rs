@@ -1,7 +1,8 @@
-//! An `XMLDSig` build without `xmldsig-sign`: verification works from public
-//! material, while signing, private-key import and randomness are not compiled.
+//! An `XMLDSig` build with the built-in provider but without `xmldsig-sign`:
+//! verification works from public material, while signing, private-key
+//! import and randomness are not compiled.
 #![cfg(all(
-    feature = "xmldsig",
+    feature = "rustcrypto",
     not(feature = "xmldsig-sign"),
     any(feature = "xml-backend-xmloxide", feature = "xml-backend-roxmltree")
 ))]

@@ -1,4 +1,5 @@
-//! RustCrypto-owned modern key handles used only behind provider dispatch.
+//! RustCrypto-owned modern key handles used only behind provider dispatch,
+//! and the provider-independent admission of their public keys.
 
 use super::SignatureAlgorithm;
 #[cfg(feature = "xmldsig-sign")]
@@ -6,6 +7,7 @@ use super::{SigningKey, SigningKeyError, SigningPublicKeyInfo};
 use alloc::borrow::ToOwned;
 #[cfg(feature = "xmldsig-sign")]
 use pkcs8::{DecodePrivateKey, EncodePrivateKey, EncodePublicKey};
+#[cfg(feature = "rustcrypto")]
 use sha2::digest::Update;
 
 #[cfg(feature = "xmldsig-sign")]
@@ -183,8 +185,28 @@ pub(crate) fn validate_public_key(
         }
     }
     match algorithm.eddsa_key_algorithm() {
+        // The built-in provider also decodes the point it will verify with.
+        #[cfg(feature = "rustcrypto")]
         Some(SignatureAlgorithm::Ed25519) => ed25519_verifying_key(der, session).map(|_| ()),
+        #[cfg(feature = "rustcrypto")]
         Some(SignatureAlgorithm::Ed448) => ed448_verifying_key(der, session).map(|_| ()),
+        // Otherwise the RFC 8410 identity and width are what can be checked
+        // here; whether the octets decode to a point is the verifying
+        // provider's decision.
+        #[cfg(not(feature = "rustcrypto"))]
+        Some(SignatureAlgorithm::Ed25519) => rfc8410_public_octets(
+            der,
+            structured_pkix::key::rfc8410::Algorithm::Ed25519,
+            session,
+        )
+        .map(|_| ()),
+        #[cfg(not(feature = "rustcrypto"))]
+        Some(SignatureAlgorithm::Ed448) => rfc8410_public_octets(
+            der,
+            structured_pkix::key::rfc8410::Algorithm::Ed448,
+            session,
+        )
+        .map(|_| ()),
         _ => Err(super::SignatureVerificationError::UnsupportedAlgorithm {
             uri: algorithm.uri().to_owned(),
         }),
@@ -206,6 +228,7 @@ fn rfc8410_public_octets<'a>(
 }
 
 /// RFC 8410 Ed25519 SPKI read by the shared PKIX reader, then point-decoded.
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn ed25519_verifying_key(
     der: &[u8],
     session: &super::pkix::CertificateSession,
@@ -223,6 +246,7 @@ pub(crate) fn ed25519_verifying_key(
 }
 
 /// RFC 8410 Ed448 SPKI read by the shared PKIX reader, then point-decoded.
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn ed448_verifying_key(
     der: &[u8],
     session: &super::pkix::CertificateSession,
@@ -239,6 +263,7 @@ pub(crate) fn ed448_verifying_key(
         .ok_or(super::SignatureVerificationError::InvalidKeyDer)
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify(
     algorithm: SignatureAlgorithm,
     der: &[u8],
@@ -256,6 +281,7 @@ pub(crate) fn verify(
     )
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify_with_context(
     algorithm: SignatureAlgorithm,
     der: &[u8],
@@ -338,6 +364,7 @@ pub(crate) fn verify_with_context(
     }
 }
 
+#[cfg(feature = "rustcrypto")]
 fn ed25519ctx_hash(context: &super::SignatureContext) -> sha2::Sha512 {
     use sha2::Digest;
     // RFC 8032 sections 2 and 5.1.6: dom2(0, C) precedes both nonce
@@ -383,6 +410,7 @@ fn sign_ed25519ctx(
     ed25519_dalek::Signature::from_components(r, s.to_bytes())
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_ed25519ctx(
     key: &ed25519_dalek::VerifyingKey,
     context: &super::SignatureContext,

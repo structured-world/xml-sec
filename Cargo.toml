@@ -408,6 +408,9 @@ rcgen = "0.14.6"
 x509-cert = { version = "0.3", default-features = false }
 x509-parser = "0.18"
 pem = "4"
+# The provider-only build's test provider computes RSA itself, as a
+# downstream provider would, without the built-in backends.
+num-bigint = "0.4"
 # The vendored ML-DSA tests draw random polynomials in every feature set.
 getrandom = { version = "0.4", features = ["sys_rng"] }
 rand_chacha = "0.10"
@@ -418,10 +421,10 @@ tempfile = "3"
 
 [features]
 # Measurement hooks only; no checks are bypassed and no timers run in production.
-benchmark-internals = ["xmldsig", "xmlenc", "c14n", "xml-backends-all"]
+benchmark-internals = ["xmldsig", "rustcrypto", "xmlenc", "c14n", "xml-backends-all"]
 benchmark-alloc = ["benchmark-internals"]
 legacy-algorithms = ["dep:ripemd", "dep:md-5", "dep:des"]
-default = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
+default = ["std", "xmldsig", "rustcrypto", "xmldsig-sign", "xmlenc", "c14n", "xml-backend-xmloxide"]
 std = [
     "thiserror/std",
     "xmlparser/std",
@@ -438,7 +441,8 @@ std = [
     "p384?/precomputed-tables",
     "p521?/precomputed-tables",
 ]
-aws-lc-fips = ["std", "xmldsig", "dep:aws-lc-rs"]
+# The FIPS provider builds beside the built-in one; the caller selects which runs.
+aws-lc-fips = ["std", "xmldsig", "rustcrypto", "dep:aws-lc-rs"]
 pkcs11 = ["std", "xmlenc", "dep:cryptoki"]
 xml-backend-xmloxide = []
 xml-backend-roxmltree = ["dep:memchr"]
@@ -449,10 +453,31 @@ xml-backends-all = ["xml-backend-xmloxide", "xml-backend-roxmltree"]
 # Compatibility alias for existing CI/fuzz builds. Unlike `xml-backends-all`,
 # this also selects differential parsing as the default runtime mode.
 xml-backend-differential = ["xml-backends-all"]
-xmldsig = [            # XML Digital Signature verification and public-key inventory
+# XML Digital Signature verification and public-key inventory. Every
+# cryptographic operation goes through the caller-selected `CryptoProvider`;
+# without `rustcrypto` none is built in, so a provider must be supplied.
+xmldsig = [
     "no-unsafe",
     "embedded",
     "dep:der",
+    "dep:winnow",
+    "dep:libm",
+    "dep:pkcs8",
+    "dep:pkcs1",
+    "dep:snafu",
+    "dep:structured-pkix",
+    # SHA-256 identities of certificate paths, resources and evidence: an
+    # identity lookup, not a document digest, so no provider computes them.
+    "dep:sha2",
+    # Constant-time comparison of computed and declared digest values.
+    "dep:subtle",
+    "dep:tinyvec",
+    "dep:zeroize",
+]
+# The built-in `RustCryptoProvider` and its algorithm backends: digests, HMAC,
+# RSA, DSA, ECDSA, EdDSA. Without it a verify-only build carries none of them.
+rustcrypto = [
+    "xmldsig",
     "dep:crypto-bigint",
     "dep:dsa",
     "dep:ed25519-dalek",
@@ -460,25 +485,15 @@ xmldsig = [            # XML Digital Signature verification and public-key inven
     "dep:ed448-goldilocks",
     "dep:hmac",
     "dep:md-5",
-    "dep:winnow",
-    "dep:libm",
     "dep:p256",
     "dep:p384",
     "dep:p521",
     "dep:primeorder",
-    "dep:pkcs8",
-    "dep:pkcs1",
     "dep:rsa",
     "dep:sha1",
-    "dep:sha2",
     "dep:keccak",
     "dep:sponge-cursor",
     "dep:signature",
-    "dep:snafu",
-    "dep:subtle",
-    "dep:structured-pkix",
-    "dep:tinyvec",
-    "dep:zeroize",
 ]
 # CMS SignedData and RFC 3161 timestamp signatures through the selected provider.
 cms = ["xmldsig", "dep:structured-cms"]
@@ -486,6 +501,8 @@ cms = ["xmldsig", "dep:structured-cms"]
 # PKCS#8, PKCS#12) on top of verification.
 xmldsig-sign = [
     "xmldsig",
+    # Private keys are imported into and signed with the built-in backends.
+    "rustcrypto",
     # Signing randomness and the signature writer need the host.
     "std",
     "dep:getrandom",
@@ -528,9 +545,9 @@ c14n = []              # XML Canonicalization (inclusive + exclusive)
 # engine shares state across threads and reads the host clock, so it needs std.
 xslt = ["xmldsig", "std", "dep:icu_collator", "dep:icu_locale", "dep:memchr", "dep:roxmltree", "dep:time", "dep:url"]
 # Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
-experimental-pq = ["xmldsig", "der/derive", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
+experimental-pq = ["xmldsig", "rustcrypto", "der/derive", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 # DSTU 4145 verification with GOST 34.311 and DSTU 7564; build capability is not policy permission.
-dstu4145 = ["xmldsig", "dep:structured-dstu4145", "dep:once_cell"]
+dstu4145 = ["xmldsig", "rustcrypto", "dep:structured-dstu4145", "dep:once_cell"]
 no-unsafe = []
 embedded = []
 

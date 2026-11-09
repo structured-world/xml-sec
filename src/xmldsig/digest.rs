@@ -6,7 +6,9 @@
 //! Operation digest computation uses the selected `CryptoProvider`; the built-in
 //! standalone convenience path uses `RustCrypto`.
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::boxed::Box;
+#[cfg(feature = "rustcrypto")]
+use alloc::vec::Vec;
 use subtle::ConstantTimeEq;
 
 /// Digest algorithms supported by `XMLDSig`.
@@ -192,6 +194,7 @@ impl DigestAlgorithm {
 /// # Panics
 /// Panics if the built-in provider violates its advertised digest capability
 /// or returns an output width inconsistent with the selected algorithm.
+#[cfg(feature = "rustcrypto")]
 #[must_use]
 pub fn compute_digest(algorithm: DigestAlgorithm, data: &[u8]) -> Vec<u8> {
     compute_digest_with_provider(

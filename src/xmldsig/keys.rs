@@ -5,9 +5,9 @@ use core::fmt;
 
 #[cfg(test)]
 use super::parse::parse_x509_certificate;
-use crate::rsa_encoding::RsaPublicKeyEncoding as _;
-use crypto_bigint::BoxedUint;
+#[cfg(feature = "rustcrypto")]
 use dsa::pkcs8::EncodePublicKey as DsaEncodePublicKey;
+#[cfg(feature = "rustcrypto")]
 use hmac::{KeyInit, Mac};
 #[cfg(test)]
 use x509_parser::prelude::FromDer;
@@ -15,18 +15,23 @@ use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
 use zeroize::Zeroizing;
 
+#[cfg(feature = "rustcrypto")]
+use super::parse::{EC_P256_OID, EC_P384_OID, EC_P521_OID};
 use super::pkix::X509DataSource;
 use super::signature::{
     signature_value_matches_spki_with_encoding, validate_dsa_signature_spki_with_minimum,
-    validate_rsa_signature_spki_with_minimum, verify_dsa_signature_spki_primitive,
-    verify_ecdsa_signature_spki_in, verify_rsa_signature_spki_primitive,
+    validate_rsa_signature_spki_with_minimum,
+};
+#[cfg(feature = "rustcrypto")]
+use super::signature::{
+    verify_dsa_signature_spki_primitive, verify_ecdsa_signature_spki_in,
+    verify_rsa_signature_spki_primitive,
 };
 use super::{
     DsigError, KeyInfo, KeyInfoSource, KeyResolver, KeyValueInfo, SignatureAlgorithm, VerifyingKey,
     X509ChainOptions, X509DataInfo,
     parse::{
-        EC_P256_OID, EC_P384_OID, EC_P521_OID, ParseError, X509ChainBuildError,
-        build_x509_certificate_paths_to_selector_targets,
+        ParseError, X509ChainBuildError, build_x509_certificate_paths_to_selector_targets,
         build_x509_certificate_paths_to_trusted_prefix, x509_certificate_matches_any_selector,
         x509_data_has_lookup_identifiers, x509_selector_categories_match_candidates,
     },
@@ -159,6 +164,31 @@ impl HmacVerificationKey {
         signature_value: &[u8],
     ) -> Result<bool, DsigError> {
         self.validate_output(policy, algorithm, signature_value)?;
+        // The secret never leaves this key, so its MAC is computed here, by
+        // the built-in backend; without it no HMAC method can be verified.
+        #[cfg(feature = "rustcrypto")]
+        {
+            self.mac_matches(algorithm, signed_data, signature_value)
+        }
+        #[cfg(not(feature = "rustcrypto"))]
+        {
+            let _ = signed_data;
+            Err(super::SignatureVerificationError::UnsupportedAlgorithm {
+                uri: algorithm.uri().into(),
+            }
+            .into())
+        }
+    }
+
+    /// Whether `signature_value` is the leading part of this key's MAC over
+    /// `signed_data`, compared in constant time.
+    #[cfg(feature = "rustcrypto")]
+    fn mac_matches(
+        &self,
+        algorithm: SignatureAlgorithm,
+        signed_data: &[u8],
+        signature_value: &[u8],
+    ) -> Result<bool, DsigError> {
         macro_rules! verify_hmac {
             ($digest:ty) => {{
                 let mut mac = hmac::Hmac::<$digest>::new_from_slice(&self.secret)
@@ -376,6 +406,40 @@ impl VerificationKey {
         if algorithm != self.algorithm {
             return Err(KeyResolutionError::AlgorithmMismatch.into());
         }
+        #[cfg(feature = "rustcrypto")]
+        {
+            self.verify_builtin(
+                algorithm,
+                context,
+                signed_data,
+                signature_value,
+                encoding,
+                session,
+            )
+        }
+        // Without the built-in backends a selected provider verifies with this
+        // key's SPKI (`verification_spki`); the key itself computes nothing.
+        #[cfg(not(feature = "rustcrypto"))]
+        {
+            let _ = (context, signed_data, signature_value, encoding, session);
+            Err(super::SignatureVerificationError::UnsupportedAlgorithm {
+                uri: algorithm.uri().into(),
+            }
+            .into())
+        }
+    }
+
+    /// The built-in backends' check of `signature_value` with this key.
+    #[cfg(feature = "rustcrypto")]
+    fn verify_builtin(
+        &self,
+        algorithm: SignatureAlgorithm,
+        context: &super::SignatureContext,
+        signed_data: &[u8],
+        signature_value: &[u8],
+        encoding: crate::policy::EcdsaSignatureValueEncoding,
+        session: &super::pkix::CertificateSession,
+    ) -> Result<bool, DsigError> {
         let key = &self.public_key_bytes;
         #[cfg(feature = "dstu4145")]
         let dstu4145 = algorithm.dstu4145_digest().is_some();
@@ -2141,19 +2205,38 @@ fn selected_x509_path_matches_selectors(
     .map_err(selector_resolution_error)
 }
 
+/// DER `SubjectPublicKeyInfo` (RFC 5280 section 4.1.2.7) of `algorithm`
+/// carrying `key` as its subjectPublicKey bits.
+fn spki_der(
+    algorithm: pkcs8::spki::AlgorithmIdentifierRef<'_>,
+    key: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    use pkcs8::der::Encode as _;
+    pkcs8::SubjectPublicKeyInfoRef {
+        algorithm,
+        subject_public_key: pkcs8::der::asn1::BitStringRef::new(0, key)
+            .map_err(|_| KeyResolutionError::InvalidPublicKey)?,
+    }
+    .to_der()
+    .map_err(|_| KeyResolutionError::InvalidPublicKey)
+}
+
+/// The rsaEncryption SPKI of `RSAKeyValue` components (RFC 3279 section
+/// 2.3.1). Key strength and exponent policy apply to the resolved key.
 fn rsa_key_value_to_spki_der(
     modulus: &[u8],
     exponent: &[u8],
 ) -> Result<Vec<u8>, KeyResolutionError> {
+    use pkcs8::der::Encode as _;
     let (modulus, exponent) = bounded_rsa_public_components(modulus, exponent)?;
-    let key = rsa::RsaPublicKey::new(
-        BoxedUint::from_be_slice_vartime(modulus),
-        BoxedUint::from_be_slice_vartime(exponent),
-    )
-    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
-    key.to_public_key_der()
-        .map_err(|_| KeyResolutionError::InvalidPublicKey)
-        .map(|der| der.as_bytes().to_vec())
+    let invalid = |_| KeyResolutionError::InvalidPublicKey;
+    let key = pkcs1::RsaPublicKeyRef {
+        modulus: pkcs1::UintRef::new(modulus).map_err(invalid)?,
+        public_exponent: pkcs1::UintRef::new(exponent).map_err(invalid)?,
+    }
+    .to_der()
+    .map_err(invalid)?;
+    spki_der(pkcs1::ALGORITHM_ID, &key)
 }
 
 pub(crate) fn bounded_rsa_public_components<'a>(
@@ -2177,9 +2260,28 @@ pub(crate) fn bounded_rsa_public_components<'a>(
     {
         return Err(KeyResolutionError::InvalidPublicKey);
     }
+    // RFC 8017 section 3.1: n is a product of odd primes and e an odd integer
+    // with 3 <= e < n. Both are trimmed, so a shorter or lexicographically
+    // smaller big-endian exponent is the smaller number.
+    let exponent_value = (exponent.len() <= 8).then(|| {
+        exponent
+            .iter()
+            .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte))
+    });
+    let below_modulus =
+        exponent.len() < modulus.len() || (exponent.len() == modulus.len() && exponent < modulus);
+    if modulus[modulus.len() - 1] & 1 == 0
+        || !exponent_value.is_some_and(|value| {
+            value >= 3 && value & 1 == 1 && value <= crate::hard_limits::RSA_PUBLIC_EXPONENT_CEILING
+        })
+        || !below_modulus
+    {
+        return Err(KeyResolutionError::InvalidPublicKey);
+    }
     Ok((modulus, exponent))
 }
 
+#[cfg(feature = "rustcrypto")]
 fn dsa_key_value_to_spki_der(
     p: &[u8],
     q: &[u8],
@@ -2188,6 +2290,7 @@ fn dsa_key_value_to_spki_der(
 ) -> Result<Vec<u8>, KeyResolutionError> {
     // Bound borrowed unsigned components before any bigint allocation or
     // subgroup exponentiation, not only after the SPKI has been produced.
+    // An invalid group fails here, so resolution moves on to the next key.
     super::signature::dsa_verifying_key(p, q, g, y)
         .ok_or(KeyResolutionError::InvalidPublicKey)?
         .to_public_key_der()
@@ -2195,6 +2298,74 @@ fn dsa_key_value_to_spki_der(
         .map(|der| der.as_bytes().to_vec())
 }
 
+/// The id-dsa SPKI of `DSAKeyValue` components: `Dss-Parms` as parameters
+/// and the INTEGER `y` as key bits (RFC 3279 section 2.3.2). Whether they
+/// form a valid group is the verifying provider's decision.
+#[cfg(not(feature = "rustcrypto"))]
+fn dsa_key_value_to_spki_der(
+    p: &[u8],
+    q: &[u8],
+    g: &[u8],
+    y: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    use pkcs8::der::{
+        Encode as _,
+        asn1::{AnyRef, ObjectIdentifier, UintRef},
+    };
+    const ID_DSA: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10040.4.1");
+    fn component(bytes: &[u8]) -> Result<UintRef<'_>, KeyResolutionError> {
+        let magnitude = &bytes[bytes.iter().take_while(|byte| **byte == 0).count()..];
+        if magnitude.is_empty()
+            || magnitude.len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING
+        {
+            return Err(KeyResolutionError::InvalidPublicKey);
+        }
+        UintRef::new(magnitude).map_err(|_| KeyResolutionError::InvalidPublicKey)
+    }
+    let invalid = |_| KeyResolutionError::InvalidPublicKey;
+    // SEQUENCE { p, q, g } encodes as the SEQUENCE OF its three INTEGERs.
+    let parameters = [component(p)?, component(q)?, component(g)?]
+        .to_der()
+        .map_err(invalid)?;
+    let key = component(y)?.to_der().map_err(invalid)?;
+    spki_der(
+        pkcs8::spki::AlgorithmIdentifierRef {
+            oid: ID_DSA,
+            parameters: Some(AnyRef::try_from(parameters.as_slice()).map_err(invalid)?),
+        },
+        &key,
+    )
+}
+
+/// The id-ecPublicKey SPKI of an `ECKeyValue`: the named curve as parameters
+/// and the uncompressed SEC1 point as key bits (RFC 5480 sections 2.1.1 and
+/// 2.2). Only an arithmetic backend can decompress a point or place it on
+/// the curve, so without one the point must be uncompressed and the
+/// verifying provider decides whether it lies on the curve.
+#[cfg(not(feature = "rustcrypto"))]
+fn ec_key_value_to_spki_der(
+    curve_oid: &str,
+    public_key: &[u8],
+) -> Result<Vec<u8>, KeyResolutionError> {
+    use pkcs8::der::asn1::{AnyRef, ObjectIdentifier};
+    // id-ecPublicKey, 1.2.840.10045.2.1 (RFC 5480 section 2.1.1).
+    const ID_EC_PUBLIC_KEY: ObjectIdentifier = ObjectIdentifier::new_unwrap("1.2.840.10045.2.1");
+    let curve =
+        ObjectIdentifier::new(curve_oid).map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    super::signature::EcCurve::from_oid_bytes(curve.as_bytes())
+        .ok_or(KeyResolutionError::InvalidPublicKey)?
+        .validate_point(public_key)
+        .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    spki_der(
+        pkcs8::spki::AlgorithmIdentifierRef {
+            oid: ID_EC_PUBLIC_KEY,
+            parameters: Some(AnyRef::from(&curve)),
+        },
+        public_key,
+    )
+}
+
+#[cfg(feature = "rustcrypto")]
 fn ec_key_value_to_spki_der(
     curve_oid: &str,
     public_key: &[u8],
@@ -2289,6 +2460,8 @@ pub(crate) fn supported_spki_is_rsa(
         SpkiAlgorithm::Ed448 => SignatureAlgorithm::Ed448,
         SpkiAlgorithm::RsaEncryption => {
             validate_rsa_spki(session, public_key_bytes)?;
+            // The built-in backend also admits the key it would verify with.
+            #[cfg(feature = "rustcrypto")]
             crate::rsa_encoding::read_spki_public_key(session, public_key_bytes)
                 .map_err(|error| structured_key_error(session, error))?
                 .ok_or(KeyResolutionError::InvalidPublicKey)?;
@@ -2365,9 +2538,26 @@ fn validate_dsa_spki(
         .map(structured_pkix::key::dsa::Component::as_bytes);
     // Borrowed magnitudes are bounded before bigint conversion; group/key
     // validity remains with RustCrypto.
-    super::signature::dsa_verifying_key(p, q, g, y)
-        .map(|_| ())
-        .ok_or(KeyResolutionError::InvalidPublicKey)
+    #[cfg(feature = "rustcrypto")]
+    {
+        super::signature::dsa_verifying_key(p, q, g, y)
+            .map(|_| ())
+            .ok_or(KeyResolutionError::InvalidPublicKey)
+    }
+    // Without it the selected provider judges the group when it verifies;
+    // here a component must be nonzero and within the process bound.
+    #[cfg(not(feature = "rustcrypto"))]
+    {
+        let bounded = |bytes: &[u8]| {
+            !matches!(bytes, [] | [0])
+                && bytes.len() <= crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING
+        };
+        if [p, q, g, y].into_iter().all(bounded) {
+            Ok(())
+        } else {
+            Err(KeyResolutionError::InvalidPublicKey)
+        }
+    }
 }
 
 fn validate_ec_spki_point(
@@ -2394,12 +2584,16 @@ fn validate_ec_spki_point(
     curve
         .validate_point(point)
         .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    // The built-in backend also places the point on the curve; otherwise
+    // the provider that verifies with the key does.
+    #[cfg(feature = "rustcrypto")]
     match curve {
         super::signature::EcCurve::P256 => p256::PublicKey::from_sec1_bytes(point).map(|_| ()),
         super::signature::EcCurve::P384 => p384::PublicKey::from_sec1_bytes(point).map(|_| ()),
         super::signature::EcCurve::P521 => p521::PublicKey::from_sec1_bytes(point).map(|_| ()),
     }
-    .map_err(|_| KeyResolutionError::InvalidPublicKey)
+    .map_err(|_| KeyResolutionError::InvalidPublicKey)?;
+    Ok(())
 }
 
 pub(crate) fn supported_key_value_is_rsa(
@@ -2435,6 +2629,8 @@ pub(crate) fn supported_key_value_is_rsa(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "rustcrypto")]
+    use crate::rsa_encoding::RsaPublicKeyEncoding as _;
     use crate::xml::dom as roxmltree;
     use alloc::collections::BTreeSet;
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -80,9 +80,9 @@ mod parser_roxmltree;
 #[cfg_attr(test, allow(clippy::unwrap_used))]
 #[path = "parser_xmloxide/lib.rs"]
 mod parser_xmloxide;
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 pub mod rsa_encoding;
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 #[path = "rustcrypto_sha3/lib.rs"]
 mod rustcrypto_sha3;
 // Checksum-pinned RustCrypto ML-DSA with checked expanded-key import. Keep it

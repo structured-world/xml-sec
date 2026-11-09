@@ -24,7 +24,10 @@ roxmltree = "0.21"
 serde_json = "1"
 
 [features]
-default = ["std", "xml-backend-xmloxide"]
+default = ["std", "rustcrypto", "xml-backend-xmloxide"]
+# The built-in crypto provider of the core. Without it validation runs only
+# through a provider the caller selects.
+rustcrypto = ["xml-sec/rustcrypto"]
 # Signature creation over the XMLDSig signer. Verification-only builds,
 # including alloc and WASM ones, do not take the signing dependencies.
 produce = ["std", "xml-sec/xmldsig-sign", "dep:base64"]
