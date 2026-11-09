@@ -268,8 +268,9 @@ library-only measurements. Sign/encrypt outputs are written to files equally.
 Input throughput and output amplification are derived from those actual files.
 System `time` CPU counters have coarse resolution; very short operations can
 legitimately report zero CPU seconds. They are not high-resolution phase profiles.
-The first build resolves the untracked library lockfile; measurement freezes and
-archives both Rust dependency graphs and source fingerprints.
+Before building, the runner aligns the untracked library lockfile to the
+measured Bergshamra commit; measurement freezes and archives both Rust
+dependency graphs and source fingerprints.
 
 Optional Linux Valgrind runs record total malloc-family allocation calls/bytes
 with Memcheck and sampled peak live heap plus allocator overhead with Massif.
@@ -316,8 +317,9 @@ by every other engine: signatures verified, ciphertexts decrypted to the
 original document. Every verifier must reject the changed signed value and the
 wrapped SAML forgery. A harness answers an operation its engine lacks with the
 reason (exit status 3); the runner records it as unsupported and never times it.
-Bergshamra signs no X509Data, has no XSLT 1.0 transform, cannot encrypt in place,
-and encrypts or decrypts only serialized XML.
+Bergshamra cannot encrypt in place, and its signing, encryption and decryption
+accept only serialized XML; whatever else it fails the cross-checks on is
+recorded as unsupported with the observed reason.
 
 Every process is wrapped by system `time` for RSS, which covers the whole
 process including key loading and warmups. Allocation counts come from separate
@@ -340,7 +342,7 @@ The report compares two comparison runs, each a directory with `comparison.json`
 `library.json` and `build.json`. The comparison runner writes the latter
 (`cargo run -p xml-sec-tools -- bench-identity NAME=VALUE...` prints it alone):
 compiler versions, the features of every binary, native flags, the heap-profiling
-mode and the pinned competitor revisions, every environment override of the build
+mode and the competitor commit the run measured, every environment override of the build
 (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `CC`,
 `RUSTC_WRAPPER`, `CFLAGS` and similar) and digests of the Cargo configuration
 files that apply, in Cargo's precedence order with each file's place. A
@@ -381,11 +383,12 @@ References: [Bergshamra CLI](https://github.com/kushaldas/bergshamra/blob/main/c
 [Replacing malloc in glibc](https://www.gnu.org/software/libc/manual/html_node/Replacing-malloc.html),
 [GitHub Pages workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
 
-`benchmarks/Dockerfile` supplies the Linux profiling tools. Mount source read-only
-and a separate writable output/build directory; select it through `CARGO_TARGET_DIR`
-and `XMLSEC1_PREFIX`. Resolve `Cargo.lock` before mounting source read-only
-(`cargo generate-lockfile`). The competitor checkout must be clean and match the pinned
-revision. Container results describe that container's architecture, not the host.
+`benchmarks/Dockerfile` supplies the Linux profiling tools. Use a writable source
+checkout, since the runner updates `benchmarks/competitors/Cargo.lock`, and a
+separate writable output/build directory selected through `CARGO_TARGET_DIR` and
+`XMLSEC1_PREFIX`. A pre-staged competitor checkout (`BERGSHAMRA_SOURCE_DIR`) must
+be clean and at the competitor's current remote `HEAD`. Container results
+describe that container's architecture, not the host.
 Both Rust binaries are built with the same stable compiler, recorded in `build.json`,
 and linked by mold through the image's per-target `CARGO_TARGET_*_RUSTFLAGS`; a
 `RUSTFLAGS` passed into the container replaces them.
