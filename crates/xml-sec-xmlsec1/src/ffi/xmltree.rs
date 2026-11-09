@@ -5,7 +5,43 @@ use std::ffi::{c_int, c_void};
 use xml_sec_libxml2::ffi::{XML_DOCUMENT_NODE, XML_ELEMENT_NODE, XmlNode};
 
 use super::contain;
-use super::tree::{readable, xmlSearchNs, xmlStrEqual};
+use super::tree::{readable, xmlNodeGetContent, xmlSearchNs, xmlStrEqual};
+
+/// `xmlSecGetNodeContentAndTrim`: the text content of `cur` without leading
+/// and trailing C-locale white space, which the caller frees with `xmlFree`.
+///
+/// # Safety
+/// `cur` is null or a live node.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecGetNodeContentAndTrim(cur: *mut XmlNode) -> *mut u8 {
+    contain(std::ptr::null_mut(), || {
+        if cur.is_null() {
+            return std::ptr::null_mut();
+        }
+        // SAFETY: a live node; the content is a NUL-terminated copy this
+        // function owns until it returns it, trimmed in place.
+        unsafe {
+            let content = xmlNodeGetContent(cur);
+            if content.is_null() {
+                return content;
+            }
+            let len = std::ffi::CStr::from_ptr(content.cast()).to_bytes().len();
+            let text = std::slice::from_raw_parts_mut(content, len + 1);
+            // C `isspace` in the "C" locale.
+            let space = |byte: &u8| matches!(byte, b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r');
+            let start = text[..len].iter().take_while(|byte| space(byte)).count();
+            let end = len
+                - text[start..len]
+                    .iter()
+                    .rev()
+                    .take_while(|byte| space(byte))
+                    .count();
+            text.copy_within(start..end, 0);
+            text[end - start] = 0;
+            content
+        }
+    })
+}
 
 /// `xmlSecGetNodeNsHref`: the namespace of `cur`, or for an unqualified
 /// node the default namespace in scope at it, as libxmlsec1 reads names.

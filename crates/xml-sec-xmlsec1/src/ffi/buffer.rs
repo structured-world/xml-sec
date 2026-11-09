@@ -7,6 +7,8 @@
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use xml_sec_libxml2::ffi::XmlNode;
+
 use super::{ALLOC_MODE_DOUBLE, contain, free, grown, malloc, realloc};
 
 #[cfg(test)]
@@ -605,6 +607,120 @@ pub(crate) unsafe extern "C" fn xmlSecBufferHexRead(
         }
         0
     })
+}
+
+/// `xmlSecBufferBase64NodeContentRead`: replaces the contents with the
+/// Base64 decoding of `node`'s trimmed text content.
+///
+/// # Safety
+/// `buf` is null or a valid buffer; `node` is null or a live node.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentRead(
+    buf: *mut XmlSecBuffer,
+    node: *mut XmlNode,
+) -> c_int {
+    contain(-1, || {
+        if buf.is_null() || node.is_null() {
+            return -1;
+        }
+        // SAFETY: a valid buffer and live node; the content is freed on
+        // every path.
+        unsafe {
+            let content = super::xmltree::xmlSecGetNodeContentAndTrim(node);
+            if content.is_null() {
+                return -1;
+            }
+            let len = CStr::from_ptr(content.cast::<c_char>()).to_bytes().len();
+            let mut written = 0;
+            // Base64 decodes to fewer bytes than its text.
+            let result = if xmlSecBufferSetMaxSize(buf, len) < 0
+                || super::base64::xmlSecBase64Decode_ex(
+                    content,
+                    xmlSecBufferGetData(buf),
+                    xmlSecBufferGetMaxSize(buf),
+                    &raw mut written,
+                ) < 0
+                || xmlSecBufferSetSize(buf, written) < 0
+            {
+                -1
+            } else {
+                0
+            };
+            free(content.cast());
+            result
+        }
+    })
+}
+
+/// `xmlSecBufferBase64NodeContentWrite`: appends the Base64 encoding of the
+/// contents, in lines of `columns`, to `node`'s content.
+///
+/// # Safety
+/// `buf` is null or a valid buffer; `node` is null or a live node.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecBufferBase64NodeContentWrite(
+    buf: *mut XmlSecBuffer,
+    node: *mut XmlNode,
+    columns: c_int,
+) -> c_int {
+    contain(-1, || {
+        if buf.is_null() || node.is_null() {
+            return -1;
+        }
+        // SAFETY: a valid buffer and live node; the encoding is freed after
+        // libxml2 copies it.
+        unsafe {
+            let content = super::base64::xmlSecBase64Encode(
+                xmlSecBufferGetData(buf),
+                xmlSecBufferGetSize(buf),
+                columns,
+            );
+            if content.is_null() {
+                return -1;
+            }
+            super::tree::xmlNodeAddContent(node, content);
+            free(content.cast());
+        }
+        0
+    })
+}
+
+/// `xmlSecBufferDebugHexDump`: the contents in lowercase hex, 32 bytes per
+/// line.
+///
+/// # Safety
+/// `buf` is null or a valid buffer; `output` is null or a C stream.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecBufferDebugHexDump(
+    buf: *mut XmlSecBuffer,
+    output: *mut c_void,
+) {
+    contain((), || {
+        if buf.is_null() || output.is_null() {
+            return;
+        }
+        // SAFETY: a valid buffer holds `size` bytes at `data`.
+        let bytes = unsafe {
+            let size = xmlSecBufferGetSize(buf);
+            let data = xmlSecBufferGetData(buf);
+            if data.is_null() {
+                &[][..]
+            } else {
+                std::slice::from_raw_parts(data, size)
+            }
+        };
+        let digits = b"0123456789abcdef";
+        let mut text = String::with_capacity(bytes.len() * 2 + bytes.len() / 32);
+        for (index, byte) in bytes.iter().enumerate() {
+            text.push(char::from(digits[usize::from(byte >> 4)]));
+            text.push(char::from(digits[usize::from(byte & 0x0f)]));
+            if (index + 1) % 32 == 0 {
+                text.push('\n');
+            }
+        }
+        // SAFETY: `output` is a live stream.
+        unsafe { super::write_stream(output, &text) };
+    });
 }
 
 /// `xmlSecMemEqual`: 1 when the `size` bytes at `buf1` and `buf2` are equal,

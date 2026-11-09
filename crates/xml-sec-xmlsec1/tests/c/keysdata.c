@@ -1,13 +1,18 @@
 /* Key-data klasses as a libxmlsec1 caller uses them: the registry and its
  * enabled subset, lookups, a custom binary key-data klass driven through
- * every dispatcher, key-data lists, a custom store klass, and the binary
- * value helpers. Built unmodified against the pinned libxmlsec1 and against
+ * every dispatcher, key-data lists, a custom store klass, the binary value
+ * helpers, a transform context's extra key data, and Base64 node content.
+ * Built unmodified against the pinned libxmlsec1 and against
  * this crate, both must print the same. */
 
 #include <stdio.h>
 #include <string.h>
 
+#include <libxml/parser.h>
+#include <libxml/tree.h>
 #include <xmlsec/xmlsec.h>
+#include <xmlsec/xmltree.h>
+#include <xmlsec/transforms.h>
 #include <xmlsec/keysdata.h>
 #include <xmlsec/keyinfo.h>
 #include <xmlsec/list.h>
@@ -117,6 +122,22 @@ static xmlSecKeyDataStoreKlass failingStoreKlass = {
     BAD_CAST "failing-store", failing_initialize, store_finalize, NULL, NULL,
 };
 
+/* ---- a transform klass that only verifies ---- */
+static int checker_verify(xmlSecTransformPtr transform, const xmlSecByte *data, xmlSecSize size,
+                          xmlSecTransformCtxPtr ctx) {
+    (void)ctx;
+    printf("verify: %s [%.*s]\n", transform->id->name, (int)size, (const char *)data);
+    transform->status = xmlSecTransformStatusOk;
+    return 0;
+}
+
+static xmlSecTransformKlass checkerKlass = {
+    sizeof(xmlSecTransformKlass), sizeof(xmlSecTransform),
+    BAD_CAST "checker", NULL, xmlSecTransformUsageSignatureMethod,
+    NULL, NULL, NULL, NULL, NULL, NULL, checker_verify,
+    xmlSecTransformDefaultGetDataType, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+};
+
 static const char *name_of(xmlSecKeyDataId id) {
     return id != NULL ? (const char *)id->name : "none";
 }
@@ -217,6 +238,56 @@ int main(void) {
     xmlSecPtrListAdd(list, store);
     xmlSecPtrListDestroy(list);
     printf("failing store: %s\n", xmlSecKeyDataStoreCreate(&failingStoreKlass) == NULL ? "refused" : "created");
+
+    /* a transform context's extra key data */
+    {
+        xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
+        xmlSecKeyDataPtr ensured;
+        xmlSecKeyDataPtr own = xmlSecKeyDataCreate(&plainKlass);
+        printf("extra get: %s\n", xmlSecTransformCtxExtraKeyDataGet(ctx, &binaryKlass) == NULL ? "none" : "some");
+        ensured = xmlSecTransformCtxExtraKeyDataEnsure(ctx, &binaryKlass);
+        printf("extra ensure: %d again same: %d get same: %d\n", ensured != NULL,
+               xmlSecTransformCtxExtraKeyDataEnsure(ctx, &binaryKlass) == ensured,
+               xmlSecTransformCtxExtraKeyDataGet(ctx, &binaryKlass) == ensured);
+        printf("extra adopt: %d", xmlSecTransformCtxExtraKeyDataAdopt(ctx, own));
+        printf(" duplicate klass: %d\n", xmlSecTransformCtxExtraKeyDataAdopt(ctx, xmlSecKeyDataCreate(&binaryKlass)));
+        printf("extra list: %d\n", (int)xmlSecPtrListGetSize(ctx->extraKeyData));
+        xmlSecTransformCtxDestroy(ctx);
+        printf("extra finalize: %d\n", calls_finalize);
+    }
+
+    /* Base64 node content and hex dumps */
+    {
+        static const char xml[] = "<a>\n  Zm9v\n  YmFy  \n</a>";
+        xmlDocPtr doc = xmlReadMemory(xml, (int)strlen(xml), "b.xml", NULL, 0);
+        xmlNodePtr root = xmlDocGetRootElement(doc);
+        xmlNodePtr out = xmlNewDocNode(doc, NULL, BAD_CAST "out", NULL);
+        xmlSecBufferPtr buf = xmlSecBufferCreate(0);
+        xmlChar *trimmed = xmlSecGetNodeContentAndTrim(root);
+        printf("trimmed: [%s]\n", (const char *)trimmed);
+        xmlFree(trimmed);
+        printf("node read: %d [%.*s]\n", xmlSecBufferBase64NodeContentRead(buf, root),
+               (int)xmlSecBufferGetSize(buf), (const char *)xmlSecBufferGetData(buf));
+        printf("node write: %d", xmlSecBufferBase64NodeContentWrite(buf, out, 4));
+        trimmed = xmlNodeGetContent(out);
+        printf(" [%s]\n", (const char *)trimmed);
+        xmlFree(trimmed);
+        xmlSecBufferSetData(buf, BAD_CAST "0123456789abcdef0123456789abcdefXY", 34);
+        xmlSecBufferDebugHexDump(buf, stdout);
+        printf("\n");
+        {
+            xmlSecTransformCtxPtr ctx = xmlSecTransformCtxCreate();
+            xmlSecTransformPtr checker = xmlSecTransformCreate(&checkerKlass);
+            printf("verify node: %d status=%d\n", xmlSecTransformVerifyNodeContent(checker, root, ctx),
+                   checker->status);
+            printf("verify without node: %d\n", xmlSecTransformVerifyNodeContent(checker, NULL, ctx));
+            xmlSecTransformDestroy(checker);
+            xmlSecTransformCtxDestroy(ctx);
+        }
+        xmlSecBufferDestroy(buf);
+        xmlFreeNode(out);
+        xmlFreeDoc(doc);
+    }
 
     printf("persist: %d", xmlSecImportGetPersistKey());
     xmlSecImportSetPersistKey();

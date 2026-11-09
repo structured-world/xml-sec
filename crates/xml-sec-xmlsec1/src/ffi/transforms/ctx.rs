@@ -6,9 +6,13 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use xml_sec_libxml2::ffi::{XmlDoc, XmlNode};
 
 use super::super::buffer::XmlSecBuffer;
+use super::super::keysdata::{
+    XmlSecKeyData, XmlSecKeyDataKlass, xmlSecKeyDataCreate, xmlSecKeyDataDestroy,
+    xmlSecKeyDataListGetKlass,
+};
 use super::super::list::{
-    XmlSecPtrList, xmlSecPtrListCopy, xmlSecPtrListDestroy, xmlSecPtrListFinalize,
-    xmlSecPtrListGetSize, xmlSecPtrListInitialize,
+    XmlSecPtrList, xmlSecPtrListAdd, xmlSecPtrListCopy, xmlSecPtrListCreate, xmlSecPtrListDestroy,
+    xmlSecPtrListFinalize, xmlSecPtrListGetItem, xmlSecPtrListGetSize, xmlSecPtrListInitialize,
 };
 use super::super::nodeset::{
     NORMAL, XmlSecNodeSet, xmlSecNodeSetCreate, xmlSecNodeSetDestroy, xmlSecNodeSetGetChildren,
@@ -102,6 +106,115 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxGetDefaultMaxDepth() -> c_uint
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn xmlSecTransformCtxSetDefaultMaxDepth(depth: c_uint) {
     DEFAULT_MAX_DEPTH.store(depth, Ordering::Relaxed);
+}
+
+/// `xmlSecTransformCtxExtraKeyDataGet`: the context's extra key data of
+/// klass `id`, or null.
+///
+/// # Safety
+/// `ctx` is null or a context; `id` is null or a key-data klass.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataGet(
+    ctx: *mut XmlSecTransformCtx,
+    id: *const XmlSecKeyDataKlass,
+) -> *mut XmlSecKeyData {
+    contain(std::ptr::null_mut(), || {
+        // SAFETY: by the caller's contract; the list holds key data.
+        unsafe {
+            let Some(context) = ctx.as_ref() else {
+                return std::ptr::null_mut();
+            };
+            let list = context.extra_key_data;
+            if id.is_null() || list.is_null() {
+                return std::ptr::null_mut();
+            }
+            (0..xmlSecPtrListGetSize(list))
+                .map(|pos| xmlSecPtrListGetItem(list, pos).cast::<XmlSecKeyData>())
+                .find(|data| !data.is_null() && std::ptr::eq((**data).id, id))
+                .unwrap_or(std::ptr::null_mut())
+        }
+    })
+}
+
+/// The context's extra key-data list, created on first use.
+///
+/// # Safety
+/// `ctx` is a context.
+unsafe fn extra_key_data(ctx: *mut XmlSecTransformCtx) -> *mut XmlSecPtrList {
+    // SAFETY: by the caller's contract; the context owns the list.
+    unsafe {
+        if (*ctx).extra_key_data.is_null() {
+            (*ctx).extra_key_data = xmlSecPtrListCreate(xmlSecKeyDataListGetKlass());
+        }
+        (*ctx).extra_key_data
+    }
+}
+
+/// `xmlSecTransformCtxExtraKeyDataEnsure`: the context's extra key data of
+/// klass `id`, created and owned by the context when missing.
+///
+/// # Safety
+/// `ctx` is null or a context; `id` is null or a key-data klass.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataEnsure(
+    ctx: *mut XmlSecTransformCtx,
+    id: *const XmlSecKeyDataKlass,
+) -> *mut XmlSecKeyData {
+    contain(std::ptr::null_mut(), || {
+        // SAFETY: by the caller's contract; a new object is destroyed when
+        // the list does not take it.
+        unsafe {
+            if ctx.is_null() || id.is_null() {
+                return std::ptr::null_mut();
+            }
+            let existing = xmlSecTransformCtxExtraKeyDataGet(ctx, id);
+            if !existing.is_null() {
+                return existing;
+            }
+            let list = extra_key_data(ctx);
+            if list.is_null() {
+                return std::ptr::null_mut();
+            }
+            let data = xmlSecKeyDataCreate(id);
+            if data.is_null() {
+                return data;
+            }
+            if xmlSecPtrListAdd(list, data.cast()) < 0 {
+                xmlSecKeyDataDestroy(data);
+                return std::ptr::null_mut();
+            }
+            data
+        }
+    })
+}
+
+/// `xmlSecTransformCtxExtraKeyDataAdopt`: the context takes `data`, unless
+/// it already holds key data of the same klass.
+///
+/// # Safety
+/// `ctx` is null or a context; `data` is null or a key-data object the
+/// caller gives up on success.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecTransformCtxExtraKeyDataAdopt(
+    ctx: *mut XmlSecTransformCtx,
+    data: *mut XmlSecKeyData,
+) -> c_int {
+    contain(-1, || {
+        // SAFETY: by the caller's contract.
+        unsafe {
+            if ctx.is_null() || data.is_null() || (*data).id.is_null() {
+                return -1;
+            }
+            if !xmlSecTransformCtxExtraKeyDataGet(ctx, (*data).id).is_null() {
+                return -1;
+            }
+            let list = extra_key_data(ctx);
+            if list.is_null() || xmlSecPtrListAdd(list, data.cast()) < 0 {
+                return -1;
+            }
+            0
+        }
+    })
 }
 
 /// `xmlSecTransformCtxCreate`: a new context, released with

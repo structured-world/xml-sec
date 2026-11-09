@@ -743,6 +743,49 @@ pub(crate) unsafe extern "C" fn xmlSecTransformVerify(
     })
 }
 
+/// `xmlSecTransformVerifyNodeContent`: verifies the Base64 decoding of
+/// `node`'s content.
+///
+/// # Safety
+/// `transform` is null or a valid transform; `node` is null or a live
+/// node; `ctx` is null or a context.
+#[unsafe(no_mangle)]
+pub(crate) unsafe extern "C" fn xmlSecTransformVerifyNodeContent(
+    transform: *mut XmlSecTransform,
+    node: *mut XmlNode,
+    ctx: *mut XmlSecTransformCtx,
+) -> c_int {
+    contain(-1, || {
+        // SAFETY: by the caller's contract; the buffer is finalized on every
+        // path.
+        unsafe {
+            if valid(transform).is_none() || node.is_null() || ctx.is_null() {
+                return -1;
+            }
+            let mut buffer = std::mem::MaybeUninit::<XmlSecBuffer>::uninit();
+            let buffer = buffer.as_mut_ptr();
+            if xmlSecBufferInitialize(buffer, 0) < 0 {
+                return -1;
+            }
+            let result = if super::buffer::xmlSecBufferBase64NodeContentRead(buffer, node) < 0
+                || xmlSecBufferGetData(buffer).is_null()
+                || xmlSecTransformVerify(
+                    transform,
+                    xmlSecBufferGetData(buffer),
+                    xmlSecBufferGetSize(buffer),
+                    ctx,
+                ) < 0
+            {
+                -1
+            } else {
+                0
+            };
+            xmlSecBufferFinalize(buffer);
+            result
+        }
+    })
+}
+
 /// `xmlSecTransformGetDataType`: what the transform takes (push) or gives
 /// (pop): binary, XML or both.
 ///

@@ -17,6 +17,7 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn xmlGetProp(node: *mut XmlNode, name: *const u8) -> *mut u8;
     pub(crate) fn xmlNodeGetContent(node: *mut XmlNode) -> *mut u8;
+    pub(crate) fn xmlNodeAddContent(node: *mut XmlNode, content: *const u8);
     pub(crate) fn xmlGetID(doc: *mut XmlDoc, id: *const u8) -> *mut XmlAttr;
     pub(crate) fn xmlSearchNs(
         doc: *mut XmlDoc,
