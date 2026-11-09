@@ -90,3 +90,52 @@ fn binary_chain_encodes_base64() {
         xmlSecTransformCtxDestroy(ctx);
     }
 }
+
+/// The library's policy runs the core's OPC relationship transform: the
+/// selected relationships, sorted by Id, with the default `TargetMode` and
+/// without comments (ISO/IEC 29500-2 section 13.2.4.24, step 3), where
+/// libxmlsec1 writes a comment as an empty `comment` element.
+#[test]
+fn library_policy_runs_the_relationship_transform() {
+    use xml_sec::xmldsig::transforms::{
+        RelationshipSelector, Transform, execute_transforms_with_policy,
+    };
+    use xml_sec::xmldsig::types::{NodeSet, TransformData};
+
+    let policy = crate::ffi::policy::verification().expect("the library policy compiles");
+    let document = xml_sec::XmlDocument::parse(
+        "<Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'>\
+         <Relationship Id='rId3' Type='urn:t:c' Target='c.xml'/><!-- note -->\
+         <Relationship Id='rId1' Type='urn:t:a' Target='a.xml' TargetMode='External'/>\
+         <Relationship Id='rId2' Type='urn:t:b' Target='b.xml'/>\
+         </Relationships>",
+    )
+    .expect("parse");
+    let transforms = [
+        Transform::Relationship(vec![
+            RelationshipSelector::SourceId("rId3".into()),
+            RelationshipSelector::SourceId("rId1".into()),
+        ]),
+        Transform::C14n(xml_sec::c14n::C14nAlgorithm::new(
+            xml_sec::c14n::C14nMode::Inclusive1_0,
+            false,
+        )),
+    ];
+    let output = document.with_view(|view| {
+        let document = view.document();
+        execute_transforms_with_policy(
+            document.root(),
+            TransformData::NodeSet(NodeSet::entire_document_without_comments(document)?),
+            &transforms,
+            policy,
+        )
+    });
+    let output = String::from_utf8(output.expect("relationship transform")).expect("UTF-8");
+    assert_eq!(
+        output,
+        "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+         <Relationship Id=\"rId1\" Target=\"a.xml\" TargetMode=\"External\" Type=\"urn:t:a\">\
+         </Relationship><Relationship Id=\"rId3\" Target=\"c.xml\" TargetMode=\"Internal\" \
+         Type=\"urn:t:c\"></Relationship></Relationships>"
+    );
+}

@@ -19,12 +19,13 @@ use super::super::xmltree::{xmlSecCheckNodeName, xmlSecGetNextElementNode};
 use super::super::{contain, free, malloc, write_stream};
 use super::{
     DATA_BIN, DATA_UNKNOWN, DATA_XML, FLAGS_USER_SPECIFIED, MODE_PUSH, STATUS_FINISHED,
-    STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, klass_text, valid,
-    xml_text, xmlSecTransformConnect, xmlSecTransformCreate, xmlSecTransformDebugDump,
-    xmlSecTransformDebugXmlDump, xmlSecTransformDestroy, xmlSecTransformGetDataType,
-    xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump, xmlSecTransformIdListFind,
-    xmlSecTransformIdListFindByHref, xmlSecTransformIdListGetKlass, xmlSecTransformIdsGet,
-    xmlSecTransformPump, xmlSecTransformPushBin, xmlSecTransformPushXml, xpath,
+    STATUS_NONE, STATUS_WORKING, XmlSecTransform, XmlSecTransformKlass, builtin, klass_text,
+    parser, valid, xml_text, xmlSecTransformConnect, xmlSecTransformCreate,
+    xmlSecTransformDebugDump, xmlSecTransformDebugXmlDump, xmlSecTransformDestroy,
+    xmlSecTransformGetDataType, xmlSecTransformIdListDebugDump, xmlSecTransformIdListDebugXmlDump,
+    xmlSecTransformIdListFind, xmlSecTransformIdListFindByHref, xmlSecTransformIdListGetKlass,
+    xmlSecTransformIdsGet, xmlSecTransformPump, xmlSecTransformPushBin, xmlSecTransformPushXml,
+    xpath,
 };
 
 /// `xmlSecTransformCtxPreExecuteCallback`.
@@ -669,7 +670,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformCtxPrepare(
             }
             let first_type = xmlSecTransformGetDataType((*ctx).first, MODE_PUSH, ctx);
             if first_type & DATA_BIN == 0 && input_type & DATA_BIN != 0 {
-                if xmlSecTransformCtxCreateAndPrepend(ctx, builtin::xml_parser()).is_null() {
+                if xmlSecTransformCtxCreateAndPrepend(ctx, parser::xml_parser()).is_null() {
                     return -1;
                 }
             } else if first_type & DATA_XML == 0

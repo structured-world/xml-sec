@@ -31,10 +31,10 @@ use super::super::nodeset::{
 use super::super::strings::{
     xmlSecAttrPrefixList, xmlSecDSigNs, xmlSecHrefBase64, xmlSecHrefC14N, xmlSecHrefC14N11,
     xmlSecHrefC14N11WithComments, xmlSecHrefC14NWithComments, xmlSecHrefEnveloped,
-    xmlSecHrefExcC14N, xmlSecHrefExcC14NWithComments, xmlSecHrefRelationship, xmlSecNameBase64,
-    xmlSecNameC14N, xmlSecNameC14N11, xmlSecNameC14N11WithComments, xmlSecNameC14NWithComments,
+    xmlSecHrefExcC14N, xmlSecHrefExcC14NWithComments, xmlSecNameBase64, xmlSecNameC14N,
+    xmlSecNameC14N11, xmlSecNameC14N11WithComments, xmlSecNameC14NWithComments,
     xmlSecNameEnveloped, xmlSecNameExcC14N, xmlSecNameExcC14NWithComments, xmlSecNameMemBuf,
-    xmlSecNameRelationship, xmlSecNodeInclusiveNamespaces, xmlSecNodeSignature, xmlSecNsExcC14N,
+    xmlSecNodeInclusiveNamespaces, xmlSecNodeSignature, xmlSecNsExcC14N,
 };
 use super::super::tree::{readable, xmlGetProp, xmlSearchNs};
 use super::super::xmltree::{xmlSecCheckNodeName, xmlSecFindParent, xmlSecGetNextElementNode};
@@ -43,7 +43,6 @@ use super::io::{
     xmlOutputBufferClose, xmlOutputBufferWrite, xmlSecBufferCreateOutputBuffer,
     xmlSecTransformCreateOutputBuffer,
 };
-use super::xpath;
 use super::{
     OPERATION_DECODE, OPERATION_ENCODE, STATUS_FINISHED, STATUS_NONE, STATUS_WORKING,
     USAGE_C14N_METHOD, USAGE_DSIG_TRANSFORM, WithContext, XmlSecTransform, XmlSecTransformCtx,
@@ -51,6 +50,7 @@ use super::{
     xmlSecTransformDefaultPopBin, xmlSecTransformDefaultPopXml, xmlSecTransformDefaultPushBin,
     xmlSecTransformDefaultPushXml, xmlSecTransformPopXml,
 };
+use super::{relationship, xpath};
 
 /// A klass with sizes, name, href and usage, and no methods.
 pub(crate) const fn klass(
@@ -97,7 +97,7 @@ pub(crate) fn defaults() -> [*const XmlSecTransformKlass; 12] {
         xpath::xpath(),
         xpath::xpath2(),
         xpath::xpointer(),
-        &raw const RELATIONSHIP,
+        relationship::relationship(),
     ]
 }
 
@@ -493,7 +493,7 @@ klass_getter! {
     xmlSecTransformXPath2GetKlass => xpath::xpath2();
     xmlSecTransformXPointerGetKlass => xpath::xpointer();
     xmlSecTransformVisa3DHackGetKlass => xpath::visa3d_hack();
-    xmlSecTransformRelationshipGetKlass => &raw const RELATIONSHIP;
+    xmlSecTransformRelationshipGetKlass => relationship::relationship();
 }
 
 unsafe extern "C" fn c14n_initialize(transform: *mut XmlSecTransform) -> c_int {
@@ -736,6 +736,27 @@ unsafe extern "C" fn c14n_push_xml(
         let Some(list) = c14n_list(transform) else {
             return -1;
         };
+        let id = (*transform).id;
+        push_rendered(transform, nodes, ctx, |nodes, out| {
+            c14n_execute(id, nodes, list, out)
+        })
+    }
+}
+
+/// The push side of a node-set-to-octets klass: on the first push, `render`
+/// writes the octets of `nodes` to the next transform, or to the object's
+/// own output buffer at the end of the chain.
+///
+/// # Safety
+/// `transform` is a valid transform of its chain; `ctx` is its context.
+pub(crate) unsafe fn push_rendered(
+    transform: *mut XmlSecTransform,
+    nodes: *mut XmlSecNodeSet,
+    ctx: *mut XmlSecTransformCtx,
+    render: impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int,
+) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe {
         if nodes.is_null() || (*nodes).doc.is_null() || ctx.is_null() {
             return -1;
         }
@@ -753,7 +774,7 @@ unsafe extern "C" fn c14n_push_xml(
         if out.is_null() {
             return -1;
         }
-        if c14n_execute(object.id, nodes, list, out) < 0 {
+        if render(nodes, out) < 0 {
             xmlOutputBufferClose(out);
             return -1;
         }
@@ -772,12 +793,35 @@ unsafe extern "C" fn c14n_pop_bin(
     size: *mut usize,
     ctx: *mut XmlSecTransformCtx,
 ) -> c_int {
-    // SAFETY: a C14N-family transform, its chain and context; `data` holds
-    // `max_size` writable bytes.
+    // SAFETY: a C14N-family transform, its chain and context.
     unsafe {
         let Some(list) = c14n_list(transform) else {
             return -1;
         };
+        let id = (*transform).id;
+        pop_rendered(transform, data, max_size, size, ctx, |nodes, out| {
+            c14n_execute(id, nodes, list, out)
+        })
+    }
+}
+
+/// The pop side of a node-set-to-octets klass: on the first pop, `render`
+/// writes the octets of the node set the previous transform pops to the
+/// object's output buffer, which then drains in chunks.
+///
+/// # Safety
+/// `transform` is a valid transform of its chain; `ctx` is its context;
+/// `data` holds `max_size` writable bytes.
+pub(crate) unsafe fn pop_rendered(
+    transform: *mut XmlSecTransform,
+    data: *mut u8,
+    max_size: usize,
+    size: *mut usize,
+    ctx: *mut XmlSecTransformCtx,
+    render: impl FnOnce(*mut XmlSecNodeSet, *mut c_void) -> c_int,
+) -> c_int {
+    // SAFETY: by the caller's contract.
+    unsafe {
         let Some(context) = ctx.as_ref() else {
             return -1;
         };
@@ -802,7 +846,7 @@ unsafe extern "C" fn c14n_pop_bin(
             if buffer.is_null() {
                 return -1;
             }
-            if c14n_execute(object.id, object.in_nodes, list, buffer) < 0 {
+            if render(object.in_nodes, buffer) < 0 {
                 xmlOutputBufferClose(buffer);
                 return -1;
             }
@@ -895,31 +939,14 @@ unsafe extern "C" fn enveloped_execute(
 }
 
 // ----------------------------------------------------------------------------
-// XPath family, XML parser, URI input and OPC relationships
+// URI input
 
-static XML_PARSER: XmlSecTransformKlass = klass(
-    size_of::<XmlSecTransform>(),
-    c"xml-parser".as_ptr().cast(),
-    std::ptr::null(),
-    USAGE_DSIG_TRANSFORM,
-);
 static INPUT_URI: XmlSecTransformKlass = klass(
     size_of::<XmlSecTransform>(),
     c"input-uri".as_ptr().cast(),
     std::ptr::null(),
     0,
 );
-static RELATIONSHIP: XmlSecTransformKlass = klass(
-    size_of::<XmlSecTransform>(),
-    xmlSecNameRelationship.as_ptr(),
-    xmlSecHrefRelationship.as_ptr(),
-    USAGE_DSIG_TRANSFORM,
-);
-
-/// The XML parser klass, the automatic binary-to-XML adapter.
-pub(crate) fn xml_parser() -> *const XmlSecTransformKlass {
-    &raw const XML_PARSER
-}
 
 /// The URI input klass.
 pub(crate) fn input_uri() -> *const XmlSecTransformKlass {

@@ -27,6 +27,8 @@ use super::{contain, free, malloc, write_stream};
 pub(crate) mod builtin;
 pub(crate) mod ctx;
 pub(crate) mod io;
+pub(crate) mod parser;
+pub(crate) mod relationship;
 pub(crate) mod xpath;
 
 #[cfg(test)]
@@ -997,7 +999,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformConnect(
             }
             return 0;
         } else if left_type & DATA_BIN != 0 && right_type & DATA_XML != 0 {
-            builtin::xml_parser()
+            parser::xml_parser()
         } else if left_type & DATA_XML != 0 && right_type & DATA_BIN != 0 {
             if std::ptr::eq(right_klass, builtin::base64()) {
                 builtin::remove_xml_tags_c14n()

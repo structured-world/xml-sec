@@ -13,6 +13,7 @@ pub(crate) mod base64;
 pub(crate) mod buffer;
 pub(crate) mod list;
 pub(crate) mod nodeset;
+pub(crate) mod parser;
 pub(crate) mod policy;
 pub(crate) mod strings;
 pub(crate) mod transforms;
