@@ -164,6 +164,45 @@ xs_verify(verifier, document, &request, &key_lookup, &evidence, &error);
 - The callback may call the library. Destroying a handle the running call
   uses, or operating on its document, returns `XS_BUSY`.
 
+## libxml2 documents
+
+An application that already holds its document as a libxml2 tree links
+`xml-sec-libxml2` instead. That library exports the whole C API above together
+with one entry point, declared in
+`crates/xml-sec-libxml2/include/xml_sec_libxml2.h`:
+
+```c
+xmlDocPtr doc = xmlReadMemory(xml, len, NULL, NULL, 0);
+XsDocument document;
+xs_libxml2_document(policy, XS_OPERATION_SIGN, doc, &document, &error);
+xs_sign(signer, document, &audit, &error);  /* fills the template in doc */
+xs_document_destroy(document);              /* doc stays the caller's */
+xmlDocDumpMemory(doc, &bytes, &size);
+```
+
+- The handle reads the tree as it is when each operation starts, under that
+  operation's compiled policy, so the application may change the tree between
+  calls. While a call runs, nothing else uses the tree.
+- Operations change the tree itself: signing writes the template's values,
+  encryption replaces the element by `EncryptedData`, decryption restores it.
+  Nodes an operation does not touch keep their pointers; nodes it removes are
+  freed before the call returns. A failed call leaves the tree as it was.
+- `xs_document_serialize` refuses the handle with `XS_DOCUMENT`: the
+  application serializes its tree with libxml2.
+- The library is built against the libxml2 `pkg-config` names (`libxml-2.0`)
+  and checks once that the linked headers lay out the tree as it expects; a
+  mismatch refuses every handle with `XS_INTERNAL`.
+
+```sh
+cargo build --release -p xml-sec-libxml2
+# target/release/libxml_sec_libxml2.{so,dylib,a}
+```
+
+Qualified platforms: Linux x86_64 with the distribution's libxml2 and macOS
+arm64 with Homebrew's, with the default features; one passing platform claims
+nothing for another, and no support level is claimed on Windows. The crate's
+`SAFETY.md` records what the bridge assumes and guarantees.
+
 ## Qualification
 
 `cargo run -p xml-sec-tools -- capi` builds the library, builds
@@ -174,10 +213,14 @@ declares. The C program signs, verifies a valid and a tampered document,
 encrypts, decrypts, verifies and decrypts with keys from a lookup, replaces the
 policy and exercises policy refusals, callback reentry and failure, and wrong,
 destroyed and invalid arguments; the C++ program verifies through a lambda
-lookup. CI runs them on Linux, macOS and Windows. `capi --sanitize` repeats
-them on Linux with the library and the crate's own tests (handle table,
-concurrent destroy, argument validation, callbacks, panic containment,
-redacted diagnostics) under
-AddressSanitizer and the programs under AddressSanitizer, LeakSanitizer and
-UndefinedBehaviorSanitizer. `SAFETY.md` in the crate records the invariants of
-its one `unsafe` module.
+lookup. On Linux and macOS it also builds the libxml2 bridge, checks its
+exports against both headers, and runs `crates/xml-sec-libxml2/tests/c/roundtrip.c`
+against the system libxml2: it signs and verifies a tree libxml2 parsed, sees a
+change the caller makes between calls, encrypts and decrypts in place, and
+checks that untouched nodes keep their pointers. CI runs them on Linux, macOS
+and Windows. `capi --sanitize` repeats them on Linux with the libraries and the
+crates' own tests (handle table, concurrent destroy, argument validation,
+callbacks, panic containment, redacted diagnostics, tree layout and edits)
+under AddressSanitizer and the programs under AddressSanitizer, LeakSanitizer
+and UndefinedBehaviorSanitizer. `SAFETY.md` in each crate records the
+invariants of its one `unsafe` module.

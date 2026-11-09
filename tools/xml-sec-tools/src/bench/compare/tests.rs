@@ -1,4 +1,4 @@
-use super::{Request, other_packages, parse};
+use super::{Request, parse};
 
 fn args(values: &[&str]) -> Vec<String> {
     values.iter().map(|&value| value.to_owned()).collect()
@@ -45,18 +45,5 @@ fn invalid_runner_arguments_never_build_or_overwrite_evidence() {
     assert_eq!(
         std::fs::read_to_string(output.join("evidence")).unwrap(),
         "preserved"
-    );
-}
-
-#[test]
-fn the_competitor_lock_refresh_compares_every_package_except_xml_sec() {
-    // Moving xml-sec is the refresh; moving any other package is a reviewed change.
-    let lock = "version = 4\n\n[[package]]\nname = \"a\"\nversion = \"1.0.0\"\n\n[[package]]\nname = \"xml-sec\"\nversion = \"0.2.0\"\n\n\n[[package]]\nname = \"z\"\nversion = \"2.0.0\"\n";
-    let refreshed = lock.replace("0.2.0", "0.3.0");
-    assert_eq!(other_packages(lock), other_packages(&refreshed));
-    assert_eq!(other_packages(lock).len(), 3);
-    assert_ne!(
-        other_packages(lock),
-        other_packages(&lock.replace("1.0.0", "1.1.0"))
     );
 }

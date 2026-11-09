@@ -1,8 +1,8 @@
-use super::cli::{Files, Kind, corpus_file, engine_arguments};
+use super::cli::{Engine, Files, Kind, Refusals, corpus_file, engine_arguments};
 use super::dashboard::{EXPECTED_CLI, EXPECTED_LIBRARY};
 use super::{
     SCENARIOS, case_files, create_evidence_directory, document_body, format_timestamp, heap_stats,
-    number, percentile, policy_refusal, read_json, resources, tamper, unsupported, wrap,
+    number, percentile, policy_refusal, read_json, resources, tamper, wrap,
 };
 use crate::repo::root;
 use crate::test_support::read;
@@ -48,17 +48,53 @@ fn wrapping_places_an_unsigned_forgery_with_the_signed_id_before_the_signed_asse
     );
 }
 
+/// An engine the comparison runs, for the attribution checks.
+fn engine(name: &'static str, kind: Kind) -> Engine {
+    Engine {
+        name,
+        kind,
+        binary: std::path::PathBuf::new(),
+        backend: None,
+    }
+}
+
+/// The competitor is measured at its current code, so its wrong result is a
+/// gap the run reports for its own operation; the reference engines' wrong
+/// results fail the run.
 #[test]
-fn unsupported_work_is_recorded_per_operation_not_per_workload() {
-    // Bergshamra verifies assertions and decrypts in-place documents it cannot produce.
-    assert!(unsupported("bergshamra", "assertion", "sign").is_some());
-    assert_eq!(unsupported("bergshamra", "assertion", "verify"), None);
-    assert!(unsupported("bergshamra", "element_in_place", "encrypt").is_some());
+fn a_failed_cross_check_is_put_down_to_the_competitor_or_fails_the_run() {
+    let ours = engine("xml-sec", Kind::Xmlsec);
+    let oracle = engine("libxmlsec1", Kind::Xmlsec);
+    let competitor = engine("bergshamra", Kind::Bergshamra);
+    let mut refused = Refusals(std::collections::BTreeMap::new());
+    refused
+        .observe(
+            (&ours, "sign"),
+            (&competitor, "verify"),
+            "digest mismatch".into(),
+        )
+        .unwrap();
+    assert!(refused.blocked(&competitor, "verify").is_some());
+    assert!(refused.blocked(&ours, "sign").is_none());
+    refused
+        .observe(
+            (&competitor, "encrypt"),
+            (&ours, "decrypt"),
+            "plaintext mismatch".into(),
+        )
+        .unwrap();
+    assert!(refused.blocked(&competitor, "encrypt").is_some());
+    assert!(refused.blocked(&ours, "decrypt").is_none());
     assert_eq!(
-        unsupported("bergshamra", "element_in_place", "decrypt"),
-        None
+        refused
+            .observe(
+                (&ours, "sign"),
+                (&oracle, "verify"),
+                "digest mismatch".into()
+            )
+            .unwrap_err(),
+        "digest mismatch"
     );
-    assert_eq!(unsupported("xml-sec", "xslt", "sign"), None);
 }
 
 #[test]
@@ -121,9 +157,6 @@ fn every_measured_engine_has_arguments_for_each_workload_operation() {
             (Kind::Bergshamra, "bergshamra"),
         ] {
             for operation in operations {
-                if unsupported(engine, scenario, operation).is_some() {
-                    continue;
-                }
                 let args = engine_arguments(kind, scenario, operation, &files).unwrap_or_default();
                 assert_eq!(
                     args.first().map(String::as_str),

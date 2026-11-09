@@ -522,6 +522,14 @@ struct ParsedDocument<'input> {
     /// the validation parses of the mutations between them.
     #[cfg(feature = "xmldsig")]
     parse_work: usize,
+    /// For a tree-backed document, the external node each arena node came
+    /// from, indexed by arena position; empty for a parsed document.
+    #[cfg(feature = "external-tree")]
+    external: Vec<Option<crate::xml::dom::external::ExternalNode>>,
+    /// For a tree-backed document, the content bytes its projection read,
+    /// which stand for the serialization's length in size checks.
+    #[cfg(feature = "external-tree")]
+    external_bytes: usize,
 }
 
 self_cell!(
@@ -585,9 +593,10 @@ pub enum XmlDocumentError {
     /// A mutation target is not an element.
     #[error("XML mutation target must be an element")]
     TargetNotElement,
-    /// A semantic node was synthesized from a shared entity-reference token.
+    /// A semantic node was synthesized from a shared entity-reference token,
+    /// or in a tree-backed document joins text from several tree nodes.
     #[error(
-        "XML mutation target originates from an entity expansion and has no unique source range"
+        "XML mutation target originates from an entity expansion or joined text and has no unique source"
     )]
     EntityExpandedMutationTarget,
     /// Replacement content does not satisfy the requested structural shape.
@@ -596,6 +605,19 @@ pub enum XmlDocumentError {
     /// Process-local document provenance space is exhausted.
     #[error("XML document identity space is exhausted")]
     IdentityExhausted,
+    /// A tree-backed document has no serialization to splice; it changes
+    /// only through edits of its tree.
+    #[cfg(feature = "external-tree")]
+    #[error("a tree-backed XML document changes only through edits of its tree")]
+    TreeBackedSerialization,
+    /// A tree operation was asked of a document parsed from text.
+    #[cfg(feature = "external-tree")]
+    #[error("the XML document was parsed from text and has no external tree")]
+    NotTreeBacked,
+    /// The external tree could not carry out an edit; it was rolled back.
+    #[cfg(feature = "external-tree")]
+    #[error("external tree edit failed: {0}")]
+    TreeEdit(String),
     /// A projected mutation exceeds the caller's active node ceiling.
     #[error("projected XML document exceeds the maximum node count of {maximum}")]
     ProjectedNodeLimit {
@@ -700,6 +722,13 @@ pub struct XmlDocument {
     /// current one: an identity of discarded bytes must not become valid again.
     #[cfg(feature = "xmldsig-sign")]
     issued: u64,
+    /// The tree that owns this document's content, when it is not parsed
+    /// from a serialization; its arena carries no source ranges.
+    #[cfg(feature = "external-tree")]
+    tree: Option<alloc::boxed::Box<dyn external::ExternalTree>>,
+    /// The tree's mark at the start of each open all-or-nothing mutation.
+    #[cfg(all(feature = "external-tree", feature = "xmldsig-sign"))]
+    tree_marks: Vec<usize>,
 }
 
 /// Every minimal alignment of the change between two texts.
@@ -895,7 +924,16 @@ fn render_content_replacement_edits(
 pub(crate) struct PreparedDocumentMutation {
     identity: DocumentIdentity,
     generation: u64,
-    cell: DocumentCell,
+    change: PreparedChange,
+}
+
+/// A validated mutation: the parsed next generation of a text document, or
+/// the edits a tree-backed document hands its tree.
+#[cfg(feature = "xmlenc")]
+enum PreparedChange {
+    Cell(DocumentCell),
+    #[cfg(feature = "external-tree")]
+    Tree(Vec<tree_edits::ValidatedChange>, DocumentParseSettings),
 }
 
 /// Borrowed semantic view of one immutable [`XmlDocument`] generation.
@@ -1109,6 +1147,71 @@ impl XmlDocument {
             atomic: Vec::new(),
             #[cfg(feature = "xmldsig-sign")]
             issued: 0,
+            #[cfg(feature = "external-tree")]
+            tree: None,
+            #[cfg(all(feature = "external-tree", feature = "xmldsig-sign"))]
+            tree_marks: Vec::new(),
+        })
+    }
+
+    /// Build a document whose content is owned by `tree`, reading it under
+    /// the XML input policy and resource limits of `policy`'s operation.
+    ///
+    /// The tree is walked once into the document's semantic view; nothing is
+    /// serialized or parsed. Mutating operations change `tree` itself.
+    ///
+    /// # Errors
+    /// The limit or DTD allowance the tree passes, or a tree its
+    /// implementation cannot report.
+    #[cfg(all(
+        feature = "external-tree",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    pub fn from_external_tree(
+        tree: alloc::boxed::Box<dyn external::ExternalTree>,
+        policy: &impl XmlDocumentPolicy,
+    ) -> Result<Self, XmlDocumentError> {
+        policy.resource_policy().validate()?;
+        let settings = DocumentParseSettings::from_policy(
+            *policy.xml_input_policy(),
+            policy.resource_policy(),
+        );
+        let (cell, has_dtd) = project_external(tree.as_ref(), settings)?;
+        let identity = allocate_document_identity(&NEXT_DOCUMENT_ID)?;
+        Ok(Self {
+            identity,
+            generation: 0,
+            requires_internal_dtd: has_dtd,
+            settings,
+            cell,
+            #[cfg(feature = "xmldsig-sign")]
+            atomic: Vec::new(),
+            #[cfg(feature = "xmldsig-sign")]
+            issued: 0,
+            tree: Some(tree),
+            #[cfg(feature = "xmldsig-sign")]
+            tree_marks: Vec::new(),
+        })
+    }
+
+    /// The external node `identity` came from, for a tree-backed document.
+    ///
+    /// # Errors
+    /// A foreign or stale identity, a parsed document, or a node produced by
+    /// an entity expansion, which keeps no external node.
+    #[cfg(feature = "external-tree")]
+    pub fn external_node(
+        &self,
+        identity: NodeIdentity,
+    ) -> Result<external::ExternalNode, XmlDocumentError> {
+        self.with_view(|view| {
+            view.validate_identity(identity)?;
+            view.parsed
+                .external
+                .get(identity.semantic_id.raw() as usize)
+                .copied()
+                .flatten()
+                .ok_or(XmlDocumentError::MissingNode)
         })
     }
 
@@ -1161,7 +1264,7 @@ impl XmlDocument {
     ) -> Result<(), crate::policy::PolicyViolation> {
         resources.validate()?;
         self.validate_xml_input_policy(xml.allow_internal_dtd)?;
-        resources.validate_xml_document_len(self.as_xml().len())?;
+        resources.validate_xml_document_len(self.content_len())?;
         self.with_view(|view| {
             // Retain lexical preflight metrics per generation, including entity expansion and
             // DTD defaults. A later stricter operation policy must not trust parse-time limits.
@@ -1193,7 +1296,22 @@ impl XmlDocument {
         })
     }
 
+    /// The size of this generation's content as resource limits count it:
+    /// the serialization's length, or for a tree-backed document the bytes
+    /// its projection read.
+    #[must_use]
+    pub fn content_len(&self) -> usize {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return self.cell.borrow_dependent().external_bytes;
+        }
+        self.as_xml().len()
+    }
+
     /// Return the deterministic serialized representation of this generation.
+    ///
+    /// A tree-backed document has none: its tree is the content, and this
+    /// is empty.
     #[must_use]
     pub fn as_xml(&self) -> &str {
         self.cell.borrow_owner()
@@ -1224,6 +1342,12 @@ impl XmlDocument {
         mutate: impl FnOnce(&mut Self) -> Result<T, E>,
     ) -> Result<T, E> {
         self.atomic.push(AtomicMutation::Started);
+        // The tree's own way back: its state when this frame began.
+        #[cfg(feature = "external-tree")]
+        if let Some(tree) = self.tree.as_mut() {
+            let mark = tree.checkpoint();
+            self.tree_marks.push(mark);
+        }
         let mut guard = AtomicGuard {
             document: self,
             succeeded: false,
@@ -1314,6 +1438,14 @@ impl XmlDocument {
                 current: self.generation,
             });
         };
+        // A tree keeps the nodes no edit replaced, so the same external node
+        // with the same expanded name is the same element.
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return base.with_dependent(|_, earlier| {
+                self.with_view(|view| carry_external(earlier, view, group, identities))
+            });
+        }
         base.with_dependent(|old, earlier| {
             self.with_view(|view| {
                 let alignments = Alignments::new(old, view.xml());
@@ -1367,6 +1499,16 @@ impl XmlDocument {
             debug_assert!(false, "a guard ends only the frame it began");
             return;
         };
+        // The tree follows the frame: back to its mark on failure, and its
+        // undo records are dropped once the outermost frame succeeds.
+        #[cfg(feature = "external-tree")]
+        if let (Some(tree), Some(mark)) = (self.tree.as_mut(), self.tree_marks.pop()) {
+            if !succeeded {
+                tree.rollback(mark);
+            } else if self.atomic.is_empty() {
+                tree.release(mark);
+            }
+        }
         let AtomicMutation::Replaced(cell, generation) = frame else {
             return;
         };
@@ -1415,6 +1557,11 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Node(replacement, ReplacementShape::SingleElement);
+            return self.change_tree(&[(target, change)], self.settings, None);
+        }
         let next = self.build_node_replacement(
             target,
             replacement,
@@ -1433,6 +1580,11 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Node(replacement, ReplacementShape::SingleElement);
+            return self.change_tree(&[(target, change)], settings, Some(budget));
+        }
         let next = self.build_node_replacement(
             target,
             replacement,
@@ -1451,16 +1603,46 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
+        self.prepare_replacement(
+            target,
+            replacement,
+            ReplacementShape::SingleElement,
+            settings,
+            budget,
+        )
+    }
+
+    /// Validate the replacement of `target` without committing it.
+    #[cfg(feature = "xmlenc")]
+    fn prepare_replacement(
+        &self,
+        target: NodeIdentity,
+        replacement: &str,
+        shape: ReplacementShape,
+        settings: DocumentParseSettings,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Node(replacement, shape);
+            let changes =
+                self.validate_tree_changes(&[(target, change)], settings, Some(budget))?;
+            return Ok(PreparedDocumentMutation {
+                identity: self.identity,
+                generation: self.generation,
+                change: PreparedChange::Tree(changes, settings),
+            });
+        }
         Ok(PreparedDocumentMutation {
             identity: self.identity,
             generation: self.generation,
-            cell: self.build_node_replacement(
+            change: PreparedChange::Cell(self.build_node_replacement(
                 target,
                 replacement,
-                ReplacementShape::SingleElement,
+                shape,
                 settings,
                 Some(budget),
-            )?,
+            )?),
         })
     }
 
@@ -1477,6 +1659,11 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement: &str,
     ) -> Result<(), XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Node(replacement, ReplacementShape::Fragment);
+            return self.change_tree(&[(target, change)], self.settings, None);
+        }
         let next = self.build_node_replacement(
             target,
             replacement,
@@ -1495,17 +1682,13 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: &XmlParseWorkBudget,
     ) -> Result<PreparedDocumentMutation, XmlDocumentError> {
-        Ok(PreparedDocumentMutation {
-            identity: self.identity,
-            generation: self.generation,
-            cell: self.build_node_replacement(
-                target,
-                replacement,
-                ReplacementShape::Fragment,
-                settings,
-                Some(budget),
-            )?,
-        })
+        self.prepare_replacement(
+            target,
+            replacement,
+            ReplacementShape::Fragment,
+            settings,
+            budget,
+        )
     }
 
     /// Insert a well-formed XML fragment immediately before one node.
@@ -1519,6 +1702,11 @@ impl XmlDocument {
         target: NodeIdentity,
         fragment: &str,
     ) -> Result<(), XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Before(fragment);
+            return self.change_tree(&[(target, change)], self.settings, None);
+        }
         // The target keeps its exact original bytes after the new fragment, so
         // the replacement changes nothing but the inserted content.
         let maximum = self.settings.max_bytes;
@@ -1690,6 +1878,11 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Content(replacement);
+            return self.change_tree(&[(target, change)], settings, budget);
+        }
         let (range, self_closing_expansion, serialized_len) = self.with_view(|view| {
             let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
@@ -1844,6 +2037,12 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         spliced: Option<&SplicedElement>,
     ) -> Result<String, XmlDocumentError> {
+        // There is no serialization of a tree to return; its signature is
+        // committed into the tree instead.
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return Err(XmlDocumentError::TreeBackedSerialization);
+        }
         validate_base64_replacements(replacements)?;
         let (mut edits, mut projected) =
             self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
@@ -1889,6 +2088,23 @@ impl XmlDocument {
     ) -> Result<(), XmlDocumentError> {
         if replacements.is_empty() {
             return Ok(());
+        }
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            // Unvalidated replacements are generated character data (base64),
+            // which a text edit carries without parsing.
+            let changes: Vec<_> = replacements
+                .iter()
+                .map(|(target, replacement)| {
+                    let change = if validate_fragments {
+                        TreeChange::Content(replacement)
+                    } else {
+                        TreeChange::SetText(replacement)
+                    };
+                    (*target, change)
+                })
+                .collect();
+            return self.change_tree(&changes, settings, budget);
         }
         let (edits, projected) =
             self.prepare_content_replacement_edits(replacements, settings.max_bytes)?;
@@ -2109,6 +2325,11 @@ impl XmlDocument {
         validate_context: bool,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<(), XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            let change = TreeChange::Append(child);
+            return self.change_tree(&[(target, change)], settings, budget);
+        }
         let projected = self.projected_child_append_len(target, child.len())?;
         if projected > settings.max_bytes {
             return Err(XmlDocumentError::DocumentTooLarge {
@@ -2182,7 +2403,100 @@ impl XmlDocument {
         self.commit_cell(next)
     }
 
-    fn commit_cell(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
+    fn commit_cell(&mut self, next: DocumentCell) -> Result<(), XmlDocumentError> {
+        // A serialization splice would change the arena and leave the tree
+        // that owns the content behind it.
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return Err(XmlDocumentError::TreeBackedSerialization);
+        }
+        self.commit_generation(next)
+    }
+
+    /// Whether this document's content is an external tree.
+    #[cfg(feature = "external-tree")]
+    #[must_use]
+    pub const fn is_tree_backed(&self) -> bool {
+        self.tree.is_some()
+    }
+
+    /// Read the external tree again; a tree that changed becomes a new
+    /// generation.
+    ///
+    /// An application whose code may have changed the tree since the last
+    /// operation calls this before the next one, with that operation's
+    /// policy, so the operation reads the tree as it is under its own XML
+    /// input and resource limits; those limits then govern the document's
+    /// later edits too. `None` reads under the limits the current generation
+    /// was read with, to learn whether anything changed. If the tree
+    /// changed, every identity of the earlier generation becomes stale; an
+    /// unchanged tree keeps its generation, its identities and evidence bound
+    /// to it.
+    ///
+    /// # Errors
+    /// [`XmlDocumentError::NotTreeBacked`] for a parsed document, an invalid
+    /// resource policy, or what the projection refuses; the document then
+    /// keeps its generation and limits.
+    #[cfg(all(
+        feature = "external-tree",
+        any(feature = "xmldsig", feature = "xmlenc")
+    ))]
+    pub fn refresh_tree(
+        &mut self,
+        policy: Option<&dyn XmlDocumentPolicy>,
+    ) -> Result<(), XmlDocumentError> {
+        let tree = self.tree.as_ref().ok_or(XmlDocumentError::NotTreeBacked)?;
+        let settings = match policy {
+            Some(policy) => {
+                policy.resource_policy().validate()?;
+                DocumentParseSettings::from_policy(
+                    *policy.xml_input_policy(),
+                    policy.resource_policy(),
+                )
+            }
+            None => self.settings,
+        };
+        let (cell, has_dtd) = project_external(tree.as_ref(), settings)?;
+        let unchanged = self.requires_internal_dtd == has_dtd
+            && same_projection(self.cell.borrow_dependent(), cell.borrow_dependent());
+        if !unchanged {
+            self.commit_generation(cell)?;
+            self.requires_internal_dtd = has_dtd;
+        }
+        self.settings = settings;
+        Ok(())
+    }
+
+    /// The content length after `added` bytes join `target`, as an upper
+    /// bound: what the edit removes is not subtracted.
+    #[cfg(feature = "external-tree")]
+    fn projected_tree_len(
+        &self,
+        target: NodeIdentity,
+        added: usize,
+    ) -> Result<usize, XmlDocumentError> {
+        self.with_view(|view| {
+            if !view.resolve_mutation_node(target)?.is_element() {
+                return Err(XmlDocumentError::TargetNotElement);
+            }
+            Ok(())
+        })?;
+        self.content_len()
+            .checked_add(added)
+            .ok_or_else(|| XmlDocumentError::InvalidReplacement("content length overflow".into()))
+    }
+
+    /// Whether an all-or-nothing mutation is open.
+    #[cfg(feature = "external-tree")]
+    fn in_transaction(&self) -> bool {
+        #[cfg(feature = "xmldsig-sign")]
+        return !self.atomic.is_empty();
+        #[cfg(not(feature = "xmldsig-sign"))]
+        false
+    }
+
+    /// Make `next` the current generation, numbered above every one issued.
+    fn commit_generation(&mut self, mut next: DocumentCell) -> Result<(), XmlDocumentError> {
         #[cfg(feature = "xmldsig-sign")]
         let issued = self.issued;
         #[cfg(not(feature = "xmldsig-sign"))]
@@ -2216,6 +2530,10 @@ impl XmlDocument {
         target: NodeIdentity,
         replacement_len: usize,
     ) -> Result<usize, XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return self.projected_tree_len(target, replacement_len);
+        }
         self.with_view(|view| {
             let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
@@ -2266,6 +2584,10 @@ impl XmlDocument {
         target: NodeIdentity,
         child_len: usize,
     ) -> Result<usize, XmlDocumentError> {
+        #[cfg(feature = "external-tree")]
+        if self.tree.is_some() {
+            return self.projected_tree_len(target, child_len);
+        }
         self.with_view(|view| {
             let node = view.resolve_mutation_node(target)?;
             if !node.is_element() {
@@ -2324,10 +2646,15 @@ impl XmlDocument {
         self.replace_serialized_with_settings(output, settings, budget)
     }
 
+    /// Commit `prepared`. A text change was parsed and charged when it was
+    /// prepared; a tree change projects the edited tree now and charges that
+    /// walk to `budget`, the operation's allowance.
     #[cfg(feature = "xmlenc")]
     pub(crate) fn commit_prepared(
         &mut self,
         prepared: PreparedDocumentMutation,
+        #[cfg_attr(not(feature = "external-tree"), expect(unused_variables))]
+        budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
         if self.identity != prepared.identity {
             return Err(XmlDocumentError::ForeignIdentity);
@@ -2338,7 +2665,13 @@ impl XmlDocument {
                 current: self.generation,
             });
         }
-        self.commit_cell(prepared.cell)
+        match prepared.change {
+            PreparedChange::Cell(cell) => self.commit_cell(cell),
+            #[cfg(feature = "external-tree")]
+            PreparedChange::Tree(changes, settings) => {
+                self.commit_tree_changes(&changes, settings, Some(budget))
+            }
+        }
     }
 
     fn replaced_range(
@@ -2518,6 +2851,28 @@ impl<'a> DocumentView<'a> {
     #[must_use]
     pub fn xml(self) -> &'a str {
         self.parsed.document.input_text()
+    }
+
+    /// Whether this generation was projected from an external tree.
+    #[cfg(feature = "external-tree")]
+    pub(crate) fn is_tree_backed(self) -> bool {
+        !self.parsed.external.is_empty()
+    }
+
+    /// The markup of `node` as this generation holds it: its exact source
+    /// bytes, or for a tree-backed document the node written from the view.
+    #[cfg(any(
+        feature = "xmlenc",
+        all(feature = "external-tree", feature = "xmldsig-sign")
+    ))]
+    pub(crate) fn markup(self, node: Node<'a, 'a>) -> alloc::borrow::Cow<'a, str> {
+        #[cfg(feature = "external-tree")]
+        if !self.parsed.external.is_empty() {
+            let mut output = String::new();
+            markup::write_node(node, &mut output);
+            return alloc::borrow::Cow::Owned(output);
+        }
+        alloc::borrow::Cow::Borrowed(&self.xml()[node.range()])
     }
 
     /// Return the document root identity.
@@ -2725,6 +3080,14 @@ impl<'a> DocumentView<'a> {
         identity: NodeIdentity,
     ) -> Result<Node<'a, 'a>, XmlDocumentError> {
         let node = self.resolve_node(identity)?;
+        // A tree-backed node is a target when it has a node of the tree to edit.
+        #[cfg(feature = "external-tree")]
+        if self.is_tree_backed() {
+            return match self.parsed.external.get(node.id().get_usize()) {
+                Some(Some(_)) => Ok(node),
+                _ => Err(XmlDocumentError::EntityExpandedMutationTarget),
+            };
+        }
         if !node.has_actionable_range() {
             return Err(XmlDocumentError::EntityExpandedMutationTarget);
         }
@@ -2877,9 +3240,146 @@ fn build_semantic_cell(
             peak_namespace_bindings,
             #[cfg(feature = "xmldsig")]
             parse_work: 0,
+            #[cfg(feature = "external-tree")]
+            external: Vec::new(),
+            #[cfg(feature = "external-tree")]
+            external_bytes: 0,
         })
     })?;
     Ok((cell, declares_doctype))
+}
+
+/// Carry element identities of `earlier` into `view` through the external
+/// node each was projected from.
+#[cfg(all(feature = "external-tree", feature = "xmldsig-sign"))]
+fn carry_external(
+    earlier: &ParsedDocument<'_>,
+    view: DocumentView<'_>,
+    group: &[usize],
+    identities: &mut [NodeIdentity],
+) -> Result<(), XmlDocumentError> {
+    let mut current = Map::default();
+    for (position, node) in view.parsed.external.iter().enumerate() {
+        if let Some(node) = node {
+            current.insert(*node, position);
+        }
+    }
+    for &index in group {
+        let position = identities[index].semantic_id.raw() as usize;
+        let element = SemanticDocument::node(&earlier.document, identities[index].semantic_id)
+            .filter(Node::is_element)
+            .ok_or(XmlDocumentError::MissingNode)?;
+        let external = earlier
+            .external
+            .get(position)
+            .copied()
+            .flatten()
+            .ok_or(XmlDocumentError::MissingNode)?;
+        let found = current
+            .get(&external)
+            .and_then(|&position| u32::try_from(position).ok())
+            .and_then(|position| view.document().get_node(NodeId::from(position)))
+            .filter(|node| {
+                let (name, found) = (element.tag_name(), node.tag_name());
+                node.is_element()
+                    && found.namespace() == name.namespace()
+                    && found.name() == name.name()
+            })
+            .ok_or(XmlDocumentError::MissingNode)?;
+        identities[index] = view.node_identity(found);
+    }
+    Ok(())
+}
+
+/// Builds a generation by walking `tree`, and returns whether the tree has a
+/// document type declaration.
+#[cfg(feature = "external-tree")]
+fn project_external(
+    tree: &dyn external::ExternalTree,
+    settings: DocumentParseSettings,
+) -> Result<(DocumentCell, bool), XmlDocumentError> {
+    use crate::xml::dom::external::{ProjectionLimits, TreeSink};
+    let limits = ProjectionLimits {
+        nodes: settings.nodes_limit,
+        depth: settings.depth_limit,
+        namespace_bindings: settings.namespace_bindings_limit,
+        bytes: settings.max_bytes,
+        allow_dtd: settings.allow_dtd,
+    };
+    let mut has_dtd = false;
+    let cell = DocumentCell::try_new(String::new(), |source| {
+        let mut sink = TreeSink::new(source, tree.document(), limits)?;
+        tree.project(&mut sink)?;
+        let (document, external, metrics) = sink.finish()?;
+        has_dtd = metrics.has_dtd;
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let _ = metrics.peak_namespace_bindings;
+        Ok::<_, XmlDocumentError>(ParsedDocument {
+            node_count: external.len(),
+            document,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+            max_depth: metrics.max_depth,
+            #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+            peak_namespace_bindings: metrics.peak_namespace_bindings,
+            // Walking the tree is the work a parse of it would be.
+            #[cfg(feature = "xmldsig")]
+            parse_work: metrics.bytes,
+            external,
+            external_bytes: metrics.bytes,
+        })
+    })?;
+    Ok((cell, has_dtd))
+}
+
+/// Whether two projections of a tree are the same generation: the same
+/// tree nodes, in the same shape, with every name, namespace scope,
+/// attribute (and its ID typing), text and instruction equal.
+#[cfg(all(
+    feature = "external-tree",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+fn same_projection(current: &ParsedDocument<'_>, next: &ParsedDocument<'_>) -> bool {
+    if current.external != next.external || current.external_bytes != next.external_bytes {
+        return false;
+    }
+    let mut left = current.document.root().descendants();
+    let mut right = next.document.root().descendants();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(left), Some(right)) if same_node(left, right) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Node ids follow document order in both projections, so equal parent ids
+/// give equal shape.
+#[cfg(all(
+    feature = "external-tree",
+    any(feature = "xmldsig", feature = "xmlenc")
+))]
+fn same_node(left: Node<'_, '_>, right: Node<'_, '_>) -> bool {
+    left.node_type() == right.node_type()
+        && left.parent().map(Node::id) == right.parent().map(Node::id)
+        && left.tag_name().name() == right.tag_name().name()
+        && left.tag_name().namespace() == right.tag_name().namespace()
+        && left.prefix() == right.prefix()
+        && left.text() == right.text()
+        && left.pi().map(|pi| (pi.target, pi.value)) == right.pi().map(|pi| (pi.target, pi.value))
+        && left.attributes().len() == right.attributes().len()
+        && left.attributes().zip(right.attributes()).all(|(a, b)| {
+            a.name() == b.name()
+                && a.namespace() == b.namespace()
+                && a.prefix() == b.prefix()
+                && a.value() == b.value()
+                && a.is_id() == b.is_id()
+        })
+        && left.namespaces().len() == right.namespaces().len()
+        && left
+            .namespaces()
+            .zip(right.namespaces())
+            .all(|(a, b)| a.name() == b.name() && a.uri() == b.uri())
 }
 
 pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
@@ -4633,7 +5133,7 @@ fn allocate_document_identity(counter: &AtomicU64) -> Result<DocumentIdentity, X
 
 /// What a node replacement must leave in its parent.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReplacementShape {
+pub(crate) enum ReplacementShape {
     /// Exactly one element, beside whitespace, comments and processing instructions.
     SingleElement,
     /// Any content that is well-formed in the parent context.
@@ -4883,6 +5383,15 @@ fn element_opening_end(element: &str) -> Result<usize, XmlDocumentError> {
         "element start tag is incomplete".into(),
     ))
 }
+
+#[cfg(feature = "external-tree")]
+pub mod external;
+#[cfg(feature = "external-tree")]
+mod markup;
+#[cfg(feature = "external-tree")]
+mod tree_edits;
+#[cfg(feature = "external-tree")]
+pub(crate) use tree_edits::{TreeChange, wrap_in_scope};
 
 #[cfg(test)]
 mod entity_ceiling_tests;
@@ -6866,7 +7375,7 @@ mod tests {
             )
             .expect("both boundary text pairs must fit in the prepared document");
         document
-            .commit_prepared(prepared)
+            .commit_prepared(prepared, &budget)
             .expect("prepared replacement must commit atomically");
 
         assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");

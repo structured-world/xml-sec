@@ -1181,10 +1181,15 @@ impl SigningKey for DsaSigningKey {
                 });
             }
         };
-        let component_len =
-            usize::try_from(self.key.verifying_key().components().q().bits_vartime())
-                .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
-                .div_ceil(8);
+        let component_len = usize::try_from(
+            self.key
+                .verifying_key()
+                .components()
+                .q()
+                .bit_width_vartime(),
+        )
+        .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
+        .div_ceil(8);
         if algorithm.dsa_component_len() != Some(component_len) {
             return Err(SigningKeyError::InvalidPublicKeyInfo);
         }
@@ -1217,9 +1222,9 @@ impl SigningKey for DsaSigningKey {
             .to_public_key_der()
             .map(|doc| doc.as_bytes().to_vec())
             .map_err(|_| SigningKeyError::PublicKeyEncodingFailed)?;
-        let modulus_bits = usize::try_from(verifying_key.components().p().bits_vartime())
+        let modulus_bits = usize::try_from(verifying_key.components().p().bit_width_vartime())
             .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?;
-        let component_len = usize::try_from(verifying_key.components().q().bits_vartime())
+        let component_len = usize::try_from(verifying_key.components().q().bit_width_vartime())
             .map_err(|_| SigningKeyError::InvalidPublicKeyInfo)?
             .div_ceil(8);
         let components = verifying_key.components();
@@ -1862,6 +1867,14 @@ impl<'a> SignContext<'a> {
         &self,
         mut document: XmlDocument,
     ) -> Result<crate::policy::Audited<String>, SigningError> {
+        // A tree's content is the tree: there is no signed text to return,
+        // so the tree is signed in place with `sign_document` instead.
+        #[cfg(feature = "external-tree")]
+        if document.is_tree_backed() {
+            return Err(map_owned_document_mutation_error(
+                crate::XmlDocumentError::TreeBackedSerialization,
+            ));
+        }
         self.validate_owned_document_input(&document)?;
         let mut budgets = SigningOperationBudgets::from_resources_with_backend(
             &self.policy.resources,
@@ -1898,7 +1911,7 @@ impl<'a> SignContext<'a> {
         budgets
             .transforms
             .xml_parse_work()
-            .admit(document.as_xml().len())?;
+            .admit(document.content_len())?;
         document.transaction(|document| {
             self.sign_document_in_place::<CommitDocument>(document, &mut budgets)
                 .map(|((), audit)| audit)
@@ -2185,15 +2198,105 @@ impl<'a> SignContext<'a> {
         setup_gate: OperationNodeId,
         generated: Vec<GeneratedC14n>,
     ) -> Result<OperationNodeId, SigningError> {
-        let candidate = c14n11_candidate(document, generated);
         let mutation =
             operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
         operation.add_dependency(mutation, setup_gate)?;
         operation.compile()?;
+        #[cfg(feature = "external-tree")]
+        if document.is_tree_backed() {
+            // The canonical form is the element the tree gains: one Transform
+            // appended to existing Transforms, or Transforms before DigestMethod.
+            let targets = document.with_view(|view| {
+                generated
+                    .iter()
+                    .map(|edit| match edit.transforms {
+                        Some(transforms) => view.node_identity_by_id(transforms),
+                        None => view.node_identity_by_id(edit.digest_method),
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let changes = generated
+                .iter()
+                .zip(targets)
+                .map(|(edit, target)| {
+                    let change = if edit.transforms.is_some() {
+                        crate::document::TreeChange::Append(&edit.canonical)
+                    } else {
+                        crate::document::TreeChange::Before(&edit.canonical)
+                    };
+                    (target, change)
+                })
+                .collect::<Vec<_>>();
+            operation.run_document_transition(mutation, document, |document, budgets| {
+                document
+                    .change_tree(
+                        &changes,
+                        self.document_parse_settings(),
+                        Some(budgets.transforms.xml_parse_work()),
+                    )
+                    .map_err(map_owned_document_mutation_error)
+            })?;
+            operation.extend();
+            return Ok(mutation);
+        }
+        let candidate = c14n11_candidate(document, generated);
         operation.run_document_transition(mutation, document, |document, budgets| {
             document
                 .replace_serialized_with_settings(
                     candidate,
+                    self.document_parse_settings(),
+                    Some(budgets.transforms.xml_parse_work()),
+                )
+                .map_err(map_owned_document_mutation_error)
+        })?;
+        operation.extend();
+        Ok(mutation)
+    }
+
+    /// Write placeholder text into every value signing fills, as a generation
+    /// of its own, so the tree becomes the document dependency analysis reads;
+    /// the final values replace it, and a failure rolls it back with the rest.
+    #[cfg(feature = "external-tree")]
+    fn commit_tree_placeholders(
+        &self,
+        document: &mut XmlDocument,
+        operation: &mut SigningExecution<'_>,
+        setup_gate: OperationNodeId,
+        references: &SigningReferenceInputs,
+        target_signature: usize,
+    ) -> Result<OperationNodeId, SigningError> {
+        let mutation =
+            operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+        operation.add_dependency(mutation, setup_gate)?;
+        operation.compile()?;
+        let targets = document.with_view(|view| {
+            let signature = find_signing_signature_node(
+                view.document(),
+                SigningSignatureTarget::Index(target_signature),
+            )?;
+            let signature_value = find_required_child(signature, "SignatureValue")?;
+            let mut targets = references
+                .signed_info
+                .iter()
+                .chain(&references.manifests)
+                .map(|reference| view.node_identity_by_id(reference.digest_value_node_id))
+                .collect::<Vec<_>>();
+            targets.push(view.node_identity(signature_value));
+            Ok::<_, SigningDigestError>(targets)
+        })?;
+        let changes = targets
+            .into_iter()
+            .map(|target| {
+                (
+                    target,
+                    crate::document::TreeChange::SetText(SIGNING_PLACEHOLDER),
+                )
+            })
+            .collect::<Vec<_>>();
+        operation.run_document_transition(mutation, document, |document, budgets| {
+            document
+                .change_tree(
+                    &changes,
                     self.document_parse_settings(),
                     Some(budgets.transforms.xml_parse_work()),
                 )
@@ -2229,6 +2332,62 @@ impl<'a> SignContext<'a> {
         Ok(spliced)
     }
 
+    /// The plan of a tree-backed document, which has no serialization to
+    /// defer a splice into: what joins the document is committed as its own
+    /// generation, then analyzed, with placeholder values committed first when
+    /// the analysis needs them.
+    #[cfg(feature = "external-tree")]
+    fn plan_tree_signing(
+        &self,
+        document: &mut XmlDocument,
+        operation: &mut SigningExecution<'_>,
+        (request, transform_options): (SigningReferenceRequest<'_, '_>, TransformOptions<'_>),
+        mut setup_gate: OperationNodeId,
+        key_info_content: Option<String>,
+        generated: Vec<GeneratedC14n>,
+    ) -> Result<PlannedReferences, SigningError> {
+        let target_signature = request.target_signature;
+        if !generated.is_empty() {
+            setup_gate = self.commit_generated_c14n(document, operation, setup_gate, generated)?;
+        }
+        if let Some(content) = key_info_content {
+            setup_gate = self.populate_signing_key_info(
+                document,
+                target_signature,
+                operation,
+                setup_gate,
+                (&content, None),
+            )?;
+        }
+        let policy = Arc::clone(operation.policy());
+        let mut references =
+            collect_signing_reference_inputs(document, &policy, operation.budgets_mut(), request)?;
+        if !current_tree_decides(document, target_signature, &references)? {
+            setup_gate = self.commit_tree_placeholders(
+                document,
+                operation,
+                setup_gate,
+                &references,
+                target_signature,
+            )?;
+            references = collect_signing_reference_inputs(
+                document,
+                &policy,
+                operation.budgets_mut(),
+                request,
+            )?;
+        }
+        let plan = analyze_signing_reference_inputs(
+            document,
+            &policy,
+            operation.budgets_mut(),
+            request,
+            transform_options,
+            &references,
+        )?;
+        Ok(((references, plan), setup_gate, None))
+    }
+
     /// Analyze the `Reference` set and settle how generated canonicalization and
     /// the writer's `KeyInfo` join the document: in the final mutation when
     /// nothing signed reads them, or as their own generations when something may.
@@ -2242,6 +2401,17 @@ impl<'a> SignContext<'a> {
         mut generated: Vec<GeneratedC14n>,
     ) -> Result<PlannedReferences, SigningError> {
         let target_signature = request.target_signature;
+        #[cfg(feature = "external-tree")]
+        if document.is_tree_backed() {
+            return self.plan_tree_signing(
+                document,
+                operation,
+                (request, transform_options),
+                setup_gate,
+                key_info_content,
+                generated,
+            );
+        }
         // A DTD's attribute default would reach the new elements when they are
         // parsed (XML 1.0 §3.3.2), and its ATTLIST could type a new ID, neither
         // of which text inserted here can stand in for.
@@ -2340,6 +2510,58 @@ impl<'a> SignContext<'a> {
         Ok((analyzed, setup_gate, None))
     }
 
+    /// The target `KeyInfo` of a tree-backed document and its markup with the
+    /// writer's content merged in.
+    ///
+    /// The merge is the one a text document runs, on the target `Signature`
+    /// written from the view inside a wrapper that declares its parent's
+    /// scope, so it reads exactly the bindings the tree gives the signature.
+    #[cfg(feature = "external-tree")]
+    fn merged_tree_key_info(
+        &self,
+        document: &XmlDocument,
+        target_signature: usize,
+        key_info_content: &str,
+        budget: &XmlParseWorkBudget,
+    ) -> Result<(crate::NodeIdentity, String), SigningError> {
+        let (key_info, standalone) = document.with_view(|view| {
+            let signature = find_signing_signature_node(
+                view.document(),
+                SigningSignatureTarget::Index(target_signature),
+            )?;
+            let key_info = find_required_child(signature, "KeyInfo")?;
+            let standalone =
+                crate::document::wrap_in_scope(&view.markup(signature), signature.parent_element())
+                    .map_err(map_owned_document_mutation_error)?;
+            Ok::<_, SigningError>((view.node_identity(key_info), standalone))
+        })?;
+        self.policy
+            .resources
+            .validate_xml_document_len(standalone.len())?;
+        let parsed = crate::document::parse_borrowed_with_settings_and_budget(
+            &standalone,
+            self.document_parse_settings(),
+            Some(budget),
+        )
+        .map_err(map_owned_document_mutation_error)?;
+        // The wrapper holds only the target, which is its first signature.
+        let spliced = super::mutation::merge_key_info_source_in_document(
+            &parsed,
+            &standalone,
+            (key_info_content, self.id_attributes),
+            0,
+            Some(&self.policy),
+            Some(budget),
+        )?;
+        let (range, length) = spliced.spans.first().cloned().ok_or_else(|| {
+            SigningError::from(SigningDigestError::InvalidStructure(
+                "KeyInfo merge replaced nothing".into(),
+            ))
+        })?;
+        let merged = spliced.xml[range.start..range.start + length].to_owned();
+        Ok((key_info, merged))
+    }
+
     /// Commit `KeyInfo` as its own generation, for a `Reference` that reads it,
     /// from `spliced` when that was made against the current generation.
     fn populate_signing_key_info(
@@ -2354,6 +2576,31 @@ impl<'a> SignContext<'a> {
             operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
         operation.add_dependency(mutation, setup_gate)?;
         operation.compile()?;
+        #[cfg(feature = "external-tree")]
+        if document.is_tree_backed() {
+            operation.run_document_transition(mutation, document, |document, budgets| {
+                let budget = budgets.transforms.xml_parse_work();
+                let (key_info, merged) = self.merged_tree_key_info(
+                    document,
+                    target_signature,
+                    key_info_content,
+                    budget,
+                )?;
+                let change = crate::document::TreeChange::Node(
+                    &merged,
+                    crate::document::ReplacementShape::SingleElement,
+                );
+                document
+                    .change_tree(
+                        &[(key_info, change)],
+                        self.document_parse_settings(),
+                        Some(budget),
+                    )
+                    .map_err(map_owned_document_mutation_error)
+            })?;
+            operation.extend();
+            return Ok(mutation);
+        }
         operation.run_document_transition(mutation, document, |document, budgets| {
             let populated = match spliced {
                 Some(spliced) => spliced,
@@ -2421,14 +2668,14 @@ impl<'a> SignContext<'a> {
                     maximum: self.policy.resources.max_xml_document_bytes,
                     actual: usize::MAX,
                 },
-            )? - document.as_xml().len();
+            )? - document.content_len();
         }
         if let Some(spliced) = key_info {
             // `spliced` and the source share everything outside its spans. The
             // replacements above may have shortened the document, so this adds
             // before it subtracts.
             projected_document_len =
-                projected_document_len + spliced.xml.len() - document.as_xml().len();
+                projected_document_len + spliced.xml.len() - document.content_len();
         }
         self.policy
             .resources
@@ -2461,7 +2708,7 @@ impl<'a> SignContext<'a> {
         let insertions = splice.map_or(&[][..], |splice| splice.insertions.as_slice());
         self.policy
             .resources
-            .validate_xml_document_len(document.as_xml().len())?;
+            .validate_xml_document_len(document.content_len())?;
         let (algorithm, hmac_output_length_bits, canonical_signed_info, signature_context) =
             operation.run_with_budgets(plan_nodes.canonicalization, |budgets| {
                 let result = canonicalize_signed_info(
@@ -2682,7 +2929,7 @@ impl<'a> SignContext<'a> {
         budgets
             .transforms
             .xml_parse_work()
-            .admit(document.as_xml().len())?;
+            .admit(document.content_len())?;
         document.transaction(|document| {
             self.sign_document_with_builder_in_place::<CommitDocument>(
                 document,
@@ -2750,7 +2997,7 @@ impl<'a> SignContext<'a> {
         drop(operation);
         self.policy
             .resources
-            .validate_xml_document_len(document.as_xml().len())?;
+            .validate_xml_document_len(document.content_len())?;
         let target_signature = document.with_view(|view| {
             let parent = if let Some(id) = self.start_node_id {
                 signing_start_node(view.document(), id, self.id_attributes)?
@@ -2821,7 +3068,7 @@ impl SignedOutput for CommitDocument {
         context
             .policy
             .resources
-            .validate_xml_document_len(document.as_xml().len())?;
+            .validate_xml_document_len(document.content_len())?;
         Ok(())
     }
 }
@@ -3058,6 +3305,9 @@ struct SigningReferenceRequest<'a, 'resources> {
 struct GeneratedC14n {
     digest_value: NodeId,
     digest_method: NodeId,
+    /// The `Transforms` it joins, when the `Reference` has one.
+    #[cfg(feature = "external-tree")]
+    transforms: Option<NodeId>,
     /// Whether it joins existing `Transforms`, instead of bringing the element.
     appends: bool,
     /// Whether nothing lies between the `Transforms` end tag and `DigestMethod`
@@ -3445,49 +3695,33 @@ fn analyze_signing_reference_inputs(
     transform_options: TransformOptions<'_>,
     references: &SigningReferenceInputs,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
-    let all_references = references.signed_info.iter().chain(&references.manifests);
-    if all_references
-        .clone()
-        .all(|reference| reference.transforms.iter().all(selects_whole_subtrees))
-    {
-        // These transforms keep or remove whole subtrees, or read only the
-        // octets or text of the nodes they are given, so a DigestValue or
-        // SignatureValue element is covered exactly when its future text is:
-        // the current tree decides every dependency without placeholder text.
-        // That holds only while filling a value removes nothing but text; a
-        // value holding other nodes needs the placeholder tree, where those
-        // nodes are already gone.
-        let analysis_references = all_references.clone().cloned().collect::<Vec<_>>();
-        let current_tree = document.with_view(|view| {
-            let signature = find_signing_signature_node(
-                view.document(),
-                SigningSignatureTarget::Index(request.target_signature),
-            )?;
-            let signature_value = find_required_child(signature, "SignatureValue")?;
-            let text_only = all_references
-                .filter_map(|reference| view.document().get_node(reference.digest_value_node_id))
-                .chain([signature_value])
-                .all(|value| value.children().all(|child| child.is_text()));
-            if !text_only {
-                return Ok(None);
-            }
-            reference_dependency_levels(
-                view.document(),
-                signature,
-                &analysis_references,
-                request.generated,
-                transform_options,
-                &budgets.transforms,
-                (
-                    request.uri_resolution(policy.transforms.same_document_id_semantics),
-                    request.provider,
-                ),
-            )
-            .map(Some)
-        })?;
-        if let Some(plan) = current_tree {
-            return Ok(plan);
-        }
+    if current_tree_decides(document, request.target_signature, references)? {
+        return current_generation_levels(
+            document,
+            policy,
+            budgets,
+            request,
+            transform_options,
+            references,
+        );
+    }
+    // A tree-backed document reaches here with placeholder text already in
+    // every value signing fills, committed as its own generation: it is the
+    // placeholder document, read without serialization.
+    #[cfg(feature = "external-tree")]
+    if document.is_tree_backed() {
+        return current_generation_levels(
+            document,
+            policy,
+            budgets,
+            request,
+            transform_options,
+            references,
+        )
+        .map(|plan| SigningDependencyPlan {
+            splice_unread: false,
+            ..plan
+        });
     }
     // Without the current tree a splice has to be committed anyway, so the caller
     // is told before this parses a document it would discard.
@@ -3504,6 +3738,79 @@ fn analyze_signing_reference_inputs(
         transform_options,
         references,
     )
+}
+
+/// The character data every value signing fills holds while digest
+/// dependencies are analyzed: valid base64, so references that read the
+/// existing or future text cannot take it for a stable input.
+const SIGNING_PLACEHOLDER: &str = "AA==";
+
+/// Whether the current generation decides every digest dependency as it
+/// stands, with no placeholder text. Transforms that keep or remove whole
+/// subtrees, or read only the octets or text of the nodes they are given,
+/// cover a `DigestValue` or `SignatureValue` element exactly when they cover
+/// its future text; that holds only while filling a value removes nothing but
+/// text, so a value holding other nodes needs the placeholder tree, where
+/// those nodes are already gone.
+fn current_tree_decides(
+    document: &XmlDocument,
+    target_signature: usize,
+    references: &SigningReferenceInputs,
+) -> Result<bool, SigningDigestError> {
+    let mut all_references = references.signed_info.iter().chain(&references.manifests);
+    if !all_references
+        .clone()
+        .all(|reference| reference.transforms.iter().all(selects_whole_subtrees))
+    {
+        return Ok(false);
+    }
+    document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        let signature_value = find_required_child(signature, "SignatureValue")?;
+        Ok(all_references
+            .by_ref()
+            .filter_map(|reference| view.document().get_node(reference.digest_value_node_id))
+            .chain([signature_value])
+            .all(|value| value.children().all(|child| child.is_text())))
+    })
+}
+
+/// The digest dependency levels of `references` on the current generation.
+fn current_generation_levels(
+    document: &XmlDocument,
+    policy: &crate::policy::SigningPolicy,
+    budgets: &SigningOperationBudgets,
+    request: SigningReferenceRequest<'_, '_>,
+    transform_options: TransformOptions<'_>,
+    references: &SigningReferenceInputs,
+) -> Result<SigningDependencyPlan, SigningDigestError> {
+    let analysis_references = references
+        .signed_info
+        .iter()
+        .chain(&references.manifests)
+        .cloned()
+        .collect::<Vec<_>>();
+    document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(request.target_signature),
+        )?;
+        reference_dependency_levels(
+            view.document(),
+            signature,
+            &analysis_references,
+            request.generated,
+            transform_options,
+            &budgets.transforms,
+            (
+                request.uri_resolution(policy.transforms.same_document_id_semantics),
+                request.provider,
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3533,7 +3840,7 @@ fn analyze_signing_placeholder_generation(
     let manifest_references = &references.manifests;
     let reference_limit = references.maximum;
     let process_manifests = references.process_manifests;
-    let placeholder = "AA==";
+    let placeholder = SIGNING_PLACEHOLDER;
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
     // existing or future text cannot be mistaken for stable inputs.
@@ -4694,6 +5001,18 @@ fn generation_reference_nodes<'a>(
     Ok(reference_nodes)
 }
 
+/// Whether `view` was projected from an external tree, whose nodes carry no
+/// source ranges.
+fn view_is_tree_backed(view: crate::document::DocumentView<'_>) -> bool {
+    #[cfg(feature = "external-tree")]
+    return view.is_tree_backed();
+    #[cfg(not(feature = "external-tree"))]
+    {
+        let _ = view;
+        false
+    }
+}
+
 fn c14n11_edit_for_reference(
     xml: &str,
     reference: Node<'_, '_>,
@@ -4813,7 +5132,16 @@ fn second_edition_c14n11_edits(
                 .into());
             }
 
-            let edit = c14n11_edit_for_reference(view.xml(), reference_node, &structure)?;
+            // A tree-backed document has no source to splice: its commit
+            // inserts the generated canonical form as a node edit instead.
+            let edit = if view_is_tree_backed(view) {
+                SourceEdit {
+                    range: 0..0,
+                    replacement: String::new(),
+                }
+            } else {
+                c14n11_edit_for_reference(view.xml(), reference_node, &structure)?
+            };
             edits.push(generated_c14n(
                 signed_info,
                 reference_node,
@@ -4827,22 +5155,36 @@ fn second_edition_c14n11_edits(
         return Ok(edits);
     }
 
-    let projected_len = edits.iter().map(|generated| &generated.edit).try_fold(
-        document.as_xml().len(),
-        |total, edit| {
+    policy
+        .resources
+        .validate_xml_document_len(projected_generated_len(document, &edits)?)
+        .map_err(SigningDigestError::Policy)?;
+    Ok(edits)
+}
+
+/// The document's content length once every generated transform joins it.
+fn projected_generated_len(
+    document: &XmlDocument,
+    edits: &[GeneratedC14n],
+) -> Result<usize, SigningDigestError> {
+    edits
+        .iter()
+        .try_fold(document.content_len(), |total, generated| {
+            let edit = &generated.edit;
+            // A tree's node edit inserts the canonical form, which no
+            // source range stands for.
+            let inserted = if edit.replacement.is_empty() {
+                generated.canonical.len()
+            } else {
+                edit.replacement.len()
+            };
             total
                 .checked_sub(edit.range.len())
-                .and_then(|value| value.checked_add(edit.replacement.len()))
+                .and_then(|value| value.checked_add(inserted))
                 .ok_or_else(|| {
                     SigningDigestError::InvalidStructure("document length overflow".into())
                 })
-        },
-    )?;
-    policy
-        .resources
-        .validate_xml_document_len(projected_len)
-        .map_err(SigningDigestError::Policy)?;
-    Ok(edits)
+        })
 }
 
 /// How `edit` joins `reference`, and its canonical form.
@@ -4866,6 +5208,8 @@ fn generated_c14n(
     GeneratedC14n {
         digest_value: structure.digest_value_node.id(),
         digest_method: structure.digest_method_node.id(),
+        #[cfg(feature = "external-tree")]
+        transforms: structure.transforms_node.map(Node::id),
         appends,
         canonical_in_place,
         in_signed_info: signed_info.subtree_contains_id(reference.id()),

@@ -17,19 +17,15 @@ fn execute(args: &Args) -> Result<Outcome, String> {
         args.operation.as_str(),
         args.boundary,
     ) {
-        ("assertion", "sign", _) => Ok(Outcome::Unsupported(
-            "leaves the template X509Data empty; the signer certificate is never written",
-        )),
-        ("xslt", _, _) => Ok(Outcome::Unsupported(
-            "implements a minimal XSLT subset that does not evaluate this stylesheet",
-        )),
         ("element_in_place", "encrypt", _) => Ok(Outcome::Unsupported(
-            "encrypts a template-supplied payload; it cannot replace an element inside its document",
+            "the encryption API encrypts a template-supplied payload; it has no call that replaces an element inside its document",
         )),
-        ("element" | "element_in_place", "encrypt" | "decrypt", Boundary::Prepared) => Ok(
-            Outcome::Unsupported("encryption and decryption accept serialized XML only"),
+        ("assertion" | "xslt", "sign", Boundary::Prepared)
+        | ("element" | "element_in_place", "encrypt" | "decrypt", Boundary::Prepared) => Ok(
+            Outcome::Unsupported("signing, encryption and decryption accept serialized XML only"),
         ),
-        ("assertion", "verify" | "reject", _) => verify(args),
+        ("assertion" | "xslt", "sign", Boundary::Parse) => sign(args),
+        ("assertion" | "xslt", "verify" | "reject", _) => verify(args),
         ("element", "encrypt", Boundary::Parse) => encrypt(args),
         ("element" | "element_in_place", "decrypt", Boundary::Parse) => decrypt(args),
         _ => Ok(Outcome::Unsupported("no such workload operation")),
@@ -46,16 +42,49 @@ fn certificate_key(args: &Args, name: &str) -> Result<bergshamra_keys::Key, Stri
         .map_err(|error| format!("{name}: {error}"))
 }
 
-/// `verify --trusted root --untrusted intermediate --enabled-key-data x509 --strict`.
+/// `sign TEMPLATE --key private.pem [--cert leaf.pem]`: the SAML signer is
+/// given its certificate for the template's `X509Data`.
+fn sign(args: &Args) -> Result<Outcome, String> {
+    let mut keys = KeysManager::new();
+    let private = args.corpus_text("private.pem")?;
+    keys.add_key(load_pem_auto(private.as_bytes(), None).map_err(|error| error.to_string())?);
+    if args.scenario == "assertion" {
+        keys.add_key(certificate_key(args, "leaf.pem")?);
+    }
+    let context = DsigContext::new_permissive(keys);
+    let template = args.input_text()?;
+    let measurement = measure(
+        args.samples,
+        || Ok::<_, String>(()),
+        |()| bergshamra_dsig::sign::sign(&context, &template).map_err(|error| error.to_string()),
+        |signed: &String| Some(signed.as_bytes().to_vec()),
+    )?;
+    Ok(Outcome::Measured(measurement))
+}
+
+/// The assertion: `verify --trusted root --untrusted intermediate
+/// --enabled-key-data x509 --strict`; the XSLT reference: `verify --key-name
+/// bench:public.pem --trusted-keys-only`.
 fn verify(args: &Args) -> Result<Outcome, String> {
     let mut keys = KeysManager::new();
-    keys.add_key(certificate_key(args, "intermediate.pem")?);
-    keys.add_key(certificate_key(args, "root.pem")?);
-    keys.add_trusted_cert(certificate_der(args, "root.pem")?);
-    keys.add_untrusted_cert(certificate_der(args, "intermediate.pem")?);
-    let mut context = DsigContext::new_permissive(keys);
-    context.enabled_key_data_x509 = true;
-    context.strict_verification = true;
+    let context = if args.scenario == "assertion" {
+        keys.add_key(certificate_key(args, "intermediate.pem")?);
+        keys.add_key(certificate_key(args, "root.pem")?);
+        keys.add_trusted_cert(certificate_der(args, "root.pem")?);
+        keys.add_untrusted_cert(certificate_der(args, "intermediate.pem")?);
+        let mut context = DsigContext::new_permissive(keys);
+        context.enabled_key_data_x509 = true;
+        context.strict_verification = true;
+        context
+    } else {
+        let public = args.corpus_text("public.pem")?;
+        let mut key = load_pem_auto(public.as_bytes(), None).map_err(|error| error.to_string())?;
+        key.name = Some("bench".to_owned());
+        keys.add_key(key);
+        let mut context = DsigContext::new_permissive(keys);
+        context.trusted_keys_only = true;
+        context
+    };
     let input = args.input_text()?;
     if args.operation == "reject" {
         // A processing error refuses the input as surely as an invalid result.

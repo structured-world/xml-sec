@@ -228,7 +228,7 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             SpkiAlgorithm::Dsa,
         ) => {
             let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
-            let component_len = usize::try_from(key.components().q().bits_vartime())
+            let component_len = usize::try_from(key.components().q().bit_width_vartime())
                 .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
                 .div_ceil(8);
             Ok(algorithm.dsa_component_len() == Some(component_len)
@@ -579,7 +579,7 @@ pub(crate) fn validate_dsa_signature_spki_with_minimum(
     session: &CertificateSession,
 ) -> Result<(), SignatureVerificationError> {
     let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
-    let modulus_bits = usize::try_from(key.components().p().bits_vartime())
+    let modulus_bits = usize::try_from(key.components().p().bit_width_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
     crate::policy::DsaKeyPolicy {
         minimum_modulus_bits,
@@ -665,7 +665,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
         });
     }
     let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
-    let component_len = usize::try_from(key.components().q().bits_vartime())
+    let component_len = usize::try_from(key.components().q().bit_width_vartime())
         .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
         .div_ceil(8);
     if algorithm.dsa_component_len() != Some(component_len) {

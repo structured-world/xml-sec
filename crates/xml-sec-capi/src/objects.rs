@@ -846,6 +846,36 @@ pub(crate) fn parse_document(
     Ok(parsed.map_err(XmlSecError::from)?)
 }
 
+/// A document whose content is `tree`, read under the compiled policy of
+/// `operation`.
+#[cfg(feature = "external-tree")]
+pub(crate) fn tree_document(
+    policies: &CompiledPolicies,
+    operation: Operation,
+    tree: Box<dyn xml_sec::document::external::ExternalTree>,
+) -> Result<XmlDocument, Failure> {
+    let projected = match operation {
+        Operation::Verify => XmlDocument::from_external_tree(
+            tree,
+            policies.verification().ok_or_else(|| disabled(operation))?,
+        ),
+        Operation::Sign => XmlDocument::from_external_tree(
+            tree,
+            policies.signing().ok_or_else(|| disabled(operation))?,
+        ),
+        Operation::Encrypt => XmlDocument::from_external_tree(
+            tree,
+            policies.encryption().ok_or_else(|| disabled(operation))?,
+        ),
+        Operation::Decrypt => XmlDocument::from_external_tree(
+            tree,
+            policies.decryption().ok_or_else(|| disabled(operation))?,
+        ),
+        _ => return Err(disabled(operation)),
+    };
+    Ok(projected.map_err(XmlSecError::from)?)
+}
+
 /// A signing operation with its key selected once.
 pub(crate) struct Signer {
     security: SharedSecurity,
@@ -868,6 +898,12 @@ impl Signer {
     }
 
     /// Fill the document's signature template.
+    /// The compiled signing policy a document is read under.
+    pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
+        let policy = self.security.policies().signing()?;
+        Some(policy)
+    }
+
     pub(crate) fn sign(&self, document: &mut XmlDocument) -> Result<PolicyAudit, Failure> {
         Ok(self
             .security
@@ -918,6 +954,12 @@ impl Verifier {
     /// Verify `document`, requiring the elements whose ID is in
     /// `expected_ids` to be authenticated. A `lookup` supplies the keys for
     /// this call in place of the verifier's key manager.
+    /// The compiled verification policy a document is read under.
+    pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
+        let policy = self.security.policies().verification()?;
+        Some(policy)
+    }
+
     pub(crate) fn verify(
         &self,
         document: &XmlDocument,
@@ -997,6 +1039,12 @@ impl Encryptor {
     }
 
     /// Replace the element with ID `element_id`, or the root, by its encryption.
+    /// The compiled encryption policy a document is read under.
+    pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
+        let policy = self.security.policies().encryption()?;
+        Some(policy)
+    }
+
     pub(crate) fn encrypt(
         &self,
         document: &mut XmlDocument,
@@ -1036,6 +1084,12 @@ impl Decryptor {
 
     /// Recover the `EncryptedData` with schema `Id` `id`, or the first one. A
     /// `lookup` supplies the keys for this call in place of the selected key.
+    /// The compiled decryption policy a document is read under.
+    pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
+        let policy = self.security.policies().decryption()?;
+        Some(policy)
+    }
+
     pub(crate) fn decrypt(
         &self,
         document: &mut XmlDocument,

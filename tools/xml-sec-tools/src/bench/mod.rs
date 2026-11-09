@@ -37,24 +37,6 @@ pub(crate) fn operations(scenario: &str) -> Result<&'static [&'static str], Stri
         .ok_or_else(|| format!("unknown workload {scenario}"))
 }
 
-/// Why `engine` cannot run `operation` of `scenario` at the pinned competitor
-/// revision, or `None` when it can; never timed.
-pub(crate) fn unsupported(engine: &str, scenario: &str, operation: &str) -> Option<&'static str> {
-    match (engine, scenario, operation) {
-        ("bergshamra", "assertion", "sign") => {
-            Some("leaves the template X509Data empty; the signer certificate is never written")
-        }
-        ("bergshamra", "element_in_place", "encrypt") => Some(
-            "CLI --node-id writes a standalone EncryptedData instead of replacing the element inside its document",
-        ),
-        ("bergshamra", "xslt", "sign") => Some("no XSLT transform"),
-        ("bergshamra", "xslt", "verify") => {
-            Some("no XSLT transform: an XSLT-transformed Reference fails with a digest mismatch")
-        }
-        _ => None,
-    }
-}
-
 /// Nearest-rank percentile (`percent` of 100); the input is not reordered.
 pub(crate) fn percentile(values: &[f64], percent: usize) -> Result<f64, String> {
     if values.is_empty()

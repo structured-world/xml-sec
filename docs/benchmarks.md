@@ -225,7 +225,7 @@ operation inside a process.
 
 ### Command-line process
 
-The runner builds the pinned Bergshamra 0.9.2 source (RustCrypto only) and the
+The runner builds Bergshamra's current source (RustCrypto only) and the
 existing libxmlsec1 1.3.13 oracle, independently of the product dependency graph.
 It compares both xml-sec XML backends against those CLIs: single-reference
 RSA-2048/SHA-256 sign/verify and AES-256-GCM encrypt/decrypt of identical plaintext
@@ -247,11 +247,16 @@ Four workloads cover the main application uses:
 | Element in place | encrypt, decrypt | The same `Payment` encrypted where it stands inside an `Order` (`--node-id`); decryption restores the whole document. |
 | XSLT reference | sign, verify | A same-document reference transformed by an XSLT 1.0 stylesheet before exclusive C14N. |
 
-Pinned Bergshamra 0.9.2 has no XSLT transform, leaves a template's `X509Data`
-empty when signing, and its CLI `--node-id` writes a standalone `EncryptedData`
-instead of replacing the element inside its document. Those operations are
-recorded as unsupported with the reason and are never timed; it still verifies
-the other engines' assertions and decrypts their in-place documents.
+What Bergshamra supports is established by each run, not assumed: every
+operation of every workload is attempted, and a Bergshamra result that fails
+the cross-checks below is recorded as unsupported with the observed reason and
+never timed, while a failure of xml-sec or libxmlsec1 stops the run. Its
+library API encrypts a template-supplied payload only, so in-place encryption
+is reported as unsupported there, and its signing, encryption and decryption
+accept serialized XML only, so they are unsupported at the prepared-document
+boundary; its verification runs at both boundaries. Each boundary is excluded
+on its own, so a result from the boundary an engine does support is still
+cross-checked before it is timed.
 
 Before timing, each engine's signature is verified by every engine, each
 ciphertext is decrypted by every engine, and all engines must reject a modified
@@ -267,8 +272,9 @@ library-only measurements. Sign/encrypt outputs are written to files equally.
 Input throughput and output amplification are derived from those actual files.
 System `time` CPU counters have coarse resolution; very short operations can
 legitimately report zero CPU seconds. They are not high-resolution phase profiles.
-The first build resolves the untracked library lockfile; measurement freezes and
-archives both Rust dependency graphs and source fingerprints.
+Before building, the runner aligns the untracked library lockfile to the
+measured Bergshamra commit; measurement freezes and archives both Rust
+dependency graphs and source fingerprints.
 
 Optional Linux Valgrind runs record total malloc-family allocation calls/bytes
 with Memcheck and sampled peak live heap plus allocator overhead with Massif.
@@ -285,14 +291,11 @@ The same corpus and keys drive one in-process harness per engine:
 
 - xml-sec through its Rust API (`SignContext`, `VerifyContext`,
   `EncryptedDataBuilder`, `DecryptContext`, xmloxide backend, RustCrypto);
-- Bergshamra 0.9.2 through its Rust API, linked only from
-  `benchmarks/competitors`, a project outside the xml-sec workspace with its own
-  `Cargo.lock` and the revision pinned in
-  `compatibility/bergshamra-0.9.2-benchmark-commit.txt`. Before building, the
-  runner refreshes only that lockfile's entry for xml-sec itself
-  (`cargo run -p xml-sec-tools -- competitor-lock`), so a new product version leaves the
-  Bergshamra graph as locked; a product dependency the locked graph cannot
-  satisfy stops the run until the lockfile is updated and committed;
+- Bergshamra through its Rust API, linked only from `benchmarks/competitors`, a
+  project outside the xml-sec workspace. Every run measures Bergshamra's current
+  code: it takes the commit its default branch points at, builds the command
+  line from that commit, moves the library harness to the same commit, and
+  records the commit in the evidence;
 - libxmlsec1 1.3.13 through its C API (`benchmarks/libxmlsec1-library.c`),
   linked against the oracle build and the OpenSSL inside it.
 
@@ -318,8 +321,9 @@ by every other engine: signatures verified, ciphertexts decrypted to the
 original document. Every verifier must reject the changed signed value and the
 wrapped SAML forgery. A harness answers an operation its engine lacks with the
 reason (exit status 3); the runner records it as unsupported and never times it.
-Bergshamra signs no X509Data, has no XSLT 1.0 transform, cannot encrypt in place,
-and encrypts or decrypts only serialized XML.
+Bergshamra cannot encrypt in place, and its signing, encryption and decryption
+accept only serialized XML; whatever else it fails the cross-checks on is
+recorded as unsupported with the observed reason.
 
 Every process is wrapped by system `time` for RSS, which covers the whole
 process including key loading and warmups. Allocation counts come from separate
@@ -342,7 +346,7 @@ The report compares two comparison runs, each a directory with `comparison.json`
 `library.json` and `build.json`. The comparison runner writes the latter
 (`cargo run -p xml-sec-tools -- bench-identity NAME=VALUE...` prints it alone):
 compiler versions, the features of every binary, native flags, the heap-profiling
-mode and the pinned competitor revisions, every environment override of the build
+mode and the competitor commit the run measured, every environment override of the build
 (`RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_PROFILE_*`, `CARGO_BUILD_*`, `CC`,
 `RUSTC_WRAPPER`, `CFLAGS` and similar) and digests of the Cargo configuration
 files that apply, in Cargo's precedence order with each file's place. A
@@ -378,16 +382,17 @@ not establish reliable p99 thresholds. The dashboard deliberately makes no
 speed superiority claim. Standalone parse/C14N, multiple signatures, Manifests
 and external resources are not ranked without matching processor boundaries.
 
-References: [Bergshamra CLI](https://github.com/kushaldas/bergshamra/blob/v0.9.2/crates/bergshamra/src/main.rs),
+References: [Bergshamra CLI](https://github.com/kushaldas/bergshamra/blob/main/crates/bergshamra/src/main.rs),
 [Valgrind Massif](https://valgrind.org/docs/manual/ms-manual.html),
 [Replacing malloc in glibc](https://www.gnu.org/software/libc/manual/html_node/Replacing-malloc.html),
 [GitHub Pages workflow](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages).
 
-`benchmarks/Dockerfile` supplies the Linux profiling tools. Mount source read-only
-and a separate writable output/build directory; select it through `CARGO_TARGET_DIR`
-and `XMLSEC1_PREFIX`. Resolve `Cargo.lock` before mounting source read-only
-(`cargo generate-lockfile`). The competitor checkout must be clean and match the pinned
-revision. Container results describe that container's architecture, not the host.
+`benchmarks/Dockerfile` supplies the Linux profiling tools. Use a writable source
+checkout, since the runner updates `benchmarks/competitors/Cargo.lock`, and a
+separate writable output/build directory selected through `CARGO_TARGET_DIR` and
+`XMLSEC1_PREFIX`. A pre-staged competitor checkout (`BERGSHAMRA_SOURCE_DIR`) must
+be clean and at the competitor's current remote `HEAD`. Container results
+describe that container's architecture, not the host.
 Both Rust binaries are built with the same stable compiler, recorded in `build.json`,
 and linked by mold through the image's per-target `CARGO_TARGET_*_RUSTFLAGS`; a
 `RUSTFLAGS` passed into the container replaces them.

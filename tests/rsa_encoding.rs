@@ -107,7 +107,7 @@ fn rsa_encoding_validates_algorithm_parameters() {
     let mut info = pkcs8::SubjectPublicKeyInfoRef::from_der(encoded.as_bytes()).unwrap();
     info.algorithm.parameters = None;
     assert!(RsaPublicKey::from_public_key_der(&info.to_der().unwrap()).is_err());
-    assert!(key.n().bits_vartime() >= 2048);
+    assert!(key.n().bit_width_vartime() >= 2048);
 }
 
 #[test]

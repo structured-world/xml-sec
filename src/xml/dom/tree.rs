@@ -263,7 +263,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         Ok(set)
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "external-tree"))]
     pub(super) fn push(
         &mut self,
         parent: Option<NodeId>,
@@ -318,7 +318,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         }
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "external-tree"))]
     pub(super) fn has_text_tail(&self, parent: NodeId) -> bool {
         // In preorder a parent's text tail is the last node pushed: an element
         // child, or anything below it, would have been pushed after it.
@@ -327,7 +327,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         })
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "external-tree"))]
     pub(super) fn append_text(
         &mut self,
         parent: NodeId,
@@ -352,7 +352,7 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
         Ok(())
     }
 
-    #[cfg(feature = "xml-backend-xmloxide")]
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "external-tree"))]
     pub(super) fn len(&self) -> usize {
         self.nodes.len()
     }
@@ -401,15 +401,22 @@ impl<'input, S: Storage> TreeBuilder<'input, S> {
                         attribute.prefix.as_deref(),
                         attribute.name.as_ref(),
                     )?;
-                    attribute.is_id = xml_id
+                    // A parser marks no attribute; an external tree marks the
+                    // IDs it registered (DTD, xml:id or caller) and holds
+                    // their values as its infoset has them, already normalized.
+                    let marked = attribute.is_id;
+                    attribute.is_id = marked
+                        || xml_id
                         || declaration
                             .is_some_and(|info| info.kind == crate::document::DtdAttributeType::Id);
                     if attribute.is_id {
-                        // xml:id section 4 and XML 1.0 section 3.3.3 require
-                        // ID normalization in the infoset, not just the index.
-                        // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
-                        // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
-                        self.storage.normalize_id(&mut attribute.value)?;
+                        if !marked {
+                            // xml:id section 4 and XML 1.0 section 3.3.3 require
+                            // ID normalization in the infoset, not just the index.
+                            // https://www.w3.org/TR/2005/REC-xml-id-20050909/#processing
+                            // https://www.w3.org/TR/2008/REC-xml-20081126/#AVNormalize
+                            self.storage.normalize_id(&mut attribute.value)?;
+                        }
                         if xml_id {
                             // xml:id sections 4/6: report constraints without
                             // suppressing assignment or making parsing fatal.

@@ -161,7 +161,7 @@ impl KeyAgreementKey for RustCryptoDhKey {
         }
         let peer = BoxedMontyForm::new(peer, &self.params);
         if peer
-            .pow_bounded_exp(&self.order, self.order.bits_vartime())
+            .pow_bounded_exp(&self.order, self.order.bit_width_vartime())
             .retrieve()
             != one
         {
@@ -221,9 +221,9 @@ fn probable_prime(
     let two = decode(&[2], precision)?;
     let maximum = candidate.wrapping_sub(&two);
     let maximum_bytes = maximum.to_be_bytes();
-    let mut bytes = vec![0; (candidate.bits_vartime() as usize).div_ceil(8)];
+    let mut bytes = vec![0; (candidate.bit_width_vartime() as usize).div_ceil(8)];
     let maximum_bytes = &maximum_bytes[maximum_bytes.len() - bytes.len()..];
-    let excess = bytes.len() * 8 - candidate.bits_vartime() as usize;
+    let excess = bytes.len() * 8 - candidate.bit_width_vartime() as usize;
     // Bounded rejection sampling avoids both RNG-error suppression and modulo
     // bias. 64 independent uniform bases bound composite acceptance by 2^-128;
     // this is a probable-prime check, not a primality certificate.

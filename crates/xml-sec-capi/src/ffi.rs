@@ -483,6 +483,65 @@ fn with_document<T>(
     body(&mut document)
 }
 
+/// Lock `document` for a signing, verification, encryption or decryption.
+///
+/// The application may have changed a tree-backed document's tree since the
+/// last call, and no tree reports that: the operation reads it as it is now,
+/// under `policy`, the operation's own compiled policy (`None`: the limits
+/// the current generation was read with).
+fn with_operation_document<T>(
+    handle: XsDocument,
+    #[cfg_attr(not(feature = "external-tree"), expect(unused_variables))] policy: Option<
+        &dyn xml_sec::XmlDocumentPolicy,
+    >,
+    body: impl FnOnce(&mut xml_sec::XmlDocument) -> Result<T, Failure>,
+) -> Result<T, Failure> {
+    with_document(handle, |document| {
+        #[cfg(feature = "external-tree")]
+        if document.is_tree_backed() {
+            document
+                .refresh_tree(policy)
+                .map_err(|error| Failure::from(xml_sec::XmlSecError::from(error)))?;
+        }
+        body(document)
+    })
+}
+
+/// Create a document handle whose content is `tree`, read under the
+/// compiled policy of `operation` (`XS_OPERATION_*`) in `policy`, with the
+/// status and error-handle reporting of the exported functions. Every later
+/// operation on the handle reads `tree` again before it starts.
+///
+/// This is the entry point of interop crates that adapt an application's
+/// own document tree; C callers reach it through their exported functions.
+///
+/// # Safety
+/// `out` is valid for writes of one `XsDocument`; `error` is null or valid
+/// for writes of one `XsError`.
+#[cfg(feature = "external-tree")]
+pub unsafe fn document_from_tree(
+    policy_handle: XsPolicy,
+    operation: u32,
+    tree: Box<dyn xml_sec::document::external::ExternalTree>,
+    out: *mut XsDocument,
+    error: *mut XsError,
+) -> XsStatus {
+    // SAFETY: the caller's contract for `error`.
+    let error = unsafe { error_slot(error) };
+    contain(error, || {
+        // SAFETY: the caller's contract for `out`.
+        let out = unsafe { output(out) }?;
+        let document = objects::tree_document(
+            &*policy(policy_handle)?,
+            objects::operation(operation)?,
+            tree,
+        )?;
+        let value = insert(Object::Document(parking_lot::Mutex::new(document)))?;
+        out.write(XsDocument { value });
+        Ok(())
+    })
+}
+
 /// The caller's audit output with its handle slot already held: an operation
 /// that changes the document can then always report its audit, and a full
 /// table refuses the call before the document changes.
@@ -882,8 +941,17 @@ pub unsafe extern "C" fn xs_document_serialize(
     contain(error, || {
         // SAFETY: the caller's contract for `out`.
         let out = unsafe { output(out) }?;
-        let bytes: Box<[u8]> =
-            with_document(document, |document| Ok(document.as_xml().as_bytes().into()))?;
+        let bytes: Box<[u8]> = with_document(document, |document| {
+            // A tree-backed document's content is the caller's tree, which
+            // the caller serializes with its own library.
+            #[cfg(feature = "external-tree")]
+            if document.is_tree_backed() {
+                return Err(Failure::from(xml_sec::XmlSecError::from(
+                    xml_sec::XmlDocumentError::TreeBackedSerialization,
+                )));
+            }
+            Ok(document.as_xml().as_bytes().into())
+        })?;
         let len = bytes.len();
         out.write(XsBuffer {
             ptr: Box::into_raw(bytes).cast::<u8>(),
@@ -965,7 +1033,9 @@ pub unsafe extern "C" fn xs_sign(
         let Object::Signer(signer) = signer.object() else {
             return Err(wrong());
         };
-        let decided = with_document(document, |document| signer.sign(document))?;
+        let decided = with_operation_document(document, signer.document_policy(), |document| {
+            signer.sign(document)
+        })?;
         audit_out(audit, &decided);
         Ok(())
     })
@@ -1069,7 +1139,7 @@ pub unsafe extern "C" fn xs_verify(
             .collect::<Result<Vec<_>, _>>()?;
         let requirement = objects::requirement(request.requirement, request.count)?;
         let slot = table::reserve().map_err(Failure::from)?;
-        let evidence = with_document(document, |document| {
+        let evidence = with_operation_document(document, verifier.document_policy(), |document| {
             verifier.verify(
                 document,
                 &ids,
@@ -1143,7 +1213,9 @@ pub unsafe extern "C" fn xs_encrypt(
         let Object::Encryptor(encryptor) = encryptor.object() else {
             return Err(wrong());
         };
-        let decided = with_document(document, |document| encryptor.encrypt(document, id))?;
+        let decided = with_operation_document(document, encryptor.document_policy(), |document| {
+            encryptor.encrypt(document, id)
+        })?;
         audit_out(audit, &decided);
         Ok(())
     })
@@ -1216,7 +1288,7 @@ pub unsafe extern "C" fn xs_decrypt(
         let Object::Decryptor(decryptor) = decryptor.object() else {
             return Err(wrong());
         };
-        let decided = with_document(document, |document| {
+        let decided = with_operation_document(document, decryptor.document_policy(), |document| {
             decryptor.decrypt(
                 document,
                 id,
@@ -1259,8 +1331,10 @@ pub unsafe extern "C" fn xs_evidence_accepted(
     contain(error, || {
         // SAFETY: the caller's contract for `accepted`.
         let out = unsafe { output(accepted) }?;
+        // A tree the caller changed since verification is a new generation
+        // the evidence does not cover; an unchanged tree keeps its generation.
         let verdict = with_evidence(evidence, |evidence| {
-            with_document(document, |document| {
+            with_operation_document(document, None, |document| {
                 evidence
                     .accepted(document)
                     .map_err(|error| Failure::from(xml_sec::XmlSecError::from(error)))

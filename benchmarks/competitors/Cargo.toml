@@ -28,11 +28,12 @@ xml-sec = { path = "../..", features = ["xslt"] }
 rsa = { package = "sad-rsa", version = "0.10.2", default-features = false }
 pem = "4"
 serde_json = "1"
-# Pinned to the revision the CLI comparison builds (compatibility/bergshamra-0.9.2-benchmark-commit.txt).
-bergshamra-dsig = { git = "https://github.com/kushaldas/bergshamra.git", rev = "747a5a877a2415fc0d58286533ae51b22cc966c3", default-features = false, features = ["rustcrypto"] }
-bergshamra-enc = { git = "https://github.com/kushaldas/bergshamra.git", rev = "747a5a877a2415fc0d58286533ae51b22cc966c3", default-features = false, features = ["rustcrypto"] }
-bergshamra-keys = { git = "https://github.com/kushaldas/bergshamra.git", rev = "747a5a877a2415fc0d58286533ae51b22cc966c3", default-features = false, features = ["rustcrypto"] }
-uppsala = "0.10.1"
+# The competitor's current code: each comparison run moves these to the
+# commit its command-line build uses, and records that commit.
+bergshamra-dsig = { git = "https://github.com/kushaldas/bergshamra.git", default-features = false, features = ["rustcrypto"] }
+bergshamra-enc = { git = "https://github.com/kushaldas/bergshamra.git", default-features = false, features = ["rustcrypto"] }
+bergshamra-keys = { git = "https://github.com/kushaldas/bergshamra.git", default-features = false, features = ["rustcrypto"] }
+uppsala = "0.12"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
