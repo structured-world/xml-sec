@@ -167,7 +167,12 @@ const PROFILES: [Profile; 19] = [
         &[],
         true,
     ),
-    profile("xslt", Some("xslt,xml-backend-xmloxide"), &[], true),
+    profile(
+        "xslt",
+        Some("xslt,rustcrypto,xml-backend-xmloxide"),
+        &[],
+        true,
+    ),
     profile(
         "legacy",
         Some("xmldsig-sign,legacy-algorithms,xml-backend-xmloxide"),

@@ -256,7 +256,7 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
         ("dsig-sign-xmloxide", "xmldsig-sign,xml-backend-xmloxide"),
         ("xmlenc-xmloxide", "xmlenc,xml-backend-xmloxide"),
         ("xmlenc-roxmltree", "xmlenc,xml-backend-roxmltree"),
-        ("xslt", "xslt,xml-backend-xmloxide"),
+        ("xslt", "xslt,rustcrypto,xml-backend-xmloxide"),
         (
             "legacy",
             "xmldsig-sign,legacy-algorithms,xml-backend-xmloxide",

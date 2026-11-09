@@ -543,7 +543,9 @@ xmlenc = [             # XML Encryption (encrypt + decrypt)
 c14n = []              # XML Canonicalization (inclusive + exclusive)
 # XMLDSig XSLT transform (http://www.w3.org/TR/1999/REC-xslt-19991116); its
 # engine shares state across threads and reads the host clock, so it needs std.
-xslt = ["xmldsig", "std", "dep:icu_collator", "dep:icu_locale", "dep:memchr", "dep:roxmltree", "dep:time", "dep:url"]
+# EXSLT `crypto:md5` and `crypto:sha1` are string functions of the engine
+# itself, not provider operations, so it compiles those two hashes.
+xslt = ["xmldsig", "std", "dep:icu_collator", "dep:icu_locale", "dep:md-5", "dep:memchr", "dep:roxmltree", "dep:sha1", "dep:time", "dep:url"]
 # Experimental libxmlsec1 algorithm identifiers; build capability is not policy permission.
 experimental-pq = ["xmldsig", "rustcrypto", "der/derive", "dep:slh-dsa", "dep:ml-kem", "dep:common", "dep:ctutils", "dep:hybrid-array", "dep:module-lattice", "dep:shake", "dep:const-oid", "signature/digest", "signature/alloc", "signature/rand_core"]
 # DSTU 4145 verification with GOST 34.311 and DSTU 7564; build capability is not policy permission.

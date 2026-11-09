@@ -242,6 +242,13 @@ fn rsa_key() -> VerificationKey {
 const RSA_SIGNED: &str =
     include_str!("fixtures/xmldsig/aleksey-xmldsig-01/enveloping-sha256-rsa-sha256.xml");
 
+/// `xml` with its whole `SignatureValue` replaced by `value`.
+fn with_signature_value(xml: &str, value: &[u8]) -> String {
+    let start = xml.find("<SignatureValue>").expect("a value") + "<SignatureValue>".len();
+    let end = xml.find("</SignatureValue>").expect("closed");
+    format!("{}{}{}", &xml[..start], b64(value), &xml[end..])
+}
+
 #[test]
 fn a_signature_verifies_through_the_callers_provider() {
     // Digests and the RSA check both run in the provider; the core supplies
@@ -265,7 +272,8 @@ fn a_tampered_signature_fails_in_the_callers_provider() {
     // The provider's own mismatch, not a refusal by the core.
     let provider = DownstreamProvider::default();
     let key = rsa_key();
-    let tampered = RSA_SIGNED.replacen("<SignatureValue>", "<SignatureValue>AAAA", 1);
+    // 256 octets frame as an RSA-2048 value, so only the provider can refuse it.
+    let tampered = with_signature_value(RSA_SIGNED, &[1; 256]);
     let result = VerifyContext::new()
         .key(&key)
         .provider(&provider)
@@ -274,6 +282,11 @@ fn a_tampered_signature_fails_in_the_callers_provider() {
     assert!(
         matches!(result.status, DsigStatus::Invalid(_)),
         "{result:?}"
+    );
+    assert_eq!(
+        *provider.keys.lock().expect("unpoisoned"),
+        [spki(RSA_PUBLIC_KEY)],
+        "the provider computed the mismatch"
     );
 }
 
@@ -448,13 +461,7 @@ fn a_signature_value_of_the_wrong_width_never_reaches_the_provider() {
     // 2048-bit modulus takes exactly 256 octets (RFC 8017 section 8.2.2).
     let provider = DownstreamProvider::default();
     let key = rsa_key();
-    let short = RSA_SIGNED.replacen("<SignatureValue>", "<SignatureValue>AAAA", 1);
-    let short = {
-        // Replace the whole value with 255 octets.
-        let start = short.find("<SignatureValue>").expect("a value") + "<SignatureValue>".len();
-        let end = short.find("</SignatureValue>").expect("closed");
-        format!("{}{}{}", &short[..start], b64(&[1; 255]), &short[end..])
-    };
+    let short = with_signature_value(RSA_SIGNED, &[1; 255]);
     let result = VerifyContext::new()
         .key(&key)
         .provider(&provider)
