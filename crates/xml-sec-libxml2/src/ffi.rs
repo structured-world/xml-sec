@@ -1154,6 +1154,30 @@ impl Drop for LibxmlTree {
     }
 }
 
+impl LibxmlTree {
+    /// The caller's document `doc` as an external tree, for crates that
+    /// project it themselves; `None` for a null or non-document pointer or a
+    /// libxml2 whose layout differs from the declarations here.
+    ///
+    /// # Safety
+    /// `doc` is null or a live `xmlDocPtr` that outlives the tree, and nothing
+    /// else changes it while the tree is projected or edited.
+    #[must_use]
+    pub unsafe fn new(doc: *mut XmlDoc) -> Option<Self> {
+        if doc.is_null() || !doc.is_aligned() || !layout_matches() {
+            return None;
+        }
+        // SAFETY: a live document by the caller's contract.
+        if unsafe { (*doc).kind } != XML_DOCUMENT_NODE {
+            return None;
+        }
+        Some(Self {
+            doc,
+            journal: Vec::new(),
+        })
+    }
+}
+
 /// Create a document handle over the caller's libxml2 document `doc`, read
 /// under the compiled policy of `operation` (`XS_OPERATION_*`) in `policy`.
 ///
@@ -1191,10 +1215,11 @@ pub unsafe extern "C" fn xs_libxml2_document(
     if !layout_matches() {
         return refuse(XS_INTERNAL);
     }
-    let tree = Box::new(LibxmlTree {
-        doc,
-        journal: Vec::new(),
-    });
+    // SAFETY: a live document that outlives the handle by the contract.
+    let Some(tree) = (unsafe { LibxmlTree::new(doc) }) else {
+        return refuse(XS_INVALID_ARGUMENT);
+    };
+    let tree = Box::new(tree);
     // SAFETY: forwarded contract for `out` and `error`.
     unsafe { xml_sec_capi::ffi::document_from_tree(policy, operation, tree, out, error) }
 }

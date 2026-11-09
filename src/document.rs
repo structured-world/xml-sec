@@ -3049,6 +3049,22 @@ impl<'a> DocumentView<'a> {
         &self.parsed.document
     }
 
+    /// The external node `node` of this view's tree was projected from, for
+    /// a tree-backed document; `None` for a parsed document and for a node an
+    /// entity expansion produced, which has no node of its own in the tree.
+    #[cfg(feature = "external-tree")]
+    #[must_use]
+    pub fn external_node_of(
+        self,
+        node: Node<'_, '_>,
+    ) -> Option<crate::document::external::ExternalNode> {
+        self.parsed
+            .external
+            .get(node.id().get_usize())
+            .copied()
+            .flatten()
+    }
+
     pub(crate) fn node_identity(self, node: Node<'_, '_>) -> NodeIdentity {
         NodeIdentity {
             document: self.identity,
