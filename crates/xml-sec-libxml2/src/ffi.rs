@@ -120,6 +120,13 @@ unsafe extern "C" {
     fn xmlSearchNs(doc: *mut XmlDoc, node: *mut XmlNode, prefix: *const XmlChar) -> *mut XmlNs;
     fn xmlUnlinkNode(node: *mut XmlNode);
     fn xmlFreeNode(node: *mut XmlNode);
+    fn xmlIsID(doc: *mut XmlDoc, element: *mut XmlNode, attribute: *mut XmlAttr) -> c_int;
+    fn xmlAddID(
+        context: *mut c_void,
+        doc: *mut XmlDoc,
+        value: *const XmlChar,
+        attribute: *mut XmlAttr,
+    ) -> *mut c_void;
 }
 
 /// The layout record this crate's declarations stand for, in the order of
@@ -383,7 +390,7 @@ impl LibxmlTree {
                     string(attr.name)?.unwrap_or_default(),
                     prefix,
                     namespace,
-                    attribute_value(attr)?,
+                    attribute_value(attr, sink)?,
                 )
             };
             sink.attribute(
@@ -801,14 +808,16 @@ unsafe fn c_bytes<'a>(text: *const XmlChar) -> Option<&'a [u8]> {
 }
 
 /// An attribute's value: its children's character data, entity references
-/// expanded.
+/// expanded. Every expansion counts toward the projection's entity ceiling
+/// and every piece is admitted against its byte limit before it is copied,
+/// so nested references cannot grow a value past what the policy allows.
 ///
 /// # Safety
 /// `attr` is a live attribute of a live tree.
-unsafe fn attribute_value(attr: &XmlAttr) -> Result<String, ParseError> {
+unsafe fn attribute_value(attr: &XmlAttr, sink: &mut TreeSink<'_>) -> Result<String, ParseError> {
     let mut value = String::new();
     // SAFETY: the attribute's children are live tree nodes.
-    unsafe { append_text(attr.children, &mut value, 0) }?;
+    unsafe { append_text(attr.children, &mut value, 0, sink) }?;
     Ok(value)
 }
 
@@ -820,6 +829,7 @@ unsafe fn append_text(
     first: *mut XmlNode,
     value: &mut String,
     depth: usize,
+    sink: &mut TreeSink<'_>,
 ) -> Result<(), ParseError> {
     // Entity expansion inside attribute values nests at most this deep.
     if depth > 64 {
@@ -832,11 +842,14 @@ unsafe fn append_text(
         match node.kind {
             XML_TEXT_NODE => {
                 // SAFETY: content is null or a NUL-terminated tree string.
-                value.push_str(unsafe { string(node.content) }?.unwrap_or_default());
+                let text = unsafe { string(node.content) }?.unwrap_or_default();
+                sink.admit_attribute_bytes(value.len() + text.len())?;
+                value.push_str(text);
             }
             XML_ENTITY_REF_NODE if !node.children.is_null() => {
+                sink.expand_attribute_entity()?;
                 // SAFETY: the declaration shares the common node part.
-                unsafe { append_text((*node.children).children, value, depth + 1) }?;
+                unsafe { append_text((*node.children).children, value, depth + 1, sink) }?;
             }
             _ => return Err(backend_error("an attribute value the tree cannot report")),
         }
@@ -929,16 +942,95 @@ impl ExternalTree for LibxmlTree {
     }
 
     fn release(&mut self, mark: usize) {
-        // The caller's ID table stays consistent without help: xmlFreeProp
-        // unregisters an ID attribute it frees, and xmlNewNsProp registers an
-        // xml:id it creates, so freed nodes leave no entry and restored or
-        // built ones keep theirs.
+        // The caller's ID table names attribute nodes. xmlFreeProp removes
+        // the entry of an ID attribute it frees, and xmlNewNsProp registers
+        // an ID it creates unless the value is already taken, which it is
+        // when a replacement keeps the ID of the element it replaces. So the
+        // built nodes the committed tree still holds are found first, the
+        // removed ones are freed, and the built ones register what they now
+        // hold alone. A rollback needs none of this: the restored nodes were
+        // never unregistered, and freeing built ones removes only their own.
+        let doc = self.document_node();
+        let kept: Vec<*mut XmlNode> = self.journal[mark..]
+            .iter()
+            .filter_map(|undo| match *undo {
+                // SAFETY: every node of the journal is still allocated; the
+                // walk reads parent links only.
+                Undo::Linked(node) if unsafe { attached(doc, node) } => Some(node),
+                _ => None,
+            })
+            .collect();
         for undo in self.journal.drain(mark..) {
             if let Undo::Unlinked { node, .. } = undo {
                 // SAFETY: an unlinked node no later edit relinked; nothing
                 // in the tree points to it any more.
                 unsafe { xmlFreeNode(node) };
             }
+        }
+        for node in kept {
+            // SAFETY: the node is in the committed tree, which the freed
+            // subtrees were not part of.
+            unsafe { register_ids(self.doc, node) };
+        }
+    }
+}
+
+/// Whether `node` hangs under the document `doc`, through its parent links.
+///
+/// # Safety
+/// `node` and its ancestors are allocated nodes.
+unsafe fn attached(doc: *mut XmlNode, node: *mut XmlNode) -> bool {
+    let mut current = node;
+    while !current.is_null() {
+        if current == doc {
+            return true;
+        }
+        // SAFETY: the caller's contract.
+        current = unsafe { (*current).parent };
+    }
+    false
+}
+
+/// Register every ID attribute in the subtree of `node` that the table does
+/// not name yet, as libxml2's parser and xmlNewNsProp would (`xmlIsID`).
+///
+/// # Safety
+/// `node` is a live node of the live document `doc`.
+unsafe fn register_ids(doc: *mut XmlDoc, node: *mut XmlNode) {
+    let mut stack = vec![node];
+    while let Some(current) = stack.pop() {
+        // SAFETY: a live node of the subtree.
+        let element = unsafe { &*current };
+        if element.kind != XML_ELEMENT_NODE {
+            continue;
+        }
+        let mut attribute = element.properties;
+        while !attribute.is_null() {
+            // SAFETY: the attribute list of a live element.
+            let attr = unsafe { &*attribute };
+            // SAFETY: live element and attribute of `doc`.
+            if attr.atype != XML_ATTRIBUTE_ID && unsafe { xmlIsID(doc, current, attribute) } == 1 {
+                // A built attribute holds one text node, its value as given.
+                let text = attr.children;
+                let value = if text.is_null() {
+                    std::ptr::null()
+                } else {
+                    // SAFETY: a live text child of the attribute.
+                    unsafe { (*text).content }
+                };
+                if !value.is_null() {
+                    // SAFETY: the value is a NUL-terminated tree string that
+                    // libxml2 copies into the table entry.
+                    unsafe { xmlAddID(std::ptr::null_mut(), doc, value, attribute) };
+                }
+            }
+            attribute = attr.next;
+        }
+        let mut child = element.children;
+        while !child.is_null() {
+            stack.push(child);
+            // SAFETY: a live child.
+            child = unsafe { (*child).next };
         }
     }
 }

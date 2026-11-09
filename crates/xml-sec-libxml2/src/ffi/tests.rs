@@ -31,6 +31,7 @@ unsafe extern "C" {
     fn xmlFreeDoc(doc: *mut XmlDoc);
     fn xmlDocDumpMemory(doc: *mut XmlDoc, memory: *mut *mut u8, size: *mut c_int);
     fn xmlGetID(doc: *mut XmlDoc, id: *const u8) -> *mut c_void;
+    fn xmlNodeSetContent(node: *mut XmlNode, content: *const u8);
     static xmlFree: unsafe extern "C" fn(*mut c_void);
 }
 
@@ -646,6 +647,32 @@ fn the_id_table_names_only_live_attributes_across_encryption() {
 }
 
 #[test]
+fn a_replacement_that_keeps_an_id_keeps_it_registered() {
+    // The replacement's xml:id is created while the replaced element still
+    // holds the same value, which libxml2 refuses to register twice; once
+    // the operation frees the old element, the new attribute must be the
+    // one the ID table names.
+    use xml_sec::policy::VerificationPolicy;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let doc = Libxml::parse("<root><secret xml:id=\"k\" Id=\"s\">old</secret></root>", 0);
+    // SAFETY: a live document and a NUL-terminated name.
+    let id = |doc: &Libxml| unsafe { xmlGetID(doc.0, c"k".as_ptr().cast()) };
+    let mut document = tree_document(&doc, &VerificationPolicy::default());
+    let target = document
+        .with_view(|view| view.node_for_id("s", &[]))
+        .expect("the element is present");
+    document
+        .replace_element(target, "<secret xml:id=\"k\" Id=\"s\">new</secret>")
+        .expect("the element is replaced");
+    let secret = doc.element("secret");
+    // SAFETY: the replacement is live and its first attribute is xml:id.
+    let attribute = unsafe { (*secret).properties };
+    assert_eq!(id(&doc), attribute.cast(), "the new attribute is the ID");
+}
+
+#[test]
 fn a_document_element_with_xml_attributes_decrypts_in_place() {
     // Decrypting the document element rebuilds it with no context element:
     // its xml: attributes still bind the implicit XML namespace (Namespaces
@@ -865,6 +892,87 @@ fn dtd_ids_and_kept_entity_references_are_read_from_the_tree() {
         verification,
         &[]
     ));
+}
+
+/// A document whose internal DTD declares `e{levels}`, expanding to
+/// `2^levels` copies of `leaf`, and whose root attribute holds a reference to
+/// it as an entity-reference child. The application builds that attribute
+/// through the tree API, so no parser amplification guard sees it.
+fn nested_attribute_entities(levels: usize, leaf: &str) -> Libxml {
+    use std::fmt::Write as _;
+    let mut dtd = format!("<!ENTITY e0 \"{leaf}\">");
+    for level in 1..=levels {
+        let below = level - 1;
+        write!(dtd, "<!ENTITY e{level} \"&e{below};&e{below};\">").expect("writes to a String");
+    }
+    let doc = Libxml::parse(&format!("<!DOCTYPE r [{dtd}]><r a=\"x\"/>"), 0);
+    let reference = std::ffi::CString::new(format!("&e{levels};")).expect("no NUL");
+    // SAFETY: the root's only attribute is live; libxml2 parses the content
+    // into an entity-reference child bound to the declaration.
+    unsafe {
+        let attribute = (*doc.element("r")).properties;
+        xmlNodeSetContent(attribute.cast(), reference.as_ptr().cast());
+    }
+    doc
+}
+
+#[test]
+fn attribute_entity_expansion_is_bounded_while_the_value_is_built() {
+    // References the tree keeps inside an attribute value are expanded by
+    // the projection; each expansion counts toward the entity ceiling and
+    // each piece toward the byte limit before it is copied, so nesting can
+    // spend neither time nor memory past the policy (XML 1.0 section 4.4.5).
+    use xml_sec::policy::{VerificationPolicy, XmlInputPolicy};
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = VerificationPolicy {
+        xml: XmlInputPolicy {
+            allow_internal_dtd: true,
+        },
+        ..VerificationPolicy::default()
+    };
+    // 2^15 expansions of an empty entity: no bytes, only work.
+    let empty = nested_attribute_entities(15, "");
+    let refused = xml_sec::XmlDocument::from_external_tree(
+        Box::new(super::LibxmlTree {
+            doc: empty.0,
+            journal: Vec::new(),
+        }),
+        &policy,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(xml_sec::XmlDocumentError::Parse(
+                xml_sec::ParseError::EntityExpansionLimitReached { .. }
+            ))
+        ),
+        "{:?}",
+        refused.err()
+    );
+    // 2^16 bytes through 2^11 expansions: refused at the byte limit before
+    // the value is built past it.
+    let mut limited = policy;
+    limited.resources.max_xml_document_bytes = 4_096;
+    let large = nested_attribute_entities(11, &"A".repeat(32));
+    let refused = xml_sec::XmlDocument::from_external_tree(
+        Box::new(super::LibxmlTree {
+            doc: large.0,
+            journal: Vec::new(),
+        }),
+        &limited,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(xml_sec::XmlDocumentError::Parse(
+                xml_sec::ParseError::ByteLimitReached { .. }
+            ))
+        ),
+        "{:?}",
+        refused.err()
+    );
 }
 
 #[test]

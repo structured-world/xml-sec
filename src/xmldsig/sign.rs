@@ -2253,6 +2253,59 @@ impl<'a> SignContext<'a> {
         Ok(mutation)
     }
 
+    /// Write placeholder text into every value signing fills, as a generation
+    /// of its own, so the tree becomes the document dependency analysis reads;
+    /// the final values replace it, and a failure rolls it back with the rest.
+    #[cfg(feature = "external-tree")]
+    fn commit_tree_placeholders(
+        &self,
+        document: &mut XmlDocument,
+        operation: &mut SigningExecution<'_>,
+        setup_gate: OperationNodeId,
+        references: &SigningReferenceInputs,
+        target_signature: usize,
+    ) -> Result<OperationNodeId, SigningError> {
+        let mutation =
+            operation.add_node(OperationNodeKind::Mutation, OperationStage::Resolve, None);
+        operation.add_dependency(mutation, setup_gate)?;
+        operation.compile()?;
+        let targets = document.with_view(|view| {
+            let signature = find_signing_signature_node(
+                view.document(),
+                SigningSignatureTarget::Index(target_signature),
+            )?;
+            let signature_value = find_required_child(signature, "SignatureValue")?;
+            let mut targets = references
+                .signed_info
+                .iter()
+                .chain(&references.manifests)
+                .map(|reference| view.node_identity_by_id(reference.digest_value_node_id))
+                .collect::<Vec<_>>();
+            targets.push(view.node_identity(signature_value));
+            Ok::<_, SigningDigestError>(targets)
+        })?;
+        let changes = targets
+            .into_iter()
+            .map(|target| {
+                (
+                    target,
+                    crate::document::TreeChange::SetText(SIGNING_PLACEHOLDER),
+                )
+            })
+            .collect::<Vec<_>>();
+        operation.run_document_transition(mutation, document, |document, budgets| {
+            document
+                .change_tree(
+                    &changes,
+                    self.document_parse_settings(),
+                    Some(budgets.transforms.xml_parse_work()),
+                )
+                .map_err(map_owned_document_mutation_error)
+        })?;
+        operation.extend();
+        Ok(mutation)
+    }
+
     /// The writer's `KeyInfo` spliced into a copy of the serialization. The
     /// helper checks its namespace wrapper and every projected replacement
     /// against policy before allocating that copy.
@@ -2279,6 +2332,62 @@ impl<'a> SignContext<'a> {
         Ok(spliced)
     }
 
+    /// The plan of a tree-backed document, which has no serialization to
+    /// defer a splice into: what joins the document is committed as its own
+    /// generation, then analyzed, with placeholder values committed first when
+    /// the analysis needs them.
+    #[cfg(feature = "external-tree")]
+    fn plan_tree_signing(
+        &self,
+        document: &mut XmlDocument,
+        operation: &mut SigningExecution<'_>,
+        (request, transform_options): (SigningReferenceRequest<'_, '_>, TransformOptions<'_>),
+        mut setup_gate: OperationNodeId,
+        key_info_content: Option<String>,
+        generated: Vec<GeneratedC14n>,
+    ) -> Result<PlannedReferences, SigningError> {
+        let target_signature = request.target_signature;
+        if !generated.is_empty() {
+            setup_gate = self.commit_generated_c14n(document, operation, setup_gate, generated)?;
+        }
+        if let Some(content) = key_info_content {
+            setup_gate = self.populate_signing_key_info(
+                document,
+                target_signature,
+                operation,
+                setup_gate,
+                (&content, None),
+            )?;
+        }
+        let policy = Arc::clone(operation.policy());
+        let mut references =
+            collect_signing_reference_inputs(document, &policy, operation.budgets_mut(), request)?;
+        if !current_tree_decides(document, target_signature, &references)? {
+            setup_gate = self.commit_tree_placeholders(
+                document,
+                operation,
+                setup_gate,
+                &references,
+                target_signature,
+            )?;
+            references = collect_signing_reference_inputs(
+                document,
+                &policy,
+                operation.budgets_mut(),
+                request,
+            )?;
+        }
+        let plan = analyze_signing_reference_inputs(
+            document,
+            &policy,
+            operation.budgets_mut(),
+            request,
+            transform_options,
+            &references,
+        )?;
+        Ok(((references, plan), setup_gate, None))
+    }
+
     /// Analyze the `Reference` set and settle how generated canonicalization and
     /// the writer's `KeyInfo` join the document: in the final mutation when
     /// nothing signed reads them, or as their own generations when something may.
@@ -2292,26 +2401,16 @@ impl<'a> SignContext<'a> {
         mut generated: Vec<GeneratedC14n>,
     ) -> Result<PlannedReferences, SigningError> {
         let target_signature = request.target_signature;
-        // A tree has no serialization to defer a splice into: what joins the
-        // document is committed as its own generation, then analyzed.
         #[cfg(feature = "external-tree")]
         if document.is_tree_backed() {
-            if !generated.is_empty() {
-                setup_gate =
-                    self.commit_generated_c14n(document, operation, setup_gate, generated)?;
-            }
-            if let Some(content) = key_info_content {
-                setup_gate = self.populate_signing_key_info(
-                    document,
-                    target_signature,
-                    operation,
-                    setup_gate,
-                    (&content, None),
-                )?;
-            }
-            let analyzed =
-                analyze_signing_references(document, operation, request, transform_options)?;
-            return Ok((analyzed, setup_gate, None));
+            return self.plan_tree_signing(
+                document,
+                operation,
+                (request, transform_options),
+                setup_gate,
+                key_info_content,
+                generated,
+            );
         }
         // A DTD's attribute default would reach the new elements when they are
         // parsed (XML 1.0 §3.3.2), and its ATTLIST could type a new ID, neither
@@ -3596,49 +3695,33 @@ fn analyze_signing_reference_inputs(
     transform_options: TransformOptions<'_>,
     references: &SigningReferenceInputs,
 ) -> Result<SigningDependencyPlan, SigningDigestError> {
-    let all_references = references.signed_info.iter().chain(&references.manifests);
-    if all_references
-        .clone()
-        .all(|reference| reference.transforms.iter().all(selects_whole_subtrees))
-    {
-        // These transforms keep or remove whole subtrees, or read only the
-        // octets or text of the nodes they are given, so a DigestValue or
-        // SignatureValue element is covered exactly when its future text is:
-        // the current tree decides every dependency without placeholder text.
-        // That holds only while filling a value removes nothing but text; a
-        // value holding other nodes needs the placeholder tree, where those
-        // nodes are already gone.
-        let analysis_references = all_references.clone().cloned().collect::<Vec<_>>();
-        let current_tree = document.with_view(|view| {
-            let signature = find_signing_signature_node(
-                view.document(),
-                SigningSignatureTarget::Index(request.target_signature),
-            )?;
-            let signature_value = find_required_child(signature, "SignatureValue")?;
-            let text_only = all_references
-                .filter_map(|reference| view.document().get_node(reference.digest_value_node_id))
-                .chain([signature_value])
-                .all(|value| value.children().all(|child| child.is_text()));
-            if !text_only {
-                return Ok(None);
-            }
-            reference_dependency_levels(
-                view.document(),
-                signature,
-                &analysis_references,
-                request.generated,
-                transform_options,
-                &budgets.transforms,
-                (
-                    request.uri_resolution(policy.transforms.same_document_id_semantics),
-                    request.provider,
-                ),
-            )
-            .map(Some)
-        })?;
-        if let Some(plan) = current_tree {
-            return Ok(plan);
-        }
+    if current_tree_decides(document, request.target_signature, references)? {
+        return current_generation_levels(
+            document,
+            policy,
+            budgets,
+            request,
+            transform_options,
+            references,
+        );
+    }
+    // A tree-backed document reaches here with placeholder text already in
+    // every value signing fills, committed as its own generation: it is the
+    // placeholder document, read without serialization.
+    #[cfg(feature = "external-tree")]
+    if document.is_tree_backed() {
+        return current_generation_levels(
+            document,
+            policy,
+            budgets,
+            request,
+            transform_options,
+            references,
+        )
+        .map(|plan| SigningDependencyPlan {
+            splice_unread: false,
+            ..plan
+        });
     }
     // Without the current tree a splice has to be committed anyway, so the caller
     // is told before this parses a document it would discard.
@@ -3655,6 +3738,79 @@ fn analyze_signing_reference_inputs(
         transform_options,
         references,
     )
+}
+
+/// The character data every value signing fills holds while digest
+/// dependencies are analyzed: valid base64, so references that read the
+/// existing or future text cannot take it for a stable input.
+const SIGNING_PLACEHOLDER: &str = "AA==";
+
+/// Whether the current generation decides every digest dependency as it
+/// stands, with no placeholder text. Transforms that keep or remove whole
+/// subtrees, or read only the octets or text of the nodes they are given,
+/// cover a `DigestValue` or `SignatureValue` element exactly when they cover
+/// its future text; that holds only while filling a value removes nothing but
+/// text, so a value holding other nodes needs the placeholder tree, where
+/// those nodes are already gone.
+fn current_tree_decides(
+    document: &XmlDocument,
+    target_signature: usize,
+    references: &SigningReferenceInputs,
+) -> Result<bool, SigningDigestError> {
+    let mut all_references = references.signed_info.iter().chain(&references.manifests);
+    if !all_references
+        .clone()
+        .all(|reference| reference.transforms.iter().all(selects_whole_subtrees))
+    {
+        return Ok(false);
+    }
+    document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(target_signature),
+        )?;
+        let signature_value = find_required_child(signature, "SignatureValue")?;
+        Ok(all_references
+            .by_ref()
+            .filter_map(|reference| view.document().get_node(reference.digest_value_node_id))
+            .chain([signature_value])
+            .all(|value| value.children().all(|child| child.is_text())))
+    })
+}
+
+/// The digest dependency levels of `references` on the current generation.
+fn current_generation_levels(
+    document: &XmlDocument,
+    policy: &crate::policy::SigningPolicy,
+    budgets: &SigningOperationBudgets,
+    request: SigningReferenceRequest<'_, '_>,
+    transform_options: TransformOptions<'_>,
+    references: &SigningReferenceInputs,
+) -> Result<SigningDependencyPlan, SigningDigestError> {
+    let analysis_references = references
+        .signed_info
+        .iter()
+        .chain(&references.manifests)
+        .cloned()
+        .collect::<Vec<_>>();
+    document.with_view(|view| {
+        let signature = find_signing_signature_node(
+            view.document(),
+            SigningSignatureTarget::Index(request.target_signature),
+        )?;
+        reference_dependency_levels(
+            view.document(),
+            signature,
+            &analysis_references,
+            request.generated,
+            transform_options,
+            &budgets.transforms,
+            (
+                request.uri_resolution(policy.transforms.same_document_id_semantics),
+                request.provider,
+            ),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3684,7 +3840,7 @@ fn analyze_signing_placeholder_generation(
     let manifest_references = &references.manifests;
     let reference_limit = references.maximum;
     let process_manifests = references.process_manifests;
-    let placeholder = "AA==";
+    let placeholder = SIGNING_PLACEHOLDER;
     // SignatureValue is the final mutable value in the signing pipeline. Give
     // it concrete character data during analysis so references that retain the
     // existing or future text cannot be mistaken for stable inputs.

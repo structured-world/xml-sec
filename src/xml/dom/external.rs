@@ -325,6 +325,41 @@ impl<'input> TreeSink<'input> {
     /// Inside a start tag, or past the entity expansion ceiling.
     pub fn enter_entity(&mut self) -> Result<(), ParseError> {
         self.outside_start_tag("entity reference")?;
+        self.count_expansion()?;
+        self.entity_depth += 1;
+        Ok(())
+    }
+
+    /// Report an entity reference the tree expands inside the value of the
+    /// attribute being built; it counts toward the same expansion ceiling as
+    /// one in content.
+    ///
+    /// # Errors
+    /// [`ParseError::EntityExpansionLimitReached`] past the ceiling.
+    pub fn expand_attribute_entity(&mut self) -> Result<(), ParseError> {
+        if self.pending.is_none() {
+            return Err(misuse("attribute entity reference outside a start tag"));
+        }
+        self.count_expansion()
+    }
+
+    /// Refuse, before it is built, an attribute value of `bytes` the byte
+    /// limit could not hold; [`Self::attribute`] charges the value itself.
+    ///
+    /// # Errors
+    /// [`ParseError::ByteLimitReached`] when the value would pass the limit.
+    pub fn admit_attribute_bytes(&self, bytes: usize) -> Result<(), ParseError> {
+        let total = self.metrics.bytes.checked_add(bytes);
+        match total {
+            Some(total) if total <= self.limits.bytes => Ok(()),
+            _ => Err(ParseError::ByteLimitReached {
+                maximum: self.limits.bytes,
+                actual: total.unwrap_or(usize::MAX),
+            }),
+        }
+    }
+
+    fn count_expansion(&mut self) -> Result<(), ParseError> {
         let maximum = crate::hard_limits::XML_ENTITY_EXPANSION_CEILING;
         if self.entity_expansions >= maximum {
             return Err(ParseError::EntityExpansionLimitReached {
@@ -333,7 +368,6 @@ impl<'input> TreeSink<'input> {
             });
         }
         self.entity_expansions += 1;
-        self.entity_depth += 1;
         Ok(())
     }
 

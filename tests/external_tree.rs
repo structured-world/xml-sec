@@ -127,6 +127,33 @@ fn signing_generates_the_c14n_transform_in_the_tree_like_text() {
 }
 
 #[test]
+fn a_transform_that_reads_node_content_signs_the_tree_like_text() {
+    // An XPath filter can read any node, so the signature's own values may
+    // enter a digest; the dependency analysis then needs the document with
+    // placeholder text in every value signing fills, which a tree holds
+    // without any serialization.
+    let canonicalization = C14nAlgorithm::new(C14nMode::Exclusive1_0, false);
+    let builder = SignatureBuilder::new(canonicalization.clone(), SignatureAlgorithm::RsaSha256)
+        .add_reference(
+            ReferenceBuilder::new(DigestAlgorithm::Sha256)
+                .uri("#secret")
+                .transform(Transform::XPath(xml_sec::xmldsig::XPathExpression::new(
+                    "true()",
+                )))
+                .transform(Transform::C14n(canonicalization)),
+        )
+        .key_info(true);
+    let tree = ModelTree::parse(PAYLOAD);
+    let mut document = tree_document(&tree);
+    sign(&mut document, &builder);
+    assert_eq!(status(&tree_document(&tree)), DsigStatus::Valid);
+    assert_eq!(tree.pending_undo(), 0);
+    let mut text = XmlDocument::parse(PAYLOAD).expect("parses");
+    sign(&mut text, &builder);
+    assert_eq!(canonical(&tree.to_xml()), canonical(text.as_xml()));
+}
+
+#[test]
 fn a_signature_verifies_on_the_tree_it_was_made_for() {
     // The projection is the whole signed content: an exact walk verifies.
     let tree = ModelTree::parse(&signed_xml());
