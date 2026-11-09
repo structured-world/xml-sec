@@ -280,6 +280,13 @@ impl<'input> TreeSink<'input> {
             let text =
                 NodeId::from(u32::try_from(before).map_err(|_| ParseError::NodesLimitReached)?);
             self.record(text, node);
+        } else if let Some(joined) = self.nodes.last_mut() {
+            // The value joined the parent's trailing text, which is the last
+            // node built: nothing follows it under its parent, and every
+            // earlier sibling's subtree was built before it. That run now
+            // spans several tree nodes, none of which alone is the node an
+            // edit would select, so it keeps no reference and refuses edits.
+            *joined = None;
         }
         Ok(())
     }

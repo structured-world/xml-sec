@@ -2053,9 +2053,9 @@ fn decrypt_owned_document_with_context(
     })?;
     processed
         .operation
-        .run_document_transition(mutation, document, |document, _| {
+        .run_document_transition(mutation, document, |document, budgets| {
             document
-                .commit_prepared(processed.output)
+                .commit_prepared(processed.output, &budgets.xml_parse)
                 .map_err(|error| map_document_error(error, context.document_parse_settings()))
         })?;
     Ok(processed.operation.audit(context.identity.as_ref()))

@@ -174,10 +174,12 @@ fn every_projected_node_keeps_the_external_node_it_came_from() {
 }
 
 #[test]
-fn adjacent_text_joins_one_node_that_keeps_the_first_reference() {
+fn adjacent_text_joins_one_node_no_edit_may_target() {
     // libxml2 keeps text and CDATA as separate siblings; the infoset has one
-    // character-data run, and an edit of it must reach the first sibling.
-    let document = project(
+    // character-data run. No single tree node is that run, so an edit of it
+    // would change only part of what was selected: it is refused before the
+    // tree is touched (this tree refuses every edit it is given).
+    let mut document = project(
         Scripted(|sink| {
             sink.begin_element(ExternalNode(2), "root", None, None)?;
             sink.open_element()?;
@@ -187,19 +189,21 @@ fn adjacent_text_joins_one_node_that_keeps_the_first_reference() {
         }),
         &VerificationPolicy::default(),
     );
-    document.with_view(|view| {
+    let text = document.with_view(|view| {
         let root = view.document().root_element();
         let children: Vec<_> = root.children().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].text(), Some("first second"));
-        let identity = view.node_identity(children[0]);
-        assert_eq!(
-            document
-                .external_node(identity)
-                .expect("joined text keeps a reference"),
-            ExternalNode(3)
-        );
+        view.node_identity(children[0])
     });
+    assert!(matches!(
+        document.external_node(text),
+        Err(XmlDocumentError::MissingNode)
+    ));
+    assert!(matches!(
+        document.replace_node_with_fragment(text, "changed"),
+        Err(XmlDocumentError::EntityExpandedMutationTarget)
+    ));
 }
 
 #[test]

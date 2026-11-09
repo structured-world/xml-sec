@@ -650,9 +650,21 @@ impl Builder {
             }
         }
         let prefix = prefix.map_or(std::ptr::null(), |prefix| prefix.as_ptr().cast());
-        // SAFETY: `doc` is live and `context` null or live; the result is a
-        // declaration of the document or of an ancestor of `context`.
-        let found = unsafe { xmlSearchNs(self.doc, self.context, prefix) };
+        // Without a context element (the document element is being replaced)
+        // search from the element being built: xmlSearchNs returns nothing for
+        // a null node, not even the implicit `xml` binding every element has
+        // (Namespaces in XML 1.0 section 3). The built element's own
+        // declarations were checked above and it has no ancestors yet.
+        let from = if self.context.is_null() {
+            self.open
+                .last()
+                .map_or(std::ptr::null_mut(), |element| element.node)
+        } else {
+            self.context
+        };
+        // SAFETY: `doc` is live and `from` null or live; the result is a
+        // declaration of the document or of `from` or an ancestor of it.
+        let found = unsafe { xmlSearchNs(self.doc, from, prefix) };
         // SAFETY: a declaration libxml2 returned is live.
         if found.is_null() || unsafe { c_bytes((*found).href) } != Some(namespace.as_bytes()) {
             return Err(edit_error("a fragment namespace its context does not bind"));
@@ -917,6 +929,10 @@ impl ExternalTree for LibxmlTree {
     }
 
     fn release(&mut self, mark: usize) {
+        // The caller's ID table stays consistent without help: xmlFreeProp
+        // unregisters an ID attribute it frees, and xmlNewNsProp registers an
+        // xml:id it creates, so freed nodes leave no entry and restored or
+        // built ones keep theirs.
         for undo in self.journal.drain(mark..) {
             if let Undo::Unlinked { node, .. } = undo {
                 // SAFETY: an unlinked node no later edit relinked; nothing

@@ -13,8 +13,10 @@ use crate::ParseError;
 use crate::collections::{Set, Table as _};
 use crate::xml::dom::Node;
 
-const WRAPPER_PREFIX: &str = "xmlsec_owned_document";
-const WRAPPER_NAMESPACE: &str = "urn:xml-sec:owned-document-validation";
+/// The wrapper element's name. It is unprefixed and declares nothing of its
+/// own, so every prefix the context binds is free for the application: only
+/// the wrapper's children are ever applied, never its name or namespace.
+const WRAPPER: &str = "wrapper";
 
 /// What one tree edit does at its target.
 #[derive(Clone, Copy)]
@@ -63,6 +65,9 @@ impl XmlDocument {
         settings: DocumentParseSettings,
         budget: Option<&XmlParseWorkBudget>,
     ) -> Result<Vec<ValidatedChange>, XmlDocumentError> {
+        if changes.len() > 1 {
+            self.with_view(|view| reject_nested_targets(view, changes))?;
+        }
         let mut targets = Set::with_entry_capacity(changes.len());
         let mut validated = Vec::with_capacity(changes.len());
         for (target, change) in changes {
@@ -120,12 +125,16 @@ impl XmlDocument {
                     }
                 };
                 let wrapper = wrap_in_scope(fragment, context)?;
-                Ok::<_, XmlDocumentError>(Planned::Fragment(external, placement, wrapper, shape))
+                // The wrapper is the fragment plus the markup around it.
+                let overhead = wrapper.len() - fragment.len();
+                Ok::<_, XmlDocumentError>(Planned::Fragment(
+                    external, placement, wrapper, overhead, shape,
+                ))
             })?;
             validated.push(match planned {
                 Planned::Text(target, text) => ValidatedChange::Text { target, text },
-                Planned::Fragment(target, placement, wrapper, shape) => {
-                    let cell = parse_fragment(wrapper, settings, budget)?;
+                Planned::Fragment(target, placement, wrapper, overhead, shape) => {
+                    let cell = parse_fragment(wrapper, overhead, settings, budget)?;
                     check_shape(&cell, shape)?;
                     ValidatedChange::Fragment {
                         target,
@@ -200,7 +209,33 @@ impl XmlDocument {
 /// A change resolved inside the view, before its fragment is parsed.
 enum Planned {
     Text(ExternalNode, String),
-    Fragment(ExternalNode, Placement, String, ReplacementShape),
+    /// The fragment in its wrapper, and the wrapper's own bytes.
+    Fragment(ExternalNode, Placement, String, usize, ReplacementShape),
+}
+
+/// Refuse targets one of which lies inside another: an edit at the outer
+/// one removes the inner node, so an edit at the inner one could only land
+/// on a detached node, which a text document refuses as overlapping ranges.
+fn reject_nested_targets(
+    view: super::DocumentView<'_>,
+    changes: &[(NodeIdentity, TreeChange<'_>)],
+) -> Result<(), XmlDocumentError> {
+    let mut nodes = Set::with_entry_capacity(changes.len());
+    for (target, _) in changes {
+        nodes.insert(view.resolve_node(*target)?.id());
+    }
+    for (target, _) in changes {
+        let mut ancestor = view.resolve_node(*target)?.parent_element();
+        while let Some(element) = ancestor {
+            if nodes.contains(&element.id()) {
+                return Err(XmlDocumentError::InvalidReplacement(
+                    "replacement targets overlap".into(),
+                ));
+            }
+            ancestor = element.parent_element();
+        }
+    }
+    Ok(())
 }
 
 fn require_element(node: Node<'_, '_>) -> Result<(), XmlDocumentError> {
@@ -252,13 +287,9 @@ pub(crate) fn wrap_in_scope(
 ) -> Result<String, XmlDocumentError> {
     let mut wrapper = String::new();
     wrapper
-        .try_reserve(fragment.len() + 2 * WRAPPER_PREFIX.len() + WRAPPER_NAMESPACE.len() + 64)
+        .try_reserve(fragment.len() + 2 * WRAPPER.len() + 64)
         .map_err(|_| XmlDocumentError::Parse(ParseError::AllocationFailed))?;
-    write!(
-        wrapper,
-        "<{WRAPPER_PREFIX}:wrapper xmlns:{WRAPPER_PREFIX}=\"{WRAPPER_NAMESPACE}\""
-    )
-    .expect("writing to a String cannot fail");
+    write!(wrapper, "<{WRAPPER}").expect("writing to a String cannot fail");
     if let Some(context) = context {
         for namespace in context.namespaces() {
             match namespace.name() {
@@ -273,7 +304,7 @@ pub(crate) fn wrap_in_scope(
     }
     wrapper.push('>');
     wrapper.push_str(fragment);
-    write!(wrapper, "</{WRAPPER_PREFIX}:wrapper>").expect("writing to a String cannot fail");
+    write!(wrapper, "</{WRAPPER}>").expect("writing to a String cannot fail");
     Ok(wrapper)
 }
 
@@ -290,11 +321,13 @@ fn escape_attribute_into(value: &str, output: &mut String) {
 
 fn parse_fragment(
     wrapper: String,
+    overhead: usize,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    // The wrapper adds a root and one element above the fragment; the
-    // projection of the edited tree then applies the caller's exact limits.
+    // The wrapper adds a root, one element and its markup around the
+    // fragment; the fragment itself stays under the caller's byte ceiling,
+    // and the projection of the edited tree then applies the exact limits.
     // A limit already at its type's maximum stays there: these allowances
     // only widen the fragment's own parse, never the committed generation.
     let fragment_settings = DocumentParseSettings {
@@ -302,7 +335,7 @@ fn parse_fragment(
         nodes_limit: settings.nodes_limit.saturating_add(2),
         depth_limit: settings.depth_limit.saturating_add(1),
         namespace_bindings_limit: settings.namespace_bindings_limit.saturating_add(1),
-        max_bytes: wrapper.len().max(settings.max_bytes),
+        max_bytes: settings.max_bytes.saturating_add(overhead),
         ..settings
     };
     build_cell(wrapper, fragment_settings, budget)

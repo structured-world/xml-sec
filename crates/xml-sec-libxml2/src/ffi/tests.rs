@@ -12,12 +12,13 @@ use xml_sec_capi::ffi::{
     XsPolicy, XsPolicyStore, XsProvider, XsSignatureOutcome, XsSigner, XsVerifier, XsVerifyRequest,
     xs_decrypt, xs_decryptor_destroy, xs_decryptor_new, xs_document_destroy, xs_document_serialize,
     xs_encrypt, xs_encryptor_destroy, xs_encryptor_new, xs_error_destroy, xs_error_message,
-    xs_evidence_destroy, xs_evidence_signature, xs_keys_add_private_pem, xs_keys_add_public_pem,
-    xs_keys_destroy, xs_keys_new, xs_policy_destroy, xs_policy_store_destroy, xs_policy_store_load,
-    xs_policy_store_new, xs_provider_destroy, xs_provider_new_rustcrypto, xs_sign,
-    xs_signer_destroy, xs_signer_new, xs_verifier_destroy, xs_verifier_new, xs_verify,
+    xs_evidence_accepted, xs_evidence_destroy, xs_evidence_signature, xs_keys_add_private_pem,
+    xs_keys_add_public_pem, xs_keys_destroy, xs_keys_new, xs_policy_destroy,
+    xs_policy_store_destroy, xs_policy_store_load, xs_policy_store_new, xs_provider_destroy,
+    xs_provider_new_rustcrypto, xs_sign, xs_signer_destroy, xs_signer_new, xs_verifier_destroy,
+    xs_verifier_new, xs_verify,
 };
-use xml_sec_capi::status::{XS_DOCUMENT, XS_INVALID_ARGUMENT, XS_OK, XsStatus};
+use xml_sec_capi::status::{XS_DOCUMENT, XS_INVALID_ARGUMENT, XS_OK, XS_VERIFICATION, XsStatus};
 
 unsafe extern "C" {
     fn xmlReadMemory(
@@ -29,6 +30,7 @@ unsafe extern "C" {
     ) -> *mut XmlDoc;
     fn xmlFreeDoc(doc: *mut XmlDoc);
     fn xmlDocDumpMemory(doc: *mut XmlDoc, memory: *mut *mut u8, size: *mut c_int);
+    fn xmlGetID(doc: *mut XmlDoc, id: *const u8) -> *mut c_void;
     static xmlFree: unsafe extern "C" fn(*mut c_void);
 }
 
@@ -284,6 +286,18 @@ fn sign(policy: &Policy, document: XsDocument) -> XsStatus {
 /// Verify `document` with the signer's public key; whether its first
 /// signature is valid.
 fn verifies(policy: &Policy, document: XsDocument) -> bool {
+    verify_then(policy, document, || ()).0
+}
+
+/// Verify `document` with the signer's public key, run `between`, then ask
+/// whether the evidence is still accepted for the document: whether the
+/// first signature is valid, and the acceptance answer, or the status
+/// refusing evidence of an earlier generation.
+fn verify_then(
+    policy: &Policy,
+    document: XsDocument,
+    between: impl FnOnce(),
+) -> (bool, Result<bool, XsStatus>) {
     let (mut keys, mut verifier, mut evidence) = (
         XsKeys::default(),
         XsVerifier::default(),
@@ -338,10 +352,21 @@ fn verifies(policy: &Policy, document: XsDocument) -> bool {
             XS_OK
         );
     }
+    between();
+    let mut accepted = 0;
+    // SAFETY: live handles and a live output.
+    let status = unsafe {
+        xs_evidence_accepted(evidence, document, &raw mut accepted, std::ptr::null_mut())
+    };
     assert_eq!(xs_evidence_destroy(evidence), XS_OK);
     assert_eq!(xs_verifier_destroy(verifier), XS_OK);
     assert_eq!(xs_keys_destroy(keys), XS_OK);
-    outcome.outcome == 1
+    let answer = if status == XS_OK {
+        Ok(accepted == 1)
+    } else {
+        Err(status)
+    };
+    (outcome.outcome == 1, answer)
 }
 
 #[test]
@@ -411,6 +436,35 @@ fn a_change_the_caller_makes_between_calls_is_seen() {
     // content; rewriting its first byte keeps the string valid.
     unsafe { *(*(*payload).children).content = b'S' };
     assert!(!verifies(&policy, verifying));
+    assert_eq!(xs_document_destroy(verifying), XS_OK);
+}
+
+#[test]
+fn evidence_is_accepted_only_while_the_tree_is_unchanged() {
+    // Acceptance answers for the document as it is: evidence of a tree the
+    // caller left alone stays accepted, and a change after verification makes
+    // it evidence of an earlier generation, refused as for a text document
+    // changed after verification.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = Policy::modern();
+    let doc = Libxml::parse(TEMPLATE, 0);
+    let document = handle(&policy, 2, &doc);
+    sign(&policy, document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    let verifying = handle(&policy, 1, &doc);
+    assert_eq!(verify_then(&policy, verifying, || ()), (true, Ok(true)));
+    let payload = doc.element("p");
+    let edit = || {
+        // SAFETY: the payload's text child is a live text node with libxml2
+        // content; rewriting its first byte keeps the string valid.
+        unsafe { *(*(*payload).children).content = b'S' };
+    };
+    assert_eq!(
+        verify_then(&policy, verifying, edit),
+        (true, Err(XS_VERIFICATION))
+    );
     assert_eq!(xs_document_destroy(verifying), XS_OK);
 }
 
@@ -542,8 +596,12 @@ fn an_element_encrypts_and_decrypts_in_the_callers_tree() {
     let before = doc.dump();
     encrypt(&policy, &doc);
     let encrypted = doc.dump();
+    // The plaintext is gone as markup; the random base64 ciphertext may hold
+    // any digit pair, so the bare value is not a check.
     assert!(
-        encrypted.contains("EncryptedData") && !encrypted.contains("42"),
+        encrypted.contains("EncryptedData")
+            && !encrypted.contains("<secret")
+            && !encrypted.contains(">42<"),
         "{encrypted}"
     );
     assert!(doc.elements().contains(&public));
@@ -557,6 +615,53 @@ fn an_element_encrypts_and_decrypts_in_the_callers_tree() {
     };
     assert_eq!(canonical(&doc.dump()), canonical(&before));
     assert!(doc.elements().contains(&public));
+}
+
+#[test]
+fn the_id_table_names_only_live_attributes_across_encryption() {
+    // libxml2's ID table points at attribute nodes: an element the operation
+    // removes and frees must leave no entry behind, and the element decryption
+    // restores is registered again, so the caller's xmlGetID never returns a
+    // freed attribute.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = Policy::modern();
+    // The operation selects the element by Id; libxml2 registers its xml:id.
+    let doc = Libxml::parse("<root><secret xml:id=\"k\" Id=\"s\">42</secret></root>", 0);
+    // SAFETY: a live document and a NUL-terminated name.
+    let id = |doc: &Libxml| unsafe { xmlGetID(doc.0, c"k".as_ptr().cast()) };
+    assert!(!id(&doc).is_null(), "libxml2 registers xml:id");
+    encrypt(&policy, &doc);
+    assert!(id(&doc).is_null(), "the freed attribute left the ID table");
+    decrypt(&policy, &doc);
+    let secret = doc.element("secret");
+    // SAFETY: the restored element is live and its first attribute is xml:id.
+    let attribute = unsafe { (*secret).properties };
+    assert_eq!(
+        id(&doc),
+        attribute.cast(),
+        "the restored attribute is the ID"
+    );
+}
+
+#[test]
+fn a_document_element_with_xml_attributes_decrypts_in_place() {
+    // Decrypting the document element rebuilds it with no context element:
+    // its xml: attributes still bind the implicit XML namespace (Namespaces
+    // in XML 1.0 section 3), which needs no declaration.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = Policy::modern();
+    let doc = Libxml::parse("<secret Id=\"s\" xml:lang=\"en\">42</secret>", 0);
+    encrypt(&policy, &doc);
+    decrypt(&policy, &doc);
+    let restored = doc.dump();
+    assert!(
+        restored.contains("<secret Id=\"s\" xml:lang=\"en\">42</secret>"),
+        "{restored}"
+    );
 }
 
 #[test]

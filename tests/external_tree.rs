@@ -145,6 +145,59 @@ fn a_changed_tree_does_not_verify() {
 }
 
 #[test]
+fn a_stricter_operation_enforces_its_byte_ceiling_on_a_tree() {
+    // A tree projected under a permissive policy and verified under one whose
+    // document ceiling it exceeds is refused, as the same text would be: the
+    // projection's bytes are the document's size.
+    let tree = ModelTree::parse(&signed_xml());
+    let document = tree_document(&tree);
+    let mut policy = VerificationPolicy::default();
+    policy.resources.max_xml_document_bytes = 64;
+    let resolver = DefaultKeyResolver::default();
+    let error = cryptographic::context()
+        .policy(policy)
+        .key_resolver(&resolver)
+        .verify_document(&document)
+        .expect_err("the document exceeds the active ceiling");
+    assert!(error.to_string().contains("XML document"), "{error}");
+}
+
+#[test]
+fn decryption_charges_the_projection_of_the_edited_tree() {
+    // Committing a decryption reads the whole edited tree again; that walk is
+    // parse work of the operation, as reparsing the text would be, so an
+    // allowance that holds the plaintext but not the document refuses it and
+    // leaves the tree encrypted.
+    let padding = "p".repeat(4_096);
+    let xml = format!("<root><pad>{padding}</pad><secret ID=\"secret\">payload</secret></root>");
+    let tree = ModelTree::parse(&xml);
+    let mut document = tree_document(&tree);
+    let content_key = [0x5a; 16];
+    EncryptedDataBuilder::new(DataEncryptionAlgorithm::Aes128Gcm)
+        .direct_key(content_key)
+        .encrypt_owned_document(
+            &mut document,
+            DocumentEncryptionOptions {
+                element_id: Some("secret"),
+            },
+        )
+        .expect("the element encrypts");
+    let encrypted = tree.to_xml();
+    let mut policy = xml_sec::policy::DecryptionPolicy::default();
+    policy.resources.max_xml_parse_work_bytes = 1_024;
+    let refused = DecryptContext::new(&SymmetricKeyDecryptor::new(content_key))
+        .policy(policy)
+        .decrypt_owned_document(&mut document, None);
+    assert!(refused.is_err(), "the projection exceeds the allowance");
+    assert_eq!(
+        tree.to_xml(),
+        encrypted,
+        "the refused decryption rolled back"
+    );
+    assert_eq!(tree.pending_undo(), 0);
+}
+
+#[test]
 fn encryption_and_decryption_change_the_tree_in_place() {
     // The element is encrypted into the caller's tree and decrypted back;
     // every node outside it is the same node throughout, and the restored

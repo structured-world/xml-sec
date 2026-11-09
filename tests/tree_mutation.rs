@@ -207,6 +207,20 @@ fn a_refresh_reads_changes_the_application_made_to_the_tree() {
 }
 
 #[test]
+fn a_refresh_of_an_unchanged_tree_keeps_the_generation() {
+    // Nothing changed, so identities and evidence of the generation stay
+    // valid; reading the tree again must not invalidate them.
+    let tree = ModelTree::parse(XML);
+    let mut document = document(&tree);
+    let first = node(&document, "first");
+    document.refresh_tree().expect("the tree is read again");
+    assert_eq!(document.generation(), 0);
+    document
+        .replace_content(first, "still valid")
+        .expect("the identity is current");
+}
+
+#[test]
 fn a_parsed_document_has_no_tree_to_refresh() {
     let mut document = XmlDocument::parse(XML).expect("parses");
     assert!(!document.is_tree_backed());
@@ -253,6 +267,53 @@ fn a_failed_transaction_rolls_the_tree_back() {
     assert_eq!(tree.nodes(), nodes);
     assert_eq!(document.generation(), 0);
     assert_eq!(tree.pending_undo(), 0);
+}
+
+#[test]
+fn overlapping_content_targets_are_refused_before_any_edit() {
+    // Replacing an element's content removes its descendants, so a second
+    // replacement inside it could only land on a detached node: the pair is
+    // refused, as for text, and the tree stays as it was.
+    let tree = ModelTree::parse(
+        r#"<root><outer Id="outer"><mid><inner Id="inner"/></mid></outer></root>"#,
+    );
+    let mut document = document(&tree);
+    let outer = node(&document, "outer");
+    let inner = node(&document, "inner");
+    let before = tree.to_xml();
+    assert!(matches!(
+        document.replace_contents(&[(outer, "<a/>".into()), (inner, "b".into())]),
+        Err(XmlDocumentError::InvalidReplacement(_))
+    ));
+    assert!(matches!(
+        document.replace_contents(&[(inner, "b".into()), (outer, "<a/>".into())]),
+        Err(XmlDocumentError::InvalidReplacement(_))
+    ));
+    assert_eq!(tree.to_xml(), before);
+    assert_eq!(document.generation(), 0);
+}
+
+#[test]
+fn a_context_may_bind_any_prefix_the_fragment_parse_uses_internally() {
+    // The fragment is parsed inside a wrapper that redeclares the context's
+    // bindings; no prefix the application binds may collide with the
+    // wrapper's own markup.
+    let tree = ModelTree::parse(concat!(
+        r#"<root xmlns:xmlsec_owned_document="urn:app">"#,
+        r#"<first Id="first">one</first></root>"#
+    ));
+    let mut document = document(&tree);
+    let first = node(&document, "first");
+    document
+        .replace_content(first, "<xmlsec_owned_document:new/>")
+        .expect("the content is replaced");
+    assert_eq!(
+        tree.to_xml(),
+        concat!(
+            r#"<root xmlns:xmlsec_owned_document="urn:app">"#,
+            r#"<first Id="first"><xmlsec_owned_document:new></xmlsec_owned_document:new></first></root>"#
+        )
+    );
 }
 
 #[test]

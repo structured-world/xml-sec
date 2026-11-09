@@ -593,9 +593,10 @@ pub enum XmlDocumentError {
     /// A mutation target is not an element.
     #[error("XML mutation target must be an element")]
     TargetNotElement,
-    /// A semantic node was synthesized from a shared entity-reference token.
+    /// A semantic node was synthesized from a shared entity-reference token,
+    /// or in a tree-backed document joins text from several tree nodes.
     #[error(
-        "XML mutation target originates from an entity expansion and has no unique source range"
+        "XML mutation target originates from an entity expansion or joined text and has no unique source"
     )]
     EntityExpandedMutationTarget,
     /// Replacement content does not satisfy the requested structural shape.
@@ -1263,7 +1264,7 @@ impl XmlDocument {
     ) -> Result<(), crate::policy::PolicyViolation> {
         resources.validate()?;
         self.validate_xml_input_policy(xml.allow_internal_dtd)?;
-        resources.validate_xml_document_len(self.as_xml().len())?;
+        resources.validate_xml_document_len(self.content_len())?;
         self.with_view(|view| {
             // Retain lexical preflight metrics per generation, including entity expansion and
             // DTD defaults. A later stricter operation policy must not trust parse-time limits.
@@ -2419,12 +2420,14 @@ impl XmlDocument {
         self.tree.is_some()
     }
 
-    /// Read the external tree again as a new generation, under the limits
-    /// the document was created with.
+    /// Read the external tree again under the limits the document was
+    /// created with; a tree that changed becomes a new generation.
     ///
     /// An application whose code may have changed the tree since the last
     /// operation calls this before the next one, so the operation reads the
-    /// tree as it is; every identity of the earlier generation becomes stale.
+    /// tree as it is. If the tree changed, every identity of the earlier
+    /// generation becomes stale; an unchanged tree keeps its generation, its
+    /// identities and evidence bound to it.
     ///
     /// # Errors
     /// [`XmlDocumentError::NotTreeBacked`] for a parsed document, or what
@@ -2433,6 +2436,13 @@ impl XmlDocument {
     pub fn refresh_tree(&mut self) -> Result<(), XmlDocumentError> {
         let tree = self.tree.as_ref().ok_or(XmlDocumentError::NotTreeBacked)?;
         let (cell, has_dtd) = project_external(tree.as_ref(), self.settings)?;
+        #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
+        let same_dtd = self.requires_internal_dtd == has_dtd;
+        #[cfg(not(any(feature = "xmldsig", feature = "xmlenc")))]
+        let same_dtd = true;
+        if same_dtd && same_projection(self.cell.borrow_dependent(), cell.borrow_dependent()) {
+            return Ok(());
+        }
         self.commit_generation(cell)?;
         #[cfg(any(feature = "xmldsig", feature = "xmlenc"))]
         {
@@ -2622,10 +2632,15 @@ impl XmlDocument {
         self.replace_serialized_with_settings(output, settings, budget)
     }
 
+    /// Commit `prepared`. A text change was parsed and charged when it was
+    /// prepared; a tree change projects the edited tree now and charges that
+    /// walk to `budget`, the operation's allowance.
     #[cfg(feature = "xmlenc")]
     pub(crate) fn commit_prepared(
         &mut self,
         prepared: PreparedDocumentMutation,
+        #[cfg_attr(not(feature = "external-tree"), expect(unused_variables))]
+        budget: &XmlParseWorkBudget,
     ) -> Result<(), XmlDocumentError> {
         if self.identity != prepared.identity {
             return Err(XmlDocumentError::ForeignIdentity);
@@ -2640,7 +2655,7 @@ impl XmlDocument {
             PreparedChange::Cell(cell) => self.commit_cell(cell),
             #[cfg(feature = "external-tree")]
             PreparedChange::Tree(changes, settings) => {
-                self.commit_tree_changes(&changes, settings, None)
+                self.commit_tree_changes(&changes, settings, Some(budget))
             }
         }
     }
@@ -3300,6 +3315,51 @@ fn project_external(
         })
     })?;
     Ok((cell, has_dtd))
+}
+
+/// Whether two projections of a tree are the same generation: the same
+/// tree nodes, in the same shape, with every name, namespace scope,
+/// attribute (and its ID typing), text and instruction equal.
+#[cfg(feature = "external-tree")]
+fn same_projection(current: &ParsedDocument<'_>, next: &ParsedDocument<'_>) -> bool {
+    if current.external != next.external || current.external_bytes != next.external_bytes {
+        return false;
+    }
+    let mut left = current.document.root().descendants();
+    let mut right = next.document.root().descendants();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(left), Some(right)) if same_node(left, right) => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Node ids follow document order in both projections, so equal parent ids
+/// give equal shape.
+#[cfg(feature = "external-tree")]
+fn same_node(left: Node<'_, '_>, right: Node<'_, '_>) -> bool {
+    left.node_type() == right.node_type()
+        && left.parent().map(Node::id) == right.parent().map(Node::id)
+        && left.tag_name().name() == right.tag_name().name()
+        && left.tag_name().namespace() == right.tag_name().namespace()
+        && left.prefix() == right.prefix()
+        && left.text() == right.text()
+        && left.pi().map(|pi| (pi.target, pi.value)) == right.pi().map(|pi| (pi.target, pi.value))
+        && left.attributes().len() == right.attributes().len()
+        && left.attributes().zip(right.attributes()).all(|(a, b)| {
+            a.name() == b.name()
+                && a.namespace() == b.namespace()
+                && a.prefix() == b.prefix()
+                && a.value() == b.value()
+                && a.is_id() == b.is_id()
+        })
+        && left.namespaces().len() == right.namespaces().len()
+        && left
+            .namespaces()
+            .zip(right.namespaces())
+            .all(|(a, b)| a.name() == b.name() && a.uri() == b.uri())
 }
 
 pub(crate) fn parse_borrowed_with_settings_and_budget<'a>(
@@ -7295,7 +7355,7 @@ mod tests {
             )
             .expect("both boundary text pairs must fit in the prepared document");
         document
-            .commit_prepared(prepared)
+            .commit_prepared(prepared, &budget)
             .expect("prepared replacement must commit atomically");
 
         assert_eq!(document.as_xml(), "<root>leftmiddleright</root>");

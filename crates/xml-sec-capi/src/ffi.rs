@@ -1324,8 +1324,10 @@ pub unsafe extern "C" fn xs_evidence_accepted(
     contain(error, || {
         // SAFETY: the caller's contract for `accepted`.
         let out = unsafe { output(accepted) }?;
+        // A tree the caller changed since verification is a new generation
+        // the evidence does not cover; an unchanged tree keeps its generation.
         let verdict = with_evidence(evidence, |evidence| {
-            with_document(document, |document| {
+            with_operation_document(document, |document| {
                 evidence
                     .accepted(document)
                     .map_err(|error| Failure::from(xml_sec::XmlSecError::from(error)))
