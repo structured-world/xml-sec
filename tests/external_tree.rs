@@ -153,6 +153,80 @@ fn a_transform_that_reads_node_content_signs_the_tree_like_text() {
     assert_eq!(canonical(&tree.to_xml()), canonical(text.as_xml()));
 }
 
+/// An enveloping template whose `Signature` is the document element.
+const ENVELOPING: &str = concat!(
+    r#"<ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"><ds:SignedInfo>"#,
+    r#"<ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>"#,
+    r#"<ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>"#,
+    r##"<ds:Reference URI="#object">"##,
+    r#"<ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>"#,
+    "<ds:DigestValue/></ds:Reference></ds:SignedInfo><ds:SignatureValue/><ds:KeyInfo/>",
+    r#"<ds:Object Id="object">data</ds:Object></ds:Signature>"#
+);
+
+/// Whether the enveloping template signs, with the certificate merged into
+/// `KeyInfo`, under resources `limit` sets to `value`.
+fn signs_enveloping_under(
+    document: &mut XmlDocument,
+    limit: fn(&mut xml_sec::policy::ResourcePolicy, usize),
+    value: usize,
+) -> bool {
+    let signing_key =
+        RsaSigningKey::from_pkcs8_pem(PRIVATE_KEY).expect("tracked private key must parse");
+    let key_info = X509CertificateKeyInfoWriter::from_pem(CERTIFICATE)
+        .expect("tracked certificate must parse");
+    let mut policy = xml_sec::policy::SigningPolicy::default();
+    limit(&mut policy.resources, value);
+    SignContext::new(&signing_key)
+        .policy(policy)
+        .key_info_writer(&key_info)
+        .sign_document(document)
+        .is_ok()
+}
+
+/// The tightest value of `limit` the enveloping template signs under as
+/// text must sign the same template as a tree.
+fn tree_signs_at_the_tightest_text_limit(
+    limit: fn(&mut xml_sec::policy::ResourcePolicy, usize),
+    range: core::ops::Range<usize>,
+) {
+    // Signing under a looser limit never fails where a tighter one passed,
+    // so the tightest passing value is a partition point.
+    let values: Vec<usize> = range.collect();
+    let tightest = values[values.partition_point(|&value| {
+        let mut text = XmlDocument::parse(ENVELOPING).expect("the template parses");
+        !signs_enveloping_under(&mut text, limit, value)
+    })];
+    let tree = ModelTree::parse(ENVELOPING);
+    let mut document = tree_document(&tree);
+    assert!(
+        signs_enveloping_under(&mut document, limit, tightest),
+        "the tree must sign under the limit text signs under ({tightest})"
+    );
+    assert_eq!(status(&tree_document(&tree)), DsigStatus::Valid);
+}
+
+#[test]
+fn a_tree_whose_signature_is_the_document_element_signs_at_the_text_limits() {
+    // Merging KeyInfo on a tree reads the signature written out on its own,
+    // inside a wrapper that carries its scope. That wrapper is no part of
+    // the document, so it takes nothing from the operation's limits: the
+    // template signs as a tree under exactly the limits it signs under as
+    // text.
+    tree_signs_at_the_tightest_text_limit(
+        |resources, depth| resources.max_xml_depth = depth,
+        1..64,
+    );
+    tree_signs_at_the_tightest_text_limit(
+        |resources, bytes| resources.max_xml_document_bytes = bytes,
+        1..8192,
+    );
+    tree_signs_at_the_tightest_text_limit(
+        |resources, nodes| resources.max_xml_nodes = nodes,
+        1..256,
+    );
+}
+
 #[test]
 fn a_signature_verifies_on_the_tree_it_was_made_for() {
     // The projection is the whole signed content: an exact walk verifies.

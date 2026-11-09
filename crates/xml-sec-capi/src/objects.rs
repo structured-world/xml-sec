@@ -897,13 +897,13 @@ impl Signer {
         Ok(Self { security, key })
     }
 
-    /// Fill the document's signature template.
     /// The compiled signing policy a document is read under.
     pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
         let policy = self.security.policies().signing()?;
         Some(policy)
     }
 
+    /// Fill the document's signature template.
     pub(crate) fn sign(&self, document: &mut XmlDocument) -> Result<PolicyAudit, Failure> {
         Ok(self
             .security
@@ -951,15 +951,15 @@ impl Verifier {
             .map_err(|error| XmlSecError::from(error).into())
     }
 
-    /// Verify `document`, requiring the elements whose ID is in
-    /// `expected_ids` to be authenticated. A `lookup` supplies the keys for
-    /// this call in place of the verifier's key manager.
     /// The compiled verification policy a document is read under.
     pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
         let policy = self.security.policies().verification()?;
         Some(policy)
     }
 
+    /// Verify `document`, requiring the elements whose ID is in
+    /// `expected_ids` to be authenticated. A `lookup` supplies the keys for
+    /// this call in place of the verifier's key manager.
     pub(crate) fn verify(
         &self,
         document: &XmlDocument,
@@ -1038,13 +1038,13 @@ impl Encryptor {
         Ok(Self { security, builder })
     }
 
-    /// Replace the element with ID `element_id`, or the root, by its encryption.
     /// The compiled encryption policy a document is read under.
     pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
         let policy = self.security.policies().encryption()?;
         Some(policy)
     }
 
+    /// Replace the element with ID `element_id`, or the root, by its encryption.
     pub(crate) fn encrypt(
         &self,
         document: &mut XmlDocument,
@@ -1082,14 +1082,14 @@ impl Decryptor {
         Ok(Self { security, resolver })
     }
 
-    /// Recover the `EncryptedData` with schema `Id` `id`, or the first one. A
-    /// `lookup` supplies the keys for this call in place of the selected key.
     /// The compiled decryption policy a document is read under.
     pub(crate) fn document_policy(&self) -> Option<&dyn xml_sec::XmlDocumentPolicy> {
         let policy = self.security.policies().decryption()?;
         Some(policy)
     }
 
+    /// Recover the `EncryptedData` with schema `Id` `id`, or the first one. A
+    /// `lookup` supplies the keys for this call in place of the selected key.
     pub(crate) fn decrypt(
         &self,
         document: &mut XmlDocument,

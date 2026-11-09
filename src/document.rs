@@ -5390,6 +5390,8 @@ pub mod external;
 mod markup;
 #[cfg(feature = "external-tree")]
 mod tree_edits;
+#[cfg(all(feature = "external-tree", feature = "xmldsig-sign"))]
+pub(crate) use tree_edits::admit_wrapper;
 #[cfg(feature = "external-tree")]
 pub(crate) use tree_edits::{TreeChange, wrap_in_scope};
 
