@@ -145,6 +145,33 @@ fn node_set_form_refuses_a_scalar_result() {
     assert!(select(&expression, None, XPathForm::NodeSet, &[]).is_err());
 }
 
+/// One request can move `here()` between expressions, as the expressions of
+/// a transform each sit in their own element, and a node outside the
+/// document is refused.
+#[test]
+fn here_moves_between_expressions_of_one_request() {
+    let document = document();
+    document.with_view(|view| {
+        let mut selector = super::Selector::new(view, Some(KEEP), &[], &ResourcePolicy::default())
+            .expect("selector");
+        let itself = XPathExpression::new("here()");
+        let at = |selector: &super::Selector<'_, '_>| {
+            selector
+                .xpath(&itself, XPathForm::NodeSet)
+                .expect("selection")
+                .into_iter()
+                .map(owned)
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        assert_eq!(at(&selector), [SelectedNode::Node(KEEP)]);
+        selector
+            .set_here(Some(ROOT))
+            .expect("a node of the document");
+        assert_eq!(at(&selector), [SelectedNode::Node(ROOT)]);
+        assert!(selector.set_here(Some(ExternalNode(99))).is_err());
+    });
+}
+
 #[test]
 fn here_names_the_caller_node_and_id_uses_the_registrations() {
     // here() is the external node the caller names; id() matches only the

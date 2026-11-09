@@ -166,3 +166,78 @@ fn walk_visits_each_member_node_once() {
         crate::ffi::tree::xmlFreeDoc(doc);
     }
 }
+
+/// The walk is in document order whatever order a caller listed the nodes
+/// in, and a lone member whose operation is not intersection is walked as
+/// the set it stands for: a union holds every node, a subtraction every node
+/// outside its list.
+#[test]
+fn walk_follows_document_order_and_the_member_operation() {
+    let xml = b"<r><a>x</a><b>y</b></r>";
+    // SAFETY: as above.
+    unsafe {
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 0);
+        assert!(!doc.is_null());
+        let root = (*doc).children;
+        let a = (*root).children;
+        let b = (*a).next;
+        let walk = |set: *mut XmlSecNodeSet| {
+            let mut seen: Vec<String> = Vec::new();
+            let data = (&raw mut seen).cast::<std::ffi::c_void>();
+            assert_eq!(super::xmlSecNodeSetWalk(set, Some(record), data), 0);
+            seen
+        };
+        let listed = || {
+            let nodes = crate::ffi::tree::xmlXPathNodeSetCreate(b);
+            crate::ffi::tree::xmlXPathNodeSetAdd(nodes, a);
+            nodes
+        };
+
+        let reversed = xmlSecNodeSetCreate(doc, listed(), TREE);
+        assert_eq!(walk(reversed), ["a", "x", "b", "y"]);
+        xmlSecNodeSetDestroy(reversed);
+
+        let union = xmlSecNodeSetAdd(
+            std::ptr::null_mut(),
+            xmlSecNodeSetCreate(doc, listed(), TREE),
+            UNION,
+        );
+        assert_eq!(walk(union), ["r", "a", "x", "b", "y"]);
+        xmlSecNodeSetDestroy(union);
+
+        let subtraction = xmlSecNodeSetAdd(
+            std::ptr::null_mut(),
+            xmlSecNodeSetCreate(doc, crate::ffi::tree::xmlXPathNodeSetCreate(a), TREE),
+            SUBTRACTION,
+        );
+        assert_eq!(walk(subtraction), ["r", "b", "y"]);
+        xmlSecNodeSetDestroy(subtraction);
+        crate::ffi::tree::xmlFreeDoc(doc);
+    }
+}
+
+/// CDATA characters are text (`XPath` 1.0 section 5.7), so the text dump
+/// that feeds Base64 writes them like any text node.
+#[test]
+fn text_dump_includes_cdata() {
+    let xml = b"<r>Zm9v<![CDATA[YmFy]]></r>";
+    // SAFETY: the libxml2 document, set and output buffer are used while live.
+    unsafe {
+        // Recovery parses with libxml2, which keeps the CDATA section.
+        let doc = crate::ffi::parser::xmlSecParseMemory(xml.as_ptr(), xml.len(), 1);
+        assert!(!doc.is_null());
+        let set = xmlSecNodeSetGetChildren(doc, std::ptr::null_mut(), 1, 0);
+        let buffer = crate::ffi::buffer::xmlSecBufferCreate(0);
+        let out = crate::ffi::transforms::io::xmlSecBufferCreateOutputBuffer(buffer);
+        assert_eq!(super::xmlSecNodeSetDumpTextNodes(set, out), 0);
+        crate::ffi::transforms::io::xmlOutputBufferClose(out);
+        let written = std::slice::from_raw_parts(
+            crate::ffi::buffer::xmlSecBufferGetData(buffer),
+            crate::ffi::buffer::xmlSecBufferGetSize(buffer),
+        );
+        assert_eq!(written, b"Zm9vYmFy");
+        crate::ffi::buffer::xmlSecBufferDestroy(buffer);
+        xmlSecNodeSetDestroy(set);
+        crate::ffi::tree::xmlFreeDoc(doc);
+    }
+}

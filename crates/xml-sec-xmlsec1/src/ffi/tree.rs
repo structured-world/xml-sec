@@ -10,6 +10,9 @@ unsafe extern "C" {
     pub(crate) fn xmlXPathNodeSetAdd(set: *mut XmlNodeSet, node: *mut XmlNode) -> c_int;
     pub(crate) fn xmlXPathNodeSetContains(set: *mut XmlNodeSet, node: *mut XmlNode) -> c_int;
     pub(crate) fn xmlXPathFreeNodeSet(set: *mut XmlNodeSet);
+    /// 1 when `first` precedes `second` in document order, -1 when it
+    /// follows, 0 for the same node, -2 when they cannot be ordered.
+    pub(crate) fn xmlXPathCmpNodes(first: *mut XmlNode, second: *mut XmlNode) -> c_int;
     pub(crate) fn xmlXPathNodeSetAddNs(
         set: *mut XmlNodeSet,
         node: *mut XmlNode,

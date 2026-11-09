@@ -152,28 +152,41 @@ impl<'a, 'r> Selector<'a, 'r> {
         registrations: &'r [IdAttributeRegistration],
         resources: &crate::policy::ResourcePolicy,
     ) -> Result<Self, TransformError> {
-        let here = match here {
-            Some(external) => Some(
-                view.node_of_external(external)
-                    .ok_or(TransformError::CrossDocumentNodeSetInput)?
-                    .id(),
-            ),
-            None => None,
-        };
         let materialization = NodeSetMaterializationBudget::with_limits(
             resources.max_node_set_entries,
             resources.max_node_set_owned_string_bytes,
             resources.max_node_set_cumulative_owned_string_bytes,
         );
         let input = NodeSet::projected(view.document().root(), true, Some(&materialization))?;
-        Ok(Self {
+        let mut selector = Self {
             view,
             input,
-            here,
+            here: None,
             registrations,
             work: XPathWorkBudget::with_limits(resources),
             materialization,
-        })
+        };
+        selector.set_here(here)?;
+        Ok(selector)
+    }
+
+    /// Make `here` the node `here()` returns for the expressions evaluated
+    /// next, as when each expression of a transform sits in its own element;
+    /// the budgets stay this request's.
+    ///
+    /// # Errors
+    /// A `here` node outside the document.
+    pub fn set_here(&mut self, here: Option<ExternalNode>) -> Result<(), TransformError> {
+        self.here = match here {
+            Some(external) => Some(
+                self.view
+                    .node_of_external(external)
+                    .ok_or(TransformError::CrossDocumentNodeSetInput)?
+                    .id(),
+            ),
+            None => None,
+        };
+        Ok(())
     }
 
     /// Evaluate `expression` as [`select_xpath`] does, charging this

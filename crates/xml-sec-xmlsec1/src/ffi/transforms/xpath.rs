@@ -67,6 +67,9 @@ struct Data {
     /// The prefixes declared on the expression's element and its ancestors,
     /// the nearest declaration of each.
     namespaces: Vec<(String, String)>,
+    /// The node `here()` returns: the element bearing the expression
+    /// (`XMLDSig` 1.1 section 6.6.3), or the node a caller named.
+    here: *mut XmlNode,
     op: c_int,
     node_set_type: c_int,
 }
@@ -255,6 +258,7 @@ unsafe fn read_data(
             kind,
             expression: expression?,
             namespaces,
+            here: node,
             op,
             node_set_type,
         })
@@ -444,6 +448,7 @@ pub(crate) unsafe extern "C" fn xmlSecTransformXPointerSetExpr(
                     kind: Kind::XPointer,
                     expression: expression.to_owned(),
                     namespaces,
+                    here,
                     op: INTERSECTION,
                     node_set_type: kind,
                 },
@@ -544,12 +549,18 @@ unsafe fn node_set(doc: *mut XmlDoc, selected: &[SelectedNode<'_>]) -> Option<*m
 /// Evaluates `data` through `selector`, whose document projects `doc`.
 ///
 /// # Safety
-/// `doc` is the live document the selector's view projects.
+/// `doc` is the live document the selector's view projects; `data.here` is
+/// a live node.
 unsafe fn evaluate(
     data: &Data,
     doc: *mut XmlDoc,
-    selector: &Selector<'_, '_>,
+    selector: &mut Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
+    // here() is defined only within the expression's own document.
+    // SAFETY: by the caller's contract.
+    let here = (!data.here.is_null() && unsafe { (*data.here).doc } == doc)
+        .then(|| ExternalNode(data.here.expose_provenance() as u64));
+    selector.set_here(here).ok()?;
     let mut expression = XPathExpression::new(data.expression.as_str());
     for (prefix, uri) in &data.namespaces {
         expression = expression.with_namespace(prefix.as_str(), uri.as_str());
@@ -618,19 +629,16 @@ unsafe extern "C" fn execute(
         let Ok(document) = XmlDocument::from_external_tree(Box::new(tree), policy) else {
             return -1;
         };
-        // here() is defined only within the transform's own document.
-        let here = ((*object.here_node).doc == doc)
-            .then(|| ExternalNode(object.here_node.expose_provenance() as u64));
         let input = object.in_nodes;
         let items: Vec<&Data> = (0..xmlSecPtrListGetSize(expressions))
             .map(|position| &*xmlSecPtrListGetItem(expressions, position).cast::<Data>())
             .collect();
         // One selector for the whole transform: its expressions charge the
-        // same budgets.
+        // same budgets, each with its own here().
         let output = document.with_view(|view| {
-            let selector = Selector::new(view, here, &[], &policy.resources).ok()?;
+            let mut selector = Selector::new(view, None, &[], &policy.resources).ok()?;
             // The input is a live set over `doc`, which the view projects.
-            combined_output(input, &items, doc, &selector)
+            combined_output(input, &items, doc, &mut selector)
         });
         match output {
             Some(result) => {
@@ -651,7 +659,7 @@ unsafe fn combined_output(
     input: *mut XmlSecNodeSet,
     items: &[&Data],
     doc: *mut XmlDoc,
-    selector: &Selector<'_, '_>,
+    selector: &mut Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
     let filter2 = items.iter().any(|data| data.kind == Kind::XPath2);
     // XPath Filter 2.0 section 3.4: the filter starts from the whole
@@ -694,7 +702,7 @@ unsafe fn combine(
     kept: *mut XmlSecNodeSet,
     items: &[&Data],
     doc: *mut XmlDoc,
-    selector: &Selector<'_, '_>,
+    selector: &mut Selector<'_, '_>,
 ) -> Option<*mut XmlSecNodeSet> {
     let mut result = start;
     // SAFETY: by the caller's contract; failed sets are released here.

@@ -9,13 +9,14 @@
 use std::ffi::{c_char, c_int, c_void};
 
 use xml_sec_libxml2::ffi::{
-    XML_ATTRIBUTE_NODE, XML_COMMENT_NODE, XML_DOCUMENT_NODE, XML_ELEMENT_NODE, XML_NAMESPACE_DECL,
-    XML_TEXT_NODE, XmlAttr, XmlDoc, XmlNode, XmlNodeSet, XmlNs,
+    XML_ATTRIBUTE_NODE, XML_CDATA_SECTION_NODE, XML_COMMENT_NODE, XML_DOCUMENT_NODE,
+    XML_ELEMENT_NODE, XML_NAMESPACE_DECL, XML_TEXT_NODE, XmlAttr, XmlDoc, XmlNode, XmlNodeSet,
+    XmlNs,
 };
 
 use super::tree::{
-    readable, xmlFreeDoc, xmlOutputBufferWriteString, xmlSearchNs, xmlXPathFreeNodeSet,
-    xmlXPathNodeSetAdd, xmlXPathNodeSetContains, xmlXPathNodeSetCreate,
+    readable, xmlFreeDoc, xmlOutputBufferWriteString, xmlSearchNs, xmlXPathCmpNodes,
+    xmlXPathFreeNodeSet, xmlXPathNodeSetAdd, xmlXPathNodeSetContains, xmlXPathNodeSetCreate,
 };
 use super::xmltree::xmlSecDepthFirstTreeWalk;
 use super::{contain, free, malloc, write_stream};
@@ -493,6 +494,43 @@ unsafe fn disjoint(nodes: &XmlNodeSet) -> bool {
     }
 }
 
+/// The listed nodes in document order, which a caller-built list need not
+/// follow; `None` when the list holds attribute or namespace nodes, which
+/// `xmlXPathCmpNodes` does not order among their element's other nodes, or
+/// libxml2 cannot order two of them.
+///
+/// # Safety
+/// `nodes` and its nodes are live.
+unsafe fn in_document_order(nodes: &XmlNodeSet) -> Option<Vec<*mut XmlNode>> {
+    let count = usize::try_from(nodes.node_nr).unwrap_or(0);
+    // SAFETY: the table holds `node_nr` live nodes.
+    let mut seeds: Vec<*mut XmlNode> = (0..count)
+        .map(|index| unsafe { nodes.node_tab.add(index).read() })
+        .collect();
+    if seeds.iter().any(|seed| {
+        // SAFETY: live nodes; a namespace member's `type` sits where a
+        // node's does.
+        let kind = unsafe { (**seed).kind };
+        matches!(kind, XML_ATTRIBUTE_NODE | XML_NAMESPACE_DECL)
+    }) {
+        return None;
+    }
+    let mut unordered = false;
+    seeds.sort_by(|left, right| {
+        // SAFETY: live nodes of one document.
+        match unsafe { xmlXPathCmpNodes(*left, *right) } {
+            1 => std::cmp::Ordering::Less,
+            -1 => std::cmp::Ordering::Greater,
+            0 => std::cmp::Ordering::Equal,
+            _ => {
+                unordered = true;
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    (!unordered).then_some(seeds)
+}
+
 /// `xmlSecNodeSetWalk`: calls `walk_func` once for every node of the set in
 /// document order, stopping at the first negative return.
 ///
@@ -522,20 +560,22 @@ pub(crate) unsafe extern "C" fn xmlSecNodeSetWalk(
             data,
         };
         let walk_data = (&raw const walk).cast_mut().cast::<c_void>();
-        // A lone member listing disjoint subtrees is walked from each listed
-        // node; any other set over the whole document, so every node is
-        // visited once (libxmlsec1 takes the shortcut for any listing member
-        // and then repeats nested nodes and misses nodes later members add).
+        // A lone intersected member listing disjoint subtrees holds nothing
+        // outside them, so it is walked from each listed node in document
+        // order; any other set over the whole document, so every node is
+        // visited once and in order (libxmlsec1 takes the shortcut for any
+        // listing member, in list order, and then repeats nested nodes and
+        // misses nodes a union or a subtraction holds outside the list).
         // SAFETY: the set's XPath nodes and document are live.
         unsafe {
             if !member.nodes.is_null()
                 && std::ptr::eq(member.next, set)
+                && member.op == INTERSECTION
                 && matches!(member.kind, NORMAL | TREE | TREE_WITHOUT_COMMENTS)
                 && disjoint(&*member.nodes)
+                && let Some(seeds) = in_document_order(&*member.nodes)
             {
-                let nodes = &*member.nodes;
-                for index in 0..usize::try_from(nodes.node_nr).unwrap_or(0) {
-                    let start = nodes.node_tab.add(index).read();
+                for start in seeds {
                     if xmlSecDepthFirstTreeWalk(start, Some(walk_node), walk_data) < 0 {
                         return -1;
                     }
@@ -564,7 +604,9 @@ unsafe extern "C" fn dump_text(
     // SAFETY: `node` is a live node of the walked set; `data` is the output
     // buffer the caller passed.
     unsafe {
-        if (*node).kind != XML_TEXT_NODE {
+        // CDATA characters are text (XPath 1.0 section 5.7); libxmlsec1
+        // writes only text nodes and drops them.
+        if !matches!((*node).kind, XML_TEXT_NODE | XML_CDATA_SECTION_NODE) {
             return 0;
         }
         if xmlOutputBufferWriteString(data, (*node).content.cast::<c_char>()) < 0 {
