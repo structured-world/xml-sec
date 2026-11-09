@@ -6,9 +6,12 @@
 //! and unlinks nodes by their pointers, and keeps what it needs to undo its
 //! edits until the core releases them. `SAFETY.md` records the invariants
 //! every `unsafe` block below relies on.
+//!
+//! The crate does not link libxml2: [`libxml2`] resolves the caller's, loaded
+//! in the process, and the structures below declare only the leading members
+//! every supported release shares.
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
-use std::sync::OnceLock;
 
 use xml_sec::ParseError;
 use xml_sec::document::external::{
@@ -17,52 +20,63 @@ use xml_sec::document::external::{
 use xml_sec_capi::ffi::{XsDocument, XsError, XsPolicy};
 use xml_sec_capi::status::{XS_INTERNAL, XS_INVALID_ARGUMENT, XsStatus};
 
+pub mod libxml2;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 #[cfg(test)]
 mod tests;
 
+use libxml2::{
+    xml_add_id, xml_free_node, xml_is_id, xml_new_doc_comment, xml_new_doc_node, xml_new_doc_pi,
+    xml_new_doc_text, xml_new_ns, xml_new_ns_prop, xml_search_ns, xml_unlink_node,
+};
+
 type XmlChar = u8;
+
+// The declarations are public so that crates over the bridge read trees
+// through the one set of declarations every supported release shares.
 
 /// `xmlNs`: a namespace declaration.
 #[repr(C)]
 pub struct XmlNs {
-    next: *mut XmlNs,
-    kind: c_int,
-    href: *const XmlChar,
-    prefix: *const XmlChar,
+    pub next: *mut XmlNs,
+    pub kind: c_int,
+    pub href: *const XmlChar,
+    pub prefix: *const XmlChar,
 }
 
 /// `xmlAttr`, up to the last member the bridge reads.
 #[repr(C)]
 pub struct XmlAttr {
-    private: *mut c_void,
-    kind: c_int,
-    name: *const XmlChar,
-    children: *mut XmlNode,
-    last: *mut XmlNode,
-    parent: *mut XmlNode,
-    next: *mut XmlAttr,
-    prev: *mut XmlAttr,
-    doc: *mut XmlDoc,
-    ns: *mut XmlNs,
-    atype: c_int,
+    pub private: *mut c_void,
+    pub kind: c_int,
+    pub name: *const XmlChar,
+    pub children: *mut XmlNode,
+    pub last: *mut XmlNode,
+    pub parent: *mut XmlNode,
+    pub next: *mut XmlAttr,
+    pub prev: *mut XmlAttr,
+    pub doc: *mut XmlDoc,
+    pub ns: *mut XmlNs,
+    pub atype: c_int,
 }
 
 /// `xmlNode`, up to the last member the bridge reads.
 #[repr(C)]
 pub struct XmlNode {
-    private: *mut c_void,
-    kind: c_int,
-    name: *const XmlChar,
-    children: *mut XmlNode,
-    last: *mut XmlNode,
-    parent: *mut XmlNode,
-    next: *mut XmlNode,
-    prev: *mut XmlNode,
-    doc: *mut XmlDoc,
-    ns: *mut XmlNs,
-    content: *mut XmlChar,
-    properties: *mut XmlAttr,
-    ns_def: *mut XmlNs,
+    pub private: *mut c_void,
+    pub kind: c_int,
+    pub name: *const XmlChar,
+    pub children: *mut XmlNode,
+    pub last: *mut XmlNode,
+    pub parent: *mut XmlNode,
+    pub next: *mut XmlNode,
+    pub prev: *mut XmlNode,
+    pub doc: *mut XmlDoc,
+    pub ns: *mut XmlNs,
+    pub content: *mut XmlChar,
+    pub properties: *mut XmlAttr,
+    pub ns_def: *mut XmlNs,
 }
 
 /// `xmlEntity`, the declaration an entity reference's `children` points to,
@@ -89,69 +103,70 @@ pub struct XmlEntity {
 /// of its top-level nodes like any element.
 #[repr(C)]
 pub struct XmlDoc {
-    private: *mut c_void,
-    kind: c_int,
-    name: *mut c_char,
-    children: *mut XmlNode,
-    last: *mut XmlNode,
-    parent: *mut XmlNode,
-    next: *mut XmlNode,
-    prev: *mut XmlNode,
-    doc: *mut XmlDoc,
-    compression: c_int,
-    standalone: c_int,
-    int_subset: *mut c_void,
+    pub private: *mut c_void,
+    pub kind: c_int,
+    pub name: *mut c_char,
+    pub children: *mut XmlNode,
+    pub last: *mut XmlNode,
+    pub parent: *mut XmlNode,
+    pub next: *mut XmlNode,
+    pub prev: *mut XmlNode,
+    pub doc: *mut XmlDoc,
+    pub compression: c_int,
+    pub standalone: c_int,
+    pub int_subset: *mut c_void,
 }
 
-const XML_ELEMENT_NODE: c_int = 1;
-const XML_TEXT_NODE: c_int = 3;
-const XML_CDATA_SECTION_NODE: c_int = 4;
-const XML_ENTITY_REF_NODE: c_int = 5;
-const XML_PI_NODE: c_int = 7;
-const XML_COMMENT_NODE: c_int = 8;
-const XML_DOCUMENT_NODE: c_int = 9;
-const XML_DTD_NODE: c_int = 14;
-const XML_XINCLUDE_START: c_int = 19;
-const XML_XINCLUDE_END: c_int = 20;
+/// `xmlNodeSet`: an `XPath` node set. Namespace members are `xmlNs` copies
+/// whose `next` names the element they belong to.
+#[repr(C)]
+pub struct XmlNodeSet {
+    pub node_nr: c_int,
+    pub node_max: c_int,
+    pub node_tab: *mut *mut XmlNode,
+}
+
+/// `XML_ELEMENT_NODE`.
+pub const XML_ELEMENT_NODE: c_int = 1;
+/// `XML_ATTRIBUTE_NODE`.
+pub const XML_ATTRIBUTE_NODE: c_int = 2;
+/// `XML_TEXT_NODE`.
+pub const XML_TEXT_NODE: c_int = 3;
+/// `XML_CDATA_SECTION_NODE`.
+pub const XML_CDATA_SECTION_NODE: c_int = 4;
+/// `XML_ENTITY_REF_NODE`.
+pub const XML_ENTITY_REF_NODE: c_int = 5;
+/// `XML_PI_NODE`.
+pub const XML_PI_NODE: c_int = 7;
+/// `XML_COMMENT_NODE`.
+pub const XML_COMMENT_NODE: c_int = 8;
+/// `XML_DOCUMENT_NODE`.
+pub const XML_DOCUMENT_NODE: c_int = 9;
+/// `XML_DTD_NODE`.
+pub const XML_DTD_NODE: c_int = 14;
+/// `XML_NAMESPACE_DECL`: a namespace node of an `XPath` node set.
+pub const XML_NAMESPACE_DECL: c_int = 18;
+/// `XML_XINCLUDE_START`.
+pub const XML_XINCLUDE_START: c_int = 19;
+/// `XML_XINCLUDE_END`.
+pub const XML_XINCLUDE_END: c_int = 20;
 const XML_ATTRIBUTE_ID: c_int = 2;
 const XML_INTERNAL_PREDEFINED_ENTITY: c_int = 6;
 
-unsafe extern "C" {
-    static xs_libxml2_layout: [usize; 0];
-    static xs_libxml2_layout_len: usize;
-
-    fn xmlNewDocNode(
-        doc: *mut XmlDoc,
-        ns: *mut XmlNs,
-        name: *const XmlChar,
-        content: *const XmlChar,
-    ) -> *mut XmlNode;
-    fn xmlNewNs(node: *mut XmlNode, href: *const XmlChar, prefix: *const XmlChar) -> *mut XmlNs;
-    fn xmlNewNsProp(
-        node: *mut XmlNode,
-        ns: *mut XmlNs,
-        name: *const XmlChar,
-        value: *const XmlChar,
-    ) -> *mut XmlAttr;
-    fn xmlNewDocText(doc: *const XmlDoc, content: *const XmlChar) -> *mut XmlNode;
-    fn xmlNewDocComment(doc: *mut XmlDoc, content: *const XmlChar) -> *mut XmlNode;
-    fn xmlNewDocPI(doc: *mut XmlDoc, name: *const XmlChar, content: *const XmlChar)
-    -> *mut XmlNode;
-    fn xmlSearchNs(doc: *mut XmlDoc, node: *mut XmlNode, prefix: *const XmlChar) -> *mut XmlNs;
-    fn xmlUnlinkNode(node: *mut XmlNode);
-    fn xmlFreeNode(node: *mut XmlNode);
-    fn xmlIsID(doc: *mut XmlDoc, element: *mut XmlNode, attribute: *mut XmlAttr) -> c_int;
-    fn xmlAddID(
-        context: *mut c_void,
-        doc: *mut XmlDoc,
-        value: *const XmlChar,
-        attribute: *mut XmlAttr,
-    ) -> *mut c_void;
+/// `xmlParserCtxt`, up to `wellFormed`: the members every libxml2 release
+/// has kept first.
+#[repr(C)]
+pub struct XmlParserCtxt {
+    pub sax: *mut c_void,
+    pub user_data: *mut c_void,
+    pub my_doc: *mut XmlDoc,
+    pub well_formed: c_int,
 }
 
-/// The layout record this crate's declarations stand for, in the order of
-/// `layout.c`.
-fn expected_layout() -> [usize; 43] {
+/// The layout these declarations stand for, in the order the header layout
+/// program of the tests prints it.
+#[cfg(test)]
+fn expected_layout() -> [usize; 53] {
     use std::mem::{offset_of, size_of};
     [
         offset_of!(XmlNode, kind),
@@ -174,6 +189,7 @@ fn expected_layout() -> [usize; 43] {
         offset_of!(XmlAttr, ns),
         offset_of!(XmlAttr, atype),
         offset_of!(XmlNs, next),
+        offset_of!(XmlNs, kind),
         offset_of!(XmlNs, href),
         offset_of!(XmlNs, prefix),
         offset_of!(XmlDoc, kind),
@@ -197,27 +213,16 @@ fn expected_layout() -> [usize; 43] {
         XML_XINCLUDE_END as usize,
         XML_ATTRIBUTE_ID as usize,
         XML_INTERNAL_PREDEFINED_ENTITY as usize,
+        XML_ATTRIBUTE_NODE as usize,
+        XML_NAMESPACE_DECL as usize,
+        offset_of!(XmlNodeSet, node_nr),
+        offset_of!(XmlNodeSet, node_max),
+        offset_of!(XmlNodeSet, node_tab),
+        offset_of!(XmlParserCtxt, sax),
+        offset_of!(XmlParserCtxt, user_data),
+        offset_of!(XmlParserCtxt, my_doc),
+        offset_of!(XmlParserCtxt, well_formed),
     ]
-}
-
-/// The layout record of the linked headers.
-fn linked_layout() -> &'static [usize] {
-    // SAFETY: `layout.c` defines `xs_libxml2_layout` as an array of
-    // `xs_libxml2_layout_len` initialized `size_t` values with static
-    // storage, and `size_t` is `usize` on every target Rust supports.
-    unsafe {
-        std::slice::from_raw_parts(
-            (&raw const xs_libxml2_layout).cast::<usize>(),
-            xs_libxml2_layout_len,
-        )
-    }
-}
-
-/// Whether the linked libxml2 lays its structures out as declared here;
-/// computed once, and every entry point refuses to touch a tree otherwise.
-fn layout_matches() -> bool {
-    static MATCHES: OnceLock<bool> = OnceLock::new();
-    *MATCHES.get_or_init(|| linked_layout() == expected_layout())
 }
 
 fn backend_error(message: &str) -> ParseError {
@@ -507,7 +512,7 @@ impl LibxmlTree {
         // SAFETY: a live linked node.
         let (parent, next) = unsafe { ((*node).parent, (*node).next) };
         // SAFETY: as above; libxml2 fixes the parent's and siblings' links.
-        unsafe { xmlUnlinkNode(node) };
+        unsafe { xml_unlink_node(node) };
         self.journal.push(Undo::Unlinked { node, parent, next });
     }
 }
@@ -564,20 +569,20 @@ impl Builder {
             FragmentEvent::Text(text) => {
                 let text = c_string(text)?;
                 // SAFETY: `doc` is live; libxml2 copies the content, unescaped.
-                let node = unsafe { xmlNewDocText(self.doc, text.as_ptr().cast()) };
+                let node = unsafe { xml_new_doc_text(self.doc, text.as_ptr().cast()) };
                 self.leaf(node)
             }
             FragmentEvent::Comment(text) => {
                 let text = c_string(text)?;
                 // SAFETY: as above.
-                let node = unsafe { xmlNewDocComment(self.doc, text.as_ptr().cast()) };
+                let node = unsafe { xml_new_doc_comment(self.doc, text.as_ptr().cast()) };
                 self.leaf(node)
             }
             FragmentEvent::ProcessingInstruction { target, value } => {
                 let (target, value) = (c_string(target)?, value.map(c_string).transpose()?);
                 // SAFETY: as above.
                 let node = unsafe {
-                    xmlNewDocPI(
+                    xml_new_doc_pi(
                         self.doc,
                         target.as_ptr().cast(),
                         value
@@ -600,7 +605,7 @@ impl Builder {
         // SAFETY: `doc` is live; libxml2 copies the name. The namespace is
         // set once the element's own declarations are known.
         let node = unsafe {
-            xmlNewDocNode(
+            xml_new_doc_node(
                 self.doc,
                 std::ptr::null_mut(),
                 name.as_ptr().cast(),
@@ -628,7 +633,7 @@ impl Builder {
         let (uri, prefix) = (c_string(uri)?, prefix.map(c_string).transpose()?);
         // SAFETY: `node` was created by this build; libxml2 copies both strings.
         let declared = unsafe {
-            xmlNewNs(
+            xml_new_ns(
                 node,
                 uri.as_ptr().cast(),
                 prefix
@@ -658,7 +663,7 @@ impl Builder {
             // SAFETY: libxml2 copies both strings; the value is taken as
             // given, without entity processing.
             let attribute = unsafe {
-                xmlNewNsProp(
+                xml_new_ns_prop(
                     element.node,
                     ns,
                     name.as_ptr().cast(),
@@ -695,7 +700,7 @@ impl Builder {
         for node in self.open.into_iter().map(|open| open.node).chain(self.top) {
             // SAFETY: created by this build and linked nowhere in the tree;
             // an open element is not linked into its parent yet.
-            unsafe { xmlFreeNode(node) };
+            unsafe { xml_free_node(node) };
         }
     }
 
@@ -744,7 +749,7 @@ impl Builder {
         };
         // SAFETY: `doc` is live and `from` null or live; the result is a
         // declaration of the document or of `from` or an ancestor of it.
-        let found = unsafe { xmlSearchNs(self.doc, from, prefix) };
+        let found = unsafe { xml_search_ns(self.doc, from, prefix) };
         // SAFETY: a declaration libxml2 returned is live.
         if found.is_null() || unsafe { c_bytes((*found).href) } != Some(namespace.as_bytes()) {
             return Err(edit_error("a fragment namespace its context does not bind"));
@@ -802,7 +807,7 @@ impl LibxmlTree {
                 if !text.is_empty() {
                     let text = c_string(text)?;
                     // SAFETY: libxml2 copies the content, unescaped.
-                    let node = unsafe { xmlNewDocText(self.doc, text.as_ptr().cast()) };
+                    let node = unsafe { xml_new_doc_text(self.doc, text.as_ptr().cast()) };
                     if node.is_null() {
                         return Err(edit_error("libxml2 could not create a text node"));
                     }
@@ -971,9 +976,9 @@ impl ExternalTree for LibxmlTree {
     }
 
     fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
-        if !layout_matches() {
+        if !libxml2::available() {
             return Err(backend_error(
-                "the linked libxml2 lays out its tree differently",
+                "no supported libxml2 is loaded in the process",
             ));
         }
         // SAFETY: `doc` is the caller's live document for the whole call.
@@ -1005,8 +1010,8 @@ impl ExternalTree for LibxmlTree {
                     // SAFETY: the node was created and linked by an edit not
                     // yet undone, so it is live and linked.
                     unsafe {
-                        xmlUnlinkNode(node);
-                        xmlFreeNode(node);
+                        xml_unlink_node(node);
+                        xml_free_node(node);
                     }
                 }
                 Some(Undo::Unlinked { node, parent, next }) => {
@@ -1042,7 +1047,7 @@ impl ExternalTree for LibxmlTree {
             if let Undo::Unlinked { node, .. } = undo {
                 // SAFETY: an unlinked node no later edit relinked; nothing
                 // in the tree points to it any more.
-                unsafe { xmlFreeNode(node) };
+                unsafe { xml_free_node(node) };
             }
         }
         for node in kept {
@@ -1087,7 +1092,8 @@ unsafe fn register_ids(doc: *mut XmlDoc, node: *mut XmlNode) {
             // SAFETY: the attribute list of a live element.
             let attr = unsafe { &*attribute };
             // SAFETY: live element and attribute of `doc`.
-            if attr.atype != XML_ATTRIBUTE_ID && unsafe { xmlIsID(doc, current, attribute) } == 1 {
+            if attr.atype != XML_ATTRIBUTE_ID && unsafe { xml_is_id(doc, current, attribute) } == 1
+            {
                 // A built attribute holds one text node, its value as given.
                 let text = attr.children;
                 let value = if text.is_null() {
@@ -1099,7 +1105,7 @@ unsafe fn register_ids(doc: *mut XmlDoc, node: *mut XmlNode) {
                 if !value.is_null() {
                     // SAFETY: the value is a NUL-terminated tree string that
                     // libxml2 copies into the table entry.
-                    unsafe { xmlAddID(std::ptr::null_mut(), doc, value, attribute) };
+                    unsafe { xml_add_id(std::ptr::null_mut(), doc, value, attribute) };
                 }
             }
             attribute = attr.next;
@@ -1117,6 +1123,30 @@ impl Drop for LibxmlTree {
     fn drop(&mut self) {
         // Committed edits only remain if a transaction never finished.
         self.release(0);
+    }
+}
+
+impl LibxmlTree {
+    /// The caller's document `doc` as an external tree, for crates that
+    /// project it themselves; `None` for a null or non-document pointer or a
+    /// libxml2 whose layout differs from the declarations here.
+    ///
+    /// # Safety
+    /// `doc` is null or a live `xmlDocPtr` that outlives the tree, and nothing
+    /// else changes it while the tree is projected or edited.
+    #[must_use]
+    pub unsafe fn new(doc: *mut XmlDoc) -> Option<Self> {
+        if doc.is_null() || !doc.is_aligned() || !libxml2::available() {
+            return None;
+        }
+        // SAFETY: a live document by the caller's contract.
+        if unsafe { (*doc).kind } != XML_DOCUMENT_NODE {
+            return None;
+        }
+        Some(Self {
+            doc,
+            journal: Vec::new(),
+        })
     }
 }
 
@@ -1154,13 +1184,14 @@ pub unsafe extern "C" fn xs_libxml2_document(
     if unsafe { (*doc).kind } != XML_DOCUMENT_NODE {
         return refuse(XS_INVALID_ARGUMENT);
     }
-    if !layout_matches() {
+    if !libxml2::available() {
         return refuse(XS_INTERNAL);
     }
-    let tree = Box::new(LibxmlTree {
-        doc,
-        journal: Vec::new(),
-    });
+    // SAFETY: a live document that outlives the handle by the contract.
+    let Some(tree) = (unsafe { LibxmlTree::new(doc) }) else {
+        return refuse(XS_INVALID_ARGUMENT);
+    };
+    let tree = Box::new(tree);
     // SAFETY: forwarded contract for `out` and `error`.
     unsafe { xml_sec_capi::ffi::document_from_tree(policy, operation, tree, out, error) }
 }

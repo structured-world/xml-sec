@@ -1,10 +1,8 @@
 //! The bridge against the linked libxml2: documents libxml2 parsed, operated
 //! on in place through the clean C API.
 
-use super::{
-    XML_ELEMENT_NODE, XmlDoc, XmlNode, expected_layout, layout_matches, linked_layout,
-    xs_libxml2_document,
-};
+use super::testing::function;
+use super::{XML_ELEMENT_NODE, XmlDoc, XmlNode, expected_layout, libxml2, xs_libxml2_document};
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::Mutex;
 use xml_sec_capi::ffi::{
@@ -20,21 +18,64 @@ use xml_sec_capi::ffi::{
 };
 use xml_sec_capi::status::{XS_DOCUMENT, XS_INVALID_ARGUMENT, XS_OK, XS_VERIFICATION, XsStatus};
 
-unsafe extern "C" {
-    fn xmlReadMemory(
-        buffer: *const c_char,
-        size: c_int,
-        url: *const c_char,
-        encoding: *const c_char,
-        options: c_int,
+// The tests are the caller: they load the system libxml2 and call it
+// through functions resolved in the process, as the library does.
+
+unsafe fn read_memory(
+    buffer: *const c_char,
+    size: c_int,
+    url: *const c_char,
+    encoding: *const c_char,
+    options: c_int,
+) -> *mut XmlDoc {
+    type F = unsafe extern "C" fn(
+        *const c_char,
+        c_int,
+        *const c_char,
+        *const c_char,
+        c_int,
     ) -> *mut XmlDoc;
-    fn xmlFreeDoc(doc: *mut XmlDoc);
-    fn xmlDocDumpMemory(doc: *mut XmlDoc, memory: *mut *mut u8, size: *mut c_int);
-    fn xmlGetID(doc: *mut XmlDoc, id: *const u8) -> *mut c_void;
-    fn xmlNodeSetContent(node: *mut XmlNode, content: *const u8);
-    fn xmlNewReference(doc: *mut XmlDoc, name: *const u8) -> *mut XmlNode;
-    fn xmlAddChild(parent: *mut XmlNode, node: *mut XmlNode) -> *mut XmlNode;
-    static xmlFree: unsafe extern "C" fn(*mut c_void);
+    // SAFETY: libxml2's `xmlReadMemory` has this signature.
+    unsafe { function::<F>("xmlReadMemory")(buffer, size, url, encoding, options) }
+}
+
+unsafe fn free_doc(doc: *mut XmlDoc) {
+    // SAFETY: the tests loaded libxml2 before parsing the document.
+    unsafe { libxml2::xml_free_doc(doc) }
+}
+
+unsafe fn dump_memory(doc: *mut XmlDoc, memory: *mut *mut u8, size: *mut c_int) {
+    type F = unsafe extern "C" fn(*mut XmlDoc, *mut *mut u8, *mut c_int);
+    // SAFETY: libxml2's `xmlDocDumpMemory` has this signature.
+    unsafe { function::<F>("xmlDocDumpMemory")(doc, memory, size) }
+}
+
+unsafe fn get_id(doc: *mut XmlDoc, id: *const u8) -> *mut c_void {
+    // SAFETY: as for `free_doc`.
+    unsafe { libxml2::xml_get_id(doc, id).cast() }
+}
+
+unsafe fn node_set_content(node: *mut XmlNode, content: *const u8) {
+    type F = unsafe extern "C" fn(*mut XmlNode, *const u8);
+    // SAFETY: libxml2's `xmlNodeSetContent` has this signature.
+    unsafe { function::<F>("xmlNodeSetContent")(node, content) }
+}
+
+unsafe fn new_reference(doc: *mut XmlDoc, name: *const u8) -> *mut XmlNode {
+    type F = unsafe extern "C" fn(*mut XmlDoc, *const u8) -> *mut XmlNode;
+    // SAFETY: libxml2's `xmlNewReference` has this signature.
+    unsafe { function::<F>("xmlNewReference")(doc, name) }
+}
+
+unsafe fn add_child(parent: *mut XmlNode, node: *mut XmlNode) -> *mut XmlNode {
+    type F = unsafe extern "C" fn(*mut XmlNode, *mut XmlNode) -> *mut XmlNode;
+    // SAFETY: libxml2's `xmlAddChild` has this signature.
+    unsafe { function::<F>("xmlAddChild")(parent, node) }
+}
+
+unsafe fn free(memory: *mut c_void) {
+    // SAFETY: as for `free_doc`; the memory is libxml2's.
+    unsafe { libxml2::xml_free(memory) }
 }
 
 /// `XML_PARSE_NOENT`: substitute entities, as libxmlsec1 parses.
@@ -143,7 +184,7 @@ impl Libxml {
     fn parse_bytes(xml: &[u8], options: c_int) -> Self {
         // SAFETY: the buffer is live for the call; libxml2 copies what it keeps.
         let doc = unsafe {
-            xmlReadMemory(
+            read_memory(
                 xml.as_ptr().cast(),
                 c_int::try_from(xml.len()).expect("small fixture"),
                 std::ptr::null(),
@@ -161,10 +202,10 @@ impl Libxml {
         // SAFETY: a live document; the outputs are live locals, and the
         // memory libxml2 returns is released with its own `xmlFree`.
         unsafe {
-            xmlDocDumpMemory(self.0, &raw mut memory, &raw mut size);
+            dump_memory(self.0, &raw mut memory, &raw mut size);
             let text =
                 std::slice::from_raw_parts(memory, usize::try_from(size).expect("size")).to_vec();
-            xmlFree(memory.cast());
+            free(memory.cast());
             String::from_utf8(text).expect("libxml2 writes UTF-8")
         }
     }
@@ -207,7 +248,7 @@ unsafe fn collect(mut node: *mut XmlNode, found: &mut Vec<*mut XmlNode>) {
 impl Drop for Libxml {
     fn drop(&mut self) {
         // SAFETY: parsed by this fixture and freed once.
-        unsafe { xmlFreeDoc(self.0) };
+        unsafe { free_doc(self.0) };
     }
 }
 
@@ -372,12 +413,60 @@ fn verify_then(
     (outcome.outcome == 1, answer)
 }
 
+/// The header layout program's output: the offsets the installed libxml2
+/// headers define, compiled and run here because the library itself is
+/// built without headers.
+fn header_layout() -> Vec<usize> {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let cflags = std::process::Command::new("pkg-config")
+        .args(["--cflags", "libxml-2.0"])
+        .output()
+        .expect("pkg-config runs");
+    assert!(cflags.status.success(), "libxml2 headers are installed");
+    let cflags = String::from_utf8(cflags.stdout).expect("UTF-8 flags");
+    // Removed on every exit path, a failed assertion included.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let program = directory.path().join("layout");
+    let mut compile =
+        std::process::Command::new(std::env::var("CC").unwrap_or_else(|_| "cc".into()));
+    compile
+        .arg(manifest.join("tests/layout.c"))
+        .arg("-o")
+        .arg(&program);
+    for flag in cflags.split_whitespace() {
+        compile.arg(flag);
+        // Some distributions point at the parent of `libxml/`.
+        if let Some(include) = flag.strip_prefix("-I") {
+            compile.arg(format!("-I{include}/libxml2"));
+        }
+    }
+    let status = compile.status().expect("the C compiler runs");
+    assert!(status.success(), "the layout program compiles");
+    let output = std::process::Command::new(&program)
+        .output()
+        .expect("the layout program runs");
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 output")
+        .lines()
+        .map(|line| line.parse().expect("one number per line"))
+        .collect()
+}
+
 #[test]
-fn the_declared_layout_is_the_linked_headers_layout() {
-    // A declaration that disagrees with the linked libxml2 would read the
-    // wrong members; the bridge refuses to touch a tree then.
-    assert_eq!(linked_layout(), expected_layout());
-    assert!(layout_matches());
+fn the_declared_layout_is_the_headers_layout() {
+    // A declaration that disagrees with libxml2's headers would read the
+    // wrong members of a caller's tree.
+    assert_eq!(header_layout(), expected_layout());
+}
+
+/// The table resolves in a process that has libxml2 loaded, and reports a
+/// supported release.
+#[test]
+fn the_callers_libxml2_is_found_in_the_process() {
+    super::testing::load_system_libxml2();
+    assert!(libxml2::available());
+    let version = libxml2::version().expect("a version");
+    assert!((20900..30000).contains(&version), "{version}");
 }
 
 #[test]
@@ -664,7 +753,7 @@ fn the_id_table_names_only_live_attributes_across_encryption() {
     // The operation selects the element by Id; libxml2 registers its xml:id.
     let doc = Libxml::parse("<root><secret xml:id=\"k\" Id=\"s\">42</secret></root>", 0);
     // SAFETY: a live document and a NUL-terminated name.
-    let id = |doc: &Libxml| unsafe { xmlGetID(doc.0, c"k".as_ptr().cast()) };
+    let id = |doc: &Libxml| unsafe { get_id(doc.0, c"k".as_ptr().cast()) };
     assert!(!id(&doc).is_null(), "libxml2 registers xml:id");
     encrypt(&policy, &doc);
     assert!(id(&doc).is_null(), "the freed attribute left the ID table");
@@ -691,7 +780,7 @@ fn a_replacement_that_keeps_an_id_keeps_it_registered() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let doc = Libxml::parse("<root><secret xml:id=\"k\" Id=\"s\">old</secret></root>", 0);
     // SAFETY: a live document and a NUL-terminated name.
-    let id = |doc: &Libxml| unsafe { xmlGetID(doc.0, c"k".as_ptr().cast()) };
+    let id = |doc: &Libxml| unsafe { get_id(doc.0, c"k".as_ptr().cast()) };
     let mut document = tree_document(&doc, &VerificationPolicy::default());
     let target = document
         .with_view(|view| view.node_for_id("s", &[]))
@@ -982,7 +1071,7 @@ fn nested_attribute_entities(levels: usize, leaf: &str) -> Libxml {
     // into an entity-reference child bound to the declaration.
     unsafe {
         let attribute = (*doc.element("r")).properties;
-        xmlNodeSetContent(attribute.cast(), reference.as_ptr().cast());
+        node_set_content(attribute.cast(), reference.as_ptr().cast());
     }
     doc
 }
@@ -1001,7 +1090,7 @@ fn chained_attribute_entities(levels: usize) -> Libxml {
     // SAFETY: as in `nested_attribute_entities`.
     unsafe {
         let attribute = (*doc.element("r")).properties;
-        xmlNodeSetContent(attribute.cast(), reference.as_ptr().cast());
+        node_set_content(attribute.cast(), reference.as_ptr().cast());
     }
     doc
 }
@@ -1059,13 +1148,13 @@ fn a_predefined_entity_reference_projects_as_its_character() {
     // nodes, one appended to the root and one made the attribute's only
     // child in place of its text, which is unlinked and freed.
     unsafe {
-        let content = xmlNewReference(doc.0, c"&amp;".as_ptr().cast());
-        assert!(!xmlAddChild(root, content).is_null());
+        let content = new_reference(doc.0, c"&amp;".as_ptr().cast());
+        assert!(!add_child(root, content).is_null());
         let attribute = (*root).properties;
-        let value = xmlNewReference(doc.0, c"&lt;".as_ptr().cast());
+        let value = new_reference(doc.0, c"&lt;".as_ptr().cast());
         let old = (*attribute).children;
-        super::xmlUnlinkNode(old);
-        super::xmlFreeNode(old);
+        libxml2::xml_unlink_node(old);
+        libxml2::xml_free_node(old);
         (*attribute).children = value;
         (*attribute).last = value;
         (*value).parent = attribute.cast();

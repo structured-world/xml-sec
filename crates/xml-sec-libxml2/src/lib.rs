@@ -6,6 +6,10 @@
 //! operation does not touch keep their pointers; nodes it creates belong to
 //! the document. Every operation reads the tree as it is when it starts.
 //!
+//! The library does not link libxml2: it calls the caller's, which a program
+//! handing it an `xmlDocPtr` has loaded, resolving the functions in the
+//! process and refusing every tree when no supported release is loaded.
+//!
 //! The library exports the clean C API (`xml_sec.h`) as well; the header is
 //! `include/xml_sec_libxml2.h`, and `SAFETY.md` records the invariants of the
 //! crate's single `unsafe` module.
