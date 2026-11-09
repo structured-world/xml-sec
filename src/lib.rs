@@ -170,6 +170,6 @@ pub mod xmlenc;
 pub use document::XmlDocumentPolicy;
 pub use document::{
     AttributeIdentity, DocumentIdentity, DocumentView, NamespaceIdentity, NodeIdentity,
-    SemanticOrder, XmlDocument, XmlDocumentError,
+    SemanticOrder, XmlDeclaration, XmlDocument, XmlDocumentError,
 };
 pub use error::XmlSecError;

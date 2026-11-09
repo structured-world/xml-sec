@@ -8,6 +8,8 @@
 #include <libxml/xmlmemory.h>
 #include <libxml/parser.h>
 #include <libxml/parserInternals.h>
+#include <libxml/uri.h>
+#include <libxml/xmlIO.h>
 
 void *xs_xmlsec1_malloc(size_t size) {
     return xmlMalloc(size);
@@ -83,6 +85,61 @@ int xs_xmlsec1_push_input(xmlParserCtxtPtr ctxt, xmlParserInputPtr input) {
 #else
     return xmlCtxtPushInput(ctxt, input);
 #endif
+}
+
+/* Passes the bytes of the resource `filename` names to `append`, read
+ * through libxml2's input layer as libxml2's own file parser reads them:
+ * the input callbacks a caller registered and the decompression libxml2
+ * applies. Returns 0, or -1 when the resource cannot be read or `append`
+ * fails. */
+int xs_xmlsec1_read_resource(const char *filename, void *sink,
+                             int (*append)(void *sink, const char *data, int len)) {
+    char chunk[4096];
+    int ret = 0;
+    xmlParserInputBufferPtr in = xmlParserInputBufferCreateFilename(filename, XML_CHAR_ENCODING_NONE);
+    if (in == NULL) {
+        return -1;
+    }
+    if (in->readcallback == NULL) {
+        /* An input libxml2 holds in memory already. */
+        if (in->buffer != NULL && xmlBufUse(in->buffer) > 0) {
+            size_t len = xmlBufUse(in->buffer);
+            ret = len > 0x7fffffff ? -1 : append(sink, (const char *)xmlBufContent(in->buffer), (int)len);
+        }
+    } else {
+        for (;;) {
+            int n = in->readcallback(in->context, chunk, (int)sizeof(chunk));
+            if (n < 0 || (n > 0 && append(sink, chunk, n) < 0)) {
+                ret = -1;
+                break;
+            }
+            if (n == 0) {
+                break;
+            }
+        }
+    }
+    xmlFreeParserInputBuffer(in);
+    return ret < 0 ? -1 : 0;
+}
+
+/* Records `filename` as the document's URL, as libxml2's file parser does,
+ * so relative references resolve against it. Returns 0 or -1. */
+int xs_xmlsec1_set_url(xmlDocPtr doc, const char *filename) {
+    xmlChar *canonic = xmlCanonicPath((const xmlChar *)filename);
+    xmlChar *url;
+    if (canonic == NULL) {
+        return -1;
+    }
+    url = xmlPathToURI(canonic);
+    xmlFree(canonic);
+    if (url == NULL) {
+        return -1;
+    }
+    if (doc->URL != NULL) {
+        xmlFree((xmlChar *)doc->URL);
+    }
+    doc->URL = url;
+    return 0;
 }
 
 /* Frees the context and any document it still owns. */

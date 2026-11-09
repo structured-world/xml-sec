@@ -37,6 +37,10 @@ the bridge adds.
   `xmlNewNs`, `xmlNewNsProp`, `xmlNewDocText` and the comment and processing
   instruction counterparts) and freed only with `xmlFreeNode`, so the
   document's allocator and dictionary own them.
+- `new_document` creates its document with `xmlNewDoc`, sets only its
+  `encoding` (a copy made with `xmlStrdup`, which `xmlFreeDoc` releases) and
+  `standalone` members before any node exists, and frees the whole document
+  with `xmlFreeDoc` when a node cannot be built.
 - Edits link nodes by hand rather than through `xmlAddChild`, so adjacent text
   nodes are never merged and the pointers the projection recorded stay valid.
 - Every edit is journaled. A failed operation unlinks and frees what it created
