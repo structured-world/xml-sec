@@ -2832,6 +2832,10 @@ impl<'a> DocumentView<'a> {
 
     /// The markup of `node` as this generation holds it: its exact source
     /// bytes, or for a tree-backed document the node written from the view.
+    #[cfg(any(
+        feature = "xmlenc",
+        all(feature = "external-tree", feature = "xmldsig-sign")
+    ))]
     pub(crate) fn markup(self, node: Node<'a, 'a>) -> alloc::borrow::Cow<'a, str> {
         #[cfg(feature = "external-tree")]
         if !self.parsed.external.is_empty() {
