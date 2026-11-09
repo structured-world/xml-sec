@@ -2524,23 +2524,30 @@ impl<'a> SignContext<'a> {
         key_info_content: &str,
         budget: &XmlParseWorkBudget,
     ) -> Result<(crate::NodeIdentity, String), SigningError> {
-        let (key_info, standalone) = document.with_view(|view| {
+        let (key_info, standalone, overhead) = document.with_view(|view| {
             let signature = find_signing_signature_node(
                 view.document(),
                 SigningSignatureTarget::Index(target_signature),
             )?;
             let key_info = find_required_child(signature, "KeyInfo")?;
-            let standalone =
-                crate::document::wrap_in_scope(&view.markup(signature), signature.parent_element())
-                    .map_err(map_owned_document_mutation_error)?;
-            Ok::<_, SigningError>((view.node_identity(key_info), standalone))
+            let markup = view.markup(signature);
+            let standalone = crate::document::wrap_in_scope(&markup, signature.parent_element())
+                .map_err(map_owned_document_mutation_error)?;
+            let overhead = standalone.len() - markup.len();
+            Ok::<_, SigningError>((view.node_identity(key_info), standalone, overhead))
         })?;
-        self.policy
+        // The wrapper is no part of the document: the temporary parse and the
+        // merge leave room for it, and the committed tree is then read under
+        // the operation's own limits.
+        let mut policy = crate::policy::SigningPolicy::clone(&self.policy);
+        crate::document::admit_wrapper(&mut policy.resources, overhead);
+        policy
             .resources
             .validate_xml_document_len(standalone.len())?;
         let parsed = crate::document::parse_borrowed_with_settings_and_budget(
             &standalone,
-            self.document_parse_settings(),
+            DocumentParseSettings::from_policy(policy.xml, &policy.resources)
+                .with_backend(self.xml_backend),
             Some(budget),
         )
         .map_err(map_owned_document_mutation_error)?;
@@ -2550,7 +2557,7 @@ impl<'a> SignContext<'a> {
             &standalone,
             (key_info_content, self.id_attributes),
             0,
-            Some(&self.policy),
+            Some(&policy),
             Some(budget),
         )?;
         let (range, length) = spliced.spans.first().cloned().ok_or_else(|| {

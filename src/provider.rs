@@ -5,7 +5,7 @@
 //! operation-specific handles; this provider owns primitive dispatch and
 //! randomness.
 
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 use crate::rustcrypto_sha3 as sha3;
 
 #[cfg(feature = "aws-lc-fips")]
@@ -28,7 +28,7 @@ mod key_encapsulation;
 pub use key_association::{KeyAssociation, KeyVerificationEvent, SignatureVerificationInput};
 #[cfg(all(feature = "xmlenc", feature = "legacy-algorithms"))]
 mod rsa_pkcs1v15;
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 pub(crate) mod rsa_pss;
 #[cfg(feature = "xmldsig")]
 pub use key_encapsulation::{
@@ -1568,7 +1568,7 @@ pub trait CryptoProvider: Send + Sync {
 pub struct RustCryptoProvider;
 
 /// Defines the `RustCrypto` incremental hasher for every compiled algorithm.
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 macro_rules! rust_crypto_digest {
     ($($(#[$attr:meta])* $variant:ident => $hasher:ty),+ $(,)?) => {
         enum RustCryptoDigest {
@@ -1614,7 +1614,7 @@ macro_rules! rust_crypto_digest {
     };
 }
 
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 rust_crypto_digest! {
     #[cfg(feature = "legacy-algorithms")]
     Md5 => md5::Md5,
@@ -1900,7 +1900,9 @@ impl CryptoProvider for RustCryptoProvider {
         })
     }
 
-    #[cfg(feature = "xmldsig")]
+    // Without `rustcrypto` this provider verifies nothing, so the trait
+    // default (no association proven) applies.
+    #[cfg(feature = "rustcrypto")]
     fn associate_verification_key(
         &self,
         actual: &[u8],
@@ -2047,12 +2049,17 @@ impl CryptoProvider for RustCryptoProvider {
             }
             #[cfg(feature = "xmldsig")]
             ProviderCapability::Decapsulate(_) => cfg!(feature = "experimental-pq"),
+            // Without `rustcrypto` no digest, signature or certificate
+            // primitive is compiled, and a supplied provider performs them.
             #[cfg(feature = "xmldsig")]
-            ProviderCapability::Digest(_) => true,
+            ProviderCapability::Digest(_) => cfg!(feature = "rustcrypto"),
             #[cfg(feature = "xmldsig")]
             // Opaque keys own these primitives and reject unsupported methods
             // during dispatch; the provider advertises its dispatch surface.
             ProviderCapability::Sign(algorithm) | ProviderCapability::Verify(algorithm) => {
+                if !cfg!(feature = "rustcrypto") {
+                    return false;
+                }
                 if let Some(parameters) = algorithm.rsa_pss_parameters()
                     && parameters.salt_len > i32::MAX as usize
                 {
@@ -2063,10 +2070,12 @@ impl CryptoProvider for RustCryptoProvider {
                     crate::xmldsig::SignatureAlgorithm::PostQuantum(_)
                 ) || cfg!(feature = "experimental-pq")
             }
-            #[cfg(feature = "xmldsig")]
+            #[cfg(feature = "rustcrypto")]
             ProviderCapability::VerifyCertificate(algorithm) => {
                 is_supported_x509_signature(algorithm)
             }
+            #[cfg(all(feature = "xmldsig", not(feature = "rustcrypto")))]
+            ProviderCapability::VerifyCertificate(_) => false,
             #[cfg(feature = "xmlenc")]
             ProviderCapability::Encrypt(_) | ProviderCapability::Decrypt(_) => true,
             #[cfg(feature = "xmlenc")]
@@ -2162,7 +2171,18 @@ impl CryptoProvider for RustCryptoProvider {
         if crate::xmldsig::dstu4145::is_ukrainian_digest(algorithm) {
             return crate::xmldsig::dstu4145::begin_digest(algorithm, memory);
         }
-        charged_digest_state(RustCryptoDigest::new(algorithm), memory)
+        #[cfg(feature = "rustcrypto")]
+        {
+            charged_digest_state(RustCryptoDigest::new(algorithm), memory)
+        }
+        #[cfg(not(feature = "rustcrypto"))]
+        {
+            let _ = memory;
+            Err(ProviderError::Unsupported {
+                operation: ProviderOperation::Digest,
+                algorithm: Some(algorithm.uri().into()),
+            })
+        }
     }
 
     #[cfg(feature = "xmldsig")]
@@ -2243,7 +2263,18 @@ impl CryptoProvider for RustCryptoProvider {
             )
             .unwrap_or(false));
         }
-        rustcrypto_x509::verify_signature(algorithm, signed_data, signature, issuer_spki_der)
+        #[cfg(feature = "rustcrypto")]
+        {
+            rustcrypto_x509::verify_signature(algorithm, signed_data, signature, issuer_spki_der)
+        }
+        #[cfg(not(feature = "rustcrypto"))]
+        {
+            let _ = (signed_data, signature, issuer_spki_der);
+            Err(ProviderError::Unsupported {
+                operation: ProviderOperation::VerifyCertificate,
+                algorithm: algorithm.oid().map(str::to_owned),
+            })
+        }
     }
 
     #[cfg(feature = "xmlenc")]
@@ -2337,7 +2368,7 @@ impl CryptoProvider for RustCryptoProvider {
     }
 }
 
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
     match algorithm {
         X509SignatureAlgorithm::Dsa(DigestAlgorithm::Sha1)
@@ -2363,7 +2394,7 @@ fn is_supported_x509_signature(algorithm: X509SignatureAlgorithm) -> bool {
     }
 }
 
-#[cfg(feature = "xmldsig")]
+#[cfg(feature = "rustcrypto")]
 pub(crate) mod rustcrypto_x509 {
     use alloc::borrow::ToOwned;
     use der::Decode as _;

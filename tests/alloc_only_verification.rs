@@ -1,8 +1,9 @@
 //! Target-coverage guarantees of verification, checked without signing so the
 //! same tests also run against the build without `std`. Documents come from
-//! `alloc_only_fixtures`, which reproduces them with the signer.
+//! `alloc_only_fixtures`, which reproduces them with the signer. Their HMAC
+//! keys are verified by the built-in backends.
 
-#![cfg(feature = "xmldsig")]
+#![cfg(feature = "rustcrypto")]
 
 use std::collections::BTreeMap;
 

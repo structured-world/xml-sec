@@ -30,6 +30,34 @@ const CMS_FORBIDDEN: &[&str] = VERIFY_ONLY_FORBIDDEN
     .expect("the list is not empty")
     .1;
 
+/// What a verification build without `rustcrypto` must not compile beyond
+/// the verify-only list: the built-in algorithm backends, so the selected
+/// provider performs every digest and signature check.
+pub(crate) const PROVIDER_ONLY_FORBIDDEN: [&str; 22] = [
+    "pkcs12",
+    "pkcs5",
+    "pbkdf2",
+    "scrypt",
+    "cms",
+    "x509-cert",
+    "x509-parser",
+    "getrandom",
+    "structured-cms",
+    "sad-rsa",
+    "dsa",
+    "p256",
+    "p384",
+    "p521",
+    "ed25519-dalek",
+    "ed448-goldilocks",
+    "curve25519-dalek",
+    "hmac",
+    "sha1",
+    "md-5",
+    "crypto-bigint",
+    "signature",
+];
+
 const BACKEND_DIAGNOSTIC: &str = "compile at least one XML backend";
 
 /// What the embedded post-quantum code relies on from its dependencies.
@@ -80,9 +108,12 @@ struct Profile {
     targets: &'static [&'static str],
     /// The facade test signs, so verification-only and core profiles omit it.
     facade: bool,
+    /// Library unit tests and doctests exercise the built-in provider, so a
+    /// build without it qualifies the library and its listed targets only.
+    provider_only: bool,
 }
 
-const PROFILES: [Profile; 17] = [
+const PROFILES: [Profile; 19] = [
     profile("default", None, &["rust_api"], false),
     profile("dom-xmloxide", Some("xml-backend-xmloxide"), &[], false),
     profile("dom-roxmltree", Some("xml-backend-roxmltree"), &[], false),
@@ -100,19 +131,21 @@ const PROFILES: [Profile; 17] = [
     ),
     profile(
         "dsig-xmloxide",
-        Some("xmldsig,xml-backend-xmloxide"),
+        Some("xmldsig,rustcrypto,xml-backend-xmloxide"),
         &["verify_only_build"],
         false,
     ),
     profile(
         "dsig-roxmltree",
-        Some("xmldsig,xml-backend-roxmltree"),
+        Some("xmldsig,rustcrypto,xml-backend-roxmltree"),
         &["verify_only_build"],
         false,
     ),
+    provider_profile("dsig-provider-xmloxide", "xmldsig,xml-backend-xmloxide"),
+    provider_profile("dsig-provider-roxmltree", "xmldsig,xml-backend-roxmltree"),
     profile(
         "cms-xmloxide",
-        Some("cms,xml-backend-xmloxide"),
+        Some("cms,rustcrypto,xml-backend-xmloxide"),
         &["cms_timestamp"],
         false,
     ),
@@ -134,7 +167,12 @@ const PROFILES: [Profile; 17] = [
         &[],
         true,
     ),
-    profile("xslt", Some("xslt,xml-backend-xmloxide"), &[], true),
+    profile(
+        "xslt",
+        Some("xslt,rustcrypto,xml-backend-xmloxide"),
+        &[],
+        true,
+    ),
     profile(
         "legacy",
         Some("xmldsig-sign,legacy-algorithms,xml-backend-xmloxide"),
@@ -173,6 +211,19 @@ const fn profile(
         features,
         targets,
         facade,
+        provider_only: false,
+    }
+}
+
+/// A verification build without the built-in provider, qualified through
+/// the test that verifies with a provider of its own.
+const fn provider_profile(name: &'static str, features: &'static str) -> Profile {
+    Profile {
+        name,
+        features: Some(features),
+        targets: &["provider_only_build"],
+        facade: false,
+        provider_only: true,
     }
 }
 
@@ -202,7 +253,10 @@ pub(crate) fn plan(
     if let Some(features) = selected.features {
         args.extend(["--no-default-features", "--features", features]);
     }
-    let mut tests = vec!["--lib"];
+    let mut tests = Vec::new();
+    if !selected.provider_only {
+        tests.push("--lib");
+    }
     for target in selected.targets {
         tests.extend(["--test", target]);
     }
@@ -220,6 +274,7 @@ pub(crate) fn plan(
     let mut actions = Vec::new();
     let forbidden: Option<&'static [&'static str]> = match selected.targets {
         ["verify_only_build"] => Some(&VERIFY_ONLY_FORBIDDEN),
+        ["provider_only_build"] => Some(&PROVIDER_ONLY_FORBIDDEN),
         ["cms_timestamp"] => Some(CMS_FORBIDDEN),
         _ => None,
     };
@@ -246,12 +301,13 @@ pub(crate) fn plan(
         ));
     }
     if phase.includes(Phase::Lint) {
-        let clippy = [
-            &["clippy"][..],
-            &args,
-            &["--all-targets", "--", "-D", "warnings"],
-        ]
-        .concat();
+        // `--lib` lints the library itself; the listed tests follow it.
+        let targets = if selected.provider_only {
+            [&["--lib"][..], &tests].concat()
+        } else {
+            vec!["--all-targets"]
+        };
+        let clippy = [&["clippy"][..], &args, &targets, &["--", "-D", "warnings"]].concat();
         actions.push(Action::Run(Step::new("lint", "cargo", &clippy)));
     }
     if phase.includes(Phase::Test) {
@@ -263,7 +319,7 @@ pub(crate) fn plan(
             actions.push(Action::Run(Step::new("test", "cargo", &run)));
         }
     }
-    if phase.includes(Phase::Doc) {
+    if phase.includes(Phase::Doc) && !selected.provider_only {
         let doc = [&["test", "--doc"][..], &args].concat();
         actions.push(Action::Run(Step::new("doc", "cargo", &doc)));
     }

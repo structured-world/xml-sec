@@ -107,7 +107,7 @@ fn verify_leaf(
     }
     let native = verification_algorithm(algorithm, spki, key.ecdsa_encoding(), session)?;
     if let Some(parameters) = algorithm.rsa_pss_parameters() {
-        let encoded = super::rsa_pss::encoded_public_key(spki, parameters, session)?;
+        let encoded = crate::xmldsig::signature::rsa_public_key_der(spki, parameters, session)?;
         return Ok(signature::UnparsedPublicKey::new(native, encoded)
             .verify(data, signature_value)
             .is_ok());

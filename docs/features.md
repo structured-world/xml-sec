@@ -8,10 +8,11 @@ See [provider boundaries](crypto-providers.md) and [policy profiles](policy-prof
 
 | Selection | Compiled surface |
 | --- | --- |
-| Defaults | `std`, `c14n`, `xmldsig`, `xmldsig-sign`, `xmlenc`, `xml-backend-xmloxide` |
+| Defaults | `std`, `c14n`, `xmldsig`, `rustcrypto`, `xmldsig-sign`, `xmlenc`, `xml-backend-xmloxide` |
 | `c14n` plus one XML backend | Canonicalization without signature/encryption dependencies; builds without `std` |
-| `xmldsig` plus one XML backend | Signature verification, policy and the public-key inventory; builds without `std` |
-| `cms` plus one XML backend | Adds the CMS `SignedData` and RFC 3161 timestamp signature provider over the selected crypto provider; implies `xmldsig`, not signing; builds without `std` |
+| `xmldsig` plus one XML backend | Signature verification, policy and the public-key inventory through a `CryptoProvider` the caller supplies; no algorithm backend is compiled; builds without `std` |
+| `xmldsig,rustcrypto` plus one XML backend | Adds the built-in `RustCryptoProvider`: digests, HMAC, RSA, DSA, ECDSA and EdDSA; builds without `std` |
+| `cms` plus one XML backend | Adds the CMS `SignedData` and RFC 3161 timestamp signature provider over the selected crypto provider; implies `xmldsig`, not signing or `rustcrypto`; builds without `std` |
 | `xmldsig-sign` plus one XML backend | Adds signing, signature templates, private-key import (PEM, PKCS#8, encrypted PKCS#8, PKCS#12) and the bundled randomness source; implies `xmldsig` and `std` |
 | `xmlenc` plus one XML backend | Encryption and its shared signature/key-inventory graph; implies `xmldsig-sign` and `std` |
 | `xslt` plus one XML backend | XMLDSig XSLT support; implies `xmldsig` and `std` |
@@ -27,8 +28,14 @@ Every core build must select `xml-backend-xmloxide` or
 `xml-backends-all` compiles both. `xml-backend-differential` also chooses
 differential parsing as the default runtime backend.
 
-RustCrypto is bundled with the signature graph, not a separate Cargo feature
-named `rustcrypto`. Compiling an optional provider does not remove RustCrypto
+The built-in provider is the `rustcrypto` feature. `xmldsig-sign`, `xmlenc`,
+`dstu4145`, `experimental-pq` and `aws-lc-fips` imply it, since they import keys
+into or implement algorithms with its backends. Without it, `default_provider()`
+reports every digest, signature and certificate check unsupported, and a
+verification must name its provider with `VerifyContext::provider`; the core
+still reads the keys, frames `SignatureValue` and applies policy itself.
+HMAC needs the built-in provider, because the secret never leaves its key.
+Compiling an optional provider does not remove RustCrypto
 key/container codecs and does not make the whole build FIPS approved. There is
 no ordinary AWS-LC adapter and no missing-operation fallback between providers.
 `legacy-algorithms` alone does not enable XMLDSig or XMLEnc. Canonicalization

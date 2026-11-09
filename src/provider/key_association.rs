@@ -2,6 +2,7 @@
 
 use crate::xmldsig::{DsigError, SignatureAlgorithm, SignatureContext, VerifyingKey};
 use structured_asn1::memory::MemoryError;
+#[cfg(feature = "rustcrypto")]
 use structured_pkix::path::WorkingKey;
 
 /// Public-key association established by the originally selected provider.
@@ -170,6 +171,7 @@ pub(super) fn compare(
     compare_with_points(actual, expected, charge, false)
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(super) fn compare_rustcrypto(
     actual: &[u8],
     expected: WorkingKey<'_>,
@@ -178,6 +180,7 @@ pub(super) fn compare_rustcrypto(
     compare_with_points(actual, expected, charge, true)
 }
 
+#[cfg(feature = "rustcrypto")]
 fn compare_with_points(
     actual: &[u8],
     expected: WorkingKey<'_>,
@@ -212,6 +215,7 @@ fn compare_with_points(
         .unwrap_or(Ok(KeyAssociation::Unproven))
 }
 
+#[cfg(feature = "rustcrypto")]
 fn associate(
     actual: structured_pkix::PublicKeyInfo<'_>,
     expected: WorkingKey<'_>,
@@ -246,7 +250,7 @@ fn associate(
     if actual_oid != expected_oid {
         return Ok(KeyAssociation::Unproven);
     }
-    if actual_oid.as_bytes() == dsa::OID.as_bytes() {
+    if actual_oid.as_bytes() == crate::xmldsig::pkix::ID_DSA {
         return Ok(compare_dsa_material(actual, expected, execution));
     }
     #[cfg(feature = "experimental-pq")]
@@ -345,6 +349,7 @@ fn associate(
     Ok(KeyAssociation::Unproven)
 }
 
+#[cfg(feature = "rustcrypto")]
 #[inline]
 fn compare_rsa_material(
     actual: structured_pkix::PublicKeyInfo<'_>,
@@ -398,6 +403,7 @@ fn compare_rsa_material(
     }
 }
 
+#[cfg(feature = "rustcrypto")]
 #[inline]
 fn compare_dsa_material(
     actual: structured_pkix::PublicKeyInfo<'_>,
@@ -429,6 +435,7 @@ fn compare_dsa_material(
     }
 }
 
+#[cfg(feature = "rustcrypto")]
 #[inline]
 fn compare_edwards_points(
     ed25519: bool,

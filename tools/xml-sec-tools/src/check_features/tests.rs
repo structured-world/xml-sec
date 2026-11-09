@@ -1,6 +1,6 @@
 use super::{
-    Action, VERIFY_ONLY_FORBIDDEN, consumer_manifest, execute, forbidden_crate, missing_feature,
-    plan,
+    Action, PROVIDER_ONLY_FORBIDDEN, VERIFY_ONLY_FORBIDDEN, consumer_manifest, execute,
+    forbidden_crate, missing_feature, plan,
 };
 use crate::repo::{Failure, Run, Step};
 use std::os::unix::process::ExitStatusExt as _;
@@ -64,12 +64,56 @@ fn minimal_signature_checks_isolate_the_package_and_do_not_enable_encryption() {
     assert_eq!(
         planned("dsig-roxmltree", "all"),
         [
-            "tree -p xml-sec --no-default-features --features xmldsig,xml-backend-roxmltree -e normal --prefix none --format {p}",
-            "clippy -p xml-sec --no-default-features --features xmldsig,xml-backend-roxmltree --all-targets -- -D warnings",
-            "nextest run -p xml-sec --no-default-features --features xmldsig,xml-backend-roxmltree --lib --test verify_only_build",
-            "test --doc -p xml-sec --no-default-features --features xmldsig,xml-backend-roxmltree",
+            "tree -p xml-sec --no-default-features --features xmldsig,rustcrypto,xml-backend-roxmltree -e normal --prefix none --format {p}",
+            "clippy -p xml-sec --no-default-features --features xmldsig,rustcrypto,xml-backend-roxmltree --all-targets -- -D warnings",
+            "nextest run -p xml-sec --no-default-features --features xmldsig,rustcrypto,xml-backend-roxmltree --lib --test verify_only_build",
+            "test --doc -p xml-sec --no-default-features --features xmldsig,rustcrypto,xml-backend-roxmltree",
         ]
     );
+}
+
+#[test]
+fn a_provider_only_build_is_qualified_through_its_own_provider_test() {
+    // Without `rustcrypto` the library's unit tests and doctests, which
+    // exercise the built-in provider, are not built; the library and the
+    // test that verifies through a caller's provider are.
+    assert_eq!(
+        planned("dsig-provider-xmloxide", "all"),
+        [
+            "tree -p xml-sec --no-default-features --features xmldsig,xml-backend-xmloxide -e normal --prefix none --format {p}",
+            "clippy -p xml-sec --no-default-features --features xmldsig,xml-backend-xmloxide --lib --test provider_only_build -- -D warnings",
+            "nextest run -p xml-sec --no-default-features --features xmldsig,xml-backend-xmloxide --test provider_only_build",
+        ]
+    );
+}
+
+#[test]
+fn a_provider_only_graph_with_any_built_in_backend_fails_before_lint() {
+    // Every built-in algorithm backend, as well as every signing or import
+    // crate, keeps the selected provider from being the only one.
+    let actions = plan("dsig-provider-roxmltree", "lint", None).unwrap();
+    assert!(matches!(actions[0], Action::VerifyOnlyGraph(..)));
+    for name in PROVIDER_ONLY_FORBIDDEN {
+        let mut runner = Recorded {
+            output: format!("xml-sec v0.2.0\n{name} v1.0.0\n"),
+            ..Recorded::default()
+        };
+        assert_eq!(
+            execute(&actions, &mut runner).unwrap_err().message,
+            format!("verification-only graph contains {name}")
+        );
+        assert_eq!(runner.calls, 1, "{name}");
+    }
+    // The verify-only build with the built-in provider admits the backends.
+    let built_in = plan("dsig-roxmltree", "lint", None).unwrap();
+    execute(
+        &built_in,
+        &mut Recorded {
+            output: "xml-sec v0.2.0\nsad-rsa v0.10.2\np256 v0.14.0\n".into(),
+            ..Recorded::default()
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -141,7 +185,7 @@ fn the_cms_profile_runs_its_real_token_tests_without_the_signing_facade_test() {
     assert_eq!(
         planned("cms-xmloxide", "test"),
         [
-            "nextest run -p xml-sec --no-default-features --features cms,xml-backend-xmloxide --lib --test cms_timestamp"
+            "nextest run -p xml-sec --no-default-features --features cms,rustcrypto,xml-backend-xmloxide --lib --test cms_timestamp"
         ]
     );
 }
@@ -206,13 +250,13 @@ fn each_minimal_profile_selects_only_its_declared_feature_graph() {
         ("dom-roxmltree", "xml-backend-roxmltree"),
         ("c14n-xmloxide", "c14n,xml-backend-xmloxide"),
         ("c14n-roxmltree", "c14n,xml-backend-roxmltree"),
-        ("dsig-xmloxide", "xmldsig,xml-backend-xmloxide"),
-        ("dsig-roxmltree", "xmldsig,xml-backend-roxmltree"),
-        ("cms-xmloxide", "cms,xml-backend-xmloxide"),
+        ("dsig-xmloxide", "xmldsig,rustcrypto,xml-backend-xmloxide"),
+        ("dsig-roxmltree", "xmldsig,rustcrypto,xml-backend-roxmltree"),
+        ("cms-xmloxide", "cms,rustcrypto,xml-backend-xmloxide"),
         ("dsig-sign-xmloxide", "xmldsig-sign,xml-backend-xmloxide"),
         ("xmlenc-xmloxide", "xmlenc,xml-backend-xmloxide"),
         ("xmlenc-roxmltree", "xmlenc,xml-backend-roxmltree"),
-        ("xslt", "xslt,xml-backend-xmloxide"),
+        ("xslt", "xslt,rustcrypto,xml-backend-xmloxide"),
         (
             "legacy",
             "xmldsig-sign,legacy-algorithms,xml-backend-xmloxide",

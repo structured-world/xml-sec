@@ -102,25 +102,26 @@ impl XmlDocument {
                         if shape == ReplacementShape::SingleElement {
                             require_element(node)?;
                         }
-                        // The document element has no parent element, and its
-                        // replacement must stay one element (XML 1.0 production 1).
                         let parent = node.parent_element();
-                        let shape = if parent.is_none() {
-                            Shape::SingleElement
-                        } else {
-                            shape.into()
+                        let shape = match parent {
+                            Some(_) => shape.into(),
+                            None => document_level(node)?,
                         };
                         (Placement::Node, fragment, shape, parent)
                     }
-                    TreeChange::Before(fragment) => match node.parent_element() {
-                        Some(parent) => {
-                            (Placement::Before, fragment, Shape::Fragment, Some(parent))
-                        }
+                    TreeChange::Before(fragment) => {
+                        let parent = node.parent_element();
                         // A node at the document level is preceded by prolog
                         // or misc content: comments, processing instructions
                         // and whitespace (XML 1.0 productions 22 and 27).
-                        None => (Placement::Before, fragment, Shape::Misc, None),
-                    },
+                        let shape = if parent.is_some() {
+                            Shape::Fragment
+                        } else {
+                            document_level(node)?;
+                            Shape::Misc
+                        };
+                        (Placement::Before, fragment, shape, parent)
+                    }
                 };
                 let wrapper = wrap_in_scope(fragment, context)?;
                 // The wrapper is the fragment plus the markup around it.
@@ -317,26 +318,63 @@ fn escape_attribute_into(value: &str, output: &mut String) {
     }
 }
 
+// What a wrapper adds to the content it wraps: a document node and the
+// wrapper element, one level of depth, and the scope it declares. Content
+// parsed inside a wrapper stays under the operation's limits, and the
+// projection of the edited tree then applies them exactly. A limit already
+// at its type's maximum stays there (hence `saturating_add`): these
+// allowances only widen a temporary parse, never a committed generation.
+const WRAPPER_NODES: u32 = 2;
+const WRAPPER_DEPTH: usize = 1;
+const WRAPPER_BINDINGS: usize = 1;
+
+/// Widen `resources` by the room a wrapper of `overhead` bytes takes, for a
+/// temporary parse of content written out inside [`wrap_in_scope`].
+#[cfg(feature = "xmldsig-sign")]
+pub(crate) fn admit_wrapper(resources: &mut crate::policy::ResourcePolicy, overhead: usize) {
+    resources.max_xml_nodes = resources
+        .max_xml_nodes
+        .saturating_add(WRAPPER_NODES as usize);
+    resources.max_xml_depth = resources.max_xml_depth.saturating_add(WRAPPER_DEPTH);
+    resources.max_xml_namespace_bindings = resources
+        .max_xml_namespace_bindings
+        .saturating_add(WRAPPER_BINDINGS);
+    resources.max_xml_document_bytes = resources.max_xml_document_bytes.saturating_add(overhead);
+}
+
 fn parse_fragment(
     wrapper: String,
     overhead: usize,
     settings: DocumentParseSettings,
     budget: Option<&XmlParseWorkBudget>,
 ) -> Result<DocumentCell, XmlDocumentError> {
-    // The wrapper adds a root, one element and its markup around the
-    // fragment; the fragment itself stays under the caller's byte ceiling,
-    // and the projection of the edited tree then applies the exact limits.
-    // A limit already at its type's maximum stays there: these allowances
-    // only widen the fragment's own parse, never the committed generation.
     let fragment_settings = DocumentParseSettings {
         allow_dtd: false,
-        nodes_limit: settings.nodes_limit.saturating_add(2),
-        depth_limit: settings.depth_limit.saturating_add(1),
-        namespace_bindings_limit: settings.namespace_bindings_limit.saturating_add(1),
+        nodes_limit: settings.nodes_limit.saturating_add(WRAPPER_NODES),
+        depth_limit: settings.depth_limit.saturating_add(WRAPPER_DEPTH),
+        namespace_bindings_limit: settings
+            .namespace_bindings_limit
+            .saturating_add(WRAPPER_BINDINGS),
         max_bytes: settings.max_bytes.saturating_add(overhead),
         ..settings
     };
     build_cell(wrapper, fragment_settings, budget)
+}
+
+/// The shape a replacement of `node`, a child of the document node, takes:
+/// the document element stays exactly one element (XML 1.0 production 1),
+/// and anything else there is `Misc` (production 27). The document node
+/// itself is the parent of that level, not a node in it.
+fn document_level(node: Node<'_, '_>) -> Result<Shape, XmlDocumentError> {
+    if node.is_element() {
+        Ok(Shape::SingleElement)
+    } else if node.is_root() {
+        Err(XmlDocumentError::InvalidReplacement(
+            "the document node has no siblings to replace it or precede it".into(),
+        ))
+    } else {
+        Ok(Shape::Misc)
+    }
 }
 
 /// The node sequence a fragment must parse to at its placement.

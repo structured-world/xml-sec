@@ -402,3 +402,72 @@ fn entity_content_is_content_that_no_edit_can_address() {
         ));
     });
 }
+
+/// The outcome of replacing the node `select` picks among the document
+/// node's children with `fragment`: an edit that passes validation reaches
+/// the read-only tree and fails there, so the error tells the two apart.
+fn replace_at_document_level(
+    xml: &str,
+    select: fn(Node<'_, '_>) -> bool,
+    fragment: &str,
+) -> XmlDocumentError {
+    let mut document = project(Mirror::new(xml), &VerificationPolicy::default());
+    let target = document.with_view(|view| {
+        let node = view
+            .document()
+            .root()
+            .children()
+            .find(|node| select(*node))
+            .expect("the node is at the document level");
+        view.node_identity(node)
+    });
+    document
+        .replace_node_with_fragment(target, fragment)
+        .expect_err("a read-only tree takes no edit")
+}
+
+#[test]
+fn a_document_level_comment_is_replaced_by_misc_content_only() {
+    // Outside the document element only comments, processing instructions
+    // and white space may stand (XML 1.0 productions 1, 22 and 27): a
+    // comment there may become another comment, never a second element.
+    let xml = "<!--before--><root/>";
+    assert!(matches!(
+        replace_at_document_level(xml, |node| node.is_comment(), "<extra/>"),
+        XmlDocumentError::InvalidReplacement(_)
+    ));
+    assert!(matches!(
+        replace_at_document_level(xml, |node| node.is_comment(), "<!--after--><?pi data?>"),
+        XmlDocumentError::TreeEdit(_)
+    ));
+    // The document element stays exactly one element.
+    assert!(matches!(
+        replace_at_document_level(xml, |node| node.is_element(), "<!--only-->"),
+        XmlDocumentError::InvalidReplacement(_)
+    ));
+    assert!(matches!(
+        replace_at_document_level(xml, |node| node.is_element(), "<other/>"),
+        XmlDocumentError::TreeEdit(_)
+    ));
+}
+
+/// The identity of the document node, for `XmlDocument::with_view`.
+fn document_node(view: crate::DocumentView<'_>) -> crate::NodeIdentity {
+    view.root()
+}
+
+#[test]
+fn the_document_node_is_no_edit_target_of_its_own() {
+    // The document node is the parent of every document-level node, not one
+    // of them: nothing stands beside it to replace it with or insert before.
+    let mut document = project(Mirror::new("<root/>"), &VerificationPolicy::default());
+    let root = document.with_view(document_node);
+    assert!(matches!(
+        document.replace_node_with_fragment(root, "<other/>"),
+        Err(XmlDocumentError::InvalidReplacement(_))
+    ));
+    assert!(matches!(
+        document.insert_before(root, "<!--before-->"),
+        Err(XmlDocumentError::InvalidReplacement(_))
+    ));
+}

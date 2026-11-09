@@ -1,7 +1,10 @@
 //! Signature verification helpers for `XMLDSig`.
 //!
-//! This module covers RSA PKCS#1 v1.5, DSA-SHA1, and ECDSA verification,
-//! including donor P-521 interoperability under the `XMLDSig` `ecdsa-sha384` URI.
+//! Public-key admission and `SignatureValue` framing read the SPKI through
+//! the shared PKIX reader and hold for every provider. With `rustcrypto`,
+//! this module also carries the built-in RSA PKCS#1 v1.5, DSA and ECDSA
+//! verification, including donor P-521 interoperability under the `XMLDSig`
+//! `ecdsa-sha384` URI.
 //!
 //! Input public keys are accepted in `SubjectPublicKeyInfo` (SPKI) form because
 //! that is how the vendored PEM fixtures are stored.
@@ -10,22 +13,28 @@
 //! - ECDSA keys are validated as uncompressed SEC1 points from the SPKI bit
 //!   string and verified with `RustCrypto` curve crates (`p256`/`p384`/`p521`).
 
+#[cfg(feature = "rustcrypto")]
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey as P256VerifyingKey};
+#[cfg(feature = "rustcrypto")]
 use p384::ecdsa::{Signature as P384Signature, VerifyingKey as P384VerifyingKey};
+#[cfg(feature = "rustcrypto")]
 use p521::ecdsa::{Signature as P521Signature, VerifyingKey as P521VerifyingKey};
+#[cfg(feature = "rustcrypto")]
+use rsa::pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey};
+#[cfg(feature = "rustcrypto")]
 use rsa::signature::hazmat::PrehashVerifier;
-use rsa::{
-    pkcs1v15::{Signature as RsaPkcs1v15Signature, VerifyingKey as RsaVerifyingKey},
-    traits::PublicKeyParts,
-};
+#[cfg(feature = "rustcrypto")]
 use sha1::Sha1;
+#[cfg(feature = "rustcrypto")]
 use sha2::{Digest, Sha224, Sha256, Sha384, Sha512};
+#[cfg(feature = "rustcrypto")]
 use signature::Verifier;
 
+#[cfg(any(feature = "rustcrypto", test))]
+use alloc::vec::Vec;
 use alloc::{
     borrow::ToOwned,
     string::{String, ToString},
-    vec::Vec,
 };
 
 use super::parse::SignatureAlgorithm;
@@ -166,8 +175,34 @@ pub(crate) fn read_rsa_public_key<'a>(
         .ok_or(SignatureVerificationError::InvalidKeyDer)
 }
 
+/// The `RSAPublicKey` DER inside `spki`, after its algorithm restrictions for
+/// `pss` are checked (RFC 4055 section 3.3). Every provider shares this
+/// preflight without allocating RSA integers.
+#[cfg(feature = "rustcrypto")]
+pub(crate) fn rsa_public_key_der<'a>(
+    spki: &'a [u8],
+    pss: super::RsaPssParameters,
+    session: &CertificateSession,
+) -> Result<&'a [u8], SignatureVerificationError> {
+    // The shared PKIX reader owns SPKI and RSASSA-PSS-params syntax.
+    // The SPKI is read at document offset zero, so its source span indexes it.
+    let span = read_rsa_public_key(session, spki, Some(pss))?
+        .element()
+        .span();
+    let range = usize::try_from(span.start).ok().and_then(|start| {
+        usize::try_from(span.length)
+            .ok()
+            .and_then(|length| start.checked_add(length))
+            .map(|end| start..end)
+    });
+    range
+        .and_then(|range| spki.get(range))
+        .ok_or(SignatureVerificationError::InvalidKeyDer)
+}
+
 /// The software RSA key of an SPKI, read under `session` with the bare
 /// decoder's admission rules.
+#[cfg(feature = "rustcrypto")]
 fn software_rsa_public_key(
     session: &CertificateSession,
     spki: &[u8],
@@ -227,16 +262,16 @@ pub(crate) fn signature_value_matches_spki_with_encoding(
             algorithm @ (SignatureAlgorithm::DsaSha1 | SignatureAlgorithm::DsaSha256),
             SpkiAlgorithm::Dsa,
         ) => {
-            let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
-            let component_len = usize::try_from(key.components().q().bit_width_vartime())
-                .map_err(|_| SignatureVerificationError::InvalidKeyDer)?
-                .div_ceil(8);
+            let (_, subgroup_bits) = dsa_parameter_bits(public_key_spki_der, session)?;
+            let component_len = subgroup_bits.div_ceil(8);
             Ok(algorithm.dsa_component_len() == Some(component_len)
                 && signature_value.len() == component_len * 2)
         }
+        // RFC 8017 section 8.2.2: the signature is exactly k octets, k the
+        // modulus length in octets.
         (method, SpkiAlgorithm::RsaEncryption) if method.is_rsa() => {
-            let key = software_rsa_public_key(session, public_key_spki_der)?;
-            Ok(signature_value.len() == key.size())
+            let key = read_rsa_public_key(session, public_key_spki_der, None)?;
+            Ok(signature_value.len() == key.modulus().as_bytes().len())
         }
         (method, SpkiAlgorithm::Ec) if method.ecdsa_digest().is_some() => {
             let (curve, _) = ecdsa_public_key(session, public_key_spki_der)?;
@@ -308,6 +343,7 @@ pub enum SignatureVerificationError {
 /// # Errors
 /// Returns an error for invalid PEM or RSA key encoding, an unsupported method,
 /// or a key that does not meet the direct helper's strength requirements.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_rsa_signature_pem(
     algorithm: SignatureAlgorithm,
@@ -336,6 +372,7 @@ pub fn verify_rsa_signature_pem(
 /// # Errors
 /// Returns an error for invalid PEM, an unsupported algorithm or curve,
 /// mismatched key metadata, or invalid signature framing.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_pem(
     algorithm: SignatureAlgorithm,
@@ -357,6 +394,7 @@ pub fn verify_ecdsa_signature_pem(
 /// # Errors
 /// Returns an error for invalid PEM, an unsupported algorithm or curve,
 /// mismatched key metadata, or framing inconsistent with `encoding`.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_pem_with_encoding(
     algorithm: SignatureAlgorithm,
@@ -375,6 +413,7 @@ pub fn verify_ecdsa_signature_pem_with_encoding(
     )
 }
 
+#[cfg(any(feature = "rustcrypto", test))]
 fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerificationError> {
     let mut block =
         PemBlock::decode(public_key_pem).ok_or(SignatureVerificationError::InvalidKeyPem)?;
@@ -386,6 +425,7 @@ fn parse_public_key_pem(public_key_pem: &str) -> Result<Vec<u8>, SignatureVerifi
 }
 
 /// One decoded PEM block of caller-supplied key or certificate text.
+#[cfg(any(feature = "rustcrypto", test))]
 pub(crate) struct PemBlock {
     /// Type label of the pre-encapsulation boundary.
     pub(crate) label: String,
@@ -393,6 +433,7 @@ pub(crate) struct PemBlock {
     pub(crate) contents: zeroize::Zeroizing<Vec<u8>>,
 }
 
+#[cfg(any(feature = "rustcrypto", test))]
 impl PemBlock {
     /// Decodes exactly one block under RFC 7468 section 2: explanatory text may
     /// precede it, only whitespace may follow, and both boundaries carry the same label.
@@ -414,6 +455,7 @@ impl PemBlock {
 /// # Errors
 /// Returns an error for invalid or mismatched RSA key encoding, an unsupported
 /// method, or a key that does not meet the direct helper's strength requirements.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_rsa_signature_spki(
     algorithm: SignatureAlgorithm,
@@ -430,6 +472,7 @@ pub fn verify_rsa_signature_spki(
     )
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify_rsa_signature_spki_with_minimum(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
@@ -479,6 +522,7 @@ pub(crate) fn validate_rsa_signature_spki_with_minimum(
     )
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify_rsa_signature_spki_primitive(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
@@ -539,6 +583,7 @@ pub(crate) fn verify_rsa_signature_spki_primitive(
 /// # Errors
 /// Returns an error for invalid DSA key encoding, an unsupported method,
 /// or key parameters that violate the direct helper's strength requirements.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_dsa_signature_spki(
     algorithm: SignatureAlgorithm,
@@ -555,6 +600,7 @@ pub fn verify_dsa_signature_spki(
     )
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify_dsa_signature_spki_with_minimum(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
@@ -578,14 +624,51 @@ pub(crate) fn validate_dsa_signature_spki_with_minimum(
     minimum_modulus_bits: usize,
     session: &CertificateSession,
 ) -> Result<(), SignatureVerificationError> {
-    let key = decode_dsa_verifying_key(public_key_spki_der, session)?;
-    let modulus_bits = usize::try_from(key.components().p().bit_width_vartime())
-        .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    // The built-in backend refuses an invalid group before the key is used,
+    // and its decoded key already carries the width.
+    #[cfg(feature = "rustcrypto")]
+    let modulus_bits = usize::try_from(
+        decode_dsa_verifying_key(public_key_spki_der, session)?
+            .components()
+            .p()
+            .bit_width_vartime(),
+    )
+    .map_err(|_| SignatureVerificationError::InvalidKeyDer)?;
+    #[cfg(not(feature = "rustcrypto"))]
+    let (modulus_bits, _) = dsa_parameter_bits(public_key_spki_der, session)?;
     crate::policy::DsaKeyPolicy {
         minimum_modulus_bits,
     }
     .validate_modulus_bits(modulus_bits)
     .map_err(SignatureVerificationError::KeyPolicy)
+}
+
+/// Bit widths of the prime `p` and subgroup order `q` a standalone DSA SPKI
+/// writes in its `Dss-Parms` (RFC 3279 section 2.3.2), read by the shared
+/// PKIX reader. Whether they form a valid group is the verifying provider's
+/// decision; zero and over-wide components are refused here.
+fn dsa_parameter_bits(
+    spki: &[u8],
+    session: &CertificateSession,
+) -> Result<(usize, usize), SignatureVerificationError> {
+    let key = session
+        .read_dsa_public_key(spki)
+        .map_err(|error| key_read_error(session, &error))?;
+    let parameters = key
+        .parameters()
+        .ok_or(SignatureVerificationError::InvalidKeyDer)?;
+    // The reader strips the sign octet, and DER leaves no other leading zero.
+    let bits = |magnitude: &[u8]| match magnitude {
+        [] | [0] => Err(SignatureVerificationError::InvalidKeyDer),
+        bytes if bytes.len() > crate::hard_limits::DSA_KEY_COMPONENT_BYTE_CEILING => {
+            Err(SignatureVerificationError::InvalidKeyDer)
+        }
+        bytes => Ok((bytes.len() - 1) * 8 + (8 - bytes[0].leading_zeros() as usize)),
+    };
+    Ok((
+        bits(parameters.p().as_bytes())?,
+        bits(parameters.q().as_bytes())?,
+    ))
 }
 
 #[cfg(feature = "xmldsig-sign")]
@@ -596,6 +679,7 @@ pub(crate) struct BorrowedDsaPublicParameters<'a> {
     pub(crate) g: der::asn1::UintRef<'a>,
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn decode_dsa_verifying_key(
     bytes: &[u8],
     session: &CertificateSession,
@@ -621,6 +705,7 @@ pub(crate) fn decode_dsa_verifying_key(
 ///
 /// Component size is a process-safety bound, not a DSA conformance rule; it is
 /// checked on borrowed bytes before any allocating bigint conversion.
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn dsa_verifying_key(
     p: &[u8],
     q: &[u8],
@@ -649,6 +734,7 @@ pub(crate) fn dsa_verifying_key(
     .ok()
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify_dsa_signature_spki_primitive(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
@@ -700,6 +786,7 @@ pub(crate) fn verify_dsa_signature_spki_primitive(
 /// # Errors
 /// Returns an error for invalid key encoding, an unsupported algorithm or curve,
 /// mismatched key metadata, or malformed fixed-width signature bytes.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_spki(
     algorithm: SignatureAlgorithm,
@@ -721,6 +808,7 @@ pub fn verify_ecdsa_signature_spki(
 /// # Errors
 /// Returns an error for invalid key encoding, an unsupported algorithm or curve,
 /// mismatched key metadata, or framing inconsistent with `encoding`.
+#[cfg(feature = "rustcrypto")]
 #[must_use = "discarding the verification result skips signature validation"]
 pub fn verify_ecdsa_signature_spki_with_encoding(
     algorithm: SignatureAlgorithm,
@@ -739,6 +827,7 @@ pub fn verify_ecdsa_signature_spki_with_encoding(
     )
 }
 
+#[cfg(feature = "rustcrypto")]
 pub(crate) fn verify_ecdsa_signature_spki_in(
     algorithm: SignatureAlgorithm,
     public_key_spki_der: &[u8],
@@ -849,17 +938,15 @@ pub(crate) enum EcCurve {
 }
 
 impl EcCurve {
-    /// Curve named by the contents octets of an OBJECT IDENTIFIER.
+    /// Curve named by the contents octets of an OBJECT IDENTIFIER:
+    /// secp256r1 1.2.840.10045.3.1.7, secp384r1 1.3.132.0.34 and secp521r1
+    /// 1.3.132.0.35 (RFC 5480 section 2.1.1.1).
     pub(crate) fn from_oid_bytes(oid: &[u8]) -> Option<Self> {
-        use pkcs8::AssociatedOid as _;
-        if oid == p256::NistP256::OID.as_bytes() {
-            Some(Self::P256)
-        } else if oid == p384::NistP384::OID.as_bytes() {
-            Some(Self::P384)
-        } else if oid == p521::NistP521::OID.as_bytes() {
-            Some(Self::P521)
-        } else {
-            None
+        match oid {
+            [0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07] => Some(Self::P256),
+            [0x2b, 0x81, 0x04, 0x00, 0x22] => Some(Self::P384),
+            [0x2b, 0x81, 0x04, 0x00, 0x23] => Some(Self::P521),
+            _ => None,
         }
     }
 
@@ -899,6 +986,7 @@ fn ecdsa_public_key<'a>(
     Ok((curve, point))
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_ecdsa_p256(
     public_key: &[u8],
     prehash: &[u8],
@@ -910,6 +998,7 @@ fn verify_ecdsa_p256(
     verify_p256_signature(&key, signature_value, signature_encoding, prehash)
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_ecdsa_p384(
     public_key: &[u8],
     prehash: &[u8],
@@ -921,6 +1010,7 @@ fn verify_ecdsa_p384(
     verify_p384_signature(&key, signature_value, signature_encoding, prehash)
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_ecdsa_p521(
     public_key: &[u8],
     prehash: &[u8],
@@ -932,11 +1022,13 @@ fn verify_ecdsa_p521(
     verify_p521_signature(&key, signature_value, signature_encoding, prehash)
 }
 
+#[cfg(feature = "rustcrypto")]
 trait DecodeEcdsaSignature: Sized {
     fn decode_fixed_width(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
     fn decode_der(bytes: &[u8]) -> Result<Self, SignatureVerificationError>;
 }
 
+#[cfg(feature = "rustcrypto")]
 macro_rules! impl_ecdsa_signature_decoder {
     ($signature:ty) => {
         impl DecodeEcdsaSignature for $signature {
@@ -953,10 +1045,14 @@ macro_rules! impl_ecdsa_signature_decoder {
     };
 }
 
+#[cfg(feature = "rustcrypto")]
 impl_ecdsa_signature_decoder!(P256Signature);
+#[cfg(feature = "rustcrypto")]
 impl_ecdsa_signature_decoder!(P384Signature);
+#[cfg(feature = "rustcrypto")]
 impl_ecdsa_signature_decoder!(P521Signature);
 
+#[cfg(feature = "rustcrypto")]
 fn verify_ecdsa_signature<K, S>(
     key: &K,
     signature_value: &[u8],
@@ -974,6 +1070,7 @@ where
     Ok(key.verify_prehash(prehash, &signature).is_ok())
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_p256_signature(
     key: &P256VerifyingKey,
     signature_value: &[u8],
@@ -983,6 +1080,7 @@ fn verify_p256_signature(
     verify_ecdsa_signature::<_, P256Signature>(key, signature_value, signature_encoding, prehash)
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_p384_signature(
     key: &P384VerifyingKey,
     signature_value: &[u8],
@@ -992,6 +1090,7 @@ fn verify_p384_signature(
     verify_ecdsa_signature::<_, P384Signature>(key, signature_value, signature_encoding, prehash)
 }
 
+#[cfg(feature = "rustcrypto")]
 fn verify_p521_signature(
     key: &P521VerifyingKey,
     signature_value: &[u8],
@@ -1001,6 +1100,7 @@ fn verify_p521_signature(
     verify_ecdsa_signature::<_, P521Signature>(key, signature_value, signature_encoding, prehash)
 }
 
+#[cfg(feature = "rustcrypto")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EcdsaSignatureEncoding {
     XmlDsigFixed,
