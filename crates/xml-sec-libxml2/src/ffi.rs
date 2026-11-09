@@ -1,0 +1,980 @@
+//! The libxml2 boundary: the crate's only `unsafe` code.
+//!
+//! [`LibxmlTree`] implements the core's external-tree contract over a
+//! caller's `xmlDoc`: it walks the tree into the core's projection, builds
+//! the nodes of validated fragments with libxml2's own constructors, links
+//! and unlinks nodes by their pointers, and keeps what it needs to undo its
+//! edits until the core releases them. `SAFETY.md` records the invariants
+//! every `unsafe` block below relies on.
+
+use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::sync::OnceLock;
+
+use xml_sec::ParseError;
+use xml_sec::document::external::{
+    ExternalNode, ExternalTree, Fragment, FragmentEvent, TreeEdit, TreeEditError, TreeSink,
+};
+use xml_sec_capi::ffi::{XsDocument, XsError, XsPolicy};
+use xml_sec_capi::status::{XS_INTERNAL, XS_INVALID_ARGUMENT, XsStatus};
+
+#[cfg(test)]
+mod tests;
+
+type XmlChar = u8;
+
+/// `xmlNs`: a namespace declaration.
+#[repr(C)]
+pub struct XmlNs {
+    next: *mut XmlNs,
+    kind: c_int,
+    href: *const XmlChar,
+    prefix: *const XmlChar,
+}
+
+/// `xmlAttr`, up to the last member the bridge reads.
+#[repr(C)]
+pub struct XmlAttr {
+    private: *mut c_void,
+    kind: c_int,
+    name: *const XmlChar,
+    children: *mut XmlNode,
+    last: *mut XmlNode,
+    parent: *mut XmlNode,
+    next: *mut XmlAttr,
+    prev: *mut XmlAttr,
+    doc: *mut XmlDoc,
+    ns: *mut XmlNs,
+    atype: c_int,
+}
+
+/// `xmlNode`, up to the last member the bridge reads.
+#[repr(C)]
+pub struct XmlNode {
+    private: *mut c_void,
+    kind: c_int,
+    name: *const XmlChar,
+    children: *mut XmlNode,
+    last: *mut XmlNode,
+    parent: *mut XmlNode,
+    next: *mut XmlNode,
+    prev: *mut XmlNode,
+    doc: *mut XmlDoc,
+    ns: *mut XmlNs,
+    content: *mut XmlChar,
+    properties: *mut XmlAttr,
+    ns_def: *mut XmlNs,
+}
+
+/// `xmlDoc`, up to the last member the bridge reads. Its first members are
+/// the common part every libxml2 node shares, so the document is the parent
+/// of its top-level nodes like any element.
+#[repr(C)]
+pub struct XmlDoc {
+    private: *mut c_void,
+    kind: c_int,
+    name: *mut c_char,
+    children: *mut XmlNode,
+    last: *mut XmlNode,
+    parent: *mut XmlNode,
+    next: *mut XmlNode,
+    prev: *mut XmlNode,
+    doc: *mut XmlDoc,
+    compression: c_int,
+    standalone: c_int,
+    int_subset: *mut c_void,
+}
+
+const XML_ELEMENT_NODE: c_int = 1;
+const XML_TEXT_NODE: c_int = 3;
+const XML_CDATA_SECTION_NODE: c_int = 4;
+const XML_ENTITY_REF_NODE: c_int = 5;
+const XML_PI_NODE: c_int = 7;
+const XML_COMMENT_NODE: c_int = 8;
+const XML_DOCUMENT_NODE: c_int = 9;
+const XML_DTD_NODE: c_int = 14;
+const XML_XINCLUDE_START: c_int = 19;
+const XML_XINCLUDE_END: c_int = 20;
+const XML_ATTRIBUTE_ID: c_int = 2;
+
+unsafe extern "C" {
+    static xs_libxml2_layout: [usize; 0];
+    static xs_libxml2_layout_len: usize;
+
+    fn xmlNewDocNode(
+        doc: *mut XmlDoc,
+        ns: *mut XmlNs,
+        name: *const XmlChar,
+        content: *const XmlChar,
+    ) -> *mut XmlNode;
+    fn xmlNewNs(node: *mut XmlNode, href: *const XmlChar, prefix: *const XmlChar) -> *mut XmlNs;
+    fn xmlNewNsProp(
+        node: *mut XmlNode,
+        ns: *mut XmlNs,
+        name: *const XmlChar,
+        value: *const XmlChar,
+    ) -> *mut XmlAttr;
+    fn xmlNewDocText(doc: *const XmlDoc, content: *const XmlChar) -> *mut XmlNode;
+    fn xmlNewDocComment(doc: *mut XmlDoc, content: *const XmlChar) -> *mut XmlNode;
+    fn xmlNewDocPI(doc: *mut XmlDoc, name: *const XmlChar, content: *const XmlChar)
+    -> *mut XmlNode;
+    fn xmlSearchNs(doc: *mut XmlDoc, node: *mut XmlNode, prefix: *const XmlChar) -> *mut XmlNs;
+    fn xmlUnlinkNode(node: *mut XmlNode);
+    fn xmlFreeNode(node: *mut XmlNode);
+}
+
+/// The layout record this crate's declarations stand for, in the order of
+/// `layout.c`.
+fn expected_layout() -> [usize; 38] {
+    use std::mem::{offset_of, size_of};
+    [
+        offset_of!(XmlNode, kind),
+        offset_of!(XmlNode, name),
+        offset_of!(XmlNode, children),
+        offset_of!(XmlNode, last),
+        offset_of!(XmlNode, parent),
+        offset_of!(XmlNode, next),
+        offset_of!(XmlNode, prev),
+        offset_of!(XmlNode, doc),
+        offset_of!(XmlNode, ns),
+        offset_of!(XmlNode, content),
+        offset_of!(XmlNode, properties),
+        offset_of!(XmlNode, ns_def),
+        offset_of!(XmlAttr, kind),
+        offset_of!(XmlAttr, name),
+        offset_of!(XmlAttr, children),
+        offset_of!(XmlAttr, parent),
+        offset_of!(XmlAttr, next),
+        offset_of!(XmlAttr, ns),
+        offset_of!(XmlAttr, atype),
+        offset_of!(XmlNs, next),
+        offset_of!(XmlNs, href),
+        offset_of!(XmlNs, prefix),
+        offset_of!(XmlDoc, kind),
+        offset_of!(XmlDoc, children),
+        offset_of!(XmlDoc, last),
+        offset_of!(XmlDoc, int_subset),
+        size_of::<c_int>(),
+        XML_ELEMENT_NODE as usize,
+        XML_TEXT_NODE as usize,
+        XML_CDATA_SECTION_NODE as usize,
+        XML_ENTITY_REF_NODE as usize,
+        XML_PI_NODE as usize,
+        XML_COMMENT_NODE as usize,
+        XML_DOCUMENT_NODE as usize,
+        XML_DTD_NODE as usize,
+        XML_XINCLUDE_START as usize,
+        XML_XINCLUDE_END as usize,
+        XML_ATTRIBUTE_ID as usize,
+    ]
+}
+
+/// The layout record of the linked headers.
+fn linked_layout() -> &'static [usize] {
+    // SAFETY: `layout.c` defines `xs_libxml2_layout` as an array of
+    // `xs_libxml2_layout_len` initialized `size_t` values with static
+    // storage, and `size_t` is `usize` on every target Rust supports.
+    unsafe {
+        std::slice::from_raw_parts(
+            (&raw const xs_libxml2_layout).cast::<usize>(),
+            xs_libxml2_layout_len,
+        )
+    }
+}
+
+/// Whether the linked libxml2 lays its structures out as declared here;
+/// computed once, and every entry point refuses to touch a tree otherwise.
+fn layout_matches() -> bool {
+    static MATCHES: OnceLock<bool> = OnceLock::new();
+    *MATCHES.get_or_init(|| linked_layout() == expected_layout())
+}
+
+fn backend_error(message: &str) -> ParseError {
+    ParseError::Backend {
+        backend: "libxml2",
+        message: message.into(),
+    }
+}
+
+fn edit_error(message: &str) -> TreeEditError {
+    TreeEditError(message.into())
+}
+
+fn reference(node: *mut XmlNode) -> ExternalNode {
+    ExternalNode(node.expose_provenance() as u64)
+}
+
+fn node_of(node: ExternalNode) -> *mut XmlNode {
+    // The value came from `reference` of a node of this tree.
+    std::ptr::with_exposed_provenance_mut(usize::try_from(node.0).unwrap_or(0))
+}
+
+/// A NUL-terminated libxml2 string as UTF-8, or `None` for null.
+///
+/// # Safety
+/// `text` is null or points to a NUL-terminated string that outlives `'a`.
+unsafe fn string<'a>(text: *const XmlChar) -> Result<Option<&'a str>, ParseError> {
+    if text.is_null() {
+        return Ok(None);
+    }
+    // SAFETY: non-null and NUL-terminated by the caller's contract.
+    let bytes = unsafe { CStr::from_ptr(text.cast::<c_char>()) }.to_bytes();
+    // libxml2 holds every tree string as UTF-8.
+    std::str::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| backend_error("a tree string is not UTF-8"))
+}
+
+/// One undo step of an edit.
+enum Undo {
+    /// The edit created and linked `node`; undoing it unlinks and frees it.
+    Linked(*mut XmlNode),
+    /// The edit unlinked `node` from `parent`, where it preceded `next`.
+    Unlinked {
+        node: *mut XmlNode,
+        parent: *mut XmlNode,
+        next: *mut XmlNode,
+    },
+}
+
+/// A caller's libxml2 document as the core's external tree.
+pub struct LibxmlTree {
+    doc: *mut XmlDoc,
+    journal: Vec<Undo>,
+}
+
+// SAFETY: the tree is reached only through the document handle that owns
+// it, which one call at a time uses under its lock; the caller does not
+// use or free the `xmlDoc` from another thread while a call runs (header
+// contract), and libxml2 tree functions keep no thread-confined state.
+unsafe impl Send for LibxmlTree {}
+// SAFETY: shared references read the tree only, under the same contract.
+unsafe impl Sync for LibxmlTree {}
+
+impl LibxmlTree {
+    fn document_node(&self) -> *mut XmlNode {
+        self.doc.cast::<XmlNode>()
+    }
+
+    /// Report the nodes from `first` on, with their descendants.
+    ///
+    /// # Safety
+    /// `first` is null or a node of this tree, valid with all its siblings
+    /// and descendants for the walk.
+    unsafe fn walk(first: *mut XmlNode, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
+        enum Frame {
+            Element(*mut XmlNode),
+            Entity(*mut XmlNode),
+        }
+        let mut stack = Vec::new();
+        let mut current = first;
+        loop {
+            if current.is_null() {
+                match stack.pop() {
+                    None => return Ok(()),
+                    Some(Frame::Element(element)) => {
+                        sink.end_element()?;
+                        // SAFETY: `element` is a node of the walked tree.
+                        current = unsafe { (*element).next };
+                    }
+                    Some(Frame::Entity(reference)) => {
+                        sink.leave_entity()?;
+                        // SAFETY: as above.
+                        current = unsafe { (*reference).next };
+                    }
+                }
+                continue;
+            }
+            // SAFETY: `current` is a live node of the tree by the walk's
+            // contract; every pointer read below is one of its members.
+            let node = unsafe { &*current };
+            let next = node.next;
+            match node.kind {
+                XML_ELEMENT_NODE => {
+                    // SAFETY: an element's name, namespace, declarations and
+                    // attributes belong to the same live tree.
+                    unsafe { Self::start_element(node, sink) }?;
+                    stack.push(Frame::Element(current));
+                    current = node.children;
+                    continue;
+                }
+                XML_TEXT_NODE | XML_CDATA_SECTION_NODE => {
+                    // SAFETY: content is null or a NUL-terminated tree string.
+                    let text = unsafe { string(node.content) }?.unwrap_or_default();
+                    sink.text(reference(current), text)?;
+                }
+                XML_COMMENT_NODE => {
+                    // SAFETY: as above.
+                    let text = unsafe { string(node.content) }?.unwrap_or_default();
+                    sink.comment(reference(current), text)?;
+                }
+                XML_PI_NODE => {
+                    // SAFETY: a PI's name is its target; content its value.
+                    let (target, value) = unsafe { (string(node.name)?, string(node.content)?) };
+                    sink.processing_instruction(
+                        reference(current),
+                        target.unwrap_or_default(),
+                        value,
+                    )?;
+                }
+                XML_ENTITY_REF_NODE => {
+                    // An entity reference's `children` is its declaration,
+                    // whose children are the parsed replacement (XML 1.0
+                    // section 4.4.2: included in the content).
+                    let entity = node.children;
+                    // SAFETY: a declaration shares the common node part.
+                    let replacement = (!entity.is_null()).then(|| unsafe { (*entity).children });
+                    let Some(replacement) = replacement.filter(|first| !first.is_null()) else {
+                        return Err(backend_error(
+                            "an entity reference whose replacement the tree does not hold",
+                        ));
+                    };
+                    sink.enter_entity()?;
+                    stack.push(Frame::Entity(current));
+                    current = replacement;
+                    continue;
+                }
+                // The document type was reported before the walk; XInclude
+                // markers carry no content.
+                XML_DTD_NODE | XML_XINCLUDE_START | XML_XINCLUDE_END => {}
+                _ => return Err(backend_error("a node type the tree may not hold")),
+            }
+            current = next;
+        }
+    }
+
+    /// Report the start tag of `element`.
+    ///
+    /// # Safety
+    /// `element` is a live element of this tree.
+    unsafe fn start_element(element: &XmlNode, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
+        // SAFETY: the element's members belong to the live tree.
+        let (name, prefix, namespace) = unsafe {
+            let ns = element.ns;
+            let (prefix, namespace) = if ns.is_null() {
+                (None, None)
+            } else {
+                (string((*ns).prefix)?, string((*ns).href)?)
+            };
+            (string(element.name)?.unwrap_or_default(), prefix, namespace)
+        };
+        let node = std::ptr::from_ref(element).cast_mut();
+        sink.begin_element(reference(node), name, prefix, namespace)?;
+        let mut declaration = element.ns_def;
+        while !declaration.is_null() {
+            // SAFETY: the declaration list of a live element.
+            let declared = unsafe { &*declaration };
+            // SAFETY: its strings are NUL-terminated tree strings.
+            let (prefix, uri) = unsafe { (string(declared.prefix)?, string(declared.href)?) };
+            sink.declare_namespace(prefix, uri.unwrap_or_default())?;
+            declaration = declared.next;
+        }
+        let mut attribute = element.properties;
+        while !attribute.is_null() {
+            // SAFETY: the attribute list of a live element.
+            let attr = unsafe { &*attribute };
+            // SAFETY: the attribute's members belong to the live tree.
+            let (name, prefix, namespace, value) = unsafe {
+                let (prefix, namespace) = if attr.ns.is_null() {
+                    (None, None)
+                } else {
+                    (string((*attr.ns).prefix)?, string((*attr.ns).href)?)
+                };
+                (
+                    string(attr.name)?.unwrap_or_default(),
+                    prefix,
+                    namespace,
+                    attribute_value(attr)?,
+                )
+            };
+            sink.attribute(
+                name,
+                prefix,
+                namespace,
+                &value,
+                attr.atype == XML_ATTRIBUTE_ID,
+            )?;
+            attribute = attr.next;
+        }
+        sink.open_element()
+    }
+
+    /// The nodes of `fragment`, created in this document as detached
+    /// sibling subtrees; `context` is the element whose scope they join.
+    ///
+    /// # Safety
+    /// `context` is null or a live element of this tree.
+    unsafe fn build(
+        &self,
+        fragment: &Fragment<'_>,
+        context: *mut XmlNode,
+    ) -> Result<Vec<*mut XmlNode>, TreeEditError> {
+        let mut builder = Builder {
+            doc: self.doc,
+            context,
+            top: Vec::new(),
+            open: Vec::new(),
+        };
+        match fragment.walk(&mut |event| builder.event(event)) {
+            Ok(()) => Ok(builder.top),
+            Err(error) => {
+                builder.discard();
+                Err(error)
+            }
+        }
+    }
+
+    /// Unlink `node`, remembering where it stood.
+    ///
+    /// # Safety
+    /// `node` is a live, linked node of this tree.
+    unsafe fn unlink(&mut self, node: *mut XmlNode) {
+        // SAFETY: a live linked node.
+        let (parent, next) = unsafe { ((*node).parent, (*node).next) };
+        // SAFETY: as above; libxml2 fixes the parent's and siblings' links.
+        unsafe { xmlUnlinkNode(node) };
+        self.journal.push(Undo::Unlinked { node, parent, next });
+    }
+}
+
+/// Builds a fragment's nodes in one document: elements stay open until their
+/// end tag, then join their parent or the top-level sequence.
+struct Builder {
+    doc: *mut XmlDoc,
+    context: *mut XmlNode,
+    top: Vec<*mut XmlNode>,
+    open: Vec<Open>,
+}
+
+impl Builder {
+    fn event(&mut self, event: FragmentEvent<'_>) -> Result<(), TreeEditError> {
+        match event {
+            FragmentEvent::StartElement {
+                local_name,
+                prefix,
+                namespace,
+            } => self.start(local_name, prefix, namespace),
+            FragmentEvent::Namespace { prefix, uri } => self.declare(prefix, uri),
+            FragmentEvent::Attribute {
+                local_name,
+                prefix,
+                namespace,
+                value,
+            } => {
+                let element = self
+                    .open
+                    .last_mut()
+                    .ok_or_else(|| edit_error("a stray attribute"))?;
+                element.attributes.push((
+                    local_name.into(),
+                    prefix.map(c_string).transpose()?,
+                    namespace.map(String::from),
+                    value.into(),
+                ));
+                Ok(())
+            }
+            FragmentEvent::OpenElement => self.open_element(),
+            FragmentEvent::EndElement => {
+                let element = self
+                    .open
+                    .pop()
+                    .ok_or_else(|| edit_error("a stray end tag"))?;
+                self.place(element.node);
+                Ok(())
+            }
+            FragmentEvent::Text(text) => {
+                let text = c_string(text)?;
+                // SAFETY: `doc` is live; libxml2 copies the content, unescaped.
+                let node = unsafe { xmlNewDocText(self.doc, text.as_ptr().cast()) };
+                self.leaf(node)
+            }
+            FragmentEvent::Comment(text) => {
+                let text = c_string(text)?;
+                // SAFETY: as above.
+                let node = unsafe { xmlNewDocComment(self.doc, text.as_ptr().cast()) };
+                self.leaf(node)
+            }
+            FragmentEvent::ProcessingInstruction { target, value } => {
+                let (target, value) = (c_string(target)?, value.map(c_string).transpose()?);
+                // SAFETY: as above.
+                let node = unsafe {
+                    xmlNewDocPI(
+                        self.doc,
+                        target.as_ptr().cast(),
+                        value
+                            .as_ref()
+                            .map_or(std::ptr::null(), |value| value.as_ptr().cast()),
+                    )
+                };
+                self.leaf(node)
+            }
+        }
+    }
+
+    fn start(
+        &mut self,
+        local_name: &str,
+        prefix: Option<&str>,
+        namespace: Option<&str>,
+    ) -> Result<(), TreeEditError> {
+        let name = c_string(local_name)?;
+        // SAFETY: `doc` is live; libxml2 copies the name. The namespace is
+        // set once the element's own declarations are known.
+        let node = unsafe {
+            xmlNewDocNode(
+                self.doc,
+                std::ptr::null_mut(),
+                name.as_ptr().cast(),
+                std::ptr::null(),
+            )
+        };
+        if node.is_null() {
+            return Err(edit_error("libxml2 could not create an element"));
+        }
+        self.open.push(Open {
+            node,
+            prefix: prefix.map(c_string).transpose()?,
+            namespace: namespace.map(String::from),
+            attributes: Vec::new(),
+        });
+        Ok(())
+    }
+
+    fn declare(&mut self, prefix: Option<&str>, uri: &str) -> Result<(), TreeEditError> {
+        let node = self
+            .open
+            .last()
+            .ok_or_else(|| edit_error("a stray declaration"))?
+            .node;
+        let (uri, prefix) = (c_string(uri)?, prefix.map(c_string).transpose()?);
+        // SAFETY: `node` was created by this build; libxml2 copies both strings.
+        let declared = unsafe {
+            xmlNewNs(
+                node,
+                uri.as_ptr().cast(),
+                prefix
+                    .as_ref()
+                    .map_or(std::ptr::null(), |prefix| prefix.as_ptr().cast()),
+            )
+        };
+        if declared.is_null() {
+            return Err(edit_error("libxml2 could not declare a namespace"));
+        }
+        Ok(())
+    }
+
+    /// The start tag ended: the element's namespace and attributes, which may
+    /// use its own declarations, are created now.
+    fn open_element(&mut self) -> Result<(), TreeEditError> {
+        let element = self
+            .open
+            .last()
+            .ok_or_else(|| edit_error("a stray start tag end"))?;
+        let ns = self.namespace(element.prefix.as_ref(), element.namespace.as_deref())?;
+        // SAFETY: the element was created by this build.
+        unsafe { (*element.node).ns = ns };
+        for (name, prefix, namespace, value) in &element.attributes {
+            let ns = self.namespace(prefix.as_ref(), namespace.as_deref())?;
+            let (name, value) = (c_string(name)?, c_string(value)?);
+            // SAFETY: libxml2 copies both strings; the value is taken as
+            // given, without entity processing.
+            let attribute = unsafe {
+                xmlNewNsProp(
+                    element.node,
+                    ns,
+                    name.as_ptr().cast(),
+                    value.as_ptr().cast(),
+                )
+            };
+            if attribute.is_null() {
+                return Err(edit_error("libxml2 could not create an attribute"));
+            }
+        }
+        Ok(())
+    }
+
+    fn leaf(&mut self, node: *mut XmlNode) -> Result<(), TreeEditError> {
+        if node.is_null() {
+            return Err(edit_error("libxml2 could not create a node"));
+        }
+        self.place(node);
+        Ok(())
+    }
+
+    /// `node` joins the innermost open element, or the top-level sequence.
+    fn place(&mut self, node: *mut XmlNode) {
+        match self.open.last() {
+            // SAFETY: both nodes were created by this build and `node` is
+            // detached.
+            Some(parent) => unsafe { link(parent.node, std::ptr::null_mut(), node) },
+            None => self.top.push(node),
+        }
+    }
+
+    /// Free everything a failed build created; none of it is in the tree.
+    fn discard(self) {
+        for node in self.open.into_iter().map(|open| open.node).chain(self.top) {
+            // SAFETY: created by this build and linked nowhere in the tree;
+            // an open element is not linked into its parent yet.
+            unsafe { xmlFreeNode(node) };
+        }
+    }
+
+    /// The declaration binding `prefix` to `namespace` for an element being
+    /// built: the nearest one on the new elements, else the context's scope.
+    fn namespace(
+        &self,
+        prefix: Option<&CString>,
+        namespace: Option<&str>,
+    ) -> Result<*mut XmlNs, TreeEditError> {
+        let Some(namespace) = namespace else {
+            return Ok(std::ptr::null_mut());
+        };
+        let wanted = prefix.map(CString::as_bytes);
+        for element in self.open.iter().rev() {
+            // SAFETY: the element and its declarations are live.
+            let mut declaration = unsafe { (*element.node).ns_def };
+            while !declaration.is_null() {
+                // SAFETY: a live declaration.
+                let declared = unsafe { &*declaration };
+                // SAFETY: its strings are NUL-terminated.
+                let found = unsafe { c_bytes(declared.prefix) };
+                if found == wanted {
+                    // SAFETY: as above.
+                    return if unsafe { c_bytes(declared.href) } == Some(namespace.as_bytes()) {
+                        Ok(declaration)
+                    } else {
+                        Err(edit_error("a fragment prefix bound to another namespace"))
+                    };
+                }
+                declaration = declared.next;
+            }
+        }
+        let prefix = prefix.map_or(std::ptr::null(), |prefix| prefix.as_ptr().cast());
+        // SAFETY: `doc` is live and `context` null or live; the result is a
+        // declaration of the document or of an ancestor of `context`.
+        let found = unsafe { xmlSearchNs(self.doc, self.context, prefix) };
+        // SAFETY: a declaration libxml2 returned is live.
+        if found.is_null() || unsafe { c_bytes((*found).href) } != Some(namespace.as_bytes()) {
+            return Err(edit_error("a fragment namespace its context does not bind"));
+        }
+        Ok(found)
+    }
+}
+
+impl LibxmlTree {
+    /// Link the nodes `built` created under `parent` before `next` (null:
+    /// as its last children), remembering each.
+    ///
+    /// # Safety
+    /// `parent` is live and `next` is null or one of its children; every
+    /// node of `built` is detached and was created in this document.
+    unsafe fn attach(
+        &mut self,
+        parent: *mut XmlNode,
+        next: *mut XmlNode,
+        built: Vec<*mut XmlNode>,
+    ) {
+        for node in built {
+            // SAFETY: the caller's contract.
+            unsafe { link(parent, next, node) };
+            self.journal.push(Undo::Linked(node));
+        }
+    }
+
+    /// Unlink every child of `element`.
+    ///
+    /// # Safety
+    /// `element` is a live element of this tree.
+    unsafe fn clear(&mut self, element: *mut XmlNode) {
+        // SAFETY: a live element.
+        let mut child = unsafe { (*element).children };
+        while !child.is_null() {
+            // SAFETY: a live child, read before it is unlinked.
+            let next = unsafe { (*child).next };
+            // SAFETY: as above.
+            unsafe { self.unlink(child) };
+            child = next;
+        }
+    }
+
+    /// Apply one edit.
+    ///
+    /// # Safety
+    /// The edit's target is a live node of this tree.
+    unsafe fn apply_one(&mut self, edit: &TreeEdit<'_>) -> Result<(), TreeEditError> {
+        match *edit {
+            TreeEdit::SetText { target, text } => {
+                let target = node_of(target);
+                // SAFETY: the target is live by the caller's contract.
+                unsafe { self.clear(target) };
+                if !text.is_empty() {
+                    let text = c_string(text)?;
+                    // SAFETY: libxml2 copies the content, unescaped.
+                    let node = unsafe { xmlNewDocText(self.doc, text.as_ptr().cast()) };
+                    if node.is_null() {
+                        return Err(edit_error("libxml2 could not create a text node"));
+                    }
+                    // SAFETY: the new node is detached; the target is live.
+                    unsafe { self.attach(target, std::ptr::null_mut(), vec![node]) };
+                }
+            }
+            TreeEdit::ReplaceContent { target, fragment } => {
+                let target = node_of(target);
+                // SAFETY: the target is a live element.
+                let built = unsafe { self.build(&fragment, target) }?;
+                // SAFETY: as above; the built nodes are detached.
+                unsafe {
+                    self.clear(target);
+                    self.attach(target, std::ptr::null_mut(), built);
+                }
+            }
+            TreeEdit::AppendChild { target, fragment } => {
+                let target = node_of(target);
+                // SAFETY: as above.
+                let built = unsafe { self.build(&fragment, target) }?;
+                // SAFETY: as above.
+                unsafe { self.attach(target, std::ptr::null_mut(), built) };
+            }
+            TreeEdit::InsertBefore { target, fragment }
+            | TreeEdit::ReplaceNode { target, fragment } => {
+                let target = node_of(target);
+                // SAFETY: the target is live; its parent is an element or
+                // the document.
+                let parent = unsafe { (*target).parent };
+                if parent.is_null() {
+                    return Err(edit_error("the target has no parent"));
+                }
+                let context = if parent == self.document_node() {
+                    std::ptr::null_mut()
+                } else {
+                    parent
+                };
+                // SAFETY: `context` is null or the live parent element.
+                let built = unsafe { self.build(&fragment, context) }?;
+                // SAFETY: `target` is a child of `parent`; the built nodes
+                // are detached.
+                unsafe { self.attach(parent, target, built) };
+                if matches!(edit, TreeEdit::ReplaceNode { .. }) {
+                    // SAFETY: `target` is still linked under `parent`.
+                    unsafe { self.unlink(target) };
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// An element a fragment build created whose end tag has not come yet.
+struct Open {
+    node: *mut XmlNode,
+    prefix: Option<CString>,
+    namespace: Option<String>,
+    /// Name, prefix, namespace and value; created once the element's own
+    /// declarations are known.
+    attributes: Vec<(String, Option<CString>, Option<String>, String)>,
+}
+
+fn c_string(value: &str) -> Result<CString, TreeEditError> {
+    // XML 1.0 section 2.2 admits no NUL character.
+    CString::new(value).map_err(|_| edit_error("a fragment string holds NUL"))
+}
+
+/// The bytes of a NUL-terminated string, or `None` for null.
+///
+/// # Safety
+/// `text` is null or NUL-terminated and live.
+unsafe fn c_bytes<'a>(text: *const XmlChar) -> Option<&'a [u8]> {
+    // SAFETY: the caller's contract.
+    (!text.is_null()).then(|| unsafe { CStr::from_ptr(text.cast::<c_char>()) }.to_bytes())
+}
+
+/// An attribute's value: its children's character data, entity references
+/// expanded.
+///
+/// # Safety
+/// `attr` is a live attribute of a live tree.
+unsafe fn attribute_value(attr: &XmlAttr) -> Result<String, ParseError> {
+    let mut value = String::new();
+    // SAFETY: the attribute's children are live tree nodes.
+    unsafe { append_text(attr.children, &mut value, 0) }?;
+    Ok(value)
+}
+
+/// Append the character data of `first` and its siblings to `value`.
+///
+/// # Safety
+/// `first` is null or a live node with live siblings.
+unsafe fn append_text(
+    first: *mut XmlNode,
+    value: &mut String,
+    depth: usize,
+) -> Result<(), ParseError> {
+    // Entity expansion inside attribute values nests at most this deep.
+    if depth > 64 {
+        return Err(backend_error("attribute entity references nest too deep"));
+    }
+    let mut current = first;
+    while !current.is_null() {
+        // SAFETY: a live node.
+        let node = unsafe { &*current };
+        match node.kind {
+            XML_TEXT_NODE => {
+                // SAFETY: content is null or a NUL-terminated tree string.
+                value.push_str(unsafe { string(node.content) }?.unwrap_or_default());
+            }
+            XML_ENTITY_REF_NODE if !node.children.is_null() => {
+                // SAFETY: the declaration shares the common node part.
+                unsafe { append_text((*node.children).children, value, depth + 1) }?;
+            }
+            _ => return Err(backend_error("an attribute value the tree cannot report")),
+        }
+        current = node.next;
+    }
+    Ok(())
+}
+
+/// Link the detached `node` under `parent` before `next`, or last.
+///
+/// # Safety
+/// `parent` is a live element or document, `next` null or a child of it,
+/// and `node` a detached node of the same document.
+unsafe fn link(parent: *mut XmlNode, next: *mut XmlNode, node: *mut XmlNode) {
+    // SAFETY: the caller's contract; the document shares the common part.
+    unsafe {
+        (*node).parent = parent;
+        let prev = if next.is_null() {
+            (*parent).last
+        } else {
+            (*next).prev
+        };
+        (*node).prev = prev;
+        (*node).next = next;
+        if prev.is_null() {
+            (*parent).children = node;
+        } else {
+            (*prev).next = node;
+        }
+        if next.is_null() {
+            (*parent).last = node;
+        } else {
+            (*next).prev = node;
+        }
+    }
+}
+
+impl ExternalTree for LibxmlTree {
+    fn document(&self) -> ExternalNode {
+        reference(self.document_node())
+    }
+
+    fn project(&self, sink: &mut TreeSink<'_>) -> Result<(), ParseError> {
+        if !layout_matches() {
+            return Err(backend_error(
+                "the linked libxml2 lays out its tree differently",
+            ));
+        }
+        // SAFETY: `doc` is the caller's live document for the whole call.
+        let (has_dtd, first) = unsafe { (!(*self.doc).int_subset.is_null(), (*self.doc).children) };
+        if has_dtd {
+            sink.document_type()?;
+        }
+        // SAFETY: the document's nodes are live for the call.
+        unsafe { Self::walk(first, sink) }
+    }
+
+    fn apply(&mut self, edits: &[TreeEdit<'_>]) -> Result<(), TreeEditError> {
+        for edit in edits {
+            // SAFETY: every target is a node the last projection reported,
+            // and the tree changed since only through these edits.
+            unsafe { self.apply_one(edit) }?;
+        }
+        Ok(())
+    }
+
+    fn checkpoint(&mut self) -> usize {
+        self.journal.len()
+    }
+
+    fn rollback(&mut self, mark: usize) {
+        while self.journal.len() > mark {
+            match self.journal.pop() {
+                Some(Undo::Linked(node)) => {
+                    // SAFETY: the node was created and linked by an edit not
+                    // yet undone, so it is live and linked.
+                    unsafe {
+                        xmlUnlinkNode(node);
+                        xmlFreeNode(node);
+                    }
+                }
+                Some(Undo::Unlinked { node, parent, next }) => {
+                    // SAFETY: undoing newest first restores the state in
+                    // which `next` followed `node` under `parent`.
+                    unsafe { link(parent, next, node) };
+                }
+                None => break,
+            }
+        }
+    }
+
+    fn release(&mut self, mark: usize) {
+        for undo in self.journal.drain(mark..) {
+            if let Undo::Unlinked { node, .. } = undo {
+                // SAFETY: an unlinked node no later edit relinked; nothing
+                // in the tree points to it any more.
+                unsafe { xmlFreeNode(node) };
+            }
+        }
+    }
+}
+
+impl Drop for LibxmlTree {
+    fn drop(&mut self) {
+        // Committed edits only remain if a transaction never finished.
+        self.release(0);
+    }
+}
+
+/// Create a document handle over the caller's libxml2 document `doc`, read
+/// under the compiled policy of `operation` (`XS_OPERATION_*`) in `policy`.
+///
+/// Every operation on the handle reads `doc` as it is when the operation
+/// starts and changes it in place. Destroying the handle leaves `doc` to the
+/// caller.
+///
+/// # Safety
+/// `doc` is a valid `xmlDocPtr` that outlives the handle; while a call on
+/// the handle runs, nothing else uses or changes `doc`. `out` is valid for
+/// writes of one `XsDocument`; `error` is null or valid for writes of one
+/// `XsError`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn xs_libxml2_document(
+    policy: XsPolicy,
+    operation: u32,
+    doc: *mut XmlDoc,
+    out: *mut XsDocument,
+    error: *mut XsError,
+) -> XsStatus {
+    let refuse = |status: XsStatus| {
+        if !error.is_null() && error.is_aligned() {
+            // SAFETY: non-null, aligned and writable by the caller's contract.
+            unsafe { error.write(XsError::default()) };
+        }
+        status
+    };
+    if doc.is_null() || !doc.is_aligned() {
+        return refuse(XS_INVALID_ARGUMENT);
+    }
+    // SAFETY: a valid document by the caller's contract.
+    if unsafe { (*doc).kind } != XML_DOCUMENT_NODE {
+        return refuse(XS_INVALID_ARGUMENT);
+    }
+    if !layout_matches() {
+        return refuse(XS_INTERNAL);
+    }
+    let tree = Box::new(LibxmlTree {
+        doc,
+        journal: Vec::new(),
+    });
+    // SAFETY: forwarded contract for `out` and `error`.
+    unsafe { xml_sec_capi::ffi::document_from_tree(policy, operation, tree, out, error) }
+}

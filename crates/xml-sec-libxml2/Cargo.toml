@@ -1,0 +1,30 @@
+[package]
+name = "xml-sec-libxml2"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0 AND MIT"
+publish = false
+description = "xml-sec operations on a caller's libxml2 document tree, in place"
+links = "xml2"
+
+[lib]
+# The library exports the clean C API together with the libxml2 entry point;
+# `rlib` lets the crate's own Rust tests call the exported functions.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+xml-sec = { path = "../..", default-features = false, features = ["std", "xmldsig", "xmldsig-sign", "xmlenc", "c14n", "external-tree"] }
+xml-sec-capi = { path = "../xml-sec-capi", default-features = false, features = ["external-tree"] }
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[features]
+default = ["xml-backend-xmloxide"]
+xml-backend-xmloxide = ["xml-sec-capi/xml-backend-xmloxide"]
+xml-backend-roxmltree = ["xml-sec-capi/xml-backend-roxmltree"]
+
+[lints]
+workspace = true
