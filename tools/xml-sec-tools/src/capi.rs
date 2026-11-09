@@ -1,11 +1,12 @@
-//! `capi [--sanitize]`: qualifies the C ABI as C and C++ callers see it.
-//! Cargo builds the shared library and names it in its artifact messages;
-//! the round-trip programs are built against the header and that library with
-//! the platform's compiler and run, and the library must export exactly the
-//! functions the header declares. `--sanitize`, on Linux, builds the library
-//! and runs the crate's tests with the address sanitizer on nightly, and builds
-//! the programs with the address (leak checking included) and undefined
-//! behavior sanitizers.
+//! `capi [--sanitize]`: qualifies the C ABI as C and C++ callers see it, for
+//! the clean C API and, on Linux and macOS, for the libxml2 bridge that
+//! exports it together with its own entry point. Cargo builds each shared
+//! library and names it in its artifact messages; the round-trip programs are
+//! built against the headers and that library with the platform's compiler
+//! and run, and the library must export exactly the functions its headers
+//! declare. `--sanitize`, on Linux, builds the libraries and runs the crates'
+//! tests with the address sanitizer on nightly, and builds the programs with
+//! the address (leak checking included) and undefined behavior sanitizers.
 
 use crate::repo::{Failure, Run, Step, System, describe, require, root};
 use object::{NameOrOrdinal, Object as _};
@@ -16,11 +17,12 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod tests;
 
-const PACKAGE: &str = "xml-sec-capi";
-const CRATE_DIR: &str = "crates/xml-sec-capi";
 const HEADER: &str = "crates/xml-sec-capi/include/xml_sec.h";
 /// Declared for libraries built with the FIPS engine only.
 const FIPS_ONLY: &str = "xs_provider_new_aws_lc_fips";
+/// The libxml2 package `pkg-config` resolves for the bridge's programs, as
+/// the bridge's build script does for the bridge itself.
+const LIBXML2: &str = "libxml-2.0";
 
 /// How the library and the programs are built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,9 +31,83 @@ pub(crate) enum Mode {
     Sanitized,
 }
 
+/// A shared library this command qualifies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Target {
+    /// The clean C API.
+    Clean,
+    /// The libxml2 bridge, which reexports the clean C API.
+    Libxml2,
+}
+
+impl Target {
+    pub(crate) const fn package(self) -> &'static str {
+        match self {
+            Self::Clean => "xml-sec-capi",
+            Self::Libxml2 => "xml-sec-libxml2",
+        }
+    }
+
+    /// The library name cargo reports and the linker resolves.
+    pub(crate) const fn artifact(self) -> &'static str {
+        match self {
+            Self::Clean => "xml_sec_capi",
+            Self::Libxml2 => "xml_sec_libxml2",
+        }
+    }
+
+    const fn crate_dir(self) -> &'static str {
+        match self {
+            Self::Clean => "crates/xml-sec-capi",
+            Self::Libxml2 => "crates/xml-sec-libxml2",
+        }
+    }
+
+    /// Every header whose functions the library exports.
+    pub(crate) const fn headers(self) -> &'static [&'static str] {
+        match self {
+            Self::Clean => &[HEADER],
+            Self::Libxml2 => &[HEADER, "crates/xml-sec-libxml2/include/xml_sec_libxml2.h"],
+        }
+    }
+
+    /// The include directories of those headers.
+    fn includes(self) -> Vec<String> {
+        self.headers()
+            .iter()
+            .map(|header| {
+                let header = root().join(header);
+                header
+                    .parent()
+                    .expect("a header lies in a directory")
+                    .display()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// The round-trip programs, relative to the crate.
+    const fn sources(self) -> &'static [&'static str] {
+        match self {
+            Self::Clean => &["tests/c/roundtrip.c", "tests/cpp/roundtrip.cpp"],
+            Self::Libxml2 => &["tests/c/roundtrip.c"],
+        }
+    }
+}
+
+/// The libraries qualified on this platform. The bridge has no claimed support
+/// level on other systems; it is reported as not qualified rather than built.
+pub(crate) const fn targets() -> &'static [Target] {
+    if cfg!(any(target_os = "linux", target_os = "macos")) {
+        &[Target::Clean, Target::Libxml2]
+    } else {
+        &[Target::Clean]
+    }
+}
+
 /// The library build: cargo's own messages name the artifacts, whatever the
 /// build-directory layout.
-pub(crate) fn build_step(mode: Mode, host: &str, rustflags: Option<&str>) -> Step {
+pub(crate) fn build_step(target: Target, mode: Mode, host: &str, rustflags: Option<&str>) -> Step {
     cargo_step(
         "build library",
         mode,
@@ -40,22 +116,20 @@ pub(crate) fn build_step(mode: Mode, host: &str, rustflags: Option<&str>) -> Ste
         &[
             "build",
             "-p",
-            PACKAGE,
+            target.package(),
             "--lib",
             "--message-format=json-render-diagnostics",
         ],
     )
 }
 
-/// The crate's own tests, run under the sanitizer with the library.
+/// The crates' own tests, run under the sanitizer with their libraries.
 pub(crate) fn test_step(host: &str, rustflags: Option<&str>) -> Step {
-    cargo_step(
-        "sanitized tests",
-        Mode::Sanitized,
-        host,
-        rustflags,
-        &["nextest", "run", "-p", PACKAGE],
-    )
+    let mut args = vec!["nextest", "run"];
+    for target in targets() {
+        args.extend(["-p", target.package()]);
+    }
+    cargo_step("sanitized tests", Mode::Sanitized, host, rustflags, &args)
 }
 
 fn cargo_step(label: &str, mode: Mode, host: &str, rustflags: Option<&str>, args: &[&str]) -> Step {
@@ -98,14 +172,17 @@ impl Library {
     }
 }
 
-/// The library named by the `compiler-artifact` message of the crate in
-/// `messages`, cargo's JSON output.
-pub(crate) fn library(messages: &str, suffix: &str) -> Result<Library, String> {
+/// The library named by the `compiler-artifact` message of `target`'s crate
+/// in `messages`, cargo's JSON output.
+pub(crate) fn library(messages: &str, target: Target, suffix: &str) -> Result<Library, String> {
+    let package = target.package();
     for line in messages.lines() {
         let Ok(message) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        if message["reason"] != "compiler-artifact" || message["target"]["name"] != "xml_sec_capi" {
+        if message["reason"] != "compiler-artifact"
+            || message["target"]["name"] != target.artifact()
+        {
             continue;
         }
         let files: Vec<PathBuf> = message["filenames"]
@@ -121,13 +198,14 @@ pub(crate) fn library(messages: &str, suffix: &str) -> Result<Library, String> {
                 .find(|file| file.to_string_lossy().ends_with(end))
                 .cloned()
         };
-        let shared = named(suffix).ok_or("cargo reported no shared library for xml-sec-capi")?;
+        let shared = named(suffix)
+            .ok_or_else(|| format!("cargo reported no shared library for {package}"))?;
         return Ok(Library {
             shared,
             import: named(".dll.lib"),
         });
     }
-    Err("cargo reported no artifact for xml-sec-capi".to_owned())
+    Err(format!("cargo reported no artifact for {package}"))
 }
 
 /// Function names `header` declares: the identifier right before a parameter
@@ -201,17 +279,30 @@ pub(crate) fn symbol_mismatch(
     })
 }
 
-/// The compiler invocation that builds `source` into `output` against the
-/// header and `library`.
+/// A program to build against `library`: its source, the executable it
+/// becomes, and the compiler and linker flags of the libraries it calls
+/// directly besides the target's own.
+pub(crate) struct Program<'a> {
+    pub(crate) source: &'a Path,
+    pub(crate) output: &'a Path,
+    pub(crate) flags: &'a [String],
+}
+
+/// The compiler invocation that builds `program` against `target`'s headers
+/// and `library`.
 pub(crate) fn compile_step(
     compiler: &cc::Tool,
     mode: Mode,
-    source: &Path,
-    output: &Path,
+    target: Target,
+    program: &Program<'_>,
     library: &Library,
 ) -> Result<Step, String> {
+    let Program {
+        source,
+        output,
+        flags,
+    } = *program;
     let directory = library.directory().display().to_string();
-    let include = root().join(CRATE_DIR).join("include").display().to_string();
     let cpp = source
         .extension()
         .is_some_and(|extension| extension == "cpp");
@@ -225,9 +316,14 @@ pub(crate) fn compile_step(
         let import = library
             .import
             .as_ref()
-            .ok_or("cargo reported no import library for xml-sec-capi")?;
+            .ok_or_else(|| format!("cargo reported no import library for {}", target.package()))?;
+        args.extend(
+            target
+                .includes()
+                .into_iter()
+                .map(|include| format!("/I{include}")),
+        );
         args.extend([
-            format!("/I{include}"),
             (if cpp { "/std:c++17" } else { "/std:c11" }).to_owned(),
             // The programs read their key files with portable stdio.
             "/D_CRT_SECURE_NO_WARNINGS".to_owned(),
@@ -241,18 +337,20 @@ pub(crate) fn compile_step(
             import.display().to_string(),
         ]);
     } else {
+        for include in target.includes() {
+            args.extend(["-I".to_owned(), include]);
+        }
         args.extend([
-            "-I".to_owned(),
-            include,
             (if cpp { "-std=c++17" } else { "-std=c99" }).to_owned(),
             "-Werror".to_owned(),
             "-o".to_owned(),
             output.display().to_string(),
             "-L".to_owned(),
             directory.clone(),
-            "-lxml_sec_capi".to_owned(),
+            format!("-l{}", target.artifact()),
             format!("-Wl,-rpath,{directory}"),
         ]);
+        args.extend(flags.iter().cloned());
         if mode == Mode::Sanitized {
             args.extend([
                 "-fsanitize=address,undefined".to_owned(),
@@ -308,6 +406,29 @@ fn checked(runner: &mut impl Run, step: &Step) -> Result<String, Failure> {
     }
 }
 
+/// Every function `target`'s headers declare.
+fn declarations(target: Target) -> Result<BTreeSet<String>, Failure> {
+    let mut names = BTreeSet::new();
+    for header in target.headers() {
+        let text = std::fs::read_to_string(root().join(header))
+            .map_err(|error| format!("read {header}: {error}"))?;
+        names.extend(declared(&text));
+    }
+    Ok(names)
+}
+
+/// The compiler and linker flags the bridge's programs need for libxml2.
+fn libxml2_flags(runner: &mut impl Run) -> Result<Vec<String>, Failure> {
+    let step = Step::new(
+        "libxml2 flags",
+        "pkg-config",
+        &["--cflags", "--libs", LIBXML2],
+    );
+    let (status, flags) = runner.stdout(&step)?;
+    require(status)?;
+    Ok(flags.split_whitespace().map(str::to_owned).collect())
+}
+
 pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> {
     let rustc = match mode {
         Mode::Plain => Step::new("rustc", "rustc", &["-vV"]),
@@ -317,28 +438,61 @@ pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> 
     require(status)?;
     let host = host(&version)?;
     let rustflags = std::env::var("RUSTFLAGS").ok();
-    let (status, messages) = runner.stdout(&build_step(mode, &host, rustflags.as_deref()))?;
-    require(status)?;
-    let library = library(&messages, std::env::consts::DLL_SUFFIX)?;
-
-    let header = std::fs::read_to_string(root().join(HEADER))
-        .map_err(|error| format!("read {HEADER}: {error}"))?;
-    if let Some(mismatch) = symbol_mismatch(&declared(&header), &exported(&library.shared)?) {
-        return Err(mismatch.into());
-    }
-
     let scratch = tempfile::tempdir().map_err(|error| format!("scratch directory: {error}"))?;
+    for &target in targets() {
+        qualify(
+            target,
+            mode,
+            &host,
+            rustflags.as_deref(),
+            scratch.path(),
+            runner,
+        )?;
+    }
+    if !targets().contains(&Target::Libxml2) {
+        println!(
+            "{}: no support level is claimed on {}; not qualified",
+            Target::Libxml2.package(),
+            std::env::consts::OS
+        );
+    }
+    if mode == Mode::Sanitized {
+        require(runner.status(&test_step(&host, rustflags.as_deref()))?)?;
+    }
+    Ok(())
+}
+
+/// Builds `target`'s library, checks its exports against its headers, and
+/// builds and runs its round-trip programs in `scratch`.
+fn qualify(
+    target: Target,
+    mode: Mode,
+    host: &str,
+    rustflags: Option<&str>,
+    scratch: &Path,
+    runner: &mut impl Run,
+) -> Result<(), Failure> {
+    let (status, messages) = runner.stdout(&build_step(target, mode, host, rustflags))?;
+    require(status)?;
+    let library = library(&messages, target, std::env::consts::DLL_SUFFIX)?;
+    if let Some(mismatch) = symbol_mismatch(&declarations(target)?, &exported(&library.shared)?) {
+        return Err(format!("{}: {mismatch}", target.package()).into());
+    }
+    let flags = match target {
+        Target::Clean => Vec::new(),
+        Target::Libxml2 => libxml2_flags(runner)?,
+    };
     let keys = root().join("tests/fixtures/keys/rsa");
-    // Both programs receive the RSA recipient's private and public key.
+    // Every program receives the RSA recipient's private and public key.
     let key_files = [
         keys.join("rsa-2048-key.pem"),
         keys.join("rsa-2048-pubkey.pem"),
     ];
-    for source in ["tests/c/roundtrip.c", "tests/cpp/roundtrip.cpp"] {
-        let source = root().join(CRATE_DIR).join(source);
+    for source in target.sources() {
+        let source = root().join(target.crate_dir()).join(source);
         let compiler = cc::Build::new()
-            .target(&host)
-            .host(&host)
+            .target(host)
+            .host(host)
             .opt_level(0)
             .debug(false)
             .cargo_metadata(false)
@@ -359,22 +513,25 @@ pub(crate) fn execute(mode: Mode, runner: &mut impl Run) -> Result<(), Failure> 
             .extension()
             .expect("a source extension")
             .to_string_lossy();
-        let output = scratch.path().join(format!(
-            "{name}-{extension}{}",
+        let output = scratch.join(format!(
+            "{}-{name}-{extension}{}",
+            target.artifact(),
             std::env::consts::EXE_SUFFIX
         ));
+        let program = Program {
+            source: &source,
+            output: &output,
+            flags: &flags,
+        };
         checked(
             runner,
-            &compile_step(&compiler, mode, &source, &output, &library)?,
+            &compile_step(&compiler, mode, target, &program, &library)?,
         )?;
         print!(
-            "{}",
+            "{}: {}",
+            target.package(),
             checked(runner, &program_step(&output, &key_files, &library))?
         );
-    }
-
-    if mode == Mode::Sanitized {
-        require(runner.status(&test_step(&host, rustflags.as_deref()))?)?;
     }
     Ok(())
 }

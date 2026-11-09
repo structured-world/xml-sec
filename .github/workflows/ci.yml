@@ -37,6 +37,11 @@ jobs:
       - uses: ./.github/actions/rust-build-cache
         with:
           domain: ordinary
+      # The libxml2 bridge, part of the workspace, builds against libxml2.
+      - uses: ./.github/actions/apt-packages
+        with:
+          packages: libxml2-dev pkg-config
+          recommends: 'false'
       # Repository tooling and its contracts on workflows and scripts.
       - run: cargo nextest run -p xml-sec-tools
       # The per-lint pedantic forbid list must match clippy's pedantic group;
@@ -147,6 +152,19 @@ jobs:
       # so every operating system repeats the store's concurrency contract.
       - name: Qualify policy reload concurrency
         run: cargo nextest run -p xml-sec-config --test store --stress-count 100
+      # The libxml2 bridge is qualified where a support level is claimed:
+      # against the distribution's libxml2 on Linux and Homebrew's on macOS.
+      - name: Provision libxml2
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/apt-packages
+        with:
+          packages: libxml2-dev pkg-config
+          recommends: 'false'
+      - name: Provision libxml2
+        if: runner.os == 'macOS'
+        run: |
+          brew install libxml2 pkgconf
+          echo "PKG_CONFIG_PATH=$(brew --prefix libxml2)/lib/pkgconfig" >> "$GITHUB_ENV"
       # Each platform's own C and C++ compilers and loader.
       - name: Qualify the C ABI round trips
         run: cargo run --quiet -p xml-sec-tools -- capi
@@ -205,6 +223,10 @@ jobs:
           domain: capi-asan
           toolchain: nightly
           save: 'true'
+      - uses: ./.github/actions/apt-packages
+        with:
+          packages: libxml2-dev pkg-config
+          recommends: 'false'
       - name: Qualify the C ABI under address, leak and undefined-behavior sanitizers
         env:
           CC: clang

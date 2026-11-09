@@ -1,6 +1,6 @@
 use super::{
-    FIPS_ONLY, HEADER, Library, Mode, build_step, declared, host, library, symbol_mismatch,
-    test_step,
+    FIPS_ONLY, HEADER, Library, Mode, Target, build_step, declared, host, library, symbol_mismatch,
+    targets, test_step,
 };
 use crate::test_support::read;
 use std::collections::BTreeSet;
@@ -29,7 +29,7 @@ fn the_library_is_the_one_cargo_names_for_the_crate() {
         r#"{"reason":"build-finished","success":true}"#,
     ]
     .join("\n");
-    let found = library(&messages, ".so").unwrap();
+    let found = library(&messages, Target::Clean, ".so").unwrap();
     assert_eq!(
         found,
         Library {
@@ -40,11 +40,47 @@ fn the_library_is_the_one_cargo_names_for_the_crate() {
     assert_eq!(found.directory(), PathBuf::from("/t/debug"));
     let windows = r#"{"reason":"compiler-artifact","target":{"name":"xml_sec_capi"},"filenames":["C:/t/xml_sec_capi.dll","C:/t/xml_sec_capi.dll.lib","C:/t/xml_sec_capi.lib"]}"#;
     assert_eq!(
-        library(windows, ".dll").unwrap().import,
+        library(windows, Target::Clean, ".dll").unwrap().import,
         Some(PathBuf::from("C:/t/xml_sec_capi.dll.lib"))
     );
-    assert!(library(&messages, ".dylib").is_err());
-    assert!(library(r#"{"reason":"build-finished","success":true}"#, ".so").is_err());
+    assert!(library(&messages, Target::Clean, ".dylib").is_err());
+    assert!(
+        library(
+            r#"{"reason":"build-finished","success":true}"#,
+            Target::Clean,
+            ".so"
+        )
+        .is_err()
+    );
+    // The bridge's build also reports the clean library it depends on; only
+    // its own artifact is the bridge.
+    let bridge = [
+        messages.as_str(),
+        r#"{"reason":"compiler-artifact","target":{"name":"xml_sec_libxml2"},"filenames":["/t/debug/libxml_sec_libxml2.rlib","/t/debug/libxml_sec_libxml2.so"]}"#,
+    ]
+    .join("\n");
+    assert_eq!(
+        library(&bridge, Target::Libxml2, ".so").unwrap().shared,
+        PathBuf::from("/t/debug/libxml_sec_libxml2.so")
+    );
+    assert!(library(&messages, Target::Libxml2, ".so").is_err());
+}
+
+#[test]
+fn the_bridge_declares_the_clean_api_and_its_entry_point() {
+    // The bridge library reexports the clean C API, so its exports are checked
+    // against both headers, and its programs include both directories.
+    let headers = Target::Libxml2.headers();
+    assert_eq!(headers[0], HEADER);
+    let bridge = declared(&read(headers[1]));
+    assert!(bridge.contains("xs_libxml2_document"));
+    assert!(!declared(&read(HEADER)).contains("xs_libxml2_document"));
+    assert_eq!(Target::Libxml2.includes().len(), 2);
+    // The bridge is qualified exactly where a support level is claimed.
+    assert_eq!(
+        targets().contains(&Target::Libxml2),
+        cfg!(any(target_os = "linux", target_os = "macos"))
+    );
 }
 
 #[test]
@@ -91,7 +127,12 @@ fn exports_and_declarations_must_match_except_the_optional_engine() {
 fn the_sanitized_build_keeps_the_callers_flags_and_names_its_target() {
     // The sanitizer applies to the target only, never to build scripts, and
     // adds to the caller's flags rather than replacing them.
-    let plain = build_step(Mode::Plain, "x86_64-unknown-linux-gnu", Some("-Dwarnings"));
+    let plain = build_step(
+        Target::Clean,
+        Mode::Plain,
+        "x86_64-unknown-linux-gnu",
+        Some("-Dwarnings"),
+    );
     assert_eq!(plain.program, "cargo");
     assert_eq!(
         plain.args,
@@ -105,6 +146,7 @@ fn the_sanitized_build_keeps_the_callers_flags_and_names_its_target() {
     );
     assert_eq!(plain.env.len(), 0);
     let sanitized = build_step(
+        Target::Clean,
         Mode::Sanitized,
         "x86_64-unknown-linux-gnu",
         Some("-Dwarnings"),
@@ -123,18 +165,12 @@ fn the_sanitized_build_keeps_the_callers_flags_and_names_its_target() {
         )]
     );
     let tests = test_step("aarch64-apple-darwin", None);
-    assert_eq!(
-        tests.args,
-        [
-            "+nightly",
-            "nextest",
-            "run",
-            "-p",
-            "xml-sec-capi",
-            "--target",
-            "aarch64-apple-darwin"
-        ]
-    );
+    let mut expected = vec!["+nightly", "nextest", "run"];
+    for target in targets() {
+        expected.extend(["-p", target.package()]);
+    }
+    expected.extend(["--target", "aarch64-apple-darwin"]);
+    assert_eq!(tests.args, expected);
     assert_eq!(
         tests.env,
         [("RUSTFLAGS".to_owned(), "-Zsanitizer=address".to_owned())]
