@@ -340,6 +340,12 @@ jobs:
           compatibility/libxmlsec1-1.3.13-ownership-rules.json
           "$XMLSEC1_PREFIX"
           compatibility/libxmlsec1-1.3.13-abi-linux-x86_64.json
+      # The compatibility library's headers are the oracle's installed ones,
+      # and its programs must print what the oracle's print.
+      - name: Check the libxmlsec1-compatible headers
+        run: cargo run --quiet -p xml-sec-tools -- xmlsec1-headers --check
+      - name: Qualify the libxmlsec1-compatible library against the oracle
+        run: cargo run --quiet -p xml-sec-tools -- capi --xmlsec1
 
   build:
     runs-on: ubuntu-latest

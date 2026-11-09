@@ -41,7 +41,7 @@ commands:
   bench-library COMPARISON_DIR SAMPLES
   bench-regression BASELINE_DIR CANDIDATE_DIR OUTPUT_DIR
   bench-xslt NEW_OUTPUT [SAMPLES]
-  capi [--sanitize]
+  capi [--sanitize | --xmlsec1]
   check-features PROFILE [all|lint|test|doc]
   ci-blocks BLOCK
   documentation [all|docs]

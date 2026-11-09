@@ -13,10 +13,9 @@ fn copied_headers_match_their_source() {
     let target = tempfile::tempdir().expect("target directory");
     installed(source.path());
     copy(source.path(), target.path()).expect("copy");
-    assert!(
-        differences(source.path(), target.path())
-            .expect("compare")
-            .is_empty()
+    assert_eq!(
+        differences(source.path(), target.path()).expect("compare"),
+        Vec::<String>::new()
     );
 }
 
