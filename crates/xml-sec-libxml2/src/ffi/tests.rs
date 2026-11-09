@@ -131,6 +131,11 @@ struct Libxml(*mut XmlDoc);
 
 impl Libxml {
     fn parse(xml: &str, options: c_int) -> Self {
+        Self::parse_bytes(xml.as_bytes(), options)
+    }
+
+    /// Parse `xml` in the encoding it declares.
+    fn parse_bytes(xml: &[u8], options: c_int) -> Self {
         // SAFETY: the buffer is live for the call; libxml2 copies what it keeps.
         let doc = unsafe {
             xmlReadMemory(
@@ -715,4 +720,128 @@ fn a_tree_with_a_dtd_is_refused_unless_the_policy_allows_one() {
     };
     assert_ne!(status, XS_OK);
     assert!(message(error).contains("DTD"), "the refusal names the DTD");
+}
+
+/// Documents whose projection must lose nothing a canonical form shows:
+/// namespace scopes and redeclarations, namespaced and `xml:` attributes,
+/// comments and processing instructions inside and around the root, CDATA,
+/// character references, attribute whitespace and non-ASCII text.
+const DIFFERENTIAL: [&str; 4] = [
+    concat!(
+        "<?xml-stylesheet href=\"a.xsl\"?><!-- before --><r xmlns=\"urn:d\" xmlns:a=\"urn:a\">",
+        "<a:e a:k=\"1\" k=\"2\" xml:lang=\"en\"><e xmlns=\"\" xmlns:a=\"urn:other\"><a:x/></e></a:e>",
+        "<!-- inside --><?pi data?></r><!-- after -->"
+    ),
+    "<r>t<![CDATA[<raw> & ]]>u&amp;&lt;&gt;&#x10FFFF;<e/>v<e></e></r>",
+    "<r a=\"x&#9;y&#10;z&#13;&quot;&lt;&amp;\" b='&apos;'>\u{e9}\u{4e2d}\u{1f600}</r>",
+    "<r xmlns:u=\"urn:u\"><u:e xmlns:u=\"urn:u\"/>  <e>\n  mixed <i>in</i> text\n</e></r>",
+];
+
+#[test]
+fn a_projected_tree_canonicalizes_as_its_text_does() {
+    // Differential check of the projection against the text parser: for each
+    // document, the libxml2 tree and the same text give the same inclusive
+    // C14N with comments, which renders every node kind and namespace scope
+    // (C14N 1.0 section 2).
+    use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document, canonicalize_xml};
+    use xml_sec::policy::VerificationPolicy;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = VerificationPolicy::default();
+    for mode in [C14nMode::Inclusive1_0, C14nMode::Exclusive1_0] {
+        let algorithm = C14nAlgorithm::new(mode, true);
+        for xml in DIFFERENTIAL {
+            let tree = Libxml::parse(xml, 0);
+            let projected = canonicalize_document(&tree_document(&tree, &policy), &algorithm)
+                .expect("the projection canonicalizes");
+            let parsed =
+                canonicalize_xml(xml.as_bytes(), &algorithm).expect("the text canonicalizes");
+            assert_eq!(
+                String::from_utf8_lossy(&projected),
+                String::from_utf8_lossy(&parsed),
+                "{mode:?}: {xml}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_document_in_another_encoding_projects_as_its_characters() {
+    // libxml2 decodes a declared encoding into UTF-8 node content, so the
+    // projection sees the characters, not the source bytes (XML 1.0 section
+    // 4.3.3): ISO-8859-1 0xE9 is U+00E9.
+    use xml_sec::c14n::{C14nAlgorithm, C14nMode, canonicalize_document};
+    use xml_sec::policy::VerificationPolicy;
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let latin = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><r a=\"\xe9\">caf\xe9</r>";
+    let tree = Libxml::parse_bytes(latin, 0);
+    let canonical = canonicalize_document(
+        &tree_document(&tree, &VerificationPolicy::default()),
+        &C14nAlgorithm::new(C14nMode::Inclusive1_0, false),
+    )
+    .expect("the projection canonicalizes");
+    assert_eq!(canonical, "<r a=\"\u{e9}\">caf\u{e9}</r>".as_bytes());
+}
+
+#[test]
+fn untouched_nodes_of_every_kind_keep_their_pointers_through_an_operation() {
+    // Signing rewrites only the template's values: comments, processing
+    // instructions, CDATA and text elsewhere stay the very nodes the caller
+    // holds, and the tree's links stay consistent.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let policy = Policy::modern();
+    let xml = TEMPLATE.replace(
+        "<other>kept</other>",
+        "<other>kept<!-- c --><?pi d?><![CDATA[raw]]></other>",
+    );
+    let doc = Libxml::parse(&xml, 0);
+    let other = doc.element("other");
+    let before = children(other);
+    let document = handle(&policy, 2, &doc);
+    sign(&policy, document);
+    assert_eq!(xs_document_destroy(document), XS_OK);
+    assert_eq!(children(other), before);
+    // SAFETY: a live document; the walk reads links only.
+    unsafe { check_links(doc.0.cast(), (*doc.0).children) };
+}
+
+/// The child nodes of `parent`, in order.
+fn children(parent: *mut XmlNode) -> Vec<*mut XmlNode> {
+    let mut found = Vec::new();
+    // SAFETY: a live element of a live document.
+    let mut child = unsafe { (*parent).children };
+    while !child.is_null() {
+        found.push(child);
+        // SAFETY: as above.
+        child = unsafe { (*child).next };
+    }
+    found
+}
+
+/// Assert that every node from `first` on names `parent` as its parent and
+/// its neighbours as each other's, and that `parent`'s `last` is the end.
+///
+/// # Safety
+/// `parent` and its descendants are live.
+unsafe fn check_links(parent: *mut XmlNode, first: *mut XmlNode) {
+    let mut previous: *mut XmlNode = std::ptr::null_mut();
+    let mut node = first;
+    // SAFETY: the caller's contract.
+    unsafe {
+        while !node.is_null() {
+            assert_eq!((*node).parent, parent);
+            assert_eq!((*node).prev, previous);
+            if (*node).kind == XML_ELEMENT_NODE {
+                check_links(node, (*node).children);
+            }
+            previous = node;
+            node = (*node).next;
+        }
+        assert_eq!((*parent).last, previous);
+    }
 }
