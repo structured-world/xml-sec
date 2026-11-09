@@ -482,12 +482,12 @@
     {
       "id": "behavior-012",
       "category": "dom-mutation",
-      "summary": "libxmlsec1 mutates SignatureValue and DigestValue nodes in place; native Rust returns a new serialized document.",
+      "summary": "libxmlsec1's DSig context mutates SignatureValue and DigestValue nodes in place; the xml-sec-libxml2 bridge edits a caller's libxml2 tree in place through the policy-bound C API, not through that context.",
       "classification": "planned-c-compatibility-boundary",
       "control": {
-        "boundary": "future libxml2 C DOM adapter",
+        "boundary": "future libxmlsec1 C context over the libxml2 DOM bridge",
         "setting": "C DOM mutation compatibility profile",
-        "default": "owned immutable Rust input with explicit returned output"
+        "default": "native Rust commits a new document generation; the bridge edits the caller's tree"
       },
       "evidence": "c-boundary-state",
       "donor_anchors": [
