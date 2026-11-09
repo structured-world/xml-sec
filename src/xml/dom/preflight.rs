@@ -266,8 +266,9 @@ impl<'input> LexicalPreflight<'input> {
 
 impl<'input, S: Storage> LexicalPreflight<'input, S> {
     /// The preflight of a document that declares nothing: no attribute
-    /// declarations exist, and the parser supplies the positions.
-    #[cfg(feature = "xml-backend-xmloxide")]
+    /// declarations exist, and the parser or the projected tree supplies the
+    /// positions.
+    #[cfg(any(feature = "xml-backend-xmloxide", feature = "external-tree"))]
     pub(super) fn unscanned(storage: S) -> Self {
         Self {
             #[cfg(feature = "xml-backend-roxmltree")]
