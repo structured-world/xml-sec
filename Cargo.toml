@@ -46,6 +46,7 @@ members = [
     "crates/xml-sec-xades",
     "crates/xml-sec-capi",
     "crates/xml-sec-libxml2",
+    "crates/xml-sec-xmlsec1",
     "tools/xmlsec1",
     "vendor/sxd-document-no-unsafe",
     "vendor/sxd-xpath-no-unsafe",

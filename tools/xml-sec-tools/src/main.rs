@@ -25,6 +25,7 @@ mod wasm_smoke;
 #[cfg(test)]
 mod workflow_contracts;
 mod xades;
+mod xmlsec1_headers;
 mod xslt_conformance;
 
 use repo::Failure;
@@ -58,6 +59,7 @@ commands:
   shared-pkix
   wasm-smoke
   xades check|corpus|dss|binding|fixtures|package ...
+  xmlsec1-headers [--check]
   xslt-conformance [--cache-managed]";
 
 fn main() -> ExitCode {
@@ -89,6 +91,7 @@ fn main() -> ExitCode {
         Some("shared-pkix") => shared_pkix::run(args),
         Some("wasm-smoke") => wasm_smoke::run(args),
         Some("xades") => xades::run(args),
+        Some("xmlsec1-headers") => xmlsec1_headers::run(args),
         Some("xslt-conformance") => xslt_conformance::run(args),
         _ => Err(Failure {
             code: 2,

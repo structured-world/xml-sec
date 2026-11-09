@@ -1,0 +1,25 @@
+[package]
+name = "xml-sec-xmlsec1"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0 AND MIT"
+publish = false
+description = "libxmlsec1 source and extension compatibility over the xml-sec core"
+
+[lib]
+# C programs link the shared or static library; `rlib` lets the crate's own
+# Rust tests call the exported functions.
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+xml-sec-libxml2 = { path = "../xml-sec-libxml2" }
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cc = "1"
+pkg-config = "0.3"
+
+[lints]
+workspace = true

@@ -1,0 +1,58 @@
+/**
+ * XML Security Library (http://www.aleksey.com/xmlsec).
+ *
+ * This is free software; see the Copyright file in the source distribution for precise wording.
+ *
+ * Copyright (C) 2002-2026 Aleksey Sanin <aleksey@aleksey.com>. All Rights Reserved.
+ */
+#ifndef __XMLSEC_PARSER_H__
+#define __XMLSEC_PARSER_H__
+
+/**
+ * @defgroup xmlsec_core_parser XML Parser
+ * @ingroup xmlsec_core
+ * @brief XML parsing helper functions.
+ * @{
+ */
+
+#include <libxml/tree.h>
+
+#include <xmlsec/exports.h>
+#include <xmlsec/xmlsec.h>
+#include <xmlsec/transforms.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif /* __cplusplus */
+
+XMLSEC_EXPORT xmlDocPtr         xmlSecParseFile         (const char *filename);
+XMLSEC_EXPORT xmlDocPtr         xmlSecParseMemory       (const xmlSecByte *buffer,
+                                                         xmlSecSize size,
+                                                         int recovery);
+XMLSEC_EXPORT xmlDocPtr         xmlSecParseMemoryExt    (const xmlSecByte *prefix,
+                                                         xmlSecSize prefixSize,
+                                                         const xmlSecByte *buffer,
+                                                         xmlSecSize bufferSize,
+                                                         const xmlSecByte *postfix,
+                                                         xmlSecSize postfixSize);
+XMLSEC_EXPORT void              xmlSecParsePrepareCtxt  (xmlParserCtxtPtr ctxt);
+
+XMLSEC_EXPORT int               xmlSecParserGetDefaultOptions(void);
+XMLSEC_EXPORT void              xmlSecParserSetDefaultOptions(int options);
+
+
+/**
+ * @brief The XML Parser transform klass.
+ */
+#define xmlSecTransformXmlParserId \
+        xmlSecTransformXmlParserGetKlass()
+XMLSEC_EXPORT xmlSecTransformId xmlSecTransformXmlParserGetKlass        (void);
+
+
+#ifdef __cplusplus
+}
+#endif /* __cplusplus */
+
+/** @} */ /** xmlsec_core_parser */
+
+#endif /* __XMLSEC_PARSER_H__ */
