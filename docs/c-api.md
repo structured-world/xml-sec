@@ -198,8 +198,10 @@ cargo build --release -p xml-sec-libxml2
 # target/release/libxml_sec_libxml2.{so,dylib,a}
 ```
 
-Linux and macOS are qualified; no support level is claimed on Windows. The
-crate's `SAFETY.md` records what the bridge assumes and guarantees.
+Qualified platforms: Linux x86_64 with the distribution's libxml2 and macOS
+arm64 with Homebrew's, with the default features; one passing platform claims
+nothing for another, and no support level is claimed on Windows. The crate's
+`SAFETY.md` records what the bridge assumes and guarantees.
 
 ## Qualification
 
